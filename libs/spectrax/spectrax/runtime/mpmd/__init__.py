@@ -52,6 +52,7 @@ from .runtime import (
     sxjit,
     sxvalue_and_grad,
 )
+from .tracing import ScheduleTracer, format_schedule_grid, trace_schedule
 from .training_step import sxvalue_and_grad_and_apply
 from .treduce import (
     Add,
@@ -62,15 +63,20 @@ from .treduce import (
     treduce,
     treduce_i,
 )
+from .watchdog import DispatchWatchdog, StalledSpan, StallReport, dispatch_watchdog
 
 __all__ = [
     "Add",
     "Concat",
+    "DispatchWatchdog",
     "Max",
     "MpmdPipelineDispatchStats",
     "MpmdPipelineExecutor",
     "Op",
     "PscanPlan",
+    "ScheduleTracer",
+    "StallReport",
+    "StalledSpan",
     "build_pscan_plan",
     "cluster_jaxpr_by_markers",
     "collect_task_times_ms",
@@ -78,7 +84,9 @@ __all__ = [
     "compile_per_rank_fwd",
     "compile_ranked_executables",
     "dispatch_pscan",
+    "dispatch_watchdog",
     "extract_rank_actions",
+    "format_schedule_grid",
     "get_num_stages",
     "get_num_stages_from_grid",
     "has_pscan",
@@ -96,6 +104,7 @@ __all__ = [
     "sxstage_region",
     "sxvalue_and_grad",
     "sxvalue_and_grad_and_apply",
+    "trace_schedule",
     "treduce",
     "treduce_i",
 ]

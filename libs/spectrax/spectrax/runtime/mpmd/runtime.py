@@ -115,6 +115,7 @@ from ..schedules import (
 )
 from ..types.array import StagesArray
 from ..types.mesh import MpMdMesh, resolve_mpmd_mesh
+from . import instrumentation as _instr
 from .grad_core import (
     _accumulate_grad_tree_donate,
     _accumulate_state,
@@ -6206,6 +6207,10 @@ def _dispatch_schedule_fused_async(
                 exc=repr(exc),
             )
             raise
+        if _instr.block_requested():
+            # Device-inclusive unit spans for an attached tracer; the
+            # dispatcher mode itself is unchanged.
+            jax.block_until_ready(out)
         elapsed_ms = (time.perf_counter_ns() - t0) / 1e6
         _all_process_debug_print(
             "stage-call-finish",
@@ -8058,6 +8063,8 @@ def _dispatch_schedule_fused_async(
             unit: Unit value consumed by this operation.
         """
         t0 = time.perf_counter_ns()
+        trace_span = _instr.begin_unit(unit, dispatch_span=trace_dispatch_span)
+        trace_error: BaseException | None = None
         _progress(
             "unit-enter",
             unit_index=unit.index,
@@ -8080,7 +8087,8 @@ def _dispatch_schedule_fused_async(
                 _run_fwd(unit.fwd_logical, unit.rank, unit.virt, unit.payload)
             else:
                 _run_bwd(unit.bwd_logical, unit.rank, unit.virt, unit.payload)
-        except BaseException:
+        except BaseException as unit_exc:
+            trace_error = unit_exc
             _progress(
                 "unit-fail",
                 unit_index=unit.index,
@@ -8096,6 +8104,7 @@ def _dispatch_schedule_fused_async(
             )
             raise
         finally:
+            _instr.end(trace_span, error=trace_error)
             elapsed_ms = (time.perf_counter_ns() - t0) / 1e6
             if stats_collector is not None:
                 stats_collector.record_unit(unit.index, unit.rank, elapsed_ms)
@@ -9515,40 +9524,68 @@ def _dispatch_schedule_fused_async(
         )
     phase_timings_ms: dict[str, float] = {}
     dispatch_wall_start_ns = time.perf_counter_ns()
-    phase_start_ns = time.perf_counter_ns()
-    _warm_compile_schedule(units)
-    phase_timings_ms["warm_compile_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
-    phase_start_ns = time.perf_counter_ns()
-    if use_ordered_deterministic_async:
-        _run_units_deterministic_nonblocking(
-            units,
-            deps,
-            transfer_worker_count=1,
+    trace_dispatch_span = None
+    if _instr.active():
+        unit_table = []
+        for trace_unit in units:
+            trace_label, _trace_meta = _instr.describe_unit(trace_unit)
+            unit_table.append({"index": trace_unit.index, "rank": trace_unit.rank, "label": trace_label})
+        trace_dispatch_span = _instr.begin(
+            "dispatch",
+            f"{type(plan['schedule']).__name__} m={m}",
+            dispatcher=stats_collector.dispatcher,
+            schedule=type(plan["schedule"]).__name__,
+            microbatches=int(m),
+            n_logical=int(n_logical),
+            n_ranks=len(rank_submeshes),
+            units=unit_table,
+            deps={int(idx): sorted(int(d) for d in unit_deps) for idx, unit_deps in deps.items()},
         )
-    elif use_ordered_threaded_async:
-        event_order = _ordered_transfer_task_order(units, deps)
-        event_gate = _OrderedScheduleTransportGate(event_order) if event_order else None
-        ordered_transfer_workers = len(event_order) if event_order else None
-        with _ordered_schedule_transport_scope(event_gate):
-            if event_gate is not None:
-                ordered_names_by_unit = {unit.index: _ordered_launch_names_for_unit(unit) for unit in units}
-                launch_gate_names_by_unit = ordered_names_by_unit
-                _run_units_ordered_dependency_async(
-                    units,
-                    deps,
-                    event_gate=event_gate,
-                    ordered_transfer_names_by_unit=ordered_names_by_unit,
-                    launch_gate_names_by_unit=launch_gate_names_by_unit,
-                    transfer_worker_count=ordered_transfer_workers,
-                )
-            else:
-                _run_units_dependency_async(units, deps, transfer_worker_count=ordered_transfer_workers)
-    elif use_threaded_async:
-        _run_units_dependency_async(units, deps)
-    else:
-        for unit in units:
-            _run_unit(unit)
-    phase_timings_ms["run_units_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
+    trace_dispatch_error: BaseException | None = None
+    try:
+        phase_start_ns = time.perf_counter_ns()
+        trace_compile_span = _instr.begin("compile", "warm compile", unit_count=len(units))
+        try:
+            _warm_compile_schedule(units)
+        finally:
+            _instr.end(trace_compile_span)
+        phase_timings_ms["warm_compile_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
+        phase_start_ns = time.perf_counter_ns()
+        if use_ordered_deterministic_async:
+            _run_units_deterministic_nonblocking(
+                units,
+                deps,
+                transfer_worker_count=1,
+            )
+        elif use_ordered_threaded_async:
+            event_order = _ordered_transfer_task_order(units, deps)
+            event_gate = _OrderedScheduleTransportGate(event_order) if event_order else None
+            ordered_transfer_workers = len(event_order) if event_order else None
+            with _ordered_schedule_transport_scope(event_gate):
+                if event_gate is not None:
+                    ordered_names_by_unit = {unit.index: _ordered_launch_names_for_unit(unit) for unit in units}
+                    launch_gate_names_by_unit = ordered_names_by_unit
+                    _run_units_ordered_dependency_async(
+                        units,
+                        deps,
+                        event_gate=event_gate,
+                        ordered_transfer_names_by_unit=ordered_names_by_unit,
+                        launch_gate_names_by_unit=launch_gate_names_by_unit,
+                        transfer_worker_count=ordered_transfer_workers,
+                    )
+                else:
+                    _run_units_dependency_async(units, deps, transfer_worker_count=ordered_transfer_workers)
+        elif use_threaded_async:
+            _run_units_dependency_async(units, deps)
+        else:
+            for unit in units:
+                _run_unit(unit)
+        phase_timings_ms["run_units_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
+    except BaseException as dispatch_exc:
+        trace_dispatch_error = dispatch_exc
+        raise
+    finally:
+        _instr.end(trace_dispatch_span, error=trace_dispatch_error)
 
     final_grads: list[object] = []
     phase_start_ns = time.perf_counter_ns()
@@ -12180,7 +12217,7 @@ def _place_state_on_rank(
 TransportKind = Literal["device_put"]
 
 
-def _transport(
+def _transport_impl(
     kind: TransportKind,
     x: object,
     dest_sharding: object,
@@ -12301,6 +12338,7 @@ def _transport(
     )
     nbytes = _tree_nbytes(x)
     skip, cache_hit = _can_skip_device_put(x, target_sharding)
+    _instr.annotate("transfer", nbytes=int(nbytes), skipped=bool(skip), cache_hit=bool(cache_hit))
     _log_transport_diagnostic(
         x,
         dest_sharding,
@@ -12340,6 +12378,7 @@ def _transport(
     )
 
     def record_method(method: str) -> None:
+        _instr.annotate("transfer", method=method)
         if stats is not None:
             stats.record_transport_method(method)
 
@@ -12596,6 +12635,45 @@ def _transport(
     if gate is not None:
         return gate.run(task_name, run_transport)
     return run_transport()
+
+
+def _transport(
+    kind: TransportKind,
+    x: object,
+    dest_sharding: object,
+    *,
+    task_name: str | None = None,
+    stats: _ScheduleStatsCollector | None = None,
+    src_rank: int | None = None,
+    dst_rank: int | None = None,
+    preserve_current_layout: bool = True,
+) -> object:
+    """Move ``x`` to ``dest_sharding``; see :func:`_transport_impl`.
+
+    Records a ``"transfer"`` instrumentation span (bytes, skip flag, chosen
+    method) when a tracer or watchdog is attached.
+    """
+    span = (
+        _instr.begin("transfer", task_name or "transfer", rank=dst_rank, src_rank=src_rank, dst_rank=dst_rank)
+        if _instr.active()
+        else None
+    )
+    try:
+        out = _transport_impl(
+            kind,
+            x,
+            dest_sharding,
+            task_name=task_name,
+            stats=stats,
+            src_rank=src_rank,
+            dst_rank=dst_rank,
+            preserve_current_layout=preserve_current_layout,
+        )
+    except BaseException as exc:
+        _instr.end(span, error=exc)
+        raise
+    _instr.end(span)
+    return out
 
 
 def _edge_transfer_sharding(
