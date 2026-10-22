@@ -27,44 +27,31 @@ Features:
     - Python AST-based parsing for safe evaluation
     - Optional delimiter token handling
     - Streaming with bracket completion
-    - Regex timeout handling for complex patterns
+    - Regex timeout handling with a linear-time structural pre-check
     - Support for nested data structures
 """
 
 from __future__ import annotations
 
 import ast
-import json
-import re
 from collections.abc import Sequence
-from typing import Any
 
+import regex as re
 from eformer.loggings import get_logger
 from transformers import PreTrainedTokenizerBase
 
 from ...openai_api_modules import (
     ChatCompletionRequest,
-    DeltaFunctionCall,
     DeltaMessage,
-    DeltaToolCall,
     ExtractedToolCallInformation,
-    FunctionCall,
-    ToolCall,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
+from ._pythonic_ast import UnexpectedAstError, compute_tool_delta, handle_single_tool, make_valid_python
 
 logger = get_logger(__name__)
 
-
-class _UnexpectedAstError(Exception):
-    """Exception raised when AST parsing encounters unexpected structure.
-
-    This exception is used internally to signal that the parsed AST does not
-    match the expected format for tool calls (e.g., not a list of function
-    calls, invalid argument types).
-    """
-
-    pass
+# Backward-compatible private alias for the shared exception type.
+_UnexpectedAstError = UnexpectedAstError
 
 
 @ToolParserManager.register_module("llama4_pythonic")  # pyright: ignore[reportUntypedClassDecorator]
@@ -79,7 +66,7 @@ class Llama4PythonicToolParser(ToolParser):
         - Python AST-based parsing
         - Optional delimiter token support
         - Streaming with bracket completion
-        - Regex timeout handling for complex patterns
+        - Regex timeout handling with a linear-time structural pre-check
         - Support for nested data structures
 
     Format:
@@ -87,24 +74,29 @@ class Llama4PythonicToolParser(ToolParser):
         or simply: [func1(arg1="val1"), func2(arg2="val2")]
 
     Attributes:
-        TOOL_CALL_REGEX: Compiled regex pattern for detecting tool call syntax.
+        TOOL_CALL_REGEX: Compiled structural pre-check. AST parsing validates the syntax.
+        regex_timeout: Maximum seconds allowed for the regex pre-check.
 
     Use --enable-auto-tool-choice --tool-call-parser llama4_pythonic
     """
 
-    TOOL_CALL_REGEX = re.compile(
-        r"\[([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s)?\),\s*)*([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s*)?\)\s*)+\]",
-        re.DOTALL,
-    )
+    TOOL_CALL_REGEX = re.compile(r"\s*\[.*\]\s*", re.DOTALL)
 
-    def __init__(self, tokenizer: PreTrainedTokenizerBase):
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, regex_timeout: float = 0.05):
         """Initialize the Llama4PythonicToolParser.
 
         Args:
             tokenizer: The tokenizer associated with the Llama 4 model.
                 Used for token-level operations during streaming.
+            regex_timeout: Positive time budget in seconds for the structural regex.
+
+        Raises:
+            ValueError: If the regex timeout is not positive and finite.
         """
         super().__init__(tokenizer)
+        if not 0 < regex_timeout < float("inf"):
+            raise ValueError("regex_timeout must be positive and finite")
+        self.regex_timeout = regex_timeout
         self.tool_call_start_token = "["
         self.tool_call_end_token = "]"
         self.bot_token = "<|python_start|>"
@@ -127,12 +119,41 @@ class Llama4PythonicToolParser(ToolParser):
         """
         self.current_tool_id = value
 
+    @staticmethod
+    def _validate_tool_call_shape(module: ast.Module) -> list[ast.Call]:
+        """Validate structure before converting the supported keyword-only calls.
+
+        Args:
+            module: Parsed complete or bracket-completed tool output.
+
+        Returns:
+            Calls whose arguments can be converted without silently dropping data.
+
+        Raises:
+            UnexpectedAstError: If output is not one list of simple calls, or
+                calls contain positional/starred arguments, keyword unpacking,
+                or repeated keyword names. Literal values are validated by the
+                shared AST converter.
+        """
+        if len(module.body) != 1 or not isinstance(module.body[0], ast.Expr):
+            raise UnexpectedAstError("Tool output must be one list of function calls")
+        parsed = module.body[0].value
+        if not isinstance(parsed, ast.List) or not all(isinstance(call, ast.Call) for call in parsed.elts):
+            raise UnexpectedAstError("Tool output must be a list of function calls")
+        for call in parsed.elts:
+            if not isinstance(call.func, ast.Name) or call.args:
+                raise UnexpectedAstError("Tool calls require a simple name and keyword-only arguments")
+            names = [keyword.arg for keyword in call.keywords]
+            if None in names or len(names) != len(set(names)):
+                raise UnexpectedAstError("Tool calls cannot unpack or repeat keyword arguments")
+        return parsed.elts
+
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
         """Extract tool calls from a complete model response.
 
         Parses the model output to identify and extract Python-style function
         calls. Handles optional <|python_start|> and <|python_end|> delimiters.
-        Uses regex for initial detection and AST parsing for extraction.
+        Uses a linear-time bracket check for initial detection and AST parsing for extraction.
 
         Args:
             model_output: The complete text output from the model.
@@ -145,34 +166,37 @@ class Llama4PythonicToolParser(ToolParser):
                 - content: Original content if no tools called, None otherwise
         """
 
+        original_output = model_output
         if model_output.startswith("<|python_start|>"):
-            model_output = model_output[len("<|python_start|>") :]
-            model_output = model_output.replace("<|python_end|>", "")
+            model_output = model_output[len("<|python_start|>") :].removesuffix("<|python_end|>")
 
-        is_tool_call_pattern = False
+        # Keep the gate structural (no nested repetition over argument values) and
+        # enforce the documented regex time budget with the timeout-capable engine.
+        stripped = model_output.strip()
+        if not (stripped.startswith("[") and stripped.endswith("]")):
+            return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=original_output)
+
         try:
-            is_tool_call_pattern = self.TOOL_CALL_REGEX.match(model_output) is not None
+            if self.TOOL_CALL_REGEX.fullmatch(stripped, timeout=self.regex_timeout) is None:
+                return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=original_output)
+            calls = self._validate_tool_call_shape(ast.parse(stripped))
+            if not calls:
+                return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=original_output)
+            return ExtractedToolCallInformation(
+                tools_called=True,
+                tool_calls=[handle_single_tool(call) for call in calls],
+                content=None,
+            )
         except TimeoutError:
-            logger.warning("Regex timeout occurred when matching tool call pattern.")
-            logger.debug("Regex timeout occurred when matching user input: %s", model_output)
-
-        if not is_tool_call_pattern:
-            return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
-
-        try:
-            module = ast.parse(model_output)
-            parsed = getattr(module.body[0], "value", None)
-            if isinstance(parsed, ast.List) and all(isinstance(e, ast.Call) for e in parsed.elts):
-                return ExtractedToolCallInformation(
-                    tools_called=True,
-                    tool_calls=[_handle_single_tool(e) for e in parsed.elts],
-                    content=None,
-                )
-            else:
-                raise _UnexpectedAstError("Tool output must be a list of function calls")
+            logger.warning("Regex timed out while detecting Llama 4 tool calls")
+            return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=original_output)
+        except SyntaxError:
+            # Bracketed prose such as "[Note] ..." is ordinary content, not a malformed call.
+            logger.debug("Model output is not valid Python; treating it as plain content.")
+            return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=original_output)
         except Exception:
             logger.exception("Error in extracting tool call from response.")
-            return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
+            return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=original_output)
 
     def extract_tool_calls_streaming(
         self,
@@ -212,7 +236,7 @@ class Llama4PythonicToolParser(ToolParser):
                 current_text = current_text[len("<|python_start|>") :]
             if current_text.endswith("<|python_end|>"):
                 current_text = current_text[: current_text.rfind("<|python_end|>")]
-            valid_and_added_text = _make_valid_python(current_text)
+            valid_and_added_text = make_valid_python(current_text)
             if valid_and_added_text is None:
                 return None
             valid_text, added_text = valid_and_added_text
@@ -221,10 +245,8 @@ class Llama4PythonicToolParser(ToolParser):
             if not module.body:
                 # Nothing parseable yet (e.g. only the <|python_start|> prefix arrived).
                 return None
-            parsed = getattr(module.body[0], "value", None)
-            if not isinstance(parsed, ast.List) or not all(isinstance(e, ast.Call) for e in parsed.elts):
-                raise _UnexpectedAstError("Tool output must be a list of function calls")
-            tool_calls = [_handle_single_tool(e) for e in parsed.elts]
+            calls = self._validate_tool_call_shape(module)
+            tool_calls = [handle_single_tool(call) for call in calls]
 
             tool_deltas = []
             for index, new_call in enumerate(tool_calls):
@@ -243,7 +265,7 @@ class Llama4PythonicToolParser(ToolParser):
                 if not new_call_complete and added_text[-2] == ")":
                     withheld_suffix = withheld_suffix + "}"
                 withheld_suffix = withheld_suffix.replace("'", '"')
-                delta = _compute_tool_delta(self.streamed_args_for_tool[index], new_call, index, withheld_suffix)
+                delta = compute_tool_delta(self.streamed_args_for_tool[index], new_call, index, withheld_suffix)
 
                 if delta is not None:
                     tool_deltas.append(delta)
@@ -264,180 +286,3 @@ class Llama4PythonicToolParser(ToolParser):
             logger.exception("Error trying to handle streaming tool call.")
             logger.debug("Skipping chunk as a result of tool streaming extraction error")
             return None
-
-
-def _get_parameter_value(val: ast.expr) -> Any:
-    """Extract parameter value from AST expression.
-
-    Recursively processes AST nodes to extract Python literals
-    including constants, dictionaries, and lists.
-
-    Args:
-        val: AST expression node to evaluate.
-
-    Returns:
-        Python value extracted from the AST node. Can be:
-            - str, int, float, bool, None for ast.Constant
-            - dict for ast.Dict (with recursive value extraction)
-            - list for ast.List (with recursive value extraction)
-
-    Raises:
-        _UnexpectedAstError: If expression is not a supported literal type
-            or if dict keys are not constants.
-    """
-    if isinstance(val, ast.Constant):
-        return val.value
-    elif isinstance(val, ast.Dict):
-        if not all(isinstance(k, ast.Constant) for k in val.keys):
-            raise _UnexpectedAstError("Dict tool call arguments must have literal keys")
-        return {k.value: _get_parameter_value(v) for k, v in zip(val.keys, val.values, strict=False)}
-    elif isinstance(val, ast.List):
-        return [_get_parameter_value(v) for v in val.elts]
-    else:
-        raise _UnexpectedAstError("Tool call arguments must be literals")
-
-
-def _handle_single_tool(call: ast.Call) -> ToolCall:
-    """Convert AST Call node to ToolCall object.
-
-    Extracts function name and keyword arguments from Python
-    function call AST representation.
-
-    Args:
-        call: AST Call node representing a function invocation.
-
-    Returns:
-        ToolCall object with:
-            - type: "function"
-            - function: FunctionCall with name and JSON-encoded arguments
-
-    Raises:
-        _UnexpectedAstError: If the function name is not a simple identifier
-            (ast.Name) or if arguments cannot be extracted.
-    """
-    if not isinstance(call.func, ast.Name):
-        raise _UnexpectedAstError("Invalid tool call name")
-    function_name = call.func.id
-    arguments = {}
-    for keyword in call.keywords:
-        arguments[keyword.arg] = _get_parameter_value(keyword.value)
-    return ToolCall(type="function", function=FunctionCall(name=function_name, arguments=json.dumps(arguments)))
-
-
-def _make_valid_python(text: str) -> tuple[str, str] | None:
-    """Complete partial Python code by adding closing brackets.
-
-    Tracks bracket stack to determine what closing characters
-    are needed to make partial Python code syntactically valid.
-    Handles brackets, parentheses, braces, and quotes.
-
-    Args:
-        text: Partial Python code string that may be incomplete.
-
-    Returns:
-        Tuple of (completed_text, added_text) where:
-            - completed_text: The input text with closing brackets appended
-            - added_text: The characters that were added to complete the code
-        Returns None if the text ends with incomplete parameter name or value
-        (e.g., ends with '=' or ':'), indicating more tokens are needed.
-
-    Raises:
-        _UnexpectedAstError: If mismatched brackets are detected.
-    """
-    bracket_stack = []
-    for index, char in enumerate(text):
-        if char in {"[", "(", "{"}:
-            bracket_stack.append(char)
-        elif char == "]":
-            if not bracket_stack or bracket_stack.pop() != "[":
-                raise _UnexpectedAstError("Mismatched square brackets")
-        elif char == ")":
-            if not bracket_stack or bracket_stack.pop() != "(":
-                raise _UnexpectedAstError("Mismatched parentheses")
-        elif char == "}":
-            if not bracket_stack or bracket_stack.pop() != "{":
-                raise _UnexpectedAstError("Mismatched curly braces")
-        elif char in {"'", '"'}:
-            if bracket_stack and bracket_stack[-1] == char:
-                if index > 0 and text[index - 1] == "\\":
-                    pass
-                else:
-                    bracket_stack.pop()
-            elif bracket_stack and bracket_stack[-1] in {"'", '"'}:
-                pass
-            else:
-                bracket_stack.append(char)
-
-    text = text.rstrip()
-    if text.endswith("=") or text.endswith(":"):
-        return None
-    if bracket_stack and bracket_stack[-1] == "{":
-        trailing_dict_text = text[: text.rfind("{")]
-        num_keys = trailing_dict_text.count(":")
-        num_values = trailing_dict_text.count(",")
-        if num_keys <= num_values:
-            return None
-    if bracket_stack and bracket_stack[-1] == "(":
-        trailing_params_text = text[: text.rfind("(")]
-        num_full_param_names = trailing_params_text.count("=")
-        num_full_param_values = trailing_params_text.count(",")
-        if num_full_param_names <= num_full_param_values:
-            return None
-    if text.endswith(","):
-        text = text[:-1]
-    if bracket_stack and bracket_stack[-1] == "[" and not text.endswith("[") and not text.endswith(")"):
-        return None
-
-    added_text = ""
-    for char in reversed(bracket_stack):
-        if char == "[":
-            added_text += "]"
-        elif char == "(":
-            added_text += ")"
-        elif char == "{":
-            added_text += "}"
-        elif char == "'":
-            added_text += "'"
-        elif char == '"':
-            added_text += '"'
-
-    return text + added_text, added_text
-
-
-def _compute_tool_delta(
-    previously_sent_args: str, new_call: ToolCall, index: int, withheld_suffix: str
-) -> DeltaToolCall | None:
-    """Compute the delta between previously sent and current tool call arguments.
-
-    Calculates what new argument data should be sent in a streaming response
-    by comparing previously sent arguments with the current state.
-
-    Args:
-        previously_sent_args: JSON string of arguments already sent to client.
-        new_call: The current ToolCall with updated arguments.
-        index: The index of this tool call in the response.
-        withheld_suffix: Characters to withhold from the end of arguments
-            (used for incomplete streaming data).
-
-    Returns:
-        DeltaToolCall containing the incremental update, or None if no new
-        data to send. For the first delta of a tool call, includes the
-        function name; subsequent deltas only include argument differences.
-    """
-    new_call_args = new_call.function.arguments
-    if withheld_suffix:
-        assert new_call_args.endswith(withheld_suffix)
-        new_call_args = new_call_args[: -len(withheld_suffix)]
-    if not previously_sent_args:
-        return DeltaToolCall(
-            id=new_call.id,
-            type="function",
-            index=index,
-            function=DeltaFunctionCall(
-                name=new_call.function.name,
-                arguments=new_call_args,
-            ),
-        )
-
-    arg_diff = new_call_args[len(previously_sent_args) :]
-    return DeltaToolCall(id=None, index=index, function=DeltaFunctionCall(arguments=arg_diff)) if arg_diff else None

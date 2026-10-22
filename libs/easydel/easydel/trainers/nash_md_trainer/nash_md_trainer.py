@@ -44,7 +44,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.helpers import capture_time
 
-from .._shared import drop_optimizer_state
+from .._shared import copy_frozen_policy, drop_optimizer_state
 from ..group_relative_policy_optimization._fn import get_per_token_logps
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
 from ..metrics import _host_mean_float
@@ -185,6 +185,7 @@ class NashMDTrainer(GRPOTrainer):
         """
         if reward_funcs is None:
             raise ValueError("NashMDTrainer requires at least one reward function.")
+        self._reference_model = reference_model
         super().__init__(
             arguments=arguments,
             model=model,
@@ -194,10 +195,6 @@ class NashMDTrainer(GRPOTrainer):
             processing_class=processing_class,
             reward_processing_classes=reward_processing_classes,
         )
-        ref_state = _ensure_state(reference_model, trainable_selector=arguments.trainable_selector)
-        if ref_state is not None:
-            self.ref_state = drop_optimizer_state(ref_state)
-
         self._beta_schedule = arguments.beta
         self._mixture_schedule = arguments.mixture_coef
         self.missing_eos_penalty = arguments.missing_eos_penalty
@@ -206,6 +203,13 @@ class NashMDTrainer(GRPOTrainer):
             reward_funcs_list = reward_funcs if isinstance(reward_funcs, list) else [reward_funcs]
             if len(reward_funcs_list) != 1:
                 raise ValueError("NashMDTrainer only supports a single reward function/model.")
+
+    def _create_reference_state(self, model: EasyDeLState) -> EasyDeLState:
+        """Keep a mixture-generation reference even when KL regularization is zero."""
+        ref_state = _ensure_state(self._reference_model, trainable_selector=self.arguments.trainable_selector)
+        # Do not retain a caller's optimizer-bearing state after freezing it.
+        self._reference_model = None
+        return copy_frozen_policy(model) if ref_state is None else drop_optimizer_state(ref_state)
 
     def _schedule_value(self, schedule: tp.Any, default: float) -> float:
         """Resolve the current value of an epoch-wise schedule.
@@ -385,7 +389,7 @@ class NashMDTrainer(GRPOTrainer):
                 )
 
         self.compute_refmodel_logps = compile_trainer_step(
-            partial(_compute_model_logps, graphdef=self.model_state.graphdef),
+            partial(_compute_model_logps, graphdef=self.ref_state.graphdef),
             mesh=mesh,
             static_argnames=("graphdef",),
             in_shardings=(

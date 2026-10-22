@@ -115,7 +115,26 @@ from easydel.utils.traversals import (
     unflatten_dict,
 )
 
-from ..base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict, is_remote_url
+# Legacy filename constants live in ``base_config``; re-exported here (see the module docstring) so there is a
+# single definition.
+from ..base_config import (  # noqa: F401
+    CHAT_TEMPLATE_NAME,
+    FEATURE_EXTRACTOR_NAME,
+    GENERATION_CONFIG_NAME,
+    IMAGE_PROCESSOR_NAME,
+    MODEL_CARD_NAME,
+    PROCESSOR_NAME,
+    SAFE_WEIGHTS_INDEX_NAME,
+    SAFE_WEIGHTS_NAME,
+    TF2_WEIGHTS_INDEX_NAME,
+    TF2_WEIGHTS_NAME,
+    TF_WEIGHTS_NAME,
+    WEIGHTS_INDEX_NAME,
+    WEIGHTS_NAME,
+    EasyDeLBaseConfig,
+    EasyDeLBaseConfigDict,
+    is_remote_url,
+)
 from ..base_config import download_url as _download_url
 from ..etils import EasyDeLBackends, EasyDeLPlatforms
 from ..sharding import MeshLike
@@ -124,22 +143,9 @@ if tp.TYPE_CHECKING:
     from ..base_module import EasyDeLBaseModule
 logger = get_logger(__name__)
 
-WEIGHTS_NAME = "pytorch_model.bin"
-WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
-TF2_WEIGHTS_NAME = "tf_model.h5"
-TF2_WEIGHTS_INDEX_NAME = "tf_model.h5.index.json"
-TF_WEIGHTS_NAME = "model.ckpt"
-SAFE_WEIGHTS_NAME = "model.safetensors"
-SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
 ED_SAFE_WEIGHTS_INDEX_NAME = "easydel-model.parameters.safetensors.index.json"
 TENSORSTORE_INDEX_NAME = "tensorstore_index.json"
 CONFIG_NAME = "config.json"
-FEATURE_EXTRACTOR_NAME = "preprocessor_config.json"
-IMAGE_PROCESSOR_NAME = FEATURE_EXTRACTOR_NAME
-PROCESSOR_NAME = "processor_config.json"
-CHAT_TEMPLATE_NAME = "chat_template.json"
-GENERATION_CONFIG_NAME = "generation_config.json"
-MODEL_CARD_NAME = "modelcard.json"
 
 
 #: Sentinel: this key was a quantization scale, already consumed alongside its
@@ -206,8 +212,6 @@ def _build_quant_decoder(hf_config: tp.Any, ckpt_keys: tp.Iterable[str]):
         return None
 
     key_set = set(ckpt_keys)
-    scale_suffixes = {".scale", ".weight_scale", ".weight_scale_inv"}
-    scale_keys = {k for k in key_set if any(k.endswith(s) for s in scale_suffixes)}
 
     def _source_for(key: str):
         """Pick the per-layer source format, honouring `overrides`."""
@@ -216,15 +220,33 @@ def _build_quant_decoder(hf_config: tp.Any, ckpt_keys: tp.Iterable[str]):
                 return fmt
         return parsed.default
 
+    # Only scales paired with quantized weights are metadata. Prefer the
+    # adapter-declared spelling, retaining historical sibling suffix aliases.
+    # A learned parameter named `scale` is not metadata merely by suffix.
+    weight_scales = {}
+    for key in key_set:
+        if not key.endswith(".weight"):
+            continue
+        stem = key[: -len(".weight")]
+        if parsed.ignored.matches(stem):
+            continue
+        suffixes = (*adapter.source_suffixes(_source_for(key)), "scale", "weight_scale", "weight_scale_inv")
+        scale_key = next(
+            (
+                f"{stem}.{suffix}"
+                for suffix in suffixes
+                if suffix in ("scale", "weight_scale", "weight_scale_inv") and f"{stem}.{suffix}" in key_set
+            ),
+            None,
+        )
+        if scale_key is not None:
+            weight_scales[key] = scale_key
+    scale_keys = set(weight_scales.values())
+
     def decode(key: str, tensor, fetch):
         if key in scale_keys:
             return _QUANT_CONSUMED
-        if not key.endswith(".weight"):
-            return None
-        stem = key[: -len(".weight")]
-        scale_key = next(
-            (f"{stem}{s}" for s in (".scale", ".weight_scale", ".weight_scale_inv") if f"{stem}{s}" in scale_keys), None
-        )
+        scale_key = weight_scales.get(key)
         if scale_key is None:
             return None
         source = _source_for(key)
@@ -266,6 +288,7 @@ def _build_quant_decoder(hf_config: tp.Any, ckpt_keys: tp.Iterable[str]):
             )
         )
 
+    decode.consumed_keys = frozenset(scale_keys)
     return decode
 
 
@@ -325,6 +348,7 @@ CANDIDATE_FILENAMES = [
     SAFE_WEIGHTS_NAME,
     ED_SAFE_WEIGHTS_INDEX_NAME,
     TENSORSTORE_INDEX_NAME,
+    "model_structure.json",
 ]
 
 
@@ -353,53 +377,250 @@ def working_or_temp_dir(working_dir: str | os.PathLike | None = None, use_temp_d
         yield working_dir
 
 
-def _tree_key_to_path(key: tp.Any) -> str:
-    """Normalize a pytree key into a slash-delimited path string.
-
-    Tuples are joined with ``/``; strings containing ``.`` are converted to
-    slash form for consistency with checkpoint indices.
-
-    Args:
-        key: A pytree key (tuple of segments or string).
-
-    Returns:
-        str: Slash-delimited path representation.
-    """
-    if isinstance(key, tuple):
-        return "/".join(str(k) for k in key)
-    s = str(key)
-    return s if "/" in s else s.replace(".", "/")
+_HUB_KWARG_NAMES = ("cache_dir", "revision", "token", "local_files_only", "force_download", "subfolder", "proxies")
+_TRANSFORMER_OPTION_NAMES = (
+    "embedding_layer_names",
+    "layernorm_names",
+    "moe_block_names",
+    "moe_names",
+    "moe_block_path",
+    "moe_path",
+    "reform_param",
+    "hf_flattened_wrappers",
+    "checkpoint_key_normalizer",
+)
 
 
-def _path_match_variants(path: str) -> tuple[str, ...]:
-    """Build exact-match path variants for different checkpoint key prefixes.
-
-    Checkpoints written by EasyDeL vs HuggingFace use different prefixes
-    (``model/parameters/...``, ``parameters/...``, ``model/...``, or bare
-    leaf paths). This helper expands a canonical path into all the common
-    aliases so :class:`Checkpointer` lookups can match on the first hit.
+def _checkpoint_transformer_options(transformer: tp.Any) -> tuple[tp.Any, ...]:
+    """Extract the conversion options shared by both streaming loaders.
 
     Args:
-        path: Slash-delimited canonical path from the live model.
+        transformer: Model's partial ``pure_transform_fn``.
 
     Returns:
-        tuple[str, ...]: Sorted, deduplicated path variants including both
-        slash- and dot-delimited forms.
+        Options in ``_TRANSFORMER_OPTION_NAMES`` order; absent options are ``None``.
     """
-    normalized = path.strip("/")
-    slash_variants = {normalized}
+    return tuple(transformer.keywords.get(name) for name in _TRANSFORMER_OPTION_NAMES)
 
-    if normalized.startswith("model/parameters/"):
-        slash_variants.add(normalized[len("model/parameters/") :])
-        slash_variants.add(normalized[len("model/") :])
-    if normalized.startswith("parameters/"):
-        slash_variants.add(normalized[len("parameters/") :])
-    if normalized.startswith("model/"):
-        slash_variants.add(normalized[len("model/") :])
 
-    dot_variants = {p.replace("/", ".") for p in slash_variants}
-    all_variants = slash_variants | dot_variants
-    return tuple(sorted(v for v in all_variants if v))
+def _extract_hub_kwargs(kwargs: collections.abc.Mapping[str, tp.Any]) -> dict[str, tp.Any]:
+    """Pick the HuggingFace Hub download kwargs out of a ``from_pretrained``-style kwargs mapping.
+
+    Args:
+        kwargs: Caller-supplied keyword arguments. Not mutated.
+
+    Returns:
+        dict[str, Any]: The subset of ``cache_dir``, ``revision``, ``token``, ``local_files_only``,
+        ``force_download``, ``subfolder`` and ``proxies`` present in ``kwargs``.
+    """
+    return {k: kwargs[k] for k in _HUB_KWARG_NAMES if k in kwargs}
+
+
+def _split_subfolder(filename: str, subfolder: str) -> tuple[str, str]:
+    """Decide whether *filename* already includes the configured subfolder.
+
+    Args:
+        filename: Candidate filename, possibly already prefixed with the subfolder.
+        subfolder: Configured repo subfolder (may be empty).
+
+    Returns:
+        tuple[str, str]: ``(filename, effective_subfolder)`` to forward to ``hf_hub_download``.
+    """
+    if not subfolder:
+        return filename, ""
+    normalized = subfolder.strip("/").replace("\\", "/")
+    if filename.startswith(normalized + "/"):
+        return filename, ""
+    return filename, normalized
+
+
+def _hf_download_file(
+    repo_id: str,
+    filename: str,
+    *,
+    subfolder: str,
+    revision: str | None,
+    cache_dir: str | None,
+    force_download: bool,
+    proxies: tp.Any,
+    token: str | bool | None,
+    local_files_only: bool,
+) -> str:
+    """Download one file from the HF Hub, honoring the configured subfolder.
+
+    Args:
+        repo_id: Hub repository id.
+        filename: Repo-relative filename.
+        subfolder: Configured repo subfolder (may be empty).
+        revision: Optional branch/tag/commit.
+        cache_dir: Hub cache directory.
+        force_download: Whether to re-download cached files.
+        proxies: Optional proxy mapping.
+        token: Hub token.
+        local_files_only: Whether to refuse network access.
+
+    Returns:
+        str: Local path to the downloaded file.
+    """
+    filename, effective_subfolder = _split_subfolder(filename, subfolder)
+    return huggingface_hub.hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        subfolder=effective_subfolder,
+        revision=revision,
+        cache_dir=cache_dir,
+        force_download=force_download,
+        proxies=proxies,
+        token=token,
+        local_files_only=local_files_only,
+    )
+
+
+def _find_local_file(root: str, filename: str, subfolder: str, *, disabled: bool = False) -> str | None:
+    """Locate *filename* under a local pretrained-model directory.
+
+    Args:
+        root: Candidate local model directory.
+        filename: Repo-relative filename.
+        subfolder: Configured repo subfolder (may be empty).
+        disabled: When ``True`` (e.g. a remote ``gs://`` source) never resolve locally.
+
+    Returns:
+        str | None: Absolute local path when the file exists, else ``None``.
+    """
+    if disabled or not os.path.isdir(root):
+        return None
+    filename, effective_subfolder = _split_subfolder(filename, subfolder)
+    if effective_subfolder:
+        root = os.path.join(root, effective_subfolder)
+    candidate = os.path.join(root, filename)
+    return candidate if os.path.isfile(candidate) else None
+
+
+def _load_json_index(path: str) -> dict[str, tp.Any]:
+    """Read a JSON checkpoint index file from *path*.
+
+    Args:
+        path: Filesystem path to the JSON file.
+
+    Returns:
+        dict: Parsed JSON contents.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _expert_merge_for_key(k: str, nk: str, *, hf_key_mapper, hf_model_type, key_normalizer):
+    """Place a per-expert key in transformers' merged expert layout (see ``resolve_expert_merge``).
+
+    Args:
+        k: Raw checkpoint key.
+        nk: The same key after normalization.
+        hf_key_mapper: ``HFCheckpointKeyMapper`` for the model, or ``None`` when the model normalizes keys itself.
+        hf_model_type: HF ``model_type`` used for the conversion-mapping lookup.
+        key_normalizer: The model's own ``checkpoint_key_normalizer`` or ``None``.
+
+    Returns:
+        The expert-merge description, or ``None`` when the key is not a mergeable expert tensor.
+    """
+    from easydel.utils.parameters_transformation import resolve_expert_merge
+
+    if hf_key_mapper is not None:
+        return hf_key_mapper.expert_merge(k)
+    return resolve_expert_merge(nk, hf_model_type, apply_renamings=key_normalizer is not None)
+
+
+def _match_moe_checkpoint_key(
+    key: str,
+    *,
+    normalize_key: tp.Callable[[str], str | None],
+    resolve_merge: tp.Callable,
+    moe_block_path: tp.Sequence[str] | None,
+    moe_names: tp.Collection[str],
+    moe_path: tp.Sequence[str] | None,
+    expert_fusion_sources: tp.Collection[str] = (),
+    hf_merge_targets: tp.Collection[str] = (),
+) -> tuple[str, int, tp.Any] | None:
+    """Resolve an expert checkpoint key to a stacked runtime or synthetic merge group.
+
+    Both streaming loaders share canonical expert-name mapping. The in-memory
+    converter may additionally request synthetic groups used by reform fusions;
+    the direct-to-disk writer requests only groups it can write incrementally.
+
+    Args:
+        key: Original checkpoint key, preserved by callers for shard fetches.
+        normalize_key: Model/HF key normalizer; ``None`` means the key is unowned.
+        resolve_merge: Resolver for HF expert-merge metadata.
+        moe_block_path: Model expert-block prefixes.
+        moe_names: Runtime expert leaf names.
+        moe_path: Declared runtime expert paths.
+        expert_fusion_sources: Additional stacked source paths consumed by reform fusions.
+        hf_merge_targets: HF merged tensor keys consumed by reform rules.
+
+    Returns:
+        ``(group_path, expert_index, synthetic_merge_spec)`` or ``None`` when unclaimed.
+    """
+    from easydel.utils.parameters_transformation import canonical_expert_leaf
+
+    if not (moe_block_path and moe_names and moe_path):
+        return None
+    normalized = normalize_key(key)
+    expert_name = moe_path[0].split(".")[-2]
+    expert_prefix = f".{expert_name}."
+    if normalized is None or expert_prefix not in normalized:
+        return None
+    merge = resolve_merge(key, normalized)
+    for block_path in moe_block_path:
+        prefix = block_path + expert_prefix
+        if not normalized.startswith(prefix):
+            continue
+        expert_part, separator, leaf = normalized[len(prefix) :].partition(".")
+        if not separator or not expert_part.isdigit():
+            continue
+        name = leaf.removesuffix(".weight")
+        if merge is not None and name not in moe_names:
+            _, _, spec, part = merge
+            canonical = canonical_expert_leaf(spec, part)
+            if canonical in moe_names:
+                name = canonical
+            elif len(spec.parts) == 1 and spec.target in moe_names:
+                name = spec.target
+        target = f"{block_path}.{expert_name}.{name}"
+        if name in moe_names or target in expert_fusion_sources:
+            return target, int(expert_part), None
+    if merge is not None and merge[0] in hf_merge_targets:
+        merged_key, expert_index, spec, part = merge
+        return f"{merged_key}#part{part}", expert_index, spec
+    return None
+
+
+def _normalize_checkpoint_key(
+    k: str, *, key_normalizer, hf_key_mapper, hf_model_type, hf_flattened_wrappers
+) -> str | None:
+    """Map a checkpoint key to EasyDeL naming (re-insert flattened wrappers).
+
+    A model's own normalizer encodes its on-disk layout; otherwise transformers' load-time renames are used, so
+    keys match what the full loader sees (e.g. VLMs saved under legacy ``language_model.model.*``).
+
+    Args:
+        k: Raw checkpoint state-dict key (old or new HF layout).
+        key_normalizer: The model's own ``checkpoint_key_normalizer`` or ``None``.
+        hf_key_mapper: ``HFCheckpointKeyMapper`` for the model, or ``None``.
+        hf_model_type: HF ``model_type`` used for the rename lookup.
+        hf_flattened_wrappers: Flattened wrapper prefixes to re-insert.
+
+    Returns:
+        str | None: The normalized key; ``None`` marks a tensor the runtime does not own.
+    """
+    from easydel.utils.parameters_transformation import StateDictConverter, hf_rename_key
+
+    if key_normalizer is not None:
+        k = key_normalizer(k)
+    else:
+        k = hf_rename_key(k, hf_model_type, mapper=hf_key_mapper)
+    if k is None:
+        return None
+    return StateDictConverter.normalize_flattened_wrapper_key(k, hf_flattened_wrappers)
 
 
 def _checkpoint_cpu_device() -> jax.Device | None:  # pyright: ignore[reportInvalidTypeForm] #type: ignore
@@ -764,13 +985,7 @@ def _parse_torch_load_options(kwargs: dict[str, tp.Any]) -> TorchLoadOptions:
         )
         torch_streaming_cache = "hf_cache"
 
-    hub_kwargs = {
-        k: kwargs[k] for k in ("cache_dir", "revision", "token", "local_files_only", "force_download") if k in kwargs
-    }
-    if "subfolder" in kwargs:
-        hub_kwargs["subfolder"] = kwargs["subfolder"]
-    if "proxies" in kwargs:
-        hub_kwargs["proxies"] = kwargs["proxies"]
+    hub_kwargs = _extract_hub_kwargs(kwargs)
 
     return TorchLoadOptions(
         mode=torch_load_mode,
@@ -983,11 +1198,21 @@ class EasyBridgeMixin(PushToHubMixin):
             logger.info(
                 f"Normalizing {len(numpy_leaf_paths)} NumPy checkpoint leaves to CPU-backed JAX arrays before save: {preview}{suffix}"
             )
+        # save_pretrained has already selected the complete checkpoint directory,
+        # including its config/card. Keep all prefixes there while recording the step
+        # in Checkpointer's standard discovery metadata.
+        checkpoint_options = {"step": int(step), "destination": "."} if step is not None else {}
         output_model_file = Checkpointer(
             base_path=str(save_directory),
             save_interval=None,
             step_policies=[],
-        ).save_pytree(tree=state_dict, prefix="model", mesh=self.mesh, dtype=float_dtype)
+        ).save_pytree(
+            tree=state_dict,
+            prefix="model",
+            mesh=self.mesh,
+            dtype=float_dtype,
+            **checkpoint_options,
+        )
 
         logger.info(f"Model weights saved in {output_model_file}")
 
@@ -999,6 +1224,8 @@ class EasyBridgeMixin(PushToHubMixin):
         float_dtype: jnp.dtype | None = None,
         step: int | None = None,
         upload_num_threads: int | None = None,
+        versioned: bool = True,
+        mismatch_allowed: bool = True,
         **kwargs,
     ):
         """Saves the model, its configuration, and optionally pushes it to the Hugging Face Hub.
@@ -1014,6 +1241,11 @@ class EasyBridgeMixin(PushToHubMixin):
                 Defaults to None.
             upload_num_threads (int | None, optional): Number of concurrent upload threads
                 to use for Hub commits. If None, EasyDeL auto-selects a capped default.
+            versioned: If True and ``step`` is given, save a complete checkpoint
+                under ``save_directory/run-{step}``. An already matching per-step
+                directory is reused. Set False when a caller owns checkpoint layout.
+            mismatch_allowed: If False, require all model parameters to be
+                materialized before saving or uploading. Defaults to True.
             **kwargs: Additional keyword arguments for Hugging Face Hub (e.g., repo_id,
                 commit_message).
 
@@ -1026,8 +1258,12 @@ class EasyBridgeMixin(PushToHubMixin):
         if easy_directory.is_file():
             logger.error(f"Provided path ({easy_directory}) should be a directory, not a file")
             return
-
         repo_id = kwargs.pop("repo_id", easy_directory.name)
+        if step is not None and versioned and easy_directory.name != f"run-{int(step)}":
+            easy_directory = easy_directory / f"run-{int(step)}"
+        if not mismatch_allowed:
+            self.assert_parameters_materialized(context="saving checkpoint (mismatch_allowed=False)")
+
         commit_message: str | None = None
         files_timestamps: dict[str, float] = {}
         if push_to_hub:
@@ -1094,7 +1330,11 @@ class EasyBridgeMixin(PushToHubMixin):
             Call ``gather_model()`` before pushing if you need gathered weights in
             the exported checkpoint.
         """
+        if not mismatch_allowed:
+            self.assert_parameters_materialized(context="pushing checkpoint (mismatch_allowed=False)")
         working_dir = ePath(repo_id.split("/")[-1])
+        if verbose:
+            logger.info("Uploading model checkpoint to %s", repo_id)
 
         repo_id = create_repo(
             repo_id,
@@ -1303,6 +1543,7 @@ class EasyBridgeMixin(PushToHubMixin):
         checkpoint_load_tensorstore_assume_metadata: bool = True,
         checkpoint_load_tensorstore_metadata_workers: int = 256,
         checkpoint_load_progress: bool | None = None,
+        mismatch_allowed: bool = True,
     ) -> EasyDeLBaseModule:
         """Loads model weights from a checkpoint file.
 
@@ -1338,6 +1579,10 @@ class EasyBridgeMixin(PushToHubMixin):
             checkpoint_load_progress: Whether to show a tqdm-style progress
                 line while TensorStore checkpoint tensors are deserialized.
                 ``None`` follows *verbose*.
+            mismatch_allowed: If ``True`` (default), checkpoint leaves that the
+                model does not declare are dropped. If ``False``, unexpected,
+                missing parameter arrays, and shape-mismatched leaves raise
+                ``ValueError`` before the state is merged.
 
         Returns:
             EasyDeLBaseModule: The model with loaded parameters.
@@ -1392,10 +1637,16 @@ class EasyBridgeMixin(PushToHubMixin):
         extraargs = {}
         itwas_tensorstore = False
         if resolved_archive_file:
-            if str(resolved_archive_file).endswith(TENSORSTORE_INDEX_NAME):
-                resolved_archive_file = _strip_trailing_separators(
-                    str(resolved_archive_file)[: -len(TENSORSTORE_INDEX_NAME)]
-                )
+            native_marker = next(
+                (
+                    name
+                    for name in (TENSORSTORE_INDEX_NAME, "model_structure.json")
+                    if str(resolved_archive_file).endswith(name)
+                ),
+                None,
+            )
+            if native_marker is not None:
+                resolved_archive_file = _strip_trailing_separators(str(resolved_archive_file)[: -len(native_marker)])
                 itwas_tensorstore = True
                 extraargs["chunk_size"] = checkpoint_load_chunk_size
                 extraargs["concurrent_gb"] = checkpoint_load_concurrent_gb
@@ -1535,6 +1786,11 @@ class EasyBridgeMixin(PushToHubMixin):
                 return key
             if len(key) > 1 and key[1:] in kernel_map:
                 return key[1:]
+            # Structure-backed SpectraX callbacks include the save prefix as
+            # well as the collection: model.parameters.<module>.weight.
+            if len(key) > 2 and key[:2] in (("model", "parameters"), ("model", "params")):
+                if key[2:] in kernel_map:
+                    return key[2:]
             return None
 
         def _quantize_kernel(kernel_value) -> dict[str, tp.Any]:
@@ -1565,6 +1821,7 @@ class EasyBridgeMixin(PushToHubMixin):
                     out["packed"] = pack_int4_adjacent(quant_kernel)
                 return out
 
+            from ejkernel.callib import ejit  # pyright: ignore[reportMissingTypeStubs]
             from ejkernel.quantization import prepack_quantized_weights  # pyright: ignore[reportMissingTypeStubs]
 
             _prepack = ejit(prepack_quantized_weights, static_argnames=["group_size", "bits", "mode", "transpose"])
@@ -1658,11 +1915,15 @@ class EasyBridgeMixin(PushToHubMixin):
                     state = flatten_dict(state)
                 state = string_key_to_int(state)
                 _declared_leaf_keys: set[tuple[tp.Any, ...]] = set()
+                _declared_leaf_shapes: dict[tuple[tp.Any, ...], tuple] = {}
                 try:
                     for _c, _d in spx.export(model)[1].raw().items():
-                        for _path in flatten_dict(_d):
+                        for _path, _value in flatten_dict(_d).items():
                             _declared_leaf_keys.add(tuple(_path))
                             _declared_leaf_keys.add((_c, *_path))
+                            if hasattr(_value, "shape"):
+                                _declared_leaf_shapes[tuple(_path)] = _value.shape
+                                _declared_leaf_shapes[(_c, *_path)] = _value.shape
                 except Exception as exc:  # keep the legacy behaviour on any surprise
                     logger.debug(f"Could not enumerate model leaves for legacy-rename guard ({exc}).")
                 state = _rename_legacy_checkpoint_leaves(state, known_keys=_declared_leaf_keys)
@@ -1785,6 +2046,17 @@ class EasyBridgeMixin(PushToHubMixin):
                         _target = _rule_sharding_for(_key)
                         if _target is None or _leaf.sharding == _target:
                             continue
+                        if (
+                            not mismatch_allowed
+                            and _key in _declared_leaf_shapes
+                            and _canonical_kernel_path(_key) not in streamed_quant
+                        ):
+                            expected_shape = _declared_leaf_shapes[_key]
+                            if _leaf.shape != expected_shape:
+                                raise ValueError(
+                                    f"Checkpoint is incompatible (mismatch_allowed=False): "
+                                    f"{'.'.join(map(str, _key))} has shape {_leaf.shape}, expected {expected_shape}"
+                                )
                         state[_key] = jax.device_put(_leaf, _target)
                         _replaced += 1
                     if _replaced:
@@ -1837,14 +2109,6 @@ class EasyBridgeMixin(PushToHubMixin):
                         "apply_quantization was requested but no quantization_config was provided; "
                         "defaulting to INT8. Pass quantization_config to control quantization type."
                     )
-                from ejkernel.callib import ejit  # pyright: ignore[reportMissingTypeStubs]
-                from ejkernel.quantization import prepack_quantized_weights  # pyright: ignore[reportMissingTypeStubs]
-
-                prepack_quantized_weights = ejit(
-                    prepack_quantized_weights,
-                    static_argnames=["group_size", "bits", "mode", "transpose"],
-                )
-
                 if kernel_map:
                     if quantizer_for_modules is None:
                         from easydel.layers.quantization._quants import EasyQuantizer
@@ -1942,6 +2206,31 @@ class EasyBridgeMixin(PushToHubMixin):
                     lm_head_names=lm_head_names,
                 )
                 unexpected_keys = set(state.keys()) - required_params
+                if unexpected_keys and not mismatch_allowed:
+                    preview = ", ".join(sorted(".".join(map(str, key)) for key in list(unexpected_keys)[:8]))
+                    more = f", ... +{len(unexpected_keys) - 8} more" if len(unexpected_keys) > 8 else ""
+                    raise ValueError(
+                        f"Checkpoint {resolved_archive_file} has {len(unexpected_keys)} leaf/leaves the model does "
+                        f"not declare (mismatch_allowed=False): {preview}{more}"
+                    )
+                if not mismatch_allowed:
+                    missing = {
+                        key
+                        for key in required_params - state.keys()
+                        if key and key[0] == "parameters" and hasattr(required_param_leaves[key], "shape")
+                    }
+                    mismatched = {
+                        key
+                        for key in required_params & state.keys()
+                        if hasattr(required_param_leaves[key], "shape")
+                        and getattr(state[key], "shape", None) != required_param_leaves[key].shape
+                    }
+                    if missing or mismatched:
+                        details = ", ".join(sorted(".".join(map(str, key)) for key in missing | mismatched)[:8])
+                        raise ValueError(
+                            f"Checkpoint {resolved_archive_file} is incompatible (mismatch_allowed=False): "
+                            f"{len(missing)} missing and {len(mismatched)} shape-mismatched leaves: {details}"
+                        )
                 for unexpected_key in unexpected_keys:
                     del state[unexpected_key]
 
@@ -2152,7 +2441,25 @@ class EasyBridgeMixin(PushToHubMixin):
             logger.info("Offline mode: forcing local_files_only=True")
             local_files_only = True
 
+        # Select a versioned checkpoint before resolving any metadata. Otherwise
+        # a root config (or its absence) can disagree with the latest weights.
+        if pretrained_model_name_or_path is not None:
+            checkpoint_root = ePath(pretrained_model_name_or_path) / subfolder
+            if checkpoint_root.is_dir() and not any((checkpoint_root / name).is_file() for name in CANDIDATE_FILENAMES):
+                latest = find_latest_checkpoint(str(checkpoint_root))
+                if latest is not None:
+                    pretrained_model_name_or_path = str(latest)
+                    subfolder = ""
         config_path = config if config is not None else pretrained_model_name_or_path
+        config_loading_kwargs = dict(
+            subfolder=subfolder,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            local_files_only=local_files_only,
+            token=token,
+            revision=revision,
+            proxies=proxies,
+        )
 
         timings: dict[str, float] = {}
         total_start = time.perf_counter()
@@ -2168,8 +2475,36 @@ class EasyBridgeMixin(PushToHubMixin):
                 backend=backend,
                 platform=platform,
                 model_task=cls._model_task,
+                **config_loading_kwargs,
             )
-            _apply_legacy_native_config_defaults(config, config_path)
+            # Auto config implementations may retain otherwise-consumed Hub
+            # kwargs as attributes. Credentials are transport-only and must
+            # never survive on the model's serializable config.
+            for credential_name in ("token", "use_auth_token", "proxies"):
+                config.__dict__.pop(credential_name, None)
+            # The compatibility adapter re-reads raw config.json to distinguish
+            # absent legacy fields from explicitly saved values. Point it at the
+            # same metadata selected above, never a conflicting checkpoint root
+            # or the Hub's default branch without the supplied access options.
+            try:
+                metadata_root = ePath(config_path)
+                metadata_path = config_path
+                if metadata_root.is_dir():
+                    metadata_path = metadata_root / subfolder / CONFIG_NAME
+                elif not metadata_root.is_file() and not is_remote_url(str(config_path)):
+                    metadata_path = api.hf_hub_download(
+                        repo_id=str(config_path),
+                        filename=CONFIG_NAME,
+                        **{
+                            **config_loading_kwargs,
+                            "revision": commit_hash or getattr(config, "_commit_hash", None) or revision,
+                        },
+                    )
+                _apply_legacy_native_config_defaults(config, str(metadata_path))
+            except Exception as exc:
+                # As in the shared adapter, inability to re-read metadata must
+                # not prevent loading an otherwise resolved configuration.
+                logger.debug("Could not read selected config for legacy defaults (%s).", exc)
         config_kwargs = {} if config_kwargs is None else config_kwargs
         config.add_basic_configurations(
             sharding_axis_dims=sharding_axis_dims,
@@ -2315,8 +2650,9 @@ class EasyBridgeMixin(PushToHubMixin):
 
         archive_name = filename or os.path.basename(str(resolved_archive_file or ""))
         resolved_archive_str = str(resolved_archive_file or "")
-        is_tensorstore_checkpoint = archive_name == TENSORSTORE_INDEX_NAME or resolved_archive_str.rstrip("/").endswith(
-            TENSORSTORE_INDEX_NAME
+        is_tensorstore_checkpoint = any(
+            archive_name == name or resolved_archive_str.rstrip("/").endswith(name)
+            for name in (TENSORSTORE_INDEX_NAME, "model_structure.json")
         )
         if auto_shard_model and shard_fns is None:
             if is_tensorstore_checkpoint:
@@ -2362,6 +2698,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 checkpoint_load_tensorstore_assume_metadata,
                 checkpoint_load_tensorstore_metadata_workers,
                 checkpoint_load_progress,
+                mismatch_allowed=mismatch_allowed,
             )
         with _phase_timer("model.quantize", accumulator=timings):
             model = model.quantize(
@@ -2901,24 +3238,6 @@ class EasyBridgeMixin(PushToHubMixin):
         subfolder = str(kwargs.get("subfolder", "") or "")
         cache_dir = kwargs.get("cache_dir", None)
 
-        def _strip_or_keep_subfolder(filename: str) -> tuple[str, str]:
-            """Decide whether *filename* already includes the configured subfolder.
-
-            Args:
-                filename: Candidate filename, possibly already prefixed with
-                    the subfolder.
-
-            Returns:
-                tuple: ``(filename, effective_subfolder)`` to forward to
-                ``hf_hub_download``.
-            """
-            if not subfolder:
-                return filename, ""
-            normalized = subfolder.strip("/").replace("\\", "/")
-            if filename.startswith(normalized + "/"):
-                return filename, ""
-            return filename, normalized
-
         def _hf_download(filename: str, *, cache_dir_override: str | None = None) -> str:
             """Download a file from the HF Hub, honoring the configured subfolder.
 
@@ -2930,11 +3249,10 @@ class EasyBridgeMixin(PushToHubMixin):
             Returns:
                 str: Local path to the downloaded file.
             """
-            filename, effective_subfolder = _strip_or_keep_subfolder(filename)
-            return huggingface_hub.hf_hub_download(
-                repo_id=pretrained_model_name_or_path,
-                filename=filename,
-                subfolder=effective_subfolder,
+            return _hf_download_file(
+                pretrained_model_name_or_path,
+                filename,
+                subfolder=subfolder,
                 revision=revision,
                 cache_dir=cache_dir_override if cache_dir_override is not None else cache_dir,
                 force_download=force_download,
@@ -2944,23 +3262,8 @@ class EasyBridgeMixin(PushToHubMixin):
             )
 
         def _find_local(filename: str) -> str | None:
-            """Locate *filename* under a local pretrained-model directory.
-
-            Args:
-                filename: Repo-relative filename.
-
-            Returns:
-                str | None: Absolute local path when the file exists, else
-                ``None``.
-            """
-            if not os.path.isdir(pretrained_model_name_or_path):
-                return None
-            filename, effective_subfolder = _strip_or_keep_subfolder(filename)
-            root = pretrained_model_name_or_path
-            if effective_subfolder:
-                root = os.path.join(root, effective_subfolder)
-            candidate = os.path.join(root, filename)
-            return candidate if os.path.isfile(candidate) else None
+            """Locate *filename* under a local pretrained-model directory (``None`` when absent)."""
+            return _find_local_file(pretrained_model_name_or_path, filename, subfolder)
 
         def _resolve_shard(fname: str, cache_dir_override: str | None = None) -> str:
             """Unified shard resolution: local first, then HF download."""
@@ -2969,17 +3272,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 return local_path
             return _hf_download(fname, cache_dir_override=cache_dir_override)
 
-        def _load_index(path: str) -> dict[str, tp.Any]:
-            """Read a JSON checkpoint index file from *path*.
-
-            Args:
-                path: Filesystem path to the JSON file.
-
-            Returns:
-                dict: Parsed JSON contents.
-            """
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+        _load_index = _load_json_index
 
         resolved_index_file: str | None = None
         resolved_single_file: str | None = None
@@ -3022,7 +3315,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 except (FileNotFoundError, huggingface_hub.errors.EntryNotFoundError):
                     resolved_single_file = None
 
-            if resolved_single_file is None:
+            if resolved_index_file is None and resolved_single_file is None:
                 try:
                     resolved_single_file = _hf_download(WEIGHTS_NAME)
                     ckpt_weight_format = "bin"
@@ -3107,9 +3400,6 @@ class EasyBridgeMixin(PushToHubMixin):
         from easydel.utils.parameters_transformation import (
             HFCheckpointKeyMapper,
             StateDictConverter,
-            canonical_expert_leaf,
-            hf_rename_key,
-            resolve_expert_merge,
         )
 
         ckpt_weight_format = ckpt_info.ckpt_weight_format
@@ -3121,23 +3411,27 @@ class EasyBridgeMixin(PushToHubMixin):
         torch_streaming_tmp_dir = load_options.streaming_tmp_dir
 
         transformer = model.pure_transform_fn
-        embedding_layer_names = transformer.keywords.get("embedding_layer_names")
-        layernorm_names = transformer.keywords.get("layernorm_names")
-        moe_block_names = transformer.keywords.get("moe_block_names")
-        moe_names = transformer.keywords.get("moe_names")
-        moe_block_path = transformer.keywords.get("moe_block_path")
-        moe_path = transformer.keywords.get("moe_path")
-        reform_param = transformer.keywords.get("reform_param")
-        hf_flattened_wrappers = transformer.keywords.get("hf_flattened_wrappers")
-        # Vendor-layout checkpoints (DeepSeek-V4) rewrite keys before every
-        # other rule; `None` marks a tensor the runtime does not own.
-        _ckpt_key_normalizer = transformer.keywords.get("checkpoint_key_normalizer")
+        (
+            embedding_layer_names,
+            layernorm_names,
+            moe_block_names,
+            moe_names,
+            moe_block_path,
+            moe_path,
+            reform_param,
+            hf_flattened_wrappers,
+            _ckpt_key_normalizer,
+        ) = _checkpoint_transformer_options(transformer)
 
         def _resolve_merge(k: str, nk: str):
             """Place a per-expert key in transformers' merged expert layout (see ``resolve_expert_merge``)."""
-            if hf_key_mapper is not None:
-                return hf_key_mapper.expert_merge(k)
-            return resolve_expert_merge(nk, hf_model_type, apply_renamings=_ckpt_key_normalizer is not None)
+            return _expert_merge_for_key(
+                k,
+                nk,
+                hf_key_mapper=hf_key_mapper,
+                hf_model_type=hf_model_type,
+                key_normalizer=_ckpt_key_normalizer,
+            )
 
         def _normalize_key(k: str) -> str | None:
             """Map a checkpoint key to EasyDeL naming (re-insert flattened wrappers).
@@ -3149,16 +3443,13 @@ class EasyBridgeMixin(PushToHubMixin):
                 str: The key with any transformers >= 5.13 flattened wrapper
                 prefix re-inserted; unchanged when already in EasyDeL layout.
             """
-            # A model's own normalizer encodes its on-disk layout; otherwise use
-            # transformers' load-time renames, so keys match what the full loader
-            # sees (e.g. VLMs saved under legacy ``language_model.model.*``).
-            if _ckpt_key_normalizer is not None:
-                k = _ckpt_key_normalizer(k)
-            else:
-                k = hf_rename_key(k, hf_model_type, mapper=hf_key_mapper)
-            if k is None:
-                return None
-            return StateDictConverter.normalize_flattened_wrapper_key(k, hf_flattened_wrappers)
+            return _normalize_checkpoint_key(
+                k,
+                key_normalizer=_ckpt_key_normalizer,
+                hf_key_mapper=hf_key_mapper,
+                hf_model_type=hf_model_type,
+                hf_flattened_wrappers=hf_flattened_wrappers,
+            )
 
         moe_names_set = set(moe_names or [])
         expected_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
@@ -3206,61 +3497,22 @@ class EasyBridgeMixin(PushToHubMixin):
         moe_expert_keys: set[str] = set()
 
         def _register_moe_key(k: str):
-            """Group an HF expert weight key under its consolidated MoE target path.
-
-            Matching runs on the normalized (EasyDeL-layout) key while the
-            original checkpoint key is stored for later shard fetches.
-
-            Args:
-                k: A flattened HF state-dict key.
-
-            Returns:
-                None. ``moe_groups`` and ``moe_expert_keys`` from the
-                enclosing scope are updated in-place.
-            """
-            if not (moe_block_path and moe_names_set and moe_path):
-                return
-            nk = _normalize_key(k)
-            # `None` marks a tensor the runtime does not own (see
-            # `apply_checkpoint_key_normalizer`); it has no expert group.
-            if nk is None or expert_prefix not in nk:
-                return
-            merge = _resolve_merge(k, nk)
-            for block_path in moe_block_path:
-                block_expert_prefix = block_path + expert_prefix
-                if not nk.startswith(block_expert_prefix):
-                    continue
-                remainder = nk[len(block_expert_prefix) :]
-                dot_idx = remainder.find(".")
-                if dot_idx <= 0:
-                    continue
-                expert_part = remainder[:dot_idx]
-                if not expert_part.isdigit():
-                    continue
-                expert_idx = int(expert_part)
-                moe_name_part = remainder[dot_idx + 1 :]
-                moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
-                if merge is not None and moe_name not in moe_names_set:
-                    merged_key, _, spec, part = merge
-                    canonical = canonical_expert_leaf(spec, part)
-                    if canonical in moe_names_set:
-                        # One runtime leaf per part under transformers' names
-                        # (Mixtral `w2` -> `down_proj`, DeepSeek-V4 `w1` -> `gate_proj`).
-                        moe_name = canonical
-                    elif len(spec.parts) == 1 and spec.target in moe_names_set:
-                        moe_name = spec.target
-                target_path = f"{block_path}.{expected_expert_name}.{moe_name}"
-                if moe_name not in moe_names_set and target_path not in expert_fusion_sources:
-                    continue
+            """Record the shared expert matcher result for in-memory stacking/fusion."""
+            match = _match_moe_checkpoint_key(
+                k,
+                normalize_key=_normalize_key,
+                resolve_merge=_resolve_merge,
+                moe_block_path=moe_block_path,
+                moe_names=moe_names_set,
+                moe_path=moe_path,
+                expert_fusion_sources=expert_fusion_sources,
+                hf_merge_targets=hf_merge_targets,
+            )
+            if match is not None:
+                target_path, expert_idx, spec = match
+                if spec is not None:
+                    hf_merge_specs[target_path.rsplit("#part", 1)[0]] = spec
                 moe_groups.setdefault(target_path, {})[expert_idx] = k
-                moe_expert_keys.add(k)
-                return
-            # Nothing on the runtime's own expert paths claims this key: build the
-            # tensor transformers merges in memory, if a rule consumes it.
-            if merge is not None and merge[0] in hf_merge_targets:
-                merged_key, expert_idx, spec, part = merge
-                hf_merge_specs[merged_key] = spec
-                moe_groups.setdefault(f"{merged_key}#part{part}", {})[expert_idx] = k
                 moe_expert_keys.add(k)
 
         if not ckpt_key_to_filename:
@@ -3289,8 +3541,11 @@ class EasyBridgeMixin(PushToHubMixin):
         for target_path in moe_groups:
             consolidated_moe_keys.add(f"{target_path}.weight")
 
-        getattr(model, "config", hf_config)
-        normalized_to_original = {nk: k for k in ckpt_key_to_filename if (nk := _normalize_key(k)) is not None}
+        quant_decode = _build_quant_decoder(hf_config, ckpt_key_to_filename)
+        consumed_quant_keys = getattr(quant_decode, "consumed_keys", frozenset())
+        normalized_to_original = {
+            nk: k for k in ckpt_key_to_filename if k not in consumed_quant_keys and (nk := _normalize_key(k)) is not None
+        }
         reform_fusion_groups, reform_fusion_rules = StateDictConverter.collect_reform_param_fusion_groups(
             normalized_to_original.keys(),
             reform_param,
@@ -3387,9 +3642,10 @@ class EasyBridgeMixin(PushToHubMixin):
                 None. Side-effect: populates the ``parameters_flat`` dict
                 in the enclosing scope.
             """
-            results = StateDictConverter.process_tensor(
-                key if pre_normalized else _normalize_key(key), tensor, converter_config
-            )
+            normalized = key if pre_normalized else _normalize_key(key)
+            if normalized is None:
+                return
+            results = StateDictConverter.process_tensor(normalized, tensor, converter_config)
             if results is None:
                 return
             for key_tuple, jax_array in results:
@@ -3432,6 +3688,33 @@ class EasyBridgeMixin(PushToHubMixin):
             with tempfile.TemporaryDirectory(dir=torch_streaming_tmp_dir) as tmpdir:
                 yield resolve_shard(fname, tmpdir)
 
+        def _read_source(key: str, getter):
+            """Decode original-key sources before stacking, fusion or conversion.
+
+            Scale lookup uses the checkpoint index, including when the sibling
+            was stored in another shard. Synthetic fused keys never pass here.
+            """
+            tensor = getter(key)
+            if quant_decode is None:
+                return tensor
+
+            def fetch(scale_key):
+                filename = ckpt_key_to_filename[scale_key]
+                if filename == ckpt_key_to_filename[key]:
+                    return getter(scale_key)
+                with _with_resolved_shard(filename) as path:
+                    if ckpt_weight_format == "safetensors":
+                        with safe_open(path, framework="pt", device="cpu") as handle:
+                            return handle.get_tensor(scale_key)
+                    try:
+                        scale_shard = torch.load(path, map_location="cpu", weights_only=True)
+                    except TypeError:
+                        scale_shard = torch.load(path, map_location="cpu")
+                    return scale_shard[scale_key]
+
+            decoded = quant_decode(key, tensor, fetch)
+            return tensor if decoded is None else decoded
+
         def _emit_stacked(stacked_key: str, stacked_tensor):
             """Convert a stacked expert tensor, or hold it until its fusion group is complete."""
             fused_key = stacked_fusion_by_source.get(stacked_key)
@@ -3462,6 +3745,8 @@ class EasyBridgeMixin(PushToHubMixin):
             """
             file_to_non_moe_keys: dict[str, list[str]] = {}
             for key, fname in ckpt_key_to_filename.items():
+                if key in consumed_quant_keys or _normalize_key(key) is None:
+                    continue
                 if key in moe_expert_keys:
                     continue
                 if key in reform_fusion_source_keys:
@@ -3501,12 +3786,12 @@ class EasyBridgeMixin(PushToHubMixin):
                     if ckpt_weight_format == "safetensors":
                         with safe_open(resolved_path, framework="pt", device="cpu") as f:
                             for k in sorted(non_moe_keys):
-                                _process_tensor(k, f.get_tensor(k))
+                                _process_tensor(k, _read_source(k, f.get_tensor))
 
                             for fused_key, source_keys in reform_fusion_groups_for_file:
                                 fused_tensor = StateDictConverter.fuse_reform_param_tensors(
                                     reform_fusion_rules[fused_key],
-                                    [f.get_tensor(source_key) for source_key in source_keys],
+                                    [_read_source(source_key, f.get_tensor) for source_key in source_keys],
                                 )
                                 _process_tensor(fused_key, fused_tensor, pre_normalized=True)
                                 del fused_tensor
@@ -3518,7 +3803,7 @@ class EasyBridgeMixin(PushToHubMixin):
                                     continue
                                 stacked_key = f"{target_path}.weight"
                                 first_key = expert_key_by_idx[expert_indices[0]]
-                                first_tensor = f.get_tensor(first_key)
+                                first_tensor = _read_source(first_key, f.get_tensor)
                                 stacked_shape = (len(expert_indices), *first_tensor.shape)
                                 stacked_tensor = torch.empty(
                                     stacked_shape,
@@ -3526,7 +3811,7 @@ class EasyBridgeMixin(PushToHubMixin):
                                     device=first_tensor.device,
                                 )
                                 for pos, expert_idx in enumerate(expert_indices):
-                                    stacked_tensor[pos] = f.get_tensor(expert_key_by_idx[expert_idx])
+                                    stacked_tensor[pos] = _read_source(expert_key_by_idx[expert_idx], f.get_tensor)
                                 _emit_stacked(stacked_key, stacked_tensor)
                                 del stacked_tensor
                                 clear_fn()
@@ -3538,12 +3823,12 @@ class EasyBridgeMixin(PushToHubMixin):
                             shard = torch.load(resolved_path, map_location="cpu")
 
                         for k in sorted(non_moe_keys):
-                            _process_tensor(k, shard[k])
+                            _process_tensor(k, _read_source(k, shard.__getitem__))
 
                         for fused_key, source_keys in reform_fusion_groups_for_file:
                             fused_tensor = StateDictConverter.fuse_reform_param_tensors(
                                 reform_fusion_rules[fused_key],
-                                [shard[source_key] for source_key in source_keys],
+                                [_read_source(source_key, shard.__getitem__) for source_key in source_keys],
                             )
                             _process_tensor(fused_key, fused_tensor, pre_normalized=True)
                             del fused_tensor
@@ -3555,7 +3840,7 @@ class EasyBridgeMixin(PushToHubMixin):
                                 continue
                             stacked_key = f"{target_path}.weight"
                             first_key = expert_key_by_idx[expert_indices[0]]
-                            first_tensor = shard[first_key]
+                            first_tensor = _read_source(first_key, shard.__getitem__)
                             stacked_shape = (len(expert_indices), *first_tensor.shape)
                             stacked_tensor = torch.empty(
                                 stacked_shape,
@@ -3563,7 +3848,7 @@ class EasyBridgeMixin(PushToHubMixin):
                                 device=first_tensor.device,
                             )
                             for pos, expert_idx in enumerate(expert_indices):
-                                stacked_tensor[pos] = shard[expert_key_by_idx[expert_idx]]
+                                stacked_tensor[pos] = _read_source(expert_key_by_idx[expert_idx], shard.__getitem__)
                             _emit_stacked(stacked_key, stacked_tensor)
                             del stacked_tensor
                             clear_fn()
@@ -3579,14 +3864,14 @@ class EasyBridgeMixin(PushToHubMixin):
                         with _with_resolved_shard(fname) as resolved_path:
                             if ckpt_weight_format == "safetensors":
                                 with safe_open(resolved_path, framework="pt", device="cpu") as f:
-                                    tensors.append(f.get_tensor(source_key))
+                                    tensors.append(_read_source(source_key, f.get_tensor))
                             else:
                                 shard = None
                                 try:
                                     shard = torch.load(resolved_path, map_location="cpu", weights_only=True)
                                 except TypeError:
                                     shard = torch.load(resolved_path, map_location="cpu")
-                                tensors.append(shard[source_key])
+                                tensors.append(_read_source(source_key, shard.__getitem__))
                                 del shard
                                 clear_fn()
 
@@ -3618,14 +3903,14 @@ class EasyBridgeMixin(PushToHubMixin):
                     with _with_resolved_shard(first_fname) as first_path:
                         if ckpt_weight_format == "safetensors":
                             with safe_open(first_path, framework="pt", device="cpu") as f:
-                                first_tensor = f.get_tensor(first_key)
+                                first_tensor = _read_source(first_key, f.get_tensor)
                         else:
                             shard = None
                             try:
                                 shard = torch.load(first_path, map_location="cpu", weights_only=True)
                             except TypeError:
                                 shard = torch.load(first_path, map_location="cpu")
-                            first_tensor = shard[first_key]
+                            first_tensor = _read_source(first_key, shard.__getitem__)
                             del shard
                             clear_fn()
 
@@ -3647,7 +3932,7 @@ class EasyBridgeMixin(PushToHubMixin):
                             if ckpt_weight_format == "safetensors":
                                 with safe_open(resolved_path, framework="pt", device="cpu") as f:
                                     for pos, key in items:
-                                        stacked_tensor[pos] = f.get_tensor(key)
+                                        stacked_tensor[pos] = _read_source(key, f.get_tensor)
                             else:
                                 shard = None
                                 try:
@@ -3655,7 +3940,7 @@ class EasyBridgeMixin(PushToHubMixin):
                                 except TypeError:
                                     shard = torch.load(resolved_path, map_location="cpu")
                                 for pos, key in items:
-                                    stacked_tensor[pos] = shard[key]
+                                    stacked_tensor[pos] = _read_source(key, shard.__getitem__)
                                 del shard
                                 clear_fn()
 
@@ -3997,9 +4282,6 @@ class EasyBridgeMixin(PushToHubMixin):
             HFCheckpointKeyMapper,
             StateDictConverter,
             TensorConverter,
-            canonical_expert_leaf,
-            hf_rename_key,
-            resolve_expert_merge,
         )
 
         if jax.process_count() > 1 and jax.process_index() != 0:
@@ -4026,16 +4308,8 @@ class EasyBridgeMixin(PushToHubMixin):
 
         save_root = ePath(save_directory)
         save_root.mkdir(parents=True, exist_ok=True)
-        if not str(save_directory).startswith("gs://"):
-            save_root.mkdir(parents=True, exist_ok=True)
 
-        hub_kwargs = {
-            k: kwargs[k] for k in ("cache_dir", "revision", "token", "local_files_only", "force_download") if k in kwargs
-        }
-        if "subfolder" in kwargs:
-            hub_kwargs["subfolder"] = kwargs["subfolder"]
-        if "proxies" in kwargs:
-            hub_kwargs["proxies"] = kwargs["proxies"]
+        hub_kwargs = _extract_hub_kwargs(kwargs)
 
         gcs_source = str(pretrained_model_name_or_path).startswith("gs://")
         gcs_meta_tmp: tempfile.TemporaryDirectory[str] | None = None
@@ -4180,23 +4454,27 @@ class EasyBridgeMixin(PushToHubMixin):
         #         spec_map = {}
 
         transformer = model.pure_transform_fn
-        embedding_layer_names = transformer.keywords.get("embedding_layer_names")
-        layernorm_names = transformer.keywords.get("layernorm_names")
-        moe_block_names = transformer.keywords.get("moe_block_names")
-        moe_names = transformer.keywords.get("moe_names")
-        moe_block_path = transformer.keywords.get("moe_block_path")
-        moe_path = transformer.keywords.get("moe_path")
-        reform_param = transformer.keywords.get("reform_param")
-        hf_flattened_wrappers = transformer.keywords.get("hf_flattened_wrappers")
-        # Vendor-layout checkpoints (DeepSeek-V4) rewrite keys before every
-        # other rule; `None` marks a tensor the runtime does not own.
-        _ckpt_key_normalizer = transformer.keywords.get("checkpoint_key_normalizer")
+        (
+            embedding_layer_names,
+            layernorm_names,
+            moe_block_names,
+            moe_names,
+            moe_block_path,
+            moe_path,
+            reform_param,
+            hf_flattened_wrappers,
+            _ckpt_key_normalizer,
+        ) = _checkpoint_transformer_options(transformer)
 
         def _resolve_merge(k: str, nk: str):
             """Place a per-expert key in transformers' merged expert layout (see ``resolve_expert_merge``)."""
-            if hf_key_mapper is not None:
-                return hf_key_mapper.expert_merge(k)
-            return resolve_expert_merge(nk, hf_model_type, apply_renamings=_ckpt_key_normalizer is not None)
+            return _expert_merge_for_key(
+                k,
+                nk,
+                hf_key_mapper=hf_key_mapper,
+                hf_model_type=hf_model_type,
+                key_normalizer=_ckpt_key_normalizer,
+            )
 
         def _normalize_key(k: str) -> str | None:
             """Map a checkpoint key to EasyDeL naming (re-insert flattened wrappers).
@@ -4208,16 +4486,13 @@ class EasyBridgeMixin(PushToHubMixin):
                 str: The key with any transformers >= 5.13 flattened wrapper
                 prefix re-inserted; unchanged when already in EasyDeL layout.
             """
-            # A model's own normalizer encodes its on-disk layout; otherwise use
-            # transformers' load-time renames, so keys match what the full loader
-            # sees (e.g. VLMs saved under legacy ``language_model.model.*``).
-            if _ckpt_key_normalizer is not None:
-                k = _ckpt_key_normalizer(k)
-            else:
-                k = hf_rename_key(k, hf_model_type, mapper=hf_key_mapper)
-            if k is None:
-                return None
-            return StateDictConverter.normalize_flattened_wrapper_key(k, hf_flattened_wrappers)
+            return _normalize_checkpoint_key(
+                k,
+                key_normalizer=_ckpt_key_normalizer,
+                hf_key_mapper=hf_key_mapper,
+                hf_model_type=hf_model_type,
+                hf_flattened_wrappers=hf_flattened_wrappers,
+            )
 
         uses_tie_word_embedding = getattr(hf_config, "tie_word_embeddings", False)
 
@@ -4238,54 +4513,19 @@ class EasyBridgeMixin(PushToHubMixin):
         expert_key_to_group: dict[str, tuple[str, int]] = {}
 
         def _register_moe_key(k: str):
-            """Group an HF expert weight key under its consolidated MoE target path.
-
-            Matching runs on the normalized (EasyDeL-layout) key while the
-            original checkpoint key is stored for later shard fetches.
-
-            Args:
-                k: A flattened HF state-dict key.
-
-            Returns:
-                None. Side-effect: updates ``moe_groups`` and
-                ``expert_key_to_group`` in the enclosing scope.
-            """
-            if not (moe_block_path and moe_names_set and moe_path):
-                return
-            nk = _normalize_key(k)
-            # `None` marks a tensor the runtime does not own (see
-            # `apply_checkpoint_key_normalizer`); it has no expert group.
-            if nk is None or expert_prefix not in nk:
-                return
-            for block_path in moe_block_path:
-                block_expert_prefix = block_path + expert_prefix
-                if not nk.startswith(block_expert_prefix):
-                    continue
-                remainder = nk[len(block_expert_prefix) :]
-                dot_idx = remainder.find(".")
-                if dot_idx <= 0:
-                    continue
-                expert_part = remainder[:dot_idx]
-                if not expert_part.isdigit():
-                    continue
-                expert_idx = int(expert_part)
-                moe_name_part = remainder[dot_idx + 1 :]
-                moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
-                if moe_name not in moe_names_set:
-                    # Per-part runtime leaves under transformers' names (Mixtral
-                    # `w2` -> `down_proj`, DeepSeek-V4 `w1` -> `gate_proj`).
-                    merge = _resolve_merge(k, nk)
-                    canonical = canonical_expert_leaf(merge[2], merge[3]) if merge is not None else None
-                    if canonical in moe_names_set:
-                        moe_name = canonical
-                    elif merge is not None and len(merge[2].parts) == 1 and merge[2].target in moe_names_set:
-                        moe_name = merge[2].target
-                    else:
-                        continue
-                target_path = f"{block_path}.{expected_expert_name}.{moe_name}"
+            """Record the shared expert matcher result for incremental disk writes."""
+            match = _match_moe_checkpoint_key(
+                k,
+                normalize_key=_normalize_key,
+                resolve_merge=_resolve_merge,
+                moe_block_path=moe_block_path,
+                moe_names=moe_names_set,
+                moe_path=moe_path,
+            )
+            if match is not None:
+                target_path, expert_idx, _ = match
                 moe_groups.setdefault(target_path, {})[expert_idx] = k
                 expert_key_to_group[k] = (target_path, expert_idx)
-                return
 
         ckpt_weight_format: tp.Literal["safetensors", "bin"] | None = None
         ckpt_key_to_filename: dict[str, str] = {}
@@ -4298,24 +4538,6 @@ class EasyBridgeMixin(PushToHubMixin):
         subfolder = str(kwargs.get("subfolder", "") or "")
         cache_dir = kwargs.get("cache_dir", None)
 
-        def _strip_or_keep_subfolder(filename: str) -> tuple[str, str]:
-            """Decide whether *filename* already includes the configured subfolder.
-
-            Args:
-                filename: Candidate filename, possibly already prefixed with
-                    the subfolder.
-
-            Returns:
-                tuple: ``(filename, effective_subfolder)`` to forward to
-                ``hf_hub_download``.
-            """
-            if not subfolder:
-                return filename, ""
-            normalized = subfolder.strip("/").replace("\\", "/")
-            if filename.startswith(normalized + "/"):
-                return filename, ""
-            return filename, normalized
-
         def _hf_download(filename: str, *, cache_dir_override: str | None = None) -> str:
             """Download a file from the HF Hub, honoring the configured subfolder.
 
@@ -4327,11 +4549,10 @@ class EasyBridgeMixin(PushToHubMixin):
             Returns:
                 str: Local path to the downloaded file.
             """
-            filename, effective_subfolder = _strip_or_keep_subfolder(filename)
-            return huggingface_hub.hf_hub_download(
-                repo_id=pretrained_model_name_or_path,
-                filename=filename,
-                subfolder=effective_subfolder,
+            return _hf_download_file(
+                pretrained_model_name_or_path,
+                filename,
+                subfolder=subfolder,
                 revision=revision,
                 cache_dir=cache_dir_override if cache_dir_override is not None else cache_dir,
                 force_download=force_download,
@@ -4341,37 +4562,10 @@ class EasyBridgeMixin(PushToHubMixin):
             )
 
         def _find_local(filename: str) -> str | None:
-            """Locate *filename* under a local pretrained-model directory.
+            """Locate *filename* under a local pretrained-model directory (``None`` when absent or remote)."""
+            return _find_local_file(pretrained_model_name_or_path, filename, subfolder, disabled=gcs_source)
 
-            Args:
-                filename: Repo-relative filename.
-
-            Returns:
-                str | None: Absolute local path when the file exists, else
-                ``None``.
-            """
-            if gcs_source:
-                return None
-            if not os.path.isdir(pretrained_model_name_or_path):
-                return None
-            filename, effective_subfolder = _strip_or_keep_subfolder(filename)
-            root = pretrained_model_name_or_path
-            if effective_subfolder:
-                root = os.path.join(root, effective_subfolder)
-            candidate = os.path.join(root, filename)
-            return candidate if os.path.isfile(candidate) else None
-
-        def _load_index(path: str) -> dict[str, tp.Any]:
-            """Read a JSON checkpoint index file from *path*.
-
-            Args:
-                path: Filesystem path to the JSON file.
-
-            Returns:
-                dict: Parsed JSON contents.
-            """
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+        _load_index = _load_json_index
 
         resolved_index_file: str | None = None
         resolved_single_file: str | None = None
@@ -4399,7 +4593,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 except FileNotFoundError:
                     resolved_single_file = None
 
-            if resolved_single_file is None:
+            if resolved_index_file is None and resolved_single_file is None:
                 try:
                     resolved_single_file = _copy_gcs_file(WEIGHTS_NAME, gcs_meta_tmp.name)
                     ckpt_weight_format = "bin"
@@ -4443,7 +4637,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 except (FileNotFoundError, EntryNotFoundError):
                     resolved_single_file = None
 
-            if resolved_single_file is None:
+            if resolved_index_file is None and resolved_single_file is None:
                 try:
                     resolved_single_file = _hf_download(WEIGHTS_NAME)
                     ckpt_weight_format = "bin"
@@ -4530,6 +4724,7 @@ class EasyBridgeMixin(PushToHubMixin):
             return abs_path, rel
 
         array_index: list[dict[str, tp.Any]] = []
+        pending_expert_entries: dict[str, dict[str, tp.Any]] = {}
         resume_paths: set[str] = set()
         if resume:
             existing_index = save_root / TENSORSTORE_INDEX_NAME
@@ -4589,6 +4784,7 @@ class EasyBridgeMixin(PushToHubMixin):
                     "dtype": str(value.dtype),
                 }
             )
+            _write_checkpoint_index()
 
         def _write_checkpoint_index() -> None:
             """Persist the TensorStore index and metadata files to ``save_root``.
@@ -4602,7 +4798,14 @@ class EasyBridgeMixin(PushToHubMixin):
                 "version": "easydel",
                 "prefixes": {"model": array_index},
             }
-            index_path.write_text(json.dumps(index_data, indent=2))
+            payload = json.dumps(index_data, indent=2)
+            if str(index_path).startswith("gs://"):
+                # Object replacement is atomic; never expose a partial JSON object.
+                index_path.write_text(payload)
+            else:
+                staged_index = save_root / f".{TENSORSTORE_INDEX_NAME}.{time.time_ns()}.tmp"
+                staged_index.write_text(payload)
+                staged_index.rename(index_path)
             meta_path = save_root / "checkpoint_metadata.json"
             meta_path.write_text(
                 json.dumps(
@@ -4794,13 +4997,13 @@ class EasyBridgeMixin(PushToHubMixin):
             )
             ts_spec["dtype"] = jnp.dtype(model.param_dtype).name
             ts_arr = ts.open(ts.Spec(ts_spec), create=True, open=True).result()
-            array_index.append(
-                {
-                    "path": rel_path,
-                    "shape": [int(d) for d in global_shape],
-                    "dtype": str(jnp.dtype(model.param_dtype)),
-                }
-            )
+            # Allocation is not completion: an interrupted expert group must
+            # never be advertised as resumable by another completed dense write.
+            pending_expert_entries[rel_path] = {
+                "path": rel_path,
+                "shape": [int(d) for d in global_shape],
+                "dtype": str(jnp.dtype(model.param_dtype)),
+            }
             return abs_path, rel_path, ts_arr
 
         def _ensure_moe_group_ready(target_path: str, *, sample_expert_tensor) -> dict[str, tp.Any] | None:
@@ -4856,7 +5059,9 @@ class EasyBridgeMixin(PushToHubMixin):
                 None.
             """
             if target_path in moe_handles:
-                moe_handles.pop(target_path, None)
+                handle = moe_handles.pop(target_path)
+                array_index.append(pending_expert_entries.pop(handle["rel_path"]))
+                _write_checkpoint_index()
 
         def _process_and_write(key: str, tensor, decode_quant: bool = True, pre_normalized: bool = False) -> None:
             """Convert a non-MoE HF tensor and persist it to TensorStore.
@@ -4885,7 +5090,7 @@ class EasyBridgeMixin(PushToHubMixin):
             if normalized is None:
                 return
             if decode_quant and quant_decode is not None:
-                decoded = quant_decode(key, tensor, _shard_getter["fn"])
+                decoded = quant_decode(key, tensor, _fetch_quant_scale)
                 if decoded is _QUANT_CONSUMED:
                     return
                 if decoded is not None:
@@ -4975,7 +5180,7 @@ class EasyBridgeMixin(PushToHubMixin):
             """Collect one per-expert tensor; write the merged tensor once its layer is complete."""
             merged_key, idx, part = stack_key_to_group[key]
             if quant_decode is not None:
-                decoded = quant_decode(key, tensor, _shard_getter["fn"])
+                decoded = quant_decode(key, tensor, _fetch_quant_scale)
                 if decoded is _QUANT_CONSUMED:
                     return
                 if decoded is not None:
@@ -4996,7 +5201,7 @@ class EasyBridgeMixin(PushToHubMixin):
             if fused_key not in expert_part_remaining:
                 return
             if quant_decode is not None:
-                decoded = quant_decode(key, tensor, _shard_getter["fn"])
+                decoded = quant_decode(key, tensor, _fetch_quant_scale)
                 if decoded is _QUANT_CONSUMED:
                     return
                 if decoded is not None:
@@ -5022,6 +5227,10 @@ class EasyBridgeMixin(PushToHubMixin):
             expert_part_remaining[fused_key] -= 1
             if expert_part_remaining[fused_key] <= 0:
                 expert_part_handles.pop(fused_key, None)
+                key_tuple = tuple(int(n) if n.isdigit() else n for n in fused_key.split("."))
+                rel_path = _tensorstore_path_for_params(key_tuple)[1]
+                array_index.append(pending_expert_entries.pop(rel_path))
+                _write_checkpoint_index()
                 label = str(rule.get("log_label", fused_key))
                 fusion_counts[label] = fusion_counts.get(label, 0) + 1
 
@@ -5040,7 +5249,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 return False
 
             if quant_decode is not None:
-                decoded = quant_decode(key, tensor, _shard_getter["fn"])
+                decoded = quant_decode(key, tensor, _fetch_quant_scale)
                 if decoded is _QUANT_CONSUMED:
                     return True
                 if decoded is not None:
@@ -5075,8 +5284,44 @@ class EasyBridgeMixin(PushToHubMixin):
         if verbose:
             logger.info(f"Sequential conversion started: {pretrained_model_name_or_path} -> {save_root}")
 
+        def _source_is_complete(key: str) -> bool:
+            """Skip completed outputs before resolving or reading their sources."""
+            if key in fusion_source_to_targets:
+                targets = fusion_source_to_targets[key]
+            elif key in expert_part_key_to_group:
+                targets = [expert_part_key_to_group[key][0]]
+            elif key in expert_key_to_group:
+                return expert_key_to_group[key][0] in resumed_moe_targets
+            else:
+                normalized = _normalize_key(key)
+                if normalized is None:
+                    return True
+                targets = [normalized]
+            return all(
+                _already_written(tuple(int(n) if n.isdigit() else n for n in target.split("."))) for target in targets
+            )
+
+        def _fetch_quant_scale(key: str):
+            filename = ckpt_key_to_filename[key]
+            if filename == _shard_getter.get("filename"):
+                return _shard_getter["fn"](key)
+            with _with_resolved_shard(filename) as path:
+                if ckpt_weight_format == "safetensors":
+                    with safe_open(path, framework="pt", device="cpu") as handle:
+                        return handle.get_tensor(key)
+                try:
+                    scale_shard = torch.load(path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    scale_shard = torch.load(path, map_location="cpu")
+                return scale_shard[key]
+
         for fname in sorted(file_to_keys.keys()):
-            keys = sorted(file_to_keys[fname])
+            keys = sorted(
+                k
+                for k in file_to_keys[fname]
+                if not _source_is_complete(k) and k not in getattr(quant_decode, "consumed_keys", ())
+            )
+            _shard_getter["filename"] = fname
             if not keys:
                 continue
 
@@ -5107,7 +5352,7 @@ class EasyBridgeMixin(PushToHubMixin):
                                 # decode has to happen here too -- this is where 97% of a
                                 # DeepSeek-V4 checkpoint's tensors actually flow.
                                 if quant_decode is not None:
-                                    _decoded = quant_decode(k, expert_tensor, _shard_getter["fn"])
+                                    _decoded = quant_decode(k, expert_tensor, _fetch_quant_scale)
                                     if _decoded is _QUANT_CONSUMED:
                                         continue
                                     if _decoded is not None:
@@ -5159,7 +5404,7 @@ class EasyBridgeMixin(PushToHubMixin):
                             # decode has to happen here too -- this is where 97% of a
                             # DeepSeek-V4 checkpoint's tensors actually flow.
                             if quant_decode is not None:
-                                _decoded = quant_decode(k, expert_tensor, _shard_getter["fn"])
+                                _decoded = quant_decode(k, expert_tensor, _fetch_quant_scale)
                                 if _decoded is _QUANT_CONSUMED:
                                     continue
                                 if _decoded is not None:
@@ -5267,6 +5512,10 @@ class EasyBridgeMixin(PushToHubMixin):
             from transformers import AutoModelForImageTextToText as module
         elif cls._model_task == TaskType.SEQUENCE_CLASSIFICATION:
             from transformers import AutoModelForSequenceClassification as module
+        elif cls._model_task == TaskType.TOKEN_CLASSIFICATION:
+            from transformers import AutoModelForTokenClassification as module
+        elif cls._model_task == TaskType.QUESTION_ANSWERING:
+            from transformers import AutoModelForQuestionAnswering as module
         elif cls._model_task == TaskType.EMBEDDING:
             from transformers import AutoModelForCausalLM as module
         elif cls._model_task == TaskType.BASE_MODULE:

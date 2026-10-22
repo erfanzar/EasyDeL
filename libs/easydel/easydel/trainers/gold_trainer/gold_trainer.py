@@ -21,6 +21,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.utils import Registry
 
+from .._shared import copy_frozen_policy
 from ..distillation_trainer import DistillationTrainer
 from .gold_config import GOLDConfig
 
@@ -76,8 +77,21 @@ class GOLDTrainer(DistillationTrainer):
             raise TypeError(f"arguments must be GOLDConfig, got {type(arguments)}")
         if model is not None and student_model is not None:
             raise ValueError("Pass either `model` or `student_model`, not both.")
-        resolved_student = student_model if student_model is not None else model
-        resolved_teacher = teacher_model if teacher_model is not None else resolved_student
+        resolved_student = self._resolve_student_model(student_model if student_model is not None else model)
+        resolved_teacher = teacher_model
+        if resolved_teacher is None:
+            # Prepare the owned, eval-mode teacher BEFORE DistillationTrainer
+            # constructs teacher shardings and eval_config_overrides variants.
+            # Use the same default teacher layout as module inputs to the
+            # distillation trainer, including any frozen student parameters.
+            source_state = (
+                resolved_student if isinstance(resolved_student, EasyDeLState) else resolved_student.to_state()
+            )
+            resolved_teacher = copy_frozen_policy(source_state)
+            teacher_module = resolved_teacher.model
+            teacher_module.eval()
+            graphdef, graphstate, graphother = teacher_module.split_module()
+            resolved_teacher = resolved_teacher.replace(graphdef=graphdef, graphstate=graphstate, graphother=graphother)
         super().__init__(
             arguments=arguments,
             processing_class=processing_class,

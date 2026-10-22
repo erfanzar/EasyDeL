@@ -22,9 +22,10 @@ work with a unified data interface.
 from __future__ import annotations
 
 import typing as tp
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Sequence
 
 from ..core.protocols import ShardedDataSource, ShardInfo
+from .base import _coerce_example
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
@@ -127,38 +128,6 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
         # used to be classified indexable and crashed at the first batch).
         return not (hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__"))
 
-    @staticmethod
-    def _to_example(value: tp.Any) -> dict[str, tp.Any]:
-        """Coerce HF row payloads into plain Python dicts for downstream consumers.
-
-        HuggingFace's ``Dataset.__getitem__`` and iteration may return
-        rich row proxies depending on the format flag and column types.
-        Rather than rely on those proxies' shape, this helper
-        normalises into a plain ``dict`` so the rest of the pipeline
-        can be schema-agnostic. Mirrors
-        :func:`_coerce_example` in :mod:`base`.
-
-        Args:
-            value: Whatever the underlying dataset yielded.
-
-        Returns:
-            dict[str, Any]: Plain dict; original ``dict`` instances
-            are returned unchanged (caller owns mutation).
-
-        Raises:
-            TypeError: When ``value`` is not mapping-like at all.
-        """
-        if isinstance(value, dict):
-            return value
-        if isinstance(value, Mapping):
-            return dict(value)
-        if hasattr(value, "items"):
-            try:
-                return dict(value.items())
-            except Exception:
-                pass
-        raise TypeError(f"Expected mapping-like dataset row, got {type(value).__name__}")
-
     @property
     def shard_names(self) -> Sequence[str]:
         """Return shard names; HF datasets expose a single synthetic shard.
@@ -187,11 +156,11 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
         """
         if self._is_iterable:
             for example in self._dataset:
-                yield self._to_example(example)
+                yield _coerce_example(example)
         else:
             # Regular Dataset - index access
             for i in range(len(self._dataset)):
-                yield self._to_example(self._dataset[i])
+                yield _coerce_example(self._dataset[i])
 
     def open_shard_at_row(self, shard_name: str, row: int) -> Iterator[dict]:
         """Open shard starting at a specific row.
@@ -206,11 +175,11 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
         if self._is_iterable:
             for i, example in enumerate(self._dataset):
                 if i >= row:
-                    yield self._to_example(example)
+                    yield _coerce_example(example)
         else:
             # Regular Dataset - direct indexing
             for i in range(row, len(self._dataset)):
-                yield self._to_example(self._dataset[i])
+                yield _coerce_example(self._dataset[i])
 
     def get_shard_info(self, shard_name: str) -> ShardInfo | None:
         """Get metadata about the shard.

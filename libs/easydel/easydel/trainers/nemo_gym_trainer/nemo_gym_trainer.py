@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import inspect
 import typing as tp
 
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -145,21 +146,25 @@ class NeMoGymTrainer(GRPOTrainer):
     def _make_nemo_environment(self, metadata: object, agent_ref: object) -> object:
         """Construct one NeMo environment using supported factory arguments.
 
-        The factory is called with filtered keyword arguments first, then with
-        metadata only, then with no arguments. That keeps EasyDeL compatible
-        with common NeMo/Gym factory signatures without an adapter class.
+        Resolve filtered keyword, metadata-positional, and no-argument
+        signatures before calling the factory exactly once. Exceptions from
+        inside the factory propagate unchanged without repeating side effects.
         """
         if self.environment_factory is None:
             raise ValueError("NeMoGymTrainer requires `environment_factory` for environment reward feedback.")
         kwargs = {"metadata": metadata, "agent_ref": agent_ref, "request_timeout": self.arguments.request_timeout}
         filtered = filter_kwargs_for_callable(self.environment_factory, kwargs)
         try:
+            signature = inspect.signature(self.environment_factory)
+        except (TypeError, ValueError):
             return self.environment_factory(**filtered)
-        except TypeError:
+        for args, call_kwargs in (((), filtered), ((metadata,), {}), ((), {})):
             try:
-                return self.environment_factory(metadata)
+                signature.bind(*args, **call_kwargs)
             except TypeError:
-                return self.environment_factory()
+                continue
+            return self.environment_factory(*args, **call_kwargs)
+        raise TypeError(f"Unsupported NeMo environment factory signature: {signature}")
 
     def _run_environment_feedback(
         self,

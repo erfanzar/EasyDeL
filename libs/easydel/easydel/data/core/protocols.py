@@ -962,39 +962,6 @@ class BaseStage(ABC):
         """
         self._metrics[key] = value
 
-    def _get_dataset_config(
-        self,
-        dataset_id: str,
-        context: "PipelineContext",
-    ) -> dict:
-        """Resolve the per-dataset config dict for ``dataset_id`` from the context.
-
-        Iterates the ``datasets`` list on the pipeline configuration and
-        matches by either explicit ``name`` or the auto-assigned
-        ``dataset_{i}`` fallback used by :class:`PipelineConfig`.
-
-        Args:
-            dataset_id: Identifier to look up — either the user-supplied
-                name or the implicit ``dataset_{i}`` form.
-            context: Pipeline context whose ``config`` mapping carries
-                the dataset declarations.
-
-        Returns:
-            dict: Matching dataset configuration dict, or an empty dict
-            when no entry matches (callers can treat empty as "use
-            defaults").
-        """
-        config = context.config
-        datasets = config.get("datasets", []) if isinstance(config, dict) else getattr(config, "datasets", []) or []
-        for i, ds_cfg in enumerate(datasets):
-            if isinstance(ds_cfg, dict):
-                ds_name = ds_cfg.get("name") or f"dataset_{i}"
-            else:
-                ds_name = getattr(ds_cfg, "name", None) or f"dataset_{i}"
-            if ds_name == dataset_id:
-                return ds_cfg
-        return {}
-
 
 @dataclass
 class PipelineContext:
@@ -1037,6 +1004,7 @@ class PipelineContext:
 
     _tokenizers: dict[str, Any] = field(default_factory=dict, repr=False)
     _cache_manager: Any = field(default=None, repr=False)
+    _dataset_cache_managers: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def get_tokenizer(self, name_or_path: str) -> Any:
         """Return a shared tokenizer, loading and caching it on first request.
@@ -1098,9 +1066,77 @@ class PipelineContext:
             key: Metric identifier within the stage namespace.
             value: Arbitrary metric payload (counter, dict, summary).
         """
+        observability = getattr(self.config, "observability", None)
+        if observability is not None and not observability.metrics_enabled:
+            return
         if stage not in self.metrics:
             self.metrics[stage] = {}
         self.metrics[stage][key] = value
+
+    def observe_rows(self, rows: Iterator[T], stage: str, dataset: str) -> Iterator[T]:
+        """Yield rows with configured progress, periodic logs, and throughput metrics.
+
+        Args:
+            rows: Lazy row or batch stream.
+            stage: Metric namespace for this stream.
+            dataset: Dataset name used in progress messages and metric keys.
+
+        Yields:
+            Each upstream item unchanged. Progress resources close on early exit as well.
+        """
+        import json
+        import logging
+        import time
+
+        from .config import ObservabilityConfig
+
+        options = getattr(self.config, "observability", None) or ObservabilityConfig()
+        log = logging.getLogger(f"easydel.data.pipeline.{id(self)}")
+        log.setLevel(options.log_level)
+        progress = None
+        if options.progress_enabled and options.progress_type == "tqdm":
+            from tqdm.auto import tqdm
+
+            progress = tqdm(desc=f"{stage}: {dataset}", unit="rows")
+        elif options.progress_enabled and options.progress_type == "rich":
+            from rich.progress import Progress
+
+            progress = Progress()
+            task = progress.add_task(f"{stage}: {dataset}", total=None)
+            progress.start()
+        count = 0
+        started = time.monotonic()
+        try:
+            for item in rows:
+                count += 1
+                if progress is not None:
+                    if options.progress_type == "rich":
+                        progress.update(task, advance=1)
+                    else:
+                        progress.update(1)
+                if count % max(options.log_interval, 1) == 0:
+                    event = {"stage": stage, "dataset": dataset, "rows": count}
+                    if options.progress_enabled and options.progress_type == "json":
+                        log.info(json.dumps(event))
+                    else:
+                        log.info("%s: %s processed %d rows", stage, dataset, count)
+                yield item
+        finally:
+            if progress is not None:
+                if options.progress_type == "rich":
+                    progress.stop()
+                else:
+                    progress.close()
+            elapsed = time.monotonic() - started
+            previous = self.metrics.get(stage, {})
+            total_rows = previous.get(f"{dataset}_rows", 0) + count
+            total_seconds = previous.get(f"{dataset}_seconds", 0.0) + elapsed
+            self.record_metric(stage, f"{dataset}_rows", total_rows)
+            self.record_metric(stage, f"{dataset}_seconds", total_seconds)
+            self.record_metric(stage, f"{dataset}_rows_per_second", total_rows / max(total_seconds, 1e-9))
+            close = getattr(rows, "close", None)
+            if close is not None:
+                close()
 
     def get_metrics(self) -> dict[str, dict[str, Any]]:
         """Return a shallow copy of every recorded metric, grouped by stage.
@@ -1112,6 +1148,32 @@ class PipelineContext:
             callers should treat the result as read-only.
         """
         return self.metrics.copy()
+
+    def get_cache_manager(self, dataset_name: str | None = None) -> Any:
+        """Resolve the shared cache with per-dataset disable and directory overrides.
+
+        Args:
+            dataset_name: Dataset declaration to consult, or None for the stage-level cache.
+
+        Returns:
+            TreeCacheManager or None when either master switch disables caching.
+        """
+        from dataclasses import replace
+
+        from .config import PipelineConfig
+
+        if dataset_name is None or not isinstance(self.config, PipelineConfig):
+            return self.cache_manager
+        dataset = self.config.get_dataset_by_name(dataset_name)
+        if not self.config.cache.enabled or (dataset is not None and not dataset.cache_enabled):
+            return None
+        if dataset is None or dataset.cache_path is None:
+            return self.cache_manager
+        if dataset_name not in self._dataset_cache_managers:
+            cache_config = replace(self.config.cache, cache_dir=dataset.cache_path)
+            context = PipelineContext(config=replace(self.config, cache=cache_config))
+            self._dataset_cache_managers[dataset_name] = context.cache_manager
+        return self._dataset_cache_managers[dataset_name]
 
     @property
     def cache_manager(self) -> Any:
@@ -1129,17 +1191,22 @@ class PipelineContext:
         """
         if self._cache_manager is None:
             from ..execution.cache import TreeCacheManager
+            from .config import CacheStageConfig
 
-            config = self.config
-            if isinstance(config, dict):
-                cache_config = config.get("cache") or {}
-                cache_dir = cache_config.get("cache_dir", ".cache/easydel_pipeline")
-            else:
-                # PipelineConfig dataclass (the normal case since the typed
-                # pipeline landed); the old dict-era `.get` crashed here.
-                cache_config = getattr(config, "cache", None)
-                cache_dir = getattr(cache_config, "cache_dir", None) or ".cache/easydel_pipeline"
-            self._cache_manager = TreeCacheManager(cache_dir=cache_dir)
+            cache_config = self.config.get("cache") if isinstance(self.config, dict) else self.config.cache
+            if isinstance(cache_config, dict):
+                cache_config = CacheStageConfig(**cache_config)
+            cache_config = cache_config or CacheStageConfig()
+            if not cache_config.enabled:
+                return None
+            self._cache_manager = TreeCacheManager(
+                cache_dir=cache_config.cache_dir,
+                memory_size=cache_config.memory_cache_size,
+                disk_expiry=cache_config.disk_cache_expiry,
+                compression=cache_config.compression,
+                cache_type=cache_config.cache_type,
+                hash_fn=cache_config.hash_fn,
+            )
         return self._cache_manager
 
 

@@ -682,6 +682,8 @@ class RequestAdmission:
                 max_model_len=max_model_len,
             )
             _rp = self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
+            if _rp is not None:
+                _rp.adjust_request(sampling_params)
             self._configure_reasoning_parser_for_prompt(
                 reasoning_parser=_rp,
                 prompt_text=prompt_for_engine,
@@ -698,32 +700,38 @@ class RequestAdmission:
         if metrics_collector:
             metrics_collector.start_request(request_id, len(token_ids))
 
-        prompt_token_segments = self._tokenize_prompt_segments(prompt_for_engine)
+        # Execution ids are authoritative: decoding and re-tokenizing can lose
+        # processor-expanded placeholders or undo context truncation.
+        prompt_token_segments = [list(token_ids)]
+        if isinstance(prompt_for_engine, (list, tuple)):
+            segments = self._tokenize_prompt_segments(prompt_for_engine)
+            if [token for segment in segments for token in segment] == token_ids:
+                prompt_token_segments = segments
 
         # Handle n > 1 sampling: create multiple EngineRequest objects
         n_samples = getattr(sampling_params, "n", 1) or 1
 
         completion_outputs = [CompletionOutput(index=i, text="", token_ids=[]) for i in range(n_samples)]
 
-        with self._output_lock:
-            self._request_outputs[request_id] = RequestOutput(
-                request_id=request_id,
-                prompt=prompt_for_engine,
-                prompt_token_ids=prompt_token_segments,
-                outputs=completion_outputs,
-                finished=False,
-                accumulated_text="",
-                delta_text="",
-                raw_accumulated_text="",
-                raw_delta_text="",
-                tokens_per_second=0.0,
-                num_generated_tokens=0,
-                time_spent_generating=0.0,
-                first_token_time=None,
-                processing_time=0.0,
-                update_seq=0,
-                delta_seq=0,
-            )
+        output = RequestOutput(
+            request_id=request_id,
+            prompt=prompt_for_engine,
+            prompt_token_ids=prompt_token_segments,
+            outputs=completion_outputs,
+            finished=False,
+            accumulated_text="",
+            delta_text="",
+            raw_accumulated_text="",
+            raw_delta_text="",
+            tokens_per_second=0.0,
+            num_generated_tokens=0,
+            time_spent_generating=0.0,
+            first_token_time=None,
+            processing_time=0.0,
+            update_seq=0,
+            delta_seq=0,
+        )
+        self._registry.register(request_id, self._registry.get_record(request_id), output)
 
         eos_token_ids = [int(tid) for tid in (self._eos_ids or []) if tid is not None]
 
@@ -794,6 +802,8 @@ class RequestAdmission:
                         parent_request_id=request_id,
                     )
                     _rp2 = self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
+                    if _rp2 is not None:
+                        _rp2.adjust_request(sampling_params)
                     self._configure_reasoning_parser_for_prompt(
                         reasoning_parser=_rp2,
                         prompt_text=prompt_for_engine,

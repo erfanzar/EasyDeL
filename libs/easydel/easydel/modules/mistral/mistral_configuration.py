@@ -194,7 +194,9 @@ class MistralConfig(EasyDeLBaseConfig):
         self.bits = bits
         # for backward compatibility
         if num_key_value_heads is None:
-            num_key_value_heads = num_attention_heads
+            if number_rep_kv < 1 or num_attention_heads % number_rep_kv:
+                raise ValueError("number_rep_kv must be a positive divisor of num_attention_heads.")
+            num_key_value_heads = num_attention_heads // number_rep_kv
 
         self.num_key_value_heads = num_key_value_heads
         self.hidden_act = hidden_act

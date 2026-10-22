@@ -42,7 +42,7 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import auto_remat, blockwise_ffn
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -232,14 +232,14 @@ class SmolLM3DecoderLayer(spx.Module):
         self.input_layernorm = RMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,
-            dtype=param_dtype,
+            dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
         self.post_attention_layernorm = RMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,
-            dtype=param_dtype,
+            dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
@@ -424,8 +424,8 @@ class SmolLM3MLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        # SmolLM3 uses SiLU gating (SwiGLU).
-        self.act_fn = jax.nn.silu
+        # Gate activation follows ``config.hidden_act`` (``silu`` => SwiGLU by default).
+        self.act_fn = ACT2FN[config.hidden_act]
 
     @property
     def reform_param(self):
@@ -543,7 +543,7 @@ class SmolLM3Model(EasyDeLBaseModule):
             self.norm = RMSNorm(
                 dim=config.hidden_size,
                 eps=config.rms_norm_eps,
-                dtype=param_dtype,
+                dtype=dtype,
                 param_dtype=param_dtype,
                 rngs=rngs,
             )
@@ -625,10 +625,8 @@ class SmolLM3Model(EasyDeLBaseModule):
             )
 
         if past_key_values is None and cache_metadata is not None:
-            if isinstance(cache_metadata, RaggedPagesMetadata):
-                past_key_values = RaggedPagesCache.init_empty(self.config)
-            else:
-                past_key_values = TransformerCache.init_empty(self.config)
+            cache_type = RaggedPagesCache if isinstance(cache_metadata, RaggedPagesMetadata) else TransformerCache
+            past_key_values = cache_type.init_empty(len(self.layers))
 
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
@@ -647,6 +645,9 @@ class SmolLM3Model(EasyDeLBaseModule):
             extra=needs_trace_cache,
         )
         cache_views = views if trace_layers else None
+        # Hoisted out of the scan body: the caching property must not be first
+        # materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
 
         def _run_layer(block, carry):
             """Apply a single decoder layer inside the layer-stack scan.
@@ -668,7 +669,7 @@ class SmolLM3Model(EasyDeLBaseModule):
                     cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
-                    frequencies=self.frequencies,
+                    frequencies=frequencies,
                 )
             hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
             cv = self._layer_cache_view_update(
@@ -820,5 +821,5 @@ class SmolLM3ForSequenceClassification(BaseSequenceClassificationModule[SmolLM3M
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            score_bias=False,
+            score_head_bias=False,
         )

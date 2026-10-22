@@ -222,7 +222,7 @@ class MiniMaxConfig(EasyDeLBaseConfig):
         self.use_cache = use_cache
         self.rope_theta = rope_theta
         self.attention_dropout = attention_dropout
-        self.head_dim = head_dim
+        self.head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
 
         self.num_experts_per_tok = num_experts_per_tok
         self.num_local_experts = num_local_experts

@@ -158,6 +158,8 @@ class DatasetConfig:
             sharded version of the dataset; ``None`` shards round-robin.
         num_shards (int | None): Optional override for the number of output
             shards; ``None`` defers to :class:`SaveStageConfig.num_shards`.
+        max_row_group_bytes (int | None): Parquet decode-memory guard in bytes.
+            ``None`` uses the reader default (24 GiB); ``0`` disables the guard.
     """
 
     # Source (required)
@@ -191,6 +193,9 @@ class DatasetConfig:
     shard_column: str | None = None
     num_shards: int | None = None
 
+    # Appended to preserve the positional constructor order of existing dataset fields.
+    max_row_group_bytes: int | None = None
+
     def __post_init__(self):
         """Validate the dataset declaration after dataclass initialization.
 
@@ -204,6 +209,8 @@ class DatasetConfig:
         """
         if not self.data_files:
             raise ValueError("data_files is required")
+        if isinstance(self.tokenizer, dict):
+            self.tokenizer = TokenizerConfig(**self.tokenizer)
 
     def get_tokenizer_config(self) -> TokenizerConfig | None:
         """Materialise :attr:`tokenizer` as a fully populated :class:`TokenizerConfig`.
@@ -416,6 +423,10 @@ class MixStageConfig:
             total = sum(self.weights.values())
             if abs(total - 1.0) > 1e-6:
                 raise ValueError(f"Weights must sum to 1.0, got {total}")
+        if self.weight_schedule is not None:
+            self.weight_schedule = [
+                WeightSchedulePoint(**point) if isinstance(point, dict) else point for point in self.weight_schedule
+            ]
 
 
 @dataclass
@@ -745,9 +756,28 @@ class PipelineConfig:
         if not self.datasets:
             raise ValueError("At least one dataset is required")
 
+        self.datasets = [DatasetConfig(**ds) if isinstance(ds, dict) else ds for ds in self.datasets]
+        stage_types = {
+            "source": SourceStageConfig,
+            "tokenize": TokenizeStageConfig,
+            "cache": CacheStageConfig,
+            "mix": MixStageConfig,
+            "pack": PackStageConfig,
+            "load": LoadStageConfig,
+            "save": SaveStageConfig,
+            "ray": RayConfig,
+            "observability": ObservabilityConfig,
+        }
+        for name, config_type in stage_types.items():
+            value = getattr(self, name)
+            if value is None:
+                setattr(self, name, config_type())
+            elif isinstance(value, dict):
+                setattr(self, name, config_type(**value))
+
         for i, ds in enumerate(self.datasets):
-            if ds.name is None:
-                ds.name = f"dataset_{i}"
+            if not ds.name:
+                ds.name = get_dataset_name(ds, i)
 
     def get_dataset_by_name(self, name: str) -> DatasetConfig | None:
         """Look up a configured dataset by its unique ``name`` field.

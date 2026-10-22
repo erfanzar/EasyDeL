@@ -68,6 +68,7 @@ class IdleMonitor:
         self._idle_reset_last_reset = 0.0
         self._idle_monitor_event = threading.Event()
         self._idle_monitor_thread: threading.Thread | None = None
+        self._lifecycle_lock = threading.RLock()
 
     def touch(self) -> None:
         """Mark the engine as active so the idle-reset watchdog re-arms.
@@ -103,11 +104,21 @@ class IdleMonitor:
         firing a reset. Idempotent — if the watchdog thread is already
         alive, nothing is created.
         """
+        with self._lifecycle_lock:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
+        """Start one watchdog while holding the lifecycle lock."""
         if self._idle_reset_seconds is None:
             return
         if self._idle_monitor_thread and self._idle_monitor_thread.is_alive():
             return
-        self._idle_monitor_event.clear()
+        # Each watchdog thread owns its stop event. ``stop()`` may be reached
+        # from the watchdog thread itself (idle reset -> pause -> terminate),
+        # and a following ``start()`` (resume) must not "un-set" the event the
+        # old thread is waiting on, or that thread would never exit.
+        stop_event = threading.Event()
+        self._idle_monitor_event = stop_event
 
         check_interval = min(1.0, max(self._idle_reset_seconds / 4.0, 0.1))
 
@@ -124,7 +135,7 @@ class IdleMonitor:
             Exceptions during the reset are logged without killing the
             daemon.
             """
-            while not self._idle_monitor_event.wait(check_interval):
+            while not stop_event.wait(check_interval):
                 if not self._is_running():
                     continue
                 now = time.time()
@@ -147,8 +158,11 @@ class IdleMonitor:
                 except Exception:
                     logger.exception("Idle reset failed")
 
-        self._idle_monitor_thread = threading.Thread(target=_idle_loop, daemon=True)
-        self._idle_monitor_thread.start()
+        # Publication and startup are serialized with stop(), which must never
+        # join an unstarted thread or miss a just-started watchdog.
+        thread = threading.Thread(target=_idle_loop, daemon=True)
+        self._idle_monitor_thread = thread
+        thread.start()
 
     def stop(self) -> None:
         """Signal the idle-reset daemon to exit and join with a short timeout.
@@ -161,14 +175,17 @@ class IdleMonitor:
         invoked from :meth:`eSurge.terminate` even when no monitor was
         started.
         """
-        if not self._idle_monitor_thread:
-            return
-        self._idle_monitor_event.set()
-        if threading.current_thread() is self._idle_monitor_thread:
-            # Avoid joining the current thread; it will exit on the next wake-up.
+        with self._lifecycle_lock:
+            thread = self._idle_monitor_thread
+            if thread is None:
+                return
+            self._idle_monitor_event.set()
             self._idle_monitor_thread = None
+        if threading.current_thread() is thread:
+            # Avoid joining the current thread; it will exit on the next wake-up.
             return
-        self._idle_monitor_thread.join(timeout=2.0)
-        if self._idle_monitor_thread.is_alive():
+        # Do not hold the lifecycle lock while waiting: the callback may itself
+        # call stop()/start(), and a new watchdog owns a different stop event.
+        thread.join(timeout=2.0)
+        if thread.is_alive():
             logger.debug("Idle monitor thread did not stop gracefully")
-        self._idle_monitor_thread = None

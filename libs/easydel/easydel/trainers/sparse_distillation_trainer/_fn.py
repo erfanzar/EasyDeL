@@ -56,6 +56,7 @@ def partial_kl_distillation_loss(
     use_hard_labels: bool = False,
     temperature: float = 4.0,
     alpha: float = 0.9,
+    shift_tokens: bool = True,
 ) -> tuple[Array, dict[str, Array]]:
     """Compute partial KL distillation loss from sparse teacher logprobs.
 
@@ -87,6 +88,10 @@ def partial_kl_distillation_loss(
         use_hard_labels: Whether to include supervised CE loss.
         temperature: Temperature for softening distributions.
         alpha: Weight for distillation loss (1.0=pure distillation).
+        shift_tokens: When ``True`` (default), ``loss_mask`` / ``attention_mask`` / ``labels`` are token-indexed
+            and are shifted left by one so that the distribution at position ``t`` (which predicts token
+            ``t+1``) is weighted by the mask of token ``t+1``. Set ``False`` if the masks are already aligned
+            with the logits.
 
     Returns:
         Tuple of ``(total_loss, {"kl_loss": ..., "ce_loss": ...})``.
@@ -122,6 +127,16 @@ def partial_kl_distillation_loss(
         mask = attention_mask.astype(dtype)
     else:
         mask = None
+
+    if shift_tokens:
+        if mask is None:
+            mask = jnp.ones(student_logits.shape[:-1], dtype=dtype)
+        # Logits/top-k at position t describe token t+1, so the token-level masks and labels (which are indexed
+        # by the token they describe) must be shifted left by one to line up with the per-position distributions.
+        if mask is not None:
+            mask = jnp.concatenate([mask[:, 1:], jnp.zeros_like(mask[:, :1])], axis=1)
+        if labels is not None:
+            labels = jnp.concatenate([labels[:, 1:], jnp.full_like(labels[:, :1], -100)], axis=1)
 
     if labels is not None:
         valid_label_mask = (labels != -100).astype(dtype)

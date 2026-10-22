@@ -153,9 +153,10 @@ class FilterByField(Transform):
 class FilterNonEmpty(Transform):
     """Drop rows whose required fields are missing or hold empty values.
 
-    Treats ``None``, ``""``, and ``[]`` as empty (the common cases
-    for tokenized data: no text, no message list). A missing field
-    counts as empty too. Useful as the first transform in a chain to
+    Treats ``None`` and zero-length strings, containers and arrays as
+    empty (the common cases for tokenized data: no text, no tokens,
+    no message list). A missing field counts as empty too; scalar values
+    such as zero and False are retained. Useful as the first transform in a chain to
     purge structurally invalid rows before they reach tokenization
     or packing.
 
@@ -176,7 +177,7 @@ class FilterNonEmpty(Transform):
         self._fields = fields
 
     def __call__(self, example: Example) -> Example | None:
-        """Drop rows where any required field is missing/None/empty-string/empty-list.
+        """Drop rows where any required field is missing, None or zero-length.
 
         Args:
             example: Input row dict.
@@ -187,8 +188,16 @@ class FilterNonEmpty(Transform):
         """
         for field in self._fields:
             value = example.get(field)
-            if value is None or value == "" or value == []:
+            if value is None:
                 return None
+            # Containers and NumPy token arrays expose their emptiness through
+            # length, not elementwise equality. Scalars (including 0/False and
+            # zero-dimensional arrays) are present values, not empty fields.
+            try:
+                if len(value) == 0:
+                    return None
+            except TypeError:
+                pass
         return example
 
     @property

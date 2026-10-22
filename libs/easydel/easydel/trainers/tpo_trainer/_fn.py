@@ -28,8 +28,8 @@ from spectrax import with_sharding_constraint
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
+from .._logprob_utils import compute_token_logps_and_entropies_chunked
 from .._shared import apply_paired_truncation, gather_multimodal_kwargs
-from ..direct_preference_optimization_trainer._fn import _compute_token_logps_chunked
 from ..training_utils import (
     filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
@@ -178,7 +178,9 @@ def tpo_concatenated_forward(
     labels = jnp.where(loss_mask, labels, 0)
     per_token_logps = jnp.where(
         loss_mask,
-        _compute_token_logps_chunked(logits, labels, chunk_size=logprob_vocab_chunk_size),
+        compute_token_logps_and_entropies_chunked(
+            logits, labels, return_entropy=False, chunk_size=logprob_vocab_chunk_size
+        )[0],
         0.0,
     )
     lengths = jnp.maximum(loss_mask.sum(-1).astype(jnp.float32), 1.0)

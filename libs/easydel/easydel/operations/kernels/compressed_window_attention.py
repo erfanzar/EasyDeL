@@ -33,9 +33,6 @@ kernel over its local heads without in-kernel collectives.
 
 from __future__ import annotations
 
-import os
-import typing as tp
-
 import jax
 from ejkernel.modules import compressed_window_attention as _ejkernel_compressed_window_attention
 from jax import numpy as jnp
@@ -45,12 +42,7 @@ from spectrax import common_types
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
-from ._compressed_window_common import head_parallel_shard_map, resolve_platform
-
-# Platform override for A/B testing the Pallas kernel against the XLA reference
-# in-model. Default "auto" prefers Pallas on TPU; the model wiring defaults to
-# "xla" for the robust GSPMD-native path until the Pallas kernel is hardened.
-_PLATFORM: tp.Final = os.getenv("EASYDEL_COMPRESSED_WINDOW_ATTENTION_PLATFORM", "auto")
+from ._compressed_window_common import configured_platform, head_parallel_shard_map, resolve_platform
 
 
 @OperationRegistry.register
@@ -123,7 +115,8 @@ class CompressedWindowAttn(OperationImpl):
             token_kv_len: Length of the token-KV region at the front of ``kv``
                 (the rest are compressed entries). Used only when ``window > 0``.
             platform: Per-call platform override (``"pallas"`` / ``"xla"`` /
-                ``None`` = the adapter default).
+                ``None`` = the ``platform`` of the ``compressed_window_attention`` operation config in
+                ``OperationMetadata.operation_configs``, ``"auto"`` when unset).
             token_valid: Optional per-key token validity ``[batch, q_len]``. When
                 given, ``bias`` holds only the compressed-entry columns and the
                 window / causal / padding mask of the token region is built by
@@ -140,7 +133,7 @@ class CompressedWindowAttn(OperationImpl):
         """
         del ignores
         runtime_dtype = self.metadata.runtime_dtype
-        resolved = resolve_platform(platform, _PLATFORM)
+        resolved = resolve_platform(platform, configured_platform(self.metadata, self.get_impl_name()))
         sharding = head_parallel_shard_map(
             self.metadata,
             mode=common_types.MODE_TRAIN,

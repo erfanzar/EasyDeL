@@ -81,6 +81,28 @@ if TYPE_CHECKING:
     import jax
 
 
+def compute_content_hash(array: np.ndarray) -> str:
+    """Compute an exhaustive content hash of an array.
+
+    The digest covers the shape, the dtype and every byte of the data. It is used as a correctness key (for example
+    in the multimodal prefix-cache page hashing), so it must never be computed from a sample of the data: two
+    different images that agree at the sampled positions would otherwise share a key and reuse the wrong KV pages.
+
+    Args:
+        array (np.ndarray): Array to hash (any shape or numeric dtype).
+
+    Returns:
+        str: 32-character hexadecimal BLAKE2b digest identifying the shape, dtype and content of ``array``.
+    """
+    array = np.asarray(array)
+    contiguous = np.ascontiguousarray(array)
+    hasher = hashlib.blake2b(digest_size=16)
+    hasher.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+    hasher.update(str(contiguous.dtype).encode())
+    hasher.update(contiguous.reshape(-1).view(np.uint8))
+    return hasher.hexdigest()
+
+
 @dataclass(frozen=True)
 class PlaceholderRange:
     """Tracks multimodal placeholder positions in a token sequence.
@@ -161,7 +183,7 @@ class MultiModalFeature:
     construction and clearing pixel values after encoding.
 
     Attributes:
-        mm_hash (str): Content-based MD5 hash of the pixel values, used for
+        mm_hash (str): Content-based hash of the pixel values, used for
             cache lookups. Computed automatically via factory methods.
         modality (str): Type of media, either "image" or "video".
         pixel_values (np.ndarray | None): Processed pixel values as numpy array.
@@ -245,7 +267,7 @@ class MultiModalFeature:
             ...     request_idx=0
             ... )
         """
-        mm_hash = cls._compute_hash(pixel_values)
+        mm_hash = cls._compute_hash(pixel_values, grid_thw)
         return cls(
             mm_hash=mm_hash,
             modality="image",
@@ -294,7 +316,7 @@ class MultiModalFeature:
             ...     request_idx=1
             ... )
         """
-        mm_hash = cls._compute_hash(pixel_values)
+        mm_hash = cls._compute_hash(pixel_values, grid_thw)
         return cls(
             mm_hash=mm_hash,
             modality="video",
@@ -305,36 +327,27 @@ class MultiModalFeature:
         )
 
     @staticmethod
-    def _compute_hash(pixel_values: np.ndarray) -> str:
-        """Compute content-based hash for caching.
-
-        Creates an MD5 hash from the pixel values that can be used as a
-        cache key. The hash includes both the shape and content of the
-        array to ensure uniqueness.
-
-        For large arrays (>1M elements), samples every 100th element to
-        speed up hashing while maintaining reasonable uniqueness for
-        typical image/video data.
+    def _compute_hash(pixel_values: np.ndarray, grid_thw: np.ndarray | None = None) -> str:
+        """Compute a cache key covering pixels and their positional grid.
 
         Args:
-            pixel_values (np.ndarray): Pixel values to hash. Can be any
-                shape (e.g., [H, W, C], [num_patches, patch_dim], etc.).
+            pixel_values: Pixel buffer of any shape; every byte, shape and dtype is hashed.
+            grid_thw: Optional THW grid. Equivalent integer grids with shape [3] and [1, 3]
+                use the same key. A missing grid yields the pixel-only hash,
+                distinct from the domain-separated grid-aware key.
 
         Returns:
-            str: 32-character hexadecimal MD5 hash string that uniquely
-                identifies the content and shape of the input array.
-
-        Note:
-            This is an internal method. The hash is automatically computed
-            by the from_image() and from_video() factory methods.
+            A 32-character hexadecimal digest for encoder and KV-prefix caching.
         """
-        shape_bytes = np.array(pixel_values.shape, dtype=np.int32).tobytes()
-        if pixel_values.size > 1_000_000:
-            sampled = pixel_values.flat[::100]
-            content_bytes = sampled.tobytes()
-        else:
-            content_bytes = pixel_values.tobytes()
-        return hashlib.md5(shape_bytes + content_bytes).hexdigest()
+        pixel_hash = compute_content_hash(pixel_values)
+        if grid_thw is None:
+            return pixel_hash
+        grid = np.asarray(grid_thw, dtype=np.int64).reshape(-1, 3)
+        hasher = hashlib.blake2b(digest_size=16)
+        hasher.update(b"multimodal-grid-thw-v1\0")
+        hasher.update(pixel_hash.encode("ascii"))
+        hasher.update(compute_content_hash(grid).encode("ascii"))
+        return hasher.hexdigest()
 
     @property
     def has_cached_embeddings(self) -> bool:
@@ -529,20 +542,28 @@ class BatchedMultiModalInputs:
         pixel_values = None
         image_grid_thw = None
         if image_features:
-            pixel_values_list = [f.pixel_values for f in image_features if f.pixel_values is not None]
+            pixel_values_list = [
+                f.pixel_values[None, ...] if f.pixel_values.ndim == 3 else f.pixel_values
+                for f in image_features
+                if f.pixel_values is not None
+            ]
             if pixel_values_list:
                 pixel_values = np.concatenate(pixel_values_list, axis=0)
-            grid_list = [f.grid_thw for f in image_features if f.grid_thw is not None]
+            grid_list = [np.asarray(f.grid_thw).reshape(-1, 3) for f in image_features if f.grid_thw is not None]
             if grid_list:
                 image_grid_thw = np.concatenate(grid_list, axis=0)
 
         pixel_values_videos = None
         video_grid_thw = None
         if video_features:
-            video_pv_list = [f.pixel_values for f in video_features if f.pixel_values is not None]
+            video_pv_list = [
+                f.pixel_values[None, ...] if f.pixel_values.ndim == 4 else f.pixel_values
+                for f in video_features
+                if f.pixel_values is not None
+            ]
             if video_pv_list:
                 pixel_values_videos = np.concatenate(video_pv_list, axis=0)
-            video_grid_list = [f.grid_thw for f in video_features if f.grid_thw is not None]
+            video_grid_list = [np.asarray(f.grid_thw).reshape(-1, 3) for f in video_features if f.grid_thw is not None]
             if video_grid_list:
                 video_grid_thw = np.concatenate(video_grid_list, axis=0)
 

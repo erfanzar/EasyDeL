@@ -60,10 +60,10 @@ from __future__ import annotations
 
 import time
 import typing
-from bisect import bisect_left
 from collections import deque
 from concurrent.futures import Future
 from functools import partial
+from math import gcd
 
 import jax
 import numpy as np
@@ -82,34 +82,30 @@ from easydel.inference.esurge.config import (
 )
 from easydel.inference.speculative import DrafterProtocol, accept_or_reject, resample_rejected
 from easydel.infra.sharding import replicated_named_sharding
+from easydel.infra.side_inputs import SideInputWindow
 from easydel.layers.quantization import TurboQuantConfig
 from easydel.utils import flags
 
 from ..core.dp_sharding import dp_shard_page_bounds, pages_per_dp_shard
 from ..core.interface import create_kv_cache_specs_from_config, estimate_runtime_page_budget
 from ..metrics import get_metrics_collector
-from ..multimodal.side_inputs import SideInputWindow, build_side_input_provider, model_has_side_inputs
-from ..outputs import ModelRunnerOutput
+from ..multimodal.cache import VisionEncoderCache
+from ..multimodal.side_inputs import build_side_input_provider, model_has_side_inputs
+from ..outputs import LogprobsLists, ModelRunnerOutput
 from ..scheduler import SchedulerOutput
 from ..utils import model_uses_mrope
 from .async_types import AsyncPreResults, AsyncWindowResult, DeviceInputTokenHandoff
-from .execution_manager import ExecutionManager
+from .execution_types import CacheGroupInputs
 from .host_sync import host_payload_broadcast_needed
 from .perf import RunnerPerfSample, RunnerPerfTracker
 from .pipeline_execution_manager import PipelineExecutionManager
+from .pipeline_execution_manager import RunnerExecutionManager as ExecutionManager
 from .pipeline_plan import build_pipeline_inference_plan, cap_metadata_pages
-from .sequence_buffer import (
-    SequenceBuffer,
-    build_allowed_mask,
-    build_sampling_arrays,
-    fill_slice,
-    move_row,
-    pack_prompts,
-    swap_rows,
-)
+from .sequence_buffer import SequenceBuffer
 from .slot_pool import RecurrentSlotPool
 from .spec.interface import NullSpeculation, SpeculativeStrategy
-from .spec.strategy import DrafterSpeculation, _snapshot_recurrent_state, _window_hidden_row
+from .spec.sampling import score_sampled_tokens, summarize_logprobs
+from .spec.strategy import DrafterSpeculation, snapshot_recurrent_state, window_hidden_row
 from .state_sync import SequenceStateSync
 from .states import CachedRequestState
 from .vlm_prefill import VlmPrefillHelper
@@ -219,6 +215,44 @@ def derive_spec_token_buckets(
     return buckets
 
 
+def _materialize_logprobs(
+    req_ids: list[str],
+    sampled_token_ids: list[list[int]],
+    payloads: dict[str, tuple[typing.Any, typing.Any, typing.Any]],
+    requested: set[str],
+) -> LogprobsLists | None:
+    """Flatten per-request device summaries in emitted-position order.
+
+    Unrequested emitted positions retain empty rows so scheduler offsets remain
+    correct for mixed batches. Partial prefill contributes no output positions.
+    """
+    if not requested:
+        return None
+    ids_out, scores_out, ranks_out = [], [], []
+    for req_id, emitted in zip(req_ids, sampled_token_ids, strict=True):
+        if req_id not in requested:
+            ids_out.extend([] for _ in emitted)
+            scores_out.extend([] for _ in emitted)
+            ranks_out.extend(0 for _ in emitted)
+            continue
+        if not emitted:
+            continue
+        if req_id not in payloads:
+            raise RuntimeError(f"Missing requested sampling probabilities for {req_id!r}.")
+        ids, scores, ranks = (np.asarray(array) for array in payloads[req_id])
+        if ids.shape[0] != len(emitted):
+            raise RuntimeError(f"Sampling probability positions do not match emitted tokens for {req_id!r}.")
+        for token, token_ids, values, rank in zip(emitted, ids, scores, ranks, strict=True):
+            if int(token_ids[0]) != int(token):
+                raise RuntimeError(f"Sampling probability token does not match output for {req_id!r}.")
+            # Sampled-first summaries may repeat the sampled token in top-k.
+            unique = dict(zip(token_ids.astype(int).tolist(), values.astype(float).tolist(), strict=True))
+            ids_out.append(list(unique))
+            scores_out.append(list(unique.values()))
+            ranks_out.append(int(rank))
+    return LogprobsLists(ids_out, scores_out, ranks_out)
+
+
 class _AsyncExecutionHandle:
     """Deferred host-materialized model output for overlap execution.
 
@@ -234,6 +268,7 @@ class _AsyncExecutionHandle:
         model_runner_output: ModelRunnerOutput,
         windows: list[AsyncWindowResult],
         finalize: typing.Callable[[list[list[int]]], None] | None = None,
+        resolve_logprobs: typing.Callable[[list[list[int]]], LogprobsLists | None] | None = None,
     ) -> None:
         """Initialize the deferred handle.
 
@@ -245,10 +280,13 @@ class _AsyncExecutionHandle:
                 whose host copies are already in flight.
             finalize: Optional callback invoked exactly once with the resolved
                 ``sampled_token_ids`` once the host data is ready.
+            resolve_logprobs: Optional deferred position-major probability
+                materializer, independent of sampler metrics.
         """
         self._model_runner_output = model_runner_output
         self._windows = windows
         self._finalize = finalize
+        self._resolve_logprobs = resolve_logprobs
         self._resolved_output: ModelRunnerOutput | None = None
 
     def get_output(self) -> ModelRunnerOutput:
@@ -292,6 +330,9 @@ class _AsyncExecutionHandle:
         output = self._model_runner_output
         output.sampled_token_ids = sampled_token_ids
         output.token_logprobs = token_logprobs or None
+        if self._resolve_logprobs is not None:
+            output.logprobs = self._resolve_logprobs(sampled_token_ids)
+            self._resolve_logprobs = None
         self._resolved_output = output
         return output
 
@@ -379,6 +420,10 @@ class eSurgeRunner:
         pp_microbatch_count: int | str | None = "auto",
         pp_microbatch_size: int | str | None = "auto",
         drafter: DrafterProtocol | None = None,
+        spec_debug_max_traces: int = 0,
+        spec_adaptive_conf_threshold: float = 0.0,
+        vision_cache: VisionEncoderCache | None = None,
+        host_payloads_replicated: bool = False,
     ):
         """Initialize the model runner.
 
@@ -420,7 +465,19 @@ class eSurgeRunner:
                 draft/verify/commit path, filling ``request.spec_token_ids``
                 from real drafts. ``None`` keeps the standard
                 single-token-per-forward decode.
+            spec_debug_max_traces: Maximum speculative verify traces to retain;
+                zero disables trace capture.
+            spec_adaptive_conf_threshold: Top-1 confidence threshold in [0, 1]
+                for early-exit drafting; zero keeps fixed-length drafting.
+            vision_cache: Optional shared multimodal manager cache for encoder
+                outputs. Passing the manager's cache shares its capacity,
+                clearing and statistics; None disables cross-request reuse.
+            host_payloads_replicated: This runner's coordinator guarantees identical
+                host payloads on all processes. Defaults to False independently of
+                legacy process-global policy; update between steps if coordination
+                starts after runner construction.
         """
+        self.host_payloads_replicated = host_payloads_replicated
         self.model = model.esurge_compatible_model
         # Compressed-window models (DeepSeek-V4) keep ALL decode state in
         # per-request slots (CompressedWindowCache rows). Requests must keep a
@@ -473,6 +530,8 @@ class eSurgeRunner:
                 drafter=self.drafter,
                 num_draft_tokens=self.num_draft_tokens,
                 draft_schedule=self.draft_schedule,
+                debug_max_traces=spec_debug_max_traces,
+                adaptive_conf_threshold=spec_adaptive_conf_threshold,
             )
             if self.drafter is not None
             else NullSpeculation()
@@ -520,9 +579,8 @@ class eSurgeRunner:
                 hbm_utilization=hbm_utilization,
                 page_size=page_size,
                 max_length=max_model_len,
-                # Born-capped here too, so the global token cap is honored for
-                # unified_attention even when cap_metadata_pages (below) is a no-op
-                # outside pipeline parallelism.
+                # Born-capped here too, so the HBM-derived page count is never
+                # sized to the full pool before the global token cap applies.
                 max_cache_tokens=max_cache_tokens,
             )
         else:
@@ -532,8 +590,9 @@ class eSurgeRunner:
                 max_length=max_model_len,
                 # Born-capped: honor the global token cap at creation time so the
                 # page pool is never sized to the full HBM-derived count first.
-                # cap_metadata_pages below still applies the capacity margin (and
-                # is a no-op for the cap itself once this has already capped).
+                # cap_metadata_pages below applies the capacity margin for every
+                # engine (SPMD and PP) and is a no-op for the cap itself once
+                # this has already capped.
                 max_cache_tokens=max_cache_tokens,
             )
         cap_metadata_pages(self.metadata, self.pipeline_plan)
@@ -612,16 +671,16 @@ class eSurgeRunner:
             vision_patch_buckets=vision_patch_buckets,
             max_num_batched_tokens=self.max_num_batched_tokens,
             max_num_tokens=self.max_num_tokens,
+            vision_cache=vision_cache,
         )
         spec_full_hidden_max_tokens = 0
         if drafter is not None:
             spec_window_tokens = max(1, int(self.num_draft_tokens) + 1)
             if bool(getattr(drafter, "supports_prefix_draft", False)):
-                spec_window_tokens = max(spec_window_tokens, int(max_num_batched_tokens))
-            spec_bucket_idx = bisect_left(self.num_tokens_paddings, spec_window_tokens)
-            if spec_bucket_idx >= len(self.num_tokens_paddings):
-                spec_bucket_idx = len(self.num_tokens_paddings) - 1
-            spec_full_hidden_max_tokens = int(self.num_tokens_paddings[spec_bucket_idx])
+                spec_window_tokens = max(spec_window_tokens, int(self.max_num_batched_tokens))
+            spec_full_hidden_max_tokens = int(
+                self.window_planner.get_token_bucket(spec_window_tokens, active_buckets=self.num_tokens_paddings)
+            )
         text_config = self.model.config.get_text_config()
         layer_types = getattr(text_config, "layer_types", ()) or ()
         recurrent_layer_types = {"linear_attention", "kda_linear_attention", "parallel_hybrid", "hybrid"}
@@ -633,8 +692,6 @@ class eSurgeRunner:
         # copy instead of snapshot + replay (``kda_packed_rows_forward`` writes and commits the KDA rows).
         spec_active = drafter is not None and int(self.num_draft_tokens) > 0
         self.spec_decode_recurrent_candidates = bool(spec_active and has_recurrent_layers)
-        # Replay-only rollback is no longer needed by any recurrent family; kept for the call sites that branch on it.
-        self.spec_decode_recurrent_replay_only = False
         # Greedy recurrent verify: how to advance the live recurrent (GDN) state
         # after a verify window.
         #   fast path (default): reuse the fused verify forward's argmax + the
@@ -650,6 +707,7 @@ class eSurgeRunner:
         # set the env to 1 when bit-exact greedy is required over throughput.
         self.spec_decode_recurrent_replay = flags.get_bool(flags.EASYDEL_SPEC_RECURRENT_REPLAY)
 
+        self.cache_group_configs, self.layer_to_cache_group = self._build_execution_cache_group_layout()
         logger.debug("Creating ExecutionManager and initializing pages cache")
         manager_cls = PipelineExecutionManager if self.pipeline_plan.is_enabled else ExecutionManager
         self.executor_manager = manager_cls(
@@ -660,6 +718,9 @@ class eSurgeRunner:
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
             metadata=self.metadata,
+            cache_group_configs=self.cache_group_configs,
+            layer_to_cache_group=self.layer_to_cache_group,
+            host_payloads_replicated=self.host_payloads_replicated,
             verbose=verbose,
             mpmd_scheduler=mpmd_scheduler,
             pipeline_plan=self.pipeline_plan,
@@ -681,7 +742,7 @@ class eSurgeRunner:
             # DSpark: the fused model step must also return the backbone's ``main_hidden`` rows.
             if self.pipeline_plan.is_enabled:
                 raise ValueError("DSpark speculative decoding does not support MPMD/PP execution.")
-            self.executor_manager._model_executor.main_hidden_enabled = True
+            self.executor_manager.set_main_hidden_enabled(True)
         self.log_it = logger.info if verbose else logger.debug
         self._setup_variables()
         self.enable_overlap_execution = enable_overlap_execution
@@ -696,6 +757,23 @@ class eSurgeRunner:
         self._handoff_scalar_cache: dict[int, jax.Array] = {}
         logger.debug("eSurgeRunner initialization complete")
         self._log_startup_summary()
+
+    @property
+    def host_payloads_replicated(self) -> bool:
+        """Return this runner's explicit, instance-local coordination guarantee."""
+        return getattr(self, "_host_payloads_replicated", False)
+
+    @host_payloads_replicated.setter
+    def host_payloads_replicated(self, enabled: bool) -> None:
+        """Update coordination between steps, including existing child preparers.
+
+        Set this on the scheduler thread before stepping after a coordinator
+        starts or stops. Other runners and the legacy global policy are untouched.
+        """
+        self._host_payloads_replicated = bool(enabled)
+        manager = getattr(self, "executor_manager", None)
+        if manager is not None:
+            manager.host_payloads_replicated = self._host_payloads_replicated
 
     def _validate_spmd_dp_support(self, *, attn_mechanism: str | None) -> None:
         """Fail early for features not wired into rank-major DP execution yet."""
@@ -743,13 +821,6 @@ class eSurgeRunner:
     def _uses_spmd_dp(self) -> bool:
         """Return whether the runner is using rank-major data-parallel execution."""
         return int(getattr(self.metadata, "data_parallel_size", 1) or 1) > 1
-
-    def _uses_recurrent_slot_pool(self) -> bool:
-        """Whether requests are pinned to pooled physical state slots.
-
-        Delegates to :meth:`RecurrentSlotPool.is_enabled`.
-        """
-        return self.slot_pool.is_enabled()
 
     def _plain_recurrent_row_sync_enabled(self) -> bool:
         """Whether device recurrent rows must track SequenceBuffer row moves.
@@ -878,13 +949,121 @@ class eSurgeRunner:
             use_mla=False,
         )
 
+    def _build_execution_cache_group_layout(self) -> tuple[tuple[typing.Any, ...], tuple[int, ...]]:
+        """Resolve static per-pool configurations and model-layer dispatch before compilation.
+
+        Cache creation already resolves physical per-layer geometry (including KV
+        head replication) into the representative config's mixed-layout map. Reuse
+        those configurations rather than reconstructing logical model geometry.
+        A single FULL pool retains the legacy execution PyTree.
+        """
+        from ..core.interface import FullAttentionSpec
+
+        groups = self.kv_cache_groups
+        if not groups or (len(groups) == 1 and isinstance(groups[0].kv_cache_spec, FullAttentionSpec)):
+            return (), ()
+        layer_groups: dict[int, int] = {}
+        configs = []
+        per_layer = getattr(self.metadata, "_mixed_layer_configs", None) or {}
+        for group_index, group in enumerate(groups):
+            if not group.layer_names:
+                raise ValueError("Independent KV pools require explicit model-layer ownership")
+            layer_indices = [int(name.rsplit(".", 1)[-1]) for name in group.layer_names]
+            for layer_index in layer_indices:
+                if layer_index < 0 or layer_index in layer_groups:
+                    raise ValueError("Each model layer must belong to exactly one KV pool")
+                layer_groups[layer_index] = group_index
+            config = per_layer.get(layer_indices[0], self.metadata)
+            # Physical geometry may differ, but all groups share one batch layout.
+            for name in (
+                "window_aware_max_num_seqs",
+                "window_aware_pages_per_request",
+                "window_aware_max_num_batched_tokens",
+            ):
+                if hasattr(config, name) and hasattr(self.metadata, name):
+                    setattr(config, name, getattr(self.metadata, name))
+            configs.append(config)
+        layer_count = int(getattr(self.model.config.get_text_config(), "num_hidden_layers", len(layer_groups)))
+        if set(layer_groups) != set(range(layer_count)):
+            raise ValueError("KV pool ownership must cover every model layer")
+        return tuple(configs), tuple(layer_groups[index] for index in range(layer_count))
+
+    def cache_group_inputs_for_execute(
+        self,
+        *,
+        window_row_indices_cpu: np.ndarray,
+        num_computed_tokens_cpu: np.ndarray,
+    ) -> tuple[CacheGroupInputs, ...]:
+        """Build complete pool inputs for normal or speculative execution windows.
+
+        Each independently versioned table is gathered in the exact model-window
+        order. Evicted leading pages of sliding/chunk pools are trimmed and their
+        cache-local progress is rebased; model token positions remain absolute.
+        Window identities include the trim offset, invalidating cached table
+        staging when a replay starts at a different local prefix.
+
+        Args:
+            window_row_indices_cpu: Global sequence rows in compact window order.
+            num_computed_tokens_cpu: Absolute per-row progress for this exact call,
+                including speculative replay/suffix calls.
+
+        Returns:
+            All independent pool inputs in static cache-group order, or an empty
+            tuple for the legacy single-FULL/MLA execution path.
+        """
+        if not getattr(self, "cache_group_configs", ()):
+            return ()
+        from ..core.interface import FullAttentionSpec
+
+        computed = np.asarray(num_computed_tokens_cpu, dtype=np.int32)
+        rows = np.asarray(window_row_indices_cpu[: len(computed)], dtype=np.int32)
+        if len(rows) != len(computed):
+            raise ValueError("Cache group rows and computed progress must align")
+        payloads = []
+        for index, group in enumerate(self.kv_cache_groups):
+            table = self.sequence_buffer.page_table[index]
+            pages = np.asarray(table.get_cpu_tensor()[rows])
+            local_computed = None
+            offsets = np.zeros(len(rows), dtype=np.int32)
+            if not isinstance(group.kv_cache_spec, FullAttentionSpec) and pages.shape[1]:
+                page_size = int(group.kv_cache_spec.page_size)
+                # Never trim uncomputed tokens, including a null-only inactive row.
+                first_live = np.argmax(pages != 0, axis=1)
+                offsets = np.minimum(first_live, np.maximum(computed, 0) // page_size)
+                chunk_size = getattr(group.kv_cache_spec, "attention_chunk_size", None)
+                if chunk_size is not None:
+                    # A chunk mask uses cache-local positions too. Only subtract a
+                    # multiple of both page size and chunk size so floor(pos/chunk)
+                    # still identifies exactly the same absolute chunk boundaries.
+                    pages_per_chunk_lattice = int(chunk_size) // gcd(int(chunk_size), page_size)
+                    offsets = (offsets // pages_per_chunk_lattice) * pages_per_chunk_lattice
+                if np.any(offsets):
+                    rebased = np.zeros_like(pages)
+                    for row, offset in enumerate(offsets):
+                        count = pages.shape[1] - int(offset)
+                        rebased[row, :count] = pages[row, int(offset) :]
+                    pages = rebased
+                local_computed = computed - offsets * page_size
+            identity = tuple(
+                int(row) * (pages.shape[1] + 1) + int(offset) for row, offset in zip(rows, offsets, strict=True)
+            )
+            payloads.append(
+                CacheGroupInputs(
+                    page_table_cpu=pages,
+                    page_table_version=getattr(table, "cpu_version", None),
+                    window_identity=identity,
+                    num_computed_tokens_cpu=local_computed,
+                )
+            )
+        return tuple(payloads)
+
     def _get_full_attention_page_table_index(self) -> int:
         """Return the page table group index for the full-attention cache group.
 
-        For mixed-attention models (e.g., sliding window + full attention), the
-        kernel must receive the full-attention group's page table because it
-        keeps all pages valid. Sliding-window groups evict old pages, leaving
-        null entries that would cause VMEM out-of-range errors on TPU.
+        This selects the legacy carrier table for common token/sampler packing.
+        Mixed-attention execution additionally supplies every independent pool
+        through :meth:`cache_group_inputs_for_execute`; layer-local cache reads
+        and writes select those complete group payloads instead of this table.
 
         Returns:
             0 if no cache groups are defined (single-group model), otherwise
@@ -1298,6 +1477,9 @@ class eSurgeRunner:
             page_sizes=[self.metadata.page_size] * num_cache_groups,
             sharding=self._empty_sharding,
         )
+        # Keep the live dictionary: admission, compaction and row swaps mutate
+        # it in place. Rebind after reset_state replaces the sequence buffer.
+        self.executor_manager.sampler_runtime.request_seeds = self.sequence_buffer.generator_seeds
         self.slot_pool = RecurrentSlotPool(
             metadata=self.metadata,
             max_num_reqs=self.max_num_reqs,
@@ -1498,113 +1680,6 @@ class eSurgeRunner:
             allow_sparse_packing=allow_sparse_packing,
         )
 
-    def _precompile_jitted_helpers(
-        self,
-        reqs_padds: list[int],
-        prompt_len_buckets: list[int],
-        precompile_allowed_mask: bool = False,
-        allowed_max: int = 512,
-    ) -> None:
-        """Precompile JIT helper kernels for various input configurations.
-
-        Compiles auxiliary JIT functions (pack_prompts, build_sampling_arrays,
-        fill_slice, swap_rows, move_row, build_allowed_mask) for different
-        request and prompt length combinations to avoid runtime compilation.
-
-        Args:
-            reqs_padds: List of request count bucket sizes to compile.
-            prompt_len_buckets: List of prompt length bucket sizes to compile.
-            precompile_allowed_mask: Whether to compile allowed mask kernel.
-            allowed_max: Maximum allowed token count for constrained decoding.
-
-        Note:
-            Compilation failures are logged at debug level and skipped,
-            allowing partial precompilation when some configurations are
-            not supported by the underlying kernels.
-        """
-        logger.info("Precompiling eSurgeRunner helper kernels")
-
-        B = self.max_num_reqs
-        T = self.max_model_len
-        V = int(self.model.config.get_text_config().vocab_size)
-
-        token_ids = jnp.zeros((B, T), dtype=jnp.int32)
-        num_prompt_tokens = jnp.zeros((B,), dtype=jnp.int32)
-
-        temperature = jnp.zeros((B,), dtype=jnp.float32)
-        min_p = jnp.zeros((B,), dtype=jnp.float32)
-        top_p = jnp.ones((B,), dtype=jnp.float32)
-        top_k = jnp.zeros((B,), dtype=jnp.int32)
-
-        for pr_len in prompt_len_buckets:
-            pr_len = min(pr_len, self.max_model_len)
-            for pr_reqs in reqs_padds:
-                try:
-                    lowered = pack_prompts.lower(  # pyright: ignore[reportFunctionMemberAccess]
-                        token_ids,
-                        num_prompt_tokens,
-                        padded_num_reqs=pr_reqs,
-                        padded_prompt_len=pr_len,
-                        pad_id=V,
-                    )
-                    _ = lowered.compile()
-                    logger.debug(f"pack_prompts compiled for (padded_num_reqs={pr_reqs}, padded_prompt_len={pr_len})")
-                except Exception as e:
-                    logger.debug(f"pack_prompts skip ({pr_reqs}, {pr_len}): {e}")
-
-        for pr_reqs in reqs_padds:
-            try:
-                lowered = build_sampling_arrays.lower(  # pyright: ignore[reportFunctionMemberAccess]
-                    temperature,
-                    min_p,
-                    top_p,
-                    top_k,
-                    jnp.int32(min(pr_reqs, B)),  # num_reqs <= padded_num_reqs
-                    padded_num_reqs=pr_reqs,
-                )
-                _ = lowered.compile()
-                logger.debug(f"build_sampling_arrays compiled for (padded_num_reqs={pr_reqs})")
-            except Exception as e:
-                logger.debug(f"build_sampling_arrays skip ({pr_reqs}): {e}")
-
-        for pr_reqs in reqs_padds:
-            try:
-                lowered = fill_slice.lower(  # pyright: ignore[reportFunctionMemberAccess]
-                    temperature,
-                    jnp.float32(0.0),
-                    int(pr_reqs),
-                    int(pr_reqs),
-                )
-                _ = lowered.compile()
-                logger.debug(f"fill_slice compiled for (num_reqs={pr_reqs}, padded_num_reqs={pr_reqs})")
-            except Exception as e:
-                logger.debug(f"fill_slice skip ({pr_reqs}): {e}")
-
-        try:
-            _ = swap_rows.lower(token_ids, jnp.int32(0), jnp.int32(1)).compile()
-            _ = move_row.lower(token_ids, jnp.int32(0), jnp.int32(1)).compile()
-            logger.debug("swap_rows and move_row compiled")
-        except Exception as e:
-            logger.debug(f"swap_rows/move_row skip: {e}")
-
-        if precompile_allowed_mask:
-            max_allowed = int(min(allowed_max, V))
-            allowed_ids_padded = jnp.zeros((B, max_allowed), dtype=jnp.int32)
-            allowed_lens = jnp.zeros((B,), dtype=jnp.int32)
-            try:
-                lowered = build_allowed_mask.lower(  # pyright: ignore[reportFunctionMemberAccess]
-                    allowed_ids_padded,
-                    allowed_lens,
-                    vocab_size=int(V),
-                    max_allowed=max_allowed,
-                )
-                _ = lowered.compile()
-                logger.debug(f"build_allowed_mask compiled for (B={B}, V={V}, max_allowed={max_allowed})")
-            except Exception as e:
-                logger.debug(f"build_allowed_mask skip (V={V}, max_allowed={max_allowed}): {e}")
-
-        logger.info("Helper kernel precompilation finished")
-
     def _precompile_draft_schedule_variants(self) -> None:
         """Warm the batched drafter's per-``k`` compiles for every schedule ``k``.
 
@@ -1757,17 +1832,6 @@ class eSurgeRunner:
 
         self._precompile_vlm_vision_helpers(max_num_batched_tokens=num_tokens_paddings[-1])
 
-        helper_prompt_buckets = [min(n, self.max_model_len) for n in num_tokens_paddings]
-        if self.pipeline_plan.is_enabled:
-            helper_prompt_buckets = sorted({helper_prompt_buckets[0], helper_prompt_buckets[-1]})
-
-        self._precompile_jitted_helpers(
-            reqs_padds=self.active_num_seq_buckets,
-            prompt_len_buckets=helper_prompt_buckets,
-            precompile_allowed_mask=False,
-            allowed_max=4096,
-        )
-
         self._precompile_draft_schedule_variants()
         self._precompile_draft_in_verify_variants()
         self._precompile_whole_block_drafter()
@@ -1831,6 +1895,11 @@ class eSurgeRunner:
         model = model.esurge_compatible_model
         graphdef = model.graphdef
         self.model = model
+        # Weight refreshes may reuse the same model object; identity alone is
+        # insufficient to invalidate cached encoder outputs in that case.
+        vlm = getattr(self, "vlm", None)
+        if vlm is not None:
+            vlm.reset_vision_cache()
         self._vlm_image_features_jit = None
         self._vlm_video_features_jit = None
         self._vlm_vision_jit_disabled = False
@@ -1862,19 +1931,12 @@ class eSurgeRunner:
 
         self.reset_state()
 
-        if clear_compiled_cache:
-            self.executor_manager.clear_cache()
+        self.executor_manager.release_model_state(clear_compiled_cache=clear_compiled_cache)
 
         self.model = None
         self._vlm_image_features_jit = None
         self._vlm_video_features_jit = None
         self._vlm_vision_jit_disabled = False
-        self.executor_manager.model = None
-        self.executor_manager.graphstate = None
-        self.executor_manager.graphother = None
-        self.executor_manager._model_executor.model = None
-        self.executor_manager._model_executor.clear_runtime_graph_args()
-        self.executor_manager._sampler_executor.model = None
 
     def destroy_kv_cache(self) -> None:
         """Drop the executor-manager's KV-pages reference to free HBM.
@@ -1897,8 +1959,8 @@ class eSurgeRunner:
         leak a second allocation. Otherwise builds the right
         ``Quantizer`` (TurboQuant gets a no-config quantizer; everything
         else gets the model's standard kv-quant config) and delegates to
-        the bounded-retry path
-        :meth:`ExecutionManager._init_operations_cache_with_retry`, which
+        the public allocation API
+        :meth:`RunnerExecutionManager.initialize_kv_cache`, which
         will shrink the page pool on PP HBM-OOM. Called by both
         :meth:`eSurge.initiate` (fresh start) and :meth:`eSurge.resume`
         (after a pause that destroyed pages).
@@ -1918,7 +1980,7 @@ class eSurgeRunner:
         else:
             quantizer = self.model._quant_class(quantization_config=kv_quant_cfg)
 
-        self.executor_manager.kv_pages = self.executor_manager._init_operations_cache_with_retry(
+        self.executor_manager.initialize_kv_cache(
             quantizer=quantizer,
             masking_details=getattr(text_config, "get_mask_details", lambda: None)(),
         )
@@ -2028,34 +2090,6 @@ class eSurgeRunner:
         """Delegates to :meth:`VlmPrefillHelper.get_video_features_jit`."""
         return self.vlm.get_video_features_jit()
 
-    def _compute_embedding_with_info_single_pass(
-        self,
-        input_ids: jax.Array,
-        embed_kwargs: dict[str, typing.Any],
-    ) -> tuple[jax.Array, typing.Any]:
-        """Compute VLM embeddings while avoiding wrapper-level duplicate vision work.
-
-        Delegates to :meth:`VlmPrefillHelper.compute_embedding_with_info_single_pass`.
-        """
-        return self.vlm.compute_embedding_with_info_single_pass(input_ids, embed_kwargs)
-
-    def _compiled_vision_embed_kwargs(self, req_state: CachedRequestState) -> dict[str, typing.Any] | None:
-        """Delegates to :meth:`VlmPrefillHelper.compiled_vision_embed_kwargs`."""
-        return self.vlm.compiled_vision_embed_kwargs(req_state)
-
-    def _compute_vlm_prefill_with_compiled_vision(
-        self,
-        req_state: CachedRequestState,
-        input_ids: jax.Array,
-        attention_mask: jax.Array,
-    ) -> tuple[jax.Array, typing.Any] | None:
-        """Delegates to :meth:`VlmPrefillHelper.compute_prefill_with_compiled_vision`."""
-        return self.vlm.compute_prefill_with_compiled_vision(
-            req_state=req_state,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
-
     def _precompile_vlm_vision_helpers(self, *, max_num_batched_tokens: int | None) -> None:
         """Delegates to :meth:`VlmPrefillHelper.precompile_vision_helpers`."""
         self.vlm.precompile_vision_helpers(max_num_batched_tokens=max_num_batched_tokens)
@@ -2085,8 +2119,8 @@ class eSurgeRunner:
     ) -> dict[str, np.ndarray]:
         """Build the per-token side inputs of models that declare them (aligned with the flat token stream).
 
-        Rows follow the batch preparer's packing: scheduled tokens of the window's requests back to back, padded rows
-        at each spec's fill value. The model's provider rebuilds everything from each request's token history, so
+        Rows follow the batch preparer's packing: scheduled tokens back to back within each DP rank's token slice,
+        with padding at each spec's fill value. The model's provider rebuilds everything from each request's token history, so
         chunked prefill, decode, preemption resume and slot reuse need no per-request provider state.
 
         Args:
@@ -2098,7 +2132,7 @@ class eSurgeRunner:
         Returns:
             ``{name: [num_tokens_static, *per_token_shape]}`` per declared side input.
         """
-        windows: list[SideInputWindow] = []
+        windows: list[tuple[int, SideInputWindow]] = []
         for pos, rid in enumerate(req_ids_window):
             n = int(scheduled_list[pos])
             if n <= 0:
@@ -2108,8 +2142,108 @@ class eSurgeRunner:
             req_state = self.requests.get(rid) if rid is not None else None
             types = None if req_state is None else req_state.token_types
             known = int(self.sequence_buffer.num_tokens_no_spec[row])
-            windows.append(SideInputWindow(self.sequence_buffer.token_ids[row], types, start, start + n, known))
-        return self._get_side_input_provider().build(windows, int(num_tokens_static))
+            windows.append((row, SideInputWindow(self.sequence_buffer.token_ids[row], types, start, start + n, known)))
+        return self._pack_side_input_windows(windows, num_tokens_static=int(num_tokens_static))
+
+    def _pack_side_input_windows(
+        self, windows: list[tuple[int, SideInputWindow]], *, num_tokens_static: int
+    ) -> dict[str, np.ndarray]:
+        """Build side inputs in the same rank-major layout as model token IDs.
+
+        Args:
+            windows: Global sequence-row index and scheduled side-input window pairs.
+            num_tokens_static: Total token bucket, including every rank's padding.
+
+        Returns:
+            Side-input arrays with per-rank padding supplied by the model provider.
+
+        Raises:
+            ValueError: If the rank layout is invalid or any rank exceeds its token budget.
+        """
+        provider = self._get_side_input_provider()
+        if not self._uses_spmd_dp():
+            return provider.build([window for _, window in windows], int(num_tokens_static))
+        dp_size = int(self.metadata.data_parallel_size)
+        rows_per_rank, extra_rows = divmod(int(self.num_reqs_max_model_len), dp_size)
+        tokens_per_rank, extra_tokens = divmod(int(num_tokens_static), dp_size)
+        if extra_rows or extra_tokens or rows_per_rank <= 0:
+            raise ValueError("Rank-major side inputs require rows and token buckets divisible by DP size.")
+        rank_windows: list[list[SideInputWindow]] = [[] for _ in range(dp_size)]
+        for row, window in windows:
+            rank = int(row) // rows_per_rank
+            if not 0 <= rank < dp_size:
+                raise ValueError(f"Side-input row {row} is outside the rank-major request layout.")
+            rank_windows[rank].append(window)
+        payloads = []
+        for rank, local_windows in enumerate(rank_windows):
+            used = sum(int(window.end) - int(window.start) for window in local_windows)
+            if used > tokens_per_rank:
+                raise ValueError(f"DP rank {rank} side inputs exceed its token budget: {used} > {tokens_per_rank}.")
+            payloads.append(provider.build(local_windows, tokens_per_rank))
+        return {name: np.concatenate([payload[name] for payload in payloads], axis=0) for name in payloads[0]}
+
+    def queue_speculative_recurrent_commit(self, req_id: str, prefix_len: int) -> None:
+        """Queue a verified prefix for the next model step's recurrent commit.
+
+        Args:
+            req_id: Request whose recurrent candidate state should be committed.
+            prefix_len: Positive number of accepted input tokens, including real tokens.
+
+        Raises:
+            ValueError: If the prefix length is not positive.
+        """
+        if int(prefix_len) <= 0:
+            raise ValueError("A speculative recurrent commit requires a positive prefix length.")
+        self._pending_spec_recurrent_commit_by_req[str(req_id)] = int(prefix_len)
+
+    def record_speculative_execution_time(self, *, replay: float = 0.0, suffix: float = 0.0) -> None:
+        """Accumulate strategy execution time for this step's performance sample.
+
+        Args:
+            replay: Seconds spent restoring and replaying an accepted prefix.
+            suffix: Seconds spent executing the suffix sampling path.
+        """
+        self._spec_replay_time_acc += float(replay)
+        self._spec_suffix_time_acc += float(suffix)
+
+    @property
+    def scheduled_token_counts_cpu(self) -> np.ndarray:
+        """Current window's host scheduled-token counts (borrowed, not copied)."""
+        return self._scheduled_full_cpu
+
+    @property
+    def active_request_mask_cpu(self) -> np.ndarray:
+        """Current window's host active-row mask (borrowed, not copied)."""
+        return self._active_mask_full_cpu
+
+    def side_inputs_for_execute(
+        self,
+        *,
+        token_ids_cpu: np.ndarray,
+        num_computed_tokens_cpu: np.ndarray,
+        scheduled_full_cpu: np.ndarray,
+        window_row_indices_cpu: np.ndarray,
+        num_tokens_static: int,
+    ) -> dict[str, np.ndarray] | None:
+        """Build model side inputs aligned with a speculative executor call.
+
+        Args:
+            token_ids_cpu: Window token-id rows passed to the executor.
+            num_computed_tokens_cpu: Window compute progress.
+            scheduled_full_cpu: Scheduled token counts per window position.
+            window_row_indices_cpu: Sequence-buffer row per window position.
+            num_tokens_static: Padded token count for the call.
+
+        Returns:
+            Model side inputs, or None for models without side inputs.
+        """
+        return self._side_inputs_for_execute(
+            token_ids_cpu=token_ids_cpu,
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
+            scheduled_full_cpu=scheduled_full_cpu,
+            window_row_indices_cpu=window_row_indices_cpu,
+            num_tokens_static=num_tokens_static,
+        )
 
     def _side_inputs_for_execute(
         self,
@@ -2124,7 +2258,7 @@ class eSurgeRunner:
 
         Built from exactly the arrays the call hands the executor: window position ``pos`` schedules
         ``scheduled_full_cpu[pos]`` tokens of ``token_ids_cpu[pos]`` starting at ``num_computed_tokens_cpu[pos]``, packed
-        back to back in window order (the batch preparer's packing). The executor and the side inputs therefore read the
+        back to back within its DP rank's padded slice (the batch preparer's packing). The executor and side inputs read the
         same token ids even when the window arrays are a pre-verify copy of the sequence buffer.
 
         Args:
@@ -2140,7 +2274,7 @@ class eSurgeRunner:
         if not model_has_side_inputs(self.model):
             return None
         req_ids = self.sequence_buffer.req_ids
-        windows: list[SideInputWindow] = []
+        windows: list[tuple[int, SideInputWindow]] = []
         for pos in range(min(len(token_ids_cpu), len(scheduled_full_cpu))):
             n = int(scheduled_full_cpu[pos])
             if n <= 0:
@@ -2151,8 +2285,8 @@ class eSurgeRunner:
             types = None if req_state is None else req_state.token_types
             start = int(num_computed_tokens_cpu[pos])
             known = int(self.sequence_buffer.num_tokens_no_spec[row]) if 0 <= row < len(req_ids) else -1
-            windows.append(SideInputWindow(token_ids_cpu[pos], types, start, start + n, known))
-        return self._get_side_input_provider().build(windows, int(num_tokens_static))
+            windows.append((row, SideInputWindow(token_ids_cpu[pos], types, start, start + n, known)))
+        return self._pack_side_input_windows(windows, num_tokens_static=int(num_tokens_static))
 
     def _precompute_vlm_prefill(self, req_state: CachedRequestState) -> None:
         """Precompute prompt embeddings (+ optional mRoPE indices) for VLM requests.
@@ -2521,6 +2655,55 @@ class eSurgeRunner:
         """
         self.state_sync.reorder_decode_first_per_shard(scheduler_output, dp_size)
 
+    def token_offsets_for_window(
+        self, *, scheduled_list, window_row_indices, num_tokens_static: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return request token offsets and rank bases in the model's flat layout.
+
+        The same rank-local padding used for input IDs must also separate vision
+        embeddings, mRoPE positions, masks and DeepStack rows. Compact request
+        order need not be rank order.
+        """
+        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+        rows_per_rank, extra_rows = divmod(int(self.num_reqs_max_model_len), dp_size)
+        tokens_per_rank, extra_tokens = divmod(int(num_tokens_static), dp_size)
+        if extra_rows or extra_tokens or rows_per_rank <= 0:
+            raise ValueError("Rank-major token offsets require divisible row and token buckets.")
+        cursors = [rank * tokens_per_rank for rank in range(dp_size)]
+        offsets = np.zeros((len(scheduled_list),), dtype=np.int32)
+        rank_bases = np.zeros_like(offsets)
+        for index, (row, count) in enumerate(zip(window_row_indices, scheduled_list, strict=True)):
+            rank = int(row) // rows_per_rank if dp_size > 1 else 0
+            if not 0 <= rank < dp_size or int(count) < 0 or int(row) < 0:
+                raise ValueError("Invalid request row or scheduled count in token window.")
+            offsets[index] = cursors[rank]
+            rank_bases[index] = rank * tokens_per_rank
+            cursors[rank] += int(count)
+            if cursors[rank] > (rank + 1) * tokens_per_rank:
+                raise ValueError("Scheduled tokens exceed their rank-local token bucket.")
+        return offsets, rank_bases
+
+    def _score_output_row(
+        self, *, logits, sampled_tokens, history, seq_len: int, sampling_params
+    ) -> tuple[typing.Any, typing.Any, typing.Any]:
+        """Enqueue compact behavior-policy scores without host token readback."""
+        params = sampling_params
+        arrays = score_sampled_tokens(
+            logits,
+            sampled_tokens,
+            np.asarray(history, dtype=np.int32)[None, :],
+            np.asarray([seq_len], dtype=np.int32),
+            np.asarray([params.temperature], dtype=np.float32),
+            np.asarray([params.top_p], dtype=np.float32),
+            np.asarray([params.top_k], dtype=np.int32),
+            np.asarray([params.min_p], dtype=np.float32),
+            np.asarray([params.frequency_penalty], dtype=np.float32),
+            np.asarray([params.presence_penalty], dtype=np.float32),
+            np.asarray([params.repetition_penalty], dtype=np.float32),
+            num_logprobs=max(0, int(params.logprobs or 0)),
+        )
+        return tuple(jax.copy_to_host_async(array) for array in arrays)
+
     def _execute_model_impl(
         self,
         scheduler_output: SchedulerOutput,
@@ -2642,6 +2825,8 @@ class eSurgeRunner:
         accepted_spec_tokens_by_req: dict[str, int] | None = {} if self.drafter is not None else None
         hidden_states_by_req: dict[str, typing.Any] | None = {} if self.drafter is not None else None
         token_logprobs: dict[str, float] = {}
+        logprob_payloads: dict[str, tuple[typing.Any, typing.Any, typing.Any]] = {}
+        requested_logprobs = {rid for rid, state in self.requests.items() if state.sampling_params.logprobs is not None}
         async_windows: list[AsyncWindowResult] = []
         sync_finalize_entries: list[tuple[CachedRequestState | None, int | None, int | None]] = []
 
@@ -2741,8 +2926,6 @@ class eSurgeRunner:
         discard_sampled_tokens_req_indices: list[int] = []
 
         is_vlm_model = self._model_uses_vlm_inputs()
-        if self._uses_spmd_dp():
-            is_vlm_model = False
         uses_mrope_model = is_vlm_model and model_uses_mrope(self.model)
 
         while start_index < self.sequence_buffer.num_slots:
@@ -2768,14 +2951,6 @@ class eSurgeRunner:
 
             original_scheduled_list = [int(n) for n in scheduled_list]
             model_scheduled_list = list(original_scheduled_list)
-            # SP3: intentionally always empty. No code path populates
-            # `sequential_greedy_spec_rows`, so the sequential-greedy spec fast
-            # path it guards below (`if int(row_pos) in sequential_greedy_spec_rows
-            # and len(scheduled_spec_tokens) == 1`) is dead. It is kept, unrevived,
-            # as the seam for a future one-token sequential-greedy verify: do NOT
-            # populate it without also validating that fast path end-to-end.
-            sequential_greedy_spec_rows: dict[int, int] = {}
-
             total_scheduled = sum(model_scheduled_list)
             token_bucket_target = total_scheduled
             if self._uses_spmd_dp():
@@ -2788,10 +2963,9 @@ class eSurgeRunner:
                     rank_scheduled_tokens[rank] += int(scheduled_tokens)
                 peak_rank_scheduled = max(rank_scheduled_tokens) if rank_scheduled_tokens else 0
                 token_bucket_target = peak_rank_scheduled * dp_size
-            idx = bisect_left(self.num_tokens_paddings, token_bucket_target)
-            if idx >= len(self.num_tokens_paddings):
-                idx = len(self.num_tokens_paddings) - 1
-            num_tokens_static = int(self.num_tokens_paddings[idx])
+            num_tokens_static = int(
+                self.window_planner.get_token_bucket(token_bucket_target, active_buckets=self.num_tokens_paddings)
+            )
 
             # Select optimal bucket for current batch size
             # This determines which compiled function to use
@@ -2812,10 +2986,6 @@ class eSurgeRunner:
                 # Avoid per-step dict lookups; SequenceBuffer keeps this aligned with its ordering.
                 req_num_tokens_np.fill(0)
                 req_num_tokens_np[:num_reqs] = self.sequence_buffer.num_tokens[window_row_indices]
-                for _row_pos in sequential_greedy_spec_rows:
-                    req_num_tokens_np[_row_pos] = int(
-                        self.sequence_buffer.num_computed_tokens[int(window_row_indices[_row_pos])]
-                    ) + int(model_scheduled_list[_row_pos])
 
                 active_mask_full_cpu = self._active_mask_full_cpu
                 active_mask_full_cpu.fill(False)
@@ -2844,7 +3014,7 @@ class eSurgeRunner:
                             slot = int(window_row_indices[row_pos])
                     recurrent_slot_indices_cpu[row_pos] = int(slot)
 
-                if host_payload_broadcast_needed():
+                if host_payload_broadcast_needed(self.host_payloads_replicated):
                     req_num_tokens_np = multihost_utils.broadcast_one_to_all(req_num_tokens_np)
 
             mrope_position_ids_cpu: np.ndarray | None = None
@@ -2873,12 +3043,20 @@ class eSurgeRunner:
                     num_tokens_static=num_tokens_static,
                     uses_mrope_model=uses_mrope_model,
                 )
+                token_offsets, _ = self.token_offsets_for_window(
+                    scheduled_list=model_scheduled_list,
+                    window_row_indices=window_row_indices,
+                    num_tokens_static=num_tokens_static,
+                )
+                # Embeddings/masks are token-aligned and rank-padded, but the
+                # model's DeepStack contract is a globally compact residual
+                # table indexed by the flattened mask's cumulative visual count.
+                # Visit requests in packed token order, not scheduler order, so
+                # empty ranks and reordered windows cannot insert residual gaps.
                 visual_off = 0
-                if uses_mrope_model:
-                    visual_off = 0
-
-                off = 0
-                for req_idx, rid in enumerate(req_ids_window):
+                for req_idx in np.argsort(token_offsets, kind="stable"):
+                    rid = req_ids_window[req_idx]
+                    off = int(token_offsets[req_idx])
                     n = int(model_scheduled_list[req_idx])
                     if n <= 0:
                         continue
@@ -2954,8 +3132,6 @@ class eSurgeRunner:
                                             num_before : num_before + num_in
                                         ]
                                     visual_off += num_in
-
-                    off += n
 
             _pt_group_idx = self._get_full_attention_page_table_index()
             page_table_cpu = self.sequence_buffer.page_table[_pt_group_idx].get_cpu_tensor()
@@ -3068,20 +3244,10 @@ class eSurgeRunner:
                 # every step whenever recurrent candidate rows are in use.
                 and (self.spec_decode_recurrent_candidates or self.spec.cache_replay_required())
             )
-            if sequential_greedy_spec_rows:
-                spec_window_needs_snapshot = False
-                for _row_pos, _rid in enumerate(req_ids_window):
-                    if _rid is None:
-                        continue
-                    _scheduled_specs = scheduler_output.scheduled_spec_decode_tokens.get(_rid, [])
-                    if _scheduled_specs and int(_row_pos) not in sequential_greedy_spec_rows:
-                        spec_window_needs_snapshot = self.spec.cache_replay_required()
-                        break
             if (
                 spec_window_needs_snapshot
                 and self.spec_decode_recurrent_candidates
                 and not self.spec_decode_recurrent_replay
-                and not sequential_greedy_spec_rows
                 # Only caches that actually carry candidate rows can commit without the snapshot. KDA layers
                 # (Kimi-Linear / GLM-5-Next) enable recurrent candidates by layer type but own no candidate rows,
                 # so their rejected drafts are rolled back by snapshot + replay and the snapshot must be kept.
@@ -3116,7 +3282,7 @@ class eSurgeRunner:
                             break
                 spec_window_needs_snapshot = _snapshot_needed
             pre_step_kv_pages = (
-                _snapshot_recurrent_state(self.executor_manager.kv_pages) if spec_window_needs_snapshot else None
+                snapshot_recurrent_state(self.executor_manager.kv_pages) if spec_window_needs_snapshot else None
             )
             window_token_offsets = np.zeros((len(model_scheduled_list),), dtype=np.int32)
             if self.drafter is not None and model_scheduled_list:
@@ -3168,6 +3334,10 @@ class eSurgeRunner:
                 repetition_penalties_cpu=repetition_penalties_window_cpu,
                 page_table_cpu=page_table_window_cpu,
                 page_table_version=page_table_window_version,
+                cache_group_inputs=self.cache_group_inputs_for_execute(
+                    window_row_indices_cpu=window_row_indices_cpu,
+                    num_computed_tokens_cpu=num_computed_tokens_window_cpu,
+                ),
                 spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
                 mrope_position_ids_cpu=mrope_position_ids_cpu,
                 prefill_embeds_cpu=prefill_embeds_cpu,
@@ -3299,6 +3469,25 @@ class eSurgeRunner:
                 elif return_async_output:
                     sync_finalize_entries.append((req_state, req_idx, seq_len))
 
+            window_metric_scores = None
+            for row_pos, rid, req_state, _req_idx, seq_len, is_valid in window_entries:
+                if not is_valid or req_state is None:
+                    continue
+                if rid not in requested_logprobs and not self.enable_sampler_metrics:
+                    continue
+                payload = self._score_output_row(
+                    logits=_logits[row_pos : row_pos + 1],
+                    sampled_tokens=out_tokens_win[row_pos : row_pos + 1],
+                    history=token_ids_window_cpu[row_pos],
+                    seq_len=int(seq_len),
+                    sampling_params=req_state.sampling_params,
+                )
+                logprob_payloads[rid] = payload
+                if self.enable_sampler_metrics:
+                    if window_metric_scores is None:
+                        window_metric_scores = jnp.zeros((padded_num_reqs,), dtype=jnp.float32)
+                    window_metric_scores = window_metric_scores.at[row_pos].set(payload[1][0, 0])
+
             if needs_async_output:
                 copy_enqueue_start = time.time()
                 row_positions = [row_pos for row_pos, *_rest in window_entries]
@@ -3309,9 +3498,7 @@ class eSurgeRunner:
                         sampled_token_ids=jax.copy_to_host_async(out_tokens_win[:padded_num_reqs]),
                         valid_mask=[is_valid for *_, is_valid in window_entries],
                         token_logprobs=(
-                            jax.copy_to_host_async(_logits[:num_reqs])
-                            if self.enable_sampler_metrics and _logits is not None
-                            else None
+                            jax.copy_to_host_async(window_metric_scores) if window_metric_scores is not None else None
                         ),
                     )
                 )
@@ -3336,37 +3523,13 @@ class eSurgeRunner:
                     start_positions=num_computed_tokens_window_cpu,
                     scheduled_spec=scheduler_output.scheduled_spec_decode_tokens,
                 )
-            _logits_maybe: typing.Any | None = _logits
-            logits_np = np.asarray(_logits_maybe) if self.enable_sampler_metrics and _logits_maybe is not None else None
+            logits_np = np.asarray(window_metric_scores) if window_metric_scores is not None else None
             total_token_materialize_time += time.time() - token_materialize_start
 
             spec_commit_scheduled_list = [int(n) for n in scheduled_list]
             spec_window_needs_commit = False
             spec_window_requires_replay = False
             rng_after_verify = self.executor_manager.rng_key if spec_decode_active_window else None
-
-            _run_suffix_sample = partial(
-                self.spec.run_suffix_sample,
-                num_computed_tokens_window_cpu=num_computed_tokens_window_cpu,
-                window_row_indices_cpu=window_row_indices_cpu,
-                recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
-                padded_num_reqs=padded_num_reqs,
-                token_ids_window_cpu=token_ids_window_cpu,
-                temperature_window_cpu=temperature_window_cpu,
-                top_p_window_cpu=top_p_window_cpu,
-                top_k_window_cpu=top_k_window_cpu,
-                min_p_window_cpu=min_p_window_cpu,
-                frequency_penalties_window_cpu=frequency_penalties_window_cpu,
-                presence_penalties_window_cpu=presence_penalties_window_cpu,
-                repetition_penalties_window_cpu=repetition_penalties_window_cpu,
-                page_table_window_cpu=page_table_window_cpu,
-                page_table_window_version=page_table_window_version,
-                mrope_position_ids_cpu=mrope_position_ids_cpu,
-                prefill_embeds_cpu=prefill_embeds_cpu,
-                prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
-                visual_pos_masks_cpu=visual_pos_masks_cpu,
-                deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
-            )
 
             _replay_prefix_sample = partial(
                 self.spec.replay_prefix_sample,
@@ -3462,8 +3625,6 @@ class eSurgeRunner:
                     if not (
                         bool(_spec_toks) and all(int(_t) >= 0 for _t in _spec_toks) and self.spec.is_spec_request(_rs)
                     ):
-                        continue
-                    if int(_rp) in sequential_greedy_spec_rows and len(_spec_toks) == 1:
                         continue
                     _real_count = _sched_n - len(_spec_toks)
                     if _real_count <= 0:
@@ -3676,120 +3837,6 @@ class eSurgeRunner:
                             spec_token_ids_all.append([])
                         continue
 
-                    if int(row_pos) in sequential_greedy_spec_rows and len(scheduled_spec_tokens) == 1:
-                        draft_token = int(scheduled_spec_tokens[0])
-                        target_token = int(tokens_np[row_pos])
-                        target_hidden = _window_hidden_row(
-                            hidden_states_for_spec,
-                            row_pos=int(row_pos),
-                            token_offset=int(window_token_offsets[int(row_pos)]),
-                            token_index=max(0, int(real_count) - 1),
-                            total_window_tokens=int(total_scheduled),
-                            padded_reqs=int(padded_num_reqs),
-                        )
-                        if target_token == draft_token:
-                            accepted = 1
-                            corrected_token, seed_hidden = _run_suffix_sample(
-                                int(row_pos),
-                                start_len=int(real_count),
-                                suffix_len=1,
-                            )
-                        else:
-                            accepted = 0
-                            corrected_token = target_token
-                            seed_hidden = target_hidden
-
-                        emitted = ([draft_token] if accepted else []) + [int(corrected_token)]
-                        sampled_token_ids_all.append(emitted)
-                        req_state.output_token_ids.extend(emitted)
-
-                        emit_start = int(num_computed_tokens_window_cpu[row_pos]) + int(real_count)
-                        emit_end = emit_start + len(emitted)
-                        if emit_end <= self.max_model_len:
-                            self.sequence_buffer.token_ids[req_idx, emit_start:emit_end] = np.asarray(
-                                emitted,
-                                dtype=np.int32,
-                            )
-                        known_len = int(num_computed_tokens_window_cpu[row_pos]) + int(real_count) + len(emitted)
-                        self.sequence_buffer.num_tokens_no_spec[req_idx] = min(known_len, self.max_model_len)
-                        self.sequence_buffer.num_tokens[req_idx] = min(known_len, self.max_model_len)
-
-                        self.spec.record_acceptance(
-                            rid,
-                            accepted=int(accepted),
-                            num_drafts=len(scheduled_spec_tokens),
-                        )
-                        if self.spec.can_batch_draft(req_state) and step_allows_batch and spec_token_ids_all is not None:
-                            # Defer to the post-loop batched draft: collect the seed,
-                            # reserve this request's positional slot in the output
-                            # list, and write the drafts once for the whole batch.
-                            spec_idx = len(spec_token_ids_all)
-                            spec_token_ids_all.append([])
-                            pending_batched_drafts.append(
-                                (
-                                    rid,
-                                    int(req_idx),
-                                    int(emitted[-1]),
-                                    max(0, int(known_len) - 2),
-                                    seed_hidden,
-                                    req_state,
-                                    int(known_len),
-                                    spec_idx,
-                                )
-                            )
-                        else:
-                            draft_timer_start = time.time()
-                            next_drafts = self.spec.draft_next(
-                                req_id=rid,
-                                seed_token=int(emitted[-1]),
-                                seed_position=max(0, int(known_len) - 2),
-                                seed_hidden=seed_hidden,
-                                req_state=req_state,
-                                # ``req_idx`` is the request's stable sequence-buffer / KV-pool
-                                # slot (window-local ``row_pos`` aliases across windows); use it
-                                # as the persistent per-request inline-MTP cache row.
-                                row_pos=int(req_idx),
-                            )
-                            total_spec_draft_time += time.time() - draft_timer_start
-                            if next_drafts:
-                                draft_start = known_len
-                                draft_end = min(draft_start + len(next_drafts), self.max_model_len)
-                                self.sequence_buffer.token_ids[req_idx, draft_start:draft_end] = np.asarray(
-                                    next_drafts[: draft_end - draft_start],
-                                    dtype=np.int32,
-                                )
-                                self.sequence_buffer.num_tokens[req_idx] = draft_end
-                            if spec_token_ids_all is not None:
-                                spec_token_ids_all.append(next_drafts)
-                        if accepted_spec_tokens_by_req is not None:
-                            accepted_spec_tokens_by_req[rid] = int(accepted)
-                        if hidden_states_by_req is not None:
-                            hidden_states_by_req[rid] = seed_hidden
-                        self.spec_decode_num_drafts_accepted += int(accepted)
-                        self.spec_decode_num_verify_steps += 1
-                        spec_commit_scheduled_list[row_pos] = int(real_count + accepted)
-                        spec_window_needs_commit = True
-                        committed_candidate = True
-                        if self.spec_decode_recurrent_replay_only:
-                            # KDA caches: nothing commits implicitly; a rejected draft is rolled back by replay.
-                            committed_candidate = False
-                        if self.spec_decode_recurrent_candidates and int(real_count) > 0:
-                            commit_timer_start = time.time()
-                            committed_candidate = self.spec.queue_or_commit_recurrent_candidate_state(
-                                req_id=str(rid),
-                                row_pos=int(row_pos),
-                                prefix_len=int(real_count + accepted),
-                                defer=not bool(getattr(self.drafter, "requires_target_kv_cache", False)),
-                            )
-                            total_spec_commit_time += time.time() - commit_timer_start
-                        if not committed_candidate:
-                            if self.spec.recurrent_candidate_count() > 0:
-                                spec_window_requires_replay = True
-                            elif accepted < len(scheduled_spec_tokens) and self.spec.cache_replay_required():
-                                spec_window_requires_replay = True
-                        tid = int(emitted[-1])
-                        continue
-
                     verify_meta = verify_meta_by_row.get(int(row_pos))
                     if verify_meta is None:
                         _meta_start = time.time()
@@ -3809,6 +3856,8 @@ class eSurgeRunner:
                     projected_target_tokens: list[int] = []
                     hidden_rows: jax.Array | None = None
                     greedy_spec = self.spec.is_greedy_request(req_state)
+                    want_output_scores = rid in requested_logprobs or self.enable_sampler_metrics
+                    output_score_rows: list[jax.Array] = []
                     recurrent_state_advanced_by_suffix = False
                     required_hidden_len = int(verify_meta.bonus_local_index) + 1
                     can_project_full_hidden = hidden_np_len >= required_hidden_len
@@ -3883,6 +3932,8 @@ class eSurgeRunner:
                                 hidden_rows = hidden_rows.at[accepted].set(replay_hidden)
                                 recurrent_state_advanced_by_suffix = True
                         else:
+                            if want_output_scores:
+                                output_score_rows = list(self.spec.filtered_log_probs(logits_rows, req_state))
                             draft_fulls = self.spec.draft_full_log_probs_by_req.pop(str(rid), None)
                             if draft_fulls is None or int(draft_fulls.shape[0]) < len(draft_tokens_for_verify):
                                 target_fulls = self.spec.filtered_log_probs(logits_rows, req_state)
@@ -3909,7 +3960,7 @@ class eSurgeRunner:
                         )
                     else:
                         corrected_token = int(tokens_np[row_pos])
-                        seed_hidden = _window_hidden_row(
+                        seed_hidden = window_hidden_row(
                             hidden_states_for_spec,
                             row_pos=int(row_pos),
                             token_offset=int(window_token_offsets[int(row_pos)]),
@@ -3948,6 +3999,8 @@ class eSurgeRunner:
                                     )
                                     if want_trace_logits:
                                         trace_logits_rows.append(target_full[0])
+                                    if want_output_scores:
+                                        output_score_rows.append(target_full[0])
                                     tok = jnp.asarray([int(draft_token)], dtype=jnp.int32)
                                     draft_full = draft_fulls[draft_idx : draft_idx + 1]
                                     d_lp = jnp.take_along_axis(draft_full, tok[:, None], axis=-1).squeeze(-1)
@@ -3970,6 +4023,8 @@ class eSurgeRunner:
                                         req_state,
                                     )
                                     corrected_token = self.spec.sample_distribution(bonus_full, req_state)
+                                    if want_output_scores:
+                                        output_score_rows.append(bonus_full[0])
                             else:
                                 # SP1: the drafter distributions are missing/short, so
                                 # every draft must be rejected (accepted stays 0).
@@ -3986,6 +4041,8 @@ class eSurgeRunner:
                                 )
                                 corrected_token = self.spec.sample_distribution(target_full, req_state)
                                 seed_hidden = target_hidden
+                                if want_output_scores:
+                                    output_score_rows.append(target_full[0])
                                 if want_trace_logits:
                                     trace_logits_rows.append(target_full[0])
 
@@ -4000,6 +4057,26 @@ class eSurgeRunner:
 
                     _emit_write_start = time.time()
                     emitted = [int(t) for t in draft_tokens_for_verify[:accepted]] + [int(corrected_token)]
+                    if want_output_scores:
+                        emitted_array = jnp.asarray(emitted, dtype=jnp.int32)
+                        if greedy_spec:
+                            output_log_probs = jnp.where(
+                                jnp.arange(_logits.shape[-1])[None, :] == emitted_array[:, None], 0.0, -jnp.inf
+                            )
+                        else:
+                            # Rejection sampling emits the target policy marginal,
+                            # not the proposal or the conditional rejection residual.
+                            output_log_probs = jnp.stack(output_score_rows[: len(emitted)])
+                        logprob_payloads[rid] = tuple(
+                            jax.copy_to_host_async(array)
+                            for array in summarize_logprobs(
+                                output_log_probs,
+                                emitted_array,
+                                num_logprobs=max(0, int(req_state.sampling_params.logprobs or 0)),
+                            )
+                        )
+                        if self.enable_sampler_metrics:
+                            token_logprobs[rid] = float(np.asarray(logprob_payloads[rid][1])[-1, 0])
                     sampled_token_ids_all.append(emitted)
                     req_state.output_token_ids.extend(emitted)
 
@@ -4089,9 +4166,7 @@ class eSurgeRunner:
                     spec_commit_scheduled_list[row_pos] = int(real_count + accepted)
                     spec_window_needs_commit = True
                     committed_candidate = True
-                    if (
-                        self.spec.rolls_back_cache or self.spec_decode_recurrent_replay_only
-                    ) and not self.spec_decode_recurrent_candidates:
+                    if self.spec.rolls_back_cache and not self.spec_decode_recurrent_candidates:
                         # DSpark on a per-slot compressed-window cache: nothing commits implicitly, so a rejected
                         # draft must restore the pre-verify snapshot and replay the accepted prefix.
                         committed_candidate = False
@@ -4133,7 +4208,7 @@ class eSurgeRunner:
                             and seq_len is not None
                             and self.spec.is_spec_request(req_state)
                         ):
-                            seed_hidden = _window_hidden_row(
+                            seed_hidden = window_hidden_row(
                                 hidden_states_for_spec,
                                 row_pos=int(row_pos),
                                 token_offset=int(window_token_offsets[int(row_pos)]),
@@ -4216,11 +4291,13 @@ class eSurgeRunner:
                                 accepted_spec_tokens_by_req.setdefault(rid, 0)
                         spec_token_ids_all.append(next_drafts)
 
-                if self.enable_sampler_metrics and logits_np is not None and row_pos < logits_np.shape[0]:
-                    try:
-                        token_logprobs[rid] = logits_np[row_pos]
-                    except Exception:
-                        pass
+                if (
+                    self.enable_sampler_metrics
+                    and rid not in token_logprobs
+                    and logits_np is not None
+                    and row_pos < logits_np.shape[0]
+                ):
+                    token_logprobs[rid] = float(logits_np[row_pos])
 
             if pending_whole_block_drafts and spec_token_ids_all is not None:
                 draft_timer_start = time.time()
@@ -4407,6 +4484,12 @@ class eSurgeRunner:
                     hidden_states=hidden_states_by_req,
                 ),
                 windows=async_windows,
+                resolve_logprobs=partial(
+                    _materialize_logprobs,
+                    req_ids_all,
+                    payloads=logprob_payloads,
+                    requested=requested_logprobs,
+                ),
                 finalize=(
                     partial(
                         self._finalize_async_scheduler_runner_state,
@@ -4432,7 +4515,7 @@ class eSurgeRunner:
                 req_id_to_row_index=req_id_to_row_index,
                 sampled_token_ids=sampled_token_ids_all,
                 spec_token_ids=spec_token_ids_all,
-                logprobs=None,
+                logprobs=_materialize_logprobs(req_ids_all, sampled_token_ids_all, logprob_payloads, requested_logprobs),
                 prompt_logprobs_dict={rid: None for rid in req_ids_all},
                 finished_sending=None,
                 finished_recving=None,

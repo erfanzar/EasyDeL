@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from easydel.utils import Registry
+from easydel.utils.compiling_utils import hash_fn
 
 from ..group_relative_policy_optimization import GRPOConfig
 
@@ -31,6 +32,8 @@ class GRPOWithReplayBufferConfig(GRPOConfig):
     retained and mixed into later updates. A value of zero keeps the base GRPO
     behavior while preserving the same trainer surface.
     """
+
+    __hash__ = hash_fn
 
     trainer_prefix: str | None = field(default="GRPOWithReplayBuffer")
     replay_buffer_size: int = field(default=64)

@@ -34,7 +34,7 @@ import jax
 from ..core.context import _enter as _ctx_enter
 from ..core.errors import IllegalMutationError
 from ..core.graph import GraphDef, bind, export, live_variables
-from ..core.module import Module, _graph_epoch, _inside_transform, _set_inside_transform
+from ..core.module import Module, _inside_transform, _set_inside_transform, _thread_graph_epoch
 from ..core.selector import Selector, SelectorSugar, as_selector
 from ..core.selector import select as _sel
 from ..core.state import State
@@ -286,6 +286,7 @@ def _run_pure_body(
             entries.append((path, v, v._value))
         initial.append(entries)
     fargs, fkwargs = splice_modules(stripped_args, stripped_kwargs, refs, modules)
+    prev_inside_transform = _inside_transform()
     _set_inside_transform(True)
     try:
         if ctx is None:
@@ -294,7 +295,7 @@ def _run_pure_body(
             with _ctx_enter(ctx):
                 out = fn(*fargs, **fkwargs)
     finally:
-        _set_inside_transform(False)
+        _set_inside_transform(prev_inside_transform)
     new_states: list[State] = []
     for entries in initial:
         changed: dict[str, dict[str, object]] = {}
@@ -404,7 +405,7 @@ def make_direct_readonly(
                 if isinstance(value, Module):
                     modules.append(value)
 
-        epoch_before = _graph_epoch()
+        epoch_before = _thread_graph_epoch()
         snapshots: list[tuple[str, str]] = []
         for module in modules:
             for path, var in live_variables(module):
@@ -441,7 +442,7 @@ def make_direct_readonly(
             _set_inside_transform(prev_active)
             _set_write_hook(prev_hook)
 
-        if _graph_epoch() != epoch_before:
+        if _thread_graph_epoch() != epoch_before:
             if structural_error_message is not None:
                 raise ValueError(structural_error_message)
             raise IllegalMutationError(
@@ -498,7 +499,7 @@ def _run_readonly_body(
     modules = [bind(g, s) for g, s in zip(gdefs, states, strict=False)]
     for src, dst in zip(orig_modules, modules, strict=False):
         _copy_runtime_state(src, dst)
-    epoch_before = _graph_epoch()
+    epoch_before = _thread_graph_epoch()
     initial: list[list[tuple[str, str]]] = []
     for m in modules:
         entries: list[tuple[str, str]] = []
@@ -506,6 +507,7 @@ def _run_readonly_body(
             entries.append((path, v.kind, v, v._value))
         initial.append(entries)
     fargs, fkwargs = splice_modules(stripped_args, stripped_kwargs, refs, modules)
+    prev_inside_transform = _inside_transform()
     _set_inside_transform(True)
     try:
         if ctx is None:
@@ -514,8 +516,8 @@ def _run_readonly_body(
             with _ctx_enter(ctx):
                 out = fn(*fargs, **fkwargs)
     finally:
-        _set_inside_transform(False)
-    if _graph_epoch() != epoch_before:
+        _set_inside_transform(prev_inside_transform)
+    if _thread_graph_epoch() != epoch_before:
         raise IllegalMutationError(
             "Module structure changed under a transform but was not declared mutable. "
             "Structural mutations are not supported here."
@@ -571,15 +573,16 @@ def _run_single_positional_body(
     initial: list[tuple[str, str]] = []
     for path, v in live_variables(module):
         initial.append((path, v.kind, v, v._value))
-    epoch_before = _graph_epoch()
+    epoch_before = _thread_graph_epoch()
     fargs = list(args_without_module)
     fargs.insert(locator, module)
+    prev_inside_transform = _inside_transform()
     _set_inside_transform(True)
     try:
         out = fn(*fargs)
     finally:
-        _set_inside_transform(False)
-    if _graph_epoch() != epoch_before:
+        _set_inside_transform(prev_inside_transform)
+    if _thread_graph_epoch() != epoch_before:
         raise IllegalMutationError(
             "Module structure changed under a transform but was not declared mutable. "
             "Structural mutations are not supported here."

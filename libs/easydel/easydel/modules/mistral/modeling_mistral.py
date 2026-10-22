@@ -53,7 +53,6 @@ from easydel.infra.modeling_outputs import (
     BaseModelOutput,
     CausalLMOutput,
     DecoderLayerOutput,
-    SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
@@ -217,21 +216,8 @@ class MistralAttention(UnifiedAttention):
             layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
-            sliding_window=config.sliding_window,
+            sliding_window=config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None,
         )
-
-    def _create_rotary(self, config: MistralConfig, dtype: jnp.dtype):
-        """Build the rotary embedding for this attention layer.
-
-        Args:
-            config (MistralConfig): Model configuration providing ``rope_theta``
-                and any ``rope_scaling`` settings.
-            dtype (jnp.dtype): Computation dtype for the rotary tables.
-
-        Returns:
-            Rotary module configured with this layer's head dimension.
-        """
-        return config.get_basic_rope(dtype, self.head_dim)
 
 
 class MistralDecoderLayer(spx.Module):
@@ -498,6 +484,10 @@ class MistralModel(EasyDeLBaseModule):
             ValueError: If both input_ids and inputs_embeds are provided or both are None.
             AssertionError: If sequence_length exceeds max_position_embeddings.
         """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
@@ -562,31 +552,19 @@ class MistralModel(EasyDeLBaseModule):
             cache views are routed through :meth:`_layer_cache_view_at` so
             the runtime can pick a windowed cache layout if appropriate.
             """
-            hs, cv, ah, aa, idx = carry
-            if output_hidden_states:
-                ah = (*ah, hs)
-            with self._layer_stage_context(idx, layers=self.layers):
-                layer_outputs = block(
-                    hidden_states=hs,
-                    mask_info=mask_info,
-                    position_ids=position_ids,
-                    mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
-                    cache_metadata=cache_metadata,
-                    output_attentions=output_attentions,
-                    frequencies=frequencies,
-                )
-            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
+            return self._decoder_scan_step(
+                block,
+                carry,
+                output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
+                trace_layers=trace_layers,
                 cache=past_key_values,
+                mask_info=mask_info,
+                position_ids=position_ids,
+                mode=mode,
+                cache_metadata=cache_metadata,
+                frequencies=frequencies,
             )
-            if output_attentions:
-                aa = (*aa, layer_outputs.attention_weight)
-            return hs, cv, ah, aa, idx + 1
 
         init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
         hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
@@ -826,88 +804,21 @@ class MistralForSequenceClassification(BaseSequenceClassificationModule[MistralM
             classifier_bias=False,
         )
 
-    def forward(
-        self,
-        input_ids: Array | None = None,
-        inputs_embeds: Array | None = None,
-        attention_mask: Array | None = None,
-        mask_info: MaskInfo | None = None,
-        position_ids: Array | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
-        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-    ) -> SequenceClassifierOutput:
-        """Forward pass through the Mistral model for sequence classification.
-
-        This method processes input sequences through the Mistral model and applies
-        a classification head to the output.
+    def pool_sequence(self, hidden_states, input_ids=None, attention_mask=None):
+        """Pool the last token for embeddings-only inputs without a padding mask.
 
         Args:
-            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
-                Must be provided if inputs_embeds is None.
-            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
-                (batch_size, sequence_length, hidden_size). Defaults to None.
-            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
-                shape (batch_size, sequence_length). Defaults to None.
-            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
-                Defaults to None.
-            position_ids (Array | None, optional): Position indices for each token, shape
-                (batch_size, sequence_length). Defaults to None.
-            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
-                Auto-detected if None. Defaults to None.
-            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
-                Cache with precomputed key-value states for generation. Defaults to None.
-            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
-                Metadata for cache management. Defaults to None.
-            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
-                Defaults to None.
-            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
-                Defaults to None.
+            hidden_states: Per-token representations shaped ``[batch, sequence, hidden]``.
+            input_ids: Optional token IDs for padding-aware pooling.
+            attention_mask: Optional token mask, preferred over token IDs.
 
         Returns:
-            SequenceClassifierOutput: Contains logits, past_key_values, hidden_states, and attentions.
+            One representation per sequence, retaining mask-aware shared pooling
+            whenever token IDs or a mask are available.
         """
-        transformer_outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            mask_info=mask_info,
-            position_ids=position_ids,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            inputs_embeds=inputs_embeds,
-        )
-
-        hidden_states = transformer_outputs.last_hidden_state
-        logits = self.score(hidden_states)
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]
-        else:
-            batch_size = inputs_embeds.shape[0]
-
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
-        else:
-            if input_ids is not None:
-                sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-            else:
-                sequence_lengths = -1
-
-        pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-        return SequenceClassifierOutput(
-            logits=pooled_logits,
-            past_key_values=past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-        )
+        if input_ids is None and attention_mask is None:
+            return hidden_states[:, -1]
+        return super().pool_sequence(hidden_states, input_ids=input_ids, attention_mask=attention_mask)
 
     def get_encoder(self):
         """

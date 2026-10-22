@@ -34,6 +34,7 @@ import typing
 
 from easydel.utils import flags
 
+from ..benchmarking import zero_schedule_needs_update
 from ..distributed.coordinator import LocalCoordinator, StepHandle
 from ..logger import logger
 from ..scheduler.dp_scheduler import DPSchedulerClosed
@@ -77,6 +78,8 @@ class EngineLoop:
             the verbose lifecycle log line).
         runner_verbose: ``runtime_config.runner_verbose``.
         info: Engine-level info logger callable.
+        on_stopped: Optional notification invoked after every thread exit,
+            once the running flag is cleared, to wake request consumers.
     """
 
     def __init__(
@@ -96,6 +99,7 @@ class EngineLoop:
         async_scheduling: bool,
         runner_verbose: bool,
         info: typing.Callable[..., None],
+        on_stopped: typing.Callable[[], None] | None = None,
     ) -> None:
         self.scheduler = scheduler
         self.runner = runner
@@ -111,6 +115,7 @@ class EngineLoop:
         self._async_scheduling = bool(async_scheduling)
         self._runner_verbose = bool(runner_verbose)
         self._info = info
+        self._on_stopped = on_stopped
 
         self._running = False
         self._thread: threading.Thread | None = None
@@ -198,12 +203,7 @@ class EngineLoop:
     @staticmethod
     def _zero_schedule_needs_update(scheduler_output: SchedulerOutput) -> bool:
         """Return whether a zero-token schedule still has bookkeeping to flush."""
-        return bool(
-            scheduler_output.finished_req_ids
-            or scheduler_output.preempted_req_ids
-            or scheduler_output.scheduled_new_reqs
-            or scheduler_output.scheduled_cached_reqs.num_reqs
-        )
+        return zero_schedule_needs_update(scheduler_output)
 
     @staticmethod
     def _idle_scheduler_tick() -> None:
@@ -302,6 +302,17 @@ class EngineLoop:
         callback and forward outputs through ``emit_outputs`` so the
         per-token detokenize/parse path stays off the scheduler thread.
         """
+        try:
+            self._run_body()
+        except BaseException as exc:
+            self._on_fatal(exc)
+        finally:
+            self._running = False
+            if self._on_stopped is not None:
+                self._on_stopped()
+
+    def _run_body(self) -> None:
+        """Initialize the coordinator and enter the selected lifecycle."""
         self._info("Starting background scheduler loop")
         if self._coordinator is None:
             self._coordinator = LocalCoordinator(self.runner)
@@ -389,10 +400,16 @@ class EngineLoop:
                         prof_process * 1e3,
                         (time.perf_counter() - prof_loop_t0) * 1e3,
                     )
+                self._handle_profiling_step()
                 consecutive_errors = 0
                 self._heartbeat()
             except KeyboardInterrupt:
                 self._info("Scheduler loop interrupted by user")
+                break
+            except DPSchedulerClosed:
+                # Not a fault: teardown began and the DP rank workers are gone.
+                # Retrying cannot succeed and delays shutdown (see _run_overlap).
+                self._info("Scheduler loop stopping: DP scheduler is shut down")
                 break
             except Exception as e:
                 consecutive_errors += 1

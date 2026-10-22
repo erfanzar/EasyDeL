@@ -89,9 +89,9 @@ DEFAULTS: eLMConfig = {
     # Quantization configuration: Settings for model weight quantization.
     # - group_size: Group size for quantization (default 128 elements).
     # - apply_quantization: Whether to apply quantization to module weights.
-    # - linear_pattern: Regex pattern matching linear layers to quantize.
-    #   ".*" matches all linear layers by default.
-    # - linear_group_size: Group size specifically for linear layer quantization.
+    # - linear_pattern: Optional regex override for the model quantization pattern.
+    #   None inherits QuantizationConfig's embedding/norm/lm_head exclusions.
+    # - linear_group_size: Optional group size override for linear layer quantization.
     # - use_qmm_best_config: Prefer ejkernel tuned QMM block configs by default.
     # - qmm_platform_override: Optional explicit QMM platform override.
     # - qmm_tpu_path_override: Optional explicit TPU fused-path override.
@@ -100,8 +100,8 @@ DEFAULTS: eLMConfig = {
     "quantization": {
         "group_size": 128,
         "apply_quantization": False,
-        "linear_pattern": ".*",
-        "linear_group_size": 64,
+        "linear_pattern": None,
+        "linear_group_size": None,
         "use_qmm_best_config": False,
         "qmm_platform_override": None,
         "qmm_tpu_path_override": None,

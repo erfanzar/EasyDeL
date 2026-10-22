@@ -243,7 +243,7 @@ def ring_attention(
     q_position_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_position_ids: Int[Array, "batch seq_len_k"] | None = None,
     softmax_aux: Float[Array, "num_sinks"] | Float[Array, "sink_heads num_sinks"] | None = None,
-    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+    bias: Float[Array, "bias_batch bias_heads bias_seq_len_q bias_seq_len_k"] | None = None,
     mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     chunk_size: int | None = None,
@@ -254,6 +254,7 @@ def ring_attention(
     fwd_params: FwdParams | None = None,
     bwd_params: BwdParams | None = None,
     fused_backward: bool = False,
+    precision: lax.PrecisionLike = lax.Precision.DEFAULT,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Compute ring attention for distributed long-sequence processing.
 
@@ -281,8 +282,11 @@ def ring_attention(
             ``sink_heads == 1`` (shared) or ``sink_heads == num_heads`` (per query
             head). Participate in softmax normalization but don't contribute to
             output.
-        bias: Optional attention bias [batch, num_heads, seq_len_q, seq_len_k].
-            Additive bias applied to attention scores before softmax.
+        bias: Optional additive attention bias [batch, num_heads, q_len, kv_len].
+            In distributed mode, query rows may be global or already sharded;
+            global KV columns are selected by the circulating shard's index.
+            Singleton batch, head, query, and KV dimensions broadcast. Bias
+            indexing is independent of segment IDs and explicit positions.
         mask_builder: Optional mask builder function (unused in XLA backend).
         sliding_window: Optional local attention window. Can be:
             - int: Window size ``W`` (HF convention; same as ``(W - 1, W - 1)``)
@@ -300,6 +304,8 @@ def ring_attention(
         fwd_params: Forward pass parameters (q_blocksize, kv_blocksize).
         bwd_params: Backward pass parameters (unused in XLA backend).
         fused_backward: Whether to fuse backward pass (unused in XLA backend).
+        precision: JAX contraction precision for both forward and backward
+            matrix products. Defaults to ``lax.Precision.DEFAULT``.
 
     Returns:
         Attention output [batch, seq_len_q, num_heads, head_dim].
@@ -408,7 +414,7 @@ def ring_attention(
         0.0,
         jnp.float32,
         jax.checkpoint_policies.nothing_saveable,
-        jax.lax.Precision.DEFAULT,
+        precision,
         True,
         sliding_window,
         logits_soft_cap,

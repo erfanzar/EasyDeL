@@ -100,7 +100,6 @@ These are set during ejkernel import or profiler setup:
 | `MEGASCALE_NUM_SLICES`            | auto    | Overrides detected TPU slice count in mesh creation.                                                          | Use on multi-slice TPU setups when device introspection is insufficient. |
 | `MIN_SHARDING_SIZE`               | `16384` | Arrays smaller than this stay unsharded in sharding utilities.                                                | Avoids overhead for small tensors.                                       |
 | `LOG_SHARDING_MOVE`               | `false` | Logs warnings when sharding specs are auto-corrected.                                                         | Debug unexpected sharding adjustments.                                   |
-| `EKERNEL_OPS`                     | `false` | Declared but not currently consumed in-tree.                                                                  | Reserved for external or future kernel-op selection.                     |
 
 ## Compilation cache
 
@@ -169,8 +168,6 @@ These are set during ejkernel import or profiler setup:
 | ----------------------------- | ------- | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
 | `FORCE_NATIVE_RUNTIME`        | `false` | Forces `forward_native` path for operations, bypassing backend-specific implementations. | Debug or avoid backend-specific kernels.                    |
 | `DISABLE_MOE_AUTOTUNE_ON_TPU` | `false` | Disables Pallas GMM autotune on TPU, uses fixed block sizes.                             | Avoid invalid tiling configs or reduce compile variability. |
-| `EP_DISPATCH`                 | `auto`  | Global MoE expert dispatch policy (not referenced in-tree).                              | Reserved for external MoE routing control.                  |
-| `EP_AUTO_TRESHOLD`            | `0`     | Threshold for automatic expert dispatch (not referenced in-tree).                        | Reserved.                                                   |
 | `PERMITTED_KV_KERNELS`        | `true`  | Allows TPU KV-cache update kernels in ragged cache.                                      | Disable to force JAX fallback kernel.                       |
 | `USE_NF4_KERNEL_TPU`          | `1`     | Enables NF4 TPU kernels when truthy.                                                     | Set to `0` to force non-kernel path.                        |
 | `WARN_ON_MATTER`              | `true`  | Warns when implicit array ops fall back to materialization.                              | Debug missing primitive handlers.                           |

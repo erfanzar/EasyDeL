@@ -146,6 +146,7 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
         lm_head_kernel_init: Callable | None = None,
         lm_head_class: spx.Module = ColumnParallelLinear,
         create_lm_head: bool = True,
+        router_aux_loss_coef: float | None = None,
     ):
         """Initialize the Conditional Generation module.
 
@@ -181,6 +182,10 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
                 ColumnParallelLinear for tensor parallelism support.
             create_lm_head: Whether to create a new LM head. Set to False if
                 the base model already has an LM head. Defaults to True.
+            router_aux_loss_coef: Coefficient for the MoE router auxiliary loss.
+                Forwarded to :class:`BaseTaskModule` so that
+                :meth:`compute_router_aux_loss` returns the weighted router loss
+                for MoE base models. None disables aux loss. Defaults to None.
 
         Example:
             ```python
@@ -212,6 +217,7 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
             rngs=rngs,
             tie_word_embeddings=tie_word_embeddings,
             logit_cap=logit_cap,
+            router_aux_loss_coef=router_aux_loss_coef,
             head_bias=lm_head_bias,
             head_kernel_init=lm_head_kernel_init,
         )
@@ -381,37 +387,6 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
             encoder_hidden_states=getattr(outputs, "encoder_hidden_states", None),
             encoder_attentions=getattr(outputs, "encoder_attentions", None),
         )
-
-    def apply_lm_head(self, hidden_states: Array) -> Array:
-        """Apply the language modeling head to hidden states.
-
-        Projects hidden states to vocabulary logits, optionally using tied
-        embedding weights.
-
-        Args:
-            hidden_states: Hidden states of shape (batch, seq_len, hidden_dim)
-                from the decoder or language model.
-
-        Returns:
-            Logits of shape (batch, seq_len, vocab_size) representing
-            unnormalized probabilities over the vocabulary.
-
-        Note:
-            When weight tying is enabled (via config), this method passes
-            the transposed embedding weights to the LM head instead of using
-            separate projection weights.
-        """
-        tie_embeddings = next(
-            (
-                getattr(self.config, key)
-                for key in ["tie_word_embeddings", "use_lm_head", "share_input_output_layers"]
-                if hasattr(self.config, key)
-            ),
-            False,
-        )
-        w = self.get_embedding().weight.value.T if tie_embeddings else None
-        lm_head = self.get_task_head()
-        return lm_head(hidden_states, w=w)
 
     def get_task_head(self):
         """Return the language modeling head.

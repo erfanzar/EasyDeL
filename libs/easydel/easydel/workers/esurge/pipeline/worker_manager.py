@@ -45,14 +45,17 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from easydel.utils import flags
 from easydel.workers.loggers import get_logger
 
 from .zmq_workers import DetokenizerWorkerClient, TokenizerWorkerClient
 
 logger = get_logger(__name__)
 
-DEFAULT_WORKER_STARTUP_TIMEOUT = 120.0
-_WORKER_STARTUP_TIMEOUT_ENV_VARS = ("EASYDEL_WORKER_STARTUP_TIMEOUT",)
+# Keep the legacy exported constant, but use the flag registry as the single source of its default.
+DEFAULT_WORKER_STARTUP_TIMEOUT = float(
+    next(spec.default for spec in flags.registered_flags() if spec.name == flags.EASYDEL_WORKER_STARTUP_TIMEOUT)
+)
 
 
 class WorkerManager:
@@ -185,22 +188,31 @@ class WorkerManager:
             except Exception:
                 self._terminate_process("_tokenizer_process")
                 self._cleanup_ipc_file(tokenizer_endpoint)
+                self._tokenizer_owned = False
                 raise
         self._tokenizer_endpoint = tokenizer_endpoint
 
         if needs_detokenizer_spawn:
-            detokenizer_endpoint = self._make_ipc_endpoint("detokenizer")
-            self._detokenizer_process = self._spawn_worker(
-                "detokenizer",
-                detokenizer_endpoint,
-                detokenizer_max_states=detokenizer_max_states,
-            )
-            self._detokenizer_owned = True
+            detokenizer_endpoint = None
             try:
+                detokenizer_endpoint = self._make_ipc_endpoint("detokenizer")
+                self._detokenizer_process = self._spawn_worker(
+                    "detokenizer",
+                    detokenizer_endpoint,
+                    detokenizer_max_states=detokenizer_max_states,
+                )
+                self._detokenizer_owned = True
                 self._wait_for_endpoint("detokenizer", detokenizer_endpoint, self._detokenizer_process)
             except Exception:
                 self._terminate_process("_detokenizer_process")
                 self._cleanup_ipc_file(detokenizer_endpoint)
+                self._detokenizer_owned = False
+                # No client exists yet, so shutdown() cannot reach an already-spawned tokenizer worker.
+                if self._tokenizer_owned:
+                    self._terminate_process("_tokenizer_process")
+                    self._cleanup_ipc_file(self._tokenizer_endpoint)
+                    self._tokenizer_owned = False
+                self._tokenizer_endpoint = None
                 raise
         self._detokenizer_endpoint = detokenizer_endpoint
 
@@ -266,29 +278,16 @@ class WorkerManager:
                 raise ValueError("startup_timeout must be greater than 0.")
             return timeout
 
-        for env_name in _WORKER_STARTUP_TIMEOUT_ENV_VARS:
-            raw_value = os.environ.get(env_name)
-            if raw_value is None:
-                continue
-            try:
-                timeout = float(raw_value)
-            except ValueError:
-                logger.warning(
-                    "Ignoring invalid %s=%r; expected a positive timeout in seconds.",
-                    env_name,
-                    raw_value,
-                )
-                continue
-            if timeout <= 0:
-                logger.warning(
-                    "Ignoring invalid %s=%r; expected a positive timeout in seconds.",
-                    env_name,
-                    raw_value,
-                )
-                continue
-            return timeout
-
-        return DEFAULT_WORKER_STARTUP_TIMEOUT
+        # ``flags.get_float`` already falls back to the registered default for unset / unparsable values.
+        timeout = flags.get_float(flags.EASYDEL_WORKER_STARTUP_TIMEOUT)
+        if timeout <= 0:
+            logger.warning(
+                "Ignoring invalid %s=%r; expected a positive timeout in seconds.",
+                flags.EASYDEL_WORKER_STARTUP_TIMEOUT,
+                timeout,
+            )
+            return DEFAULT_WORKER_STARTUP_TIMEOUT
+        return timeout
 
     def _spawn_worker(
         self,
@@ -324,9 +323,12 @@ class WorkerManager:
             cmd.extend(["--max-states", str(detokenizer_max_states)])
 
         env = os.environ.copy()
-        env.setdefault("JAX_PLATFORMS", "cpu")
-        env.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
-        env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+        # A model process already has accelerator/distributed settings. These
+        # workers must override them, not inherit them via setdefault().
+        env["JAX_PLATFORMS"] = "cpu"
+        env["JAX_PLATFORM_NAME"] = "cpu"
+        env["ENABLE_DISTRIBUTED_INIT"] = "0"
+        env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
         env.setdefault("PYTHONUNBUFFERED", "1")
 
         return subprocess.Popen(cmd, env=env)
@@ -396,21 +398,22 @@ class WorkerManager:
             endpoint: Endpoint URI to clean up if owned.
         """
         client = getattr(self, client_attr)
-        if client is None:
-            return
         owned = getattr(self, owned_attr)
-        try:
-            if owned:
-                client.shutdown()
-            else:
-                client.close()
-        except Exception:
-            pass
+        if client is not None:
+            try:
+                if owned:
+                    client.shutdown()
+                else:
+                    client.close()
+            except Exception:
+                pass
         setattr(self, client_attr, None)
 
         self._terminate_process(process_attr)
         if owned:
             self._cleanup_ipc_file(endpoint)
+        # A later start() (e.g. in attach mode) must not inherit ownership of a worker it did not spawn.
+        setattr(self, owned_attr, False)
 
     def _terminate_process(self, process_attr: str) -> None:
         """Terminate the worker subprocess held by ``process_attr``.

@@ -354,7 +354,6 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
         hidden_states = outputs.last_hidden_state
 
         score_head = getattr(self, self._score_head_name)
-        logits = score_head(hidden_states)
 
         if input_ids is not None:
             batch_size = input_ids.shape[0]
@@ -364,9 +363,10 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
         if self.config.pad_token_id is None and attention_mask is None and batch_size != 1:
             raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
 
-        pooled_logits = self.pool_sequence(logits, input_ids=input_ids, attention_mask=attention_mask)
+        pooled_hidden = self.pool_sequence(hidden_states, input_ids=input_ids, attention_mask=attention_mask)
+        pooled_logits = score_head(pooled_hidden)
 
-        aux_loss = self.compute_router_aux_loss(outputs)
+        aux_loss = self.compute_aux_loss(outputs, attention_mask=attention_mask)
 
         return SequenceClassifierOutput(
             logits=pooled_logits,

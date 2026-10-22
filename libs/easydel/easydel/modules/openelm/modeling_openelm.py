@@ -28,10 +28,9 @@ Exports:
     - ``OpenELMForCausalLM``: causal LM head wrapper.
 """
 
-import importlib
-import types
 import typing
-from functools import cached_property
+from copy import copy
+from functools import cached_property, lru_cache, wraps
 
 import jax
 import spectrax as spx
@@ -54,7 +53,7 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
+from easydel.infra.utils import ACT2FN, blockwise_ffn, get_gradient_checkpoint_policy
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -72,44 +71,25 @@ from .openelm_configuration import OpenELMConfig, make_divisible
 def _openelm_decoder_layer_block(config: OpenELMConfig) -> type["OpenELMDecoderLayer"]:
     """Return the decoder-layer class to instantiate for this config.
 
-    OpenELM generation rebuilds a no-checkpoint graph for traced decoding. That
-    only works if the original decoder-layer class stays unmodified, so we wrap a
-    throwaway subclass when gradient checkpointing is enabled instead of mutating
-    ``OpenELMDecoderLayer`` in place.
+    OpenELM generation rebuilds a no-checkpoint graph for traced decoding.
+    A stable rematerialized subclass keeps the original class unmodified and
+    remains resolvable through graph export/bind round-trips.
 
     Args:
         config: OpenELM model configuration. Its ``gradient_checkpointing``
             and ``gradient_checkpointing_targets`` fields control whether a
-            rematerialized subclass is created.
+            rematerialization is enabled.
 
     Returns:
         Either the plain ``OpenELMDecoderLayer`` class (when checkpointing is
-        disabled) or a dynamically created ``auto_remat``-wrapped subclass.
+        disabled) or its stable rematerialized subclass.
     """
     policy = getattr(config, "gradient_checkpointing", None)
     policy_value = getattr(policy, "value", policy)
     if policy is None or str(policy_value).lower() in {"", "none"}:
         return OpenELMDecoderLayer
 
-    remat_layer_block = types.new_class(
-        "OpenELMDecoderLayerRemat",
-        (OpenELMDecoderLayer,),
-    )
-    remat_layer_block.__module__ = OpenELMDecoderLayer.__module__
-    # Register the dynamic class in its module so spectrax can resolve it
-    # during jax.eval_shape / bind round-trips.
-    try:
-        parent_module = importlib.import_module(remat_layer_block.__module__)
-        if not hasattr(parent_module, remat_layer_block.__name__):
-            setattr(parent_module, remat_layer_block.__name__, remat_layer_block)
-    except ImportError:
-        pass
-    return auto_remat(
-        remat_layer_block,
-        policy=policy,
-        save_names=config.gradient_checkpointing_targets,
-        exclude_names=config.gradient_checkpointing_targets,
-    )
+    return OpenELMDecoderLayerRemat
 
 
 class OpenELMMultiHeadCausalAttention(UnifiedAttention):
@@ -120,11 +100,10 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
     ``num_kv_heads`` to each layer (read here from
     ``config.num_query_heads[layer_idx]`` /
     ``config.num_kv_heads[layer_idx]`` produced by the config's layer-wise
-    scaling formula). This module temporarily mutates ``config.num_attention_heads``
-    and ``config.num_key_value_heads`` so that the parent
-    :class:`UnifiedAttention` initializer sees the layer-local values when
-    sizing the QKV / output projections, then restores the originals so
-    other layers can pick their own counts. The QKV projection is
+    scaling formula). A shallow layer-local configuration copy supplies
+    ``num_attention_heads`` and ``num_key_value_heads`` to the parent
+    :class:`UnifiedAttention` initializer without mutating the shared config.
+    The QKV projection is
     *fused* into a single ``ColumnParallelLinear`` of width
     ``(num_q_heads + num_k_heads + num_v_heads) * head_dim`` and split
     along the head axis afterwards. Optional Q/K-norm
@@ -177,31 +156,20 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
         self.num_k_heads = config.num_kv_heads[layer_idx]
         self.num_v_heads = config.num_kv_heads[layer_idx]
         self.head_dim = config.head_dim
-        original_num_heads = getattr(config, "num_attention_heads", None)
-        original_num_kv_heads = getattr(config, "num_key_value_heads", None)
-        config.num_attention_heads = self.num_q_heads
-        config.num_key_value_heads = self.num_k_heads
-        try:
-            super().__init__(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-                layer_idx=layer_idx,
-                attention_type="standard",
-                causal=True,
-                use_gqa=True,
-            )
-        finally:
-            if original_num_heads is None:
-                delattr(config, "num_attention_heads")
-            else:
-                config.num_attention_heads = original_num_heads
-            if original_num_kv_heads is None:
-                delattr(config, "num_key_value_heads")
-            else:
-                config.num_key_value_heads = original_num_kv_heads
+        layer_config = copy(config)
+        layer_config.num_attention_heads = self.num_q_heads
+        layer_config.num_key_value_heads = self.num_k_heads
+        super().__init__(
+            config=layer_config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            attention_type="standard",
+            causal=True,
+            use_gqa=True,
+        )
         # Override base head bookkeeping with per-layer values
         self.num_heads = self.num_q_heads
         self.num_key_value_heads = self.num_k_heads
@@ -414,6 +382,7 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
             causal=causal_for_kernel,
             sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
+            output_attentions=output_attentions,
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
@@ -719,6 +688,32 @@ class OpenELMDecoderLayer(spx.Module):
         )
 
 
+@lru_cache(maxsize=32)
+def _rematerialized_decoder_forward(policy, targets):
+    """Cache a functional remat wrapper without modifying a decoder class.
+
+    Args:
+        policy: Checkpoint policy name or callable.
+        targets: Immutable checkpoint-name selection.
+
+    Returns:
+        Rematerialized decoder forward callable.
+    """
+    if not callable(policy):
+        policy = get_gradient_checkpoint_policy(policy, list(targets), list(targets))
+    return spx.remat(OpenELMDecoderLayer.forward, policy=policy, mutable=["rng"])
+
+
+class OpenELMDecoderLayerRemat(OpenELMDecoderLayer):
+    """Stable graph-resolvable checkpointed decoder, with per-model policy selection."""
+
+    @wraps(OpenELMDecoderLayer.forward)
+    def forward(self, *args, **kwargs):
+        policy = self.config.gradient_checkpointing
+        targets = tuple(self.config.gradient_checkpointing_targets or ())
+        return _rematerialized_decoder_forward(policy, targets)(self, *args, **kwargs)
+
+
 @register_module(TaskType.BASE_MODULE, config=OpenELMConfig, model_type="openelm")
 class OpenELMModel(EasyDeLBaseModule):
     """OpenELM base trunk: token embeddings + layer-wise-scaled decoder stack + final RMSNorm.
@@ -740,6 +735,8 @@ class OpenELMModel(EasyDeLBaseModule):
         norm (RMSNorm): Final layer normalization.
         gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
     """
+
+    requires_generation_compatible_graph: typing.ClassVar[bool] = True
 
     def __init__(
         self,
@@ -798,19 +795,6 @@ class OpenELMModel(EasyDeLBaseModule):
                 eps=1e-6,
                 rngs=rngs,
             )
-        if config.share_input_output_layers:
-            self.classifier = None
-        else:
-            with self.assign_layer_stage(config.num_hidden_layers - 1, total_layers=config.num_hidden_layers):
-                self.classifier = ColumnParallelLinear(
-                    config.model_dim,
-                    config.vocab_size,
-                    use_bias=False,
-                    rngs=rngs,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                )
         self.num_transformer_layers = config.num_transformer_layers
 
     @cached_property
@@ -877,10 +861,10 @@ class OpenELMModel(EasyDeLBaseModule):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
-        if inputs_embeds is None and input_ids is not None:
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.token_embeddings(input_ids.astype("i4")), "embeddings")
-        else:
-            raise ValueError("you should specify inputs_embeds or input_ids one of them")
         sequence_length = inputs_embeds.shape[1]
 
         assert sequence_length <= self.config.max_context_length, (
@@ -1027,6 +1011,7 @@ class OpenELMForCausalLM(BaseCausalLMModule[OpenELMModel, OpenELMConfig]):
     _task_type = TaskType.CAUSAL_LM
     _model_type = "openelm"
     _config_class = OpenELMConfig
+    requires_generation_compatible_graph: typing.ClassVar[bool] = True
 
     def __init__(
         self,

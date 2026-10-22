@@ -28,26 +28,27 @@ scheduler thread, so the single-writer discipline for ``kv_pages`` /
 
 from __future__ import annotations
 
-import os
+import logging
 import time
 import typing as tp
 from functools import partial
 
 import jax
 import numpy
+from eformer.loggings import get_logger
 from ejkernel.ops import forward_autotune_only  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 
 from easydel.infra.sharding import replicate_on_array_mesh
 
 from ..async_types import DeviceInputTokenHandoff
-from ..execution_types import BatchMetadata
+from ..execution_types import BatchMetadata, CacheGroupInputs
 from .sampler_executor import _get_padded_num_reqs_with_upper_limit
 
 if tp.TYPE_CHECKING:
     from ..execution_manager import ExecutionManager
 
-_PP_MB_DEBUG = bool(os.environ.get("ESURGE_PP_MB_DEBUG"))
+logger = get_logger("eSurge-PipelineMicrobatch")
 
 
 class _PipelineMicrobatchScratchSlot(tp.TypedDict):
@@ -132,6 +133,21 @@ def _combine_pipeline_hidden_parts(
         return combined
 
 
+@jax.jit
+def _window_handoff_positions(input_positions, count, offset, token_start, token_count):
+    """Keep the original live handoff span and rebase matching token positions.
+
+    Sparse handoffs are not indexed by request row: their slots cover only
+    unresolved placeholders. Masking on device avoids materializing sampled
+    tokens or live counts on the host. Invalid slots use -1, which cannot match
+    a model input position; the original token-id buffer can remain shared.
+    """
+    slots = jnp.arange(input_positions.shape[0], dtype=jnp.int32)
+    live = (slots >= offset) & (slots < offset + count)
+    live &= (input_positions >= token_start) & (input_positions < token_start + token_count)
+    return jnp.where(live, input_positions - token_start, -1)
+
+
 class PipelineMicrobatchExecutor:
     """SpectraX PP decode-wavefront executor for ``ExecutionManager``.
 
@@ -141,6 +157,33 @@ class PipelineMicrobatchExecutor:
     then combines hidden states, runs the LM head, and samples — returning
     the same tuple shape as :meth:`ExecutionManager.execute`.
     """
+
+    supports_cache_groups = True
+
+    @staticmethod
+    def _window_cache_groups(
+        groups: tuple[CacheGroupInputs, ...], chunk: numpy.ndarray, capacity: int
+    ) -> tuple[CacheGroupInputs, ...]:
+        """Window and pad every pool leaf together, retaining pool-local versions."""
+        windowed = []
+        for group in groups:
+            selected = group.for_rows(chunk)
+            count = len(chunk)
+            table = numpy.zeros((capacity, selected.page_table_cpu.shape[1]), dtype=selected.page_table_cpu.dtype)
+            table[:count] = selected.page_table_cpu
+            progress = None
+            if selected.num_computed_tokens_cpu is not None:
+                progress = numpy.zeros((capacity,), dtype=selected.num_computed_tokens_cpu.dtype)
+                progress[:count] = selected.num_computed_tokens_cpu
+            windowed.append(
+                CacheGroupInputs(
+                    page_table_cpu=table,
+                    page_table_version=selected.page_table_version,
+                    window_identity=selected.window_identity + (-1,) * (capacity - count),
+                    num_computed_tokens_cpu=progress,
+                )
+            )
+        return tuple(windowed)
 
     def __init__(self, manager: "ExecutionManager") -> None:
         """Bind the owning manager and initialize reusable caches.
@@ -165,16 +208,16 @@ class PipelineMicrobatchExecutor:
 
     @staticmethod
     def _skip(reason: str, **ctx: tp.Any) -> None:
-        """Log (when ``ESURGE_PP_MB_DEBUG`` is set) why the wavefront was skipped.
+        """Log (at DEBUG level) why the wavefront was skipped.
 
         Diagnostic-only: every ``try_execute`` bailout routes through here so a
-        single instrumented decode run reveals which gate keeps the PP wavefront
-        overlap from engaging. Returns ``None`` so callers can ``return
-        self._skip(...)`` directly.
+        single decode run with debug logging enabled reveals which gate keeps
+        the PP wavefront overlap from engaging. Returns ``None`` so callers can
+        ``return self._skip(...)`` directly.
         """
-        if _PP_MB_DEBUG:
+        if logger.level <= logging.DEBUG:
             extra = " ".join(f"{k}={v}" for k, v in ctx.items())
-            print(f"[pp-mb-skip] {reason} {extra}".rstrip(), flush=True)
+            logger.debug("[pp-mb-skip] %s", f"{reason} {extra}".rstrip())
         return None
 
     def _get_pipeline_handoff_scalars(self, *, offset: int, count: int) -> tuple[jax.Array, jax.Array]:
@@ -509,6 +552,7 @@ class PipelineMicrobatchExecutor:
         video_grid_thw: numpy.ndarray | None,
         device_token_handoff: DeviceInputTokenHandoff | None,
         wait_for_outputs: bool,
+        cache_group_inputs: tuple[CacheGroupInputs, ...] = (),
     ) -> _PipelineExecuteResult | None:
         """Try the SpectraX PP wavefront path for decode-only microbatches.
 
@@ -620,13 +664,6 @@ class PipelineMicrobatchExecutor:
         chunks = [active_positions[i : i + microbatch_req_count] for i in range(0, active_count, microbatch_req_count)]
         if len(chunks) < 2:
             return self._skip("chunks<2", num_chunks=len(chunks), microbatch_req_count=microbatch_req_count)
-        if device_token_handoff is not None and int(device_token_handoff.token_ids.shape[0]) < active_count:
-            return self._skip(
-                "handoff_too_small",
-                handoff_rows=int(device_token_handoff.token_ids.shape[0]),
-                active_count=active_count,
-            )
-
         input_batches: list[tuple[tp.Any, tp.Any, tp.Any, BatchMetadata]] = []
         metadata_batches: list[BatchMetadata] = []
         original_positions: list[numpy.ndarray] = []
@@ -652,7 +689,7 @@ class PipelineMicrobatchExecutor:
             page_table_cpu=page_table_cpu,
         )
 
-        handoff_offset = 0
+        token_offset = 0
         for chunk, scratch_slot in zip(chunks, scratch_slots, strict=True):
             scratch_start = time.time()
             (
@@ -686,44 +723,60 @@ class PipelineMicrobatchExecutor:
             microbatch_scratch_time += time.time() - scratch_start
 
             metadata_start = time.time()
-            batch_metadata, input_ids_buf, position_ids_buf, _scheduled_dev, _active_dev = (
-                self._manager._batch_preparer.prepare_batch_metadata(
-                    num_tokens_static=microbatch_num_tokens,
-                    scheduled_full_cpu=mb_scheduled,
-                    active_mask_full_cpu=mb_active,
-                    input_ids_buf=input_ids_buf,
-                    position_ids_buf=position_ids_buf,
-                    token_ids_cpu=mb_token_ids,
-                    num_computed_tokens_cpu=mb_num_computed,
-                    temperature_cpu=mb_temperature,
-                    top_p_cpu=mb_top_p,
-                    top_k_cpu=mb_top_k,
-                    min_p_cpu=mb_min_p,
-                    frequency_penalties_cpu=mb_frequency,
-                    presence_penalties_cpu=mb_presence,
-                    repetition_penalties_cpu=mb_repetition,
-                    page_table_cpu=mb_page_table,
-                    page_table_version=None,
-                    padded_num_reqs_in=microbatch_padded_reqs,
+            group_kwargs = {}
+            prepare = self._manager._batch_preparer.prepare_batch_metadata
+            if cache_group_inputs:
+                prepare = self._manager.prepare_batch_metadata
+                group_kwargs["cache_group_inputs"] = self._window_cache_groups(
+                    cache_group_inputs, chunk, int(mb_token_ids.shape[0])
                 )
+            batch_metadata, input_ids_buf, position_ids_buf, _scheduled_dev, _active_dev = prepare(
+                num_tokens_static=microbatch_num_tokens,
+                scheduled_full_cpu=mb_scheduled,
+                active_mask_full_cpu=mb_active,
+                input_ids_buf=input_ids_buf,
+                position_ids_buf=position_ids_buf,
+                token_ids_cpu=mb_token_ids,
+                num_computed_tokens_cpu=mb_num_computed,
+                temperature_cpu=mb_temperature,
+                top_p_cpu=mb_top_p,
+                top_k_cpu=mb_top_k,
+                min_p_cpu=mb_min_p,
+                frequency_penalties_cpu=mb_frequency,
+                presence_penalties_cpu=mb_presence,
+                repetition_penalties_cpu=mb_repetition,
+                page_table_cpu=mb_page_table,
+                page_table_version=None,
+                padded_num_reqs_in=microbatch_padded_reqs,
+                **group_kwargs,
             )
             microbatch_metadata_time += time.time() - metadata_start
             local_count = int(chunk.shape[0])
             if device_token_handoff is not None and local_count > 0:
                 handoff_start = time.time()
                 handoff_offset_dev, handoff_count_dev = self._get_pipeline_handoff_scalars(
-                    offset=handoff_offset,
-                    count=local_count,
+                    offset=0,
+                    count=int(device_token_handoff.input_positions.shape[0]),
+                )
+                original_offset = device_token_handoff.offset
+                if original_offset is None:
+                    original_offset = handoff_offset_dev
+                local_positions = _window_handoff_positions(
+                    device_token_handoff.input_positions,
+                    device_token_handoff.count,
+                    original_offset,
+                    token_offset,
+                    local_count,
                 )
                 local_handoff = DeviceInputTokenHandoff(
-                    input_positions=device_token_handoff.input_positions,
+                    input_positions=local_positions,
                     token_ids=device_token_handoff.token_ids,
                     count=handoff_count_dev,
                     offset=handoff_offset_dev,
                 )
                 batch_metadata = self._manager._apply_device_token_handoff(batch_metadata, local_handoff)
                 microbatch_handoff_time += time.time() - handoff_start
-            handoff_offset += local_count
+            token_offset += local_count
             for key, value in self._manager._batch_preparer.last_prep_stats.items():
                 prep_stats_accum[key] = prep_stats_accum.get(key, 0.0) + float(value)
 

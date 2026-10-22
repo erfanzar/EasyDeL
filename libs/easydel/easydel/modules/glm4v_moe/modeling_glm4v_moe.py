@@ -34,10 +34,10 @@ Exports:
 """
 
 import jax
-import jax.numpy as jnp
 import spectrax as spx
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 from spectrax import apply_logical_sharding, common_types, nn
 
@@ -53,6 +53,7 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
+from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     ModelOutput,
@@ -60,9 +61,9 @@ from easydel.infra.modeling_outputs import (
     VLMCausalLMOutput,
 )
 from easydel.infra.utils import auto_remat, blockwise_ffn
-from easydel.layers import Embed, RMSNorm, RowParallelLinear
-from easydel.layers.attention import UnifiedAttention
+from easydel.layers import Embed, RMSNorm
 from easydel.modules._base import BaseVisionLanguageModule
+from easydel.modules.glm.modeling_glm import GlmAttention
 from easydel.modules.glm4_moe.modeling_glm4_moe import Glm4MoeMLP, Glm4MoeMoE
 from easydel.modules.glm4v.modeling_glm4v import Glm4vModel, Glm4vVisionModel
 
@@ -96,7 +97,7 @@ class Glm4vMoeModelOutputWithPast(ModelOutput):
     all_router_losses: tuple[Array] | None = None
 
 
-class Glm4vMoeTextAttention(UnifiedAttention):
+class Glm4vMoeTextAttention(GlmAttention):
     """GLM4V-MoE attention with bias-free output projection.
 
     Implements multi-head self-attention with GPT-J style rotary position
@@ -131,40 +132,7 @@ class Glm4vMoeTextAttention(UnifiedAttention):
             precision=precision,
             rngs=rngs,
             layer_idx=layer_idx,
-            attention_type="standard",
-            causal=True,
             use_qk_norm=getattr(config, "use_qk_norm", False),
-        )
-
-    def _create_o_proj(
-        self,
-        config: Glm4vMoeTextConfig,
-        dtype: jnp.dtype,
-        param_dtype: jnp.dtype,
-        precision: jax.lax.PrecisionLike,
-        rngs: spx.Rngs,
-    ) -> RowParallelLinear:
-        """Create the output projection layer without bias.
-
-        Args:
-            config (Glm4vMoeTextConfig): Text decoder configuration.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): Numerical precision for operations.
-            rngs (spx.Rngs): Random number generator state.
-
-        Returns:
-            RowParallelLinear: Output projection layer.
-        """
-        return RowParallelLinear(
-            self.num_heads * self.head_dim,
-            config.hidden_size,
-            rngs=rngs,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
-            precision=precision,
         )
 
     def _create_rotary(self, config: Glm4vMoeTextConfig, dtype: jnp.dtype):
@@ -522,6 +490,27 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
 
         views = past_key_values.views if past_key_values is not None else None
         has_cache_views = views is not None and any(v is not None for v in views)
+        router_token_mask = None
+        if output_router_logits:
+            # MaskInfo is authoritative, including when no attention_mask was
+            # supplied. Snapshot query validity before the layers update caches.
+            query_segments = mask_info.q_segment_ids
+            if query_segments is not None:
+                router_token_mask = query_segments >= 0
+                if router_token_mask.ndim == 3:
+                    router_token_mask = jnp.any(router_token_mask, axis=1)
+                if router_token_mask.shape[-1] != sequence_length:
+                    # A generation padding mask may cover the entire cache,
+                    # whereas router logits cover only this call's query rows.
+                    query_start = getattr(cache_metadata, "indexes", None)
+                    if query_start is None and views is not None:
+                        query_start = next((v.indexes for v in views if getattr(v, "indexes", None) is not None), None)
+                    if query_start is None:
+                        query_start = max(0, router_token_mask.shape[-1] - sequence_length)
+                    query_indices = jnp.asarray(query_start).reshape(-1, 1) + jnp.arange(sequence_length)[None, :]
+                    router_token_mask = jnp.take_along_axis(
+                        router_token_mask, query_indices, axis=-1, mode="fill", fill_value=False
+                    )
         needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
         # Router-logit aggregation grows a Python tuple per layer, which
         # lax.scan cannot carry — collecting it forces the trace path too.
@@ -536,8 +525,6 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
         # Hoisted out of the loop body: the caching property must not be
         # first materialized inside the lax.scan trace (tracer leak).
         frequencies = self.frequencies
-
-        layer_outputs = None
 
         def _layer_loop(block, carry):
             """Run one GLM-4V-MoE text decoder layer inside ``self.layers.scan``.
@@ -567,7 +554,8 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
-            if output_router_logits:
+            # Dense (``first_k_dense_replace``) layers have no router: skip their ``None``.
+            if output_router_logits and layer_outputs.router_logits is not None:
                 all_router_logits += (layer_outputs.router_logits,)
             cv = self._layer_cache_view_update(
                 cv,
@@ -588,13 +576,25 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
+        all_router_losses = None
+        if output_router_logits:
+            all_router_losses = tuple(
+                auxiliary_load_balancing_loss_func(
+                    gate_logits=(logits,),
+                    num_experts=self.config.n_routed_experts,
+                    top_k=self.config.num_experts_per_tok,
+                    attention_mask=router_token_mask,
+                )
+                for logits in all_router_logits
+            )
+
         return MoeModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
             past_key_values=past_key_values,
             router_logits=all_router_logits,
-            all_router_losses=getattr(layer_outputs, "all_router_losses", None) if layer_outputs is not None else None,
+            all_router_losses=all_router_losses,
         )
 
     def get_decoder(self):
@@ -724,7 +724,9 @@ class Glm4vMoeModel(Glm4vModel):
 
         Returns:
             Glm4vMoeModelOutputWithPast: Model outputs including hidden states, cache,
-                rope deltas, router logits, and auxiliary router losses.
+                rope deltas, router logits, and per-layer auxiliary load-balancing
+                losses when ``output_router_logits`` is enabled. The task head weights
+                their sum using ``router_aux_loss_coef``.
         """
         del cache_position
 
@@ -1008,6 +1010,10 @@ class Glm4vMoeForConditionalGeneration(BaseVisionLanguageModule[Glm4vMoeModel, G
             lm_logits = self.compute_lm_logits(hidden_states)
             lm_logits = self.apply_logit_cap(lm_logits)
 
+        # Weight the sum of the text decoder's per-layer load-balancing losses.
+        # Losses are collected only when ``output_router_logits`` is enabled.
+        aux_loss = self.compute_router_aux_loss(outputs, attention_mask=attention_mask)
+
         return VLMCausalLMOutput(
             logits=lm_logits,
             past_key_values=outputs.past_key_values,
@@ -1016,6 +1022,7 @@ class Glm4vMoeForConditionalGeneration(BaseVisionLanguageModule[Glm4vMoeModel, G
             attentions=outputs.attentions,
             rope_deltas=getattr(outputs, "rope_deltas", None),
             router_logits=getattr(outputs, "router_logits", None) if output_router_logits else None,
+            aux_loss=aux_loss,
         )
 
 

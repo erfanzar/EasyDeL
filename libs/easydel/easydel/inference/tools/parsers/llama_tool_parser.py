@@ -134,9 +134,9 @@ class Llama3JsonToolParser(ToolParser):
         self.streamed_args_for_tool: list[str] = []
         self.bot_token = "<|python_tag|>"
         self.bot_token_id = tokenizer.encode(self.bot_token, add_special_tokens=False)[0]
-        self.tool_call_regex = re.compile(
-            r"{[^{}]*(?:{[^{}]*}[^{}]*)*}(?:\s*;\s*{[^{}]*(?:{[^{}]*}[^{}]*)*})*", re.DOTALL
-        )
+        # Match candidate starts only; JSONDecoder determines the full extent,
+        # respecting arbitrary nesting and braces inside quoted values.
+        self.tool_call_regex = re.compile(r"\{")
 
     def get_tool_machinery_hints(self) -> Sequence[str]:
         """Include the bare-JSON prefix: this parser accepts markerless calls.
@@ -196,14 +196,27 @@ class Llama3JsonToolParser(ToolParser):
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
         try:
-            json_str = match.group(0)
-            json_objects = [obj.strip() for obj in json_str.split(";")]
+            # Decode outer objects directly. Neither semicolons nor braces inside
+            # JSON strings are structural delimiters.
+            decoder = json.JSONDecoder()
+            json_objects: list[dict] = []
+            position = match.start()
+            while position < len(model_output):
+                candidate = self.tool_call_regex.search(model_output, position)
+                if candidate is None:
+                    break
+                try:
+                    obj, position = decoder.raw_decode(model_output, candidate.start())
+                except json.JSONDecodeError:
+                    position = candidate.end()
+                    continue
+                if isinstance(obj, dict) and "name" in obj and ("arguments" in obj or "parameters" in obj):
+                    json_objects.append(obj)
+            if not json_objects:
+                return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
             tool_calls: list[ToolCall] = []
-            for json_obj in json_objects:
-                if not json_obj:
-                    continue
-                obj = json.loads(json_obj)
+            for obj in json_objects:
                 tool_calls.append(
                     ToolCall(
                         type="function",

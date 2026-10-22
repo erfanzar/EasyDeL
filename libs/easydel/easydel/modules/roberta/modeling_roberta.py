@@ -75,7 +75,16 @@ from .roberta_configuration import RobertaConfig as RobertaConfig
 
 
 def dot_product_attention_weights(
-    query, key, *, init_bias=None, dropout_rate=0.0, broadcast_dropout=False, dtype=None, precision=None
+    query,
+    key,
+    *,
+    init_bias=None,
+    dropout_rate=0.0,
+    broadcast_dropout=False,
+    dtype=None,
+    precision=None,
+    dropout_rng=None,
+    softmax_dtype=None,
 ):
     """Compute scaled dot-product attention weights without applying values.
 
@@ -87,28 +96,46 @@ def dot_product_attention_weights(
         query: Query tensor of shape ``(..., q, h, d)``.
         key: Key tensor of shape ``(..., k, h, d)``.
         init_bias: Optional additive attention bias broadcastable to
-            ``(..., h, q, k)`` (e.g. an attention mask). ``None`` means
-            no bias.
+            ``(..., h, q, k)`` (e.g. an attention mask), or a zero-argument
+            callable returning that bias. ``None`` means no bias.
         dropout_rate: Probability of dropping individual attention
-            weights after softmax. Defaults to ``0.0`` (disabled).
-        broadcast_dropout: Currently unused; preserved for API
-            compatibility with sibling implementations.
-        dtype: Currently unused; preserved for API compatibility.
-        precision: Currently unused; preserved for API compatibility.
+            weights after softmax. Defaults to ``0.0`` (disabled). Dropout is
+            only applied when ``dropout_rng`` is also given, so evaluation
+            (no rng) is always deterministic.
+        broadcast_dropout: When ``True`` the dropout mask is shared across
+            all leading batch dimensions (it only varies over ``h, q, k``).
+        dtype: Optional dtype the returned weights are cast to.
+        precision: Matmul precision for the query/key contraction.
+        dropout_rng: PRNG key used to draw the dropout mask. ``None`` disables
+            dropout regardless of ``dropout_rate``.
+        softmax_dtype: Optional dtype of the softmax accumulator (use the
+            config's ``attn_softmax_dtype``). ``None`` keeps the input dtype.
 
     Returns:
         Attention weight tensor of shape ``(..., h, q, k)`` with the
         softmax applied along the key axis.
     """
     depth = query.shape[-1]
-    attn_scores = jnp.einsum("...qhd,...khd->...hqk", query, key) / jnp.sqrt(depth).astype(query.dtype)
+    attn_scores = jnp.einsum("...qhd,...khd->...hqk", query, key, precision=precision) / jnp.sqrt(depth).astype(
+        query.dtype
+    )
+    if softmax_dtype is not None:
+        attn_scores = attn_scores.astype(softmax_dtype)
+    if callable(init_bias):
+        init_bias = init_bias()
     if init_bias is not None:
         attn_scores = attn_scores + init_bias
     attn_weights = jax.nn.softmax(attn_scores, axis=-1)
-    if dropout_rate > 0.0:
+    if dropout_rate > 0.0 and dropout_rng is not None:
         keep_prob = 1.0 - dropout_rate
-        mask = jax.random.bernoulli(jax.random.PRNGKey(0), keep_prob, attn_weights.shape)
+        if broadcast_dropout:
+            mask_shape = (1,) * (attn_weights.ndim - 3) + tuple(attn_weights.shape[-3:])
+        else:
+            mask_shape = attn_weights.shape
+        mask = jax.random.bernoulli(dropout_rng, keep_prob, mask_shape)
         attn_weights = jnp.where(mask, attn_weights / keep_prob, 0)
+    if dtype is not None:
+        attn_weights = attn_weights.astype(dtype)
     return attn_weights
 
 
@@ -278,6 +305,7 @@ class RobertaSelfAttention(AttentionModule):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
+        self.rngs = rngs
         self.head_dim = self.config.hidden_size // self.config.num_attention_heads
         if self.config.hidden_size % self.config.num_attention_heads != 0:
             raise ValueError(
@@ -421,14 +449,29 @@ class RobertaSelfAttention(AttentionModule):
             attn_weights = out.attention_weights
             attn_output = out.attention_outputs
         else:
+            if self.causal and not is_cross_attention and not mask_info.causal_mask_baked_in:
+                # The performer normally applies causality. The explicit head-mask
+                # path must do so too, using the positions updated by the cache.
+                mask_info = mask_info.replace()
+                visibility = mask_info.get_or_compute_attention_mask()
+                q_positions, kv_positions = mask_info.get_or_compute_positions()
+                visibility = visibility & (kv_positions[:, None, None, :] <= q_positions[:, None, :, None])
+                mask_info = mask_info.replace(attention_mask=visibility, causal_mask_baked_in=True)
+                init_attention_bias = mask_info.create_bias(self.dtype)
+            dropout_rate = self.config.attention_probs_dropout_prob
+            dropout_rng = None
+            if self.training and dropout_rate > 0.0 and getattr(self, "rngs", None) is not None:
+                dropout_rng = self.rngs.key("dropout")
             attn_weights = dot_product_attention_weights(
                 query_states,
                 key_states,
                 init_bias=init_attention_bias,
-                dropout_rate=self.config.attention_probs_dropout_prob,
+                dropout_rate=dropout_rate,
                 broadcast_dropout=True,
                 dtype=self.dtype,
-                precision=None,
+                precision=self.precision,
+                dropout_rng=dropout_rng,
+                softmax_dtype=getattr(self.config, "attn_softmax_dtype", jnp.float32),
             )
 
             attn_weights = jnp.einsum("...hqk,h->...hqk", attn_weights, layer_head_mask)
@@ -733,6 +776,7 @@ class RobertaOutput(spx.Module):
             self.config.hidden_size,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             dtype=dtype,
+            param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
         )
@@ -1467,6 +1511,7 @@ class RobertaModel(EasyDeLBaseModule):
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
+        mask_info: MaskInfo | None = None,
     ):
         """Forward pass through the RoBERTa model.
 
@@ -1490,6 +1535,8 @@ class RobertaModel(EasyDeLBaseModule):
                 Cached key/value states for efficient generation.
             output_attentions (bool): Whether to return attention weights from all layers.
             output_hidden_states (bool): Whether to return hidden states from all layers.
+            mask_info (MaskInfo, optional): Pre-computed mask information. When given it is used
+                as-is instead of deriving the mask from ``attention_mask``.
 
         Returns:
             BaseModelOutputWithPoolingAndCrossAttentions: Named tuple containing:
@@ -1512,7 +1559,14 @@ class RobertaModel(EasyDeLBaseModule):
             # `padding_idx + 1`; padding tokens stay at `padding_idx`.
             padding_idx = getattr(self.config, "pad_token_id", 0) or 0
             not_pad = (input_ids != padding_idx).astype("i4")
-            position_ids = jnp.cumsum(not_pad, axis=1) * not_pad + jnp.asarray(padding_idx, dtype="i4")
+            previous_length = 0
+            if past_key_values is not None and past_key_values.views:
+                first_view = past_key_values.views[0]
+                if isinstance(first_view, TransformerCacheView):
+                    previous_length = first_view.indexes[:, None]
+            position_ids = (jnp.cumsum(not_pad, axis=1) + previous_length) * not_pad + jnp.asarray(
+                padding_idx, dtype="i4"
+            )
 
         hidden_states = self.embeddings(
             input_ids=input_ids,
@@ -1522,7 +1576,7 @@ class RobertaModel(EasyDeLBaseModule):
         )
 
         mask_info = MaskInfo.dynamic_init(
-            mask_info=None,
+            mask_info=mask_info,
             input_ids=input_ids,
             inputs_embeds=hidden_states,
             attention_mask=attention_mask,
@@ -1575,6 +1629,7 @@ class RobertaModel(EasyDeLBaseModule):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             cross_attentions=outputs.cross_attentions,
+            past_key_values=outputs.past_key_values,
         )
 
     def get_encoder(self):
@@ -2123,11 +2178,11 @@ class RobertaForQuestionAnswering(BaseQuestionAnsweringModule[RobertaModel, Robe
 
     def forward(
         self,
-        input_ids,
-        attention_mask,
-        token_type_ids,
-        position_ids,
-        head_mask,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        token_type_ids: Int[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        head_mask: Bool[Array, "num_heads"] | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -2359,6 +2414,7 @@ class RobertaForCausalLM(BaseCausalLMModule[RobertaModel, RobertaConfig]):  # ty
             past_key_values=past_key_values,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            mask_info=mask_info,
         )
 
         hidden_states = outputs.last_hidden_state
@@ -2376,6 +2432,7 @@ class RobertaForCausalLM(BaseCausalLMModule[RobertaModel, RobertaConfig]):  # ty
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             cross_attentions=outputs.cross_attentions,
+            past_key_values=outputs.past_key_values,
         )
 
     def get_encoder(self):
@@ -2396,7 +2453,7 @@ class RobertaForCausalLM(BaseCausalLMModule[RobertaModel, RobertaConfig]):  # ty
         Returns:
             spx.Module: The underlying ``RobertaModel`` decoder.
         """
-        return self.roberta.get_decoder()
+        return self.roberta
 
     def get_lm_head(self):
         """Return the masked-language-modelling-style LM head.

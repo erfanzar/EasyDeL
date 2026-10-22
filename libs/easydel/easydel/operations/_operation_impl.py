@@ -52,7 +52,11 @@ Example:
 
 from __future__ import annotations
 
+import math
+import typing as tp
+
 import einops
+import jax
 import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
@@ -62,15 +66,28 @@ from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Bool, Float
 from spectrax import common_types
 
+from easydel.axis import ATTN_DP
+from easydel.infra.sharding import mesh_axis_size
+from easydel.utils import flags
+
 from ._base_operation import BaseOperation, OperationRegistry
 from ._operation_meta import OperationMetadata
 from .requirements import ExecutionMode, OperationRequirements
 
-__all__ = ["OperationImpl", "OperationMetadata", "OperationOutput", "OperationRegistry"]
+__all__ = [
+    "ENABLE_DP_LOCAL_PAGE_PATH",
+    "OperationImpl",
+    "OperationMetadata",
+    "OperationOutput",
+    "OperationRegistry",
+    "dp_page_axis",
+]
 
 OperationRegistry = OperationRegistry
 
 logger = get_logger("EasyDeL-OperationOperator")
+
+ENABLE_DP_LOCAL_PAGE_PATH = flags.get_bool(flags.EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH)
 
 
 NOT_GIVEN = common_types.NOT_GIVEN
@@ -102,13 +119,68 @@ def axis_entry_shard_factor(mesh, axis_entry) -> int:
         The product of the mesh sizes of the named axes (1 when unsharded or
         when no mesh is available).
     """
-    if mesh is None or axis_entry is None:
-        return 1
-    axis_names = axis_entry if isinstance(axis_entry, tuple) else (axis_entry,)
-    factor = 1
-    for name in axis_names:
-        factor *= int(mesh.shape[name])
-    return factor
+    return mesh_axis_size(mesh, axis_entry)
+
+
+def run_mosaic_kernel(
+    kernel: tp.Callable,
+    fallback: tp.Callable[[str], tp.Any],
+    args: tuple,
+    *,
+    mesh,
+    specs: tp.Callable[[], tuple[tuple[Ps, ...], tp.Any] | None],
+):
+    """Run a Mosaic kernel directly or under a safe ``shard_map``, otherwise fall back.
+
+    Args:
+        kernel: Local-device kernel callable.
+        fallback: XLA fallback receiving a diagnostic reason.
+        args: Array arguments for the local kernel.
+        mesh: Explicit mesh, or ``None``.
+        specs: Lazy input/output specs provider; ``None`` means the layout cannot be partitioned safely.
+
+    Returns:
+        The local, mapped, or fallback kernel result.
+    """
+    ambient = jax.sharding.get_abstract_mesh()
+    if not ambient.empty and ambient.manual_axes:
+        auto = [name for name in ambient.axis_names if name not in ambient.manual_axes and ambient.shape[name] > 1]
+        if auto:
+            return fallback(f"ambient manual axes {tuple(ambient.manual_axes)} with sharded auto axes {auto}")
+        return kernel(*args)
+    mesh = getattr(mesh, "jax_mesh", mesh)
+    if mesh is None:
+        if jax.device_count() == 1:
+            return kernel(*args)
+        return fallback("no mesh on a multi-device host")
+    if mesh.size == 1:
+        return kernel(*args)
+    resolved = specs()
+    if resolved is None:
+        return fallback("kernel sharding is not a supported independent-axis layout")
+    in_specs, out_specs = resolved
+    for arg, spec in zip(args, in_specs, strict=True):
+        for dim, axes in zip(arg.shape, spec, strict=False):
+            size = mesh_axis_size(mesh, axes)
+            if int(dim) % size:
+                return fallback(f"dimension {int(dim)} is not divisible by mesh axes {axes} (size {size})")
+    return jax.shard_map(kernel, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False)(*args)
+
+
+def dp_page_axis(cache_view):
+    """Resolve the logical KV-page axis for a paged cache view.
+
+    Shared by the paged-attention adapters so the data-parallel page semantics live in one place.
+
+    Args:
+        cache_view: Paged cache view whose ``metadata`` may carry ``data_parallel_size``.
+
+    Returns:
+        ``ATTN_DP`` when the cache reports ``data_parallel_size > 1``, else ``common_types.EMPTY``
+        (replicated pages).
+    """
+    dp_size = max(1, int(getattr(cache_view.metadata, "data_parallel_size", 1)))
+    return ATTN_DP if dp_size > 1 else common_types.EMPTY
 
 
 @auto_pytree
@@ -132,10 +204,9 @@ class OperationImpl(BaseOperation):
     subclass this rather than :class:`BaseOperation` directly to inherit:
 
     * Backend-aware dispatch via :class:`BaseOperation.__call__`.
-    * The mask/segment/head-repeat utilities defined below
-      (:meth:`_split_attention_mask`, :meth:`_combine_query_kv_masks`,
-      :meth:`_create_causal_mask`, :meth:`repeat_kv_heads`,
-      :meth:`_handle_kvhead`).
+    * The mask/head utilities defined below (:meth:`_split_attention_mask`,
+      :meth:`_combine_query_kv_masks`, :meth:`_create_causal_mask`,
+      :meth:`_handle_kvhead`, :meth:`repeat_kv_heads`, :meth:`expand_kv_heads_for_shard`).
     * Mode discrimination via :meth:`get_mode` (decode vs train) and
       sharding-spec construction via :meth:`create_stable_sharding`.
 
@@ -303,6 +374,39 @@ class OperationImpl(BaseOperation):
             to all positions up to and including itself.
         """
         return jnp.tril(jnp.ones((qseq, qseq), dtype="b1"))
+
+    def expand_kv_heads_for_shard(
+        self,
+        key: Array,
+        value: Array,
+        *,
+        head_axis: int,
+        query_sharding: Ps | None,
+        query_head_axis: int,
+        num_q_heads: int | None = None,
+    ) -> tuple[Array, Array]:
+        """Block-repeat KV heads just enough to shard consistently with query heads.
+
+        Args:
+            key: Key tensor, with KV heads at ``head_axis``.
+            value: Value tensor with the same head layout.
+            head_axis: Head dimension of key and value tensors.
+            query_sharding: Resolved query PartitionSpec, or ``None``.
+            query_head_axis: Query-head entry in ``query_sharding``.
+            num_q_heads: Optional guard requiring the expanded KV count to divide query heads.
+
+        Returns:
+            Key and value tensors with minimally expanded heads, or unchanged tensors when no repair is needed.
+        """
+        num_kv_heads = key.shape[head_axis]
+        factor = 1
+        if query_sharding is not None and len(query_sharding) > query_head_axis:
+            factor = axis_entry_shard_factor(self.metadata.mesh, query_sharding[query_head_axis])
+        if factor > 1 and num_kv_heads > 1 and num_kv_heads % factor:
+            repetitions = factor // math.gcd(num_kv_heads, factor)
+            if num_q_heads is None or num_q_heads % (num_kv_heads * repetitions) == 0:
+                return jnp.repeat(key, repetitions, axis=head_axis), jnp.repeat(value, repetitions, axis=head_axis)
+        return key, value
 
     @staticmethod
     def repeat_kv_heads(

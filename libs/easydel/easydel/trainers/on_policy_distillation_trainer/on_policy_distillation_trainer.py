@@ -320,9 +320,13 @@ class OnPolicyDistillationTrainer(Trainer):
             self.arguments.alpha,
             straight_through_emulator,
             self.arguments.logits_chunk_size,
+            self.arguments.beta,
+            self.arguments.cakld_gamma,
+            self.arguments.loss_top_k,
+            self.arguments.loss_add_tail,
         )
 
-        static_argnames = tuple(range(3, 12))
+        static_argnames = tuple(range(3, 16))
 
         self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
@@ -347,6 +351,10 @@ class OnPolicyDistillationTrainer(Trainer):
             self.arguments.alpha,
             None,  # straight_through_emulator
             self.arguments.logits_chunk_size,
+            self.arguments.beta,
+            self.arguments.cakld_gamma,
+            self.arguments.loss_top_k,
+            self.arguments.loss_add_tail,
         )
 
         self._runtime_trace("eval.compile_wrapper.begin")

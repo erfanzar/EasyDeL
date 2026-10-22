@@ -80,15 +80,17 @@ from easydel.layers import (
     dense_gate_up_layout,
     gated_mlp_forward,
 )
-from easydel.layers.attention import UnifiedAttention
+from easydel.layers.attention import SoftCappedAttentionModule, UnifiedAttention
 from easydel.layers.norms import RMSNorm
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule, BaseVisionLanguageModule
 from easydel.modules.auto.auto_modeling import AutoEasyDeLVisionModel
-from easydel.modules.gemma2.modeling_gemma2 import Gemma2SoftCappedAttentionModule
 
 from .gemma3_configuration import Gemma3Config, Gemma3TextConfig
 
 logger = get_logger(__name__)
+
+# Public alias for the shared soft-capped attention module; avoids importing the Gemma2 model family.
+Gemma2SoftCappedAttentionModule = SoftCappedAttentionModule
 
 
 def _gemma3_embed_scale(embed_tokens: tp.Any, hidden_size: int, inputs_embeds: Array) -> Array:
@@ -141,41 +143,37 @@ class Gemma3ModelOutputWithPast(ModelOutput):
 
 
 @auto_pytree
-class Gemma3CausalLMOutputWithPast(ModelOutput):
-    """Outputs for the Gemma 3 multimodal causal LM forward pass.
+class Gemma3CausalLMOutputWithPast(VLMCausalLMOutput):
+    """Gemma3 conditional-generation outputs, including projected vision features.
 
-    Returned by the vision-language wrappers (e.g.
-    :class:`Gemma3ForConditionalGeneration`) when they need to surface both
-    the LM logits and the projected vision features alongside the standard
-    causal-LM outputs.
-
-    Attributes:
-        loss: Optional next-token-prediction loss of shape ``(1,)`` populated
-            when ``labels`` are supplied.
-        logits: Vocabulary logits of shape ``(batch, seq_len,
-            text_config.vocab_size)``, possibly tanh-softcapped by
-            ``final_logit_softcapping``.
-        last_hidden_state: Final pre-LM-head hidden states of shape
-            ``(batch, seq_len, hidden_size)``.
-        past_key_values: Updated hybrid KV cache returned by the language
-            model.
-        hidden_states: Optional tuple of per-layer hidden states when
-            ``output_hidden_states=True``.
-        attentions: Optional tuple of per-layer attention weights when
-            ``output_attentions=True``.
-        image_hidden_states: Projected vision features of shape
-            ``(batch, mm_tokens_per_image, hidden_size)`` produced by
-            :class:`Gemma3MultiModalProjector`, or ``None`` when no
-            ``pixel_values`` were provided.
+    Shares the standard VLM fields while preserving the family output's positional constructor.
+    Returned by :class:`Gemma3ForConditionalGeneration` with vocabulary logits, final hidden states,
+    updated cache, optional per-layer hidden states/attentions, and projected ``image_hidden_states``.
+    ``loss`` is populated by the inherited training loss interface when labels are supplied.
     """
 
-    loss: Array | None = None
-    logits: Array | None = None
-    last_hidden_state: Array | None = None
-    past_key_values: TransformerCache | None = None
-    hidden_states: tuple[Array] | None = None
-    attentions: tuple[Array] | None = None
-    image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
+    def __init__(
+        self,
+        loss: Array | None = None,
+        logits: Array | None = None,
+        last_hidden_state: Array | None = None,
+        past_key_values: TransformerCache | None = None,
+        hidden_states: tuple[Array] | None = None,
+        attentions: tuple[Array] | None = None,
+        image_hidden_states: Array | None = None,
+        **kwargs,
+    ):
+        """Build the family output; additional standard VLM fields may be passed by keyword."""
+        super().__init__(
+            loss=loss,
+            logits=logits,
+            last_hidden_state=last_hidden_state,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+            attentions=attentions,
+            image_hidden_states=image_hidden_states,
+            **kwargs,
+        )
 
 
 class Gemma3RMSNorm(RMSNorm):
@@ -319,9 +317,9 @@ class Gemma3Attention(UnifiedAttention):
             rngs: Random number generator state for the attention dropout.
 
         Returns:
-            Gemma2SoftCappedAttentionModule: Configured attention backend.
+            SoftCappedAttentionModule: Configured attention backend.
         """
-        return Gemma2SoftCappedAttentionModule(
+        return SoftCappedAttentionModule(
             rngs=rngs,
             base_config=config,
             softmax_scale=config.query_pre_attn_scalar**-0.5,
@@ -1091,6 +1089,26 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]): 
             cap = jnp.array(self.config.final_logit_softcapping, dtype=lm_logits.dtype)
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)
         return lm_logits
+
+    def get_lm_logit_postprocess(self):
+        """Capture text logits' base clipping followed by optional soft-capping.
+
+        Returns:
+            Scalar-only logit postprocessor, or ``None`` for identity.
+        """
+        clip_fn = self.get_base_lm_logit_postprocess()
+        cap_value = self.config.final_logit_softcapping
+        if cap_value is None:
+            return clip_fn
+
+        def _postprocess(logits):
+            """Clip raw text logits, then apply the tanh soft-cap."""
+            if clip_fn is not None:
+                logits = clip_fn(logits)
+            cap = jnp.array(cap_value, dtype=logits.dtype)
+            return cap * jax.nn.tanh(logits / cap)
+
+        return _postprocess
 
     def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
         """Build a trace-safe LM-head projection with Gemma-3 soft-capping.
@@ -1983,7 +2001,7 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
         if apply_lm_head:
             lm_logits = self.compute_lm_logits(hidden_states)
 
-        return VLMCausalLMOutput(
+        return Gemma3CausalLMOutputWithPast(
             logits=lm_logits,
             last_hidden_state=hidden_states,
             past_key_values=outputs.past_key_values,
@@ -2004,45 +2022,51 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
         Returns:
             LM logits with optional softcapping applied
         """
-        lm_logits = self.lm_head(hidden_states)
+        lm_logits = super().apply_lm_head(hidden_states)
         if self.config.get_text_config().final_logit_softcapping is not None:
             cap = jnp.array(self.config.get_text_config().final_logit_softcapping, dtype=lm_logits.dtype)
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)
         return lm_logits
 
-    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
-        """Build a trace-safe VLM LM-head projection with Gemma-3 soft-capping.
+    def get_lm_logit_postprocess(self):
+        """Capture VLM logits' optional soft-cap followed by base clipping.
 
-        Bypasses ``nn.remat`` on the LM head by routing through
-        ``self.lm_head.native_forward`` (safe under tracing), applies the
-        shared ``apply_logit_cap`` post-processing, then layers the
-        ``text_config.final_logit_softcapping`` tanh-softcap on top when
-        configured.
-
-        Args:
-            vocab_shard_stage: Unused; accepted for API parity with the base
-                helper.
+        Unlike the text-only head, this head soft-caps in ``apply_lm_head``
+        before ``compute_lm_logits`` applies the base clipping stage.
 
         Returns:
-            Callable[[Array], Array]: A function mapping hidden states of
-            shape ``[B, T, H]`` to logits of shape ``[B, T, V]``.
+            Scalar-only logit postprocessor, or ``None`` for identity.
         """
-        _native = self.lm_head.native_forward
+        clip_fn = self.get_base_lm_logit_postprocess()
         cap_value = self.config.get_text_config().final_logit_softcapping
-        _cap = self.apply_logit_cap
+        if cap_value is None:
+            return clip_fn
+
+        def _postprocess(logits):
+            """Soft-cap raw VLM logits, then clip the result."""
+            cap = jnp.array(cap_value, dtype=logits.dtype)
+            logits = cap * jax.nn.tanh(logits / cap)
+            return clip_fn(logits) if clip_fn is not None else logits
+
+        return _postprocess
+
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
+        """Build a trace-safe VLM projection with soft-capping before clipping.
+
+        Args:
+            vocab_shard_stage: Optional pipeline-stage hint forwarded to the
+                raw projection helper.
+
+        Returns:
+            Callable mapping hidden states ``[B, T, H]`` to logits ``[B, T, V]``.
+        """
+        base_fn = EasyDeLBaseModule.make_lm_head_fn(self, vocab_shard_stage=vocab_shard_stage)
+        postprocess = self.get_lm_logit_postprocess()
 
         def _project(hidden_states):
-            """Project hidden states with LM head and apply VLM logit softcap.
-
-            Bypasses :class:`nn.remat` on the LM head (uses ``native_forward``)
-            so that the wrapper is trace-safe, then layers the
-            text-config-controlled tanh-softcap on top.
-            """
-            lm_logits = _cap(_native(hidden_states))
-            if cap_value is not None:
-                cap = jnp.array(cap_value, dtype=lm_logits.dtype)
-                lm_logits = cap * jax.nn.tanh(lm_logits / cap)
-            return lm_logits
+            """Project without remat and preserve the full-logit transform order."""
+            logits = base_fn(hidden_states)
+            return postprocess(logits) if postprocess is not None else logits
 
         return _project
 

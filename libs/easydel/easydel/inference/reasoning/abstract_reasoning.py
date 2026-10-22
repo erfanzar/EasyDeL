@@ -26,15 +26,15 @@ Note:
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
 import os
-import sys
 from collections.abc import Callable, Sequence
 from functools import cached_property
-from typing import Literal, TypeAlias, assert_never
+from typing import Literal, TypeAlias
 
 from transformers import AutoTokenizer as AnyTokenizer
+
+from easydel.utils._parser_utils import import_from_path as _import_from_path
+from easydel.utils._parser_utils import is_list_of as _is_list_of
 
 from ..openai_api_modules import DeltaMessage
 
@@ -93,6 +93,9 @@ def shared_vocab(tokenizer) -> dict[str, int]:
     cached = getattr(tokenizer, "_easydel_shared_vocab", None)
     if cached is not None:
         return cached
+    if not callable(getattr(tokenizer, "get_vocab", None)):
+        # Text-only extraction (e.g. make_reasoning_stripper) needs no tokenizer.
+        return {}
     vocab = tokenizer.get_vocab()
     try:
         tokenizer._easydel_shared_vocab = vocab
@@ -114,6 +117,28 @@ class ReasoningParser:
     Attributes:
         model_tokenizer (AnyTokenizer): Tokenizer instance for the model.
     """
+
+    # Text-delimiter parsers may need to buffer ambiguous prefixes even outside reasoning.
+    streaming_all_phases: bool = False
+
+    def finalize_streaming(
+        self, current_text: str, current_token_ids: Sequence[int] = (), request=None
+    ) -> DeltaMessage | None:
+        """Release any text withheld pending a possible delimiter at end of stream.
+
+        Consumers call this once after the last streaming delta. Stateless/token-boundary
+        parsers have nothing to flush; buffering parsers override this hook. Repeated calls
+        must not emit the same withheld text again.
+
+        Args:
+            current_text: Complete decoded output, including the final delta.
+            current_token_ids: Complete generated token sequence.
+            request: Optional request context.
+
+        Returns:
+            A final reasoning/content delta, or ``None`` when nothing was withheld.
+        """
+        return None
 
     def __init__(self, tokenizer: AnyTokenizer):
         """Initialize the reasoning parser with a tokenizer.
@@ -137,6 +162,21 @@ class ReasoningParser:
             prompt_token_ids: Token IDs for ``prompt_text``.
         """
         del prompt_text, prompt_token_ids
+
+    def adjust_request(self, request):
+        """Adjust a request/sampling-params object before generation starts.
+
+        Parsers whose delimiters are special tokens (for example Gemma4's channel markers) override this to force
+        ``skip_special_tokens=False`` so the markers survive detokenization. The default implementation is a no-op
+        that returns ``request`` unchanged, so callers can invoke it uniformly on any reasoning parser.
+
+        Args:
+            request: Mutable request or sampling-params object exposing the attributes the parser may adjust.
+
+        Returns:
+            The (possibly mutated) ``request``.
+        """
+        return request
 
     @cached_property
     def vocab(self) -> dict[str, int]:
@@ -211,6 +251,23 @@ class ReasoningParser:
             ``None`` when the parser found no such portion.
         """
         raise NotImplementedError
+
+    def extract_reasoning_final(self, model_output: str, request=None) -> tuple[str | None, str | None]:
+        """Return terminal channel snapshots for streaming catch-up.
+
+        The default uses batch extraction. Buffering parsers can preserve streaming
+        whitespace and release ambiguous terminal prefixes without reclassifying text.
+
+        Args:
+            model_output: Complete decoded output, including the final snapshot.
+            request: Optional request context.
+
+        Returns:
+            Complete reasoning and visible content for final delta reconciliation.
+        """
+        if request is None:
+            return self.extract_reasoning(model_output)
+        return self.extract_reasoning(model_output, request)
 
     def extract_reasoning_streaming(
         self,
@@ -328,7 +385,7 @@ class ReasoningParserManager:
         if not isinstance(force, bool):
             raise TypeError(f"force must be a boolean, but got {type(force)}")
 
-        if not (name is None or isinstance(name, str) or _is_list_of(name, str)):
+        if not (name is None or isinstance(name, str) or _is_list_of(name, str, check="all")):
             raise TypeError(f"name must be None, an instance of str, or a sequence of str, but got {type(name)}")
 
         if module is not None:
@@ -360,48 +417,3 @@ class ReasoningParserManager:
             import logging
 
             logging.getLogger(__name__).warning("Failed to load module '%s' from %s.", module_name, plugin_path)
-
-
-def _import_from_path(module_name: str, file_path: str | os.PathLike):
-    """Import a Python module from a file path dynamically.
-
-    Args:
-        module_name: Name to associate with the loaded module in ``sys.modules``.
-        file_path: Filesystem path to the ``.py`` source file.
-
-    Returns:
-        The newly imported module object.
-
-    Raises:
-        ModuleNotFoundError: If the file cannot be located or no spec is created.
-    """
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    if spec is None:
-        raise ModuleNotFoundError(f"No module named '{module_name}'")
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def _is_list_of(value: object, typ, *, check: Literal["first", "all"] = "first") -> bool:
-    """Return ``True`` when ``value`` is a list whose elements match ``typ``.
-
-    Args:
-        value: Object to inspect.
-        typ: Type expected for the list elements.
-        check: ``"first"`` checks only the first element (cheap heuristic),
-            ``"all"`` checks every element.
-
-    Returns:
-        ``True`` when ``value`` is a list and the requested elements all
-        match ``typ``; ``False`` otherwise.
-    """
-    if not isinstance(value, list):
-        return False
-    if check == "first":
-        return len(value) == 0 or isinstance(value[0], typ)
-    elif check == "all":
-        return all(isinstance(v, typ) for v in value)
-    assert_never(check)

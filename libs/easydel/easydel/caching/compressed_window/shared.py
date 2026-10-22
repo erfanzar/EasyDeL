@@ -496,6 +496,7 @@ class SharedCompressedWindowCache(BaseCache):
     __str__ = __repr__
 
 
+@auto_pytree
 class SharedCompressedWindowMetadata(BaseRunTimeMetadata):
     """Runtime-metadata placeholder: all step bookkeeping derives from the views' ``cache_position``."""
 

@@ -611,11 +611,14 @@ def find_latest_checkpoint(base_path: str) -> str | None:
         try:
             meta = read_checkpoint_metadata(path)
             ts = dt.datetime.fromisoformat(meta.get("timestamp", "1970-01-01T00:00:00"))
+            # Legacy metadata uses local, naive datetimes; EasyDeL state
+            # metadata includes a UTC offset. Compare both on the same timeline.
+            ts = ts.astimezone(dt.UTC)
             step = int(meta.get("step", -1))
             return (ts, step)
         except Exception as e:
             logger.debug(f"Could not read metadata for {path}: {e}")
-            return (dt.datetime.min, -1)
+            return (dt.datetime.min.replace(tzinfo=dt.UTC), -1)
 
     return max(ckpts, key=sort_key)
 

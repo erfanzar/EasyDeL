@@ -88,9 +88,24 @@ class RunningMoments:
         arr = jnp.asarray(values).reshape(-1)
         if arr.size == 0:
             return
-        batch_mean = float(arr.mean())
-        batch_var = float(arr.var())
-        batch_count = float(arr.size)
+        self.update_from_moments(float(arr.mean()), float(arr.var()), float(arr.size))
+
+    def update_from_moments(self, batch_mean: float, batch_var: float, batch_count: float):
+        """Merge pre-aggregated batch moments into the running statistics.
+
+        Used when only the batch sum / sum of squares / count are available on
+        host (for example after a jitted step reduced the per-example rewards).
+
+        Args:
+            batch_mean: Mean of the new values.
+            batch_var: Population variance of the new values.
+            batch_count: Number of new values. Non-positive counts are ignored.
+        """
+        if not batch_count > 0:
+            return
+        batch_mean = float(batch_mean)
+        batch_var = max(float(batch_var), 0.0)
+        batch_count = float(batch_count)
 
         delta = batch_mean - self.mean
         tot_count = self.count + batch_count
@@ -167,8 +182,7 @@ def concatenated_forward(
         is_encoder_decoder: Selects the encoder-decoder branch when
             ``True``.
         label_pad_token_id: Sentinel token id marking positions that
-            should be excluded from the loss mask in the causal LM
-            branch.
+            should be excluded from the loss mask in either architecture.
         padding_value: Token id used when padding completions
             (forwarded by the caller; this function does not pad
             itself).
@@ -211,7 +225,7 @@ def concatenated_forward(
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         outputs = model(**call_kwargs)
         logits = outputs.logits
-        loss_mask = completion_attention_mask.astype(bool)
+        loss_mask = completion_attention_mask.astype(bool) & (completion_labels != label_pad_token_id)
         labels_safe = jnp.where(loss_mask, completion_labels, 0)
         gathered_logps, _ = compute_token_logps_and_entropies_chunked(
             logits,
@@ -561,6 +575,13 @@ def training_step(
                         "count/rejected": rejected_valid.sum(),
                         "loss/chosen": chosen_losses.sum() / jnp.maximum(chosen_valid.sum(), 1.0),
                         "loss/rejected": rejected_losses.sum() / jnp.maximum(rejected_valid.sum(), 1.0),
+                        # Reward moments consumed host-side by ``RunningMoments`` (BCO delta).
+                        # Every row is either chosen or rejected, so these cover the whole batch;
+                        # gradient accumulation scales all three alike, so ratios stay exact.
+                        "reward_moments/sum": chosen_rewards_masked.sum() + rejected_rewards_masked.sum(),
+                        "reward_moments/sumsq": jnp.square(chosen_rewards_masked).sum()
+                        + jnp.square(rejected_rewards_masked).sum(),
+                        "reward_moments/count": chosen_valid.sum() + rejected_valid.sum(),
                     },
                 )
             return metrics.loss, metrics
@@ -629,10 +650,13 @@ def _bco_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
         scheduled losses (covers ``beta`` / partition spec / forward fn
         / quantization emulator).
     """
-    return scheduled_loss_cache_key(
-        call,
-        value_fields=("beta", "partition_spec"),
-        object_fields=("concatenated_forward_fn", "straight_through_emulator"),
+    return (
+        *scheduled_loss_cache_key(
+            call,
+            value_fields=("beta", "partition_spec", "gradient_accumulation_steps"),
+            object_fields=("concatenated_forward_fn", "straight_through_emulator"),
+        ),
+        call.batch["label"].shape[0],
     )
 
 
@@ -644,13 +668,17 @@ def _make_bco_scheduled_loss(call):
             beta, and partition spec.
 
     Returns:
-        A closure ``loss_fn(tree, batch) -> scalar`` ready to be wrapped
-        with :func:`spx.sxvalue_and_grad`.
+        A closure ``loss_fn(tree, batch) -> (scalar, reward_moments)`` ready
+        for :func:`spx.sxvalue_and_grad` with ``has_aux=True``.
     """
     concatenated_forward_fn = call.get("concatenated_forward_fn")
     beta = call.get("beta")
     partition_spec = call.get("partition_spec")
-    call.get("straight_through_emulator")
+    straight_through_emulator = call.get("straight_through_emulator")
+    # The pipeline averages auxiliary metrics over its own microbatches. Report
+    # moments at accumulation-minibatch scale, independent of pipeline chunking,
+    # so the host hook uses the same count correction as the ordinary step.
+    moment_count = call.batch["label"].shape[0] / max(int(call.get("gradient_accumulation_steps", 1)), 1)
 
     def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
         """Compute the BCO scalar loss for the scheduled-VJP path.
@@ -661,7 +689,8 @@ def _make_bco_scheduled_loss(call):
                 and (optionally) ``udm_weights``.
 
         Returns:
-            The scalar BCO loss (with optional aux-loss term added).
+            The scalar BCO loss (with optional aux-loss term added) and
+            reward moments consumed by the trainer's running threshold.
 
         Raises:
             RuntimeError: If ``reference_logps`` is missing from the
@@ -677,6 +706,8 @@ def _make_bco_scheduled_loss(call):
             with jax.named_scope("easydel/trainer/bco/scheduled_loss/bind_module"):
                 call_batch = dict(batch)
                 call_batch.pop("running_mean", None)
+                if straight_through_emulator is not None:
+                    tree = straight_through_emulator(tree)
                 module = bind_scheduled_module(call, tree)
                 call_batch = constrain_scheduled_batch(module, call_batch, partition_spec)
                 _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
@@ -703,7 +734,7 @@ def _make_bco_scheduled_loss(call):
                 )
 
             with jax.named_scope("easydel/trainer/bco/scheduled_loss/compute_bco_loss"):
-                loss, *_ = compute_bco_loss(
+                loss, chosen_rewards, rejected_rewards, *_ = compute_bco_loss(
                     completion_logps,
                     reference_completion_logps,
                     chosen_mask,
@@ -714,7 +745,12 @@ def _make_bco_scheduled_loss(call):
                 )
                 if policy_outputs.get("aux_loss") is not None:
                     loss = loss + policy_outputs["aux_loss"]
-            return loss
+            rewards = chosen_rewards + rejected_rewards
+            return loss, {
+                "reward_moments/sum": jnp.mean(rewards) * moment_count,
+                "reward_moments/sumsq": jnp.mean(jnp.square(rewards)) * moment_count,
+                "reward_moments/count": jnp.asarray(moment_count, dtype=jnp.float32),
+            }
 
     return scheduled_loss
 
@@ -726,6 +762,7 @@ register_scheduled_loss_adapter(
         make_loss=_make_bco_scheduled_loss,
         make_cache_key=_bco_scheduled_loss_cache_key,
         prepare_batch=_prepare_bco_scheduled_batch,
+        has_aux=True,
     ),
 )
 

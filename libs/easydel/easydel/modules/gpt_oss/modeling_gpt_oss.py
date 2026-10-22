@@ -70,28 +70,16 @@ from easydel.layers import (
     MoeRoutingStrategy,
     RMSNorm,
     RowParallelMoELinear,
+    swiglu_oai,
 )
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .gpt_oss_configuration import GptOssConfig
 
-
-class GptOssRMSNorm(RMSNorm):
-    """GPT-OSS RMS Normalization layer.
-
-    This is a simple extension of RMSNorm for GPT-OSS models. RMS (Root Mean Square)
-    Layer Normalization normalizes the input tensor by its RMS value, providing
-    stable training dynamics without centering the activations.
-
-    Attributes:
-        dim (int): Dimensionality of the input features.
-        eps (float): Small epsilon value for numerical stability.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-    """
-
-    ...
+# Keep direct imports of the original public norm name compatible while the
+# model and its checkpoint parameters use the shared implementation.
+GptOssRMSNorm = RMSNorm
 
 
 class GptOssExperts(spx.Module):
@@ -103,8 +91,9 @@ class GptOssExperts(spx.Module):
     implements a *non-standard* gated MLP, deliberately tuned for
     stability under aggressive bf16 / int8 quantisation:
 
-    1. ``w0 = gate_proj(x)`` → clipped to ``(-inf, 7.0]``.
-    2. ``w1 = up_proj(x)`` → clipped to ``[-7.0, 7.0]``.
+    1. ``w0 = gate_proj(x)`` → clipped to ``(-inf, limit]``.
+    2. ``w1 = up_proj(x)`` → clipped to ``[-limit, limit]``.
+       (``limit = config.mlp_activations_limit``, 7.0 by default.)
     3. ``glu = w0 * sigmoid(alpha * w0)`` with ``alpha=1.702`` (the
        Swish-style approximation to GeLU used by xAI / OpenAI).
     4. ``intermediate = (w1 + 1.0) * glu`` — note the **+1 shift on the up
@@ -264,12 +253,7 @@ class GptOssExperts(spx.Module):
         w0 = self.gate_proj(hidden_states, group_sizes, sorted_experts)
         w1 = self.up_proj(hidden_states, group_sizes, sorted_experts)
 
-        w0 = jnp.clip(w0, min=None, max=7.0)
-        w1 = jnp.clip(w1, min=-7.0, max=7.0)
-
-        glu = w0 * jax.nn.sigmoid(w0 * self.alpha)
-        intermediate = (w1 + 1.0) * glu
-
+        intermediate = swiglu_oai(w0, w1, alpha=self.alpha, limit=self.config.mlp_activations_limit)
         return self.down_proj(intermediate, group_sizes, sorted_experts)
 
 
@@ -407,10 +391,7 @@ class GptOssMLP(BaseMoeModule):
             ``mlp_activations_limit`` (default 7.0) on each side to keep
             the gate values in a stable range.
             """
-            w0 = jnp.clip(w0, min=None, max=7.0)
-            w1 = jnp.clip(w1, min=-7.0, max=7.0)
-            glu = w0 * jax.nn.sigmoid(w0 * self.experts.alpha)
-            return (w1 + 1.0) * glu
+            return swiglu_oai(w0, w1, alpha=self.experts.alpha, limit=self.config.mlp_activations_limit)
 
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
@@ -585,14 +566,14 @@ class GptOssDecoderLayer(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.input_layernorm = GptOssRMSNorm(
+        self.input_layernorm = RMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.post_attention_layernorm = GptOssRMSNorm(
+        self.post_attention_layernorm = RMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=dtype,
@@ -748,7 +729,7 @@ class GptOssModel(EasyDeLBaseModule):
 
         final_layer_idx = max(0, config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
-            self.norm = GptOssRMSNorm(
+            self.norm = RMSNorm(
                 dim=config.hidden_size,
                 eps=config.rms_norm_eps,
                 dtype=dtype,
@@ -936,6 +917,8 @@ class GptOssModel(EasyDeLBaseModule):
             trace=trace_layers,
         )
         hidden_states = self.norm(hidden_states)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
 
         return MoeModelOutput(
             last_hidden_state=hidden_states,

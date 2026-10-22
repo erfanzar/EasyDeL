@@ -23,6 +23,8 @@ import types
 import typing as tp
 from dataclasses import dataclass, field
 
+from .._shared.rollout_lifecycle import after_futures
+
 SnapshotT = tp.TypeVar("SnapshotT")
 PayloadT = tp.TypeVar("PayloadT")
 ResultT = tp.TypeVar("ResultT")
@@ -399,7 +401,13 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
             futures = [record.future for record in self._records.values()]
         return sum(future.cancel() for future in futures)
 
-    def close(self, *, wait: bool = True, cancel_pending: bool = True) -> None:
+    def close(
+        self,
+        *,
+        wait: bool = True,
+        cancel_pending: bool = True,
+        on_idle: tp.Callable[[], None] | None = None,
+    ) -> None:
         """Stop accepting work and release all outstanding capacity.
 
         Closing discards unconsumed completion records. With ``wait=True`` the
@@ -408,13 +416,18 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
         Args:
             wait: Wait for running workers to finish.
             cancel_pending: Cancel executor tasks that have not started.
+            on_idle: Optional cleanup called after all running readers exit,
+                including when ``wait=False`` returns before they finish.
         """
 
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+            futures = [record.future for record in self._records.values()]
         self._executor.shutdown(wait=wait, cancel_futures=cancel_pending)
+        if on_idle is not None:
+            after_futures(futures, on_idle)
         with self._lock:
             outstanding = len(self._records)
             self._records.clear()

@@ -42,6 +42,7 @@ from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers import RMSNorm as Mamba2RMSNorm
 from easydel.layers.attention import MaskInfo
+from easydel.layers.linears import rescaled_residual_init
 from easydel.modules._base import BaseCausalLMModule
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import SSM2Op
@@ -193,9 +194,12 @@ class MambaRMSNormGated(spx.Module):
 
         y = w * RMSNorm(silu(gate) * x)
 
-    When ``gate`` is ``None`` this collapses to a plain RMSNorm. Always casts
-    to fp32 internally and casts back to the input dtype on the way out so
-    bf16 trunks do not lose precision in the rescale.
+    ``norm_before_gate=True`` instead normalizes before multiplying by the
+    activated gate. ``rms_norm=False`` selects mean-centered LayerNorm, as
+    specified by :class:`Mamba2Config`. When ``gate`` is ``None`` this collapses
+    to the selected plain normalization. Always casts to fp32 internally and
+    casts back to the input dtype on the way out so bf16 trunks do not lose
+    precision in the rescale.
     """
 
     def __init__(
@@ -203,17 +207,25 @@ class MambaRMSNormGated(spx.Module):
         hidden_size: int,
         eps: float = 1e-6,
         dtype: jnp.dtype = jnp.float32,
+        norm_before_gate: bool = False,
+        rms_norm: bool = True,
     ):
-        """Initialize gated RMSNorm layer.
+        """Initialize gated normalization without changing the checkpoint weight layout.
 
         Args:
             hidden_size (int): Dimensionality of the hidden states.
             eps (float, optional): Small constant for numerical stability. Defaults to 1e-6.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
+            dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.float32.
+            norm_before_gate (bool, optional): Normalize before SiLU gating. Defaults to False,
+                preserving the standalone layer's gate-then-normalize behavior.
+            rms_norm (bool, optional): Use RMSNorm, or mean-centered LayerNorm when False.
+                Defaults to True.
         """
         self.hidden_size = hidden_size
         self.eps = eps
         self.dtype = dtype
+        self.norm_before_gate = norm_before_gate
+        self.rms_norm = rms_norm
         self.weight = ArrayParam.bound(
             shape=(self.hidden_size,),
             dtype=self.dtype,
@@ -235,14 +247,20 @@ class MambaRMSNormGated(spx.Module):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.astype(jnp.float32)
 
-        if gate is not None:
-            gate = gate.astype(jnp.float32)
-            hidden_states = hidden_states * jax.nn.silu(gate)
+        gate_activation = None if gate is None else jax.nn.silu(gate.astype(jnp.float32))
+        if gate_activation is not None and not self.norm_before_gate:
+            hidden_states = hidden_states * gate_activation
 
+        if not self.rms_norm:
+            # The config promises LayerNorm as the alternative to RMSNorm. Keep its
+            # affine scale at the existing ``norm.weight`` checkpoint path.
+            hidden_states = hidden_states - jnp.mean(hidden_states, axis=-1, keepdims=True)
         variance = jnp.mean(jnp.square(hidden_states), axis=-1, keepdims=True)
-        hidden_states = hidden_states * jax.lax.rsqrt(variance + self.eps)
+        hidden_states = self.weight.value * (hidden_states * jax.lax.rsqrt(variance + self.eps))
 
-        return (self.weight.value * hidden_states).astype(input_dtype)
+        if gate_activation is not None and self.norm_before_gate:
+            hidden_states = hidden_states * gate_activation
+        return hidden_states.astype(input_dtype)
 
 
 class Mamba2Mixer(spx.Module):
@@ -361,19 +379,17 @@ class Mamba2Mixer(spx.Module):
             rngs=rngs,
         )
 
-        dt = jax.lax.clamp(
-            self.config.time_step_floor,
-            jnp.exp(
-                jax.random.normal(
-                    key=rngs.parameters,
-                    shape=(self.config.num_heads,),
-                    dtype=self.param_dtype,
-                )
-                * (jnp.log(self.config.time_step_max) - jnp.log(self.config.time_step_min))
-                + jnp.log(self.config.time_step_min)
-            ).astype(jnp.float32),
-            1e9,
+        # dt ~ LogUniform[time_step_min, time_step_max], floored at ``time_step_floor`` (reference Mamba-2).
+        dt = jnp.exp(
+            jax.random.uniform(
+                key=rngs.parameters,
+                shape=(self.config.num_heads,),
+                dtype=jnp.float32,
+            )
+            * (jnp.log(self.config.time_step_max) - jnp.log(self.config.time_step_min))
+            + jnp.log(self.config.time_step_min)
         )
+        dt = jnp.maximum(dt, self.config.time_step_floor)
 
         inv_dt = dt + jnp.log(-jnp.expm1(-dt))
         self.dt_bias = ArrayParam.bound(
@@ -399,11 +415,16 @@ class Mamba2Mixer(spx.Module):
             key=None,
         )
 
+        # HF Mamba2 checkpoints use gate-then-RMSNorm regardless of the legacy
+        # config flags. Keep that checkpoint computation as the mixer contract.
         self.norm = MambaRMSNormGated(
             self.intermediate_size,
             eps=self.layer_norm_epsilon,
             dtype=self.param_dtype,
         )
+        out_proj_kwargs = {}
+        if config.rescale_prenorm_residual:
+            out_proj_kwargs["kernel_init"] = rescaled_residual_init(config.num_hidden_layers)
         self.out_proj = RowParallelLinear(
             self.intermediate_size,
             self.hidden_size,
@@ -412,6 +433,7 @@ class Mamba2Mixer(spx.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            **out_proj_kwargs,
         )
 
         metadata = OperationMetadata(
@@ -508,7 +530,7 @@ class Mamba2Mixer(spx.Module):
         cache_view = cache_params
 
         # Convolution on conv_in (depthwise, causal). Cache stores conv input, not conv output.
-        if seq_len == 1 and cache_params is not None and cache_params.conv_state is not None:
+        if seq_len == 1 and segment_ids is None and cache_params is not None and cache_params.conv_state is not None:
             new_token = conv_in[:, 0, :]  # [batch, conv_dim]
             conv_state, _, cache_view = cache_params.concatenate_to_cache(conv_state=new_token)
 
@@ -516,7 +538,12 @@ class Mamba2Mixer(spx.Module):
             conv_out = self.act(conv_out_full[:, :, self.conv_kernel_size - 1]).astype(dtype)[:, None, :]
         else:
             if segment_ids is None:
-                conv_out = self.conv1d(jnp.swapaxes(conv_in, 2, 1))[..., :seq_len]
+                conv_in_t = conv_in.transpose(0, 2, 1)
+                history_length = 0
+                if cache_params is not None and cache_params.conv_state is not None:
+                    history_length = cache_params.conv_state.shape[-1]
+                    conv_in_t = jnp.concatenate((cache_params.conv_state.astype(dtype), conv_in_t), axis=-1)
+                conv_out = self.conv1d(conv_in_t)[..., history_length : history_length + seq_len]
                 conv_out = self.act(jnp.swapaxes(conv_out, 2, 1)).astype(dtype)  # [batch, seq_len, conv_dim]
             else:
                 kernel = jnp.asarray(self.conv1d.weight).squeeze(1).T
@@ -526,17 +553,17 @@ class Mamba2Mixer(spx.Module):
                     kernel,
                     segment_ids,
                     bias=bias,
+                    initial_state=cache_params.conv_state if cache_params is not None else None,
                     activation=self.act,
                     output_dtype=dtype,
                 )
 
             if cache_params is not None:
                 if segment_ids is None:
-                    conv_in_t = conv_in.transpose(0, 2, 1)  # [batch, conv_dim, seq_len]
-                    if seq_len >= self.conv_kernel_size:
+                    if conv_in_t.shape[-1] >= self.conv_kernel_size:
                         new_conv_state = conv_in_t[:, :, -self.conv_kernel_size :]
                     else:
-                        pad_width = self.conv_kernel_size - seq_len
+                        pad_width = self.conv_kernel_size - conv_in_t.shape[-1]
                         new_conv_state = jnp.pad(conv_in_t, ((0, 0), (0, 0), (pad_width, 0)))
                 cache_view = cache_params.replace(conv_state=new_conv_state)
 
@@ -985,6 +1012,7 @@ class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):  # type:
         apply_lm_head: bool = True,
         cache_position: Array | None = None,
         attention_mask: Array | None = None,
+        mask_info: MaskInfo | None = None,
         **kwargs,
     ) -> tuple | Mamba2CausalLMOutput:
         """Forward pass for causal language modeling.
@@ -1003,6 +1031,7 @@ class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):  # type:
             cache_position (Array | None, optional): Position indices for cache updates. Defaults to None.
             attention_mask (Array | None, optional): Mask of shape [batch, seq_len] where 1 indicates
                 valid tokens and 0 indicates padding. Defaults to None.
+            mask_info: Packed document boundaries forwarded unchanged to the trunk.
             **kwargs: Additional keyword arguments (unused).
 
         Returns:
@@ -1016,6 +1045,7 @@ class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):  # type:
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             cache_params=cache_params,
             cache_position=cache_position,
             output_hidden_states=output_hidden_states,
@@ -1029,6 +1059,7 @@ class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):  # type:
             logits=logits,
             cache_params=mamba_outputs.cache_params,
             hidden_states=mamba_outputs.hidden_states,
+            last_hidden_state=mamba_outputs.last_hidden_state,
         )
 
     def prepare_inputs_for_generation(

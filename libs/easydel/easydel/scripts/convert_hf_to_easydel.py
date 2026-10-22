@@ -53,7 +53,6 @@ Disk usage tips:
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -69,6 +68,18 @@ from eformer.paths import ePath
 # ``AutoConfig.from_pretrained`` on a checkpoint whose architecture is newer
 # than the host's transformers fails before model resolution ever happens.
 import easydel.modules  # noqa: F401
+from easydel.infra.factory import TaskType as RegistryTaskType
+from easydel.modules.auto.auto_configuration import (
+    IMAGE_TEXT_TO_TEXT_MODEL_TYPES as IMAGE_TEXT_TO_TEXT_MODEL_TYPES,
+)
+from easydel.modules.auto.auto_configuration import (
+    infer_task_from_config,
+)
+
+try:  # package import (``python -m easydel.scripts...``)
+    from ._hf_common import enable_hf_fast_transfer
+except ImportError:  # run directly as a script: the script directory is on ``sys.path``
+    from _hf_common import enable_hf_fast_transfer  # type: ignore
 
 try:
     from eformer.loggings import get_logger
@@ -95,70 +106,32 @@ except ModuleNotFoundError:  # pragma: no cover
 
 logger = get_logger("Convertor")
 
-IMAGE_TEXT_TO_TEXT_MODEL_TYPES = frozenset(
-    {
-        "gemma3",
-        "gemma4",
-        "glm4v",
-        "glm4v_moe",
-        "glm46v",
-        "hunyuan_vl",
-        "idefics",
-        "idefics2",
-        "internvl",
-        "kimi_vl",
-        "llava",
-        "llama4",
-        "minimax_m3_vl",
-        "mistral3",
-        "muse_glimmer",
-        "paligemma",
-        "qwen2_vl",
-        "qwen2_5_vl",
-        "qwen2vl",
-        "qwen2_5vl",
-        "qwen3_5",
-        "qwen3_5_moe",
-        "qwen3_vl",
-        "qwen3_vl_moe",
-    }
-)
-
 
 def _infer_task_from_hf_config(config) -> TaskType:
-    """Infer the EasyDeL task type from a HuggingFace config object.
-
-    Inspects ``config.architectures``, ``config.model_type`` and
-    ``config.is_encoder_decoder`` to choose the most specific
-    ``AutoEasyDeLModel*`` task.
+    """Infer a converter CLI task using the shared loaded-config inference.
 
     Args:
-        config: Loaded HuggingFace ``PretrainedConfig`` instance.
+        config: Loaded HuggingFace ``PretrainedConfig`` instance or config mapping.
 
     Returns:
-        ``TaskType`` literal that matches the config's architecture.
+        Converter ``TaskType`` literal. Ambiguous conditional-generation names,
+        unknown configurations and tasks without a converter auto class fall
+        back to ``causal_lm``.
     """
-    architectures = [str(a) for a in (getattr(config, "architectures", None) or [])]
-    joined = " ".join(architectures).lower()
-    model_type = str(getattr(config, "model_type", "") or "").lower()
-
-    if model_type in {"clip", "siglip"}:
-        return "zero_shot_image_classification"
-    if "forspeechseq2seq" in joined or model_type in {"whisper", "speech_to_text", "speech-to-text"}:
-        return "speech_seq2seq"
-    if "forimagetexttotext" in joined or "vision2seq" in joined or model_type in IMAGE_TEXT_TO_TEXT_MODEL_TYPES:
-        return "image_text_to_text"
-    if getattr(config, "is_encoder_decoder", False) or "forseq2seqlm" in joined:
-        return "seq2seq"
-    if "forzeroshotimageclassification" in joined or "zeroshotimageclassification" in joined:
-        return "zero_shot_image_classification"
-    if "forsequenceclassification" in joined or "sequenceclassification" in joined:
-        return "sequence_classification"
-    if "fordiffusionlm" in joined or model_type.endswith("diffusion"):
-        return "diffusion_lm"
-    if "forcausallm" in joined or "causallm" in joined or "forconditionalgeneration" in joined:
-        return "causal_lm"
-    return "causal_lm"
+    task = infer_task_from_config(config, conditional_generation_task=RegistryTaskType.CAUSAL_LM)
+    task_to_cli: dict[RegistryTaskType, TaskType] = {
+        RegistryTaskType.CAUSAL_LM: "causal_lm",
+        RegistryTaskType.SEQUENCE_TO_SEQUENCE: "seq2seq",
+        RegistryTaskType.SPEECH_SEQUENCE_TO_SEQUENCE: "speech_seq2seq",
+        RegistryTaskType.IMAGE_TEXT_TO_TEXT: "image_text_to_text",
+        RegistryTaskType.ZERO_SHOT_IMAGE_CLASSIFICATION: "zero_shot_image_classification",
+        RegistryTaskType.SEQUENCE_CLASSIFICATION: "sequence_classification",
+        RegistryTaskType.DIFFUSION_LM: "diffusion_lm",
+        RegistryTaskType.BASE_MODULE: "base",
+        RegistryTaskType.BASE_VISION: "vision",
+        RegistryTaskType.ANY_TO_ANY: "any_to_any",
+    }
+    return task_to_cli.get(task, "causal_lm") if task is not None else "causal_lm"
 
 
 def _import_easydel_family(meta_source: str) -> None:
@@ -336,8 +309,9 @@ class ConvertArgs:
             are already cached.
         trust_remote_code (bool): Allow loading custom code from
             the source repo (required for some architectures).
-        enable_hf_transfer (bool): Set ``HF_HUB_ENABLE_HF_TRANSFER``
-            and import ``hf_transfer`` for accelerated downloads.
+        enable_hf_transfer (bool): Enable accelerated HF downloads
+            (``hf_transfer`` on legacy ``huggingface_hub``, the Xet
+            backend on current releases).
     """
 
     source: str = field(metadata={"help": "HF repo id (e.g. meta-llama/Llama-3.1-8B) or local path"})
@@ -416,7 +390,7 @@ class ConvertArgs:
     trust_remote_code: bool = field(default=False, metadata={"help": "Pass trust_remote_code=True to HF loaders"})
     enable_hf_transfer: bool = field(
         default=False,
-        metadata={"help": "Enable hf_transfer accelerated HF downloads (requires `pip install hf_transfer`)"},
+        metadata={"help": "Enable accelerated HF downloads (hf_transfer on legacy hub, hf_xet on current hub)."},
     )
 
 
@@ -441,11 +415,9 @@ def main(argv: list[str] | None = None) -> None:
     (args,) = parser.parse_args_into_dataclasses(args=argv, look_for_args_file=False)
 
     if args.enable_hf_transfer:
-        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-        try:
-            import hf_transfer  # noqa: F401  # pyright: ignore[reportMissingImports, reportUnusedImport]
-        except Exception:
-            logger.warning("`hf_transfer` is not installed. Run: pip install -U hf_transfer")
+        transfer_warning = enable_hf_fast_transfer()
+        if transfer_warning:
+            logger.warning(transfer_warning)
 
     # `pathlib.Path` mangles an object-store URI instead of rejecting it:
     # `gs://bucket/x` becomes the relative path `gs:/bucket/x`, which
@@ -521,34 +493,36 @@ def main(argv: list[str] | None = None) -> None:
     model_cls = task_to_cls[task]
 
     # Save tokenizer/processor too so `save_pretrained(..., push_to_hub=True)` uploads a complete repo.
+    # Each preprocessing artifact is optional (a text-only model has no image processor), so a failed load
+    # does not abort the conversion, but it is reported instead of silently dropped.
     try:
         from transformers import AutoProcessor
 
         processor = AutoProcessor.from_pretrained(meta_source, **hf_kwargs)
         processor.save_pretrained(str(out_dir))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Skipping processor: {type(e).__name__}: {e}")
     try:
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(meta_source, **hf_kwargs)
         tokenizer.save_pretrained(str(out_dir))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Skipping tokenizer: {type(e).__name__}: {e}")
     try:
         from transformers import AutoImageProcessor
 
-        image_processor = AutoImageProcessor.from_pretrained(args.source, **hf_kwargs)
+        image_processor = AutoImageProcessor.from_pretrained(meta_source, **hf_kwargs)
         image_processor.save_pretrained(str(out_dir))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Skipping image processor: {type(e).__name__}: {e}")
     try:
         from transformers import AutoFeatureExtractor
 
         feature_extractor = AutoFeatureExtractor.from_pretrained(meta_source, **hf_kwargs)
         feature_extractor.save_pretrained(str(out_dir))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Skipping feature extractor: {type(e).__name__}: {e}")
 
     if args.convert_mode == "sequential":
         from easydel.infra.base_module import EasyDeLBaseModule

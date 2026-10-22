@@ -23,6 +23,7 @@ This module provides:
 
 from __future__ import annotations
 
+import copy
 import itertools
 import logging
 import math
@@ -42,6 +43,30 @@ logger = logging.getLogger(__name__)
 # Sentinel returned by probe draws in `_empty_constituents`; mixed rows are dicts,
 # so a private object() can never collide with a real example.
 _PROBE_EMPTY = object()
+
+
+def largest_remainder_counts(weights: np.ndarray, block_size: int) -> np.ndarray:
+    """Split ``block_size`` slots across datasets by largest-remainder rounding.
+
+    Floors each ``weight * block_size`` and hands the leftover slots to the largest fractional
+    parts (stable ties by index), so the counts always sum to ``block_size`` and no dataset is
+    systematically over-sampled. Shared by :class:`MixedShardedSource` and
+    :func:`block_mixture_interleave` so both mixers round identically.
+
+    Args:
+        weights: Normalized (sum to 1) per-dataset weights.
+        block_size: Total number of examples per mixing block.
+
+    Returns:
+        np.ndarray: Integer per-dataset counts summing to ``block_size``.
+    """
+    exact = weights * block_size
+    counts = np.floor(exact).astype(int)
+    remainder = int(block_size - counts.sum())
+    if remainder > 0:
+        order = np.argsort(-(exact - counts), kind="stable")
+        counts[order[:remainder]] += 1
+    return counts
 
 
 class WeightScheduler:
@@ -196,6 +221,8 @@ class MixedShardState:
         examples_yielded (int): Total examples produced across all
             blocks since iteration began. Useful for progress
             display and for debugging schedule resumption.
+        seed (int | None): Effective RNG seed captured by the mixer, including
+            an automatically chosen seed for an initially unseeded mix.
     """
 
     source_index: int
@@ -203,6 +230,7 @@ class MixedShardState:
     row_index: int
     block_index: int = 0
     examples_yielded: int = 0
+    seed: int | None = None
 
 
 class MixedShardedSource(ShardedDataSource[dict]):
@@ -219,8 +247,10 @@ class MixedShardedSource(ShardedDataSource[dict]):
     Behaviour at end-of-source is controlled by ``stop_strategy``:
     ``"restart"`` recycles the constituent, ``"first_exhausted"``
     halts the entire mix, ``"all_exhausted"`` keeps drawing from
-    the surviving sources until every constituent has been
-    exhausted at least once. Optional :class:`WeightScheduler`
+    the surviving positive-weight sources until each is exhausted.
+    Zero-weight sources are excluded; a schedule stops when no currently
+    eligible source can yield, since its emitted-row counter cannot then
+    advance to a future schedule knot. Optional :class:`WeightScheduler`
     integration replaces the static weights with curriculum-driven
     weights at each block.
     """
@@ -260,10 +290,16 @@ class MixedShardedSource(ShardedDataSource[dict]):
                 ``sources`` keys, or the weights sum to a non-positive
                 value.
         """
+        if not sources:
+            raise ValueError("No datasets to mix")
+        if not isinstance(block_size, (int, np.integer)) or block_size <= 0:
+            raise ValueError("block_size must be a positive integer")
         self._sources = sources
         self._names = list(sources.keys())
         self._block_size = block_size
-        self._seed = seed
+        # Draw one seed per source, not one per block traversal, so even an
+        # initially unseeded mix can be checkpointed and replayed exactly.
+        self._seed = seed if seed is not None else int(np.random.SeedSequence().entropy)
         self._stop_strategy = stop_strategy
         self._weight_scheduler = weight_scheduler
 
@@ -325,24 +361,28 @@ class MixedShardedSource(ShardedDataSource[dict]):
             equals ``self._block_size``.
         """
         ws = np.array([weights.get(name, 0) for name in self._names], dtype=np.float64)
+        if not np.all(np.isfinite(ws)) or np.any(ws < 0) or ws.sum() <= 0:
+            raise ValueError("Mixture weights must be finite, nonnegative and have a positive sum")
         ws = ws / ws.sum()
 
-        exact = ws * self._block_size
-        counts_arr = np.floor(exact).astype(int)
-        remainder = int(self._block_size - counts_arr.sum())
-        if remainder > 0:
-            # Largest-remainder rounding: hand the leftover slots to the
-            # largest fractional parts (stable ties by index). Dumping the
-            # whole remainder on argmax(ws) systematically over-sampled the
-            # heaviest dataset by up to len(sources)-1 rows per block.
-            order = np.argsort(-(exact - counts_arr), kind="stable")
-            counts_arr[order[:remainder]] += 1
+        # Largest-remainder rounding: giving the whole remainder to argmax(ws)
+        # would over-sample the heaviest dataset by up to len(sources)-1 rows per block.
+        counts_arr = largest_remainder_counts(ws, self._block_size)
 
         return {name: int(counts_arr[i]) for i, name in enumerate(self._names)}
 
-    def _block_source_ids(self, block_idx: int, examples_emitted: int) -> list[str]:
-        """Build the deterministic per-row source order for one mixer block."""
+    def _block_source_ids(self, block_idx: int, examples_emitted: int, excluded: set[str] | None = None) -> list[str]:
+        """Build a deterministic block, redistributing finite mixes over live sources.
+
+        Zero-weight sources are excluded. If every currently eligible source is
+        exhausted, return an empty block rather than spinning: an emitted-row
+        schedule cannot advance to a future knot without emitting another row.
+        """
         weights = self._get_weights_for_step(examples_emitted)
+        if excluded:
+            weights = {name: weight for name, weight in weights.items() if name not in excluded}
+        if not any(weights.get(name, 0) > 0 for name in self._names):
+            return []
         counts = self._compute_counts(weights)
 
         ids = []
@@ -372,6 +412,51 @@ class MixedShardedSource(ShardedDataSource[dict]):
                 offsets[name] += 1
 
         return offsets
+
+    def resume_state(self, row: int) -> MixedShardState:
+        """Capture the next emitted position after ``row`` mixed examples.
+
+        Replays the source to discover exact delivered shard/row positions, including
+        empty constituents, filtering readers and finite stop strategies. The marker
+        includes the effective seed so it also resumes on a newly constructed mixer
+        when the original mix was unseeded. Replay costs O(row) reads.
+
+        Args:
+            row: Number of mixed examples already emitted.
+
+        Returns:
+            MixedShardState: Marker for the next example. An exhausted stream has
+            ``source_index == -1`` and resumes as an empty iterator.
+        """
+        row = max(int(row), 0)
+        stream = self._iter_positioned()
+        try:
+            for _ in range(row):
+                if next(stream, None) is None:
+                    return MixedShardState(-1, 0, 0, examples_yielded=row, seed=self._seed)
+            item = next(stream, None)
+            if item is None:
+                return MixedShardState(-1, 0, 0, examples_yielded=row, seed=self._seed)
+            return item[1]
+        finally:
+            stream.close()
+
+    def open_shard_from_state(self, state: MixedShardState) -> "Iterator[dict]":
+        """Continue the mixed stream from a captured :class:`MixedShardState`.
+
+        Args:
+            state: Marker captured by :meth:`resume_state`; its emitted count
+                and effective seed identify the replay position.
+
+        Returns:
+            Iterator[dict]: Mixed rows starting at the marked position.
+        """
+        if state.source_index == -1:
+            return iter(())
+        resumed = copy.copy(self)
+        if state.seed is not None:
+            resumed._seed = state.seed
+        return resumed.open_shard_at_row(self.shard_names[0], state.examples_yielded)
 
     def _empty_constituents(self) -> set[str]:
         """Identify constituents that can never yield a single row.
@@ -442,57 +527,77 @@ class MixedShardedSource(ShardedDataSource[dict]):
             dict: Mixed rows with the extra ``"__source__"`` field.
             Iteration ends per the configured ``stop_strategy``.
         """
-        # Create iterators for all sources (from all their shards)
-        iters = {}
-        for name, source in self._sources.items():
-            iters[name] = self._chain_shards(source)
+        stream = self._iter_positioned(capture_state=False)
+        try:
+            for example, _ in stream:
+                yield example
+        finally:
+            stream.close()
 
+    def _iter_positioned(self, capture_state: bool = True) -> "Iterator[tuple[dict, MixedShardState | None]]":
+        """Drive the mixer with exact delivered positions for checkpoint capture.
+
+        Ordinary iteration disables marker allocation; checkpoint capture enables it.
+        """
+
+        def constituent(source):
+            for shard_index, shard_name in enumerate(source.shard_names):
+                rows = iter(source.open_shard(shard_name))
+                try:
+                    for row_index, example in enumerate(rows):
+                        yield example, shard_index, row_index
+                finally:
+                    close = getattr(rows, "close", None)
+                    if close is not None:
+                        close()
+
+        iters = {name: constituent(source) for name, source in self._sources.items()}
         block_idx = 0
         examples_emitted = 0
         dead: set[str] = set()
-
-        while True:
-            # Resolve the mixing weights for the current schedule position. NOTE: the mixer is a pure data
-            # iterator with no knowledge of batch size, so the schedule is driven by the cumulative count of
-            # EMITTED EXAMPLES -- not optimizer steps. To target an optimizer step N, set the schedule point
-            # at ``N * global_batch_size`` examples.
-            ids = self._block_source_ids(block_idx, examples_emitted)
-
-            # Yield examples from the block. `dead` tracks DISTINCT exhausted
-            # sources across blocks: the old per-block event counter compared
-            # against len(sources), which (a) killed the whole mix when one
-            # empty source was merely drawn len(sources) times in a block and
-            # (b) under all_exhausted never terminated at all whenever
-            # block_size != len(sources) (all-dead blocks counted block_size
-            # events, not len(sources)).
-            for name in ids:
-                if name in dead:
-                    continue
-                try:
-                    example = next(iters[name])
-                    example["__source__"] = name
-                    yield example
-                    examples_emitted += 1
-                except StopIteration:
-                    if self._stop_strategy == "restart":
-                        iters[name] = self._chain_shards(self._sources[name])
-                        try:
-                            example = next(iters[name])
-                            example["__source__"] = name
-                            yield example
-                            examples_emitted += 1
-                        except StopIteration:
-                            logger.warning(f"Dataset '{name}' is empty")
+        source_indices = {name: index for index, name in enumerate(self._names)}
+        try:
+            while True:
+                # Schedules use emitted examples, not planned ids: dead sources
+                # and finite stop strategies can make a block emit fewer rows.
+                ids = self._block_source_ids(block_idx, examples_emitted, excluded=dead)
+                if not ids:
+                    return
+                for name in ids:
+                    if name in dead:
+                        continue
+                    item = next(iters[name], None)
+                    if item is None:
+                        if self._stop_strategy == "first_exhausted":
+                            return
+                        if self._stop_strategy == "restart":
+                            iters[name].close()
+                            iters[name] = constituent(self._sources[name])
+                            item = next(iters[name], None)
+                        if item is None:
                             dead.add(name)
-                    elif self._stop_strategy == "first_exhausted":
-                        return
-                    else:  # all_exhausted
-                        dead.add(name)
-
-            if len(dead) == len(self._names):
-                return
-
-            block_idx += 1
+                            continue
+                    example, shard_index, row_index = item
+                    state = (
+                        MixedShardState(
+                            source_index=source_indices[name],
+                            shard_index=shard_index,
+                            row_index=row_index,
+                            block_index=block_idx,
+                            examples_yielded=examples_emitted,
+                            seed=self._seed,
+                        )
+                        if capture_state
+                        else None
+                    )
+                    yield {**example, "__source__": name}, state
+                    examples_emitted += 1
+                if len(dead) == len(self._names):
+                    return
+                block_idx += 1
+        finally:
+            for stream in iters.values():
+                stream.close()
 
     def open_shard_at_row(self, _shard_name: str, row: int) -> "Iterator[dict]":
         """Open the virtual mixed shard after ``row`` emitted examples."""
@@ -758,7 +863,7 @@ class MixStage(BaseStage):
             sources=data,
             weights=self._stage_config.weights,
             block_size=self._stage_config.block_size,
-            seed=self._stage_config.seed or context.seed,
+            seed=self._stage_config.seed if self._stage_config.seed is not None else context.seed,
             stop_strategy=self._stage_config.stop_strategy,
             weight_scheduler=weight_scheduler,
         )
@@ -837,13 +942,8 @@ def block_mixture_interleave(
     else:
         ws = np.ones(n, dtype=np.float64) / n
 
-    exact = ws * block_size
-    counts = np.floor(exact).astype(int)
-    remainder = int(block_size - counts.sum())
-    if remainder > 0:
-        # Largest-remainder rounding (see MixedShardedSource._compute_counts).
-        order = np.argsort(-(exact - counts), kind="stable")
-        counts[order[:remainder]] += 1
+    # Largest-remainder rounding, shared with MixedShardedSource._compute_counts.
+    counts = largest_remainder_counts(ws, block_size)
 
     def gen():
         """Inline closure that drives the deterministic block-based interleaver.

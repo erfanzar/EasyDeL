@@ -115,6 +115,10 @@ class FusedColumnLayout:
             back to one contiguous tensor.
         log_label (str | None): Optional human-friendly label used in
             checkpoint reform logs; falls back to a per-segment default.
+        target_prefix (str | None): Default destination prefix of the fused
+            tensor in the EasyDeL state tree (e.g. ``"qkv_proj"``). Used by
+            :meth:`reform_param` when it is called without an explicit
+            prefix; ``None`` means the caller must pass one.
     """
 
     segments: tuple[FusedSegment, ...]
@@ -122,6 +126,7 @@ class FusedColumnLayout:
     torch_dim: int = 0
     source_is_fused: bool = False
     log_label: str | None = None
+    target_prefix: str | None = None
 
     def __post_init__(self) -> None:
         """Validate segment uniqueness and positivity.
@@ -209,7 +214,7 @@ class FusedColumnLayout:
 
     def reform_param(
         self,
-        target_prefix: str,
+        target_prefix: str | None = None,
         *,
         config: EasyDeLBaseConfig | None = None,
         include_bias: bool = False,
@@ -228,7 +233,8 @@ class FusedColumnLayout:
 
         Args:
             target_prefix: Destination prefix in the EasyDeL state tree
-                (e.g. ``"qkv_proj"``, ``"gate_up_proj"``).
+                (e.g. ``"qkv_proj"``, ``"gate_up_proj"``). Defaults to the
+                layout's own :attr:`target_prefix` when omitted.
             config: Owning model config used to resolve the TP size.
             include_bias: When ``True`` also generate the bias-fusion
                 rule. Default ``False`` because most attention/MLP fused
@@ -241,7 +247,17 @@ class FusedColumnLayout:
         Returns:
             :type:`ReformParam` dict suitable for merging into a module's
             ``reform_param``.
+
+        Raises:
+            ValueError: If neither ``target_prefix`` nor the layout's own
+                :attr:`target_prefix` is set.
         """
+        if target_prefix is None:
+            target_prefix = self.target_prefix
+        if target_prefix is None:
+            raise ValueError(
+                "FusedColumnLayout.reform_param needs a target_prefix (none was given and none is set on the layout)."
+            )
         if self.source_is_fused:
             return self._prefused_reform_param(
                 target_prefix,
@@ -254,6 +270,7 @@ class FusedColumnLayout:
             f"{target_prefix}.weight",
             tuple(segment.tensor_name("weight") for segment in self.segments),
             config=config,
+            interleave_for_tp=self.interleave_for_tp,
             dim=self.torch_dim,
             segment_sizes=self.segment_sizes,
             log_label=weight_log_label or self.log_label or f"{target_prefix} fused weight groups",
@@ -264,6 +281,7 @@ class FusedColumnLayout:
                     f"{target_prefix}.bias",
                     tuple(segment.tensor_name("bias") for segment in self.segments),
                     config=config,
+                    interleave_for_tp=self.interleave_for_tp,
                     dim=self.torch_dim,
                     segment_sizes=self.segment_sizes,
                     log_label=bias_log_label or self.log_label or f"{target_prefix} fused bias groups",
@@ -339,6 +357,7 @@ def dense_gate_up_layout(
     gate_prefix: str = "gate_proj",
     up_prefix: str = "up_proj",
     source_is_fused: bool = False,
+    target_prefix: str | None = None,
 ) -> FusedColumnLayout:
     """Construct the canonical dense MLP ``[gate | up]`` fused layout.
 
@@ -352,6 +371,8 @@ def dense_gate_up_layout(
         up_prefix: HF source-tensor prefix for the up half.
         source_is_fused: Set when the HF checkpoint already stores one
             fused ``gate_up_proj`` tensor instead of separate gate/up.
+        target_prefix: Default destination prefix used by
+            :meth:`FusedColumnLayout.reform_param` when called without one.
 
     Returns:
         :class:`FusedColumnLayout` with two equal-sized segments and
@@ -364,6 +385,7 @@ def dense_gate_up_layout(
         ),
         source_is_fused=source_is_fused,
         log_label="dense-MLP gate/up groups",
+        target_prefix=target_prefix,
     )
 
 
@@ -375,6 +397,7 @@ def dense_qkv_layout(
     key_prefix: str = "k_proj",
     value_prefix: str = "v_proj",
     source_is_fused: bool = False,
+    target_prefix: str | None = None,
 ) -> FusedColumnLayout:
     """Construct the canonical dense attention ``[Q | K | V]`` fused layout.
 
@@ -391,6 +414,8 @@ def dense_qkv_layout(
         value_prefix: HF source-tensor prefix for the V half.
         source_is_fused: Set when the HF checkpoint already stores one
             fused ``qkv_proj`` tensor instead of separate q/k/v.
+        target_prefix: Default destination prefix used by
+            :meth:`FusedColumnLayout.reform_param` when called without one.
 
     Returns:
         :class:`FusedColumnLayout` with three segments and
@@ -404,4 +429,5 @@ def dense_qkv_layout(
         ),
         source_is_fused=source_is_fused,
         log_label="dense-attention Q/K/V groups",
+        target_prefix=target_prefix,
     )

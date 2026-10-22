@@ -79,6 +79,47 @@ _TOKENIZED_FIELDS = {
 }
 
 
+def preprocess_dataset_with_num_proc(dataset: tp.Any, transform: tp.Callable, num_proc: int | None) -> tp.Any:
+    """Preprocess datasets through the trainers' shared source boundary.
+
+    The default ``None`` leaves preprocessing to the trainer. Explicit worker
+    counts use process-backed mapping for materialized HF datasets, including
+    wrapped datasets, and retain lazy transforms for streaming/custom sources.
+    Named evaluation datasets are processed independently.
+
+    Args:
+        dataset: HuggingFace dataset, sharded source, mapping of datasets, or None.
+        transform: Per-row preprocessing callable.
+        num_proc: Optional positive number of worker processes.
+
+    Returns:
+        Preprocessed datasets, or the original input when no workers are configured.
+
+    Raises:
+        ValueError: If the worker count is invalid.
+    """
+    if num_proc is None or dataset is None:
+        return dataset
+    from types import SimpleNamespace
+
+    from datasets import Dataset
+
+    from easydel.data.core.protocols import ShardedDataSource
+    from easydel.data.sources.hf_wrapper import HFDatasetShardedSource
+
+    from .base_trainer import BaseTrainer
+
+    # Reuse both validation and mapping without constructing a model/trainer.
+    context = SimpleNamespace(arguments=SimpleNamespace(dataset_num_proc=num_proc))
+    workers = BaseTrainer._dataset_preprocess_workers(context)
+    context._dataset_preprocess_workers = lambda: workers
+    if isinstance(dataset, dict):
+        return {key: preprocess_dataset_with_num_proc(value, transform, workers) for key, value in dataset.items()}
+    source = dataset if isinstance(dataset, ShardedDataSource) else HFDatasetShardedSource(dataset)
+    result = BaseTrainer._preprocess_source(context, source, transform)
+    return result._dataset if isinstance(dataset, Dataset) else result
+
+
 def purify_example(example: dict, keep_fields: set[str] | None = None) -> dict:
     """Remove non-tokenized fields from example, keeping only JAX-compatible arrays.
 
@@ -555,6 +596,15 @@ class BCOPreprocessTransform(ExpandTransform):
         self._pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
         self._embedding_tokenizer = embedding_tokenizer
         self._tools = tools
+        self._unpaired_transform = KTOPreprocessTransform(
+            tokenizer=tokenizer,
+            max_prompt_length=max_prompt_length,
+            max_completion_length=max_completion_length,
+            add_special_tokens=add_special_tokens,
+            label_pad_token_id=label_pad_token_id,
+            embedding_tokenizer=embedding_tokenizer,
+            tools=tools,
+        )
 
     def __call__(self, example: Example) -> Iterator[Example]:
         """Process example and yield one or more tokenized examples.
@@ -628,77 +678,8 @@ class BCOPreprocessTransform(ExpandTransform):
         )
 
     def _tokenize_unpaired(self, example: dict) -> dict:
-        """Tokenize a single unpaired example.
-
-        Args:
-            example: Dict with prompt, completion, label fields.
-
-        Returns:
-            Tokenized example with prompt_input_ids, completion_input_ids, etc.
-
-        Raises:
-            KeyError: If required fields (prompt, completion, label) are missing.
-        """
-        result = maybe_convert_to_chatml(dict(example))
-        result = maybe_apply_chat_template(
-            result,
-            self._tokenizer,
-            resolve_example_tools(result, self._tools),
-        )
-
-        # Strict field access - will raise KeyError if missing
-        prompt = result["prompt"]
-        completion = result["completion"]
-        label = result["label"]
-
-        # Tokenize prompt and completion separately
-        prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
-        completion_ids = self._tokenizer(completion, add_special_tokens=False)["input_ids"]
-
-        bos_token_id = self._tokenizer.bos_token_id
-        eos_token_id = self._tokenizer.eos_token_id
-
-        if self._add_special_tokens and bos_token_id is not None:
-            prompt_ids = [bos_token_id, *prompt_ids]
-
-        if eos_token_id is not None:
-            completion_ids = [*completion_ids, eos_token_id]
-
-        # Truncate prompt (from left, keep most recent context)
-        if self._max_prompt_length is not None:
-            prompt_ids = prompt_ids[-self._max_prompt_length :]
-
-        # Truncate completion (from right)
-        if self._max_completion_length is not None:
-            completion_ids = completion_ids[: self._max_completion_length]
-
-        full_ids = prompt_ids + completion_ids
-        prompt_len = len(prompt_ids)
-
-        # Create labels: mask prompt tokens with label_pad_token_id
-        full_labels = [self._label_pad_token_id] * prompt_len + completion_ids
-
-        # Create attention masks (all 1s for actual tokens)
-        prompt_mask = [1] * len(prompt_ids)
-        full_mask = [1] * len(full_ids)
-
-        result["prompt_input_ids"] = prompt_ids
-        result["prompt_attention_mask"] = prompt_mask
-        result["completion_input_ids"] = full_ids
-        result["completion_attention_mask"] = full_mask
-        result["completion_labels"] = full_labels
-        result["label"] = bool(label)
-
-        if self._embedding_tokenizer is not None:
-            emb_tokenized = self._embedding_tokenizer(
-                prompt,
-                truncation=True,
-                add_special_tokens=False,
-            )
-            result["embedding_input_ids"] = emb_tokenized["input_ids"]
-            result["embedding_attention_mask"] = emb_tokenized["attention_mask"]
-
-        return purify_example(result)
+        """Use the shared KTO unpaired-preference tokenizer for each BCO branch."""
+        return self._unpaired_transform(example)
 
     def __repr__(self) -> str:
         """Return a debug-friendly representation including the length caps."""
@@ -913,6 +894,19 @@ class ORPOPreprocessTransform(DPOPreprocessTransform):
         ...     max_completion_length=256,
         ... )
     """
+
+    def __call__(self, example: Example) -> Example:
+        """Reject empty preference targets instead of creating undefined log odds."""
+        if self._max_completion_length is not None and self._max_completion_length <= 0:
+            raise ValueError("ORPO requires a positive max_completion_length.")
+        result = super().__call__(example)
+        for branch in ("chosen", "rejected"):
+            if not any(
+                label != self._label_pad_token_id and bool(active)
+                for label, active in zip(result[f"{branch}_labels"], result[f"{branch}_attention_mask"], strict=True)
+            ):
+                raise ValueError(f"ORPO {branch} sequence has no scoreable completion labels.")
+        return result
 
     def __repr__(self) -> str:
         """Return a debug-friendly representation including the length caps."""
@@ -1550,11 +1544,21 @@ class SFTPreprocessTransform(Transform):
         result["attention_mask"] = tokens["attention_mask"]
 
         if self._mask_prompt:
-            prompt_len = min(len(prompt_ids), len(tokens["input_ids"]))
-            seq_len = len(tokens["input_ids"])
-            # Mask: 0 for prompt tokens, 1 for completion tokens, 0 for padding
-            completion_mask = [0] * prompt_len + [1] * (seq_len - prompt_len)
-            completion_mask = [m * a for m, a in zip(completion_mask, tokens["attention_mask"], strict=True)]
+            # Work in unpadded token coordinates. Left truncation discards prompt
+            # tokens first; left padding shifts the retained boundary again.
+            retained_length = sum(tokens["attention_mask"])
+            removed_left = 0
+            if self._truncation and self._truncation_mode == "keep_end":
+                full_ids = self._tokenizer(full_text, add_special_tokens=False, truncation=False, padding=False)[
+                    "input_ids"
+                ]
+                removed_left = max(len(full_ids) - retained_length, 0)
+            prompt_len = max(len(prompt_ids) - removed_left, 0)
+            token_index = 0
+            completion_mask = []
+            for active in tokens["attention_mask"]:
+                completion_mask.append(int(bool(active) and token_index >= prompt_len))
+                token_index += int(bool(active))
             result["completion_mask"] = completion_mask
 
         result = self._pad_row_to_multiple(result)

@@ -69,19 +69,36 @@ def test_operation_returns_mask_consistent_with_its_indices():
 
     rng = np.random.default_rng(3)
     batch, seq, heads, dim, k = 2, 64, 4, 16, 32
+    query = rng.normal(size=(batch, seq, heads, dim)).astype(np.float32)
+    key = rng.normal(size=(batch, seq, dim)).astype(np.float32)
+    weights = rng.normal(size=(batch, seq, heads)).astype(np.float32)
+    positions = np.broadcast_to(np.arange(seq, dtype=np.int32), (batch, seq))
+    eligible = np.broadcast_to(np.arange(seq)[None, None, :] <= positions[..., None], (batch, seq, seq))
     op = GlmMoeDsaIndexerOp(OperationMetadata(runtime_dtype=jnp.float32, base_config=EasyDeLBaseConfig()))
-    causal = jnp.tril(jnp.ones((seq, seq), jnp.bool_))[None].repeat(batch, 0)
     out = op(
-        query_states=jnp.asarray(rng.normal(size=(batch, seq, heads, dim)), jnp.float32),
-        key_states=jnp.asarray(rng.normal(size=(batch, seq, dim)), jnp.float32),
-        head_weights=jnp.asarray(rng.normal(size=(batch, seq, heads)), jnp.float32),
-        position_ids=jnp.broadcast_to(jnp.arange(seq), (batch, seq)),
+        query_states=jnp.asarray(query),
+        key_states=jnp.asarray(key),
+        head_weights=jnp.asarray(weights),
+        position_ids=jnp.asarray(positions),
         qk_rope_head_dim=0,
         index_topk=k,
         softmax_scale=dim**-0.5,
-        attention_mask=causal,
+        attention_mask=jnp.asarray(eligible),
+        # Match the independent NumPy fp32 contractions, including on TPU.
+        precision=jax.lax.Precision.HIGHEST,
     )
-    np.testing.assert_array_equal(np.asarray(out.topk_mask), np.asarray(_one_hot_mask(out.topk_indices, seq)))
+    scores = np.einsum("bshd,btd->bsht", query, key) * np.float32(dim**-0.5)
+    scores = np.einsum("bsht,bsh->bst", np.maximum(scores, np.float32(0)), weights)
+    scores = np.where(eligible, scores, -np.inf)
+    expected_indices = np.argsort(-scores, axis=-1, kind="stable")[..., :k]
+    raw_indices = np.asarray(out.topk_indices)
+    # Legacy top-k retains raw masked filler IDs; preserve that compatibility
+    # independently of the authoritative mask's eligibility filtering.
+    np.testing.assert_array_equal(raw_indices, expected_indices)
+    expected_mask = np.zeros((batch, seq, seq), dtype=bool)
+    np.put_along_axis(expected_mask, raw_indices, True, axis=-1)
+    expected_mask &= eligible
+    np.testing.assert_array_equal(np.asarray(out.topk_mask), expected_mask)
 
 
 @pytest.mark.parametrize("selector", [BaseIndexer.select_candidates, CompressedIndexer.select_candidates])

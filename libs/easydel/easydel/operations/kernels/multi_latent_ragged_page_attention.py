@@ -46,6 +46,10 @@ from ejkernel.modules import (
     multi_latent_ragged_page_attention_v2,  # pyright: ignore[reportMissingTypeStubs]
     sparse_multi_latent_ragged_page_attention,  # pyright: ignore[reportMissingTypeStubs]
 )
+from ejkernel.modules.operations.configs import (
+    MultiLatentRaggedPageAttentionConfig,
+    MultiLatentRaggedPageAttentionV2Config,
+)
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, Float
@@ -54,7 +58,6 @@ from spectrax import common_types as ct
 from easydel.axis import ATTN_DP
 from easydel.caching import MLARaggedPagesCacheView, RaggedPagesMetadata
 from easydel.infra.sharding import axis_index, mesh_axis_size, normalize_axis_names
-from easydel.utils.helpers import check_bool_flag
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationRegistry
@@ -65,24 +68,10 @@ from ..requirements import (
     OperationRequirements,
     RequirementsBuilder,
 )
+from ._paged_common import ENABLE_DP_LOCAL_PAGE_PATH, dp_page_axis, request_distribution_bounds
 
-ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
-
-
-def _dp_page_axis(cache_view: MLARaggedPagesCacheView):
-    """Return the sharding axis name for KV pages based on data-parallel size.
-
-    When data parallelism is active (``data_parallel_size > 1``), pages are
-    sharded along the ``ATTN_DP`` axis. Otherwise they are replicated.
-
-    Args:
-        cache_view: MLA ragged-pages cache view carrying DP metadata.
-
-    Returns:
-        ``ATTN_DP`` when the data-parallel size exceeds 1, else ``ct.EMPTY``.
-    """
-    dp_size = max(1, int(getattr(cache_view.metadata, "data_parallel_size", 1)))
-    return ATTN_DP if dp_size > 1 else ct.EMPTY
+# Backward-compatible alias for callers importing the former adapter helper.
+_dp_page_axis = dp_page_axis
 
 
 def _mla_kernel_call(dense_fn, ignore: dict, total_tokens: int, common_call_kwargs: dict):
@@ -194,19 +183,17 @@ def _reshape_feature_tensor(x, name: str):
 def _resolve_num_queries_per_block(
     *,
     num_q_heads: int,
-    requested: int | None,
-    cfg_requested: int | None,
+    requested: int | tuple[int, int, int] | None,
+    cfg_requested: int | tuple[int, int, int] | None,
     q_dtype: jnp.dtype | None = None,
     head_axis_size: int = 1,
-) -> int:
-    """Pick a TPU-safe ``num_queries_per_block`` for the ejkernel MLA decode path.
+    query_token_blocks: bool = False,
+) -> int | tuple[int, int, int] | None:
+    """Pick TPU-safe query blocks for either MLA kernel version.
 
-    The ejkernel TPU MLA kernel requires (decode):
-    ``local_heads_per_q_packing % num_queries_per_block == 0``
-    where ``local_heads = num_q_heads / head_axis_size`` (tensor-parallel sharding).
-
-    This function tries the *requested* (or *cfg_requested*) value first, then
-    falls back to the largest divisor from a fixed candidate list.
+    Both kernels trace single-query decode tiles, whose packed local head
+    count must be divisible by the query block size. Preserve the original
+    head-divisor fallback even for v2, including when no size is requested.
 
     Args:
         num_q_heads: Total number of query heads (before TP sharding).
@@ -215,17 +202,35 @@ def _resolve_num_queries_per_block(
             *requested* is None).
         q_dtype: Query dtype; float16/bfloat16 enables 2x packing.
         head_axis_size: Tensor-parallel axis size (number of TP shards).
+        query_token_blocks: Accepted for compatibility; v2 also needs safe
+            single-query decode blocks.
 
     Returns:
-        A positive integer block size that evenly divides the packed local
-        head count.
+        A head-compatible block size, or three such sizes for a tuple/list.
+
+    Raises:
+        ValueError: If a tuple/list has the wrong length.
     """
+    del query_token_blocks
+    preferred = requested if requested is not None else cfg_requested
     q_packing = 2 if q_dtype is not None and jnp.finfo(q_dtype).bits == 16 else 1
     local_heads = max(1, int(num_q_heads) // max(1, head_axis_size))
     # align_to mimics the kernel's padding to q_packing multiples.
     aligned_local = local_heads + (-local_heads % q_packing)
     packed_heads = aligned_local // q_packing
-    preferred = requested if requested is not None else cfg_requested
+    if isinstance(preferred, (tuple, list)):
+        if len(preferred) != 3:
+            raise ValueError("num_queries_per_block must have exactly three entries.")
+        return tuple(
+            _resolve_num_queries_per_block(
+                num_q_heads=num_q_heads,
+                requested=item,
+                cfg_requested=None,
+                q_dtype=q_dtype,
+                head_axis_size=head_axis_size,
+            )
+            for item in preferred
+        )
     preferred = None if preferred is None else max(1, int(preferred))
 
     if preferred is not None and packed_heads % preferred == 0:
@@ -240,32 +245,8 @@ def _resolve_num_queries_per_block(
     return 1
 
 
-def _request_distribution_bounds(scheduled: jax.Array, context_lens: jax.Array) -> jax.Array:
-    """Compute a ``[decode_end, prefill_end, total]`` request distribution vector.
-
-    Classifies each scheduled request as decode (one new token, non-empty
-    context) vs prefill (everything else) and returns prefix-sum bounds that
-    the kernel uses to dispatch the right code path per request.
-
-    Args:
-        scheduled: ``int32[num_requests]`` count of newly scheduled tokens
-            per request.
-        context_lens: ``int32[num_requests]`` total context lengths.
-
-    Returns:
-        jax.Array: ``int32[3]`` array ``[decode_end, prefill_end, total]``
-        suitable for indexing into the request list.
-    """
-    scheduled = jnp.asarray(scheduled, dtype=jnp.int32)
-    context_lens = jnp.asarray(context_lens, dtype=jnp.int32)
-
-    has_tokens = scheduled > 0
-    total = jnp.sum(has_tokens).astype(jnp.int32)
-    is_decode = (scheduled == 1) & (context_lens > 1) & has_tokens
-    decode = jnp.sum(is_decode & has_tokens).astype(jnp.int32)
-    prefill_count = jnp.sum((~is_decode) & has_tokens).astype(jnp.int32)
-    prefill_end = decode + prefill_count
-    return jnp.stack((decode, prefill_end, total)).astype(jnp.int32)
+# Backward-compatible alias for callers importing the former adapter helper.
+_request_distribution_bounds = request_distribution_bounds
 
 
 def _resolve_distribution(cache_metadata: RaggedPagesMetadata) -> jax.Array:
@@ -313,6 +294,11 @@ class MultiLatentRaggedPageAttn(OperationImpl):
     Registered under the name ``"multi_latent_ragged_page_attention_v1"``.
     """
 
+    _kernel_function = staticmethod(multi_latent_ragged_page_attention)
+    _config_type = MultiLatentRaggedPageAttentionConfig
+    _supports_rank_major_dp = False
+    _query_token_blocks = False
+
     @classmethod
     def get_impl_name(cls) -> str | tuple[str]:
         """Return the registered operation name for this implementation."""
@@ -336,7 +322,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
         v_scale: float | None = None,
         **ignore,
     ) -> AttentionOutput:
-        """Run the MLA ragged-paged attention kernel (v1 implementation).
+        """Run MLA ragged-paged attention with the implementation's kernel and config type.
 
         This is the primary forward path.  It resolves sharding specs,
         builds the request-distribution vector, and dispatches to either
@@ -410,26 +396,38 @@ class MultiLatentRaggedPageAttn(OperationImpl):
         resolve = resolver.resolve
         request_distribution = _resolve_distribution(cache_metadata)
 
-        request_distribution = jnp.array([0, 0, request_distribution[2]], dtype=jnp.int32)
-        page_axis = _dp_page_axis(cache_view)
+        use_rank_major_dp = self._supports_rank_major_dp and getattr(request_distribution, "ndim", 0) == 2
+        if use_rank_major_dp:
+            request_distribution = jnp.stack(
+                (
+                    jnp.zeros_like(request_distribution[:, 2]),
+                    jnp.zeros_like(request_distribution[:, 2]),
+                    request_distribution[:, 2],
+                ),
+                axis=1,
+            ).astype(jnp.int32)
+        else:
+            request_distribution = jnp.array([0, 0, request_distribution[2]], dtype=jnp.int32)
+        page_axis = dp_page_axis(cache_view)
         head_aware_kv = keys_values.ndim == 3
+        q_token_axis = ATTN_DP if use_rank_major_dp else ct.EMPTY
 
         qaxes_nope = resolve(
-            axes=[ct.EMPTY, ct.EMPTY, ct.EMPTY] if head_aware_kv else [ct.EMPTY, ct.HEAD, ct.EMPTY],
+            axes=[q_token_axis, ct.EMPTY, ct.EMPTY] if head_aware_kv else [q_token_axis, ct.HEAD, ct.EMPTY],
             mode=ct.MODE_PREFILL,
             shape=queries_nope.shape,
         )
         qaxes_pe = resolve(
-            axes=[ct.EMPTY, ct.EMPTY, ct.EMPTY] if head_aware_kv else [ct.EMPTY, ct.HEAD, ct.EMPTY],
+            axes=[q_token_axis, ct.EMPTY, ct.EMPTY] if head_aware_kv else [q_token_axis, ct.HEAD, ct.EMPTY],
             mode=ct.MODE_PREFILL,
             shape=queries_pe.shape,
         )
         kv_values_axes = resolve(
-            axes=[ct.EMPTY, ct.EMPTY] if keys_values.ndim == 2 else [ct.EMPTY, ct.EMPTY, ct.EMPTY],
+            axes=[q_token_axis, ct.EMPTY] if keys_values.ndim == 2 else [q_token_axis, ct.EMPTY, ct.EMPTY],
             mode=ct.MODE_PREFILL,
             shape=keys_values.shape,
         )
-        keys_pe_axes = resolve(axes=[ct.EMPTY, ct.EMPTY], mode=ct.MODE_PREFILL, shape=keys_pe.shape)
+        keys_pe_axes = resolve(axes=[q_token_axis, ct.EMPTY], mode=ct.MODE_PREFILL, shape=keys_pe.shape)
 
         kv_pages_spec = resolve(
             axes=[page_axis, ct.EMPTY, ct.EMPTY, ct.EMPTY],
@@ -445,14 +443,15 @@ class MultiLatentRaggedPageAttn(OperationImpl):
         )
 
         platform = "pallas" if jax.default_backend() == "tpu" else "auto"
-        cfg = self.metadata.get_operation_config("multi_latent_ragged_page_attention_v1")
+        cfg = self.metadata.get_operation_config(self.get_impl_name())
         if cfg is None:
             cfg = self.metadata.get_operation_config("multi_latent_ragged_page_attention")
 
-        # Extract tuning knobs from the EasyDeL operation config (dict).
-        chunk_prefill_size = cfg.get("chunk_prefill_size") if cfg else None
-        num_kv_pages_per_block = cfg.get("num_kv_pages_per_block") if cfg else None
-        cfg_num_queries_per_block = cfg.get("num_queries_per_block") if cfg else None
+        # Operation configs support both legacy mappings and ejkernel dataclasses.
+        cfg_value = cfg.get if isinstance(cfg, dict) else lambda name: getattr(cfg, name, None)
+        chunk_prefill_size = cfg_value("chunk_prefill_size")
+        num_kv_pages_per_block = cfg_value("num_kv_pages_per_block")
+        cfg_num_queries_per_block = cfg_value("num_queries_per_block")
 
         # Compute TP axis size for head sharding so we resolve the correct
         # num_queries_per_block for the local (sharded) head count.
@@ -470,18 +469,19 @@ class MultiLatentRaggedPageAttn(OperationImpl):
             cfg_requested=cfg_num_queries_per_block,
             q_dtype=queries_nope.dtype,
             head_axis_size=head_axis_size,
+            query_token_blocks=self._query_token_blocks,
         )
 
-        # Build an ejkernel config so the autotuner uses a compatible
-        # num_queries_per_block (must divide local packed heads on each shard).
-        from ejkernel.modules.operations.configs import MultiLatentRaggedPageAttentionConfig as _MlrpaCfg
-
-        ejkernel_cfg = _MlrpaCfg(
+        # Both versions trace decode tiles that require packed-head-compatible blocks.
+        ejkernel_cfg = self._config_type(
             chunk_prefill_size=chunk_prefill_size,
             num_kv_pages_per_block=num_kv_pages_per_block,
             num_queries_per_block=resolved_num_queries_per_block,
-            vmem_limit_bytes=vmem_limit_bytes,
-            platform=platform,
+            vmem_limit_bytes=vmem_limit_bytes if vmem_limit_bytes is not None else cfg_value("vmem_limit_bytes"),
+            platform=cfg_value("platform") or platform,
+            backend=cfg_value("backend") or "any",
+            num_warps=cfg_value("num_warps") if cfg_value("num_warps") is not None else 4,
+            num_stages=cfg_value("num_stages") if cfg_value("num_stages") is not None else 1,
         )
         common_call_kwargs = dict(
             softmax_scale=softmax_scale,
@@ -505,12 +505,15 @@ class MultiLatentRaggedPageAttn(OperationImpl):
             and int(cache_metadata.context_lens.shape[0]) % page_axis_size == 0
         )
 
+        if use_rank_major_dp and not can_use_dp_local:
+            raise ValueError("Rank-major DP MLA ragged attention requires the DP-local page path.")
+
         sparse_selected, _kernel = _mla_kernel_call(
-            multi_latent_ragged_page_attention, ignore, queries_nope.shape[0], common_call_kwargs
+            self._kernel_function, ignore, queries_nope.shape[0], common_call_kwargs
         )
         extra_specs, extra_args = (), ()
         if sparse_selected is not None:
-            extra_specs = (resolve(axes=[ct.EMPTY, ct.EMPTY], mode=ct.MODE_PREFILL, shape=sparse_selected.shape),)
+            extra_specs = (resolve(axes=[q_token_axis, ct.EMPTY], mode=ct.MODE_PREFILL, shape=sparse_selected.shape),)
             extra_args = (sparse_selected,)
 
         if can_use_dp_local:
@@ -547,7 +550,6 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                 full_distribution,
                 *extra,
             ):
-                del full_distribution
                 shard_idx = axis_index(page_axis_names)
                 row_start = shard_idx * jnp.int32(rows_per_shard)
 
@@ -564,15 +566,18 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                     axis=0,
                 )
                 local_block_tables = local_pages_rows.reshape((rows_per_shard * max_pages_per_req,))
-                local_query_start_loc = jax.lax.dynamic_slice_in_dim(
-                    full_query_start_loc,
-                    start_index=row_start,
-                    slice_size=rows_per_shard + 1,
-                    axis=0,
-                )
-
-                local_scheduled = local_query_start_loc[1:] - local_query_start_loc[:-1]
-                local_distribution = _request_distribution_bounds(local_scheduled, local_context_lens)
+                if use_rank_major_dp:
+                    local_query_start_loc = full_query_start_loc[shard_idx]
+                    local_distribution = full_distribution[shard_idx]
+                else:
+                    local_query_start_loc = jax.lax.dynamic_slice_in_dim(
+                        full_query_start_loc,
+                        start_index=row_start,
+                        slice_size=rows_per_shard + 1,
+                        axis=0,
+                    )
+                    local_scheduled = local_query_start_loc[1:] - local_query_start_loc[:-1]
+                    local_distribution = _request_distribution_bounds(local_scheduled, local_context_lens)
                 local_total = local_distribution[2]
 
                 local_num_pages = jnp.int32(local_kv_pages.shape[0])
@@ -592,6 +597,9 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                     local_distribution,
                     selected=extra[0] if extra else None,
                 )
+
+                if use_rank_major_dp:
+                    return local_output, local_kv_pages
 
                 row_ids = jnp.arange(rows_per_shard, dtype=jnp.int32)[:, None]
                 token_ids = jnp.arange(local_queries_nope.shape[0], dtype=jnp.int32)[None, :]
@@ -846,7 +854,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
 
 
 @OperationRegistry.register
-class MultiLatentRaggedPageAttnV2(OperationImpl):
+class MultiLatentRaggedPageAttnV2(MultiLatentRaggedPageAttn):
     """Multi-Latent Attention v2 with per-case (decode/prefill/mixed) block-size tuning.
 
     Extends the v1 MLA ragged-paged attention with per-case block-size
@@ -865,374 +873,10 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
         """
         return "multi_latent_ragged_page_attention_v2"
 
-    def forward_core(
-        self,
-        queries_nope: Float[Array, "total_tokens num_q_heads qk_nope_dim"],
-        queries_pe: Float[Array, "total_tokens num_q_heads qk_pe_dim"],
-        keys_values: Float[Array, "total_tokens kv_lora_rank"],
-        keys_pe: Float[Array, "total_tokens qk_pe_dim"],
-        cache_view: MLARaggedPagesCacheView,
-        cache_metadata: RaggedPagesMetadata,
-        softmax_scale: float | None = None,
-        logits_soft_cap: float | None = None,
-        sliding_window: int | None = None,
-        vmem_limit_bytes: int | None = None,
-        mask_value: float | None = None,
-        q_scale: float | None = None,
-        k_scale: float | None = None,
-        v_scale: float | None = None,
-        **ignore,
-    ) -> AttentionOutput:
-        """Run the MLA ragged-paged attention kernel (v2 implementation).
-
-        v2 differs from v1 only in the underlying ejkernel call and config
-        type; the surrounding sharding, distribution-vector handling and
-        DP-local fast path are otherwise identical.
-
-        Args:
-            queries_nope: Non-positional query projections.
-            queries_pe: Positional-embedding query projections.
-            keys_values: Low-rank latent KV (rank-2 shared-head, or rank-3
-                head-aware).
-            keys_pe: Positional-embedding key projections.
-            cache_view: MLA ragged-pages cache view.
-            cache_metadata: Batch scheduling metadata.
-            softmax_scale: Multiplicative scale applied before softmax.
-            logits_soft_cap: Optional soft-capping of logits.
-            sliding_window: Sliding-window size for local attention.
-            vmem_limit_bytes: VMEM budget hint forwarded to the kernel
-                config.
-            mask_value: Value used for masked positions; defaults to
-                ``-0.7 * float32_max``.
-            q_scale: Optional quantization scale for queries.
-            k_scale: Optional quantization scale for keys.
-            v_scale: Optional quantization scale for values.
-            **ignore: Extra kwargs accepted for forward-compatibility.
-
-        Returns:
-            AttentionOutput: Attended output and updated cache view.
-
-        Raises:
-            ValueError: When ``keys_pe`` is missing, tensor ranks are wrong,
-                or token-axis sizes disagree across inputs.
-        """
-        if keys_pe is None:
-            raise ValueError("multi_latent_ragged_page_attention_v2 requires `keys_pe`.")
-
-        queries_nope = _reshape_query_tensor(queries_nope, "queries_nope")
-        queries_pe = _reshape_query_tensor(queries_pe, "queries_pe")
-        keys_values = _reshape_feature_tensor(keys_values, "keys_values")
-        keys_pe = _reshape_feature_tensor(keys_pe, "keys_pe")
-        if queries_nope.shape[:2] != queries_pe.shape[:2]:
-            raise ValueError(
-                "`queries_nope` and `queries_pe` must share [total_tokens, num_q_heads]. "
-                f"Got {queries_nope.shape[:2]} vs {queries_pe.shape[:2]}."
-            )
-        if keys_values.ndim not in (2, 3):
-            raise ValueError(f"`keys_values` must be rank-2 or rank-3. Got shape={keys_values.shape}.")
-        if keys_pe.ndim != 2:
-            raise ValueError(f"`keys_pe` must be rank-2. Got shape={keys_pe.shape}.")
-        if keys_values.shape[0] != queries_nope.shape[0]:
-            raise ValueError(
-                "`keys_values` token dim must match `queries_nope` token dim. "
-                f"Got {keys_values.shape[0]} vs {queries_nope.shape[0]}."
-            )
-        if keys_pe.shape[0] != queries_nope.shape[0]:
-            raise ValueError(
-                "`keys_pe` token dim must match `queries_nope` token dim. "
-                f"Got {keys_pe.shape[0]} vs {queries_nope.shape[0]}."
-            )
-
-        kv_pages = cache_view.kv_pages
-        resolver = self.metadata.runtime_sharding_resolver.with_mesh(self.metadata.mesh)
-        resolve = resolver.resolve
-        request_distribution = _resolve_distribution(cache_metadata)
-        use_rank_major_dp = getattr(request_distribution, "ndim", 0) == 2
-        if use_rank_major_dp:
-            request_distribution = jnp.stack(
-                (
-                    jnp.zeros_like(request_distribution[:, 2]),
-                    jnp.zeros_like(request_distribution[:, 2]),
-                    request_distribution[:, 2],
-                ),
-                axis=1,
-            ).astype(jnp.int32)
-        else:
-            request_distribution = jnp.array([0, 0, request_distribution[2]], dtype=jnp.int32)
-        page_axis = _dp_page_axis(cache_view)
-        head_aware_kv = keys_values.ndim == 3
-        q_token_axis = ATTN_DP if use_rank_major_dp else ct.EMPTY
-
-        qaxes_nope = resolve(
-            axes=[q_token_axis, ct.EMPTY, ct.EMPTY] if head_aware_kv else [q_token_axis, ct.HEAD, ct.EMPTY],
-            mode=ct.MODE_PREFILL,
-            shape=queries_nope.shape,
-        )
-        qaxes_pe = resolve(
-            axes=[q_token_axis, ct.EMPTY, ct.EMPTY] if head_aware_kv else [q_token_axis, ct.HEAD, ct.EMPTY],
-            mode=ct.MODE_PREFILL,
-            shape=queries_pe.shape,
-        )
-        kv_values_axes = resolve(
-            axes=[q_token_axis, ct.EMPTY] if keys_values.ndim == 2 else [q_token_axis, ct.EMPTY, ct.EMPTY],
-            mode=ct.MODE_PREFILL,
-            shape=keys_values.shape,
-        )
-        keys_pe_axes = resolve(axes=[q_token_axis, ct.EMPTY], mode=ct.MODE_PREFILL, shape=keys_pe.shape)
-
-        kv_pages_spec = resolve(
-            axes=[page_axis, ct.EMPTY, ct.EMPTY, ct.EMPTY],
-            mode=ct.MODE_PREFILL,
-            shape=kv_pages.shape,
-        )
-        page_axis_names = normalize_axis_names(kv_pages_spec[0] if len(kv_pages_spec) > 0 else None)
-        page_axis_size = mesh_axis_size(self.metadata.mesh, page_axis_names)
-        kv_pages_spec_replicated = resolve(
-            axes=[ct.EMPTY, ct.EMPTY, ct.EMPTY, ct.EMPTY],
-            mode=ct.MODE_PREFILL,
-            shape=kv_pages.shape,
-        )
-
-        platform = "pallas" if jax.default_backend() == "tpu" else "auto"
-        cfg = self.metadata.get_operation_config("multi_latent_ragged_page_attention_v2")
-        if cfg is None:
-            cfg = self.metadata.get_operation_config("multi_latent_ragged_page_attention")
-
-        chunk_prefill_size = cfg.get("chunk_prefill_size") if cfg else None
-        num_kv_pages_per_block = cfg.get("num_kv_pages_per_block") if cfg else None
-        cfg_num_queries_per_block = cfg.get("num_queries_per_block") if cfg else None
-
-        head_spec = resolve(
-            axes=[ct.HEAD],
-            mode=ct.MODE_PREFILL,
-            shape=(queries_nope.shape[1],),
-        )
-        head_axis_names = normalize_axis_names(head_spec[0] if len(head_spec) > 0 else None)
-        head_axis_size = mesh_axis_size(self.metadata.mesh, head_axis_names) if not head_aware_kv else 1
-
-        resolved_num_queries_per_block = _resolve_num_queries_per_block(
-            num_q_heads=queries_nope.shape[1],
-            requested=ignore.get("num_queries_per_block"),
-            cfg_requested=cfg_num_queries_per_block,
-            q_dtype=queries_nope.dtype,
-            head_axis_size=head_axis_size,
-        )
-
-        from ejkernel.modules.operations.configs import MultiLatentRaggedPageAttentionV2Config as _MlrpaV2Cfg
-
-        ejkernel_cfg = _MlrpaV2Cfg(
-            chunk_prefill_size=chunk_prefill_size,
-            num_kv_pages_per_block=num_kv_pages_per_block,
-            num_queries_per_block=resolved_num_queries_per_block,
-            vmem_limit_bytes=vmem_limit_bytes,
-            platform=platform,
-        )
-        common_call_kwargs = dict(
-            softmax_scale=softmax_scale,
-            logits_soft_cap=logits_soft_cap,
-            sliding_window=sliding_window,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            cfg=ejkernel_cfg,
-        )
-        if mask_value is not None:
-            common_call_kwargs["mask_value"] = mask_value
-        else:
-            common_call_kwargs["mask_value"] = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
-
-        can_use_dp_local = (
-            ENABLE_DP_LOCAL_PAGE_PATH
-            and page_axis == ATTN_DP
-            and page_axis_size > 1
-            and len(page_axis_names) > 0
-            and int(cache_metadata.context_lens.shape[0]) % page_axis_size == 0
-        )
-        if use_rank_major_dp and not can_use_dp_local:
-            raise ValueError("Rank-major DP MLA ragged attention requires the DP-local page path.")
-
-        sparse_selected, _kernel = _mla_kernel_call(
-            multi_latent_ragged_page_attention_v2, ignore, queries_nope.shape[0], common_call_kwargs
-        )
-        extra_specs, extra_args = (), ()
-        if sparse_selected is not None:
-            extra_specs = (resolve(axes=[q_token_axis, ct.EMPTY], mode=ct.MODE_PREFILL, shape=sparse_selected.shape),)
-            extra_args = (sparse_selected,)
-
-        if can_use_dp_local:
-            rows_per_shard = int(cache_metadata.context_lens.shape[0]) // page_axis_size
-            max_pages_per_req = int(cache_metadata.pages_tables.shape[1])
-
-            @partial(
-                jax.shard_map,
-                mesh=self.metadata.mesh,
-                in_specs=(
-                    qaxes_nope,
-                    qaxes_pe,
-                    kv_values_axes,
-                    keys_pe_axes,
-                    kv_pages_spec,
-                    Ps(),
-                    Ps(),
-                    Ps(),
-                    Ps(),
-                    *extra_specs,
-                ),
-                out_specs=(qaxes_nope, kv_pages_spec),
-                check_vma=False,
-            )
-            def _mapped(
-                local_queries_nope,
-                local_queries_pe,
-                local_keys_values,
-                local_keys_pe,
-                local_kv_pages,
-                full_context_lens,
-                full_pages_tables,
-                full_query_start_loc,
-                full_distribution,
-                *extra,
-            ):
-                shard_idx = axis_index(page_axis_names)
-                row_start = shard_idx * jnp.int32(rows_per_shard)
-
-                local_context_lens = jax.lax.dynamic_slice_in_dim(
-                    full_context_lens,
-                    start_index=row_start,
-                    slice_size=rows_per_shard,
-                    axis=0,
-                )
-                local_pages_rows = jax.lax.dynamic_slice_in_dim(
-                    full_pages_tables,
-                    start_index=row_start,
-                    slice_size=rows_per_shard,
-                    axis=0,
-                )
-                local_block_tables = local_pages_rows.reshape((rows_per_shard * max_pages_per_req,))
-                if use_rank_major_dp:
-                    local_query_start_loc = full_query_start_loc[shard_idx]
-                    local_distribution = full_distribution[shard_idx]
-                else:
-                    local_query_start_loc = jax.lax.dynamic_slice_in_dim(
-                        full_query_start_loc,
-                        start_index=row_start,
-                        slice_size=rows_per_shard + 1,
-                        axis=0,
-                    )
-                    local_scheduled = local_query_start_loc[1:] - local_query_start_loc[:-1]
-                    local_distribution = _request_distribution_bounds(local_scheduled, local_context_lens)
-                local_total = local_distribution[2]
-
-                local_num_pages = jnp.int32(local_kv_pages.shape[0])
-                page_offset = shard_idx * local_num_pages
-                local_block_tables = local_block_tables - page_offset
-                local_block_tables = jnp.clip(local_block_tables, 0, local_num_pages - 1)
-
-                local_output, local_kv_pages = _kernel(
-                    local_queries_nope,
-                    local_queries_pe,
-                    local_keys_values,
-                    local_keys_pe,
-                    local_kv_pages,
-                    local_context_lens,
-                    local_block_tables,
-                    local_query_start_loc,
-                    local_distribution,
-                    selected=extra[0] if extra else None,
-                )
-
-                if use_rank_major_dp:
-                    return local_output, local_kv_pages
-
-                row_ids = jnp.arange(rows_per_shard, dtype=jnp.int32)[:, None]
-                token_ids = jnp.arange(local_queries_nope.shape[0], dtype=jnp.int32)[None, :]
-                starts = local_query_start_loc[:-1, None]
-                ends = local_query_start_loc[1:, None]
-                active_rows = row_ids < local_total
-                local_token_mask = jnp.any(active_rows & (token_ids >= starts) & (token_ids < ends), axis=0)
-                local_output = jnp.where(local_token_mask[:, None, None], local_output, jnp.zeros_like(local_output))
-                if len(page_axis_names) == 1:
-                    output = jax.lax.psum(local_output.astype(jnp.float32), page_axis_names[0]).astype(
-                        local_output.dtype
-                    )
-                else:
-                    output = jax.lax.psum(local_output.astype(jnp.float32), tuple(page_axis_names)).astype(
-                        local_output.dtype
-                    )
-                return output, local_kv_pages
-
-            output, kv_pages = _mapped(
-                queries_nope,
-                queries_pe,
-                keys_values,
-                keys_pe,
-                kv_pages,
-                cache_metadata.context_lens,
-                cache_metadata.pages_tables,
-                cache_metadata.query_start_loc,
-                request_distribution,
-                *extra_args,
-            )
-        else:
-
-            @partial(
-                jax.shard_map,
-                mesh=self.metadata.mesh,
-                in_specs=(
-                    qaxes_nope,
-                    qaxes_pe,
-                    kv_values_axes,
-                    keys_pe_axes,
-                    kv_pages_spec_replicated,
-                    Ps(),
-                    Ps(),
-                    Ps(),
-                    Ps(),
-                    *extra_specs,
-                ),
-                out_specs=(qaxes_nope, kv_pages_spec_replicated),
-                check_vma=False,
-            )
-            def _mapped_global(
-                local_queries_nope,
-                local_queries_pe,
-                local_keys_values,
-                local_keys_pe,
-                local_kv_pages,
-                full_context_lens,
-                full_pages_tables,
-                full_query_start_loc,
-                full_distribution,
-                *extra,
-            ):
-                return _kernel(
-                    local_queries_nope,
-                    local_queries_pe,
-                    local_keys_values,
-                    local_keys_pe,
-                    local_kv_pages,
-                    full_context_lens,
-                    full_pages_tables.reshape(-1),
-                    full_query_start_loc,
-                    full_distribution,
-                    selected=extra[0] if extra else None,
-                )
-
-            output, kv_pages = _mapped_global(
-                queries_nope,
-                queries_pe,
-                keys_values,
-                keys_pe,
-                kv_pages,
-                cache_metadata.context_lens,
-                cache_metadata.pages_tables,
-                cache_metadata.query_start_loc,
-                request_distribution,
-                *extra_args,
-            )
-
-        cache_view.kv_pages = kv_pages
-        return AttentionOutput(attention_weights=None, attention_outputs=output, cache_view=cache_view)
+    _kernel_function = staticmethod(multi_latent_ragged_page_attention_v2)
+    _config_type = MultiLatentRaggedPageAttentionV2Config
+    _supports_rank_major_dp = True
+    _query_token_blocks = True
 
     def forward_native(self, *args, **kwargs) -> AttentionOutput:
         """Platform-agnostic forward; delegates to :meth:`forward_core`.

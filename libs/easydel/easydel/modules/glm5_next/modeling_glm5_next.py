@@ -58,6 +58,7 @@ import jax
 import jax.numpy as jnp
 import spectrax as spx
 from eformer.loggings import get_logger
+from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -106,9 +107,17 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
-from easydel.layers.indexer import IndexerConfig, IndexerKind, IndexerSelection, SparseIndexer, paged_pool_select
+from easydel.layers.indexer import (
+    IndexerConfig,
+    IndexerKind,
+    IndexerSelection,
+    SparseIndexer,
+    indexer_distillation_loss,
+    paged_pool_select,
+    use_sparse_training_attention,
+)
 from easydel.layers.linear_attention import apply_conv_with_state, apply_mask_to_padding_states
-from easydel.layers.moe import moe_group_topk_select
+from easydel.layers.moe import fp32_router_logits, moe_group_topk_select
 from easydel.layers.norms import lowfloats
 from easydel.layers.residual import (
     HyperStreamSharding,
@@ -124,10 +133,7 @@ from easydel.operations.kernels import (
     KernelDeltaAttnOp,
     fused_kda_gate_per_channel,
 )
-from easydel.operations.kernels.dsa_sparse_attention import (
-    sparse_selected_training_attention,
-    use_sparse_training_attention,
-)
+from easydel.operations.kernels.dsa_sparse_attention import sparse_selected_training_attention
 from easydel.operations.kernels.kda import kda_packed_rows_forward
 from easydel.utils.checkpoint_keys import KEEP, KeyRuleSet, Map
 
@@ -139,6 +145,42 @@ from .glm5_next_configuration import (
 logger = get_logger(__name__)
 
 _KDA_CHUNK_SIZE = 64
+
+
+def _pool_indexer_segment_ids(mask_info: MaskInfo, pairwise_mask: Array | None) -> tuple[Array, Array]:
+    """Recover document ownership before pooling uncached pairwise-only inputs.
+
+    Pairwise ``MaskInfo`` inputs carry padding labels, not document identities.
+    As in the TransformerCache auxiliary append, a boundary exists only when
+    no query's visible key interval spans it. This works for both causal and
+    bidirectional document masks without mistaking holes in a sparse mask for
+    document boundaries. Explicit nonzero segment identities remain authoritative.
+
+    Args:
+        mask_info: Current self-attention metadata.
+        pairwise_mask: Boolean visibility in ``[batch, query, key]`` layout.
+
+    Returns:
+        Query and key document identities, with ``-1`` for padding.
+    """
+    query_segments, key_segments = mask_info.get_or_compute_segment_ids()
+    if pairwise_mask is None:
+        return query_segments, key_segments
+    padding_labels = jnp.all(query_segments <= 0, axis=-1) & jnp.all(key_segments <= 0, axis=-1)
+    key_positions = jnp.arange(pairwise_mask.shape[-1], dtype=jnp.int32)
+    first_visible = jnp.argmax(pairwise_mask, axis=-1)
+    last_visible = jnp.max(jnp.where(pairwise_mask, key_positions, -1), axis=-1)
+    splits = key_positions[:-1]
+    crosses = (first_visible[:, :, None] <= splits) & (last_visible[:, :, None] > splits)
+    boundaries = jnp.pad(~jnp.any(crosses, axis=-2), ((0, 0), (1, 0)), constant_values=False)
+    recovered_keys = jnp.cumsum(boundaries, axis=-1, dtype=jnp.int32)
+    recovered_keys = jnp.where(jnp.any(pairwise_mask, axis=-2), recovered_keys, -1)
+    recovered_queries = jnp.take_along_axis(recovered_keys, first_visible, axis=-1)
+    recovered_queries = jnp.where(jnp.any(pairwise_mask, axis=-1), recovered_queries, -1)
+    return (
+        jnp.where(padding_labels[:, None], recovered_queries, query_segments),
+        jnp.where(padding_labels[:, None], recovered_keys, key_segments),
+    )
 
 
 class Glm5NextTextMLP(spx.Module):
@@ -458,11 +500,7 @@ class Glm5NextTextTopKRouter(spx.Module):
         Returns:
             Router logits of shape ``(tokens, n_routed_experts)`` (fp32).
         """
-        hidden_states = hidden_states.reshape(-1, self.config.hidden_size)
-        return checkpoint_name(
-            jnp.matmul(hidden_states.astype(jnp.float32), self.weight.value.astype(jnp.float32)),
-            "moe_router_logits",
-        )
+        return fp32_router_logits(hidden_states, self.weight.value, self.config.hidden_size)
 
 
 class Glm5NextTextMoE(BaseMoeModule):
@@ -793,6 +831,23 @@ class Glm5NextForgetGate(spx.Module):
         )
 
 
+class _Glm5NextConv1d(nn.Conv1d):
+    """Keep convolution storage independent of projection computation dtype."""
+
+    def forward(self, x, **kwargs):
+        """Convolve in the incoming projection dtype without changing parameters."""
+        return spx.functional.conv(
+            x,
+            self.weight.value.astype(x.dtype),
+            self.bias.value.astype(x.dtype) if self.use_bias else None,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+            precision=self.precision,
+        )
+
+
 class Glm5NextLinearAttention(spx.Module):
     """KDA (Kimi-style kernel delta attention) block for GLM-5 linear layers.
 
@@ -868,35 +923,38 @@ class Glm5NextLinearAttention(spx.Module):
         self.v_proj = column_linear(config.hidden_size, self.value_dim)
 
         # Three depthwise causal convs (slices of HF's fused conv1d weight).
-        self.q_conv1d = nn.Conv1d(
+        self.q_conv1d = _Glm5NextConv1d(
             in_channels=self.key_dim,
             out_channels=self.key_dim,
             kernel_size=self.d_conv,
             groups=self.key_dim,
             padding=((self.d_conv - 1, 0),),
             dtype=dtype,
+            param_dtype=param_dtype,
             rngs=rngs,
             use_bias=False,
             precision=precision,
         )
-        self.k_conv1d = nn.Conv1d(
+        self.k_conv1d = _Glm5NextConv1d(
             in_channels=self.key_dim,
             out_channels=self.key_dim,
             kernel_size=self.d_conv,
             groups=self.key_dim,
             padding=((self.d_conv - 1, 0),),
             dtype=dtype,
+            param_dtype=param_dtype,
             rngs=rngs,
             use_bias=False,
             precision=precision,
         )
-        self.v_conv1d = nn.Conv1d(
+        self.v_conv1d = _Glm5NextConv1d(
             in_channels=self.value_dim,
             out_channels=self.value_dim,
             kernel_size=self.d_conv,
             groups=self.value_dim,
             padding=((self.d_conv - 1, 0),),
             dtype=dtype,
+            param_dtype=param_dtype,
             rngs=rngs,
             use_bias=False,
             precision=precision,
@@ -1143,6 +1201,7 @@ class Glm5NextLinearAttention(spx.Module):
             chunk_size=self.chunk_size,
             per_channel_decay=True,
             segment_ids=segment_ids,
+            continue_initial_state=cache_view is not None,
         )
 
         output = kda_output.attention_outputs
@@ -1243,13 +1302,28 @@ class Glm5NextLinearAttention(spx.Module):
         )
 
 
+@auto_pytree
+class _Glm5NextAttentionOutput(AttentionLayerOutput):
+    """Attention output carrying an optional unscaled indexer warm-up loss."""
+
+    indexer_aux_loss: Array | None = None
+
+
+@auto_pytree
+class _Glm5NextDecoderOutput(DecoderLayerOutput):
+    """Decoder output carrying an optional unscaled indexer warm-up loss."""
+
+    indexer_aux_loss: Array | None = None
+
+
 class Glm5NextIndexer(SparseIndexer):
     """GLM-5 k-pool DSA indexer on the unified :class:`SparseIndexer` layer.
 
-    Thin configuration adapter: the projection plumbing, pool compression,
-    ReLU-weighted scoring, top-k selection and tail-pool expansion all live in
-    the shared :class:`~easydel.layers.indexer.SparseIndexer`; this subclass
-    only maps the model config onto :class:`IndexerConfig`. Checkpoint
+    Projection plumbing, pool compression, ReLU-weighted scoring, top-k
+    selection and tail-pool expansion live in the shared
+    :class:`~easydel.layers.indexer.SparseIndexer`. This subclass maps the
+    model config and adds opt-in differentiable scores for distillation (the
+    shared pool strategy only exposes hard selections). Checkpoint
     parameter names (``wq_b`` / ``wk`` / ``k_norm`` / ``weights_proj`` /
     ``index_kpool_compress_ape`` / ``index_kpool_compress_gate``) are owned by
     the parent class and are unchanged.
@@ -1305,6 +1379,94 @@ class Glm5NextIndexer(SparseIndexer):
         # Row-parallel TPU top-k resolves its layout from the model mesh.
         self.mesh_source = config
 
+    def distillation_loss(
+        self,
+        hidden_states: Array,
+        q_resid: Array,
+        attention_query: Array,
+        attention_key: Array,
+        visibility: Array,
+        query_segment_ids: Array,
+        key_segment_ids: Array,
+        *,
+        scaling: float,
+        sinks: Array | None = None,
+    ) -> Array:
+        """Distil dense MLA attention mass onto the scored, complete k-pools.
+
+        The shared pool indexer exposes selections, not differentiable scores.
+        Reuse its projections, learned pooling and head reduction here, without
+        its hard top-k. Inputs are detached so only indexer parameters train.
+        Incomplete tails are always-selected tokens, not scored candidates.
+
+        Args:
+            hidden_states: Indexer inputs ``[B, S, D]``.
+            q_resid: MLA query residual ``[B, S, R]``.
+            attention_query: Actual NoPE MLA queries ``[B, S, H, Dq]``.
+            attention_key: Actual per-head MLA keys ``[B, T, H, Dq]``.
+            visibility: Pre-selection causal/padding/document mask ``[B, S, T]``.
+            query_segment_ids: Query document identities ``[B, S]``.
+            key_segment_ids: Key document identities ``[B, T]``; negative means padding.
+            scaling: MLA softmax scale, not the indexer's projection scale.
+            sinks: Optional attention sinks, one per MLA head.
+
+        Returns:
+            Unscaled scalar mean KL over queries reaching a complete pool.
+        """
+        hidden_states = jax.lax.stop_gradient(hidden_states)
+        q_resid = jax.lax.stop_gradient(q_resid)
+        attention_query = jax.lax.stop_gradient(attention_query)
+        attention_key = jax.lax.stop_gradient(attention_key)
+        valid = jnp.any(visibility, axis=1)
+        query, packed = self.project_state(hidden_states, q_resid=q_resid, attention_mask=valid)
+        kpool = self.config.kpool_size
+        token_positions = jnp.broadcast_to(jnp.arange(packed.shape[1]), valid.shape)
+
+        def query_loss(inputs):
+            hidden, projected, target_query, visible, position = inputs
+            # Pooling compacts visible tokens before grouping when masks are not
+            # prefixes (padding, packed documents or arbitrary pairwise masks).
+            # For prefixes this produces exactly the same complete candidates as
+            # storage-wide pooling. No [B, S, T, D] temporary is materialized.
+            local = packed.at[..., -1].set(visible.astype(packed.dtype))
+            pool_keys, members, pool_valid = self._pooled_states(local, key_segment_ids)
+            dots = jnp.einsum(
+                "bhd,bpd->bhp", projected.astype(jnp.float32), pool_keys.astype(jnp.float32), precision=self.precision
+            )
+            scores = self._reduce_heads(jax.nn.relu(dots * self.softmax_scale)[:, None], hidden[:, None])
+            scores = jnp.where(pool_valid[:, None], scores, -jnp.inf)
+            # Candidate groups are over compacted valid tokens, not necessarily
+            # consecutive physical rows. Gather the target keys into that exact
+            # group order before asking the shared op to sum token mass per pool.
+            indices = jnp.maximum(members.reshape(members.shape[0], -1), 0)
+            entries = jnp.take_along_axis(attention_key, indices[..., None, None], axis=1).transpose(0, 2, 1, 3)
+            entry_positions = jnp.take_along_axis(token_positions, indices, axis=1)
+            entry_segments = jnp.take_along_axis(key_segment_ids, indices, axis=1)
+            entry_valid = jnp.repeat(pool_valid, kpool, axis=-1)
+            loss = indexer_distillation_loss(
+                target_query[:, :, None, :],
+                entries,
+                scores,
+                scaling=scaling,
+                sinks=sinks,
+                entry_group=kpool,
+                entry_valid=entry_valid,
+                q_positions=position[:, None],
+                entry_positions=entry_positions,
+                q_segment_ids=jnp.take_along_axis(query_segment_ids, position[:, None], axis=1),
+                entry_segment_ids=entry_segments,
+                precision=self.precision,
+                block_q=1,
+            )
+            count = jnp.sum(jnp.any(pool_valid, axis=-1), dtype=jnp.float32)
+            return loss * count, count
+
+        sums, counts = jax.lax.map(
+            query_loss,
+            tuple(jnp.swapaxes(x, 0, 1) for x in (hidden_states, query, attention_query, visibility, token_positions)),
+        )
+        return jnp.sum(sums) / jnp.maximum(jnp.sum(counts), 1.0)
+
 
 class Glm5NextDSAAttention(UnifiedAttention):
     """Multi-head Latent Attention (NoPE) with k-pool DSA sparse gating.
@@ -1319,9 +1481,10 @@ class Glm5NextDSAAttention(UnifiedAttention):
     to the selected ``index_topk`` (+ tail pool) tokens by ANDing a
     scatter mask into the pairwise ``mask_info`` attention mask.
 
-    Cache: full-attention KV pages via ``UnifiedAttention.concatenate``; the
-    indexer's packed per-token states ride the same view's
-    ``recurrent_state`` slot (unused by full-attention layers).
+    Cache: full-attention KV pages via ``UnifiedAttention.concatenate``;
+    ordinary transformer views keep packed per-token indexer features in
+    position-aligned ``auxiliary_state``. Legacy recurrent-state views and
+    paged serving retain their existing storage contracts.
 
     The ``projection_mapping`` class variable rewrites attribute names into
     HF-checkpoint-compatible names (``q_a_proj``, ``kv_a_proj_with_mqa``,
@@ -1563,8 +1726,8 @@ class Glm5NextDSAAttention(UnifiedAttention):
 
         Returns:
             :class:`AttentionLayerOutput` with the attention output, optional
-            weights, and the updated cache view (with the indexer packed
-            states re-stashed in ``recurrent_state``).
+            weights, and the updated cache view with position-aligned
+            persistent indexer features.
         """
         del position_ids, frequencies, alibi
         bsz, q_len, _ = hidden_states.shape
@@ -1600,12 +1763,16 @@ class Glm5NextDSAAttention(UnifiedAttention):
             ):
                 cached_packed_states = maybe_cached
 
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info, input_ids=None, inputs_embeds=hidden_states, attention_mask=None
+        )
         q_mask = None
-        if mask_info is not None:
+        if mask_info is not None and not isinstance(cache_view, TransformerCacheView):
             q_mask = typing.cast("Array | None", mask_info.q_attention_mask)
-            if q_mask is not None and q_mask.shape[1] != q_len:
-                q_mask = q_mask[:, :q_len]
-            q_mask = q_mask.astype(bool)
+            if q_mask is not None:
+                if q_mask.shape[1] != q_len:
+                    q_mask = q_mask[:, :q_len]
+                q_mask = q_mask.astype(bool)
 
         # Ragged serving with paged indexer state: selections are chunk (pool) ids over the
         # real per-request history and attention runs through the sparse MLA op.
@@ -1622,6 +1789,8 @@ class Glm5NextDSAAttention(UnifiedAttention):
         )
 
         shared_indexer = self.config.indexer_types[self.layer_idx] == "shared"
+        aux_active = cache_view is None and not shared_indexer and self.config.indexer_aux_loss_coef > 0.0
+        indexer_aux_loss = None
         if shared_indexer:
             if previous_topk_indices is None:
                 raise ValueError("A shared GLM-5 indexer requires a preceding full layer's top-k selection.")
@@ -1649,14 +1818,83 @@ class Glm5NextDSAAttention(UnifiedAttention):
             )
             cache_view = cache_view.replace(indexer_token_pages=token_pages, indexer_pool_pages=pool_pages)
             indexer_out = None
+        elif isinstance(cache_view, TransformerCacheView):
+            # Query validity must follow the owning cache's selected query rows,
+            # not the prefix of a full-history mask. Let the cache resolve
+            # per-row insertion offsets (including metadata overrides), padding
+            # and sliding coordinates before packing current indexer features.
+            _, current_index_mask, _ = cache_view.update_auxiliary(
+                jnp.zeros((bsz, q_len, self.indexer.packed_state_dim), dtype=jnp.float32),
+                mask_info,
+                cache_metadata,
+                causal=self.causal,
+                mode=mode,
+                runtime_sharding_resolver=self.config.runtime_sharding_resolver,
+            )
+            q_mask = jnp.any(current_index_mask.get_or_compute_attention_mask(dtype=jnp.bool_), axis=(1, 3))
+            index_query, current_packed = self.indexer.project_state(
+                hidden_states, q_resid=q_resid, attention_mask=q_mask
+            )
+            # Keep indexer features in exactly the same physical layout as KV,
+            # including per-row offsets, postpadding and sliding block tails.
+            packed_states, index_mask, cache_view = cache_view.update_auxiliary(
+                current_packed,
+                mask_info,
+                cache_metadata,
+                causal=self.causal,
+                mode=mode,
+                runtime_sharding_resolver=self.config.runtime_sharding_resolver,
+            )
+            query_segments, key_segments = index_mask.get_or_compute_segment_ids()
+            indexer_out = self.indexer.select_from_state(
+                hidden_states,
+                index_query,
+                packed_states,
+                attention_mask=q_mask,
+                pairwise_mask=index_mask.get_or_compute_attention_mask(dtype=jnp.bool_),
+                query_positions=index_mask.q_positions,
+                key_positions=index_mask.kv_positions,
+                segment_ids=query_segments,
+                key_segment_ids=key_segments,
+            )
+            topk_indices = indexer_out.topk_indices
         else:
+            pairwise_mask = (
+                pairwise_attention_mask_from_mask_info(mask_info, q_len, q_len) if cached_packed_states is None else None
+            )
+            query_segments, key_segments = (
+                _pool_indexer_segment_ids(mask_info, pairwise_mask) if cached_packed_states is None else (None, None)
+            )
             indexer_out = self.indexer(
-                hidden_states=hidden_states,
-                q_resid=q_resid,
+                hidden_states=jax.lax.stop_gradient(hidden_states) if aux_active else hidden_states,
+                q_resid=jax.lax.stop_gradient(q_resid) if aux_active else q_resid,
                 attention_mask=q_mask,
                 cached_packed=cached_packed_states,
+                pairwise_mask=pairwise_mask,
+                segment_ids=query_segments,
+                key_segment_ids=key_segments,
             )
             topk_indices, packed_states = indexer_out.topk_indices, indexer_out.packed_state
+            if aux_active:
+                positions = jnp.arange(q_len)
+                visible = jnp.broadcast_to(positions[None, None, :] <= positions[None, :, None], (bsz, q_len, q_len))
+                if pairwise_mask is not None:
+                    visible = visible & pairwise_mask
+                if q_mask is not None:
+                    visible = visible & q_mask[:, :, None] & q_mask[:, None, :]
+                visible = visible & (query_segments[:, :, None] == key_segments[:, None, :])
+                visible = visible & (query_segments[:, :, None] >= 0) & (key_segments[:, None, :] >= 0)
+                indexer_aux_loss = self.indexer.distillation_loss(
+                    hidden_states,
+                    q_resid,
+                    query_states,
+                    key_states,
+                    visible,
+                    query_segments,
+                    key_segments,
+                    scaling=self.attention_performer.softmax_scale,
+                    sinks=self._softmax_aux(),
+                )
 
             if has_recurrent_slot and hasattr(cache_view, "replace"):
                 try:
@@ -1751,24 +1989,40 @@ class Glm5NextDSAAttention(UnifiedAttention):
             # the packed window (garbage mask). Restrict the mask build to
             # dense (non-ragged) cache consumers, which do honor mask_info.
             kv_len = key_states.shape[1]
-            if q_len == kv_len or cached_packed_states is not None or shared_indexer:
-                selection = IndexerSelection(topk_indices) if shared_indexer else indexer_out.selection
-                topk_mask = selection.to_mask(kv_len)
-                attention_mask = (
-                    pairwise_attention_mask_from_mask_info(mask_info, q_len, kv_len) if mask_info is not None else None
-                )
-                combined_mask = topk_mask if attention_mask is None else attention_mask & topk_mask
-                if attention_mask is not None:
-                    mask_info = mask_info.replace(attention_mask=combined_mask[:, None, :, :])
+            selection = IndexerSelection(topk_indices) if shared_indexer else indexer_out.selection
+            topk_mask = selection.to_mask(kv_len)
+            attention_mask = pairwise_attention_mask_from_mask_info(mask_info, q_len, kv_len)
+            combined_mask = topk_mask if attention_mask is None else attention_mask & topk_mask
+            # Pool selection already enforces causality in the aligned cache's
+            # absolute positions (also for selections reused by shared layers).
+            # An absolute history mask need not carry the cache's baked-causal
+            # flag: passing causal=True would then add a chunk-relative triangle
+            # and incorrectly hide live historical keys in continuation blocks.
+            mask_info = mask_info.replace(
+                attention_mask=combined_mask[:, None, :, :],
+                causal_mask_baked_in=mask_info.causal_mask_baked_in or self.causal,
+            )
+            causal_for_kernel = False
 
-        if combined_mask is not None and use_sparse_training_attention(
-            self,
-            topk_indices,
-            cache_view,
-            mask_info,
-            output_attentions,
-            sliding_window_for_kernel,
-            seq_len=q_len,
+        # The sparse training operation has no dropout/RNG contract. Match the
+        # dispatcher's effective training state before allowing that fast path.
+        deterministic = self.attention_performer.deterministic
+        if deterministic is None:
+            deterministic = mode != common_types.MODE_TRAIN or not self.attention_performer.training
+        attention_dropout_active = not deterministic and self.attention_performer.dropout_prob > 0.0
+        if (
+            combined_mask is not None
+            and not attention_dropout_active
+            and use_sparse_training_attention(
+                topk_indices=topk_indices,
+                cache_view=cache_view,
+                mask_info=mask_info,
+                output_attentions=output_attentions,
+                sliding_window=sliding_window_for_kernel,
+                softmax_aux=self.get_softmax_aux(),
+                sparse_training=getattr(self.config, "dsa_sparse_training", None),
+                seq_len=q_len,
+            )
         ):
             # Training/no-cache: same per-head q/k/v and top-k mask as the dense path, but a
             # tile-skipping flash kernel instead of materialized [B, H, S, S] masked scores.
@@ -1787,7 +2041,12 @@ class Glm5NextDSAAttention(UnifiedAttention):
             attn_output = attn_heads.astype(hidden_states.dtype).reshape(bsz, q_len, -1)
             attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
             attn_output = self.shard_attention_prod(attn_output)
-            result = AttentionLayerOutput(attention_output=attn_output, attention_weight=None, cache_view=cache_view)
+            result = _Glm5NextAttentionOutput(
+                attention_output=attn_output,
+                attention_weight=None,
+                cache_view=cache_view,
+                indexer_aux_loss=indexer_aux_loss,
+            )
             return (result, topk_indices) if return_topk_indices else result
 
         softmax_aux = self._softmax_aux()
@@ -1805,6 +2064,7 @@ class Glm5NextDSAAttention(UnifiedAttention):
             causal=causal_for_kernel,
             sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
+            output_attentions=output_attentions,
             **mla_kwargs,
         )
 
@@ -1831,10 +2091,11 @@ class Glm5NextDSAAttention(UnifiedAttention):
         attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
         attn_output = self.shard_attention_prod(attn_output)
 
-        result = AttentionLayerOutput(
+        result = _Glm5NextAttentionOutput(
             attention_output=attn_output,
             attention_weight=attentions.attention_weights if output_attentions else None,
             cache_view=cache_view,
+            indexer_aux_loss=indexer_aux_loss,
         )
         return (result, topk_indices) if return_topk_indices else result
 
@@ -2078,17 +2339,27 @@ class Glm5NextDecoderLayer(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        result = DecoderLayerOutput(
+        result = _Glm5NextDecoderOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
             cache_view=attn_outputs.cache_view,
             router_logits=router_logits,
+            indexer_aux_loss=getattr(attn_outputs, "indexer_aux_loss", None),
         )
         return (result, topk_indices) if return_topk_indices else result
 
 
+class _Glm5NextIndexerCacheMixin:
+    """Preallocate pooled indexer features alongside ordinary MLA KV storage."""
+
+    def create_transformer_cache_config(self, batch_size, max_length, pad_token_id=None, layer_idx=None):
+        """Keep standard cache geometry and request float32 pooled features."""
+        config = super().create_transformer_cache_config(batch_size, max_length, pad_token_id, layer_idx)
+        return config.replace(auxiliary_dim=2 * self.config.get_text_config().index_head_dim + 1)
+
+
 @register_module(TaskType.BASE_MODULE, config=Glm5NextTextConfig, model_type="glm5_next_text")
-class Glm5NextTextModel(EasyDeLBaseModule):
+class Glm5NextTextModel(_Glm5NextIndexerCacheMixin, EasyDeLBaseModule):
     """GLM-5-Next text backbone (no language-model head).
 
     Embeds tokens, broadcasts the embedding to ``hc_mult`` mHC residual
@@ -2290,9 +2561,9 @@ class Glm5NextTextModel(EasyDeLBaseModule):
         def _layer_loop(block, carry):
             """Run one heterogeneous decoder layer inside the stack loop.
 
-            Threads ``(streams, cache_views, all_hidden_states,
-            all_attentions, all_router_logits, layer_index)`` through the
-            Python-traced loop.
+            Threads streams, cache views, collected outputs, layer index,
+            the previous selection and the unscaled per-layer indexer loss sum
+            through the Python-traced loop.
 
             Args:
                 block: The decoder layer module.
@@ -2301,10 +2572,7 @@ class Glm5NextTextModel(EasyDeLBaseModule):
             Returns:
                 Updated carry ``(streams, cache_views, ..., idx + 1)``.
             """
-            if has_shared_indexers:
-                hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx, prev_topk = carry
-            else:
-                hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
+            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx, prev_topk, indexer_aux = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -2339,14 +2607,23 @@ class Glm5NextTextModel(EasyDeLBaseModule):
                 cache=past_key_values,
             )
 
-            result = (hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1)
-            return (*result, prev_topk) if has_shared_indexers else result
+            layer_aux = layer_outputs.indexer_aux_loss
+            if layer_aux is not None:
+                indexer_aux = layer_aux if indexer_aux is None else indexer_aux + layer_aux
+            return (
+                hidden_states,
+                cv,
+                all_hidden_states,
+                all_attentions,
+                all_router_logits,
+                idx + 1,
+                prev_topk,
+                indexer_aux,
+            )
 
-        initial = (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0)
-        if has_shared_indexers:
-            initial = (*initial, None)
+        initial = (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0, None, None)
         final = self.layers.scan(_layer_loop, initial, trace=trace_layers)
-        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = final[:6]
+        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _, _, indexer_aux_loss = final
 
         # Unweighted mean over mHC streams, then final norm.
         hidden_states = self.norm(_hc_head_collapse(hidden_states))
@@ -2360,6 +2637,7 @@ class Glm5NextTextModel(EasyDeLBaseModule):
             attentions=all_attentions,
             router_logits=all_router_logits,
             past_key_values=past_key_values,
+            indexer_aux_loss=indexer_aux_loss,
         )
 
 
@@ -2377,7 +2655,7 @@ GLM5_NEXT_KEY_RULES = KeyRuleSet(
 
 
 @register_module(TaskType.CAUSAL_LM, config=Glm5NextTextConfig, model_type="glm5_next_text")
-class Glm5NextForCausalLM(BaseCausalLMModule[Glm5NextTextModel, Glm5NextTextConfig]):  # type: ignore
+class Glm5NextForCausalLM(_Glm5NextIndexerCacheMixin, BaseCausalLMModule[Glm5NextTextModel, Glm5NextTextConfig]):  # type: ignore
     """GLM-5-Next model with a causal language-modelling head.
 
     Wraps :class:`Glm5NextTextModel` and adds a bias-free LM head projecting

@@ -250,10 +250,8 @@ class StableLmAttention(UnifiedAttention):
             layer_idx (int): Index of this layer in the model.
         """
         self.qk_layernorm = config.qk_layernorm
-        self.partial_rotary_factor = config.partial_rotary_factor
 
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.rotary_emb_dim = int(config.partial_rotary_factor * self.head_dim)
 
         super().__init__(
             config,
@@ -818,6 +816,9 @@ class StableLmModel(EasyDeLBaseModule):
             extra=needs_trace_cache,
         )
         cache_views = views if trace_layers else None
+        # Hoisted out of the scan body: the caching property must not be first
+        # materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
 
         def _run_layer(block, carry):
             """Apply a single decoder layer inside the layer-stack scan.
@@ -839,7 +840,7 @@ class StableLmModel(EasyDeLBaseModule):
                     cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
-                    frequencies=self.frequencies,
+                    frequencies=frequencies,
                 )
             hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
             cv = self._layer_cache_view_update(

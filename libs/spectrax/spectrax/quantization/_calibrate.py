@@ -25,6 +25,10 @@ Supported calibration methods, spelled ``<method>[,<arg>...]``:
 ``minmax[,scale]``
     Asymmetric, ranged on the true minimum and maximum, with the range
     forced to contain zero so that zero stays exactly representable.
+``affine``
+    Exact affine grid from each tile's true minimum and maximum, without
+    expanding the range to contain zero. Uses unsigned integer codes and an
+    unrounded floating-point zero point. A constant tile uses scale one.
 ``rms,scale``
     Symmetric, ranged on the root-mean-square times a required factor.
     Far more robust to outliers than absmax; the factor sets how many
@@ -39,8 +43,10 @@ Ported from Google's Qwix (``qwix._src.core.qarray``, Apache-2.0).
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Collection, Mapping
 
+import jax
 import jax.numpy as jnp
 
 from ..core._typing import Array
@@ -61,7 +67,13 @@ __all__ = [
 
 
 Calibration = dict[str, Array]
-"""Per-tile statistics: ``{"absmax": ...}`` or ``{"min": ..., "max": ...}``."""
+"""Per-tile statistics.
+
+Symmetric methods return ``absmax``; minmax returns ``min`` and ``max``.
+Exact affine returns ``affine_neg_min`` and ``affine_max``. Storing the
+negated minimum makes a tree-wide maximum collective correctly combine
+both affine extrema across shards.
+"""
 
 
 @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
@@ -143,8 +155,9 @@ def calibrate(array: Array, how: HowToQuantize) -> Calibration:
 
     Returns:
         ``{"absmax": ...}`` for symmetric methods, or
-        ``{"min": ..., "max": ...}`` for asymmetric ones. Every value has
-        the shape returned by :func:`scale_shape`.
+        ``{"min": ..., "max": ...}`` for minmax, or ``{"affine_neg_min":
+        ..., "affine_max": ...}`` for exact affine. Every value has the
+        shape returned by :func:`scale_shape`.
 
     Raises:
         ValueError: If the method string is unknown, if ``rms`` is used
@@ -171,6 +184,15 @@ def calibrate(array: Array, how: HowToQuantize) -> Calibration:
         if args:
             absmax = absmax * args[0]
         return {"absmax": absmax.reshape(target)}
+
+    if method == "affine":
+        if args:
+            raise ValueError("The 'affine' calibration method takes no arguments.")
+        # Validate the integer grid without importing any deployment framework.
+        numerics.asymmetric_bound(how.qtype)
+        low = jnp.min(split, axis=reduce_axes, keepdims=True)
+        high = jnp.max(split, axis=reduce_axes, keepdims=True)
+        return {"affine_neg_min": -low.reshape(target), "affine_max": high.reshape(target)}
 
     if method == "minmax":
         low = jnp.min(split, axis=reduce_axes, keepdims=True)
@@ -202,9 +224,70 @@ def calibrate(array: Array, how: HowToQuantize) -> Calibration:
         return {"min": jnp.full(per_tensor, low, array.dtype), "max": jnp.full(per_tensor, high, array.dtype)}
 
     raise ValueError(
-        f"Unknown calibration method {how.calibration_method!r}. Supported: absmax[,scale], minmax[,scale], "
+        f"Unknown calibration method {how.calibration_method!r}. Supported: absmax[,scale], minmax[,scale], affine, "
         "rms,scale, fixed[,min],max."
     )
+
+
+def calibrate_across_axis(
+    array: Array, how: HowToQuantize, axis_name: str | tuple[str, ...] | None, *, array_axis: int
+) -> Calibration:
+    """Calibrate global contraction tiles without gathering the operand.
+
+    Complete tiles local to a shard remain independent. A tile crossing a
+    shard boundary combines statistics only from pieces of that global tile,
+    including when a boundary cuts a tile at a non-integral tile offset.
+
+    Args:
+        array: Rank-local operand.
+        how: Quantization slicing and calibration settings.
+        axis_name: Mesh axis (or ordered axes) partitioning ``array_axis``.
+            ``None`` performs ordinary local calibration.
+        array_axis: Operand axis partitioned over ``axis_name``.
+
+    Returns:
+        Statistics broadcastable to the local operand, on the global grid.
+    """
+    if axis_name is None or array_axis in how.channelwise_axes:
+        return calibrate(array, how)
+    method = how.calibration_method.lower().split(",")[0]
+    if method == "fixed":
+        return calibrate(array, dataclasses.replace(how, tiled_axes={}))
+    if array_axis in how.tiled_axes:
+        local_size = array.shape[array_axis]
+        global_size = local_size * jax.lax.axis_size(axis_name)
+        tile_size = resolve_tile_size(global_size, how.tiled_axes[array_axis])
+        how = dataclasses.replace(how, tiled_axes={**how.tiled_axes, array_axis: tile_size})
+        if local_size % tile_size == 0:
+            return calibrate(array, how)
+        piece_size = math.gcd(local_size, tile_size)
+        piece_how = dataclasses.replace(how, tiled_axes={**how.tiled_axes, array_axis: piece_size})
+        calibration = calibrate(array, piece_how)
+        pieces_per_tile = tile_size // piece_size
+        local_pieces = local_size // piece_size
+        tile_ids = (jax.lax.axis_index(axis_name) * local_pieces + jnp.arange(local_pieces)) // pieces_per_tile
+        for key, value in calibration.items():
+            pieces = jax.lax.all_gather(value, axis_name, axis=array_axis, tiled=True)
+            shape = (
+                *pieces.shape[:array_axis],
+                global_size // tile_size,
+                pieces_per_tile,
+                *pieces.shape[array_axis + 1 :],
+            )
+            pieces = pieces.reshape(shape)
+            if method == "rms":
+                combined = jnp.sqrt(jnp.mean(jnp.square(pieces), axis=array_axis + 1))
+            else:
+                combined = (jnp.min if key == "min" else jnp.max)(pieces, axis=array_axis + 1)
+            calibration[key] = jnp.take(combined, tile_ids, axis=array_axis)
+        return calibration
+    calibration = calibrate(array, how)
+    for key, value in calibration.items():
+        if method == "rms":
+            calibration[key] = jnp.sqrt(jax.lax.pmean(jnp.square(value), axis_name))
+        else:
+            calibration[key] = (jax.lax.pmin if key == "min" else jax.lax.pmax)(value, axis_name)
+    return calibration
 
 
 def _snap_up_to_power_of_two(scale: Array) -> Array:
@@ -241,15 +324,27 @@ def compute_scale_zero_point(
     Args:
         calibration: Statistics from :func:`calibrate`.
         qtype: The target quantized type.
+        power_of_two_scale: Round each scale up to a power of two.
 
     Returns:
         ``(scale, zero_point)``, where ``zero_point`` is ``None`` for
-        symmetric quantization.
+        symmetric quantization, integer-valued for minmax, or an unrounded
+        floating-point value for the unsigned exact-affine grid.
 
     Raises:
         ValueError: If the statistics dict has neither the symmetric nor
             the asymmetric key set.
     """
+    if "affine_neg_min" in calibration and "affine_max" in calibration:
+        qmin, qmax = numerics.asymmetric_bound(qtype)
+        scale = (calibration["affine_max"] + calibration["affine_neg_min"]) / (qmax - qmin)
+        scale = jnp.where(scale == 0, 1, scale)
+        if power_of_two_scale:
+            scale = _snap_up_to_power_of_two(scale)
+        # Use with exact_affine=True in quantize_with_scale_zero_point.
+        # Rounding/clipping this zero point would move shifted/constant tiles.
+        return scale, calibration["affine_neg_min"] / scale
+
     if "min" in calibration and "max" in calibration:
         qmin, qmax = numerics.asymmetric_bound(qtype)
         scale = (calibration["max"] - calibration["min"]) / (qmax - qmin)
@@ -275,6 +370,8 @@ def quantize_with_scale_zero_point(
     scale: Array,
     zero_point: Array | None = None,
     noise_fn: NoiseFn | None = None,
+    *,
+    exact_affine: bool = False,
 ) -> QArray:
     """Quantize ``array`` using a scale and zero point that are already known.
 
@@ -293,6 +390,10 @@ def quantize_with_scale_zero_point(
         scale: Per-tile scale, generic-broadcastable to ``array``.
         zero_point: Per-tile zero point for asymmetric quantization.
         noise_fn: Optional noise source enabling stochastic rounding.
+        exact_affine: Use unsigned codes with an unrounded floating zero
+            point, as returned by exact-affine calibration. Defaults to
+            ``False``: signed grid, including caller-supplied floating zero
+            points.
 
     Returns:
         The quantized array.
@@ -305,11 +406,25 @@ def quantize_with_scale_zero_point(
         raise ValueError(f"Refusing to quantize a {array.dtype} array; only bfloat16/float32/float64 are candidates.")
     if zero_point is not None and zero_point.shape != scale.shape:
         raise ValueError(f"zero_point shape {zero_point.shape} must match scale shape {scale.shape}.")
+    if exact_affine and (zero_point is None or not jnp.issubdtype(zero_point.dtype, jnp.floating)):
+        raise ValueError("Exact affine quantization requires an unrounded floating-point zero_point.")
 
     scale = scale.astype(array.dtype)
     qvalue = generic_broadcast_op(jnp.divide, array, scale)
     if zero_point is not None:
         qvalue = generic_broadcast_op(jnp.add, qvalue, zero_point.astype(qvalue.dtype))
+        if exact_affine:
+            qmin, qmax = numerics.asymmetric_bound(qtype)
+            if noise_fn is not None:
+                qvalue = qvalue.astype(jnp.float32) + noise_fn(qvalue.shape)
+            bits = numerics.qtype_bits(qtype)
+            storage = jnp.uint4 if bits <= 4 else jnp.uint8
+            return QArray(
+                qvalue=jnp.round(qvalue).clip(0, qmax - qmin).astype(storage),
+                scale=scale,
+                zero_point=zero_point,
+                qtype=qtype,
+            )
     return QArray(
         qvalue=numerics.convert_to(qvalue, qtype, noise_fn),
         scale=scale,
@@ -332,7 +447,9 @@ def quantize(array: Array, how: HowToQuantize) -> QArray:
     """
     calibration = calibrate(array, how)
     scale, zero_point = compute_scale_zero_point(calibration, how.qtype, power_of_two_scale=how.power_of_two_scale)
-    return quantize_with_scale_zero_point(array, how.qtype, scale, zero_point, how.noise_fn)
+    return quantize_with_scale_zero_point(
+        array, how.qtype, scale, zero_point, how.noise_fn, exact_affine="affine_neg_min" in calibration
+    )
 
 
 def dequantize(array: QArray) -> Array:
@@ -344,7 +461,15 @@ def dequantize(array: QArray) -> Array:
     Returns:
         ``(qvalue - zero_point) * scale``, in the scale's dtype.
     """
-    qvalue = numerics.convert_from(array.qvalue, array.qtype).astype(array.scale.dtype)
+    # Reconstruct exact affine in at least fp32, even with bf16 metadata:
+    # rounding a fractional zero-point subtraction before scaling moves the grid.
+    exact_affine = (
+        array.zero_point is not None
+        and jnp.issubdtype(array.zero_point.dtype, jnp.floating)
+        and jnp.issubdtype(array.qvalue.dtype, jnp.unsignedinteger)
+    )
+    compute_dtype = jnp.promote_types(array.scale.dtype, jnp.float32) if exact_affine else array.scale.dtype
+    qvalue = numerics.convert_from(array.qvalue, array.qtype).astype(compute_dtype)
     if array.zero_point is not None:
         qvalue = generic_broadcast_op(jnp.subtract, qvalue, array.zero_point.astype(qvalue.dtype))
-    return generic_broadcast_op(jnp.multiply, qvalue, array.scale)
+    return generic_broadcast_op(jnp.multiply, qvalue, array.scale.astype(compute_dtype)).astype(array.scale.dtype)

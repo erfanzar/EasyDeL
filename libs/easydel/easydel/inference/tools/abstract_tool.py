@@ -49,17 +49,20 @@ See Also:
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
 import os
-import sys
 from collections.abc import Callable, Sequence
 from functools import cached_property
-from typing import Literal, TypeAlias, assert_never
+from typing import Literal, TypeAlias
 
+from eformer.loggings import get_logger
 from transformers import AutoTokenizer as AnyTokenizer
 
+from easydel.utils._parser_utils import import_from_path as _import_from_path
+from easydel.utils._parser_utils import is_list_of as _is_list_of
+
 from ..openai_api_modules import ChatCompletionRequest, DeltaMessage, ExtractedToolCallInformation
+
+logger = get_logger(__name__)
 
 ToolParserName: TypeAlias = Literal[
     "glm47",
@@ -736,7 +739,7 @@ class ToolParserManager:
         Note:
             - The parser class(es) in the file should use @register_module
               decorator or call register_module during module initialization.
-            - If loading fails, a message is printed but no exception is raised.
+            - If loading fails, the exception is logged with its traceback but not raised.
             - The module is registered in sys.modules under its filename
               (without extension).
         """
@@ -745,7 +748,7 @@ class ToolParserManager:
         try:
             import_from_path(module_name, plugin_path)
         except Exception:
-            print("Failed to load module '%s' from %s.", module_name, plugin_path)
+            logger.exception("Failed to load module '%s' from %s.", module_name, plugin_path)
             return
 
 
@@ -784,16 +787,7 @@ def import_from_path(module_name: str, file_path: str | os.PathLike):
         This implementation is based on the official Python importlib recipe:
         https://docs.python.org/3/library/importlib.html#importing-a-source-file-directly
     """
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    if spec is None:
-        raise ModuleNotFoundError(f"No module named '{module_name}'")
-
-    assert spec.loader is not None
-
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+    return _import_from_path(module_name, file_path)
 
 
 def is_list_of(value: object, typ, *, check: Literal["first", "all"] = "first") -> bool:
@@ -834,12 +828,4 @@ def is_list_of(value: object, typ, *, check: Literal["first", "all"] = "first") 
         The "first" mode is suitable when you expect homogeneous lists and
         want better performance. Use "all" when strict validation is required.
     """
-    if not isinstance(value, list):
-        return False
-
-    if check == "first":
-        return len(value) == 0 or isinstance(value[0], typ)
-    elif check == "all":
-        return all(isinstance(v, typ) for v in value)
-
-    assert_never(check)
+    return _is_list_of(value, typ, check=check)

@@ -59,10 +59,11 @@ import time
 from .metrics import MetricsCollector, get_metrics_collector
 
 try:
-    from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server
+    from prometheus_client import REGISTRY, Counter, Gauge, Histogram, Info, start_http_server
 
     _prometheus_available = True
 except ImportError:
+    REGISTRY = None
     Counter = None
     Gauge = None
     Histogram = None
@@ -208,58 +209,99 @@ class PrometheusMetrics:
         self.cache_hit_rate = Gauge(f"{prefix}cache_hit_rate", "Cache hit rate (0-1)")
 
         self.system_info = Info(f"{prefix}system_info", "System information")
+        self.system_info.info(self._collect_system_info())
+
+        # Every collector registered in the default registry, so ``close`` can
+        # release the metric names and a later instance can register them again.
+        self._collectors = [
+            value for value in vars(self).values() if isinstance(value, (Counter, Gauge, Histogram, Info))
+        ]
 
         # Monotonic cursor: total requests seen so far (completed + failed).
         # Used to process only new completions from the deque without
         # double-counting, even after the deque wraps around.
         self._completions_cursor: int = 0
-        # Track the id() of the last deque entry we observed for
-        # scheduler and runner metrics to avoid re-observing the same
-        # object.  Using object identity is safe because the deque holds
-        # dataclass instances that are never replaced in-place.
-        self._last_scheduler_id: int = 0
-        self._last_runner_id: int = 0
+        # Keep the actual cursor objects alive across bounded-deque eviction;
+        # an integer id alone can be recycled for a genuinely new snapshot.
+        self._last_scheduler_entry = None
+        self._last_runner_entry = None
 
     @staticmethod
-    def _observe_new_entries(deque, cursor_id: int, observe_fn) -> int:
-        """Observe deque entries added after the cursor, return new cursor id.
-
-        Uses a single pass: if the cursor is found, only entries after it are
-        observed. If the cursor was evicted (not found), all entries collected
-        during the scan are observed.
-
-        Args:
-            deque: Bounded deque holding the metrics records to scan.
-            cursor_id: ``id()`` of the last observed entry, or ``0`` to
-                observe everything in the deque on the first call.
-            observe_fn: Callable invoked once per new entry (e.g. to
-                update a Prometheus histogram).
+    def _collect_system_info() -> dict[str, str]:
+        """Collect string-valued system metadata for the ``system_info`` metric.
 
         Returns:
-            The ``id()`` of the deque's last entry, suitable to be passed
-            back as ``cursor_id`` on the next call. Returns ``0`` when
-            the deque is empty.
+            Mapping of label name to string value (Python/JAX versions and, when
+            the JAX backend is available, backend name and device counts).
+        """
+        import platform
+
+        import jax
+
+        info = {
+            "python_version": platform.python_version(),
+            "jax_version": str(jax.__version__),
+        }
+        try:
+            info["jax_backend"] = str(jax.default_backend())
+            info["device_count"] = str(jax.device_count())
+            info["process_count"] = str(jax.process_count())
+        except Exception:
+            pass
+        return info
+
+    def close(self) -> None:
+        """Unregister every collector from the default Prometheus registry.
+
+        After ``close`` the metric names are free again, so a new
+        :class:`PrometheusMetrics` with the same prefix can be created (for
+        example when monitoring is stopped and started again). Idempotent.
+        """
+        for collector in self._collectors:
+            try:
+                REGISTRY.unregister(collector)
+            except KeyError:
+                pass
+        self._collectors = []
+
+    @staticmethod
+    def _observe_new_entries(deque, cursor, observe_fn):
+        """Observe entries after a retained object cursor, or all if evicted.
+
+        Args:
+            deque: Bounded deque of immutable metrics snapshots.
+            cursor: Last observed snapshot, or ``None`` on the first call.
+            observe_fn: Callable invoked once per newly retained snapshot.
+
+        Returns:
+            The last snapshot itself, keeping its identity alive until the
+            next poll, or ``None`` for an empty deque.
         """
         if not deque:
-            return 0
-        if cursor_id == 0:
-            for item in deque:
-                observe_fn(item)
-            return id(deque[-1])
+            return None
         pending = []
         found = False
         for item in deque:
             if found:
                 observe_fn(item)
-            elif id(item) == cursor_id:
-                found = True  # skip this one, observe the rest
+            elif item is cursor:
+                found = True
             else:
                 pending.append(item)
         if not found:
-            # Cursor was evicted — observe everything we skipped
             for item in pending:
                 observe_fn(item)
-        return id(deque[-1])
+        return deque[-1]
+
+    def _observe_scheduler_entry(self, entry) -> None:
+        """Fold one new scheduler snapshot into the schedule histogram and preemption counter.
+
+        Args:
+            entry: A ``SchedulerMetrics`` record not yet observed.
+        """
+        self.schedule_duration.observe(entry.schedule_time)
+        if entry.num_preempted_requests > 0:
+            self.preempted_requests_total.inc(entry.num_preempted_requests)
 
     def update_from_metrics_collector(self, collector: MetricsCollector) -> None:
         """Update Prometheus metrics from the metrics collector.
@@ -320,19 +362,19 @@ class PrometheusMetrics:
                 self.waiting_requests.set(latest_scheduler.num_waiting_requests)
                 self.running_requests.set(latest_scheduler.num_running_requests)
                 self.scheduled_tokens.set(latest_scheduler.num_scheduled_tokens)
-                self._last_scheduler_id = self._observe_new_entries(
+                self._last_scheduler_entry = self._observe_new_entries(
                     collector.scheduler_metrics,
-                    self._last_scheduler_id,
-                    lambda sm: self.schedule_duration.observe(sm.schedule_time),
+                    self._last_scheduler_entry,
+                    self._observe_scheduler_entry,
                 )
 
             if collector.runner_metrics:
                 latest_runner = collector.runner_metrics[-1]
                 # Gauge: always set to latest
                 self.batch_size.set(latest_runner.batch_size)
-                self._last_runner_id = self._observe_new_entries(
+                self._last_runner_entry = self._observe_new_entries(
                     collector.runner_metrics,
-                    self._last_runner_id,
+                    self._last_runner_entry,
                     lambda rm: self.model_execution_duration.observe(rm.execution_time),
                 )
 
@@ -644,28 +686,33 @@ class eSurgeMonitoringServer:
         self.dashboard_port = dashboard_port
         self.update_interval = update_interval
 
+        self.metrics_prefix = metrics_prefix
         self.prometheus_metrics = None
         if PROMETHEUS_AVAILABLE:
             self.prometheus_metrics = PrometheusMetrics(metrics_prefix)
 
         self.running = False
         self._update_thread: threading.Thread | None = None
+        self._update_stop_event = threading.Event()
+        self._http_server = None
+        self._http_thread: threading.Thread | None = None
 
-    def _update_metrics_loop(self) -> None:
-        """Background thread to update Prometheus metrics.
+    def _update_metrics_loop(self, stop_event: threading.Event | None = None) -> None:
+        """Poll the collector until this updater's stop event is set.
 
-        Continuously polls the MetricsCollector and updates Prometheus
-        metrics at the configured interval.
+        Args:
+            stop_event: Per-start lifecycle event; defaults to the current event.
         """
-        while self.running:
+        if stop_event is None:
+            stop_event = self._update_stop_event
+        while not stop_event.is_set():
             try:
                 collector = get_metrics_collector()
                 if collector and self.prometheus_metrics:
                     self.prometheus_metrics.update_from_metrics_collector(collector)
-                time.sleep(self.update_interval)
             except Exception as e:
                 logging.error(f"Error updating metrics: {e}")
-                time.sleep(self.update_interval)
+            stop_event.wait(self.update_interval)
 
     def start_prometheus_server(self) -> None:
         """Start Prometheus metrics server.
@@ -676,7 +723,11 @@ class eSurgeMonitoringServer:
             logging.warning("Prometheus client not available, skipping Prometheus server")
             return
 
-        start_http_server(self.prometheus_port)
+        if self._http_server is not None:
+            return
+
+        # Keep the (server, thread) pair so ``stop`` can release the listening port.
+        self._http_server, self._http_thread = start_http_server(self.prometheus_port)
         logging.info(f"Prometheus metrics server started on port {self.prometheus_port}")
         logging.info(f"Metrics available at: http://localhost:{self.prometheus_port}/metrics")
 
@@ -689,35 +740,74 @@ class eSurgeMonitoringServer:
         if self.running:
             return
 
+        if self.prometheus_metrics is None and PROMETHEUS_AVAILABLE:
+            # ``stop`` released the previous metric set; build a fresh one on restart.
+            self.prometheus_metrics = PrometheusMetrics(self.metrics_prefix)
+
         self.running = True
 
-        self.start_prometheus_server()
-
-        self._update_thread = threading.Thread(target=self._update_metrics_loop, daemon=True)
-        self._update_thread.start()
+        try:
+            self.start_prometheus_server()
+            self._update_stop_event = threading.Event()
+            self._update_thread = threading.Thread(
+                target=self._update_metrics_loop, args=(self._update_stop_event,), daemon=True
+            )
+            self._update_thread.start()
+        except BaseException:
+            # Failed binds and updater startup must release metric names and
+            # any listener already opened, just like an ordinary stop.
+            self.stop()
+            raise
 
         logging.info("eSurge monitoring server started")
 
     def stop(self) -> None:
         """Stop the monitoring server.
 
-        Signals the update thread to stop and waits for it to finish.
+        Signals the update thread to stop and waits for it to finish, shuts
+        down the Prometheus HTTP listener (freeing its port) and unregisters
+        the metric set, so :meth:`start` can be called again on the same port.
         """
         self.running = False
+        self._update_stop_event.set()
         if self._update_thread:
-            self._update_thread.join(timeout=1.0)
+            if self._update_thread.is_alive():
+                self._update_thread.join(timeout=1.0)
+            self._update_thread = None
+
+        if self._http_server is not None:
+            try:
+                self._http_server.shutdown()
+                self._http_server.server_close()
+            except Exception:
+                logging.debug("Failed to shut down Prometheus HTTP server", exc_info=True)
+            self._http_server = None
+        if self._http_thread is not None:
+            self._http_thread.join(timeout=1.0)
+            self._http_thread = None
+
+        if self.prometheus_metrics is not None:
+            self.prometheus_metrics.close()
+            self.prometheus_metrics = None
 
         logging.info("eSurge monitoring server stopped")
 
 
 _monitoring_server: eSurgeMonitoringServer | None = None
 _console_monitor: RichConsoleMonitor | None = None
+_monitoring_lock = threading.RLock()
+# Each successful start acquires one idempotent lease per owner. ``None`` is
+# the legacy process-wide owner; stack shutdown must not release that lease.
+_monitoring_server_owners: dict[int | None, object | None] = {}
+_console_monitor_owners: dict[int | None, object | None] = {}
 
 
 def start_monitoring_server(
     prometheus_port: int = 8000,
     dashboard_port: int | None = None,
     update_interval: float = 1.0,
+    *,
+    owner: object | None = None,
 ) -> eSurgeMonitoringServer:
     """Start the global monitoring server.
 
@@ -728,6 +818,9 @@ def start_monitoring_server(
         prometheus_port: Port for Prometheus metrics endpoint.
         dashboard_port: Deprecated; retained for compatibility (ignored).
         update_interval: Update interval in seconds.
+        owner: Optional identity acquiring a shared service lease. Release it
+            with ``stop_monitoring(owner=owner)``. Repeated starts by the same
+            owner are idempotent. ``None`` retains process-wide ownership.
 
     Returns:
         The eSurgeMonitoringServer instance.
@@ -738,18 +831,24 @@ def start_monitoring_server(
     """
     global _monitoring_server
 
-    if _monitoring_server is None:
-        _monitoring_server = eSurgeMonitoringServer(
-            prometheus_port=prometheus_port,
-            dashboard_port=dashboard_port,
-            update_interval=update_interval,
-        )
+    with _monitoring_lock:
+        if _monitoring_server is None:
+            server = eSurgeMonitoringServer(
+                prometheus_port=prometheus_port,
+                dashboard_port=dashboard_port,
+                update_interval=update_interval,
+            )
+            # Publish only after startup succeeds so a failed bind cannot pin the
+            # global service to an unusable port or configuration.
+            server.start()
+            _monitoring_server = server
+        else:
+            _monitoring_server.start()
+        _monitoring_server_owners[None if owner is None else id(owner)] = owner
+        return _monitoring_server
 
-    _monitoring_server.start()
-    return _monitoring_server
 
-
-def start_console_monitor(refresh_rate: float = 1.0) -> RichConsoleMonitor:
+def start_console_monitor(refresh_rate: float = 1.0, *, owner: object | None = None) -> RichConsoleMonitor:
     """Start the global console monitor.
 
     Creates and starts the console monitor singleton. Subsequent calls
@@ -757,6 +856,9 @@ def start_console_monitor(refresh_rate: float = 1.0) -> RichConsoleMonitor:
 
     Args:
         refresh_rate: Display refresh rate in seconds.
+        owner: Optional identity acquiring an idempotent shared service lease,
+            released with ``stop_monitoring(owner=owner)``. ``None`` retains
+            process-wide ownership.
 
     Returns:
         The RichConsoleMonitor instance.
@@ -767,18 +869,28 @@ def start_console_monitor(refresh_rate: float = 1.0) -> RichConsoleMonitor:
     """
     global _console_monitor
 
-    if _console_monitor is None:
-        _console_monitor = RichConsoleMonitor(refresh_rate=refresh_rate)
+    with _monitoring_lock:
+        if _console_monitor is None:
+            monitor = RichConsoleMonitor(refresh_rate=refresh_rate)
+            monitor.start()
+            _console_monitor = monitor
+        else:
+            _console_monitor.start()
+        _console_monitor_owners[None if owner is None else id(owner)] = owner
+        return _console_monitor
 
-    _console_monitor.start()
-    return _console_monitor
 
+def stop_monitoring(*, owner: object | None = None) -> None:
+    """Stop all monitoring services, or release only one owner's leases.
 
-def stop_monitoring() -> None:
-    """Stop all monitoring services.
+    With no owner, stops both services and clears the global instances
+    (process-wide cleanup). With an owner, releases only
+    that owner's leases; a service is stopped and cleared only when its last
+    lease is released. An owner that never started a service cannot stop it.
 
-    Stops both the monitoring server and console monitor if they are running,
-    and clears the global instances.
+    Args:
+        owner: Identity passed to the start functions, or ``None`` to stop all
+            services regardless of ownership.
 
     Example:
         >>> start_monitoring_server()
@@ -787,10 +899,21 @@ def stop_monitoring() -> None:
     """
     global _monitoring_server, _console_monitor
 
-    if _monitoring_server:
-        _monitoring_server.stop()
-        _monitoring_server = None
+    with _monitoring_lock:
+        owner_key = None if owner is None else id(owner)
+        stop_server = owner is None or owner_key in _monitoring_server_owners
+        stop_console = owner is None or owner_key in _console_monitor_owners
+        if owner is None:
+            _monitoring_server_owners.clear()
+            _console_monitor_owners.clear()
+        else:
+            _monitoring_server_owners.pop(owner_key, None)
+            _console_monitor_owners.pop(owner_key, None)
 
-    if _console_monitor:
-        _console_monitor.stop()
-        _console_monitor = None
+        if stop_server and not _monitoring_server_owners and _monitoring_server is not None:
+            _monitoring_server.stop()
+            _monitoring_server = None
+
+        if stop_console and not _console_monitor_owners and _console_monitor is not None:
+            _console_monitor.stop()
+            _console_monitor = None

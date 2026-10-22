@@ -62,7 +62,6 @@ from easydel.infra.mixins.bridge import TENSORSTORE_INDEX_NAME
 from easydel.layers import QuantizationConfig
 from easydel.typings import typed_config
 
-SAFETENSOR_INDEX_NAME = "tensorstore_index.json"
 MODEL_INDEX_NAME = "model_structure.json"
 
 
@@ -114,6 +113,7 @@ def _normalize_pretrained_loading(self) -> None:
         "checkpoint_load_tensorstore_metadata_workers": 256,
         "checkpoint_load_progress": None,
         "from_torch": None,
+        "subfolder": "",
     },
     post_init=_normalize_pretrained_loading,
 )
@@ -174,6 +174,7 @@ class PreTrainedLoading(TypedDict, total=False):
     local_files_only: NotRequired[bool]
     token: NotRequired[str | bool | None]
     revision: NotRequired[str]
+    subfolder: NotRequired[str]
 
     @classmethod
     def from_dict(
@@ -297,6 +298,8 @@ class BaseAutoEasyModel:
                 - ``local_files_only`` (bool): Disallow network access.
                 - ``token`` (str | bool | None): HF Hub auth token.
                 - ``revision`` (str): HF Hub revision/branch.
+                - ``subfolder`` (str): Checkpoint subdirectory, used for format
+                  detection and forwarded to either bridge loader. Defaults to ``""``.
 
         Returns:
             EasyDeLBaseModule: The loaded EasyDeL model module.
@@ -305,7 +308,15 @@ class BaseAutoEasyModel:
 
         if config.from_torch is None:
             try:
-                config.from_torch = not cls._is_easydel(config.pretrained_model_name_or_path)
+                config.from_torch = not cls._is_easydel(
+                    config.pretrained_model_name_or_path,
+                    subfolder=config.subfolder,
+                    **{
+                        name: config[name]
+                        for name in ("cache_dir", "force_download", "local_files_only", "token", "revision")
+                        if name in config
+                    },
+                )
             except OSError as e:
                 config.from_torch = "Error no file named easydel-model.parameters" in str(e)
 
@@ -417,17 +428,17 @@ class BaseAutoEasyModel:
         local_files_only: bool = False,
         token: str | bool | None = None,
         revision: str = "main",
+        subfolder: str = "",
     ):
         """Check whether the given path/identifier points to an EasyDeL checkpoint."""
         from transformers.utils import cached_file as _cached_file
 
         proxies = None
-        subfolder = ""
         commit_hash = None
         pretrained_model_name_or_path = str(pretrained_model_name_or_path)
         epath = ePath(pretrained_model_name_or_path)
         if epath.is_dir():
-            if (epath / subfolder / SAFETENSOR_INDEX_NAME).exists():
+            if (epath / subfolder / TENSORSTORE_INDEX_NAME).exists():
                 return True
             if (epath / subfolder / MODEL_INDEX_NAME).exists():
                 return True
@@ -619,6 +630,27 @@ class AutoStateForZeroShotImageClassification(BaseAutoEasyState):
     _base = AutoEasyDeLModelForZeroShotImageClassification
 
 
+class AutoEasyDeLModelForImageClassification(BaseAutoEasyModel):
+    """Auto loader for image-classification models.
+
+    Loads modules registered under ``TaskType.IMAGE_CLASSIFICATION`` (for
+    example the CLIP and SigLIP vision towers with a classification head),
+    which map pixel values to ``num_labels`` logits.
+    """
+
+    model_task: TaskType = TaskType.IMAGE_CLASSIFICATION
+
+
+class AutoStateForImageClassification(BaseAutoEasyState):
+    """Auto state factory for image-classification models.
+
+    Wraps :class:`AutoEasyDeLModelForImageClassification` to produce an
+    :class:`EasyDeLState`.
+    """
+
+    _base = AutoEasyDeLModelForImageClassification
+
+
 class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
     """Auto loader for speech sequence-to-sequence models.
 
@@ -789,12 +821,10 @@ class AutoEasyDeLAnyToAnyModel(BaseAutoEasyModel):
     model_task: TaskType = TaskType.ANY_TO_ANY
 
 
-class AutoStateAnyToAnyModel(BaseAutoEasyModel):
+class AutoStateAnyToAnyModel(BaseAutoEasyState):
     """Auto state factory for the generic ``ANY_TO_ANY`` task family.
 
-    Despite extending :class:`BaseAutoEasyModel` historically (rather than
-    :class:`BaseAutoEasyState`), this class is consumed in state-creation
-    flows; ``_base`` points at :class:`AutoEasyDeLAnyToAnyModel`.
+    Wraps :class:`AutoEasyDeLAnyToAnyModel` and produces an :class:`EasyDeLState`.
     """
 
     _base = AutoEasyDeLAnyToAnyModel

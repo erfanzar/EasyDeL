@@ -105,6 +105,8 @@ from __future__ import annotations
 
 import typing as tp
 
+from .collators import _as_list
+
 if tp.TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
 
@@ -119,9 +121,11 @@ def _row_embed_rows(row: dict) -> int:
 
     By the pack invariant this equals the row's ``<image>`` placeholder count and its decoded embed
     row count, so it is exactly what the materializer concatenates into the ``(max_embed_rows, H)``
-    buffer. Text-only rows have no ``embed_n_tok`` -> 0.
+    buffer. Text-only rows have no ``embed_n_tok`` (absent key, ``None`` value as written by parquet
+    text-only rows, or an empty list) -> 0. Uses the same None/ndarray-tolerant coercion as the
+    materializer in :mod:`easydel.data.transforms.collators` so both agree on the row contract.
     """
-    return int(sum(int(x) for x in row.get("embed_n_tok", [])))
+    return int(sum(int(x) for x in _as_list(row.get("embed_n_tok"))))
 
 
 class EmbedsWindowPacker:

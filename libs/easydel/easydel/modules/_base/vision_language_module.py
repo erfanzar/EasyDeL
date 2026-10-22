@@ -86,6 +86,7 @@ from easydel.caching import (
     TransformerMetadata,
 )
 from easydel.infra.modeling_outputs import VLMCausalLMOutput
+from easydel.layers.rotary import MultiModalRotaryEmbedding
 
 from ._base_task_module import ConfigT, ModelT
 from ._vlm_features import (
@@ -311,6 +312,7 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             rngs=rngs,
             tie_word_embeddings=tie_word_embeddings,
             logit_cap=logit_cap,
+            router_aux_loss_coef=router_aux_loss_coef,
             lm_head_name=lm_head_name,
             lm_head_bias=lm_head_bias,
             lm_head_kernel_init=lm_head_kernel_init,
@@ -341,14 +343,23 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             self._video_feature = None
 
         if self._uses_mrope:
+            rotary_modules = tuple(spx.iter_modules(self.base_model, with_path=False, select=MultiModalRotaryEmbedding))
+            # Families configure their own allocation, sometimes with different
+            # head widths. Keep it for the default section; a custom constructor
+            # allocation must reach the actual attention modules, not just this
+            # wrapper's position helper.
+            effective_section = mrope_section
+            if tuple(mrope_section) == (24, 20, 20) and rotary_modules:
+                effective_section = rotary_modules[0].mrope_section
             self._mrope_feature = MultiDimensionalRoPEFeature(
                 spatial_merge_size=spatial_merge_size,
-                mrope_section=mrope_section,
+                mrope_section=effective_section,
             )
+            if tuple(mrope_section) != (24, 20, 20):
+                for rotary in rotary_modules:
+                    self._mrope_feature.configure_rotary(rotary)
         else:
             self._mrope_feature = None
-
-        self._router_aux_loss_coef = router_aux_loss_coef
 
     def _clear_dynamic_language_stage_hints(self) -> None:
         """Let MPMD infer language-model ownership in multimodal schedules.
@@ -532,6 +543,66 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             "Override get_video_features() to add video support."
         )
 
+    def compute_video_grid(
+        self, num_frames: int, height: int, width: int, patch_size: int, spatial_merge_size: int | None = None
+    ) -> tuple[int, int, int]:
+        """Compute the token grid using this wrapper's temporal/spatial settings.
+
+        Args:
+            num_frames: Number of video frames.
+            height: Frame height in pixels.
+            width: Frame width in pixels.
+            patch_size: Vision patch size in pixels.
+            spatial_merge_size: Optional override of the configured spatial merge.
+
+        Returns:
+            Post-merge temporal, height and width token counts.
+
+        Raises:
+            NotImplementedError: If video support is disabled.
+        """
+        if self._video_feature is None:
+            raise NotImplementedError(f"{type(self).__name__} does not support video input.")
+        if spatial_merge_size is None:
+            spatial_merge_size = self._mrope_feature.spatial_merge_size if self._mrope_feature is not None else 1
+        return self._video_feature.compute_video_grid(num_frames, height, width, patch_size, spatial_merge_size)
+
+    def get_temporal_positions(self, video_grid_thw: Array, second_per_grid_ts: list[float] | None = None) -> Array:
+        """Return video token positions scaled by the configured tokens per second.
+
+        Args:
+            video_grid_thw: Post-merge temporal, height and width grids.
+            second_per_grid_ts: Optional seconds per temporal grid for each video.
+
+        Returns:
+            Flattened temporal positions for all video tokens.
+
+        Raises:
+            NotImplementedError: If video support is disabled.
+        """
+        if self._video_feature is None:
+            raise NotImplementedError(f"{type(self).__name__} does not support video input.")
+        return self._video_feature.get_temporal_positions(video_grid_thw, second_per_grid_ts)
+
+    def compute_vision_positions(self, grid_thw: tuple[int, int, int], start_position: int = 0):
+        """Return mRoPE positions for a raw vision grid using the configured merge.
+
+        Args:
+            grid_thw: Pre-merge temporal, height and width grid.
+            start_position: Offset added to each dimension.
+
+        Returns:
+            Temporal, height and width position arrays, one entry per merged token.
+
+        Raises:
+            NotImplementedError: If multi-dimensional RoPE is disabled.
+        """
+        if self._mrope_feature is None:
+            raise NotImplementedError(f"{type(self).__name__} does not use multi-dimensional RoPE.")
+        t, h, w = grid_thw
+        merge = self._mrope_feature.spatial_merge_size
+        return self._mrope_feature.compute_vision_positions((t, h // merge, w // merge), start_position)
+
     @staticmethod
     def merge_multimodal_embeddings(
         input_ids: Int[Array, "batch seq_len"],
@@ -655,44 +726,28 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         feature_layer: int | list[int] | None = None,
         select_strategy: str | None = None,
     ) -> Array:
-        """Select features from vision encoder hidden states.
-
-        Uses the VisionEncoderFeature helper to extract features from
-        specified layer(s) using the configured selection strategy.
+        """Select vision features, retaining the subclass extension interface.
 
         Args:
-            hidden_states: Tuple of hidden states from all vision encoder layers.
-                Each element has shape (batch_size, num_patches, hidden_size).
-            feature_layer: Override for which layer(s) to use.
-                If None, uses the layer specified during initialization.
-            select_strategy: Override for selection strategy.
-                If None, uses the strategy specified during initialization.
+            hidden_states: Hidden states from all vision encoder layers.
+            feature_layer: Optional override of the configured layer selection.
+            select_strategy: Optional override of the configured token selection.
 
         Returns:
-            Array: Selected vision features. Shape depends on strategy
-                and number of layers selected.
+            Selected features, with multiple layers concatenated when requested.
         """
         return self._vision_encoder_feature.extract_features(
-            hidden_states,
-            feature_layer=feature_layer,
-            select_strategy=select_strategy,
+            hidden_states, feature_layer=feature_layer, select_strategy=select_strategy
         )
 
-    def _get_multimodal_mask(
-        self,
-        input_ids: Int[Array, "batch seq_len"],
-    ) -> Array:
-        """Get boolean mask indicating multimodal token positions.
-
-        Creates a mask identifying where placeholder tokens appear in the
-        input sequence. This is used for merging vision embeddings.
+    def _get_multimodal_mask(self, input_ids: Int[Array, "batch seq_len"]) -> Array:
+        """Return the mask of image/video placeholders for subclass merging.
 
         Args:
-            input_ids: Input token IDs with shape (batch_size, seq_len).
+            input_ids: Input token IDs with shape ``(batch_size, seq_len)``.
 
         Returns:
-            Bool[Array, "batch seq_len"]: Boolean mask where True indicates
-                positions that are vision/video placeholders.
+            Boolean mask identifying image and video placeholder tokens.
         """
         return self._multimodal_merge_feature.create_multimodal_mask(input_ids)
 
@@ -897,9 +952,6 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
                 )
                 # Generate answer autoregressively
         """
-        image_hidden_states = None
-        video_hidden_states = None
-
         outputs = self.base_model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -933,8 +985,9 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         rope_deltas = getattr(outputs, "rope_deltas", None)
         router_logits = getattr(outputs, "router_logits", None)
         image_hidden_states = getattr(outputs, "image_hidden_states", None)
+        video_hidden_states = getattr(outputs, "video_hidden_states", None)
 
-        aux_loss = self.compute_router_aux_loss(outputs)
+        aux_loss = self.compute_aux_loss(outputs, attention_mask=attention_mask)
 
         return VLMCausalLMOutput(
             logits=lm_logits,
@@ -948,6 +1001,7 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             rope_deltas=rope_deltas,
             router_logits=router_logits,
             aux_loss=aux_loss,
+            indexer_aux_loss=getattr(outputs, "indexer_aux_loss", None),
         )
 
     def _drop_trainer_only_kwargs(self, kwargs: dict) -> dict:
@@ -1058,6 +1112,12 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
                 )
                 model_inputs["position_ids"] = position_ids
                 model_inputs["rope_deltas"] = rope_deltas
+            elif position_ids is None:
+                model_inputs["position_ids"] = self._mrope_feature.get_default_position_ids(
+                    sequence_length=input_ids.shape[1], batch_size=input_ids.shape[0]
+                )
+                if rope_deltas is None:
+                    model_inputs["rope_deltas"] = jnp.zeros((input_ids.shape[0], 1), dtype=jnp.int32)
             elif position_ids is not None and hasattr(position_ids, "ndim") and position_ids.ndim == 2:
                 batch_size, sequence_length = position_ids.shape
                 position_ids = jnp.broadcast_to(position_ids[None, :, :], (3, batch_size, sequence_length))

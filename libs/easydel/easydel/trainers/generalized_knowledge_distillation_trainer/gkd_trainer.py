@@ -41,6 +41,7 @@ import typing as tp
 
 import jax
 import numpy as np
+from eformer import common_types
 from eformer.loggings import get_logger
 from jax import numpy as jnp
 from transformers import GenerationConfig
@@ -207,6 +208,43 @@ class GKDTrainer(SFTTrainer):
         except Exception as exc:  # pragma: no cover - generation is optional
             self.gkd_generate_function = None
             logger.warning("Failed to initialize GKD generation function, on-policy sampling disabled: %s", exc)
+        self.gkd_teacher_generate_function = (
+            self._create_teacher_generate_function(shard_inputs=shard_inputs) if self.seq_kd else None
+        )
+
+    def _create_teacher_generate_function(self, *, shard_inputs: bool):
+        """Compile sequence-KD generation against the optimizer-free teacher.
+
+        Teacher architecture and optimizer metadata need not match the student,
+        so the student's compiled generation callable cannot accept this state.
+        """
+        config = self._prepare_generation_config(self.generation_config)
+        mesh = self.teacher_state.model.mesh
+        empty_sharding = replicated_named_sharding(mesh)
+
+        def generate(state, input_ids, attention_mask):
+            module = state.model
+            with module.mesh:
+                if shard_inputs:
+                    resolver = getattr(module.config, "runtime_sharding_resolver", None)
+                    if resolver is not None:
+                        axes = [common_types.BATCH, common_types.SEQUENCE_PARALLEL]
+                        input_ids = resolver.shard(input_ids, axes=axes, mode=common_types.MODE_PREFILL)
+                        attention_mask = resolver.shard(attention_mask, axes=axes, mode=common_types.MODE_PREFILL)
+                outputs = module.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    generation_config=config,
+                )
+                sequences = outputs.sequences if hasattr(outputs, "sequences") else outputs
+                return sequences, input_ids, attention_mask
+
+        return compile_trainer_step(
+            generate,
+            mesh=mesh,
+            in_shardings=(self.teacher_state.shardings, empty_sharding, empty_sharding),
+            out_shardings=(empty_sharding, empty_sharding, empty_sharding),
+        )
 
     @staticmethod
     def _resolve_teacher_model(
@@ -284,7 +322,7 @@ class GKDTrainer(SFTTrainer):
         self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             gkd_step,
-            in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
+            in_shardings=(self.eval_state_shardings, empty_sharding, self._eval_shared_fn_extra_args[0].shardings),
             out_shardings=empty_sharding,
             static_argnums=static_argnums,
             mesh=self.model.mesh,
@@ -323,8 +361,26 @@ class GKDTrainer(SFTTrainer):
 
     @property
     def _eval_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
-        """Forward the live teacher state alongside the shared evaluation step."""
-        return (self.teacher_state,)
+        """Forward live teacher buffers with matching evaluation static metadata."""
+        graphdef = getattr(self, "_eval_teacher_graphdef", None)
+        teacher = self.teacher_state
+        if graphdef is not None:
+            teacher = teacher.replace(graphdef=graphdef)
+        return (teacher,)
+
+    def _configure_eval_config_override(self):
+        """Apply evaluation config overrides to the teacher forward as well."""
+        super()._configure_eval_config_override()
+        self._eval_teacher_graphdef = None
+        if self._eval_graphdef is not None:
+            self._eval_teacher_graphdef = self._build_config_override_graphdef(
+                model=self.teacher_state.model,
+                overrides=self.arguments.eval_config_overrides,
+                reference_graphstate=self.teacher_state.graphstate,
+                trainable_selector=None,
+                label="eval_config_overrides (teacher)",
+                eval_mode=True,
+            )
 
     def _preprocess_batch_input(
         self,
@@ -345,7 +401,7 @@ class GKDTrainer(SFTTrainer):
         batch = self._apply_user_data_collator(batch)
         # Purify batch first to handle list of dicts (uncollated batch)
         batch = self._purify_batch(batch)
-        if not is_train or self.gkd_generate_function is None:
+        if not is_train:
             return batch, {}
 
         batch_copy = dict(batch)
@@ -357,7 +413,7 @@ class GKDTrainer(SFTTrainer):
                 batch_copy = generated
                 info.update(meta)
 
-        if self._should_use_student_sampling():
+        if self.gkd_generate_function is not None and self._should_use_student_sampling():
             generated, meta = self._apply_generation(state, batch_copy, source="student")
             if generated is not None:
                 batch_copy = generated
@@ -394,6 +450,8 @@ class GKDTrainer(SFTTrainer):
         """
         prompts = self._extract_prompts(batch)
         if prompts is None:
+            if source == "teacher":
+                raise ValueError("Sequence-KD requires prompt fields, completion_mask, or prompt-masked labels.")
             if not self._warned_missing_prompt:
                 logger.warning(
                     "Unable to derive prompts from batch; on-policy sampling is disabled until prompts are available."
@@ -403,9 +461,12 @@ class GKDTrainer(SFTTrainer):
         prompt_ids, prompt_mask, prompt_lengths = prompts
         prompt_seq_len = int(prompt_ids.shape[1])
 
+        generate = self.gkd_teacher_generate_function if source == "teacher" else self.gkd_generate_function
         try:
-            sequences, _, _ = jax.block_until_ready(self.gkd_generate_function(generator_state, prompt_ids, prompt_mask))
+            sequences, _, _ = jax.block_until_ready(generate(generator_state, prompt_ids, prompt_mask))
         except Exception as exc:  # pragma: no cover - generation failures are rare
+            if source == "teacher":
+                raise RuntimeError("Sequence-KD teacher generation failed.") from exc
             logger.warning("Failed to generate %s continuations: %s", source, exc)
             return None, {}
 
@@ -506,7 +567,9 @@ class GKDTrainer(SFTTrainer):
         completion_mask *= attention_mask
 
         labels_dtype = np.asarray(original_batch.get("labels", seq_np)).dtype
-        labels = seq_np.astype(labels_dtype, copy=False)
+        # Labels are masked in place; generated tokens may share a read-only
+        # device buffer and must never be overwritten by the ignore index.
+        labels = seq_np.astype(labels_dtype, copy=True)
         labels[attention_mask == 0] = -100
         if prompt_cutoff > 0:
             labels[:, :prompt_cutoff] = -100

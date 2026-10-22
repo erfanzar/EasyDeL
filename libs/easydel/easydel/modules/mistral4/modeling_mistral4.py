@@ -62,7 +62,6 @@ from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
-    MLARaggedPagesCacheView,
     OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -73,9 +72,7 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
     BaseModelOutput,
     DecoderLayerOutput,
     MoeCausalLMOutput,
@@ -99,7 +96,7 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
-from easydel.layers.rotary import apply_rope_interleaved
+from easydel.layers.moe import moe_group_topk_select
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .mistral4_configuration import Mistral4Config
@@ -205,14 +202,13 @@ class Mistral4MLP(spx.Module):
 
 
 class Mistral4TopkRouter(spx.Module):
-    """Mistral4 router: plain softmax scores over the router logits.
+    """Mistral4 router emitting raw logits for routing diagnostics and losses.
 
     Unlike DeepSeek-V3's biased-sigmoid ``noaux_tc`` router, Mistral4 scores
-    experts with a single softmax over the router logits — there is no
-    ``e_score_correction_bias`` and no sigmoid. Group restriction and top-k
-    selection happen in :meth:`Mistral4MoE._select_experts_static` (wired as
-    the MoE ``select_hook``), which consumes the full per-expert softmax
-    scores this module returns.
+    experts with a single fp32 softmax in the MoE normalization hook — there
+    is no ``e_score_correction_bias`` and no sigmoid. Group restriction and
+    top-k selection consume those probabilities through
+    :func:`easydel.layers.moe.moe_group_topk_select` with ``score_fn="none"``.
     """
 
     def __init__(
@@ -255,20 +251,20 @@ class Mistral4TopkRouter(spx.Module):
         )
 
     def forward(self, hidden_states: Float[Array, "tokens hidden_dim"]) -> Array:
-        """Compute full-expert softmax scores for ``moe_call`` to route on.
+        """Compute full-expert raw logits, preserving them for auxiliary losses.
 
         Args:
             hidden_states (Array): Input tensor of shape ``[batch * seq_len, hidden_dim]``.
 
         Returns:
-            Array: Per-expert softmax scores ``[batch * seq_len, n_routed_experts]``.
+            Array: Per-expert fp32 logits ``[batch * seq_len, n_routed_experts]``.
         """
         logits = jnp.dot(
             hidden_states.astype(jnp.float32),
             self.weight.value.astype(jnp.float32),
             precision=self.precision,
         )
-        return jax.nn.softmax(logits, axis=-1)
+        return logits
 
 
 class Mistral4MLPMoE(spx.Module):
@@ -398,8 +394,8 @@ class Mistral4MoE(BaseMoeModule):
 
     Composes the routing and expert paths into one block:
 
-    * **Router** (:class:`Mistral4TopkRouter`) emits full per-expert softmax
-      scores; expert selection happens in the ``select_hook``:
+    * **Router** (:class:`Mistral4TopkRouter`) emits raw logits, normalized
+      once to fp32 softmax scores before expert selection in the ``select_hook``:
       per-group score = sum of the top-2 softmax scores in the group, the
       ``topk_group`` best groups are kept, then ``num_experts_per_tok``
       experts are chosen among them; weights are the gathered softmax
@@ -445,6 +441,7 @@ class Mistral4MoE(BaseMoeModule):
             load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
         )
         self.config = config
+        self.layer_idx = layer_idx
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
@@ -466,19 +463,11 @@ class Mistral4MoE(BaseMoeModule):
             precision=precision,
             rngs=rngs,
         )
-        # Route on the gate's full per-expert softmax scores: identity-normalize (the gate already emits
-        # probabilities) and run Mistral4's grouped top-k in the select_hook, which returns weights AND
-        # expert indices (mirrors the DeepSeek-V3 / GLM-MoE-DSA wiring).
+        # Preserve raw logits for outputs/losses; normalize exactly once before
+        # grouped selection, which consumes full per-expert probabilities.
         self.moe_hooks = self.moe_hooks.replace(
-            normalize_gate_logits=lambda x: x,
-            select_hook=functools.partial(
-                self._select_experts_static,
-                n_group=config.n_group,
-                topk_group=config.topk_group,
-                n_routed_experts=config.n_routed_experts,
-                norm_topk_prob=config.norm_topk_prob,
-                routed_scaling_factor=config.routed_scaling_factor,
-            ),
+            normalize_gate_logits=lambda x: jax.nn.softmax(x.astype(jnp.float32), axis=-1),
+            select_hook=self._select_experts,
         )
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -491,58 +480,39 @@ class Mistral4MoE(BaseMoeModule):
                 rngs=rngs,
             )
 
-    @staticmethod
-    def _select_experts_static(
-        gate_logits: Array,
-        pre_bias_logits: Array | None,
-        k: int,
-        *,
-        n_group: int,
-        topk_group: int,
-        n_routed_experts: int,
-        norm_topk_prob: bool,
-        routed_scaling_factor: float,
-    ) -> tuple[Array, Array]:
-        """Mistral4 grouped top-k over the gate's full-expert softmax scores.
-
-        ``gate_logits`` is ``[tokens, n_routed_experts]`` softmax scores.
-        Restricts selection to the ``topk_group`` groups with the largest
-        top-2 mass, picks ``k`` experts within them, renormalizes when
-        ``norm_topk_prob`` (denominator ``sum + 1e-20``), then scales by
-        ``routed_scaling_factor`` — returning BOTH the weights and the
-        expert indices. Mirrors
-        ``transformers.Mistral4MoE.route_tokens_to_experts`` exactly except
-        that scores enter pre-computed (the gate applies the softmax).
+    def _select_experts(self, gate_logits: Array, pre_bias_logits: Array | None, k: int) -> tuple[Array, Array]:
+        """Select eligible experts, preserving zero-weight slots beyond group capacity.
 
         Args:
-            gate_logits: Full per-expert softmax scores ``[tokens, n_routed_experts]``.
-            pre_bias_logits: Unused (kept for select-hook signature parity).
-            k: Number of experts to select per token.
-            n_group: Number of expert groups.
-            topk_group: Number of groups to keep per token.
-            n_routed_experts: Total routed expert count.
-            norm_topk_prob: Whether to renormalise the selected weights.
-            routed_scaling_factor: Multiplier applied to the final weights.
+            gate_logits: Full per-expert softmax scores, shaped ``[tokens, experts]``.
+            pre_bias_logits: Optional hook input, passed through to the shared selector.
+            k: Number of output routing slots per token.
 
         Returns:
-            tuple[Array, Array]: ``(topk_weights, topk_indices)`` of shape
-            ``[tokens, k]`` each.
+            Weights and indices shaped ``[tokens, k]``. Slots beyond the retained
+            groups' capacity have zero weight and cannot activate excluded experts.
         """
-        scores = gate_logits.astype(jnp.float32)
-        token_count = scores.shape[0]
-        group_scores = scores.reshape(token_count, n_group, n_routed_experts // n_group)
-        group_scores = jnp.sum(jax.lax.top_k(group_scores, k=2)[0], axis=-1)
-        group_idx = jax.lax.top_k(group_scores, k=topk_group)[1]
-        group_mask = jnp.zeros_like(group_scores)
-        row_idx = jnp.arange(token_count)[:, None]
-        group_mask = group_mask.at[row_idx, group_idx].set(1.0)
-        score_mask = jnp.repeat(group_mask[:, :, None], n_routed_experts // n_group, axis=2).reshape(token_count, -1)
-        masked_scores = jnp.where(score_mask > 0, scores, 0.0)
-        topk_weight, topk_idx = jax.lax.top_k(masked_scores, k=k)
-        if norm_topk_prob:
-            topk_weight = topk_weight / (jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20)
-        topk_weight = topk_weight * routed_scaling_factor
-        return topk_weight, topk_idx
+        config = self.config
+        capacity = config.n_routed_experts
+        if config.n_group > 1:
+            capacity = (config.n_routed_experts // config.n_group) * min(config.topk_group, config.n_group)
+        eligible_k = min(k, capacity)
+        weights, indices = moe_group_topk_select(
+            gate_logits,
+            pre_bias_logits,
+            eligible_k,
+            n_routed_experts=config.n_routed_experts,
+            score_fn="none",
+            n_group=config.n_group,
+            topk_group=config.topk_group,
+            norm_topk_prob=config.norm_topk_prob,
+            routed_scaling_factor=config.routed_scaling_factor,
+        )
+        if eligible_k < k:
+            padding = ((0, 0), (0, k - eligible_k))
+            weights = jnp.pad(weights, padding)
+            indices = jnp.pad(indices, padding)
+        return weights, indices
 
     def forward(self, hidden_states: Array):
         """Process tokens through MoE experts with routing.
@@ -562,6 +532,9 @@ class Mistral4MoE(BaseMoeModule):
             gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
             wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
+            # The standard path uses layer_idx to emit tensor-valued debug callbacks.
+            # Keep ordinary forwards silent; layer identity is supplied only on explicit opt-in.
+            layer_idx=self.layer_idx if self.config.moe_debug else None,
         )
         if self.config.n_shared_experts is not None:
             out = out + self.shared_experts(hidden_states)
@@ -712,248 +685,29 @@ class Mistral4Attention(UnifiedAttention):
             jnp.floor(positions / self.llama_4_original_max_position_embeddings)
         )
 
-    def forward_mla(
+    def _postprocess_mla_queries(
         self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo | None,
+        q_nope: Float[Array, "batch heads seq_len nope_dim"],
+        q_pe: Float[Array, "batch heads seq_len rope_dim"],
         position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-        alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
-    ) -> AttentionLayerOutput:
-        """Run the Mistral4 MLA attention forward pass.
-
-        Mirrors :meth:`UnifiedAttention.forward_mla` (both the standard
-        decompressed path and the weight-absorbed MLA ragged-pages path)
-        with two Mistral4 deltas: RoPE is applied with the interleaved
-        pairing when ``config.rope_interleave`` and, after RoPE, queries
-        are scaled by the Llama-4 attention temperature.
+    ) -> tuple[Array, Array]:
+        """Apply Llama-4 temperature before either shared MLA cache path.
 
         Args:
-            hidden_states: Residual stream ``[batch, seq_len, hidden_dim]``.
-            mask_info: Mask information for attention.
-            position_ids: Position indices used for RoPE and the attention
-                temperature.
-            mode: Runtime mode (train / prefill / decode).
-            cache_view: Optional KV cache view; an
-                :class:`MLARaggedPagesCacheView` triggers the weight-absorbed
-                path.
-            cache_metadata: Optional cache metadata companion.
-            output_attentions: Whether to return materialized attention
-                weights.
-            frequencies: Optional precomputed RoPE cos/sin cache.
-            alibi: Accepted for signature parity with the other forward
-                paths; unused by MLA.
+            q_nope: Non-positional query components in compute dtype.
+            q_pe: Rotary-transformed positional query components in compute dtype.
+            position_ids: Query positions, including any cache offset.
 
         Returns:
-            :class:`AttentionLayerOutput` containing the attention output,
-            optional attention weights, and the updated cache view.
+            Both query components scaled by the position-dependent temperature,
+            with their original shapes and dtypes preserved.
         """
-        bsz, q_len, _ = hidden_states.shape
-
-        if not self.use_mla_lora:
-            q = checkpoint_name(self.mla_q_proj(hidden_states), name="attn_query")
-        else:
-            q = checkpoint_name(
-                self.mla_q_b_proj(
-                    self.mla_q_a_layernorm(checkpoint_name(self.mla_q_a_proj(hidden_states), name="attn_query_a"))
-                ),
-                name="attn_query",
-            )
-
-        # Reshape and transpose: [batch, heads, seq, dim]
-        q = q.reshape(bsz, q_len, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
-        q_nope, q_pe = q[..., : self.qk_nope_head_dim], q[..., self.qk_nope_head_dim :]
-
-        compressed_kv = self.mla_kv_a_proj_with_mqa(hidden_states)
-        k_pe = compressed_kv[..., self.kv_lora_rank :]
-        compressed_kv = compressed_kv[..., : self.kv_lora_rank]
-
-        k_pe = k_pe.reshape(bsz, q_len, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
-
-        _use_mla_ragged = isinstance(cache_view, MLARaggedPagesCacheView)
-
-        if not _use_mla_ragged:
-            kv = (
-                self.mla_kv_b_proj(self.mla_kv_a_layernorm(compressed_kv))
-                .reshape(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-                .transpose(0, 2, 1, 3)
-            )
-            k_nope = kv[..., : self.qk_nope_head_dim]
-            value_states = kv[..., self.qk_nope_head_dim : self.qk_nope_head_dim + self.v_head_dim]
-        else:
-            compressed_kv = self.mla_kv_a_layernorm(compressed_kv)
-            k_nope = None
-            value_states = None
-
-        if frequencies is not None:
-            freq_array = frequencies.value if hasattr(frequencies, "value") else frequencies
-            freqs = freq_array[position_ids]
-            cos, sin = jnp.split(freqs, 2, -1)
-            cos = cos[:, None, :, :].astype(q_pe.dtype)
-            sin = sin[:, None, :, :].astype(q_pe.dtype)
-            if self.config.rope_interleave:
-                q_pe = apply_rope_interleaved(q_pe, cos, sin)
-                k_pe = apply_rope_interleaved(k_pe, cos, sin)
-            else:
-                q1, q2 = jnp.split(q_pe, 2, axis=-1)
-                k1, k2 = jnp.split(k_pe, 2, axis=-1)
-                q_pe = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
-                k_pe = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
-
-        # Llama-4 attention temperature: scale the full query (nope + pe) by a
-        # per-position factor. Applying it to both slices here is equivalent to
-        # HF's post-concat multiply and keeps the weight-absorbed path exact.
         attn_scale = self._llama_4_attn_scale(position_ids)
         if attn_scale is not None:
             scale = attn_scale[:, None, :, None]
             q_nope = (q_nope * scale).astype(q_nope.dtype)
             q_pe = (q_pe * scale).astype(q_pe.dtype)
-
-        causal_for_kernel = self.causal
-        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
-            causal_for_kernel = False
-
-        sliding_window_for_kernel = self.sliding_window
-        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
-            sliding_window_for_kernel = None
-
-        if _use_mla_ragged:
-            # Weight absorption: split kv_b_proj weight into W_k and W_v.
-            kv_b_weight = self.mla_kv_b_proj.weight.value
-            kv_b_weight = kv_b_weight.reshape(self.kv_lora_rank, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-            w_k = kv_b_weight[:, :, : self.qk_nope_head_dim]
-            w_v = kv_b_weight[:, :, self.qk_nope_head_dim :]
-
-            q_absorbed = jnp.einsum(
-                "bnsd,and->bnsa",
-                q_nope.astype(jnp.float32),
-                w_k.astype(jnp.float32),
-            ).astype(q_nope.dtype)
-
-            mla_queries_nope = q_absorbed.transpose(0, 2, 1, 3)
-            mla_queries_pe = q_pe.transpose(0, 2, 1, 3)
-            mla_keys_values = compressed_kv
-            mla_keys_pe = k_pe[:, 0, :, :]
-
-            mla_softmax_scale = self.attention_performer.softmax_scale
-
-            key_for_cache = jnp.concatenate(
-                [compressed_kv[:, :, None, :], k_pe.transpose(0, 2, 1, 3)],
-                axis=-1,
-            )
-            query_for_concat = mla_queries_nope
-            value_for_cache = key_for_cache  # MLA: value pages = key pages
-
-            (
-                _,
-                _,
-                mask_info,
-                init_attention_bias,
-                cache_view,
-                cache_metadata,
-            ) = self.concatenate(
-                query=query_for_concat,
-                key=key_for_cache,
-                value=value_for_cache,
-                cache_view=cache_view,
-                cache_metadata=cache_metadata,
-                mask_info=mask_info,
-            )
-
-            softmax_aux = self._softmax_aux()
-
-            attentions = self.attention_performer.forward(
-                query_states=query_for_concat,
-                key_states=key_for_cache,
-                value_states=value_for_cache,
-                mode=mode,
-                bias=None,
-                cache_metadata=cache_metadata,
-                cache_view=cache_view,
-                init_bias=init_attention_bias,
-                mask_info=mask_info,
-                causal=causal_for_kernel,
-                sliding_window=sliding_window_for_kernel,
-                softmax_aux=softmax_aux,
-                queries_nope=mla_queries_nope,
-                queries_pe=mla_queries_pe,
-                keys_values=mla_keys_values,
-                keys_pe=mla_keys_pe,
-                softmax_scale=mla_softmax_scale,
-                output_attentions=output_attentions,
-            )
-
-            attn_out = attentions.attention_outputs
-            attn_out = jnp.einsum(
-                "tna,anh->tnh",
-                attn_out.astype(jnp.float32),
-                w_v.astype(jnp.float32),
-            ).astype(attn_out.dtype)
-
-            attn_output = attn_out.reshape(bsz, q_len, -1)
-        else:
-            query_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), q_pe.dtype)
-            query_states = query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
-            query_states = query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
-
-            key_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), k_pe.dtype)
-            key_states = key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
-            key_states = key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
-
-            query_states = query_states.transpose(0, 2, 1, 3)
-            key_states = key_states.transpose(0, 2, 1, 3)
-            value_states = value_states.transpose(0, 2, 1, 3)
-
-            (
-                key_states,
-                value_states,
-                mask_info,
-                init_attention_bias,
-                cache_view,
-                cache_metadata,
-            ) = self.concatenate(
-                query=query_states,
-                key=key_states,
-                value=value_states,
-                cache_view=cache_view,
-                cache_metadata=cache_metadata,
-                mask_info=mask_info,
-            )
-
-            softmax_aux = self._softmax_aux()
-
-            attentions = self.attention_performer.forward(
-                query_states=query_states,
-                key_states=key_states,
-                value_states=value_states,
-                mode=mode,
-                bias=None,
-                cache_metadata=cache_metadata,
-                cache_view=cache_view,
-                init_bias=init_attention_bias,
-                mask_info=mask_info,
-                causal=causal_for_kernel,
-                sliding_window=sliding_window_for_kernel,
-                softmax_aux=softmax_aux,
-                output_attentions=output_attentions,
-            )
-
-            attn_out = attentions.attention_outputs
-            attn_output = self._merge_heads(attn_out)
-
-        attn_output = self.shard_attention_prod(attn_output)
-        attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
-        attn_output = self.shard_attention_prod(attn_output)
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
-        )
+        return q_nope, q_pe
 
 
 class Mistral4DecoderLayer(spx.Module):
@@ -1287,6 +1041,15 @@ class Mistral4Model(EasyDeLBaseModule):
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
         sequence_length = inputs_embeds.shape[1]
 
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        output_router_logits = (
+            output_router_logits
+            if output_router_logits is not None
+            else getattr(self.config, "output_router_logits", False)
+        )
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
         all_router_logits = () if output_router_logits else None
@@ -1536,39 +1299,7 @@ class Mistral4ForCausalLM(BaseCausalLMModule[Mistral4Model, Mistral4Config]):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
-            aux_loss_fn=self._compute_aux_loss,
         )
-
-    def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute the optional auxiliary loss for MoE load balancing.
-
-        Mistral4's reference implementation trains without an auxiliary
-        router loss; the loss is only computed when the config defines a
-        non-``None`` ``router_aux_loss_coef``.
-
-        Args:
-            outputs: Model outputs containing router logits.
-            attention_mask: Attention mask for valid tokens.
-
-        Returns:
-            Auxiliary loss value for load balancing, or None when disabled
-            or no router logits are present.
-        """
-        coef = getattr(self.config, "router_aux_loss_coef", None)
-        if coef is None:
-            return None
-        if outputs.router_logits is None or len(outputs.router_logits) == 0:
-            return None
-
-        all_router_logits = jnp.stack(outputs.router_logits, axis=0)
-
-        aux_loss = auxiliary_load_balancing_loss_func(
-            gate_logits=all_router_logits,
-            num_experts=self.config.n_routed_experts,
-            top_k=self.config.num_experts_per_tok,
-            attention_mask=attention_mask,
-        )
-        return aux_loss * coef
 
     def create_transformer_cache_config(self, batch_size: int, max_length: int, **kwargs):
         """Create the cache configuration for MLA attention.

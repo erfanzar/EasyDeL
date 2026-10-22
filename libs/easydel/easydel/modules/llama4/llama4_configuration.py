@@ -124,8 +124,9 @@ class Llama4VisionConfig(EasyDeLBaseConfig):
             Number of input image channels (3 for RGB).
         intermediate_size (`int`, *optional*, defaults to 5632):
             Dimensionality of the MLP intermediate layer in the vision encoder.
-        vision_output_dim (`int`, *optional*, defaults to 7680):
-            Output dimensionality of the vision encoder before projection.
+        vision_output_dim (`int`, *optional*):
+            Output dimensionality of the vision encoder before multimodal projection.
+            Defaults to ``projector_output_dim``.
         image_size (`int`, *optional*, defaults to 448):
             Input image resolution (height and width).
         patch_size (`int`, *optional*, defaults to 14):
@@ -165,7 +166,7 @@ class Llama4VisionConfig(EasyDeLBaseConfig):
         num_attention_heads: int = 16,
         num_channels: int = 3,
         intermediate_size: int = 5632,
-        vision_output_dim: int = 7680,
+        vision_output_dim: int | None = None,
         image_size: int = 448,
         patch_size: int = 14,
         norm_eps: float = 1e-5,
@@ -191,8 +192,9 @@ class Llama4VisionConfig(EasyDeLBaseConfig):
             num_attention_heads (int, optional): Number of attention heads. Defaults to 16.
             num_channels (int, optional): Input image channels. Defaults to 3.
             intermediate_size (int, optional): MLP intermediate dimension. Defaults to 5632.
-            vision_output_dim (int, optional): Vision encoder output dimension before
-                projection. Defaults to 7680.
+            vision_output_dim (int | None, optional): Vision encoder output dimension before
+                multimodal projection. Defaults to projector_output_dim; an explicit
+                value must match it.
             image_size (int, optional): Input image resolution. Defaults to 448.
             patch_size (int, optional): Patch size for the vision transformer. Defaults to 14.
             norm_eps (float, optional): Epsilon for normalization layers. Defaults to 1e-5.
@@ -222,7 +224,13 @@ class Llama4VisionConfig(EasyDeLBaseConfig):
         self.num_channels = num_channels
         self.intermediate_size = intermediate_size
         self.image_size = image_size
-        self.vision_output_dim = vision_output_dim
+        # The adapter is the vision tower's final operation. Its output and
+        # the multimodal projector input must describe the same width.
+        self.vision_output_dim = projector_output_dim if vision_output_dim is None else vision_output_dim
+        if self.vision_output_dim != projector_output_dim:
+            raise ValueError("vision_output_dim must equal the vision adapter's projector_output_dim")
+        if pixel_shuffle_ratio <= 0 or not float(hidden_size / pixel_shuffle_ratio**2).is_integer():
+            raise ValueError("pixel_shuffle_ratio must be positive and produce an integral shuffled hidden width")
         self.patch_size = patch_size
         self.norm_eps = norm_eps
         self.num_attention_heads = num_attention_heads

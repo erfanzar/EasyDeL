@@ -55,6 +55,7 @@ from ...openai_api_modules import (
     ToolCall,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
+from ._schema_params import lookup_tool_properties
 
 logger = get_logger(__name__)
 
@@ -133,7 +134,6 @@ class MinimaxM2ToolParser(ToolParser):
         self.current_param_name: str | None = None
         self.current_param_value: str = ""
         self.param_count: int = 0
-        self.in_param: bool = False
         self.in_function: bool = False
         self.accumulated_text: str = ""
         self.json_started: bool = False
@@ -181,7 +181,6 @@ class MinimaxM2ToolParser(ToolParser):
         self.current_param_name = None
         self.current_param_value = ""
         self.param_count = 0
-        self.in_param = False
         self.in_function = False
         self.accumulated_text = ""
         self.json_started = False
@@ -209,20 +208,18 @@ class MinimaxM2ToolParser(ToolParser):
             return name_str[1:-1]
         return name_str
 
-    def _convert_param_value(self, value: str, param_type: str) -> Any:
-        """Convert a parameter value based on a single type.
+    def _record_streamed_args(self, fragment: str) -> None:
+        """Append an emitted argument fragment to the current tool's streamed-argument buffer.
 
-        Convenience wrapper around _convert_param_value_with_types
-        for single type conversion.
+        Keeps ``streamed_args_for_tool`` aligned with what has been sent to the client so that
+        consumers inspecting the parser see the arguments streamed per tool index.
 
         Args:
-            value: The string value to convert.
-            param_type: The target type name.
-
-        Returns:
-            The converted value.
+            fragment: The argument text just emitted for the current tool.
         """
-        return self._convert_param_value_with_types(value, [param_type])
+        while len(self.streamed_args_for_tool) <= self.current_tool_index:
+            self.streamed_args_for_tool.append("")
+        self.streamed_args_for_tool[self.current_tool_index] += fragment
 
     def _extract_types_from_schema(self, schema: Any) -> list[str]:
         """Extract possible types from a JSON schema definition.
@@ -297,8 +294,7 @@ class MinimaxM2ToolParser(ToolParser):
             return None
 
         normalized_types = [t.lower() for t in param_types]
-        if "null" in normalized_types or value.lower() in ("null", "none", "nil"):
-            return None
+        # A nullable schema allows None; it must not turn non-null values into None.
 
         type_priority = [
             "integer",
@@ -390,18 +386,7 @@ class MinimaxM2ToolParser(ToolParser):
 
         function_name = self._extract_name(name_match.group(1))
 
-        param_config: dict[str, Any] = {}
-        if tools:
-            for tool in tools:
-                if (
-                    hasattr(tool, "function")
-                    and tool.function.name == function_name
-                    and hasattr(tool.function, "parameters")
-                ):
-                    params = tool.function.parameters
-                    if isinstance(params, dict) and "properties" in params:
-                        param_config = params["properties"]
-                    break
+        param_config = lookup_tool_properties(function_name, tools)
 
         param_dict: dict[str, Any] = {}
         for match in self.parameter_complete_regex.findall(invoke_str):
@@ -498,7 +483,7 @@ class MinimaxM2ToolParser(ToolParser):
                 - tool_calls: Tool call deltas with function name or arguments
             Returns None if more tokens are needed.
         """
-        if not previous_text or self.tool_call_start_token in delta_text:
+        if not previous_text:
             self._reset_streaming_state()
             self.streaming_request = request
 
@@ -578,6 +563,8 @@ class MinimaxM2ToolParser(ToolParser):
 
                     if len(self.prev_tool_call_arr) <= self.current_tool_index:
                         self.prev_tool_call_arr.append({"name": self.current_function_name, "arguments": "{}"})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_index:
+                        self.streamed_args_for_tool.append("")
 
                     return DeltaMessage(
                         tool_calls=[
@@ -592,14 +579,12 @@ class MinimaxM2ToolParser(ToolParser):
             return None
 
         if self.in_function:
-            if self.in_function and not self.json_started:
+            if not self.json_started:
                 self.json_started = True
+                self._record_streamed_args("{")
                 return DeltaMessage(
                     tool_calls=[DeltaToolCall(index=self.current_tool_index, function=DeltaFunctionCall(arguments="{"))]
                 )
-
-            if not self.json_started:
-                self.json_started = True
 
             if not self.json_closed and self.invoke_end_token in tool_text:
                 total_param_count = tool_text.count(self.parameter_prefix)
@@ -622,19 +607,10 @@ class MinimaxM2ToolParser(ToolParser):
                                     if param_value.endswith("\n"):
                                         param_value = param_value[:-1]
 
-                                    param_config: dict[str, Any] = {}
-                                    if self.streaming_request and self.streaming_request.tools:
-                                        for tool in self.streaming_request.tools:
-                                            if (
-                                                hasattr(tool, "function")
-                                                and tool.function.name == self.current_function_name
-                                                and hasattr(tool.function, "parameters")
-                                            ):
-                                                params = tool.function.parameters
-                                                if isinstance(params, dict) and "properties" in params:
-                                                    param_config = params["properties"]
-                                                break
-
+                                    param_config = lookup_tool_properties(
+                                        self.current_function_name,
+                                        self.streaming_request.tools if self.streaming_request else None,
+                                    )
                                     param_type = self._get_param_types_from_config(param_name, param_config)
                                     invoke_params[param_name] = self._convert_param_value_with_types(
                                         param_value, param_type
@@ -647,6 +623,7 @@ class MinimaxM2ToolParser(ToolParser):
                         except Exception:
                             pass
 
+                    self._record_streamed_args("}")
                     result = DeltaMessage(
                         tool_calls=[
                             DeltaToolCall(index=self.current_tool_index, function=DeltaFunctionCall(arguments="}"))
@@ -669,7 +646,7 @@ class MinimaxM2ToolParser(ToolParser):
                 param_starts.append(idx)
                 idx += len(self.parameter_prefix)
 
-            if not self.in_param and self.param_count < len(param_starts) and len(param_starts) > self.param_count:
+            if self.param_count < len(param_starts):
                 param_idx = param_starts[self.param_count]
                 param_start = param_idx + len(self.parameter_prefix)
                 remaining = tool_text[param_start:]
@@ -706,19 +683,10 @@ class MinimaxM2ToolParser(ToolParser):
 
                         self.accumulated_params[self.current_param_name] = param_value
 
-                        param_config: dict[str, Any] = {}
-                        if self.streaming_request and self.streaming_request.tools:
-                            for tool in self.streaming_request.tools:
-                                if (
-                                    hasattr(tool, "function")
-                                    and tool.function.name == self.current_function_name
-                                    and hasattr(tool.function, "parameters")
-                                ):
-                                    params = tool.function.parameters
-                                    if isinstance(params, dict) and "properties" in params:
-                                        param_config = params["properties"]
-                                    break
-
+                        param_config = lookup_tool_properties(
+                            self.current_function_name,
+                            self.streaming_request.tools if self.streaming_request else None,
+                        )
                         param_type = self._get_param_types_from_config(self.current_param_name, param_config)
                         converted_value = self._convert_param_value_with_types(param_value, param_type)
                         serialized_value = json.dumps(converted_value, ensure_ascii=False)
@@ -729,8 +697,7 @@ class MinimaxM2ToolParser(ToolParser):
                             json_fragment = f', "{self.current_param_name}": {serialized_value}'
 
                         self.param_count += 1
-                        if self.current_tool_index < len(self.streamed_args_for_tool):
-                            self.streamed_args_for_tool[self.current_tool_index] += json_fragment
+                        self._record_streamed_args(json_fragment)
 
                         return DeltaMessage(
                             tool_calls=[

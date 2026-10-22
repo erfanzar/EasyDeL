@@ -26,7 +26,6 @@ from __future__ import annotations
 import dataclasses
 import typing as tp
 
-import numpy as np
 import spectrax as spx
 from eformer.loggings import get_logger
 
@@ -41,7 +40,12 @@ from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import SFTPreprocessTransform
 from ..trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
-from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
+from ..training_utils import (
+    compile_trainer_step,
+    normalize_completion_masks_and_labels,
+    resolve_mask_prompt,
+    resolve_straight_through_emulator,
+)
 from ..utils import DataCollatorForCompletionOnlyLM
 from ._fn import speculative_decoding_step
 from .spec_config import SpeculativeDecodingConfig
@@ -388,10 +392,7 @@ class SpeculativeDecodingTrainer(Trainer):
         if self._is_pretokenized():
             return None
         text_field = getattr(self.arguments, "dataset_text_field", None) or "text"
-        mask_prompt = bool(getattr(self.arguments, "assistant_only_loss", False))
-        completion_only_loss = getattr(self.arguments, "completion_only_loss", None)
-        if completion_only_loss is not None:
-            mask_prompt = bool(completion_only_loss)
+        mask_prompt = resolve_mask_prompt(self.arguments)
         return SFTPreprocessTransform(
             tokenizer=self.processing_class,
             max_length=self.arguments.max_length,
@@ -478,39 +479,7 @@ class SpeculativeDecodingTrainer(Trainer):
         """
         batch, infos = super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
 
-        if "assistant_masks" in batch:
-            if "completion_mask" not in batch:
-                batch["completion_mask"] = batch["assistant_masks"]
-            batch.pop("assistant_masks", None)
-
-        attention_mask = batch.get("attention_mask")
-        completion_mask = batch.get("completion_mask")
-
-        if completion_mask is not None:
-            completion_mask_np = np.asarray(completion_mask)
-            if attention_mask is not None:
-                completion_mask_np = completion_mask_np * np.asarray(attention_mask)
-            completion_dtype = (
-                np.asarray(attention_mask).dtype if attention_mask is not None else completion_mask_np.dtype
-            )
-            batch["completion_mask"] = completion_mask_np.astype(completion_dtype, copy=False)
-
-            if "labels" not in batch and "input_ids" in batch:
-                labels = np.asarray(batch["input_ids"]).astype(np.int32, copy=True)
-                labels[completion_mask_np == 0] = -100
-                if attention_mask is not None:
-                    labels[np.asarray(attention_mask) == 0] = -100
-                batch["labels"] = labels
-
-        if "labels" in batch and "completion_mask" not in batch:
-            labels_np = np.asarray(batch["labels"])
-            if (labels_np == -100).any():
-                completion_mask_np = (labels_np != -100).astype(np.int32)
-                if attention_mask is not None:
-                    completion_mask_np = completion_mask_np * np.asarray(attention_mask)
-                batch["completion_mask"] = completion_mask_np
-
-        return batch, infos
+        return normalize_completion_masks_and_labels(batch, assistant_mask_fallback_on_empty=False), infos
 
     @property
     def _train_shared_fn_extra_args(self) -> tuple[EasyDeLState]:

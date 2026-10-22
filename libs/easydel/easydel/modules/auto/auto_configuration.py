@@ -17,8 +17,10 @@ This module exposes:
 
 - :func:`get_modules_by_type` — resolve ``(config_cls, module_cls)`` from a
   registered ``model_type`` and :class:`TaskType`.
+- :func:`infer_task_from_config` — infer a :class:`TaskType` from an already-loaded
+  HuggingFace configuration mapping or object.
 - :func:`infer_task_from_hf_config` — read a HuggingFace ``config.json`` (local
-  or hub) and map ``architectures[0]`` to a :class:`TaskType`.
+  or hub) and infer its :class:`TaskType`.
 - :func:`normalize_task` — normalize loose strings/aliases to :class:`TaskType`.
 - :class:`AutoEasyDeLConfig` — load the correct ``EasyDeLBaseConfig`` subclass
   for a HuggingFace identifier or local path.
@@ -42,7 +44,9 @@ from spectrax import PartitionAxis, make_shard_and_gather_fns
 
 from easydel.infra.base_module import EasyDeLBaseConfig, EasyDeLBaseModule
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
+from easydel.infra.factory import TASK_ALIASES as TASK_ALIASES
 from easydel.infra.factory import TaskType, registry
+from easydel.infra.factory import normalize_task as normalize_task
 from easydel.infra.sharding import MeshLike, replicated_named_sharding
 from easydel.utils.instrumentation import phase_timer
 from easydel.utils.traversals import flatten_dict, unflatten_dict
@@ -104,42 +108,110 @@ def is_flatten(pytree: dict):
     return True if isinstance(mpl, tuple) else False
 
 
-TASK_ALIASES: dict[str, TaskType] = {
-    "causal_lm": TaskType.CAUSAL_LM,
-    "lm": TaskType.CAUSAL_LM,
-    "seq2seq": TaskType.SEQUENCE_TO_SEQUENCE,
-    "sequence_to_sequence": TaskType.SEQUENCE_TO_SEQUENCE,
-    "speech_seq2seq": TaskType.SPEECH_SEQUENCE_TO_SEQUENCE,
-    "image_text_to_text": TaskType.IMAGE_TEXT_TO_TEXT,
-    "zero_shot_image_classification": TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION,
-    "diffusion_lm": TaskType.DIFFUSION_LM,
-    "embedding": TaskType.EMBEDDING,
-    "base": TaskType.BASE_MODULE,
-}
+IMAGE_TEXT_TO_TEXT_MODEL_TYPES = frozenset(
+    {
+        "aya_vision",
+        "gemma3",
+        "gemma4",
+        "glm4v",
+        "glm4v_moe",
+        "glm46v",
+        "hunyuan_vl",
+        "idefics",
+        "idefics2",
+        "internvl",
+        "kimi_vl",
+        "llava",
+        "llama4",
+        "minimax_m3_vl",
+        "mistral3",
+        "muse_glimmer",
+        "paligemma",
+        "qwen2_vl",
+        "qwen2_5_vl",
+        "qwen2vl",
+        "qwen2_5vl",
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+    }
+)
 
 
-def normalize_task(t: TaskType | str | None) -> TaskType | None:
-    """Normalize task type specification to TaskType enum.
+def infer_task_from_config(
+    config: Mapping[str, tp.Any] | tp.Any,
+    *,
+    conditional_generation_task: TaskType = TaskType.IMAGE_TEXT_TO_TEXT,
+) -> TaskType | None:
+    """Infer a registry task from an already-loaded HuggingFace configuration.
 
-    Handles string aliases, case variations, and hyphen/underscore differences.
+    Examines all architectures as well as ``model_type`` and
+    ``is_encoder_decoder`` without loading weights, executing remote code, or
+    accessing the network. Specific multimodal/speech families take precedence
+    over generic language-model architecture names and encoder-decoder flags.
 
     Args:
-        t: Task type specification (TaskType, string alias, or None)
+        config: A configuration mapping or an object such as ``PretrainedConfig``.
+        conditional_generation_task: Task for an otherwise ambiguous
+            ``ForConditionalGeneration`` architecture. Defaults to image-to-text
+            for compatibility with ``infer_task_from_hf_config``. Conversion
+            callers that historically treated this ambiguous name as a causal
+            LM may pass ``TaskType.CAUSAL_LM``; specific families and explicit
+            encoder-decoder configurations are unaffected.
 
     Returns:
-        Normalized TaskType or None if not recognized
-
-    Example:
-        >>> normalize_task("causal-lm")
-        <TaskType.CAUSAL_LM: 'causal_lm'>
-        >>> normalize_task("LM")
-        <TaskType.CAUSAL_LM: 'causal_lm'>
+        Inferred registry ``TaskType``, or ``None`` when no supported task can
+        be identified. Callers may apply their own causal-LM fallback.
     """
-    if t is None:
-        return None
-    if isinstance(t, TaskType):
-        return t
-    return TASK_ALIASES.get(str(t).strip().lower().replace("-", "_"))
+    get = config.get if isinstance(config, Mapping) else lambda name, default=None: getattr(config, name, default)
+    architectures = get("architectures", None) or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    joined = " ".join(str(architecture) for architecture in architectures).lower()
+    model_type = str(get("model_type", "") or "").lower()
+
+    # Explicit tower/task architectures must win over dual-encoder family defaults.
+    if "forimageclassification" in joined:
+        return TaskType.IMAGE_CLASSIFICATION
+    if "cliptextmodelwithprojection" in joined:
+        return TaskType.EMBEDDING
+    if model_type in {"clip", "siglip"}:
+        return TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION
+    if "omni" in joined:
+        return TaskType.ANY_TO_ANY
+    if (
+        any(marker in joined for marker in ("forspeechseq2seq", "whisper"))
+        or model_type in {"whisper", "speech2text", "speech_to_text", "speech-to-text"}
+        or ("forconditionalgeneration" in joined and any(marker in model_type for marker in ("whisper", "speech2text")))
+    ):
+        return TaskType.SPEECH_SEQUENCE_TO_SEQUENCE
+    if (
+        any(marker in joined for marker in ("forimagetexttotext", "vision2seq"))
+        or model_type in IMAGE_TEXT_TO_TEXT_MODEL_TYPES
+    ):
+        return TaskType.IMAGE_TEXT_TO_TEXT
+    if get("is_encoder_decoder", False) or "forseq2seqlm" in joined:
+        return TaskType.SEQUENCE_TO_SEQUENCE
+    if "zeroshotimageclassification" in joined:
+        return TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION
+    if "sequenceclassification" in joined:
+        return TaskType.SEQUENCE_CLASSIFICATION
+    if "foraudioclassification" in joined:
+        return TaskType.AUDIO_CLASSIFICATION
+    if "forembedding" in joined or "forsentenceembedding" in joined:
+        return TaskType.EMBEDDING
+    if "fordiffusionlm" in joined or "diffusion" in model_type:
+        return TaskType.DIFFUSION_LM
+    if "causallm" in joined:
+        return TaskType.CAUSAL_LM
+    if "forconditionalgeneration" in joined:
+        return conditional_generation_task
+    if model_type == "clip_text_model":
+        return TaskType.BASE_MODULE
+    if "vision" in model_type or "clip" in model_type:
+        return TaskType.BASE_VISION
+    return None
 
 
 def infer_task_from_hf_config(model_name_or_path: str) -> TaskType | None:
@@ -214,56 +286,13 @@ def infer_task_from_hf_config(model_name_or_path: str) -> TaskType | None:
                         )
                     return None
 
-        architectures = config.get("architectures", [])
-        model_type = config.get("model_type", "").lower()
-
-        if not architectures:
+        task = infer_task_from_config(config)
+        if task is None:
             logger.warning(
-                f"No architectures found in config for {model_name_or_path}. Task type will fallback to CAUSAL_LM."
+                f"Could not map configuration for {model_name_or_path} to a TaskType. "
+                f"Task type will fallback to CAUSAL_LM."
             )
-            return None
-
-        arch = architectures[0]
-        if "ForCausalLM" in arch:
-            return TaskType.CAUSAL_LM
-
-        elif "Omni" in arch:
-            return TaskType.ANY_TO_ANY
-
-        elif "ForConditionalGeneration" in arch:
-            if any(x in model_type for x in ["whisper", "speech2text"]):
-                return TaskType.SPEECH_SEQUENCE_TO_SEQUENCE
-            else:
-                return TaskType.IMAGE_TEXT_TO_TEXT
-
-        elif "ForSequenceClassification" in arch:
-            return TaskType.SEQUENCE_CLASSIFICATION
-
-        elif "ForAudioClassification" in arch:
-            return TaskType.AUDIO_CLASSIFICATION
-
-        elif "ForImageClassification" in arch:
-            return TaskType.IMAGE_CLASSIFICATION
-
-        elif any(x in arch for x in ["ForSpeechSeq2Seq", "Whisper"]):
-            return TaskType.SPEECH_SEQUENCE_TO_SEQUENCE
-
-        elif "ForZeroShotImageClassification" in arch:
-            return TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION
-
-        elif "ForEmbedding" in arch or "ForSentenceEmbedding" in arch:
-            return TaskType.EMBEDDING
-
-        if "vision" in model_type or "clip" in model_type:
-            return TaskType.BASE_VISION
-        elif "diffusion" in model_type:
-            return TaskType.DIFFUSION_LM
-
-        logger.warning(
-            f"Could not map architecture '{arch}' to a TaskType for {model_name_or_path}. "
-            f"Task type will fallback to CAUSAL_LM."
-        )
-        return None
+        return task
 
     except Exception as e:
         logger.warning(
@@ -333,6 +362,7 @@ class AutoEasyDeLConfig:
         platform: EasyDeLPlatforms | None = None,
         model_task: TaskType = TaskType.AUTO_BIND,
         from_torch: bool = False,
+        trust_remote_code: bool | None = None,
         **kwargs,
     ) -> EasyDeLBaseConfig:
         """Load and finalize an :class:`EasyDeLBaseConfig` for a HF identifier or local path.
@@ -374,8 +404,14 @@ class AutoEasyDeLConfig:
             from_torch (bool, optional): Bypass the EasyDeL config registry and
                 read with ``transformers.AutoConfig`` directly. Defaults to
                 ``False``.
+            trust_remote_code (bool | None, optional): Whether ``transformers`` may execute Python code shipped
+                with the Hub repo (``auto_map``) while cross-checking the config. ``None`` is treated as
+                ``False``. When given explicitly it is also recorded on the returned config. Defaults to ``None``.
             **kwargs: Additional attributes copied onto the resulting config
-                via ``setattr`` (overrides any value set above).
+                via ``setattr`` (overrides any value set above). Hub options
+                ``subfolder``, ``cache_dir``, ``force_download``, ``local_files_only``,
+                ``token``, ``revision`` and ``proxies`` are forwarded to each
+                configuration-loading stage, but are not stored as config attributes.
 
         Returns:
             EasyDeLBaseConfig: The fully resolved, mesh-aware model config.
@@ -395,12 +431,23 @@ class AutoEasyDeLConfig:
             partition_axis = PartitionAxis()
         from transformers import AutoConfig
 
+        # Every resolution stage must read the same checkpoint metadata. In
+        # particular, a root config must never shadow a selected subfolder.
+        config_loading_kwargs = {
+            name: kwargs[name]
+            for name in ("subfolder", "cache_dir", "force_download", "local_files_only", "token", "revision", "proxies")
+            if name in kwargs
+        }
         if from_torch:
-            config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+            config = AutoConfig.from_pretrained(
+                pretrained_model_name_or_path,
+                trust_remote_code=bool(trust_remote_code),
+                **config_loading_kwargs,
+            )
             model_type: str = config.model_type
             architectures = config.architectures
         else:
-            config_dict, _ = EasyDeLBaseConfig.get_config_dict(pretrained_model_name_or_path)
+            config_dict, _ = EasyDeLBaseConfig.get_config_dict(pretrained_model_name_or_path, **config_loading_kwargs)
             config = None
             model_type: str = config_dict.get("model_type", "") or ""
             architectures = config_dict.get("architectures")
@@ -416,7 +463,7 @@ class AutoEasyDeLConfig:
             try:
                 from transformers import PretrainedConfig
 
-                config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path)
+                config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **config_loading_kwargs)
                 raw_model_type = config_dict.get("model_type", "")
                 if _registered(raw_model_type):
                     model_type = raw_model_type
@@ -424,7 +471,11 @@ class AutoEasyDeLConfig:
                 ...
 
         try:
-            hf_config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
+            hf_config = AutoConfig.from_pretrained(
+                pretrained_model_name_or_path,
+                trust_remote_code=bool(trust_remote_code),
+                **config_loading_kwargs,
+            )
             ovo_model_type: str = hf_config.model_type
 
             if model_type != ovo_model_type and not _registered(model_type):
@@ -439,13 +490,24 @@ class AutoEasyDeLConfig:
         except Exception:
             ...
 
+        if isinstance(model_task, str) and not isinstance(model_task, TaskType):
+            # Accept loose task strings ("causal_lm", "seq2seq", ...) as documented by ``normalize_task``.
+            try:
+                model_task = TaskType(model_task)
+            except ValueError:
+                resolved_task = normalize_task(model_task)
+                if resolved_task is None:
+                    raise ValueError(f"Unknown model_task {model_task!r}.") from None
+                model_task = resolved_task
         if model_task == TaskType.AUTO_BIND:
-            model_task = infer_task_from_hf_config(pretrained_model_name_or_path)
+            # Infer from the metadata already resolved with the selected Hub
+            # options rather than reading the checkpoint root again.
+            model_task = infer_task_from_config(config if config is not None else config_dict) or TaskType.CAUSAL_LM
         config_class = get_modules_by_type(
             model_type,
             cls.bind_model_task(model_task, architectures),
         )[0]
-        config = config_class.from_pretrained(pretrained_model_name_or_path)
+        config = config_class.from_pretrained(pretrained_model_name_or_path, **config_loading_kwargs)
         if hasattr(config, "attach_custom_arguments"):
             config.attach_custom_arguments()
 
@@ -457,8 +519,11 @@ class AutoEasyDeLConfig:
             backend=backend,
             platform=platform,
         )
+        if trust_remote_code is not None:
+            config.trust_remote_code = trust_remote_code
         for k, v in kwargs.items():
-            setattr(config, k, v)
+            if k not in config_loading_kwargs:
+                setattr(config, k, v)
 
         return config
 

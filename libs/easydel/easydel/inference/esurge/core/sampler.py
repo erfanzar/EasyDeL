@@ -35,7 +35,9 @@ from .binary_search import (
     apply_min_p_mask,
     apply_penalties,
     apply_topk_mask,
+    apply_topk_mask_bf16,
     apply_topp_mask,
+    apply_topp_mask_bf16,
 )
 from .sampling_metadata import SamplingMetadata
 
@@ -95,15 +97,20 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
         return jax.vmap(sample_one)(legi, sampling_seeds)
 
     def sample_filtered(legi):
-        # Convert to float32 for numerical stability in filtering operations.
-        legi = legi.astype(jnp.float32)
+        # Keep bf16 logits compact through top-k/p masking; those variants
+        # compute their comparisons and probability reductions in float32.
+        use_bf16_masks = legi.dtype == jnp.bfloat16
+        topk_mask = apply_topk_mask_bf16 if use_bf16_masks else apply_topk_mask
+        topp_mask = apply_topp_mask_bf16 if use_bf16_masks else apply_topp_mask
+        if not use_bf16_masks:
+            legi = legi.astype(jnp.float32)
 
         def apply_topk(legi):
             """Apply top-k filtering to each sample in the batch."""
 
             def topk_per_sample(logits_i, k_i):
                 """Apply top-k mask to a single sample if k > 0."""
-                return lax.cond(k_i > 0, lambda: apply_topk_mask(logits_i[None, :], k_i, min_val)[0], lambda: logits_i)
+                return lax.cond(k_i > 0, lambda: topk_mask(logits_i[None, :], k_i, min_val)[0], lambda: logits_i)
 
             return jax.vmap(topk_per_sample)(legi, sampling_metadata.top_ks)
 
@@ -116,13 +123,16 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
                 """Apply top-p mask to a single sample if p < 1.0."""
                 return lax.cond(
                     p_i < 1.0,
-                    lambda: apply_topp_mask(logits_i[None, :], p_i, min_val)[0],
+                    lambda: topp_mask(logits_i[None, :], p_i, min_val)[0],
                     lambda: logits_i,
                 )
 
             return jax.vmap(topp_per_sample)(legi, sampling_metadata.top_ps)
 
         legi = lax.cond(need_top_p, apply_topp, lambda x: x, legi)
+        # Temperature scaling, min-p probabilities and categorical sampling
+        # retain the float32 arithmetic used by the regular filtering path.
+        legi = legi.astype(jnp.float32)
 
         def apply_temp(legi):
             """Scale logits by per-sample temperature values.
@@ -293,6 +303,13 @@ def apply_history_penalties(
 
     This matches the host-side `SamplingParams` processor ordering used by
     EasyDeL: presence penalty, then frequency penalty, then repetition penalty.
+
+    Note:
+        The production runner penalizes from precomputed count matrices
+        (:func:`build_history_token_counts` + :func:`apply_history_penalties_from_counts`)
+        so counts are maintained incrementally across decode steps. This
+        one-shot wrapper is kept as the readable reference implementation of
+        that pipeline and is exercised directly by the penalty parity tests.
 
     Args:
         logits: Next-token logits [batch, vocab_size].

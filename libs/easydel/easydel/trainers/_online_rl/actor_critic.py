@@ -37,6 +37,7 @@ from .._logprob_utils import (
     compute_token_logps_and_entropies_chunked,
     resolve_lmhead_chunksize,
 )
+from .._shared.policy_losses import clipped_ppo_policy_loss, sao_policy_loss
 from ..training_utils import (
     ScheduledLossAdapter,
     make_assertions_and_get_sizes,
@@ -46,6 +47,7 @@ from ..training_utils import (
     update_metrics,
     update_state_respectfully,
 )
+from .math import global_token_mean, target_aligned_token_ids
 
 if tp.TYPE_CHECKING:
     from .config import OnlineActorCriticConfig
@@ -152,7 +154,7 @@ def score_actor_tokens(
     Returns:
         ``(logps, entropies)`` with shape ``[batch, sequence - 1]``.
     """
-    target_ids = input_ids[:, 1:]
+    target_ids = target_aligned_token_ids(input_ids)
     call_kwargs: dict[str, tp.Any] = {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
@@ -250,8 +252,7 @@ def _token_normalizer(
 
 def _masked_mean(value: jax.Array, mask: jax.Array) -> jax.Array:
     """Compute a numerically safe masked mean."""
-    mask = mask.astype(jnp.float32)
-    return jnp.sum(value * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+    return global_token_mean(value, mask)
 
 
 def actor_step(
@@ -305,22 +306,6 @@ def actor_step(
         log_ratio = current_logps - behavior_logps
         ratio = jnp.exp(log_ratio)
 
-        if algorithm == "sao":
-            lower = jnp.log1p(-jnp.asarray(dis_epsilon_low, dtype=jnp.float32))
-            upper = jnp.log1p(jnp.asarray(dis_epsilon_high, dtype=jnp.float32))
-            keep = ((log_ratio > lower) & (log_ratio < upper)).astype(jnp.float32) * action_mask
-            detached_weight = jax.lax.stop_gradient(ratio * keep)
-            per_token_policy_loss = -detached_weight * advantages * current_logps
-            clip_fraction = 1.0 - _masked_mean(keep, action_mask)
-        elif algorithm == "ppo":
-            unclipped = -advantages * ratio
-            clipped = -advantages * jnp.clip(ratio, 1.0 - cliprange, 1.0 + cliprange)
-            per_token_policy_loss = jnp.maximum(unclipped, clipped)
-            keep = action_mask
-            clip_fraction = _masked_mean((clipped > unclipped).astype(jnp.float32), action_mask)
-        else:
-            raise ValueError(f"Unknown online actor algorithm: {algorithm!r}.")
-
         local_count = jnp.sum(action_mask)
         normalizer = _token_normalizer(
             minibatch,
@@ -328,7 +313,32 @@ def actor_step(
             gradient_accumulation_steps,
             use_global_normalizer,
         )
-        policy_loss = jnp.sum(per_token_policy_loss * action_mask) / normalizer
+        if algorithm == "sao":
+            policy_loss, keep = sao_policy_loss(
+                current_logps,
+                behavior_logps,
+                advantages,
+                action_mask,
+                epsilon_low=dis_epsilon_low,
+                epsilon_high=dis_epsilon_high,
+                normalizer=normalizer,
+                return_keep_mask=True,
+            )
+            clip_fraction = 1.0 - _masked_mean(keep, action_mask)
+        elif algorithm == "ppo":
+            policy_loss, clip_fraction = clipped_ppo_policy_loss(
+                current_logps,
+                behavior_logps,
+                advantages,
+                action_mask,
+                cliprange=cliprange,
+                normalizer=normalizer,
+                return_clip_fraction=True,
+            )
+            keep = action_mask
+        else:
+            raise ValueError(f"Unknown online actor algorithm: {algorithm!r}.")
+
         if entropies is None:
             entropy = jnp.asarray(0.0, dtype=jnp.float32)
         else:

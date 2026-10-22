@@ -177,6 +177,7 @@ class CLIPVisionEmbeddings(EasyDeLLayerStackMixin, spx.Module):
             padding="VALID",
             use_bias=False,
             dtype=dtype,
+            param_dtype=param_dtype,
             rngs=rngs,
             precision=precision,
         )
@@ -966,8 +967,16 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
-        if pixel_values is not None and pixel_values.ndim == 4:
-            # Convert from NCHW (PyTorch) to NHWC (JAX)
+        if pixel_values is None or pixel_values.ndim != 4:
+            raise ValueError("pixel_values must be a rank-four NCHW or NHWC image batch")
+        channels_first = pixel_values.shape[1] == self.config.num_channels
+        channels_last = pixel_values.shape[-1] == self.config.num_channels
+        if channels_first == channels_last:
+            raise ValueError(
+                f"Cannot determine an unambiguous channel axis for pixel_values shape {pixel_values.shape} "
+                f"with num_channels={self.config.num_channels}"
+            )
+        if channels_first:
             pixel_values = jnp.transpose(pixel_values, (0, 2, 3, 1))
         hidden_states = self.embeddings(pixel_values)
         hidden_states = self.pre_layrnorm(hidden_states)
@@ -1137,6 +1146,7 @@ class CLIPTextModel(EasyDeLBaseModule):
         return self.text_model.embeddings
 
 
+@register_module(config=CLIPTextConfig, model_type="clip_text_model", task_type=TaskType.EMBEDDING)
 class CLIPTextModelWithProjection(EasyDeLBaseModule):
     """CLIP text encoder + linear projection into the shared embedding space.
 
@@ -1192,25 +1202,37 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
     def forward(
         self,
         input_ids: Int[Array, "batch seq_len"],
-        mask_info: MaskInfo,
-        position_ids: Int[Array, "batch seq_len"],
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
+        attention_mask: Array | None = None,
     ) -> CLIPTextModelOutput:
         """Forward pass through the CLIP text model with projection.
 
         Args:
             input_ids: Input token IDs of shape (batch_size, sequence_length).
-            mask_info: Attention mask information for masking padded tokens.
-            position_ids: Position indices of shape (batch_size, sequence_length).
+            mask_info: Attention mask information for masking padded tokens. Built from ``attention_mask``
+                (all-ones when that is also omitted) if not provided.
+            position_ids: Position indices of shape (batch_size, sequence_length). Auto-generated if not provided.
             output_attentions: Whether to return attention weights. Defaults to False.
             output_hidden_states: Whether to return hidden states from all layers.
                 Defaults to False.
+            attention_mask: Optional boolean mask of shape (batch_size, sequence_length); only used when
+                ``mask_info`` is not given.
 
         Returns:
             CLIPTextModelOutput containing projected text embeddings, last hidden state,
             optional hidden states, and optional attention weights.
         """
+        batch_size, seq_len = input_ids.shape
+        if position_ids is None:
+            position_ids = jnp.broadcast_to(jnp.arange(seq_len, dtype=jnp.int32)[None, :], (batch_size, seq_len))
+        if mask_info is None:
+            if attention_mask is None:
+                attention_mask = jnp.ones((batch_size, seq_len), dtype=jnp.bool_)
+            mask_info = MaskInfo.from_attention_mask(attention_mask)
+
         text_outputs = self.text_model(
             input_ids=input_ids,
             mask_info=mask_info,
@@ -1254,6 +1276,33 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
         Returns the embedding layer of the module.
         """
         return self.text_model.embeddings
+
+    @classmethod
+    def get_torch_loader(cls):
+        """Resolve an isolated HF auto-loader for projected text imports and exports.
+
+        The base export path resolves the concrete class through ``_model_mapping``.
+        Resolve both HF and EasyDeL configs on a private auto-loader so checkpoint
+        loading and export agree without changing Transformers' global mappings.
+        """
+        if cls.hf_torch_auto_loader is not None:
+            return cls.hf_torch_auto_loader
+        from collections import OrderedDict
+
+        from transformers import AutoModel
+        from transformers.models.auto.auto_factory import _LazyAutoMapping
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+
+        class AutoCLIPTextModelWithProjection(AutoModel):
+            """HF auto-model registry scoped to the projected CLIP text encoder."""
+
+            # HF lazy mappings resolve config class names, so both CLIPTextConfig
+            # implementations select the same projected encoder.
+            _model_mapping = _LazyAutoMapping(
+                CONFIG_MAPPING_NAMES, OrderedDict(clip_text_model="CLIPTextModelWithProjection")
+            )
+
+        return AutoCLIPTextModelWithProjection
 
 
 @register_module(config=CLIPVisionConfig, model_type="clip_vision_model", task_type=TaskType.BASE_VISION)
@@ -1359,7 +1408,8 @@ class CLIPVisionModel(EasyDeLBaseModule):
         return self.vision_model.embeddings
 
 
-@register_module(config=CLIPVisionConfig, model_type="clip", task_type=TaskType.IMAGE_CLASSIFICATION)
+@register_module(config=CLIPVisionConfig, model_type="clip_vision_model", task_type=TaskType.IMAGE_CLASSIFICATION)
+@register_module(config=CLIPConfig, model_type="clip", task_type=TaskType.IMAGE_CLASSIFICATION)
 class CLIPForImageClassification(BaseImageClassificationModule[CLIPVisionTransformer, CLIPVisionConfig]):  # type: ignore
     """CLIP vision tower + linear ``classifier`` head for supervised image classification.
 
@@ -1374,7 +1424,7 @@ class CLIPForImageClassification(BaseImageClassificationModule[CLIPVisionTransfo
 
     def __init__(
         self,
-        config: CLIPVisionConfig,
+        config: CLIPVisionConfig | CLIPConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -1384,12 +1434,22 @@ class CLIPForImageClassification(BaseImageClassificationModule[CLIPVisionTransfo
         """Initialize CLIP for image classification.
 
         Args:
-            config (CLIPVisionConfig): Vision model configuration with num_labels.
+            config (CLIPVisionConfig | CLIPConfig): Vision configuration with num_labels,
+                or a legacy composite configuration whose vision tower is used.
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             rngs (spx.Rngs): Random number generator state.
         """
+        if isinstance(config, CLIPConfig):
+            # Keep the legacy `clip` registration usable with actual composite
+            # configs, carrying task/sharding overrides onto the vision tower.
+            values = config.to_dict()
+            values.update(config.vision_config.to_dict())
+            for name in ("id2label", "label2id", "problem_type", "sharding_axis_dims", "sharding_axis_names"):
+                values[name] = getattr(config, name)
+            values["num_labels"] = config.num_labels
+            config = CLIPVisionConfig.from_dict(values)
         super().__init__(
             config=config,
             base_model_class=CLIPVisionTransformer,

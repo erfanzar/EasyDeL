@@ -67,7 +67,7 @@ from ..engine_types import EngineCoreOutput, EngineCoreOutputs
 from ..metrics import get_metrics_collector
 from ..outputs import ModelRunnerOutput
 from ..request import EngineRequest, EngineRequestStatus
-from .image_spans import align_prefill_chunk, check_image_spans_fit
+from .image_spans import align_prefill_chunk, expand_request_images
 from .interface import SchedulerInterface
 from .output import CachedRequestData, NewRequestData, SchedulerOutput
 from .request_queue import SchedulingPolicy, create_request_queue
@@ -238,7 +238,6 @@ class Scheduler(SchedulerInterface):
         self.req_id_to_dp_rank: dict[str, int] = {}
 
         self.finished_req_ids: set[str] = set()
-        self.finished_recving_kv_req_ids: set[str] = set()
 
         self.use_eagle = bool(use_eagle and num_draft_tokens > 0)
         self.num_spec_tokens = num_draft_tokens
@@ -272,6 +271,9 @@ class Scheduler(SchedulerInterface):
         async_scheduling: bool = True,
         long_prefill_token_threshold: int | None = None,
         num_draft_tokens: int = 0,
+        chunked_prefill_enabled: bool = False,
+        token_safety_margin: int | None = None,
+        include_finished_set: bool = False,
     ) -> Scheduler:
         """Create a Scheduler instance from an eSurgeRunner.
 
@@ -289,6 +291,12 @@ class Scheduler(SchedulerInterface):
             enable_prefix_caching: Whether to enable prefix caching for
                 faster inference on repeated prefixes. Defaults to True.
             async_scheduling: Whether to enable async scheduler overlap.
+            long_prefill_token_threshold: Cap each prefill step at this many tokens.
+            num_draft_tokens: Number of speculative tokens (0 disables).
+            chunked_prefill_enabled: Allow prefill to span multiple steps when a single chunk exceeds the
+                per-step token budget.
+            token_safety_margin: Tokens reserved for safety; enables the token-budget manager when not ``None``.
+            include_finished_set: Track finished request IDs per client.
 
         Returns:
             Scheduler: A configured Scheduler instance ready for use.
@@ -340,6 +348,9 @@ class Scheduler(SchedulerInterface):
             async_scheduling=async_scheduling,
             long_prefill_token_threshold=long_prefill_token_threshold,
             num_draft_tokens=int(num_draft_tokens),
+            chunked_prefill_enabled=chunked_prefill_enabled,
+            token_safety_margin=token_safety_margin,
+            include_finished_set=include_finished_set,
         )
 
         data_parallel_size = int(getattr(metadata, "data_parallel_size", 1) or 1)
@@ -353,6 +364,9 @@ class Scheduler(SchedulerInterface):
                 async_scheduling=async_scheduling,
                 long_prefill_token_threshold=long_prefill_token_threshold,
                 num_draft_tokens=num_draft_tokens,
+                chunked_prefill_enabled=chunked_prefill_enabled,
+                token_safety_margin=token_safety_margin,
+                include_finished_set=include_finished_set,
             )
 
         if async_scheduling:
@@ -402,7 +416,7 @@ class Scheduler(SchedulerInterface):
         """
         bucket = self._select_seq_bucket(desired_running)
         self._current_seq_bucket = bucket
-        return desired_running <= bucket
+        return desired_running <= self.max_num_running_reqs and desired_running <= bucket
 
     def schedule(self) -> SchedulerOutput:
         """Schedule requests for the next forward pass.
@@ -440,7 +454,21 @@ class Scheduler(SchedulerInterface):
         req_to_new_page_ids: dict[str, tuple[list[int], ...]] = {}
         num_scheduled_tokens: dict[str, int] = {}
         if self._token_budget_manager:
-            token_budget = self._token_budget_manager.begin_cycle(self.kv_cache_manager, len(self.running))
+            # Free pages constrain new admissions, not progress in pages that a running request
+            # already owns. Keep allocation/preemption reachable when the pool is full.
+            running_token_demand = sum(
+                max(
+                    0,
+                    min(
+                        request.num_tokens_with_spec + request.num_output_placeholders - request.num_computed_tokens,
+                        self.max_model_len - 1 - request.num_computed_tokens,
+                    ),
+                )
+                for request in self.running
+            )
+            token_budget = self._token_budget_manager.begin_cycle(
+                self.kv_cache_manager, len(self.running), running_token_demand=running_token_demand
+            )
         else:
             if self.max_num_scheduled_tokens is None:
                 raise ValueError("max_num_scheduled_tokens must not be None when token budget manager is disabled")
@@ -672,11 +700,11 @@ class Scheduler(SchedulerInterface):
                 token_budget = self._token_budget_manager.remaining
             else:
                 token_budget -= num_new_tokens
-            if token_budget <= 0:
-                req_index += 1
-                break
             req_index += 1
 
+            # Speculative bookkeeping must run even when this request used up the budget: ``num_new_tokens`` was
+            # derived from ``num_tokens_with_spec`` so the drafts it covers have to be trimmed and recorded. The
+            # ``while`` condition already ends the loop once ``token_budget`` is exhausted.
             if request.spec_token_ids:
                 num_scheduled_spec_tokens = num_new_tokens + request.num_computed_tokens - request.num_tokens
                 if num_scheduled_spec_tokens > 0:
@@ -690,6 +718,12 @@ class Scheduler(SchedulerInterface):
         # relative FCFS order stable across the skip/requeue round-trip.
         skipped_waiting_requests = create_request_queue(self.policy)
         if not preempted_reqs:
+            if self._token_budget_manager:
+                # The running-work floor must never turn into spare admission capacity.
+                remaining_batch_budget = token_budget
+                admission_budget = self._token_budget_manager.begin_cycle(self.kv_cache_manager, len(self.running))
+                self._token_budget_manager.consume(max(0, admission_budget - remaining_batch_budget))
+                token_budget = self._token_budget_manager.remaining
             while self.waiting and token_budget > 0:
                 if not self._ensure_capacity(len(self.running) + 1):
                     break
@@ -708,8 +742,6 @@ class Scheduler(SchedulerInterface):
                         skipped_waiting_requests.add_request(request)
                         continue
 
-                num_external_computed_tokens = 0
-                load_kv_async = False
                 row_shard_hint = _pick_new_shard(request)
                 if use_dp_local_shard_hints and row_shard_hint is None:
                     self.waiting.pop_request()
@@ -723,59 +755,52 @@ class Scheduler(SchedulerInterface):
                         data_parallel_size=self.data_parallel_size,
                     )
 
-                    num_computed_tokens = num_new_local_computed_tokens + num_external_computed_tokens
+                    num_computed_tokens = num_new_local_computed_tokens
 
                 else:
                     new_computed_pages = self.kv_cache_manager.create_empty_page_list()
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
-                if load_kv_async:
-                    if num_external_computed_tokens <= 0:
-                        raise RuntimeError("num_external_computed_tokens must be positive when load_kv_async is enabled")
-                    num_new_tokens = 0
+                num_new_tokens = request.num_tokens - num_computed_tokens
+                if (
+                    self.long_prefill_token_threshold is not None
+                    and 0 < self.long_prefill_token_threshold < num_new_tokens
+                ):
+                    num_new_tokens = self.long_prefill_token_threshold
 
-                else:
-                    num_new_tokens = request.num_tokens - num_computed_tokens
-                    if (
-                        self.long_prefill_token_threshold is not None
-                        and 0 < self.long_prefill_token_threshold < num_new_tokens
-                    ):
-                        num_new_tokens = self.long_prefill_token_threshold
+                if not self.chunked_prefill_enabled and num_new_tokens > token_budget:
+                    is_inherently_too_large = (
+                        self.max_num_scheduled_tokens is not None and num_new_tokens >= self.max_num_scheduled_tokens
+                    )
+                    is_batch_empty = (
+                        len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs) == 0
+                    )
 
-                    if not self.chunked_prefill_enabled and num_new_tokens > token_budget:
-                        is_inherently_too_large = (
-                            self.max_num_scheduled_tokens is not None and num_new_tokens >= self.max_num_scheduled_tokens
-                        )
-                        is_batch_empty = (
-                            len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs) == 0
-                        )
-
-                        if is_inherently_too_large:
-                            pass
-                        elif is_batch_empty:
-                            pass
-                        else:
-                            self.waiting.pop_request()
-                            skipped_waiting_requests.add_request(request)
-                            continue
-
-                    num_new_tokens = min(num_new_tokens, token_budget)
-                    if num_new_tokens <= 0:
-                        # Avoid starvation: a waiting request with no schedulable
-                        # tokens cannot make progress in this queue state.
-                        request = self.waiting.pop_request()
-                        logger.warning(
-                            "Dropping request %s: zero schedulable prompt tokens "
-                            "(num_tokens=%d, num_computed_tokens=%d).",
-                            request.request_id,
-                            request.num_tokens,
-                            num_computed_tokens,
-                        )
-                        request.status = EngineRequestStatus.FINISHED_ABORTED
-                        self._free_request(request)
+                    if is_inherently_too_large:
+                        pass
+                    elif is_batch_empty:
+                        pass
+                    else:
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.add_request(request)
                         continue
-                if not load_kv_async and getattr(request, "image_spans", None):
+
+                num_new_tokens = min(num_new_tokens, token_budget)
+                if num_new_tokens <= 0:
+                    # Avoid starvation: a waiting request with no schedulable
+                    # tokens cannot make progress in this queue state.
+                    request = self.waiting.pop_request()
+                    logger.warning(
+                        "Dropping request %s: zero schedulable prompt tokens (num_tokens=%d, num_computed_tokens=%d).",
+                        request.request_id,
+                        request.num_tokens,
+                        num_computed_tokens,
+                    )
+                    request.status = EngineRequestStatus.FINISHED_ABORTED
+                    self._free_request(request)
+                    continue
+                if getattr(request, "image_spans", None):
                     aligned_tokens = align_prefill_chunk(
                         request.image_spans, num_computed_tokens, num_new_tokens, token_budget
                     )
@@ -786,7 +811,7 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = aligned_tokens
                 new_pages = self.kv_cache_manager.allocate_slots(
                     request,
-                    num_new_tokens + num_external_computed_tokens,
+                    num_new_tokens,
                     num_new_local_computed_tokens,
                     new_computed_pages,
                     num_lookahead_tokens=self.num_lookahead_tokens,
@@ -797,10 +822,6 @@ class Scheduler(SchedulerInterface):
                     break
 
                 request = self.waiting.pop_request()
-                if load_kv_async:
-                    skipped_waiting_requests.add_request(request)
-                    request.status = EngineRequestStatus.WAITING_FOR_REMOTE_KVS
-                    continue
 
                 req_index += 1
                 self.running.append(request)
@@ -1046,6 +1067,15 @@ class Scheduler(SchedulerInterface):
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         num_nans_in_logits = model_runner_output.num_nans_in_logits
+        # LogprobsLists is position-major: flatten requests in runner output order,
+        # then each request's accepted speculative tokens and bonus token. Compute
+        # offsets before stop handling, which may shorten a request's token list.
+        logprobs = model_runner_output.logprobs
+        logprob_offsets: list[int] = []
+        if logprobs is not None:
+            logprob_offsets = list(itertools.accumulate((len(tokens) for tokens in sampled_token_ids), initial=0))
+            if any(len(field) != logprob_offsets[-1] for field in logprobs):
+                raise ValueError("Runner logprobs must contain one position per sampled token in output order.")
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
 
@@ -1080,7 +1110,9 @@ class Scheduler(SchedulerInterface):
                     len(sampled_token_ids),
                 )
                 continue
-            generated_token_ids = sampled_token_ids[out_index] if sampled_token_ids else []
+            # Keep runner-owned rows unchanged: async consumers and DP routing may
+            # still need the original lengths after scheduler stop truncation.
+            generated_token_ids = list(sampled_token_ids[out_index]) if sampled_token_ids else []
             if spec_token_ids is not None:
                 request.spec_token_ids = list(spec_token_ids[out_index]) if out_index < len(spec_token_ids) else []
             accepted_spec_tokens = num_accepted_spec_tokens.get(req_id)
@@ -1119,6 +1151,11 @@ class Scheduler(SchedulerInterface):
                     EngineCoreOutput(
                         request_id=req_id,
                         new_token_ids=new_token_ids,
+                        new_logprobs=(
+                            logprobs.slice(logprob_offsets[out_index], logprob_offsets[out_index] + len(new_token_ids))
+                            if logprobs is not None and request.sampling_params.logprobs is not None
+                            else None
+                        ),
                         finish_reason=request.get_finished_reason(),
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         stop_reason=request.stop_reason,
@@ -1209,18 +1246,12 @@ class Scheduler(SchedulerInterface):
 
     def _expand_request_images(self, request: EngineRequest) -> None:
         """Expand a request's image placeholders into image spans and attach the preprocessed patches."""
-        if self.image_expander is None:
-            raise ValueError(
-                f"Request {request.request_id} carries images but the served model does not declare image support."
-            )
-        expanded = self.image_expander.expand(request.prompt_token_ids, request.images)
-        check_image_spans_fit(expanded.spans, self.max_num_scheduled_tokens, request.request_id)
-        if len(expanded.token_ids) >= self.max_model_len:
-            raise ValueError(
-                f"Request {request.request_id}: image-expanded prompt has {len(expanded.token_ids)} tokens, "
-                f"which does not fit max_model_len={self.max_model_len}."
-            )
-        request.set_expanded_prompt(expanded.token_ids, expanded.token_types, expanded.spans, expanded.features)
+        expand_request_images(
+            request,
+            self.image_expander,
+            max_num_scheduled_tokens=self.max_num_scheduled_tokens,
+            max_model_len=self.max_model_len,
+        )
 
     def finish_requests(
         self,

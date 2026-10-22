@@ -33,12 +33,16 @@ Module exports:
     - :class:`LayerOperationInfo`: Per-layer/slot discovered op + cache info.
     - :class:`OperationsCacheInfo`: Aggregated, model-wide cache snapshot.
     - :class:`OperationCacheMixin`: Methods plugged into ``EasyDeLBaseModule``.
+    - :class:`PagedCacheBudget`: Physical-stage page-pool sizing result.
+    - :func:`compute_paged_cache_budget`: Shared heterogeneous-layer budgeting.
+    - :func:`cap_paged_cache_pages`: DP alignment and token-ceiling enforcement.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from easydel.caching.budget import PagedCacheBudget, cap_paged_cache_pages, compute_paged_cache_budget
 from easydel.operations import OperationRegistry
 from easydel.operations.requirements import (
     CacheType,
@@ -51,7 +55,13 @@ __all__ = [
     "LayerOperationInfo",
     "OperationCacheMixin",
     "OperationsCacheInfo",
+    "PagedCacheBudget",
+    "cap_paged_cache_pages",
+    "compute_paged_cache_budget",
 ]
+
+
+# Keep the original public infra names as aliases to the import-safe cache API.
 
 
 @dataclass

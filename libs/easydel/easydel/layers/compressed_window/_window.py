@@ -34,12 +34,16 @@ __all__ = (
     "TRAIN_ATTEND_PLATFORM",
     "block_sink_attention",
     "block_token_bias",
+    "entry_reach",
+    "entry_visibility",
     "gather_selected_entries",
     "ring_decode_write",
     "ring_prefill_write",
     "ring_slot_positions",
     "ring_visibility_bias",
     "sink_attention",
+    "window_token_bias",
+    "window_visible",
 )
 
 MASK_MIN = float(jnp.finfo(jnp.float32).min)
@@ -54,6 +58,73 @@ DECODE_ATTEND_PLATFORM = "xla"
 # adapter choose (tiled-flash Pallas on TPU -- KV streaming, online softmax, sliding-window band skip -- and the
 # differentiable XLA reference elsewhere, identical f32 math).
 TRAIN_ATTEND_PLATFORM: str | None = None
+
+
+def entry_reach(positions: Int[Array, "..."], rate: int) -> Int[Array, "..."]:
+    """Number of compressed entries a query at ``positions`` may see: ``(position + 1) // rate``.
+
+    Entry ``w`` pools tokens ``[w * rate, (w + 1) * rate)``, so it is complete (and causal) for a query at ``t`` iff
+    ``w < (t + 1) // rate``. A position of ``-1`` reaches nothing.
+
+    Args:
+        positions: Query (or stream) positions, any shape.
+        rate: Source tokens per entry.
+
+    Returns:
+        int32 entry counts, same shape as ``positions``.
+    """
+    return (positions.astype(jnp.int32) + 1) // rate
+
+
+def entry_visibility(
+    positions: Int[Array, "batch seq"],
+    num_entries: int,
+    rate: int,
+    *,
+    emitted_position: Int[Array, " batch"] | None = None,
+) -> Bool[Array, "batch seq entries"]:
+    """Causal visibility of compressed-entry slots: query ``t`` sees entry ``w`` iff ``w < (t + 1) // rate``.
+
+    Args:
+        positions: Query positions ``[B, S]``.
+        num_entries: Width of the entry axis.
+        rate: Source tokens per entry.
+        emitted_position: Optional per-row stream position of the newest token written to a cache ``[B]``. Entries
+            not yet emitted (``w >= (emitted_position + 1) // rate``) are hidden too (decode over a padded buffer).
+
+    Returns:
+        Boolean visibility ``[B, S, num_entries]``.
+    """
+    entries = jnp.arange(num_entries, dtype=jnp.int32)
+    visible = entries[None, None, :] < entry_reach(positions, rate)[..., None]
+    if emitted_position is not None:
+        visible = visible & (entries[None, None, :] < entry_reach(emitted_position, rate)[:, None, None])
+    return visible
+
+
+def window_visible(q_pos: Int[Array, "..."], k_pos: Int[Array, "..."], window: int) -> Bool[Array, "..."]:
+    """Sliding-window causal visibility: key ``k_pos`` is visible to query ``q_pos`` iff ``q_pos - window < k_pos <=
+    q_pos`` (broadcasting)."""
+    return (k_pos <= q_pos) & (k_pos > q_pos - window)
+
+
+def window_token_bias(token_valid: Bool[Array, "batch seq"], window: int) -> Float[Array, "batch 1 seq seq"]:
+    """Dense additive bias of a sequence's own sliding-window token region.
+
+    Key ``k`` is visible to query ``q`` iff ``q - window < k <= q`` and ``token_valid[k]``. Only dense fallback paths
+    need this; the registered compressed-window op builds the same mask in-kernel from ``token_valid``.
+
+    Args:
+        token_valid: Per-key validity ``[B, S]``.
+        window: Sliding-window size.
+
+    Returns:
+        Additive fp32 bias ``[B, 1, S, S]``.
+    """
+    positions = jnp.arange(token_valid.shape[1], dtype=jnp.int32)
+    allowed = window_visible(positions[:, None], positions[None, :], window)[None, None]
+    allowed = allowed & token_valid.astype(bool)[:, None, None, :]
+    return jnp.where(allowed, 0.0, MASK_MIN).astype(jnp.float32)
 
 
 def sink_attention(
@@ -96,22 +167,24 @@ def ring_prefill_write(
     ring: Float[Array, "batch window dim"],
     kv: Float[Array, "batch seq dim"],
     window: int,
+    *,
+    start_position: int = 0,
 ) -> Float[Array, "batch window dim"]:
-    """Seed a ring with the last ``window`` token KVs of a prefill that starts at position 0.
+    """Seed a ring with the last ``window`` token KVs of a prefill.
 
     Args:
         ring: Ring buffer ``[B, window, D]``.
         kv: Prefill token KVs ``[B, S, D]``.
         window: Ring length.
+        start_position: Absolute position of the first KV, for pre-projected prompt tails.
 
     Returns:
         The updated ring (slot ``p % window`` holds position ``p`` for the last ``window`` positions).
     """
     seq = kv.shape[1]
-    if seq >= window:
-        slot_idx = jnp.arange(seq - window, seq) % window
-        return ring.at[:, slot_idx].set(kv[:, seq - window :].astype(ring.dtype))
-    return ring.at[:, :seq].set(kv.astype(ring.dtype))
+    start = max(0, seq - window)
+    slot_idx = (start_position + jnp.arange(start, seq)) % window
+    return ring.at[:, slot_idx].set(kv[:, start:].astype(ring.dtype))
 
 
 def ring_decode_write(

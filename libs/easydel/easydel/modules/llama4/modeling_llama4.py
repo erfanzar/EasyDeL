@@ -40,6 +40,7 @@ Exports:
 
 import math
 import typing as tp
+from dataclasses import dataclass
 from functools import partial
 
 import jax
@@ -69,7 +70,8 @@ from easydel.infra.modeling_outputs import (
     BaseModelOutput,
     DecoderLayerOutput,
     EncoderLayerOutput,
-    ModelOutput,
+    MoeCausalLMOutput,
+    MoeModelOutput,
     VLMCausalLMOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
@@ -87,19 +89,43 @@ from easydel.layers import (
     gated_mlp_forward,
     moe_down_projection_reform_param,
     moe_fused_gate_up_reform_param,
-    split_fused_gate_up_projection,
 )
 from easydel.layers import RMSNorm as Llama4TextRMSNorm
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule, UnifiedAttention
-from easydel.layers.norms import LayerNorm
-from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule, BaseVisionLanguageModule
+from easydel.layers.mlp import moe_gated_expert_forward
+from easydel.layers.norms import LayerNorm, rms_norm
+from easydel.layers.rotary import apply_rope_interleaved
+from easydel.modules._base import (
+    BaseCausalLMModule,
+    BaseSequenceClassificationModule,
+    BaseVisionLanguageModule,
+    pixel_unshuffle_grid,
+)
 from easydel.utils.compiling_utils import ejit
 
 from .llama4_configuration import Llama4Config, Llama4TextConfig, Llama4VisionConfig
 
 
+@dataclass
+class _Llama4OutputFields:
+    """Seed the legacy field order before the unified VLM dataclass adds fields.
+
+    Dataclasses collect inherited fields in reverse MRO order. Keeping this
+    layout last in the public class's bases makes ``loss`` the first field for
+    ModelOutput's mapping/iterable constructor and preserves positional, tuple,
+    pickle and PyTree reconstruction without separate compatibility wrappers.
+    """
+
+    loss: Array | None = None
+    logits: Array = None
+    past_key_values: TransformerCache | None = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
+    image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
+
+
 @auto_pytree
-class Llama4CausalLMOutputWithPast(ModelOutput):
+class Llama4CausalLMOutputWithPast(VLMCausalLMOutput, _Llama4OutputFields):
     """
     Base class for Llama4Vision causal language model (or autoregressive) outputs.
 
@@ -132,13 +158,6 @@ class Llama4CausalLMOutputWithPast(ModelOutput):
             An `Array` of size (batch_size * num_patches, num_images, sequence_length, hidden_size)`.
             image_hidden_states of the model produced by the vision encoder and after projecting the last hidden state.
     """
-
-    loss: Array | None = None
-    logits: Array = None
-    past_key_values: TransformerCache | None = None
-    hidden_states: tuple[Array] | None = None
-    attentions: tuple[Array] | None = None
-    image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
 @ejit(static_argnums=(0, 1, 2, 3))  # pyright: ignore[reportUntypedFunctionDecorator]
@@ -175,33 +194,6 @@ def _vision_freqs(idx, hidden_size, num_attention_heads, rope_theta):
     freqs = jnp.concatenate([freqs_x, freqs_y], axis=-1)[..., ::2]
     freqs = jnp.where(img_idx.reshape(-1, 1, 1) < 0, 0.0, freqs)
     return jnp.exp(1j * freqs)
-
-
-def _create_chunked_attention_mask(  # pyright: ignore[reportUnusedFunction]
-    attention_chunk_size: int,
-    start: int,
-    end: int,
-):
-    """Create a chunked causal attention mask for sliding-window attention.
-
-    Builds a boolean mask over positions ``[start, end)`` such that token ``i``
-    can attend to token ``j`` only if they fall in the same chunk
-    (``i // chunk == j // chunk``) and ``j <= i``.
-
-    Args:
-        attention_chunk_size (int): Length of one attention chunk.
-        start (int): Inclusive start position.
-        end (int): Exclusive end position.
-
-    Returns:
-        jnp.ndarray: Boolean mask of shape ``(end - start, end - start)``.
-    """
-    blcok_position = jnp.abs(
-        (jnp.arange(start, end)[None, :] // attention_chunk_size)
-        - jnp.arange(start, end)[:, None] // attention_chunk_size
-    )
-    token_position = jnp.arange(start, end)[None, :] - jnp.arange(start, end)[:, None]
-    return ((blcok_position == 0) & (token_position <= 0)).astype("b1")
 
 
 class Llama4TextExperts(spx.Module):
@@ -309,9 +301,7 @@ class Llama4TextExperts(spx.Module):
         Returns:
             Transformed hidden states after expert processing [batch, seq_len, hidden_dim].
         """
-        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
-        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
+        return moe_gated_expert_forward(self, hidden_states, group_sizes, sorted_experts)
 
 
 class Llama4TextL2Norm(spx.Module):
@@ -345,7 +335,7 @@ class Llama4TextL2Norm(spx.Module):
         Returns:
             jnp.ndarray: Normalized array of the same shape as ``x``.
         """
-        return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
+        return rms_norm(x.astype(jnp.float32), eps=self.eps).astype(x.dtype)
 
     @jax.named_scope("easydel-L2norm")
     def forward(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -1291,11 +1281,13 @@ class Llama4TextModel(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-    ) -> BaseModelOutput:
+        output_router_logits: bool | None = None,
+    ) -> MoeModelOutput:
         """Forward pass through the Llama4 text base model.
 
         Processes input tokens through embedding, all decoder layers with RoPE and RMSNorm,
-        and final normalization.
+        and final normalization. ``output_router_logits`` defaults to the config
+        setting and collects outputs only from layers that contain MoE routers.
 
         Args:
             input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
@@ -1335,6 +1327,8 @@ class Llama4TextModel(EasyDeLBaseModule):
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
         sequence_length = inputs_embeds.shape[1]
 
+        output_router_logits = self.config.output_router_logits if output_router_logits is None else output_router_logits
+        all_router_logits = () if output_router_logits else None
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
         assert sequence_length <= self.config.max_position_embeddings, (
@@ -1382,7 +1376,7 @@ class Llama4TextModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache,
+            extra=needs_trace_cache or output_router_logits,
         )
         cache_views = views if trace_layers else None
 
@@ -1395,7 +1389,7 @@ class Llama4TextModel(EasyDeLBaseModule):
             (chunked or full) ``mask_info`` plus complex RoPE ``frequencies``
             from the enclosing scope.
             """
-            hidden_states, cv, all_hidden_states, all_attentions, idx = carry
+            hidden_states, cv, all_hidden_states, all_attentions, router_outputs, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1414,6 +1408,7 @@ class Llama4TextModel(EasyDeLBaseModule):
                     cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
+                    output_router_logits=output_router_logits,
                     frequencies=frequencies,
                 )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
@@ -1429,11 +1424,13 @@ class Llama4TextModel(EasyDeLBaseModule):
                 cache=past_key_values,
             )
 
-            return hidden_states, cv, all_hidden_states, all_attentions, idx + 1
+            if output_router_logits and layer_outputs.router_logits is not None:
+                router_outputs += (layer_outputs.router_logits,)
+            return hidden_states, cv, all_hidden_states, all_attentions, router_outputs, idx + 1
 
-        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
+            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
             trace=trace_layers,
         )
         hidden_states = self.norm(hidden_states)
@@ -1441,11 +1438,12 @@ class Llama4TextModel(EasyDeLBaseModule):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        return BaseModelOutput(
+        return MoeModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
             past_key_values=past_key_values,
+            router_logits=all_router_logits,
         )
 
     def get_encoder(self):
@@ -1520,6 +1518,42 @@ class Llama4ForCausalLM(BaseCausalLMModule[Llama4TextModel, Llama4TextConfig]):
             precision=precision,
             rngs=rngs,
             lm_head_bias=False,
+            router_aux_loss_coef=config.router_aux_loss_coef,
+        )
+
+    def forward(
+        self,
+        input_ids=None,
+        inputs_embeds=None,
+        attention_mask=None,
+        mask_info=None,
+        position_ids=None,
+        mode=None,
+        past_key_values=None,
+        cache_metadata=None,
+        apply_lm_head=True,
+        output_attentions=None,
+        output_hidden_states=None,
+        output_router_logits=None,
+    ) -> MoeCausalLMOutput:
+        """Return token logits and the configured per-MoE-layer router diagnostics.
+
+        Router auxiliary loss uses the shared task implementation and the
+        configured coefficient, including the attention mask for padded tokens.
+        """
+        return self.forward_moe(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            apply_lm_head=apply_lm_head,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
         )
 
 
@@ -1655,29 +1689,11 @@ def pixel_shuffle(input_tensor, shuffle_ratio):
         jnp.ndarray: Shuffled features of shape
         ``(batch, new_num_patches, channels / shuffle_ratio**2)``.
     """
-    batch_size, num_patches, channels = input_tensor.shape
-    patch_size = int(math.sqrt(num_patches))
-
-    input_tensor = input_tensor.reshape(batch_size, patch_size, patch_size, -1)
-    batch_size, height, width, channels = input_tensor.shape
-
-    reshaped_tensor = input_tensor.reshape(
-        batch_size,
-        height,
-        int(width * shuffle_ratio),
-        int(channels / shuffle_ratio),
-    )
-    reshaped_tensor = jnp.transpose(reshaped_tensor, (0, 2, 1, 3))
-    reshaped_tensor = reshaped_tensor.reshape(
-        batch_size,
-        int(height * shuffle_ratio),
-        int(width * shuffle_ratio),
-        int(channels / (shuffle_ratio**2)),
-    )
-    reshaped_tensor = jnp.transpose(reshaped_tensor, (0, 2, 1, 3))
-
-    output_tensor = reshaped_tensor.reshape(batch_size, -1, reshaped_tensor.shape[-1])
-    return output_tensor
+    batch_size, num_patches, _ = input_tensor.shape
+    side = int(math.sqrt(num_patches))
+    grid = input_tensor.reshape(batch_size, side, side, -1)
+    shuffled = pixel_unshuffle_grid(grid, int(side * shuffle_ratio), int(side * shuffle_ratio))
+    return shuffled.reshape(batch_size, -1, shuffled.shape[-1])
 
 
 class Llama4VisionPixelShuffleMLP(spx.Module):
@@ -1801,23 +1817,11 @@ def vision_apply_rotary_emb(
         tuple[jax.Array, jax.Array]: Rotated query and key with shapes/dtypes
         matching their inputs.
     """
-    query_dtype = query.dtype
-    key_dtype = key.dtype
-    query_reshaped = query.astype(jnp.float32).reshape((*query.shape[:-1], -1, 2))
-    key_reshaped = key.astype(jnp.float32).reshape((*key.shape[:-1], -1, 2))
-    query_complex = jax.lax.complex(query_reshaped[..., 0], query_reshaped[..., 1])
-    key_complex = jax.lax.complex(key_reshaped[..., 0], key_reshaped[..., 1])
-    frequencies_broadcast = reshape_for_broadcast(frequencies, query_complex)
-    query_rotated = query_complex * frequencies_broadcast
-    key_rotated = key_complex * frequencies_broadcast
-    query_out_real_imag = jnp.stack(
-        [jnp.real(query_rotated), jnp.imag(query_rotated)],
-        axis=-1,
-    )
-    key_out_real_imag = jnp.stack([jnp.real(key_rotated), jnp.imag(key_rotated)], axis=-1)
-    query_out = query_out_real_imag.reshape(query.shape)
-    key_out = key_out_real_imag.reshape(key.shape)
-    return query_out.astype(query_dtype), key_out.astype(key_dtype)
+    frequencies_broadcast = reshape_for_broadcast(frequencies, query[..., ::2])
+    cos, sin = jnp.real(frequencies_broadcast), jnp.imag(frequencies_broadcast)
+    query_out = apply_rope_interleaved(query.astype(jnp.float32), cos, sin)
+    key_out = apply_rope_interleaved(key.astype(jnp.float32), cos, sin)
+    return query_out.astype(query.dtype), key_out.astype(key.dtype)
 
 
 class Llama4VisionAttention(AttentionModule):
@@ -1978,8 +1982,8 @@ class Llama4VisionMLP2(spx.Module):
 
     Attributes:
         fc1, fc2 (ColumnParallelLinear): The two linear projections; their
-            input/output widths come from ``config.intermediate_size``,
-            ``config.projector_input_dim`` and ``config.projector_output_dim``.
+            input width is the shuffled ``hidden_size / pixel_shuffle_ratio**2``;
+            subsequent widths are ``projector_input_dim`` and ``projector_output_dim``.
         activation_fn (Callable): GELU.
         hidden_size, intermediate_size: Mirror config.
     """
@@ -2020,8 +2024,9 @@ class Llama4VisionMLP2(spx.Module):
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(0.01),
         )
-        self.fc1 = linear_class(self.intermediate_size, config.projector_input_dim)
-        self.fc2 = linear_class(config.projector_output_dim, config.projector_output_dim)
+        shuffled_width = round(config.hidden_size / config.pixel_shuffle_ratio**2)
+        self.fc1 = linear_class(shuffled_width, config.projector_input_dim)
+        self.fc2 = linear_class(config.projector_input_dim, config.projector_output_dim)
 
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
         """Apply two-layer feedforward transformation with GELU activation.
@@ -2464,6 +2469,8 @@ class Llama4UnfoldConvolution(spx.Module):
         return hidden_states
 
 
+@register_module(TaskType.BASE_VISION, config=Llama4VisionConfig, model_type="llama4_vision_model")
+@register_module(TaskType.BASE_MODULE, config=Llama4VisionConfig, model_type="llama4_vision_model")
 @register_module(TaskType.BASE_VISION, config=Llama4VisionConfig, model_type="llama4_vision")
 @register_module(TaskType.BASE_MODULE, config=Llama4VisionConfig, model_type="llama4_vision")
 class Llama4VisionModel(EasyDeLBaseModule):
@@ -2946,12 +2953,15 @@ class Llama4ForConditionalGeneration(BaseVisionLanguageModule[Llama4ForCausalLM,
             **lm_kwargs,
         )
 
-        return VLMCausalLMOutput(
+        return Llama4CausalLMOutputWithPast(
             logits=outputs.logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
+            last_hidden_state=getattr(outputs, "last_hidden_state", None),
             attentions=outputs.attentions,
             image_hidden_states=image_features if pixel_values is not None else None,
+            router_logits=getattr(outputs, "router_logits", None),
+            aux_loss=getattr(outputs, "aux_loss", None),
         )
 
     def init_cache(

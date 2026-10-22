@@ -80,13 +80,18 @@ See Also:
 
 from __future__ import annotations
 
+import hashlib
 import os
+from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
+from eformer.loggings import get_logger
 
 from .cache import VisionEncoderCache
-from .types import MultiModalFeature
+from .types import MultiModalFeature, compute_content_hash
+
+logger = get_logger("eSurge-MultiModalManager")
 
 _PILImage: Any | None
 
@@ -202,8 +207,9 @@ class MultiModalManager:
     def resize_to_bucket(self, image: Any) -> Any:
         """Resize image to nearest resolution bucket.
 
-        Selects the bucket with total pixels closest to the original image
-        to minimize quality loss while enabling compilation reuse.
+        Selects the bucket (from the manager's configured ``resolution_buckets``) with total pixels closest to the
+        original image to minimize quality loss while enabling compilation reuse. ``process_images`` additionally
+        aligns the buckets to the model's patch geometry; use this method for the plain configured buckets.
 
         Args:
             image: PIL Image to resize.
@@ -211,17 +217,80 @@ class MultiModalManager:
         Returns:
             Resized PIL Image at bucket resolution.
         """
-        w, h = image.size
-        original_pixels = h * w
+        return self._resize_to_buckets(image, self.resolution_buckets)
 
-        # Buckets are stored as (H, W).
-        target_h, target_w = min(self.resolution_buckets, key=lambda b: abs(b[0] * b[1] - original_pixels))
+    @staticmethod
+    def _media_cache_key(kind: str, media: list[Any]) -> str:
+        """Content key of a list of images / videos for the preprocessing cache.
 
-        if (h, w) == (target_h, target_w):
-            return image
+        Args:
+            kind: ``"image"`` or ``"video"`` (keeps the two key spaces apart).
+            media: PIL images or ``[T, H, W, C]`` video arrays.
 
-        pil_image = _require_pillow()
-        return image.resize((target_w, target_h), pil_image.Resampling.LANCZOS)
+        Returns:
+            Hex digest covering the kind, the number of items and the exhaustive content hash of each item.
+        """
+        hasher = hashlib.blake2b(digest_size=16)
+        hasher.update(kind.encode())
+        hasher.update(str(len(media)).encode())
+        for item in media:
+            array = np.asarray(item.convert("RGB")) if hasattr(item, "convert") else np.asarray(item)
+            hasher.update(compute_content_hash(array).encode())
+        return hasher.hexdigest()
+
+    def _cached_preprocess(
+        self, kind: str, media: list[Any], compute: Any
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Run ``compute()`` through the preprocessing cache (``self.cache``) keyed by the media content.
+
+        The same images / videos are commonly re-sent (multi-turn chats, repeated requests); preprocessing is then
+        served from the cache instead of being recomputed. With the cache disabled (or sized ``0``) this simply calls
+        ``compute()``.
+
+        Args:
+            kind: ``"image"`` or ``"video"``.
+            media: The input media list (hashed for the cache key).
+            compute: Zero-argument callable producing the ``(pixel_values, grid_thw)`` tuple.
+
+        Returns:
+            The ``(pixel_values, grid_thw)`` tuple.
+        """
+        cache = getattr(self, "cache", None)
+        if cache is None:
+            return compute()
+        try:
+            key = self._media_cache_key(kind, media)
+        except Exception:
+            return compute()
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        result = compute()
+        cache.put(key, result)
+        return result
+
+    def _call_media_processor(self, **media: Any) -> tuple[Any, Exception | None]:
+        """Call the HF processor on one media kwarg (``images=`` or ``videos=``), retrying with dummy text.
+
+        Some VLM processors require ``text`` even when only vision tensors are needed.
+
+        Args:
+            **media: A single ``images=`` or ``videos=`` keyword with the media list.
+
+        Returns:
+            ``(processed, None)`` on success, or ``(None, error)`` when the processor failed; the error is kept so the
+            caller can surface it instead of reporting a misleading "unsupported" message.
+        """
+        count = len(next(iter(media.values())))
+        try:
+            return self.processor(**media, return_tensors="np"), None
+        except Exception as exc:
+            if isinstance(exc, ValueError) and "either `text` or `text_target`" in str(exc):
+                try:
+                    return self.processor(text=[""] * count, **media, return_tensors="np"), None
+                except Exception as retry_exc:
+                    return None, retry_exc
+            return None, exc
 
     @staticmethod
     def _align_dim_to_multiple(dim: int, multiple: int) -> int:
@@ -500,24 +569,25 @@ class MultiModalManager:
 
         GLM4V/GLM46V, Qwen VL and Muse-Glimmer models in EasyDeL expect `pixel_values` shaped
         as flattened spatio-temporal patches: [num_patches_total, patch_features].
-        This method checks the model_type to determine if flat-patch format
-        is expected.
+
+        A model (or its config) opts in or out explicitly by declaring a boolean
+        ``supports_flat_patch_inputs`` attribute. The
+        ``esurge_flat_patch_inputs`` hook is also honoured as an explicit serving
+        override. Routing depends only on these capabilities, not on the model's
+        family name; models without a declaration use their processor's output.
 
         Returns:
             bool: True if the model expects flat-patch inputs, False otherwise.
         """
         if self.model is None:
             return False
-        model_type = str(getattr(getattr(self.model, "config", None), "model_type", "")).lower()
-        return model_type in {
-            "glm4v",
-            "glm4v_moe",
-            "glm46v",
-            "muse_glimmer",
-            "qwen2_vl",
-            "qwen3_vl",
-            "qwen3_vl_moe",
-        }
+        config = getattr(self.model, "config", None)
+        for attribute in ("esurge_flat_patch_inputs", "supports_flat_patch_inputs"):
+            for owner in (self.model, config):
+                declared = getattr(owner, attribute, None)
+                if isinstance(declared, bool):
+                    return declared
+        return False
 
     def _pad_flat_patches_for_merge(
         self,
@@ -593,7 +663,17 @@ class MultiModalManager:
                 ((0, 0), (0, pad_h), (0, pad_w), (0, 0)),
                 mode="edge",
             )
-            out_chunks.append(padded.reshape(t_i * new_h * new_w, patch_dim))
+            # An incomplete grid cannot contain complete merge blocks: its incoming
+            # rows are raster ordered. Emit the padded grid in tower merge order.
+            merged = padded.reshape(
+                t_i,
+                new_h // spatial_merge_size,
+                spatial_merge_size,
+                new_w // spatial_merge_size,
+                spatial_merge_size,
+                patch_dim,
+            ).transpose(0, 1, 3, 2, 4, 5)
+            out_chunks.append(merged.reshape(t_i * new_h * new_w, patch_dim))
             out_grid.append(np.asarray([t_i, new_h, new_w], dtype=np.int64))
 
         if not out_chunks:
@@ -666,14 +746,22 @@ class MultiModalManager:
         grid_h = h_padded // patch_size
         grid_w = w_padded // patch_size
 
-        # [t_groups, temporal_patch_size, grid_h, patch_size, grid_w, patch_size, C]
-        patches = frames.reshape(t_groups, temporal_patch_size, grid_h, patch_size, grid_w, patch_size, channels)
-        # [t_groups, grid_h, grid_w, temporal_patch_size, patch_size, patch_size, C]
-        patches = patches.transpose(0, 2, 4, 1, 3, 5, 6)
-        # [num_patches, temporal_patch_size, patch_size, patch_size, C]
-        patches = patches.reshape(t_groups * grid_h * grid_w, temporal_patch_size, patch_size, patch_size, channels)
-        # [num_patches, C, temporal_patch_size, patch_size, patch_size]
-        patches = patches.transpose(0, 4, 1, 2, 3)
+        # Contiguous patch rows form merge_size x merge_size spatial blocks,
+        # matching the tower's rotary coordinates and spatial merger. Within a
+        # patch the feature order remains [C, temporal, patch_h, patch_w].
+        patches = frames.reshape(
+            t_groups,
+            temporal_patch_size,
+            grid_h // spatial_merge_size,
+            spatial_merge_size,
+            patch_size,
+            grid_w // spatial_merge_size,
+            spatial_merge_size,
+            patch_size,
+            channels,
+        )
+        patches = patches.transpose(0, 2, 5, 3, 6, 8, 1, 4, 7)
+        patches = patches.reshape(t_groups * grid_h * grid_w, channels, temporal_patch_size, patch_size, patch_size)
         flat = patches.reshape(patches.shape[0], -1).astype(np.float32, copy=False)
 
         grid_thw = np.asarray([t_groups, grid_h, grid_w], dtype=np.int64)
@@ -734,29 +822,22 @@ class MultiModalManager:
         """
         if not images:
             return None, None
+        return self._cached_preprocess("image", images, lambda: self._preprocess_images(images))
 
+    def _preprocess_images(self, images: list[Any]) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Uncached implementation of :meth:`process_images` (resize, processor call, flat-patch fallback)."""
         resize_buckets = self._get_resize_buckets_for_model()
         bucketed_images = [self._resize_to_buckets(img.convert("RGB"), resize_buckets) for img in images]
 
         vision_cfg = self._get_vision_config()
         spatial_merge_size = int(getattr(vision_cfg, "spatial_merge_size", 1) or 1) if vision_cfg is not None else 1
 
+        processor_error: Exception | None = None
         if self.processor is not None:
-            try:
-                processed = self.processor(images=bucketed_images, return_tensors="np")
-            except Exception as exc:
-                # Some VLM processors require `text` even when only image tensors are needed.
-                if isinstance(exc, ValueError) and "either `text` or `text_target`" in str(exc):
-                    try:
-                        processed = self.processor(
-                            text=[""] * len(bucketed_images), images=bucketed_images, return_tensors="np"
-                        )
-                    except Exception:
-                        processed = None
-                else:
-                    processed = None
+            processed, processor_error = self._call_media_processor(images=bucketed_images)
 
-            if isinstance(processed, dict):
+            # HF processors return ``BatchFeature`` / ``BatchEncoding`` (``UserDict``), not ``dict``.
+            if isinstance(processed, Mapping):
                 pixel_values = processed.get("pixel_values")
                 image_grid_thw = processed.get("image_grid_thw")
                 if pixel_values is not None:
@@ -782,6 +863,14 @@ class MultiModalManager:
                 f"Processor {type(self.processor).__name__ if self.processor is not None else None} "
                 "does not support image preprocessing, and this model does not expose a compatible "
                 "flat-patch vision interface for fallback preprocessing."
+                + (f" Processor error: {type(processor_error).__name__}: {processor_error}" if processor_error else "")
+            ) from processor_error
+        if processor_error is not None:
+            logger.warning(
+                "Processor %s failed on images (%s: %s); using the built-in flat-patch preprocessing fallback.",
+                type(self.processor).__name__,
+                type(processor_error).__name__,
+                processor_error,
             )
 
         if vision_cfg is None:
@@ -846,24 +935,20 @@ class MultiModalManager:
         """
         if not videos:
             return None, None
+        return self._cached_preprocess("video", videos, lambda: self._preprocess_videos(videos))
 
+    def _preprocess_videos(self, videos: list[np.ndarray]) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Uncached implementation of :meth:`process_videos` (processor call, flat-patch fallback)."""
         vision_cfg = self._get_vision_config()
         spatial_merge_size = int(getattr(vision_cfg, "spatial_merge_size", 1) or 1) if vision_cfg is not None else 1
         resize_buckets = self._get_resize_buckets_for_model()
 
+        processor_error: Exception | None = None
         if self.processor is not None:
-            try:
-                processed = self.processor(videos=videos, return_tensors="np")
-            except Exception as exc:
-                if isinstance(exc, ValueError) and "either `text` or `text_target`" in str(exc):
-                    try:
-                        processed = self.processor(text=[""] * len(videos), videos=videos, return_tensors="np")
-                    except Exception:
-                        processed = None
-                else:
-                    processed = None
+            processed, processor_error = self._call_media_processor(videos=videos)
 
-            if isinstance(processed, dict):
+            # HF processors return ``BatchFeature`` / ``BatchEncoding`` (``UserDict``), not ``dict``.
+            if isinstance(processed, Mapping):
                 pixel_values_videos = processed.get("pixel_values_videos")
                 video_grid_thw = processed.get("video_grid_thw")
                 if pixel_values_videos is not None:
@@ -889,6 +974,14 @@ class MultiModalManager:
                 f"Processor {type(self.processor).__name__ if self.processor is not None else None} "
                 "does not support video preprocessing, and this model does not expose a compatible "
                 "flat-patch vision interface for fallback preprocessing."
+                + (f" Processor error: {type(processor_error).__name__}: {processor_error}" if processor_error else "")
+            ) from processor_error
+        if processor_error is not None:
+            logger.warning(
+                "Processor %s failed on videos (%s: %s); using the built-in flat-patch preprocessing fallback.",
+                type(self.processor).__name__,
+                type(processor_error).__name__,
+                processor_error,
             )
 
         if vision_cfg is None:
@@ -1307,6 +1400,8 @@ class MultiModalManager:
         self,
         images: list[Any] | None,
         request_idx: int = 0,
+        *,
+        processed: tuple[np.ndarray | None, np.ndarray | None] | None = None,
     ) -> list[MultiModalFeature]:
         """Process images and create MultiModalFeature objects.
 
@@ -1322,6 +1417,9 @@ class MultiModalManager:
                 Can be None or empty, in which case an empty list is returned.
             request_idx (int): Index of the request in a batch. Used for
                 tracking which request each feature belongs to. Defaults to 0.
+            processed (tuple | None): Optional ``(pixel_values, image_grid_thw)`` already returned by
+                :meth:`process_images` for the same ``images``. When given, the images are not preprocessed
+                a second time. Defaults to None (preprocess here).
 
         Returns:
             list[MultiModalFeature]: List of feature objects, one per input
@@ -1336,7 +1434,7 @@ class MultiModalManager:
         if not images:
             return []
 
-        pixel_values, image_grid_thw = self.process_images(images)
+        pixel_values, image_grid_thw = processed if processed is not None else self.process_images(images)
 
         if pixel_values is None:
             return []
@@ -1383,6 +1481,8 @@ class MultiModalManager:
         self,
         videos: list[np.ndarray] | None,
         request_idx: int = 0,
+        *,
+        processed: tuple[np.ndarray | None, np.ndarray | None] | None = None,
     ) -> list[MultiModalFeature]:
         """Process videos and create MultiModalFeature objects.
 
@@ -1399,6 +1499,9 @@ class MultiModalManager:
                 empty list is returned.
             request_idx (int): Index of the request in a batch. Used for
                 tracking which request each feature belongs to. Defaults to 0.
+            processed (tuple | None): Optional ``(pixel_values_videos, video_grid_thw)`` already returned by
+                :meth:`process_videos` for the same ``videos``. When given, the videos are not preprocessed
+                a second time. Defaults to None (preprocess here).
 
         Returns:
             list[MultiModalFeature]: List of feature objects, one per input
@@ -1413,7 +1516,7 @@ class MultiModalManager:
         if not videos:
             return []
 
-        pixel_values_videos, video_grid_thw = self.process_videos(videos)
+        pixel_values_videos, video_grid_thw = processed if processed is not None else self.process_videos(videos)
 
         if pixel_values_videos is None:
             return []

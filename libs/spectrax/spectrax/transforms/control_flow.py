@@ -40,7 +40,7 @@ import jax
 import jax.lax as lax
 
 from ..core.graph import bind, export
-from ..core.module import Module, _set_inside_transform
+from ..core.module import Module, _inside_transform, _set_inside_transform
 from ..core.selector import SelectorSugar
 from ..core.state import State
 from .scan import _check_invariant_equal
@@ -124,11 +124,12 @@ def _run_branch(
         A pair ``(branch_output, new_state)``.
     """
     m = bind(gdef, state)
+    prev_inside_transform = _inside_transform()
     _set_inside_transform(True)
     try:
         y = fn(m, *operands)
     finally:
-        _set_inside_transform(False)
+        _set_inside_transform(prev_inside_transform)
     _, new_state = export(m)
     return y, new_state
 
@@ -457,11 +458,12 @@ def while_loop(
         c_state, uc = loop_carry
         full = c_state.overlay(invariant)
         m = bind(gdef, full)
+        prev_inside_transform = _inside_transform()
         _set_inside_transform(True)
         try:
             return cond_fn(m, uc)
         finally:
-            _set_inside_transform(False)
+            _set_inside_transform(prev_inside_transform)
 
     def body_wrap(loop_carry: tuple[State, object]) -> tuple[State, object]:
         """:func:`jax.lax.while_loop` body.
@@ -481,11 +483,12 @@ def while_loop(
         c_state, uc = loop_carry
         full = c_state.overlay(invariant)
         m = bind(gdef, full)
+        prev_inside_transform = _inside_transform()
         _set_inside_transform(True)
         try:
             new_uc = body_fn(m, uc)
         finally:
-            _set_inside_transform(False)
+            _set_inside_transform(prev_inside_transform)
         _, new_state = export(m)
         new_c, new_inv = (State({}), new_state) if mutable_sel is None else mutable_sel.partition_state(m, new_state)
         _check_invariant_equal(invariant, new_inv)
@@ -595,11 +598,12 @@ def fori_loop(
             m = bind(gdef, state)
             if modulelist_caches:
                 _inject_traced_caches(m, modulelist_caches)
+            prev_inside_transform = _inside_transform()
             _set_inside_transform(True)
             try:
                 new_user_carry = body_fn(i, m, user_carry)
             finally:
-                _set_inside_transform(False)
+                _set_inside_transform(prev_inside_transform)
             _, new_state = export(m)
             _check_invariant_equal(state, new_state)
             assert_state_unchanged(init_module, state, new_state)
@@ -632,11 +636,12 @@ def fori_loop(
         # the carried (mutable) leaves every iteration. Stacking from the
         # rebound items sees the current carry; the parameter stacking is
         # loop-invariant.
+        prev_inside_transform = _inside_transform()
         _set_inside_transform(True)
         try:
             new_uc = body_fn(i, m, uc)
         finally:
-            _set_inside_transform(False)
+            _set_inside_transform(prev_inside_transform)
         _, new_state = export(m)
         new_c, new_inv = (State({}), new_state) if mutable_sel is None else mutable_sel.partition_state(m, new_state)
         _check_invariant_equal(invariant, new_inv)
@@ -731,11 +736,12 @@ def remat_scan(
         """
         full = c.overlay(invariant)
         m = bind(gdef, full)
+        prev_inside_transform = _inside_transform()
         _set_inside_transform(True)
         try:
             y = fn(m, x)
         finally:
-            _set_inside_transform(False)
+            _set_inside_transform(prev_inside_transform)
         _, new_state = export(m)
         new_c, new_inv = (State({}), new_state) if mutable_sel is None else mutable_sel.partition_state(m, new_state)
         _check_invariant_equal(invariant, new_inv)

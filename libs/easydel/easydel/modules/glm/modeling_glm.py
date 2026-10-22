@@ -176,6 +176,7 @@ class GlmAttention(UnifiedAttention):
         *,
         rngs: spx.Rngs,
         layer_idx: int,
+        use_qk_norm: bool = False,
     ):
         """Initialize GLM attention layer with grouped-query attention support.
 
@@ -186,6 +187,7 @@ class GlmAttention(UnifiedAttention):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
+            use_qk_norm (bool): Enable per-head query/key RMS normalization. Defaults to False.
         """
         self.layer_idx = layer_idx
         super().__init__(
@@ -195,6 +197,7 @@ class GlmAttention(UnifiedAttention):
             precision=precision,
             rngs=rngs,
             layer_idx=layer_idx,
+            use_qk_norm=use_qk_norm,
         )
 
     def _create_rotary(self, config: GlmConfig, dtype: jnp.dtype):
@@ -741,5 +744,5 @@ class GlmForSequenceClassification(BaseSequenceClassificationModule[GlmModel, Gl
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            score_bias=False,
+            score_head_bias=False,
         )

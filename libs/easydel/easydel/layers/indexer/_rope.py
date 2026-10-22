@@ -27,6 +27,8 @@ from __future__ import annotations
 from jax import numpy as jnp
 from jaxtyping import Array, Float
 
+from easydel.layers.rotary import apply_rope_interleaved, apply_rope_split_half
+
 __all__ = ("apply_indexer_rope", "truncate_cos_sin")
 
 
@@ -51,13 +53,6 @@ def truncate_cos_sin(
     if width is None:
         return cos, sin
     return cos[..., :width], sin[..., :width]
-
-
-def _rotate_half(x: Float[Array, "... d"]) -> Float[Array, "... d"]:
-    """NeoX split-half rotation partner: ``[-x2, x1]`` for ``x = [x1, x2]``."""
-    half = x.shape[-1] // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return jnp.concatenate([-x2, x1], axis=-1)
 
 
 def apply_indexer_rope(
@@ -101,21 +96,15 @@ def apply_indexer_rope(
                 f"split_half RoPE received a cos table (width {rotary_dim}) wider than the feature dim "
                 f"({x.shape[-1]}); truncate the table or use a narrower rope_dim."
             )
-        # Pre-doubled tables ([half | half]) carry the full rotated width.
-        x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
-        rotated = x_rot * cos + _rotate_half(x_rot) * sin
-        if rotary_dim == x.shape[-1]:
-            return rotated
-        return jnp.concatenate([rotated, x_pass], axis=-1)
+        # Pre-doubled tables ([half | half]) carry the full rotated width; channels past it pass through.
+        return apply_rope_split_half(x, cos, sin, unsqueeze_dim=None, compute_dtype=None)
 
     # Interleaved (adjacent-channel) pairing on the leading even slice.
     width = min(rotary_dim * 2, x.shape[-1])
     width -= width % 2
     x_rot, x_pass = x[..., :width], x[..., width:]
     cos_w, sin_w = cos[..., : width // 2], sin[..., : width // 2]
-    x1, x2 = x_rot[..., 0::2], x_rot[..., 1::2]
-    rotated = jnp.stack([x1 * cos_w - x2 * sin_w, x2 * cos_w + x1 * sin_w], axis=-1)
-    rotated = rotated.reshape(x_rot.shape)
+    rotated = apply_rope_interleaved(x_rot, cos_w, sin_w)
     if width == x.shape[-1]:
         return rotated
     return jnp.concatenate([rotated, x_pass], axis=-1)

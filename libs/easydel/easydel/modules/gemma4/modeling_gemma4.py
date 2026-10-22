@@ -113,7 +113,8 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
-from easydel.layers.norms._norms import lowfloats
+from easydel.layers.norms import lowfloats, rms_norm
+from easydel.layers.rotary import apply_basic_rope
 from easydel.modules._base import BaseCausalLMModule, BaseVisionLanguageModule
 from easydel.modules.auto.auto_modeling import AutoEasyDeLVisionModel
 
@@ -190,7 +191,10 @@ class Gemma4RMSNorm(spx.Module):
     is used for value normalization in Gemma4's attention layers.
 
     The normalization is always computed in float32 for numerical stability,
-    regardless of the input dtype.
+    regardless of the input dtype. The statistics come from the shared
+    :func:`easydel.layers.norms.rms_norm`; the parameter layout (``weight``
+    absent when ``with_scale=False``) and the output-dtype rule (bfloat16 /
+    lowfloat inputs stay in float32 for the attention path) are Gemma4-specific.
 
     Args:
         config: Model configuration providing ``rms_norm_eps`` and ``hidden_size``.
@@ -252,21 +256,6 @@ class Gemma4RMSNorm(spx.Module):
                 key=None,
             )
 
-    def _norm(self, x: jax.Array) -> jax.Array:
-        """Apply RMS normalization without any learnable parameters.
-
-        Computes ``x / sqrt(mean(x^2) + epsilon)`` element-wise along the last
-        dimension.
-
-        Args:
-            x: Input tensor of arbitrary shape. Normalization is applied along
-                the last axis.
-
-        Returns:
-            Normalized tensor with the same shape as ``x``.
-        """
-        return x * (1 / jnp.sqrt(jnp.power(x, 2).mean(-1, keepdims=True) + self.epsilon))
-
     def forward(self, hidden_states: Array) -> jax.Array:
         """Apply RMS normalization with optional learnable scale.
 
@@ -284,11 +273,9 @@ class Gemma4RMSNorm(spx.Module):
             Normalized (and optionally scaled) tensor with the same shape as
             the input.
         """
-        variance = self._norm(hidden_states.astype(jnp.float32))
+        out = rms_norm(hidden_states.astype(jnp.float32), self.epsilon)
         if self.with_scale:
-            out = self.weight.value.astype(jnp.float32) * variance
-        else:
-            out = variance
+            out = self.weight.value.astype(jnp.float32) * out
         target_dtype = hidden_states.dtype
         if _gemma4_needs_fp32_attention_cache(target_dtype):
             target_dtype = jnp.float32
@@ -684,8 +671,6 @@ class Gemma4VisionRotaryEmbedding(spx.Module):
             tuple[Array, Array]: Rotated ``(query, key)`` tensors of the same
             shape as the inputs.
         """
-        from easydel.layers.rotary._compute_fns import apply_basic_rope
-
         return apply_basic_rope(
             query=query,
             key=key,
@@ -893,8 +878,6 @@ class Gemma4VisionAttention(spx.Module):
         )
         batch_size, sequence_length, _ = hidden_states.shape
 
-        self.num_attention_heads * self.head_dim
-        self.num_key_value_heads * self.head_dim
         if self.use_clipped_linears:
             query_states = self.q_proj(hidden_states)
             key_states = self.k_proj(hidden_states)
@@ -1680,13 +1663,12 @@ class Gemma4Attention(UnifiedAttention):
         self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
         self.kv_shared_layer_index = None
         if self.is_kv_shared_layer:
-            prev_layers = config.layer_types[:first_kv_shared_layer_idx]
-            layer_type = config.layer_types[layer_idx]
-            if layer_type in prev_layers:
-                self.kv_shared_layer_index = len(prev_layers) - 1 - prev_layers[::-1].index(layer_type)
-            else:
+            # Single source of truth for the donor lookup (also consumed by generation/cache setup).
+            self.kv_shared_layer_index = config.get_kv_shared_layer_mapping().get(layer_idx)
+            if self.kv_shared_layer_index is None:
                 self.is_kv_shared_layer = False
 
+        causal = causal and config.use_bidirectional_attention != "all"
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1695,7 +1677,7 @@ class Gemma4Attention(UnifiedAttention):
             rngs=rngs,
             layer_idx=layer_idx,
             attention_type="standard",
-            causal=True,
+            causal=causal,
             sliding_window=config.sliding_window if self.is_sliding else None,
             use_qk_norm=True,
         )
@@ -2012,6 +1994,55 @@ class Gemma4Attention(UnifiedAttention):
         # Using object.__setattr__ to bypass SpecTrax pytree validation.
         object.__setattr__(self, "_captured_kv", (key_states, value_states))
 
+        return self._attend_and_project(
+            query_states,
+            key_states,
+            value_states,
+            mask_info=mask_info,
+            mode=mode,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
+            output_attentions=output_attentions,
+            use_cache=True,
+        )
+
+    def _attend_and_project(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        *,
+        mask_info,
+        mode,
+        cache_view,
+        cache_metadata,
+        output_attentions,
+        use_cache,
+        shared_attention_context=None,
+    ):
+        """Shared post-QKV tail: cache concat, attention kernel, head merge, ``o_proj``, dropout.
+
+        Used by both the donor/standard path (:meth:`_forward_with_kv_capture`) and the
+        KV-shared path of :meth:`forward` so the two cannot drift apart.
+
+        Args:
+            query_states: Normed, rotated queries ``[batch, seq_len, num_heads, head_dim]``.
+            key_states: Normed, rotated keys ``[batch, kv_len, num_kv_heads, head_dim]``.
+            value_states: Normed values, same layout as ``key_states``.
+            mask_info: Attention mask configuration.
+            mode: Runtime execution mode.
+            cache_view: KV cache view for this layer.
+            cache_metadata: Cache management metadata.
+            output_attentions: Whether to return attention weights.
+            use_cache: Whether to run :meth:`concatenate` (cache write/read, mask and bias setup). A
+                KV-shared layer without a cache view skips it and attends over the shared K/V directly.
+            shared_attention_context: Optional donor-resolved keys, values, mask,
+                bias factory, metadata, causal flag and window. Reused without
+                writing the donor cache a second time.
+
+        Returns:
+            ``AttentionLayerOutput`` with attention output, optional weights, and the cache view.
+        """
         causal_for_kernel = self.causal
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
             causal_for_kernel = False
@@ -2020,24 +2051,57 @@ class Gemma4Attention(UnifiedAttention):
         if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
             sliding_window_for_kernel = None
 
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-            sliding_window=sliding_window_for_kernel,
-        )
-        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
-            sliding_window_for_kernel = None
+        init_attention_bias = None
+        if use_cache:
+            (
+                key_states,
+                value_states,
+                mask_info,
+                init_attention_bias,
+                cache_view,
+                cache_metadata,
+            ) = self.concatenate(
+                query=query_states,
+                key=key_states,
+                value=value_states,
+                cache_view=cache_view,
+                cache_metadata=cache_metadata,
+                mask_info=mask_info,
+                sliding_window=sliding_window_for_kernel,
+                causal=causal_for_kernel,
+            )
+            if mask_info is not None and getattr(mask_info, "causal_mask_baked_in", False):
+                causal_for_kernel = False
+            if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+                sliding_window_for_kernel = None
+
+        if shared_attention_context is not None:
+            # Reuse the donor's attention-time history, not just its storage:
+            # sliding multi-token appends can attend to more rows than the
+            # final cache window retains. No second append or window roll.
+            (
+                key_states,
+                value_states,
+                mask_info,
+                init_attention_bias,
+                cache_metadata,
+                causal_for_kernel,
+                sliding_window_for_kernel,
+            ) = shared_attention_context
+        elif not self.is_kv_shared_layer:
+            object.__setattr__(
+                self,
+                "_captured_attention_context",
+                (
+                    key_states,
+                    value_states,
+                    mask_info,
+                    init_attention_bias,
+                    cache_metadata,
+                    causal_for_kernel,
+                    sliding_window_for_kernel,
+                ),
+            )
 
         softmax_aux = self._softmax_aux()
 
@@ -2054,6 +2118,8 @@ class Gemma4Attention(UnifiedAttention):
             causal=causal_for_kernel,
             sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
+            output_attentions=output_attentions,
+            precision=self.precision,
         )
 
         if attentions.cache_view is not None:
@@ -2069,7 +2135,7 @@ class Gemma4Attention(UnifiedAttention):
 
         return AttentionLayerOutput(
             attention_output=attn_output,
-            attention_weight=attentions.attention_weight if output_attentions else None,
+            attention_weight=attentions.attention_weights if output_attentions else None,
             cache_view=cache_view,
         )
 
@@ -2085,6 +2151,7 @@ class Gemma4Attention(UnifiedAttention):
         frequencies=None,
         alibi=None,
         shared_key_value=None,
+        shared_attention_context=None,
     ):
         """Gemma4 attention forward with optional KV sharing.
 
@@ -2108,6 +2175,8 @@ class Gemma4Attention(UnifiedAttention):
                 from the donor layer.  Both tensors are already normed and
                 rotary-embedded with shape
                 ``[batch, seq_len, num_kv_heads, head_dim]``.
+            shared_attention_context: Optional donor-resolved attention history
+                and masks, passed by the text model for read-only cache sharing.
 
         Returns:
             ``AttentionLayerOutput`` with attention output, optional weights,
@@ -2151,73 +2220,21 @@ class Gemma4Attention(UnifiedAttention):
             frequencies,
         )
 
-        causal_for_kernel = self.causal
-        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
-            causal_for_kernel = False
-
-        sliding_window_for_kernel = self._kernel_sliding_window()
-        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
-            sliding_window_for_kernel = None
-
-        # Shared layers read from the donor's cache view (which is aliased
-        # to this layer's view).  The donor already wrote K/V for the current
-        # tokens, so we call concatenate for cache reads (mask setup, bias
-        # init) but the write is effectively a no-op since the pages already
-        # contain the correct data.  For the eager (no-cache) path the shared
-        # K/V are used directly without any cache interaction.
-        init_attention_bias = None
-        if cache_view is not None:
-            (
-                key_states,
-                value_states,
-                mask_info,
-                init_attention_bias,
-                cache_view,
-                cache_metadata,
-            ) = self.concatenate(
-                query=query_states,
-                key=key_states,
-                value=value_states,
-                cache_view=cache_view,
-                cache_metadata=cache_metadata,
-                mask_info=mask_info,
-                sliding_window=sliding_window_for_kernel,
-            )
-            if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
-                sliding_window_for_kernel = None
-
-        softmax_aux = self._softmax_aux()
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
+        # The model supplies the donor's resolved attention context, including
+        # the complete history and its aligned mask. Reusing it is read-only;
+        # concatenating into the donor's advanced view would append twice.
+        # Standalone callers can still supply their own pre-update cache view.
+        return self._attend_and_project(
+            query_states,
+            key_states,
+            value_states,
             mask_info=mask_info,
-            causal=causal_for_kernel,
-            sliding_window=sliding_window_for_kernel,
-            softmax_aux=softmax_aux,
-        )
-
-        if attentions.cache_view is not None:
-            cache_view = attentions.cache_view
-
-        attention_out = self._merge_heads(attentions.attention_outputs)
-        attn_output = self.shard_attention_prod(attention_out)
-        attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
-        attn_output = self.shard_attention_prod(attn_output)
-
-        if hasattr(self, "resid_dropout"):
-            attn_output = self.resid_dropout(attn_output)
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weight if output_attentions else None,
+            mode=mode,
             cache_view=cache_view,
+            cache_metadata=cache_metadata,
+            output_attentions=output_attentions,
+            use_cache=cache_view is not None and shared_attention_context is None,
+            shared_attention_context=shared_attention_context,
         )
 
 
@@ -2830,6 +2847,7 @@ class Gemma4DecoderLayer(spx.Module):
         default_frequencies: Array | None = None,
         per_layer_input: Array | None = None,
         shared_key_value: tuple[Array, Array] | None = None,
+        shared_attention_context: tuple | None = None,
     ) -> DecoderLayerOutput:
         """Execute one decoder layer forward pass.
 
@@ -2851,6 +2869,8 @@ class Gemma4DecoderLayer(spx.Module):
                 ``None`` if per-layer inputs are disabled.
             shared_key_value: Optional ``(key_states, value_states)`` tuple
                 from the donor layer for KV sharing.
+            shared_attention_context: Optional complete attention-time history
+                and masks resolved by the donor, avoiding a second cache append.
 
         Returns:
             ``DecoderLayerOutput`` containing the transformed hidden states,
@@ -2876,6 +2896,7 @@ class Gemma4DecoderLayer(spx.Module):
             output_attentions,
             frequencies,
             shared_key_value=shared_key_value,
+            shared_attention_context=shared_attention_context,
         )
         hidden_states = self.post_attention_layernorm(attn_outputs.attention_output)
         hidden_states = checkpoint_name(residual + hidden_states, "residual")
@@ -3055,10 +3076,6 @@ class Gemma4TextModel(EasyDeLBaseModule):
                     param_dtype=param_dtype,
                     dim=config.hidden_size_per_layer_input,
                 )
-
-        # Keep the cached layer-type summary hashable so split graphdefs can
-        # flow through static JAX/SpecTrax compilation paths.
-        self.unique_layer_types = tuple(dict.fromkeys(config.layer_types))
 
     def get_per_layer_inputs(self, input_ids: Array) -> Array:
         """Look up per-layer input embeddings from the dedicated embedding table.
@@ -3248,7 +3265,7 @@ class Gemma4TextModel(EasyDeLBaseModule):
         mask_info_full = mask_info
         mask_info_sliding = mask_info
 
-        if token_type_ids is not None:
+        if token_type_ids is not None and self.config.use_bidirectional_attention == "vision":
             token_type_ids = jnp.asarray(token_type_ids, dtype=jnp.int32)
             is_vision = (token_type_ids == 1) | (token_type_ids == 2)
             prev_is_vision = jnp.pad(is_vision, ((0, 0), (1, 0)), constant_values=False)[:, :-1]
@@ -3292,6 +3309,7 @@ class Gemma4TextModel(EasyDeLBaseModule):
         # For cached inference, shared layers also use the donor's cache view
         # (their own views[idx] is None to avoid duplicate buffer donation).
         shared_kv: dict[int, tuple[Array, Array]] = {}
+        shared_attention_contexts: dict[int, tuple] = {}
         donor_cache_views: dict[int, typing.Any] = {}
 
         def _layer_loop(block, carry):
@@ -3334,6 +3352,7 @@ class Gemma4TextModel(EasyDeLBaseModule):
                     default_frequencies=self.default_frequencies,
                     per_layer_input=per_layer_input,
                     shared_key_value=shared_key_value,
+                    shared_attention_context=shared_attention_contexts.get(attn.kv_shared_layer_index),
                 )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
@@ -3341,6 +3360,10 @@ class Gemma4TextModel(EasyDeLBaseModule):
             if captured is not None and not attn.is_kv_shared_layer:
                 shared_kv[idx] = captured
                 object.__setattr__(attn, "_captured_kv", None)
+                context = getattr(attn, "_captured_attention_context", None)
+                if context is not None:
+                    shared_attention_contexts[idx] = context
+                    object.__setattr__(attn, "_captured_attention_context", None)
                 # Track the donor's (potentially updated) cache view.
                 self._layer_cache_view_update(donor_cache_views, idx, layer_outputs.cache_view, enabled=True)
 
@@ -3388,6 +3411,35 @@ class Gemma4TextModel(EasyDeLBaseModule):
     def get_embedding(self):
         """Return the token embedding layer."""
         return self.embed_tokens
+
+
+def _project_tied_text_embedding(embedding, hidden_states, precision):
+    """Preserve embedding dtype promotion while honoring the owning head's precision."""
+    query, weight = embedding.promote_dtype((hidden_states, embedding.weight.value), dtype=embedding.dtype)
+    return jnp.dot(query, weight.T, precision=precision)
+
+
+class _Gemma4TextLMHeadProjection(spx.Module):
+    """Exportable text-only projection, including precision and ordered soft-capping.
+
+    This transient module references the existing projection, never the backbone;
+    it does not add parameters or alter the model's checkpoint paths.
+    """
+
+    def __init__(self, projection, *, tied, precision, postprocess):
+        """Capture the selected projection and the owning text head's static policy."""
+        self.projection = projection
+        self.tied = tied
+        self.precision = precision
+        self.postprocess = postprocess
+
+    def forward(self, hidden_states):
+        """Project hidden rows and apply the text head's optional soft-cap exactly once."""
+        if self.tied:
+            logits = _project_tied_text_embedding(self.projection, hidden_states, self.precision)
+        else:
+            logits = self.projection.native_forward(hidden_states)
+        return logits if self.postprocess is None else self.postprocess(logits)
 
 
 @register_module(TaskType.CAUSAL_LM, config=Gemma4TextConfig, model_type="gemma4_text")
@@ -3536,8 +3588,9 @@ class Gemma4ForCausalLM(BaseCausalLMModule[Gemma4TextModel, Gemma4TextConfig]):
             # Gemma4 checkpoints tie the text LM head to the input embedding
             # matrix. Going through the generic ColumnParallelLinear `w=...`
             # override can drift under TPU TP layouts, so use the embedding's
-            # native attend path directly for tied-text logits.
-            lm_logits = self.get_embedding().attend(hidden_states)
+            # native attend math directly for tied-text logits, with the
+            # model's explicit matmul precision rather than the ambient default.
+            lm_logits = self._make_tied_lm_head_fn()(hidden_states)
         else:
             lm_logits = super().apply_lm_head(hidden_states)
         if self.config.final_logit_softcapping is not None:
@@ -3545,42 +3598,79 @@ class Gemma4ForCausalLM(BaseCausalLMModule[Gemma4TextModel, Gemma4TextConfig]):
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)
         return lm_logits
 
-    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
-        """Trace-safe projection preserving Gemma-4 tied-embedding attend path and soft-capping."""
+    def get_lm_logit_postprocess(self):
+        """Capture the text head's soft-cap without introducing base clipping.
+
+        ``compute_lm_logits`` directly constrains ``apply_lm_head`` and does
+        not apply the base task module's clipping, even when configured.
+
+        Returns:
+            Scalar-only soft-capping callable, or ``None`` for identity.
+        """
         cap_value = self.config.final_logit_softcapping
+        if cap_value is None:
+            return None
+
+        def _postprocess(logits):
+            """Apply only the text head's tanh soft-cap."""
+            cap = jnp.array(cap_value, dtype=logits.dtype)
+            return cap * jax.nn.tanh(logits / cap)
+
+        return _postprocess
+
+    def _make_tied_lm_head_fn(self):
+        """Capture the native embedding projection with the model's precision.
+
+        The embedding's dtype promotion and weight layout are preserved, but
+        the dot receives explicit precision just like the untied linear head.
+        The returned callable reads parameters without mutating the module.
+
+        Returns:
+            Trace-safe callable from hidden states to uncapped tied logits.
+        """
+        embedding = self.get_embedding()
+        precision = self.precision
+
+        def _project(hidden_states):
+            """Project using the native embedding dtype and explicit precision."""
+            return _project_tied_text_embedding(embedding, hidden_states, precision)
+
+        return _project
+
+    def get_lm_head_projection(self) -> spx.Module:
+        """Export the complete small text head for both eSurge split entry points.
+
+        Exporting only the embedding loses this model's explicit matmul precision.
+        Keep the precision and soft-cap with the selected projection instead, so
+        split serving uses the same hidden-to-logits map as the full model.
+        The returned transient module shares existing parameters without changing
+        the model's checkpoint keys or retaining its backbone.
+
+        Returns:
+            Exportable projection with tied/untied selection and text soft-capping.
+        """
+        tied = getattr(self.config, "tie_word_embeddings", False)
+        return _Gemma4TextLMHeadProjection(
+            self.get_embedding() if tied else self.get_lm_head(),
+            tied=tied,
+            precision=self.precision,
+            postprocess=self.get_lm_logit_postprocess(),
+        )
+
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
+        """Trace-safe projection preserving tied embedding attend and soft-capping."""
         if getattr(self.config, "tie_word_embeddings", False):
-            # Embed.attend only reads .value — already trace-safe.
-            _attend = self.get_embedding().attend
-
-            def _project(hidden_states):
-                """Tied-embedding LM head projection with optional softcap.
-
-                Uses ``Embed.attend`` to read the embedding matrix
-                (trace-safe — bypasses :class:`nn.remat` on the LM head) and
-                then applies ``cap * tanh(logits / cap)`` when configured.
-                """
-                lm_logits = _attend(hidden_states)
-                if cap_value is not None:
-                    cap = jnp.array(cap_value, dtype=lm_logits.dtype)
-                    lm_logits = cap * jax.nn.tanh(lm_logits / cap)
-                return lm_logits
-
+            base_fn = self._make_tied_lm_head_fn()
         else:
-            # Untied: delegate to base (native_forward bypass) + add capping.
-            base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
-            if cap_value is None:
-                return base_fn
+            # Bypass BaseTaskModule's clipping: full text logits do not use it.
+            base_fn = EasyDeLBaseModule.make_lm_head_fn(self, vocab_shard_stage=vocab_shard_stage)
+        postprocess = self.get_lm_logit_postprocess()
+        if postprocess is None:
+            return base_fn
 
-            def _project(hidden_states):
-                """Untied LM head projection with logit softcapping.
-
-                Reuses the base ``make_lm_head_fn`` (which already bypasses
-                ``nn.remat`` on the LM head) and applies
-                ``cap * tanh(logits / cap)``.
-                """
-                logits = base_fn(hidden_states)
-                cap = jnp.array(cap_value, dtype=logits.dtype)
-                return cap * jax.nn.tanh(logits / cap)
+        def _project(hidden_states):
+            """Project without remat, then apply the text-only soft-cap."""
+            return postprocess(base_fn(hidden_states))
 
         return _project
 
@@ -4102,23 +4192,35 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
             logits = cap * jax.nn.tanh(logits / cap)
         return logits
 
-    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
-        """Trace-safe projection with Gemma-4 VLM soft-capping."""
-        base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
+    def get_lm_logit_postprocess(self):
+        """Capture VLM soft-capping followed by base clipping.
+
+        Returns:
+            Scalar-only logit postprocessor, or ``None`` for identity.
+        """
+        clip_fn = self.get_base_lm_logit_postprocess()
         cap_value = getattr(self.config.text_config, "final_logit_softcapping", None)
         if cap_value is None:
+            return clip_fn
+
+        def _postprocess(logits):
+            """Soft-cap raw multimodal logits before clipping them."""
+            cap = jnp.array(cap_value, dtype=logits.dtype)
+            logits = cap * jax.nn.tanh(logits / cap)
+            return clip_fn(logits) if clip_fn is not None else logits
+
+        return _postprocess
+
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
+        """Trace-safe VLM projection with soft-capping before base clipping."""
+        base_fn = EasyDeLBaseModule.make_lm_head_fn(self, vocab_shard_stage=vocab_shard_stage)
+        postprocess = self.get_lm_logit_postprocess()
+        if postprocess is None:
             return base_fn
 
         def _project(hidden_states):
-            """Multimodal LM head projection with text-config softcapping.
-
-            Wraps the base trace-safe LM head projector and applies
-            ``cap * tanh(logits / cap)`` using
-            ``config.text_config.final_logit_softcapping``.
-            """
-            logits = base_fn(hidden_states)
-            cap = jnp.array(cap_value, dtype=logits.dtype)
-            return cap * jax.nn.tanh(logits / cap)
+            """Project without remat and preserve the full-logit transform order."""
+            return postprocess(base_fn(hidden_states))
 
         return _project
 

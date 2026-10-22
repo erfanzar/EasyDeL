@@ -15,14 +15,7 @@
 
 from __future__ import annotations
 
-import typing as tp
+from ..model_loading import zero_reward_func
 
-
-def _zero_reward_func(completions: tp.Sequence[object], **_: object) -> list[float]:
-    """Default reward hook for SDFT when users only need self-distillation.
-
-    SDFT can reuse generation-oriented trainer plumbing even when no external
-    reward model is involved. Returning one zero per completion keeps the batch
-    shape valid while leaving the self-distillation loss to drive training.
-    """
-    return [0.0] * len(completions)
+# Keep the exported SDFT hook name as a backwards-compatible alias.
+_zero_reward_func = zero_reward_func

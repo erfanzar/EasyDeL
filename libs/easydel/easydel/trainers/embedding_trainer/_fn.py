@@ -243,8 +243,8 @@ def embedding_training_step(
     (Matryoshka Representation Learning). The encoder runs in the
     module's default (train) mode inside the training loss closure, so
     any dropout configured on the encoder is active during embedding
-    training; the eval path (``base_step``) is what switches to
-    ``eval()``.
+    training; :func:`embedding_evaluation_step` switches the encoder to
+    ``eval()`` for contrastive evaluation.
 
     The batch must carry tokenised ``query_*`` and ``positive_*``
     streams; ``negative_*`` is optional and triggers explicit hard
@@ -402,9 +402,8 @@ def _embedding_loss_values(
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Run the encoder and compute the chosen contrastive loss.
 
-    Computes embeddings for the concatenated query / positive / negative
-    sequences in a single forward pass before splitting them again,
-    which is friendlier to sharding than three separate forwards.
+    Encodes query, positive, and optional negative streams independently so
+    each stream may have its own padded sequence width, just as in training.
 
     Args:
         module: Encoder module.
@@ -428,24 +427,26 @@ def _embedding_loss_values(
     }
     base_loss_fn = loss_fns[loss_type]
 
-    input_ids = [batch["query_input_ids"], batch["positive_input_ids"]]
-    attention_mask = [batch["query_attention_mask"], batch["positive_attention_mask"]]
-    has_negatives = "negative_input_ids" in batch
-    if has_negatives:
-        input_ids.append(batch["negative_input_ids"])
-        attention_mask.append(batch["negative_attention_mask"])
-
-    q_size = batch["query_input_ids"].shape[0]
-    p_size = batch["positive_input_ids"].shape[0]
-    all_embeds = _embed_batch(
+    q_embeds = _embed_batch(
         module,
-        jnp.concatenate(input_ids, axis=0),
-        jnp.concatenate(attention_mask, axis=0),
+        batch["query_input_ids"],
+        batch["query_attention_mask"],
         normalize=normalize,
     )
-    q_embeds = all_embeds[:q_size]
-    p_embeds = all_embeds[q_size : q_size + p_size]
-    n_embeds = all_embeds[q_size + p_size :] if has_negatives else None
+    p_embeds = _embed_batch(
+        module,
+        batch["positive_input_ids"],
+        batch["positive_attention_mask"],
+        normalize=normalize,
+    )
+    n_embeds = None
+    if "negative_input_ids" in batch:
+        n_embeds = _embed_batch(
+            module,
+            batch["negative_input_ids"],
+            batch["negative_attention_mask"],
+            normalize=normalize,
+        )
 
     loss_kwargs = {}
     if loss_type in ("infonce", "mnrl"):
@@ -467,6 +468,53 @@ def _embedding_loss_values(
     if n_embeds is not None:
         return base_loss_fn(q_embeds, p_embeds, n_embeds, **loss_kwargs)
     return base_loss_fn(q_embeds, p_embeds, **loss_kwargs)
+
+
+def embedding_evaluation_step(
+    state: EasyDeLState,
+    batch: dict[str, jax.Array],
+    loss_type: str = "infonce",
+    temperature: float = 0.05,
+    margin: float = 0.2,
+    normalize: bool = True,
+    matryoshka_dims: list[int] | None = None,
+    partition_spec: PartitionSpec | None = None,
+) -> LossMetrics:
+    """Evaluate the contrastive objective without gradients or optimizer updates.
+
+    Args:
+        state: Encoder state, left unchanged.
+        batch: Tokenized query/positive streams and optional hard negatives.
+        loss_type: InfoNCE, MNRL, or triplet objective.
+        temperature: InfoNCE/MNRL temperature.
+        margin: Triplet margin.
+        normalize: Whether to normalize embeddings.
+        matryoshka_dims: Optional nested embedding dimensions.
+        partition_spec: Input batch sharding spec.
+
+    Returns:
+        Contrastive loss and retrieval or triplet metrics in evaluation mode.
+    """
+    module = state.merge(state.graphstate)
+    # Configured evaluators bind an eval-mode graphdef before tracing. Calling
+    # eval() even on an eval-mode module mutates SpectraX's structural epoch.
+    if getattr(module, "training", True):
+        module.eval()
+    batch = with_sharding_constraint(batch, partition_spec, mesh=module.mesh, ignore_mpmd=True)
+    loss, extra_metrics = _embedding_loss_values(
+        module=module,
+        batch=batch,
+        loss_type=loss_type,
+        temperature=temperature,
+        margin=margin,
+        normalize=normalize,
+        matryoshka_dims=matryoshka_dims,
+    )
+    return LossMetrics(
+        loss=loss,
+        accuracy=extra_metrics.get("contrastive_accuracy"),
+        other_metrics=extra_metrics,
+    )
 
 
 def _embedding_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:

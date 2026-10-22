@@ -247,6 +247,8 @@ class InternVLConfig(EasyDeLBaseConfig):
                 f"Got: {vision_feature_select_strategy}"
             )
 
+        if isinstance(vision_feature_layer, list) and not vision_feature_layer:
+            raise ValueError("`vision_feature_layer` must select at least one vision layer.")
         self.vision_feature_select_strategy = vision_feature_select_strategy
         self.vision_feature_layer = vision_feature_layer
 

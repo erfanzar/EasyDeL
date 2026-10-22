@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import typing
 from typing import Any
 
@@ -371,21 +372,19 @@ def is_recoverable_chat_template_tool_error(exc: Exception) -> bool:
         errors that should propagate.
     """
 
+    shape_keys = {"items", "function", "parameters", "properties", "arguments", "name"}
     if isinstance(exc, KeyError):
         missing_key = exc.args[0] if len(exc.args) > 0 else None
-        if missing_key in {"items", "function"}:
+        if isinstance(missing_key, str) and missing_key in shape_keys:
             return True
 
     exc_text = str(exc)
-    if exc_text.strip("'\"") in {"items", "function"}:
+    if exc_text.strip("'\"") in shape_keys:
+        return True
+    if isinstance(exc, TypeError) and re.search(r"\b(?:parameters|properties|arguments)\b", exc_text):
         return True
 
-    return (
-        "has no attribute 'items'" in exc_text
-        or "items" in exc_text
-        or "has no attribute 'function'" in exc_text
-        or "tool_data['function']" in exc_text
-    )
+    return any(f"has no attribute '{key}'" in exc_text for key in shape_keys) or "tool_data['function']" in exc_text
 
 
 def to_structured_text_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

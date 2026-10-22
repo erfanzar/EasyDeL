@@ -32,11 +32,13 @@ import jax
 import jax.lax
 import numpy as np
 import spectrax as spx
+from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 from spectrax import common_types, nn
+from spectrax.functional import conv
 
 from easydel.infra.base_module import EasyDeLBaseModule, EasyDeLLayerStackMixin
 from easydel.infra.factory import TaskType, register_module
@@ -51,7 +53,7 @@ from easydel.layers import (
     gated_mlp_forward,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.rotary import rotate_half
+from easydel.layers.rotary import apply_rope_split_half
 
 from .pixtral_configuration import PixtralVisionConfig
 
@@ -104,11 +106,28 @@ def generate_block_segment_ids(patch_embeds_list, tensor):
     return jnp.broadcast_to(block_ids[None, :], (tensor.shape[0], seq_len))
 
 
-def _concrete_image_sizes(image_sizes) -> list[tuple[int, int]] | None:
-    """Return ``image_sizes`` as host ``(height, width)`` ints, or ``None`` when traced/absent.
+@auto_pytree
+class PixtralVisionModelOutput(BaseModelOutput):
+    """Vision features with explicit geometry for fixed-capacity compiled outputs.
 
-    The per-image patch crop (like the Mistral3 patch merger) needs static sizes;
-    under ``jit`` with traced ``image_sizes`` the full padded grid is kept.
+    Attributes:
+        patch_attention_mask: Valid-token mask of shape (1, capacity). Genuine
+            patches are packed into a contiguous prefix; remaining rows are zero.
+        patch_lengths: Number of genuine patches per image, shape (num_images,).
+        patch_grid_sizes: Genuine (height, width) patch counts per image. Consumers
+            performing spatial merging must use these rather than padded capacity.
+    """
+
+    patch_attention_mask: Array | None = None
+    patch_lengths: Array | None = None
+    patch_grid_sizes: Array | None = None
+
+
+def _concrete_image_sizes(image_sizes) -> list[tuple[int, int]] | None:
+    """Return host crop sizes, or None to select runtime masked patch packing.
+
+    Traced sizes cannot determine a JAX output shape. The vision forward instead
+    packs genuine patches into a fixed-capacity buffer and returns their lengths.
     """
     if image_sizes is None:
         return None
@@ -185,8 +204,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=0):
     else:
         cos = jnp.expand_dims(cos, axis=unsqueeze_dim)
         sin = jnp.expand_dims(sin, axis=unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = apply_rope_split_half(q, cos, sin, unsqueeze_dim=None)
+    k_embed = apply_rope_split_half(k, cos, sin, unsqueeze_dim=None)
     return q_embed, k_embed
 
 
@@ -299,11 +318,6 @@ class PixtralAttention(AttentionModule):
         self.rngs = rngs
         self.hidden_size = config.hidden_size
         self.head_dim = self.config.head_dim
-
-        self.num_key_value_groups = self.config.num_attention_heads // self.config.num_attention_heads
-
-        if self.num_key_value_groups == 1:
-            assert self.config.num_attention_heads == self.config.num_attention_heads
 
         qkv_dim = config.num_attention_heads * self.head_dim
         qkv_layout = dense_qkv_layout(qkv_dim, qkv_dim)
@@ -419,6 +433,8 @@ class PixtralAttention(AttentionModule):
             init_bias=init_attention_bias,
             mask_info=mask_info,
             causal=False,
+            output_attentions=output_attentions,
+            precision=self.precision,
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
@@ -615,6 +631,8 @@ class PixtralTransformer(EasyDeLLayerStackMixin, spx.Module):
             BaseModelOutput: Contains last_hidden_state, optional hidden_states, optional attentions,
                 and past_key_values (always None for vision encoder).
         """
+        output_attentions = self.config.output_attentions if output_attentions is None else output_attentions
+        output_hidden_states = self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
@@ -628,7 +646,8 @@ class PixtralTransformer(EasyDeLLayerStackMixin, spx.Module):
         if position_ids is None:
             position_ids = mask_info.q_position_ids
 
-        hidden_states = inputs_embeds
+        query_valid = (mask_info.q_segment_ids >= 0)[..., None]
+        hidden_states = jnp.where(query_valid, inputs_embeds, 0)
 
         def _layer_loop(block, carry):
             """Apply a single vision-encoder layer inside the layer-stack scan.
@@ -649,7 +668,10 @@ class PixtralTransformer(EasyDeLLayerStackMixin, spx.Module):
                     output_attentions=output_attentions,
                     frequencies=position_embeddings,
                 )
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, _idx, layers=self.layers)
+            # Keep all-masked padding rows inert between blocks, including on
+            # backends whose all-masked softmax result is unspecified.
+            hidden_states = jnp.where(query_valid, layer_outputs.hidden_states, 0)
+            hidden_states = self._mark_layer_stage_boundary(hidden_states, _idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
@@ -672,6 +694,23 @@ class PixtralTransformer(EasyDeLLayerStackMixin, spx.Module):
             hidden_states=all_hidden_states,
             attentions=all_attentions,
             past_key_values=None,
+        )
+
+
+class _PixtralPatchConv2d(nn.Conv2d):
+    """Keep patch parameters in storage dtype while convolving in activation dtype."""
+
+    def forward(self, x: Array, **_: object) -> Array:
+        """Cast operands together without mutating the checkpoint parameter leaves."""
+        return conv(
+            x,
+            self.weight.value.astype(x.dtype),
+            self.bias.value.astype(x.dtype) if self.use_bias else None,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+            precision=self.precision,
         )
 
 
@@ -715,13 +754,14 @@ class PixtralVisionModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.patch_conv = nn.Conv2d(
+        self.patch_conv = _PixtralPatchConv2d(
             in_channels=config.num_channels,
             out_channels=config.hidden_size,
             kernel_size=config.patch_size,
             stride=config.patch_size,
             use_bias=False,
             dtype=dtype,
+            param_dtype=param_dtype,
             rngs=rngs,
             precision=precision,
         )
@@ -756,12 +796,13 @@ class PixtralVisionModel(EasyDeLBaseModule):
     def forward(
         self,
         pixel_values: list[Array],
-        output_hidden_states: bool | None = False,
+        output_hidden_states: bool | None = None,
         output_attentions: bool | None = None,
         *args,
         image_sizes: Array | None = None,
+        pad_to_max_patches: bool = False,
         **kwargs,
-    ) -> BaseModelOutput:
+    ) -> PixtralVisionModelOutput:
         """Forward pass through the Pixtral vision model.
 
         Processes variable-resolution images through patch embedding, 2D RoPE,
@@ -771,44 +812,83 @@ class PixtralVisionModel(EasyDeLBaseModule):
             pixel_values (list[Array]): List of input images, each of shape (channels, height, width).
                 Images can have different resolutions.
             output_hidden_states (bool | None, optional): Whether to return hidden states from all
-                layers. Defaults to False.
+                layers. None uses config.output_hidden_states.
             output_attentions (bool | None, optional): Whether to return attention weights.
-                Defaults to None.
+                None uses config.output_attentions.
             *args: Additional positional arguments (unused, for compatibility).
             image_sizes (Array | None, optional): Per-image ``(height, width)`` in pixels.
-                When given (and concrete), each image's patch grid is cropped to
-                ``(height // patch_size, width // patch_size)`` exactly like HF, so
-                padded batches of differently sized images yield the right patch
-                counts. Traced sizes under ``jit`` keep the full padded grid.
+                Concrete sizes crop to ``(height // patch_size, width // patch_size)``.
+                Runtime sizes pack the same genuine patches into a fixed-capacity
+                prefix, exclude padding from attention, and return explicit geometry.
+            pad_to_max_patches (bool): Use fixed-capacity packing for concrete sizes
+                too, so eager and compiled calls have identical output layouts.
+                Defaults to False, preserving the concrete ragged output shape.
             **kwargs: Additional keyword arguments (unused, for compatibility).
 
         Returns:
-            BaseModelOutput: Contains last_hidden_state of shape (1, total_patches, hidden_size),
-                optional hidden_states, and optional attentions.
+            PixtralVisionModelOutput: Features of shape (1, capacity, hidden_size),
+                optional hidden states/attentions, valid-token mask, per-image patch
+                lengths, and spatial grid sizes. With runtime geometry, capacity is
+                the padded pixel grid capacity and only the valid prefix is genuine.
         """
         patch_embeds_list = [
             self.patch_conv(jnp.expand_dims(img, 0).astype(self.dtype).transpose(0, 2, 3, 1)) for img in pixel_values
         ]
         patch_embeds_list = [p.transpose(0, 3, 1, 2) for p in patch_embeds_list]
         concrete_sizes = _concrete_image_sizes(image_sizes)
+        if image_sizes is not None and np.shape(image_sizes) != (len(patch_embeds_list), 2):
+            raise ValueError("image_sizes must have shape (num_images, 2)")
         if concrete_sizes is not None:
+            for image, (height, width) in zip(pixel_values, concrete_sizes, strict=True):
+                if not (0 < height <= image.shape[-2]):
+                    raise ValueError("image height must be positive and fit the padded pixel grid")
+                if not (0 < width <= image.shape[-1]):
+                    raise ValueError("image width must be positive and fit the padded pixel grid")
+        if concrete_sizes is not None and not pad_to_max_patches:
             patch_size = self.config.patch_size
             patch_embeds_list = [
                 p[..., : size[0] // patch_size, : size[1] // patch_size]
                 for p, size in zip(patch_embeds_list, concrete_sizes, strict=True)
             ]
+        grid_capacity = jnp.asarray([p.shape[-2:] for p in patch_embeds_list], dtype=jnp.int32)
+        runtime_packing = image_sizes is not None and (concrete_sizes is None or pad_to_max_patches)
+        if runtime_packing:
+            patch_grid_sizes = jnp.minimum(
+                jnp.maximum(jnp.asarray(image_sizes, dtype=jnp.int32) // self.config.patch_size, 0), grid_capacity
+            )
+        else:
+            patch_grid_sizes = grid_capacity
+        patch_lengths = jnp.prod(patch_grid_sizes, axis=-1)
+        patch_valid = jnp.concatenate(
+            [
+                (
+                    (jnp.arange(p.shape[-2])[:, None] < patch_grid_sizes[index, 0])
+                    & (jnp.arange(p.shape[-1])[None, :] < patch_grid_sizes[index, 1])
+                ).reshape(-1)
+                for index, p in enumerate(patch_embeds_list)
+            ]
+        )
         patch_embeds = jnp.concatenate(
             [jnp.transpose(jnp.reshape(p, (p.shape[0], p.shape[1], -1)), (0, 2, 1)) for p in patch_embeds_list],
             axis=1,
         )
-        patch_embeds = checkpoint_name(self.ln_pre(patch_embeds), "embeddings")
-
         position_ids = position_ids_in_meshgrid(
             patch_embeds_list,
             max_width=self.config.image_size // self.config.patch_size,
         )
-
         segment_ids = generate_block_segment_ids([p.shape[-2] * p.shape[-1] for p in patch_embeds_list], patch_embeds)
+        if runtime_packing:
+            # Stable packing preserves image order and each genuine row-major crop,
+            # including rectangular images whose padding is not a simple suffix.
+            order = jnp.argsort(~patch_valid, stable=True)
+            patch_embeds = patch_embeds[:, order]
+            position_ids = position_ids[order]
+            segment_ids = segment_ids[:, order]
+            patch_valid = patch_valid[order]
+        patch_attention_mask = patch_valid[None, :]
+        segment_ids = jnp.where(patch_attention_mask, segment_ids, -1)
+        patch_embeds = jnp.where(patch_attention_mask[..., None], self.ln_pre(patch_embeds), 0)
+        patch_embeds = checkpoint_name(patch_embeds, "embeddings")
         transformer_output = self.transformer(
             inputs_embeds=patch_embeds,
             mask_info=MaskInfo.from_segments(segment_ids),
@@ -816,10 +896,30 @@ class PixtralVisionModel(EasyDeLBaseModule):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
-        return BaseModelOutput(
-            last_hidden_state=checkpoint_name(transformer_output.last_hidden_state, "model_output"),
-            hidden_states=transformer_output.hidden_states,
-            attentions=transformer_output.attentions,
+
+        def mask_features(features):
+            return jnp.where(patch_attention_mask[..., None], features, 0)
+
+        return PixtralVisionModelOutput(
+            last_hidden_state=checkpoint_name(mask_features(transformer_output.last_hidden_state), "model_output"),
+            hidden_states=(
+                tuple(mask_features(hidden) for hidden in transformer_output.hidden_states)
+                if transformer_output.hidden_states is not None
+                else None
+            ),
+            attentions=(
+                tuple(
+                    jnp.where(
+                        patch_attention_mask[:, None, :, None] & patch_attention_mask[:, None, None, :], weights, 0
+                    )
+                    for weights in transformer_output.attentions
+                )
+                if transformer_output.attentions is not None
+                else None
+            ),
+            patch_attention_mask=patch_attention_mask,
+            patch_lengths=patch_lengths,
+            patch_grid_sizes=patch_grid_sizes,
         )
 
     def get_encoder(self):

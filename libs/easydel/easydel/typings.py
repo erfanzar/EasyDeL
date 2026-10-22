@@ -138,10 +138,28 @@ class ConfigDict(dict):
         """
         spec = type(self).__spec__
         if spec is not None and hasattr(spec, "from_dict"):
-            return spec.from_dict(self, **updates)
+            return spec.from_dict(dict(self), **updates)
         merged = type(self)(self)
         merged.update(updates)
         return merged
+
+    def __reduce_ex__(self, protocol: int) -> tuple:
+        """Reconstruct through the public spec instead of its dynamic runtime class.
+
+        Items are restored by pickle after memoizing the empty instance, which
+        preserves shared references and cycles without rerunning validators.
+        """
+        spec = type(self).__spec__
+        return (_new_config_dict, (spec if spec is not None else type(self),), None, None, iter(self.items()))
+
+
+def _new_config_dict(spec: type) -> ConfigDict:
+    """Allocate an empty config for pickle using an importable spec or dict class."""
+    return getattr(spec, "__typed_config_instance_cls__", spec)()
+
+
+class _ConfigSchemaError(TypeError):
+    """A mapping does not satisfy a typed-config schema (not a validator error)."""
 
 
 PostInit = tp.Callable[[tp.Any], None]
@@ -219,12 +237,13 @@ def typed_config(
         except (NameError, TypeError):
             annotations = dict(getattr(spec, "__annotations__", {}))
 
-        # Compute required/optional from resolved annotations rather than
-        # __required_keys__ / __optional_keys__ — those are computed by the
-        # TypedDict metaclass at class-creation time, but `from __future__ import
-        # annotations` makes the raw annotations strings, so the metaclass can't
-        # see Required[]/NotRequired[] wrappers and treats them all as plain.
+        # The metaclass tracks inherited requiredness per field: __total__ only
+        # applies to fields declared in this spec, not to its bases' fields.
+        # Resolved wrappers take precedence because postponed annotations hide
+        # Required/NotRequired from the TypedDict metaclass at class creation.
         total = bool(getattr(spec, "__total__", True))
+        inherited_required = getattr(spec, "__required_keys__", frozenset())
+        inherited_optional = getattr(spec, "__optional_keys__", frozenset())
         required_keys: set[str] = set()
         optional_keys: set[str] = set()
         for name, ann in annotations.items():
@@ -232,6 +251,10 @@ def typed_config(
             if origin is tp.Required:
                 required_keys.add(name)
             elif origin is tp.NotRequired:
+                optional_keys.add(name)
+            elif name in inherited_required:
+                required_keys.add(name)
+            elif name in inherited_optional:
                 optional_keys.add(name)
             elif total:
                 required_keys.add(name)
@@ -291,7 +314,7 @@ def typed_config(
 
             unknown = sorted(set(values) - all_keys)
             if unknown:
-                raise TypeError(f"{cls.__name__}.from_dict() got unknown field(s): {', '.join(unknown)}.")
+                raise _ConfigSchemaError(f"{cls.__name__}.from_dict() got unknown field(s): {', '.join(unknown)}.")
 
             instance = instance_cls()
             for k, v in defaults_.items():
@@ -300,7 +323,7 @@ def typed_config(
 
             missing = sorted(required_keys - set(instance))
             if missing:
-                raise TypeError(f"{cls.__name__}.from_dict() missing required field(s): {', '.join(missing)}.")
+                raise _ConfigSchemaError(f"{cls.__name__}.from_dict() missing required field(s): {', '.join(missing)}.")
 
             for k in list(instance.keys()):
                 ann = unwrapped.get(k)
@@ -324,7 +347,6 @@ def typed_config(
         spec.from_dict = from_dict
         spec.coerce_config = coerce_config
         spec.__typed_config_instance_cls__ = instance_cls
-        spec.__typed_config_defaults__ = types.MappingProxyType(defaults_)
         return spec
 
     if spec is not None and isinstance(spec, type):
@@ -391,12 +413,25 @@ def _coerce_value(annotation: tp.Any, value: tp.Any) -> tp.Any:
     args = tp.get_args(annotation)
 
     if origin in (tp.Union, types.UnionType):
+        # An already-coerced branch wins over other mapping-compatible schemas.
+        for arg in args:
+            target = _config_target(arg)
+            if target is not None and isinstance(value, target.__typed_config_instance_cls__):
+                return value
+        schema_errors: list[_ConfigSchemaError] = []
         for arg in args:
             if arg is type(None):
                 continue
-            coerced = _try_coerce(arg, value)
+            try:
+                coerced = _try_coerce(arg, value)
+            except _ConfigSchemaError as error:
+                schema_errors.append(error)
+                continue
             if coerced is not _COERCE_FAIL:
                 return coerced
+        if schema_errors:
+            details = "; ".join(str(error) for error in schema_errors)
+            raise _ConfigSchemaError(f"No union config schema matched: {details}") from schema_errors[-1]
         return value
 
     coerced = _try_coerce(annotation, value)

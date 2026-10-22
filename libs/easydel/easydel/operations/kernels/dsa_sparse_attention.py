@@ -40,6 +40,9 @@ from jaxtyping import Array, Bool, Float
 from spectrax import common_types
 
 from easydel.infra.sequence_packing import pairwise_attention_mask_from_mask_info
+from easydel.infra.sharding import mesh_axis_size
+
+from .._operation_impl import run_mosaic_kernel
 
 logger = get_logger(__name__)
 
@@ -97,60 +100,20 @@ def sparse_selected_training_attention(
         logger.warning_once(f"sparse_selected_training_attention: {reason}; using the XLA implementation.")
         return xla(query, key, value, mask, block_q=int(block_q), block_k=int(block_k), **kw)
 
-    # Inside an outer shard_map with manual axes (e.g. an SPMD pipeline body) a nested shard_map
-    # over the full mesh is invalid: run the kernel directly if every remaining auto axis has
-    # size 1, else keep the XLA path.
-    ambient = jax.sharding.get_abstract_mesh()
-    if not ambient.empty and ambient.manual_axes:
-        auto = [n for n in ambient.axis_names if n not in ambient.manual_axes and ambient.shape[n] > 1]
-        if auto:
-            return run_xla(f"ambient manual axes {tuple(ambient.manual_axes)} with sharded auto axes {auto}")
-        return pallas(query, key, value, mask, **kw)
-    # Mosaic kernels are not SPMD-partitionable: run directly on one device, under shard_map
-    # over the (batch, head) axes on a multi-device mesh, and fall back to XLA otherwise.
-    mesh = None if metadata is None else metadata.mesh
-    if mesh is None:
-        if jax.device_count() == 1:
-            return pallas(query, key, value, mask, **kw)
-        return run_xla("no mesh on a multi-device host")
-    if mesh.size == 1:
-        return pallas(query, key, value, mask, **kw)
-    specs = _bthd_specs(metadata)
-    if specs is None:
-        return run_xla("attention sharding is not a plain (batch, head) layout")
-    q_spec, kv_spec, batch_axes = specs
-    if not (
-        _divides(mesh, q_spec[0], query.shape[0])
-        and _divides(mesh, q_spec[2], query.shape[2])
-        and _divides(mesh, kv_spec[2], key.shape[2])
-    ):
-        # A non-dividing batch/head shard would error inside shard_map; keep the SPMD XLA path.
-        return run_xla(
-            f"batch {query.shape[0]} / heads {query.shape[2]} / kv heads {key.shape[2]} "
-            "are not divisible by their mesh axes"
-        )
-    return jax.shard_map(
+    def specs():
+        layout = _bthd_specs(metadata)
+        if layout is None:
+            return None
+        q_spec, kv_spec, batch_axes = layout
+        return (q_spec, kv_spec, kv_spec, PartitionSpec(batch_axes, None, None)), q_spec
+
+    return run_mosaic_kernel(
         lambda q, k, v, m: pallas(q, k, v, m, **kw),
-        mesh=mesh,
-        in_specs=(q_spec, kv_spec, kv_spec, PartitionSpec(batch_axes, None, None)),
-        out_specs=q_spec,
-        check_vma=False,
-    )(query, key, value, mask)
-
-
-def _axes_size(mesh, axes) -> int:
-    """Number of devices along a PartitionSpec entry (None, an axis name, or a tuple of names)."""
-    if axes is None:
-        return 1
-    names = axes if isinstance(axes, tuple) else (axes,)
-    size = 1
-    for name in names:
-        size *= int(mesh.shape[name])
-    return size
-
-
-def _divides(mesh, axes, dim: int) -> bool:
-    return int(dim) % _axes_size(mesh, axes) == 0
+        run_xla,
+        (query, key, value, mask),
+        mesh=None if metadata is None else metadata.mesh,
+        specs=specs,
+    )
 
 
 def _bthd_specs(metadata):
@@ -164,7 +127,7 @@ def _bthd_specs(metadata):
 
     def eff(axes):
         # Axes spanning a single device (e.g. ``sp`` of size 1) are not really sharded.
-        return None if axes is None or _axes_size(mesh, axes) == 1 else axes
+        return None if axes is None or mesh_axis_size(mesh, axes) == 1 else axes
 
     q = tuple(eff(a) for a in tuple(rules.query) + (None,) * (4 - len(tuple(rules.query))))
     k = tuple(eff(a) for a in tuple(rules.key) + (None,) * (4 - len(tuple(rules.key))))
@@ -175,9 +138,15 @@ def _bthd_specs(metadata):
     return PartitionSpec(q[0], None, q[2], None), PartitionSpec(k[0], None, k[2], None), q[0]
 
 
-# Auto mode threshold. One glm_moe_dsa layer fwd+bwd on TPU v5 with 512x512 tiles: sparse
-# 8.05 / 21.3 / 66.4 / 224.5 ms vs dense 7.35 / 22.2 / 74.1 / OOM ms at 4k / 8k / 16k / 32k.
-AUTO_SPARSE_MIN_SEQ = 8192
+def __getattr__(name: str):
+    """Resolve the historical threshold export lazily from its layer owner."""
+    if name == "AUTO_SPARSE_MIN_SEQ":
+        # Layers import numerical operations while initializing; an eager
+        # layer import here would introduce an operations/layers import cycle.
+        from easydel.layers.indexer import AUTO_SPARSE_MIN_SEQ
+
+        return AUTO_SPARSE_MIN_SEQ
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def use_sparse_training_attention(
@@ -192,17 +161,35 @@ def use_sparse_training_attention(
     ``concatenate``'s ``init_attention_bias`` is a lazy closure derived from ``mask_info``
     alone; the sparse helper receives the same combined mask, so it needs no check here.
     """
-    eligible = (
-        topk_indices is not None
-        and cache_view is None
-        and mask_info is not None
-        and not output_attentions
-        and sliding_window is None
-        and layer._softmax_aux() is None
+    # Import only when called: layers import numerical operations during
+    # initialization. Let the shared policy reject unsupported input features
+    # before accessing layer hooks/config.
+    from easydel.layers.indexer import use_sparse_training_attention as layer_policy
+
+    inputs = dict(
+        topk_indices=topk_indices,
+        cache_view=cache_view,
+        mask_info=mask_info,
+        output_attentions=output_attentions,
+        sliding_window=sliding_window,
     )
-    if not eligible:
+    if not layer_policy(**inputs, softmax_aux=None, sparse_training=True):
         return False
-    flag = getattr(layer.config, "dsa_sparse_training", None)
-    if flag is not None:
-        return bool(flag)
-    return jax.default_backend() == "tpu" and seq_len is not None and int(seq_len) >= AUTO_SPARSE_MIN_SEQ
+
+    accessor = getattr(layer, "get_softmax_aux", None)
+    if accessor is None:
+        # Older duck-typed callers implement only the original hook. Keep that
+        # protocol working here, while all new layer callers use the public API.
+        accessor = layer._softmax_aux
+    softmax_aux = accessor()
+    return layer_policy(
+        **inputs,
+        softmax_aux=softmax_aux,
+        sparse_training=getattr(layer.config, "dsa_sparse_training", None) if softmax_aux is None else None,
+        seq_len=seq_len,
+    )
+
+
+# Retain every historical implicit wildcard export, including imported names,
+# while advertising the lazy threshold without importing its layer owner here.
+__all__ = [name for name in globals() if not name.startswith("_")] + ["AUTO_SPARSE_MIN_SEQ"]  # noqa: F822

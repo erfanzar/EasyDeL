@@ -57,6 +57,8 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, ToolParserName] = {
     "qwen3": "hermes",
     "qwen2_moe": "hermes",
     "qwen2": "hermes",
+    "deepseek_v32": "deepseek_v32",
+    "deepseek_v31": "deepseek_v31",
     "deepseek_v3": "deepseek_v3",
     "deepseek_v2": "deepseek_v3",
     "deepseek": "hermes",
@@ -122,7 +124,8 @@ the model's ``model_type`` string.
 
 _TEMPLATE_HINTS: list[tuple[str, ToolParserName]] = [
     ("<|tool_calls_section_begin|>", "kimi_k2"),
-    ("<|tool▁calls▁begin|>", "deepseek_v3"),
+    ("<｜DSML｜function_calls>", "deepseek_v32"),
+    ("<｜tool▁calls▁begin｜>", "deepseek_v3"),
     ("[TOOL_CALLS]", "mistral"),
     ("<|action_start|>", "internlm"),
     ("<seed:tool_call>", "seed_oss"),
@@ -140,7 +143,8 @@ _TEMPLATE_HINTS: list[tuple[str, ToolParserName]] = [
 
 _VOCAB_HINTS: list[tuple[str, ToolParserName]] = [
     ("<|tool_calls_section_begin|>", "kimi_k2"),
-    ("<|tool▁calls▁begin|>", "deepseek_v3"),
+    ("<｜DSML｜function_calls>", "deepseek_v32"),
+    ("<｜tool▁calls▁begin｜>", "deepseek_v3"),
     ("[TOOL_CALLS]", "mistral"),
     ("<|action_start|>", "internlm"),
     ("<seed:tool_call>", "seed_oss"),

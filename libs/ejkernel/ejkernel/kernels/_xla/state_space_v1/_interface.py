@@ -245,6 +245,7 @@ def state_space_v1(
     *,
     block_d: int = 64,
     block_e: int = 128,
+    use_associative_scan: bool | None = None,
 ) -> tuple[
     Float[Array, "batch seq_len intermediate_size"],
     Float[Array, "batch intermediate_size ssm_state_size"],
@@ -289,6 +290,10 @@ def state_space_v1(
             Shape: [batch, intermediate_size, d_conv]
         act_fn: Optional activation function for gating (e.g., jax.nn.silu).
             If gate is provided but act_fn is None, defaults to jax.nn.silu.
+        use_associative_scan: True uses fp32 parallel affine composition;
+            False or None retains the sequential/custom-VJP implementation.
+        block_d: Compatibility tile size (unused by XLA).
+        block_e: Compatibility gating tile size (unused by XLA).
 
     Returns:
         Tuple of:
@@ -327,16 +332,47 @@ def state_space_v1(
 
     use_single_step = seq_len == 1 and initial_state is not None
 
-    output, ssm_state = _ssm1_core(
-        hidden_states=hidden_states,
-        A=A,
-        B=B,
-        C=C,
-        D=D,
-        dt=dt,
-        initial_state=initial_state,
-        use_single_step=use_single_step,
-    )
+    if seq_len == 0:
+        output = jnp.zeros_like(hidden_states)
+        ssm_state = (
+            jnp.zeros((hidden_states.shape[0], hidden_states.shape[-1], A.shape[-1]), dtype=dtype)
+            if initial_state is None
+            else initial_state
+        )
+    elif use_associative_scan:
+        # Compose affine transitions (a, b): h -> a*h+b. Keeping this
+        # branch in ordinary JAX gives autodiff the same parallel-prefix
+        # semantics, including gradients through the initial state.
+        x = hidden_states.astype(jnp.float32)
+        delta = dt.astype(jnp.float32)
+        decay = jnp.exp(delta[..., None] * A.astype(jnp.float32)[None, None])
+        update = delta[..., None] * B.astype(jnp.float32)[:, :, None, :] * x[..., None]
+
+        def compose(left, right):
+            a_left, b_left = left
+            a_right, b_right = right
+            return a_right * a_left, a_right * b_left + b_right
+
+        prefix_a, prefix_b = jax.lax.associative_scan(compose, (decay, update), axis=1)
+        state = (
+            jnp.zeros((x.shape[0], x.shape[-1], A.shape[-1]), dtype=jnp.float32)
+            if initial_state is None
+            else initial_state.astype(jnp.float32)
+        )
+        states = prefix_a * state[:, None] + prefix_b
+        output = jnp.sum(states * C.astype(jnp.float32)[:, :, None, :], axis=-1) + D.astype(jnp.float32) * x
+        ssm_state = states[:, -1]
+    else:
+        output, ssm_state = _ssm1_core(
+            hidden_states=hidden_states,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            dt=dt,
+            initial_state=initial_state,
+            use_single_step=use_single_step,
+        )
 
     if gate is not None:
         if act_fn is None:

@@ -32,7 +32,14 @@ from collections.abc import Iterable
 from ..logger import logger
 from ..request import EngineRequest
 from .dp_sharding import dp_shard_for_page_id, dp_shard_page_bounds, pages_per_dp_shard
-from .utils import CachePage, FreeCachePageQueue, PageHash, PageHashWithGroupId, hash_page_tokens
+from .utils import (
+    CachePage,
+    FreeCachePageQueue,
+    PageHash,
+    PageHashWithGroupId,
+    hash_page_tokens,
+    request_page_hash_extra_keys,
+)
 
 
 class PagePool:
@@ -188,6 +195,7 @@ class PagePool:
         if len(page_hashes) < num_cached_pages:
             raise ValueError(f"page_hashes length ({len(page_hashes)}) must be >= num_cached_pages ({num_cached_pages})")
         new_page_hashes = page_hashes[num_cached_pages:]
+        extra_keys = request_page_hash_extra_keys(request)
 
         if num_cached_pages == 0:
             prev_page_hash_value = None
@@ -211,7 +219,7 @@ class PagePool:
                 else:
                     blk_idx = num_cached_pages + i
                     page_tokens = request.all_token_ids[blk_idx * page_size : (blk_idx + 1) * page_size]
-                    null_hash = hash_page_tokens(hash, prev_page_hash_value, page_tokens, None)
+                    null_hash = hash_page_tokens(hash, prev_page_hash_value, page_tokens, extra_keys)
                     page_hashes.append(null_hash)
                     prev_page_hash_value = null_hash.hash_value
                 continue
@@ -233,7 +241,7 @@ class PagePool:
                         f"{len(page_tokens)} at {blk_idx}th page for request "
                         f"{request.request_id}({request})"
                     )
-                page_hash = hash_page_tokens(hash, prev_page_hash_value, page_tokens, None)
+                page_hash = hash_page_tokens(hash, prev_page_hash_value, page_tokens, extra_keys)
                 page_hashes.append(page_hash)
 
             page_hash_with_group_id = PageHashWithGroupId(page_hash, kv_cache_group_id)
@@ -368,12 +376,34 @@ class PagePool:
 
         Args:
             ordered_pages: Pages to free, ordered by eviction priority.
+
+        Raises:
+            RuntimeError: If a non-null page is freed more times than it was
+                referenced (``ref_cnt`` underflow).
         """
 
         pages_list = list(ordered_pages)
+        remaining_refs: dict[int, int] = {}
+        # Validate the whole batch first, including repeated references to the
+        # same page, so an invalid release cannot leave the pool half-mutated.
         for page in pages_list:
-            page.ref_cnt -= 1
-        self.free_page_queue.append_n([page for page in pages_list if page.ref_cnt == 0 and not page.is_null])
+            if not page.is_null:
+                key = id(page)
+                remaining = remaining_refs.get(key, page.ref_cnt) - 1
+                if remaining < 0:
+                    raise RuntimeError(f"ref_cnt underflow on page {page.page_id}")
+                remaining_refs[key] = remaining
+
+        freed_pages = []
+        for page in pages_list:
+            if page.is_null:
+                # The null placeholder is shared and never pooled; its count is not tracked strictly.
+                page.ref_cnt -= 1
+            else:
+                page.decr_ref()
+                if page.ref_cnt == 0:
+                    freed_pages.append(page)
+        self.free_page_queue.append_n(freed_pages)
 
     def reset_prefix_cache(self) -> bool:
         """Reset the prefix cache, clearing every cached page hash.

@@ -101,6 +101,7 @@ def _bump_graph_epoch() -> None:
     """
     global _GRAPH_EPOCH
     _GRAPH_EPOCH += 1
+    _THREAD_GRAPH_EPOCH.value = getattr(_THREAD_GRAPH_EPOCH, "value", 0) + 1
 
 
 def _graph_epoch() -> int:
@@ -110,6 +111,26 @@ def _graph_epoch() -> int:
         Return the current global graph-structure epoch.
     """
     return _GRAPH_EPOCH
+
+
+_THREAD_GRAPH_EPOCH: threading.local = threading.local()
+"""Per-thread count of structural mutations performed by the current thread.
+
+Transforms use it to detect structural mutations made by the function they
+trace. The global :data:`_GRAPH_EPOCH` cannot serve that purpose: a module
+built or reshaped concurrently by another thread (a background engine loop,
+a worker) would otherwise be reported as an illegal mutation by an unrelated
+trace running in this thread.
+"""
+
+
+def _thread_graph_epoch() -> int:
+    """Return how many structural mutations the current thread has performed.
+
+    Returns:
+        The current thread's structural-mutation counter.
+    """
+    return getattr(_THREAD_GRAPH_EPOCH, "value", 0)
 
 
 def _public_value(value: object) -> object:

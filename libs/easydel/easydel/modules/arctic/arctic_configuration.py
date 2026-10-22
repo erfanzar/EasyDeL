@@ -246,6 +246,10 @@ class ArcticConfig(EasyDeLBaseConfig):
         self.moe_train_capacity_factor = moe_train_capacity_factor
         self.moe_eval_capacity_factor = moe_eval_capacity_factor
         self.enable_expert_tensor_parallelism = enable_expert_tensor_parallelism
+        if enable_expert_tensor_parallelism:
+            # Expert tensor parallelism (EP x TP) is realised by the shared MoE stack through
+            # ``use_expert_tensor_mode``; set it before the base config reads it.
+            self.use_expert_tensor_mode = True
         self.moe_min_capacity = moe_min_capacity
         self.moe_token_dropping = moe_token_dropping
         self.parallel_attn_mlp_res = parallel_attn_mlp_res

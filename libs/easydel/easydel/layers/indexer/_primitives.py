@@ -102,35 +102,24 @@ def topk_selection_mask(
     values: Float[Array, "... k"],
     indices: Int[Array, "... k"],
 ) -> Bool[Array, "... n"]:
-    """Boolean form of a ``jax.lax.top_k(scores, k)`` selection, without scattering.
+    """Convert a ``lax.top_k`` selection to a boolean mask without scatter.
 
-    ``top_k`` keeps every score above its ``k``-th value plus the
-    lowest-index scores tied with it, so the kept ties are exactly those at or
-    below the largest selected tie index. Scores are compared by IEEE
-    totalOrder (signed zeros, infinities and NaN payloads ordered), as
-    ``top_k`` orders them, so the mask equals the one-hot of ``indices``. It
-    costs elementwise passes instead of a ``[..., k, n]`` one-hot reduction or
-    a scatter, both of which are slow on TPU.
+    Resolve the shared operation helper only when called: cache construction
+    imports indexer layers before the caching package has finished exporting
+    the cache-view types consumed by operations.
 
     Args:
-        scores: The exact array ``top_k`` ranked.
-        values: ``top_k`` values ``[..., k]`` (descending), ``k >= 1``.
-        indices: ``top_k`` indices ``[..., k]``.
+        scores: The exact scores ranked by ``top_k``, shaped ``[..., n]``.
+        values: Descending selected scores ``[..., k]``, with ``k >= 1``.
+        indices: Selected indices of the same shape as ``values``.
 
     Returns:
-        Boolean ``[..., n]``; ``True`` where ``indices`` selected the position.
+        Boolean mask ``[..., n]`` matching the selected indices, including
+        IEEE total-order ties.
     """
+    from easydel.operations.kernels._mask_info import topk_selection_mask as selection_mask
 
-    def order_key(x):
-        bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.int32)
-        return jnp.where(bits < 0, bits ^ jnp.int32(0x7FFFFFFF), bits)
-
-    keys = order_key(scores)
-    value_keys = order_key(values)
-    kth = value_keys[..., -1:]
-    tie_cut = jnp.max(jnp.where(value_keys == kth, indices, -1), axis=-1, keepdims=True)
-    position = jax.lax.broadcasted_iota(jnp.int32, scores.shape, scores.ndim - 1)
-    return (keys > kth) | ((keys == kth) & (position <= tie_cut))
+    return selection_mask(scores=scores, values=values, indices=indices)
 
 
 def indices_to_bool_mask(

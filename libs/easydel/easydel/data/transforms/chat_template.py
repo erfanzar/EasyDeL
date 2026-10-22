@@ -70,35 +70,34 @@ def is_conversational(example: dict) -> bool:
     return False
 
 
-def convert_to_chatml(messages: list[dict]) -> list[dict]:
+def convert_to_chatml(messages: list[dict], role_mapping: dict[str, str] | None = None) -> list[dict]:
     """Re-key from/value-style messages into ChatML's role/content shape.
 
     Many open-source datasets follow the ShareGPT convention
     (``{"from": ..., "value": ...}``) instead of the OpenAI/ChatML
     convention (``{"role": ..., "content": ...}``). This helper
-    rewrites the keys without touching message order or values.
-    Messages already in role/content shape are passed through
-    unchanged so the function is safe to call defensively.
+    rewrites the keys without changing message order or dropping tool-call
+    metadata. Roles are normalized using the standard ShareGPT mapping by
+    default, including messages already using role/content keys.
 
     Args:
         messages: Sequence of message dicts; entries may be in either
             shape and are converted independently.
+        role_mapping: Role rename map. None uses DEFAULT_ROLE_MAPPING;
+            an empty map preserves role values without normalization.
 
     Returns:
         list[dict]: New list of messages in ``role``/``content``
         shape; the originals are not mutated.
     """
+    mapping = DEFAULT_ROLE_MAPPING if role_mapping is None else role_mapping
     result = []
     for msg in messages:
-        if "from" in msg and "value" in msg:
-            result.append(
-                {
-                    "role": msg["from"],
-                    "content": msg["value"],
-                }
-            )
-        else:
-            result.append(msg)
+        converted = {key: value for key, value in msg.items() if key not in ("from", "value", "role", "content")}
+        role = msg.get("from", msg.get("role", "user"))
+        converted["role"] = mapping.get(role, role)
+        converted["content"] = msg.get("value", msg.get("content", None if converted.get("tool_calls") else ""))
+        result.append(converted)
     return result
 
 
@@ -214,9 +213,10 @@ class ChatTemplateTransform(Transform):
             return result
 
         if self._convert_from_value and messages:
-            first_msg = messages[0] if isinstance(messages, list) and messages else None
-            if isinstance(first_msg, dict) and "from" in first_msg and "value" in first_msg:
-                messages = convert_to_chatml(messages)
+            # Normalize each message independently: a ChatML system turn may
+            # precede ShareGPT turns, and tool-call-only assistants need not
+            # have a value/content field.
+            messages = convert_to_chatml(messages)
 
         try:
             formatted_text = self._tokenizer.apply_chat_template(
@@ -558,32 +558,7 @@ class ConvertToChatML(Transform):
         if messages is None:
             return result
 
-        # Convert messages. Preserve every key beyond the from/value ->
-        # role/content normalization: rebuilding only role+content silently
-        # deleted tool_calls / tool_call_id / name from tool-use datasets,
-        # rendering empty assistant turns downstream.
-        converted = []
-        for msg in messages:
-            new_msg = {k: v for k, v in msg.items() if k not in ("from", "value", "role", "content")}
-
-            if "from" in msg:
-                role = msg["from"]
-            elif "role" in msg:
-                role = msg["role"]
-            else:
-                role = "user"  # Default to user if unknown
-
-            # Apply role mapping (normalize to ChatML standard roles)
-            new_msg["role"] = self._role_mapping.get(role, role)
-
-            if "value" in msg:
-                new_msg["content"] = msg["value"]
-            elif "content" in msg:
-                new_msg["content"] = msg["content"]
-            else:
-                new_msg["content"] = None if new_msg.get("tool_calls") else ""
-
-            converted.append(new_msg)
+        converted = convert_to_chatml(messages, role_mapping=self._role_mapping)
 
         if source_field and source_field != self._output_field:
             result.pop(source_field, None)

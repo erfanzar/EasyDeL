@@ -34,7 +34,7 @@ import jax.lax as lax
 
 from ..core.errors import IllegalMutationError
 from ..core.graph import bind, export, live_variables
-from ..core.module import Module, _graph_epoch, _set_inside_transform
+from ..core.module import Module, _inside_transform, _set_inside_transform, _thread_graph_epoch
 from ..core.selector import SelectorSugar
 from ..core.state import State
 from .split_merge import _ModuleRef, apply_mutations, assert_state_unchanged, make_direct_readonly, resolve_mutable
@@ -105,15 +105,16 @@ def associative_scan(
             Result described by this helper.
         """
         m = bind(gdef, state)
-        epoch_before = _graph_epoch()
+        epoch_before = _thread_graph_epoch()
         snapshots = [(path, var.kind, var, var._value) for path, var in live_variables(m)]
+        prev_inside_transform = _inside_transform()
         _set_inside_transform(True)
         try:
             out = fn(m, a, b)
         finally:
-            _set_inside_transform(False)
+            _set_inside_transform(prev_inside_transform)
 
-        if _graph_epoch() != epoch_before:
+        if _thread_graph_epoch() != epoch_before:
             raise IllegalMutationError(
                 "associative_scan() does not support structural module "
                 "mutations because jax.lax.associative_scan has no "
@@ -209,11 +210,12 @@ def scan(
         """
         full = carry.overlay(invariant)
         m = bind(gdef, full)
+        prev_inside_transform = _inside_transform()
         _set_inside_transform(True)
         try:
             y = fn(m, x)
         finally:
-            _set_inside_transform(False)
+            _set_inside_transform(prev_inside_transform)
         _, new_state = export(m)
         new_carry, new_invariant = (
             (State({}), new_state) if mutable_sel is None else mutable_sel.partition_state(m, new_state)

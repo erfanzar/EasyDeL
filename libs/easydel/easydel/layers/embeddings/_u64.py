@@ -50,6 +50,15 @@ def from_uint32(value: Array) -> U64:
     return jnp.zeros_like(value, dtype=_U32), value.astype(_U32)
 
 
+def to_python(value: U64):
+    """Reassemble ``(hi, lo)`` into a host NumPy uint64 array without enabling JAX x64."""
+    import numpy as np
+
+    hi = np.asarray(value[0], dtype=np.uint64)
+    lo = np.asarray(value[1], dtype=np.uint64)
+    return (hi << np.uint64(32)) | lo
+
+
 def _mul32(a: Array, b: Array) -> U64:
     """Exact ``uint32 x uint32 -> uint64`` product as ``(hi, lo)``.
 
@@ -127,12 +136,3 @@ def u64_mod_small(value: U64, modulus: Array) -> Array:
             digit = (word >> _U32(shift)) & _U32(0xF)
             rem = ((rem << _U32(4)) + digit) % m
     return rem
-
-
-def to_python(value: U64) -> Array:
-    """Reassemble ``(hi, lo)`` into a Python-int array (host-side, for tests)."""
-    import numpy as np
-
-    hi = np.asarray(value[0], dtype=np.uint64)
-    lo = np.asarray(value[1], dtype=np.uint64)
-    return (hi << np.uint64(32)) | lo

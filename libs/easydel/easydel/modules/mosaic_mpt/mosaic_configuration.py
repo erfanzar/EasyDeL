@@ -298,6 +298,7 @@ class MptConfig(EasyDeLBaseConfig):
         self.use_norm_bias = use_norm_bias
         self.use_lm_head = use_lm_head
         self.n_heads = n_heads
+        self.num_key_value_heads = 1 if self.attn_config.attn_type == "multiquery_attention" else n_heads
         self.n_layers = n_layers
         self.expansion_ratio = expansion_ratio
         self.max_seq_len = max_seq_len
@@ -326,19 +327,3 @@ class MptConfig(EasyDeLBaseConfig):
             self.layer_types = ["full_attention"] * self.n_layers
 
         super().__init__(bits=bits, **kwargs)
-
-    @staticmethod
-    def _set_config_defaults(config, config_defaults):
-        """Sets default values for missing configuration parameters.
-
-        Args:
-            config (dict): The configuration dictionary to update.
-            config_defaults (dict): A dictionary containing default values.
-
-        Returns:
-            dict: The updated configuration dictionary.
-        """
-        for k, v in config_defaults.items():
-            if k not in config:
-                config[k] = v
-        return config

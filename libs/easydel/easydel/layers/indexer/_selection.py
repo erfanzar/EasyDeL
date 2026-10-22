@@ -35,7 +35,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array
 
-from ._primitives import topk_selection_mask
+from ._primitives import ste_score_proxy, topk_selection_mask
 
 
 class IndexerScoreSharding(common_types.DynamicShardingAxes):
@@ -196,7 +196,7 @@ class IndexerSelection(tp.NamedTuple):
             # so an all-invalid row cannot create inf-inf NaNs in gradients.
             scores = self.score_proxy.astype(dtype)
             scores = jnp.where(mask & jnp.isfinite(scores), scores, 0.0)
-            bias = bias + (scores - jax.lax.stop_gradient(scores))
+            bias = bias + ste_score_proxy(scores, mask)
         return bias
 
 

@@ -67,26 +67,30 @@ from easydel.layers import (
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
     RMSNorm,
-    RowParallelLinear,
     RowParallelMoELinear,
-    dense_gate_up_layout,
-    gated_mlp_forward,
     moe_down_projection_reform_param,
     moe_fused_gate_up_reform_param,
-    split_fused_gate_up_projection,
 )
-from easydel.modules._base import BaseVisionLanguageModule
+from easydel.layers.mlp import moe_gated_expert_forward
+from easydel.modules._base import BaseVisionLanguageModule, DeepStackVisualMixin, QwenVLMultimodalMixin
 from easydel.modules.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VisionTransformerPretrainedModel,
+    Qwen3VLModel,
     Qwen3VLTextAttention,
-    merge_multimodal_embeddings,
+    Qwen3VLTextMLP,
+)
+from easydel.modules.qwen3_vl.modeling_qwen3_vl import (
+    get_rope_index as qwen3_vl_get_rope_index,
+)
+from easydel.modules.qwen3_vl.modeling_qwen3_vl import (
+    merge_multimodal_embeddings as merge_multimodal_embeddings,
 )
 
 from .qwen3_vl_moe_configuration import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig, Qwen3VLMoeVisionConfig
 
 
 @auto_pytree
-class Qwen3VLMoeCausalLMOutputWithPast(ModelOutput):
+class Qwen3VLMoeCausalLMOutputWithPast(VLMCausalLMOutput):
     """Output class for Qwen3-VL-MoE causal language model.
 
     Attributes:
@@ -108,6 +112,68 @@ class Qwen3VLMoeCausalLMOutputWithPast(ModelOutput):
     rope_deltas: Array | None = None
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
     router_logits: tuple[Array] | None = None
+
+    def __init__(
+        self,
+        loss=None,
+        logits=None,
+        past_key_values=None,
+        hidden_states=None,
+        attentions=None,
+        rope_deltas=None,
+        image_hidden_states=None,
+        router_logits=None,
+        **kwargs,
+    ):
+        """Preserve the original positional API while accepting unified VLM fields."""
+        super().__init__(
+            loss=loss,
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+            attentions=attentions,
+            rope_deltas=rope_deltas,
+            image_hidden_states=image_hidden_states,
+            router_logits=router_logits,
+            **kwargs,
+        )
+
+    def __reduce__(self):
+        """Restore fields and ordered mapping through pickle state, not positional arguments.
+
+        ModelOutput's positional reconstruction follows inherited dataclass order,
+        whereas this class deliberately keeps its legacy constructor order.
+        OrderedDict's state and item iterator already preserve every field.
+        """
+        constructor, _args, *state = super().__reduce__()
+        return constructor, (), *state
+
+    def __post_init__(self):
+        """Keep legacy mapping, tuple and integer-index ordering before added VLM fields."""
+        super().__post_init__()
+        self._restore_legacy_order()
+
+    def _sync_output_field(self, name, value):
+        """Preserve legacy ordering on mutation and pickle/deepcopy reconstruction."""
+        super()._sync_output_field(name, value)
+        self._restore_legacy_order()
+
+    def _restore_legacy_order(self):
+        """Place historical fields ahead of newly inherited VLM fields."""
+        for name in reversed(
+            (
+                "loss",
+                "logits",
+                "past_key_values",
+                "hidden_states",
+                "attentions",
+                "rope_deltas",
+                "image_hidden_states",
+                "router_logits",
+            )
+        ):
+            if name in self:
+                self.move_to_end(name, last=False)
 
 
 @auto_pytree
@@ -168,125 +234,20 @@ def get_rope_index(
         Tuple of (position_ids, mrope_position_deltas).
         position_ids has shape (3, batch_size, sequence_length).
     """
-    if second_per_grid_ts is None:
-        second_per_grid_ts = []
-
-    if video_grid_thw is not None:
-        video_grid_thw = video_grid_thw.copy()
-        video_grid_thw = np.repeat(video_grid_thw, video_grid_thw[:, 0].astype(int), axis=0)
-        video_grid_thw[:, 0] = 1
-
-    if input_ids.shape[-1] != 1 and attention_mask is not None:
-        attention_mask = attention_mask[:, : input_ids.shape[-1]]
-
-    batch_size, seq_length = input_ids.shape[:2]
-    position_ids = np.zeros((3, batch_size, seq_length), dtype=np.int32)
-    mrope_position_deltas: list[int] = []
-    image_index, video_index = 0, 0
-
-    if image_grid_thw is not None or video_grid_thw is not None:
-        for i in range(batch_size):
-            valid_mask = attention_mask[i] == 1 if attention_mask is not None else np.ones(seq_length, dtype=bool)
-            input_tokens = input_ids[i][valid_mask].tolist()
-            vision_start_indices = np.where(np.array(input_tokens) == vision_start_token_id)[0]
-            vision_tokens = np.array(input_tokens)[vision_start_indices + 1]
-            image_nums = int(np.sum(vision_tokens == image_token_id))
-            video_nums = int(np.sum(vision_tokens == video_token_id))
-
-            llm_pos_ids_list: list[np.ndarray] = []
-            st = 0
-            remain_images, remain_videos = image_nums, video_nums
-
-            for _ in range(image_nums + video_nums):
-                video_second_per_grid_t = 0.0
-                try:
-                    ed_image = input_tokens.index(image_token_id, st) if remain_images > 0 else len(input_tokens) + 1
-                except ValueError:
-                    ed_image = len(input_tokens) + 1
-                try:
-                    ed_video = input_tokens.index(video_token_id, st) if remain_videos > 0 else len(input_tokens) + 1
-                except ValueError:
-                    ed_video = len(input_tokens) + 1
-
-                if ed_image < ed_video:
-                    assert image_grid_thw is not None
-                    t, h, w = image_grid_thw[image_index]
-                    image_index += 1
-                    remain_images -= 1
-                    ed = ed_image
-                else:
-                    assert video_grid_thw is not None
-                    t, h, w = video_grid_thw[video_index]
-                    video_second_per_grid_t = 1.0
-                    if second_per_grid_ts:
-                        video_second_per_grid_t = second_per_grid_ts[video_index]
-                    video_index += 1
-                    remain_videos -= 1
-                    ed = ed_video
-
-                llm_grid_t, llm_grid_h, llm_grid_w = (
-                    int(t),
-                    int(h) // spatial_merge_size,
-                    int(w) // spatial_merge_size,
-                )
-                text_len = ed - st
-
-                st_idx = llm_pos_ids_list[-1].max().item() + 1 if len(llm_pos_ids_list) > 0 else 0
-                llm_pos_ids_list.append(
-                    np.broadcast_to(np.arange(text_len, dtype=np.int32).reshape(1, -1), (3, text_len)) + st_idx
-                )
-
-                t_index = (
-                    (
-                        np.broadcast_to(
-                            np.arange(llm_grid_t, dtype=np.int32).reshape(-1, 1),
-                            (llm_grid_t, llm_grid_h * llm_grid_w),
-                        )
-                        * video_second_per_grid_t
-                        * tokens_per_second
-                    )
-                    .astype(np.int32)
-                    .flatten()
-                )
-                h_index = np.broadcast_to(
-                    np.arange(llm_grid_h, dtype=np.int32).reshape(1, -1, 1),
-                    (llm_grid_t, llm_grid_h, llm_grid_w),
-                ).flatten()
-                w_index = np.broadcast_to(
-                    np.arange(llm_grid_w, dtype=np.int32).reshape(1, 1, -1),
-                    (llm_grid_t, llm_grid_h, llm_grid_w),
-                ).flatten()
-
-                llm_pos_ids_list.append(
-                    np.stack([t_index, h_index, w_index], axis=0) + text_len + st_idx,
-                )
-                st = ed + llm_grid_t * llm_grid_h * llm_grid_w
-
-            if st < len(input_tokens):
-                st_idx = llm_pos_ids_list[-1].max().item() + 1 if len(llm_pos_ids_list) > 0 else 0
-                text_len = len(input_tokens) - st
-                llm_pos_ids_list.append(
-                    np.broadcast_to(np.arange(text_len, dtype=np.int32).reshape(1, -1), (3, text_len)) + st_idx
-                )
-
-            llm_positions = np.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
-            target_seq_len = seq_len if seq_len is not None else llm_positions.shape[-1]
-            llm_positions = llm_positions[:, context_len:target_seq_len]
-
-            position_ids[:, i, valid_mask] = llm_positions
-            mrope_position_deltas.append(int(llm_positions.max() + 1 - len(input_tokens)))
-    else:
-        if attention_mask is not None:
-            position_ids = jnp.cumsum(attention_mask, axis=-1) - 1
-            position_ids = jnp.where(attention_mask == 0, 1, position_ids)
-            position_ids = jnp.expand_dims(position_ids, axis=0).repeat(3, axis=0)
-            max_position_ids = jnp.max(position_ids, axis=(0, 2), keepdims=True)
-            mrope_position_deltas = (max_position_ids + 1 - attention_mask.shape[-1]).reshape(-1)
-        else:
-            position_ids = jnp.arange(seq_length).reshape(1, 1, -1).repeat(3, axis=0).repeat(batch_size, axis=1)
-            mrope_position_deltas = jnp.zeros((batch_size,), dtype=input_ids.dtype)
-
-    return jnp.asarray(position_ids), jnp.asarray(mrope_position_deltas).reshape(-1, 1)
+    return qwen3_vl_get_rope_index(
+        input_ids=input_ids,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        attention_mask=attention_mask,
+        spatial_merge_size=spatial_merge_size,
+        image_token_id=image_token_id,
+        video_token_id=video_token_id,
+        vision_start_token_id=vision_start_token_id,
+        tokens_per_second=tokens_per_second,
+        second_per_grid_ts=second_per_grid_ts,
+        context_len=context_len,
+        seq_len=seq_len,
+    )
 
 
 @register_module(TaskType.BASE_VISION, config=Qwen3VLMoeConfig, model_type="qwen3_vl_moe")
@@ -313,88 +274,8 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(Qwen3VisionTransformerPretraine
 Qwen3VLMoeTextAttention = Qwen3VLTextAttention
 
 
-class Qwen3VLMoeTextMLP(spx.Module):
-    """SwiGLU feed-forward network for Qwen3-VL-MoE text decoder (dense MLP).
-
-    Implements the feedforward network with SwiGLU activation function
-    for enhanced representation learning in the text decoder.
-    """
-
-    def __init__(
-        self,
-        config: Qwen3VLMoeTextConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: spx.Rngs,
-        layer_idx: int,
-    ):
-        """Initialize Qwen3-VL-MoE text MLP block.
-
-        Args:
-            config (Qwen3VLMoeTextConfig): Text decoder configuration.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-            layer_idx (int): Index of this layer in the decoder.
-        """
-        self.config = config
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-
-        self.gate_up_proj = ColumnParallelLinear(
-            config.hidden_size,
-            (config.intermediate_size, config.intermediate_size),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-            layout=dense_gate_up_layout(config.intermediate_size),
-        )
-        self.down_proj = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    @property
-    def reform_param(self):
-        """Checkpoint reform rules for the fused gate-up projection.
-
-        Returns:
-            dict: Mapping from external ``gate_up_proj`` checkpoint
-            entries to the layout used internally by the fused
-            :attr:`gate_up_proj` ColumnParallelLinear, allowing
-            HuggingFace-style separate gate / up weights to be merged
-            into the fused layout used here (and back again).
-        """
-        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
-
-    def forward(self, hidden_states: Array) -> Array:
-        """Apply SwiGLU feedforward transformation.
-
-        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
-        supported layouts through the ejkernel fused MLP kernels and runs
-        the legacy composition otherwise.
-
-        Args:
-            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
-
-        Returns:
-            Array: Transformed hidden states of shape (batch, seq_len, hidden_dim).
-        """
-        return gated_mlp_forward(self, hidden_states)
+class Qwen3VLMoeTextMLP(Qwen3VLTextMLP):
+    """Dense SwiGLU block, sharing Qwen3-VL's parameter and checkpoint layout."""
 
 
 class Qwen3VLMoeMLPStack(spx.Module):
@@ -490,9 +371,7 @@ class Qwen3VLMoeMLPStack(spx.Module):
             ``(num_dispatched_tokens, hidden_size)`` ready to be
             scattered back to their source token positions.
         """
-        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
-        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
+        return moe_gated_expert_forward(self, hidden_states, group_sizes, sorted_experts)
 
 
 class Qwen3VLMoeTextSparseBlock(BaseMoeModule):
@@ -536,9 +415,14 @@ class Qwen3VLMoeTextSparseBlock(BaseMoeModule):
             hidden_size=config.hidden_size,
             lbl_coef=None,
             rzl_coef=None,
-            routing_strategy=MoeRoutingStrategy.TOP_K,
+            routing_strategy=MoeRoutingStrategy.TOP_K if config.norm_topk_prob else MoeRoutingStrategy.TOP_K_NDIV,
             load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
         )
+        # Qwen normalizes even a single selected expert, unlike the shared
+        # Mixtral-style TOP_K default. Install the family policy once, not in
+        # forward, so mutable-aware transforms see no structural mutation.
+        if config.norm_topk_prob and self.moe_hooks.refine_weights_hook is None and self.moe_hooks.select_hook is None:
+            self.moe_hooks = self.moe_hooks.replace(refine_weights_hook=self.normalize_selected_weights)
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -562,6 +446,18 @@ class Qwen3VLMoeTextSparseBlock(BaseMoeModule):
             rngs=rngs,
         )
         self.layer_idx: int | None = None
+
+    @staticmethod
+    def normalize_selected_weights(weights: Array) -> Array:
+        """Normalize Qwen's selected probabilities, including top-1 routing.
+
+        Args:
+            weights: Selected expert probabilities with experts on the last axis.
+
+        Returns:
+            Probabilities normalized over the selected experts for each token.
+        """
+        return weights / jnp.maximum(weights.sum(axis=-1, keepdims=True), 1e-8)
 
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Forward pass of the Sparse MoE block.
@@ -742,7 +638,7 @@ class Qwen3VLMoeTextDecoderLayer(spx.Module):
 
 
 @register_module(TaskType.BASE_MODULE, config=Qwen3VLMoeTextConfig, model_type="qwen3_vl_moe")
-class Qwen3VLMoeTextModel(EasyDeLBaseModule):
+class Qwen3VLMoeTextModel(DeepStackVisualMixin, EasyDeLBaseModule):
     """Text decoder model for Qwen3-VL-MoE with MoE support.
 
     Implements the text decoder component of Qwen3-VL-MoE, utilizing transformer blocks
@@ -1038,32 +934,6 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
             router_logits=all_router_logits if output_router_logits else None,
         )
 
-    def _deepstack_process(
-        self,
-        hidden_states: Array,
-        visual_pos_masks: Array,
-        visual_embeds: Array,
-    ) -> Array:
-        """Add visual embeddings to hidden states at visual token positions.
-
-        Args:
-            hidden_states (Array): Current hidden states of shape (batch, seq_len, hidden_dim).
-            visual_pos_masks (Array): Boolean mask indicating visual token positions.
-            visual_embeds (Array): Visual embeddings to inject.
-
-        Returns:
-            Array: Updated hidden states with visual embeddings added.
-        """
-        visual_embeds = visual_embeds.astype(hidden_states.dtype)
-        batch_size, seq_len, hidden_dim = hidden_states.shape
-        flat_hidden = hidden_states.reshape(-1, hidden_dim)
-        flat_mask = visual_pos_masks.reshape(-1)
-        cumsum_mask = jnp.cumsum(flat_mask) - 1
-        cumsum_mask = jnp.where(flat_mask, cumsum_mask, 0)
-        visual_updates = visual_embeds[cumsum_mask]
-        flat_hidden = jnp.where(flat_mask[:, None], flat_hidden + visual_updates, flat_hidden)
-        return flat_hidden.reshape(batch_size, seq_len, hidden_dim)
-
     def get_encoder(self):
         """Get the encoder component.
 
@@ -1098,7 +968,7 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.VISION_LM, config=Qwen3VLMoeConfig, model_type="qwen3_vl_moe")
-class Qwen3VLMoeModel(EasyDeLBaseModule):
+class Qwen3VLMoeModel(QwenVLMultimodalMixin, EasyDeLBaseModule):
     """Qwen3-VL-MoE multimodal model integrating vision encoder and text decoder with MoE.
 
     This model handles the fusion of visual and textual information by:
@@ -1153,8 +1023,6 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-
-        self.rope_deltas = None
 
     def get_input_embeddings(self):
         """Get the input embeddings layer.
@@ -1218,17 +1086,8 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
             Tuple of (position_ids, mrope_position_deltas).
             position_ids has shape (3, batch_size, sequence_length).
         """
-        tokens_per_second = getattr(self.config.vision_config, "tokens_per_second", 2.0)
-        return get_rope_index(
-            input_ids=input_ids,
-            image_grid_thw=np.array(image_grid_thw) if image_grid_thw is not None else None,
-            video_grid_thw=np.array(video_grid_thw) if video_grid_thw is not None else None,
-            attention_mask=attention_mask,
-            spatial_merge_size=self.config.vision_config.spatial_merge_size,
-            image_token_id=self.config.image_token_id,
-            video_token_id=self.config.video_token_id,
-            vision_start_token_id=self.config.vision_start_token_id,
-            tokens_per_second=tokens_per_second,
+        return Qwen3VLModel.get_rope_index(
+            self, input_ids, image_grid_thw=image_grid_thw, video_grid_thw=video_grid_thw, attention_mask=attention_mask
         )
 
     def compute_embedding(
@@ -1267,47 +1126,19 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
         Returns:
             Array: Fused embeddings with visual features merged in.
         """
-        if inputs_embeds is None:
-            if input_ids is None:
-                raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
-            inputs_embeds = super().compute_embedding(input_ids)
-
-        if input_ids is None and (image_embeds is not None or video_embeds is not None):
-            raise ValueError("`input_ids` must be provided to merge multimodal embeddings.")
-
-        if image_embeds is None and pixel_values is not None:
-            image_embeds_tuple, _deepstack_image_embeds = self.get_image_features(
-                pixel_values,
-                image_grid_thw,
-                image_max_grid_size,
-            )
-            image_embeds = jnp.concatenate(image_embeds_tuple, axis=0)
-
-        if image_embeds is not None:
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                multimodal_embeddings=image_embeds.astype(inputs_embeds.dtype),
-                placeholder_token_id=self.config.image_token_id,
-            )
-
-        if video_embeds is None and pixel_values_videos is not None:
-            video_embeds_tuple, _deepstack_video_embeds = self.get_video_features(
-                pixel_values_videos,
-                video_grid_thw,
-                video_max_grid_size,
-            )
-            video_embeds = jnp.concatenate(video_embeds_tuple, axis=0)
-
-        if video_embeds is not None:
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                multimodal_embeddings=video_embeds.astype(inputs_embeds.dtype),
-                placeholder_token_id=self.config.video_token_id,
-            )
-
-        return inputs_embeds
+        return super().compute_embedding(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            image_max_grid_size=image_max_grid_size,
+            video_max_grid_size=video_max_grid_size,
+            image_embeds=image_embeds,
+            video_embeds=video_embeds,
+            **kwargs,
+        )
 
     def compute_embedding_with_info(
         self,
@@ -1323,6 +1154,8 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
         image_embeds: Array | None = None,
         video_embeds: Array | None = None,
         attention_mask: Array | None = None,
+        deepstack_image_embeds: list[Array] | None = None,
+        deepstack_video_embeds: list[Array] | None = None,
         **kwargs,
     ) -> tuple[Array, EmbeddingInfo]:
         """Compute embeddings with full information for generation.
@@ -1343,110 +1176,50 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
             image_embeds: Pre-computed image embeddings.
             video_embeds: Pre-computed video embeddings.
             attention_mask: Attention mask for padding.
-            **kwargs: Additional arguments (unused).
+            deepstack_image_embeds: Optional cached per-layer image residuals, paired with image_embeds.
+            deepstack_video_embeds: Optional cached per-layer video residuals, paired with video_embeds.
+            **kwargs: Additional compatibility arguments.
 
         Returns:
             Tuple of (embeddings, EmbeddingInfo) containing fused embeddings
             and metadata for generation.
+
+        Raises:
+            ValueError: If input_ids is None or cached residual shapes/layer counts disagree.
         """
-        if input_ids is None:
-            raise ValueError("`input_ids` must be provided when calling `compute_embedding_with_info`.")
-
-        if inputs_embeds is None:
-            inputs_embeds = super().compute_embedding(input_ids)
-
-        text_embeds = inputs_embeds
-
-        deepstack_image_embeds = None
-        deepstack_video_embeds = None
-
-        if image_embeds is None and pixel_values is not None:
-            image_embeds_tuple, deepstack_image_embeds = self.get_image_features(
-                pixel_values,
-                image_grid_thw,
-                image_max_grid_size,
-            )
-            image_embeds = jnp.concatenate(image_embeds_tuple, axis=0)
-
-        if video_embeds is None and pixel_values_videos is not None:
-            video_embeds_tuple, deepstack_video_embeds = self.get_video_features(
-                pixel_values_videos,
-                video_grid_thw,
-                video_max_grid_size,
-            )
-            video_embeds = jnp.concatenate(video_embeds_tuple, axis=0)
-
-        if image_embeds is not None:
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                multimodal_embeddings=image_embeds.astype(inputs_embeds.dtype),
-                placeholder_token_id=self.config.image_token_id,
-            )
-
-        if video_embeds is not None:
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                multimodal_embeddings=video_embeds.astype(inputs_embeds.dtype),
-                placeholder_token_id=self.config.video_token_id,
-            )
-
-        visual_pos_masks = None
-        deepstack_visual_embeds = None
-
-        has_deepstack_images = deepstack_image_embeds is not None and len(deepstack_image_embeds) > 0
-        has_deepstack_videos = deepstack_video_embeds is not None and len(deepstack_video_embeds) > 0
-        if has_deepstack_images or has_deepstack_videos:
-            image_mask, video_mask = self.get_placeholder_mask(
-                input_ids,
-                inputs_embeds=text_embeds,
-                image_features=image_embeds.astype(text_embeds.dtype) if image_embeds is not None else None,
-                video_features=video_embeds.astype(text_embeds.dtype) if video_embeds is not None else None,
-            )
-
-            if image_embeds is not None and video_embeds is not None and has_deepstack_images and has_deepstack_videos:
-                visual_pos_masks = image_mask | video_mask
-                deepstack_visual_embeds = []
-
-                image_mask_joint = image_mask[visual_pos_masks]
-                video_mask_joint = video_mask[visual_pos_masks]
-
-                for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds, strict=False):
-                    embed_joint = jnp.zeros((image_mask_joint.shape[0], img_embed.shape[-1]), dtype=img_embed.dtype)
-
-                    img_idx = jnp.cumsum(image_mask_joint) - 1
-                    img_idx = jnp.where(image_mask_joint, img_idx, 0)
-                    embed_joint = jnp.where(image_mask_joint[:, None], img_embed[img_idx], embed_joint)
-
-                    vid_idx = jnp.cumsum(video_mask_joint) - 1
-                    vid_idx = jnp.where(video_mask_joint, vid_idx, 0)
-                    embed_joint = jnp.where(video_mask_joint[:, None], vid_embed[vid_idx], embed_joint)
-
-                    deepstack_visual_embeds.append(embed_joint)
-            elif image_embeds is not None and has_deepstack_images:
-                visual_pos_masks = image_mask
-                deepstack_visual_embeds = deepstack_image_embeds
-            elif video_embeds is not None and has_deepstack_videos:
-                visual_pos_masks = video_mask
-                deepstack_visual_embeds = deepstack_video_embeds
-
-        position_ids, rope_deltas = self.get_rope_index(
-            input_ids=input_ids,
+        for name, features, residuals in (
+            ("image", image_embeds, deepstack_image_embeds),
+            ("video", video_embeds, deepstack_video_embeds),
+        ):
+            if residuals is not None and (
+                features is None or any(residual.shape != features.shape for residual in residuals)
+            ):
+                raise ValueError(f"Cached {name} DeepStack residuals require matching `{name}_embeds` shapes.")
+        embeddings, info = super().compute_embedding_with_info(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
+            image_max_grid_size=image_max_grid_size,
+            video_max_grid_size=video_max_grid_size,
+            image_embeds=image_embeds,
+            video_embeds=video_embeds,
             attention_mask=attention_mask,
+            **kwargs,
         )
-
-        info = EmbeddingInfo(
-            position_ids=position_ids,
-            rope_deltas=rope_deltas,
-            visual_pos_masks=visual_pos_masks,
-            deepstack_visual_embeds=deepstack_visual_embeds,
-            deepstack_image_embeds=deepstack_image_embeds,
-            deepstack_video_embeds=deepstack_video_embeds,
-        )
-        return inputs_embeds, info
+        if deepstack_image_embeds is not None or deepstack_video_embeds is not None:
+            images = info.deepstack_image_embeds if deepstack_image_embeds is None else deepstack_image_embeds
+            videos = info.deepstack_video_embeds if deepstack_video_embeds is None else deepstack_video_embeds
+            if images and videos and len(images) != len(videos):
+                raise ValueError("Image and video DeepStack residuals must have the same number of layers.")
+            image_mask, video_mask = self.get_placeholder_mask(input_ids, embeddings)
+            info.visual_pos_masks, info.deepstack_visual_embeds = self.merge_deepstack_features(
+                image_mask if images else None, video_mask if videos else None, images, videos
+            )
+            info.deepstack_image_embeds, info.deepstack_video_embeds = images, videos
+        return embeddings, info
 
     def get_video_features(
         self,
@@ -1488,24 +1261,7 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
         Returns:
             Tuple of (image_embeds_tuple, deepstack_image_embeds)
         """
-        pixel_values = pixel_values.astype(self.visual.get_dtype())
-
-        if image_max_grid_size is None and image_grid_thw is not None:
-            image_max_grid_size = int(np.array(image_grid_thw)[:, 1:].max())
-
-        grid_thw = np.array(image_grid_thw) if image_grid_thw is not None else None
-
-        image_embeds, deepstack_image_embeds = self.visual(
-            pixel_values,
-            grid_thw=grid_thw,
-            max_grid_size=image_max_grid_size,
-        )
-
-        split_sizes = (np.prod(grid_thw, axis=-1) // (self.visual.spatial_merge_size**2)).tolist()
-        split_points = np.cumsum(split_sizes[:-1]) if len(split_sizes) > 1 else []
-        image_embeds_tuple = tuple(jnp.split(image_embeds, split_points, axis=0))
-
-        return image_embeds_tuple, deepstack_image_embeds
+        return super().get_image_features(pixel_values, image_grid_thw, image_max_grid_size)
 
     def get_placeholder_mask(
         self,
@@ -1528,41 +1284,7 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
         Returns:
             Tuple of (special_image_mask, special_video_mask).
         """
-        if input_ids is None:
-            image_embed_ref = self.get_input_embeddings()(jnp.array(self.config.image_token_id, dtype=jnp.int32))
-            special_image_mask = jnp.all(inputs_embeds == image_embed_ref, axis=-1)
-
-            video_embed_ref = self.get_input_embeddings()(jnp.array(self.config.video_token_id, dtype=jnp.int32))
-            special_video_mask = jnp.all(inputs_embeds == video_embed_ref, axis=-1)
-        else:
-            special_image_mask = input_ids == self.config.image_token_id
-            special_video_mask = input_ids == self.config.video_token_id
-
-        n_image_tokens = special_image_mask.sum()
-        if image_features is not None:
-            try:
-                image_token_count = int(n_image_tokens)
-            except (TypeError, ValueError, jax.errors.ConcretizationTypeError):
-                image_token_count = None
-            if image_token_count is not None and image_token_count * inputs_embeds.shape[-1] != image_features.size:
-                raise ValueError(
-                    f"Image features and image tokens do not match: "
-                    f"tokens: {n_image_tokens}, features {image_features.shape[0]}"
-                )
-
-        n_video_tokens = special_video_mask.sum()
-        if video_features is not None:
-            try:
-                video_token_count = int(n_video_tokens)
-            except (TypeError, ValueError, jax.errors.ConcretizationTypeError):
-                video_token_count = None
-            if video_token_count is not None and video_token_count * inputs_embeds.shape[-1] != video_features.size:
-                raise ValueError(
-                    f"Video features and video tokens do not match: "
-                    f"tokens: {n_video_tokens}, features {video_features.shape[0]}"
-                )
-
-        return special_image_mask, special_video_mask
+        return super().get_placeholder_mask(input_ids, inputs_embeds, image_features, video_features)
 
     def forward(
         self,
@@ -1635,93 +1357,25 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        precomputed_visual_pos_masks = visual_pos_masks
-        precomputed_deepstack_visual_embeds = deepstack_visual_embeds
-
-        if inputs_embeds is None:
-            inputs_embeds = self.compute_embedding(input_ids)
-
-        image_mask = None
-        video_mask = None
-        deepstack_image_embeds = None
-        deepstack_video_embeds = None
-        image_embeds = None
-        video_embeds = None
-
-        if pixel_values is not None:
-            image_embeds_tuple, deepstack_image_embeds = self.get_image_features(
-                pixel_values,
-                image_grid_thw,
-                image_max_grid_size,
-            )
-            image_embeds = jnp.concatenate(image_embeds_tuple, axis=0).astype(inputs_embeds.dtype)
-            image_mask, _ = self.get_placeholder_mask(
-                input_ids,
-                inputs_embeds=inputs_embeds,
-                image_features=image_embeds,
-            )
-
-        if pixel_values_videos is not None:
-            video_embeds_tuple, deepstack_video_embeds = self.get_video_features(
-                pixel_values_videos,
-                video_grid_thw,
-                video_max_grid_size,
-            )
-            video_embeds = jnp.concatenate(video_embeds_tuple, axis=0).astype(inputs_embeds.dtype)
-            _, video_mask = self.get_placeholder_mask(
-                input_ids,
-                inputs_embeds=inputs_embeds,
-                video_features=video_embeds,
-            )
-
-        if image_embeds is not None or video_embeds is not None:
-            inputs_embeds = self.compute_embedding(
-                input_ids,
-                inputs_embeds=inputs_embeds,
-                image_embeds=image_embeds,
-                video_embeds=video_embeds,
-            )
-
-        computed_visual_pos_masks = None
-        computed_deepstack_visual_embeds = None
-
-        if image_mask is not None and video_mask is not None:
-            computed_visual_pos_masks = image_mask | video_mask
-            computed_deepstack_visual_embeds = []
-
-            image_mask_joint = image_mask[computed_visual_pos_masks]
-            video_mask_joint = video_mask[computed_visual_pos_masks]
-
-            for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds, strict=False):
-                embed_joint = jnp.zeros((image_mask_joint.shape[0], img_embed.shape[-1]), dtype=img_embed.dtype)
-
-                img_idx = jnp.cumsum(image_mask_joint) - 1
-                img_idx = jnp.where(image_mask_joint, img_idx, 0)
-                embed_joint = jnp.where(image_mask_joint[:, None], img_embed[img_idx], embed_joint)
-
-                vid_idx = jnp.cumsum(video_mask_joint) - 1
-                vid_idx = jnp.where(video_mask_joint, vid_idx, 0)
-                embed_joint = jnp.where(video_mask_joint[:, None], vid_embed[vid_idx], embed_joint)
-
-                computed_deepstack_visual_embeds.append(embed_joint)
-        elif image_mask is not None:
-            computed_visual_pos_masks = image_mask
-            computed_deepstack_visual_embeds = deepstack_image_embeds
-        elif video_mask is not None:
-            computed_visual_pos_masks = video_mask
-            computed_deepstack_visual_embeds = deepstack_video_embeds
-
-        if computed_visual_pos_masks is not None:
-            visual_pos_masks = computed_visual_pos_masks
-            deepstack_visual_embeds = computed_deepstack_visual_embeds
-        else:
-            visual_pos_masks = precomputed_visual_pos_masks
-            deepstack_visual_embeds = precomputed_deepstack_visual_embeds
-            if deepstack_visual_embeds is not None and visual_pos_masks is None:
-                raise ValueError("`visual_pos_masks` must be provided when `deepstack_visual_embeds` is not None.")
+        inputs_embeds, embedding_info = self.prepare_multimodal_embeddings(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            image_max_grid_size=image_max_grid_size,
+            video_max_grid_size=video_max_grid_size,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+        )
+        visual_pos_masks = embedding_info.visual_pos_masks
+        deepstack_visual_embeds = embedding_info.deepstack_visual_embeds
 
         rope_deltas = None
-        if position_ids is None:
+        # Embeddings-only text input has no placeholder IDs to parse; let the
+        # text decoder infer its three position axes from the effective mask.
+        if position_ids is None and input_ids is not None:
             position_ids, rope_deltas = self.get_rope_index(
                 input_ids,
                 image_grid_thw if pixel_values is not None else None,
@@ -1928,6 +1582,29 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
         """
         return self.model.get_image_features(pixel_values, image_grid_thw, image_max_grid_size)
 
+    def compute_embedding_with_info(
+        self, input_ids, *args, deepstack_image_embeds=None, deepstack_video_embeds=None, **kwargs
+    ):
+        """Prepare embeddings and cached/native DeepStack metadata in one pass.
+
+        Args:
+            input_ids: Input token IDs.
+            *args: Positional arguments forwarded to the multimodal model.
+            deepstack_image_embeds: Optional cached per-layer image residuals.
+            deepstack_video_embeds: Optional cached per-layer video residuals.
+            **kwargs: Embedding, pixel, grid and attention inputs for the model.
+
+        Returns:
+            Fused embeddings and EmbeddingInfo, without a second vision encode.
+        """
+        return self.model.compute_embedding_with_info(
+            input_ids,
+            *args,
+            deepstack_image_embeds=deepstack_image_embeds,
+            deepstack_video_embeds=deepstack_video_embeds,
+            **kwargs,
+        )
+
     def compute_embedding(self, input_ids, *args, **kwargs):
         """Compute embeddings with optional multimodal fusion.
 
@@ -2077,7 +1754,7 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
 
         aux_loss = self.compute_router_aux_loss(outputs)
 
-        return VLMCausalLMOutput(
+        return Qwen3VLMoeCausalLMOutputWithPast(
             logits=lm_logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,

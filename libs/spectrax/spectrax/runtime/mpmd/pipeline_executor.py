@@ -55,6 +55,7 @@ from .runtime import (
 __all__ = [
     "MpmdPipelineDispatchStats",
     "MpmdPipelineExecutor",
+    "MpmdPreparedPlanSummary",
 ]
 
 PyTree: tp.TypeAlias = object
@@ -131,10 +132,34 @@ class _MpmdState(tp.TypedDict, total=False):
     dynamic: set[int]
     explicit_in_sh: dict[int, PyTree]
     fn_outvar_map: PyTree
+    donate_argnums_per_stage: list[tuple[int, ...]]
     mpmd_mesh: MpMdMesh
     dynamic_flat_to_orig_flat: dict[int, int]
     out_shardings: PyTree
     result_treedef: PyTree
+
+
+class MpmdPreparedPlanSummary(tp.TypedDict):
+    """Detached host-only counts describing a cached forward pipeline plan.
+
+    Per-stage tuples follow compiled stage order. Donation argnums are copied
+    as tuples; ``donation_counts`` gives their lengths. Output owners are stage
+    indices, or source-kind strings for outputs forwarded from input leaves.
+    """
+
+    arg_leaf_counts: tuple[int, ...]
+    num_stages: int
+    kv_leaves: int
+    metadata_leaves: int
+    dynamic_slots: tuple[int, ...]
+    dynamic_kv_slots: tuple[int, ...]
+    dynamic_metadata_slots: tuple[int, ...]
+    stage_slots: tuple[int, ...]
+    prev_slots: tuple[int, ...]
+    total_invars: tuple[int, ...]
+    donated_by_stage: tuple[tuple[int, ...], ...]
+    donation_counts: tuple[int, ...]
+    kv_outputs_by_stage: dict[int | str, int]
 
 
 class _MpmdPreparedCallable(tp.Protocol):
@@ -566,6 +591,77 @@ class MpmdPipelineExecutor:
         any worker threads around.
         """
         self._prepare_cache.clear()
+
+    def get_prepared_plan_summary(
+        self,
+        prepare_cache_key: tp.Hashable,
+        *,
+        kv_argnum: int,
+        metadata_argnum: int,
+    ) -> MpmdPreparedPlanSummary | None:
+        """Return a compact audit without exposing private prepared-plan state.
+
+        This only inspects host metadata; it does not prepare a plan, execute
+        stages, or copy device arrays. The returned containers are detached
+        from the cache and can be modified without changing execution.
+
+        Args:
+            prepare_cache_key: Bucket key previously passed to ``dispatch_many``.
+            kv_argnum: Positional argument containing the carried state leaves.
+                For output ownership, these leaves must be the leading leaves
+                of the function's flattened output (the forward-cache ABI).
+            metadata_argnum: Positional argument containing runtime metadata.
+                Missing or out-of-range argument slots contribute zero leaves.
+
+        Returns:
+            ``None`` when the key is absent. Otherwise a mapping containing
+            argument leaf counts, stage count, KV/metadata leaf counts, per-stage
+            dynamic/KV/metadata slot counts, stage/previous-edge counts, total
+            invar counts, donated argnums and their counts, and KV-output counts
+            grouped by owning stage or forwarded-input source kind.
+        """
+        entry = self._prepare_cache.get(prepare_cache_key)
+        if entry is None:
+            return None
+
+        def arg_indices(argnum: int) -> range:
+            """Return the flattened input span for an available argument."""
+            if not 0 <= argnum < len(entry.arg_leaf_counts):
+                return range(0)
+            start = entry.arg_offsets[argnum]
+            return range(start, start + entry.arg_leaf_counts[argnum])
+
+        kv_indices = arg_indices(kv_argnum)
+        metadata_indices = arg_indices(metadata_argnum)
+        plans = entry.invar_plans
+        donated_by_stage = tuple(tuple(argnums) for argnums in entry.state.get("donate_argnums_per_stage", ()))
+        kv_outputs_by_stage: dict[int | str, int] = {}
+        for mapping in tuple(entry.state.get("fn_outvar_map", ()))[: len(kv_indices)]:
+            if not mapping:
+                continue
+            owner = mapping[0]
+            key = int(owner) if isinstance(owner, int) else str(owner)
+            kv_outputs_by_stage[key] = kv_outputs_by_stage.get(key, 0) + 1
+
+        return MpmdPreparedPlanSummary(
+            arg_leaf_counts=entry.arg_leaf_counts,
+            num_stages=len(plans),
+            kv_leaves=len(kv_indices),
+            metadata_leaves=len(metadata_indices),
+            dynamic_slots=tuple(len(plan.dynamic_slots) for plan in plans),
+            dynamic_kv_slots=tuple(
+                sum(int(orig_idx) in kv_indices for _, orig_idx in plan.dynamic_slots) for plan in plans
+            ),
+            dynamic_metadata_slots=tuple(
+                sum(int(orig_idx) in metadata_indices for _, orig_idx in plan.dynamic_slots) for plan in plans
+            ),
+            stage_slots=tuple(len(plan.stage_slots) for plan in plans),
+            prev_slots=tuple(len(plan.prev_slots) for plan in plans),
+            total_invars=tuple(len(plan.template) for plan in plans),
+            donated_by_stage=donated_by_stage,
+            donation_counts=tuple(len(argnums) for argnums in donated_by_stage),
+            kv_outputs_by_stage=kv_outputs_by_stage,
+        )
 
     def dispatch(self, sxjit_fn: _MpmdPreparedCallable, *args: PyTree) -> PyTree:
         """Execute one ``sxjit`` call through the pipeline executor.
@@ -1567,6 +1663,8 @@ class MpmdPipelineExecutor:
             Result described by this helper.
         """
         state = call.state
+        stage_entry = state["compiled"][logical_stage_idx]
+        expected_shardings = stage_entry[6] if len(stage_entry) > 6 else None
         if invar_plan is not None:
             return _assemble_invars_from_plan(
                 invar_plan,
@@ -1582,6 +1680,7 @@ class MpmdPipelineExecutor:
                 runtime_static_flat_indices=runtime_static_flat_indices,
                 runtime_static_cache=runtime_static_cache,
                 transport_context=(microbatch_idx, logical_stage_idx),
+                expected_shardings=expected_shardings,
             )
         return _assemble_invars(
             invar_map,
@@ -1600,6 +1699,7 @@ class MpmdPipelineExecutor:
             runtime_static_flat_indices=runtime_static_flat_indices,
             runtime_static_cache=runtime_static_cache,
             transport_context=(microbatch_idx, logical_stage_idx),
+            expected_shardings=expected_shardings,
         )
 
     def _make_invar_plans(self, state: _MpmdState) -> tuple[_InvarAssemblyPlan, ...]:

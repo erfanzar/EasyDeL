@@ -44,6 +44,42 @@ def check_image_spans_fit(spans: tp.Sequence[tuple[int, int]], max_tokens: int, 
             )
 
 
+def expand_request_images(
+    request: tp.Any,
+    image_expander: tp.Any | None,
+    *,
+    max_num_scheduled_tokens: int,
+    max_model_len: int,
+) -> None:
+    """Expand a request's image placeholders into image spans and attach the preprocessed patches.
+
+    Shared by :class:`Scheduler` and the data-parallel coordinator so a request is expanded exactly once, in the
+    process that owns the model's expander, before it is routed to a rank scheduler.
+
+    Args:
+        request: Engine request carrying ``images``; updated in place via ``set_expanded_prompt``.
+        image_expander: Model-provided expander (``esurge_image_expander_builder``) or ``None``.
+        max_num_scheduled_tokens: Per-step token budget an image span must fit in.
+        max_model_len: Maximum context length the expanded prompt must stay below.
+
+    Raises:
+        ValueError: If the served model declares no image support, an image span exceeds the per-step budget, or the
+            expanded prompt does not fit ``max_model_len``.
+    """
+    if image_expander is None:
+        raise ValueError(
+            f"Request {request.request_id} carries images but the served model does not declare image support."
+        )
+    expanded = image_expander.expand(request.prompt_token_ids, request.images)
+    check_image_spans_fit(expanded.spans, max_num_scheduled_tokens, request.request_id)
+    if len(expanded.token_ids) >= max_model_len:
+        raise ValueError(
+            f"Request {request.request_id}: image-expanded prompt has {len(expanded.token_ids)} tokens, "
+            f"which does not fit max_model_len={max_model_len}."
+        )
+    request.set_expanded_prompt(expanded.token_ids, expanded.token_types, expanded.spans, expanded.features)
+
+
 def align_prefill_chunk(
     spans: tp.Sequence[tuple[int, int]],
     num_computed_tokens: int,
@@ -76,4 +112,4 @@ def align_prefill_chunk(
     return int(num_new_tokens)
 
 
-__all__ = ["align_prefill_chunk", "check_image_spans_fit"]
+__all__ = ["align_prefill_chunk", "check_image_spans_fit", "expand_request_images"]

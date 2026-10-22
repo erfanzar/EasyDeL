@@ -116,6 +116,19 @@ class SiglipTextModelOutput(ModelOutput):
 
 
 @auto_pytree
+class SiglipImageClassifierOutput(ImageClassifierOutput):
+    """Image-classification output including logits and optional supervised loss.
+
+    Attributes:
+        logits: Per-image classification or regression scores.
+        loss: Scalar supervised loss when labels are provided.
+    """
+
+    logits: Array | None = None
+    loss: Array | None = None
+
+
+@auto_pytree
 class SiglipOutput(ModelOutput):
     """Output bundle for the dual-tower contrastive SigLIP model.
 
@@ -189,6 +202,7 @@ class SiglipVisionEmbeddings(EasyDeLLayerStackMixin, spx.Module):
             rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
+        self.dtype = dtype
         self.embed_dim = config.hidden_size
         self.image_size = config.image_size
         self.patch_size = config.patch_size
@@ -209,6 +223,7 @@ class SiglipVisionEmbeddings(EasyDeLLayerStackMixin, spx.Module):
             stride=self.patch_size,
             padding="VALID",
             dtype=dtype,
+            param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
         )
@@ -261,15 +276,22 @@ class SiglipVisionEmbeddings(EasyDeLLayerStackMixin, spx.Module):
             (batch_size, num_patches, hidden_size).
         """
         _, _, height, width = pixel_values.shape
-        target_dtype = self.patch_embedding.weight.dtype
-
-        pixel_values = pixel_values.transpose(0, 2, 3, 1).astype(dtype=target_dtype)
-        patch_embeds = self.patch_embedding(pixel_values).transpose(0, 3, 1, 2)
+        pixel_values = pixel_values.transpose(0, 2, 3, 1).astype(self.dtype)
+        # Conv2d stores parameters in param_dtype; cast temporary operands only,
+        # preserving checkpoint leaves while keeping activation computation in dtype.
+        patch_embeds = spx.functional.conv(
+            pixel_values,
+            self.patch_embedding.weight.value.astype(self.dtype),
+            self.patch_embedding.bias.value.astype(self.dtype),
+            stride=self.patch_embedding.stride,
+            padding=self.patch_embedding.padding,
+            precision=self.patch_embedding.precision,
+        ).transpose(0, 3, 1, 2)
 
         embeddings = jnp.reshape(patch_embeds, (*patch_embeds.shape[:2], -1))
         embeddings = jnp.transpose(embeddings, (0, 2, 1))
         if interpolate_pos_encoding:
-            embeddings = embeddings + self.interpolate(embeddings, height, width)
+            embeddings = embeddings + self.interpolate(embeddings, height, width).astype(self.dtype)
         else:
             embeddings = embeddings + self.position_embedding(jnp.arange(self.num_positions, dtype="i4").reshape(1, -1))
         return checkpoint_name(embeddings, "embeddings")
@@ -975,7 +997,8 @@ class SiglipTextModel(EasyDeLBaseModule):
         position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-    ) -> tuple | BaseModelOutputWithPooling:
+        return_embeds: bool = False,
+    ) -> tuple | BaseModelOutputWithPooling | SiglipTextModelOutput:
         """Forward pass through the SigLIP text model.
 
         Args:
@@ -988,10 +1011,13 @@ class SiglipTextModel(EasyDeLBaseModule):
             output_attentions: Whether to return attention weights. Defaults to config value.
             output_hidden_states: Whether to return hidden states from all layers.
                 Defaults to config value.
+            return_embeds: Return a ``SiglipTextModelOutput`` with the projected
+                ``text_embeds`` field instead of the default pooling output.
 
         Returns:
             BaseModelOutputWithPooling containing last hidden state, pooled output,
-            optional hidden states, and optional attention weights.
+            optional hidden states, and optional attention weights. When
+            ``return_embeds=True``, returns ``SiglipTextModelOutput`` instead.
 
         Raises:
             ValueError: If input_ids is not provided.
@@ -1007,13 +1033,21 @@ class SiglipTextModel(EasyDeLBaseModule):
         if position_ids is None:
             position_ids = mask_info.q_position_ids
 
-        return self.text_model(
+        outputs = self.text_model(
             input_ids=input_ids,
             mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
+        if return_embeds:
+            return SiglipTextModelOutput(
+                text_embeds=outputs.pooler_output,
+                last_hidden_state=outputs.last_hidden_state,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+        return outputs
 
     def get_encoder(self):
         """
@@ -1204,6 +1238,7 @@ class MultiheadAttention(spx.Module):
         partition_manager=None,
         *,
         rngs: spx.Rngs,
+        softmax_dtype: jnp.dtype = jnp.float32,
     ):
         """Initialize multi-head attention module.
 
@@ -1215,6 +1250,8 @@ class MultiheadAttention(spx.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             rngs (spx.Rngs): Random number generator state.
+            softmax_dtype: Attention score/softmax accumulation dtype, promoted
+                to at least float32. Defaults to float32.
 
         Raises:
             ValueError: If embed_dim or num_heads is non-positive.
@@ -1228,6 +1265,9 @@ class MultiheadAttention(spx.Module):
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.partition_manager = partition_manager
+        self.dtype = dtype
+        self.precision = precision
+        self.softmax_dtype = jnp.promote_types(jnp.float32, softmax_dtype)
 
         self.head_dim = embed_dim // num_heads
         assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
@@ -1279,21 +1319,23 @@ class MultiheadAttention(spx.Module):
         qb, kb, vb = jnp.split(self.in_proj_bias, 3, -1)
         qw, kw, vw = jnp.split(self.in_proj_weight, 3, -1)
 
-        qout = ((query @ qw) + qb).reshape(qbs, qss, self.num_heads, -1)
-        kout = ((key @ kw) + kb).reshape(b, s, self.num_heads, -1)
-        vout = ((value @ vw) + vb).reshape(b, s, self.num_heads, -1)
+        def project(inputs, weight, bias):
+            return jnp.matmul(
+                inputs.astype(self.dtype), weight.astype(self.dtype), precision=self.precision
+            ) + bias.astype(self.dtype)
 
-        attn = jnp.einsum(
-            "bhqk,bkhd->bqhd",
-            jax.nn.softmax(
-                jnp.einsum(
-                    "bqhd,bkhd->bhqk",
-                    qout * (qout.shape[-1] ** -0.5),
-                    kout,
-                )
-            ),
-            vout,
+        qout = project(query, qw, qb).reshape(qbs, qss, self.num_heads, -1)
+        kout = project(key, kw, kb).reshape(b, s, self.num_heads, -1)
+        vout = project(value, vw, vb).reshape(b, s, self.num_heads, -1)
+
+        scores = jnp.einsum(
+            "bqhd,bkhd->bhqk",
+            qout.astype(self.softmax_dtype) * (self.head_dim**-0.5),
+            kout.astype(self.softmax_dtype),
+            precision=self.precision,
         )
+        probabilities = jax.nn.softmax(scores, axis=-1).astype(vout.dtype)
+        attn = jnp.einsum("bhqk,bkhd->bqhd", probabilities, vout, precision=self.precision)
 
         attn_output = checkpoint_name(self.out_proj(attn.reshape(qbs, qss, qds)), "attn_output")
         attn_output = apply_logical_sharding(
@@ -1346,6 +1388,7 @@ class SiglipMultiheadAttentionPoolingHead(spx.Module):
             precision=precision,
             partition_manager=config.runtime_sharding_resolver,
             rngs=rngs,
+            softmax_dtype=getattr(config, "attn_softmax_dtype", jnp.float32),
         )
         self.layernorm = LayerNorm(
             config.hidden_size,
@@ -1443,7 +1486,8 @@ class SiglipVisionModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         interpolate_pos_encoding: bool = False,
-    ) -> tuple | BaseModelOutputWithPooling:
+        return_embeds: bool = False,
+    ) -> tuple | BaseModelOutputWithPooling | SiglipVisionModelOutput:
         """Forward pass through the SigLIP vision model.
 
         Args:
@@ -1453,17 +1497,32 @@ class SiglipVisionModel(EasyDeLBaseModule):
                 Defaults to config value.
             interpolate_pos_encoding: Whether to interpolate position embeddings for
                 different image resolutions. Defaults to False.
+            return_embeds: Return a ``SiglipVisionModelOutput`` with normalized
+                contrastive ``image_embeds`` instead of the default pooling output.
 
         Returns:
             BaseModelOutputWithPooling containing last hidden state, pooled output,
-            optional hidden states, and optional attention weights.
+            optional hidden states, and optional attention weights. When
+            ``return_embeds=True``, returns ``SiglipVisionModelOutput`` instead.
         """
-        return self.vision_model(
+        outputs = self.vision_model(
             pixel_values=pixel_values,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             interpolate_pos_encoding=interpolate_pos_encoding,
         )
+        if return_embeds:
+            image_embeds = outputs.pooler_output
+            if image_embeds is not None:
+                norm = jnp.linalg.norm(image_embeds.astype(jnp.float32), axis=-1, keepdims=True)
+                image_embeds = (image_embeds / jnp.maximum(norm, jnp.finfo(jnp.float32).tiny)).astype(image_embeds.dtype)
+            return SiglipVisionModelOutput(
+                image_embeds=image_embeds,
+                last_hidden_state=outputs.last_hidden_state,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+        return outputs
 
     def get_encoder(self):
         """
@@ -1838,7 +1897,6 @@ class SiglipForImageClassification(BaseImageClassificationModule[SiglipVisionMod
             classifier_bias=True,
         )
         self.num_labels = config.num_labels
-        self.use_classif = self.classifier is not None
 
     def forward(
         self,
@@ -1852,7 +1910,10 @@ class SiglipForImageClassification(BaseImageClassificationModule[SiglipVisionMod
 
         Args:
             pixel_values: Input pixel values of shape (batch_size, channels, height, width).
-            labels: Ground truth labels for computing loss (unused in this implementation).
+            labels: Ground truth labels. Integer class indices use cross-entropy,
+                floating-point multi-label targets use binary cross-entropy, and
+                ``num_labels == 1`` uses mean squared error. ``config.problem_type``
+                can explicitly select the loss.
             output_attentions: Whether to return attention weights. Defaults to config value.
             output_hidden_states: Whether to return hidden states from all layers.
                 Defaults to config value.
@@ -1881,8 +1942,34 @@ class SiglipForImageClassification(BaseImageClassificationModule[SiglipVisionMod
         if self.classifier is not None:
             logits = self.classifier(logits)
 
-        return ImageClassifierOutput(
+        loss = None
+        if labels is not None:
+            if self.classifier is None:
+                raise ValueError("Supervised classification requires config.num_labels > 0.")
+            problem_type = getattr(self.config, "problem_type", None)
+            if problem_type is None:
+                if self.num_labels == 1:
+                    problem_type = "regression"
+                elif jnp.issubdtype(labels.dtype, jnp.integer):
+                    problem_type = "single_label_classification"
+                else:
+                    problem_type = "multi_label_classification"
+            scores = logits.astype(jnp.float32)
+            if problem_type == "regression":
+                targets = labels.astype(jnp.float32).reshape(scores.shape)
+                loss = jnp.mean(jnp.square(scores - targets))
+            elif problem_type == "single_label_classification":
+                targets = labels.astype(jnp.int32).reshape(-1, 1)
+                loss = -jnp.take_along_axis(jax.nn.log_softmax(scores, axis=-1), targets, axis=-1).mean()
+            elif problem_type == "multi_label_classification":
+                targets = labels.astype(jnp.float32)
+                loss = jnp.mean(jax.nn.softplus(scores) - scores * targets)
+            else:
+                raise ValueError(f"Unsupported problem_type: {problem_type!r}")
+
+        return SiglipImageClassifierOutput(
             logits=logits,
+            loss=loss,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )

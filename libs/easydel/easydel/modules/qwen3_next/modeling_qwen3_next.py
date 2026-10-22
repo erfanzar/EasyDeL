@@ -86,7 +86,6 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
     AttentionLayerOutput,
     DecoderLayerOutput,
@@ -113,6 +112,7 @@ from easydel.layers import (
     RMSNormGated,
     RowParallelLinear,
     RowParallelMoELinear,
+    all_gather_then_dot,
     build_fused_gate_up_projection,
     gated_mlp_forward,
     interleave_segments_last_axis,
@@ -128,7 +128,6 @@ from easydel.layers import (
     torch_interleave_segments_for_tp,
     with_tp_last_axis_sharding,
 )
-from easydel.layers._sharding import all_gather_then_dot
 from easydel.layers.attention import UnifiedAttention
 from easydel.layers.linear_attention import (
     apply_conv_with_state,
@@ -1710,7 +1709,7 @@ def _apply_qwen3_next_packed_updates_ragged(
         and not bool(disable_recurrent_scan_prefill)
         and (
             force_recurrent_scan_prefill
-            or (seq_len >= 128 and seq_len <= recurrent_scan_prefill_max_seq_len)
+            or (1 < seq_len <= recurrent_scan_prefill_max_seq_len)
             or (_has_candidate_rows and seq_len <= 256)
         )
     )
@@ -2417,8 +2416,6 @@ class Qwen3NextFullAttention(UnifiedAttention):
         )
         self.layer_idx = layer_idx
         self.attn_output_gate = bool(getattr(config, "attn_output_gate", True))
-        num_kv_heads = int(getattr(config, "num_key_value_heads", self.num_key_value_heads))
-        self.logical_num_key_value_heads = num_kv_heads
 
     def _q_proj_multiplier(self) -> int:
         """Return ``2`` when the query projection also produces an output gate.
@@ -2431,41 +2428,6 @@ class Qwen3NextFullAttention(UnifiedAttention):
         helper returns ``1``.
         """
         return 2 if bool(getattr(self, "attn_output_gate", True)) else 1
-
-    def _create_q_proj(
-        self,
-        config,
-        dtype,
-        param_dtype,
-        precision,
-        rngs,
-    ):
-        """Create query projection with 2x output for query + gate.
-
-        HuggingFace Qwen3Next uses q_proj that outputs doubled dimension,
-        which is then split into query states and gate values.
-
-        Args:
-            config: Owning :class:`Qwen3NextConfig`.
-            dtype: Compute dtype for the projection.
-            param_dtype: Parameter dtype for the kernel.
-            precision: JAX precision flag forwarded to the matmul.
-            rngs: Random number generator state for initialisation.
-
-        Returns:
-            :class:`ColumnParallelLinear` with output width
-            ``num_heads * head_dim * 2``.
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            self.num_heads * self.head_dim * 2,  # 2x for query + gate
-            rngs=rngs,
-            use_bias=getattr(config, "attention_bias", False),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
-            precision=precision,
-        )
 
     def _create_fused_qkv_proj(self, config, dtype, param_dtype, precision, rngs):
         """Create packed ``[Q(+gate) | K | V]`` projection.
@@ -2500,44 +2462,6 @@ class Qwen3NextFullAttention(UnifiedAttention):
             kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
             precision=precision,
             layout=layout,
-        )
-
-    def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Create the per-KV-head key projection.
-
-        Returns:
-            :class:`ColumnParallelLinear` with output width
-            ``num_key_value_heads * head_dim``; used only on the
-            non-fused projection code path.
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=getattr(config, "attention_bias", False),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
-            precision=precision,
-        )
-
-    def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Create the per-KV-head value projection.
-
-        Returns:
-            :class:`ColumnParallelLinear` with output width
-            ``num_key_value_heads * head_dim``; used only on the
-            non-fused projection code path.
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=getattr(config, "attention_bias", False),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
-            precision=precision,
         )
 
     def _create_q_norm(self, config, dtype, param_dtype, rngs):
@@ -3039,6 +2963,9 @@ class Qwen3NextLinearAttention(spx.Module):
         # tap j (0..K-1) reads position t - (K-1-j); j=K-1 is the current token.
         for j in range(k_size):
             shift = k_size - 1 - j
+            if shift >= s:
+                # This tap reads only left padding for short sequences.
+                continue
             if shift == 0:
                 shifted_x = x
                 same_seg = jnp.ones((b, s), dtype=jnp.bool_)
@@ -3222,7 +3149,7 @@ class Qwen3NextLinearAttention(spx.Module):
                 seq_len_static = int(conv_input.shape[1])
                 use_dp_recurrent_scan_prefill = (
                     jax.default_backend() == "tpu"
-                    and seq_len_static >= 128
+                    and seq_len_static > 1
                     and (force_dp_recurrent_scan_prefill or seq_len_static <= dp_recurrent_scan_max_prefill)
                 )
                 query_start_loc_by_rank = jnp.asarray(packed_query_start_loc, dtype=jnp.int32)
@@ -3285,8 +3212,11 @@ class Qwen3NextLinearAttention(spx.Module):
                         conv_states=selected_conv_state,
                         recurrent_states=selected_recurrent_state,
                         conv_input=conv_input_i[None, ...],
-                        beta=beta_i[None, ...],
-                        decay=None,
+                        beta=jax.nn.sigmoid(beta_i[None, ...]),
+                        decay=A[None, None, :]
+                        * jax.nn.softplus(
+                            alpha_i[None, ...].astype(jnp.float32) + self.dt_bias.value.astype(jnp.float32)
+                        ),
                         kernel=kernel,
                         query_start_loc=qsl_i,
                         num_requests=num_requests_i,
@@ -4130,31 +4060,7 @@ class Qwen3NextForCausalLM(BaseCausalLMModule[Qwen3NextModel, Qwen3NextConfig]):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
-            aux_loss_fn=self._compute_aux_loss,
         )
-
-    def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute auxiliary load balancing loss from router logits.
-
-        Uses the auxiliary load balancing loss function to encourage balanced
-        token routing across experts.
-
-        Args:
-            outputs: Model outputs containing router_logits.
-            attention_mask: Attention mask for valid tokens.
-
-        Returns:
-            Auxiliary loss value or None if no router logits are available.
-        """
-        if outputs.router_logits is None or len(outputs.router_logits) == 0:
-            return None
-        aux_loss = auxiliary_load_balancing_loss_func(
-            gate_logits=outputs.router_logits,
-            num_experts=self.config.num_experts,
-            top_k=self.config.num_experts_per_tok,
-            attention_mask=attention_mask,
-        )
-        return aux_loss * self.config.router_aux_loss_coef
 
 
 __all__ = [

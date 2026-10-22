@@ -89,26 +89,205 @@ class DraftStep:
     hidden_states: Float[Array, "batch seq hidden"] | None = None
 
 
-class _HiddenStateCarrier:
-    """Minimal ``outputs``-shaped object exposing ``last_hidden_state``.
+def _slice_view_row(view, row):
+    """Slice a batch-N cache view down to a batch-1 view at ``row``.
 
-    The Qwen3.5 MTP path (``compute_mtp_outputs``) expects an object
-    with a ``.last_hidden_state`` attribute. This carrier lets the
-    drafter reuse that path while passing a bare hidden-state array.
-    It is created transiently during JIT tracing (not a pytree leaf
-    / not a jit input), so it adds no overhead.
+    Args:
+        view: Transformer cache view whose leading axis is the request pool.
+        row: Traced (or static) batch row to extract.
+
+    Returns:
+        A view whose KV, position, segment, and auxiliary state carry only ``row``.
     """
+    return view.replace(
+        key=jax.lax.dynamic_slice_in_dim(view.key, row, 1, axis=0),
+        value=jax.lax.dynamic_slice_in_dim(view.value, row, 1, axis=0),
+        indexes=jax.lax.dynamic_slice_in_dim(view.indexes, row, 1, axis=0),
+        starts=jax.lax.dynamic_slice_in_dim(view.starts, row, 1, axis=0),
+        segment_ids=(
+            None if view.segment_ids is None else jax.lax.dynamic_slice_in_dim(view.segment_ids, row, 1, axis=0)
+        ),
+        auxiliary_state=(
+            None if view.auxiliary_state is None else jax.lax.dynamic_slice_in_dim(view.auxiliary_state, row, 1, axis=0)
+        ),
+    )
 
-    __slots__ = ("last_hidden_state",)
 
-    def __init__(self, last_hidden_state: Array):
-        """Store ``last_hidden_state`` for later ``.last_hidden_state`` access.
+def _scatter_view_row(full, updated, row):
+    """Write a batch-1 updated view back into ``row`` of the pool view.
 
-        Args:
-            last_hidden_state: Hidden-state tensor to expose as the
-                ``.last_hidden_state`` attribute on this carrier.
-        """
-        self.last_hidden_state = last_hidden_state
+    Args:
+        full: The batch-N pool cache view.
+        updated: The batch-1 view produced by the row-targeted forward.
+        row: Traced (or static) batch row to overwrite.
+
+    Returns:
+        ``full`` with ``row`` replaced by ``updated``.
+    """
+    segment_ids = full.segment_ids
+    if updated.segment_ids is not None:
+        if segment_ids is None:
+            # Legacy pools have one implicit continuation segment per row.
+            # Materialize that ownership only when a row gains explicit history,
+            # retaining valid tokens (0) versus unwritten slots (-1) elsewhere.
+            width = full.key.shape[1]
+            segment_ids = jnp.where(jnp.arange(width)[None, :] < full.indexes[:, None], 0, -1).astype(
+                updated.segment_ids.dtype
+            )
+        segment_ids = jax.lax.dynamic_update_slice_in_dim(segment_ids, updated.segment_ids, row, axis=0)
+    auxiliary_state = full.auxiliary_state
+    if updated.auxiliary_state is not None:
+        if auxiliary_state is None:
+            auxiliary_state = jnp.zeros(
+                (*full.key.shape[:2], updated.auxiliary_state.shape[-1]), dtype=updated.auxiliary_state.dtype
+            )
+        auxiliary_state = jax.lax.dynamic_update_slice_in_dim(auxiliary_state, updated.auxiliary_state, row, axis=0)
+    return full.replace(
+        key=jax.lax.dynamic_update_slice_in_dim(full.key, updated.key, row, axis=0),
+        value=jax.lax.dynamic_update_slice_in_dim(full.value, updated.value, row, axis=0),
+        indexes=jax.lax.dynamic_update_slice_in_dim(full.indexes, updated.indexes, row, axis=0),
+        starts=jax.lax.dynamic_update_slice_in_dim(full.starts, updated.starts, row, axis=0),
+        segment_ids=segment_ids,
+        auxiliary_state=auxiliary_state,
+    )
+
+
+def _rollback_cache_views(cache: TransformerCache, committed: jax.Array, collected_mask: jax.Array):
+    """Roll collected rows' write index back to their committed MTP context length.
+
+    Args:
+        cache: Pool ``TransformerCache`` about to be advanced.
+        committed: ``(N,)`` per-row rollback target (committed context length).
+        collected_mask: ``(N,)`` boolean; only ``True`` rows are rolled back.
+
+    Returns:
+        ``(rolled_cache, orig_indexes, orig_starts)``. The originals feed
+        :func:`_restore_cache_views` after the draft forwards ran.
+    """
+    committed = committed.astype(jnp.int32)
+    rolled_views: list = []
+    orig_indexes: list = []
+    orig_starts: list = []
+    for v in cache.views:
+        if v is None:
+            rolled_views.append(None)
+            orig_indexes.append(None)
+            orig_starts.append(None)
+            continue
+        orig_indexes.append(v.indexes)
+        orig_starts.append(v.starts)
+        idx = v.indexes.astype(jnp.int32)
+        rolled = jnp.where(collected_mask, jnp.minimum(idx, committed), idx)
+        rolled_views.append(v.replace(indexes=rolled.astype(v.indexes.dtype)))
+    return TransformerCache(views=rolled_views), orig_indexes, orig_starts
+
+
+def _restore_cache_views(cache: TransformerCache, orig_indexes: list, orig_starts: list, collected_mask: jax.Array):
+    """Keep the advanced cache only for collected rows; restore the rest.
+
+    Non-collected rows ride the batched forward but must never have their write
+    index (or ``starts``) corrupted, so their pre-forward values are put back.
+
+    Args:
+        cache: Cache returned by the draft forwards.
+        orig_indexes: Pre-forward ``indexes`` per view from :func:`_rollback_cache_views`.
+        orig_starts: Pre-forward ``starts`` per view from :func:`_rollback_cache_views`.
+        collected_mask: ``(N,)`` boolean; ``True`` rows keep their advanced state.
+
+    Returns:
+        The cache with non-collected rows restored.
+    """
+    fixed_views = []
+    for v, orig_idx, orig_st in zip(cache.views, orig_indexes, orig_starts, strict=False):
+        if v is None:
+            fixed_views.append(None)
+            continue
+        adv_idx = v.indexes.astype(jnp.int32)
+        fixed_idx = jnp.where(collected_mask, adv_idx, orig_idx.astype(jnp.int32))
+        v2 = v.replace(indexes=fixed_idx.astype(v.indexes.dtype))
+        if orig_st is not None:
+            adv_st = v.starts
+            mask_st = collected_mask.reshape((-1,) + (1,) * (adv_st.ndim - 1))
+            v2 = v2.replace(starts=jnp.where(mask_st, adv_st, orig_st))
+        fixed_views.append(v2)
+    return TransformerCache(views=fixed_views)
+
+
+def _mtp_forward_core(
+    mtp: typing.Any,
+    next_embeds: Array,
+    frequencies: Array | None,
+    ids: Array,
+    hidden: Array,
+    pos: Array | None,
+    cache: TransformerCache | None,
+    row: jax.Array | None,
+) -> tuple[Array, TransformerCache | None]:
+    """Shared inline-MTP-head body: fuse embeddings + hidden and run the MTP layers.
+
+    Both :meth:`_mtp_forward_compute` (whole target model) and
+    :meth:`_mtp_forward_compute_parts` (explicit submodules) differ only in how
+    they resolve the input embeddings, rotary table and LM head; everything in
+    between lives here so the two cannot drift apart.
+
+    Args:
+        mtp: The inline MTP block (``model.mtp``).
+        next_embeds: ``(batch, seq, hidden)`` embeddings of ``ids``.
+        frequencies: Rotary frequency table array, or ``None``.
+        ids: ``(batch, seq)`` next-token ids (used for the prefill/decode mode only).
+        hidden: ``(batch, seq, hidden)`` target hidden rows to fuse.
+        pos: Absolute positions for ``hidden``; ``None`` builds ``arange``.
+        cache: Inline-MTP ``TransformerCache`` to read/advance, or ``None``.
+        row: Optional traced batch row; the pool cache is sliced to this row for a
+            batch-1 forward and the advanced view scattered back.
+
+    Returns:
+        ``(hidden_out, new_cache)`` where ``hidden_out`` is the post-norm MTP hidden.
+    """
+    normed_e = mtp.pre_fc_norm_embedding(next_embeds)
+    normed_h = mtp.pre_fc_norm_hidden(hidden)
+    h = mtp.fc(jnp.concatenate([normed_e, normed_h], axis=-1))
+    mask_info = MaskInfo.dynamic_init(
+        mask_info=None,
+        input_ids=None,
+        inputs_embeds=h,
+        attention_mask=None,
+    )
+    if pos is None:
+        batch_size, seq_len = h.shape[:2]
+        pos = jnp.arange(seq_len, dtype=jnp.int32)[None, :].repeat(batch_size, axis=0)
+    views = cache.views if cache is not None else None
+    new_views = []
+    mtp_mode = common_types.MODE_PREFILL if ids.shape[1] > 1 else common_types.MODE_DECODE
+    for layer in mtp.layers:
+        cv_full = views[layer.layer_idx] if views is not None and layer.layer_idx < len(views) else None
+        # Per-request row targeting: slice this request's row out of the shared pool cache so the
+        # batch-1 attention only touches it.
+        cv_in = _slice_view_row(cv_full, row) if (cv_full is not None and row is not None) else cv_full
+        cache_metadata = (
+            TransformerMetadata(
+                postpadded=False,
+                starts=cv_in.starts,
+                indexes=cv_in.indexes,
+            )
+            if cv_in is not None
+            else None
+        )
+        h, _cache_view = layer(
+            h,
+            mask_info,
+            pos,
+            mtp_mode,
+            cv_in,
+            cache_metadata,
+            frequencies,
+        )
+        if cv_full is not None and row is not None:
+            _cache_view = _scatter_view_row(cv_full, _cache_view, row)
+        new_views.append(_cache_view)
+    h = mtp.norm(h)
+    new_cache = TransformerCache(views=new_views) if cache is not None else None
+    return h, new_cache
 
 
 class DrafterProtocol(typing.Protocol):
@@ -445,66 +624,8 @@ class Qwen3_5MTPDrafter:
             ``(hidden_out, logits, new_cache)``.
         """
 
-        def _slice_view_row(view, row_):
-            """Slice a batch-N cache view down to a batch-1 view at ``row``."""
-            return view.replace(
-                key=jax.lax.dynamic_slice_in_dim(view.key, row_, 1, axis=0),
-                value=jax.lax.dynamic_slice_in_dim(view.value, row_, 1, axis=0),
-                indexes=jax.lax.dynamic_slice_in_dim(view.indexes, row_, 1, axis=0),
-                starts=jax.lax.dynamic_slice_in_dim(view.starts, row_, 1, axis=0),
-            )
-
-        def _scatter_view_row(full, updated, row_):
-            """Write a batch-1 updated view back into ``row`` of the pool view."""
-            return full.replace(
-                key=jax.lax.dynamic_update_slice_in_dim(full.key, updated.key, row_, axis=0),
-                value=jax.lax.dynamic_update_slice_in_dim(full.value, updated.value, row_, axis=0),
-                indexes=jax.lax.dynamic_update_slice_in_dim(full.indexes, updated.indexes, row_, axis=0),
-                starts=jax.lax.dynamic_update_slice_in_dim(full.starts, updated.starts, row_, axis=0),
-            )
-
         next_embeds = embed_module(ids.astype("i4"))
-        normed_e = mtp.pre_fc_norm_embedding(next_embeds)
-        normed_h = mtp.pre_fc_norm_hidden(hidden)
-        h = mtp.fc(jnp.concatenate([normed_e, normed_h], axis=-1))
-        mask_info = MaskInfo.dynamic_init(
-            mask_info=None,
-            input_ids=None,
-            inputs_embeds=h,
-            attention_mask=None,
-        )
-        if pos is None:
-            batch_size, seq_len = h.shape[:2]
-            pos = jnp.arange(seq_len, dtype=jnp.int32)[None, :].repeat(batch_size, axis=0)
-        views = cache.views if cache is not None else None
-        new_views = []
-        mtp_mode = common_types.MODE_PREFILL if ids.shape[1] > 1 else common_types.MODE_DECODE
-        for layer in mtp.layers:
-            cv_full = views[layer.layer_idx] if views is not None and layer.layer_idx < len(views) else None
-            cv_in = _slice_view_row(cv_full, row) if (cv_full is not None and row is not None) else cv_full
-            cache_metadata = (
-                TransformerMetadata(
-                    postpadded=False,
-                    starts=cv_in.starts,
-                    indexes=cv_in.indexes,
-                )
-                if cv_in is not None
-                else None
-            )
-            h, _cache_view = layer(
-                h,
-                mask_info,
-                pos,
-                mtp_mode,
-                cv_in,
-                cache_metadata,
-                frequencies,
-            )
-            if cv_full is not None and row is not None:
-                _cache_view = _scatter_view_row(cv_full, _cache_view, row)
-            new_views.append(_cache_view)
-        h = mtp.norm(h)
-        new_cache = TransformerCache(views=new_views) if cache is not None else None
+        h, new_cache = _mtp_forward_core(mtp, next_embeds, frequencies, ids, hidden, pos, cache, row)
         w = embed_module.weight.value.T if tie_embeddings else None
         return h, lm_head_module(h, w=w), new_cache
 
@@ -683,6 +804,7 @@ class Qwen3_5MTPDrafter:
                 value_heads=int(spec["value_heads"]),
                 key_dim=int(spec["key_dim"]),
                 value_dim=int(spec["value_dim"]),
+                auxiliary_dim=spec.get("auxiliary_dim"),
             )
             return TransformerCache.init_cache(
                 mesh=mesh,
@@ -700,6 +822,15 @@ class Qwen3_5MTPDrafter:
                 )
                 or 4096
             )
+        auxiliary_dim = None
+        config_factory = getattr(self.model, "create_transformer_cache_config", None)
+        if callable(config_factory):
+            # Keep model-declared indexer storage without replacing the inline
+            # MTP block's local layer count or dense attention geometry.
+            model_cache_config = config_factory(
+                batch_size=int(batch_size), max_length=max(1, int(max_length)), pad_token_id=0
+            )
+            auxiliary_dim = getattr(model_cache_config, "auxiliary_dim", None)
         cache_config = TransformerCacheConfig.create(
             batch_size=int(batch_size),
             sequence_length=max(1, int(max_length)),
@@ -711,6 +842,7 @@ class Qwen3_5MTPDrafter:
             value_heads=num_kv_heads,
             key_dim=head_dim,
             value_dim=head_dim,
+            auxiliary_dim=auxiliary_dim,
         )
         return TransformerCache.init_cache(
             mesh=mesh,
@@ -822,76 +954,12 @@ class Qwen3_5MTPDrafter:
                 return model.get_input_embeddings()(ids_.astype("i4"))
             return model.model.get_embedding()(ids_.astype("i4"))
 
-        def _slice_view_row(view, row_):
-            """Slice a batch-N cache view down to a batch-1 view at ``row``."""
-            return view.replace(
-                key=jax.lax.dynamic_slice_in_dim(view.key, row_, 1, axis=0),
-                value=jax.lax.dynamic_slice_in_dim(view.value, row_, 1, axis=0),
-                indexes=jax.lax.dynamic_slice_in_dim(view.indexes, row_, 1, axis=0),
-                starts=jax.lax.dynamic_slice_in_dim(view.starts, row_, 1, axis=0),
-            )
-
-        def _scatter_view_row(full, updated, row_):
-            """Write a batch-1 updated view back into ``row`` of the pool view."""
-            return full.replace(
-                key=jax.lax.dynamic_update_slice_in_dim(full.key, updated.key, row_, axis=0),
-                value=jax.lax.dynamic_update_slice_in_dim(full.value, updated.value, row_, axis=0),
-                indexes=jax.lax.dynamic_update_slice_in_dim(full.indexes, updated.indexes, row_, axis=0),
-                starts=jax.lax.dynamic_update_slice_in_dim(full.starts, updated.starts, row_, axis=0),
-            )
-
-        mtp = model.mtp
         next_embeds = _embed_next(ids)
-        normed_e = mtp.pre_fc_norm_embedding(next_embeds)
-        normed_h = mtp.pre_fc_norm_hidden(hidden)
-        h = mtp.fc(jnp.concatenate([normed_e, normed_h], axis=-1))
-        mask_info = MaskInfo.dynamic_init(
-            mask_info=None,
-            input_ids=None,
-            inputs_embeds=h,
-            attention_mask=None,
-        )
-        if pos is None:
-            batch_size, seq_len = h.shape[:2]
-            pos = jnp.arange(seq_len, dtype=jnp.int32)[None, :].repeat(
-                batch_size,
-                axis=0,
-            )
         base_model = getattr(model, "model", None)
         language_model = getattr(base_model, "language_model", None)
         frequencies_owner = language_model if language_model is not None else base_model
         frequencies = getattr(frequencies_owner, "frequencies", None)
-        views = cache.views if cache is not None else None
-        new_views = []
-        mtp_mode = common_types.MODE_PREFILL if ids.shape[1] > 1 else common_types.MODE_DECODE
-        for layer in mtp.layers:
-            cv_full = views[layer.layer_idx] if views is not None and layer.layer_idx < len(views) else None
-            # Per-request row targeting: slice this request's row out of the
-            # shared pool cache so the batch-1 attention only touches it.
-            cv_in = _slice_view_row(cv_full, row) if (cv_full is not None and row is not None) else cv_full
-            cache_metadata = (
-                TransformerMetadata(
-                    postpadded=False,
-                    starts=cv_in.starts,
-                    indexes=cv_in.indexes,
-                )
-                if cv_in is not None
-                else None
-            )
-            h, _cache_view = layer(
-                h,
-                mask_info,
-                pos,
-                mtp_mode,
-                cv_in,
-                cache_metadata,
-                frequencies,
-            )
-            if cv_full is not None and row is not None:
-                _cache_view = _scatter_view_row(cv_full, _cache_view, row)
-            new_views.append(_cache_view)
-        h = mtp.norm(h)
-        new_cache = TransformerCache(views=new_views) if cache is not None else None
+        h, new_cache = _mtp_forward_core(model.mtp, next_embeds, frequencies, ids, hidden, pos, cache, row)
         return h, model.apply_lm_head(h), new_cache
 
     def _mtp_hidden_and_logits(
@@ -928,21 +996,7 @@ class Qwen3_5MTPDrafter:
             str(target_hidden_states.dtype),
             None if position_ids is None else tuple(position_ids.shape),
             None if position_ids is None else str(position_ids.dtype),
-            None
-            if mtp_cache is None
-            else tuple(
-                None
-                if view is None
-                else (
-                    tuple(view.key.shape),
-                    str(view.key.dtype),
-                    tuple(view.value.shape),
-                    str(view.value.dtype),
-                    tuple(view.indexes.shape),
-                    str(view.indexes.dtype),
-                )
-                for view in mtp_cache.views
-            ),
+            self._cache_signature(mtp_cache),
             bool(use_row),
         )
         fn = self._jit_mtp.get(key)
@@ -1167,21 +1221,7 @@ class Qwen3_5MTPDrafter:
             str(cur_hidden.dtype),
             tuple(position.shape),
             str(position.dtype),
-            None
-            if mtp_cache is None
-            else tuple(
-                None
-                if view is None
-                else (
-                    tuple(view.key.shape),
-                    str(view.key.dtype),
-                    tuple(view.value.shape),
-                    str(view.value.dtype),
-                    tuple(view.indexes.shape),
-                    str(view.indexes.dtype),
-                )
-                for view in mtp_cache.views
-            ),
+            self._cache_signature(mtp_cache),
             bool(use_row),
         )
         fn = self._jit_adaptive.get(key)
@@ -1386,21 +1426,7 @@ class Qwen3_5MTPDrafter:
             str(hidden0.dtype),
             tuple(pos0.shape),
             str(pos0.dtype),
-            None
-            if mtp_cache is None
-            else tuple(
-                None
-                if view is None
-                else (
-                    tuple(view.key.shape),
-                    str(view.key.dtype),
-                    tuple(view.value.shape),
-                    str(view.value.dtype),
-                    tuple(view.indexes.shape),
-                    str(view.indexes.dtype),
-                )
-                for view in mtp_cache.views
-            ),
+            self._cache_signature(mtp_cache),
         )
         fn = self._jit_batched.get(key)
         if fn is not None:
@@ -1420,20 +1446,8 @@ class Qwen3_5MTPDrafter:
             orig_indexes: list = []
             orig_starts: list = []
             if has_cache:
-                committed = committed_lens.astype(jnp.int32)
-                rolled_views = []
-                for v in cache0.views:
-                    if v is None:
-                        rolled_views.append(None)
-                        orig_indexes.append(None)
-                        orig_starts.append(None)
-                        continue
-                    orig_indexes.append(v.indexes)
-                    orig_starts.append(v.starts)
-                    idx = v.indexes.astype(jnp.int32)
-                    rolled = jnp.where(collected_mask, jnp.minimum(idx, committed), idx)
-                    rolled_views.append(v.replace(indexes=rolled.astype(v.indexes.dtype)))
-                cache: TransformerCache | None = TransformerCache(views=rolled_views)
+                cache: TransformerCache | None
+                cache, orig_indexes, orig_starts = _rollback_cache_views(cache0, committed_lens, collected_mask)
             else:
                 cache = None
 
@@ -1452,20 +1466,7 @@ class Qwen3_5MTPDrafter:
             drafts = jnp.stack(drafts_cols, axis=1)
 
             if has_cache and cache is not None:
-                fixed_views = []
-                for v, orig_idx, orig_st in zip(cache.views, orig_indexes, orig_starts, strict=False):
-                    if v is None:
-                        fixed_views.append(None)
-                        continue
-                    adv_idx = v.indexes.astype(jnp.int32)
-                    fixed_idx = jnp.where(collected_mask, adv_idx, orig_idx.astype(jnp.int32))
-                    v2 = v.replace(indexes=fixed_idx.astype(v.indexes.dtype))
-                    if orig_st is not None:
-                        adv_st = v.starts
-                        mask_st = collected_mask.reshape((-1,) + (1,) * (adv_st.ndim - 1))
-                        v2 = v2.replace(starts=jnp.where(mask_st, adv_st, orig_st))
-                    fixed_views.append(v2)
-                cache = TransformerCache(views=fixed_views)
+                cache = _restore_cache_views(cache, orig_indexes, orig_starts, collected_mask)
             return drafts, cache
 
         fn = jax.jit(_run)
@@ -1683,19 +1684,8 @@ class Qwen3_5MTPDrafter:
             orig_indexes: list = []
             orig_starts: list = []
             if has_cache:
-                rolled_views = []
-                for v in cache0.views:
-                    if v is None:
-                        rolled_views.append(None)
-                        orig_indexes.append(None)
-                        orig_starts.append(None)
-                        continue
-                    orig_indexes.append(v.indexes)
-                    orig_starts.append(v.starts)
-                    idx = v.indexes.astype(jnp.int32)
-                    rolled = jnp.where(collected_mask, jnp.minimum(idx, committed), idx)
-                    rolled_views.append(v.replace(indexes=rolled.astype(v.indexes.dtype)))
-                cache: TransformerCache | None = TransformerCache(views=rolled_views)
+                cache: TransformerCache | None
+                cache, orig_indexes, orig_starts = _rollback_cache_views(cache0, committed, collected_mask)
             else:
                 cache = None
 
@@ -1716,20 +1706,7 @@ class Qwen3_5MTPDrafter:
             drafts = jnp.stack(drafts_cols, axis=1)
 
             if has_cache and cache is not None:
-                fixed_views = []
-                for v, orig_idx, orig_st in zip(cache.views, orig_indexes, orig_starts, strict=False):
-                    if v is None:
-                        fixed_views.append(None)
-                        continue
-                    adv_idx = v.indexes.astype(jnp.int32)
-                    fixed_idx = jnp.where(collected_mask, adv_idx, orig_idx.astype(jnp.int32))
-                    v2 = v.replace(indexes=fixed_idx.astype(v.indexes.dtype))
-                    if orig_st is not None:
-                        adv_st = v.starts
-                        mask_st = collected_mask.reshape((-1,) + (1,) * (adv_st.ndim - 1))
-                        v2 = v2.replace(starts=jnp.where(mask_st, adv_st, orig_st))
-                    fixed_views.append(v2)
-                cache = TransformerCache(views=fixed_views)
+                cache = _restore_cache_views(cache, orig_indexes, orig_starts, collected_mask)
             return arg_mat, accepted, seed_positions, drafts, cache
 
         # Donate the MTP pool cache (arg 12): the program aliases the pool

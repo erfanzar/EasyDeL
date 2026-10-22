@@ -65,6 +65,12 @@ Two execution regimes are supported:
   and decode all resume from per-slot positions. The XLA scan path is the
   correctness reference; a fused ragged kernel is a planned TPU follow-up.
 
+With ``indexer_aux_loss_coef > 0``, stateless CSA layers train their indexers
+against detached dense sink-augmented attention targets. Only indexer
+parameters receive the auxiliary gradient; the LM-loss selection STE is
+replaced by this warm-up objective. HCA and cached calls do not participate.
+The default coefficient ``0.0`` retains the existing forward and STE.
+
 Note:
     The fused compressed-window decode kernel stays on the ``"xla"`` platform by
     default. Measured on v5p-8 at cc32 with A16W4, ``"xla"`` is the faster
@@ -135,6 +141,7 @@ from easydel.layers.compressed_window import (
     block_token_bias,
     build_packed_slot_meta,
     compress_windows,
+    entry_visibility,
     gather_selected_entries,
     grid_to_tokens,
     occupied_columns,
@@ -145,7 +152,13 @@ from easydel.layers.compressed_window import (
     tokens_to_grid,
     trace_compressor_stream,
 )
-from easydel.layers.indexer import CompressedIndexer, CompressedIndexerConfig, IndexerSelection
+from easydel.layers.indexer import (
+    CompressedIndexer,
+    CompressedIndexerConfig,
+    indexer_distillation_loss,
+    is_vacuous_selection,
+    selection_bias,
+)
 from easydel.layers.residual import (
     HyperStreamSharding,
     ManifoldHyperConnection,
@@ -167,68 +180,13 @@ _TRAIN_KERNEL_PLATFORM = TRAIN_ATTEND_PLATFORM
 
 
 def _entry_causal_bias(position_ids: Array, n_entries: int, rate: int) -> Array:
-    """Build the additive causal bias over compressed entries for a query block.
-
-    Query at position ``t`` may see entry ``w`` iff ``w < (t + 1) // rate``.
-
-    Args:
-        position_ids: Query positions ``[batch, seq]``.
-        n_entries: Number of compressed-entry slots on the KV axis.
-        rate: Compression rate.
-
-    Returns:
-        Additive fp32 bias ``[batch, 1, seq, n_entries]``.
-    """
-    entry_indices = jnp.arange(n_entries)
-    causal_threshold = (position_ids + 1) // rate
-    visible = entry_indices[None, None, :] < causal_threshold[..., None]
-    return jnp.where(visible, 0.0, MASK_MIN)[:, None, :, :].astype(jnp.float32)
-
-
-def _indexer_selection_is_vacuous(index_topk: int, n_slots: int) -> bool:
-    """Whether the indexer's ``top_k`` is incapable of excluding any entry.
-
-    Asked for at least as many entries as exist, ``top_k`` returns all of them,
-    merely reordered by score -- and its consumer scatters the indices into a
-    position-indexed bias where order carries no information. The selection is
-    then equivalent to plain visibility, and everything computed to produce it
-    is dead.
-
-    Both arguments are static, so callers branch on this at trace time.
-
-    Args:
-        index_topk: Configured number of entries the indexer selects.
-        n_slots: Compressed entry slots available (``max_length // rate``).
-
-    Returns:
-        ``True`` when the selection cannot exclude anything.
-    """
-    return index_topk >= n_slots
+    """Additive fp32 causal bias ``[B, 1, S, n_entries]`` over compressed entries (see :func:`entry_visibility`)."""
+    return jnp.where(entry_visibility(position_ids, n_entries, rate), 0.0, MASK_MIN)[:, None].astype(jnp.float32)
 
 
 def _decode_entry_visibility(position_ids: Array, cache_position: Array, n_entries: int, rate: int) -> Array:
-    """Visibility of padded compressed-entry slots during a decode step.
-
-    Entry ``w`` is visible iff it is causally reachable
-    (``w < (position + 1) // rate``) AND it has actually been emitted
-    (``w < (cache_position + 1) // rate``, counting the entry possibly
-    emitted by the current token's window closing).
-
-    Args:
-        position_ids: Query positions ``[batch, 1]``.
-        cache_position: Per-row stream positions ``[batch]`` of the current
-            token.
-        n_entries: Static padded entry capacity.
-        rate: Compression rate.
-
-    Returns:
-        Boolean visibility ``[batch, 1, n_entries]``.
-    """
-    entry_indices = jnp.arange(n_entries)
-    causal_threshold = (position_ids + 1) // rate  # [B, 1]
-    emitted = (cache_position.astype(jnp.int32) + 1) // rate  # [B]
-    visible = entry_indices[None, None, :] < causal_threshold[..., None]
-    return visible & (entry_indices[None, None, :] < emitted[:, None, None])
+    """Causal and emitted-entry visibility ``[B, 1, n_entries]`` of padded entry slots during a decode step."""
+    return entry_visibility(position_ids, n_entries, rate, emitted_position=cache_position)
 
 
 def _entry_finalizer(config: DeepseekV4Config, kv_norm: RMSNorm, rate: int):
@@ -577,7 +535,7 @@ class _DeepseekV4IndexerAdapter:
     @staticmethod
     def selection_is_vacuous(index_topk, n_slots):
         """Retain the model's serving fast-path policy."""
-        return _indexer_selection_is_vacuous(index_topk, n_slots)
+        return is_vacuous_selection(index_topk, n_slots)
 
 
 def _compressed_indexer_config(config: DeepseekV4Config) -> CompressedIndexerConfig:
@@ -679,34 +637,54 @@ class DeepseekV4CSACompressor(spx.Module):
         hidden_states: Float[Array, "batch seq hidden"],
         q_residual: Float[Array, "batch seq q_lora"],
         position_ids: Int[Array, "batch seq"],
-    ) -> tuple[Array | None, Array | None]:
+        return_scores: bool = False,
+    ) -> tuple[Array | None, Array | None] | tuple[Array | None, Array | None, Array | None]:
         """Produce compressed KV entries and the indexer-gated block bias.
 
         Args:
             hidden_states: Attention-input hidden states ``[B, S, D_model]``.
             q_residual: Normed query LoRA residual shared with core attention.
             position_ids: Query positions ``[B, S]``.
+            return_scores: Return detached-input indexer scores for warm-up
+                instead of adding the LM-loss straight-through gradient.
 
         Returns:
             Tuple ``(compressed_kv, block_bias)`` with ``compressed_kv`` of
             shape ``[B, T, head_dim]`` (``T = S // compress_rate``) and an
             additive fp32 ``block_bias`` ``[B, 1, S, T]`` opening only the
             indexer-selected, causally valid entries; both ``None`` when no
-            complete window fits.
+            complete window fits. With ``return_scores``, a third element
+            holds full-domain differentiable scores ``[B, S, T]`` (``-inf``
+            outside the causal entry domain), or ``None`` without entries.
+
+        Note:
+            ``return_scores=True`` is the warm-up path: indexer inputs are
+            detached and selection has no STE, so the indexer learns only
+            through the auxiliary KL. Compressed attention entries remain
+            attached to the main LM objective. The default path is unchanged.
         """
         seq_len = hidden_states.shape[1]
         rate = self.compress_rate
         n_windows = seq_len // rate
         if n_windows == 0:
-            return None, None
+            return (None, None, None) if return_scores else (None, None)
         usable = n_windows * rate
         kv = self.kv_proj(hidden_states)[:, :usable]
         gate = self.gate_proj(hidden_states)[:, :usable]
         compressed, _, _ = self._compress_windows(kv, gate)
+        if return_scores:
+            indices, scores = self.indexer(
+                jax.lax.stop_gradient(hidden_states),
+                jax.lax.stop_gradient(q_residual),
+                position_ids,
+                return_scores=True,
+            )
+            # CompressedIndexer returns raw scores; distillation requires the
+            # full causal domain, NOT just the selected top-k subset.
+            scores = jnp.where(entry_visibility(position_ids, n_windows, rate), scores, -jnp.inf)
+            return compressed, selection_bias(indices, n_windows), scores
         selection = self.indexer(hidden_states, q_residual, position_ids, return_selection=True)
-        block_bias = _indexer_opened_bias(
-            selection.indices, n_windows, score_proxy=selection.score_proxy, mask=selection.mask
-        )
+        block_bias = selection_bias(selection.indices, n_windows, score_proxy=selection.score_proxy, mask=selection.mask)
         return compressed, block_bias
 
     def _compress_windows(self, kv: Array, gate: Array) -> tuple[Array, Array, Array]:
@@ -781,7 +759,7 @@ class DeepseekV4CSACompressor(spx.Module):
         top_k_indices, cache_view = self.indexer.cached_forward(hidden_states, q_residual, position_ids, cache_view)
         block_bias = None
         if n_windows > 0:
-            block_bias = _indexer_opened_bias(top_k_indices, n_windows)
+            block_bias = selection_bias(top_k_indices, n_windows)
         return compressed, block_bias, cache_view
 
     def _cached_decode(
@@ -845,7 +823,7 @@ class DeepseekV4CSACompressor(spx.Module):
         # put that attention at ~68% of the decode step. The gather moves
         # ~512x512x2 bytes per layer instead.
         #
-        # `-1` marks an invalid pick, exactly as `_indexer_opened_bias` treated
+        # `-1` marks an invalid pick, exactly as `selection_bias` treats
         # it: index 0 is substituted so the gather stays in bounds and the bias
         # masks the column out, so the attended set is unchanged.
         picks = top_k_indices[:, 0]  # [B, K]
@@ -938,31 +916,6 @@ class DeepseekV4CSACompressor(spx.Module):
         )
 
 
-def _indexer_opened_bias(
-    top_k_indices: Array,
-    compressed_len: int,
-    score_proxy: Array | None = None,
-    mask: Array | None = None,
-) -> Array:
-    """Turn indexer picks into an additive bias over the compressed-entry axis.
-
-    Args:
-        top_k_indices: Selected entry indices ``[B, S, k]``; ``-1`` marks
-            invalid picks (dropped).
-        compressed_len: Length of the compressed-entry axis being opened.
-        score_proxy: Optional full-domain scores ``[B, S, compressed_len]``;
-            provide zero-primal gradients only at selected entries.
-        mask: Optional dense form of ``top_k_indices`` from the indexer; saves
-            scattering the indices.
-
-    Returns:
-        Additive fp32 bias ``[B, 1, S, compressed_len]`` that is zero on the
-        selected valid entries and ``MASK_MIN`` elsewhere.
-    """
-    selection = IndexerSelection(top_k_indices, score_proxy, mask)
-    return selection.to_bias(compressed_len, dtype=jnp.float32, mask_value=MASK_MIN)[:, None, :, :]
-
-
 _COMPRESSOR_CLASSES: dict[str, type | None] = {
     "sliding_attention": None,
     "compressed_sparse_attention": DeepseekV4CSACompressor,
@@ -1028,6 +981,14 @@ class DeepseekV4Attention(CompressedWindowAttention):
             None
             if compressor_class is None
             else compressor_class(config, dtype=dtype, param_dtype=param_dtype, precision=precision, rngs=rngs)
+        )
+
+    def _indexer_aux_active(self, cache_view: CompressedWindowCacheView | None) -> bool:
+        """CSA warm-up applies only to stateless calls with a positive coefficient."""
+        return (
+            self.layer_type == "compressed_sparse_attention"
+            and cache_view is None
+            and self.config.indexer_aux_loss_coef > 0.0
         )
 
     def _decode_attend(
@@ -1372,7 +1333,8 @@ class DeepseekV4Attention(CompressedWindowAttention):
         token_bias: Float[Array, "batch 1 seq seq"] | None,
         cache_view: CompressedWindowCacheView | None = None,
         packed_meta: "PackedSlotMeta | None" = None,
-    ) -> tuple[Array, CompressedWindowCacheView | None]:
+        return_indexer_aux_loss: bool = False,
+    ) -> tuple[Array, CompressedWindowCacheView | None] | tuple[Array, CompressedWindowCacheView | None, Array | None]:
         """Run V4 attention (stateless, cached prefill, decode, or packed).
 
         The regime is selected statically: no ``cache_view`` means the
@@ -1394,14 +1356,21 @@ class DeepseekV4Attention(CompressedWindowAttention):
             packed_meta: Optional packed-serving token-to-slot mapping; when
                 given (with ``cache_view``), the flat ``[1, T]`` stream is
                 served against per-slot state.
+            return_indexer_aux_loss: Append the unscaled CSA warm-up loss to
+                the returned tuple (``None`` when inactive or without entries).
 
         Returns:
             Tuple of the attention output ``[B, S, D_model]`` and the
-            updated cache view (``None`` when running stateless).
+            updated cache view (``None`` when running stateless), optionally
+            followed by the indexer auxiliary loss.
         """
         if cache_view is not None and packed_meta is not None:
-            return self._packed_forward(hidden_states, position_embeddings, position_ids, cache_view, packed_meta)
+            output, cache_view = self._packed_forward(
+                hidden_states, position_embeddings, position_ids, cache_view, packed_meta
+            )
+            return (output, cache_view, None) if return_indexer_aux_loss else (output, cache_view)
 
+        indexer_aux_loss = None
         _, seq_len, _ = hidden_states.shape
         cos, sin = position_embeddings[self.rope_label]
 
@@ -1425,11 +1394,31 @@ class DeepseekV4Attention(CompressedWindowAttention):
                 )
             attn_bias = token_bias
             if self.compressor is not None:
-                if cache_view is None:
+                index_scores = None
+                if self._indexer_aux_active(cache_view):
+                    compressed_kv, block_bias, index_scores = self.compressor(
+                        hidden_states, q_residual, position_ids, return_scores=True
+                    )
+                elif cache_view is None:
                     compressed_kv, block_bias = self.compressor(hidden_states, q_residual, position_ids)
                 else:
                     compressed_kv, block_bias, cache_view = self.compressor.cached_forward(
                         hidden_states, q_residual, position_ids, cache_view
+                    )
+                if index_scores is not None:
+                    # The token-bias diagonal recovers the original per-key
+                    # padding validity: every live token can attend itself.
+                    token_valid = jnp.diagonal(token_bias[:, 0], axis1=-2, axis2=-1) == 0
+                    indexer_aux_loss = indexer_distillation_loss(
+                        q,
+                        compressed_kv,
+                        index_scores,
+                        scaling=self.scaling,
+                        window_kv=kv,
+                        sinks=self.sinks.value,
+                        token_valid=token_valid,
+                        window=self.sliding_window,
+                        precision=self.precision,
                     )
                 if compressed_kv is not None:
                     kv = jnp.concatenate([kv, compressed_kv.astype(kv.dtype)], axis=1)
@@ -1451,7 +1440,8 @@ class DeepseekV4Attention(CompressedWindowAttention):
             )
 
         # V == K carried RoPE: project_output undoes it at the query positions, then the grouped output projection.
-        return self.project_output(attn_output.transpose(0, 2, 1, 3), cos, sin), cache_view
+        output = self.project_output(attn_output.transpose(0, 2, 1, 3), cos, sin)
+        return (output, cache_view, indexer_aux_loss) if return_indexer_aux_loss else (output, cache_view)
 
 
 class DeepseekV4MLP(spx.Module):
@@ -1787,6 +1777,19 @@ class DeepseekV4HashRouter(DeepseekV4TopKRouter):
             key=rngs.param,
         )
 
+    @property
+    def reform_param(self):
+        """Load routing IDs in their declared fp32 storage, not the model dtype."""
+        return {
+            "tid2eid$": {
+                "splits": [{"name": "tid2eid", "spliter": lambda tensor: tensor.float()}],
+                "inverse_spliter": lambda tensor: tensor,
+                # The generic converter casts every leaf to param_dtype. Keep
+                # the fp32 table exact even when the other weights use bf16.
+                "preserve_dtype": True,
+            }
+        }
+
 
 class DeepseekV4SparseMoeBlock(BaseMoeModule):
     """DeepSeek-V4 MoE block: routed experts + clamped shared expert.
@@ -1957,6 +1960,13 @@ class DeepseekV4SparseMoeBlock(BaseMoeModule):
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_scores, "moe_router_logits")
 
 
+@auto_pytree
+class _DeepseekV4DecoderLayerOutput(DecoderLayerOutput):
+    """Layer output carrying an unscaled CSA indexer warm-up loss."""
+
+    indexer_aux_loss: Array | None = None
+
+
 class DeepseekV4DecoderLayer(spx.Module):
     """DeepSeek-V4 decoder block with hyper-connection residual streams.
 
@@ -2059,29 +2069,38 @@ class DeepseekV4DecoderLayer(spx.Module):
                 mapping (threaded to attention).
 
         Returns:
-            DecoderLayerOutput with the updated streams in ``hidden_states``
-            and the updated ``cache_view``.
+            DecoderLayerOutput with the updated streams in ``hidden_states``,
+            the updated ``cache_view`` and an optional unscaled
+            ``indexer_aux_loss`` for stateless CSA warm-up.
         """
         post, comb, collapsed = self.attn_hc(hidden_streams)
-        attn_output, cache_view = self.self_attn(
+        aux_active = self.self_attn._indexer_aux_active(cache_view)
+        attn_result = self.self_attn(
             self.input_layernorm(collapsed),
             position_embeddings,
             position_ids,
             token_bias,
             cache_view=cache_view,
             packed_meta=packed_meta,
+            return_indexer_aux_loss=aux_active,
         )
+        indexer_aux_loss = None
+        if aux_active:
+            attn_output, cache_view, indexer_aux_loss = attn_result
+        else:
+            attn_output, cache_view = attn_result
         hidden_streams = manifold_residual_write(hidden_streams, attn_output, post, comb, precision=self.precision)
 
         post, comb, collapsed = self.ffn_hc(hidden_streams)
         mlp_output, router_logits = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
         hidden_streams = manifold_residual_write(hidden_streams, mlp_output, post, comb, precision=self.precision)
 
-        return DecoderLayerOutput(
+        return _DeepseekV4DecoderLayerOutput(
             hidden_states=hidden_streams,
             attention_weight=None,
             cache_view=cache_view,
             router_logits=router_logits if output_router_logits else None,
+            indexer_aux_loss=indexer_aux_loss,
         )
 
 
@@ -2248,7 +2267,9 @@ class DeepseekV4Model(EasyDeLBaseModule):
 
         Returns:
             MoeModelOutput with the collapsed final hidden state and, in
-            cached mode, the updated cache in ``past_key_values``.
+            cached mode, the updated cache in ``past_key_values``. During
+            stateless CSA warm-up, ``indexer_aux_loss`` holds the unscaled
+            per-layer KL sum; the task head applies the coefficient once.
 
         Raises:
             TypeError: If ``past_key_values`` is not a
@@ -2302,7 +2323,7 @@ class DeepseekV4Model(EasyDeLBaseModule):
         is_decode = cached and sequence_length == 1 and not is_packed
         if not is_packed and sequence_length > 1:
             reject_packed_or_padded_batch(mask_info, attention_mask, family="DeepSeek-V4")
-            if cached is None and packed_qsl is not None and packed_num_seqs is not None and batch == 1:
+            if not cached and packed_qsl is not None and packed_num_seqs is not None and batch == 1:
                 raise ValueError(
                     "DeepSeek-V4 stateless packed-document calls are not supported: pass a cache or an "
                     "unpacked batch (CSA/HCA compression follows physical offsets)."
@@ -2376,7 +2397,7 @@ class DeepseekV4Model(EasyDeLBaseModule):
 
         def _layer_loop(block, carry):
             """Run one decoder layer inside the (python-loop) layer scan."""
-            hidden_streams, all_hidden_states, all_router_logits, captures, idx = carry
+            hidden_streams, all_hidden_states, all_router_logits, captures, indexer_aux_loss, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_streams,)
             cache_view = self._layer_cache_view_at(None, idx, enabled=cached, cache=past_key_values)
@@ -2398,14 +2419,17 @@ class DeepseekV4Model(EasyDeLBaseModule):
             if idx in dspark_targets:
                 # DSpark main hidden: the stream mean of the target layer's OUTPUT (V4.1 reads its input instead).
                 captures += (hidden_streams.mean(axis=2),)
-            return hidden_streams, all_hidden_states, all_router_logits, captures, idx + 1
+            layer_aux = layer_outputs.indexer_aux_loss
+            if layer_aux is not None:
+                indexer_aux_loss = layer_aux if indexer_aux_loss is None else indexer_aux_loss + layer_aux
+            return hidden_streams, all_hidden_states, all_router_logits, captures, indexer_aux_loss, idx + 1
 
         # NOTE: layers are structurally heterogeneous (per-layer compressor /
         # rope selection), so this always uses the python-loop path;
         # `scan_layers=True` is unsupported for this family.
-        hidden_streams, all_hidden_states, all_router_logits, captures, _ = self.layers.scan(
+        hidden_streams, all_hidden_states, all_router_logits, captures, indexer_aux_loss, _ = self.layers.scan(
             _layer_loop,
-            (hidden_streams, all_hidden_states, all_router_logits, () if output_dspark_hidden else None, 0),
+            (hidden_streams, all_hidden_states, all_router_logits, () if output_dspark_hidden else None, None, 0),
             trace=True,
         )
         hidden_states = self.norm(self.hc_head(hidden_streams))
@@ -2417,6 +2441,7 @@ class DeepseekV4Model(EasyDeLBaseModule):
                 attentions=None,
                 router_logits=all_router_logits,
                 past_key_values=past_key_values if cached else None,
+                indexer_aux_loss=indexer_aux_loss,
                 main_hidden=jnp.concatenate(captures, axis=-1),  # appended in ascending layer order
             )
 
@@ -2426,6 +2451,7 @@ class DeepseekV4Model(EasyDeLBaseModule):
             attentions=None,
             router_logits=all_router_logits,
             past_key_values=past_key_values if cached else None,
+            indexer_aux_loss=indexer_aux_loss,
         )
 
     def create_compressed_window_cache_config(
@@ -2758,7 +2784,8 @@ class DeepseekV4ForCausalLM(BaseCausalLMModule[DeepseekV4Model, DeepseekV4Config
             if apply_lm_head:
                 logits = self.compute_lm_logits(self.prepare_lm_head_inputs(outputs.last_hidden_state))
             return DeepseekV4CausalLMOutput(
-                aux_loss=self.compute_router_aux_loss(outputs),
+                aux_loss=self.compute_aux_loss(outputs, attention_mask=attention_mask),
+                indexer_aux_loss=outputs.indexer_aux_loss,
                 logits=logits,
                 hidden_states=outputs.hidden_states,
                 last_hidden_state=outputs.last_hidden_state,

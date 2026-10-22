@@ -29,7 +29,6 @@ import typing as tp
 
 import jax
 import optax  # pyright: ignore[reportMissingTypeStubs]
-from jax import Array as JaxArray
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from spectrax import with_sharding_constraint
@@ -51,21 +50,6 @@ from ..training_utils import (
 )
 
 
-def _stop_gradient_tree(tree):
-    """Apply ``jax.lax.stop_gradient`` to every JAX array leaf in a pytree.
-
-    Non-array leaves are returned unchanged.
-
-    Args:
-        tree: An arbitrary pytree, typically a parameter / state container.
-
-    Returns:
-        A pytree with the same structure where each :class:`jax.Array` leaf
-        has been wrapped in :func:`jax.lax.stop_gradient`.
-    """
-    return jax.tree_util.tree_map(lambda x: jax.lax.stop_gradient(x) if isinstance(x, JaxArray) else x, tree)
-
-
 def on_policy_distillation_step(
     student_state: EasyDeLState,
     batch: collections.abc.Mapping[str, jax.Array],
@@ -79,6 +63,10 @@ def on_policy_distillation_step(
     alpha: float = 0.9,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
     logits_chunk_size: int | None = None,
+    beta: float | None = None,
+    cakld_gamma: float | None = None,
+    loss_top_k: int = 0,
+    loss_add_tail: bool = False,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Run one on-policy distillation step (forward, KL loss, optional update).
 
@@ -126,7 +114,13 @@ def on_policy_distillation_step(
         logits_chunk_size (int | None): When positive, evaluate the
             distillation loss in vocabulary chunks driven by the
             (headless) student LM head to bound peak memory; ``None``
-            disables chunking.
+            disables chunking. Advanced divergence/support selectors use the
+            dense loss, matching offline distillation's objective dispatch.
+        beta: Optional generalized Jensen-Shannon coefficient, including
+            forward/reverse KL endpoints. ``None`` selects forward KL.
+        cakld_gamma: Optional confidence-aware KL mixture coefficient.
+        loss_top_k: Teacher top-k support size; zero selects the full vocabulary.
+        loss_add_tail: Include the probability tail in top-k distillation.
 
     Returns:
         tuple[EasyDeLState, LossMetrics] | LossMetrics: In training mode
@@ -142,7 +136,12 @@ def on_policy_distillation_step(
         )
         batch = with_sharding_constraint(batch, partition_spec, mesh=student_state.model.mesh, ignore_mpmd=True)
 
-    use_chunked = logits_chunk_size is not None and logits_chunk_size > 0
+    # Match the offline trainer: the streaming KL kernel implements forward KL
+    # only. Advanced objectives use the shared dense implementation, never silently
+    # substitute a different divergence when chunking is configured.
+    use_advanced_vocab_loss = beta is not None or cakld_gamma is not None or loss_top_k > 0 or loss_add_tail
+    use_chunked = logits_chunk_size is not None and logits_chunk_size > 0 and not use_advanced_vocab_loss
+    shift_tokens = bool(getattr(loss_config, "shift_tokens", True)) if loss_config is not None else True
 
     def loss_fn(tree, minibatch):
         """Compute the on-policy distillation loss for a minibatch.
@@ -243,6 +242,7 @@ def on_policy_distillation_step(
                     temperature=temperature,
                     alpha=alpha,
                     chunk_size=int(logits_chunk_size),
+                    shift_tokens=shift_tokens,
                 )
             else:
                 total_loss, loss_components = distillation_loss(
@@ -254,6 +254,12 @@ def on_policy_distillation_step(
                     use_hard_labels=False,
                     temperature=temperature,
                     alpha=alpha,
+                    beta=beta,
+                    cakld_gamma=cakld_gamma,
+                    loss_top_k=loss_top_k,
+                    loss_add_tail=loss_add_tail,
+                    shift_tokens=shift_tokens,
+                    partition_manager=getattr(module, "partition_manager", None),
                 )
 
         metrics = LossMetrics(

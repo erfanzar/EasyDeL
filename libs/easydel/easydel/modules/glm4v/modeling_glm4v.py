@@ -74,14 +74,14 @@ from easydel.layers import (
     RMSNorm,
     RowParallelLinear,
     dense_gate_up_layout,
-    gated_mlp_forward,
     split_fused_gate_up_projection,
     split_interleaved_pair_last_axis,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention, block_diagonal_bias
 from easydel.layers.norms import LayerNorm
-from easydel.layers.rotary import apply_rope_split_half
+from easydel.layers.rotary import apply_rope_split_half, vision_grid_rotary_embeddings
 from easydel.modules._base import BaseVisionLanguageModule
+from easydel.modules.glm.modeling_glm import GlmAttention, GlmMLP
 
 from .glm4v_configuration import Glm4vConfig, Glm4vTextConfig, Glm4vVisionConfig
 
@@ -875,37 +875,7 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         Returns:
             Array: Rotary position embeddings for all patches.
         """
-        merge_size = self.spatial_merge_size
-        freq_table = jnp.outer(
-            jnp.arange(0, max_grid_size, dtype=jnp.float32),
-            1.0 / (10000 ** (jnp.arange(0, self._head_dim_ro * 2, 2, dtype=jnp.float32) / (self._head_dim_ro * 2))),
-        )
-
-        pos_ids_list = []
-        for num_frames, height, width in grid_thw:
-            num_frames, height, width = int(num_frames), int(height), int(width)
-            merged_h, merged_w = height // merge_size, width // merge_size
-
-            block_rows = jnp.arange(merged_h)
-            block_cols = jnp.arange(merged_w)
-            intra_row = jnp.arange(merge_size)
-            intra_col = jnp.arange(merge_size)
-
-            row_idx = block_rows[:, None, None, None] * merge_size + intra_row[None, None, :, None]
-            row_idx = jnp.broadcast_to(row_idx, (merged_h, merged_w, merge_size, merge_size)).reshape(-1)
-
-            col_idx = block_cols[None, :, None, None] * merge_size + intra_col[None, None, None, :]
-            col_idx = jnp.broadcast_to(col_idx, (merged_h, merged_w, merge_size, merge_size)).reshape(-1)
-
-            coords = jnp.stack([row_idx, col_idx], axis=-1)
-            if num_frames > 1:
-                coords = jnp.tile(coords, (num_frames, 1))
-            pos_ids_list.append(coords)
-
-        pos_ids = jnp.concatenate(pos_ids_list, axis=0)
-        embeddings = freq_table[pos_ids]
-        embeddings = embeddings.reshape(pos_ids.shape[0], -1)
-        return embeddings
+        return vision_grid_rotary_embeddings(grid_thw, max_grid_size, 2 * self._head_dim_ro, self.spatial_merge_size)
 
     def forward(self, hidden_states: Array, *, grid_thw: Array) -> Array:
         """Encode image/video pixel values to vision features.
@@ -997,168 +967,22 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         return self.patch_embed
 
 
-class Glm4vTextMLP(spx.Module):
+class Glm4vTextMLP(GlmMLP):
     """SwiGLU feed-forward network for GLM4V text decoder.
 
-    Implements a gated feedforward network with fused gate-up projections
-    for the text decoder transformer blocks.
+    The HF GLM-4V text decoder stores the same pre-fused ``gate_up_proj`` tensor as GLM, so the
+    implementation is shared with :class:`~easydel.modules.glm.modeling_glm.GlmMLP`; this subclass
+    keeps the GLM4V public name and accepts a :class:`Glm4vTextConfig`.
     """
 
-    def __init__(
-        self,
-        config: Glm4vTextConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: spx.Rngs,
-    ):
-        """Initialize text decoder MLP block.
 
-        Args:
-            config (Glm4vTextConfig): Text decoder configuration.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-        """
-        self.config = config
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-
-        self.gate_up_proj = ColumnParallelLinear(
-            config.hidden_size,
-            (config.intermediate_size, config.intermediate_size),
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-            # HF GLM-4V checkpoints store gate_up_proj pre-fused (one tensor).
-            layout=dense_gate_up_layout(config.intermediate_size, source_is_fused=True),
-        )
-        self.down_proj = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    @property
-    def reform_param(self) -> dict:
-        """Checkpoint rules for the pre-fused HF ``gate_up_proj`` tensor."""
-        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config, include_bias=False)
-
-    def forward(self, hidden_states: Array) -> Array:
-        """Apply gated feedforward transformation.
-
-        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
-        supported layouts through the ejkernel fused MLP kernels and runs
-        the legacy composition otherwise.
-
-        Args:
-            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
-
-        Returns:
-            Array: Transformed tensor of shape (batch, seq_len, hidden_dim).
-        """
-        return gated_mlp_forward(self, hidden_states)
-
-
-class Glm4vTextAttention(UnifiedAttention):
+class Glm4vTextAttention(GlmAttention):
     """GLM4V attention with bias-free output projection (HF-compatible).
 
-    Implements multi-head self-attention with GPT-J style rotary position
-    embeddings and grouped-query attention support for the text decoder.
+    GPT-J style (interleaved even/odd) partial rotary embeddings, grouped-query attention and a
+    biasless ``o_proj`` are identical to :class:`~easydel.modules.glm.modeling_glm.GlmAttention`;
+    this subclass keeps the GLM4V public name and accepts a :class:`Glm4vTextConfig`.
     """
-
-    def __init__(
-        self,
-        config: Glm4vTextConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: spx.Rngs,
-        layer_idx: int,
-    ):
-        """Initialize text decoder attention layer.
-
-        Args:
-            config (Glm4vTextConfig): Text decoder configuration.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-            layer_idx (int): Index of this layer in the decoder.
-        """
-        super().__init__(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-            layer_idx=layer_idx,
-            attention_type="standard",
-            causal=True,
-        )
-
-    def _create_rotary(self, config: Glm4vTextConfig, dtype: jnp.dtype):
-        """Create GPT-J style rotary position embeddings.
-
-        Args:
-            config (Glm4vTextConfig): Text decoder configuration.
-            dtype (jnp.dtype): Data type for the rotary embeddings.
-
-        Returns:
-            Rotary position embedding module.
-        """
-        # HF Glm4vText uses GPT-J style rotary (even/odd rotation) with partial rotary factor.
-        return config.get_basic_rope(
-            dtype=dtype,
-            head_size=self.head_dim,
-            rotary_dim=self.head_dim,
-            base=getattr(config, "rope_theta", 10000.0),
-            is_neox_style=False,
-        )
-
-    def _create_o_proj(
-        self,
-        config: Glm4vTextConfig,
-        dtype: jnp.dtype,
-        param_dtype: jnp.dtype,
-        precision: jax.lax.PrecisionLike,
-        rngs: spx.Rngs,
-    ) -> RowParallelLinear:
-        """Create the output projection layer without bias.
-
-        Args:
-            config (Glm4vTextConfig): Text decoder configuration.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): Numerical precision for operations.
-            rngs (spx.Rngs): Random number generator state.
-
-        Returns:
-            RowParallelLinear: Output projection layer.
-        """
-        return RowParallelLinear(
-            self.num_heads * self.head_dim,
-            config.hidden_size,
-            rngs=rngs,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
-            precision=precision,
-        )
 
 
 class Glm4vTextDecoderLayer(spx.Module):

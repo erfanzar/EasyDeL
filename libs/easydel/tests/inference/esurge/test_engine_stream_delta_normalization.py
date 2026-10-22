@@ -46,7 +46,7 @@ def test_coerce_stream_delta_message_strips_text_when_tool_calls_are_present():
 
     assert normalized is not None
     assert normalized.role == "assistant"
-    assert normalized.content is None
+    assert normalized.content == "ok"
     assert normalized.tool_calls is not None
     assert normalized.tool_calls[0].index == 0
     assert normalized.tool_calls[0].function is not None

@@ -52,7 +52,7 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
+from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
@@ -61,7 +61,6 @@ from easydel.layers import (
     dense_gate_up_layout,
     dense_qkv_layout,
     gated_mlp_forward,
-    split_fused_qkv_projection,
 )
 from easydel.layers import RMSNorm as RMSNorm
 from easydel.layers.attention import UnifiedAttention
@@ -236,10 +235,8 @@ class Phi3Attention(UnifiedAttention):
         self.o_proj = self._create_o_proj(config, dtype, param_dtype, precision, rngs)
         self.attention_performer = self._create_attention_performer(config, rngs)
         self.rotary = self._create_rotary(config, dtype)
-        if hasattr(config, "resid_pdrop") and config.resid_pdrop > 0:
-            self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
-        else:
-            self.resid_dropout = None
+        # Residual dropout on the attention output is applied once, by ``Phi3DecoderLayer.resid_attn_dropout``;
+        # no attention-internal ``resid_dropout`` is created so the base forward does not apply it a second time.
 
     def _create_rotary(self, config: Phi3Config, dtype: jnp.dtype):
         """Create rotary position embedding for Phi-3 attention.
@@ -261,112 +258,8 @@ class Phi3Attention(UnifiedAttention):
             is_neox_style=True,
         )
 
-    def forward(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo | None,
-        position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ) -> AttentionLayerOutput:
-        """Compute attention with fused QKV projection and optional sliding window.
-
-        Applies fused query/key/value projection, rotary position embeddings,
-        and grouped query attention with optional sliding window masking.
-
-        Args:
-            hidden_states: Input tensor of shape (batch_size, sequence_length, hidden_dim).
-            mask_info: Attention mask information including causal and padding masks.
-            position_ids: Position indices for tokens, shape (batch_size, sequence_length).
-            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER) for optimization.
-            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional):
-                Cache view for key/value states during generation. Defaults to None.
-            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
-                Metadata for paged attention mechanisms. Defaults to None.
-            output_attentions (bool, optional): Whether to return attention weights.
-                Defaults to False.
-            frequencies (Array | None, optional): Precomputed RoPE frequencies.
-                Defaults to None.
-
-        Returns:
-            AttentionLayerOutput containing attention output, optional weights, and cache view.
-        """
-        batch_size, sequence_length = hidden_states.shape[:2]
-        qkv = checkpoint_name(self.qkv_proj(hidden_states), "attn_qkv")
-        q_size = self.config.num_attention_heads * self.head_dim
-        kv_size = self.config.num_key_value_heads * self.head_dim
-        query_states, key_states, value_states = split_fused_qkv_projection(
-            qkv,
-            q_size=q_size,
-            kv_size=kv_size,
-            config=self.config,
-        )
-
-        query_states = query_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_attention_heads,
-            self.head_dim,
-        )
-        key_states = key_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
-        value_states = value_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
-
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-        query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-            sliding_window=self.sliding_window,
-        )
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=True,
-            sliding_window=self.sliding_window,
-        )
-        attn_output = self._merge_heads(attentions.attention_outputs)
-        attn_output = self.shard_attention_prod(attn_output=attn_output)
-        attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
-        attn_output = self.shard_attention_prod(attn_output=attn_output)
-        if self.resid_dropout is not None:
-            attn_output = self.resid_dropout(attn_output)
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
-        )
+    # ``forward`` is inherited from ``UnifiedAttention``: it splits the fused ``qkv_proj`` through the layout, applies
+    # RoPE / sliding window / baked-mask handling and forwards ``output_attentions`` to the performer.
 
 
 class Phi3DecoderLayer(spx.Module):
@@ -610,7 +503,7 @@ class Phi3Model(EasyDeLBaseModule):
             determined by head dimension and RoPE theta base.
         """
         return self.config.get_basic_frequencies(
-            head_size=self.config.hidden_size // self.config.num_attention_heads,
+            head_size=self.config.head_dim,
             base=self.config.rope_theta,
         )
 
@@ -677,6 +570,8 @@ class Phi3Model(EasyDeLBaseModule):
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
         sequence_length = inputs_embeds.shape[1]
 
+        output_attentions = self.config.output_attentions if output_attentions is None else output_attentions
+        output_hidden_states = self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
         assert sequence_length <= self.config.max_position_embeddings, (
@@ -702,7 +597,7 @@ class Phi3Model(EasyDeLBaseModule):
             past_key_values = TransformerCache.init_empty(len(self.layers))
 
         hidden_states = apply_logical_sharding(
-            inputs_embeds,
+            self.embed_dropout(inputs_embeds),
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
@@ -710,7 +605,7 @@ class Phi3Model(EasyDeLBaseModule):
         views = past_key_values.views if past_key_values is not None else None
         has_cache_views = views is not None and any(v is not None for v in views)
         needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
-        frequencies = self.config.get_basic_frequencies()
+        frequencies = self.frequencies
 
         trace_layers = self._layer_scan_trace(
             trace,

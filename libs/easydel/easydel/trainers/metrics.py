@@ -904,14 +904,15 @@ class MetricsHistogram:
         Returns:
             Tuple of (bin_counts, bin_edges)
         """
+        arr = arr.astype(jnp.float32)
         bin_edges = jnp.histogram_bin_edges(arr, 64)
         left_edges = bin_edges[:-1, None]
         right_edges = bin_edges[1:, None]
-        index = ((arr >= left_edges) & (arr < right_edges)).astype(arr.dtype)
-        out = index.sum(axis=1, dtype=arr.dtype)
+        index = ((arr >= left_edges) & (arr < right_edges)).astype(jnp.int32)
+        out = index.sum(axis=1, dtype=jnp.int32)
         out = jax.lax.cond(
             out.size >= 1,
-            lambda o: o.at[-1].add(jnp.sum(arr == arr.max())),
+            lambda o: o.at[-1].add(jnp.sum(arr == bin_edges[-1], dtype=jnp.int32)),
             lambda o: o,
             out,
         )
@@ -927,7 +928,7 @@ class MetricsHistogram:
         Returns:
             MetricsHistogram instance
         """
-        flat_arr = arr.reshape(-1)
+        flat_arr = arr.reshape(-1).astype(jnp.float32)
         bin_counts, bin_edges = cls._create_histogram_bin_edges(flat_arr)
         return cls(
             bin_counts=bin_counts,
@@ -1131,6 +1132,9 @@ def run_watchers(
     if not active:
         return {}
 
+    raw = getattr(params, "raw", None)
+    if callable(raw):
+        params = raw()
     flat_params = traversals.flatten_dict(params)
     metrics: dict[str, tp.Any] = {}
 

@@ -57,15 +57,12 @@ from .._shared import copy_frozen_policy
 from ..metrics import _host_mean_float, _host_scalar_float
 from ..model_loading import reject_string_model_id
 from ..prompt_transforms import GRPOPreprocessTransform
-from ..prompt_utils import apply_chat_template
-from ..reward_protocol import RewardProtocol
+from ..reward_protocol import RewardProtocol, normalize_reward_state, render_reward_texts, resolve_reward_weights
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_utils import (
     compile_trainer_step,
-    filter_kwargs_for_callable,
     resolve_straight_through_emulator,
-    sanitize_model_call_kwargs,
 )
 from ._fn import ppo_step
 from .modeling_value_head import CausalLMWithValueHead
@@ -239,59 +236,20 @@ class PPOTrainer(Trainer):
             reward_processing_classes = [None] * len(reward_funcs)
         elif not isinstance(reward_processing_classes, list):
             reward_processing_classes = [reward_processing_classes]
-        else:
-            if len(reward_processing_classes) != len(reward_funcs):
-                raise ValueError("The number of reward processing classes must match the number of reward functions.")
+        if len(reward_processing_classes) != len(reward_funcs):
+            raise ValueError("The number of reward processing classes must match the number of reward functions.")
 
-        empty_sharding = replicated_named_sharding(model.model.mesh)
         if not isinstance(reward_processing_classes, list):
             raise TypeError(f"reward_processing_classes must be a list, got {type(reward_processing_classes)}")
 
         for i, (reward_processing_class, reward_func) in enumerate(
-            zip(reward_processing_classes, reward_funcs, strict=False)
+            zip(reward_processing_classes, reward_funcs, strict=True)
         ):
             reward_func = self._resolve_reward_func_model(reward_func)
             if isinstance(reward_func, EasyDeLBaseModule | EasyDeLState):
                 if isinstance(reward_func, EasyDeLBaseModule):
                     reward_func = reward_func.to_state(trainable_selector=arguments.trainable_selector)
-                    sharding = reward_func.shardings
-
-                    def apply_fn(gs, gt, batch, graphdef):
-                        """Sharded reward-model forward used to score completions.
-
-                        Args:
-                            gs: Reward model graph state (parameters).
-                            gt: Reward model auxiliary state.
-                            batch: Tokenized batch passed to the reward model.
-                            graphdef: Reward model graph definition.
-
-                        Returns:
-                            The reward model's full output (typically with a
-                            ``logits`` field used as the scalar score).
-                        """
-                        gt = jax.tree_util.tree_map(
-                            lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
-                            gt,
-                        )
-                        module = spx.bind(graphdef, gs.merge(gt, copy=False))
-                        batch = with_sharding_constraint(
-                            arr=batch,
-                            sharding=self.arguments.step_partition_spec,
-                            mesh=module.mesh,
-                            ignore_mpmd=True,
-                        )
-                        call_kwargs = filter_kwargs_for_callable(getattr(module, "forward", module), batch)
-                        call_kwargs = sanitize_model_call_kwargs(call_kwargs)
-                        return module(**call_kwargs)
-
-                    apply_fn = compile_trainer_step(
-                        partial(apply_fn, graphdef=reward_func.graphdef),
-                        mesh=model.model.mesh,
-                        static_argnames=("graphdef",),
-                        in_shardings=(sharding.graphstate, sharding.graphother, empty_sharding),
-                        out_shardings=empty_sharding,
-                    )
-                    reward_func = reward_func.replace(apply_fn=apply_fn)
+                reward_func = normalize_reward_state(reward_func)
 
                 if reward_processing_class is None:
                     reward_processing_class = AutoTokenizer.from_pretrained(reward_func.model.config._name_or_path)
@@ -308,7 +266,7 @@ class PPOTrainer(Trainer):
             )
 
         self.reward_weights = jnp.asarray(
-            arguments.reward_weights if arguments.reward_weights is not None else [1.0] * len(reward_funcs),
+            resolve_reward_weights(reward_funcs, arguments.reward_weights),
             dtype="f4",
         )
         self.reward_func_names = [getattr(func, "__name__", None) or func.__class__.__name__ for func in reward_funcs]
@@ -1157,26 +1115,18 @@ class PPOTrainer(Trainer):
             rewards_per_func = jnp.full((completion_ids.shape[0], len(self.reward_funcs)), jnp.nan, dtype="f4")
             with capture_time() as rewarding_time_fn:
                 for i, (reward_func, reward_processing_class) in enumerate(
-                    zip(self.reward_funcs, self.reward_processing_classes, strict=False)
+                    zip(self.reward_funcs, self.reward_processing_classes, strict=True)
                 ):
                     if isinstance(reward_func, EasyDeLState):
-                        if is_conv:
-                            messages = [
-                                {"messages": p + c}
-                                for p, c in zip(completion_prompts, structured_completions, strict=False)
-                            ]
-                            texts = [
-                                apply_chat_template(
-                                    x,
-                                    reward_processing_class,
-                                    tools=self._reward_chat_template_tools(),
-                                )["text"]
-                                for x in messages
-                            ]
-                        else:
-                            texts = [p + c for p, c in zip(completion_prompts, completions, strict=False)]
+                        texts = render_reward_texts(
+                            completion_prompts,
+                            structured_completions if is_conv else completions,
+                            reward_processing_class,
+                            tools=self._reward_chat_template_tools(),
+                        )
 
                         rew = reward_func.apply_fn(
+                            reward_func.graphdef,
                             reward_func.graphstate,
                             reward_func.graphother,
                             dict(

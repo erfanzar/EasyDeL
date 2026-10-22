@@ -6,11 +6,13 @@
 #
 #     https://www.apache.org/licenses/LICENSE-2.0
 
-"""DeepSeek-V4.1 indexer auxiliary objective (``indexer_aux_loss_coef``).
+"""DeepSeek-V4.1 indexer auxiliary objective (``indexer_aux_loss_coef``), model level.
 
 ``KL(stop_grad(dense head-summed attention over compressed entries) || softmax(indexer scores))`` summed over index
-source layers. Checks: the loss against a float64 NumPy reference, finite non-zero gradients on every indexer parameter
-(and exactly zero elsewhere), the loss decreasing under optax steps, and the default (coef 0) forward unchanged.
+source layers. The loss math itself (float64 NumPy parity, lazy scores, optional window / sink) is covered by
+``tests/operations/kernels/test_indexer_distill.py``. Checks here: finite non-zero gradients on every indexer
+parameter (and exactly zero elsewhere), the loss decreasing under optax steps, and the default (coef 0) forward
+unchanged.
 """
 
 import functools
@@ -20,12 +22,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import pytest
 import spectrax as spx
 from easydel.infra.base_state import EasyDeLState
-from easydel.layers.indexer import IndexerScoreInputs, shared_key_scores
 from easydel.modules.deepseek_v41 import DeepseekV41Config, DeepseekV41ForCausalLM
-from easydel.modules.deepseek_v41.modeling_deepseek_v41 import indexer_distillation_loss
 
 try:
     from tests.modules import _deepseek_v41_reference as ref
@@ -33,117 +32,6 @@ except ImportError:  # pragma: no cover
     from modules import _deepseek_v41_reference as ref  # pyright: ignore[reportMissingImports]
 
 COEF = 0.5
-MASK = -1e30
-
-
-def _reference_kl(q, kv, entries, sinks, bias, scores, scaling) -> float:
-    batch, heads, seq, _ = q.shape
-    num_entries = entries.shape[1]
-    total, count = 0.0, 0
-    for b in range(batch):
-        for s in range(seq):
-            reach = np.isfinite(scores[b, s])
-            if not reach.any():
-                continue
-            summed = np.zeros(num_entries)
-            for h in range(heads):
-                window = (q[b, h, s] @ kv[b].T) * scaling + bias[b, 0, s]
-                entry = np.where(reach, (q[b, h, s] @ entries[b].T) * scaling, -np.inf)
-                logits = np.concatenate([window, entry, [sinks[h]]])
-                probs = np.exp(logits - logits.max())
-                probs /= probs.sum()
-                summed += probs[seq : seq + num_entries]
-            target = summed / summed.sum()
-            row = np.where(reach, scores[b, s], -np.inf)
-            log_pred = row - row.max()
-            log_pred = log_pred - np.log(np.exp(log_pred).sum())
-            total += sum(target[t] * (np.log(target[t]) - log_pred[t]) for t in range(num_entries) if target[t] > 0)
-            count += 1
-    return total / count
-
-
-@pytest.mark.parametrize("block_q", [64, 4, 1])
-@pytest.mark.parametrize("padded", [False, True])
-def test_distillation_loss_matches_numpy_reference(block_q, padded):
-    """The query-tiled, window-banded loss equals a dense float64 reference (several tilings, padded keys)."""
-    rng = np.random.default_rng(0)
-    batch, heads, seq, dim, ratio, window = 2, 3, 6, 4, 2, 3
-    num_entries = seq // ratio
-    q = rng.normal(size=(batch, heads, seq, dim))
-    kv = rng.normal(size=(batch, seq, dim))
-    entries = rng.normal(size=(batch, num_entries, dim))
-    sinks = rng.normal(size=(heads,))
-    positions = np.arange(seq)
-    valid = np.ones((batch, seq), bool)
-    if padded:
-        valid[0, 2] = False
-        valid[1, 4] = False
-    allowed = (positions[None, :] <= positions[:, None]) & (positions[None, :] > positions[:, None] - window)
-    allowed = allowed[None] & valid[:, None, :]
-    bias = np.where(allowed, 0.0, MASK)[:, None]
-    reach = np.arange(num_entries)[None, :] < ((positions + 1) // ratio)[:, None]  # query 0 reaches nothing
-    scores = np.where(reach[None], rng.normal(size=(batch, seq, num_entries)), -np.inf)
-    scaling = dim**-0.5
-    expected = _reference_kl(q, kv, entries, sinks, bias, scores, scaling)
-    assert expected > 1e-3
-
-    def loss(q_, scores_):
-        return indexer_distillation_loss(
-            q_,
-            jnp.asarray(kv, jnp.float32),
-            jnp.asarray(entries, jnp.float32),
-            jnp.asarray(sinks, jnp.float32),
-            jnp.asarray(valid),
-            scores_,
-            window=window,
-            scaling=scaling,
-            precision=jax.lax.Precision.HIGHEST,
-            block_q=block_q,
-        )
-
-    q32, scores32 = jnp.asarray(q, jnp.float32), jnp.asarray(scores, jnp.float32)
-    np.testing.assert_allclose(float(loss(q32, scores32)), expected, rtol=1e-4)
-    grad_q, grad_scores = jax.grad(loss, argnums=(0, 1))(q32, scores32)
-    assert not np.any(np.asarray(grad_q))  # attention side is stop-gradient
-    grad_scores = np.asarray(grad_scores)
-    assert np.isfinite(grad_scores).all() and np.any(grad_scores != 0)
-    assert not np.any(grad_scores[~np.broadcast_to(reach[None], grad_scores.shape)])
-
-
-@pytest.mark.parametrize("block_q", [64, 4, 3])
-def test_lazy_score_inputs_match_dense_scores(block_q):
-    """Per-tile scores from IndexerScoreInputs give the same loss and indexer gradients as dense scores."""
-    rng = np.random.default_rng(1)
-    batch, heads, seq, dim, ratio, window = 2, 3, 10, 4, 2, 3
-    ih, idim = 2, 5
-    num_entries = seq // ratio
-    q = jnp.asarray(rng.normal(size=(batch, heads, seq, dim)), jnp.float32)
-    kv = jnp.asarray(rng.normal(size=(batch, seq, dim)), jnp.float32)
-    entries = jnp.asarray(rng.normal(size=(batch, num_entries, dim)), jnp.float32)
-    sinks = jnp.asarray(rng.normal(size=(heads,)), jnp.float32)
-    valid = jnp.ones((batch, seq), bool).at[0, 3].set(False)
-    iq = jnp.asarray(rng.normal(size=(batch, seq, ih, idim)), jnp.float32)
-    iw = jnp.asarray(rng.normal(size=(batch, seq, ih)), jnp.float32)
-    ik = jnp.asarray(rng.normal(size=(batch, num_entries, idim)), jnp.float32)
-    positions = jnp.broadcast_to(jnp.arange(seq, dtype=jnp.int32)[None], (batch, seq))
-    hi = jax.lax.Precision.HIGHEST
-    kwargs = dict(window=window, scaling=dim**-0.5, precision=hi, block_q=block_q)
-
-    def lazy(a, b, c):
-        inputs = IndexerScoreInputs(a, b, c, positions, ratio, hi)
-        return indexer_distillation_loss(q, kv, entries, sinks, valid, inputs, **kwargs)
-
-    def dense(a, b, c):
-        scores = shared_key_scores(a, b, c, positions, ratio, hi)
-        return indexer_distillation_loss(q, kv, entries, sinks, valid, scores, **kwargs)
-
-    lv, lg = jax.value_and_grad(lazy, argnums=(0, 1, 2))(iq, iw, ik)
-    dv, dg = jax.value_and_grad(dense, argnums=(0, 1, 2))(iq, iw, ik)
-    assert float(dv) > 1e-3
-    np.testing.assert_allclose(float(lv), float(dv), rtol=1e-5)
-    for a, b in zip(lg, dg, strict=True):
-        assert np.isfinite(np.asarray(a)).all() and np.any(np.asarray(b) != 0)
-        np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-4, atol=1e-6)
 
 
 def _make_config(coef: float) -> DeepseekV41Config:

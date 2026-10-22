@@ -231,10 +231,9 @@ def make_reasoning_stripper(
 ) -> tp.Callable[[str], str]:
     """Build a function that strips reasoning blocks from model output.
 
-    Auto-detects the reasoning format and returns a compiled-regex
-    stripping function for the correct start/end tags.  Handles both
-    closed tags (``start...end``) and unclosed tags where the model
-    hit the token limit before producing the end tag.
+    Auto-detects the format and delegates extraction to its registered parser,
+    including asymmetric, channel-delimited and text-delimited grammars.
+    Closed and token-limit-truncated reasoning blocks are both removed.
 
     Args:
         parser_name: Explicit parser name override.
@@ -256,19 +255,30 @@ def make_reasoning_stripper(
     except KeyError:
         parser_cls = None
 
-    if parser_cls is None:
-        start_tokens = ("<think>",)
-        end_token = "</think>"
-    else:
-        start_token = getattr(parser_cls, "start_token", "<think>")
-        end_token = getattr(parser_cls, "end_token", "</think>")
-        start_tokens = getattr(parser_cls, "reasoning_start_tokens", (start_token,))
-        if isinstance(start_tokens, str):
-            start_tokens = (start_tokens,)
-        else:
-            start_tokens = tuple(str(token) for token in start_tokens if token)
-        if not start_tokens:
-            start_tokens = (start_token,)
+    if parser_cls is not None:
+
+        def strip_registered_reasoning(text: str) -> str:
+            """Use the registered grammar, including asymmetric and text-delimited formats."""
+            parser = parser_cls(tokenizer)
+            _, content = parser.extract_reasoning(text)
+            result = content or ""
+            start = getattr(parser, "start_token", "")
+            openers = getattr(parser, "reasoning_start_tokens", (start,))
+            if isinstance(openers, str):
+                openers = (openers,)
+            # Strip repeated reasoning blocks, not just the first.
+            while result and any(marker and marker in result for marker in openers):
+                _, following = parser.extract_reasoning(result)
+                following = following or ""
+                if following == result:
+                    break
+                result = following
+            return result.strip()
+
+        return strip_registered_reasoning
+
+    start_tokens = ("<think>",)
+    end_token = "</think>"
 
     escaped_start_pattern = "|".join(sorted((re.escape(token) for token in start_tokens), key=len, reverse=True))
     escaped_end = re.escape(end_token)

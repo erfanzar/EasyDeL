@@ -418,38 +418,45 @@ def blockwise_ffn(remat_ffn: tp.Callable, inputs: jax.Array, chunk_size: int) ->
         remat_ffn: The feed-forward network function to apply. Should be
             rematerialized (checkpointed) for memory efficiency.
         inputs: Input tensor with shape (batch_size, sequence_length, hidden_dim).
-        chunk_size: Size of chunks to process. Sequence length must be
-            divisible by chunk_size.
+        chunk_size: Size of chunks to process. Sequence lengths that are not a
+            multiple of chunk_size are supported: the full chunks are scanned and the
+            remaining tail is processed as one shorter chunk.
 
     Returns:
         Output tensor with same shape as inputs.
 
     Raises:
-        EasyDeLBlockWiseFFNError: If inputs have wrong shape or chunk_size
-            doesn't divide sequence length evenly.
+        EasyDeLBlockWiseFFNError: If inputs have the wrong shape, chunk_size is not
+            positive, or the wrapped feed-forward network fails.
 
     Note:
-        - For generation (sequence_length=1), applies FFN directly without chunking
+        - For generation (sequence_length=1) or sequences no longer than
+          chunk_size, applies FFN directly without chunking
         - For training, processes sequence in chunks to reduce memory
-        - Requires sequence_length to be divisible by chunk_size
+        - Behaves like ``layers.attention.blockwise_ffn`` for every sequence length
 
     Example:
         >>> ffn = lambda x: mlp(x)  # Your FFN function
         >>> chunked_output = blockwise_ffn(ffn, inputs, chunk_size=256)
     """
-    generating = inputs.shape[1] == 1
     try:
-        if generating:
+        seq_len = inputs.shape[1]
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
+        if seq_len <= chunk_size:
             return remat_ffn(inputs)
-        else:
-            inputs_chunked = rearrange(inputs, "b (c n) d -> c b n d", n=chunk_size)
-            _, outputs = jax.lax.scan(
-                f=lambda carry, x: (carry, remat_ffn(x)),
-                init=jnp.array(0, dtype=jnp.int32),
-                xs=inputs_chunked,
-                unroll=True,
-            )
-            return rearrange(outputs, "c b n d -> b (c n) d")
+        main_len = (seq_len // chunk_size) * chunk_size
+        inputs_chunked = rearrange(inputs[:, :main_len], "b (c n) d -> c b n d", n=chunk_size)
+        _, outputs = jax.lax.scan(
+            f=lambda carry, x: (carry, remat_ffn(x)),
+            init=jnp.array(0, dtype=jnp.int32),
+            xs=inputs_chunked,
+            unroll=True,
+        )
+        outputs = rearrange(outputs, "c b n d -> b (c n) d")
+        if main_len < seq_len:
+            outputs = jnp.concatenate([outputs, remat_ffn(inputs[:, main_len:])], axis=1)
+        return outputs
     except Exception as e:
         raise EasyDeLBlockWiseFFNError(
             "You Are using BlockWise FFN from near-infinite-context length paper and you might be passing "
@@ -1050,29 +1057,34 @@ def count_flop_jaxpr(jaxpr) -> int:
 
     def compute_conv_flops(eqn) -> int:
         """Compute FLOPs for convolution operation."""
-        lhs_shape = eqn.invars[0].aval.shape
         rhs_shape = eqn.invars[1].aval.shape
 
         dimension_numbers = eqn.params.get("dimension_numbers", None)
         if not dimension_numbers:
             return 0
 
-        lhs_spec, rhs_spec, _out_spec = dimension_numbers
+        # ``ConvDimensionNumbers`` stores integer dimension positions:
+        # lhs_spec = (batch, feature, *spatial), rhs_spec = (out_feature, in_feature, *spatial),
+        # out_spec = (batch, feature, *spatial).
+        _lhs_spec, rhs_spec, out_spec = dimension_numbers
+        out_shape = eqn.outvars[0].aval.shape
 
-        batch_size = lhs_shape[lhs_spec.index("N")]
-        in_channels = lhs_shape[lhs_spec.index("C")]
-        out_channels = rhs_shape[rhs_spec.index("O")]
+        batch_size = out_shape[out_spec[0]]
+        out_channels = out_shape[out_spec[1]]
+        # The kernel's input-feature dim is already divided by ``feature_group_count``.
+        in_channels_per_group = rhs_shape[rhs_spec[1]]
 
-        spatial_size = 1
+        out_spatial_size = 1
+        for d in out_spec[2:]:
+            out_spatial_size *= out_shape[d]
         kernel_size = 1
-        for d in range(len(lhs_spec) - 2):
-            spatial_size *= lhs_shape[lhs_spec.index(str(d))]
-            kernel_size *= rhs_shape[rhs_spec.index(str(d))]
+        for d in rhs_spec[2:]:
+            kernel_size *= rhs_shape[d]
 
-        ops_per_point = 2 * kernel_size * in_channels - 1
-        total_points = batch_size * spatial_size * out_channels
+        ops_per_point = 2 * kernel_size * in_channels_per_group - 1
+        total_points = batch_size * out_spatial_size * out_channels
 
-        return ops_per_point * total_points
+        return int(ops_per_point * total_points)
 
     def compute_reduce_flops(eqn) -> int:
         """Compute FLOPs for reduction operations."""
@@ -1103,25 +1115,24 @@ def count_flop_jaxpr(jaxpr) -> int:
         return qk_flops + softmax_flops + av_flops
 
     def count_scan_flops(eqn) -> int:
-        """Count FLOPs in a scan operation."""
+        """Count FLOPs in a scan operation (body FLOPs times the static trip count)."""
         scan_jaxpr = eqn.params.get("jaxpr", None)
-        if scan_jaxpr:
+        if scan_jaxpr is not None:
             body_flops = count_flop_jaxpr(scan_jaxpr)
-            length = eqn.invars[0].aval.shape[0]
+            length = int(eqn.params.get("length", 1))
             return body_flops * length
         return 0
 
     def count_cond_flops(eqn) -> int:
-        """Count FLOPs in a conditional operation."""
-        true_jaxpr = eqn.params.get("true_jaxpr", None)
-        false_jaxpr = eqn.params.get("false_jaxpr", None)
-
-        total_flops = 0
-        if true_jaxpr:
-            total_flops += count_flop_jaxpr(true_jaxpr)
-        if false_jaxpr:
-            total_flops += count_flop_jaxpr(false_jaxpr)
-        return total_flops // 2
+        """Count FLOPs in a conditional operation (mean over the branches)."""
+        branches = eqn.params.get("branches", None)
+        if branches is None:
+            branches = tuple(
+                branch for branch in (eqn.params.get("true_jaxpr"), eqn.params.get("false_jaxpr")) if branch is not None
+            )
+        if not branches:
+            return 0
+        return sum(count_flop_jaxpr(branch) for branch in branches) // len(branches)
 
     def get_scatter_flops(eqn) -> int:
         """Count FLOPs in a scatter operation."""
@@ -1166,10 +1177,7 @@ def count_flop_jaxpr(jaxpr) -> int:
         return compute_binary_op_flops(eqn)
 
     def count_custom_vjp_flops(eqn) -> int:
-        """Count FLOPs in custom VJP operation."""
-        fwd_jaxpr = eqn.params.get("fun_jaxpr", None)
-        if fwd_jaxpr:
-            return count_flop_jaxpr(fwd_jaxpr)
+        """Custom-VJP calls contribute nothing themselves; the generic sub-jaxpr recursion counts the body once."""
         return 0
 
     def compute_sqrt_flops(eqn) -> int:
@@ -1278,6 +1286,7 @@ def count_flop_jaxpr(jaxpr) -> int:
         "and": compute_and_flops,
         "random_fold_in": lambda eqn: 0,  # Random number generation, no FLOPs
         "custom_vjp_call_jaxpr": count_custom_vjp_flops,
+        "custom_vjp_call": count_custom_vjp_flops,
         "logistic": lambda eqn: 4 * compute_unary_op_flops(eqn),  # sigmoid function
         # No-op operations (0 FLOPs)
         "stop_gradient": lambda eqn: 0,  # Just passes through the value
@@ -1305,6 +1314,10 @@ def count_flop_jaxpr(jaxpr) -> int:
         "rem": compute_rem_flops,
     }
 
+    # Primitives whose handler already accounts for their sub-jaxprs; the generic recursion below must
+    # not visit those bodies again (it would double count them, and miss the scan trip count).
+    self_recursing_primitives = frozenset({"scan", "cond"})
+
     flops = 0
 
     def visit_jaxpr(jaxpr):
@@ -1324,6 +1337,8 @@ def count_flop_jaxpr(jaxpr) -> int:
             else:
                 warnings.warn(f"Unhandled primitive {primitive_name}", stacklevel=1)
 
+            if primitive_name in self_recursing_primitives:
+                continue
             for subjaxpr in jaxprs_in_params(eqn.params):
                 visit_jaxpr(subjaxpr)
 
@@ -2327,8 +2342,24 @@ class ArrayParam(spx.Parameter):
 
     shape: Sequence[int]
     dtype: DTypeLike
-    init_method: str = "normal"
-    init_kwargs: hashable_dict | None = None
+
+    @property
+    def init_method(self) -> str:
+        """Initializer name retained by SpectraX graph/state round-trips."""
+        return self.metadata.get("init_method", "normal")
+
+    @init_method.setter
+    def init_method(self, value: str) -> None:
+        self.metadata["init_method"] = value
+
+    @property
+    def init_kwargs(self) -> hashable_dict | None:
+        """Initializer arguments shared by eager and sequential initialization."""
+        return self.metadata.get("init_kwargs")
+
+    @init_kwargs.setter
+    def init_kwargs(self, value: hashable_dict | None) -> None:
+        self.metadata["init_kwargs"] = None if value is None else hashable_dict(value)
 
     def __init__(
         self,

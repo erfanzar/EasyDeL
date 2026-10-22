@@ -343,11 +343,12 @@ class CombineFields(Transform):
             combined = self._separator.join(str(v) for v in values if v is not None)
 
         result = example.copy()
-        result[self._target_field] = combined
-
         if self._drop_sources:
             for field in self._source_fields:
                 result.pop(field, None)
+        # The target may also be a source (e.g. augmenting an existing text
+        # column). Publish it after removing the original component fields.
+        result[self._target_field] = combined
 
         return result
 

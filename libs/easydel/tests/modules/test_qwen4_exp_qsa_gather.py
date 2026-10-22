@@ -92,12 +92,21 @@ def _full_width_reference(q, key, value, selected, scale):
 
     # Full-width masked softmax, grouped per KV head (head h -> kv h // groups).
     q4 = q[:, 0].reshape(batch, kv_heads, groups, dim)
-    scores = jnp.einsum("bhgd,bshd->bhgs", q4.astype(jnp.float32), key.astype(jnp.float32)) * scale
+    scores = (
+        jnp.einsum(
+            "bhgd,bshd->bhgs",
+            q4.astype(jnp.float32),
+            key.astype(jnp.float32),
+            precision=jax.lax.Precision.HIGHEST,
+        )
+        * scale
+    )
     drop = jnp.where(valid, sel, seq)  # invalid slots land on the drop column
-    full_mask = jnp.zeros((batch, seq + 1), bool).at[:, drop].set(True)[:, :seq]
+    rows = jnp.arange(batch)[:, None]
+    full_mask = jnp.zeros((batch, seq + 1), bool).at[rows, drop].set(True)[:, :seq]
     scores = jnp.where(full_mask[:, None, None, :], scores, -1e30)
     probs = jax.nn.softmax(scores, axis=-1)
-    out = jnp.einsum("bhgs,bshd->bhgd", probs.astype(value.dtype), value)
+    out = jnp.einsum("bhgs,bshd->bhgd", probs.astype(value.dtype), value, precision=jax.lax.Precision.HIGHEST)
     return out.reshape(batch, 1, heads, dim)
 
 
@@ -105,8 +114,11 @@ def _make_gather_callable():
     """Call the production gathered-attention method without constructing a layer."""
 
     def gather(q, key, value, selected):
-        attention = SimpleNamespace(head_dim=q.shape[-1])
-        return Qwen4ExpAttention._decode_gather_attention(attention, q, key, value, selected)
+        attention = Qwen4ExpAttention.__new__(Qwen4ExpAttention)
+        attention.head_dim = q.shape[-1]
+        attention.num_heads = q.shape[2]
+        attention.precision = jax.lax.Precision.HIGHEST
+        return attention._decode_gather_attention(q, key, value, selected)
 
     return gather
 
@@ -121,9 +133,10 @@ def test_gather_matches_masked_full_width(seed):
     value = jax.random.normal(jax.random.PRNGKey(seed + 20), (batch, seq, kv_heads, dim), jnp.bfloat16)
 
     # Contract-valid selections: duplicate-free (select() emits disjoint
-    # block members + tail) with some -1 padding at the end.
+    # block members + tail) with some -1 padding at the end. Use disjoint
+    # selections across batch rows so the reference also guards row isolation.
     perm = jax.random.permutation(jax.random.PRNGKey(seed + 30), jnp.arange(seq, dtype=jnp.int32), axis=-1)
-    sel = jnp.broadcast_to(perm[:width], (batch, 1, width))
+    sel = perm[: batch * width].reshape(batch, 1, width)
     pad_cols = jnp.arange(width) > (width - 3)
     sel = jnp.where(jnp.broadcast_to(pad_cols, sel.shape), -1, sel)
 
@@ -431,7 +444,10 @@ def test_paged_gather_keeps_requests_on_their_own_physical_pages():
         value_pages=values,
         flattened_kv_pages=lambda: interleaved,
     )
-    attn = SimpleNamespace(head_dim=1)
+    attn = Qwen4ExpAttention.__new__(Qwen4ExpAttention)
+    attn.head_dim = 1
+    attn.num_heads = 1
+    attn.precision = jax.lax.Precision.HIGHEST
     q = jnp.zeros((1, 2, 1, 1), jnp.float32)
     selected = jnp.array([[[0, 1], [0, 1]]], jnp.int32)
     out = Qwen4ExpAttention._paged_gather_attention(attn, q, view, meta, selected)

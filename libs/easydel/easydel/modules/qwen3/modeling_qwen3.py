@@ -468,6 +468,8 @@ class Qwen3Model(EasyDeLBaseModule):
                 self.embed_tokens(input_ids.astype("i4")), "embeddings"
             )
         sequence_length = inputs_embeds.shape[1]
+        output_attentions = self.config.output_attentions if output_attentions is None else output_attentions
+        output_hidden_states = self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
 
         all_attentions: tuple[Float[Array, ...], ...] | None = () if output_attentions else None
         all_hidden_states: tuple[Float[Array, "batch seq_len hidden_dim"], ...] | None = (

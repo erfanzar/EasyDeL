@@ -32,8 +32,8 @@ Components:
   classification tasks.
 """
 
+import copy
 import math
-import random
 import typing as tp
 from functools import partial
 
@@ -86,6 +86,33 @@ from easydel.modules._base import BaseConditionalGenerationModule
 from .whisper_configuration import WhisperConfig as WhisperConfig
 
 remat = spx.remat
+
+
+class _WhisperConv1d(nn.Conv1d):
+    """Keep stem parameters in storage dtype and cast only convolution operands.
+
+    SpectraX convolutions treat ``dtype`` as a storage alias. Whisper's public
+    ``dtype`` instead specifies computation, independently of ``param_dtype``.
+    Inheriting the convolution retains the existing ``conv{1,2}.weight/bias``
+    checkpoint paths without mutating their values during a forward pass.
+    """
+
+    def __init__(self, *args, dtype, **kwargs):
+        super().__init__(*args, dtype=dtype, **kwargs)
+        self.compute_dtype = dtype
+
+    def forward(self, x, **kwargs):
+        """Apply the stem convolution in Whisper's activation dtype."""
+        return spx.functional.conv(
+            jnp.asarray(x, dtype=self.compute_dtype),
+            self.weight.value.astype(self.compute_dtype),
+            self.bias.value.astype(self.compute_dtype) if self.use_bias else None,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+            precision=self.precision,
+        )
 
 
 def shift_tokens_right(
@@ -765,22 +792,24 @@ class WhisperEncoder(EasyDeLBaseModule):
         )
         # HF uses symmetric ``padding=1`` on both convs. ``"SAME"`` would pad the
         # stride-2 conv2 as (0, 1) for L=3000, shifting every frame by half a step.
-        self.conv1 = nn.Conv1d(
+        self.conv1 = _WhisperConv1d(
             self.config.num_mel_bins,
             self.config.d_model,
             kernel_size=3,
             padding=((1, 1),),
             dtype=dtype,
+            param_dtype=param_dtype,
             rngs=rngs,
             precision=precision,
         )
-        self.conv2 = nn.Conv1d(
+        self.conv2 = _WhisperConv1d(
             self.config.d_model,
             self.config.d_model,
             kernel_size=3,
             stride=2,
             padding=((1, 1),),
             dtype=dtype,
+            param_dtype=param_dtype,
             rngs=rngs,
             precision=precision,
         )
@@ -872,8 +901,8 @@ class WhisperEncoder(EasyDeLBaseModule):
 
         hidden_states = self.dropout_layer(hidden_states)
 
-        # LayerDrop draws a python coin per layer, which cannot ride a
-        # lax.scan body — training with layerdrop forces the trace path.
+        # Keep layer-local RNG updates outside the stacked readonly scan
+        # when stochastic LayerDrop is active.
         trace_layers = self._layer_scan_trace(
             False,
             output_hidden_states=output_hidden_states,
@@ -893,16 +922,24 @@ class WhisperEncoder(EasyDeLBaseModule):
             if output_hidden_states:
                 assert all_hidden_states is not None
                 all_hidden_states = (*all_hidden_states, hidden_states)
-            dropout_probability = random.uniform(0, 1)
-            if self.training and (dropout_probability < self.layerdrop):
-                layer_outputs = (hidden_states, None)
-            else:
-                with self._layer_stage_context(idx, layers=self.layers):
-                    layer_outputs = encoder_layer(
-                        hidden_states=hidden_states,
-                        mask_info=mask_info,
-                        output_attentions=output_attentions,
-                    )
+            residual = hidden_states
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = encoder_layer(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    output_attentions=output_attentions,
+                )
+            if self.training and self.layerdrop > 0:
+                drop_layer = jax.random.bernoulli(self.rngs.key("dropout"), self.layerdrop)
+                # Dynamic None entries cannot be represented in a compiled output;
+                # dropped layers expose zero attention weights instead.
+                layer_outputs = (
+                    jnp.where(drop_layer, residual, layer_outputs[0]),
+                    *(
+                        None if value is None else jnp.where(drop_layer, jnp.zeros_like(value), value)
+                        for value in layer_outputs[1:]
+                    ),
+                )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs[0], idx, layers=self.layers)
             if output_attentions:
                 assert all_attentions is not None
@@ -1112,8 +1149,8 @@ class WhisperDecoder(EasyDeLBaseModule):
         views = past_key_values.views if past_key_values is not None else None
         has_cache_views = views is not None and any(v is not None for v in views)
         needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
-        # LayerDrop draws a python coin per layer, which cannot ride a
-        # lax.scan body — training with layerdrop forces the trace path.
+        # Keep layer-local RNG updates outside the stacked readonly scan
+        # when stochastic LayerDrop is active.
         trace_layers = self._layer_scan_trace(
             False,
             output_hidden_states=output_hidden_states,
@@ -1135,22 +1172,28 @@ class WhisperDecoder(EasyDeLBaseModule):
             hidden_states, cv, all_hidden_states, all_self_attns, all_cross_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-                # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
-            dropout_probability = random.uniform(0, 1)
-            if self.training and (dropout_probability < self.layerdrop):
-                layer_outputs = (hidden_states, None, None, None)
-            else:
-                with self._layer_stage_context(idx, layers=self.layers):
-                    layer_outputs = decoder_layer(
-                        hidden_states=hidden_states,
-                        mask_info=mask_info,
-                        encoder_hidden_states=encoder_hidden_states,
-                        encoder_mask_info=encoder_mask_info,
-                        mode=mode,
-                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
-                        cache_metadata=cache_metadata,
-                        output_attentions=output_attentions,
-                    )
+            residual = hidden_states
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = decoder_layer(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_mask_info=encoder_mask_info,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                )
+            if self.training and self.layerdrop > 0:
+                drop_layer = jax.random.bernoulli(self.rngs.key("dropout"), self.layerdrop)
+                layer_outputs = (
+                    jnp.where(drop_layer, residual, layer_outputs[0]),
+                    *(
+                        None if value is None else jnp.where(drop_layer, jnp.zeros_like(value), value)
+                        for value in layer_outputs[1:-1]
+                    ),
+                    layer_outputs[-1],
+                )
             cv = self._layer_cache_view_update(
                 cv,
                 idx,
@@ -1241,24 +1284,6 @@ class WhisperModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def _get_decoder_module(self):
-        """Internal accessor for the decoder used by generation utilities.
-
-        Returns:
-            WhisperDecoder: The autoregressive text decoder that
-            cross-attends to the encoder outputs.
-        """
-        return self.decoder
-
-    def _get_encoder_module(self):
-        """Internal accessor for the encoder used by caching helpers.
-
-        Returns:
-            WhisperEncoder: The acoustic encoder that consumes the
-            mel-spectrogram input features.
-        """
-        return self.encoder
-
     def forward(
         self,
         input_features: jnp.ndarray,
@@ -1342,6 +1367,7 @@ class WhisperModel(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = False,
         output_hidden_states: bool | None = False,
+        encoder_mask_info: MaskInfo | None = None,
     ):
         """Performs decoding using the decoder module.
 
@@ -1355,6 +1381,7 @@ class WhisperModel(EasyDeLBaseModule):
             cache_metadata (tp.Optional[TransformerMetadata]): Metadata for paged attention.
             output_attentions (bool): Whether to return attention weights.
             output_hidden_states (bool): Whether to return hidden states for all layers.
+            encoder_mask_info (MaskInfo | None): Optional cross-attention mask over encoder keys.
 
         Returns:
             BaseModelOutputWithPastAndCrossAttentions | tuple: Decoder output.
@@ -1382,6 +1409,7 @@ class WhisperModel(EasyDeLBaseModule):
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
             encoder_hidden_states=encoder_hidden_states,
+            encoder_mask_info=encoder_mask_info,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
@@ -1517,25 +1545,6 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
             lm_head_kernel_init=jax.nn.initializers.normal(config.init_std),
             create_lm_head=True,
         )
-
-    def _get_encoder_module(self):
-        """Reach the encoder owned by the wrapped :class:`WhisperModel`.
-
-        Used by generation helpers that pre-encode the audio once and
-        reuse the resulting hidden states across decoding steps.
-
-        Returns:
-            WhisperEncoder: ``self.model.encoder``.
-        """
-        return self.model.encoder
-
-    def _get_decoder_module(self):
-        """Reach the decoder owned by the wrapped :class:`WhisperModel`.
-
-        Returns:
-            WhisperDecoder: ``self.model.decoder``.
-        """
-        return self.model.decoder
 
     def forward(
         self,
@@ -1693,9 +1702,24 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
         )
 
         encoder_hidden_states = encoder_outputs[0]
+        encoder_mask_info = None
+        if encoder_attention_mask is not None:
+            expected_shape = encoder_hidden_states.shape[:2]
+            if encoder_attention_mask.shape != expected_shape:
+                raise ValueError(
+                    f"encoder_attention_mask must have shape {expected_shape}, got {encoder_attention_mask.shape}."
+                )
+            # Cross-attention has distinct query and key lengths. A 3-D mask
+            # broadcasts the encoder padding mask over decoder queries.
+            cross_attention_mask = jnp.broadcast_to(
+                encoder_attention_mask[:, None, :],
+                (decoder_input_ids.shape[0], decoder_input_ids.shape[1], encoder_hidden_states.shape[1]),
+            )
+            encoder_mask_info = MaskInfo.from_attention_mask(cross_attention_mask)
 
         outputs = self.model.decode(
             encoder_hidden_states=encoder_hidden_states,
+            encoder_mask_info=encoder_mask_info,
             decoder_mask_info=decoder_mask_info,
             decoder_input_ids=decoder_input_ids,
             decoder_position_ids=decoder_position_ids,
@@ -1827,8 +1851,7 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
             - The no_timestamps_token is forced when return_timestamps=False to suppress
               timestamp generation
         """
-        if generation_config is None:
-            generation_config = self.generation_config
+        generation_config = copy.deepcopy(self.generation_config if generation_config is None else generation_config)
 
         if return_timestamps is not None:
             generation_config.return_timestamps = return_timestamps
@@ -1843,34 +1866,46 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
             generation_config.language = language
 
         if "decoder_input_ids" in kwargs:
-            decoder_input_length = len(kwargs["decoder_input_ids"])
+            decoder_input_length = kwargs["decoder_input_ids"].shape[-1]
         else:
             decoder_input_length = 1
 
-        forced_decoder_ids = []
+        configured_ids = kwargs.pop("forced_decoder_ids", getattr(generation_config, "forced_decoder_ids", None))
+        forced_decoder_ids = list(configured_ids) if configured_ids is not None else []
 
-        if hasattr(generation_config, "is_multilingual") and generation_config.is_multilingual:
-            if hasattr(generation_config, "language"):
-                forced_decoder_ids.append((1, generation_config.lang_to_id[generation_config.language]))
-            else:
-                forced_decoder_ids.append((1, None))
-
-            if hasattr(generation_config, "task"):
-                forced_decoder_ids.append((2, generation_config.task_to_id[generation_config.task]))
-            else:
-                forced_decoder_ids.append((2, generation_config.task_to_id["transcribe"]))
+        if getattr(generation_config, "is_multilingual", False):
+            if not forced_decoder_ids:
+                configured_language = getattr(generation_config, "language", None)
+                language_id = generation_config.lang_to_id[configured_language] if configured_language else None
+                configured_task = getattr(generation_config, "task", None) or "transcribe"
+                forced_decoder_ids = [(1, language_id), (2, generation_config.task_to_id[configured_task])]
+            elif language is not None or task is not None:
+                # Explicit call options override their prefix positions, not the
+                # caller's remaining forced tokens. Config-only defaults do not
+                # replace an explicitly configured forced-token sequence.
+                forced_tokens = dict(forced_decoder_ids)
+                if language is not None:
+                    forced_tokens[1] = generation_config.lang_to_id[language]
+                if task is not None:
+                    forced_tokens[2] = generation_config.task_to_id[task]
+                forced_decoder_ids = sorted(forced_tokens.items())
 
         if (
             hasattr(generation_config, "return_timestamps") and generation_config.return_timestamps
         ) or return_timestamps:
-            logits_processor = [WhisperTimeStampLogitsProcessor(generation_config, self.config, decoder_input_length)]
+            logits_processor = LogitsProcessorList(logits_processor or [])
+            logits_processor.append(
+                WhisperTimeStampLogitsProcessor(generation_config, self.config, decoder_input_length)
+            )
         else:
-            if forced_decoder_ids and forced_decoder_ids[-1][0] != generation_config.no_timestamps_token_id:
-                idx = forced_decoder_ids[-1][0] + 1 if forced_decoder_ids else 1
-                forced_decoder_ids.append((idx, generation_config.no_timestamps_token_id))
+            no_timestamps_token_id = getattr(generation_config, "no_timestamps_token_id", None)
+            if no_timestamps_token_id is not None and all(
+                token != no_timestamps_token_id for _, token in forced_decoder_ids
+            ):
+                idx = max((position for position, _ in forced_decoder_ids), default=0) + 1
+                forced_decoder_ids.append((idx, no_timestamps_token_id))
 
-        if len(forced_decoder_ids) > 0:
-            generation_config.forced_decoder_ids = forced_decoder_ids
+        generation_config.forced_decoder_ids = forced_decoder_ids or None
 
         return super().generate(
             input_features,
@@ -1913,10 +1948,13 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
             jnp.ndarray: Generated token IDs including forced tokens.
                 Shape: (batch_size, generated_sequence_length).
         """
-        if generation_config is None:
-            generation_config = self.generation_config
+        generation_config = copy.deepcopy(self.generation_config if generation_config is None else generation_config)
         generation_config.forced_decoder_ids = None
-        logits_processor = LogitsProcessorList()
+        logits_processor = LogitsProcessorList(kwargs.pop("logits_processor", None) or [])
+        if not isinstance(forced_decoder_ids, dict):
+            forced_decoder_ids = {
+                int(position): None if token is None else int(token) for position, token in forced_decoder_ids
+            }
         logits_processor.append(ForceTokensLogitsProcessor(forced_decoder_ids))
         if return_timestamps:
             logits_processor.append(WhisperTimeStampLogitsProcessor(generation_config, self.config, 1))

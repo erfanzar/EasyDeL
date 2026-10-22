@@ -172,8 +172,6 @@ def apply_topk_mask_bf16(x: jnp.ndarray, k: jax.Array, replace_val: float) -> jn
         unnecessary upcasting overhead.
     """
     batch_shape = tuple(list(x.shape)[:-1])
-    original_dtype = x.dtype
-
     x_f32 = x.astype(jnp.float32)
     x_for_loop = x_f32
     reduce_axis = x_f32.ndim - 1
@@ -193,11 +191,7 @@ def apply_topk_mask_bf16(x: jnp.ndarray, k: jax.Array, replace_val: float) -> jn
     cutoff = -cutoff
     cutoff = lax.expand_dims(cutoff, (cutoff.ndim,))
 
-    if original_dtype == jnp.bfloat16:
-        cutoff_orig = cutoff.astype(original_dtype)
-        return jnp.where(x >= cutoff_orig, x, jnp.full_like(x, replace_val))
-    else:
-        return jnp.where(x_f32 >= cutoff, x, jnp.full_like(x, replace_val))
+    return jnp.where(x_f32 >= cutoff, x, jnp.full_like(x, replace_val))
 
 
 def apply_topk_mask(x: jnp.ndarray, k: jax.Array, replace_val: float) -> jnp.ndarray:
@@ -259,19 +253,15 @@ def apply_topp_mask_bf16(logits: jnp.ndarray, p: jax.Array, replace_val: float) 
 
     Performance:
         - 33 reductions over vocab_size (1 softmax + 32 binary search)
-        - Keeps softmax in original dtype when possible
-        - Only uses float32 for accumulation precision
+        - Preserves the original logits dtype when applying the mask
+        - Computes softmax and probability reductions in float32 for precision
 
     Note:
         The bfloat16 variant minimizes unnecessary casting while maintaining
         numerical precision where needed.
     """
     batch_shape = tuple(list(logits.shape)[:-1])
-    original_dtype = logits.dtype
-
-    probs = jax.nn.softmax(logits, axis=-1)
-
-    probs_f32 = probs.astype(jnp.float32) if original_dtype == jnp.bfloat16 else probs
+    probs_f32 = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
     probs_for_reduction = probs_f32
     reduce_axis = probs_for_reduction.ndim - 1
     if probs_for_reduction.ndim > 1:
@@ -290,12 +280,7 @@ def apply_topp_mask_bf16(logits: jnp.ndarray, p: jax.Array, replace_val: float) 
     threshold = apply_float32_bsearch(batch_shape, predicate)
     threshold = lax.expand_dims(threshold, (threshold.ndim,))
 
-    if original_dtype == jnp.bfloat16:
-        threshold_orig = threshold.astype(original_dtype)
-        probs_orig = probs
-        return jnp.where(probs_orig >= threshold_orig, logits, jnp.full_like(logits, replace_val))
-    else:
-        return jnp.where(probs_f32 >= threshold, logits, jnp.full_like(logits, replace_val))
+    return jnp.where(probs_f32 >= threshold, logits, jnp.full_like(logits, replace_val))
 
 
 def apply_topp_mask(logits: jnp.ndarray, p: jax.Array, replace_val: float) -> jnp.ndarray:

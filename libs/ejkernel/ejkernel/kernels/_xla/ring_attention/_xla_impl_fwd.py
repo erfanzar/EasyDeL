@@ -266,7 +266,20 @@ def _blockwise_attention_fwd(
             if logits_soft_cap is not None:
                 attn_weights = jnp.tanh(attn_weights / logits_soft_cap) * logits_soft_cap
 
-            bias_chunk = _chunk_bias_fn(q_chunk_idx_start + q_chunk_idx, k_chunk_idx_start + k_chunk_idx)
+            # Positions/segments travel with local shards, while a bias can
+            # retain global query rows and/or all circulating KV columns.
+            bias_chunk = _chunk_bias_fn(
+                q_chunk_idx_start + q_chunk_idx,
+                k_chunk_idx_start + k_chunk_idx,
+                query_local_chunk_idx=q_chunk_idx,
+                key_local_chunk_idx=k_chunk_idx,
+                bias_query_chunk_idx=(
+                    q_chunk_idx if bias is None or bias.shape[-2] <= q_len else q_chunk_idx_start + q_chunk_idx
+                ),
+                bias_key_chunk_idx=(
+                    k_chunk_idx if bias is None or bias.shape[-1] <= kv_len else k_chunk_idx_start + k_chunk_idx
+                ),
+            )
             attn_weights = attn_weights + bias_chunk
 
             valid = jnp.isfinite(attn_weights)
@@ -506,7 +519,6 @@ def _ring_attention_fwd(
 
     axis_size = lax.psum(1, axis_name) if axis_name is not None else 1
     q_block_size, kv_blocksize = (q_len, kv_len)
-    use_positions = q_position_ids is not None and kv_position_ids is not None
 
     def scan_kv_block(carry, idx):
         """Process one ring step: compute local attention and rotate KV blocks.
@@ -527,9 +539,9 @@ def _ring_attention_fwd(
         prev_max_score, numerator, denominator, key, value, kv_segment_ids, kv_position_ids = carry
         axis_idx = lax.axis_index(axis_name) if axis_name is not None else 0
         q_block_idx = axis_idx
-        q_chunk_idx_start = 0 if use_positions else q_block_idx * (q_block_size // query_chunk_size)
+        q_chunk_idx_start = q_block_idx * (q_block_size // query_chunk_size)
         k_block_idx = (axis_idx - idx) % axis_size
-        k_chunk_idx_start = 0 if use_positions else k_block_idx * (kv_blocksize // key_chunk_size)
+        k_chunk_idx_start = k_block_idx * (kv_blocksize // key_chunk_size)
         numerator, denominator, max_score = _blockwise_attention_fwd(
             query,
             key,

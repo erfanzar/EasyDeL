@@ -161,8 +161,9 @@ class MptAttention(UnifiedAttention):
 
     Differences from a standard transformer attention:
 
-    * **Fused QKV**: a single linear ``Wqkv`` of width ``3 * d_model`` is
-      split into Q, K, V slices instead of three separate projections.
+    * **Fused QKV**: a single linear ``Wqkv`` is split into Q, K, V slices.
+      Multi-query attention uses one K/V head; multi-head attention uses
+      ``n_heads`` K/V heads (total width ``3 * d_model``).
     * **No RoPE / learned positional embeddings**: positional information
       enters as a per-head ALiBi bias matrix
       ``-m_h * (i - j)`` for ``j <= i`` added directly to the QK scores
@@ -179,10 +180,8 @@ class MptAttention(UnifiedAttention):
     combined into a single additive bias before the softmax kernel.
 
     Attributes:
-        Wqkv (ColumnParallelLinear): Fused QKV projection ``d_model -> 3 * d_model``.
+        Wqkv (ColumnParallelLinear): Fused QKV projection with the configured K/V width.
         out_proj (RowParallelLinear): Output projection ``d_model -> d_model``.
-        resid_dropout (nn.Dropout): Residual-stream dropout applied to the
-            attention output.
     """
 
     def __init__(
@@ -238,7 +237,7 @@ class MptAttention(UnifiedAttention):
         """
         self.Wqkv = ColumnParallelLinear(
             config.hidden_size,
-            config.hidden_size * 3,
+            (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
             use_bias=config.use_bias,
@@ -258,10 +257,7 @@ class MptAttention(UnifiedAttention):
             precision=precision,
         )
 
-        self.resid_dropout = nn.Dropout(
-            config.attn_config.attn_pdrop,
-            rngs=rngs,
-        )
+        self.rngs = rngs
 
         self.attention_performer = self._create_attention_performer(config, rngs)
         self._create_alibi_slopes(config)
@@ -339,11 +335,13 @@ class MptAttention(UnifiedAttention):
         if clip_qkv:
             # HF MPT clamps the fused QKV activations to ``[-clip_qkv, clip_qkv]``.
             mixed_qkv = jnp.clip(mixed_qkv, -clip_qkv, clip_qkv)
-        query_states, key_states, value_states = jnp.split(mixed_qkv, 3, -1)
+        query_width = self.num_heads * self.head_dim
+        kv_width = self.num_key_value_heads * self.head_dim
+        query_states, key_states, value_states = jnp.split(mixed_qkv, (query_width, query_width + kv_width), -1)
 
-        query_states = rearrange(query_states, "b s (h d) -> b s h d", h=self.config.n_heads)
-        key_states = rearrange(key_states, "b s (h d) -> b s h d", h=self.config.n_heads)
-        value_states = rearrange(value_states, "b s (h d) -> b s h d", h=self.config.n_heads)
+        query_states = rearrange(query_states, "b s (h d) -> b s h d", h=self.num_heads)
+        key_states = rearrange(key_states, "b s (h d) -> b s h d", h=self.num_key_value_heads)
+        value_states = rearrange(value_states, "b s (h d) -> b s h d", h=self.num_key_value_heads)
 
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
@@ -385,11 +383,14 @@ class MptAttention(UnifiedAttention):
             value_states=value_states,
             mode=mode,
             bias=alibi_bias,
+            deterministic=not self.training,
+            dropout_rng=self.rngs.key("dropout") if self.training and self.attention_performer.dropout_prob else None,
             cache_metadata=cache_metadata,
             cache_view=cache_view,
             init_bias=None,
             mask_info=mask_info,
             causal=causal_for_kernel,
+            output_attentions=output_attentions,
         )
 
         attn_output = self.shard_attention_prod(
@@ -397,7 +398,6 @@ class MptAttention(UnifiedAttention):
         )
         attn_output = checkpoint_name(self.out_proj(attn_output), name="attn_output")
         attn_output = self.shard_attention_prod(attn_output)
-        attn_output = self.resid_dropout(attn_output)
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -713,6 +713,7 @@ class MptModel(EasyDeLBaseModule):
         return build_mpt_alibi_tensor(
             sequence_length=self.config.max_seq_len,
             num_heads=self.config.n_heads,
+            alibi_bias_max=self.config.attn_config.alibi_bias_max,
         )
 
     def forward(
@@ -936,3 +937,42 @@ class MptForCausalLM(BaseCausalLMModule[MptModel, MptConfig]):
             rngs=rngs,
             lm_head_bias=config.use_bias if hasattr(config, "use_bias") else False,
         )
+
+    def _resolved_logit_scale(self) -> float:
+        """Resolve the documented numeric or inverse-square-root logit scale."""
+        scale = self.config.logit_scale
+        if scale is None:
+            return 1.0
+        if scale == "inv_sqrt_d_model":
+            return self.config.d_model**-0.5
+        if isinstance(scale, str):
+            raise ValueError(f"Unsupported MPT logit_scale: {scale!r}")
+        return float(scale)
+
+    def compute_lm_logits(self, hidden_states: Array) -> Array:
+        """Project and clip logits, then apply MPT's configured output scale."""
+        return super().compute_lm_logits(hidden_states) * self._resolved_logit_scale()
+
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
+        """Build a trace-safe projection with the same MPT logit scaling."""
+        project = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
+        scale = self._resolved_logit_scale()
+
+        def scaled_project(hidden_states):
+            return project(hidden_states) * scale
+
+        return scaled_project
+
+    def get_lm_logit_postprocess(self):
+        """Capture clipping and scaling for an exported split LM head."""
+        clip = self.get_base_lm_logit_postprocess()
+        scale = self._resolved_logit_scale()
+        if scale == 1.0:
+            return clip
+
+        def postprocess(logits):
+            if clip is not None:
+                logits = clip(logits)
+            return logits * scale
+
+        return postprocess

@@ -23,7 +23,6 @@ HuggingFace-named ``state_dict`` so the checkpoint conversion path — including
 the fused ``[Q | gate | K | V]`` and ``[gate | up]`` layouts — is exercised too.
 """
 
-import inspect
 import math
 
 import easydel as ed
@@ -892,22 +891,33 @@ def test_config_round_trips_through_save_pretrained(tmp_path):
         ed.MuseGlimmerVisionConfig(num_hidden_layers=6, layer_types=["not_a_layer_type"] * 6)
 
 
+@pytest.mark.cpu_ok
 def test_registered_in_shared_model_type_tables():
-    """The family must be listed wherever the stack gates on ``model_type``.
+    """Muse-Glimmer resolves as a VLM even with the converter's causal-LM fallback.
 
-    ``MuseGlimmerForConditionalGeneration`` matches neither the
-    ``forimagetexttotext`` nor the ``vision2seq`` architecture heuristic, so the
-    HF->EasyDeL converter only routes it to the image-text-to-text task via the
-    explicit table. eSurge separately keys flat-patch preprocessing off
-    ``model_type``, and Muse-Glimmer consumes pre-packed patches.
+    The family-specific routing must win over the ambiguous
+    ``ForConditionalGeneration`` architecture. eSurge must also accept its
+    pre-packed vision inputs.
     """
+    from types import SimpleNamespace
+
     from easydel.inference.esurge.multimodal.manager import MultiModalManager
-    from easydel.scripts.convert_hf_to_easydel import IMAGE_TEXT_TO_TEXT_MODEL_TYPES
+    from easydel.modules.auto.auto_configuration import infer_task_from_config
 
-    assert "muse_glimmer" in IMAGE_TEXT_TO_TEXT_MODEL_TYPES
+    # Use the family's actual capability declaration without constructing model weights.
+    config = ed.MuseGlimmerConfig(
+        text_config=_text_config(),
+        vision_config=_vision_config(),
+        architectures=["MuseGlimmerForConditionalGeneration"],
+    )
+    assert (
+        infer_task_from_config(config, conditional_generation_task=ed.TaskType.CAUSAL_LM)
+        == ed.TaskType.IMAGE_TEXT_TO_TEXT
+    )
 
-    source = inspect.getsource(MultiModalManager._supports_flat_patch_inputs)
-    assert '"muse_glimmer"' in source, "muse_glimmer must be treated as a flat-patch VLM"
+    manager = object.__new__(MultiModalManager)
+    manager.model = SimpleNamespace(config=config)
+    assert manager._supports_flat_patch_inputs() is True
 
 
 def test_vision_config_exposes_shared_preprocessing_aliases():

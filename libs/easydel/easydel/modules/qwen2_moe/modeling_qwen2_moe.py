@@ -49,14 +49,13 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     MoeCausalLMOutput,
     MoeModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import auto_remat, blockwise_ffn
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     BaseMoeModule,
     ColumnParallelLinear,
@@ -72,10 +71,10 @@ from easydel.layers import (
     gated_mlp_forward,
     moe_down_projection_reform_param,
     moe_fused_gate_up_reform_param,
-    split_fused_gate_up_projection,
 )
 from easydel.layers import RMSNorm as RMSNorm
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.mlp import moe_gated_expert_forward
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .qwen2_moe_configuration import Qwen2MoeConfig
@@ -139,7 +138,7 @@ class Qwen2MoeMLPStack(spx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
         )
-        self.act_fn = jax.nn.silu
+        self.act_fn = ACT2FN[config.hidden_act]
 
     @property
     def reform_param(self):
@@ -162,9 +161,7 @@ class Qwen2MoeMLPStack(spx.Module):
         Returns:
             Array: Output tensor of shape (total_tokens, hidden_size) after MoE MLP transformation.
         """
-        gate_up = self.gate_up_proj(x, group_sizes, sorted_experts)
-        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
+        return moe_gated_expert_forward(self, x, group_sizes, sorted_experts)
 
 
 class Qwen2MoeMLP(spx.Module):
@@ -221,7 +218,7 @@ class Qwen2MoeMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.act_fn = jax.nn.silu
+        self.act_fn = ACT2FN[config.hidden_act]
 
     @property
     def reform_param(self):
@@ -321,77 +318,6 @@ class Qwen2MoeAttention(UnifiedAttention):
             layout=qkv_layout,
         )
 
-    def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Build the query projection with Qwen2-MoE's optional QKV bias.
-
-        Overrides :meth:`UnifiedAttention._create_q_proj` so the query
-        ``ColumnParallelLinear`` honours ``config.qkv_bias`` (Qwen2-MoE
-        attaches a learned bias to all three projections, unlike the
-        Llama-style default which omits it).
-
-        Args:
-            config: Qwen2-MoE configuration.
-            dtype: Activation dtype.
-            param_dtype: Parameter dtype.
-            precision: JAX matmul precision.
-            rngs: Initializer RNGs.
-
-        Returns:
-            ColumnParallelLinear: Q projection mapping
-            ``hidden_size`` → ``num_attention_heads * head_dim``.
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=config.qkv_bias,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-        )
-
-    def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Build the key projection with Qwen2-MoE's optional QKV bias.
-
-        Overrides the default to thread ``config.qkv_bias`` through to
-        the ``ColumnParallelLinear``. Output dimension follows the GQA
-        contract ``num_key_value_heads * head_dim``.
-
-        Returns:
-            ColumnParallelLinear: K projection.
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=config.qkv_bias,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-        )
-
-    def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Build the value projection with Qwen2-MoE's optional QKV bias.
-
-        Mirrors :meth:`_create_k_proj` for the V projection so all three
-        QKV projections share a consistent bias setting.
-
-        Returns:
-            ColumnParallelLinear: V projection.
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=config.qkv_bias,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-        )
-
     def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
         """Build the output projection without bias.
 
@@ -427,9 +353,10 @@ class Qwen2MoeAttention(UnifiedAttention):
         Returns:
             RoPE module produced by ``config.get_basic_rope``.
         """
+        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
         return config.get_basic_rope(
-            head_size=config.hidden_size // config.num_attention_heads,
-            rotary_dim=config.hidden_size // config.num_attention_heads,
+            head_size=head_dim,
+            rotary_dim=head_dim,
             base=config.rope_theta,
             dtype=dtype,
         )
@@ -698,7 +625,7 @@ class Qwen2MoeDecoderLayer(spx.Module):
 
         feed_forward_input = self.post_attention_layernorm(hidden_states)
 
-        if self.config.num_experts > 0:
+        if isinstance(self.mlp, Qwen2MoeSparseBlock):
             feed_forward_hidden_states, router_logits = self.mlp(feed_forward_input)
         else:
             if self.config.use_scan_mlp:
@@ -949,7 +876,8 @@ class Qwen2MoeModel(EasyDeLBaseModule):
             if output_attentions:
                 all_self_attns += (layer_outputs.attention_weight,)
 
-            if output_router_logits:
+            # Dense layers (``mlp_only_layers`` / ``decoder_sparse_step``) have no router.
+            if output_router_logits and layer_outputs.router_logits is not None:
                 all_router_logits += (layer_outputs.router_logits,)
 
             cv = self._layer_cache_view_update(
@@ -1114,28 +1042,7 @@ class Qwen2MoeForCausalLM(BaseCausalLMModule[Qwen2MoeModel, Qwen2MoeConfig]):  #
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
-            aux_loss_fn=self._compute_aux_loss,
         )
-
-    def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute auxiliary load balancing loss from router logits.
-
-        Args:
-            outputs: Model outputs containing router_logits from MoE layers.
-            attention_mask: Attention mask to exclude padding tokens from loss computation.
-
-        Returns:
-            Optional auxiliary loss value for load balancing, or None if router_logits unavailable.
-        """
-        if outputs.router_logits is None or len(outputs.router_logits) == 0:
-            return None
-        aux_loss = auxiliary_load_balancing_loss_func(
-            gate_logits=outputs.router_logits,
-            num_experts=self.config.num_experts,
-            top_k=self.config.num_experts_per_tok,
-            attention_mask=attention_mask,
-        )
-        return aux_loss * self.config.router_aux_loss_coef
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Qwen2MoeConfig, model_type="qwen2_moe")
@@ -1184,6 +1091,7 @@ class Qwen2MoeForSequenceClassification(BaseSequenceClassificationModule[Qwen2Mo
             rngs=rngs,
             pooling_strategy="last",
             score_head_bias=False,
+            router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
     def forward(
@@ -1217,7 +1125,7 @@ class Qwen2MoeForSequenceClassification(BaseSequenceClassificationModule[Qwen2Mo
                 in classification). Defaults to None.
             cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None): Cache metadata
                 (ignored in classification). Defaults to None.
-            apply_lm_head (bool): Unused in classification. Defaults to True.
+            apply_lm_head (bool): Whether to apply the classification head. Defaults to True.
             output_attentions (bool | None): Whether to return attention weights. Defaults to None.
             output_hidden_states (bool | None): Whether to return hidden states. Defaults to None.
 
@@ -1228,8 +1136,30 @@ class Qwen2MoeForSequenceClassification(BaseSequenceClassificationModule[Qwen2Mo
                 - hidden_states (tuple[Array, ...] | None): All hidden states if output_hidden_states=True.
                 - attentions (tuple[Array, ...] | None): All attention weights if output_attentions=True.
         """
-        transformer_outputs = self.model(
+        if not apply_lm_head:
+            outputs = self.model(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                mask_info=mask_info,
+                position_ids=position_ids,
+                mode=mode,
+                past_key_values=past_key_values,
+                cache_metadata=cache_metadata,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+            )
+            return SequenceClassifierOutput(
+                logits=None,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                aux_loss=self.compute_router_aux_loss(outputs, attention_mask=attention_mask),
+            )
+        # Pooling (attention-mask aware), cache pass-through and the router aux loss live in the shared base forward.
+        return super().forward(
             input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             mask_info=mask_info,
             position_ids=position_ids,
@@ -1238,34 +1168,6 @@ class Qwen2MoeForSequenceClassification(BaseSequenceClassificationModule[Qwen2Mo
             cache_metadata=cache_metadata,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            inputs_embeds=inputs_embeds,
-        )
-
-        hidden_states = transformer_outputs.last_hidden_state
-        logits = self.score(hidden_states)
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]
-        else:
-            batch_size = inputs_embeds.shape[0]
-
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
-        else:
-            if input_ids is not None:
-                sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-            else:
-                sequence_lengths = -1
-
-        pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-        return SequenceClassifierOutput(
-            logits=pooled_logits,
-            past_key_values=past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
         )
 
     def get_encoder(self):

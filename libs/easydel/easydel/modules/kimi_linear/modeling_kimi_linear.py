@@ -55,7 +55,6 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
     AttentionLayerOutput,
     DecoderLayerOutput,
@@ -63,6 +62,7 @@ from easydel.infra.modeling_outputs import (
     MoeModelOutput,
 )
 from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info
+from easydel.infra.sharding import sharding_for_layout
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import (
     BaseMoeModule,
@@ -71,6 +71,7 @@ from easydel.layers import (
     Embed,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    RMSNorm,
     RMSNormGated,
     RowParallelLinear,
     RowParallelMoELinear,
@@ -99,17 +100,8 @@ from .kimi_linear_configuration import KimiLinearConfig
 logger = get_logger(__name__)
 
 
-class KimiRMSNorm(spx.Module):
-    """RMSNorm for Kimi Linear.
-
-    Standard RMSNorm implementation with configurable epsilon.
-
-    Attributes:
-        hidden_size: Dimension of the input features.
-        eps: Small constant for numerical stability.
-    """
-
-    kernel_init = staticmethod(jax.nn.initializers.ones)
+class KimiRMSNorm(RMSNorm):
+    """Backward-compatible Kimi norm API using the shared fp32-scale implementation."""
 
     def __init__(
         self,
@@ -120,37 +112,123 @@ class KimiRMSNorm(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
-        """Initialize KimiRMSNorm layer.
+        """Initialize the shared norm while preserving the original constructor.
 
         Args:
-            hidden_size (int): Dimension of the input features.
-            eps (float, optional): Small constant for numerical stability. Defaults to 1e-6.
+            hidden_size: Trailing feature dimension.
+            eps: Variance epsilon.
+            dtype: Compute dtype.
+            param_dtype: Weight storage dtype.
+            rngs: Random number generator state.
+        """
+        super().__init__(hidden_size, eps, dtype, param_dtype, fp32_scale=True, rngs=rngs)
+        self.hidden_size = hidden_size
+
+
+def _kimi_rms_norm(
+    dim: int,
+    config: KimiLinearConfig,
+    dtype: jnp.dtype,
+    param_dtype: jnp.dtype,
+    rngs: spx.Rngs,
+) -> RMSNorm:
+    """Build the shared :class:`RMSNorm` in Kimi's fp32 order.
+
+    Kimi computes the statistics and the ``weight *`` multiply in float32 and casts once at the end, which is
+    ``RMSNorm(fp32_scale=True)``. The parameter keeps the ``weight`` leaf name, so checkpoints are unchanged.
+
+    Args:
+        dim: Feature width to normalize.
+        config: Model configuration (supplies ``rms_norm_eps``).
+        dtype: Compute dtype.
+        param_dtype: Parameter storage dtype.
+        rngs: Random number generator state.
+
+    Returns:
+        The configured norm layer.
+    """
+    return RMSNorm(dim, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, fp32_scale=True, rngs=rngs)
+
+
+def _attn_res_stream(block_residuals: tuple[Array, ...], partial_block: Array | None) -> Array:
+    """Return the full residual stream implied by Attention-Residuals state.
+
+    Args:
+        block_residuals: Frozen block residuals (block 0 is the embedding output).
+        partial_block: The open partial block, or ``None`` directly after a block boundary.
+
+    Returns:
+        The sum of every block and the partial block, shape ``(batch, seq_len, hidden_dim)``.
+    """
+    total = block_residuals[0]
+    for residual in block_residuals[1:]:
+        total = total + residual
+    return total if partial_block is None else total + partial_block
+
+
+class KimiAttentionResidual(spx.Module):
+    """Attention-Residuals mixer: a softmax over RMS-normed residual candidates.
+
+    Instead of feeding a sublayer the plain running sum, every sublayer reads a learned, depth-wise softmax mix of
+    the stored block residuals and the current partial block. Candidate ``i`` (shape ``(batch, seq, hidden)``) is
+    scored by ``query . RMSNorm(candidate_i)`` with a single learned pseudo-query, and the weights are a softmax
+    over the candidate axis. The pseudo-query starts at zero, so the mix starts as a uniform average.
+
+    Attributes:
+        weight: Learned pseudo-query of shape ``(hidden_size,)``.
+        norm: RMSNorm applied to the candidates before scoring.
+    """
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize the mixer.
+
+        Args:
+            config (KimiLinearConfig): Model configuration.
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             rngs (spx.Rngs): Random number generator state.
         """
-        self.hidden_size = hidden_size
-        self.eps = eps
         self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.weight = spx.Parameter(
-            KimiRMSNorm.kernel_init(rngs.parameters, (hidden_size,), param_dtype),
+        self.weight = ArrayParam.bound(
+            shape=(config.hidden_size,),
+            dtype=param_dtype,
+            init_method="constant",
+            init_kwargs={"value": 0.0},
+            key=rngs.parameters,
+            # Like the norm's scale, the depth query is replicated on its owning stage,
+            # not left on the initializer's single default device in an MPMD model.
+            sharding=sharding_for_layout(common_types.Replicated),
         )
+        self.norm = _kimi_rms_norm(config.hidden_size, config, dtype, param_dtype, rngs)
 
-    def forward(self, hidden_states: Float[Array, "... hidden_size"]) -> Float[Array, "... hidden_size"]:
-        """Apply RMSNorm normalization.
+    def forward(
+        self, candidates: Float[Array, "num batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Mix the candidates with depth-wise softmax attention.
 
         Args:
-            hidden_states (Array): Input tensor of shape (..., hidden_size).
+            candidates (Array): Stacked residual candidates, shape ``(num, batch, seq_len, hidden_dim)``.
 
         Returns:
-            Array: Normalized tensor of the same shape as input.
+            Array: Mixed activation, shape ``(batch, seq_len, hidden_dim)``, in the candidates' dtype.
         """
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.astype(jnp.float32)
-        variance = jnp.mean(hidden_states**2, axis=-1, keepdims=True)
-        hidden_states = hidden_states * jax.lax.rsqrt(variance + self.eps)
-        return (self.weight.value * hidden_states).astype(input_dtype)
+        keys = self.norm(candidates).astype(jnp.float32)
+        query = self.weight.value.astype(jnp.float32)
+        quant_rule = spx.quantization.rule_for(self, "dot_general")
+        if quant_rule is not None:
+            query = spx.quantization.fake_quant(query, rule=quant_rule, contracting_axes=(0,), is_weight=True)
+            keys = spx.quantization.fake_quant(keys, rule=quant_rule, contracting_axes=(keys.ndim - 1,), is_weight=False)
+        logits = jnp.einsum("d,nbtd->nbt", query, keys)
+        alpha = jax.nn.softmax(logits, axis=0)
+        mixed = jnp.einsum("nbt,nbtd->btd", alpha, candidates.astype(jnp.float32))
+        return mixed.astype(candidates.dtype)
 
 
 SITU_ACTIVATION = "situ"
@@ -652,13 +730,7 @@ class KimiSparseMoeBlock(BaseMoeModule):
                 rngs=rngs,
             )
             self.routed_expert_norm = (
-                KimiRMSNorm(
-                    hidden_size=self.moe_hidden_size,
-                    eps=config.rms_norm_eps,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    rngs=rngs,
-                )
+                _kimi_rms_norm(self.moe_hidden_size, config, dtype, param_dtype, rngs)
                 if getattr(config, "latent_moe_use_norm", False)
                 else None
             )
@@ -845,121 +917,12 @@ class KimiMLAAttention(UnifiedAttention):
             precision (jax.lax.PrecisionLike): Numerical precision.
             rngs (spx.Rngs): Random number generator state.
         """
-
-        if not self.use_mla_lora:
-            setattr(
-                self,
-                self.projection_mapping["mla_q_proj"],
-                ColumnParallelLinear(
-                    config.hidden_size,
-                    config.num_attention_heads * self.q_head_dim,
-                    rngs=rngs,
-                    use_bias=False,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                    precision=precision,
-                ),
-            )
-        else:
-            setattr(
-                self,
-                self.projection_mapping["mla_q_a_proj"],
-                ColumnParallelLinear(
-                    config.hidden_size,
-                    config.q_lora_rank,
-                    rngs=rngs,
-                    use_bias=False,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                    precision=precision,
-                ),
-            )
-            setattr(
-                self,
-                self.projection_mapping["mla_q_a_layernorm"],
-                KimiRMSNorm(
-                    config.q_lora_rank,
-                    eps=config.rms_norm_eps,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    rngs=rngs,
-                ),
-            )
-            setattr(
-                self,
-                self.projection_mapping["mla_q_b_proj"],
-                ColumnParallelLinear(
-                    config.q_lora_rank,
-                    config.num_attention_heads * self.q_head_dim,
-                    rngs=rngs,
-                    use_bias=False,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                    precision=precision,
-                ),
-            )
-
-        setattr(
-            self,
-            self.projection_mapping["mla_kv_a_proj_with_mqa"],
-            ColumnParallelLinear(
-                config.hidden_size,
-                config.kv_lora_rank + config.qk_rope_head_dim,
-                rngs=rngs,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-        setattr(
-            self,
-            self.projection_mapping["mla_kv_a_layernorm"],
-            KimiRMSNorm(
-                config.kv_lora_rank,
-                eps=config.rms_norm_eps,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                rngs=rngs,
-            ),
-        )
-        setattr(
-            self,
-            self.projection_mapping["mla_kv_b_proj"],
-            ColumnParallelLinear(
-                config.kv_lora_rank,
-                config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
-                rngs=rngs,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-
-        setattr(
-            self,
-            self.projection_mapping["output_projection"],
-            RowParallelLinear(
-                config.num_attention_heads * config.v_head_dim,
-                config.hidden_size,
-                rngs=rngs,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-
-        self.rotary = self._create_rotary(config, dtype)
-
-        self.attention_performer = self._create_attention_performer(config, rngs)
+        self._build_mla_projections(config, dtype, param_dtype, precision, rngs)
+        # Keep the shared projections and checkpoint leaves, but use Kimi's fp32 multiply-then-cast norm order.
+        # Configure the existing norms rather than allocating replacements and advancing the initialization RNG.
+        if self.use_mla_lora:
+            getattr(self, self.projection_mapping["mla_q_a_layernorm"]).fp32_scale = True
+        getattr(self, self.projection_mapping["mla_kv_a_layernorm"]).fp32_scale = True
 
     def forward(
         self,
@@ -1096,7 +1059,6 @@ class KimiDeltaAttention(spx.Module):
         self.head_k_dim = linear_config.get("head_k_dim", head_dim)
         self.head_v_dim = linear_config.get("head_v_dim", head_dim)
         self.d_conv = linear_config.get("d_conv", linear_config.get("short_conv_kernel_size", 4))
-        self.expand_ratio = linear_config.get("expand_ratio", 1)
         self.gate_low_rank_dim = linear_config.get("gate_low_rank_dim", head_dim)
         self.chunk_size = linear_config.get("chunk_size", 64)
 
@@ -1387,6 +1349,9 @@ class KimiDeltaAttention(spx.Module):
             segment_ids=segment_ids,
             chunk_size=self.chunk_size,
             per_channel_decay=True,
+            # A dense cache carries memory from previous chunks. Keep the first
+            # live segment connected while preserving packed-training resets.
+            continue_initial_state=cache_view is not None,
         )
 
         output = kda_output.attention_outputs
@@ -1511,20 +1476,16 @@ class KimiDecoderLayer(spx.Module):
                 rngs=rngs,
             )
 
-        self.input_layernorm = KimiRMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
-        self.post_attention_layernorm = KimiRMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        self.input_layernorm = _kimi_rms_norm(config.hidden_size, config, dtype, param_dtype, rngs)
+        self.post_attention_layernorm = _kimi_rms_norm(config.hidden_size, config, dtype, param_dtype, rngs)
+
+        # Attention Residuals: one depth-wise mixer per sublayer input (attention, then feed-forward).
+        if config.attn_res_block_size is not None:
+            self.attn_res = KimiAttentionResidual(config, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+            self.mlp_res = KimiAttentionResidual(config, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        else:
+            self.attn_res = None
+            self.mlp_res = None
 
     def forward(
         self,
@@ -1537,6 +1498,7 @@ class KimiDecoderLayer(spx.Module):
         output_attentions: bool = False,
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        block_residuals: tuple[Array, ...] | None = None,
     ) -> DecoderLayerOutput:
         """Forward pass through the decoder layer.
 
@@ -1544,8 +1506,15 @@ class KimiDecoderLayer(spx.Module):
         Uses either MLA or KDA attention based on layer configuration, and either
         dense MLP or sparse MoE for the feedforward network.
 
+        With Attention Residuals (``config.attn_res_block_size`` set and ``block_residuals`` given) the layer is
+        pre-normalization over a depth-wise softmax mix instead of the plain stream: each sublayer reads
+        ``softmax-mix(block_residuals + [partial_block])`` and its output is added to ``partial_block``.
+
         Args:
-            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+            hidden_states (Array | None): Input tensor of shape (batch, seq_len, hidden_dim). With attention
+                residuals this is the current partial block, or ``None`` right after a block boundary.
+            block_residuals (tuple[Array, ...] | None, optional): Completed block residuals, each of shape
+                (batch, seq_len, hidden_dim). ``None`` selects the plain residual stream. Defaults to None.
             mask_info (MaskInfo | None): Attention mask information including causal masks.
             position_ids (Array): Position indices for tokens, shape (batch, seq_len).
             mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode) for optimization.
@@ -1564,7 +1533,12 @@ class KimiDecoderLayer(spx.Module):
             DecoderLayerOutput: Contains hidden states, attention weights, router logits,
                 and updated cache view.
         """
-        normed_hidden = self.input_layernorm(hidden_states)
+        use_attn_res = block_residuals is not None and self.attn_res is not None
+        partial_block = hidden_states
+        if use_attn_res:
+            normed_hidden = self.input_layernorm(self._mix_residuals(self.attn_res, block_residuals, partial_block))
+        else:
+            normed_hidden = self.input_layernorm(hidden_states)
 
         if self.is_kda_layer:
             attn_outputs = self.self_attn(
@@ -1589,9 +1563,15 @@ class KimiDecoderLayer(spx.Module):
         attn_weight = attn_outputs.attention_weight
         cache_view = attn_outputs.cache_view
 
-        hidden_states = checkpoint_name(hidden_states + attn_output, "residual")
-
-        feed_forward_input = self.post_attention_layernorm(hidden_states)
+        if use_attn_res:
+            partial_block = attn_output if partial_block is None else partial_block + attn_output
+            partial_block = checkpoint_name(partial_block, "residual")
+            feed_forward_input = self.post_attention_layernorm(
+                self._mix_residuals(self.mlp_res, block_residuals, partial_block)
+            )
+        else:
+            hidden_states = checkpoint_name(hidden_states + attn_output, "residual")
+            feed_forward_input = self.post_attention_layernorm(hidden_states)
 
         router_logits = None
         if self.is_moe_layer:
@@ -1605,7 +1585,10 @@ class KimiDecoderLayer(spx.Module):
         else:
             feed_forward_output = self.mlp(feed_forward_input)
 
-        hidden_states = checkpoint_name(hidden_states + feed_forward_output, "residual")
+        if use_attn_res:
+            hidden_states = checkpoint_name(partial_block + feed_forward_output, "residual")
+        else:
+            hidden_states = checkpoint_name(hidden_states + feed_forward_output, "residual")
 
         return DecoderLayerOutput(
             hidden_states=checkpoint_name(hidden_states, "layer_output"),
@@ -1613,6 +1596,25 @@ class KimiDecoderLayer(spx.Module):
             router_logits=router_logits if output_router_logits else None,
             cache_view=cache_view,
         )
+
+    @staticmethod
+    def _mix_residuals(
+        mixer: "KimiAttentionResidual",
+        block_residuals: tuple[Array, ...],
+        partial_block: Array | None,
+    ) -> Array:
+        """Softmax-mix the stored block residuals with the current partial block.
+
+        Args:
+            mixer: The sublayer's :class:`KimiAttentionResidual`.
+            block_residuals: Completed block residuals.
+            partial_block: Current partial block, or ``None`` directly after a block boundary.
+
+        Returns:
+            Mixed activation of shape (batch, seq_len, hidden_dim).
+        """
+        candidates = block_residuals if partial_block is None else (*block_residuals, partial_block)
+        return mixer(jnp.stack(candidates, axis=0))
 
 
 #: Moonshot's published Kimi-Linear keys keep MoE layers under ``block_sparse_moe`` with per-expert ``w1``/``w3``/``w2``
@@ -1756,13 +1758,7 @@ class KimiLinearModel(EasyDeLBaseModule):
 
         final_layer_idx = max(0, config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
-            self.norm = KimiRMSNorm(
-                config.hidden_size,
-                eps=config.rms_norm_eps,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                rngs=rngs,
-            )
+            self.norm = _kimi_rms_norm(config.hidden_size, config, dtype, param_dtype, rngs)
 
     @cached_property
     def frequencies(self):
@@ -1888,14 +1884,23 @@ class KimiLinearModel(EasyDeLBaseModule):
         needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
         # Router-logit aggregation grows a Python tuple per layer, which
         # lax.scan cannot carry — collecting it forces the trace path too.
+        # Attention Residuals grow a per-block residual list as layers run, which lax.scan cannot carry either.
+        attn_res_block_size = self.config.attn_res_block_size
+        use_attn_res = attn_res_block_size is not None
         trace_layers = self._layer_scan_trace(
             False,
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache or bool(output_router_logits),
+            extra=needs_trace_cache or bool(output_router_logits) or use_attn_res,
         )
         cache_views = views if trace_layers else None
+        if use_attn_res:
+            # Keep every live candidate in the leading activation carry. ModuleList.scan moves only that
+            # array onto each layer's stage mesh in eager MPMD; a separate residual tuple would stay behind.
+            # Block 0 is the embedding output. The layer index identifies whether the last candidate is
+            # an open partial block, so no placeholder array is needed at block boundaries.
+            hidden_states = hidden_states[None, ...]
         # Hoisted out of the loop body: the caching property must not be
         # first materialized inside the lax.scan trace (tracer leak).
         frequencies = self.frequencies
@@ -1906,19 +1911,31 @@ class KimiLinearModel(EasyDeLBaseModule):
             Each ``block`` may be either an MLA full-attention or a KDA
             linear-attention decoder layer; the per-layer cache view returned
             by :meth:`_layer_cache_view_at` adapts to the layer kind via
-            :class:`HybridCache`. The carry threads hidden states, the cache
+            :class:`HybridCache`. The leading carry array contains hidden states, or every live residual
+            candidate stacked along a new leading axis when Attention Residuals are enabled. This keeps eager
+            stage placement and compiled stage transfers aligned. The other carry items are the cache
             view ``cv``, optional ``all_hidden_states`` / ``all_attentions``
             tuples, MoE router logits (when ``output_router_logits`` is
             set), and the layer index. Returns the updated carry for the
             next iteration.
             """
             hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
+            block_residuals = None
+            if use_attn_res:
+                candidates = tuple(hidden_states[i] for i in range(hidden_states.shape[0]))
+                if int(idx) % attn_res_block_size == 0:
+                    block_residuals, hidden_states = candidates, None
+                else:
+                    block_residuals, hidden_states = candidates[:-1], candidates[-1]
             if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+                all_hidden_states += (
+                    _attn_res_stream(block_residuals, hidden_states) if use_attn_res else hidden_states,
+                )
 
             with self._layer_stage_context(idx, layers=self.layers):
                 layer_outputs = block(
                     hidden_states=hidden_states,
+                    block_residuals=block_residuals,
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
@@ -1929,7 +1946,15 @@ class KimiLinearModel(EasyDeLBaseModule):
                     frequencies=frequencies,
                 )
 
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            if use_attn_res:
+                # Freeze the partial block implicitly at a block boundary: the next layer then treats every
+                # entry as completed. Otherwise it splits off the last entry as the still-open partial block.
+                hidden_states = jnp.stack((*block_residuals, layer_outputs.hidden_states), axis=0)
+                # Transfer the entire packed state in compiled MPMD too. Wrap it so the boundary helper does
+                # not apply a rank-three hidden-state sharding contract to this rank-four candidate stack.
+                hidden_states = self._mark_layer_stage_boundary((hidden_states,), idx, layers=self.layers)[0]
+            else:
+                hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
@@ -1952,7 +1977,12 @@ class KimiLinearModel(EasyDeLBaseModule):
             (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
             trace=trace_layers,
         )
+        if use_attn_res:
+            # The model output is the full residual stream: every frozen block plus the open partial block.
+            hidden_states = _attn_res_stream(tuple(hidden_states[i] for i in range(hidden_states.shape[0])), None)
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
 
         return MoeModelOutput(
             last_hidden_state=hidden_states,
@@ -2048,7 +2078,8 @@ class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig
             precision=precision,
             rngs=rngs,
             lm_head_bias=False,
-            router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
+            # Kimi configs usually carry no coefficient; default to 0.001.
+            router_aux_loss_coef=getattr(config, "router_aux_loss_coef", 0.001),
         )
 
     def forward(
@@ -2114,32 +2145,11 @@ class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
-            aux_loss_fn=self._compute_aux_loss,
         )
 
-    def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute auxiliary loss from router logits for MoE load balancing.
-
-        Calculates the auxiliary load balancing loss to encourage uniform
-        expert utilization across the MoE layers.
-
-        Args:
-            outputs: Model outputs containing router_logits from MoE layers.
-            attention_mask: Attention mask to exclude padding tokens from loss.
-
-        Returns:
-            Array | None: Auxiliary loss value, or None if no router logits available.
-        """
-        if outputs.router_logits is None or len(outputs.router_logits) == 0:
-            return None
-        aux_loss = auxiliary_load_balancing_loss_func(
-            gate_logits=outputs.router_logits,
-            num_experts=self.config.num_experts,
-            top_k=self.config.num_experts_per_token,
-            attention_mask=attention_mask,
-        )
-        router_aux_loss_coef = getattr(self.config, "router_aux_loss_coef", 0.001)
-        return aux_loss * router_aux_loss_coef
+    def _router_top_k(self) -> int:
+        """Kimi's config names the routing width ``num_experts_per_token``."""
+        return self.config.num_experts_per_token
 
 
 __all__ = [

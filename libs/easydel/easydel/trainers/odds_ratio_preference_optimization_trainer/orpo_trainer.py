@@ -22,7 +22,6 @@ preference-pair data collators and the JIT-compiled step in ``_fn``.
 from __future__ import annotations
 
 import typing as tp
-from collections import defaultdict
 from functools import partial
 
 from eformer.loggings import get_logger
@@ -171,8 +170,6 @@ class ORPOTrainer(Trainer):
             if data_collator is None
             else data_collator
         )
-
-        self._stored_metrics = defaultdict(lambda: defaultdict(list))
 
         model = self._resolve_policy_model(model)
         if not isinstance(model, EasyDeLState):

@@ -32,7 +32,7 @@ Exports:
 """
 
 from functools import cached_property
-from typing import ClassVar, cast
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -173,81 +173,6 @@ class GPTJAttention(UnifiedAttention):
             softmax_scale=self.head_dim**-0.5,
         )
 
-    def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Create query projection layer.
-
-        Args:
-            config: Model configuration with hidden_size and num_attention_heads.
-            dtype: Data type for computations.
-            param_dtype: Data type for parameters.
-            precision: JAX precision setting.
-            rngs: Random number generators.
-
-        Returns:
-            ColumnParallelLinear layer projecting from hidden_size to
-            num_attention_heads * head_dim.
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            use_bias=False,
-            dtype=dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-    def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Create key projection layer.
-
-        Args:
-            config: Model configuration with hidden_size.
-            dtype: Data type for computations.
-            param_dtype: Data type for parameters.
-            precision: JAX precision setting.
-            rngs: Random number generators.
-
-        Returns:
-            ColumnParallelLinear layer projecting from hidden_size to
-            num_key_value_heads * head_dim.
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            use_bias=False,
-            dtype=dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-    def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Create value projection layer.
-
-        Args:
-            config: Model configuration with hidden_size.
-            dtype: Data type for computations.
-            param_dtype: Data type for parameters.
-            precision: JAX precision setting.
-            rngs: Random number generators.
-
-        Returns:
-            ColumnParallelLinear layer projecting from hidden_size to
-            num_key_value_heads * head_dim.
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            use_bias=False,
-            dtype=dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
     def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
         """Create output projection layer.
 
@@ -301,30 +226,6 @@ class GPTJAttention(UnifiedAttention):
 
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
 
-    def _split_heads(self, hidden_states):
-        """Split hidden states into separate attention heads.
-
-        Args:
-            hidden_states: Input tensor with shape (batch, seq_len, num_heads * head_dim).
-
-        Returns:
-            Tensor reshaped to (batch, seq_len, num_heads, head_dim).
-        """
-        return hidden_states.reshape((*hidden_states.shape[:2], self.config.num_attention_heads, self.head_dim))
-
-    def _get_output_proj(self, attn_output: Array) -> Array:
-        """Apply output projection with checkpoint naming and residual dropout.
-
-        Args:
-            attn_output: Attention output with shape (batch, seq_len, hidden_size).
-
-        Returns:
-            Projected output after applying dropout, with shape (batch, seq_len, hidden_size).
-        """
-        attn_output = checkpoint_name(self.out_proj(attn_output), "attn_output")
-        attn_output = self.shard_attention_prod(attn_output)
-        return cast(Array, self.resid_dropout(attn_output))
-
 
 class GPTJMLP(spx.Module):
     """GPT-J MLP module.
@@ -372,7 +273,7 @@ class GPTJMLP(spx.Module):
             embed_dim,
             intermediate_size,
             dtype=dtype,
-            param_dtype=dtype,
+            param_dtype=param_dtype,
             precision=precision,
             kernel_init=kernel_init,
             rngs=rngs,
@@ -381,7 +282,7 @@ class GPTJMLP(spx.Module):
             intermediate_size,
             embed_dim,
             dtype=dtype,
-            param_dtype=dtype,
+            param_dtype=param_dtype,
             precision=precision,
             kernel_init=kernel_init,
             rngs=rngs,
@@ -464,7 +365,7 @@ class GPTJBlock(spx.Module):
             self.config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             dtype=dtype,
-            param_dtype=dtype,
+            param_dtype=param_dtype,
             rngs=rngs,
         )
 
@@ -472,7 +373,7 @@ class GPTJBlock(spx.Module):
             config,
             layer_idx=layer_idx,
             dtype=dtype,
-            param_dtype=dtype,
+            param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
         )
@@ -481,7 +382,7 @@ class GPTJBlock(spx.Module):
             config,
             inner_dim,
             dtype=dtype,
-            param_dtype=dtype,
+            param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
         )
@@ -737,7 +638,7 @@ class GPTJModel(EasyDeLBaseModule):
         if past_key_values is None:
             past_key_values = TransformerCache.init_empty(len(self.h))
 
-        hidden_states = self.dropout(inputs_embeds)
+        hidden_states = self.dropout(hidden_states)
 
         views = past_key_values.views if past_key_values is not None else None
         has_cache_views = views is not None and any(v is not None for v in views)

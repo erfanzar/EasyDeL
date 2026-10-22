@@ -55,7 +55,7 @@ from easydel.infra.modeling_outputs import ModelOutput, VLMCausalLMOutput
 from easydel.infra.utils import ACT2FN
 from easydel.layers import RowParallelLinear
 from easydel.layers.norms import LayerNorm
-from easydel.modules._base import BaseVisionLanguageModule
+from easydel.modules._base import BaseVisionLanguageModule, pixel_unshuffle_grid
 from easydel.modules.auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
 
 from .aya_vision_configuration import AyaVisionConfig
@@ -240,28 +240,8 @@ class AyaVisionMultiModalProjector(spx.Module):
         """
         batch_size, seq_length, _ = image_features.shape
         height = width = int(seq_length**0.5)
-        image_features = image_features.reshape(
-            image_features.shape[0],
-            width,
-            height,
-            -1,
-        )
-        channels = image_features.shape[-1]
-        image_features = image_features.reshape(
-            batch_size,
-            width,
-            int(height / self.downsample_factor),
-            int(channels * self.downsample_factor),
-        )
-        image_features = jnp.transpose(image_features, (0, 2, 1, 3))
-        image_features = image_features.reshape(
-            batch_size,
-            int(height / self.downsample_factor),
-            int(width / self.downsample_factor),
-            -1,
-        )
-        image_features = jnp.transpose(image_features, (0, 2, 1, 3))
-        return image_features
+        grid = image_features.reshape(batch_size, width, height, -1)
+        return pixel_unshuffle_grid(grid, int(width / self.downsample_factor), int(height / self.downsample_factor))
 
 
 @register_module(TaskType.BASE_VISION, config=AyaVisionConfig, model_type="aya_vision")

@@ -19,123 +19,9 @@ from collections.abc import Mapping
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+from easydel.modules.qwen3_5.rope_utils import normalize_rope_scaling_for_mrope
 from easydel.modules.qwen3_next.qwen3_next_configuration import Qwen3NextConfig
 from easydel.modules.qwen3_vl_moe.qwen3_vl_moe_configuration import Qwen3VLMoeVisionConfig
-
-
-def _hf_supports_mrope_rope_type() -> bool:
-    """Probe whether the installed transformers exposes the ``"mrope"`` validator.
-
-    Mirrors the helper of the same name in ``qwen3_5_configuration``;
-    multimodal RoPE was added to ``modeling_rope_utils`` after the
-    initial Qwen2-VL release, so older transformers installations do
-    not accept ``rope_type="mrope"`` during validation.
-
-    Returns:
-        ``True`` iff ``transformers`` ships an mRoPE validator;
-        ``False`` if the import fails or the entry is missing.
-    """
-    try:
-        from transformers import modeling_rope_utils
-    except Exception:
-        return False
-
-    validators = getattr(modeling_rope_utils, "ROPE_VALIDATION_FUNCTIONS", None)
-    return isinstance(validators, Mapping) and "mrope" in validators
-
-
-def _normalize_rope_scaling_for_mrope(rope_scaling: dict | None) -> dict | None:
-    """Patch a Qwen3.5-MoE ``rope_scaling`` dict for HF cross-version use.
-
-    See :func:`qwen3_5_configuration._normalize_rope_scaling_for_mrope`
-    for the rationale: when mRoPE-specific keys are present but no
-    explicit ``rope_type`` is set, this helper picks ``"mrope"`` on
-    modern transformers and falls back to ``"default"`` on older
-    ones, so config validation succeeds in both cases.
-
-    Returns:
-        A new dict with normalised keys, the original mapping
-        unchanged when no mRoPE keys are present, or ``None`` when
-        the input was ``None``.
-    """
-    if not isinstance(rope_scaling, dict):
-        return rope_scaling
-    normalized = dict(rope_scaling)
-    has_mrope_keys = "mrope_section" in normalized or "mrope_interleaved" in normalized
-    if has_mrope_keys:
-        rope_type = normalized.get("rope_type", normalized.get("type"))
-        if rope_type in (None, "default", "mrope"):
-            target_rope_type = "mrope" if _hf_supports_mrope_rope_type() else "default"
-            normalized["rope_type"] = target_rope_type
-            normalized["type"] = target_rope_type
-    return normalized
-
-
-def _patch_hf_qwen3_5_moe_load_balancing_loss() -> None:
-    """Monkey-patch the HF ``load_balancing_loss_func`` for Qwen3.5-MoE.
-
-    Some HuggingFace revisions contain shape regressions in the auxiliary
-    load-balancing loss when an attention mask is supplied.  This patch wraps
-    the original function with a try/except fallback that retries without the
-    mask and, as a last resort, returns a zero-valued loss tensor.
-
-    The patch is idempotent: it marks the replacement with a
-    ``_easydel_qwen3_5_moe_lb_patch`` flag and skips if already applied.
-    """
-    try:
-        from transformers.utils import is_torch_available
-
-        if not is_torch_available():
-            return
-        from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf_qwen3_5_moe
-    except Exception:
-        return
-
-    original_fn = getattr(hf_qwen3_5_moe, "load_balancing_loss_func", None)
-    if original_fn is None or getattr(original_fn, "_easydel_qwen3_5_moe_lb_patch", False):
-        return
-
-    def _patched_load_balancing_loss_func(
-        gate_logits,
-        num_experts=None,
-        top_k=2,
-        attention_mask=None,
-    ):
-        """HF-compatible Qwen3.5-MoE load-balancing loss with mask-shape guard.
-
-        Wraps :func:`hf_qwen3_5_moe.load_balancing_loss_func` to recover
-        from an upstream regression where some HF snapshots compute an
-        invalid expert attention-mask shape on small synthetic inputs.
-        On the second ``RuntimeError`` it returns ``0.0`` instead.
-        """
-        try:
-            return original_fn(
-                gate_logits=gate_logits,
-                num_experts=num_experts,
-                top_k=top_k,
-                attention_mask=attention_mask,
-            )
-        except RuntimeError:
-            try:
-                return original_fn(
-                    gate_logits=gate_logits,
-                    num_experts=num_experts,
-                    top_k=top_k,
-                    attention_mask=None,
-                )
-            except RuntimeError:
-                import torch
-
-                compute_device = None
-                if isinstance(gate_logits, tuple) and len(gate_logits) > 0:
-                    compute_device = gate_logits[0].device
-                return torch.tensor(0.0, device=compute_device)
-
-    _patched_load_balancing_loss_func._easydel_qwen3_5_moe_lb_patch = True  # type: ignore[attr-defined]
-    hf_qwen3_5_moe.load_balancing_loss_func = _patched_load_balancing_loss_func
-
-
-_patch_hf_qwen3_5_moe_load_balancing_loss()
 
 
 @register_config("qwen3_5_moe_text")
@@ -253,7 +139,7 @@ class Qwen3_5MoeTextConfig(Qwen3NextConfig):
 
         See class docstring for detailed parameter descriptions.
         """
-        rope_scaling = _normalize_rope_scaling_for_mrope(rope_scaling or rope_parameters)
+        rope_scaling = normalize_rope_scaling_for_mrope(rope_scaling or rope_parameters)
         if rope_theta is None and isinstance(rope_scaling, dict):
             rope_theta = rope_scaling.get("rope_theta")
         if rope_theta is None:

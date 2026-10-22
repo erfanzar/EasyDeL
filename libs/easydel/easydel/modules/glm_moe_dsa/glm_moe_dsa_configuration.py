@@ -24,65 +24,16 @@ GLM-MoE-DSA is a decoder-only LLM that combines:
 - A grouped top-k Mixture-of-Experts FFN with shared experts following a
   dense-to-sparse layer schedule (``mlp_layer_types``).
 
-This module exposes :class:`GlmMoeDsaConfig` and a
-:func:`_rope_scaling_from_rope_parameters` helper for normalising HF
-RoPE configuration mappings.
+This module exposes :class:`GlmMoeDsaConfig`. HF ``rope_parameters`` /
+``rope_scaling`` normalisation is shared with the other GLM families via
+:func:`~easydel.layers.rotary.rope_scaling_from_rope_parameters`.
 """
 
-import typing
 import typing as tp
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
-
-
-def _rope_scaling_from_rope_parameters(
-    rope_parameters: dict[str, typing.Any] | None,
-    rope_scaling: dict[str, typing.Any] | None,
-) -> dict[str, typing.Any] | None:
-    """Convert ``rope_parameters`` or ``rope_scaling`` dict into a normalised rope-scaling dict.
-
-    HuggingFace checkpoints may store the rope configuration under either
-    ``rope_scaling`` (older) or ``rope_parameters`` (newer).  This helper
-    normalises both representations into a single ``rope_scaling`` dict that
-    the rest of the code can consume.
-
-    Args:
-        rope_parameters: Newer-style rope configuration dict (may be ``None``).
-        rope_scaling: Legacy rope scaling dict (takes precedence if provided).
-
-    Returns:
-        A normalised rope-scaling dict, or ``None`` when neither input is set.
-    """
-    if rope_scaling is not None:
-        if "type" in rope_scaling and "rope_type" not in rope_scaling:
-            rope_scaling = dict(rope_scaling)
-            rope_scaling["rope_type"] = rope_scaling["type"]
-        return rope_scaling
-
-    if rope_parameters is None:
-        return None
-
-    rope_scaling_out: dict[str, typing.Any] = {
-        "rope_type": rope_parameters.get("rope_type", "default"),
-    }
-    for key in (
-        "factor",
-        "original_max_position_embeddings",
-        "low_freq_factor",
-        "high_freq_factor",
-        "short_factor",
-        "long_factor",
-        "beta_fast",
-        "beta_slow",
-        "extrapolation_factor",
-        "attn_factor",
-        "mscale",
-        "mscale_all_dim",
-    ):
-        if key in rope_parameters:
-            rope_scaling_out[key] = rope_parameters[key]
-    return rope_scaling_out
+from easydel.layers.rotary import rope_scaling_from_rope_parameters
 
 
 @register_config("glm_moe_dsa")
@@ -153,6 +104,10 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
         index_n_heads (`int`, *optional*, defaults to 32):
             Number of heads in the sparse attention indexer (auto-calculated as
             ``num_attention_heads // 2`` when ``None``).
+        indexer_aux_loss_coef (`float`, *optional*, defaults to 0.0):
+            Nonnegative weight of the indexer KL warm-up loss. Positive values train
+            full-layer indexers from detached dense MLA attention targets on stateless
+            forwards only. Zero disables the auxiliary computation entirely.
         indexer_rope_interleave (`bool`, *optional*, defaults to ``True``):
             Whether to use interleaved RoPE layout for the indexer (``True``
             in GLM-MoE-DSA checkpoints and the HF implementation).
@@ -217,13 +172,14 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
         pretraining_tp: int = 1,
         tie_word_embeddings: bool = False,
         rope_theta: float | None = None,
-        rope_parameters: dict[str, typing.Any] | None = None,
-        rope_scaling: dict[str, typing.Any] | None = None,
+        rope_parameters: dict[str, tp.Any] | None = None,
+        rope_scaling: dict[str, tp.Any] | None = None,
         rope_interleave: bool = True,
         index_topk: int = 2048,
         index_head_dim: int = 128,
         index_n_heads: int | None = 32,
         indexer_rope_interleave: bool = True,
+        indexer_aux_loss_coef: float = 0.0,
         indexer_types: list[str] | None = None,
         index_topk_pattern: str | list[str] | None = None,
         index_topk_freq: int = 1,
@@ -272,7 +228,7 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
             rope_theta: RoPE base frequency. Falls back to
                 ``rope_parameters["rope_theta"]`` and finally ``10000.0``.
             rope_parameters: HF-style RoPE parameters (merged via
-                :func:`_rope_scaling_from_rope_parameters`).
+                :func:`~easydel.layers.rotary.rope_scaling_from_rope_parameters`).
             rope_scaling: EasyDeL-flavoured RoPE scaling dict.
             rope_interleave: Whether main attention uses interleaved RoPE.
             index_topk: Number of cached tokens the DSA indexer selects
@@ -282,6 +238,8 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
                 to ``num_attention_heads // 2`` when ``None``.
             indexer_rope_interleave: Whether the DSA indexer uses
                 interleaved RoPE.
+            indexer_aux_loss_coef: Nonnegative indexer KL warm-up weight;
+                zero disables it, and cached forwards never compute it.
             indexer_types: Optional per-layer ``"full"``/``"shared"``
                 indexer schedule; ``"full"`` layers run their own DSA
                 indexer, ``"shared"`` layers reuse the previous full
@@ -308,8 +266,11 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
             ValueError: If ``n_routed_experts`` is not divisible by
                 ``n_group``, if ``mlp_layer_types`` or ``indexer_types``
                 length disagrees with ``num_hidden_layers``, or if either
-                contains an unknown entry.
+                contains an unknown entry, or ``indexer_aux_loss_coef`` is negative.
         """
+        if not indexer_aux_loss_coef >= 0.0:
+            raise ValueError("indexer_aux_loss_coef must be >= 0.")
+        self.indexer_aux_loss_coef = float(indexer_aux_loss_coef)
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -344,7 +305,7 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
         self.index_head_dim = index_head_dim
         self.index_n_heads = index_n_heads if index_n_heads is not None else max(1, num_attention_heads // 2)
         self.indexer_rope_interleave = indexer_rope_interleave
-        self.rope_scaling = _rope_scaling_from_rope_parameters(rope_parameters, rope_scaling)
+        self.rope_scaling = rope_scaling_from_rope_parameters(rope_parameters, rope_scaling)
 
         if rope_theta is None and rope_parameters is not None:
             rope_theta = rope_parameters.get("rope_theta", 10000.0)

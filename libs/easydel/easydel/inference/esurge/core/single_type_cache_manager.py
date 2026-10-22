@@ -145,6 +145,14 @@ class SingleTypeCacheManager(ABC):
                 attempt and must be detached after allocation failure.
         """
         if not new_computed_pages:
+            # ``save_new_computed_pages`` registers ``num_cached_page[request_id] = 0`` and an empty
+            # ``req_to_pages`` entry even when no pages were attached. If the allocation then failed
+            # and the request holds no pages, drop that registration so a retry that finds prefix
+            # hits is treated as a first attach instead of tripping the "already registered" assert.
+            if not self.req_to_pages.get(request_id):
+                self.req_to_pages.pop(request_id, None)
+                if not self.num_cached_page.get(request_id):
+                    self.num_cached_page.pop(request_id, None)
             return
 
         req_pages = self.req_to_pages.get(request_id)
@@ -696,7 +704,7 @@ class ChunkedLocalAttentionManager(SingleTypeCacheManager):
             kv_cache_group_ids: The ids of the kv cache groups.
             page_pool: The page pool.
             kv_cache_spec: The kv cache spec.
-            use_eagle: Whether to use eagle (must be ``False`` here).
+            use_eagle: Reserve one hit page for EAGLE hidden-state recomputation.
             dp_shard_hint: Optional DP shard hint used to constrain cache
                 hits to shard-local page IDs.
             data_parallel_size: Total number of DP shards.
@@ -706,38 +714,44 @@ class ChunkedLocalAttentionManager(SingleTypeCacheManager):
             out-of-window positions filled by ``null_page``.
 
         Raises:
-            AssertionError: If the spec is not :class:`ChunkedLocalAttentionSpec`
-                or if ``use_eagle`` is True (unsupported combination).
+            AssertionError: If the spec is not :class:`ChunkedLocalAttentionSpec`.
         """
         assert isinstance(kv_cache_spec, ChunkedLocalAttentionSpec), (
             "ChunkedLocalAttentionManager can only be used for " + "chunked local attention groups"
         )
-        assert use_eagle is False, "Hybrid KV cache is not supported for " + "eagle + chunked local attention."
-        max_num_pages = max_length // kv_cache_spec.page_size
-        if max_length > 0:
-            local_attention_start_idx = (
-                max_length // kv_cache_spec.attention_chunk_size * kv_cache_spec.attention_chunk_size
+        page_size = kv_cache_spec.page_size
+        endpoint = min(max_length // page_size, len(page_hashes)) * page_size
+        reserve_eagle_page = use_eagle
+        while True:
+            # The next executed token is at the page-aligned endpoint, not
+            # max_length. An unaligned chunk boundary can lie between them.
+            chunk_start = endpoint // kv_cache_spec.attention_chunk_size * kv_cache_spec.attention_chunk_size
+            start_page = chunk_start // page_size
+            computed_pages: tuple[list[CachePage], ...] = tuple(
+                [page_pool.null_page] * start_page for _ in kv_cache_group_ids
             )
-        else:
-            local_attention_start_idx = 0
-
-        local_attention_start_page_idx = local_attention_start_idx // kv_cache_spec.page_size
-        computed_pages: tuple[list[CachePage], ...] = tuple(
-            [page_pool.null_page] * local_attention_start_page_idx for _ in range(len(kv_cache_group_ids))
-        )
-        for i in range(local_attention_start_page_idx, max_num_pages):
-            page_hash = page_hashes[i]
-            if cached_page := page_pool.get_cached_page(
-                page_hash,
-                kv_cache_group_ids,
-                dp_shard_hint=dp_shard_hint,
-                data_parallel_size=data_parallel_size,
-            ):
-                for computed, cached in zip(computed_pages, cached_page, strict=False):
+            for i in range(start_page, endpoint // page_size):
+                cached_page = page_pool.get_cached_page(
+                    page_hashes[i],
+                    kv_cache_group_ids,
+                    dp_shard_hint=dp_shard_hint,
+                    data_parallel_size=data_parallel_size,
+                )
+                if cached_page is None:
+                    break
+                for computed, cached in zip(computed_pages, cached_page, strict=True):
                     computed.append(cached)
-            else:
-                break
-        return computed_pages
+            hit_length = len(computed_pages[0]) * page_size
+            if hit_length != endpoint:
+                # A miss can move the next token into an earlier chunk; pages
+                # previously represented by nulls must then be looked up.
+                endpoint = hit_length
+                continue
+            if reserve_eagle_page and endpoint:
+                reserve_eagle_page = False
+                endpoint -= page_size
+                continue
+            return computed_pages
 
     def remove_skipped_pages(self, request_id: str, num_computed_tokens: int) -> None:
         """Remove pages outside the current attention chunk.

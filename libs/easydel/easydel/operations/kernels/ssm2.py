@@ -114,7 +114,7 @@ def _single_step_ssm2_fwd(
     return y, ssm_state_new
 
 
-def _packed_ssm2_fwd(
+def packed_ssm2_fwd(
     x: Float[Array, "slots width num_heads head_dim"],
     A_real: Float[Array, "num_heads"],
     B: Float[Array, "slots width n_groups ssm_state_size"],
@@ -125,7 +125,22 @@ def _packed_ssm2_fwd(
     ssm_state: Float[Array, "slots num_heads head_dim ssm_state_size"],
     n_groups: int = 1,
 ) -> tuple[Float[Array, "slots width num_heads head_dim"], Float[Array, "slots num_heads head_dim ssm_state_size"]]:
-    """Run SSM2 over slot-major packed grids, leaving state unchanged in padding cells."""
+    """Run SSM2 over slot-major packed grids, leaving padding states unchanged.
+
+    Args:
+        x: Inputs [slots, width, num_heads, head_dim].
+        A_real: Negative real transition coefficients [num_heads].
+        B: Input coefficients [slots, width, n_groups, state_size].
+        C: Output coefficients [slots, width, n_groups, state_size].
+        D: Skip coefficients [num_heads].
+        dt: Positive time steps [slots, width, num_heads].
+        valid: Boolean validity mask [slots, width].
+        ssm_state: Initial states [slots, num_heads, head_dim, state_size].
+        n_groups: Number of coefficient groups; must divide num_heads.
+
+    Returns:
+        Outputs in the input layout, zero at invalid cells, and final float32 states.
+    """
 
     def step(state, values):
         x_t, b_t, c_t, dt_t, is_valid = values
@@ -142,6 +157,10 @@ def _packed_ssm2_fwd(
     return outputs.swapaxes(0, 1), final_state
 
 
+# Compatibility for existing model callers; new callers use the public helper.
+_packed_ssm2_fwd = packed_ssm2_fwd
+
+
 def _segmented_ssm2_fwd(
     x: Float[Array, "batch seq_len num_heads head_dim"],
     A_real: Float[Array, "num_heads"],
@@ -154,7 +173,11 @@ def _segmented_ssm2_fwd(
     ssm_state: Float[Array, "batch num_heads head_dim ssm_state_size"] | None = None,
     n_groups: int = 1,
 ) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim ssm_state_size"]]:
-    """Reference SSM2 scan that resets recurrent state at packed boundaries."""
+    """Continue the first document's state, resetting only subsequent packed runs.
+
+    Padding emits zero and preserves state. Interior padding separates runs,
+    whereas leading padding must not discard a supplied continuation state.
+    """
     batch_size, seq_len, num_heads, head_dim = x.shape
     state_size = B.shape[-1]
     segment_ids = normalize_packed_segment_ids(segment_ids, seq_len, pad_from_last=False)
@@ -163,12 +186,13 @@ def _segmented_ssm2_fwd(
     else:
         ssm_state = ssm_state.astype(jnp.float32)
     previous_segment = jnp.full((batch_size,), -1, dtype=segment_ids.dtype)
+    seen_valid = jnp.zeros((batch_size,), dtype=jnp.bool_)
 
     def _step(carry, step_inputs):
-        state, prev_segment = carry
+        state, prev_segment, seen = carry
         x_t, b_t, c_t, dt_t, segment_t = step_inputs
         valid = segment_t >= 0
-        new_segment = valid & (segment_t != prev_segment)
+        new_segment = valid & seen & (segment_t != prev_segment)
         state = jnp.where(new_segment[:, None, None, None], jnp.zeros_like(state), state)
         y_t, next_state = _single_step_ssm2_fwd(
             x=x_t,
@@ -181,13 +205,13 @@ def _segmented_ssm2_fwd(
             n_groups=n_groups,
         )
         y_t = jnp.where(valid[:, None, None], y_t, jnp.zeros_like(y_t))
-        next_state = jnp.where(valid[:, None, None, None], next_state, jnp.zeros_like(next_state))
+        next_state = jnp.where(valid[:, None, None, None], next_state, state)
         next_segment = jnp.where(valid, segment_t, -1)
-        return (next_state, next_segment), y_t
+        return (next_state, next_segment, seen | valid), y_t
 
-    (final_state, _), outputs = jax.lax.scan(
+    (final_state, _, _), outputs = jax.lax.scan(
         _step,
-        (ssm_state, previous_segment),
+        (ssm_state, previous_segment, seen_valid),
         (
             x.swapaxes(0, 1),
             B.swapaxes(0, 1),
@@ -307,6 +331,9 @@ class SSM2Op(OperationImpl):
             gate: Optional gate tensor [batch, seq_len, intermediate_size]
             conv_state: Optional conv state for caching
             ssm_state: Optional SSM state for caching
+            segment_ids: Optional document IDs; negative IDs emit zero and
+                preserve state. The first valid run continues ssm_state, and
+                subsequent document boundaries reset it.
             n_groups: Number of groups for B, C
             use_gated_rmsnorm: Whether to use gated RMSNorm for output
             rmsnorm_eps: Epsilon for RMSNorm
@@ -320,9 +347,7 @@ class SSM2Op(OperationImpl):
         # Convert A from log form to real form (negative for stability)
         A_real = -jnp.exp(A.astype(jnp.float32))
 
-        if segment_ids is not None and x.shape[1] > 1:
-            if gate is not None or use_gated_rmsnorm:
-                raise ValueError("Segmented SSM2 fallback expects gating to be applied by the caller.")
+        if segment_ids is not None:
             y, new_ssm_state = _segmented_ssm2_fwd(
                 x=x,
                 A_real=A_real,
@@ -334,6 +359,12 @@ class SSM2Op(OperationImpl):
                 ssm_state=ssm_state,
                 n_groups=n_groups,
             )
+            if gate is not None:
+                flat_y = y.reshape(*y.shape[:2], -1)
+                if use_gated_rmsnorm:
+                    variance = jnp.mean(jnp.square(flat_y.astype(jnp.float32)), axis=-1, keepdims=True)
+                    flat_y = flat_y.astype(jnp.float32) * lax.rsqrt(variance + rmsnorm_eps)
+                y = (flat_y * jax.nn.silu(gate.reshape(flat_y.shape))).reshape(y.shape)
             return SSM2Output(
                 attention_outputs=y.astype(dtype),
                 attention_weights=None,

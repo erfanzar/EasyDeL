@@ -15,6 +15,7 @@
 """Tests for PhiMoE model."""
 
 import easydel as ed
+import jax.numpy as jnp
 import pytest
 import transformers
 
@@ -54,6 +55,8 @@ class TestPhiMoE:
             num_local_experts=small_model_config.get("num_experts", 8),
             num_experts_per_tok=small_model_config.get("num_experts_per_tok", 2),
             rope_scaling=rope_scaling,
+            attn_dtype=jnp.float32,
+            attn_softmax_dtype=jnp.float32,
         )
 
     @pytest.mark.parametrize("mpmd_schedule_kind", LOSS_SCHEDULE_KINDS, indirect=True)
@@ -65,7 +68,7 @@ class TestPhiMoE:
             hf_class=transformers.PhimoeForCausalLM,
             task=ed.TaskType.CAUSAL_LM,
             config=phimoe_config,
-            small_model_config=small_model_config,
+            small_model_config={**small_model_config, "attn_dtype": jnp.float32, "attn_softmax_dtype": jnp.float32},
         )
         assert result.success, f"PhiMoE CAUSAL_LM failed: {result.error_message or result.comparison.details}"
 
@@ -78,7 +81,7 @@ class TestPhiMoE:
             hf_class=transformers.PhimoeForCausalLM,
             task=ed.TaskType.CAUSAL_LM,
             config=phimoe_config,
-            small_model_config=small_model_config,
+            small_model_config={**small_model_config, "attn_dtype": jnp.float32, "attn_softmax_dtype": jnp.float32},
             max_new_tokens=16,
         )
         assert result.success, f"PhiMoE generation failed: {result.error_message}"

@@ -28,7 +28,7 @@ from jaxtyping import Array, Bool, Float
 from easydel.layers.linears import ColumnParallelLinear
 
 from ._config import IndexerConfig, IndexerKind
-from ._primitives import indices_to_bool_mask, is_vacuous_selection, visible_causal_mask
+from ._primitives import indices_to_bool_mask, visible_causal_mask
 from ._rope import apply_indexer_rope, truncate_cos_sin
 from ._selection import BaseIndexer, IndexerSelection, SelectionSpec, top_k_indices
 
@@ -245,6 +245,13 @@ class SparseIndexer(BaseIndexer):
         frequencies: Float[Array, "batch seq 2 rotary"] | None = None,
         pairwise_mask: Array | None = None,
         prev_topk_indices: Array | None = None,
+        *,
+        cache_positions: Array | None = None,
+        key_valid_mask: Array | None = None,
+        query_positions: Array | None = None,
+        key_positions: Array | None = None,
+        segment_ids: Array | None = None,
+        key_segment_ids: Array | None = None,
     ) -> IndexerOutput:
         """Score candidates and return the top-k selection.
 
@@ -264,6 +271,24 @@ class SparseIndexer(BaseIndexer):
             prev_topk_indices: Another layer's selection for ``shared``
                 indexer layers; when given, it is returned unchanged and
                 nothing is computed.
+            cache_positions: Optional physical insertion slots ``[batch, seq]``
+                in preallocated ``cached_packed`` storage. Writes preserve its
+                shape; negative/out-of-range slots and padded queries are ignored.
+                Without this argument new rows are appended.
+            key_valid_mask: Optional post-update validity ``[batch, kv]``;
+                required to distinguish unused slots in keys-only storage.
+            query_positions: Logical causal positions ``[batch, seq]``. Defaults
+                to ``cache_positions`` for indexed writes or append coordinates.
+                These are independent of the RoPE-only ``position_ids``.
+            key_positions: Logical positions ``[batch, kv]`` of stored rows;
+                defaults to physical row numbers. Supply these for shifted caches.
+            segment_ids: Current query document identities ``[batch, seq]``;
+                negative identities are invalid. With no cached history, also
+                supplies key identities. Pool grouping and APE offsets restart
+                at every document boundary.
+            key_segment_ids: Document identities over the complete post-update
+                storage ``[batch, kv]``. Required for segmented cached calls;
+                the owning cache retains these separately from packed channels.
 
         Returns:
             :class:`IndexerOutput` with the ``-1``-padded top-k indices and
@@ -277,14 +302,167 @@ class SparseIndexer(BaseIndexer):
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, seq_len), dtype=jnp.bool_)
 
+        if cache_positions is not None:
+            if cached_packed is None or self.config.packed_state == "none":
+                raise ValueError("cache_positions requires preallocated cached_packed storage.")
+            if cache_positions.shape != (batch_size, seq_len):
+                raise ValueError("cache_positions must have shape [batch, seq].")
+            if self.config.packed_state == "keys" and key_valid_mask is None:
+                raise ValueError("Indexed keys-only storage requires a full key_valid_mask.")
         query, key, gate_scores = self._project(hidden_states, q_resid, frequencies, position_ids)
-        packed_state = self._pack_state(key, gate_scores, attention_mask, cached_packed)
+        packed_state = self._pack_state(key, gate_scores, attention_mask, cached_packed, cache_positions)
+        if key_segment_ids is None and segment_ids is not None and cached_packed is None:
+            key_segment_ids = segment_ids
+        if query_positions is None:
+            query_positions = cache_positions
+        return self.select_from_state(
+            hidden_states,
+            query,
+            packed_state,
+            attention_mask=attention_mask,
+            pairwise_mask=pairwise_mask,
+            key_states=key,
+            key_valid_mask=key_valid_mask,
+            query_positions=query_positions,
+            key_positions=key_positions,
+            segment_ids=segment_ids,
+            key_segment_ids=key_segment_ids,
+        )
+
+    def project_state(
+        self,
+        hidden_states: Array,
+        q_resid: Array | None = None,
+        attention_mask: Array | None = None,
+        position_ids: Array | None = None,
+        frequencies: Array | None = None,
+    ) -> tuple[Array, Array]:
+        """Project current queries and packed features for an external cache update.
+
+        Args:
+            hidden_states: Current inputs ``[batch, seq, hidden]``.
+            q_resid: Optional MLA query residual.
+            attention_mask: Optional current-token validity ``[batch, seq]``.
+            position_ids: Optional RoPE positions (not cache insertion slots).
+            frequencies: Optional RoPE tables.
+
+        Returns:
+            Current queries and packed state. Pass the state through the owning
+            cache's public auxiliary update, then call :meth:`select_from_state`
+            with its attention-time state and aligned visibility/segments. This
+            also supports sliding windows without reproducing cache layout math.
+
+        Raises:
+            ValueError: If the strategy has no packed-state representation.
+        """
+        if self.config.packed_state == "none":
+            raise ValueError("project_state requires a stateful packed layout.")
+        if attention_mask is None:
+            attention_mask = jnp.ones(hidden_states.shape[:2], dtype=jnp.bool_)
+        query, key, gates = self._project(hidden_states, q_resid, frequencies, position_ids)
+        return query, self._pack_state(key, gates, attention_mask, None)
+
+    def select_from_state(
+        self,
+        hidden_states: Array,
+        query: Array,
+        packed_state: Array | None,
+        *,
+        attention_mask: Array | None = None,
+        pairwise_mask: Array | None = None,
+        key_states: Array | None = None,
+        key_valid_mask: Array | None = None,
+        query_positions: Array | None = None,
+        key_positions: Array | None = None,
+        segment_ids: Array | None = None,
+        key_segment_ids: Array | None = None,
+    ) -> IndexerOutput:
+        """Rank an externally aligned indexer state without updating it again.
+
+        Args:
+            hidden_states: Current inputs supplying learned head weights.
+            query: Current projected/rotated queries from :meth:`project_state`.
+            packed_state: Full attention-time features in physical KV order.
+            attention_mask: Current-token validity, all-valid by default.
+            pairwise_mask: Optional boolean/additive aligned query-key mask.
+            key_states: Current keys for stateless strategies only.
+            key_valid_mask: Optional full-storage key validity.
+            query_positions: Optional logical causal positions of queries.
+            key_positions: Optional logical positions of stored keys.
+            segment_ids: Optional query document identities.
+            key_segment_ids: Optional full-storage key document identities.
+
+        Returns:
+            Selection over physical storage rows, and the supplied packed state.
+            Segments, validity and causality are enforced before ranking.
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+        if attention_mask is None:
+            attention_mask = jnp.ones((batch_size, seq_len), dtype=jnp.bool_)
+        key = key_states
+        if packed_state is None and key is None:
+            raise ValueError("select_from_state requires packed_state or stateless key_states.")
+        kv_len = key.shape[1] if packed_state is None else packed_state.shape[1]
+        if key_valid_mask is not None:
+            if key_valid_mask.shape != (batch_size, kv_len):
+                raise ValueError("key_valid_mask must cover the full post-update indexer storage.")
+            key_valid_mask = key_valid_mask.astype(jnp.bool_)
+            if self.config.packed_state == "key_gate_valid":
+                packed_state = packed_state.at[..., -1].set(key_valid_mask.astype(packed_state.dtype))
+        if (segment_ids is None) != (key_segment_ids is None):
+            raise ValueError("Segmented indexing requires both segment_ids and full key_segment_ids.")
+        if segment_ids is not None:
+            if segment_ids.shape != (batch_size, seq_len) or key_segment_ids.shape != (batch_size, kv_len):
+                raise ValueError("Segment identities must match current queries and full post-update storage.")
+            attention_mask = attention_mask & (segment_ids >= 0)
+
+        # Keep the legacy token scorer's caller-owned causality when no new
+        # metadata is supplied; indexed storage and packed documents require
+        # explicit positions/validity before ranking rather than after top-k.
+        visibility = None
+        if self.config.kind == IndexerKind.POOL or any(
+            value is not None for value in (key_valid_mask, query_positions, key_positions, segment_ids)
+        ):
+            if query_positions is None:
+                query_positions = jnp.broadcast_to(kv_len - seq_len + jnp.arange(seq_len), (batch_size, seq_len))
+            if key_positions is None:
+                key_positions = jnp.broadcast_to(jnp.arange(kv_len), (batch_size, kv_len))
+            visibility = (
+                (key_positions[:, None, :] <= query_positions[:, :, None])
+                & (key_positions[:, None, :] >= 0)
+                & (query_positions[:, :, None] >= 0)
+            )
+            visibility = visibility & attention_mask[..., None]
+            if key_valid_mask is not None:
+                visibility = visibility & key_valid_mask[:, None, :]
+            elif self.config.packed_state == "key_gate_valid":
+                visibility = visibility & (packed_state[:, None, :, -1] >= 0.5)
+            elif kv_len == seq_len:
+                visibility = visibility & attention_mask[:, None, :]
+            if segment_ids is not None:
+                visibility = visibility & (segment_ids[:, :, None] == key_segment_ids[:, None, :])
+
+        if self.config.kind == IndexerKind.POOL and pairwise_mask is not None:
+            mask = pairwise_mask[:, 0] if pairwise_mask.ndim == 4 else pairwise_mask
+            if mask.dtype != jnp.bool_:
+                mask = jnp.isfinite(mask) & (mask > jnp.finfo(mask.dtype).min)
+            visibility = visibility & mask
 
         topk_mask = None
         if self.config.kind == IndexerKind.POOL:
-            topk_indices, topk_mask = self._select_pool(hidden_states, query, packed_state, attention_mask)
+            topk_indices, topk_mask = self._select_pool(
+                hidden_states, query, packed_state, attention_mask, visibility, key_segment_ids
+            )
             score_proxy = None
         else:
+            if visibility is not None:
+                if pairwise_mask is None:
+                    pairwise_mask = visibility
+                else:
+                    mask = pairwise_mask[:, 0] if pairwise_mask.ndim == 4 else pairwise_mask
+                    pairwise_mask = (
+                        mask & visibility if mask.dtype == jnp.bool_ else jnp.where(visibility, mask, -jnp.inf)
+                    )
             topk_indices, score_proxy = self._select_token(
                 hidden_states, query, key, packed_state, attention_mask, pairwise_mask
             )
@@ -344,9 +522,9 @@ class SparseIndexer(BaseIndexer):
             freqs = frequencies[position_ids] if position_ids is not None else frequencies
             cos, sin = jnp.split(freqs.astype(jnp.float32), 2, axis=-1)
             if self.config.rope_style == "interleaved":
-                rope_dim = cos.shape[-1]
-                rope_dim = max(1, min(2 * rope_dim, self.head_dim) // 2)
-                cos_t, sin_t = truncate_cos_sin(cos, sin, rope_dim)
+                requested_width = self.head_dim if self.config.rope_dim is None else self.config.rope_dim
+                half_width = min(requested_width, self.head_dim, 2 * cos.shape[-1]) // 2
+                cos_t, sin_t = truncate_cos_sin(cos, sin, half_width)
                 query = apply_indexer_rope(query, cos_t[:, :, None, :], sin_t[:, :, None, :], style="interleaved")
                 key = apply_indexer_rope(key, cos_t, sin_t, style="interleaved")
             else:
@@ -360,6 +538,7 @@ class SparseIndexer(BaseIndexer):
                 "bsh,gh->bsg",
                 hidden_states.astype(jnp.float32),
                 self.index_kpool_compress_gate.value.astype(jnp.float32),
+                precision=self.precision,
             )
         return query, key, gate_scores
 
@@ -369,14 +548,16 @@ class SparseIndexer(BaseIndexer):
         gate_scores: Array | None,
         attention_mask: Bool[Array, "batch seq"],
         cached_packed: Array | None,
+        cache_positions: Array | None = None,
     ) -> Array | None:
-        """Append the current tokens' state to the cached state.
+        """Append current state or update explicitly indexed fixed-capacity rows.
 
         Args:
             key: Normalized index keys ``[batch, seq, head_dim]``.
             gate_scores: Gate projection scores (``key_gate_valid`` only).
             attention_mask: Current-token padding mask.
             cached_packed: Previously cached state.
+            cache_positions: Optional per-row physical insertion slots.
 
         Returns:
             The packed state ``[batch, cached + seq, dim]``, or ``None`` for
@@ -390,6 +571,14 @@ class SparseIndexer(BaseIndexer):
             current = jnp.concatenate(
                 [key, gate_scores.astype(key.dtype), attention_mask.astype(key.dtype)[..., None]],
                 axis=-1,
+            )
+        if cache_positions is not None:
+            capacity = cached_packed.shape[1]
+            slots = jnp.where(
+                attention_mask & (cache_positions >= 0) & (cache_positions < capacity), cache_positions, capacity
+            )
+            return jax.vmap(lambda old, pos, new: old.at[pos].set(new, mode="drop"))(
+                cached_packed, slots, current.astype(cached_packed.dtype)
             )
         if cached_packed is not None:
             return jnp.concatenate([cached_packed, current], axis=1)
@@ -413,7 +602,7 @@ class SparseIndexer(BaseIndexer):
         if self.config.head_reduction == "uniform":
             return jnp.sum(scores, axis=2)
         weights = self.weights_proj(hidden_states).astype(jnp.float32) * (self.n_heads**-0.5)
-        return jnp.einsum("bsh,bshn->bsn", weights, scores)
+        return jnp.einsum("bsh,bshn->bsn", weights, scores, precision=self.precision)
 
     def _select_token(
         self,
@@ -444,12 +633,13 @@ class SparseIndexer(BaseIndexer):
             keys_f32 = keys_f32[..., : self.head_dim]
         keys_f32 = keys_f32.astype(jnp.float32)
 
-        scores = jnp.einsum("bshd,btd->bsht", query.astype(jnp.float32), keys_f32)
+        scores = jnp.einsum("bshd,btd->bsht", query.astype(jnp.float32), keys_f32, precision=self.precision)
         scores = scores * self.softmax_scale
         if self.config.score_activation == "relu":
             scores = jax.nn.relu(scores)
         index_scores = self._reduce_heads(scores, hidden_states)
 
+        valid_candidates = None
         if pairwise_mask is not None:
             mask = pairwise_mask
             if mask.ndim == 4:
@@ -457,20 +647,83 @@ class SparseIndexer(BaseIndexer):
             if mask.shape[-1] != index_scores.shape[-1]:
                 mask = mask[..., : index_scores.shape[-1]]
             if mask.dtype == jnp.bool_:
+                valid_candidates = jnp.broadcast_to(mask, index_scores.shape)
                 index_scores = jnp.where(mask, index_scores, jnp.finfo(jnp.float32).min)
             else:
                 index_scores = index_scores + mask.astype(jnp.float32)
+                valid_candidates = jnp.isfinite(index_scores) & (mask > jnp.finfo(mask.dtype).min)
 
         select_k = min(self.index_topk, index_scores.shape[-1])
-        topk_indices = top_k_indices(index_scores, select_k, self.mesh_source).astype("i4")
+        if valid_candidates is None:
+            topk_indices = top_k_indices(index_scores, select_k, self.mesh_source).astype("i4")
+        else:
+            topk_indices = self.select_candidates(index_scores, select_k, valid_candidates, self.mesh_source).indices
         return topk_indices, index_scores
 
     def _select_pool(
+        self,
+        hidden_states: Array,
+        query: Array,
+        packed_state: Array,
+        attention_mask: Array,
+        visibility: Array | None = None,
+        key_segment_ids: Array | None = None,
+    ) -> tuple[Array, Array]:
+        """Group visible keys consistently for both ranked pools and their tail.
+
+        Prefix visibility can reuse storage-wide summaries. Sliding windows or
+        arbitrary pairwise masks can cut across those groups: in that case each
+        query's visible keys must be compacted *before* learned pooling. Map
+        queries sequentially to avoid a query-by-key-by-channel temporary.
+        Returned indices always retain the original physical cache coordinates.
+        """
+        valid_keys = packed_state[..., -1] >= 0.5
+        visible = (
+            visible_causal_mask(query.shape[1], packed_state.shape[1], valid_keys)
+            if visibility is None
+            else visibility & valid_keys[:, None, :]
+        )
+        positions = jnp.arange(packed_state.shape[1])
+        last_visible = jnp.max(jnp.where(visible, positions, -1), axis=-1)
+        prefix = valid_keys[:, None, :] & (positions <= last_visible[..., None])
+        if key_segment_ids is not None:
+            last_segment = jnp.take_along_axis(key_segment_ids, jnp.maximum(last_visible, 0), axis=1)
+            prefix = prefix & (key_segment_ids[:, None, :] == last_segment[..., None])
+
+        def shared_pools(_):
+            return self._select_storage_pools(
+                hidden_states, query, packed_state, attention_mask, visible, key_segment_ids
+            )
+
+        def query_local_pools(_):
+            def select_one(inputs):
+                hidden, projected, current_valid, current_visible = inputs
+                local_state = packed_state.at[..., -1].set(current_visible.astype(packed_state.dtype))
+                indices, mask = self._select_storage_pools(
+                    hidden[:, None],
+                    projected[:, None],
+                    local_state,
+                    current_valid[:, None],
+                    key_segment_ids=key_segment_ids,
+                )
+                return indices[:, 0], mask[:, 0]
+
+            indices, mask = jax.lax.map(
+                select_one,
+                tuple(jnp.swapaxes(x, 0, 1) for x in (hidden_states, query, attention_mask, visible)),
+            )
+            return jnp.swapaxes(indices, 0, 1), jnp.swapaxes(mask, 0, 1)
+
+        return jax.lax.cond(jnp.all(prefix == visible), shared_pools, query_local_pools, operand=None)
+
+    def _select_storage_pools(
         self,
         hidden_states: Float[Array, "batch seq hidden"],
         query: Float[Array, "batch seq heads head_dim"],
         packed_state: Array,
         attention_mask: Bool[Array, "batch seq"],
+        visibility: Array | None = None,
+        key_segment_ids: Array | None = None,
     ) -> tuple[Array, Array | None]:
         """Score pool summaries, top-k pools, expand back to token indices.
 
@@ -480,6 +733,8 @@ class SparseIndexer(BaseIndexer):
             packed_state: Packed ``[key | gate | valid]`` states over the
                 full KV range.
             attention_mask: Current-token padding mask.
+            visibility: Optional explicit causal/document visibility.
+            key_segment_ids: Optional document identities for pool boundaries.
 
         Returns:
             ``(topk_indices [batch, seq, width], topk_mask [batch, seq, kv])``
@@ -492,12 +747,18 @@ class SparseIndexer(BaseIndexer):
         kpool = self.config.kpool_size
 
         valid_keys = packed_state[..., -1] >= 0.5
-        visible_tokens = visible_causal_mask(seq_len, kv_len, valid_keys)
+        visible_tokens = (
+            visible_causal_mask(seq_len, kv_len, valid_keys)
+            if visibility is None
+            else visibility & valid_keys[:, None, :]
+        )
 
-        pool_keys, pool_indices, pool_valid = self._pooled_states(packed_state)
+        pool_keys, pool_indices, pool_valid = self._pooled_states(packed_state, key_segment_ids)
         num_pools = pool_keys.shape[1]
 
-        scores = jnp.einsum("bshd,bpd->bshp", query.astype(jnp.float32), pool_keys.astype(jnp.float32))
+        scores = jnp.einsum(
+            "bshd,bpd->bshp", query.astype(jnp.float32), pool_keys.astype(jnp.float32), precision=self.precision
+        )
         scores = scores * self.softmax_scale
         if self.config.score_activation == "relu":
             scores = jax.nn.relu(scores)
@@ -508,6 +769,14 @@ class SparseIndexer(BaseIndexer):
         pool_end = jnp.clip(pool_indices[..., -1], 0, kv_len - 1)
         pool_end_q = jnp.broadcast_to(pool_end[:, None, :], (batch_size, seq_len, num_pools))
         pool_visible = jnp.take_along_axis(visible_tokens, pool_end_q.astype("i4"), axis=2)
+        # Explicit logical positions may differ from physical row order.
+        # Every member must be visible, not just the final physical row.
+        if visibility is not None:
+            for member in range(kpool - 1):
+                member_q = jnp.broadcast_to(
+                    jnp.maximum(pool_indices[..., member], 0)[:, None, :], (batch_size, seq_len, num_pools)
+                )
+                pool_visible = pool_visible & jnp.take_along_axis(visible_tokens, member_q, axis=2)
         valid_candidates = pool_visible & pool_valid[:, None, :]
 
         min_score = jnp.finfo(jnp.float32).min
@@ -528,19 +797,22 @@ class SparseIndexer(BaseIndexer):
 
         topk_indices = jnp.where(selected_valid_flat, selected_indices, -1)
 
-        # Dense form of the same selection. Selected pools are complete, so
-        # pool ``p`` covers tokens ``first_key + p*kpool + [0, kpool)``: mark
-        # the pools, repeat each over its members and shift by ``first_key``.
-        # This avoids scattering the token indices, which is slow on TPU.
-        pool_mask = selection.mask
-        if pool_mask is None:
-            pool_mask = jnp.zeros(index_scores.shape, dtype=jnp.bool_)
-        token_mask = jnp.repeat(pool_mask, kpool, axis=-1)
-        token_mask = jnp.pad(token_mask, [(0, 0), (0, 0), (kv_len, 0)])
-        first_key = self._first_valid_key(valid_keys)
-        topk_mask = jax.vmap(lambda row, start: jax.lax.dynamic_slice_in_dim(row, start, kv_len, axis=-1))(
-            token_mask, kv_len - first_key
-        )
+        # Map each physical token's compact valid-token rank back to its
+        # selected pool. This preserves cache coordinates even when cached
+        # right padding leaves holes before a live continuation, without a
+        # scatter or a query-by-pool-by-token temporary.
+        if key_segment_ids is not None:
+            # Per-document incomplete groups are excluded from the ranked
+            # candidate axis, so a global token-rank division is not a pool ID.
+            topk_mask = indices_to_bool_mask(topk_indices, kv_len)
+        else:
+            pool_mask = selection.mask
+            if pool_mask is None:
+                pool_mask = jnp.zeros(index_scores.shape, dtype=jnp.bool_)
+            token_pool = jnp.maximum(jnp.cumsum(valid_keys, axis=-1) - 1, 0) // kpool
+            token_pool = jnp.broadcast_to(token_pool[:, None, :], (batch_size, seq_len, kv_len))
+            topk_mask = jnp.take_along_axis(pool_mask, token_pool.astype("i4"), axis=-1)
+            topk_mask = topk_mask & valid_keys[:, None, :]
 
         output_width = self.index_topk
         if self.config.select_tail:
@@ -557,23 +829,27 @@ class SparseIndexer(BaseIndexer):
         return topk_indices.astype("i4"), topk_mask
 
     @staticmethod
-    def _first_valid_key(key_valid: Bool[Array, "batch kv"]) -> Array:
-        """Index of each row's first valid key; ``kv`` for an all-invalid row."""
+    def _compact_valid_indices(key_valid: Bool[Array, "batch kv"]) -> Array:
+        """Map valid-token ranks to original cache indices, padded with ``-1``."""
         kv_length = key_valid.shape[-1]
-        return jnp.where(jnp.any(key_valid, axis=-1), jnp.argmax(key_valid, axis=-1), kv_length)
+        return jax.vmap(lambda row: jnp.nonzero(row, size=kv_length, fill_value=-1)[0])(key_valid)
 
     def _pooled_states(
         self,
         packed_state: Array,
+        key_segment_ids: Array | None = None,
     ) -> tuple[Array, Array, Array]:
         """Build compressed k-pool candidates from the packed state.
 
-        Pooling starts at the first valid token so padded prefixes do not
-        misalign the groups; incomplete pools are marked invalid.
+        Pools group consecutive *valid* tokens, keeping their original
+        cache indices. Padding at the start or between cached chunks never
+        consumes a pool slot; incomplete pools are marked invalid.
 
         Args:
             packed_state: Packed ``[key | gate | valid]`` states
                 ``(batch, kv, 2 * head_dim + 1)``.
+            key_segment_ids: Optional document identities; complete pools
+                never cross a boundary, and APE slot zero restarts there.
 
         Returns:
             Tuple of pool summary keys ``(batch, pools, head_dim)``, raw
@@ -587,12 +863,37 @@ class SparseIndexer(BaseIndexer):
         kpool = self.config.kpool_size
         num_pools = (kv_len + kpool - 1) // kpool
 
-        first_key = self._first_valid_key(valid_keys)
-        offsets = jnp.arange(num_pools * kpool).reshape(1, num_pools, kpool)
-        pool_indices = first_key[:, None, None] + offsets
+        if key_segment_ids is None:
+            compact_indices = self._compact_valid_indices(valid_keys)
+            compact_indices = jnp.pad(compact_indices, [(0, 0), (0, num_pools * kpool - kv_len)], constant_values=-1)
+            pool_indices = compact_indices.reshape(valid_keys.shape[0], num_pools, kpool)
+        else:
+            valid_keys = valid_keys & (key_segment_ids >= 0)
+            compact_indices = self._compact_valid_indices(valid_keys)
+            compact_segments = jnp.take_along_axis(key_segment_ids, jnp.maximum(compact_indices, 0), axis=1)
+            ranks = jnp.broadcast_to(jnp.arange(kv_len), valid_keys.shape)
+            boundary = jnp.concatenate(
+                [
+                    jnp.ones((valid_keys.shape[0], 1), dtype=jnp.bool_),
+                    compact_segments[:, 1:] != compact_segments[:, :-1],
+                ],
+                axis=1,
+            )
+            run_start = jax.lax.associative_scan(jnp.maximum, jnp.where(boundary, ranks, 0), axis=1)
+            local_rank = ranks - run_start
+            complete_end = ((local_rank + 1) % kpool == 0) & (compact_indices >= 0)
+            # At most ceil(kv/kpool) complete pools can exist, even when every
+            # document leaves an incomplete tail. Compact only complete groups
+            # instead of allocating a candidate for every possible segment.
+            ends = jax.vmap(lambda row: jnp.nonzero(row, size=num_pools, fill_value=-1)[0])(complete_end)
+            member_ranks = ends[..., None] - kpool + 1 + jnp.arange(kpool)
+            pool_indices = jnp.take_along_axis(
+                compact_indices[:, None, :], jnp.clip(member_ranks, 0, kv_len - 1), axis=2
+            )
+            pool_indices = jnp.where(ends[..., None] >= 0, pool_indices, -1)
 
         safe_indices = jnp.clip(pool_indices, 0, kv_len - 1)
-        in_range = pool_indices < kv_len
+        in_range = pool_indices >= 0
 
         def take(x, idx):
             # x: [B, n, d]; idx: [B, P, kpool] -> [B, P, kpool, d]
@@ -642,17 +943,10 @@ class SparseIndexer(BaseIndexer):
         if max_tail_width == 0:
             return topk_indices
 
-        _, _, kv_length = token_visible.shape
-        tail_start, tail_count = self._visible_tail_range(token_visible, key_valid)
-        tail_offsets = jnp.arange(max_tail_width)
-        tail_indices = tail_start[..., None] + tail_offsets
-
-        tail_valid = (tail_offsets[None, None, :] < tail_count[..., None]) & (tail_indices < kv_length)
-        safe_tail = jnp.clip(tail_indices, 0, kv_length - 1)
-        tail_visible = jnp.take_along_axis(token_visible, safe_tail.astype("i4"), axis=2).astype(bool) & (
-            tail_indices >= 0
-        )
-        tail_indices = jnp.where(tail_valid & tail_visible, tail_indices, -1)
+        tail_mask = self._visible_tail_mask(token_visible, key_valid)
+        # The compact ranks are query/document-local, while returned indices
+        # always remain physical cache coordinates.
+        tail_indices = jax.vmap(jax.vmap(lambda row: jnp.nonzero(row, size=max_tail_width, fill_value=-1)[0]))(tail_mask)
         return jnp.concatenate([topk_indices, tail_indices], axis=-1)
 
     def _visible_tail_range(
@@ -660,11 +954,10 @@ class SparseIndexer(BaseIndexer):
         token_visible: Bool[Array, "batch q kv"],
         key_valid: Bool[Array, "batch kv"],
     ) -> tuple[Array, Array]:
-        """Start and length ``(batch, q)`` of each query's incomplete tail pool."""
-        first_key = self._first_valid_key(key_valid)
-        visible_count = jnp.sum(token_visible, axis=-1)
+        """Compact rank start and length of each query's incomplete tail pool."""
+        visible_count = jnp.sum(token_visible & key_valid[:, None, :], axis=-1)
         tail_count = visible_count % self.config.kpool_size
-        return first_key[:, None] + visible_count - tail_count, tail_count
+        return visible_count - tail_count, tail_count
 
     def _visible_tail_mask(
         self,
@@ -675,12 +968,7 @@ class SparseIndexer(BaseIndexer):
         if self.config.kpool_size == 1:
             return jnp.zeros_like(token_visible, dtype=jnp.bool_)
         tail_start, tail_count = self._visible_tail_range(token_visible, key_valid)
-        position = jax.lax.broadcasted_iota(jnp.int32, token_visible.shape, 2)
+        rank = jnp.cumsum(token_visible & key_valid[:, None, :], axis=-1) - 1
         start = tail_start[..., None]
-        in_tail = (position >= start) & (position < start + tail_count[..., None])
+        in_tail = (rank >= start) & (rank < start + tail_count[..., None])
         return in_tail & token_visible.astype(jnp.bool_)
-
-
-# convenience re-exports for callers that mask attention from indices
-indices_to_mask = indices_to_bool_mask
-vacuous_selection = is_vacuous_selection

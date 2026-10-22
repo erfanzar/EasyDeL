@@ -86,13 +86,19 @@ Auto Classes:
     - AutoState: Load model weights/checkpoints
 """
 
-from .auto_configuration import AutoEasyDeLConfig, AutoShardAndGatherFunctions, get_modules_by_type
+from .auto_configuration import (
+    AutoEasyDeLConfig,
+    AutoShardAndGatherFunctions,
+    get_modules_by_type,
+    infer_task_from_config,
+)
 from .auto_modeling import (
     AutoEasyDeLAnyToAnyModel,
     AutoEasyDeLModel,
     AutoEasyDeLModelForCausalLM,
     AutoEasyDeLModelForDiffusionLM,
     AutoEasyDeLModelForEmbedding,
+    AutoEasyDeLModelForImageClassification,
     AutoEasyDeLModelForImageTextToText,
     AutoEasyDeLModelForSeq2SeqLM,
     AutoEasyDeLModelForSequenceClassification,
@@ -104,6 +110,7 @@ from .auto_modeling import (
     AutoStateForCausalLM,
     AutoStateForDiffusionLM,
     AutoStateForEmbedding,
+    AutoStateForImageClassification,
     AutoStateForImageSequenceClassification,
     AutoStateForImageTextToText,
     AutoStateForSeq2SeqLM,
@@ -119,6 +126,7 @@ __all__ = (
     "AutoEasyDeLModelForCausalLM",
     "AutoEasyDeLModelForDiffusionLM",
     "AutoEasyDeLModelForEmbedding",
+    "AutoEasyDeLModelForImageClassification",
     "AutoEasyDeLModelForImageTextToText",
     "AutoEasyDeLModelForSeq2SeqLM",
     "AutoEasyDeLModelForSequenceClassification",
@@ -131,6 +139,7 @@ __all__ = (
     "AutoStateForCausalLM",
     "AutoStateForDiffusionLM",
     "AutoStateForEmbedding",
+    "AutoStateForImageClassification",
     "AutoStateForImageSequenceClassification",
     "AutoStateForImageTextToText",
     "AutoStateForSeq2SeqLM",
@@ -138,4 +147,5 @@ __all__ = (
     "AutoStateForZeroShotImageClassification",
     "AutoStateVisionModel",
     "get_modules_by_type",
+    "infer_task_from_config",
 )

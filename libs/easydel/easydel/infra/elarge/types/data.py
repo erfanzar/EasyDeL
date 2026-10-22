@@ -63,6 +63,11 @@ class TextDatasetInformCfg(TypedDict, total=False):
             before tokenization.
     """
 
+    name: NotRequired[str | None]
+    weight: NotRequired[float]
+    max_samples: NotRequired[int | None]
+    filter_fn: NotRequired[tp.Callable[[dict[str, Any]], bool] | None]
+    map_fn: NotRequired[tp.Callable[[dict[str, Any]], dict[str, Any]] | None]
     type: NotRequired[DatasetTypeLike | str | None]
     data_files: NotRequired[str | os.PathLike | list[str | os.PathLike] | None]
     dataset_split_name: NotRequired[str | None]
@@ -94,6 +99,11 @@ class VisualDatasetInformCfg(TypedDict, total=False):
         preprocessing_fn: Preprocessing function for each example.
     """
 
+    name: NotRequired[str | None]
+    weight: NotRequired[float]
+    max_samples: NotRequired[int | None]
+    filter_fn: NotRequired[tp.Callable[[dict[str, Any]], bool] | None]
+    map_fn: NotRequired[tp.Callable[[dict[str, Any]], dict[str, Any]] | None]
     type: NotRequired[DatasetTypeLike | str | None]
     data_files: NotRequired[str | os.PathLike | list[str | os.PathLike] | None]
     dataset_split_name: NotRequired[str | None]
@@ -225,6 +235,8 @@ class DatasetMixtureCfg(TypedDict, total=False):
     image_target_field: NotRequired[str]
     batch_size: NotRequired[int]
     shuffle_buffer_size: NotRequired[int | None]
+    shuffle: NotRequired[bool]
+    max_samples: NotRequired[int | None]
     seed: NotRequired[int | None]
 
     pack_tokens: NotRequired[bool]

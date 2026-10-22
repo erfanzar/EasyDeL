@@ -102,7 +102,7 @@ Reference:
     See: https://huggingface.co/mistralai/Pixtral-12B
 """
 
-from .modeling_pixtral import PixtralVisionModel
+from .modeling_pixtral import PixtralVisionModel, PixtralVisionModelOutput
 from .pixtral_configuration import PixtralVisionConfig
 
-__all__ = "PixtralVisionConfig", "PixtralVisionModel"
+__all__ = "PixtralVisionConfig", "PixtralVisionModel", "PixtralVisionModelOutput"

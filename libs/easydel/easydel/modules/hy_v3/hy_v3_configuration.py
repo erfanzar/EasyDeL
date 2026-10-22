@@ -24,12 +24,8 @@ DeepSeek-style sigmoid MoE: per-layer dense/sparse MLP scheduling
 fp32 combination of routed and shared outputs.
 """
 
-from eformer.loggings import get_logger
-
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
-
-logger = get_logger(__name__)
 
 # HF ``HYV3Config.default_theta`` — HYV3 uses a much larger rotary base
 # frequency than the Llama (1e4) / Qwen (1e6) families. Do not "fix" this.

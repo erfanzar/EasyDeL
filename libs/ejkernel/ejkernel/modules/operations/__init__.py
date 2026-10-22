@@ -285,6 +285,7 @@ from .ragged_causal_conv1d import (
     ragged_causal_conv1d,
     ragged_causal_conv1d_head_sharded,
     ragged_causal_conv1d_op,
+    reorder_conv_features_for_sharding,
 )
 from .ragged_decode_attention import RaggedDecodeAttention, ragged_decode_attention
 from .ragged_gated_delta_rule import RaggedGatedDeltaRule, ragged_gated_delta_rule
@@ -514,6 +515,7 @@ __all__ = (
     "recurrent_attention",
     "reduce_scatter",
     "reduce_scatter_matmul",
+    "reorder_conv_features_for_sharding",
     "resolve_mlp_combine",
     "ring_attention",
     "rwkv4",

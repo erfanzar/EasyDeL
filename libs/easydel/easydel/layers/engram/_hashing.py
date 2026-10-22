@@ -39,30 +39,7 @@ import typing as tp
 
 import numpy as np
 
-
-def _is_prime(n: int) -> bool:
-    """Deterministic Miller-Rabin primality test (exact for ``n < 3.3e24``)."""
-    if n < 2:
-        return False
-    witnesses = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
-    for p in witnesses:
-        if n % p == 0:
-            return n == p
-    d, s = n - 1, 0
-    while d % 2 == 0:
-        d //= 2
-        s += 1
-    for a in witnesses:
-        x = pow(a, d, n)
-        if x in (1, n - 1):
-            continue
-        for _ in range(s - 1):
-            x = x * x % n
-            if x == n - 1:
-                break
-        else:
-            return False
-    return True
+from easydel.layers.embeddings._primes import next_prime_after
 
 
 @functools.lru_cache(maxsize=16)
@@ -94,9 +71,7 @@ def engram_bucket_primes(
         for _ in range(max_ngram_size - 1):
             sizes, current = [], vocab_size - 1
             for _ in range(n_heads):
-                current += 1
-                while not _is_prime(current) or current in seen:
-                    current += 1
+                current = next_prime_after(current, seen)
                 seen.add(current)
                 sizes.append(current)
             per_ngram.append(tuple(sizes))

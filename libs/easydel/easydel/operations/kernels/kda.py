@@ -53,13 +53,13 @@ from ejkernel.kernels import Backend, Platform, kernel_registry  # pyright: igno
 from jax import lax
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float
-from spectrax import with_sharding_constraint
+from spectrax import sanitize_partition_spec_for_mesh_and_shape, with_sharding_constraint
 
 from easydel.caching import KDACacheView
 from easydel.infra.sequence_packing import normalize_packed_segment_ids
 
 from .._attention_outputs import AttentionOutput
-from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry, run_mosaic_kernel
 from ..requirements import (
     CacheType,
     ExecutionMode,
@@ -165,6 +165,7 @@ def _recurrent_kda_fwd(
     initial_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
     use_qk_l2norm: bool = True,
     segment_ids: Array | None = None,
+    continue_initial_state: bool = False,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
@@ -194,7 +195,10 @@ def _recurrent_kda_fwd(
             before the loop.
         segment_ids: Optional packed-sequence ids,
             ``(batch, seq_len)``; state resets at segment boundaries and
-            padded steps are zeroed.
+            padded steps emit zero outputs.
+        continue_initial_state: Preserve incoming memory into the first live segment
+            and retain memory over padding. Later segment changes still reset state.
+            False preserves the packed-training first-segment reset/padding behavior.
 
     Returns:
         tuple: ``(outputs, final_state)`` where ``outputs`` has shape
@@ -215,6 +219,7 @@ def _recurrent_kda_fwd(
         initial_state=initial_state,
         use_qk_l2norm=use_qk_l2norm,
         segment_ids=segment_ids,
+        continue_initial_state=continue_initial_state,
     )
 
 
@@ -629,6 +634,7 @@ def _recurrent_kda_per_channel_fwd(
     initial_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
     use_qk_l2norm: bool = True,
     segment_ids: Array | None = None,
+    continue_initial_state: bool = False,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
@@ -654,7 +660,10 @@ def _recurrent_kda_per_channel_fwd(
         use_qk_l2norm: Whether to L2-normalize Q and K before the loop.
         segment_ids: Optional packed-sequence ids,
             ``(batch, seq_len)``; state resets at segment boundaries and
-            padded steps are zeroed.
+            padded steps emit zero outputs.
+        continue_initial_state: Preserve incoming memory into the first live segment
+            and retain memory over padding. Later segment changes still reset state.
+            False preserves the packed-training first-segment reset/padding behavior.
 
     Returns:
         tuple: ``(outputs, final_state)`` — outputs of shape
@@ -713,9 +722,13 @@ def _recurrent_kda_per_channel_fwd(
             state, prev_segment = carry
             q_t, k_t, v_t, g_t, beta_t, segment_t = inputs
             valid = segment_t >= 0
+            old_state = state
             new_segment = valid & (segment_t != prev_segment)
+            if continue_initial_state:
+                # The first live segment continues incoming memory, even after leading padding.
+                new_segment = new_segment & (prev_segment >= 0)
             state = jnp.where(new_segment[:, None, None, None], jnp.zeros_like(state), state)
-            next_segment = jnp.where(valid, segment_t, -1)
+            next_segment = jnp.where(valid, segment_t, prev_segment if continue_initial_state else -1)
         g_exp = jnp.exp(g_t)[:, :, :, None]  # (B, H, K, 1) — per-channel decay
         beta_scaled = beta_t[:, :, None]
         state = state * g_exp
@@ -726,7 +739,8 @@ def _recurrent_kda_per_channel_fwd(
         output = jnp.sum(state * q_t[:, :, :, None], axis=-2)
         if valid is not None:
             output = jnp.where(valid[:, None, None], output, jnp.zeros_like(output))
-            state = jnp.where(valid[:, None, None, None], state, jnp.zeros_like(state))
+            padding_state = old_state if continue_initial_state else jnp.zeros_like(state)
+            state = jnp.where(valid[:, None, None, None], state, padding_state)
             return (state, next_segment), output
 
         return state, output
@@ -763,50 +777,18 @@ def _kda_chunk_local(k_beta, key, query, g_cumsum, *, mesh=None, lead_specs=None
     if jax.default_backend() != "tpu":
         return xla(*args)
     pallas = kernel_registry.get("kda_chunk_local", platform=Platform.PALLAS, backend=Backend.TPU)
-    ambient = jax.sharding.get_abstract_mesh()
-    if not ambient.empty and ambient.manual_axes:
-        auto = [n for n in ambient.axis_names if n not in ambient.manual_axes and ambient.shape[n] > 1]
-        if auto:
-            logger.warning_once(
-                f"kda_chunk_local: ambient manual axes {tuple(ambient.manual_axes)} with sharded auto axes "
-                f"{auto}; using the XLA implementation instead of the Pallas kernel."
-            )
-            return xla(*args)
-        return pallas(*args, sub_block=sub_block)
-    size = getattr(mesh, "size", None)
-    if mesh is None:
-        if jax.device_count() == 1:
-            return pallas(*args, sub_block=sub_block)
-        logger.warning_once("kda_chunk_local: no mesh on a multi-device host; using the XLA implementation.")
+
+    def fallback(reason):
+        logger.warning_once(f"kda_chunk_local: {reason}; using the XLA implementation.")
         return xla(*args)
-    if size == 1:
-        return pallas(*args, sub_block=sub_block)
-    if lead_specs is None:
-        logger.warning_once(
-            "kda_chunk_local: batch/head sharding of the KDA inputs is not a plain (batch, head) layout; "
-            "using the XLA implementation."
-        )
-        return xla(*args)
-    for axes, dim in ((lead_specs[0], k_beta.shape[1]), (lead_specs[1], k_beta.shape[2])):
-        names = () if axes is None else (axes if isinstance(axes, tuple) else (axes,))
-        n = 1
-        for name in names:
-            n *= int(mesh.shape[name])
-        if int(dim) % n:
-            # A non-dividing batch/head shard would error inside shard_map; keep the XLA path.
-            logger.warning_once(
-                f"kda_chunk_local: dimension {int(dim)} is not divisible by mesh axes {axes} (size {n}); "
-                "using the XLA implementation."
-            )
-            return xla(*args)
-    spec = PartitionSpec(None, lead_specs[0], lead_specs[1], None, None)
-    return jax.shard_map(
-        lambda *a: pallas(*a, sub_block=sub_block),
-        mesh=mesh,
-        in_specs=(spec,) * 4,
-        out_specs=(spec, spec),
-        check_vma=False,
-    )(*args)
+
+    def specs():
+        if lead_specs is None:
+            return None
+        spec = PartitionSpec(None, lead_specs[0], lead_specs[1], None, None)
+        return (spec,) * 4, (spec, spec)
+
+    return run_mosaic_kernel(lambda *a: pallas(*a, sub_block=sub_block), fallback, args, mesh=mesh, specs=specs)
 
 
 def _chunk_kda_per_channel_fwd(
@@ -821,6 +803,7 @@ def _chunk_kda_per_channel_fwd(
     segment_ids: Array | None = None,
     kernel_mesh=None,
     kernel_lead_specs: tuple | None = None,
+    continue_initial_state: bool = False,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
@@ -860,6 +843,11 @@ def _chunk_kda_per_channel_fwd(
         initial_state: Optional starting recurrent state,
             ``(batch, num_heads, head_dim, d_state)``.
         use_qk_l2norm: Whether to L2-normalize Q and K before processing.
+        segment_ids: Optional packed document IDs; negative IDs denote padding.
+        kernel_mesh: Optional mesh for the chunk-local kernel.
+        kernel_lead_specs: Optional row/head mesh axes for the chunk-local kernel.
+        continue_initial_state: Continue incoming memory through the first valid
+            segment and padding; False preserves packed-training resets.
 
     Returns:
         tuple: ``(outputs, final_state)`` with outputs of shape
@@ -880,6 +868,7 @@ def _chunk_kda_per_channel_fwd(
         segment_ids=segment_ids,
         kernel_mesh=kernel_mesh,
         kernel_lead_specs=kernel_lead_specs,
+        continue_initial_state=continue_initial_state,
     )
 
 
@@ -896,6 +885,7 @@ def _chunked_scan_per_channel_rows(
     segment_ids: Array | None = None,
     kernel_mesh=None,
     kernel_lead_specs: tuple | None = None,
+    continue_initial_state: bool = False,
 ) -> tuple[Float[Array, "rows heads seq_len d_state"], Float[Array, "rows heads head_dim d_state"]]:
     """Chunked per-channel KDA over independent rows (training and non-packed prefill).
 
@@ -915,7 +905,9 @@ def _chunked_scan_per_channel_rows(
     ``beta`` are zeroed). With ``segment_ids`` (packed training), the state resets whenever
     the segment id changes and positions with a negative id are padding, exactly like
     :func:`_recurrent_kda_per_channel_fwd`'s segment mode (``initial_state`` is then
-    ignored, as there). Boundaries may fall anywhere inside a chunk: pairs across runs are
+    reset for the first run unless ``continue_initial_state=True``). Continuation preserves
+    memory across padding and into the first valid segment, while later live segment
+    changes reset it. Boundaries may fall anywhere inside a chunk: pairs across runs are
     masked out of the intra-chunk matrices, the incoming state only reaches the chunk's
     first run, and the outgoing state only collects the chunk's last run.
 
@@ -932,6 +924,10 @@ def _chunked_scan_per_channel_rows(
         use_qk_l2norm: Whether to L2-normalize Q and K first.
         segment_ids: Optional packed-sequence ids ``(rows, seq_len)``; negative ids are
             padding. See above.
+        kernel_mesh: Optional mesh for the chunk-local kernel.
+        kernel_lead_specs: Optional row/head mesh axes for the chunk-local kernel.
+        continue_initial_state: Continue incoming memory through the first valid
+            segment and padding; False preserves packed-training resets.
 
     Returns:
         tuple: ``(outputs, final_state)`` — outputs
@@ -953,8 +949,18 @@ def _chunked_scan_per_channel_rows(
         tok_valid = tok_valid & (seg >= 0)
         # Run ids (>= 1): a new run starts whenever the segment id changes, padding included,
         # which is exactly when the recurrent reference resets its state.
-        change = jnp.concatenate([jnp.ones((R, 1), dtype=bool), seg[:, 1:] != seg[:, :-1]], axis=1)
-        run = jnp.cumsum(change.astype(jnp.int32), axis=1)
+        if continue_initial_state:
+            # Padding is inert: compare each live token to the preceding live segment,
+            # not to a padding sentinel, and let the first live run inherit memory.
+            indices = jnp.broadcast_to(jnp.arange(L), (R, L))
+            last_valid = lax.associative_scan(jnp.maximum, jnp.where(tok_valid, indices, -1), axis=1)
+            previous = jnp.concatenate([jnp.full((R, 1), -1), last_valid[:, :-1]], axis=1)
+            previous_segment = jnp.take_along_axis(seg, jnp.maximum(previous, 0), axis=1)
+            change = tok_valid & (previous >= 0) & (seg != previous_segment)
+            run = 1 + jnp.cumsum(change.astype(jnp.int32), axis=1)
+        else:
+            change = jnp.concatenate([jnp.ones((R, 1), dtype=bool), seg[:, 1:] != seg[:, :-1]], axis=1)
+            run = jnp.cumsum(change.astype(jnp.int32), axis=1)
     valid4 = tok_valid[:, None, :, None]
     query = jnp.where(valid4, query.astype(jnp.float32), 0.0)
     key = jnp.where(valid4, key.astype(jnp.float32), 0.0)
@@ -1009,8 +1015,9 @@ def _chunked_scan_per_channel_rows(
 
     if run_c is not None:
         run_last = run_c[:, :, -1]  # (C, R)
-        # Chunk 0 never continues (the reference starts from a reset, ignoring initial_state).
-        run_prev = jnp.concatenate([jnp.full((1, R), -2, dtype=run_c.dtype), run_last[:-1]], axis=0)
+        # Packed training starts from a reset; cached continuation inherits the first run.
+        first_run = run_c[:1, :, 0] if continue_initial_state else jnp.full((1, R), -2, dtype=run_c.dtype)
+        run_prev = jnp.concatenate([first_run, run_last[:-1]], axis=0)
         continues = (run_c == run_prev[:, :, None]).astype(jnp.float32)[:, :, None, :, None]
         in_last = (run_c == run_last[:, :, None]).astype(jnp.float32)[:, :, None, :, None]
         keep = (run_last == run_prev).astype(jnp.float32)[:, :, None, None]
@@ -1665,6 +1672,7 @@ class KernelDeltaAttnOp(OperationImpl):
         segment_ids: Array | None = None,
         chunk_size: int = 64,
         per_channel_decay: bool = False,
+        continue_initial_state: bool = False,
         **kwargs,
     ) -> KDAOutput:
         """Forward pass for KDA attention.
@@ -1687,6 +1695,10 @@ class KernelDeltaAttnOp(OperationImpl):
             chunk_size: Chunk size for training mode (default: 64)
             per_channel_decay: Force the per-channel-decay kernels; inferred
                 automatically when ``decay.ndim == 4``.
+            continue_initial_state: For cached multi-token segmented continuation,
+                preserve incoming state into the first valid segment and over padding.
+                Real within-chunk segment changes still reset memory. False keeps
+                the packed-training reset behavior.
             **kwargs: Additional ignored arguments
 
         Returns:
@@ -1708,7 +1720,11 @@ class KernelDeltaAttnOp(OperationImpl):
             with mesh:
                 mode = self.get_mode(query=query, BTHD=True)
                 shardings = self.metadata.get_shardings(mode, layout="bthd")
-                query = with_sharding_constraint(arr=query, sharding=shardings.query, mesh=mesh)
+                # The constraints below sanitize abstract policy axes against the
+                # actual mesh and tensor shape. Use that same effective query
+                # layout for the chunk-local shard_map, not the raw policy spec.
+                query_spec = sanitize_partition_spec_for_mesh_and_shape(shardings.query, mesh=mesh, shape=query.shape)
+                query = with_sharding_constraint(arr=query, sharding=query_spec, mesh=mesh)
                 key = with_sharding_constraint(arr=key, sharding=shardings.key, mesh=mesh)
                 value = with_sharding_constraint(arr=value, sharding=shardings.value, mesh=mesh)
 
@@ -1777,7 +1793,11 @@ class KernelDeltaAttnOp(OperationImpl):
                 chunk_fwd = _chunk_kda_per_channel_fwd if per_channel else _chunk_kda_fwd
                 extra = {}
                 if per_channel:
-                    extra = {"segment_ids": segment_ids, "kernel_mesh": mesh}
+                    extra = {
+                        "segment_ids": segment_ids,
+                        "kernel_mesh": mesh,
+                        "continue_initial_state": continue_initial_state,
+                    }
                     if shardings is not None and mesh is not None:
 
                         def _eff(axes):
@@ -1790,7 +1810,7 @@ class KernelDeltaAttnOp(OperationImpl):
                                 n *= int(mesh.shape[name])
                             return None if n == 1 else axes
 
-                        qs = tuple(_eff(a) for a in tuple(shardings.query) + (None,) * (4 - len(tuple(shardings.query))))
+                        qs = tuple(_eff(a) for a in tuple(query_spec) + (None,) * (4 - len(tuple(query_spec))))
                         # BTHD spec -> (batch, head) axes; seq / head_dim must be unsharded.
                         if qs[1] is None and qs[3] is None:
                             extra["kernel_lead_specs"] = (qs[0], qs[2])
@@ -1816,6 +1836,7 @@ class KernelDeltaAttnOp(OperationImpl):
                     initial_state=recurrent_state,
                     use_qk_l2norm=True,
                     segment_ids=segment_ids,
+                    continue_initial_state=continue_initial_state,
                 )
 
             outputs = outputs.transpose(0, 2, 1, 3)
@@ -1867,6 +1888,7 @@ class KernelDeltaAttnOp(OperationImpl):
         segment_ids: Array | None = None,
         chunk_size: int = 64,
         per_channel_decay: bool = False,
+        continue_initial_state: bool = False,
         **kwargs,
     ) -> KDAOutput:
         """Execute the KDA operation.
@@ -1888,6 +1910,10 @@ class KernelDeltaAttnOp(OperationImpl):
             chunk_size: Chunk size for training mode
             per_channel_decay: Force the per-channel-decay kernels; inferred
                 automatically when ``decay.ndim == 4``.
+            continue_initial_state: For cached multi-token segmented continuation,
+                preserve incoming state into the first valid segment and over padding.
+                Real within-chunk segment changes still reset memory. False keeps
+                the packed-training reset behavior.
             **kwargs: Additional arguments
 
         Returns:
@@ -1906,6 +1932,7 @@ class KernelDeltaAttnOp(OperationImpl):
             segment_ids=segment_ids,
             chunk_size=chunk_size,
             per_channel_decay=per_channel_decay,
+            continue_initial_state=continue_initial_state,
             **kwargs,
         )
 

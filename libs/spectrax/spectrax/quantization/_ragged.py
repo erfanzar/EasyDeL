@@ -43,7 +43,7 @@ from ..core._typing import Array, DType
 from . import _numerics as numerics
 from ._calibrate import (
     HowToQuantize,
-    calibrate,
+    calibrate_across_axis,
     compute_scale_zero_point,
     dequantize,
     quantize,
@@ -161,14 +161,16 @@ def _is_output_dequantizable(operand: MaybeQArray) -> bool:
         operand: A quantized or plain array.
 
     Returns:
-        ``True`` when the operand is a quantized affine type whose
-        contracted axis carries a single shared scale. A subchannel-tiled
-        contraction cannot factor out of the sum, and a code book such as
-        ``nf4`` has no arithmetic meaning before dequantization.
+        ``True`` when the operand is an arithmetic quantized type with
+        no zero point and a single shared scale on the contracted axis.
+        A subchannel-tiled scale cannot factor out of the sum, and a code
+        book such as ``nf4`` has no arithmetic meaning before dequantization.
     """
     if not isinstance(operand, QArray):
         return not numerics.should_quantize(operand.dtype)
-    if not numerics.can_dequantize_on_output(operand.qtype):
+    if not numerics.can_dequantize_on_output(operand.qtype) or operand.zero_point is not None:
+        # This fast path factors out scales only; it has no zero-point
+        # correction. Reconstruct asymmetric operands before contracting.
         return False
     return operand.scale.shape[1] == 1
 
@@ -248,12 +250,10 @@ def _ragged_dot_maybe_quantized(
 def _quantize_across_axis(array: Array, how: HowToQuantize, axis_name: str | None) -> QArray:
     """Quantize an array whose contracted axis may be sharded.
 
-    Inside a ``shard_map`` a local reduction over a sharded contraction
-    sees one shard of what is logically a single tensor, so every rank
-    would derive a different scale for the same weight. Reducing the
-    calibration across the axis first restores the global statistic and
-    keeps a quantization-aware training run matched to the single-scale
-    layout it will later be served with.
+    Calibration follows the global contraction tiles, not rank-local tile
+    indices. Complete tiles within a shard need no collective. Tiles that
+    cross shard boundaries combine only statistics from their own pieces;
+    gathering those small statistics avoids gathering the operand itself.
 
     Args:
         array: The array to quantize.
@@ -264,12 +264,11 @@ def _quantize_across_axis(array: Array, how: HowToQuantize, axis_name: str | Non
     Returns:
         The quantized array.
     """
-    if axis_name is None:
-        return quantize(array, how)
-    calibration = calibrate(array, how)
-    calibration = jax.tree.map(lambda value: jax.lax.pmax(value, axis_name), calibration)
+    calibration = calibrate_across_axis(array, how, axis_name, array_axis=1)
     scale, zero_point = compute_scale_zero_point(calibration, how.qtype, power_of_two_scale=how.power_of_two_scale)
-    return quantize_with_scale_zero_point(array, how.qtype, scale, zero_point, how.noise_fn)
+    return quantize_with_scale_zero_point(
+        array, how.qtype, scale, zero_point, how.noise_fn, exact_affine="affine_neg_min" in calibration
+    )
 
 
 def _ragged_dot_qt_fwd(
@@ -328,10 +327,12 @@ def _ragged_dot_qt_bwd(
 ) -> tuple[Array, Array, None]:
     """Compute both operand gradients against the saved quantized residuals.
 
-    Each gradient folds the *other* operand's scale into the cotangent
-    before contracting, so the residual can be used as raw quantized
-    values. For the weight's scale that fold is a row gather, because the
-    scale a row needs depends on which expert the row was routed to.
+    Symmetric arithmetic residuals with a shared contraction scale fold
+    that scale into the cotangent before contracting, so the residual can
+    be used as raw quantized values. For the weight's scale that fold is
+    a row gather, because the scale a row needs depends on which expert
+    the row was routed to. Asymmetric, tiled and code-book residuals are
+    reconstructed first, preserving their complete quantization grid.
 
     Args:
         rule: The governing rule.
@@ -356,9 +357,14 @@ def _ragged_dot_qt_bwd(
     lhs_cotangent = cotangent
     rhs_operand: MaybeQArray = rhs
     if isinstance(rhs, QArray):
-        row_groups = _row_group_ids(group_sizes, num_rows)
-        lhs_cotangent = lhs_cotangent * _gather_group_scale(rhs.scale, row_groups).astype(lhs_cotangent.dtype)
-        rhs_operand = rhs.qvalue
+        if _is_output_dequantizable(rhs) and rhs.qtype == rhs.qvalue.dtype:
+            row_groups = _row_group_ids(group_sizes, num_rows)
+            lhs_cotangent = lhs_cotangent * _gather_group_scale(rhs.scale, row_groups).astype(lhs_cotangent.dtype)
+            rhs_operand = rhs.qvalue
+        else:
+            # A scale fold alone loses affine offsets and code-book values;
+            # tiled scales also cannot be gathered as a single row scale.
+            rhs_operand = dequantize(rhs)
     # ``[G, K, N] -> [G, N, K]``: the backward contracts the cotangent's N
     # against the weight's N. A QArray swaps every component in lock step,
     # so this is the same call either way.
@@ -386,8 +392,11 @@ def _ragged_dot_qt_bwd(
     rhs_cotangent = cotangent
     lhs_operand: MaybeQArray = lhs
     if isinstance(lhs, QArray):
-        rhs_cotangent = generic_broadcast_op(jnp.multiply, rhs_cotangent, lhs.scale.astype(rhs_cotangent.dtype))
-        lhs_operand = lhs.qvalue
+        if _is_output_dequantizable(lhs) and lhs.qtype == lhs.qvalue.dtype:
+            rhs_cotangent = generic_broadcast_op(jnp.multiply, rhs_cotangent, lhs.scale.astype(rhs_cotangent.dtype))
+            lhs_operand = lhs.qvalue
+        else:
+            lhs_operand = dequantize(lhs)
 
     if rule.bwd_qtype is not None and numerics.should_quantize(rhs_cotangent.dtype):
         rhs_cotangent = dequantize(
@@ -491,10 +500,12 @@ def qragged_dot(
         preferred_element_type: Requested output dtype.
         group_offset: Forwarded to :func:`jax.lax.ragged_dot`.
         calibration_axis_name: Mesh axis the contracted dimension is sharded
-            over, when this runs inside a ``shard_map``. Without it each rank
-            calibrates against its own shard and derives a different scale
-            for what is logically one tensor. Passed as a name rather than a
-            callable so it stays hashable and does not defeat the jit cache.
+            over, when this runs inside a ``shard_map``. Calibration then
+            follows global tiles, including tiles spanning multiple ranks;
+            complete local tiles keep independent scales. Fractional tile
+            sizes resolve against the global contraction length. Without this
+            name calibration is local to each shard. Passed as a name rather
+            than a callable so it stays hashable and does not defeat the jit cache.
 
     Returns:
         The contraction result ``[M, N]``. The quantized path explicitly

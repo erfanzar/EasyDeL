@@ -23,7 +23,6 @@ fused policies and metrics.
 from __future__ import annotations
 
 import enum
-import os
 import typing
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -48,10 +47,6 @@ DP = common_types.DP
 FSDP = common_types.FSDP
 TP = common_types.TP
 SP = common_types.SP
-
-EP_DISPATCH = os.getenv("EP_DISPATCH", "auto")
-EP_AUTO_THRESHOLD = int(os.getenv("EP_AUTO_THRESHOLD", os.getenv("EP_AUTO_TRESHOLD", "0")))
-GMM_PLATFORM = None
 
 
 class MoEMethods(enum.StrEnum):
@@ -88,128 +83,172 @@ class MoEMethods(enum.StrEnum):
 
 
 def rsum_scatter(x: jax.Array, axis_name: str, scatter_dimension: int, tiled: bool = True) -> jax.Array:
-    """Perform reduce-scatter along ``axis_name`` returning per-device tiles.
-
-    Thin wrapper around :func:`jax.lax.psum_scatter` that combines an
-    all-reduce sum with a scatter so each device ends up with a different
-    slice of the reduced result along ``scatter_dimension``.
+    """Sum over ``axis_name`` and scatter the result along ``scatter_dimension``.
 
     Args:
         x: Input array to reduce and scatter.
-        axis_name: Name of the mesh axis to reduce-scatter along (e.g., "dp", "tp", "ep").
-        scatter_dimension: Dimension of `x` along which to scatter the result.
-            Each device receives a slice of size `x.shape[scatter_dimension] / num_devices`.
-        tiled: If True, the output is tiled (concatenated) across devices in the
-            scatter dimension. Defaults to True.
+        axis_name: Bound mesh axis to reduce over.
+        scatter_dimension: Dimension along which the reduced result is split.
+        tiled: Whether to concatenate each device's tile along the scatter dimension.
 
     Returns:
-        Reduced and scattered array. Shape is the same as input, but the
-        scatter_dimension is divided by the number of devices in the axis.
-
-    Example:
-        >>> # Reduce-scatter across data parallel axis
-        >>> x = jnp.ones((8, 1024))  # On each device
-        >>> result = rsum_scatter(x, "dp", scatter_dimension=0)
-        >>> # result.shape = (8 // dp_size, 1024) with summed values
+        The local tile of the reduced array.
     """
     return lax.psum_scatter(x, axis_name, scatter_dimension=scatter_dimension, tiled=tiled)
 
 
 def argsort(x: jax.Array) -> jax.Array:
-    """Return indices that would sort ``x`` along its last axis.
-
-    Convenience wrapper around :func:`jnp.argsort` (fixed ``axis=-1``);
-    used throughout the MoE pipeline to sort tokens by expert assignment.
+    """Return stable sorting indices for the last dimension of ``x``.
 
     Args:
-        x: Input array to sort. Can have any number of dimensions.
+        x: Input array to sort.
 
     Returns:
-        Integer array of indices that would sort `x` along axis=-1.
-        Has the same shape as `x`.
-
-    Example:
-        >>> x = jnp.array([[3, 1, 2], [6, 4, 5]])
-        >>> indices = argsort(x)
-        >>> # indices = [[1, 2, 0], [1, 2, 0]]
-        >>> sorted_x = jnp.take_along_axis(x, indices, axis=-1)
+        Indices with the same shape as ``x`` that sort its last dimension.
     """
     return jnp.argsort(x, axis=-1)
 
 
 def take1d(x: jax.Array, idx: jax.Array) -> jax.Array:
-    """Gather along axis 0 using ``idx``.
-
-    Convenience wrapper around :func:`jnp.take` for extracting rows from a
-    2-D array (or elements from a 1-D array).
+    """Gather rows along the first dimension.
 
     Args:
-        x: Input array to index. Shape: (N, ...).
-        idx: Integer array of indices to extract. Shape: (M,).
-            Values should be in range [0, N).
+        x: Input array of shape ``(N, ...)``.
+        idx: Row indices of shape ``(M,)``.
 
     Returns:
-        Array with selected elements. Shape: (M, ...) where ... matches
-        the trailing dimensions of `x`.
-
-    Example:
-        >>> x = jnp.array([[10, 20], [30, 40], [50, 60]])
-        >>> idx = jnp.array([2, 0, 1])
-        >>> result = take1d(x, idx)
-        >>> # result = [[50, 60], [10, 20], [30, 40]]
+        Selected rows with shape ``(M, ...)``.
     """
     return jnp.take(x, idx, axis=0)
 
 
 def repeat_take_sorted(x: jax.Array, sort_idx: jax.Array, k: int) -> jax.Array:
-    """Replicate rows of ``x`` k times implicitly, then reorder by ``sort_idx``.
-
-    This function is used in MoE to replicate token representations k times
-    (once per selected expert) and then sort them by expert assignment.
-    The sort indices are assumed to be for a k-times-repeated array, where
-    `sort_idx // k` maps back to the original row indices.
+    """Repeat each row ``k`` times implicitly and gather in ``sort_idx`` order.
 
     Args:
-        x: Input array to repeat and sort. Shape: (N, ...).
-        sort_idx: Sorted indices for the repeated array. Shape: (N*k,).
-            Each group of k consecutive original indices can map to any position.
-        k: Repetition factor (typically `num_experts_per_tok`).
+        x: Input rows of shape ``(N, ...)``.
+        sort_idx: Indices into the repeated rows, of shape ``(N * k,)``.
+        k: Repetition count, typically the number of experts selected per token.
 
     Returns:
-        Sorted and implicitly repeated array. Shape: (N*k, ...) where each
-        original row appears k times, reordered according to `sort_idx`.
-
-    Example:
-        >>> x = jnp.array([[1, 2], [3, 4]])  # 2 tokens
-        >>> sort_idx = jnp.array([2, 0, 3, 1])  # Sorted for 2*2=4 entries
-        >>> result = repeat_take_sorted(x, sort_idx, k=2)
-        >>> # Maps indices [2,0,3,1] -> [1,0,1,0] -> rows [3,4], [1,2], [3,4], [1,2]
+        Repeated and reordered rows with shape ``(N * k, ...)``.
     """
     return jnp.take(x, sort_idx // k, axis=0)
 
 
 def bincount(x: jax.Array, length: int) -> jax.Array:
-    """Count occurrences of each non-negative integer in ``x`` up to ``length``.
-
-    Thin wrapper around :func:`jnp.bincount` with the output length passed
-    explicitly. Used in MoE to count how many tokens are assigned to each
-    expert.
+    """Count non-negative integer values in a fixed-width histogram.
 
     Args:
-        x: Integer array to count. Shape: (N,). Values should be in range [0, length).
-            Negative values are ignored.
-        length: Length of the output array. Determines the number of bins.
+        x: One-dimensional integer bin indices. Negative entries are ignored.
+        length: Number of histogram bins.
 
     Returns:
-        Count array where result[i] = number of times i appears in x.
-        Shape: (length,).
-
-    Example:
-        >>> expert_ids = jnp.array([0, 2, 1, 0, 2, 2])
-        >>> counts = bincount(expert_ids, length=4)
-        >>> # counts = [2, 1, 3, 0] - expert 0: 2 tokens, expert 1: 1 token, etc.
+        Counts of shape ``(length,)``.
     """
-    return jnp.bincount(x, length=length)
+    # JAX clips negative entries into bin zero; mask them to honor this helper's contract.
+    return jnp.bincount(x, weights=(x >= 0).astype(jnp.int32), length=length)
+
+
+def canon_dim(ndim: int, dim: int) -> int:
+    """Canonicalize a dimension index, accepting negative NumPy-style indices.
+
+    Args:
+        ndim: Rank of the indexed array.
+        dim: Dimension index in ``[-ndim, ndim)``.
+
+    Returns:
+        Non-negative dimension index in ``[0, ndim)``.
+    """
+    return dim if dim >= 0 else ndim + dim
+
+
+def psum_maybe(
+    x: jax.Array,
+    axes: tuple[str, ...],
+    mesh: MeshLike,
+    dtype: jnp.dtype = jnp.float32,
+) -> jax.Array:
+    """Sum only across axes present on ``mesh`` with size greater than one.
+
+    Args:
+        x: Input array.
+        axes: Candidate bound mesh axes to reduce over.
+        mesh: Mesh describing the available axes and their sizes.
+        dtype: Accumulation dtype; the result is cast back to the input dtype.
+
+    Returns:
+        Reduced array, or ``x`` unchanged if no axis qualifies.
+    """
+    names = tuple(a for a in axes if a in mesh.axis_names and mesh.shape.get(a, 1) > 1)
+    return lax.psum(x.astype(dtype), names).astype(x.dtype) if names else x
+
+
+def rsum_scatter_maybe(
+    x: jax.Array, axis_name: str, dim: int, mesh: MeshLike, dtype: jnp.dtype = jnp.float32
+) -> jax.Array:
+    """Reduce-scatter only when ``axis_name`` exists and has size greater than one.
+
+    Args:
+        x: Input array.
+        axis_name: Candidate bound mesh axis to reduce over.
+        dim: Dimension to scatter, accepting negative indices.
+        mesh: Mesh describing the available axes and sizes.
+        dtype: Accumulation dtype; the result is cast back to the input dtype.
+
+    Returns:
+        The local tile of the reduced array, or ``x`` unchanged for a trivial axis.
+    """
+    if axis_name not in mesh.axis_names or mesh.shape.get(axis_name, 1) == 1:
+        return x
+    dim = canon_dim(x.ndim, dim)
+    return lax.psum_scatter(x.astype(dtype), axis_name, scatter_dimension=dim, tiled=True).astype(x.dtype)
+
+
+def slice_k_for_param_shards(
+    x_mat: jax.Array, chunk: int, axes: tuple[str, ...], mesh: MeshLike, axis: int = 1
+) -> jax.Array:
+    """Select the activation chunk corresponding to the local parameter shard.
+
+    Args:
+        x_mat: Activation array.
+        chunk: Width of the parameter shard along ``axis``.
+        axes: Bound mesh axes, ordered fastest varying first.
+        mesh: Mesh describing their sizes.
+        axis: Activation dimension to slice.
+
+    Returns:
+        The local activation chunk, or the full array for unsharded parameters.
+    """
+    idx = 0
+    stride = 1
+    for ax in axes:
+        size = mesh.shape.get(ax, 1)
+        if size > 1:
+            idx = idx + lax.axis_index(ax) * stride
+            stride *= size
+    if stride == 1 or chunk == x_mat.shape[axis]:
+        return x_mat
+    return lax.dynamic_slice_in_dim(x_mat, start_index=idx * chunk, slice_size=chunk, axis=axis)
+
+
+def tp_global_topk(logits_shard: jax.Array, k: int, tp_axis: str) -> tuple[jax.Array, jax.Array]:
+    """Compute global top-k over expert shards, gathering only local candidates.
+
+    Args:
+        logits_shard: Local router logits with shape ``(..., local_experts)``.
+        k: Number of experts to select globally, at most the global expert count.
+        tp_axis: Bound tensor-parallel axis holding the expert shards.
+
+    Returns:
+        Top-k values and global expert indices, each with shape ``(..., k)``.
+    """
+    vals_l, idx_l = lax.top_k(logits_shard, min(k, logits_shard.shape[-1]))
+    idx_l = idx_l + lax.axis_index(tp_axis) * logits_shard.shape[-1]
+    vals_all = lax.all_gather(vals_l, tp_axis, axis=-1, tiled=True)
+    idx_all = lax.all_gather(idx_l, tp_axis, axis=-1, tiled=True)
+    vals_g, pos = lax.top_k(vals_all, k)
+    return vals_g, jnp.take_along_axis(idx_all, pos, axis=-1)
 
 
 def sort_activations(
@@ -434,126 +473,6 @@ class MoeFusedHooks:
             >>> # hooks.before_gate is preserved, after_gate and before_wo are updated
         """
         return replace(self, **kws)
-
-
-def canon_dim(ndim: int, dim: int) -> int:
-    """Canonicalize a (possibly negative) dimension index into ``[0, ndim)``.
-
-    Follows NumPy/JAX convention: ``-1`` becomes ``ndim - 1``, ``-2`` becomes
-    ``ndim - 2``, etc. Non-negative inputs pass through unchanged.
-
-    Args:
-        ndim: Total number of dimensions in the array.
-        dim: Dimension index to canonicalize. Can be negative.
-            Must be in range [-ndim, ndim).
-
-    Returns:
-        Non-negative dimension index in range [0, ndim).
-
-    Example:
-        >>> canon_dim(3, -1)  # Last dimension of 3D array
-        2
-        >>> canon_dim(3, 1)   # Already positive
-        1
-        >>> canon_dim(4, -2)  # Second to last
-        2
-    """
-    return dim if dim >= 0 else (ndim + dim)
-
-
-def psum_maybe(
-    x: jax.Array,
-    axes: tuple[str, ...],
-    mesh: MeshLike,
-    dtype: jnp.dtype = jnp.float32,
-) -> jax.Array:
-    """Reduce-sum ``x`` only across axes that actually exist on ``mesh``.
-
-    Filters the requested axes down to those that exist in the mesh *and*
-    have size > 1, runs the ``psum`` in ``dtype`` for numerical stability,
-    and casts back to the input dtype. When no axis qualifies the input is
-    returned unchanged.
-
-    Args:
-        x: Input array to reduce.
-        axes: Tuple of axis names to potentially reduce over.
-        mesh: JAX device mesh containing available axes.
-        dtype: Data type for accumulation during reduction. Defaults to float32
-            for numerical stability.
-
-    Returns:
-        Reduced array if valid axes exist, otherwise the original array.
-        Always returns in the original dtype of x.
-
-    """
-    names = tuple(a for a in axes if a in mesh.axis_names and mesh.shape.get(a, 1) > 1)
-    return lax.psum(x.astype(dtype), names).astype(x.dtype) if names else x
-
-
-def rsum_scatter_maybe(
-    x: jax.Array, axis_name: str, dim: int, mesh: MeshLike, dtype: jnp.dtype = jnp.float32
-) -> jax.Array:
-    """Reduce-scatter ``x`` along ``axis_name`` only when that axis is non-trivial.
-
-    Checks that ``axis_name`` is present in ``mesh`` and has size > 1; if so,
-    runs :func:`jax.lax.psum_scatter` in ``dtype`` and casts back. Otherwise
-    returns ``x`` unchanged.
-
-    Args:
-        x: Input array to reduce-scatter.
-        axis_name: Name of the axis to reduce-scatter along.
-        dim: Dimension of x to split during scatter. Can be negative.
-        mesh: JAX device mesh containing available axes.
-        dtype: Data type for accumulation during reduction. Defaults to float32.
-
-    Returns:
-        Reduce-scattered array with the scatter dimension divided by axis size,
-        or the original array if the axis doesn't exist or has size 1.
-
-    """
-    if axis_name not in mesh.axis_names or mesh.shape.get(axis_name, 1) == 1:
-        return x
-    dim = canon_dim(x.ndim, dim)
-    return lax.psum_scatter(x.astype(dtype), axis_name, scatter_dimension=dim, tiled=True).astype(x.dtype)
-
-
-def slice_k_for_param_shards(
-    x_mat: jax.Array, chunk: int, axes: tuple[str, ...], mesh: MeshLike, axis: int = 1
-) -> jax.Array:
-    """Slice the local ``chunk`` of activations matching multi-axis param sharding.
-
-    When parameters are sharded across several mesh axes (e.g. SP + FSDP),
-    the local rank's slice is identified by the row-major linearisation of
-    its per-axis indices over ``axes``. This helper computes that linear
-    index, multiplies by ``chunk``, and returns the matching dynamic slice
-    of ``x_mat`` along ``axis``. Returns ``x_mat`` unchanged when no axis
-    contributes (stride 1) or when the requested ``chunk`` equals the full
-    axis length.
-
-    Args:
-        x_mat: Activation tensor to slice.
-        chunk: Size of each parameter chunk (local size after sharding).
-        axes: Tuple of axis names that shard the parameter dimension, in row-major
-            order. For example, ("sp", "fsdp") means SP varies faster than FSDP.
-        mesh: JAX device mesh.
-        axis: Dimension of x_mat to slice. Defaults to 1 (typically the hidden dimension).
-
-    Returns:
-        Sliced tensor of size chunk along the specified axis, or the original tensor
-        if no sharding is needed (stride=1 or chunk matches full size).
-
-    """
-    idx = 0
-    stride = 1
-    for ax in axes:
-        size = mesh.shape.get(ax, 1)
-        if size > 1:
-            idx = idx + lax.axis_index(ax) * stride
-            stride *= size
-    if stride == 1 or chunk == x_mat.shape[axis]:
-        return x_mat
-    start = idx * chunk
-    return lax.dynamic_slice_in_dim(x_mat, start_index=start, slice_size=chunk, axis=axis)
 
 
 class _Transform(enum.Enum):
@@ -884,42 +803,6 @@ def chunk_group_sizes(
     return (hi - lo).astype(group_starts.dtype)
 
 
-def tp_global_topk(logits_shard: jax.Array, k: int, tp_axis: str) -> tuple[jax.Array, jax.Array]:
-    """Compute global top-k across tensor-parallel shards with minimal communication.
-
-    Pipeline:
-
-    1. Local ``lax.top_k`` over this shard's expert subset.
-    2. ``all_gather`` of the per-shard top-k values and indices along ``tp_axis``.
-    3. Final ``lax.top_k`` on the gathered tile.
-
-    Communicates ``k * tp_size`` values per token instead of ``E`` values.
-
-    Args:
-        logits_shard: Local router logits for experts on this shard.
-            Shape: (batch_size, E_local) where E_local = total_experts / tp_size.
-        k: Number of top experts to select globally.
-        tp_axis: Name of the tensor parallel mesh axis.
-
-    Returns:
-        A tuple of (values, indices) where:
-            - values: Top-k router logit values. Shape: (batch_size, k).
-            - indices: Global expert indices for top-k experts. Shape: (batch_size, k).
-
-    """
-    vals_l, idx_l = jax.lax.top_k(logits_shard, k)
-    shard = jax.lax.axis_index(tp_axis)
-    E_local = logits_shard.shape[-1]
-    idx_l = idx_l + shard * E_local
-
-    vals_all = jax.lax.all_gather(vals_l, tp_axis, axis=-1, tiled=True)
-    idx_all = jax.lax.all_gather(idx_l, tp_axis, axis=-1, tiled=True)
-
-    vals_g, pos = jax.lax.top_k(vals_all, k)
-    idx_g = jnp.take_along_axis(idx_all, pos, axis=-1)
-    return vals_g, idx_g
-
-
 def get_experts_location(
     gate_logits,
     pre_bias_logits,
@@ -975,6 +858,8 @@ def permute(
     refine_weights_hook: typing.Callable[[jax.Array], jax.Array] | None = None,
     refine_inputs_hook: typing.Callable[[jax.Array, jax.Array, tuple[int]], jax.Array] | None = None,
     scale_replicated_inputs: typing.Callable[[jax.Array, jax.Array], jax.Array] | None = None,
+    preselected_routing: tuple[jax.Array, jax.Array] | None = None,
+    record_replica_id: jax.Array | int | None = None,
 ) -> tuple[Array, Array, Array, Array, Array]:
     """Permute tokens by expert assignment for grouped matmul.
 
@@ -1013,6 +898,16 @@ def permute(
         refine_weights_hook: Optional function to modify selected weights.
         refine_inputs_hook: Optional function to refine or modify token representations based
             on the selected weights and original input shape.
+        scale_replicated_inputs: Optional function to scale replicated tokens by selected weights.
+        preselected_routing: Optional ``(weights, expert_indices)`` pair, each shaped
+            ``(batch * seq, num_experts_per_tok)``. When provided, bypasses
+            ``gate_logits``, ``pre_bias_logits``, ``select_hook`` and
+            ``refine_weights_hook``; weights must already be refined. This allows
+            full-block routing/capacity decisions to be reused by chunked dispatch
+            without selecting or normalizing again. Input hooks still apply.
+        record_replica_id: Optional index among shards holding identical router
+            histograms. Only replica zero is recorded; distinct token shards must
+            each use zero so genuine calls/chunks remain additive.
 
     Returns:
         A 5-tuple `(sorted_inputs, sorted_selected_experts, weights, group_size, sorted_experts)`
@@ -1049,13 +944,19 @@ def permute(
     inputs_shape = inputs.shape
     bsz_times_seq_len = inputs_shape[0] * inputs_shape[1]
     inputs_2d = jnp.reshape(inputs, (bsz_times_seq_len, inputs_shape[2]))
-    weights, selected_experts = get_experts_location(
-        gate_logits=gate_logits,
-        pre_bias_logits=pre_bias_logits,
-        select_hook=select_hook,
-        refine_weights_hook=refine_weights_hook,
-        num_experts_per_tok=num_experts_per_tok,
-    )
+    if preselected_routing is None:
+        weights, selected_experts = get_experts_location(
+            gate_logits=gate_logits,
+            pre_bias_logits=pre_bias_logits,
+            select_hook=select_hook,
+            refine_weights_hook=refine_weights_hook,
+            num_experts_per_tok=num_experts_per_tok,
+        )
+    else:
+        weights, selected_experts = preselected_routing
+        expected_shape = (bsz_times_seq_len, num_experts_per_tok)
+        if weights.shape != expected_shape or selected_experts.shape != expected_shape:
+            raise ValueError(f"preselected_routing weights and expert indices must have shape {expected_shape}.")
     if refine_inputs_hook:
         inputs_2d = refine_inputs_hook(inputs_2d, weights, inputs_shape)
 
@@ -1080,6 +981,7 @@ def permute(
         num_experts=num_experts,
         roll_to_expert_id=roll_to_expert_id,
         layer_idx=layer_idx,
+        replica_id=record_replica_id,
     )
 
     expert_indices = jnp.arange(num_experts)

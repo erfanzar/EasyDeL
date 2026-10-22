@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import typing as tp
 
+import jax
 from eformer.jaximus import ImplicitArray
 from eformer.pytree import auto_pytree, field, xTree
 from jax import lax
@@ -77,12 +78,9 @@ from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float, Int
 from spectrax import PartitionAxis, with_sharding_constraint
 
-from easydel.utils.helpers import check_bool_flag
-
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, BaseRunTimeMetadata
 
 if tp.TYPE_CHECKING:
-
     from ..kda.cache import KDACacheView
     from ..ragged_page.cache import RaggedPagesCacheView
     from ..recurrent.cache import RecurrentCacheView
@@ -99,17 +97,32 @@ PARALLEL_HYBRID = "parallel_hybrid"
 LayerType = tp.Literal["full_attention", "linear_attention", "kda_linear_attention", "parallel_hybrid", "hybrid"]
 
 
-def _linear_recurrent_state_dtype(cache_dtype: jnp.dtype) -> jnp.dtype:
+#: ``HybridCacheConfig.recurrent_state_dtype`` sentinel selecting the cache dtype for the recurrent state.
+RECURRENT_STATE_DTYPE_CACHE = "cache"
+
+
+def _linear_recurrent_state_dtype(cache_dtype: jnp.dtype, recurrent_state_dtype: str | None = None) -> jnp.dtype:
     """Return storage dtype for GDN/KDA recurrent state.
 
-    the TPU serving path stores convolution state in the cache dtype but keeps the
-    recurrent GDN matrix in fp32. EasyDeL's GDN kernels also run the recurrent
-    math in fp32; storing the row in fp32 avoids a full bf16->fp32 cast of the
-    state pool on every decode step.
+    The TPU serving path stores convolution state in the cache dtype but keeps the
+    recurrent GDN matrix in fp32 by default. EasyDeL's GDN kernels also run the
+    recurrent math in fp32; storing the row in fp32 avoids a full bf16->fp32 cast
+    of the state pool on every decode step.
+
+    Args:
+        cache_dtype: Dtype used for the KV / conv-state tensors of the cache.
+        recurrent_state_dtype: ``HybridCacheConfig.recurrent_state_dtype``. ``None``
+            keeps the recurrent state in float32; :data:`RECURRENT_STATE_DTYPE_CACHE`
+            stores it in ``cache_dtype``; any other value is a dtype name.
+
+    Returns:
+        The dtype used to allocate the recurrent state tensors.
     """
-    if check_bool_flag("EASYDEL_HYBRID_RECURRENT_FLOAT32", True):
+    if recurrent_state_dtype is None:
         return jnp.float32
-    return cache_dtype
+    if recurrent_state_dtype == RECURRENT_STATE_DTYPE_CACHE:
+        return cache_dtype
+    return jnp.dtype(recurrent_state_dtype)
 
 
 @auto_pytree
@@ -140,6 +153,10 @@ class HybridCacheConfig(BaseCacheConfig):
             is one of ``FULL_ATTENTION``, ``LINEAR_ATTENTION``,
             ``KDA_LINEAR_ATTENTION``, ``PARALLEL_HYBRID``, or ``HYBRID``
             (the latter is normalized to ``PARALLEL_HYBRID``).
+        recurrent_state_dtype (str | None): Storage dtype of the recurrent
+            state of linear / KDA / parallel-hybrid layers. ``None`` (default)
+            keeps it in float32, ``"cache"`` stores it in the cache dtype, and
+            any other value is a dtype name such as ``"bfloat16"``.
     """
 
     num_hidden_layers: int = field(pytree_node=False)
@@ -159,6 +176,8 @@ class HybridCacheConfig(BaseCacheConfig):
 
     layer_types: tuple[str, ...] = field(pytree_node=False)
 
+    recurrent_state_dtype: str | None = field(pytree_node=False, default=None)
+
     @classmethod
     def create(
         cls,
@@ -173,6 +192,7 @@ class HybridCacheConfig(BaseCacheConfig):
         d_state: int,
         layer_types: tuple[str, ...] | list[str],
         num_attention_heads: int | None = None,
+        recurrent_state_dtype: tp.Any = None,
     ) -> "HybridCacheConfig":
         """Create a HybridCacheConfig instance with validation.
 
@@ -188,6 +208,9 @@ class HybridCacheConfig(BaseCacheConfig):
             d_state: Recurrent state dimension for linear attention.
             layer_types: Per-layer attention type ("full_attention" or "linear_attention").
             num_attention_heads: Number of attention heads (defaults to num_key_value_heads).
+            recurrent_state_dtype: Storage dtype of the recurrent state. ``None``
+                keeps float32 (default), ``"cache"`` uses the cache dtype, or pass
+                any dtype (``jnp.bfloat16`` / ``"bfloat16"``).
 
         Returns:
             HybridCacheConfig instance.
@@ -224,6 +247,9 @@ class HybridCacheConfig(BaseCacheConfig):
         if num_attention_heads is None:
             num_attention_heads = num_key_value_heads
 
+        if recurrent_state_dtype is not None and recurrent_state_dtype != RECURRENT_STATE_DTYPE_CACHE:
+            recurrent_state_dtype = jnp.dtype(recurrent_state_dtype).name
+
         return cls(
             num_hidden_layers=num_hidden_layers,
             partition_axis=partition_axis,
@@ -236,6 +262,7 @@ class HybridCacheConfig(BaseCacheConfig):
             d_state=d_state,
             num_attention_heads=num_attention_heads,
             layer_types=tuple(normalized_layer_types),
+            recurrent_state_dtype=recurrent_state_dtype,
         )
 
     def is_full_attention(self, layer_idx: int) -> bool:
@@ -427,7 +454,7 @@ class HybridCacheView(BaseCacheView):
                 sharding=partition_specs,
             )
         elif layer_type == LINEAR_ATTENTION:
-            recurrent_dtype = _linear_recurrent_state_dtype(dtype)
+            recurrent_dtype = _linear_recurrent_state_dtype(dtype, metadata.recurrent_state_dtype)
             conv_state = with_sharding_constraint(
                 arr=jnp.zeros(
                     shape=(
@@ -464,7 +491,7 @@ class HybridCacheView(BaseCacheView):
             # Allocate separate Q/K/V conv states + recurrent state for KDA (Kimi Linear)
             # For KDA, d_inner is split into key_dim (Q/K) and value_dim (V)
             # We use d_inner for key dimension and d_state for value dimension
-            recurrent_dtype = _linear_recurrent_state_dtype(dtype)
+            recurrent_dtype = _linear_recurrent_state_dtype(dtype, metadata.recurrent_state_dtype)
             key_dim = metadata.num_attention_heads * metadata.head_dim
             value_dim = metadata.d_state  # In KDA, value has different dimension
 
@@ -515,7 +542,7 @@ class HybridCacheView(BaseCacheView):
         elif layer_type == PARALLEL_HYBRID:
             # Allocate BOTH KV cache AND recurrent state for parallel hybrid layers
             # (e.g., FalconH1 where attention and SSM run in parallel)
-            recurrent_dtype = _linear_recurrent_state_dtype(dtype)
+            recurrent_dtype = _linear_recurrent_state_dtype(dtype, metadata.recurrent_state_dtype)
 
             # KV cache (same as FULL_ATTENTION)
             key = with_sharding_constraint(
@@ -627,6 +654,14 @@ class HybridCacheView(BaseCacheView):
             Tuple of (key_cache, value_cache, updated_view).
             For non-full-attention layers, key_cache and value_cache are None.
         """
+
+        def update_rows(old, new, positions):
+            """Write each row at its own traced sequence position."""
+            positions = jnp.broadcast_to(jnp.asarray(positions, dtype=jnp.int32), (new.shape[0],))
+            return jax.vmap(lambda row, block, pos: lax.dynamic_update_slice(row, block, (pos, 0, 0)))(
+                old, new.astype(old.dtype), positions
+            )
+
         if self.layer_type == FULL_ATTENTION:
             if key_states is None or value_states is None:
                 return self.key, self.value, self
@@ -639,10 +674,8 @@ class HybridCacheView(BaseCacheView):
             new_key = self.key
             new_value = self.value
 
-            # Simple update: assume cache_position is a scalar for all batches
-            start_indices = (0, int(cache_position[0]), 0, 0)
-            new_key = lax.dynamic_update_slice(new_key, key_states, start_indices)
-            new_value = lax.dynamic_update_slice(new_value, value_states, start_indices)
+            new_key = update_rows(new_key, key_states, cache_position)
+            new_value = update_rows(new_value, value_states, cache_position)
 
             new_positions = cache_position + seq_len
 
@@ -701,9 +734,8 @@ class HybridCacheView(BaseCacheView):
                 if cache_position is None:
                     cache_position = self.positions
 
-                start_indices = (0, int(cache_position[0]), 0, 0)
-                new_key = lax.dynamic_update_slice(self.key, key_states, start_indices)
-                new_value = lax.dynamic_update_slice(self.value, value_states, start_indices)
+                new_key = update_rows(self.key, key_states, cache_position)
+                new_value = update_rows(self.value, value_states, cache_position)
                 new_positions = cache_position + seq_len
 
             # Update recurrent state (like LINEAR_ATTENTION)
@@ -737,7 +769,9 @@ class HybridCacheView(BaseCacheView):
 
         Args:
             new_hidden_state: New hidden state to insert.
-            cache_position: Position index for insertion (optional).
+            cache_position: Position index of the inserted state (optional). When
+                given, ``positions`` is advanced to ``cache_position + 1`` so the
+                view's position bookkeeping follows the conv-state update.
 
         Returns:
             Updated HybridCacheView.
@@ -753,7 +787,10 @@ class HybridCacheView(BaseCacheView):
         conv_state = jnp.roll(self.conv_state, shift=-1, axis=-1)
         conv_state = conv_state.at[:, :, -1].set(new_hidden_state)
 
-        return self.replace(conv_state=conv_state)
+        if cache_position is None:
+            return self.replace(conv_state=conv_state)
+        positions = jnp.broadcast_to(jnp.asarray(cache_position, dtype=self.positions.dtype) + 1, self.positions.shape)
+        return self.replace(conv_state=conv_state, positions=positions)
 
     def update_kda_states(
         self,
@@ -1255,47 +1292,6 @@ class HybridMetadata(BaseRunTimeMetadata):
         indexes: Current position indices.
     """
 
-    postpadded: bool = False
+    postpadded: bool = field(pytree_node=False, default=False)
     starts: tp.Any | None = None  # jnp.ndarray
     indexes: tp.Any | None = None  # jnp.ndarray
-
-
-if __name__ == "__main__":
-    from spectrax import PartitionAxis
-
-    print("Testing HybridCache...")
-
-    num_layers = 8
-    layer_types = tuple("full_attention" if (i + 1) % 4 == 0 else "linear_attention" for i in range(num_layers))
-
-    print(f"Layer types: {layer_types}")
-
-    metadata = HybridCacheConfig.create(
-        num_hidden_layers=num_layers,
-        partition_axis=PartitionAxis(),
-        batch_size=2,
-        sequence_length=128,
-        num_key_value_heads=8,
-        head_dim=64,
-        d_inner=1024,
-        d_conv=4,
-        d_state=64,
-        layer_types=layer_types,
-    )
-
-    print(f"Created metadata with {metadata.num_hidden_layers} layers")
-
-    cache = HybridCache.init_cache(metadata, dtype=jnp.float32)
-    print(f"Initialized cache with {len(cache)} views")
-
-    for i, view in enumerate(cache.views):
-        print(f"  Layer {i}: {view.layer_type}")
-        if view.layer_type == FULL_ATTENTION:
-            print(f"    KV cache: key={view.key.shape}, value={view.value.shape}")
-        else:
-            print(f"    Recurrent state: conv={view.conv_state.shape}, recurrent={view.recurrent_state.shape}")
-
-    # Test KV cache update on a full attention layer (layer 3)
-    print("\nTesting KV cache update on layer 3 (full_attention)...")
-    key_states = jnp.ones((2, 10, 8, 64))
-    value_states = jnp.ones((2, 10, 8, 64))

@@ -31,8 +31,7 @@ from datetime import datetime
 
 import jax
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("MemoryMonitor")
+logger = logging.getLogger(__name__)
 
 try:
     import pandas as pd  # pyright: ignore[reportMissingTypeStubs]

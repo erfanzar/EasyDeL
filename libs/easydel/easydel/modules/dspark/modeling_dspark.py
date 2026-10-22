@@ -550,7 +550,15 @@ class DSparkModel(EasyDeLBaseModule, SpecDecodeBase):
         context_position_ids = make_position_ids(inputs_embeds=target_hidden_states)
         draft_position_ids = make_position_ids(input_ids=input_ids)
         kv_position_ids = jnp.concatenate((context_position_ids, draft_position_ids), axis=1)
-        mask = causal_attention_mask(batch_size, seq_len, target_hidden_states.shape[1] + seq_len)
+        # Context and draft keys share zero-based positions, not a single
+        # concatenated timeline. Apply causality to each stream independently.
+        mask = jnp.concatenate(
+            (
+                causal_attention_mask(batch_size, seq_len, target_hidden_states.shape[1]),
+                causal_attention_mask(batch_size, seq_len, seq_len),
+            ),
+            axis=-1,
+        )
         if attention_mask is not None:
             context_mask = expand_attention_mask(attention_mask, q_len=seq_len, kv_len=target_hidden_states.shape[1])
             draft_mask = expand_attention_mask(attention_mask, q_len=seq_len, kv_len=seq_len)

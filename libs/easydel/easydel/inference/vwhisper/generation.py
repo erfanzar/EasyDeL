@@ -112,12 +112,18 @@ def _compiled_generate(  # pyright: ignore[reportUnusedFunction]
         - The model.mesh context is used for proper device placement.
     """
     model = spx.bind(graphdef, graphstate)
+    generation_kwargs = {}
+    if inference_config.max_length is not None:
+        generation_kwargs["max_length"] = inference_config.max_length
+    if inference_config.logits_processor is not None:
+        generation_kwargs["logits_processor"] = inference_config.logits_processor
     with model.mesh:
         return model._force_generate(
             input_features=input_features,
             forced_decoder_ids=decoder_input_ids,
             return_timestamps=return_timestamps,
             generation_config=inference_config.generation_config,
+            **generation_kwargs,
         )
 
 
@@ -127,6 +133,7 @@ def get_decoder_input_ids(
     task=None,
     language=None,
     return_timestamps=False,
+    is_multilingual=None,
 ):
     """Construct decoder input IDs for Whisper generation.
 
@@ -158,6 +165,9 @@ def get_decoder_input_ids(
         return_timestamps (bool, optional): Whether timestamp tokens
             should be generated. When False, the no_timestamps_token
             is added to suppress timestamp generation. Defaults to False.
+        is_multilingual (bool | None, optional): Overrides the
+            ``is_multilingual`` flag of ``generation_config``. If None, the
+            generation config's flag is used. Defaults to None.
 
     Returns:
         list[tuple[int, int]]: List of (position, token_id) tuples
@@ -212,7 +222,8 @@ def get_decoder_input_ids(
           suggestions for valid languages.
     """
     generation_config = generation_config or model_config
-    is_multilingual = getattr(generation_config, "is_multilingual", None)
+    if is_multilingual is None:
+        is_multilingual = getattr(generation_config, "is_multilingual", None)
     decoder_input_ids = []
     if is_multilingual:
         if language is not None:
@@ -245,7 +256,7 @@ def get_decoder_input_ids(
     if (
         not return_timestamps
         and decoder_input_ids
-        and decoder_input_ids[-1][0] != generation_config.no_timestamps_token_id
+        and decoder_input_ids[-1][1] != generation_config.no_timestamps_token_id
     ):
         next_idx = (decoder_input_ids[-1][0] + 1) if decoder_input_ids else 1
         decoder_input_ids.append((next_idx, generation_config.no_timestamps_token_id))

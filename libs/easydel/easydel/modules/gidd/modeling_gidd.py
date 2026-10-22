@@ -58,6 +58,7 @@ from easydel.layers import (
     dense_qkv_layout,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.norms import RMSNorm
 
 from .gidd_configuration import GiddConfig
 
@@ -403,10 +404,6 @@ class GiddAttention(AttentionModule):
         qkv = checkpoint_name(self.qkv_proj(hidden_states), name="attn_qkv")
         query_states, key_states, value_states = self.qkv_proj.split(qkv, config=self.config)
 
-        if self.use_qk_norm:
-            query_states = self._norm(query_states)
-            key_states = self._norm(key_states)
-
         qshape = (
             batch_size,
             sequence_length,
@@ -422,6 +419,12 @@ class GiddAttention(AttentionModule):
         query_states = query_states.reshape(qshape)
         key_states = key_states.reshape(kv_shape)
         value_states = value_states.reshape(kv_shape)
+
+        # Normalize independently within each head, not over the concatenated
+        # projection: other heads' magnitudes must not change this head's scores.
+        if self.use_qk_norm:
+            query_states = self._norm(query_states)
+            key_states = self._norm(key_states)
 
         (
             query_states,
@@ -467,6 +470,7 @@ class GiddAttention(AttentionModule):
             init_bias=init_attention_bias,
             mask_info=None,
             causal=False,
+            precision=self.precision,
         )
 
         # Project attention outputs back to hidden dimension
@@ -483,7 +487,7 @@ class GiddAttention(AttentionModule):
         )
 
 
-class GiddRMSNorm(spx.Module):
+class GiddRMSNorm(RMSNorm):
     """RMSNorm with the ``(1 + weight)`` scale, zero-init weight, fp32 variance.
 
     Same formulation as Gemma's RMSNorm (variance reduced in float32, scale
@@ -492,9 +496,13 @@ class GiddRMSNorm(spx.Module):
     for diffusion training because the reverse process is sensitive to the
     initial noise level — a layer that is the identity at step 0 lets the
     denoiser's residual stream survive the early gradient updates intact.
+
+    The math is :class:`easydel.layers.norms.RMSNorm` with ``scale_offset=1.0`` and
+    ``fp32_scale=True`` (statistics and the ``1 + weight`` multiply in float32, one cast
+    to ``dtype`` at the end); the weight is stored in ``param_dtype`` under the key ``weight``.
     """
 
-    kernel_init = staticmethod(jax.nn.initializers.ones)
+    kernel_init = staticmethod(jax.nn.initializers.zeros)
 
     def __init__(
         self,
@@ -509,34 +517,21 @@ class GiddRMSNorm(spx.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
         """
-        self.config = config
-        self.epsilon = self.config.rms_norm_eps
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.weight = ArrayParam.bound(
-            shape=(self.config.hidden_size,),
-            dtype=param_dtype,
-            init_method="zeros",
-            key=None,
+        super().__init__(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            scale_offset=1.0,
+            fp32_scale=True,
+            output_dtype=dtype,
         )
+        self.config = config
+        self.epsilon = config.rms_norm_eps
 
-    def forward(
-        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
-    ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Apply RMSNorm to the input tensor.
-
-        Args:
-            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
-
-        Returns:
-            Array: Normalized tensor of the same shape.
-        """
-        variance = hidden_states.astype(jnp.float32)
-        variance = jnp.power(variance, 2)
-        variance = variance.mean(-1, keepdims=True)
-
-        hidden_states = hidden_states / jnp.sqrt(variance + self.epsilon)
-        return (1 + self.weight.value.astype(self.dtype)) * jnp.asarray(hidden_states, dtype=self.dtype)
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
+        """Normalize and return the configured compute dtype, including low-float dtypes."""
+        return super().forward(hidden_states).astype(self.dtype)
 
 
 class GiddLayer(spx.Module):
@@ -667,7 +662,7 @@ class GiddLayer(spx.Module):
         )
 
 
-@register_module(TaskType.BASE_MODULE, config=GiddConfig, model_type="Gidd")
+@register_module(TaskType.BASE_MODULE, config=GiddConfig, model_type="gidd")
 class GiddModel(EasyDeLBaseModule):
     """GIDD model implementation for diffusion language modeling.
 
@@ -774,7 +769,11 @@ class GiddModel(EasyDeLBaseModule):
                 Defaults to None.
             position_ids (Array | None, optional): Position indices for each token, shape
                 (batch_size, seq_len). Defaults to None.
-            log_snr (Array | None, optional): Log signal-to-noise ratio for diffusion. Defaults to None.
+            log_snr (Array | None, optional): Log signal-to-noise ratio used to condition the input
+                embeddings with a fixed sinusoidal noise-level encoding. Accepts a scalar, per-example
+                values of shape (batch_size,), or per-token values broadcastable to (batch_size, seq_len).
+                When batch_size equals seq_len, a vector is per-example; use (1, seq_len) for per-token values.
+                None and zero leave embeddings unchanged. Defaults to None.
             noise_mask (Array | None, optional): Binary mask for noise tokens. Defaults to None.
             mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
                 Auto-detected if None. Defaults to None.
@@ -824,6 +823,24 @@ class GiddModel(EasyDeLBaseModule):
             position_ids = mask_info.q_position_ids
 
         hidden_states = inputs_embeds
+        if log_snr is not None:
+            # Fixed Fourier conditioning preserves existing checkpoint keys. Map log-SNR to the noise
+            # variance in [0, 1], including +/-inf diffusion endpoints, and centre at log-SNR == 0 so
+            # callers can explicitly request the unconditioned path without changing the architecture.
+            noise_level = jax.nn.sigmoid(-jnp.asarray(log_snr, dtype=jnp.float32)) - 0.5
+            # A batch-sized vector is interpreted per example, including when
+            # batch_size == seq_len. Other vectors use normal trailing-axis token broadcasting.
+            if noise_level.ndim == 1 and noise_level.shape[0] == hidden_states.shape[0]:
+                noise_level = noise_level[:, None]
+            try:
+                noise_level = jnp.broadcast_to(noise_level, hidden_states.shape[:2])
+            except ValueError as exc:
+                raise ValueError("log_snr must be scalar, per-example [batch], or per-token [batch, seq_len]") from exc
+            half_dim = (self.config.hidden_size + 1) // 2
+            inv_freq = jnp.exp(-jnp.log(10000.0) * jnp.arange(half_dim, dtype=jnp.float32) / max(half_dim - 1, 1))
+            phase = noise_level[..., None] * inv_freq
+            conditioning = jnp.concatenate((jnp.sin(phase), jnp.cos(phase) - 1.0), axis=-1)
+            hidden_states = hidden_states + conditioning[..., : self.config.hidden_size].astype(hidden_states.dtype)
 
         if mode is None:
             mode = (
@@ -929,7 +946,7 @@ class GiddModel(EasyDeLBaseModule):
         return self.embed_tokens
 
 
-@register_module(TaskType.DIFFUSION_LM, config=GiddConfig, model_type="Gidd")
+@register_module(TaskType.DIFFUSION_LM, config=GiddConfig, model_type="gidd")
 class GiddForDiffusionLM(EasyDeLBaseModule):
     """GIDD model with a language modeling head for diffusion language modeling tasks.
 
@@ -1017,7 +1034,11 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
                 Defaults to None.
             position_ids (Array | None, optional): Position indices for each token, shape
                 (batch_size, seq_len). Defaults to None.
-            log_snr (Array | None, optional): Log signal-to-noise ratio for diffusion. Defaults to None.
+            log_snr (Array | None, optional): Log signal-to-noise ratio used to condition the input
+                embeddings with a fixed sinusoidal noise-level encoding. Accepts a scalar, per-example
+                values of shape (batch_size,), or per-token values broadcastable to (batch_size, seq_len).
+                When batch_size equals seq_len, a vector is per-example; use (1, seq_len) for per-token values.
+                None and zero leave embeddings unchanged. Defaults to None.
             noise_mask (Array | None, optional): Binary mask for noise tokens. Defaults to None.
             mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
                 Auto-detected if None. Defaults to None.
@@ -1084,7 +1105,18 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
         Returns:
             Vocabulary logits ``[..., vocab_size]``.
         """
-        return self.lm_head(hidden_states)
+        tie_embeddings = bool(getattr(self.config, "tie_word_embeddings", False))
+        w = self.get_embedding().weight.value.T if tie_embeddings else None
+        return self.lm_head(hidden_states, w=w)
+
+    def get_lm_logit_postprocess(self):
+        """Declare that diffusion logits have no post-projection transforms.
+
+        Returns:
+            ``None`` for identity, including when unrelated clipping or scale
+            attributes are present on the configuration.
+        """
+        return None
 
     def get_encoder(self):
         """Returns the encoder part of the model's graph definition.

@@ -800,5 +800,5 @@ class Exaone4ForSequenceClassification(BaseSequenceClassificationModule[Exaone4M
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            score_bias=False,
+            score_head_bias=False,
         )

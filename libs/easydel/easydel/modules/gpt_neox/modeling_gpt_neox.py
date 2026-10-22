@@ -700,6 +700,9 @@ class GPTNeoXModel(EasyDeLBaseModule):
             extra=needs_trace_cache,
         )
         cache_views = views if trace_layers else None
+        # Hoisted out of the loop body: the caching property must not be
+        # first materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
 
         def _run_layer(block, carry):
             """Run one GPT-NeoX layer inside ``self.layers.scan``.
@@ -719,7 +722,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
                     mode=mode,
                     cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
-                    frequencies=self.frequencies,
+                    frequencies=frequencies,
                     output_attentions=output_attentions,
                 )
             hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)

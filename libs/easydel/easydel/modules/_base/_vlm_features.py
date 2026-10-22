@@ -140,6 +140,29 @@ def torch_bicubic_resize(x: Array, height: int, width: int) -> Array:
     return out.astype(x.dtype)
 
 
+def pixel_unshuffle_grid(x: Array, out_d1: int, out_d2: int) -> Array:
+    """Space-to-channel rearrangement of a ``[B, d1, d2, C]`` patch grid (vision "pixel shuffle" downsampler).
+
+    The shared reshape/transpose order of the Llama-4, InternVL and AyaVision projectors:
+    ``[B, d1, d2, C] -> [B, d1, out_d2, .] -> [B, out_d2, d1, .] -> [B, out_d2, out_d1, .] -> [B, out_d1, out_d2, .]``,
+    so channels grow by ``(d1 * d2) / (out_d1 * out_d2)``. Callers own shape validation, grid inference and any
+    flattening.
+
+    Args:
+        x: Patch grid ``[batch, d1, d2, channels]``.
+        out_d1: Output size of axis 1 (e.g. ``int(d1 * ratio)``).
+        out_d2: Output size of axis 2.
+
+    Returns:
+        ``[batch, out_d1, out_d2, channels * d1 * d2 / (out_d1 * out_d2)]``.
+    """
+    batch, d1 = x.shape[0], x.shape[1]
+    x = x.reshape(batch, d1, out_d2, -1)
+    x = jnp.transpose(x, (0, 2, 1, 3))
+    x = x.reshape(batch, out_d2, out_d1, -1)
+    return jnp.transpose(x, (0, 2, 1, 3))
+
+
 class VisionEncoderFeature:
     """Manage vision encoder feature extraction for VLM models.
 
@@ -517,15 +540,22 @@ class MultiModalMergeFeature:
             3. Gathers from padded array (non-multimodal positions get dummy row)
             4. Uses where() to select between original and gathered embeddings
         """
-        # Create dummy row for padding (index 0 maps to dummy)
-        dummy_row = jnp.zeros_like(multimodal_embeddings[0:1])
+        batch_size, seq_len, hidden = inputs_embeds.shape
+        # Flatten (batch, seq) so the cumsum counts placeholders across the whole batch;
+        # a 2-D cumsum would be flattened implicitly and break the (B, S, H) broadcast.
+        flat_mask = is_multimodal.reshape(-1)
+        flat_embeds = inputs_embeds.reshape(-1, hidden)
+
+        # Explicit (1, hidden) pad row: ``zeros_like(multimodal_embeddings[0:1])`` is empty when
+        # no features are provided, which turns the gather below into an out-of-bounds read.
+        dummy_row = jnp.zeros((1, hidden), dtype=multimodal_embeddings.dtype)
         flattened_padded = jnp.concatenate([dummy_row, multimodal_embeddings], axis=0)
 
-        gather_indices = jnp.cumsum(is_multimodal)
+        gather_indices = jnp.cumsum(flat_mask)
         update_values = flattened_padded[gather_indices]
 
-        condition = jnp.expand_dims(is_multimodal, axis=-1)
-        return jnp.where(condition, update_values, inputs_embeds)
+        merged = jnp.where(flat_mask[:, None], update_values, flat_embeds)
+        return merged.reshape(batch_size, seq_len, hidden)
 
     def create_multimodal_mask(
         self,
@@ -860,8 +890,33 @@ class MultiDimensionalRoPEFeature:
             )
             ```
         """
+        if len(mrope_section) != 3 or any(not isinstance(size, int) or size < 0 for size in mrope_section):
+            raise ValueError("mrope_section must contain three nonnegative integer sizes for T, H and W.")
+        if sum(mrope_section) == 0:
+            raise ValueError("mrope_section must allocate at least one frequency component.")
         self.spatial_merge_size = spatial_merge_size
-        self.mrope_section = mrope_section
+        self.mrope_section = tuple(mrope_section)
+
+    def configure_rotary(self, rotary) -> None:
+        """Apply this feature's THW allocation to an existing multimodal rotary module.
+
+        The rotary module retains its frequency base, partial rotary dimension,
+        dtype, interleaving and repetition style. Only its per-axis allocation
+        changes, using the same exact proportional scaling as its constructor.
+        No parameters or checkpoint paths are created or renamed.
+
+        Args:
+            rotary: A ``MultiModalRotaryEmbedding`` used by the language backbone.
+
+        Raises:
+            ValueError: If the allocation cannot represent the rotary dimension.
+        """
+        expected = rotary.rotary_dim // 2
+        total = sum(self.mrope_section)
+        scaled = tuple(divmod(size * expected, total) for size in self.mrope_section)
+        if expected <= 0 or any(remainder for _, remainder in scaled):
+            raise ValueError(f"mrope_section={self.mrope_section} is incompatible with rotary_dim={rotary.rotary_dim}.")
+        rotary.mrope_section = tuple(size for size, _ in scaled)
 
     @property
     def is_enabled(self) -> bool:

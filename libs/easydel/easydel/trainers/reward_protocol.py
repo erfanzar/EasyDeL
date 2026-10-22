@@ -41,9 +41,13 @@ pairwise selection).
 
 from __future__ import annotations
 
+import inspect
 import typing as tp
+from functools import partial
 
-from .training_utils import filter_kwargs_for_callable
+import spectrax as spx
+
+from .training_utils import compile_trainer_step, filter_kwargs_for_callable, sanitize_model_call_kwargs
 
 Reduction = tp.Literal["sum", "mean"]
 
@@ -66,6 +70,119 @@ _PER_ITEM_RENAME = {
     "prompts": "prompt",
     "prompt_texts": "prompt_text",
 }
+
+
+def resolve_reward_weights(
+    reward_funcs: tp.Sequence[object], configured_weights: tp.Sequence[float] | None = None
+) -> list[float]:
+    """Resolve explicit config weights or each reward's declared multiplier.
+
+    Args:
+        reward_funcs: Reward models or Python scoring callables.
+        configured_weights: Optional config override, one value per reward.
+
+    Returns:
+        Float multipliers in the same order as the reward functions.
+
+    Raises:
+        ValueError: If explicit weights do not match the reward count.
+    """
+    if configured_weights is not None:
+        if len(configured_weights) != len(reward_funcs):
+            raise ValueError("`reward_weights` must match the number of reward functions.")
+        return [float(weight) for weight in configured_weights]
+    return [float(getattr(func, "weight", 1.0)) for func in reward_funcs]
+
+
+def reward_model_forward(graphdef, graphstate, graphother, batch):
+    """Run a reward state, filtering against its actual invocation entry point."""
+    module = spx.bind(graphdef, graphstate.merge(graphother, copy=False))
+    # SpectraX permits overriding __call__ directly, while EasyDeL also wraps
+    # it with a generic *args/**kwargs stage dispatcher. Use an explicit call
+    # signature when present, otherwise the underlying forward signature.
+    call_parameters = inspect.signature(module.__call__).parameters.values()
+    explicit_call = any(
+        parameter.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        for parameter in call_parameters
+    )
+    target = module if explicit_call else module.forward
+    kwargs = filter_kwargs_for_callable(target, batch)
+    return module(**sanitize_model_call_kwargs(kwargs))
+
+
+def _bound_reward_forward(graphdef, graphstate, graphother, batch, *, apply_fn):
+    """Adapt the historical graphdef-bound three-argument reward convention."""
+    return apply_fn(graphstate, graphother, batch)
+
+
+def normalize_reward_state(state, *, forward=reward_model_forward):
+    """Preserve custom reward forwards and install a graphdef-first default.
+
+    Both the legacy ``(graphstate, graphother, batch)`` and graphdef-first
+    four-argument custom forwards remain supported without replacing their logic.
+    """
+    apply_fn = state.apply_fn
+    if apply_fn is None:
+        apply_fn = compile_trainer_step(forward, mesh=state.model.mesh, static_argnums=(0,))
+    else:
+        try:
+            signature = inspect.signature(apply_fn)
+        except (TypeError, ValueError):
+            signature = None
+        if signature is not None:
+            try:
+                signature.bind(None, None, None, None)
+            except TypeError:
+                signature.bind(None, None, None)
+                apply_fn = partial(_bound_reward_forward, apply_fn=apply_fn)
+    return state.replace(apply_fn=apply_fn)
+
+
+def render_reward_texts(prompts, completions, processor, *, tools=None):
+    """Render structured conversations with the reward processor's chat template."""
+    from .prompt_utils import apply_chat_template
+
+    texts = []
+    for prompt, completion in zip(prompts, completions, strict=True):
+        if isinstance(prompt, list) or isinstance(completion, list):
+            texts.append(
+                apply_chat_template({"messages": as_messages(prompt, completion)}, processor, tools=tools)["text"]
+            )
+        else:
+            texts.append(f"{prompt}{completion}")
+    return texts
+
+
+def align_reward_sidechannels(batch, *, prompt_count: int, completion_count: int):
+    """Repeat prompt-owned fields in generation's prompt-major candidate order.
+
+    Scalars and mappings are shared metadata. Sequence/array columns must be
+    prompt-aligned or already completion-aligned; ambiguous lengths are rejected.
+    """
+    if prompt_count < 1 or completion_count % prompt_count:
+        raise ValueError("Reward completions must form an integral number of candidates per prompt.")
+    factor = completion_count // prompt_count
+    aligned = {}
+    for key, value in batch.items():
+        is_sequence = isinstance(value, (list, tuple))
+        is_array = hasattr(value, "shape") and len(value.shape) > 0
+        if not is_sequence and not is_array:
+            aligned[key] = value
+            continue
+        length = len(value)
+        if length == completion_count:
+            aligned[key] = value
+        elif length == prompt_count:
+            if is_sequence:
+                values = [item for item in value for _ in range(factor)]
+                aligned[key] = tuple(values) if isinstance(value, tuple) else values
+            else:
+                aligned[key] = value.repeat(factor, axis=0)
+        else:
+            raise ValueError(
+                f"Reward field {key!r} has {length} rows, expected {prompt_count} prompts or {completion_count} completions."
+            )
+    return aligned
 
 
 def as_messages(prompt: PromptType | None, completion: CompletionType) -> list[ChatMessage]:

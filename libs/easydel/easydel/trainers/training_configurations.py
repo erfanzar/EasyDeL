@@ -68,6 +68,18 @@ from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
 
 from .metrics import LogWatcher, MetricsHistogram, compute_weight_stats, run_watchers
+from .training_utils import (
+    AFFINE_SUPPORTED_BITS as AFFINE_SUPPORTED_BITS,
+)
+from .training_utils import (
+    FIXED_QUANTIZATION_BITS_BY_MODE as FIXED_QUANTIZATION_BITS_BY_MODE,
+)
+from .training_utils import (
+    QuantizationMode as QuantizationMode,
+)
+from .training_utils import (
+    validate_quantization_bits,
+)
 from .utils import JaxDistributedConfig
 
 try:
@@ -87,24 +99,8 @@ else:
 MetricsType = dict[str, float | list | tuple | np.ndarray | Array | Tensor | None]
 logger = get_logger(__name__)
 
-QuantizationMode = tp.Literal[
-    "nf4",
-    "affine",
-    "mxfp8",
-    "nvfp8",
-    "mxfp4",
-    "nvfp4",
-]
 STE_QAT_QUANTIZATION_MODES: tuple[QuantizationMode, ...] = tp.get_args(QuantizationMode)
 STE_QAT_QUANTIZATION_MODES_DOC = ", ".join(f"'{mode}'" for mode in STE_QAT_QUANTIZATION_MODES)
-AFFINE_SUPPORTED_BITS = frozenset({2, 3, 4, 5, 6, 7, 8})
-FIXED_QUANTIZATION_BITS_BY_MODE: dict[QuantizationMode, int] = {
-    "nf4": 4,
-    "mxfp4": 4,
-    "nvfp4": 4,
-    "mxfp8": 8,
-    "nvfp8": 8,
-}
 
 
 def get_safe_arr(xs):
@@ -995,6 +991,16 @@ class TrainingArguments:
         default=None,
         metadata={"help": "The maximum training time (e.g., '1d', '2h30m')."},
     )
+    host_phase_log_path: str | None = field(
+        default=None,
+        kw_only=True,
+        metadata={
+            "help": (
+                "Optional per-host timing log: a local append-only JSONL file, or a cloud prefix "
+                "containing immutable per-step JSONL chunks."
+            )
+        },
+    )
     train_on_inputs: bool = field(
         default=True,
         metadata={"help": "Whether to train on the input data."},
@@ -1255,6 +1261,8 @@ class TrainingArguments:
         """
         if self.gradient_accumulation_steps <= 0:
             raise ValueError("`gradient_accumulation_steps` can't be lower than 1.")
+        if self.training_time_limit is not None:
+            self._time_to_seconds(self.training_time_limit)
 
         self.sequence_packing = bool(self.sequence_packing)
 
@@ -1264,21 +1272,7 @@ class TrainingArguments:
             raise ValueError("`lmhead_chunksize` must be > 0 when specified.")
         if self.quantization_group_size is not None and self.quantization_group_size <= 0:
             raise ValueError("`quantization_group_size` must be > 0 when specified.")
-        if self.quantization_bits is not None and self.quantization_bits <= 0:
-            raise ValueError("`quantization_bits` must be > 0 when specified.")
-        if self.quantization_mode == "affine" and self.quantization_bits is not None:
-            if self.quantization_bits not in AFFINE_SUPPORTED_BITS:
-                bits_values = ", ".join(str(v) for v in sorted(AFFINE_SUPPORTED_BITS))
-                raise ValueError(
-                    f"`quantization_bits` for `affine` must be one of {{{bits_values}}}, got {self.quantization_bits}."
-                )
-        if self.quantization_mode in FIXED_QUANTIZATION_BITS_BY_MODE and self.quantization_bits is not None:
-            expected_bits = FIXED_QUANTIZATION_BITS_BY_MODE[self.quantization_mode]
-            if self.quantization_bits != expected_bits:
-                raise ValueError(
-                    f"`quantization_bits` for `{self.quantization_mode}` must be {expected_bits}, "
-                    f"got {self.quantization_bits}."
-                )
+        validate_quantization_bits(self.quantization_mode, self.quantization_bits)
 
     def _setup_distributed(self):
         """
@@ -1610,9 +1604,11 @@ class TrainingArguments:
         Convert a human-readable time string to seconds.
 
         Supports various time formats:
+        - Days: "1d", "2day", "3days"
         - Hours: "23h", "2hour", "3hours"
         - Minutes: "50min", "30m", "45minutes"
         - Seconds: "30s", "120sec", "60seconds"
+        - Compound durations: "1d2h30m", "2 hours 30 minutes"
 
         Args:
             time_str: The time string to convert
@@ -1624,26 +1620,32 @@ class TrainingArguments:
             ValueError: If the time format is not recognized
 
         Example:
-            >>> _time_to_seconds("2h30min")  # Would need parsing enhancement
+            >>> _time_to_seconds("2h30min")
+            9000
             >>> _time_to_seconds("90min")
             5400
         """
-        match = re.match(r"(\d+)\s*(h|hour|hours|min|m|minutes|s|sec|seconds)", time_str.lower())
-        if not match:
-            raise ValueError("Invalid time format. Use `50min` for minutes, `23h` for hours, or `30s` for seconds.")
-        value, unit = match.groups()
         unit_to_seconds = {
+            "d": 86400,
+            "day": 86400,
+            "days": 86400,
             "h": 3600,
             "hour": 3600,
             "hours": 3600,
             "min": 60,
             "m": 60,
+            "minute": 60,
             "minutes": 60,
             "s": 1,
             "sec": 1,
+            "second": 1,
             "seconds": 1,
-        }.get(unit.lower())
-        return int(value) * unit_to_seconds
+        }
+        units = "|".join(sorted(unit_to_seconds, key=len, reverse=True))
+        token = rf"(\d+)\s*({units})"
+        if not isinstance(time_str, str) or re.fullmatch(rf"\s*(?:{token}\s*)+", time_str.lower()) is None:
+            raise ValueError("Invalid time format. Use a duration such as `1d`, `2h30m`, `50min`, or `30s`.")
+        return sum(int(value) * unit_to_seconds[unit] for value, unit in re.findall(token, time_str.lower()))
 
     def get_path(self) -> ePathLike:
         """Get the path to the checkpoint directory.
@@ -1753,8 +1755,11 @@ class TrainingArguments:
         if self._im_a_hidden_checkpoint_manager is not None:
             return self._im_a_hidden_checkpoint_manager
 
+        save_directory = self._get_save_directory()
+        if save_directory is None:
+            raise ValueError("A save_directory and model_name are required to create a checkpoint manager.")
         self._im_a_hidden_checkpoint_manager = Checkpointer(
-            base_path=str(self._get_save_directory()),
+            base_path=str(save_directory),
             save_interval=self.get_save_interval_timedelta(),
             step_policies=self.get_checkpoint_policies(),
         )
@@ -2104,7 +2109,7 @@ class TrainingArguments:
 
                         wandb_metrics[key] = (
                             self._create_wandb_histogram(value)
-                            if isinstance(value, float | int | list | tuple | np.generic | jax.Array)
+                            if isinstance(value, float | int | list | tuple | np.ndarray | np.generic | jax.Array)
                             else value
                         )
 
@@ -2172,15 +2177,14 @@ class TrainingArguments:
                                    None if an error occurs.
 
         Note:
-            Handles dtype conversion for bfloat16 to float32/float16 for
+            Handles dtype conversion for bfloat16 to float32 for
             compatibility with wandb. Automatically moves JAX arrays to CPU.
         """
         try:
-            if isinstance(value, jax.Array | np.generic):
+            if isinstance(value, jax.Array | np.ndarray | np.generic):
                 value = np.array(jax.device_get(value))
-                if value.dtype in [np.bfloat16]:
+                if value.dtype == jnp.bfloat16:
                     value = value.astype(np.float32)
-                value = value.astype(np.float16)
                 return wandb.Histogram(value)
             return value
         except Exception as e:
@@ -2363,6 +2367,8 @@ class TrainingArguments:
         Returns:
             The checkpoint directory path, or None if no path is configured.
         """
+        if self.save_directory is None or self.model_name is None:
+            return None
         if create:
             self.ensure_checkpoint_path()
         return self.get_path()

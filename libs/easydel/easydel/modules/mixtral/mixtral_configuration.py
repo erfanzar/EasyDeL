@@ -135,7 +135,12 @@ class MixtralConfig(EasyDeLBaseConfig):
         attention_bias (`bool`, *optional*, defaults to `False`):
             Whether to use bias in the attention layer.
         initialization_of_moe (`bool`, *optional*, defaults to `False`):
-            Whether to initialize the MoE layers.
+            Force random MoE initialization even in checkpoint-loading mode. Ordinary
+            model construction always samples expert and router kernels using
+            ``initializer_range``, including when this legacy flag is False.
+        moe_checkpoint_loading (`bool`, *optional*, defaults to `False`):
+            Explicit loading-only mode: allocate zero MoE placeholders unless
+            ``initialization_of_moe`` is True. Load all MoE weights before using the model.
         router_jitter_noise (`float`, *optional*, defaults to 0.0):
             Amount of uniform noise to add to router logits during training to improve exploration
             and prevent premature expert specialization. The noise is sampled from Uniform(-noise, +noise)
@@ -179,6 +184,7 @@ class MixtralConfig(EasyDeLBaseConfig):
         router_jitter_noise: float = 0.0,
         head_dim: int | None = None,
         layer_types: list[str] | None = None,
+        moe_checkpoint_loading: bool = False,
         **kwargs,
     ):
         """Initialize the Mixtral configuration.
@@ -227,8 +233,9 @@ class MixtralConfig(EasyDeLBaseConfig):
                 configuration. Defaults to None.
             attention_bias (bool, optional): Whether attention projections use bias.
                 Defaults to False.
-            initialization_of_moe (bool, optional): Whether to initialize MoE layers
-                explicitly. Defaults to False.
+            initialization_of_moe (bool, optional): Force random MoE initialization
+                even in checkpoint-loading mode. Ordinary construction initializes
+                randomly regardless of this legacy flag. Defaults to False.
             router_jitter_noise (float, optional): Uniform noise amplitude added to
                 router logits during training. Defaults to 0.0.
             head_dim (int | None, optional): Per-head dimension; defaults to
@@ -236,6 +243,9 @@ class MixtralConfig(EasyDeLBaseConfig):
             layer_types (list[str] | None, optional): Per-layer attention type. If
                 ``None``, defaults to ``"sliding_attention"`` (or ``"full_attention"``
                 if ``sliding_window`` is ``None``) for every layer. Defaults to None.
+            moe_checkpoint_loading (bool, optional): Explicit loading-only mode.
+                Allocate zero MoE placeholders unless ``initialization_of_moe`` is True;
+                load all MoE weights before use. Defaults to False.
             **kwargs: Additional keyword arguments forwarded to ``EasyDeLBaseConfig``.
         """
         self.vocab_size = vocab_size
@@ -255,11 +265,14 @@ class MixtralConfig(EasyDeLBaseConfig):
         # for backward compatibility
         self.rope_scaling = rope_scaling
         if num_key_value_heads is None:
-            num_key_value_heads = num_attention_heads
+            if number_rep_kv < 1 or num_attention_heads % number_rep_kv:
+                raise ValueError("number_rep_kv must be a positive divisor of num_attention_heads.")
+            num_key_value_heads = num_attention_heads // number_rep_kv
 
         self.num_key_value_heads = num_key_value_heads
         self.hidden_act = hidden_act
         self.initialization_of_moe = initialization_of_moe
+        self.moe_checkpoint_loading = moe_checkpoint_loading
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
@@ -286,30 +299,6 @@ class MixtralConfig(EasyDeLBaseConfig):
             bits=bits,
             **kwargs,
         )
-
-    @property
-    def granted_freq_max_position_embedding(self) -> int:
-        """Returns the maximum position embedding size specifically for frequency-based position embeddings.
-
-        If `freq_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
-        `max_position_embeddings`.
-
-        Returns:
-            int: The granted maximum position embedding size for frequency encoding.
-        """
-        return getattr(self, "freq_max_position_embeddings", self.max_position_embeddings)
-
-    @property
-    def granted_mask_max_position_embedding(self) -> int:
-        """Returns the maximum position embedding size specifically for mask-based position embeddings.
-
-        If `mask_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
-        `max_position_embeddings`.
-
-        Returns:
-            int: The granted maximum position embedding size for mask encoding.
-        """
-        return getattr(self, "mask_max_position_embeddings", self.max_position_embeddings)
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Retrieve attention mask details for each layer in the model.

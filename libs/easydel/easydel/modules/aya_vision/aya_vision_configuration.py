@@ -86,7 +86,7 @@ class AyaVisionConfig(EasyDeLBaseConfig):
                 tower config or its dict form. ``None`` falls back to a default
                 SigLIP encoder (``hidden_size=1152``, ``patch_size=14``,
                 ``image_size=384``, ``num_hidden_layers=26``,
-                ``num_attention_heads=14``).
+                ``num_attention_heads=16``).
             text_config (dict | EasyDeLBaseConfig | None, optional): Text
                 decoder config or its dict form. ``None`` falls back to a
                 default :class:`Cohere2Config`.
@@ -105,7 +105,8 @@ class AyaVisionConfig(EasyDeLBaseConfig):
 
         Raises:
             ValueError: If ``vision_feature_select_strategy`` is not one of
-                ``"default"`` or ``"full"``.
+                ``"default"`` or ``"full"``, or the vision hidden width is not
+                divisible by its positive attention head count.
         """
         self.image_token_index = image_token_index
         self.downsample_factor = downsample_factor
@@ -133,10 +134,12 @@ class AyaVisionConfig(EasyDeLBaseConfig):
                 patch_size=14,
                 image_size=384,
                 num_hidden_layers=26,
-                num_attention_heads=14,
+                num_attention_heads=16,
                 vision_use_head=False,
             )
 
+        if vision_config.num_attention_heads <= 0 or vision_config.hidden_size % vision_config.num_attention_heads:
+            raise ValueError("vision_config.hidden_size must be divisible by a positive num_attention_heads")
         self.vision_config = vision_config
 
         if isinstance(text_config, dict):

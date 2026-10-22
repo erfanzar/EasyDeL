@@ -28,7 +28,6 @@ JSON-Schema declared types using the tool definitions on the request.
 
 from __future__ import annotations
 
-import ast
 import json
 import re
 import uuid
@@ -49,6 +48,7 @@ from ...openai_api_modules import (
     ToolDefinition,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
+from ._schema_params import convert_param_value, get_arguments_config
 
 logger = get_logger(__name__)
 
@@ -171,23 +171,7 @@ class Qwen3CoderToolParser(ToolParser):
             A dict mapping parameter names to their schema definitions,
             or an empty dict if the function is not found or has no schema.
         """
-        if tools is None:
-            return {}
-        for config in tools:
-            if not hasattr(config, "type") or not (hasattr(config, "function") and hasattr(config.function, "name")):
-                continue
-            if config.type == "function" and config.function.name == func_name:
-                if not hasattr(config.function, "parameters"):
-                    return {}
-                params = config.function.parameters
-                if isinstance(params, dict) and "properties" in params:
-                    return params["properties"]
-                elif isinstance(params, dict):
-                    return params
-                else:
-                    return {}
-        logger.debug("Tool '%s' is not defined in the tools list.", func_name)
-        return {}
+        return get_arguments_config(func_name, tools)
 
     def _convert_param_value(self, param_value: str, param_name: str, param_config: dict, func_name: str) -> Any:
         """Convert a raw string parameter value to its schema-defined type.
@@ -207,92 +191,7 @@ class Qwen3CoderToolParser(ToolParser):
             The converted value in the appropriate Python type, or the
             original string if conversion is not possible.
         """
-        if param_value.lower() == "null":
-            return None
-        if param_name not in param_config:
-            if param_config != {}:
-                logger.debug(
-                    "Parsed parameter '%s' is not defined in the tool parameters for tool '%s', directly "
-                    "returning the string value.",
-                    param_name,
-                    func_name,
-                )
-            return param_value
-        if isinstance(param_config[param_name], dict) and "type" in param_config[param_name]:
-            param_type = str(param_config[param_name]["type"]).strip().lower()
-        elif isinstance(param_config[param_name], dict) and "anyOf" in param_config[param_name]:
-            param_type = "object"
-        else:
-            param_type = "string"
-        if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
-            return param_value
-        elif (
-            param_type.startswith("int")
-            or param_type.startswith("uint")
-            or param_type.startswith("long")
-            or param_type.startswith("short")
-            or param_type.startswith("unsigned")
-        ):
-            try:
-                return int(param_value)
-            except (ValueError, TypeError):
-                logger.debug(
-                    "Parsed value '%s' of parameter '%s' is not an integer in tool '%s', degenerating to string.",
-                    param_value,
-                    param_name,
-                    func_name,
-                )
-                return param_value
-        elif param_type.startswith("num") or param_type.startswith("float"):
-            try:
-                float_param_value = float(param_value)
-                return float_param_value if float_param_value - int(float_param_value) != 0 else int(float_param_value)
-            except (ValueError, TypeError):
-                logger.debug(
-                    "Parsed value '%s' of parameter '%s' is not a float in tool '%s', degenerating to string.",
-                    param_value,
-                    param_name,
-                    func_name,
-                )
-                return param_value
-        elif param_type in ["boolean", "bool", "binary"]:
-            param_value = param_value.lower()
-            if param_value not in ["true", "false"]:
-                logger.debug(
-                    "Parsed value '%s' of parameter '%s' is not a boolean (`true` or `false`) in tool '%s', "
-                    "degenerating to false.",
-                    param_value,
-                    param_name,
-                    func_name,
-                )
-            return param_value == "true"
-        else:
-            if (
-                param_type in ["object", "array", "arr"]
-                or param_type.startswith("dict")
-                or param_type.startswith("list")
-            ):
-                try:
-                    return json.loads(param_value)
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    logger.debug(
-                        "Parsed value '%s' of parameter '%s' cannot be parsed with json.loads in tool '%s', "
-                        "will try other methods to parse it.",
-                        param_value,
-                        param_name,
-                        func_name,
-                    )
-            try:
-                param_value = ast.literal_eval(param_value)
-            except (ValueError, SyntaxError, TypeError):
-                logger.debug(
-                    "Parsed value '%s' of parameter '%s' cannot be converted via Python ast.literal_eval() "
-                    "in tool '%s', degenerating to string.",
-                    param_value,
-                    param_name,
-                    func_name,
-                )
-            return param_value
+        return convert_param_value(param_value, param_name, param_config, func_name)
 
     def _parse_xml_function_call(self, function_call_str: str, tools: list[ToolDefinition] | None) -> ToolCall | None:
         """Parse a single XML function call string into a ToolCall object.

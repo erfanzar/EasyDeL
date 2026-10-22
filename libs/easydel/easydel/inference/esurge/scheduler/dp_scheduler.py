@@ -23,17 +23,21 @@ owning rank scheduler.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import dataclasses
 import enum
 import multiprocessing
 import os
 import signal
+import subprocess
+import sys
 import threading
 import time
 import typing
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from multiprocessing.connection import Connection
+from pathlib import Path
 
 import cloudpickle
 from eformer.loggings import get_logger
@@ -43,6 +47,7 @@ from ..core.interface import CacheGroupsConfig
 from ..engine_types import EngineCoreOutputs, FinishReason
 from ..outputs import LogprobsLists, ModelRunnerOutput
 from ..request import EngineRequest, EngineRequestStatus
+from .image_spans import expand_request_images
 from .interface import SchedulerInterface
 from .output import CachedRequestData, NewRequestData, SchedulerOutput
 from .scheduler import Scheduler
@@ -93,6 +98,53 @@ class _SchedulerWorkerError(Exception):
 
     def __reduce__(self):
         return (self.__class__, (self.rank, self.message))
+
+
+class _SchedulerWorkerProcess:
+    """Subprocess lifecycle adapter with an explicit, child-only environment.
+
+    The bootstrap runs as a script so its environment is in place before importing EasyDeL or unpickling the
+    scheduler class. Non-default multiprocessing start methods are selected inside that isolated process.
+    """
+
+    def __init__(self, input_conn: Connection, output_conn: Connection, start_method: str) -> None:
+        multiprocessing.get_context(start_method)  # Validate before creating a subprocess.
+        child_env = dict(os.environ)
+        child_env["ENABLE_DISTRIBUTED_INIT"] = "0"
+        child_env["JAX_PLATFORMS"] = "cpu"
+        child_env["JAX_PLATFORM_NAME"] = "cpu"
+        self._process = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("worker_main.py")),
+                str(input_conn.fileno()),
+                str(output_conn.fileno()),
+                start_method,
+            ],
+            env=child_env,
+            pass_fds=(input_conn.fileno(), output_conn.fileno()),
+            start_new_session=True,
+        )
+
+    @property
+    def pid(self) -> int:
+        return self._process.pid
+
+    @property
+    def exitcode(self) -> int | None:
+        return self._process.poll()
+
+    def is_alive(self) -> bool:
+        return self._process.poll() is None
+
+    def join(self, timeout: float | None = None) -> None:
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            self._process.wait(timeout=timeout)
+
+    def kill(self) -> None:
+        # The launcher may own a fork/forkserver child. Its private session lets cleanup stop the whole worker tree.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(self.pid, signal.SIGKILL)
 
 
 def _pending_prefill_tokens(scheduler: Scheduler) -> int:
@@ -194,39 +246,25 @@ class _SchedulerWorkerClient:
         output_parent, output_child = ctx.Pipe()
         self._input_conn = input_parent
         self._output_conn = output_parent
-        self._process = ctx.Process(
-            target=_scheduler_worker_process,
-            args=(self.rank, input_child, output_child, scheduler_cls, scheduler_kwargs),
-            name=f"eSurgeDPSchedulerRank{self.rank}",
-        )
-        # A rank scheduler is pure host-side bookkeeping, but under the default
-        # ``spawn`` start method the child re-imports easydel to unpickle the
-        # target, and that import calls ``initialize_distributed()``, which
-        # defaults to ON. A second incarnation connecting to the parent's
-        # coordination service makes the parent's own distributed client abort
-        # the whole process ("tried to connect with a different incarnation"),
-        # killing the engine a few seconds after the workers come up. Every
-        # other spawned EasyDeL worker already opts out the same way (see
-        # ``workers/esurge/pipeline/worker_main.py``); this one must too, and it
-        # has to happen in the parent because ``spawn`` snapshots ``os.environ``
-        # at exec time -- before any code in the child runs.
-        previous_distributed_init = os.environ.get("ENABLE_DISTRIBUTED_INIT")
-        os.environ["ENABLE_DISTRIBUTED_INIT"] = "0"
         try:
-            self._process.start()
+            self._process = _SchedulerWorkerProcess(input_child, output_child, start_method)
+            self._input_conn.send_bytes(cloudpickle.dumps((self.rank, scheduler_cls, scheduler_kwargs)))
+        except BaseException:
+            if hasattr(self, "_process"):
+                self._process.kill()
+                self._process.join(timeout=1.0)
+            self._input_conn.close()
+            self._output_conn.close()
+            raise
         finally:
-            if previous_distributed_init is None:
-                os.environ.pop("ENABLE_DISTRIBUTED_INIT", None)
-            else:
-                os.environ["ENABLE_DISTRIBUTED_INIT"] = previous_distributed_init
-        input_child.close()
-        output_child.close()
+            input_child.close()
+            output_child.close()
         atexit.register(self._atexit_cleanup)
 
     def _atexit_cleanup(self) -> None:
         if self._process.is_alive():
             try:
-                os.kill(self._process.pid, signal.SIGKILL)
+                self._process.kill()
             except OSError:
                 pass
         self._process.join(timeout=1.0)
@@ -356,7 +394,7 @@ class _SchedulerWorkerClient:
         self._process.join(timeout=5.0)
         if self._process.is_alive():
             try:
-                os.kill(self._process.pid, signal.SIGKILL)
+                self._process.kill()
             except OSError:
                 pass
             self._process.join(timeout=1.0)
@@ -416,7 +454,10 @@ class DPScheduler(SchedulerInterface):
         self.async_scheduling = bool(async_scheduling)
         self.data_parallel_size = self.dp_size
         self.use_worker_processes = bool(use_worker_processes)
-        self.worker_start_method = worker_start_method or os.environ.get("EASYDEL_DP_SCHEDULER_START_METHOD", "spawn")
+        self.worker_start_method = worker_start_method or "spawn"
+        # Set by ``from_runner`` for models that expand image placeholders at admission (DeepSeek-V4.1). Images are
+        # expanded here, before routing, because the rank schedulers (possibly separate processes) have no expander.
+        self.image_expander: typing.Any | None = None
         self.req_id_to_dp_rank: dict[str, int] = {}
         self._requests: dict[str, EngineRequest] = {}
         self._cached_rank_outputs: deque[list[SchedulerOutput]] = deque()
@@ -505,6 +546,9 @@ class DPScheduler(SchedulerInterface):
         async_scheduling: bool = True,
         long_prefill_token_threshold: int | None = None,
         num_draft_tokens: int = 0,
+        chunked_prefill_enabled: bool = False,
+        token_safety_margin: int | None = None,
+        include_finished_set: bool = False,
     ) -> DPScheduler:
         from ..core.interface import create_kv_cache_specs_from_config
 
@@ -524,7 +568,7 @@ class DPScheduler(SchedulerInterface):
                 use_mla=False,
             )
 
-        return cls(
+        scheduler = cls(
             kv_cache_config=CacheGroupsConfig(num_pages=metadata.num_pages, kv_cache_groups=kv_cache_groups),
             dp_size=int(getattr(metadata, "data_parallel_size", 1) or 1),
             max_num_seqs=runner.max_num_seqs,
@@ -537,7 +581,14 @@ class DPScheduler(SchedulerInterface):
             async_scheduling=async_scheduling,
             long_prefill_token_threshold=long_prefill_token_threshold,
             num_draft_tokens=int(num_draft_tokens),
+            chunked_prefill_enabled=chunked_prefill_enabled,
+            token_safety_margin=token_safety_margin,
+            include_finished_set=include_finished_set,
         )
+        image_expander_builder = getattr(type(runner.model), "esurge_image_expander_builder", None)
+        if image_expander_builder is not None:
+            scheduler.image_expander = image_expander_builder(runner.model)
+        return scheduler
 
     @property
     def requests(self) -> dict[str, EngineRequest]:
@@ -668,6 +719,14 @@ class DPScheduler(SchedulerInterface):
             raise ValueError(
                 f"Request {request.request_id} already assigned to DP rank {self.req_id_to_dp_rank[request.request_id]}."
             )
+        images = getattr(request, "images", None)
+        if images is not None and len(images) > 0:
+            expand_request_images(
+                request,
+                self.image_expander,
+                max_num_scheduled_tokens=self.max_num_scheduled_tokens,
+                max_model_len=self.max_model_len,
+            )
         rank = self._find_best_rank_for_request(request)
         self.req_id_to_dp_rank[request.request_id] = rank
         self._requests[request.request_id] = request
@@ -718,8 +777,10 @@ class DPScheduler(SchedulerInterface):
         token_budget_initial = 0
         token_budget_remaining = 0
         req_ids_per_rank: dict[int, list[str]] = {}
+        pending_structured_output_tokens = False
 
         for rank, output in enumerate(rank_outputs):
+            pending_structured_output_tokens |= bool(getattr(output, "pending_structured_output_tokens", False))
             num_scheduled_tokens.update(output.num_scheduled_tokens)
             scheduled_spec_decode_tokens.update(output.scheduled_spec_decode_tokens)
             finished_req_ids.update(output.finished_req_ids)
@@ -764,6 +825,7 @@ class DPScheduler(SchedulerInterface):
             req_id_to_dp_rank=assigned_dp_rank,
             max_num_scheduled_tokens_per_dp_rank=max_tokens_per_rank,
             req_ids_per_rank=req_ids_per_rank,
+            pending_structured_output_tokens=pending_structured_output_tokens,
         )
 
     def _combine_cached_request_data(self, rank_outputs: list[SchedulerOutput]) -> CachedRequestData:
@@ -822,6 +884,10 @@ class DPScheduler(SchedulerInterface):
             for client_index, engine_outputs in rank_engine_outputs.items():
                 if engine_outputs.finished_requests:
                     finished_req_ids.update(engine_outputs.finished_requests)
+                # Lifecycle cleanup must not depend on the optional finished-set notifications.
+                finished_req_ids.update(
+                    output.request_id for output in engine_outputs.outputs if output.finish_reason is not None
+                )
                 existing = combined.get(client_index)
                 if existing is None:
                     combined[client_index] = engine_outputs
@@ -835,8 +901,7 @@ class DPScheduler(SchedulerInterface):
         self._mirror_engine_outputs(combined)
         for req_id in scheduler_output.finished_req_ids | finished_req_ids:
             self.req_id_to_dp_rank.pop(req_id, None)
-            if req_id in finished_req_ids:
-                self._requests.pop(req_id, None)
+            self._requests.pop(req_id, None)
 
         return combined
 
@@ -901,6 +966,7 @@ class DPScheduler(SchedulerInterface):
             },
             suggested_bucket=scheduler_output.suggested_bucket,
             async_scheduling=scheduler_output.async_scheduling,
+            pending_structured_output_tokens=scheduler_output.pending_structured_output_tokens,
             req_id_to_dp_rank={req_id: rank for req_id in rank_req_ids if req_id in scheduler_output.req_id_to_dp_rank},
         )
 
@@ -909,6 +975,17 @@ class DPScheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> list[ModelRunnerOutput]:
+        # Probabilities are flattened sampled-token positions, not request rows.
+        # Partial-prefill rows contribute zero positions and speculative rows can
+        # contribute several. Keep the original runner order within each row.
+        logprob_ranges: list[range] = []
+        if model_runner_output.logprobs is not None:
+            position = 0
+            for tokens in model_runner_output.sampled_token_ids:
+                logprob_ranges.append(range(position, position + len(tokens)))
+                position += len(tokens)
+            if any(len(field) != position for field in model_runner_output.logprobs):
+                raise ValueError("Runner logprobs must contain one position per sampled token in output order.")
         outputs: list[ModelRunnerOutput] = []
         for rank in range(self.dp_size):
             req_ids = scheduler_output.req_ids_per_rank.get(rank, [])
@@ -930,7 +1007,10 @@ class DPScheduler(SchedulerInterface):
                     spec_token_ids=[model_runner_output.spec_token_ids[i] for i in global_indices]
                     if model_runner_output.spec_token_ids is not None
                     else None,
-                    logprobs=self._slice_logprobs(model_runner_output.logprobs, global_indices)
+                    logprobs=self._slice_logprobs(
+                        model_runner_output.logprobs,
+                        [position for i in global_indices for position in logprob_ranges[i]],
+                    )
                     if model_runner_output.logprobs is not None
                     else None,
                     prompt_logprobs_dict={

@@ -154,12 +154,21 @@ class Xerxes2Config(EasyDeLBaseConfig):
         self.vhead_dim = vhead_dim
         self.mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
         self.hidden_act = hidden_act if hidden_act is not None else "silu"
-        if rope_scaling is None:
-            rope_scaling = {"type": "linear", "factor": 1.0}
+        if rope_scaling is None and kwargs.get("rope_parameters") is None:
+            rope_scaling = {
+                "rope_type": "yarn",
+                "factor": 1.0,
+                "original_max_position_embeddings": 4096,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "mscale": 1,
+                "mscale_all_dim": 0,
+            }
         self.rope_scaling = rope_scaling
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = ["full_attention"] * self.num_hidden_layers
+        kwargs.setdefault("attention_bias", False)
         super().__init__(
             bos_token_id=bos_token_id,
             scan_layers=scan_layers,
@@ -169,6 +178,33 @@ class Xerxes2Config(EasyDeLBaseConfig):
             bits=bits,
             **kwargs,
         )
+
+    @property
+    def q_lora_rank(self):
+        """Shared MLA spelling of the checkpoint-compatible query rank."""
+        return self.q_lora_dim
+
+    @q_lora_rank.setter
+    def q_lora_rank(self, value):
+        self.q_lora_dim = value
+
+    @property
+    def kv_lora_rank(self):
+        """Shared MLA spelling of the checkpoint-compatible key/value rank."""
+        return self.kv_lora_dim
+
+    @kv_lora_rank.setter
+    def kv_lora_rank(self, value):
+        self.kv_lora_dim = value
+
+    @property
+    def v_head_dim(self):
+        """Shared MLA spelling of the checkpoint-compatible value head width."""
+        return self.vhead_dim
+
+    @v_head_dim.setter
+    def v_head_dim(self, value):
+        self.vhead_dim = value
 
     def _get_rope_config(self) -> RopeConfig:
         """Build the :class:`RopeConfig` used by Xerxes2 attention.

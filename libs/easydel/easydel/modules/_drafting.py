@@ -94,7 +94,7 @@ def validate_target_layer_ids(
     for layer_id in values:
         if layer_id == -1 and not allow_embedding:
             raise ValueError("`-1` target layer is only valid for DSpark/DFlash.")
-        if layer_id < -1 or (layer_id == -1 and not allow_embedding):
+        if layer_id < -1:
             raise ValueError(f"Invalid target layer id: {layer_id}.")
         if num_target_layers is not None and layer_id >= int(num_target_layers):
             raise ValueError(f"target_layer_id {layer_id} is out of range for {num_target_layers} target layers.")
@@ -110,6 +110,8 @@ def extract_context_feature(
     *,
     target_hidden_size: int | None = None,
     allow_embedding: bool = True,
+    stacked_layout: tp.Literal["layer_first", "sequence_first"] | None = None,
+    num_target_layers: int | None = None,
 ) -> jax.Array:
     """Extract and concatenate target hidden states.
 
@@ -124,12 +126,17 @@ def extract_context_feature(
         layer_ids: Target layer indices to extract (validated internally).
         target_hidden_size: Hidden size per layer (used for 3-D array validation). Defaults to ``None``.
         allow_embedding: Whether ``-1`` (embedding layer) is permitted. Defaults to ``True``.
+        stacked_layout: Explicit axis convention for 4-D arrays. If omitted,
+            infer only when exactly one axis can represent the layer stack.
+        num_target_layers: Decoder depth (excluding the embedding output) of a
+            complete target stack, used to disambiguate its layer axis.
 
     Returns:
         Concatenated hidden features array.
 
     Raises:
-        ValueError: If the input shape is unsupported or does not match ``target_hidden_size``.
+        ValueError: If the input shape is unsupported, does not match
+            ``target_hidden_size``, or has ambiguous layer and sequence axes.
     """
     layer_ids = validate_target_layer_ids(layer_ids, allow_embedding=allow_embedding)
     if isinstance(hidden_states, list | tuple):
@@ -146,10 +153,22 @@ def extract_context_feature(
         raise ValueError(f"Unsupported target hidden-state shape: {hidden_states.shape}.")
 
     required_layers = max((0 if layer_id == -1 else layer_id + 1) for layer_id in layer_ids) + 1
-    layer_first = int(hidden_states.shape[0]) >= required_layers and (
-        int(hidden_states.shape[0]) == required_layers or int(hidden_states.shape[2]) < required_layers
-    )
+    if stacked_layout not in (None, "layer_first", "sequence_first"):
+        raise ValueError(f"Unsupported stacked_layout: {stacked_layout!r}.")
+    layer_first = int(hidden_states.shape[0]) >= required_layers
     sequence_first = int(hidden_states.shape[2]) >= required_layers
+    if num_target_layers is not None:
+        stack_depth = int(num_target_layers) + 1
+        layer_first &= int(hidden_states.shape[0]) == stack_depth
+        sequence_first &= int(hidden_states.shape[2]) == stack_depth
+    if stacked_layout is not None:
+        layer_first &= stacked_layout == "layer_first"
+        sequence_first &= stacked_layout == "sequence_first"
+    if layer_first and sequence_first:
+        raise ValueError(
+            "Ambiguous target hidden-state layout; provide stacked_layout or num_target_layers "
+            f"for shape {hidden_states.shape}."
+        )
     if layer_first:
         selected = [hidden_states[0 if layer_id == -1 else layer_id + 1] for layer_id in layer_ids]
     elif sequence_first:
@@ -586,22 +605,24 @@ class DraftAttention(spx.Module):
         Returns:
             Tuple of ``(rotated_query, rotated_key)`` with the same shapes as the inputs.
         """
-        if q_position_ids is None or kv_position_ids is None:
+        if q_position_ids is None and kv_position_ids is None:
             return query, key
-        if query.shape[1] == key.shape[1] and q_position_ids.shape == kv_position_ids.shape:
+        if query.shape[1] == key.shape[1] and q_position_ids is kv_position_ids:
             return self.rotary(positions=q_position_ids, query=query, key=key, frequencies=frequencies)
-        query, _ = self.rotary(
-            positions=q_position_ids,
-            query=query,
-            key=jnp.zeros_like(query),
-            frequencies=frequencies,
-        )
-        key, _ = self.rotary(
-            positions=kv_position_ids,
-            query=key,
-            key=key,
-            frequencies=frequencies,
-        )
+        if q_position_ids is not None:
+            query, _ = self.rotary(
+                positions=q_position_ids,
+                query=query,
+                key=jnp.zeros_like(query),
+                frequencies=frequencies,
+            )
+        if kv_position_ids is not None:
+            key, _ = self.rotary(
+                positions=kv_position_ids,
+                query=key,
+                key=key,
+                frequencies=frequencies,
+            )
         return query, key
 
     def forward(

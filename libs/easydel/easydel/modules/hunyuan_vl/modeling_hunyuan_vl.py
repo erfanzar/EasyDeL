@@ -207,35 +207,10 @@ def get_rope_index(
     return jnp.asarray(position_ids, dtype="i4"), jnp.asarray(rope_deltas, dtype="i4").reshape(-1, 1)
 
 
-def merge_multimodal_embeddings(
-    input_ids: jax.Array,
-    inputs_embeds: jax.Array,
-    multimodal_embeddings: jax.Array,
-    placeholder_token_id: int,
-) -> jax.Array:
-    """Scatter visual embeddings into text embeddings at placeholder positions.
-
-    Args:
-        input_ids: Token ids of shape ``(batch, seq_len)``.
-        inputs_embeds: Text embeddings of shape ``(batch, seq_len, hidden)``.
-        multimodal_embeddings: Flattened visual embeddings of shape
-            ``(total_tokens, hidden)``.
-        placeholder_token_id: Token id marking placeholder positions.
-
-    Returns:
-        jax.Array: Merged embeddings of shape ``(batch, seq_len, hidden)``.
-    """
-    batch_size, seq_len, hidden = inputs_embeds.shape
-    is_multimodal = (input_ids == placeholder_token_id).reshape(-1)
-    flat_embeds = inputs_embeds.reshape(-1, hidden)
-
-    dummy_row = jnp.zeros_like(multimodal_embeddings[0:1])
-    flattened_padded = jnp.concatenate([dummy_row, multimodal_embeddings], axis=0)
-    gather_indices = jnp.cumsum(is_multimodal)
-    update_values = flattened_padded[gather_indices]
-
-    merged = jnp.where(is_multimodal[:, None], update_values, flat_embeds)
-    return merged.reshape(batch_size, seq_len, hidden)
+# The cumsum-gather merge (plus placeholder-count validation, list-of-ids and
+# ``multimodal_embeddings_valid_length`` support) lives on the shared VLM base;
+# keep the module-level name so existing importers keep working.
+merge_multimodal_embeddings = BaseVisionLanguageModule.merge_multimodal_embeddings
 
 
 class HunYuanVLVisionEmbeddings(spx.Module):
@@ -724,6 +699,7 @@ class HunYuanVLVisionPatchMerger(spx.Module):
         return self.after_rms(hidden_states)
 
 
+@register_module(TaskType.BASE_VISION, config=HunYuanVLVisionConfig, model_type="hunyuan_vl_vision")
 @register_module(TaskType.BASE_VISION, config=HunYuanVLVisionConfig, model_type="hunyuan_vl")
 class HunYuanVLVisionModel(EasyDeLBaseModule):
     """HunYuanVL vision tower: patch embedding, encoder blocks, patch merger.
@@ -1110,7 +1086,7 @@ class HunYuanVLTextDecoderLayer(spx.Module):
         )
 
 
-@register_module(TaskType.BASE_MODULE, config=HunYuanVLTextConfig, model_type="hunyuan_vl")
+@register_module(TaskType.BASE_MODULE, config=HunYuanVLTextConfig, model_type="hunyuan_vl_text")
 class HunYuanVLTextModel(EasyDeLBaseModule):
     """HunYuanVL language-model trunk processing text and visual tokens."""
 
@@ -1406,7 +1382,6 @@ class HunYuanVLModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.rope_deltas = None
 
     def set_embeddings(self, value):
         """Set the text token embedding.
@@ -1926,23 +1901,6 @@ class HunYuanVLForConditionalGeneration(BaseVisionLanguageModule[HunYuanVLModel,
             }
         )
         return model_inputs
-
-    def _create_required_props_from_kwargs(
-        self,
-        model_kwargs: dict[str, Array],
-    ) -> tp.Mapping[str, dict[str, tp.Any]] | None:
-        """Preserve grid shapes across generation steps.
-
-        Args:
-            model_kwargs: Current generation kwargs.
-
-        Returns:
-            Mapping | None: Properties to preserve.
-        """
-        basics = {}
-        if "image_grid_thw" in model_kwargs:
-            basics.update({"image_grid_thw": {"value": jnp.array(model_kwargs["image_grid_thw"])}})
-        return basics
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
         """Advance generation state and drop one-time vision inputs.

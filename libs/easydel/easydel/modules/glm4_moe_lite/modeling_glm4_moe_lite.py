@@ -47,7 +47,6 @@ from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
-    MLARaggedPagesCacheView,
     OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -58,7 +57,7 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeModelOutput
+from easydel.infra.modeling_outputs import DecoderLayerOutput, MoeModelOutput
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import (
     BaseMoeModule,
@@ -78,8 +77,8 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
-from easydel.layers.moe import moe_group_topk_select
-from easydel.layers.rotary import apply_rope_interleaved, yarn_get_mscale
+from easydel.layers.moe import fp32_router_logits, moe_group_topk_select
+from easydel.layers.rotary import yarn_get_mscale
 from easydel.modules._base import BaseCausalLMModule
 
 from .glm4_moe_lite_configuration import Glm4MoeLiteConfig
@@ -348,11 +347,7 @@ class Glm4MoeLiteTopKRouter(spx.Module):
             fp32 router logits of shape
             ``(num_tokens, n_routed_experts)``.
         """
-        hidden_states = hidden_states.reshape(-1, self.config.hidden_size)
-        return checkpoint_name(
-            jnp.matmul(hidden_states.astype(jnp.float32), self.weight.value.astype(jnp.float32)),
-            "moe_router_logits",
-        )
+        return fp32_router_logits(hidden_states, self.weight.value, self.config.hidden_size)
 
 
 class Glm4MoeLiteMoE(BaseMoeModule):
@@ -624,215 +619,10 @@ class Glm4MoeLiteAttention(UnifiedAttention):
             dropout_prob=getattr(config, "attention_dropout", 0.0),
         )
 
-    def forward_mla(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo | None,
-        position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-        alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
-    ):
-        """Run the MLA attention forward pass.
-
-        Computes Q via the optional LoRA chain, projects the compressed KV
-        latent, applies RoPE (interleaved or split) only to the
-        ``qk_rope_head_dim`` slice, and dispatches to the attention
-        performer. When the cache is an :class:`MLARaggedPagesCacheView`,
-        the kv-up projection is **absorbed** into the queries and the cache
-        stores only the layer-normed compressed latent — the kernel then
-        operates directly on the latent dim and the value up-projection is
-        re-applied on the way out.
-
-        Args:
-            hidden_states: Residual ``(batch, seq_len, hidden_size)``.
-            mask_info: Pre-computed attention mask metadata, or ``None``.
-            position_ids: Position indices for RoPE.
-            mode: Runtime mode (train/decode/etc.) propagated to the kernel.
-            cache_view: KV cache view (regular or MLA-paged).
-            cache_metadata: Cache metadata for paged attention.
-            output_attentions: If ``True``, return attention weights.
-            frequencies: Pre-computed RoPE cos/sin table (``head_dim`` =
-                ``qk_rope_head_dim``).
-            alibi: Optional ALiBi bias; unused by MLA but accepted for
-                signature compatibility.
-
-        Returns:
-            :class:`AttentionLayerOutput` with the projected attention
-            output, optional attention weights, and the (possibly updated)
-            cache view.
-        """
-        bsz, q_len, _ = hidden_states.shape
-
-        if not self.use_mla_lora:
-            q = checkpoint_name(self.mla_q_proj(hidden_states), name="attn_query")
-        else:
-            q = checkpoint_name(
-                self.mla_q_b_proj(
-                    self.mla_q_a_layernorm(checkpoint_name(self.mla_q_a_proj(hidden_states), name="attn_query_a"))
-                ),
-                name="attn_query",
-            )
-
-        q = q.reshape(bsz, q_len, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
-        q_nope, q_pe = q[..., : self.qk_nope_head_dim], q[..., self.qk_nope_head_dim :]
-
-        compressed_kv = self.mla_kv_a_proj_with_mqa(hidden_states)
-        k_pe = compressed_kv[..., self.kv_lora_rank :]
-        compressed_kv = compressed_kv[..., : self.kv_lora_rank]
-
-        k_pe = k_pe.reshape(bsz, q_len, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
-
-        kv = (
-            self.mla_kv_b_proj(self.mla_kv_a_layernorm(compressed_kv))
-            .reshape(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-        k_nope = kv[..., : self.qk_nope_head_dim]
-        value_states = kv[..., self.qk_nope_head_dim : self.qk_nope_head_dim + self.v_head_dim]
-
-        if frequencies is not None:
-            freq_array = frequencies.value if hasattr(frequencies, "value") else frequencies
-            freqs = freq_array[position_ids]
-            cos, sin = jnp.split(freqs, 2, -1)
-            cos = cos[:, None, :, :].astype(q_pe.dtype)
-            sin = sin[:, None, :, :].astype(q_pe.dtype)
-            if self.config.rope_interleave:
-                q_pe = apply_rope_interleaved(q_pe, cos, sin)
-                k_pe = apply_rope_interleaved(k_pe, cos, sin)
-            else:
-                q1, q2 = jnp.split(q_pe, 2, axis=-1)
-                k1, k2 = jnp.split(k_pe, 2, axis=-1)
-                q_pe = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
-                k_pe = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
-
-        query_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), q_pe.dtype)
-        query_states = query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
-        query_states = query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
-
-        key_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), k_pe.dtype)
-        key_states = key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
-        key_states = key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
-
-        query_states = query_states.transpose(0, 2, 1, 3)
-        key_states = key_states.transpose(0, 2, 1, 3)
-        value_states = value_states.transpose(0, 2, 1, 3)
-
-        causal_for_kernel = self.causal
-        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
-            causal_for_kernel = False
-
-        sliding_window_for_kernel = self.sliding_window
-        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
-            sliding_window_for_kernel = None
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-        )
-
-        softmax_aux = self._softmax_aux()
-
-        # Absorbed MLA: absorb kv_b_proj weights into queries so the kernel
-        # works directly on the compressed latent (non-head-aware path).
-        mla_kwargs: dict = {}
-        _absorbed_W_v = None
-        if isinstance(cache_view, MLARaggedPagesCacheView):
-            W = self.mla_kv_b_proj.weight.value  # [kv_lora_rank, local_heads*(nope+v)]
-            local_heads = W.shape[1] // (self.qk_nope_head_dim + self.v_head_dim)
-            W = W.reshape(self.kv_lora_rank, local_heads, self.qk_nope_head_dim + self.v_head_dim)
-            W_nope = W[:, :, : self.qk_nope_head_dim]  # [kv_lora_rank, local_heads, nope]
-            _absorbed_W_v = W[:, :, self.qk_nope_head_dim :]  # [kv_lora_rank, local_heads, v]
-
-            # q_nope: [bsz, heads, seq, nope] @ W_nope: [kv_lora_rank, heads, nope]
-            # -> q_absorbed: [bsz, heads, seq, kv_lora_rank]
-            q_absorbed = jnp.einsum("bhsd,khd->bhsk", q_nope, W_nope)
-
-            mla_kwargs["queries_nope"] = q_absorbed.transpose(0, 2, 1, 3)  # [bsz, seq, heads, kv_lora_rank]
-            mla_kwargs["queries_pe"] = q_pe.transpose(0, 2, 1, 3)  # [bsz, seq, heads, rope_dim]
-            # Store layernormed latent — kv_b_proj weights were trained against
-            # layernorm output, so the cached latent must match.
-            mla_kwargs["keys_values"] = self.mla_kv_a_layernorm(compressed_kv)  # [bsz, seq, kv_lora_rank]
-            mla_kwargs["keys_pe"] = k_pe[:, 0, :, :]  # [bsz, seq, rope_dim]
-            # Same scale as the dense path: original q_head_dim (not the absorbed
-            # dim) with any YaRN mscale**2.
-            mla_kwargs["softmax_scale"] = self.attention_performer.softmax_scale
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=causal_for_kernel,
-            sliding_window=sliding_window_for_kernel,
-            softmax_aux=softmax_aux,
-            **mla_kwargs,
-        )
-
-        attn_out = attentions.attention_outputs
-        if _absorbed_W_v is not None and attn_out.ndim == 3:
-            # Absorbed MLA output: [total_tokens, heads, kv_lora_rank]
-            # Value up-projection: recover per-head v_head_dim
-            # _absorbed_W_v: [kv_lora_rank, heads, v_head_dim]
-            attn_out = jnp.einsum("thk,khv->thv", attn_out, _absorbed_W_v)
-            # attn_out: [total_tokens, heads, v_head_dim]
-            batch_size = hidden_states.shape[0]
-            seq_len = hidden_states.shape[1]
-            attn_output = attn_out.reshape(batch_size, seq_len, -1)
-        elif isinstance(cache_view, MLARaggedPagesCacheView) and attn_out.ndim == 3:
-            batch_size = hidden_states.shape[0]
-            seq_len = hidden_states.shape[1]
-            attn_output = attn_out.reshape(batch_size, seq_len, -1)
-        else:
-            attn_output = self._merge_heads(attn_out)
-        expected_attn_dim = self.num_heads * self.v_head_dim
-        if attn_output.shape[-1] != expected_attn_dim:
-            actual_attn_dim = int(attn_output.shape[-1])
-            if actual_attn_dim % self.num_heads == 0 and expected_attn_dim % self.num_heads == 0:
-                actual_head_dim = actual_attn_dim // self.num_heads
-                expected_head_dim = expected_attn_dim // self.num_heads
-                attn_output = attn_output.reshape(*attn_output.shape[:-1], self.num_heads, actual_head_dim)
-                if actual_head_dim > expected_head_dim:
-                    attn_output = attn_output[..., :expected_head_dim]
-                elif actual_head_dim < expected_head_dim:
-                    pad_width = [(0, 0)] * attn_output.ndim
-                    pad_width[-1] = (0, expected_head_dim - actual_head_dim)
-                    attn_output = jnp.pad(attn_output, pad_width)
-                attn_output = attn_output.reshape(*attn_output.shape[:-2], expected_attn_dim)
-            elif actual_attn_dim > expected_attn_dim:
-                attn_output = attn_output[..., :expected_attn_dim]
-            else:
-                pad_width = [(0, 0)] * attn_output.ndim
-                pad_width[-1] = (0, expected_attn_dim - actual_attn_dim)
-                attn_output = jnp.pad(attn_output, pad_width)
-        attn_output = self.shard_attention_prod(attn_output)
-        attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
-        attn_output = self.shard_attention_prod(attn_output)
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
-        )
+    # ``forward_mla`` is inherited from :class:`UnifiedAttention`: it builds the q LoRA chain, splits the
+    # ``kv_a`` projection, applies (interleaved or split-half) RoPE per ``config.rope_interleave``, reads the
+    # softmax scale from ``self.attention_performer`` (the YaRN-aware performer built above), and skips
+    # ``kv_b_proj`` on the weight-absorbed ``MLARaggedPagesCacheView`` path.
 
 
 class Glm4MoeLiteDecoderLayer(spx.Module):
@@ -1314,75 +1104,27 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
         dtype: jnp.dtype | None = None,
         max_cache_tokens: int | None = None,
     ):
-        """Create the paged KV-cache configuration for MLA attention.
-
-        GLM4-MoE-Lite uses MLA, where the runtime attention head width is
-        ``qk_nope_head_dim + qk_rope_head_dim`` (not ``config.head_dim``).
-        When the configured attention mechanism is MLA-paged, defers to
-        :meth:`_create_mla_ragged_page_cache_config`.
-
-        Args:
-            max_length: Maximum model context length.
-            page_size: Tokens per page.
-            hbm_utilization: Fraction of HBM the cache may consume.
-            dtype: Optional override for the cache dtype.
-
-            max_cache_tokens: Optional hard ceiling on total KV-cache tokens;
-                the page count becomes ``min(hbm-derived, cap)``. Defaults to None.
-
-        Returns:
-            A cache config object suitable for the chosen attention
-            mechanism.
-        """
-        from easydel.caching import RaggedPagesCacheConfig
-        from easydel.layers.attention import AttentionMechanisms
-
+        """Create MLA or expanded-KV pages, also for config-only callers."""
         text_config = self.config.get_text_config()
-
-        q_head_dim = self.config.qk_nope_head_dim + self.config.qk_rope_head_dim
-        v_head_dim = self.config.v_head_dim
-
-        match text_config.attn_mechanism:
-            case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3:
-                version = "v3"
-            case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2:
-                version = "v2"
-            case _:
-                version = "v3"
-
-        attn_mechanism = getattr(text_config, "attn_mechanism", None)
-        if hasattr(attn_mechanism, "value"):
-            attn_mechanism = attn_mechanism.value
-        is_mla_ragged = str(attn_mechanism) in (
-            "multi_latent_ragged_page_attention_v1",
-            "multi_latent_ragged_page_attention_v2",
-        )
-        if is_mla_ragged:
+        mechanism = getattr(text_config.attn_mechanism, "value", text_config.attn_mechanism)
+        if mechanism in ("multi_latent_ragged_page_attention_v1", "multi_latent_ragged_page_attention_v2"):
             return self._create_mla_ragged_page_cache_config(
                 max_length=max_length,
                 page_size=page_size,
-                max_cache_tokens=max_cache_tokens,
                 hbm_utilization=hbm_utilization,
                 dtype=dtype,
+                max_cache_tokens=max_cache_tokens,
             )
-
-        return RaggedPagesCacheConfig.create(
-            mesh=self.mesh,
-            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
-            kvdtype=text_config.kvdtype if dtype is None else dtype,
-            max_model_length=max_length,
-            num_hidden_layers=self.config.num_hidden_layers,
-            num_kv_heads=self.config.num_attention_heads,
-            kv_head_dim_size=q_head_dim,
-            k_headdim=q_head_dim,
-            v_headdim=v_head_dim,
-            hbm_utilization=hbm_utilization,
+        return Glm4MoeLiteForCausalLM._create_standard_ragged_page_cache_config(
+            self,
+            max_length=max_length,
             page_size=page_size,
+            hbm_utilization=hbm_utilization,
+            dtype=dtype,
             max_cache_tokens=max_cache_tokens,
-            version=version,
         )
 
-    def _create_mla_ragged_page_cache_config(
+    def _create_standard_ragged_page_cache_config(
         self,
         max_length: int,
         *,
@@ -1392,48 +1134,63 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
         num_hidden_layers_override: int | None = None,
         max_cache_tokens: int | None = None,
     ):
-        """Create the MLA ragged cache using GLM4-MoE-Lite's compressed KV width.
+        """Size a non-MLA paged cache for the decompressed key/value heads.
 
-        Stores only the ``kv_lora_rank``-wide compressed latent plus the
-        ``qk_rope_head_dim``-wide RoPE branch — not the full per-head
-        keys/values — exactly matching what the absorbed-MLA kernel
-        expects.
+        The inherited public builder handles attention-mechanism dispatch and
+        MLA latent-cache geometry. Only the standard-cache geometry differs:
+        keys have ``qk_nope_head_dim + qk_rope_head_dim`` channels and values
+        have ``v_head_dim`` channels, with ``num_attention_heads`` KV heads.
 
         Args:
             max_length: Maximum model context length.
             page_size: Tokens per page.
             hbm_utilization: Fraction of HBM the cache may consume.
-            dtype: Optional override for the cache dtype.
-            num_hidden_layers_override: Optional override for the layer
-                count, useful when fewer layers are materialised on this
-                shard than the config declares.
-            max_cache_tokens: Optional ceiling on the total page-pool token capacity.
+            dtype: Optional cache dtype override.
+            num_hidden_layers_override: Explicit number of cache-bearing layers.
+            max_cache_tokens: Optional hard ceiling on total KV-cache tokens.
 
         Returns:
-            An :class:`MLARaggedPagesCacheConfig` ready to be allocated.
+            A paged cache configuration matching decompressed MLA heads.
         """
-        from easydel.caching import MLARaggedPagesCacheConfig
+        from easydel.caching import RaggedPagesCacheConfig
+        from easydel.layers.attention import AttentionMechanisms
 
         text_config = self.config.get_text_config()
-        kvdtype = text_config.kvdtype if dtype is None else dtype
-        num_hidden_layers = (
-            int(num_hidden_layers_override) if num_hidden_layers_override is not None else self.config.num_hidden_layers
-        )
+        q_head_dim = text_config.qk_nope_head_dim + text_config.qk_rope_head_dim
+        if dtype is None:
+            dtype = text_config.kvdtype
+            if isinstance(dtype, str):
+                dtype = getattr(jnp, dtype, jnp.bfloat16)
 
-        # GLM4-MoE-Lite sends the absorbed MLA kernel the compressed latent
-        # ``compressed_kv`` with width ``kv_lora_rank`` plus the RoPE branch.
-        return MLARaggedPagesCacheConfig.create(
-            mesh=self.mesh,
+        if num_hidden_layers_override is not None:
+            num_hidden_layers = num_hidden_layers_override
+        elif hasattr(self, "_standard_ragged_layer_indices_for_cache_budget") and hasattr(
+            self, "_pp_stage_cache_layer_count"
+        ):
+            layer_indices = self._standard_ragged_layer_indices_for_cache_budget()
+            num_hidden_layers = self._pp_stage_cache_layer_count(
+                layer_indices,
+                total_layers=text_config.num_hidden_layers,
+            )
+        else:
+            # The public builder also accepts config/mesh-only callers.
+            num_hidden_layers = text_config.num_hidden_layers
+
+        version = "v2" if text_config.attn_mechanism == AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2 else "v3"
+        return RaggedPagesCacheConfig.create(
+            mesh=text_config.mesh,
             runtime_sharding_resolver=text_config.runtime_sharding_resolver,
-            kvdtype=kvdtype,
+            kvdtype=dtype,
             max_model_length=max_length,
-            num_hidden_layers=num_hidden_layers,
-            num_kv_heads=self.config.num_attention_heads,
-            kv_lora_rank=self.config.kv_lora_rank,
-            qk_rope_head_dim=self.config.qk_rope_head_dim,
+            num_hidden_layers=max(1, int(num_hidden_layers)),
+            num_kv_heads=text_config.num_attention_heads,
+            kv_head_dim_size=q_head_dim,
+            k_headdim=q_head_dim,
+            v_headdim=text_config.v_head_dim,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             max_cache_tokens=max_cache_tokens,
+            version=version,
         )
 
 

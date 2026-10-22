@@ -67,7 +67,7 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import LayerNorm
@@ -106,7 +106,6 @@ class OPTAttention(AttentionModule):
         bias (bool): Whether the QKV / output projections carry a bias.
         q_proj, k_proj, v_proj, out_proj (ColumnParallelLinear): The four
             attention projections.
-        dropout_layer (nn.Dropout): Dropout on the attention probabilities.
         attention_module (FlexibleAttentionModule): Underlying flash /
             chunked attention performer.
     """
@@ -176,8 +175,13 @@ class OPTAttention(AttentionModule):
         )
         self.out_proj = linear(embed_dim, embed_dim, rngs=rngs)
 
-        self.dropout_layer = nn.Dropout(rate=self.dropout, rngs=rngs)
-        self.attention_module = FlexibleAttentionModule(base_config=config, softmax_scale=self.head_dim**-0.5)
+        self.rngs = rngs
+        self.attention_module = FlexibleAttentionModule(
+            base_config=config,
+            softmax_scale=self.head_dim**-0.5,
+            dropout_prob=self.dropout,
+            rngs=rngs,
+        )
 
     def forward(
         self,
@@ -243,8 +247,11 @@ class OPTAttention(AttentionModule):
             init_bias=init_attention_bias,
             mask_info=mask_info,
             causal=self.causal,
+            deterministic=not self.training,
+            dropout_rng=self.rngs.key("dropout") if self.training and self.dropout else None,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
+            output_attentions=output_attentions,
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
@@ -276,8 +283,8 @@ class OPTDecoderLayer(spx.Module):
 
     The FFN is the classic ``up -> ReLU -> down`` with ``fc1: embed_dim ->
     ffn_dim`` and ``fc2: ffn_dim -> embed_dim`` (``ffn_dim`` is also exposed
-    under the ``intermediate_size`` alias). All linears carry biases, the activation
-    is plain ReLU (or the function named by ``activation_function``), and
+    under the ``intermediate_size`` alias). Linear biases follow ``enable_bias``;
+    the activation is plain ReLU (or the function named by ``activation_function``), and
     dropout is applied on both the attention output and the FFN output.
 
     Attributes:
@@ -323,6 +330,7 @@ class OPTDecoderLayer(spx.Module):
             num_heads=config.num_attention_heads,
             dropout=config.attention_dropout,
             causal=True,
+            bias=config.enable_bias,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -336,6 +344,8 @@ class OPTDecoderLayer(spx.Module):
             self.embed_dim,
             dtype=self.dtype,
             param_dtype=param_dtype,
+            use_scale=config.layer_norm_elementwise_affine,
+            use_bias=config.layer_norm_elementwise_affine,
             rngs=rngs,
             epsilon=1e-05,
         )
@@ -346,6 +356,7 @@ class OPTDecoderLayer(spx.Module):
             param_dtype=param_dtype,
             precision=precision,
             kernel_init=jax.nn.initializers.normal(config.init_std),
+            use_bias=config.enable_bias,
             rngs=rngs,
         )
         self.fc2 = RowParallelLinear(
@@ -355,12 +366,15 @@ class OPTDecoderLayer(spx.Module):
             param_dtype=param_dtype,
             precision=precision,
             kernel_init=jax.nn.initializers.normal(config.init_std),
+            use_bias=config.enable_bias,
             rngs=rngs,
         )
         self.final_layer_norm = LayerNorm(
             self.embed_dim,
             dtype=self.dtype,
             param_dtype=param_dtype,
+            use_scale=config.layer_norm_elementwise_affine,
+            use_bias=config.layer_norm_elementwise_affine,
             rngs=rngs,
             epsilon=1e-05,
         )
@@ -465,7 +479,7 @@ class OPTDecoderLayer(spx.Module):
         )
 
 
-class OPTLearnedPositionalEmbedding(spx.Module):
+class OPTLearnedPositionalEmbedding(Embed):
     """Learned absolute position embedding table with a fixed-offset lookup.
 
     OPT uses learned (not sinusoidal, not RoPE) absolute position
@@ -504,32 +518,15 @@ class OPTLearnedPositionalEmbedding(spx.Module):
                 Defaults to `jax.nn.initializers.normal(stddev=1.0)`.
             rngs (spx.Rngs): Random number generators.
         """
+        super().__init__(
+            num_embeddings + offset,
+            features,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            embedding_init=embedding_init or jax.nn.initializers.normal(stddev=1.0),
+            rngs=rngs,
+        )
         self.offset = offset
-        self.num_embeddings = num_embeddings
-        self.features = features
-        self.dtype = dtype or param_dtype
-        self.param_dtype = param_dtype
-
-        # Create embedding parameter directly to match HuggingFace structure
-        # HuggingFace uses 'weight' (PyTorch) which becomes 'kernel' in SpecTrax
-        if embedding_init is not None:
-            value = embedding_init(rngs.parameters, (num_embeddings + offset, features), param_dtype)
-            self.weight = ArrayParam.bound(
-                shape=(num_embeddings + offset, features),
-                dtype=param_dtype,
-                init_method="variance_scaling",
-                init_kwargs={"scale": 1.0, "mode": "fan_in", "distribution": "normal"},
-                key=rngs.parameters,
-                value=value,
-            )
-        else:
-            self.weight = ArrayParam.bound(
-                shape=(num_embeddings + offset, features),
-                dtype=param_dtype,
-                init_method="variance_scaling",
-                init_kwargs={"scale": 1.0, "mode": "fan_in", "distribution": "normal"},
-                key=rngs.parameters,
-            )
 
     def forward(self, inputs: Array) -> Array:
         """Apply learned positional embeddings with offset.
@@ -540,12 +537,7 @@ class OPTLearnedPositionalEmbedding(spx.Module):
         Returns:
             Positional embeddings [batch, seq_len, features]
         """
-        indices = inputs + self.offset
-        # Use take for embedding lookup, matching Embed behavior
-        embedded = jnp.take(self.weight.value, indices, axis=0)
-        if self.dtype != self.param_dtype:
-            embedded = embedded.astype(self.dtype)
-        return embedded
+        return super().forward(inputs + self.offset)
 
 
 class OPTDecoder(EasyDeLBaseModule):
@@ -609,6 +601,11 @@ class OPTDecoder(EasyDeLBaseModule):
         )
 
         self.dropout_layer = nn.Dropout(rate=self.config.dropout, rngs=rngs)
+        self.rngs = rngs
+        if self.config.layerdrop > 0:
+            # Declare the stream before tracing so scan and explicit iteration
+            # use the same stream rather than the transform-time fallback.
+            rngs.stream("dropout")
 
         embed_dim = self.config.hidden_size
         self.padding_idx = self.config.pad_token_id
@@ -625,13 +622,13 @@ class OPTDecoder(EasyDeLBaseModule):
             )
 
         self.position_offset = offset
-        # Use `Embed` directly so HF -> EasyDeL conversion treats this as an embedding
-        # (no weight transpose) and maps `*.weight` -> `*.embedding`.
+        # The Embed subclass preserves embedding conversion and checkpoint key paths.
         assert self.config.max_position_embeddings is not None
         with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
-            self.embed_positions = Embed(
-                self.config.max_position_embeddings + offset,
+            self.embed_positions = OPTLearnedPositionalEmbedding(
+                self.config.max_position_embeddings,
                 embed_dim,
+                offset=offset,
                 embedding_init=jax.nn.initializers.normal(config.init_std),
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -671,6 +668,8 @@ class OPTDecoder(EasyDeLBaseModule):
                     dtype=self.dtype,
                     param_dtype=param_dtype,
                     epsilon=1e-05,
+                    use_scale=config.layer_norm_elementwise_affine,
+                    use_bias=config.layer_norm_elementwise_affine,
                     rngs=rngs,
                 )
         else:
@@ -759,8 +758,8 @@ class OPTDecoder(EasyDeLBaseModule):
             # provides per-token positions via `q_position_ids`.
             position_ids = jnp.clip(mask_info.q_position_ids[:, :sequence_length], min=0).astype(jnp.int32)
 
-        positions = self.embed_positions((position_ids + self.position_offset).astype("i4"))
-        hidden_states = inputs_embeds + positions
+        positions = self.embed_positions(position_ids.astype("i4"))
+        hidden_states = self.dropout_layer(inputs_embeds + positions)
 
         if mode is None:
             mode = (
@@ -812,6 +811,30 @@ class OPTDecoder(EasyDeLBaseModule):
                     output_attentions=output_attentions,
                 )
 
+            if self.training and self.config.layerdrop > 0:
+                # Keep the scan/output structure stable while dropping the entire
+                # block's residual update (no inverted-dropout rescaling). Draw
+                # through the bound layer: only its RNG writes are scan-carried.
+                drop_layer = jax.random.uniform(decoder_layer.self_attn.rngs.key("dropout")) < self.config.layerdrop
+                layer_outputs.hidden_states = jnp.where(drop_layer, hidden_states, layer_outputs.hidden_states)
+                if layer_outputs.attention_weight is not None:
+                    layer_outputs.attention_weight = jnp.where(drop_layer, 0, layer_outputs.attention_weight)
+                previous_view = self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values)
+                if previous_view is not None and layer_outputs.cache_view is not None:
+                    if isinstance(previous_view, TransformerCacheView) and previous_view.segment_ids is None:
+                        # A legacy view acquires segment history on its first append.
+                        # Recover its *old* labels from that update, but invalidate
+                        # every newly appended slot before selecting a dropped layer.
+                        segments = layer_outputs.cache_view.segment_ids
+                        if segments is not None:
+                            columns = jnp.arange(segments.shape[-1])[None, :]
+                            valid = (columns >= previous_view.starts[:, None]) & (
+                                columns < previous_view.indexes[:, None]
+                            )
+                            previous_view = previous_view.replace(segment_ids=jnp.where(valid, segments, -1))
+                    layer_outputs.cache_view = jax.tree_util.tree_map(
+                        lambda old, new: jnp.where(drop_layer, old, new), previous_view, layer_outputs.cache_view
+                    )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
             if output_attentions:
                 all_self_attns += (layer_outputs.attention_weight,)
@@ -1070,6 +1093,7 @@ class OPTForCausalLM(BaseCausalLMModule[OPTModel, OPTConfig]):  # type: ignore
             precision=precision,
             rngs=rngs,
             lm_head_bias=False,
+            lm_head_input_dim=config.word_embed_proj_dim,
             tie_word_embeddings=config.tie_word_embeddings if hasattr(config, "tie_word_embeddings") else False,
         )
 

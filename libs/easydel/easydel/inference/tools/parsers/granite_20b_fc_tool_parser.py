@@ -219,7 +219,6 @@ class Granite20bFCToolParser(ToolParser):
         if not current_text.startswith(self.bot_token):
             return DeltaMessage(content=delta_text)
 
-        flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
         try:
             tool_call_arr = []
             is_complete = []
@@ -228,6 +227,13 @@ class Granite20bFCToolParser(ToolParser):
                 start_idx = consume_space(start_idx, current_text)
 
                 while start_idx < len(current_text):
+                    # Incomplete strings are safe only for the tool whose name
+                    # has already been emitted, never for a newly encountered tool.
+                    flags = (
+                        Allow.ALL
+                        if len(tool_call_arr) == self.current_tool_id and self.current_tool_name_sent
+                        else Allow.ALL & ~Allow.STR
+                    )
                     (obj, end_idx) = partial_json_loads(current_text[start_idx:], flags)
                     is_complete.append(is_complete_json(current_text[start_idx : start_idx + end_idx]))
                     start_idx += end_idx
@@ -245,47 +251,112 @@ class Granite20bFCToolParser(ToolParser):
                 return None
 
             elif len(tool_call_arr) > 0 and len(tool_call_arr) > self.current_tool_id + 1:
+                deltas: list[DeltaToolCall] = []
                 if self.current_tool_id >= 0:
+                    closing_name = current_tool_call.get("name")
+                    # A multi-object jump can close the tool at current_tool_id before its
+                    # name/id was ever streamed. Arguments must never reach a client for an
+                    # index that was not announced, so name, id and type travel together
+                    # with the first arguments.
+                    announce = not self.current_tool_name_sent and bool(closing_name)
                     cur_arguments = current_tool_call.get("arguments")
-                    if cur_arguments:
+                    argument_diff = ""
+                    if cur_arguments is not None and (self.current_tool_name_sent or announce):
                         cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
                         sent = len(self.streamed_args_for_tool[self.current_tool_id])
                         argument_diff = cur_args_json[sent:]
-
+                    if argument_diff or announce:
                         logger.debug("got arguments diff: %s", argument_diff)
-                        delta = DeltaMessage(
-                            tool_calls=[
-                                DeltaToolCall(
-                                    index=self.current_tool_id,
-                                    function=DeltaFunctionCall(arguments=argument_diff).model_dump(exclude_none=True),
-                                )
-                            ]
+                        deltas.append(
+                            DeltaToolCall(
+                                index=self.current_tool_id,
+                                type="function" if announce else None,
+                                id=f"chatcmpl-tool-{uuid4()}" if announce else None,
+                                function=DeltaFunctionCall(
+                                    name=closing_name if announce else None,
+                                    arguments=argument_diff or None,
+                                ).model_dump(exclude_none=True),
+                            )
                         )
                         self.streamed_args_for_tool[self.current_tool_id] += argument_diff
-                    else:
-                        delta = None
-                else:
-                    delta = None
-                self.current_tool_id = len(tool_call_arr) - 1
+
+                # Every object before the newest one is complete. Emit each of them in full
+                # so current_tool_id stays in sync with streamed_args_for_tool.
+                while self.current_tool_id < len(tool_call_arr) - 1:
+                    self.current_tool_id += 1
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+                    if self.current_tool_id >= len(tool_call_arr) - 1:
+                        break
+                    closed_tool_call: dict = tool_call_arr[self.current_tool_id]
+                    closed_function = DeltaFunctionCall(name=closed_tool_call.get("name"))
+                    closed_arguments = closed_tool_call.get("arguments")
+                    if closed_arguments is not None:
+                        closed_args_json = json.dumps(closed_arguments, ensure_ascii=False)
+                        closed_function = DeltaFunctionCall(
+                            name=closed_tool_call.get("name"), arguments=closed_args_json
+                        )
+                        self.streamed_args_for_tool[self.current_tool_id] = closed_args_json
+                    deltas.append(
+                        DeltaToolCall(
+                            index=self.current_tool_id,
+                            type="function",
+                            id=f"chatcmpl-tool-{uuid4()}",
+                            function=closed_function.model_dump(exclude_none=True),
+                        )
+                    )
+
                 self.current_tool_name_sent = False
-                self.streamed_args_for_tool.append("")
+                newest = tool_call_arr[self.current_tool_id]
+                newest_name = newest.get("name")
+                if newest_name:
+                    # Do not require a later (possibly nonexistent) tick to announce
+                    # the last tool in a multi-call chunk.
+                    newest_args = newest.get("arguments")
+                    arguments_json = (
+                        json.dumps(newest_args, ensure_ascii=False)
+                        if newest_args is not None and is_complete[self.current_tool_id]
+                        else None
+                    )
+                    deltas.append(
+                        DeltaToolCall(
+                            index=self.current_tool_id,
+                            type="function",
+                            id=f"chatcmpl-tool-{uuid4()}",
+                            function=DeltaFunctionCall(name=newest_name, arguments=arguments_json),
+                        )
+                    )
+                    self.current_tool_name_sent = True
+                    self.streamed_args_for_tool[self.current_tool_id] = arguments_json or ""
+                self.prev_tool_call_arr = tool_call_arr
                 logger.debug("starting on new tool %d", self.current_tool_id)
-                return delta
+                return DeltaMessage(tool_calls=deltas) if deltas else None
 
             elif not self.current_tool_name_sent:
                 function_name = current_tool_call.get("name")
                 if function_name:
+                    # The first complete name can arrive in the final chunk.
+                    # Deliver its complete arguments now, not on a nonexistent tick.
+                    arguments = current_tool_call.get("arguments")
+                    arguments_json = (
+                        json.dumps(arguments, ensure_ascii=False)
+                        if arguments is not None and is_complete[self.current_tool_id]
+                        else None
+                    )
                     delta = DeltaMessage(
                         tool_calls=[
                             DeltaToolCall(
                                 index=self.current_tool_id,
                                 type="function",
                                 id=f"chatcmpl-tool-{uuid4()}",
-                                function=DeltaFunctionCall(name=function_name).model_dump(exclude_none=True),
+                                function=DeltaFunctionCall(name=function_name, arguments=arguments_json).model_dump(
+                                    exclude_none=True
+                                ),
                             )
                         ]
                     )
                     self.current_tool_name_sent = True
+                    self.streamed_args_for_tool[self.current_tool_id] = arguments_json or ""
                 else:
                     delta = None
 
@@ -293,7 +364,7 @@ class Granite20bFCToolParser(ToolParser):
                 cur_arguments = current_tool_call.get("arguments")
                 delta = None
 
-                if cur_arguments:
+                if cur_arguments is not None:
                     sent = len(self.streamed_args_for_tool[self.current_tool_id])
                     cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
                     prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get("arguments")

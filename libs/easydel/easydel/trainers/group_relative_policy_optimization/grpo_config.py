@@ -625,6 +625,8 @@ class GRPOConfig(TrainingArguments):
             )
         if self.esurge_importance_sampling_cap <= 0.0:
             raise ValueError("`esurge_importance_sampling_cap` must be positive.")
+        if self.use_transformers_paged:
+            raise ValueError("`use_transformers_paged=True` is unsupported; use EasyDeL eSurge generation instead.")
         if self.num_completions_to_print is not None and self.num_completions_to_print <= 0:
             raise ValueError("`num_completions_to_print` must be a positive integer when set.")
 

@@ -43,8 +43,6 @@ class AsyncGRPOConfig(GRPOConfig):
     queue_maxsize: int = field(default=0)
     weight_sync_steps: int = field(default=1)
     heartbeat_stale_after_s: float = field(default=120.0)
-    log_completions: bool = field(default=False)
-    num_completions_to_print: int | None = field(default=None)
 
     def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None) -> None:
         """Normalize GRPO settings and validate local async execution knobs.

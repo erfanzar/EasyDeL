@@ -65,15 +65,47 @@ Example:
 from __future__ import annotations
 
 import typing
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
-from eformer.pytree import auto_pytree
+import numpy as np
+from eformer.pytree import auto_pytree, field
 
-from easydel.caching import HybridCache, RaggedPagesCache, UnifiedAttentionCache
+from easydel.caching import HybridCache, RaggedPagesCache, RaggedPagesMetadata, UnifiedAttentionCache
 
 if typing.TYPE_CHECKING:
     pass
+
+
+@dataclass(frozen=True)
+class CacheGroupInputs:
+    """Host inputs for one independently allocated KV pool, in compact window-row order.
+
+    ``page_table_version`` belongs to this pool, not to the legacy/FULL table.
+    ``window_identity`` additionally distinguishes packed windows at the same allocator
+    version. ``num_computed_tokens_cpu`` optionally supplies cache-local progress for
+    rebased sliding windows; it never changes the model's absolute token positions.
+    Configurations and the static layer mapping are supplied to ExecutionManager.
+    """
+
+    page_table_cpu: np.ndarray
+    page_table_version: int | None = None
+    window_identity: tuple[int, ...] | None = None
+    num_computed_tokens_cpu: np.ndarray | None = None
+
+    def for_rows(self, rows: np.ndarray) -> CacheGroupInputs:
+        """Window every group leaf together for a packed window or PP microbatch."""
+        rows = np.asarray(rows, dtype=np.int32)
+        identity = self.window_identity
+        return CacheGroupInputs(
+            page_table_cpu=self.page_table_cpu[rows],
+            page_table_version=self.page_table_version,
+            window_identity=tuple(int(identity[row]) if identity is not None else int(row) for row in rows),
+            num_computed_tokens_cpu=(
+                None if self.num_computed_tokens_cpu is None else self.num_computed_tokens_cpu[rows]
+            ),
+        )
 
 
 @auto_pytree(frozen=True)
@@ -194,6 +226,11 @@ class BatchMetadata:
     model_side_inputs: dict[str, jax.Array] | None = None
 
     spec_recurrent_commit: jax.Array | None = None
+
+    # Complete group payloads travel as dynamic PyTree leaves; the layer mapping
+    # is static so all compiled forward variants dispatch identically.
+    cache_groups: tuple[RaggedPagesMetadata, ...] = field(pytree_node=True, default=())
+    layer_to_cache_group: tuple[int, ...] = field(pytree_node=False, default=())
 
     @property
     def model_input_ids(self) -> jax.Array:
@@ -535,8 +572,8 @@ class StepFunctionInputs:
 
         Outputs a formatted summary of all array shapes in this input structure,
         useful for debugging compilation issues or verifying input dimensions.
-        The output includes sections for MinimalDeviceState, Paged KV Cache,
-        Request Arrays, BatchMetadata, and optional VLM data.
+        The output includes sections for Paged KV Cache, Request Arrays,
+        BatchMetadata, and optional VLM data.
 
         Note:
             This method accesses device arrays and should not be called in
@@ -545,9 +582,6 @@ class StepFunctionInputs:
         lines = []
 
         lines.append("StepFunctionInputs Status")
-        lines.append("\nMinimalDeviceState:")
-        lines.append(f"  token_ids:       {self.device_state.token_ids.shape}")
-        lines.append(f"  num_tokens:      {self.device_state.num_tokens.shape}")
         lines.append("\nPaged KV Cache:")
         last_view = self.kv_pages.views[-1]
         if hasattr(last_view, "kv_pages"):

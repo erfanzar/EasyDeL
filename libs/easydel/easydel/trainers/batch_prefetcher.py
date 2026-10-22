@@ -25,7 +25,8 @@ structural guarantees:
   stream in exactly the order a serial loop would consume them, regardless of
   worker count. Collated batches are delivered in fetch order.
 - **Bounded memory.** At most ``buffer_size`` batches are pending at any time;
-  each pending batch holds a full collated global batch in host memory.
+  each pending batch holds a collated global batch and a raw replay copy in
+  host memory.
 
 With ``worker_count > 1`` collation fans out across threads while fetch stays
 serialized, so sustained producer throughput approaches
@@ -43,6 +44,7 @@ from __future__ import annotations
 import collections
 import collections.abc
 import concurrent.futures
+import copy
 import threading
 import typing as tp
 
@@ -130,11 +132,11 @@ class TrainBatchPrefetcher:
         self._closed = False
         self._last_fetch_seconds: float | None = None
         self._last_collate_seconds: float | None = None
-        # Iterator position as of the last batch actually DELIVERED via
-        # :meth:`next`, distinct from ``_data_iter`` (advanced the instant a
-        # ticket's fetch turn arrives, up to ``buffer_size`` ahead of
-        # consumption). See :attr:`data_iter` for why the distinction matters.
+        # Mutable iterators cannot be snapshotted by saving a reference. Keep
+        # raw lookahead for replay instead, including when collation mutates it.
+        self._undelivered: dict[int, tp.Any] = {}
         self._last_delivered_iter = data_iter
+        self._resume_iter = self._resume_batches()
         self._top_up()
 
     def _load(self, ticket: int) -> tuple[tp.Any, float, float, tp.Any]:
@@ -144,9 +146,9 @@ class TrainBatchPrefetcher:
             ticket: This task's position in the global fetch order.
 
         Returns:
-            Tuple ``(batch, fetch_seconds, collate_seconds, iter_snapshot)``
-            where ``iter_snapshot`` is the shared iterator's value immediately
-            after this ticket's fetch.
+            Tuple ``(batch, fetch_seconds, collate_seconds, (ticket, iter_snapshot))``.
+            The ticket identifies raw lookahead; the snapshot preserves cursor-style
+            fetch functions that return an immutable resume position.
 
         Raises:
             _PrefetcherClosed: If the prefetcher closed before this ticket's
@@ -162,6 +164,8 @@ class TrainBatchPrefetcher:
                     raw_batch, self._data_iter = self._fetch_fn(self._data_iter, self._dataloader)
                 fetch_seconds = float(fetch_time())
                 iter_snapshot = self._data_iter
+                if isinstance(iter_snapshot, collections.abc.Iterator):
+                    self._undelivered[ticket] = copy.deepcopy(raw_batch)
             finally:
                 # Advance the turn even on a failed fetch so later tickets
                 # don't deadlock waiting for one that will never complete.
@@ -169,7 +173,7 @@ class TrainBatchPrefetcher:
                 self._fetch_cond.notify_all()
         with capture_time() as collate_time:
             batch = self._data_collator(raw_batch)
-        return batch, fetch_seconds, float(collate_time()), iter_snapshot
+        return batch, fetch_seconds, float(collate_time()), (ticket, iter_snapshot)
 
     def _top_up(self, limit: int | None = None) -> None:
         """Submit producer tasks until ``limit`` (default: full capacity) are pending."""
@@ -210,11 +214,12 @@ class TrainBatchPrefetcher:
             with self._fetch_cond:
                 future = self._pending.popleft()
         with capture_time() as wait_time:
-            batch, fetch_seconds, collate_seconds, iter_snapshot = future.result()
+            batch, fetch_seconds, collate_seconds, (ticket, iter_snapshot) = future.result()
         self._last_fetch_seconds = fetch_seconds
         self._last_collate_seconds = collate_seconds
         with self._fetch_cond:
             self._last_delivered_iter = iter_snapshot
+            self._undelivered.pop(ticket, None)
         if schedule_next:
             self._top_up()
         return batch, float(wait_time()), fetch_seconds + collate_seconds
@@ -230,8 +235,10 @@ class TrainBatchPrefetcher:
 
     @property
     def data_iter(self) -> collections.abc.Iterator[tp.Any]:
-        """Iterator position as of the last batch delivered via :meth:`next`.
+        """Replay iterator resuming after the last batch delivered via :meth:`next`.
 
+        Starting this iterator closes the prefetcher before replaying raw lookahead,
+        so it is safe to persist the iterator before calling :meth:`close`.
         Deliberately not the latest FETCHED position. With readahead
         buffering, a ticket's fetch (and thus the shared iterator's advance)
         can complete up to ``buffer_size`` batches before the caller consumes
@@ -242,7 +249,16 @@ class TrainBatchPrefetcher:
         fetched-but-unconsumed batches still sitting in the buffer.
         """
         with self._fetch_cond:
-            return self._last_delivered_iter
+            if not isinstance(self._last_delivered_iter, collections.abc.Iterator):
+                return self._last_delivered_iter
+            return self._resume_iter
+
+    def _resume_batches(self) -> collections.abc.Iterator[tp.Any]:
+        """Quiesce producers before replaying raw lookahead and the source tail."""
+        self.close()
+        for ticket in sorted(self._undelivered):
+            yield self._undelivered.pop(ticket)
+        yield from self._data_iter
 
     @property
     def last_fetch_seconds(self) -> float | None:
@@ -255,15 +271,12 @@ class TrainBatchPrefetcher:
         return self._last_collate_seconds
 
     def close(self) -> None:
-        """Cancel pending work and shut down the producer threads.
+        """Stop producers, retaining fetched but unconsumed raw batches for replay.
 
-        Idempotent. Tasks that already fetched their rows (up to
-        ``buffer_size`` of them) are discarded without being delivered, but
-        this does *not* lose their place in the stream: :attr:`data_iter`
-        reports the position as of the last batch actually delivered via
-        :meth:`next`, not the latest fetch, so a caller that persists it as a
-        resume position re-fetches exactly the discarded batches next time
-        instead of silently skipping them.
+        Idempotent. Pending collation results are discarded, but :attr:`data_iter`
+        replays their raw batches before advancing the quiesced source iterator.
+        Waiting for active tasks guarantees no worker can advance a handed-back
+        iterator after shutdown.
         """
         with self._fetch_cond:
             self._closed = True
@@ -272,4 +285,7 @@ class TrainBatchPrefetcher:
             self._fetch_cond.notify_all()
         for future in pending:
             future.cancel()
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        # No producer may advance the source after it is handed back to a
+        # caller. Fetching tasks hold _fetch_cond, so all raw rows are recorded
+        # before closure; finish collating tasks outside that lock.
+        self._executor.shutdown(wait=True, cancel_futures=True)

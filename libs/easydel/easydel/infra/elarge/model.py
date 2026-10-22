@@ -31,6 +31,7 @@ Key Features:
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import pprint
@@ -65,6 +66,7 @@ from .builders import (
     to_load_state_kwargs,
 )
 from .processing import (
+    clone_config,
     load_elm_config,
     make_serializable,
     materialize_base_config,
@@ -529,6 +531,9 @@ class eLargeModel:
             >>> elm.set_model("/path/to/local/model")
         """
         self._config["model"]["name_or_path"] = model_name_or_path
+        self._model = None
+        self._state = None
+        self._tokenizer = None
         return self
 
     def set_teacher_model(self, model_name_or_path: str) -> eLargeModel:
@@ -661,8 +666,8 @@ class eLargeModel:
     def set_quantization(
         self,
         method: str | None = None,
-        group_size: int = 128,
-        use_qmm_best_config: bool = False,
+        group_size: int | None = None,
+        use_qmm_best_config: bool | None = None,
         qmm_platform_override: str | None | object = _QUANT_UNSET,
         qmm_tpu_path_override: str | None | object = _QUANT_UNSET,
         **kwargs,
@@ -697,13 +702,32 @@ class eLargeModel:
         quant = self._config.setdefault("quantization", {})
         if method is not None:
             quant["method"] = method
-        quant["group_size"] = group_size
-        quant["use_qmm_best_config"] = bool(use_qmm_best_config)
+        if group_size is not None:
+            quant["group_size"] = group_size
+            quant["linear_group_size"] = group_size
+        if use_qmm_best_config is not None:
+            quant["use_qmm_best_config"] = bool(use_qmm_best_config)
+        if method is not None:
+            quant["apply_quantization"] = True
         if qmm_platform_override is not _QUANT_UNSET:
             quant["qmm_platform_override"] = qmm_platform_override
         if qmm_tpu_path_override is not _QUANT_UNSET:
             quant["qmm_tpu_path_override"] = qmm_tpu_path_override
         quant.update(kwargs)
+        if method is not None or group_size is not None or "linear_pattern" in kwargs or "linear_group_size" in kwargs:
+            current = quant.get("model")
+            values = current.to_dict() if hasattr(current, "to_dict") else dict(current or {})
+            if method is not None:
+                values["dtype"] = "int8" if method == "a8bit" else method
+                values.setdefault("group_size", quant.get("group_size", 128))
+            if group_size is not None:
+                values["group_size"] = group_size
+            if "linear_group_size" in kwargs:
+                values["group_size"] = kwargs["linear_group_size"]
+            if "linear_pattern" in kwargs:
+                values["pattern"] = kwargs["linear_pattern"]
+            quant["model"] = values
+        self._config = normalize(self._config)
         return self
 
     def set_operation_configs(
@@ -761,8 +785,8 @@ class eLargeModel:
     def set_esurge(
         self,
         max_model_len: int | None = None,
-        max_num_seqs: int = 16,
-        hbm_utilization: float = 0.85,
+        max_num_seqs: int | None = None,
+        hbm_utilization: float | None = None,
         enable_window_aware_runtime_cap: bool | object = _ESURGE_UNSET,
         tool_parser: ToolParserName | None | object = _ESURGE_UNSET,
         reasoning_parser: ReasoningParserName | None | object = _ESURGE_UNSET,
@@ -827,11 +851,13 @@ class eLargeModel:
             ...     enable_prefix_caching=True
             ... )
         """
-        esurge = self._config.setdefault("esurge", {})
+        esurge = clone_config(self._config.get("esurge", {}))
         if max_model_len is not None:
             esurge["max_model_len"] = max_model_len
-        esurge["max_num_seqs"] = max_num_seqs
-        esurge["hbm_utilization"] = hbm_utilization
+        if max_num_seqs is not None:
+            esurge["max_num_seqs"] = max_num_seqs
+        if hbm_utilization is not None:
+            esurge["hbm_utilization"] = hbm_utilization
         esurge.update(kwargs)
         if enable_window_aware_runtime_cap is not _ESURGE_UNSET:
             esurge["enable_window_aware_runtime_cap"] = bool(enable_window_aware_runtime_cap)
@@ -845,9 +871,9 @@ class eLargeModel:
     def set_mixture(
         self,
         informs: list[TextDatasetInformCfg | VisualDatasetInformCfg] | None = None,
-        batch_size: int = 32,
-        streaming: bool = True,
-        use_fast_loader: bool = True,
+        batch_size: int | None = None,
+        streaming: bool | None = None,
+        use_fast_loader: bool | None = None,
         **kwargs,
     ) -> eLargeModel:
         """Configure data mixture settings for training/evaluation.
@@ -890,9 +916,12 @@ class eLargeModel:
         mixture = self._config.setdefault("mixture", {})
         if informs is not None:
             mixture["informs"] = informs
-        mixture["batch_size"] = batch_size
-        mixture["streaming"] = streaming
-        mixture["use_fast_loader"] = use_fast_loader
+        if batch_size is not None:
+            mixture["batch_size"] = batch_size
+        if streaming is not None:
+            mixture["streaming"] = streaming
+        if use_fast_loader is not None:
+            mixture["use_fast_loader"] = use_fast_loader
         mixture.update(kwargs)
         return self
 
@@ -1121,7 +1150,7 @@ class eLargeModel:
             >>> # Modify the dict without affecting elm
             >>> config_dict["model"]["dtype"] = "fp16"
         """
-        return dict(self._config)
+        return clone_config(self._config)
 
     def get_from_pretrained_kwargs(self) -> dict[str, Any]:
         """Get kwargs for model.from_pretrained() calls.
@@ -1237,6 +1266,9 @@ class eLargeModel:
                 raise ValueError("Model name/path must be set before building")
             with phase_timer("build_model", tag="eLargeModel"):
                 self._model = build_model(self._config)
+                # A freshly loaded model cannot share a previously restored
+                # optimizer/parameter state, which build_trainer prefers.
+                self._state = None
         return self._model
 
     def build_state(
@@ -1550,10 +1582,9 @@ class eLargeModel:
 
         Normalizes the ``trainer`` section against the (optionally overridden)
         trainer flavor, resolves the matching TrainingArguments class via
-        :func:`get_training_arguments_class`, and instantiates it. Falls back
-        to a parameter-filtered constructor call when the resolved class does
-        not accept every key present in the normalized config — useful when the
-        eLarge config carries trainer-agnostic overrides.
+        :func:`get_training_arguments_class`, and instantiates it once. Options
+        unsupported by the selected argument class are filtered before construction
+        so trainer-agnostic overrides remain supported; constructor errors propagate.
 
         Args:
             trainer_type: Optional override for the trainer family. When
@@ -1570,17 +1601,24 @@ class eLargeModel:
             trainer_cfg["trainer_type"] = trainer_type
         trainer_cfg = normalize_trainer_config(trainer_cfg)
         args_class = get_training_arguments_class(trainer_cfg.get("trainer_type", "sft"))
-        config_for_args = {key: value for key, value in trainer_cfg.items() if key != "trainer_type"}
+        return trainer_cfg, self._instantiate_training_arguments(args_class, trainer_cfg)
 
-        try:
-            return trainer_cfg, args_class(**config_for_args)
-        except TypeError:
-            import inspect
+    def _instantiate_training_arguments(self, args_class, trainer_cfg, explicit_keys=None):
+        """Construct once, filtering routing and trainer-agnostic options.
 
-            sig = inspect.signature(args_class.__init__)
-            valid_params = set(sig.parameters.keys()) - {"self"}
-            filtered_config = {key: value for key, value in config_for_args.items() if key in valid_params}
-            return trainer_cfg, args_class(**filtered_config)
+        Unsupported options retain the historical filtered-constructor behavior.
+        Constructor errors propagate without a retry. ``explicit_keys`` remains
+        accepted for compatibility but does not change option filtering.
+        """
+        config_for_args = {
+            key: value
+            for key, value in trainer_cfg.items()
+            if key != "trainer_type" and key not in ELARGE_ONLY_TRAINER_KEYS
+        }
+        params = inspect.signature(args_class).parameters
+        if not any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+            config_for_args = {key: value for key, value in config_for_args.items() if key in params}
+        return args_class(**config_for_args)
 
     def _build_pre_tokenize_transform(
         self,
@@ -2329,7 +2367,10 @@ class eLargeModel:
         logger.info("Beginning training...")
         results = trainer.train()
         logger.info("Training completed successfully")
-        self._model = trainer.model
+        # TrainerOutput carries the replacement state, including optimizer
+        # counters. Updating only the model leaves a restored checkpoint cached.
+        self._state = getattr(results, "state", None)
+        self._model = self._state.model if self._state is not None else trainer.model
         return results
 
     def build_training_arguments(self, args_class: TrainingArguments | None = None, **overrides):
@@ -2351,23 +2392,8 @@ class eLargeModel:
             trainer_type = trainer_cfg.get("trainer_type", "sft")
             args_class = get_training_arguments_class(trainer_type)
 
-        config_for_args = {k: v for k, v in trainer_cfg.items() if k != "trainer_type"}
-        # Training buckets are passed as explicit trainer kwargs from
-        # build_trainer (TrainingBucket objects + resolved BucketRule + built
-        # sources), not through TrainingArguments. Strip the raw eLarge keys so
-        # they don't leak into the dataclass (which uses different field names).
-        for _bk in ELARGE_ONLY_TRAINER_KEYS:
-            config_for_args.pop(_bk, None)
-
-        try:
-            return args_class(**config_for_args)
-        except TypeError:
-            import inspect
-
-            sig = inspect.signature(args_class.__init__)
-            valid_params = set(sig.parameters.keys()) - {"self"}
-            filtered_config = {k: v for k, v in config_for_args.items() if k in valid_params}
-            return args_class(**filtered_config)
+        explicit_keys = set(self._config.get("trainer", {})) | set(overrides)
+        return self._instantiate_training_arguments(args_class, trainer_cfg, explicit_keys)
 
     def build_trainer(
         self,
@@ -2441,8 +2467,32 @@ class eLargeModel:
             with phase_timer(f"build_trainer.resolve_class.{trainer_type}", tag="eLargeModel"):
                 trainer_class = get_trainer_class(trainer_type)
 
+        if args_class is None:
+            args_class = get_training_arguments_class(trainer_type)
+        argument_params = inspect.signature(args_class).parameters
+        constructor_params = inspect.signature(trainer_class).parameters
+        arguments_accept_extra = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in argument_params.values())
+        trainer_accepts_extra = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in constructor_params.values())
+        argument_overrides = {}
+        runtime_overrides = {}
+        for key, value in kwargs.items():
+            # Declared runtime extensions beat an arguments **kwargs catch-all;
+            # declared argument fields remain arguments, never trainer kwargs.
+            if key in BuildTrainerKws.__annotations__:
+                runtime_overrides[key] = value
+            elif key in argument_params:
+                argument_overrides[key] = value
+            elif key in constructor_params:
+                runtime_overrides[key] = value
+            elif arguments_accept_extra:
+                argument_overrides[key] = value
+            elif trainer_accepts_extra:
+                runtime_overrides[key] = value
+            else:
+                raise TypeError(f"Unsupported trainer/argument option: {key}")
+
         with phase_timer("build_trainer.training_arguments", tag="eLargeModel"):
-            training_args = self.build_training_arguments(args_class=args_class, **kwargs)
+            training_args = self.build_training_arguments(args_class=args_class, **argument_overrides)
 
         if train_dataset is None and "mixture" in self._config:
             # Use new get_train_source() which auto-selects based on use_sharded_source
@@ -2732,7 +2782,7 @@ class eLargeModel:
             trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
             trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
 
-        elif trainer_type in {"xpo", "nash-md", "nash_md"}:
+        elif trainer_type in {"xpo", "nash-md"}:
             if reward_funcs is None and reward_model is None:
                 reward_model = self.build_reward_model()
 
@@ -2873,7 +2923,7 @@ class eLargeModel:
             trainer_kwargs["train_dataset"] = train_dataset
             trainer_kwargs["eval_dataset"] = eval_dataset
 
-        elif trainer_type in {"agentic-moshpit", "agentic_moshpit"}:
+        elif trainer_type == "agentic-moshpit":
             env_factory = kwargs.get("env_factory")
             if env_factory is None:
                 raise ValueError(
@@ -2920,9 +2970,6 @@ class eLargeModel:
             trainer_kwargs["train_dataset"] = train_dataset
             trainer_kwargs["eval_dataset"] = eval_dataset
 
-        if kwargs.get("bema_callback", None) is not None and trainer_class.__name__ == "BEMADPOTrainer":
-            trainer_kwargs["bema_callback"] = kwargs["bema_callback"]
-
         # Attach training buckets (None values are stripped below for non-bucket runs).
         if buckets is not None:
             trainer_kwargs["buckets"] = buckets
@@ -2931,26 +2978,19 @@ class eLargeModel:
 
         trainer_kwargs = {k: v for k, v in trainer_kwargs.items() if v is not None}
 
-        for key, value in kwargs.items():
+        for key, value in runtime_overrides.items():
+            # SAO shares online actor/critic options with compaction RL, but
+            # ignores compaction-only controls.
+            if trainer_type == "sao" and key in {"tool_guard", "compaction_controller"}:
+                continue
+            # env_factory is a public alias consumed above by the environment
+            # trainer branches. Do not forward the alias a second time.
+            if key == "env_factory" and "environment_factory" in trainer_kwargs:
+                continue
+            if key not in constructor_params and not trainer_accepts_extra:
+                raise TypeError(f"Unsupported trainer runtime option: {key}")
             if key not in trainer_kwargs and value is not None:
-                if key not in [
-                    "data_collator",
-                    "formatting_func",
-                    "reward_processing_classes",
-                    "data_tokenize_fn",
-                    "feedback_func",
-                    "critic_model",
-                    "critic_state",
-                    "critic_trainable_selector",
-                    "rollout_provider",
-                    "env_factory",
-                    "environment_factory",
-                    "bema_callback",
-                    "tools",
-                    "tool_guard",
-                    "compaction_controller",
-                ]:
-                    trainer_kwargs[key] = value
+                trainer_kwargs[key] = value
 
         with phase_timer(f"build_trainer.init.{trainer_type}", tag="eLargeModel"):
             return trainer_class(**trainer_kwargs)
@@ -3380,25 +3420,27 @@ class eLargeModel:
         if quant.get("method"):
             lines.append(_line(f"▸ quant: {quant['method']} (group:{quant.get('group_size', 128)})"))
 
-        esurge = self._config.get("esurge", {})
-        if esurge and any(esurge.get(k) for k in ["max_model_len", "max_num_seqs", "hbm_utilization"]):
+        esurge = normalize_esurge_sections(self._config.get("esurge", {}))
+        runtime = esurge["runtime"]
+        cache = esurge["cache"]
+        if runtime or cache:
             lines.append(_sep())
             lines.append(_line("eSurge"))
 
-            ctx = esurge.get("max_model_len", 0)
-            seqs = esurge.get("max_num_seqs", 0)
-            hbm = esurge.get("hbm_utilization", 0)
+            ctx = runtime.get("max_model_len", 0)
+            seqs = runtime.get("max_num_seqs", 0)
+            hbm = cache.get("hbm_utilization", 0)
             lines.append(_line(f"▸ {ctx:,} context x {seqs} sequences"))
 
             parts = []
             if hbm:
                 parts.append(f"{hbm:.0%} HBM")
-            page_size = esurge.get("page_size")
+            page_size = cache.get("page_size")
             if page_size:
                 parts.append(f"page:{page_size}")
-            if esurge.get("enable_prefix_caching"):
+            if cache.get("enable_prefix_caching"):
                 parts.append("prefix_cache")
-            min_input_pad = esurge.get("min_input_pad")
+            min_input_pad = runtime.get("min_input_pad")
             if min_input_pad:
                 parts.append(f"pad:{min_input_pad}")
             if parts:

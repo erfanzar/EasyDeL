@@ -576,6 +576,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     profiler_enable_hlo_proto: NotRequired[bool | None]
     profiler_stop_step: NotRequired[int | None]
     training_time_limit: NotRequired[str | None]
+    host_phase_log_path: NotRequired[str | None]
     step_start_point: NotRequired[int | None]
     force_step_start_point: NotRequired[bool]
     resume_if_possible: NotRequired[bool]
@@ -3049,11 +3050,13 @@ def get_trainer_defaults(trainer_type: str) -> TrainerConfig:
         >>> defaults["optimizer"]  # From base defaults
         'adamw'
     """
+    from ..processing import clone_config
+
     trainer_type = _normalize_trainer_type(trainer_type)
     defaults = dict(BASE_TRAINER_DEFAULTS)
     if trainer_type in TRAINER_SPECIFIC_DEFAULTS:
         defaults.update(TRAINER_SPECIFIC_DEFAULTS[trainer_type])
-    return defaults  # type: ignore[return-value]
+    return clone_config(defaults)  # type: ignore[return-value]
 
 
 def normalize_trainer_config(config: dict[str, Any]) -> TrainerConfig:

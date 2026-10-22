@@ -86,7 +86,8 @@ def _normalize_tpu_generation(value: str | None) -> str | None:
     """Normalize a user-provided TPU generation selector."""
     if value is None:
         return None
-    normalized = value.strip().lower().replace("_", "-")
+    # GCE machine-type metadata is a resource path, not a bare type name.
+    normalized = value.strip().lower().rsplit("/", 1)[-1].replace("_", "-")
     if not normalized:
         return None
     if normalized in _TPU_GENERATION_ALIASES:
@@ -99,6 +100,8 @@ def _normalize_tpu_generation(value: str | None) -> str | None:
         ("ct5p", "v5p"),
         ("v5e", "v5e"),
         ("ct5e", "v5e"),
+        ("v5lite", "v5e"),
+        ("ct5lp", "v5e"),
         ("v4", "v4"),
         ("ct4", "v4"),
     ):
@@ -112,12 +115,11 @@ def _get_metadata_value(path: str) -> str | None:
     try:
         import urllib.request as _urllib_request
 
-        timeout = float(_os.getenv("EASYDEL_TPU_METADATA_TIMEOUT", "0.05"))
         request = _urllib_request.Request(
             f"http://169.254.169.254/computeMetadata/v1/{path}",
             headers={"Metadata-Flavor": "Google"},
         )
-        with _urllib_request.urlopen(request, timeout=max(timeout, 0.001)) as response:
+        with _urllib_request.urlopen(request, timeout=0.05) as response:
             value = response.read(128).decode("utf-8", errors="ignore").strip()
     except Exception:
         return None
@@ -426,63 +428,6 @@ def _patch_eformer_exception_serialization() -> None:
     _ExceptionInfo.ser_exc_info = classmethod(_patched_ser_exc_info)
 
 
-def _patch_transformers_autoconfig_gated_repo_skip() -> None:
-    """Convert gated-repo config load failures to ``pytest.skip`` under pytest."""
-    try:
-        from transformers import AutoConfig as _HFAutoConfig
-    except Exception:
-        return
-
-    auto_config_from_pretrained = _HFAutoConfig.__dict__.get("from_pretrained", None)
-    if not isinstance(auto_config_from_pretrained, classmethod):
-        return
-    original_fn = auto_config_from_pretrained.__func__
-    if getattr(original_fn, "_easydel_gated_repo_patch", False):
-        return
-
-    def _patched_from_pretrained(cls, *args, **kwargs):
-        """Convert gated-repo ``OSError``s into ``unittest.SkipTest`` under pytest.
-
-        Args:
-            cls: The owning ``AutoConfig`` class.
-            *args: Forwarded positional args (e.g. repo id).
-            **kwargs: Forwarded keyword args.
-
-        Returns:
-            The original ``from_pretrained`` result on success.
-
-        Raises:
-            OSError: When the failure is not a gated-repo error.
-            unittest.SkipTest: When running under pytest and the failure is
-                a known gated-repo error message.
-        """
-        import os as _runtime_os
-
-        try:
-            return original_fn(cls, *args, **kwargs)
-        except OSError as exc:
-            if "PYTEST_CURRENT_TEST" not in _runtime_os.environ:
-                raise
-            message = str(exc).lower()
-            is_gated_error = (
-                "gated repo" in message
-                or "gated model" in message
-                or "you are trying to access a gated repo" in message
-                or "access to this model is restricted" in message
-                or "access to this repository is restricted" in message
-                or ("401" in message and "huggingface" in message)
-            )
-            if not is_gated_error:
-                raise
-            import unittest as _unittest
-
-            model_id = args[0] if args else kwargs.get("pretrained_model_name_or_path", "<unknown>")
-            raise _unittest.SkipTest(f"Skipping gated Hugging Face repo during tests: {model_id}") from exc
-
-    _patched_from_pretrained._easydel_gated_repo_patch = True  # type: ignore[attr-defined]
-    _HFAutoConfig.from_pretrained = classmethod(_patched_from_pretrained)
-
-
 def _apply_auto_environment() -> None:
     """Apply EasyDeL's default environment and logging setup."""
     if not _check_bool_flag("EASYDEL_AUTO", True):
@@ -526,7 +471,6 @@ def _apply_auto_environment() -> None:
         "--xla_gpu_enable_pipelined_all_reduce=true  "
         "--xla_gpu_enable_reduce_scatter_combine_by_dim=false  "
         "--xla_gpu_enable_all_gather_combine_by_dim=false  "
-        "--xla_gpu_enable_reduce_scatter_combine_by_dim=false  "
         "--xla_gpu_all_gather_combine_threshold_bytes=33554432 "
         "--xla_gpu_reduce_scatter_combine_threshold_bytes=33554432 "
         "--xla_gpu_all_reduce_combine_threshold_bytes=33554432 "
@@ -551,6 +495,40 @@ def _apply_auto_environment() -> None:
         _os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
     if _os.getenv("JAX_TRACEBACK_FILTERING", None) is None:
         _os.environ["JAX_TRACEBACK_FILTERING"] = "off"
+        # Dependencies may already have imported JAX, which reads environment
+        # defaults only once. Update the live setting as well as the environment.
+        import jax as _jax
+
+        _jax.config.update("jax_traceback_filtering", "off")
+
+
+def _validate_dependency_versions() -> None:
+    """Enforce sibling compatibility using EasyDeL's installed requirements.
+
+    Release tooling updates the package metadata, so it is the single source
+    of truth for the supported eformer and ejkernel versions.
+
+    Raises:
+        ImportError: If an installed sibling does not satisfy its requirement.
+    """
+    from importlib.metadata import requires, version
+
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+    for requirement_text in requires("easydel") or ():
+        requirement = Requirement(requirement_text)
+        name = canonicalize_name(requirement.name)
+        if name not in {"eformer", "ejkernel"}:
+            continue
+        if requirement.marker is not None and not requirement.marker.evaluate({"extra": ""}):
+            continue
+        installed_version = version(requirement.name)
+        if not requirement.specifier.contains(installed_version, prereleases=True):
+            raise ImportError(
+                f"This version of EasyDeL requires {requirement.name}{requirement.specifier}, "
+                f"but found {requirement.name} {installed_version}."
+            )
 
 
 def apply_linkup() -> None:
@@ -560,7 +538,6 @@ def apply_linkup() -> None:
     _patch_transformers_mrope_default_rope_validation()
     _patch_transformers_import_utils()
     _patch_eformer_exception_serialization()
-    _patch_transformers_autoconfig_gated_repo_skip()
     _patch_transformers_init_weights_tie_signature()
     _patch_removed_jax_config_flags()
     _apply_auto_environment()

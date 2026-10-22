@@ -209,6 +209,44 @@ class OperationsMetadata(BaseRunTimeMetadata):
     ragged: tp.Any | None = None  # RaggedPagesMetadata
     recurrent: tp.Any | None = None  # RecurrentMetadata
 
+    @classmethod
+    def wrap(cls, metadata: tp.Any) -> OperationsMetadata | None:
+        """Wrap a type-specific runtime metadata object in an :class:`OperationsMetadata`.
+
+        The wrapper's field is chosen from the concrete metadata type, so the result can be
+        handed to any cache view / operation that accepts :class:`OperationsMetadata` and is
+        unwrapped again by :func:`unwrap_metadata`.
+
+        Args:
+            metadata: A ``TransformerMetadata``, ``HybridMetadata``, ``RaggedPagesMetadata`` or
+                ``RecurrentMetadata`` instance, an existing :class:`OperationsMetadata` (returned
+                unchanged), or ``None``.
+
+        Returns:
+            The wrapped metadata, or ``None`` when ``metadata`` is ``None``.
+
+        Raises:
+            TypeError: If ``metadata`` is not one of the supported metadata types.
+        """
+        if metadata is None or isinstance(metadata, cls):
+            return metadata
+
+        # Imported lazily: the concrete cache modules import this module.
+        from .hybrid.cache import HybridMetadata
+        from .ragged_page.cache import RaggedPagesMetadata
+        from .recurrent.cache import RecurrentMetadata
+        from .transformer.cache import TransformerMetadata
+
+        if isinstance(metadata, TransformerMetadata):
+            return cls(transformer=metadata)
+        if isinstance(metadata, HybridMetadata):
+            return cls(hybrid=metadata)
+        if isinstance(metadata, RaggedPagesMetadata):
+            return cls(ragged=metadata)
+        if isinstance(metadata, RecurrentMetadata):
+            return cls(recurrent=metadata)
+        raise TypeError(f"Cannot wrap {type(metadata).__name__} in OperationsMetadata.")
+
     @property
     def cache_type(self) -> str:
         """Determine the cache type based on which field is populated.

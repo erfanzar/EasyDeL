@@ -164,6 +164,7 @@ class VanillaAttn(OperationImpl):
         sliding_window: int | tuple[int, int] | None = None,
         precision: jax.lax.PrecisionLike = None,
         compute_dtype: jnp.dtype | None = None,
+        normalize_output: bool = True,
         **ignore,
     ) -> AttentionOutput:
         """
@@ -188,11 +189,18 @@ class VanillaAttn(OperationImpl):
             compute_dtype: Optional per-call dtype for the logits, softmax and value product, overriding the
                 config-derived ``runtime_dtype`` / ``runtime_softmax_dtype`` (e.g. fp32 vision towers inside a
                 bf16-attention model). ``None`` keeps the metadata dtypes.
+            normalize_output: Divide exponentiated attention weights by their sum.
+                False retains the numerically stabilized numerator, including sink
+                logits in the row maximum, before applying attention-weight dropout.
             **ignore: Additional ignored arguments.
 
         Returns:
             AttentionOutput containing attention outputs and weights.
         """
+        # Configs use zero as the disabled soft-cap sentinel. Normalize before
+        # either implementation so neither divides logits by zero.
+        if logits_soft_cap == 0.0:
+            logits_soft_cap = None
         mesh = self.metadata.mesh
         if mesh is None:
             raise ValueError("VanillaAttn requires a mesh to be set on metadata")
@@ -220,21 +228,27 @@ class VanillaAttn(OperationImpl):
             runtime_dtype: jnp.dtype = self.metadata.runtime_dtype
             softmax_dtype: jnp.dtype | None = self.metadata.runtime_softmax_dtype
             if compute_dtype is not None:
-                runtime_dtype = softmax_dtype = compute_dtype
+                runtime_dtype = compute_dtype
+            # Softmax and unnormalized exponentials always accumulate in fp32
+            # (or a wider explicitly requested type), including bf16 callers.
+            softmax_dtype = jnp.promote_types(softmax_dtype or runtime_dtype or query.dtype, jnp.float32)
             is_decode_mode: bool = model_mode == common_types.MODE_DECODE
             causal_computed: bool = causal if not is_decode_mode else False
             if mask_info is not None and getattr(mask_info, "causal_mask_baked_in", False):
                 # The mask already carries the (absolute-position) causal term; the kernel's top-left (Q, K)
                 # triangle would re-restrict cached multi-token steps to chunk-relative rows (r15 S10-1).
                 causal_computed = False
-            if self._can_use_segmented_attention(mask_info):
+            if (
+                self._can_use_segmented_attention(mask_info)
+                or not normalize_output
+                or (dropout_prob > 0.0 and not deterministic)
+            ):
                 outputs, weights = self._forward_segmented(
                     query=query,
                     key=key,
                     value=value,
-                    mask_info=tp.cast("MaskInfo", mask_info),
+                    mask_info=mask_info if mask_info is not None else MaskInfo(),
                     bias=bias,
-                    init_bias=init_bias,
                     deterministic=deterministic,
                     dropout_rng=dropout_rng,
                     softmax_aux=softmax_aux,
@@ -246,6 +260,7 @@ class VanillaAttn(OperationImpl):
                     runtime_dtype=runtime_dtype,
                     softmax_dtype=softmax_dtype,
                     precision=precision,
+                    normalize_output=normalize_output,
                 )
                 outputs_sharded = with_sharding_constraint(arr=outputs, sharding=shardings.output, mesh=mesh)
                 return AttentionOutput(attention_weights=weights, attention_outputs=outputs_sharded)
@@ -303,7 +318,6 @@ class VanillaAttn(OperationImpl):
         value: Float[Array, "batch kv_len num_kv_heads vhead_dim"],
         mask_info: MaskInfo,
         bias: Float[Array, "batch num_heads seq_len kv_len"] | None,
-        init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None,
         deterministic: bool,
         dropout_rng: PRNGKeyArray | None,
         softmax_aux: Array | None,
@@ -315,7 +329,9 @@ class VanillaAttn(OperationImpl):
         runtime_dtype: jnp.dtype,
         softmax_dtype: jnp.dtype | None,
         precision: jax.lax.PrecisionLike = None,
+        normalize_output: bool = True,
     ) -> tuple[Array, Array]:
+        """Explicit masked attention, including packed and unnormalized passes."""
         batch_size, q_len, num_q_heads, head_dim = query.shape
         kv_len = key.shape[1]
         num_kv_heads = key.shape[2]
@@ -326,7 +342,7 @@ class VanillaAttn(OperationImpl):
                 )
             key, value = self.repeat_kv_heads(key, value, num_q_heads // num_kv_heads)
 
-        compute_dtype = softmax_dtype or runtime_dtype or query.dtype
+        compute_dtype = jnp.promote_types(softmax_dtype or runtime_dtype or query.dtype, jnp.float32)
         scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
         logits = jnp.einsum(
             "bqhd,bkhd->bhqk",
@@ -340,30 +356,28 @@ class VanillaAttn(OperationImpl):
             cap = jnp.asarray(logits_soft_cap, dtype=compute_dtype)
             logits = cap * jnp.tanh(logits / cap)
 
-        # In the standard attention stack this closure materializes
-        # ``mask_info.create_bias()``, which expands packed segment ids to a
-        # dense mask. Segment/causal/sliding masks are applied below directly.
-        if bias is None and init_bias is not None and not self._can_use_segmented_attention(mask_info):
-            bias = init_bias()
+        # Segment/causal/sliding masks are applied below directly, without
+        # materializing the dense mask through the public init_bias closure.
         if bias is not None:
             logits = logits + bias.astype(logits.dtype)
 
         q_segment_ids = _segment_ids_2d(getattr(mask_info, "_q_segment_ids", None))
         kv_segment_ids = _segment_ids_2d(getattr(mask_info, "_kv_segment_ids", None))
         if q_segment_ids is None and kv_segment_ids is None:
-            raise ValueError("Segmented vanilla attention requires q_segment_ids or kv_segment_ids.")
-        if q_segment_ids is None:
-            q_segment_ids = _match_sequence_length(tp.cast("Array", kv_segment_ids), q_len)
-        if kv_segment_ids is None:
-            kv_segment_ids = q_segment_ids
+            valid = jnp.ones((batch_size, q_len, kv_len), dtype=jnp.bool_)
+        else:
+            if q_segment_ids is None:
+                q_segment_ids = _match_sequence_length(tp.cast("Array", kv_segment_ids), q_len)
+            if kv_segment_ids is None:
+                kv_segment_ids = q_segment_ids
 
-        q_segment_ids = _match_sequence_length(q_segment_ids.astype(jnp.int32), q_len)
-        kv_segment_ids = _match_sequence_length(kv_segment_ids.astype(jnp.int32), kv_len)
-        valid = (
-            (q_segment_ids[:, :, None] >= 0)
-            & (kv_segment_ids[:, None, :] >= 0)
-            & (q_segment_ids[:, :, None] == kv_segment_ids[:, None, :])
-        )
+            q_segment_ids = _match_sequence_length(q_segment_ids.astype(jnp.int32), q_len)
+            kv_segment_ids = _match_sequence_length(kv_segment_ids.astype(jnp.int32), kv_len)
+            valid = (
+                (q_segment_ids[:, :, None] >= 0)
+                & (kv_segment_ids[:, None, :] >= 0)
+                & (q_segment_ids[:, :, None] == kv_segment_ids[:, None, :])
+            )
 
         q_positions = _positions_or_range(mask_info.q_positions, batch_size, q_len)
         kv_positions = _positions_or_range(mask_info.kv_positions, batch_size, kv_len)
@@ -378,8 +392,18 @@ class VanillaAttn(OperationImpl):
             valid = valid & (kv_positions[:, None, :] >= q_positions[:, :, None] - int(left_window))
             valid = valid & (kv_positions[:, None, :] <= q_positions[:, :, None] + int(right_window))
 
-        mask_value = jnp.finfo(logits.dtype).min
-        logits = jnp.where(valid[:, None, :, :], logits, mask_value)
+        valid = valid[:, None, :, :]
+        attention_mask = getattr(mask_info, "_attention_mask", None)
+        if attention_mask is not None:
+            if attention_mask.ndim == 2:
+                attention_mask = attention_mask[:, None, None, :kv_len]
+            else:
+                attention_mask = attention_mask[..., :q_len, :kv_len]
+                if attention_mask.ndim == 3:
+                    attention_mask = attention_mask[:, None, :, :]
+            attention_mask = attention_mask.astype(jnp.bool_)
+            valid = valid & attention_mask
+        logits = jnp.where(valid, logits, -jnp.inf)
 
         if softmax_aux is not None:
             # Settled sink layout (r15 S07-1): 1-D of length Hq is per query head, any other 1-D length is
@@ -401,9 +425,21 @@ class VanillaAttn(OperationImpl):
                     f"got shape {aux.shape}."
                 )
             aux = jnp.broadcast_to(aux[None, :, None, :], (batch_size, num_q_heads, q_len, aux.shape[-1]))
-            weights = jax.nn.softmax(jnp.concatenate([logits, aux], axis=-1), axis=-1)[..., :kv_len]
+            all_logits = jnp.concatenate([logits, aux], axis=-1)
         else:
-            weights = jax.nn.softmax(logits, axis=-1)
+            all_logits = logits
+
+        # Match Flash's stabilized numerator semantics when normalization is
+        # disabled. Sink logits participate in the maximum and denominator, but
+        # have no value vectors and are not included in returned weights.
+        row_max = jnp.max(all_logits, axis=-1, keepdims=True)
+        row_max = jnp.where(jnp.isfinite(row_max), row_max, 0.0)
+        numerator = jnp.exp(all_logits - row_max)
+        if normalize_output:
+            denominator = jnp.sum(numerator, axis=-1, keepdims=True)
+            numerator = numerator / jnp.where(denominator > 0, denominator, 1.0)
+        weights = numerator[..., :kv_len]
+        weights = jnp.where(valid, weights, 0.0)
 
         if dropout_prob > 0.0 and not deterministic:
             if dropout_rng is None:
@@ -498,6 +534,7 @@ class VanillaAttn(OperationImpl):
         causal: bool = False,
         sliding_window: int | tuple[int, int] | None = None,
         precision: jax.lax.PrecisionLike = None,
+        normalize_output: bool = True,
         **ignore,
     ) -> AttentionOutput:
         """
@@ -538,6 +575,7 @@ class VanillaAttn(OperationImpl):
             logits_soft_cap=logits_soft_cap,
             causal=causal,
             precision=precision,
+            normalize_output=normalize_output,
             **ignore,
         )
 

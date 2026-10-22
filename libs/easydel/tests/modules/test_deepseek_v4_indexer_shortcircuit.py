@@ -18,7 +18,7 @@ Entries number ``max_length // rate``, so at ``max_model_len=2048`` every
 DeepSeek-V4 layer has at most as many compressed entries as ``index_topk``:
 compressed_sparse rate 4 gives 512 entries against ``index_topk`` 512, and
 heavily_compressed rate 128 gives 16. ``top_k`` then returns *every* slot,
-merely reordered by score -- and the consumer ``_indexer_opened_bias`` scatters
+merely reordered by score -- and the consumer ``selection_bias`` scatters
 those indices into a position-indexed bias, where order cannot matter.
 
 Profiling a cc32 decode step measured ``sort`` at 3.0 ms of 40.3 ms, before
@@ -38,7 +38,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import jax
 import numpy as np
 import pytest
-from easydel.modules.deepseek_v4.modeling_deepseek_v4 import _indexer_opened_bias
+from easydel.layers.indexer import selection_bias
 from jax import numpy as jnp
 
 BATCH, SEQ = 3, 1
@@ -59,7 +59,7 @@ def _shortcircuit_path(visible, n_slots):
 
 
 def _bias(indices, n_slots):
-    return np.asarray(_indexer_opened_bias(indices, n_slots), np.float32)
+    return np.asarray(selection_bias(indices, n_slots), np.float32)
 
 
 @pytest.mark.parametrize("n_slots", [16, 64, 512])
@@ -168,14 +168,14 @@ def test_end_to_end_model_matches_with_and_without_the_shortcut():
         out = model(input_ids=ids, position_ids=pos, past_key_values=cache, cache_metadata=_Meta())
         return np.asarray(out.logits, np.float32)
 
-    original = mod._indexer_selection_is_vacuous
+    original = mod.is_vacuous_selection
     assert original(config.index_topk, 16), "config chosen so the shortcut fires; it did not"
     with_shortcut = run()
     try:
-        mod._indexer_selection_is_vacuous = lambda *_a, **_k: False  # force the full indexer
+        mod.is_vacuous_selection = lambda *_a, **_k: False  # force the full indexer
         full_path = run()
     finally:
-        mod._indexer_selection_is_vacuous = original
+        mod.is_vacuous_selection = original
 
     assert np.all(np.isfinite(with_shortcut))
     delta = float(np.max(np.abs(with_shortcut - full_path)))
@@ -230,13 +230,13 @@ def test_live_prefix_equivalence_is_not_vacuous():
     assert not np.array_equal(got, want), "scoring excluded nothing -- the gate would be untested"
 
 
-def test_indexer_opened_bias_score_proxy_is_primal_exact_and_differentiable():
+def test_selection_bias_score_proxy_is_primal_exact_and_differentiable():
     indices = jnp.array([[[0, 2]]], jnp.int32)
-    plain = _indexer_opened_bias(indices, 4)
+    plain = selection_bias(indices, 4)
     scores = jnp.array([[[0.2, -0.1, 0.7, 0.3]]], jnp.float32)
 
     def loss(s):
-        bias = _indexer_opened_bias(indices, 4, score_proxy=s)
+        bias = selection_bias(indices, 4, score_proxy=s)
         assert jnp.array_equal(bias, plain)
         probs = jax.nn.softmax(bias[:, 0], axis=-1)
         return jnp.sum(probs * jnp.arange(4, dtype=jnp.float32))

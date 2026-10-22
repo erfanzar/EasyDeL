@@ -30,11 +30,12 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.layers.compressed_window import MASK_MIN
+from easydel.layers.compressed_window import MASK_MIN, entry_reach
 from easydel.layers.linears import ColumnParallelLinear
 from easydel.layers.norms import RMSNorm
 
 from ._paged import bounded_block_max_topk, slot_entry_topk
+from ._selection import IndexerSelection
 
 __all__ = (
     "IndexerScoreInputs",
@@ -105,7 +106,7 @@ def shared_key_scores(
     """
     logits = jnp.einsum("bshd,btd->bsht", q.astype(jnp.float32), index_k.astype(jnp.float32), precision=precision)
     scores = jnp.sum(jax.nn.relu(logits) * weights[..., None], axis=2)
-    compress_lens = (positions.astype(jnp.int32) + 1) // ratio
+    compress_lens = entry_reach(positions, ratio)
     reachable = jnp.arange(index_k.shape[1], dtype=jnp.int32)[None, None, :] < compress_lens[..., None]
     return jnp.where(reachable, scores, -jnp.inf)
 
@@ -132,22 +133,46 @@ class IndexerScoreInputs(tp.NamedTuple):
         """Full ``[B, S, T]`` scores."""
         return self.rows(self.q, self.weights, self.positions)
 
+    def pad_rows(self, pad: int) -> IndexerScoreInputs:
+        """Append ``pad`` query rows that reach nothing (position ``-1``), for tiling along ``seq``."""
+        if pad <= 0:
+            return self
+        return self._replace(
+            q=jnp.pad(self.q, ((0, 0), (0, pad), (0, 0), (0, 0))),
+            weights=jnp.pad(self.weights, ((0, 0), (0, pad), (0, 0))),
+            positions=jnp.pad(self.positions.astype(jnp.int32), ((0, 0), (0, pad)), constant_values=-1),
+        )
 
-def selection_bias(topk: Int[Array, "batch seq k"], num_entries: int) -> Float[Array, "batch 1 seq entries"]:
-    """Additive fp32 bias opening the selected compressed entries (``-1`` = no entry).
+    def score_rows(self, start: Array, size: int) -> Array:
+        """Scores ``[B, size, T]`` of query rows ``start .. start + size`` (``start`` may be traced)."""
+        return self.rows(
+            jax.lax.dynamic_slice_in_dim(self.q, start, size, axis=1),
+            jax.lax.dynamic_slice_in_dim(self.weights, start, size, axis=1),
+            jax.lax.dynamic_slice_in_dim(self.positions, start, size, axis=1),
+        )
+
+
+def selection_bias(
+    topk: Int[Array, "batch seq k"],
+    num_entries: int,
+    *,
+    score_proxy: Float[Array, "batch seq entries"] | None = None,
+    mask: Bool[Array, "batch seq entries"] | None = None,
+) -> Float[Array, "batch 1 seq entries"]:
+    """Additive fp32 bias opening the selected compressed entries (``-1`` / out-of-range = no entry).
 
     Args:
         topk: Selected entry offsets ``[B, S, k]``.
         num_entries: Width of the entry axis.
+        score_proxy: Optional full-domain indexer scores ``[B, S, T]``; adds a straight-through term that is zero in
+            the primal and routes gradients into the scores at selected entries.
+        mask: Optional dense form of ``topk`` (saves the scatter when its width is ``num_entries``).
 
     Returns:
         ``[B, 1, S, T]`` bias: ``0`` at selected entries, the fp32 minimum elsewhere.
     """
-    batch, seq, _ = topk.shape
-    target = jnp.where(topk >= 0, topk, num_entries)
-    opened = jnp.zeros((batch, seq, num_entries), dtype=bool)
-    opened = opened.at[jnp.arange(batch)[:, None, None], jnp.arange(seq)[None, :, None], target].set(True, mode="drop")
-    return jnp.where(opened, 0.0, MASK_MIN).astype(jnp.float32)[:, None]
+    selection = IndexerSelection(topk, score_proxy, mask)
+    return selection.to_bias(num_entries, dtype=jnp.float32, mask_value=MASK_MIN)[:, None]
 
 
 @dataclass(frozen=True)
@@ -320,7 +345,7 @@ class SharedKeyIndexer(spx.Module):
             empty = (jnp.full((batch, seq, 0), -1, dtype=jnp.int32), empty_candidates)
             return (*empty, None) if return_scores else empty
         q, weights = self.query_and_weights(hidden_states, q_residual, rotate_queries)
-        compress_lens = (positions.astype(jnp.int32) + 1) // self.ratio
+        compress_lens = entry_reach(positions, self.ratio)
         # Selection carries no gradient; it reads only each query's reachable prefix (shared bounded selectors).
         sel_q = jax.lax.stop_gradient(q.astype(jnp.float32))
         sel_w = jax.lax.stop_gradient(weights)

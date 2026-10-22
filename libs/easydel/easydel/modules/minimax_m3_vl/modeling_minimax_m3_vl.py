@@ -89,11 +89,12 @@ from easydel.layers import (
     swiglu_oai,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.embeddings._vision import VisionPatchEmbed as Qwen2VLPatchEmbed
 from easydel.layers.indexer import BlockMaxIndexer, BlockMaxIndexerConfig
 from easydel.layers.moe import moe_group_topk_select
 from easydel.layers.norms import LayerNorm, RMSNorm
+from easydel.layers.rotary import apply_rope_split_half
 from easydel.modules._base import BaseCausalLMModule, BaseVisionLanguageModule
-from easydel.modules.qwen2_vl.modeling_qwen2_vl import Qwen2VLPatchEmbed
 
 from .minimax_m3_vl_configuration import (
     MiniMaxM3VLConfig,
@@ -138,7 +139,9 @@ def _apply_partial_rotary(x: Array, cos: Array, sin: Array) -> Array:
 
     Mirrors HF's GLM/MiniMax ``apply_rotary_pos_emb``: the leading
     ``rotary_dim`` channels are rotated with the rotate-half convention and
-    the tail passes through unchanged.
+    the tail passes through unchanged. Delegates to the shared
+    :func:`easydel.layers.rotary.apply_rope_split_half` with the tables
+    already broadcastable and the rotation run in the operands' own dtypes.
 
     Args:
         x: Input tensor ``[..., head_dim]``; broadcastable against ``cos``.
@@ -148,15 +151,7 @@ def _apply_partial_rotary(x: Array, cos: Array, sin: Array) -> Array:
     Returns:
         Tensor of the same shape as ``x`` with the leading channels rotated.
     """
-    rotary_dim = cos.shape[-1]
-    x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
-    half = rotary_dim // 2
-    x1, x2 = x_rot[..., :half], x_rot[..., half:]
-    rotated = jnp.concatenate([-x2, x1], axis=-1)
-    x_rot = x_rot * cos + rotated * sin
-    if x_pass.shape[-1] == 0:
-        return x_rot
-    return jnp.concatenate([x_rot, x_pass], axis=-1)
+    return apply_rope_split_half(x, cos, sin, unsqueeze_dim=None, compute_dtype=None)
 
 
 def _gather_cos_sin(
@@ -1138,6 +1133,7 @@ class MiniMaxM3VLTextModel(EasyDeLBaseModule):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         all_router_logits = () if output_router_logits else None
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -1232,6 +1228,8 @@ class MiniMaxM3VLTextModel(EasyDeLBaseModule):
             trace=trace_layers,
         )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
 
         return MoeModelOutput(
             last_hidden_state=hidden_states,

@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import signal
 import threading
 import time
@@ -119,6 +120,7 @@ from .distributed.request_plane import create_request_plane
 from .distributed.wire import EngineSpec
 from .engine import build_engine_assets
 from .engine.admission import RequestAdmission, clone_sampling_params
+from .engine.bootstrap import normalize_decoding_engine, select_decoding_engine
 from .engine.chat_templating import format_chat_prompt, normalize_stop_sequences
 from .engine.idle import IdleMonitor
 from .engine.loop import EngineLoop
@@ -130,7 +132,6 @@ from .metrics import get_metrics_collector, log_metrics_summary
 from .multimodal import MultiModalManager
 from .request import EngineRequestStatus
 from .runners import eSurgeRunner
-from .runners.host_sync import mark_host_payloads_replicated
 from .scheduler import Scheduler
 
 if typing.TYPE_CHECKING:
@@ -142,8 +143,6 @@ if typing.TYPE_CHECKING:
 # Configuration constants
 
 
-DEFAULT_DETOKENIZER_MAX_STATES = 1 << 16  # 65536 states for streaming decode
-DEFAULT_PAGE_SIZE_GPU_MIN = 256  # Minimum efficient page size for GPU
 DEFAULT_DECODE_INTERVAL_TOKENS = 16  # Decode every N tokens
 DEFAULT_DECODE_INTERVAL_SECS = 0.04  # Or decode every N seconds (20ms)
 WORKER_DRAIN_MAX_RETRIES = 3  # Maximum retry attempts for worker drain
@@ -370,6 +369,9 @@ class eSurge:
         distributed: eSurgeDistributedConfig | typing.Mapping[str, Any] | None = None,
         drafter: DrafterProtocol | bool | typing.Mapping[str, Any] | None = None,
         drafter_config: eSurgeDrafterConfig | typing.Mapping[str, Any] | None = None,
+        spec_debug_max_traces: int | None = None,
+        spec_adaptive_conf_threshold: float | None = None,
+        decoding_engine: str | None = None,
     ):
         """Initialize the eSurge engine.
 
@@ -542,6 +544,16 @@ class eSurge:
                 — e.g. the built-in MTP head on Qwen3.5/3.6 checkpoints) with
                 the tuned defaults (4 draft tokens, persistent MTP KV). No
                 drafter class or method name needed.
+            decoding_engine: Explicit serving backend: ``"ring"`` uses registered
+                paged ring attention and ``"triton"`` uses GPU unified paged
+                attention. ``None``/``"auto"`` preserve automatic backend selection.
+                Applies equally to loaded models and string model ids; unsupported
+                model/cache combinations raise rather than silently substituting.
+            spec_debug_max_traces: Maximum speculative verify traces to retain.
+                ``None`` uses the runtime setting (default zero, capture disabled).
+            spec_adaptive_conf_threshold: Draft early-exit confidence in [0, 1].
+                ``None`` uses the runtime setting (default zero, fixed-length drafting).
+                Explicit values override runtime settings, including zero.
             drafter_config (eSurgeDrafterConfig | Mapping[str, Any] | None):
                 Declarative drafter settings. When enabled, eSurge calls
                 ``model.drafter(method=..., num_draft_tokens=..., ...)`` after
@@ -558,6 +570,7 @@ class eSurge:
         """
         from easydel.modules.auto.auto_modeling import PreTrainedLoading
 
+        self.decoding_engine = normalize_decoding_engine(decoding_engine)
         loading_data = dict(loading_kwargs or {})
         configured_model = loading_data.pop("pretrained_model_name_or_path", None)
         if configured_model is not None and configured_model != model:
@@ -606,6 +619,21 @@ class eSurge:
             drafter_config = aggregate.drafter
 
         self.runtime_config = eSurgeRuntimeConfig.coerce_config(runtime)
+        if spec_debug_max_traces is None:
+            spec_debug_max_traces = self.runtime_config.get("spec_debug_max_traces", 0)
+        if spec_adaptive_conf_threshold is None:
+            spec_adaptive_conf_threshold = self.runtime_config.get("spec_adaptive_conf_threshold", 0.0)
+        if (
+            isinstance(spec_debug_max_traces, bool)
+            or not isinstance(spec_debug_max_traces, int)
+            or spec_debug_max_traces < 0
+        ):
+            raise ValueError("spec_debug_max_traces must be a non-negative integer")
+        spec_adaptive_conf_threshold = float(spec_adaptive_conf_threshold)
+        if not 0.0 <= spec_adaptive_conf_threshold <= 1.0:
+            raise ValueError("spec_adaptive_conf_threshold must be finite and in [0, 1]")
+        self.spec_debug_max_traces = spec_debug_max_traces
+        self.spec_adaptive_conf_threshold = spec_adaptive_conf_threshold
         self.cache_config = eSurgeCacheRuntimeConfig.coerce_config(cache)
         self.context_config = eSurgeContextConfig.coerce_config(context)
         self.worker_config = eSurgeWorkerConfig.coerce_config(workers)
@@ -648,8 +676,11 @@ class eSurge:
             drafter=drafter,
             data_parallelism_axis=self.data_parallelism_axis,
             dtype=dtype,
+            decoding_engine=self.decoding_engine,
         )
         model = assets.model
+        if self.decoding_engine is not None:
+            model = select_decoding_engine(model, self.decoding_engine)
         self.processor = assets.processor
         self.tokenizer = assets.tokenizer
         self._apply_data_parallel_axis_to_model(model)
@@ -700,7 +731,6 @@ class eSurge:
         )
         self._tokenizer_endpoint = self._worker_manager.tokenizer_endpoint
         self._detokenizer_endpoint = self._worker_manager.detokenizer_endpoint
-        self._worker_startup_timeout = self._worker_manager._startup_timeout
 
         self.tool_parser = assets.tool_parser_name
         self.reasoning_parser_name = assets.reasoning_parser_name
@@ -765,7 +795,10 @@ class eSurge:
             pp_microbatch_size=self.runtime_config.pp_microbatch_size,
             compile_vision_encoder=self.vision_config.compile_vision_encoder,
             vision_patch_buckets=self.vision_config.vision_patch_buckets,
+            vision_cache=self._multimodal_manager.cache if self._multimodal_manager is not None else None,
             drafter=drafter,
+            spec_debug_max_traces=self.spec_debug_max_traces,
+            spec_adaptive_conf_threshold=self.spec_adaptive_conf_threshold,
         )
         self._install_side_input_tokenizer_state()
 
@@ -783,15 +816,11 @@ class eSurge:
                 long_prefill_token_threshold,
             )
 
-        self.scheduler = Scheduler.from_runner(
-            self.runner,
-            max_num_batched_tokens=max_num_batched_tokens,
-            enable_prefix_caching=self.cache_config.enable_prefix_caching,
-            async_scheduling=runner_async_scheduling,
-            long_prefill_token_threshold=long_prefill_token_threshold,
-            num_draft_tokens=self.runner.num_draft_tokens,
-        )
+        # Remembered so a weight hot-swap rebuilds the scheduler with the same settings.
+        self._runner_async_scheduling = runner_async_scheduling
+        self._long_prefill_token_threshold = long_prefill_token_threshold
         self._scheduler_max_num_batched_tokens = max_num_batched_tokens
+        self.scheduler = self._build_scheduler()
 
         # Request-scoped state lives in the registry; the attribute names
         # below alias its containers/locks for the engine-resident methods
@@ -866,6 +895,7 @@ class eSurge:
                 "max_model_len": self.runtime_config.max_model_len,
                 "max_num_seqs": self.runtime_config.max_num_seqs,
                 "page_size": self.cache_config.page_size,
+                "decoding_engine": self.decoding_engine,
                 "data_parallelism_axis": self.data_parallelism_axis,
                 "max_num_batched_tokens": (
                     int(self.scheduler.max_num_scheduled_tokens)
@@ -873,6 +903,11 @@ class eSurge:
                     else None
                 ),
                 "enable_window_aware_runtime_cap": self.runtime_config.enable_window_aware_runtime_cap,
+                "chunked_prefill_enabled": self.runtime_config.chunked_prefill_enabled,
+                "token_safety_margin": self.runtime_config.token_safety_margin,
+                "include_finished_set": self.runtime_config.include_finished_set,
+                "spec_debug_max_traces": self.spec_debug_max_traces,
+                "spec_adaptive_conf_threshold": self.spec_adaptive_conf_threshold,
                 "scheduler_policy": str(
                     self.scheduler.policy.value if hasattr(self.scheduler.policy, "value") else self.scheduler.policy
                 ),
@@ -921,10 +956,13 @@ class eSurge:
         self.distributed_role = "leader" if self._step_coordinator.is_leader else "worker"
         self.distributed_rank = int(self._step_coordinator.rank)
         self.distributed_world_size = int(self._step_coordinator.world_size)
-        if self.distributed_world_size > 1:
-            # The step-replication plane makes host payloads identical by
-            # construction; skip the per-step broadcast_one_to_all collectives.
-            mark_host_payloads_replicated(True)
+        # Only this coordinator's replicated step stream grants the exemption.
+        # LocalCoordinator deliberately reports world_size=1 even with multiple
+        # JAX processes: independent replicated drivers still need broadcasts.
+        # Set the runner policy after coordinator construction (which follows
+        # runner warmup), but before either leader or worker starts stepping.
+        # Assign False too, so sequential/concurrent engines remain isolated.
+        self.runner.host_payloads_replicated = self.distributed_world_size > 1
 
         self.initiate()
 
@@ -974,6 +1012,11 @@ class eSurge:
             return QueueStats()
 
     @property
+    def alive(self) -> bool:
+        """Whether this engine can currently make progress on admitted requests."""
+        return self._generation_alive
+
+    @property
     def _generation_alive(self) -> bool:
         """Whether requests can make progress on this rank.
 
@@ -987,22 +1030,6 @@ class eSurge:
             return True
         thread = getattr(self, "_worker_replay_thread", None)
         return thread is not None and thread.is_alive()
-
-    @property
-    def _scheduler_thread(self) -> threading.Thread | None:
-        """The scheduler loop's daemon thread (or ``None``)."""
-        loop = getattr(self, "_engine_loop", None)
-        if loop is not None:
-            return loop.thread
-        return getattr(self, "_scheduler_thread_fallback", None)
-
-    @_scheduler_thread.setter
-    def _scheduler_thread(self, value: threading.Thread | None) -> None:
-        loop = getattr(self, "_engine_loop", None)
-        if loop is not None:
-            loop._thread = value
-        else:
-            self._scheduler_thread_fallback = value
 
     @cached_property
     def esurge_name(self) -> str:
@@ -1450,19 +1477,26 @@ class eSurge:
         mm_features: list | None = None,
     ) -> list[EngineRequest] | None:
         """Admit a request via :meth:`RequestAdmission.add_request` (see there for details)."""
-        return self._admission.add_request(
-            request_id,
-            prompt,
-            sampling_params,
-            prompt_token_ids=prompt_token_ids,
-            tool_parser_request=tool_parser_request,
-            defer_scheduler_enqueue=defer_scheduler_enqueue,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
-            mm_features=mm_features,
-        )
+        if self._registry.output_is_retained(request_id):
+            raise ValueError(f"Request {request_id!r} already has an active consumer")
+        self._registry.retain_output(request_id)
+        try:
+            return self._admission.add_request(
+                request_id,
+                prompt,
+                sampling_params,
+                prompt_token_ids=prompt_token_ids,
+                tool_parser_request=tool_parser_request,
+                defer_scheduler_enqueue=defer_scheduler_enqueue,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                pixel_values_videos=pixel_values_videos,
+                video_grid_thw=video_grid_thw,
+                mm_features=mm_features,
+            )
+        except BaseException:
+            self._registry.release_output(request_id)
+            raise
 
     def _generate_request_id(self) -> str:
         """Allocate a fresh request id (see :meth:`RequestAdmission.generate_request_id`)."""
@@ -1478,7 +1512,39 @@ class eSurge:
         """Clone + finalize sampling params (see :meth:`RequestAdmission.prepare_sampling_params_for_request`)."""
         return self._admission.prepare_sampling_params_for_request(template, request_id=request_id, prompt=prompt)
 
-    _TOOL_TOKEN_PATTERNS = ("tool_call", "tool_response", "tool")
+    # Tool-protocol special tokens are delimiter-wrapped (``<|tool_call>``, ``<tool_response|>``,
+    # ``[TOOL_CALLS]``); ordinary vocabulary pieces such as "tool" or "stool" must stay sampleable.
+    _TOOL_PROTOCOL_TOKEN_RE = re.compile(
+        r"^(?:<[/|｜]*tool(?:[_▁](?:calls?|responses?|results?|outputs?|section|argument|sep|begin|start|end))*[|｜]*>"
+        r"|\[/?tool(?:_calls?|_responses?)?\])$",
+        re.IGNORECASE,
+    )
+
+    def _resolve_tool_protocol_token_ids(self) -> tuple[int, ...]:
+        """Return the ids of tool-protocol special tokens in the tokenizer vocabulary.
+
+        The vocabulary scan is O(V), so the result is cached per tokenizer instance.
+
+        Returns:
+            Sorted token ids whose text is a delimiter-wrapped tool-protocol token;
+            empty when the tokenizer exposes no vocabulary.
+        """
+        tokenizer = getattr(self, "tokenizer", None)
+        if tokenizer is None or not hasattr(tokenizer, "get_vocab"):
+            return ()
+        cached = getattr(self, "_tool_protocol_token_cache", None)
+        if cached is not None and cached[0] is tokenizer:
+            return cached[1]
+        try:
+            vocab = tokenizer.get_vocab()
+        except Exception:
+            return ()
+        pattern = self._TOOL_PROTOCOL_TOKEN_RE
+        ids = tuple(
+            sorted(int(token_id) for token_text, token_id in vocab.items() if pattern.match(str(token_text)) is not None)
+        )
+        self._tool_protocol_token_cache = (tokenizer, ids)
+        return ids
 
     def _prepare_chat_sampling_params(
         self,
@@ -1513,22 +1579,9 @@ class eSurge:
 
         if tools:
             sampling_params.skip_special_tokens = False
-            sampling_params.logit_bias = None
             return sampling_params
 
-        vocab: dict[str, int] = {}
-        if hasattr(self, "tokenizer") and hasattr(self.tokenizer, "get_vocab"):
-            try:
-                vocab = self.tokenizer.get_vocab()
-            except Exception:
-                pass
-
-        tool_token_ids: list[int] = []
-        for token_text, token_id in vocab.items():
-            for pattern in self._TOOL_TOKEN_PATTERNS:
-                if pattern in token_text.lower():
-                    tool_token_ids.append(token_id)
-                    break
+        tool_token_ids = self._resolve_tool_protocol_token_ids()
 
         if tool_token_ids:
             merged_logit_bias = dict(sampling_params.logit_bias or {})
@@ -1677,11 +1730,11 @@ class eSurge:
                 that sample, marking the parent finished once every sample
                 has terminated).
 
-        State on exit: the request is no longer in
-        ``_active_requests`` / ``_request_events``, the scheduler has
-        released its row and pages, and the output object reflects the
-        abort. A best-effort log line records the before/after queue
-        counts for postmortem.
+        State on exit: the request is no longer in ``_active_requests``,
+        the scheduler has released its row and pages, and the output reflects
+        the abort. An active consumer retains its parent wake event and
+        terminal output until acknowledgement; otherwise retention applies
+        immediately. A best-effort log line records the queue counts.
         """
         # A finished output may still have live scheduler rows or remote
         # subscribers; always run cleanup before deciding which output fields
@@ -1844,7 +1897,8 @@ class eSurge:
                 after_waiting,
             )
         log_metrics_summary()
-        if ro is not None and ro.finished:
+        registry = getattr(self, "_registry", None)
+        if ro is not None and ro.finished and (registry is None or not registry.output_is_retained(parent_request_id)):
             with self._request_lock:
                 self._request_events.pop(parent_request_id, None)
                 if n_samples > 1:
@@ -2231,6 +2285,24 @@ class eSurge:
                 _SCHEDULER_HEARTBEAT_WARN_S,
             )
 
+    def _release_output_consumer(self, request_id: str) -> None:
+        """Acknowledge a result, or cancel it if its consumer exits early."""
+        registry = getattr(self, "_registry", None)
+        if registry is None or not registry.output_is_retained(request_id):
+            return
+        registry.release_output(request_id)
+        output = registry.get_output(request_id)
+        if output is None:
+            return
+        if not output.finished:
+            self.abort_request(request_id)
+            return
+        with self._request_lock:
+            self._request_events.pop(request_id, None)
+            for index in range(len(output.outputs)):
+                self._request_events.pop(f"{request_id}-{index}", None)
+        registry.track_finished(request_id)
+
     def _track_finished_output(self, request_id: str) -> None:
         """Track and evict completed RequestOutput objects to cap memory usage.
 
@@ -2241,20 +2313,8 @@ class eSurge:
         Args:
             request_id: ID of the request that just finished.
         """
-        max_outputs = self._max_request_outputs
-        if max_outputs is None:
-            return
-        if max_outputs <= 0:
-            self._request_outputs.pop(request_id, None)
-            return
-        if request_id in self._finished_request_ids:
-            return
-        self._finished_request_ids.append(request_id)
-        while len(self._finished_request_ids) > max_outputs:
-            old_id = self._finished_request_ids.popleft()
-            if old_id == request_id:
-                continue
-            self._request_outputs.pop(old_id, None)
+        self._registry.release_output(request_id)
+        self._registry.track_finished(request_id)
 
     def _on_output_worker_fatal(self, exc: BaseException, tb: str) -> None:
         """Record an output-worker failure and wake every blocked caller.
@@ -2434,6 +2494,7 @@ class eSurge:
                 emit_outputs=self._enqueue_engine_outputs,
                 drain_parser_stops=self._drain_parser_stop_requests_locked,
                 on_fatal=self._abort_scheduler_due_to_error,
+                on_stopped=self._registry.signal_all,
                 heartbeat=self._update_scheduler_heartbeat,
                 handle_profiling_step=self._handle_profiling_step,
                 is_nonrecoverable=self._is_nonrecoverable_scheduler_error,
@@ -2607,6 +2668,30 @@ class eSurge:
         self.runner.release_model_state(clear_compiled_cache=clear_compiled_cache)
         self._paused = True
 
+    def _build_scheduler(self) -> Scheduler:
+        """Construct the scheduler from the runner and the engine's resolved settings.
+
+        Single construction path shared by ``__init__`` and
+        :meth:`update_model_weights` so a hot swap keeps async scheduling, the
+        (possibly PP-defaulted) long-prefill threshold and the speculative
+        lookahead (``runner.num_draft_tokens``) the engine was built with.
+
+        Returns:
+            A freshly constructed :class:`Scheduler` bound to ``self.runner``.
+        """
+        runtime = eSurgeRuntimeConfig.coerce_config(getattr(self, "runtime_config", None))
+        return Scheduler.from_runner(
+            self.runner,
+            max_num_batched_tokens=self._scheduler_max_num_batched_tokens,
+            enable_prefix_caching=self.cache_config.enable_prefix_caching,
+            async_scheduling=self._runner_async_scheduling,
+            long_prefill_token_threshold=self._long_prefill_token_threshold,
+            num_draft_tokens=self.runner.num_draft_tokens,
+            chunked_prefill_enabled=runtime.chunked_prefill_enabled,
+            token_safety_margin=runtime.token_safety_margin,
+            include_finished_set=runtime.include_finished_set,
+        )
+
     def update_model_weights(
         self,
         model: EasyDeLBaseModule | None = None,
@@ -2669,27 +2754,25 @@ class eSurge:
         split_graphdef = None
         split_graphstate = None
         split_graphother = None
-        using_compatible_split = False
         if model is not None and (graphdef is None or graphstate is None or graphother is None):
-            using_compatible_split = self._model_overrides_esurge_graphdef(model)
             _split_model, split_graphdef, split_graphstate, split_graphother = (
                 self._split_graph_components_for_weight_update(model)
             )
 
         if model is None:
             model = spx.bind(graphdef, graphstate.overlay(graphother))
-        if using_compatible_split and graphdef is None:
-            if graphstate is None:
-                graphstate = split_graphstate
-            if graphother is None:
-                graphother = split_graphother
-        else:
-            if graphstate is None:
-                graphstate = split_graphstate
-            if graphother is None:
-                graphother = split_graphother
+        if graphstate is None:
+            graphstate = split_graphstate
+        if graphother is None:
+            graphother = split_graphother
         if graphdef is None:
             graphdef = self._resolve_graphdef_for_weight_update(model, split_graphdef)
+        if getattr(self, "decoding_engine", None) is not None:
+            # Graph-component callers must honor the same explicit selection as
+            # model callers, including refreshes with a training attention graph.
+            replacement = spx.bind(graphdef, graphstate.overlay(graphother))
+            replacement = select_decoding_engine(replacement, self.decoding_engine)
+            graphdef = replacement.graphdef
 
         self.runner.update_model_weights(
             graphdef=graphdef,
@@ -2717,11 +2800,7 @@ class eSurge:
         if request_plane is not None and request_plane.owns_scheduling:
             request_plane.reset()
 
-        self.scheduler = Scheduler.from_runner(
-            self.runner,
-            max_num_batched_tokens=self._scheduler_max_num_batched_tokens,
-            enable_prefix_caching=self.cache_config.enable_prefix_caching,
-        )
+        self.scheduler = self._build_scheduler()
 
         if restart_scheduler and was_running:
             self.initiate()
@@ -3068,6 +3147,19 @@ class eSurge:
             if len(request_ids) != len(prompts):
                 raise ValueError("Length of request_id list must match number of prompts.")
 
+        registry = getattr(self, "_registry", None)
+        if len(set(request_ids)) != len(request_ids) or (
+            registry is not None and any(registry.output_is_retained(rid) for rid in request_ids)
+        ):
+            raise ValueError("Request ids must be unique and cannot have an active consumer")
+        try:
+            return self._generate_batch(prompts, sampling_params, request_ids, use_tqdm, tool_parser_request)
+        finally:
+            for rid in request_ids:
+                self._release_output_consumer(rid)
+
+    def _generate_batch(self, prompts, sampling_params, request_ids, use_tqdm, tool_parser_request):
+        """Admit and collect a batch while the public caller owns its output leases."""
         base_sampling_params = sampling_params or SamplingParams(max_tokens=128)
 
         defer_batch_enqueue = len(prompts) > 1
@@ -3123,7 +3215,9 @@ class eSurge:
                     self._recover_orphaned_request(req_id)
             with self._output_lock:
                 for req_id in request_ids:
-                    if req_id not in completed and req_id in self._request_outputs:
+                    if req_id not in completed and req_id not in self._request_outputs:
+                        raise RuntimeError(f"Output for admitted request {req_id!r} disappeared")
+                    if req_id not in completed:
                         output = self._request_outputs[req_id]
                         if output.finished:
                             completed.add(req_id)
@@ -3228,132 +3322,14 @@ class eSurge:
             tool_parser_request=tool_parser_request,
         )
 
-        self._ensure_scheduler_running(context="stream-start")
-
-        with self._request_lock:
-            req_event = self._request_events.get(request_id)
-        if req_event is None:
-            raise RuntimeError("Request event missing")
-
-        last_update_seq = -1
-        last_accumulated_text = ""
-        last_raw_accumulated_text = ""
-        last_accumulated_reasoning = ""
         try:
-            while True:
-                req_event.wait(timeout=1.0)
-                req_event.clear()
-                self._raise_if_scheduler_failed()
-                if not self._generation_alive:
-                    self.abort_request(request_id)
-                    raise RuntimeError("Background scheduler stopped while streaming request.")
-                if self._recover_orphaned_request(request_id):
-                    continue
-
-                snapshot = None
-                with self._output_lock:
-                    ro = self._request_outputs.get(request_id)
-                    if ro is None:
-                        continue
-
-                    if ro.update_seq != last_update_seq:
-                        # Snapshot without holding the lock during yield
-                        finished_snapshot = bool(ro.finished)
-                        outputs_copy = []
-                        for comp in ro.outputs:
-                            token_ids = list(comp.token_ids) if finished_snapshot else comp.token_ids
-                            logprobs = (
-                                [dict(lp) for lp in comp.logprobs]
-                                if finished_snapshot and comp.logprobs
-                                else comp.logprobs
-                            )
-                            outputs_copy.append(
-                                CompletionOutput(
-                                    index=comp.index,
-                                    text=comp.text,
-                                    token_ids=token_ids,
-                                    cumulative_logprob=comp.cumulative_logprob,
-                                    logprobs=logprobs,
-                                    finish_reason=comp.finish_reason,
-                                    tool_calls=comp.tool_calls,
-                                    reasoning_content=comp.reasoning_content,
-                                    raw_text=comp.raw_text,
-                                )
-                            )
-
-                        snapshot_delta = self._compute_snapshot_delta_text(
-                            ro.accumulated_text,
-                            last_accumulated_text,
-                            ro.delta_text,
-                        )
-                        snapshot_raw_delta = self._compute_snapshot_delta_text(
-                            ro.raw_accumulated_text,
-                            last_raw_accumulated_text,
-                            ro.raw_delta_text or "",
-                        )
-                        snapshot_reasoning_delta = self._compute_snapshot_delta_text(
-                            ro.reasoning_content or "",
-                            last_accumulated_reasoning,
-                            ro.delta_reasoning_content or "",
-                        )
-
-                        snapshot = RequestOutput(
-                            request_id=ro.request_id,
-                            prompt=ro.prompt,
-                            prompt_token_ids=list(ro.prompt_token_ids),
-                            outputs=outputs_copy,
-                            finished=ro.finished,
-                            metrics=dict(ro.metrics) if ro.metrics is not None else None,
-                            accumulated_text=ro.accumulated_text,
-                            delta_text=snapshot_delta,
-                            raw_accumulated_text=ro.raw_accumulated_text,
-                            raw_delta_text=snapshot_raw_delta,
-                            tokens_per_second=ro.tokens_per_second,
-                            num_generated_tokens=ro.num_generated_tokens,
-                            time_spent_generating=ro.time_spent_generating,
-                            first_token_time=ro.first_token_time,
-                            processing_time=ro.processing_time,
-                            update_seq=ro.update_seq,
-                            delta_seq=ro.delta_seq,
-                            tool_calls=ro.tool_calls,
-                            delta_tool_calls=ro.delta_tool_calls,
-                            reasoning_content=ro.reasoning_content,
-                            delta_reasoning_content=snapshot_reasoning_delta or None,
-                        )
-                        last_update_seq = ro.update_seq
-                        last_accumulated_text = ro.accumulated_text
-                        last_raw_accumulated_text = ro.raw_accumulated_text
-                        last_accumulated_reasoning = ro.reasoning_content or ""
-
-                if snapshot is not None:
-                    if (
-                        not snapshot.finished
-                        and snapshot.num_generated_tokens == 0
-                        and not snapshot.delta_text
-                        and not snapshot.raw_delta_text
-                        and not snapshot.delta_reasoning_content
-                        and not snapshot.delta_tool_calls
-                    ):
-                        continue
-                    yield snapshot
-                    if snapshot.finished:
-                        break
+            self._ensure_scheduler_running(context="stream-start")
+            yield from self._iter_request_snapshots(
+                request_id,
+                stopped_message="Background scheduler stopped while streaming request.",
+            )
         finally:
-            with self._output_lock:
-                ro = self._request_outputs.get(request_id)
-                n_samples = len(ro.outputs) if ro is not None else 0
-                finished = ro.finished if ro is not None else True
-            if finished:
-                with self._request_lock:
-                    self._request_events.pop(request_id, None)
-                    if n_samples > 1:
-                        for sample_idx in range(n_samples):
-                            self._request_events.pop(f"{request_id}-{sample_idx}", None)
-                if self._max_request_outputs is not None:
-                    with self._output_lock:
-                        self._track_finished_output(request_id)
-            else:
-                self.abort_request(request_id)
+            self._release_output_consumer(request_id)
 
     @overload
     def chat(
@@ -3533,6 +3509,7 @@ class eSurge:
         request_id: str | None = None,
         chat_template: str | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        usage_callback: typing.Callable[[int, int], None] | None = None,
     ) -> Iterator[ChatCompletionStreamResponse]:
         """Bridge :meth:`chat` snapshots into OpenAI ``ChatCompletionStreamResponse`` frames.
 
@@ -3551,6 +3528,10 @@ class eSurge:
             tools, tool_choice, sampling_params, request_id,
                 chat_template, chat_template_kwargs: Same semantics as
                 :meth:`chat`.
+            usage_callback: Optional observer receiving cumulative prompt and
+                completion token counts for each consumed engine snapshot,
+                before its protocol chunks are emitted (including snapshots
+                with no visible delta). Does not change wire usage fields.
 
         Yields:
             ``ChatCompletionStreamResponse`` frames, one per snapshot,
@@ -3570,6 +3551,7 @@ class eSurge:
         yield from iter_chat_completion_stream_responses(
             typing.cast(Iterator[RequestOutputLike], outputs),
             model=model,
+            usage_callback=usage_callback,
         )
 
     def iter_responses_stream(
@@ -3587,6 +3569,7 @@ class eSurge:
         created_at: int | None = None,
         chat_template: str | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        usage_callback: typing.Callable[[int, int], None] | None = None,
     ) -> Iterator[StreamEventFrame]:
         """Bridge :meth:`chat` snapshots into OpenAI Responses-API stream frames.
 
@@ -3613,6 +3596,10 @@ class eSurge:
             messages, tools, tool_choice, sampling_params, request_id,
                 chat_template, chat_template_kwargs: Same semantics as
                 :meth:`chat`.
+            usage_callback: Optional observer receiving cumulative prompt and
+                completion token counts for each consumed engine snapshot,
+                before its protocol chunks are emitted (including snapshots
+                with no visible delta). Does not change wire usage fields.
 
         Yields:
             :class:`StreamEventFrame` events compatible with the OpenAI
@@ -3636,6 +3623,7 @@ class eSurge:
             include_reasoning_summary=include_reasoning_summary,
             final_response_overrides=final_response_overrides,
             created_at=created_at,
+            usage_callback=usage_callback,
         )
 
     def _messages_have_multimodal_content(self, messages: list[dict]) -> bool:
@@ -3720,9 +3708,15 @@ class eSurge:
 
         mm_features = []
         if images:
-            mm_features.extend(self._multimodal_manager.process_images_to_features(images))
+            mm_features.extend(
+                self._multimodal_manager.process_images_to_features(images, processed=(pixel_values, image_grid_thw))
+            )
         if videos:
-            mm_features.extend(self._multimodal_manager.process_videos_to_features(videos))
+            mm_features.extend(
+                self._multimodal_manager.process_videos_to_features(
+                    videos, processed=(pixel_values_videos, video_grid_thw)
+                )
+            )
 
         prompt_token_ids = self._multimodal_manager.tokenize_multimodal(
             messages=messages,
@@ -3764,7 +3758,11 @@ class eSurge:
             mm_features=mm_features,
         )
 
-        self._ensure_scheduler_running(context="multimodal-chat-start")
+        try:
+            self._ensure_scheduler_running(context="multimodal-chat-start")
+        except BaseException:
+            self._release_output_consumer(request_id)
+            raise
 
         if stream:
             return self._stream_multimodal_request(request_id)
@@ -3776,16 +3774,8 @@ class eSurge:
 
         Mirror of :meth:`stream` for the multimodal path: the caller has
         already submitted the request via :meth:`_chat_multimodal`, so
-        this helper only owns the read loop. On every wakeup it
-        snapshots the live ``_request_outputs`` entry (under
-        ``_output_lock``), copies the per-sample fields into a fresh
-        :class:`RequestOutput`, computes monotonically-correct
-        ``delta_text`` / ``raw_delta_text`` /
-        ``delta_reasoning_content`` against the previous snapshot, and
-        yields the result. Exits when ``finished`` flips true; in the
-        ``finally`` block, cleans up per-request events and either
-        records the completed output for retention or aborts the
-        request when the consumer abandons mid-stream.
+        this helper only owns the read loop (shared with :meth:`stream`
+        through :meth:`_iter_request_snapshots`).
 
         Args:
             request_id: Parent request id returned by
@@ -3798,6 +3788,36 @@ class eSurge:
         Raises:
             RuntimeError: If the per-request event is missing (indicates
                 the engine never registered this id) or the scheduler
+                stops mid-stream.
+        """
+        yield from self._iter_request_snapshots(
+            request_id,
+            stopped_message="Background scheduler stopped while streaming multimodal request.",
+        )
+
+    def _iter_request_snapshots(self, request_id: str, *, stopped_message: str) -> Iterator[RequestOutput]:
+        """Shared read loop behind :meth:`stream` and :meth:`_stream_multimodal_request`.
+
+        On every wakeup it snapshots the live ``_request_outputs`` entry (under
+        ``_output_lock``), copies the per-sample fields into a fresh
+        :class:`RequestOutput`, computes monotonically-correct
+        ``delta_text`` / ``raw_delta_text`` / ``delta_reasoning_content``
+        against the previous snapshot, and yields the result. Exits when
+        ``finished`` flips true; in the ``finally`` block, cleans up
+        per-request events and either records the completed output for
+        retention (``max_request_outputs``) or aborts the request when the
+        consumer abandons mid-stream.
+
+        Args:
+            request_id: Parent request id of an already-admitted request.
+            stopped_message: Error text raised when the scheduler stops mid-stream.
+
+        Yields:
+            New :class:`RequestOutput` snapshots whose ``delta_*`` fields
+            describe what changed since the last yield.
+
+        Raises:
+            RuntimeError: If the per-request event is missing or the scheduler
                 stops mid-stream.
         """
         with self._request_lock:
@@ -3816,7 +3836,7 @@ class eSurge:
                 self._raise_if_scheduler_failed()
                 if not self._generation_alive:
                     self.abort_request(request_id)
-                    raise RuntimeError("Background scheduler stopped while streaming multimodal request.")
+                    raise RuntimeError(stopped_message)
                 if self._recover_orphaned_request(request_id):
                     continue
 
@@ -3824,9 +3844,10 @@ class eSurge:
                 with self._output_lock:
                     ro = self._request_outputs.get(request_id)
                     if ro is None:
-                        continue
+                        raise RuntimeError(f"Output for admitted request {request_id!r} disappeared")
 
                     if ro.update_seq != last_update_seq:
+                        # Snapshot without holding the lock during yield
                         finished_snapshot = bool(ro.finished)
                         outputs_copy = []
                         for comp in ro.outputs:
@@ -3908,6 +3929,9 @@ class eSurge:
                     if snapshot.finished:
                         break
         finally:
+            registry = getattr(self, "_registry", None)
+            if registry is not None:
+                registry.release_output(request_id)
             with self._output_lock:
                 ro = self._request_outputs.get(request_id)
                 n_samples = len(ro.outputs) if ro is not None else 0
@@ -3918,6 +3942,9 @@ class eSurge:
                     if n_samples > 1:
                         for sample_idx in range(n_samples):
                             self._request_events.pop(f"{request_id}-{sample_idx}", None)
+                if self._max_request_outputs is not None:
+                    with self._output_lock:
+                        self._track_finished_output(request_id)
             else:
                 self.abort_request(request_id)
 
@@ -3950,6 +3977,13 @@ class eSurge:
         if req_event is None:
             raise RuntimeError("Request event missing")
 
+        try:
+            return self._wait_for_request_output(request_id, req_event)
+        finally:
+            self._release_output_consumer(request_id)
+
+    def _wait_for_request_output(self, request_id: str, req_event: threading.Event) -> RequestOutput:
+        """Collect one admitted request while its consumer holds the result lease."""
         output: RequestOutput | None = None
         while True:
             req_event.wait(timeout=1.0)
@@ -3962,7 +3996,9 @@ class eSurge:
                 continue
             with self._output_lock:
                 output = self._request_outputs.get(request_id)
-                if output is not None and output.finished:
+                if output is None:
+                    raise RuntimeError(f"Output for admitted request {request_id!r} disappeared")
+                if output.finished:
                     break
 
         # Request is finished; cleanup per-request events (retention honors max_request_outputs).

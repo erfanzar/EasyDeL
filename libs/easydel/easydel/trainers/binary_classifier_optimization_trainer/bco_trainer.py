@@ -23,11 +23,13 @@ imbalanced.
 
 from __future__ import annotations
 
+import json
 import typing as tp
 
 import jax
 import numpy as np
 from eformer.loggings import get_logger
+from eformer.paths import ePath
 from jax import numpy as jnp
 from tqdm.autonotebook import tqdm
 
@@ -35,6 +37,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
+from easydel.utils import is_remote_path
 from easydel.utils.registery import Registry
 
 from .._shared import copy_frozen_policy, drop_optimizer_state
@@ -42,6 +45,7 @@ from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import BCOPreprocessTransform
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
+from ..training_configurations import MetricsType
 from ..training_utils import compile_trainer_auxiliary, compile_trainer_step, resolve_straight_through_emulator
 from ..utils import BCODataCollatorGrain, BCODataCollatorTFDS
 from ._fn import RunningMoments, concatenated_forward, evaluation_step, training_step
@@ -53,6 +57,30 @@ if tp.TYPE_CHECKING:
     from easydel.data.core.protocols import ShardedDataSource
 
 logger = get_logger(__name__)
+
+BCO_RUNNING_MOMENTS_FILE = "bco_running_moments.json"
+"""Sidecar file (inside a checkpoint directory) holding the running BCO ``delta`` statistics."""
+
+
+class _EncoderDecoderBCOPreprocessTransform(BCOPreprocessTransform):
+    """Keep encoder prompts separate from completion-only decoder targets."""
+
+    def __call__(self, example):
+        for row in super().__call__(example):
+            labels = row["completion_labels"]
+            start = 0
+            while start < len(labels) and labels[start] == self._label_pad_token_id:
+                start += 1
+            row = dict(row)
+            for key in (
+                "completion_input_ids",
+                "completion_attention_mask",
+                "completion_labels",
+                "completion_decoder_input_ids",
+            ):
+                if key in row:
+                    row[key] = row[key][start:]
+            yield row
 
 
 @Registry.register("trainer", "bco")
@@ -231,6 +259,21 @@ class BCOTrainer(Trainer):
         # - Tokenize
         # All preprocessing is done lazily via the transform during iteration.
 
+        if arguments.dataset_num_proc is not None:
+            # Parallel eager preprocessing (``Dataset.map(num_proc=...)``) for map-style HF datasets;
+            # everything else keeps the lazy per-iteration BCOPreprocessTransform path.
+            eager_transform = self._get_preprocess_transform()
+            train_dataset = self._preprocess_dataset_parallel(train_dataset, eager_transform, arguments.dataset_num_proc)
+            if isinstance(eval_dataset, dict):
+                eval_dataset = {
+                    name: self._preprocess_dataset_parallel(value, eager_transform, arguments.dataset_num_proc)
+                    for name, value in eval_dataset.items()
+                }
+            else:
+                eval_dataset = self._preprocess_dataset_parallel(
+                    eval_dataset, eager_transform, arguments.dataset_num_proc
+                )
+
         super().__init__(
             arguments=arguments,
             dataset_train=train_dataset,
@@ -243,6 +286,54 @@ class BCOTrainer(Trainer):
         # Train UDM classifier after BaseTrainer sets up _train_source
         if self.embedding_func is not None and self.embedding_tokenizer is not None:
             self._train_density_ratio_classifier()
+
+    @staticmethod
+    def _preprocess_dataset_parallel(dataset: tp.Any, transform: BCOPreprocessTransform, num_proc: int | None) -> tp.Any:
+        """Run BCO preprocessing eagerly over a map-style HF dataset with ``num_proc`` workers.
+
+        Applies ``transform`` (unpairing, chat templating, tokenization) through
+        ``Dataset.map(batched=True, num_proc=...)``. Datasets that are not map-style
+        :class:`datasets.Dataset` objects, or that already carry ``prompt_input_ids``, are
+        returned unchanged and are preprocessed lazily by the trainer as usual.
+
+        Args:
+            dataset: Dataset (or ``None``) to preprocess.
+            transform: The :class:`BCOPreprocessTransform` to apply per row.
+            num_proc: Worker process count; values ``<= 1`` run in-process.
+
+        Returns:
+            The tokenized dataset, or ``dataset`` unchanged when eager preprocessing does not apply.
+        """
+        from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
+
+        if dataset is None or not isinstance(dataset, Dataset):
+            return dataset
+        column_names = list(dataset.column_names)
+        if "prompt_input_ids" in column_names:
+            return dataset
+
+        def _expand(batch: dict[str, list]) -> dict[str, list]:
+            keys = list(batch.keys())
+            out_rows = [
+                out
+                for values in zip(*batch.values(), strict=True)
+                for out in transform(dict(zip(keys, values, strict=True)))
+            ]
+            out_keys: list[str] = []
+            for row in out_rows:
+                for key in row:
+                    if key not in out_keys:
+                        out_keys.append(key)
+            return {key: [row.get(key) for row in out_rows] for key in out_keys}
+
+        return dataset.map(
+            _expand,
+            batched=True,
+            batch_size=64,
+            remove_columns=column_names,
+            num_proc=num_proc if num_proc is not None and num_proc > 1 else None,
+            desc="BCO preprocessing",
+        )
 
     @staticmethod
     def _resolve_policy_model(
@@ -267,23 +358,27 @@ class BCOTrainer(Trainer):
         """Put BCO policy/reference state modules into eval mode when requested."""
         return tuple(disable_state_dropout(state) for state in states)
 
-    def _get_preprocess_transform(self) -> BCOPreprocessTransform | None:
-        """Build the lazy BCO preprocessing transform for ``ShardedDataSource``.
+    def _get_preprocess_transform(self) -> BCOPreprocessTransform:
+        """Build the lazy BCO preprocessing transform for every source.
 
         :class:`BCOPreprocessTransform` is an expand-style transform
         that runs the full preprocessing pipeline (extract prompts from
         chosen/rejected pairs, unpair preference data into desirable /
         undesirable rows, apply the chat template, and tokenise) during
-        iteration rather than ahead of time.
+        iteration rather than ahead of time. It passes already-tokenised
+        rows through unchanged, so eager training preprocessing does not
+        disable lazy preprocessing of raw evaluation sources.
 
         Returns:
-            The configured :class:`BCOPreprocessTransform`, or ``None``
-            if the dataset is already tokenised (carries
-            ``prompt_input_ids``).
+            The configured :class:`BCOPreprocessTransform`, which checks
+            each row for existing ``prompt_input_ids`` independently.
         """
-        if self._is_pretokenized():
-            return None
-        return BCOPreprocessTransform(
+        transform_type = (
+            _EncoderDecoderBCOPreprocessTransform
+            if getattr(self.arguments, "is_encoder_decoder", False)
+            else BCOPreprocessTransform
+        )
+        return transform_type(
             tokenizer=self.processing_class,
             max_prompt_length=self.arguments.max_prompt_length,
             max_completion_length=self.arguments.max_completion_length,
@@ -296,9 +391,9 @@ class BCOTrainer(Trainer):
         """Return ``True`` when the train dataset already carries token ids.
 
         Peeks at the first sample of the first shard and checks for the
-        presence of ``prompt_input_ids``. Used to short-circuit the
-        preprocessing transform when callers feed in an already-
-        tokenised dataset.
+        presence of ``prompt_input_ids``. This query describes only the
+        training source; the preprocessing transform checks each row so
+        raw evaluation sources are still tokenised independently.
 
         Returns:
             ``True`` if the dataset is pre-tokenised, ``False`` if not
@@ -330,8 +425,10 @@ class BCOTrainer(Trainer):
     ) -> "ShardedDataSource | None":
         """Wrap a dataset in a sharded source, applying BCO tokenization if needed."""
         source = self._to_sharded_source(dataset)
-        if source is None or self._source_has_reference_logps(source) or self._source_is_pretokenized(source):
-            return source
+        if source is None:
+            return None
+        # Scores do not imply tokenization. The row-aware transform preserves
+        # tokenized examples and reference_logps, including mixed-schema sources.
         return source.transform(self._get_preprocess_transform())
 
     def _vectorize_prompt(self, input_ids: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
@@ -349,12 +446,21 @@ class BCOTrainer(Trainer):
             attention_mask: Matching ``[batch, seq]`` attention mask.
 
         Returns:
-            ``np.ndarray`` of prompt embeddings. Returns an empty array
+            ``[batch, hidden]`` embeddings, mask-mean-pooled for token-level
+            outputs. One-dimensional token inputs are promoted to a singleton
+            batch. Returns an empty array
             when ``embedding_func`` or ``embedding_tokenizer`` is
             unset.
         """
         if self.embedding_func is None or self.embedding_tokenizer is None:
             return np.array([])
+        input_ids = np.asarray(input_ids)
+        attention_mask = np.asarray(attention_mask)
+        if input_ids.ndim == 1:
+            input_ids = input_ids[None, :]
+            attention_mask = attention_mask[None, :]
+        if input_ids.ndim != 2 or attention_mask.shape != input_ids.shape:
+            raise ValueError("UDM input_ids and attention_mask must have matching [batch, seq] shapes.")
         input_ids = np.where(
             input_ids == self.processing_class.pad_token_id,
             getattr(self.embedding_tokenizer, "pad_token_id", self.processing_class.pad_token_id),
@@ -366,7 +472,13 @@ class BCOTrainer(Trainer):
         )
         if isinstance(embeddings, tuple):
             embeddings = embeddings[0]
-        return np.asarray(embeddings)
+        embeddings = np.asarray(embeddings)
+        if embeddings.ndim == 3 and embeddings.shape[:2] == input_ids.shape:
+            mask = attention_mask.astype(embeddings.dtype)[..., None]
+            embeddings = (embeddings * mask).sum(axis=1) / np.maximum(mask.sum(axis=1), 1)
+        if embeddings.ndim != 2 or embeddings.shape[0] != input_ids.shape[0]:
+            raise ValueError("UDM embedding_func must return [batch, seq, hidden] or [batch, hidden] embeddings.")
+        return embeddings
 
     def _train_density_ratio_classifier(self):
         """Fit the UDM density-ratio classifier on prompt embeddings.
@@ -406,7 +518,7 @@ class BCOTrainer(Trainer):
                 if emb.size == 0:
                     continue
 
-                pooled = emb.mean(axis=0)
+                pooled = emb[0]
                 if example.get("label", True):
                     desirable_embeddings.append(pooled)
                 else:
@@ -484,7 +596,7 @@ class BCOTrainer(Trainer):
 
         for _ in range(max_iter):
             logits = embeddings @ weights + bias
-            preds = 1.0 / (1.0 + np.exp(-logits))
+            preds = np.exp(-np.logaddexp(0.0, -logits))
             weights_vec = np.where(labels == 1, pos_weight, neg_weight)
             error = (preds - labels) * weights_vec
             grad_w = embeddings.T @ error / embeddings.shape[0]
@@ -524,20 +636,23 @@ class BCOTrainer(Trainer):
             straight_through_emulator=self.arguments.straight_through_emulator,
         )
 
-        def forward_fn(model, batch):
+        def forward_fn(model, batch, vocab_shard_stage=None):
             """Compute the BCO concatenated forward pass for ``batch``.
 
             Args:
                 model: The current policy or reference model module.
                 batch: The collated BCO batch.
+                vocab_shard_stage: Terminal pipeline-stage rank forwarded by the scheduled (MPMD)
+                    loss for vocab-sharded LM-head scoring; ``None`` outside pipeline schedules.
 
             Returns:
-                A 4-tuple ``(chosen_logps, rejected_logps, chosen_logits,
-                rejected_logits)`` plus optional aux-loss components.
+                Dict with ``completion_logps``, ``completion_logits``, ``mean_completion_logits``
+                and optionally ``aux_loss`` (see :func:`concatenated_forward`).
             """
             return concatenated_forward(
                 model,
                 batch,
+                vocab_shard_stage=vocab_shard_stage,
                 is_encoder_decoder=self.arguments.is_encoder_decoder,
                 label_pad_token_id=self.arguments.label_pad_token_id,
                 padding_value=self.padding_value,
@@ -773,6 +888,75 @@ class BCOTrainer(Trainer):
         setattr(self, source_attr, self._build_source_from_dataset(updated_dataset))
         return True
 
+    def on_step_end(
+        self,
+        state: EasyDeLState,
+        metrics: MetricsType,
+        step: int,
+    ) -> tuple[EasyDeLState, MetricsType]:
+        """Fold this step's implicit rewards into the running BCO ``delta``.
+
+        The compiled training step reports the sum, sum of squares and count of the
+        per-example implicit rewards (``reward_moments/*``). They are merged into
+        :attr:`running` so the next batch's ``running_mean`` (the BCO ``delta``
+        classifier threshold) tracks the mean reward as documented. Steps that do not
+        report reward moments leave the statistics unchanged.
+
+        Args:
+            state: Policy state after the optimizer update.
+            metrics: Metrics returned by the training step.
+            step: Global training step index.
+
+        Returns:
+            ``(state, metrics)`` forwarded from the parent hook.
+        """
+        state, metrics = super().on_step_end(state, metrics, step)
+        other = getattr(metrics, "other_metrics", None) or {}
+        count = other.get("reward_moments/count")
+        if count is not None:
+            # ``minibatch_call`` averages metrics over the accumulation microbatches, so all three
+            # reported moments are the true totals divided by ``gradient_accumulation_steps``.
+            # Ratios (mean, variance) are therefore exact; only the count needs rescaling.
+            reported_count = float(jax.device_get(count))
+            if reported_count > 0:
+                total = float(jax.device_get(other["reward_moments/sum"]))
+                total_sq = float(jax.device_get(other["reward_moments/sumsq"]))
+                mean = total / reported_count
+                variance = total_sq / reported_count - mean * mean
+                true_count = reported_count * max(int(self.arguments.gradient_accumulation_steps), 1)
+                self.running.update_from_moments(mean, variance, true_count)
+        return state, metrics
+
+    def _save_state(self, state: EasyDeLState, save_directory: str | None = None, *args, **kwargs) -> str:
+        """Save the policy state and the running BCO delta statistics next to it.
+
+        Args:
+            state: Policy state to serialize.
+            save_directory: Optional checkpoint directory override.
+            *args: Forwarded to the parent implementation.
+            **kwargs: Forwarded to the parent implementation.
+
+        Returns:
+            Path of the written checkpoint directory.
+        """
+        directory = super()._save_state(state, save_directory, *args, **kwargs)
+        if not is_remote_path(directory) or jax.process_index() == 0:
+            (ePath(directory) / BCO_RUNNING_MOMENTS_FILE).write_text(json.dumps(self.running.as_dict()))
+        return directory
+
+    def _load_auxiliary_states(self, checkpoint_path: str) -> None:
+        """Restore the running BCO delta statistics saved by :meth:`_save_state`.
+
+        Checkpoints written before the statistics were persisted have no such file;
+        ``delta`` then restarts from its initial value.
+
+        Args:
+            checkpoint_path: Checkpoint directory the policy state was resumed from.
+        """
+        moments_path = ePath(checkpoint_path) / BCO_RUNNING_MOMENTS_FILE
+        if moments_path.exists():
+            self.running.load_dict(json.loads(moments_path.read_text()))
+
     def _preprocess_batch_input(
         self,
         state: EasyDeLState,
@@ -823,12 +1007,8 @@ class BCOTrainer(Trainer):
                 np.asarray(batch["embedding_attention_mask"]),
             )
             if embeddings.size > 0:
-                if embeddings.ndim == 3:
-                    pooled = embeddings.mean(axis=1)
-                else:
-                    pooled = embeddings
-                logits = pooled @ weights + bias
-                prob = 1.0 / (1.0 + np.exp(-logits))
+                logits = embeddings @ weights + bias
+                prob = np.exp(-np.logaddexp(0.0, -logits))
                 ratio = prob / (1.0 - prob + 1e-8)
                 ratio = np.clip(ratio, self.arguments.min_density_ratio, self.arguments.max_density_ratio)
                 weights_array = np.where(np.asarray(batch["label"], dtype=bool), 1.0, ratio)

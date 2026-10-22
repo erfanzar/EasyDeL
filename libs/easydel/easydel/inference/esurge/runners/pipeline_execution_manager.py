@@ -12,15 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pipeline-parallel-aware execution manager for eSurge.
+"""Runner execution-manager lifecycle and pipeline-plan validation.
 
-Holds the single subclass of :class:`ExecutionManager` selected when the
-runner detects an enabled :class:`PipelineInferencePlan`. The subclass
-exists purely to enforce a hard invariant — *if PP is on, the plan must
-travel with the manager* — at construction time. All actual pipeline
-mechanics (per-stage compile, queue-backed dispatch, final-stage sampler
-placement) live in :class:`ExecutionManager` and
-:class:`ModelStepExecutor`; this file is a thin guard.
+:class:`RunnerExecutionManager` exposes idempotent cache allocation to the
+runner while retaining the base manager's bounded allocation retries.
+:class:`PipelineExecutionManager` adds the construction-time invariant that
+an enabled pipeline plan must travel with a PP manager. Pipeline mechanics
+remain in :class:`ExecutionManager` and :class:`ModelStepExecutor`.
 """
 
 from __future__ import annotations
@@ -35,7 +33,90 @@ from .pipeline_plan import PipelineInferencePlan
 logger = get_logger("eSurge-PipelineExecutionManager")
 
 
-class PipelineExecutionManager(ExecutionManager):
+class RunnerExecutionManager(ExecutionManager):
+    """Execution manager with a public, idempotent cache-allocation boundary.
+
+    Both SPMD and PP runners use this lifecycle API. The inherited allocation
+    implementation remains the single owner of cache layout, speculative
+    scratch sizing and bounded PP HBM-OOM shrink/retry behavior.
+    """
+
+    def execute_model(
+        self, num_tokens: int, padded_num_reqs: int, inputs: tp.Any, use_pipeline_runtime: bool = True
+    ) -> tp.Any:
+        """Retain the actual model request bucket, including PP prefix compaction."""
+        output = super().execute_model(
+            num_tokens=num_tokens,
+            padded_num_reqs=padded_num_reqs,
+            inputs=inputs,
+            use_pipeline_runtime=use_pipeline_runtime,
+        )
+        self._last_model_request_bucket = int(padded_num_reqs)
+        return output
+
+    def hidden_state_layout(
+        self, hidden_states: tp.Any, *, num_tokens: int, padded_num_reqs: int
+    ) -> tp.Literal["tokens", "requests"]:
+        """Identify the executed bucket's token-major or gathered hidden output.
+
+        Active token counts cannot discriminate these layouts: a compact output
+        can contain more padded request rows than the replay has active tokens.
+        Use the actual token/request buckets, and the executor's compiled-output
+        policy when those bucket sizes coincide. No device data is read.
+
+        Args:
+            hidden_states: Hidden output returned by this manager's execution.
+            num_tokens: Static token bucket used by that execution.
+            padded_num_reqs: Static model request bucket used by that execution.
+
+        Returns:
+            ``"tokens"`` for full backbone rows, ``"requests"`` for last-token
+            rows gathered by request.
+
+        Raises:
+            ValueError: If neither output layout matches the executed buckets.
+        """
+        hidden_len = int(hidden_states.shape[0])
+        executor = self._model_executor
+        if executor._uses_mpmd_mesh():
+            # PP may narrow a prefix-contiguous request bucket. Its fused step
+            # returns gathered rows; the stitched backbone path returns full rows.
+            model_request_bucket = int(getattr(self, "_last_model_request_bucket", padded_num_reqs))
+            fused_key = (int(num_tokens), model_request_bucket, "model_step", executor._compile_mode())
+            if hidden_len == model_request_bucket and fused_key in executor._cache:
+                return "requests"
+            if hidden_len == int(num_tokens):
+                return "tokens"
+        else:
+            token_rows = hidden_len == int(num_tokens)
+            request_rows = hidden_len == int(padded_num_reqs)
+            if token_rows != request_rows:
+                return "tokens" if token_rows else "requests"
+            if token_rows:
+                return "tokens" if 0 < int(num_tokens) <= self.full_hidden_state_max_tokens else "requests"
+        raise ValueError("Hidden output does not match the executed token or request bucket.")
+
+    def initialize_kv_cache(self, *, quantizer: tp.Any, masking_details: tp.Any = None) -> tp.Any:
+        """Return existing cache pages or allocate them through bounded retries.
+
+        Args:
+            quantizer: Quantizer built from the live model's KV-cache config.
+                Passed unchanged to the inherited allocation implementation.
+            masking_details: Optional live model mask details.
+
+        Returns:
+            Existing or newly allocated operations cache.
+
+        Raises:
+            Exception: Propagates allocation failures after the inherited retry
+                policy is exhausted, leaving ``kv_pages`` unset for a later retry.
+        """
+        if self.kv_pages is None:
+            self.kv_pages = self._init_operations_cache_with_retry(quantizer=quantizer, masking_details=masking_details)
+        return self.kv_pages
+
+
+class PipelineExecutionManager(RunnerExecutionManager):
     """:class:`ExecutionManager` specialization gated on an enabled PP plan.
 
     Selected by :class:`eSurgeRunner` when

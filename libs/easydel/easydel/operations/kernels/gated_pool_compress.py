@@ -44,7 +44,118 @@ from jaxtyping import Array
 from .._operation_impl import OperationImpl, OperationOutput, OperationRegistry
 from ..requirements import ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
 
-__all__ = ("GatedPoolCompressOp", "GatedPoolCompressOutput", "gated_pool_compress_op")
+__all__ = (
+    "BlockGroupLayout",
+    "GatedPoolCompressOp",
+    "GatedPoolCompressOutput",
+    "block_group_layout",
+    "gated_pool_compress_op",
+    "gather_group_members",
+    "last_closed_overlap",
+    "overlap_group_slots",
+    "refresh_group_state",
+)
+
+
+class BlockGroupLayout(tp.NamedTuple):
+    """Fixed-shape mapping of new tokens to compression groups and refreshed state slots.
+
+    Attributes:
+        from_state: Members sourced from the open-group buffer, ``[B, G * ratio]``.
+        state_index: Open-group slot for each member.
+        block_index: Block column for each new member.
+        closed: Groups completed by the block, ``[B, G]``.
+        entry: Stream entry indices, ``[B, G]``.
+        refresh: Buffer slots overwritten by this block, ``[B, ratio]``.
+        refresh_source: Block column whose value lands in each refreshed slot.
+    """
+
+    from_state: Array
+    state_index: Array
+    block_index: Array
+    closed: Array
+    entry: Array
+    refresh: Array
+    refresh_source: Array
+
+
+def block_group_layout(positions: Array, valid: Array, ratio: int) -> BlockGroupLayout:
+    """Map consecutive stream positions (valid prefixes per row) to ``ratio``-token groups.
+
+    Args:
+        positions: Stream positions ``[B, block]``; invalid cells are ignored.
+        valid: Boolean prefix mask of the same shape.
+        ratio: Positive, static compression group size.
+
+    Returns:
+        Layout with ``ceil((ratio - 1 + block) / ratio)`` group slots per row.
+    """
+    rows, block = positions.shape
+    positions = positions.astype(jnp.int32)
+    n_valid = jnp.sum(valid, axis=1).astype(jnp.int32)
+    pos0 = positions[:, 0]
+    offset = pos0 % ratio
+    groups = -(-(ratio - 1 + block) // ratio)
+    virtual = jnp.arange(groups * ratio, dtype=jnp.int32)[None, :]
+    from_state = jnp.broadcast_to(virtual < offset[:, None], (rows, groups * ratio))
+    state_index = jnp.broadcast_to(jnp.clip(virtual, 0, ratio - 1), (rows, groups * ratio))
+    block_index = jnp.clip(virtual - offset[:, None], 0, block - 1)
+    group = jnp.arange(groups, dtype=jnp.int32)[None, :]
+    closed = ((group * ratio + ratio - 1) < (offset + n_valid)[:, None]) & (n_valid > 0)[:, None]
+    entry = pos0[:, None] // ratio + group
+    last = pos0 + n_valid - 1
+    member = last[:, None] - ((last[:, None] - jnp.arange(ratio, dtype=jnp.int32)[None, :]) % ratio)
+    refresh = (member >= pos0[:, None]) & (n_valid > 0)[:, None]
+    refresh_source = jnp.clip(member - pos0[:, None], 0, block - 1)
+    return BlockGroupLayout(from_state, state_index, block_index, closed, entry, refresh, refresh_source)
+
+
+def gather_group_members(layout: BlockGroupLayout, state: Array, fresh: Array) -> Array:
+    """Gather ``[B, groups, ratio, features]`` members from earlier state and new block tokens."""
+    rows, ratio = fresh.shape[0], state.shape[1]
+    old = jnp.take_along_axis(state, layout.state_index[..., None], axis=1)
+    new = jnp.take_along_axis(fresh, layout.block_index[..., None], axis=1)
+    return jnp.where(layout.from_state[..., None], old, new).reshape(rows, -1, ratio, fresh.shape[-1])
+
+
+def overlap_group_slots(
+    kv_members: Array, gate_members: Array, overlap_kv: Array, overlap_gate: Array, head_dim: int
+) -> tuple[Array, Array]:
+    """Return two-series pool slots ``[Ca of previous group | Cb of current group]``."""
+    prev_kv = jnp.concatenate([overlap_kv.astype(kv_members.dtype)[:, None], kv_members[:, :-1, :, :head_dim]], axis=1)
+    prev_gate = jnp.concatenate(
+        [overlap_gate.astype(gate_members.dtype)[:, None], gate_members[:, :-1, :, :head_dim]], axis=1
+    )
+    return (
+        jnp.concatenate([prev_kv, kv_members[..., head_dim:]], axis=2),
+        jnp.concatenate([prev_gate, gate_members[..., head_dim:]], axis=2),
+    )
+
+
+def last_closed_overlap(
+    layout: BlockGroupLayout,
+    kv_members: Array,
+    gate_members: Array,
+    overlap_kv: Array,
+    overlap_gate: Array,
+    head_dim: int,
+) -> tuple[Array, Array]:
+    """Carry the last closed group's Ca half forward, leaving rows with no closed group unchanged."""
+    n_closed = jnp.sum(layout.closed, axis=1).astype(jnp.int32)
+    last = jnp.clip(n_closed - 1, 0, kv_members.shape[1] - 1)[:, None, None, None]
+    ca_kv = jnp.take_along_axis(kv_members, last, axis=1)[:, 0, :, :head_dim]
+    ca_gate = jnp.take_along_axis(gate_members, last, axis=1)[:, 0, :, :head_dim]
+    any_closed = (n_closed > 0)[:, None, None]
+    return (
+        jnp.where(any_closed, ca_kv.astype(overlap_kv.dtype), overlap_kv),
+        jnp.where(any_closed, ca_gate.astype(overlap_gate.dtype), overlap_gate),
+    )
+
+
+def refresh_group_state(layout: BlockGroupLayout, state: Array, fresh: Array) -> Array:
+    """Apply the latest block write for each open-group buffer slot."""
+    src = jnp.take_along_axis(fresh, layout.refresh_source[..., None], axis=1)
+    return jnp.where(layout.refresh[..., None], src, state)
 
 
 @auto_pytree
@@ -183,15 +294,6 @@ def _extend(
     compute_dtype: jnp.dtype | None,
 ) -> GatedPoolCompressOutput:
     """Advance by a block per row; every group closing inside the block is pooled in one pass."""
-    # The group-layout helpers live with the layer package, which itself reaches this operation lazily.
-    from easydel.layers.compressed_window._compressor import (
-        block_group_layout,
-        gather_group_members,
-        last_closed_overlap,
-        overlap_group_slots,
-        refresh_group_state,
-    )
-
     layout = block_group_layout(positions, valid, rate)
     fresh_kv = kv.astype(buffer_kv.dtype)
     fresh_gate = gate.astype(buffer_gate.dtype)

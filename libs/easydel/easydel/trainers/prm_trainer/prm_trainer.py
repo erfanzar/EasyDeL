@@ -20,8 +20,7 @@ import typing as tp
 from easydel.infra.base_state import EasyDeLState
 from easydel.utils import Registry
 
-from ..model_loading import disable_state_dropout, reject_string_model_id
-from ..reward_trainer import RewardTrainer
+from ..model_loading import apply_tokenizer_overrides, disable_state_dropout, reject_string_model_id
 from ..trainer import Trainer
 from .prm_config import PRMConfig
 from .prm_preprocess import PRMPreprocessTransform
@@ -71,14 +70,9 @@ class PRMTrainer(Trainer):
         if processing_class is None:
             raise ValueError("processing_class must be specified.")
         if isinstance(model, str):
-            raise ValueError(
-                "EasyDeL PRMTrainer does not accept token-classification model ids. "
-                "Load an initialized EasyDeL token-classification module/state first."
-            )
-        if isinstance(model, str):
             reject_string_model_id(model, role="token-classification model")
         tokenizer = processing_class.tokenizer if hasattr(processing_class, "tokenizer") else processing_class
-        RewardTrainer._apply_tokenizer_overrides(tokenizer, eos_token=arguments.eos_token, pad_token=arguments.pad_token)
+        apply_tokenizer_overrides(tokenizer, eos_token=arguments.eos_token, pad_token=arguments.pad_token)
         if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
             tokenizer.pad_token = tokenizer.eos_token
         if not isinstance(model, EasyDeLState):
@@ -97,24 +91,32 @@ class PRMTrainer(Trainer):
             processing_class=processing_class,
         )
 
-    def _get_preprocess_transform(self) -> PRMPreprocessTransform | None:
-        """Return PRM preprocessing unless the source already has labels.
+    def _get_preprocess_transform(self, is_eval: bool = False) -> PRMPreprocessTransform:
+        """Return PRM preprocessing with the requested training or evaluation policy.
 
         The transform is configured from trainer arguments, including step
         separator, max lengths, final-step-only supervision, and padding
-        multiple. Pretokenized sources skip this path entirely.
+        multiple. Pretokenized rows pass through unchanged.
         """
-        if self._is_pretokenized():
-            return None
         return PRMPreprocessTransform(
-            tokenizer=self.processing_class,
+            tokenizer=getattr(self.processing_class, "tokenizer", self.processing_class),
             step_separator=self.arguments.step_separator,
             max_length=self.arguments.max_length,
             max_completion_length=self.arguments.max_completion_length,
             train_on_last_step_only=self.arguments.train_on_last_step_only,
-            is_eval=False,
+            is_eval=is_eval,
             pad_to_multiple_of=self.arguments.pad_to_multiple_of,
         )
+
+    def _apply_preprocess_transforms(self) -> None:
+        """Apply independent training and evaluation label policies to PRM sources."""
+        self._dataset_preprocess_workers()
+        if self._train_source is not None:
+            self._train_source = self._preprocess_source(self._train_source, self._get_preprocess_transform())
+        if self._eval_source is not None:
+            self._eval_source = self._preprocess_source(self._eval_source, self._get_preprocess_transform(is_eval=True))
+        if getattr(self.arguments, "sequence_packing", False):
+            self._apply_sequence_packing_to_sources()
 
     @staticmethod
     def tokenize_row(

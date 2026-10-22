@@ -431,7 +431,7 @@ def init_none_hash() -> None:
     global none_hash
 
     _hash_seed_env: str | None = os.getenv("PYTHONHASHSEED")
-    hash_seed: int | None = int(_hash_seed_env) if _hash_seed_env is not None else None
+    hash_seed: int | None = int(_hash_seed_env) if _hash_seed_env not in (None, "random") else None
     none_hash = int.from_bytes(os.urandom(32), byteorder="big") if hash_seed is None else hash(hash_seed)
 
 
@@ -475,6 +475,19 @@ def hash_page_tokens(
     )
 
 
+def request_page_hash_extra_keys(request: EngineRequest) -> tuple[Any, ...] | None:
+    """Return the same multimodal identity for initial and incremental page hashes."""
+    mm_features = getattr(request, "mm_features", None)
+    if getattr(request, "has_vision", False) and mm_features:
+        try:
+            return tuple(
+                (str(getattr(feat, "modality", "mm")), str(getattr(feat, "mm_hash", ""))) for feat in mm_features
+            )
+        except Exception:
+            return ("multimodal",)
+    return None
+
+
 def hash_request_tokens(hash_function: Any, page_size: int, request: EngineRequest) -> list[PageHash]:
     """Compute hash values for all complete pages in a request's token sequence.
 
@@ -504,24 +517,7 @@ def hash_request_tokens(hash_function: Any, page_size: int, request: EngineReque
         6
     """
     token_ids = request.all_token_ids
-
-    req_extra_keys = None
-    # Vision-language models: KV prefix caching must include multimodal content.
-    #
-    # For many VLMs the prompt `token_ids` can be identical across different
-    # images/videos (e.g. `<image>` placeholders expand to a fixed count based
-    # on resolution bucket), while the actual KV state depends on the vision
-    # inputs. If we don't include a multimodal key here, prefix caching may
-    # incorrectly reuse a KV prefix computed for a different image, causing the
-    # model to "see" the wrong picture.
-    mm_features = getattr(request, "mm_features", None)
-    if getattr(request, "has_vision", False) and mm_features:
-        try:
-            req_extra_keys = tuple(
-                (str(getattr(feat, "modality", "mm")), str(getattr(feat, "mm_hash", ""))) for feat in mm_features
-            )
-        except Exception:
-            req_extra_keys = ("multimodal",)
+    req_extra_keys = request_page_hash_extra_keys(request)
 
     ret = []
     parent_page_hash_value = None

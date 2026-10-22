@@ -60,7 +60,8 @@ class SpeculativeStrategy(typing.Protocol):
         reject_backoff_steps: Drafter-call backoff after a full rejection
             (``0`` disables the stop-loss).
         debug_traces: Collected host-side verify traces (diagnostics).
-        debug_max_traces: Trace budget (``EASYDEL_SPEC_DECODE_DEBUG_STEPS``).
+        debug_max_traces: Trace budget, configured with the runner's
+            ``spec_debug_max_traces`` constructor argument.
         draft_full_log_probs_by_req: Per-request stacked draft
             log-probability tensors awaiting verification.
     """

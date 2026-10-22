@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from easydel.utils import Registry
+from easydel.utils.compiling_utils import hash_fn
 
 from ..group_relative_policy_optimization import GRPOConfig
 
@@ -32,6 +33,8 @@ class MiniLLMConfig(GRPOConfig):
     changes how the per-token advantage is accumulated; ``kd_temperature``
     scales the sampled-token reverse-KL signal.
     """
+
+    __hash__ = hash_fn
 
     trainer_prefix: str | None = field(default="MiniLLM")
     rkl_advantage: bool = field(default=True)

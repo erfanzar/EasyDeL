@@ -49,8 +49,10 @@ as long as `actions:` exists.
 
 from __future__ import annotations
 
+import argparse
 import json
 import pprint
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -68,10 +70,18 @@ class ElargeArgs:
         config: Path to the YAML configuration file.
         dry_run: If ``True``, parse and print the config/actions without
             executing them.
+        dp_router_child: Internal marker set on the CPU-pinned re-exec of the
+            data-parallel serve router so it does not re-exec again. Not meant
+            to be passed by hand.
     """
 
     config: str | None = field(default=None, metadata={"help": "Path to YAML config.", "aliases": ["-c"]})
     dry_run: bool = field(default=False, metadata={"help": "Parse and print config/actions, then exit."})
+    dp_router_child: bool = field(default=False, metadata={"help": argparse.SUPPRESS})
+
+
+# True inside the CPU-pinned re-exec of the DP-serve router (set from ``--dp-router-child`` in ``main``).
+_DP_ROUTER_CHILD: ContextVar[bool] = ContextVar("_DP_ROUTER_CHILD", default=False)
 
 
 def _load_yaml(path: str) -> dict[str, Any]:
@@ -321,7 +331,7 @@ def _serve_replicated(
     import tempfile
     import time
 
-    if os.environ.get("_ELARGE_DP_ROUTER") != "1":
+    if not _DP_ROUTER_CHILD.get():
         # This process already imported easydel/jax, which initializes the
         # local accelerator at import time — and the replicas need those
         # chips. Re-exec ourselves CPU-pinned: the exec replaces the
@@ -340,11 +350,15 @@ def _serve_replicated(
             except (OSError, ValueError):
                 continue
         environ = dict(os.environ)
-        environ["_ELARGE_DP_ROUTER"] = "1"
         environ["JAX_PLATFORMS"] = "cpu"
         environ["ENABLE_DISTRIBUTED_INIT"] = "0"
         logger.info("Re-executing the DP-serve router CPU-pinned; replicas own the accelerator.")
-        os.execve(sys.executable, [sys.executable, "-m", "easydel.scripts.elarge", *sys.argv[1:]], environ)
+        # The child is marked with an internal CLI flag so it does not re-exec again.
+        os.execve(
+            sys.executable,
+            [sys.executable, "-m", "easydel.scripts.elarge", *sys.argv[1:], "--dp-router-child"],
+            environ,
+        )
 
     try:
         import yaml
@@ -416,56 +430,60 @@ def _serve_replicated(
         chip_envs = _plan_replica_tpu_envs(count)
         platform_override = replicas_params.get("platform")
         targets = []
-        for index in range(count):
-            control_port = base_control_port + index
-            overlay = {
-                "config": config_dict,
-                "actions": [
-                    {
-                        "serve_replica": {
-                            "control_port": control_port,
-                            "auth_token": auth_token,
-                            "bind_host": "127.0.0.1",
+        try:
+            for index in range(count):
+                control_port = base_control_port + index
+                overlay = {
+                    "config": config_dict,
+                    "actions": [
+                        {
+                            "serve_replica": {
+                                "control_port": control_port,
+                                "auth_token": auth_token,
+                                "bind_host": "127.0.0.1",
+                            }
                         }
-                    }
-                ],
-            }
-            overlay_path = os.path.join(workdir, f"replica_{index}.yaml")
-            with open(overlay_path, "w", encoding="utf-8") as handle:
-                yaml.safe_dump(overlay, handle, sort_keys=False)
+                    ],
+                }
+                overlay_path = os.path.join(workdir, f"replica_{index}.yaml")
+                with open(overlay_path, "w", encoding="utf-8") as handle:
+                    yaml.safe_dump(overlay, handle, sort_keys=False)
 
-            env = dict(os.environ)
-            env.update(chip_envs[index])
-            env["ENABLE_DISTRIBUTED_INIT"] = "0"
-            # Replicas auto-detect their accelerator; drop the router's
-            # CPU pin and re-exec marker unless the YAML forces a platform.
-            env.pop("JAX_PLATFORMS", None)
-            env.pop("_ELARGE_DP_ROUTER", None)
-            if platform_override:
-                env["JAX_PLATFORMS"] = str(platform_override)
+                env = dict(os.environ)
+                env.update(chip_envs[index])
+                env["ENABLE_DISTRIBUTED_INIT"] = "0"
+                # Replicas auto-detect their accelerator; drop the router's
+                # CPU pin unless the YAML forces a platform.
+                env.pop("JAX_PLATFORMS", None)
+                if platform_override:
+                    env["JAX_PLATFORMS"] = str(platform_override)
 
-            log_path = os.path.join(workdir, f"replica_{index}.log")
-            log_file = open(log_path, "w")
-            log_paths.append(log_path)
-            open_logs.append(log_file)
-            procs.append(
-                subprocess.Popen(
-                    [sys.executable, "-m", "easydel.scripts.elarge", "--config", overlay_path],
-                    env=env,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
+                log_path = os.path.join(workdir, f"replica_{index}.log")
+                log_file = open(log_path, "w")
+                log_paths.append(log_path)
+                open_logs.append(log_file)
+                procs.append(
+                    subprocess.Popen(
+                        [sys.executable, "-m", "easydel.scripts.elarge", "--config", overlay_path],
+                        env=env,
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                    )
                 )
-            )
-            targets.append(("127.0.0.1", control_port))
+                targets.append(("127.0.0.1", control_port))
+        except BaseException:
+            # A failed spawn must not strand the replicas already started (each holds TPU chips).
+            _stop_replicas(procs, open_logs)
+            raise
         logger.info("Spawned %d replica processes (logs under %s); waiting for their request planes.", count, workdir)
-
-    from easydel.inference import eSurgeApiServer
-    from easydel.inference.esurge.distributed.remote_engine import RemoteEngineHandle
-    from easydel.inference.esurge.distributed.request_plane import RequestPlaneUnavailable
-    from easydel.inference.esurge.distributed.routed_engine import RoutedEngine
 
     handles: list[RemoteEngineHandle] = []
     try:
+        from easydel.inference import eSurgeApiServer
+        from easydel.inference.esurge.distributed.remote_engine import RemoteEngineHandle
+        from easydel.inference.esurge.distributed.request_plane import RequestPlaneUnavailable
+        from easydel.inference.esurge.distributed.routed_engine import RoutedEngine
+
         deadline = time.time() + ready_timeout_s
         for index, (addr, control_port) in enumerate(targets):
             while True:
@@ -515,13 +533,35 @@ def _serve_replicated(
                 handle.close()
             except Exception:
                 pass
+        _stop_replicas(procs, open_logs)
+
+
+def _stop_replicas(procs: list[Any], open_logs: list[Any]) -> None:
+    """Terminate spawned replica processes and close their log files.
+
+    Args:
+        procs: Replica ``subprocess.Popen`` handles (may be empty).
+        open_logs: Open replica log file objects.
+    """
+    import subprocess
+
+    try:
         for proc in procs:
-            proc.terminate()
+            try:
+                proc.terminate()
+            except OSError:
+                # An exited process may disappear between startup failure and cleanup.
+                continue
         for proc in procs:
             try:
                 proc.wait(timeout=15)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                proc.wait()
+    finally:
         for log_file in open_logs:
             log_file.close()
 
@@ -810,6 +850,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("config_pos", nargs="?", help="Path to YAML config.")
     args, extra = parser.parse_args_into_dataclasses(args=argv, look_for_args_file=False)
+
+    _DP_ROUTER_CHILD.set(bool(args.dp_router_child))
 
     config_path = args.config or getattr(extra, "config_pos", None)
     if not config_path:

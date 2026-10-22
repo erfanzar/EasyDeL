@@ -138,6 +138,23 @@ def _infer_batch_embed_dim(rows: list[dict], embeds_list: list[np.ndarray], embe
         row_dim = row.get("embed_dim")
         if row_dim is not None:
             dims.add(int(row_dim))
+        # Resolve width across the whole batch BEFORE decoding any text-only
+        # row. Inspect every image blob so metadata cannot hide mixed widths.
+        counts = [int(v) for v in _as_list(row.get("embed_n_tok"))]
+        blobs = _as_list(row.get("image_embeds"))
+        if len(counts) != len(blobs):
+            raise ValueError(f"embed_n_tok/image_embeds length mismatch: {len(counts)} != {len(blobs)}")
+        for count, blob in zip(counts, blobs, strict=True):
+            if count < 0:
+                raise ValueError("embed_n_tok must be nonnegative")
+            if count == 0:
+                if len(blob):
+                    raise ValueError("nonempty image embedding blob has zero embed_n_tok")
+                continue
+            denominator = count * 2  # The persisted format is bf16.
+            if len(blob) % denominator:
+                raise ValueError(f"cannot infer embed_dim: blob has {len(blob)} bytes for {count} bf16 rows")
+            dims.add(len(blob) // denominator)
     for embeds in embeds_list:
         if embeds.ndim == 2 and embeds.shape[1] > 0:
             dims.add(int(embeds.shape[1]))
@@ -145,10 +162,19 @@ def _infer_batch_embed_dim(rows: list[dict], embeds_list: list[np.ndarray], embe
         raise ValueError("embed_dim is required when every packed row is text-only")
     if len(dims) != 1:
         raise ValueError(f"mixed embed_dim values in one packed batch: {sorted(dims)}")
-    return dims.pop()
+    dimension = dims.pop()
+    if dimension <= 0:
+        raise ValueError("embed_dim must be positive")
+    return dimension
 
 
-def _decode_row_embeds(row: dict, embed_dim: int | None = None, embed_dtype: tp.Any = np.float32) -> np.ndarray:
+def _decode_row_embeds(
+    row: dict,
+    embed_dim: int | None = None,
+    embed_dtype: tp.Any = np.float32,
+    *,
+    image_token_id: int | None = None,
+) -> np.ndarray:
     """Decode a row's per-image bf16 blobs to a single ``(sum(embed_n_tok), embed_dim)`` array."""
     import ml_dtypes
 
@@ -158,6 +184,13 @@ def _decode_row_embeds(row: dict, embed_dim: int | None = None, embed_dtype: tp.
     blobs = _as_list(row.get("image_embeds"))
     if len(ent) != len(blobs):
         raise ValueError(f"embed_n_tok/image_embeds length mismatch: {len(ent)} != {len(blobs)}")
+    if image_token_id is not None:
+        placeholders = int(np.count_nonzero(np.asarray(row["input_ids"]) == image_token_id))
+        if placeholders != sum(ent):
+            raise ValueError(
+                f"per-row placeholder/embed mismatch: {placeholders} image-placeholder tokens "
+                f"but {sum(ent)} decoded embed rows"
+            )
     mats = [
         np.frombuffer(b, dtype=ml_dtypes.bfloat16).reshape(ent[i], ed).astype(resolved_dtype, copy=False)
         for i, b in enumerate(blobs)
@@ -186,6 +219,7 @@ def collate_embeds_pack(
     """
     assert pad_id != image_token_id, "pad_id must not collide with the image placeholder id"
     resolved_dtype = _resolve_embed_dtype(embed_dtype)
+    resolved_embed_dim = _infer_batch_embed_dim(rows, [], embed_dim)
     bsz = len(rows)
     max_len = max(len(r["input_ids"]) for r in rows)
 
@@ -203,7 +237,7 @@ def collate_embeds_pack(
         input_ids[bi, :length] = ids
         attention_mask[bi, :length] = np.asarray(r["attention_mask"], dtype=np.int32)
         labels[bi, :length] = np.asarray(r["labels"], dtype=np.int32)
-        embeds_list.append(_decode_row_embeds(r, embed_dim, resolved_dtype))
+        embeds_list.append(_decode_row_embeds(r, resolved_embed_dim, resolved_dtype, image_token_id=image_token_id))
         grids.append(np.asarray(r["image_grid_thw"], dtype=np.int32).reshape(-1, 3))
         place_positions = np.flatnonzero(ids == image_token_id).astype(np.int32, copy=False)
         n_place = place_positions.shape[0]
@@ -292,6 +326,7 @@ def collate_bucket_static(
             "the bucketed window must equal the band's upper edge"
         )
 
+    resolved_embed_dim = _infer_batch_embed_dim(rows, [], embed_dim)
     bsz = len(rows)
     input_ids = np.full((bsz, seq_len), pad_id, dtype=np.int32)
     attention_mask = np.zeros((bsz, seq_len), dtype=np.int32)
@@ -311,7 +346,7 @@ def collate_bucket_static(
         input_ids[bi, :length] = ids
         attention_mask[bi, :length] = np.asarray(r["attention_mask"], dtype=np.int32)
         labels[bi, :length] = np.asarray(r["labels"], dtype=np.int32)
-        embeds_list.append(_decode_row_embeds(r, embed_dim, resolved_dtype))
+        embeds_list.append(_decode_row_embeds(r, resolved_embed_dim, resolved_dtype, image_token_id=image_token_id))
         grids.append(np.asarray(r["image_grid_thw"], dtype=np.int32).reshape(-1, 3))
         place_positions = np.flatnonzero(ids == image_token_id).astype(np.int32, copy=False)
         n_place = place_positions.shape[0]
@@ -404,6 +439,7 @@ def collate_packed_embeds(
     # regime. Do NOT check slen_band: packing DELIBERATELY mixes sub-band lengths into one window, so
     # the ``collate_bucket_static`` ``slen_band == seq_len`` equality does not apply here.
     flat_rows = [r for pack in packs for r in pack]
+    resolved_embed_dim = _infer_batch_embed_dim(flat_rows, [], embed_dim)
     for key in ("source", "area_bucket"):
         vals = {r[key] for r in flat_rows if key in r}
         assert len(vals) <= 1, (
@@ -473,7 +509,7 @@ def collate_packed_embeds(
                 example_positions = np.arange(length, dtype=np.int32).reshape(1, 1, -1).repeat(3, axis=0)
             position_ids[:, wi, window_slice] = np.asarray(example_positions)[:, 0, :]
 
-            embeds_list.append(_decode_row_embeds(r, embed_dim, resolved_dtype))
+            embeds_list.append(_decode_row_embeds(r, resolved_embed_dim, resolved_dtype, image_token_id=image_token_id))
             grids.append(grid)
             place_positions = np.flatnonzero(ids == image_token_id).astype(np.int32, copy=False)
             n_place = place_positions.shape[0]

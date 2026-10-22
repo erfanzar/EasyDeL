@@ -346,8 +346,8 @@ class Registry:
             category: Registry bucket to search.
             impl_name: Alias to look up.
             wakeup: When ``True`` (default), the method first imports
-                ``easydel.inference``/``infra``/``kernels``/``layers``/
-                ``modules``/``trainers`` so that any decorator-based
+                ``easydel.inference``/``infra``/``layers``/``modules``/
+                ``operations``/``trainers`` so that any decorator-based
                 registrations sitting behind a lazy module get a chance to
                 execute. Set to ``False`` for tight inner loops where the
                 module is known to already be imported.
@@ -363,7 +363,7 @@ class Registry:
         wakeup_error: Exception | None = None
         if wakeup:
             try:
-                from easydel import inference, infra, kernels, layers, modules, trainers  # noqa  # pyright: ignore[reportUnusedImport]
+                from easydel import inference, infra, layers, modules, operations, trainers  # noqa  # pyright: ignore[reportUnusedImport]
             except Exception as exc:
                 wakeup_error = exc
                 logger.debug("Registry wakeup failed while importing EasyDeL built-ins.", exc_info=True)
@@ -452,9 +452,9 @@ class Registry:
         """
         if wakeup:
             try:
-                from easydel import inference, infra, kernels, layers, modules, trainers  # noqa  # pyright: ignore[reportUnusedImport]
+                from easydel import inference, infra, layers, modules, operations, trainers  # noqa  # pyright: ignore[reportUnusedImport]
             except Exception:
-                ...
+                logger.debug("Registry wakeup failed while importing EasyDeL built-ins.", exc_info=True)
         with cls._lock:
             return dict(cls._registry.get(category, {}))
 

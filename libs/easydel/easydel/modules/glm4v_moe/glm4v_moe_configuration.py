@@ -23,8 +23,9 @@ schedule). This module exposes:
   routing knobs and mRoPE.
 - :class:`Glm4vMoeConfig`: top-level VLM config that composes the two
   sub-configs and stores image/video special-token ids.
-- :func:`_rope_scaling_from_rope_parameters`: HF-to-EasyDeL RoPE bridge
-  with the GLM-4V mRoPE preset as the default fallback.
+- :func:`~easydel.layers.rotary._scaling.rope_scaling_from_rope_parameters`:
+  shared HF-to-EasyDeL RoPE bridge, used here with the GLM-4V mRoPE preset as the
+  default fallback.
 - :func:`_patch_hf_glm4v_moe_router_logits_output`: import-time patch
   that backfills missing ``router_logits`` and ``num_experts(_per_tok)``
   attributes on older HF GLM-4V-MoE releases so EasyDeL conversion code
@@ -36,6 +37,8 @@ from collections.abc import Mapping
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+from easydel.layers.rotary._scaling import rope_scaling_from_rope_parameters
+from easydel.modules.glm4v.glm4v_configuration import GLM4V_DEFAULT_ROPE_SCALING
 
 
 def _patch_hf_glm4v_moe_router_logits_output() -> None:
@@ -142,63 +145,6 @@ def _patch_hf_glm4v_moe_router_logits_output() -> None:
 
 
 _patch_hf_glm4v_moe_router_logits_output()
-
-
-def _rope_scaling_from_rope_parameters(
-    rope_parameters: dict[str, typing.Any] | None,
-    rope_scaling: dict[str, typing.Any] | None,
-) -> dict[str, typing.Any] | None:
-    """Normalise HF ``rope_parameters`` into EasyDeL ``rope_scaling`` for GLM-4V-MoE.
-
-    Mirrors :func:`easydel.modules.glm4v.glm4v_configuration._rope_scaling_from_rope_parameters`:
-    when ``rope_scaling`` is supplied it wins (a stray ``type`` key is
-    aliased to ``rope_type``); otherwise the relevant keys are copied from
-    ``rope_parameters`` including ``mrope_section`` / ``mrope_interleaved``.
-    Falls back to the GLM-4V-MoE mRoPE preset
-    ``{"rope_type": "default", "mrope_section": [8, 12, 12]}`` when both
-    inputs are missing.
-
-    Args:
-        rope_parameters: HF-style RoPE parameters mapping or ``None``.
-        rope_scaling: EasyDeL RoPE scaling mapping or ``None``.
-
-    Returns:
-        A normalised ``rope_scaling`` mapping (never ``None``).
-    """
-    if rope_scaling is not None:
-        # HF sometimes uses "type" instead of "rope_type"
-        if "type" in rope_scaling and "rope_type" not in rope_scaling:
-            rope_scaling = dict(rope_scaling)
-            rope_scaling["rope_type"] = rope_scaling["type"]
-        return rope_scaling
-
-    if rope_parameters is None:
-        # Default mRoPE for GLM4V-family models.
-        # Matches upstream GLM4V-family configs (e.g. zai-org/GLM-4.5V).
-        return {"rope_type": "default", "mrope_section": [8, 12, 12]}
-
-    rope_scaling_out: dict[str, typing.Any] = {
-        "rope_type": rope_parameters.get("rope_type", "default"),
-    }
-    for key in (
-        "factor",
-        "original_max_position_embeddings",
-        "low_freq_factor",
-        "high_freq_factor",
-        "short_factor",
-        "long_factor",
-        "beta_fast",
-        "beta_slow",
-        "extrapolation_factor",
-        "attn_factor",
-        "mscale",
-        "mscale_all_dim",
-        "mrope_section",
-        "mrope_interleaved",
-    ):
-        if key in rope_parameters:
-            rope_scaling_out[key] = rope_parameters[key]
-    return rope_scaling_out
 
 
 @register_config("glm4v_moe_vision")
@@ -441,7 +387,7 @@ class Glm4vMoeTextConfig(EasyDeLBaseConfig):
                 ``rope_parameters["rope_theta"]`` and then ``10000.0``.
             rope_scaling: EasyDeL-flavoured RoPE scaling dict.
             rope_parameters: HF-style RoPE parameters (merged via
-                :func:`_rope_scaling_from_rope_parameters`).
+                :func:`~easydel.layers.rotary._scaling.rope_scaling_from_rope_parameters`).
             moe_intermediate_size: Inner width of each routed expert FFN.
             num_experts_per_tok: Routed experts selected per token.
             n_shared_experts: Shared experts always applied to every token.
@@ -475,7 +421,9 @@ class Glm4vMoeTextConfig(EasyDeLBaseConfig):
         if rope_theta is None and rope_parameters is not None:
             rope_theta = rope_parameters.get("rope_theta", 10000.0)
         self.rope_theta = 10000.0 if rope_theta is None else float(rope_theta)
-        self.rope_scaling = _rope_scaling_from_rope_parameters(rope_parameters, rope_scaling)
+        self.rope_scaling = rope_scaling_from_rope_parameters(
+            rope_parameters, rope_scaling, default=GLM4V_DEFAULT_ROPE_SCALING
+        )
 
         self.moe_intermediate_size = moe_intermediate_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -542,6 +490,8 @@ class Glm4vMoeConfig(EasyDeLBaseConfig):
     """
 
     model_type = "glm4v_moe"
+    # The vision stem consumes flattened spatio-temporal patches, not NCHW images.
+    esurge_flat_patch_inputs = True
     sub_configs: typing.ClassVar = {
         "vision_config": Glm4vMoeVisionConfig,
         "text_config": Glm4vMoeTextConfig,

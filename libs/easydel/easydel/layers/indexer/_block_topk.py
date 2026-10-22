@@ -52,6 +52,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from ..linears import ColumnParallelLinear
 from ..norms import RMSNorm
+from ..rotary import apply_rope_split_half
 from ._selection import BaseIndexer, IndexerSelection, SelectionSpec
 
 __all__ = ("BlockTopKIndexer", "apply_partial_rope")
@@ -76,18 +77,7 @@ def apply_partial_rope(
     Returns:
         Rotated tensor with the same shape as ``x``.
     """
-    rotary_dim = cos.shape[-1]
-    x_rope, x_nope = x[..., :rotary_dim], x[..., rotary_dim:]
-    half = rotary_dim // 2
-    x1, x2 = x_rope[..., :half], x_rope[..., half:]
-    # cos/sin arrive pre-doubled ([half | half]); this is exactly
-    # (x1 + i x2) * (cos + i sin) in split-half (NeoX) form.
-    rotated = jnp.concatenate(
-        [x1 * cos[..., :half] - x2 * sin[..., :half], x2 * cos[..., half:] + x1 * sin[..., half:]], axis=-1
-    )
-    if rotary_dim == x.shape[-1]:
-        return rotated
-    return jnp.concatenate([rotated, x_nope], axis=-1)
+    return apply_rope_split_half(x, cos, sin, unsqueeze_dim=None, compute_dtype=None)
 
 
 class BlockTopKIndexer(BaseIndexer):
@@ -264,7 +254,7 @@ class BlockTopKIndexer(BaseIndexer):
             Positive infinity is a valid score; negative infinity is not.
         """
         picked = self.select_candidates(scores, min(self.block_topk, scores.shape[-1]), mesh_source=self.mesh_source)
-        selected = self._expand_selection(picked.indices, picked.indices >= 0, first_visible, q_indices, q_live)
+        selected = self.expand_selection(picked.indices, picked.indices >= 0, first_visible, q_indices, q_live)
         if kv_len is None or picked.mask is None:
             return IndexerSelection(selected)
         mask = self._expand_selection_mask(picked.mask, first_visible, q_indices, q_live, kv_len)
@@ -440,7 +430,7 @@ class BlockTopKIndexer(BaseIndexer):
             return selected, token_scores
         return selected
 
-    def _expand_selection(
+    def expand_selection(
         self,
         top_blocks: Int[Array, "batch qseq k"],
         picked_valid: Bool[Array, "batch qseq k"],
@@ -453,6 +443,21 @@ class BlockTopKIndexer(BaseIndexer):
         Block members are disjoint by construction and the incomplete tail
         block is always fully visible to its query, so the returned indices
         are duplicate-free, ``-1``-padded to ``token_budget + ratio - 1``.
+        Ranking may come from dense scores or a bounded paged top-k kernel;
+        this method only expands the existing picks without rescoring keys.
+
+        Args:
+            top_blocks: Selected logical block indices, relative to each
+                row's first visible token. Valid picks must be distinct,
+                complete blocks visible to their query.
+            picked_valid: Whether each selected block contributes members.
+            first_visible: Absolute first-visible token offset per row.
+            q_idx: Absolute token offset of each query.
+            q_live: Whether each query belongs to the visible sequence.
+
+        Returns:
+            Logical token offsets, with invalid block members and tail
+            lanes set to ``-1`` and fixed width ``token_budget + ratio - 1``.
         """
         batch, q_len, k_pick = top_blocks.shape
         ratio = self.compress_ratio
@@ -475,6 +480,9 @@ class BlockTopKIndexer(BaseIndexer):
         elif selected.shape[-1] < width:
             selected = jnp.pad(selected, ((0, 0), (0, 0), (0, width - selected.shape[-1])), constant_values=-1)
         return selected.astype(jnp.int32)
+
+    # Keep the original name and parameter names for existing model adapters.
+    _expand_selection = expand_selection
 
     def _expand_selection_mask(
         self,
@@ -600,7 +608,7 @@ class BlockTopKIndexer(BaseIndexer):
                 block_end[:, None, :k_pick] <= write_at.astype(jnp.int32)[:, None, None]
             )
             picked_valid = picked_valid & q_live[:, None, None]
-            return self._expand_selection(
+            return self.expand_selection(
                 top_blocks,
                 picked_valid,
                 first_visible,

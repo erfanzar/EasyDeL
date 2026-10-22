@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array
 
-from easydel.infra.sharding import pick_mesh, resolve_safe_sharding
+from easydel.infra.sharding import resolve_safe_sharding
 
 
 def all_gather_then_dot(x: Array, kernel: Array, axis_name: str, *, precision: jax.lax.PrecisionLike) -> Array:
@@ -37,4 +37,4 @@ def all_gather_then_dot(x: Array, kernel: Array, axis_name: str, *, precision: j
     return jnp.einsum("...i,io->...o", gathered, kernel, precision=precision)
 
 
-__all__ = ["all_gather_then_dot", "pick_mesh", "resolve_safe_sharding"]
+__all__ = ["all_gather_then_dot", "resolve_safe_sharding"]

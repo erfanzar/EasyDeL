@@ -197,6 +197,9 @@ class Mistral4Config(EasyDeLBaseConfig):
         layer_types (`list[str]`, *optional*):
             Per-layer attention types; defaults to ``"full_attention"`` for
             every layer.
+        moe_debug (`bool`, *optional*, defaults to `False`):
+            Opt into per-layer router and expert tensor diagnostics on the standard
+            MoE execution path. May add host callbacks; ordinary forwards remain silent.
     """
 
     model_type = "mistral4"
@@ -245,6 +248,7 @@ class Mistral4Config(EasyDeLBaseConfig):
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
         layer_types: list[str] | None = None,
+        moe_debug: bool = False,
         **kwargs,
     ):
         """Initialize a new Mistral4Config instance.
@@ -289,6 +293,8 @@ class Mistral4Config(EasyDeLBaseConfig):
             attention_bias: Whether attention projections carry biases.
             attention_dropout: Dropout on the attention probabilities.
             layer_types: Per-layer attention type schedule.
+            moe_debug: Opt into tensor diagnostics on the standard MoE path.
+                Defaults to False; enabling this may add host callbacks.
             **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
 
         Raises:
@@ -320,6 +326,7 @@ class Mistral4Config(EasyDeLBaseConfig):
         self.num_experts_per_tok = num_experts_per_tok
         self.first_k_dense_replace = first_k_dense_replace
         self.norm_topk_prob = norm_topk_prob
+        self.moe_debug = moe_debug
         self.hidden_act = hidden_act
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps

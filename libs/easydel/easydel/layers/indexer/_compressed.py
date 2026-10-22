@@ -30,7 +30,12 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Float, Int
 
-from easydel.layers.compressed_window import advance_compressor_stream, compress_windows, trace_compressor_stream
+from easydel.layers.compressed_window import (
+    advance_compressor_stream,
+    compress_windows,
+    entry_visibility,
+    trace_compressor_stream,
+)
 from easydel.layers.linears import ColumnParallelLinear
 from easydel.layers.norms import RMSNorm
 
@@ -306,8 +311,7 @@ class CompressedIndexer(BaseIndexer):
 
     def _select_causal(self, index_scores: Array, position_ids: Array, compressed_len: int) -> IndexerSelection:
         """:meth:`_select_causal_top_k` as a full selection (indices and mask)."""
-        causal_threshold = (position_ids + 1) // self.compress_rate
-        valid = jnp.arange(compressed_len)[None, None, :] < causal_threshold[..., None]
+        valid = entry_visibility(position_ids, compressed_len, self.compress_rate)
         return self.select_candidates(index_scores, self.index_topk, valid, self.mesh_source)
 
     def _select_causal_top_k(self, index_scores: Array, position_ids: Array, compressed_len: int) -> Array:

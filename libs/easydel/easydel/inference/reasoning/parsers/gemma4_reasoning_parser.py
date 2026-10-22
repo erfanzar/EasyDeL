@@ -32,7 +32,8 @@ from functools import cached_property
 from transformers import AutoTokenizer as AnyTokenizer
 
 from ...openai_api_modules import DeltaMessage
-from ..abstract_reasoning import ReasoningParser, ReasoningParserManager
+from ..abstract_reasoning import ReasoningParserManager
+from ..basic_parsers import BaseThinkingReasoningParser
 
 # Role label that Gemma4 emits at the start of the thinking channel.
 _THOUGHT_PREFIX = "thought\n"
@@ -42,7 +43,7 @@ CHANNEL_END = "<channel|>"
 
 
 @ReasoningParserManager.register_module("gemma4")  # pyright: ignore[reportUntypedClassDecorator]
-class Gemma4ReasoningParser(ReasoningParser):
+class Gemma4ReasoningParser(BaseThinkingReasoningParser):
     """Extract reasoning content from Gemma4 model outputs.
 
     Gemma4 uses ``<|channel>thought\\n...reasoning...<channel|>`` for
@@ -125,6 +126,7 @@ class Gemma4ReasoningParser(ReasoningParser):
                 compatibility).
         """
         del prompt_token_ids
+        self._emitted_reasoning = self._emitted_content = ""
         self._prompt_channel = None
         for match in self._channel_pattern.finditer(prompt_text or ""):
             self._prompt_channel = match.group(1).strip() or None
@@ -202,46 +204,32 @@ class Gemma4ReasoningParser(ReasoningParser):
         early reasoning tokens until the prefix is fully consumed, then
         emit the remainder.
         """
-        del previous_token_ids, delta_token_ids, request
+        return self._emit_snapshot(*self._channel_snapshot(current_text))
 
-        previous_reasoning, previous_content = self._parse_channels(
-            previous_text,
-            initial_channel=self._prompt_channel,
-        )
-        current_reasoning, current_content = self._parse_channels(
-            current_text,
-            initial_channel=self._prompt_channel,
-        )
+    def _channel_snapshot(self, text: str, *, final: bool = False) -> tuple[str, str]:
+        """Buffer unfinished channel headers and release ambiguous labels on channel exit."""
+        stable = text
+        if not final:
+            stable = self._without_marker_prefix(stable, CHANNEL_START)
+        opening = stable.rfind(CHANNEL_START)
+        if opening >= 0 and CHANNEL_END not in stable[opening + len(CHANNEL_START) :]:
+            stable = stable[:opening]
+        reasoning, content = self._parse_channels(stable, initial_channel=self._prompt_channel)
+        reasoning = reasoning or ""
+        last_channel = self._prompt_channel
+        for match in self._channel_pattern.finditer(stable):
+            last_channel = match.group(1).strip()
+        if not final and last_channel in self._REASONING_CHANNELS and _THOUGHT_PREFIX.startswith(reasoning):
+            reasoning = ""
+        else:
+            reasoning = _strip_thought_label(reasoning)
+        return reasoning, content or ""
 
-        reasoning_delta = _suffix(previous_reasoning, current_reasoning)
-        content_delta = _suffix(previous_content, current_content)
-
-        # Strip the thought\n prefix from the reasoning stream
-        if reasoning_delta is not None:
-            self._reasoning_text += reasoning_delta
-
-            if not self._prefix_stripped:
-                if self._reasoning_text.startswith(_THOUGHT_PREFIX):
-                    prefix_len = len(_THOUGHT_PREFIX)
-                    prev_reasoning_len = len(self._reasoning_text) - len(reasoning_delta)
-                    if prev_reasoning_len >= prefix_len:
-                        self._prefix_stripped = True
-                    else:
-                        chars_of_prefix_in_delta = prefix_len - prev_reasoning_len
-                        stripped = reasoning_delta[chars_of_prefix_in_delta:]
-                        self._prefix_stripped = len(self._reasoning_text) >= prefix_len
-                        reasoning_delta = stripped or None
-                elif _THOUGHT_PREFIX.startswith(self._reasoning_text):
-                    # Still buffering — might be partial prefix
-                    reasoning_delta = None
-                else:
-                    # Doesn't match prefix at all — emit everything buffered
-                    self._prefix_stripped = True
-                    reasoning_delta = self._reasoning_text
-
-        if reasoning_delta is None and content_delta is None:
-            return None
-        return DeltaMessage(reasoning_content=reasoning_delta, content=content_delta)
+    def extract_reasoning_final(self, model_output: str, request=None) -> tuple[str | None, str | None]:
+        """Suppress confirmed channel headers even when generation ends inside a header."""
+        reasoning, content = self._channel_snapshot(model_output, final=True)
+        recognized = CHANNEL_START in model_output or self._prompt_channel is not None
+        return reasoning if recognized or reasoning else None, content or None
 
     _REASONING_CHANNELS = frozenset({"thought", "analysis"})
 
@@ -282,8 +270,8 @@ class Gemma4ReasoningParser(ReasoningParser):
             current_channel = match.group(1).strip() or None
             cursor = match.end()
 
-        reasoning = "".join(reasoning_parts).strip() or None
-        content = "".join(content_parts).strip() or None
+        reasoning = "".join(reasoning_parts) or None
+        content = "".join(content_parts) or None
         return reasoning, content
 
 

@@ -239,6 +239,10 @@ class SFTConfig(TrainingArguments):
         max_sequence_length: int | None,
         quantization_block: int | None,
     ):
+        if self.activation_offloading:
+            raise ValueError("`activation_offloading=True` is not supported by EasyDeL SFT.")
+        if self.dataset_num_proc is not None and self.dataset_num_proc <= 0:
+            raise ValueError("`dataset_num_proc` must be positive when set.")
         if self.loss_type not in ("nll", "dft", "chunked_nll"):
             raise ValueError("`loss_type` must be one of 'nll', 'dft', or 'chunked_nll'.")
         if self.truncation_mode not in ("keep_end", "keep_start"):

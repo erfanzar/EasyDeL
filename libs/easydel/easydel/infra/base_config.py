@@ -110,8 +110,7 @@ logger = get_logger(__name__)
 DEFAULT_SHARDING_AXIS_DIMS: tuple[int, ...] = (1, 1, -1, 1, 1, 1)
 DEFAULT_SHARDING_AXIS_NAMES: tuple[str, ...] = ("pp", "dp", "fsdp", "ep", "tp", "sp")
 
-# Model weight file name constants for different frameworks.
-# These are used when loading/saving models in various formats.
+# Model weight / processor file-name constants retained for direct-import compatibility.
 
 WEIGHTS_NAME = "pytorch_model.bin"
 
@@ -160,10 +159,6 @@ SP_IS_EP_BOUND = True
 
 # Whether to use ring topology for expert dispatch by default.
 RING_EXPERTS = False
-
-# Environment variable flags for runtime configuration.
-# Flag indicating whether EKernel operations are enabled via EKERNEL_OPS env var.
-EKERNEL_OPS = check_bool_flag("EKERNEL_OPS", default=False)
 
 _REMOVED_BASE_CONFIG_KEYS = frozenset(
     {
@@ -758,6 +753,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         "_experts_implementation_internal": None,
     }
 
+    # Families whose HF config stores RoPE parameters per layer type (``{layer_type: {...}}``) set this to True.
+    per_layer_rope_parameters: tp.ClassVar[bool] = False
+
     _rope_relevant_keys: tp.ClassVar[set[str]] = {
         "rope_parameters",
         "rope_scaling",
@@ -765,6 +763,22 @@ class EasyDeLBaseConfig(PretrainedConfig):
         "partial_rotary_factor",
         "layer_types",
     }
+
+    _mesh_cache_names: tp.ClassVar[tuple[str, ...]] = (
+        "_hidden_mesh",
+        "_hidden_explicit_mesh",
+        "_hidden_manual_mesh",
+    )
+    _mesh_input_keys: tp.ClassVar[frozenset[str]] = frozenset(
+        {
+            "sharding_axis_dims",
+            "sharding_axis_names",
+            "sharding_dcn_axis_dims",
+            "backend",
+            "should_sort_granules_by_key",
+            "allow_split_physical_axes",
+        }
+    )
 
     def __setattr__(self, key, value):
         """Set an attribute, normalizing RoPE and MoE-related fields on the fly.
@@ -778,6 +792,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         # HF v5 expects `rope_parameters` to include `rope_theta`.
         # Keep late assignments (e.g. tests mutating `config.rope_scaling`) compatible.
+        if key in self._mesh_input_keys and key in self.__dict__ and self.__dict__[key] != value:
+            # Explicit user meshes are pinned; only topology-derived caches
+            # should be rebuilt after late overrides (including graph rebuilds).
+            for cache_name in self._mesh_cache_names:
+                if self.__dict__.get(f"{cache_name}_auto_created", False):
+                    object.__setattr__(self, cache_name, None)
         raw_rope_parameters = None
         if key in {"rope_scaling", "rope_parameters"} and isinstance(value, dict):
             raw_rope_parameters = value
@@ -1006,10 +1026,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
         layer_types = getattr(self, "layer_types", None)
         unique_layer_types = list(dict.fromkeys(layer_types)) if isinstance(layer_types, (list, tuple)) else None
         # Only a small set of models encode RoPE parameters per layer-type in HF configs.
-        # Most models (e.g. Gemma2) expect a flat `rope_parameters` mapping.
-        per_layer_rope_model_types = {"gemma3_text"}
-        model_type = getattr(self, "model_type", None)
-        multi_layer_rope = model_type in per_layer_rope_model_types and bool(unique_layer_types)
+        # Most models (e.g. Gemma2) expect a flat `rope_parameters` mapping. Families opt in by
+        # setting the ``per_layer_rope_parameters`` class attribute to True.
+        declares_per_layer_rope = bool(getattr(type(self), "per_layer_rope_parameters", False))
+        multi_layer_rope = declares_per_layer_rope and bool(unique_layer_types)
 
         rope_parameters = getattr(self, "rope_parameters", None) if hasattr(self, "rope_parameters") else None
         if rope_parameters is None and rope_theta is None:
@@ -1599,7 +1619,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             return self._hidden_mesh
 
         mesh = self._as_spx_mesh(self._build_mesh())
-        self.set_model_mesh(mesh)
+        self._propagate_mesh_to_sub_configs(mesh, "_hidden_mesh", "set_model_mesh", auto_created=True)
         return mesh
 
     @property
@@ -1613,7 +1633,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             return self._hidden_explicit_mesh
 
         mesh = self._as_spx_mesh(self._build_mesh(axis_types="explicit"))
-        self.set_explicit_mesh(mesh)
+        self._propagate_mesh_to_sub_configs(mesh, "_hidden_explicit_mesh", "set_explicit_mesh", auto_created=True)
         return mesh
 
     @property
@@ -1627,7 +1647,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             return self._hidden_manual_mesh
 
         mesh = self._as_spx_mesh(self._build_mesh(axis_types="manual"))
-        self.set_manual_mesh(mesh)
+        self._propagate_mesh_to_sub_configs(mesh, "_hidden_manual_mesh", "set_manual_mesh", auto_created=True)
         return mesh
 
     def _stage_spmd_devices(self) -> np.ndarray:
@@ -1787,6 +1807,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         mesh: MeshLike,
         attr_name_on_self: str,
         setter_method_name: str,
+        *,
+        auto_created: bool = False,
+        _visited: set[int] | None = None,
     ):
         """Propagate a mesh to ``self`` and all declared sub-configurations.
 
@@ -1800,9 +1823,18 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 config and its sub-configs (e.g. ``"_hidden_mesh"``).
             setter_method_name: Public setter to invoke on sub-configs when
                 present (e.g. ``"set_model_mesh"``).
+            auto_created: Whether topology overrides may invalidate this cache.
+                False for explicit user assignments, True for lazy construction.
+            _visited: Shared identity set to guard cyclic config graphs.
         """
+        if _visited is None:
+            _visited = set()
+        if id(self) in _visited:
+            return
+        _visited.add(id(self))
         spx_mesh = self._as_spx_mesh(mesh)
         setattr(self, attr_name_on_self, spx_mesh)
+        setattr(self, f"{attr_name_on_self}_auto_created", auto_created)
 
         sub_configs = getattr(self, "sub_configs", None)
         if not isinstance(sub_configs, dict):
@@ -1813,7 +1845,15 @@ class EasyDeLBaseConfig(PretrainedConfig):
             if sub_cfg is None:
                 continue
             try:
-                if hasattr(sub_cfg, setter_method_name):
+                if isinstance(sub_cfg, EasyDeLBaseConfig):
+                    sub_cfg._propagate_mesh_to_sub_configs(
+                        spx_mesh,
+                        attr_name_on_self,
+                        setter_method_name,
+                        auto_created=auto_created,
+                        _visited=_visited,
+                    )
+                elif hasattr(sub_cfg, setter_method_name):
                     getattr(sub_cfg, setter_method_name)(spx_mesh)
                 else:
                     setattr(sub_cfg, attr_name_on_self, spx_mesh)
@@ -1847,6 +1887,16 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         self._propagate_mesh_to_sub_configs(mesh, "_hidden_manual_mesh", "set_manual_mesh")
 
+    def get_mesh(self) -> spx.SpxMesh:
+        """Return the device mesh for this configuration.
+
+        Equivalent to the :attr:`mesh` property; kept as a method for callers that prefer an explicit getter.
+
+        Returns:
+            spx.SpxMesh: The (lazily created or explicitly set) device mesh.
+        """
+        return self.mesh
+
     def jax_mesh(self):
         """Deprecated method for getting the JAX mesh.
 
@@ -1856,7 +1906,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         Returns:
             JAX device mesh.
         """
-        warnings.warn("`jax_mesh` is deprecated use `get_mesh` or `mesh`", stacklevel=1)
+        warnings.warn("`jax_mesh` is deprecated use `get_mesh` or `mesh`", DeprecationWarning, stacklevel=2)
         return self.get_mesh()
 
     @classmethod
@@ -1925,7 +1975,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             >>> config = EasyDeLBaseConfig(backend='')
             >>> config.get_backend()  # Might return 'gpu', 'tpu', etc.
         """
-        return self.backend if not self.backend == "" else jax.extend.backend.get_backend().platform
+        return self.backend if self.backend else jax.extend.backend.get_backend().platform
 
     def read_basics_from_config(self, config: EasyDeLBaseConfig):
         """Reads and applies basic configuration attributes from another config instance.
@@ -1992,6 +2042,11 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "moe_chunk_size",
             "moe_fsdp_shard_expert_weights",
             "moe_ep_carries_batch",
+            "use_fused_mlp",
+            "collective_matmul_impl",
+            "fcm_max_ratio",
+            "fcm_min_ratio",
+            "operation_configs",
         ]
         for key in base_reads:
             if hasattr(config, key):
@@ -2694,6 +2749,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         try:
             result = copy.deepcopy(self.__dict__)
             result.pop(_ROPE_FIELDS_SYNCED_ATTR, None)
+            for cache_name in self._mesh_cache_names:
+                result.pop(f"{cache_name}_auto_created", None)
             if hasattr(self.__class__, "model_type"):
                 result["model_type"] = self.__class__.model_type
 
@@ -2941,9 +2998,21 @@ class EasyDeLBaseConfig(PretrainedConfig):
         files_timestamps: dict[str, float] = {}
         if push_to_hub:
             commit_message = kwargs.pop("commit_message", None)
-            repo_id = kwargs.pop("repo_id", save_directory.split(os.path.sep)[-1])
-            repo_id = self._create_repo(repo_id, **kwargs)
-            files_timestamps = self._get_files_timestamps(save_directory)
+            repo_id = kwargs.pop("repo_id", None) or easy_directory.name
+            create_repo = getattr(self, "_create_repo", None)
+            if callable(create_repo):
+                repo_id = create_repo(repo_id, **kwargs)
+            else:
+                # transformers v5 dropped ``PushToHubMixin._create_repo``; create the repo through the Hub API.
+                from huggingface_hub import create_repo as hub_create_repo
+
+                repo_id = hub_create_repo(
+                    repo_id,
+                    token=kwargs.get("token"),
+                    private=kwargs.get("private"),
+                    exist_ok=True,
+                ).repo_id
+            files_timestamps = self._get_files_timestamps(str(easy_directory))
 
         output_config_file = easy_directory / CONFIG_NAME
 
@@ -2952,7 +3021,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         if push_to_hub:
             self._upload_modified_files(
-                save_directory,
+                str(easy_directory),
                 repo_id,
                 files_timestamps,
                 commit_message=commit_message,
@@ -3099,7 +3168,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             resolved_config_file = download_url(pretrained_model_name_or_path)
         else:
             configuration_file = kwargs.pop("_configuration_file", CONFIG_NAME) if gguf_file is None else gguf_file
-            google_cloud_file = ePath(pretrained_model_name_or_path) / configuration_file
+            google_cloud_file = ePath(pretrained_model_name_or_path) / subfolder / configuration_file
             if not google_cloud_file.exists():
                 try:
                     resolved_config_file = cached_file(
@@ -3498,50 +3567,78 @@ class EasyDeLBaseConfig(PretrainedConfig):
         mask = self._create_causal_mask(target_length)
         return ModuleCaches(spx.with_sharding_constraint(mask, Ps(), mesh=self.mesh, ignore_mpmd=True))
 
-    def get_fcm_mask(self, batch_size, seq_length, deterministic: bool):
+    def get_fcm_mask(
+        self,
+        batch_size: int | None = None,
+        seq_length: int | None = None,
+        deterministic: bool = False,
+        rng: jax.Array | None = None,
+        *,
+        key: jax.Array | None = None,
+        shape: tuple[int, int, int, int] | None = None,
+        fcm_ratio: float | None = None,
+    ):
         """Generate a Forgetful Causal Mask (FCM) for training.
 
-        FCM is a regularization technique that randomly drops some causal
-        constraints during training. This encourages the model to be more
-        robust by not over-relying on the full context. The dropping ratio
-        is sampled uniformly between `fcm_min_ratio` and `fcm_max_ratio`.
-
-        Only applied in non-deterministic mode (training) and when
-        `fcm_max_ratio > 0`.
+        FCM randomly hides context positions during training. By default the
+        dropping ratio is sampled per sequence uniformly between
+        ``fcm_min_ratio`` and ``fcm_max_ratio``. The documented ``key``, ``shape``,
+        ``fcm_ratio`` calling convention is also supported for a fixed ratio.
 
         Args:
-            batch_size (int): Number of sequences in the batch.
-            seq_length (int): Length of each sequence.
-            deterministic (bool): If True, returns None (no FCM applied).
-                Set to False during training to enable FCM.
+            batch_size: Number of sequences. May be omitted when ``shape`` is given.
+            seq_length: Sequence length. May be omitted when ``shape`` is given.
+            deterministic: If True, return None (no FCM applied).
+            rng: PRNG key used to sample the mask. Required when FCM is active.
+                A config owns no RNG stream, so the caller supplies it explicitly.
+            key: Alias for ``rng`` used by the shape-based calling convention.
+            shape: Optional mask shape ``(batch_size, 1, seq_length, seq_length)``.
+            fcm_ratio: Optional fixed dropping probability in [0, 1]. Overrides
+                the configured ratio range and enables FCM even if that range is disabled.
 
         Returns:
-            jnp.ndarray | None: Boolean mask with shape [batch_size, 1, seq_length, seq_length]
-                where True indicates positions that should be attended to.
-                Returns None if:
-                - `deterministic` is True (evaluation/inference mode)
-                - `fcm_max_ratio` is 0 or negative (FCM disabled)
+            Boolean mask of shape ``[batch_size, 1, seq_length, seq_length]``
+            where True means visible, or None when deterministic or when FCM is
+            disabled and no fixed ratio was supplied. The first context position
+            is always visible. Combine this mask with the causal attention mask.
 
-        Note:
-            The first position (index 0) is always attended to, ensuring
-            the model can always see the beginning of sequence token.
-            Requires `self.make_rng("fcm")` to be available for random sampling.
+        Raises:
+            ValueError: If active FCM lacks a PRNG key, the dimensions or ratio
+                are invalid, or conflicting calling conventions are supplied.
         """
-        if not deterministic and self.fcm_max_ratio > 0:
-            fcm_ratio = jax.random.uniform(
-                self.make_rng("fcm"),
+        if deterministic or (fcm_ratio is None and self.fcm_max_ratio <= 0):
+            return None
+        if rng is not None and key is not None:
+            raise ValueError("Specify only one of `rng` and `key`.")
+        rng = key if rng is None else rng
+        if rng is None:
+            raise ValueError("`get_fcm_mask` requires `rng` or `key` (a JAX PRNG key) when FCM is active.")
+        if shape is not None:
+            if len(shape) != 4 or shape[1] != 1 or shape[2] != shape[3]:
+                raise ValueError("`shape` must be (batch_size, 1, seq_length, seq_length).")
+            if batch_size is not None and batch_size != shape[0]:
+                raise ValueError("`batch_size` conflicts with `shape`.")
+            if seq_length is not None and seq_length != shape[2]:
+                raise ValueError("`seq_length` conflicts with `shape`.")
+            batch_size, seq_length = shape[0], shape[2]
+        if batch_size is None or seq_length is None or batch_size <= 0 or seq_length <= 0:
+            raise ValueError("Positive `batch_size` and `seq_length` (or `shape`) are required.")
+        if fcm_ratio is None:
+            if not 0 <= self.fcm_min_ratio <= self.fcm_max_ratio <= 1:
+                raise ValueError("FCM ratios must satisfy 0 <= fcm_min_ratio <= fcm_max_ratio <= 1.")
+            ratio_key, mask_key = jax.random.split(rng)
+            ratio = jax.random.uniform(
+                ratio_key,
                 shape=(batch_size, 1, 1, 1),
                 minval=self.fcm_min_ratio,
                 maxval=self.fcm_max_ratio,
             )
-            fcm_mask = (
-                jax.random.uniform(self.make_rng("fcm"), shape=(batch_size, 1, seq_length, seq_length)) > fcm_ratio
-            )
-            fcm_mask = fcm_mask.at[:, :, :, 0].set(True)
-            fcm_mask = fcm_mask.astype("bool")
         else:
-            fcm_mask = None
-        return fcm_mask
+            if not 0 <= fcm_ratio <= 1:
+                raise ValueError("`fcm_ratio` must be in [0, 1].")
+            ratio, mask_key = fcm_ratio, rng
+        mask = jax.random.uniform(mask_key, shape=(batch_size, 1, seq_length, seq_length)) >= ratio
+        return mask.at[:, :, :, 0].set(True)
 
     def get_kv_shared_layer_mapping(self) -> dict[int, int]:
         """Return a mapping from KV-shared layer indices to their donor indices.

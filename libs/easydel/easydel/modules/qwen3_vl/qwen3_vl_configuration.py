@@ -251,6 +251,7 @@ class Qwen3VLConfig(EasyDeLBaseConfig):
     """
 
     model_type = "qwen3_vl"
+    esurge_flat_patch_inputs: typing.ClassVar[bool] = True
     sub_configs: typing.ClassVar = {
         "vision_config": Qwen3VLVisionConfig,
         "text_config": Qwen3VLTextConfig,

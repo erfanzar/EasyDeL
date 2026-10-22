@@ -72,6 +72,51 @@ def normalize_attn_mechanism_value(attn_mechanism: Any) -> str | None:
     return str(attn_mechanism)
 
 
+def normalize_decoding_engine(decoding_engine: str | None) -> str | None:
+    """Normalize an explicit serving backend; ``None``/``auto`` retain auto-selection."""
+    if decoding_engine is None or decoding_engine == "auto":
+        return None
+    if decoding_engine not in ("ring", "triton"):
+        raise ValueError("decoding_engine must be 'auto', 'ring', 'triton', or None")
+    return decoding_engine
+
+
+def select_decoding_engine(model: EasyDeLBaseModule, decoding_engine: str | None) -> EasyDeLBaseModule:
+    """Select a registered paged backend without changing parameters or hiding substitution.
+
+    Args:
+        model: Loaded target module. Its original config and state are not mutated.
+        decoding_engine: ``ring`` selects the paged ring adapter; ``triton`` selects
+            GPU unified paged attention. ``None``/``auto`` preserve automatic selection.
+
+    Returns:
+        A compatible module with the requested attention graph and original state.
+
+    Raises:
+        ValueError: For unknown engines, unavailable GPU execution, or a model whose
+            cache/compatibility contract cannot retain the requested implementation.
+    """
+    decoding_engine = normalize_decoding_engine(decoding_engine)
+    if decoding_engine is None:
+        return model.esurge_compatible_model
+
+    mechanism = "ring_paged" if decoding_engine == "ring" else "unified_attention"
+    selected = model.get_esurge_compatible_model(decoding_engine=decoding_engine)
+    # Runners and wrapper models also resolve this legacy property. Verify that
+    # it preserves the public explicit-selection contract rather than retargeting.
+    compatible = selected.esurge_compatible_model
+    compatible_config = compatible.config.get_text_config()
+    if normalize_attn_mechanism_value(getattr(compatible_config, "attn_mechanism", None)) != mechanism or any(
+        normalize_attn_mechanism_value(getattr(compatible_config, field, None)) not in {None, mechanism}
+        for field in ("decode_attn_mechanism", "mla_attn_mechanism")
+    ):
+        raise ValueError(
+            f"Model eSurge compatibility cannot retain decoding_engine={decoding_engine!r} ({mechanism!r}); "
+            "refusing to silently substitute a different attention backend"
+        )
+    return compatible
+
+
 def _text_config_uses_mla(text_config: Any) -> bool:
     """Detect whether a text config indicates Multi-Latent Attention (MLA).
 
@@ -357,6 +402,7 @@ def _load_model(
     runtime_config: eSurgeRuntimeConfig,
     data_parallelism_axis: str,
     dtype,
+    decoding_engine: str | None = None,
 ) -> EasyDeLBaseModule:
     """Load a model from an id/path with eSurge attention preferences.
 
@@ -371,6 +417,7 @@ def _load_model(
         runtime_config: Runtime section (max_model_len feeds rope/mask caps).
         data_parallelism_axis: KV-page DP axis name (mesh membership check).
         dtype: Compute/storage dtype for the loaded weights.
+        decoding_engine: Explicit paged backend selection, or ``None`` for automatic.
 
     Returns:
         The loaded (and possibly graphdef-swapped) module.
@@ -386,6 +433,17 @@ def _load_model(
     user_config_kwargs = dict(loading_kwargs.config_kwargs or {})
     user_provided_attn = "attn_mechanism" in user_config_kwargs
     requested_attn = user_config_kwargs.get("attn_mechanism") if user_provided_attn else None
+    decoding_engine = normalize_decoding_engine(decoding_engine)
+    if decoding_engine is not None:
+        if decoding_engine == "triton" and backend != "gpu":
+            raise ValueError("decoding_engine='triton' requires a GPU backend")
+        requested_attn = "ring_paged" if decoding_engine == "ring" else "unified_attention"
+        user_provided_attn = True
+        user_config_kwargs.update(
+            decode_attn_mechanism=requested_attn,
+            mla_attn_mechanism=requested_attn,
+            esurge_decoding_engine=decoding_engine,
+        )
     if requested_attn is None:
         user_provided_attn = False
 
@@ -438,17 +496,24 @@ def _load_model(
     loading["precision"] = jax.lax.Precision.DEFAULT
     loading["sharding_axis_dims"] = tuple(loading_kwargs.sharding_axis_dims)
     loading["sharding_axis_names"] = sharding_axis_names_resolved
-    loading["config_kwargs"] = EasyDeLBaseConfigDict(
+    # Explicit model config overrides win over engine defaults. Backend policy
+    # is resolved above (including explicit decoding_engine validation).
+    config_defaults = dict(
         attn_mechanism=requested_attn if user_provided_attn else preferred_attn_mechanism,
         attn_dtype=dtype,
         kvdtype=dtype,
         freq_max_position_embeddings=runtime_config.max_model_len,
         mask_max_position_embeddings=runtime_config.max_model_len,
-        **user_config_kwargs,
     )
+    config_defaults.update(user_config_kwargs)
+    loading["config_kwargs"] = EasyDeLBaseConfigDict(**config_defaults)
 
     with set_inference_mode():
         loaded = AutoEasyDeLModelForCausalLM.from_pretrained(**loading)
+    if decoding_engine is not None:
+        # The explicit path is validated centrally after loading. Do not apply
+        # automatic MLA/backend retargeting before that validation can run.
+        return loaded
     text_config = loaded.config.get_text_config()
     has_mla_attention, has_non_mla_attention = detect_mla_attention_mix(loaded, text_config)
 
@@ -707,6 +772,7 @@ def build_engine_assets(
     drafter: DrafterProtocol | bool | None,
     data_parallelism_axis: str,
     dtype,
+    decoding_engine: str | None = None,
 ) -> EngineAssets:
     """Resolve every model-facing asset the eSurge engine composes over.
 
@@ -720,6 +786,7 @@ def build_engine_assets(
         drafter: Explicit drafter object / ``True`` for auto / ``None``.
         data_parallelism_axis: Normalized KV-page DP axis name.
         dtype: Compute/storage dtype for model loading.
+        decoding_engine: Explicit paged backend preference forwarded to the loader.
 
     Returns:
         A fully-populated :class:`EngineAssets`.
@@ -733,6 +800,7 @@ def build_engine_assets(
             runtime_config=runtime_config,
             data_parallelism_axis=data_parallelism_axis,
             dtype=dtype,
+            decoding_engine=decoding_engine,
         )
 
     tool_parser_name, tool_parser_class, reasoning_parser_name, reasoning_parser_class = _resolve_parsers(

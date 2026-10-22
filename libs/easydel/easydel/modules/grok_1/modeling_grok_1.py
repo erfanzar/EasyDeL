@@ -53,7 +53,6 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeCausalLMOutput, MoeModelOutput
 from easydel.infra.utils import auto_remat
 from easydel.layers import (
@@ -799,8 +798,6 @@ class Grok1Model(EasyDeLBaseModule):
         all_self_attns = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
 
-        if output_router_logits is None:
-            output_router_logits = self.config.output_router_logits
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -1041,29 +1038,7 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):  # type: ig
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
-            aux_loss_fn=self._compute_aux_loss,
         )
-
-    def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute auxiliary load balancing loss from router logits.
-
-        Args:
-            outputs: Model outputs containing router_logits from MoE layers.
-            attention_mask: Attention mask to exclude padding tokens from loss computation.
-
-        Returns:
-            Optional auxiliary loss value for load balancing, or None if router_logits unavailable.
-        """
-        if outputs.router_logits is None or len(outputs.router_logits) == 0:
-            return None
-
-        aux_loss = auxiliary_load_balancing_loss_func(
-            gate_logits=outputs.router_logits,
-            num_experts=self.config.num_experts,
-            top_k=self.config.num_experts_per_tok,
-            attention_mask=attention_mask,
-        )
-        return aux_loss * self.config.router_aux_loss_coef
 
     def apply_lm_head(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
         """Apply language model head with Grok-1's output multiplier scaling.
@@ -1081,13 +1056,32 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):  # type: ig
         lm_logits = lm_logits * self.output_multiplier_scale
         return lm_logits
 
-    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
-        """Trace-safe projection with Grok-1 output multiplier scaling."""
-        base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
+    def get_lm_logit_postprocess(self):
+        """Capture Grok-1's output scaling followed by base clipping for split heads.
+
+        Only the scalar multiplier and scalar-only clipping callable are captured,
+        not the live model or its parameter tree. The order matches
+        ``apply_lm_head`` followed by the inherited ``compute_lm_logits`` cap.
+        """
         scale = self.output_multiplier_scale
+        clip_fn = self.get_base_lm_logit_postprocess()
+
+        def _postprocess(logits: Array) -> Array:
+            """Scale raw vocabulary logits before applying the optional cap."""
+            logits = logits * scale
+            return logits if clip_fn is None else clip_fn(logits)
+
+        return _postprocess
+
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
+        """Trace-safe projection with output scaling before base logit clipping."""
+        # Start from the raw projection: BaseTaskModule's wrapper already clips,
+        # which would put clipping before Grok-1's multiplier instead of after it.
+        base_fn = EasyDeLBaseModule.make_lm_head_fn(self, vocab_shard_stage=vocab_shard_stage)
+        postprocess = self.get_lm_logit_postprocess()
 
         def _project(hidden_states):
-            """Apply the LM head and multiply by Grok-1's output scale."""
-            return base_fn(hidden_states) * scale
+            """Project, scale, and clip in the same order as the full-logit path."""
+            return postprocess(base_fn(hidden_states))
 
         return _project

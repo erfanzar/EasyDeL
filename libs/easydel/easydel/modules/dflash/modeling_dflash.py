@@ -30,12 +30,11 @@ from .dflash_configuration import DFlashConfig
 DFlashForwardOutput = DraftModelOutput
 
 
-class DFlashAttention(DSparkAttention):
-    """DSpark block attention reused by the DFlash CE-only drafter."""
-
-
-class DFlashDecoderLayer(DSparkDecoderLayer):
-    """DSpark block-refinement layer used unchanged by DFlash."""
+# These are the same public building blocks used by DSparkModel.__init__.
+# Aliases keep the DFlash import/constructor API and make its exported types
+# match the live backbone, without building and discarding a second layer stack.
+DFlashAttention = DSparkAttention
+DFlashDecoderLayer = DSparkDecoderLayer
 
 
 @register_module(TaskType.BASE_MODULE, config=DFlashConfig, model_type="dflash")

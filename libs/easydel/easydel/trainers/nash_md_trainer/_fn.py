@@ -202,7 +202,7 @@ def nash_md_step(
                 policy_logps = policy_token_logps.sum(axis=1)
                 log_ratio = policy_token_logps - ref_token_logps
                 kl_vector = log_ratio.sum(axis=1)
-                kl_loss = (log_ratio * policy_token_logps).sum(axis=1)
+                kl_loss = (jax.lax.stop_gradient(log_ratio) * policy_token_logps).sum(axis=1)
 
                 score = (probabilities - 0.5) * policy_logps
                 loss_vector = beta * kl_loss - score
@@ -309,7 +309,7 @@ def _make_nash_md_scheduled_loss(call):
             with jax.named_scope("easydel/trainer/nash_md/scheduled_loss/compute_nash_md_loss"):
                 policy_logps = policy_token_logps.sum(axis=1)
                 log_ratio = policy_token_logps - ref_token_logps
-                kl_loss = (log_ratio * policy_token_logps).sum(axis=1)
+                kl_loss = (jax.lax.stop_gradient(log_ratio) * policy_token_logps).sum(axis=1)
                 score = (batch["probabilities"] - 0.5) * policy_logps
                 return (beta * kl_loss - score).mean()
 

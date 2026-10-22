@@ -72,7 +72,6 @@ from __future__ import annotations
 
 import typing as tp
 from enum import Enum
-from functools import partial
 
 import jax
 from eformer.jaximus import ImplicitArray, register
@@ -218,6 +217,272 @@ def _expand_mask_kv_dim(
     return mask_info.replace(attention_mask=attn, kv_segment_ids=kv_seg)
 
 
+def _recover_pairwise_segment_ids(
+    mask_info: MaskInfo,
+    write_index: jnp.ndarray,
+    cached_segment_ids: jnp.ndarray | None,
+    *,
+    sliding: bool,
+) -> MaskInfo:
+    """Recover packed ownership that a pairwise mask's padding labels omit.
+
+    ``MaskInfo.from_attention_mask`` deliberately labels every valid token zero.
+    For a square, query-local self-attention mask, a packed boundary is possible
+    only when no query sees keys on both sides of it. Missing adjacent edges are
+    not sufficient: a longer-range edge can span the apparent boundary. Taking
+    each query's entire visible key interval conservatively merges such spans,
+    preserving every explicitly allowed pairwise edge. Query ownership comes
+    from its first visible key (not its diagonal: padding queries can still be
+    valid queries). Existing nonzero explicit segment labels win.
+
+    The first local segment continues the last cached segment; later segments
+    receive fresh labels. Callers use a zero origin for absolute masks, whose
+    pairwise historical restrictions remain unchanged. All-zero valid labels
+    denote the first local continuation segment regardless of whether the mask
+    was supplied as segments or has already been materialized. Materialize a copy so that interpreting a mask
+    for auxiliary selection cannot change its later interpretation by KV append.
+    """
+    mask_info = mask_info.replace()
+    attn = mask_info.get_or_compute_attention_mask(dtype=jnp.bool_)
+    if attn.shape[-2] != attn.shape[-1]:
+        return mask_info
+    q_segments, kv_segments = mask_info.get_or_compute_segment_ids()
+    padding_labels = jnp.all(q_segments <= 0, axis=-1) & jnp.all(kv_segments <= 0, axis=-1)
+    pairwise = jnp.any(attn, axis=1)
+    valid_keys = jnp.any(pairwise, axis=-2)
+    first_visible_key = jnp.argmax(pairwise, axis=-1)
+    key_positions = jnp.arange(pairwise.shape[-1], dtype=jnp.int32)
+    last_visible_key = jnp.max(jnp.where(pairwise, key_positions, -1), axis=-1)
+    # A query's visible keys must all receive the same ownership label. Infer
+    # boundaries from complete visible intervals, including across heads, rather
+    # than just the super/subdiagonal of an arbitrary pairwise mask.
+    splits = key_positions[:-1]
+    crosses = (first_visible_key[:, :, None] <= splits) & (last_visible_key[:, :, None] > splits)
+    boundaries = jnp.pad(~jnp.any(crosses, axis=-2), ((0, 0), (1, 0)), constant_values=False)
+    recovered = jnp.cumsum(boundaries, axis=-1, dtype=jnp.int32)
+    continuation = jnp.zeros_like(write_index)
+    label_origin = continuation
+    if cached_segment_ids is not None:
+        width = cached_segment_ids.shape[-1]
+        last = jnp.minimum(write_index, width) - 1 if sliding else write_index - 1
+        continuation = jnp.take_along_axis(cached_segment_ids, jnp.clip(last, 0, width - 1)[:, None], axis=-1)[:, 0]
+        continuation = jnp.where(write_index > 0, jnp.maximum(continuation, 0), 0)
+        # Explicit historical labels need not be monotone. A fresh packed
+        # segment must not collide with an older label before the continuation.
+        label_origin = jnp.maximum(jnp.max(cached_segment_ids, axis=-1), continuation)
+    recovered = jnp.where(recovered == 0, continuation[:, None], recovered + label_origin[:, None])
+    recovered = jnp.where(valid_keys, recovered, -1)
+    recovered_queries = jnp.take_along_axis(recovered, first_visible_key, axis=-1)
+    recovered_queries = jnp.where(jnp.any(pairwise, axis=-1), recovered_queries, -1)
+    return mask_info.replace(
+        _q_segment_ids=jnp.where(padding_labels[:, None], recovered_queries, q_segments),
+        _kv_segment_ids=jnp.where(padding_labels[:, None], recovered, kv_segments),
+    )
+
+
+def _align_postpadded_mask(
+    mask_info: MaskInfo,
+    target_kv_len: int,
+    write_index: jnp.ndarray,
+    new_lengths: jnp.ndarray,
+    query_len: int,
+    *,
+    sliding: bool,
+    cached_segment_ids: jnp.ndarray | None = None,
+    first_position: jnp.ndarray | None = None,
+    causal: bool = True,
+) -> MaskInfo:
+    """Map an append's mask to persistent or attention-time KV coordinates.
+
+    Args:
+        mask_info: Incoming query-local or absolute attention mask.
+        target_kv_len: Width of the returned KV storage.
+        write_index: Absolute first incoming position per batch item.
+        new_lengths: Valid incoming token counts, excluding right padding.
+        query_len: Number of incoming query rows, including right padding.
+        sliding: Whether storage contains a rolled trailing window.
+        cached_segment_ids: Historical segment labels in the cache's previous
+            storage coordinates. None supports legacy views, whose history is
+            assumed to continue the first incoming segment.
+        first_position: Optional absolute first attention-time KV column. This
+            permits returning the old tail plus a whole query block while the
+            persistent cache retains only its final window.
+        causal: Add causal visibility for query-local masks. False preserves
+            bidirectional incoming edges (and any explicit caller restrictions).
+
+    Returns:
+        MaskInfo with query_len rows and target_kv_len storage-aligned columns.
+        Query-local columns are offset by write_index; historical columns remain
+        available to valid queries. Absolute masks retain their pairwise masking.
+    """
+    attn = mask_info.get_or_compute_attention_mask(dtype=jnp.bool_)
+    local = attn.shape[-1] == query_len
+    query_start = jnp.clip(write_index, 0, max(attn.shape[-2] - query_len, 0))
+    attn = jax.vmap(lambda x, start: lax.dynamic_slice_in_dim(x, start, query_len, axis=1))(attn, query_start)
+    end = write_index + new_lengths
+    first = jnp.maximum(end - target_kv_len, 0) if sliding else jnp.zeros_like(end)
+    if first_position is not None:
+        first = first_position
+    positions = first[:, None] + jnp.arange(target_kv_len, dtype=write_index.dtype)[None, :]
+    source_columns = positions - write_index[:, None] if local else positions
+    columns_in_mask = (source_columns >= 0) & (source_columns < attn.shape[-1])
+    columns = jnp.clip(source_columns, 0, attn.shape[-1] - 1)
+    aligned = jnp.take_along_axis(attn, columns[:, None, None, :], axis=-1)
+    aligned = aligned & columns_in_mask[:, None, None, :]
+    if local:
+        # There is no historical padding information in a query-local mask.
+        # The view's starts/end bounds identify valid history instead. Preserve
+        # all-masked query rows (e.g. padding from a segment-based input mask).
+        historical = positions < write_index[:, None]
+        query_valid = jnp.any(attn, axis=-1, keepdims=True)
+        aligned = jnp.where(historical[:, None, None, :], query_valid, aligned)
+        if causal:
+            query_positions = write_index[:, None] + jnp.arange(query_len, dtype=write_index.dtype)[None, :]
+            aligned = aligned & (positions[:, None, None, :] <= query_positions[:, None, :, None])
+    aligned = aligned & (positions < end[:, None])[:, None, None, :]
+
+    def slice_queries(x):
+        """Keep optional query metadata aligned with the selected mask rows."""
+        if x is None:
+            return None
+        return jax.vmap(lambda row, start: lax.dynamic_slice_in_dim(row, start, query_len, axis=0))(x, query_start)
+
+    q_segments, kv_segments = mask_info.get_or_compute_segment_ids()
+    q_segments = slice_queries(q_segments)
+    translated_segments = jnp.take_along_axis(kv_segments, columns, axis=-1)
+    translated_segments = jnp.where(columns_in_mask, translated_segments, -1)
+    if local:
+        if cached_segment_ids is None:
+            # A manually constructed legacy view has no historical labels.
+            # Only its continuation segment may see that history, never later
+            # packed segments from this append.
+            historical_segments = jnp.broadcast_to(kv_segments[:, :1], positions.shape)
+        else:
+            old_width = cached_segment_ids.shape[-1]
+            old_first = jnp.maximum(write_index - old_width, 0) if sliding else jnp.zeros_like(write_index)
+            old_columns = jnp.clip(positions - old_first[:, None], 0, old_width - 1)
+            historical_segments = jnp.take_along_axis(cached_segment_ids, old_columns, axis=-1)
+        translated_segments = jnp.where(positions < write_index[:, None], historical_segments, translated_segments)
+        same_segment = (q_segments[:, :, None] == translated_segments[:, None, :]) & (q_segments[:, :, None] >= 0)
+        aligned = aligned & same_segment[:, None, :, :]
+    kv_segments = jnp.where(positions < end[:, None], translated_segments, -1)
+    return mask_info.replace(
+        attention_mask=aligned,
+        _q_segment_ids=q_segments,
+        _kv_segment_ids=kv_segments,
+        q_positions=slice_queries(mask_info.q_positions),
+        kv_positions=positions if mask_info.kv_positions is not None else None,
+        causal_mask_baked_in=(local and causal) or mask_info.causal_mask_baked_in,
+    )
+
+
+def _append_cache_rows(old, new, indexes, lengths, *, sliding: bool):
+    """Write per-row valid tokens in the shared KV/auxiliary physical layout."""
+
+    @jax.vmap
+    def append(row, tokens, index, length):
+        width = row.shape[0]
+        if not sliding:
+            offsets = jnp.arange(tokens.shape[0], dtype=index.dtype)
+            positions = index + offsets
+            valid = (offsets < length) & (positions >= 0) & (positions < width)
+            return row.at[jnp.where(valid, positions, width)].set(tokens.astype(row.dtype), mode="drop")
+        end = index + length
+        positions = jnp.maximum(end - width, 0) + jnp.arange(width)
+        old_rows = jnp.clip(positions - jnp.maximum(index - width, 0), 0, width - 1)
+        new_rows = jnp.clip(positions - index, 0, tokens.shape[0] - 1)
+        broadcast = (width,) + (1,) * (row.ndim - 1)
+        result = jnp.where((positions < index).reshape(broadcast), row[old_rows], tokens[new_rows])
+        return jnp.where((positions < end).reshape(broadcast), result, 0).astype(row.dtype)
+
+    return append(old, new, indexes, lengths)
+
+
+def _attention_cache_rows(old, new, indexes, lengths):
+    """Return the old trailing window plus all current rows for block attention."""
+    width = old.shape[1]
+    attention_width = width + new.shape[1]
+
+    @jax.vmap
+    def rows(row, tokens, index, length):
+        positions = jnp.maximum(index - width, 0) + jnp.arange(attention_width)
+        old_rows = jnp.clip(positions - jnp.maximum(index - width, 0), 0, width - 1)
+        new_rows = jnp.clip(positions - index, 0, tokens.shape[0] - 1)
+        broadcast = (attention_width,) + (1,) * (row.ndim - 1)
+        result = jnp.where((positions < index).reshape(broadcast), row[old_rows], tokens[new_rows])
+        return jnp.where((positions < index + length).reshape(broadcast), result, 0)
+
+    return rows(old, new, indexes, lengths)
+
+
+def _append_cache_mask(mask_info, width, indexes, lengths, starts, segment_ids, query_len, *, sliding_window, causal):
+    """Align ownership, padding and windows identically for KV and auxiliary states."""
+    local = mask_info.kv_len == query_len
+    incoming = _recover_pairwise_segment_ids(
+        mask_info,
+        indexes if local else jnp.zeros_like(indexes),
+        segment_ids if local else None,
+        sliding=sliding_window is not None,
+    )
+    aligned = _align_postpadded_mask(
+        incoming,
+        width,
+        indexes,
+        lengths,
+        query_len,
+        sliding=sliding_window is not None,
+        cached_segment_ids=segment_ids,
+        causal=causal,
+    )
+    stored_segments = aligned.get_or_compute_segment_ids()[1]
+    first = jnp.zeros_like(indexes)
+    if sliding_window is not None:
+        first = jnp.maximum(indexes + lengths - width, 0)
+        if query_len > 1:
+            first = jnp.maximum(indexes - width, 0)
+            aligned = _align_postpadded_mask(
+                incoming,
+                width + query_len,
+                indexes,
+                lengths,
+                query_len,
+                sliding=True,
+                cached_segment_ids=segment_ids,
+                first_position=first,
+                causal=causal,
+            )
+    attn = aligned.get_or_compute_attention_mask(dtype=jnp.bool_)
+    kv_positions = first[:, None] + jnp.arange(attn.shape[-1], dtype=jnp.int32)[None, :]
+    query_positions = indexes[:, None] + jnp.arange(query_len)[None, :]
+    attn = attn & (kv_positions >= starts[:, None])[:, None, None, :]
+    if sliding_window is not None:
+        relative = kv_positions[:, None, :] - query_positions[:, :, None]
+        window = (relative > -sliding_window) & (relative <= 0 if causal else relative < sliding_window)
+        attn = attn & window[:, None, :, :]
+        aligned = aligned.replace(
+            sliding_window_baked_in=True, causal_mask_baked_in=causal or aligned.causal_mask_baked_in
+        )
+    return aligned.replace(attention_mask=attn, q_positions=query_positions, kv_positions=kv_positions), stored_segments
+
+
+def _append_metadata(indexes, starts, mask_info, query_len, cache_metadata):
+    """Resolve the identical insertion offsets and valid lengths for every cache state."""
+    metadata = unwrap_metadata(cache_metadata, "transformer")
+    write_index = indexes if metadata is None or metadata.indexes is None else metadata.indexes
+    starts = starts if metadata is None or metadata.starts is None else metadata.starts
+    write_index = jnp.asarray(write_index, dtype=indexes.dtype)
+    starts = jnp.asarray(starts, dtype=indexes.dtype)
+    lengths = jnp.full_like(write_index, query_len)
+    if metadata is not None and metadata.postpadded:
+        valid_keys = jnp.any(mask_info.replace().get_or_compute_attention_mask(dtype=jnp.bool_), axis=(1, 2))
+        offsets = jnp.arange(query_len, dtype=jnp.int32)[None, :]
+        if valid_keys.shape[-1] != query_len:
+            offsets = offsets + write_index[:, None]
+        valid_new = jnp.take_along_axis(valid_keys, offsets, axis=1, mode="fill", fill_value=False)
+        lengths = jnp.sum(valid_new, axis=-1, dtype=indexes.dtype)
+    return write_index, starts, lengths
+
+
 @register("dynamic_update_slice")
 def _(
     primitive: Primitive,
@@ -326,6 +591,8 @@ class TransformerCacheConfig(BaseCacheConfig):
         sliding_window (int | None): Size of sliding attention window.
         update_causal_mask (bool): Whether to update causal masks dynamically.
         create_attention_bias (bool): Whether to create attention bias terms.
+        auxiliary_dim (int | None): Optional per-token indexer feature width.
+            Allocated in float32 with the same batch/capacity as KV before tracing.
     """
 
     batch_size: int = field(pytree_node=False)
@@ -342,6 +609,7 @@ class TransformerCacheConfig(BaseCacheConfig):
 
     update_causal_mask: bool = field(pytree_node=False)
     create_attention_bias: bool = field(pytree_node=False)
+    auxiliary_dim: int | None = field(pytree_node=False, default=None)
 
     @classmethod
     def create(
@@ -359,6 +627,7 @@ class TransformerCacheConfig(BaseCacheConfig):
         update_causal_mask: bool = True,
         create_attention_bias: bool = True,
         sliding_window: int | None = None,
+        auxiliary_dim: int | None = None,
     ) -> TransformerCacheConfig:
         """Create a TransformerCacheConfig instance with validation.
 
@@ -378,6 +647,9 @@ class TransformerCacheConfig(BaseCacheConfig):
             update_causal_mask: Whether to update causal masks dynamically.
             create_attention_bias: Whether to create attention bias terms.
             sliding_window: Optional sliding window size for local attention.
+            auxiliary_dim: Optional persistent indexer width. For example pooled
+                key/gate/valid features use 2 * index_head_dim + 1; token keys
+                use index_head_dim. Omitted means no auxiliary allocation.
 
         Returns:
             TransformerCacheConfig: Validated configuration instance.
@@ -391,6 +663,8 @@ class TransformerCacheConfig(BaseCacheConfig):
             raise ValueError("batch_size must be positive")
         if sequence_length <= 0:
             raise ValueError("sequence_length must be positive")
+        if auxiliary_dim is not None and auxiliary_dim <= 0:
+            raise ValueError("auxiliary_dim must be positive when specified")
 
         if head_dim is not None:
             key_dim = key_dim or head_dim
@@ -420,6 +694,7 @@ class TransformerCacheConfig(BaseCacheConfig):
             update_causal_mask=update_causal_mask,
             create_attention_bias=create_attention_bias,
             sliding_window=sliding_window,
+            auxiliary_dim=auxiliary_dim,
         )
 
 
@@ -450,6 +725,10 @@ class TransformerCacheView(BaseCacheView):
         maximum_sequence_length (int): Maximum cacheable sequence length.
         layer_index (int | None): Index of this layer in the model.
         masking_details (AttnMaskDetail | None): Attention mask configuration.
+        segment_ids (Array | None): Historical segment labels in the same
+            storage coordinates as key/value, populated by cache updates.
+        auxiliary_state (Array | None): Optional fixed-capacity float32 indexer
+            features [batch, capacity, auxiliary_dim], serialized in the view pytree.
     """
 
     key: Float[JAXArray, "batch seq_len num_key_heads key_dim"] | ImplicitArray | None
@@ -467,6 +746,8 @@ class TransformerCacheView(BaseCacheView):
         pytree_node=False, default_factory=lambda: (BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM)
     )
     batch_sharding_axes: tuple[object | None, ...] = field(pytree_node=False, default_factory=lambda: (BATCH,))
+    segment_ids: Int[JAXArray, "batch seq_len"] | None = None
+    auxiliary_state: Float[JAXArray, "batch seq_len auxiliary_dim"] | None = None
 
     @classmethod
     def init(
@@ -587,6 +868,20 @@ class TransformerCacheView(BaseCacheView):
                 maximum_sequence_length=mt.sequence_length,
                 kv_sharding_axes=tuple(kv_sharding_axes),
                 batch_sharding_axes=tuple(batch_axes),
+                segment_ids=apply_logical_sharding(
+                    jnp.full(kshape[:2], -1, dtype=jnp.int32),
+                    axes=kv_sharding_axes[:2],
+                    mode=MODE_PREFILL,
+                    partition_manager=runtime_sharding_resolver,
+                ),
+                auxiliary_state=None
+                if config.auxiliary_dim is None
+                else apply_logical_sharding(
+                    jnp.zeros((*kshape[:2], config.auxiliary_dim), dtype=jnp.float32),
+                    axes=(*kv_sharding_axes[:2], None),
+                    mode=MODE_PREFILL,
+                    partition_manager=runtime_sharding_resolver,
+                ),
             )
         return out
 
@@ -597,7 +892,92 @@ class TransformerCacheView(BaseCacheView):
             value=None if self.value is None else jnp.zeros_like(self.value),
             indexes=jnp.zeros_like(self.indexes),
             starts=jnp.zeros_like(self.starts),
+            segment_ids=None if self.segment_ids is None else jnp.full_like(self.segment_ids, -1),
+            auxiliary_state=None if self.auxiliary_state is None else jnp.zeros_like(self.auxiliary_state),
         )
+
+    def read_auxiliary(self) -> JAXArray | None:
+        """Read fixed-capacity auxiliary storage in the same physical layout as KV.
+
+        Unused slots are zero, not valid candidates. Use the mask returned by
+        :meth:`update_auxiliary` for selection rather than scoring unused slots.
+        None means auxiliary storage was not requested at allocation time.
+        """
+        return self.auxiliary_state
+
+    def update_auxiliary(
+        self,
+        new_states: JAXArray,
+        mask_info: MaskInfo,
+        cache_metadata: TransformerMetadata | OperationsMetadata | HybridMetadata | None = None,
+        *,
+        causal: bool = True,
+        mode: common_types.RUNTIME_MODE_TYPES = MODE_PREFILL,
+        runtime_sharding_resolver: RuntimeShardingResolver | PartitionManager | None = None,
+        partition_manager: RuntimeShardingResolver | PartitionManager | None = None,
+    ) -> tuple[JAXArray, MaskInfo, TransformerCacheView]:
+        """Append indexer features before the matching KV append, without advancing KV.
+
+        Args:
+            new_states: Current per-token features [batch, query_len, auxiliary_dim].
+            mask_info: The original incoming KV mask, including packed ownership.
+            cache_metadata: The same optional offsets, starts and postpadding
+                metadata passed to the matching :meth:`concatenate_to_cache`.
+            causal: Whether selection is causal (default) or bidirectional.
+            mode: Runtime sharding mode.
+            runtime_sharding_resolver: Optional runtime sharding policy.
+            partition_manager: Compatibility alias for the runtime policy.
+
+        Returns:
+            Attention-time features, their aligned visibility mask, and a view
+            with updated fixed-capacity auxiliary storage. Indexes, starts and
+            segment history are deliberately not advanced: call concatenate_to_cache
+            on this returned view with the SAME original mask/metadata next. For a
+            sliding block the first output includes the old tail plus current rows,
+            exactly like attention-time KV; the stored state keeps the final window.
+
+        Raises:
+            ValueError: If storage was not preallocated or feature shapes mismatch.
+        """
+        from easydel.infra.utils import AttnMaskType
+
+        old = self.auxiliary_state
+        if old is None:
+            raise ValueError("Request auxiliary_dim in TransformerCacheConfig before decoding")
+        if new_states.ndim != 3 or new_states.shape[0] != old.shape[0] or new_states.shape[2] != old.shape[2]:
+            raise ValueError("new_states must have shape [cache batch, query_len, auxiliary_dim]")
+        if self.key is None or old.shape[:2] != self.key.shape[:2]:
+            raise ValueError("auxiliary storage must have the same batch and capacity as KV")
+        indexes, starts, lengths = _append_metadata(
+            self.indexes, self.starts, mask_info, new_states.shape[1], cache_metadata
+        )
+        sliding_window = (
+            self.masking_details.size
+            if self.masking_details is not None and self.masking_details.mask_type == AttnMaskType.SLIDING
+            else None
+        )
+        stored = _append_cache_rows(old, new_states, indexes, lengths, sliding=sliding_window is not None)
+        attention = stored
+        if sliding_window is not None and new_states.shape[1] > 1:
+            attention = _attention_cache_rows(old, new_states, indexes, lengths)
+        aligned_mask, _ = _append_cache_mask(
+            mask_info,
+            old.shape[1],
+            indexes,
+            lengths,
+            starts,
+            self.segment_ids,
+            new_states.shape[1],
+            sliding_window=sliding_window,
+            causal=causal,
+        )
+        resolver = coerce_runtime_sharding_resolver(
+            runtime_sharding_resolver if runtime_sharding_resolver is not None else partition_manager
+        )
+        axes = (*self.kv_sharding_axes[:2], None)
+        stored = apply_logical_sharding(stored, axes=axes, mode=mode, partition_manager=resolver)
+        attention = apply_logical_sharding(attention, axes=axes, mode=mode, partition_manager=resolver)
+        return attention, aligned_mask, self.replace(auxiliary_state=stored)
 
     @jax.named_scope("easydel-transformer-cacheview-concatenate-to-cache")
     def concatenate_to_cache(
@@ -611,6 +991,7 @@ class TransformerCacheView(BaseCacheView):
         mask_info: MaskInfo,
         runtime_sharding_resolver: RuntimeShardingResolver | PartitionManager | None = None,
         partition_manager: RuntimeShardingResolver | PartitionManager | None = None,
+        causal: bool = True,
     ) -> tuple[
         Float[JAXArray, "batch seq_len num_key_heads key_dim"],
         Float[JAXArray, "batch seq_len num_value_heads value_dim"],
@@ -634,45 +1015,44 @@ class TransformerCacheView(BaseCacheView):
             mode: Runtime mode (e.g., MODE_PREFILL) for sharding resolution.
             quantizer: Quantizer to apply to stored cache tensors.
             cache_metadata: Runtime metadata (TransformerMetadata,
-                OperationsMetadata, or HybridMetadata). Unwrapped internally.
+                OperationsMetadata, or HybridMetadata). Explicit indexes override
+                the view's write positions, and starts exclude earlier KV slots.
+                With postpadded=True only valid incoming tokens advance indexes;
+                padding is identified from mask_info and is not retained in a
+                sliding window.
             mask_info: MaskInfo object with attention mask configuration.
                 KV dimension is expanded automatically if needed.
             runtime_sharding_resolver: Runtime sharding resolver for cache tensors.
             partition_manager: Deprecated compatibility alias for
                 ``runtime_sharding_resolver``.
+            causal: Whether to bake causal visibility into query-local masks.
+                False retains future keys in the current append and applies a
+                symmetric local window when sliding attention is configured.
 
         Returns:
             tuple: Five-element tuple containing:
-                - key_cache: Updated key cache in runtime dtype.
-                - value_cache: Updated value cache in runtime dtype.
+                - key_cache: Attention-time keys in runtime dtype. Sliding
+                  multi-token appends return the old tail plus current block;
+                  only the final window is stored in updated_view.
+                - value_cache: Corresponding attention-time values.
                 - mask_info: Updated MaskInfo with applied KV lengths.
                 - updated_view: New TransformerCacheView with advanced positions.
                 - masking_details: AttnMaskDetail for attention computation.
         """
         from easydel.infra.utils import AttnMaskType
 
-        cache_metadata = unwrap_metadata(cache_metadata, "transformer")
-
         runtime_dtype = query.dtype
         num_updated_cache_vectors = query.shape[1]
         masking_details = self.masking_details
-        indexes = self.indexes
+        indexes, starts, new_lengths = _append_metadata(
+            self.indexes, self.starts, mask_info, num_updated_cache_vectors, cache_metadata
+        )
         runtime_sharding_resolver = coerce_runtime_sharding_resolver(
             runtime_sharding_resolver if runtime_sharding_resolver is not None else partition_manager
         )
-        sharding_statics = dict(mode=MODE_PREFILL, partition_manager=runtime_sharding_resolver)
+        sharding_statics = dict(mode=mode, partition_manager=runtime_sharding_resolver)
 
-        # Expand mask KV dimension if it doesn't match cache size
-        # This is needed when using HybridCache with TransformerCacheView
-        key_shape = self.key.shape if hasattr(self.key, "shape") else None
-        cache_kv_len = key_shape[1] if key_shape is not None else 0
-        mask_kv_len = mask_info.kv_len
-        query_local_mask = mask_kv_len is not None and mask_kv_len < cache_kv_len
-        causal_already_baked = bool(
-            getattr(mask_info, "_causal_baked", False) or getattr(mask_info, "causal_mask_baked_in", False)
-        )
-        if query_local_mask:
-            mask_info = _expand_mask_kv_dim(mask_info, cache_kv_len, indexes, num_updated_cache_vectors)
+        cache_kv_len = self.key.shape[1]
 
         def _kv_struct_shard(
             x: Float[JAXArray, "batch seq_len num_heads head_dim"],
@@ -688,99 +1068,38 @@ class TransformerCacheView(BaseCacheView):
             axes = getattr(self, "kv_sharding_axes", (BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM))
             return tp.cast(JAXArray, apply_logical_sharding(x, axes=axes, **sharding_statics))
 
-        @partial(jax.vmap, in_axes=(0, 0, 0), out_axes=(0))
-        def _update_kv(
-            old: Float[JAXArray, "seq_len num_heads head_dim"],
-            new: Float[JAXArray, "query_len num_heads head_dim"],
-            slot: Int[JAXArray, ""],
-        ) -> Float[JAXArray, "seq_len num_heads head_dim"]:
-            """Insert ``new`` into ``old`` at ``slot`` along the sequence dim.
-
-            Vectorized over the batch dimension via ``jax.vmap``.
-
-            Args:
-                old: Existing per-batch cache slice.
-                new: New tokens to write.
-                slot: Sequence position to begin writing at.
-
-            Returns:
-                The updated cache slice for this batch element.
-            """
-            return lax.dynamic_update_slice(old, new.astype(old.dtype), (slot, 0, 0))
-
-        @partial(jax.vmap, in_axes=(0, 0, 0), out_axes=(0))
-        def _update_kv_sliding(
-            old_cache: Float[JAXArray, "window_size num_heads head_dim"],
-            new_values: Float[JAXArray, "query_len num_heads head_dim"],
-            current_index: Int[JAXArray, ""],
-        ) -> Float[JAXArray, "window_size num_heads head_dim"]:
-            """Update a sliding-window KV cache slot in-place.
-
-            Args:
-                old_cache: The existing window-sized slot.
-                new_values: New tokens to append.
-                current_index: Logical write position into the window.
-
-            Returns:
-                The updated window contents, either by overwriting in place or
-                by rolling the buffer when the new tokens overflow the window.
-            """
-            new_len = new_values.shape[0]
-            window_size = old_cache.shape[0]
-            if new_len >= window_size:
-                return new_values[-window_size:, :, :].astype(old_cache.dtype)
-
-            total_tokens = current_index + new_len
-
-            def _fits_in_window():
-                """Branch: write at ``current_index`` without rolling."""
-                return lax.dynamic_update_slice(old_cache, new_values.astype(old_cache.dtype), (current_index, 0, 0))
-
-            def _overflow_window():
-                """Branch: drop the oldest tokens so the window keeps the most recent ``window_size``.
-
-                The window must become the last ``window_size`` of ``(old[0:current_index] ++ new)``: drop
-                ``shift = total_tokens - window_size`` from the front. The head is the still-valid tail of the
-                old window (``old_cache[shift:current_index]``) and ``new_values`` (guaranteed shorter than the
-                window here) fills the rest. The previous ``old_cache[new_len:]`` only matched when the window
-                was already full (``current_index == window_size``); otherwise it spliced in stale slots.
-                """
-                shift = total_tokens - window_size
-                head = lax.dynamic_slice_in_dim(old_cache, shift, window_size - new_len, axis=0)
-                return jnp.concatenate([head, new_values.astype(old_cache.dtype)], axis=0)
-
-            return lax.cond(total_tokens <= window_size, _fits_in_window, _overflow_window)
-
-        sliding_window = None
-
-        if masking_details is not None and masking_details.mask_type == AttnMaskType.SLIDING:
-            value_cache_updated = _update_kv_sliding(_maybe_materialize(self.value), value, indexes)
-            key_cache_updated = _update_kv_sliding(_maybe_materialize(self.key), key, indexes)
-            sliding_window = masking_details.size
-        else:
-            value_cache_updated = _update_kv(_maybe_materialize(self.value), value, indexes)
-            key_cache_updated = _update_kv(_maybe_materialize(self.key), key, indexes)
+        sliding_window = (
+            masking_details.size
+            if masking_details is not None and masking_details.mask_type == AttnMaskType.SLIDING
+            else None
+        )
+        value_cache_updated = _append_cache_rows(
+            _maybe_materialize(self.value), value, indexes, new_lengths, sliding=sliding_window is not None
+        )
+        key_cache_updated = _append_cache_rows(
+            _maybe_materialize(self.key), key, indexes, new_lengths, sliding=sliding_window is not None
+        )
 
         write_index = indexes
-        indexes = indexes + num_updated_cache_vectors
-        mask_info = mask_info.apply_kv_lengths(
-            kv_lengths=indexes,
-            q_len=num_updated_cache_vectors,
-            end_index=indexes,
+        indexes = indexes + new_lengths
+        mask_info, segment_ids_updated = _append_cache_mask(
+            mask_info,
+            cache_kv_len,
+            write_index,
+            new_lengths,
+            starts,
+            self.segment_ids,
+            num_updated_cache_vectors,
             sliding_window=sliding_window,
+            causal=causal,
         )
-        if query_local_mask and sliding_window is None and not causal_already_baked:
-            # A query-local mask gives no absolute row positions: kernels then apply a top-left (Q, K) causal
-            # triangle, so row r of a multi-token step written at cache index i saw keys <= r instead of <= i + r
-            # (r15 S10-1, every dense-cache family). Rows sit at absolute slots write_index + r here, so bake
-            # the absolute causal term; callers passing a full-window mask (generate, Llama4, Gemma3) never take
-            # this branch, and sliding caches are skipped because their rolled columns are not absolute.
-            attn = mask_info.get_or_compute_attention_mask(dtype=jnp.bool_)
-            rows = jnp.arange(attn.shape[-2], dtype=jnp.int32)[None, :]
-            pos = jnp.asarray(write_index, jnp.int32).reshape(-1, 1) + rows
-            kv_idx = jnp.arange(attn.shape[-1], dtype=jnp.int32)[None, None, :]
-            causal = kv_idx <= pos[:, :, None]
-            mask_info = mask_info.replace(attention_mask=attn & causal[:, None, :, :], causal_mask_baked_in=True)
+        attention_key = key_cache_updated
+        attention_value = value_cache_updated
+        if sliding_window is not None and num_updated_cache_vectors > 1:
+            # Earlier queries need the old tail plus the complete current block,
+            # whereas persistent storage only retains the final window.
+            attention_key = _attention_cache_rows(_maybe_materialize(self.key), key, write_index, new_lengths)
+            attention_value = _attention_cache_rows(_maybe_materialize(self.value), value, write_index, new_lengths)
 
         # Keep the cache storage dtype stable (matches the cache allocation dtype) while
         # returning KV in runtime dtype for the attention computation.
@@ -788,9 +1107,10 @@ class TransformerCacheView(BaseCacheView):
         key_cache_storage = _kv_struct_shard(key_cache_updated)
         batch_axes = getattr(self, "batch_sharding_axes", (BATCH,))
         indexes_updated = apply_logical_sharding(indexes, axes=batch_axes, **sharding_statics)
+        starts_updated = apply_logical_sharding(starts, axes=batch_axes, **sharding_statics)
 
-        value_cache_out = value_cache_storage.astype(runtime_dtype)
-        key_cache_out = key_cache_storage.astype(runtime_dtype)
+        value_cache_out = _kv_struct_shard(attention_value).astype(runtime_dtype)
+        key_cache_out = _kv_struct_shard(attention_key).astype(runtime_dtype)
 
         return (
             key_cache_out,
@@ -800,6 +1120,10 @@ class TransformerCacheView(BaseCacheView):
                 key=quantizer(key_cache_storage),
                 value=quantizer(value_cache_storage),
                 indexes=indexes_updated,
+                starts=starts_updated,
+                segment_ids=apply_logical_sharding(
+                    segment_ids_updated, axes=self.kv_sharding_axes[:2], **sharding_statics
+                ),
             ),
             masking_details,
         )
@@ -913,17 +1237,21 @@ class TransformerCache(BaseCache):
             )
 
     @classmethod
-    def init_empty(cls, num_hidden_layers: int) -> TransformerCache:
+    def init_empty(cls, num_hidden_layers: tp.Any) -> TransformerCache:
         """Initialize an empty transformer cache without allocated storage.
 
         Creates a cache structure with None views that can be populated later.
 
         Args:
-            num_hidden_layers: Number of layers to create placeholders for.
+            num_hidden_layers: Number of layers to create placeholders for. For
+                convenience an object exposing ``num_hidden_layers`` (a model
+                config) is also accepted.
 
         Returns:
             TransformerCache: Cache instance with uninitialized (None) views.
         """
+        if not isinstance(num_hidden_layers, int):
+            num_hidden_layers = getattr(num_hidden_layers, "num_hidden_layers", num_hidden_layers)
         return cls(views=[None for _ in range(num_hidden_layers)])
 
     def __repr__(self):

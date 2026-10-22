@@ -83,12 +83,16 @@ class ExpertLoadRecord:
         regime: ``"decode"`` or ``"prefill"``, from the ambient
             :func:`~easydel.infra.sharding.decode_mode_specs` scope.
         step: Monotonic index of the forward pass within the recording scope.
+        call_id: Optional identity shared only by replicas of one call/chunk.
+        replica_id: Optional replica identity; deduplication requires both IDs.
     """
 
     counts: np.ndarray
     layer_idx: int | None
     regime: str
     step: int
+    call_id: tp.Hashable | None = None
+    replica_id: int | None = None
 
 
 @dataclass
@@ -109,24 +113,67 @@ class ExpertLoadRecorder:
     _step: int = 0
     _dropped: int = 0
 
-    def add(self, counts: np.ndarray, layer_idx: int | None, regime: str) -> None:
-        """Append one histogram, dropping the oldest when at capacity."""
+    def add(
+        self,
+        counts: np.ndarray,
+        layer_idx: int | None,
+        regime: str,
+        *,
+        call_id: tp.Hashable | None = None,
+        replica_id: int | None = None,
+    ) -> None:
+        """Append one histogram, dropping the oldest when at capacity.
+
+        Without explicit identity every addition is a genuine call/chunk. To
+        submit replicas, give them the same call_id and distinct replica_id;
+        only that identified call is deduplicated, never inferred from counts.
+        """
         if len(self.records) >= self.max_records:
             self.records.pop(0)
             self._dropped += 1
-        self.records.append(ExpertLoadRecord(np.asarray(counts), layer_idx, regime, self._step))
+        self.records.append(ExpertLoadRecord(np.asarray(counts), layer_idx, regime, self._step, call_id, replica_id))
 
     def mark_step(self) -> None:
         """Advance the forward-pass counter (optional; for per-step stats)."""
         self._step += 1
 
-    def stack(self, regime: str | None = None) -> dict[int, np.ndarray]:
-        """Sum histograms per layer.
+    def _logical_records(self, regime: str | None) -> list[tuple[int, ExpertLoadRecord]]:
+        """Use one aggregation contract for summaries and interchange exports."""
+        chosen = [r for r in self.records if regime is None or r.regime == regime]
+        labelled = {int(r.layer_idx) for r in chosen if r.layer_idx is not None}
+        next_anonymous = 0
+        anonymous_calls = {}
+        seen = set()
+        logical = []
+        for rec in chosen:
+            if rec.layer_idx is None:
+                call = (rec.step, rec.regime, rec.call_id)
+                identified = rec.call_id is not None and rec.replica_id is not None
+                if identified and call in anonymous_calls:
+                    key = anonymous_calls[call]
+                else:
+                    while next_anonymous in labelled:
+                        next_anonymous += 1
+                    key = next_anonymous
+                    next_anonymous += 1
+                    if identified:
+                        anonymous_calls[call] = key
+            else:
+                key = int(rec.layer_idx)
+            if rec.call_id is not None and rec.replica_id is not None:
+                identity = (rec.step, key, rec.regime, rec.call_id)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+            logical.append((key, rec))
+        return logical
 
-        Records are duplicated across EP shards (every shard traces the same
-        ``permute`` over replicated tokens), and identical duplicates would
-        inflate every count by ``ep_size`` uniformly — harmless for ratios, but
-        it makes absolute counts misleading, so they are averaged out.
+    def stack(self, regime: str | None = None) -> dict[int, np.ndarray]:
+        """Sum genuine calls/chunks per layer, deduplicating only identified replicas.
+
+        Runtime dispatch filters known replica shards before recording. Public
+        additions without call/replica identities are never averaged, even when
+        mark_step is omitted. Anonymous layers retain the call-order fallback.
 
         Args:
             regime: Keep only records from this regime, or ``None`` for all.
@@ -134,25 +181,11 @@ class ExpertLoadRecorder:
         Returns:
             ``{layer_idx: counts}`` with counts summed over steps.
         """
-        chosen = [r for r in self.records if regime is None or r.regime == regime]
-        if not chosen:
-            return {}
-        n_experts = int(chosen[0].counts.shape[0])
-        labelled = all(r.layer_idx is not None for r in chosen)
         per_layer: dict[int, np.ndarray] = {}
-        dupes: dict[int, int] = {}
-        for i, rec in enumerate(chosen):
-            key = int(rec.layer_idx) if labelled else i
+        for key, rec in self._logical_records(regime):
             acc = per_layer.get(key)
-            per_layer[key] = rec.counts.astype(np.int64) if acc is None else acc + rec.counts
-            dupes[key] = dupes.get(key, 0) + 1
-        if labelled:
-            steps = max(1, len({r.step for r in chosen}))
-            for key in per_layer:
-                reps = max(1, dupes[key] // max(1, steps))
-                if reps > 1:
-                    per_layer[key] = per_layer[key] // reps
-        del n_experts
+            counts = rec.counts.astype(np.int64)
+            per_layer[key] = counts if acc is None else acc + counts
         return per_layer
 
     def summary(self, regime: str | None = None) -> dict[str, tp.Any]:
@@ -208,20 +241,17 @@ class ExpertLoadRecorder:
         the step axis matters: aggregate counts understate per-step decode
         skew, and any placement solver worth running consumes the steps.
         """
-        chosen = [r for r in self.records if regime is None or r.regime == regime]
-        if not chosen:
+        logical = self._logical_records(regime)
+        if not logical:
             return {}
-        steps = sorted({r.step for r in chosen})
-        layers = sorted({int(r.layer_idx) for r in chosen if r.layer_idx is not None}) or [0]
-        n_e = int(chosen[0].counts.shape[0])
+        steps = sorted({r.step for _, r in logical})
+        layers = sorted({key for key, _ in logical})
+        n_e = int(logical[0][1].counts.shape[0])
         out = np.zeros((len(steps), len(layers), n_e), dtype=np.int64)
         s_ix = {s: i for i, s in enumerate(steps)}
         l_ix = {v: i for i, v in enumerate(layers)}
-        for rec in chosen:
-            li = l_ix.get(int(rec.layer_idx)) if rec.layer_idx is not None else 0
-            if li is None:
-                continue
-            out[s_ix[rec.step], li] += rec.counts.astype(np.int64)
+        for key, rec in logical:
+            out[s_ix[rec.step], l_ix[key]] += rec.counts.astype(np.int64)
         phys = np.tile(np.arange(n_e, dtype=np.int64), (len(layers), 1))
         return {"logical_count": out, "physical_to_logical_map": phys}
 
@@ -345,7 +375,13 @@ def record_expert_load(ep_size: int = 1, max_records: int = 200_000) -> tp.Itera
         _recorder_var.reset(token)
 
 
-def maybe_record_group_sizes(group_size, num_experts: int, roll_to_expert_id=None, layer_idx: int | None = None) -> None:
+def maybe_record_group_sizes(
+    group_size,
+    num_experts: int,
+    roll_to_expert_id=None,
+    layer_idx: int | None = None,
+    replica_id=None,
+) -> None:
     """Record ``group_size`` when a recording scope is active; else do nothing.
 
     Called from :func:`~._communication_utils.permute`. When no scope is open
@@ -359,23 +395,36 @@ def maybe_record_group_sizes(group_size, num_experts: int, roll_to_expert_id=Non
             (ring-of-experts). Undone here so records are always in GLOBAL
             expert order regardless of dispatch path.
         layer_idx: Owning layer, when the caller knows it.
+        replica_id: Index among identical dispatch histograms; only zero is kept.
+            Omit when the caller has not explicitly identified replication.
     """
     recorder = _recorder_var.get()
     if recorder is None:
         return
     import jax
+    from jax import numpy as jnp
 
     from easydel.infra.sharding import inference_mode_forces_decode
 
     regime = "decode" if inference_mode_forces_decode() else "prefill"
-    roll = int(roll_to_expert_id) if isinstance(roll_to_expert_id, int) else 0
+    # The ring-of-experts roll is ``experts_per_shard * lax.axis_index(...)`` -- a tracer -- so it has to travel
+    # through the callback as an operand and be applied host-side; a Python-int-only path would silently skip it.
+    roll = jnp.zeros((), jnp.int32) if roll_to_expert_id is None else jnp.asarray(roll_to_expert_id, jnp.int32)
 
-    def _sink(counts):
+    replica = jnp.zeros((), jnp.int32) if replica_id is None else jnp.asarray(replica_id, jnp.int32)
+
+    def _sink(counts, shift, replica):
+        # Explicit dispatch topology identifies identical EP/TP replicas.
+        # Keep every genuine DP shard, chunk and repeated forward from replica
+        # zero instead of guessing a multiplicity from the record count.
+        if int(np.asarray(replica)) != 0:
+            return
         counts = np.asarray(counts)
         if counts.ndim != 1 or counts.shape[0] != num_experts:
             return
-        if roll:
-            counts = np.roll(counts, roll)
+        shift = int(np.asarray(shift))
+        if shift:
+            counts = np.roll(counts, shift)
         recorder.add(counts, layer_idx, regime)
 
-    jax.debug.callback(_sink, group_size)
+    jax.debug.callback(_sink, group_size, roll, replica)

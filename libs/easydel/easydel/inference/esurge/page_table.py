@@ -74,11 +74,10 @@ class PageTable:
         self.max_num_pages_per_req = max_num_pages_per_req
         self.max_num_batched_tokens = max_num_batched_tokens
 
-        self.page_table = jnp.zeros(
-            (max_num_reqs, max_num_pages_per_req),
-            dtype=jnp.int32,
-            device=sharding,
-        )
+        # The device mirror is materialised lazily (first ``page_table`` access / ``commit`` / ``get_device_tensor``):
+        # production code only reads ``page_table_cpu``, so most tables never pay for the device array.
+        self._sharding = sharding
+        self._page_table_device: jax.Array | None = None
         self.page_table_cpu = np.zeros(
             (max_num_reqs, max_num_pages_per_req),
             dtype=np.int32,
@@ -88,6 +87,24 @@ class PageTable:
         # higher-level code to cache device views derived from `page_table_cpu`
         # (e.g., `pages_tables`) and refresh only when necessary.
         self.cpu_version: int = 0
+
+    @property
+    def page_table(self) -> jax.Array:
+        """Device mirror ``[max_num_reqs, max_num_pages_per_req]`` int32 (zeros until the first ``commit``).
+
+        Allocated on first access so tables that are only used through ``page_table_cpu`` never hold a device array.
+        """
+        if self._page_table_device is None:
+            self._page_table_device = jnp.zeros(
+                (self.max_num_reqs, self.max_num_pages_per_req),
+                dtype=jnp.int32,
+                device=self._sharding,
+            )
+        return self._page_table_device
+
+    @page_table.setter
+    def page_table(self, value: jax.Array) -> None:
+        self._page_table_device = value
 
     def append_row(
         self,
@@ -211,7 +228,8 @@ class PageTable:
         Note:
             This clears both the page table and the page counts.
         """
-        self.page_table = jnp.zeros_like(self.page_table)
+        # Dropping the mirror re-materialises it as zeros on next device access (no fresh allocation per clear).
+        self._page_table_device = None
         self.page_table_cpu.fill(0)
         self.num_pages_per_row.fill(0)
         self.cpu_version += 1

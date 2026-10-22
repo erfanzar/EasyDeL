@@ -29,7 +29,7 @@ from .chat_template import (
     ConvertToChatML,
     MaybeApplyChatTemplate,
 )
-from .collators import collate_packed_embeds
+from .collators import collate_bucket_static, collate_embeds_pack, collate_packed_embeds
 from .field_ops import (
     AddField,
     CombineFields,
@@ -165,6 +165,8 @@ __all__ = [
     "WeightScheduler",
     "batched_tokenize_iterator",
     "block_mixture_interleave",
+    "collate_bucket_static",
+    "collate_embeds_pack",
     "collate_packed_embeds",
     "compute_tokenizer_hash",
     "pack_constant_length",

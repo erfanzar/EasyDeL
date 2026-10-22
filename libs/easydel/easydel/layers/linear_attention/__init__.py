@@ -34,9 +34,11 @@ from ._conv_state import (
     apply_manual_depthwise_conv,
     shift_conv_state_left,
 )
+from ._depthwise_conv import ChannelMajorConv1D
 from ._masking import apply_mask_to_padding_states
 
 __all__ = (
+    "ChannelMajorConv1D",
     "apply_conv_with_state",
     "apply_manual_depthwise_conv",
     "apply_mask_to_padding_states",

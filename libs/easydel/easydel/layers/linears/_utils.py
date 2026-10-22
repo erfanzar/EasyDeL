@@ -144,37 +144,37 @@ def nf4_qmm_jax(
         >>> x = jnp.ones((32, 768), dtype=jnp.bfloat16)
         >>> output = nf4_qmm_jax(x, wq, wscale)
     """
+    if x.ndim != 2 or wq.ndim != 3 or wscale.shape != wq.shape[:2] or x.shape[1] != wq.shape[0]:
+        raise ValueError("NF4 matmul requires x[M,K], packed weights[K,blocks,bytes], and scales[K,blocks].")
+    if min(BK, BM, BNQL) <= 0:
+        raise ValueError("NF4 tile sizes must be positive.")
     qfeatures = wq.shape[-1]
     qnumblocks = wq.shape[-2]
     qblocksize = qfeatures * 2
     UN = qblocksize * qnumblocks
-    M = x.shape[0]
-    K = x.shape[1]
-    bnql = min(BNQL, qnumblocks)
-    BN = min(cdiv(bnql, qnumblocks) * qnumblocks, UN)
+    M, K = x.shape
+    if M == 0 or K == 0 or UN == 0:
+        return jnp.zeros((M, UN), dtype=jnp.float32)
+    # BNQL is measured in quantization blocks, not unpacked channels.
+    BQ = min(BNQL, qnumblocks)
+    BN = BQ * qblocksize
     bm, bk = min(BM, M), min(BK, K)
-    num_mblocks = cdiv(M, bm)
-    num_kblocks = cdiv(K, bk)
-    num_nblocks = cdiv(UN, BN)
-    BQ = cdiv(num_nblocks, qnumblocks)
-    output = jnp.zeros([M, UN])
+    num_mblocks, num_kblocks, num_nblocks = cdiv(M, bm), cdiv(K, bk), cdiv(qnumblocks, BQ)
+    # Pad all partial tiles: dynamic_slice otherwise clamps a final start
+    # backwards and silently multiplies overlapping rows/columns twice.
+    x = jnp.pad(x, ((0, num_mblocks * bm - M), (0, num_kblocks * bk - K))).astype(compute_dtype)
+    wq = jnp.pad(wq, ((0, num_kblocks * bk - K), (0, num_nblocks * BQ - qnumblocks), (0, 0)))
+    wscale = jnp.pad(wscale, ((0, num_kblocks * bk - K), (0, num_nblocks * BQ - qnumblocks)))
+    output = jnp.zeros((num_mblocks * bm, num_nblocks * BN), dtype=jnp.float32)
     for midx in range(num_mblocks):
         for nidx in range(num_nblocks):
-            acc = jnp.zeros([bm, BN], compute_dtype)
+            acc = jnp.zeros((bm, BN), dtype=jnp.float32)
             for kidx in range(num_kblocks):
                 a = jax.lax.dynamic_slice(x, (midx * bm, kidx * bk), (bm, bk))
                 b = jax.lax.dynamic_slice(wq, (kidx * bk, nidx * BQ, 0), (bk, BQ, qfeatures))
                 bs = jax.lax.dynamic_slice(wscale, (kidx * bk, nidx * BQ), (bk, BQ))
-
-                b = jnp.stack([(b >> 4) & 0xF, b & 0xF], axis=-1)
-                *batch_dims, num_blocks, _ = b.shape
-                b = b.reshape(*batch_dims, num_blocks, -1)
-                b = i4tou4(b)
-                b = nf4xf32_to_f32(b).reshape(*b.shape[:-2], -1)
-                w = (b * jnp.expand_dims(bs, -1)).reshape(bk, -1).astype(compute_dtype)
-                acc += jnp.dot(a, w)
-            output = output.at[
-                midx * bm : (midx * bm) + bm,
-                nidx * BN : (nidx * BN) + BN,
-            ].set(acc)
-    return output
+                codes = jnp.stack([(b >> 4) & 0xF, b & 0xF], axis=-1).reshape(bk, BQ, qblocksize)
+                w = (nf4xf32_to_f32(codes) * bs[..., None]).reshape(bk, BN).astype(compute_dtype)
+                acc += jnp.dot(a, w, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+            output = jax.lax.dynamic_update_slice(output, acc, (midx * bm, nidx * BN))
+    return output[:M, :UN]

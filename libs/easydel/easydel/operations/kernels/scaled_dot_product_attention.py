@@ -178,6 +178,7 @@ class ScaledDotProductAttn(OperationImpl):
         sliding_window: int | tuple[int, int] | None = None,
         cum_seqlens_q: Int[Array, "batch"] | None = None,  # noqa
         cum_seqlens_k: Int[Array, "batch"] | None = None,  # noqa
+        compute_dtype: jnp.dtype | None = None,
         **ignore,
     ) -> AttentionOutput:
         """Run scaled dot-product attention via the ejkernel SDPA wrapper.
@@ -207,6 +208,8 @@ class ScaledDotProductAttn(OperationImpl):
                 length packing, shape ``(batch + 1,)``.
             cum_seqlens_k: Cumulative key/value sequence lengths for
                 variable-length packing, shape ``(batch + 1,)``.
+            compute_dtype: Optional Q/K/V and bias computation dtype, overriding
+                metadata runtime dtype. The backend accumulates softmax in fp32.
             **ignore: Forward-compatibility kwargs (ignored).
 
         Returns:
@@ -216,12 +219,17 @@ class ScaledDotProductAttn(OperationImpl):
         """
         head_dim: int = query.shape[-1]
         softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
-        dtype: jnp.dtype = self.metadata.runtime_dtype
+        dtype: jnp.dtype = compute_dtype or self.metadata.runtime_dtype or query.dtype
         model_mode: common_types.RUNTIME_MODE_TYPES = self.get_mode(query=query, BTHD=True)  # type: ignore
 
-        # Disable causal masking in decode mode
+        # Cached visibility can already encode absolute positions. Do not
+        # intersect it with a second, chunk-relative backend triangle/window.
         is_decode_mode: bool = model_mode == common_types.MODE_DECODE
-        causal_computed: bool = causal if not is_decode_mode else False
+        causal_computed: bool = causal and not is_decode_mode
+        if mask_info is not None and mask_info.causal_mask_baked_in:
+            causal_computed = False
+        if mask_info is not None and mask_info.sliding_window_baked_in:
+            sliding_window = None
 
         shardings = self.metadata.get_shardings(model_mode, layout="bthd")
 
@@ -364,6 +372,7 @@ class ScaledDotProductAttn(OperationImpl):
         sliding_window: int | tuple[int, int] | None = None,
         cum_seqlens_q: Int[Array, "batch"] | None = None,  # noqa
         cum_seqlens_k: Int[Array, "batch"] | None = None,  # noqa
+        compute_dtype: jnp.dtype | None = None,
         **ignore,
     ) -> AttentionOutput:
         """Run SDPA, dispatching to the backend-specific forward method.
@@ -383,6 +392,7 @@ class ScaledDotProductAttn(OperationImpl):
                 attention.
             cum_seqlens_k: Cumulative key/value sequence lengths for packed
                 attention.
+            compute_dtype: Optional computation dtype overriding metadata runtime dtype.
             **ignore: Forward-compatibility kwargs (ignored).
 
         Returns:
@@ -400,6 +410,7 @@ class ScaledDotProductAttn(OperationImpl):
             sliding_window=sliding_window,
             cum_seqlens_q=cum_seqlens_q,
             cum_seqlens_k=cum_seqlens_k,
+            compute_dtype=compute_dtype,
             **ignore,
         )
 

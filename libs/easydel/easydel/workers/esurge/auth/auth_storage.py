@@ -188,7 +188,8 @@ class AuthStorage:
         Returns:
                 Dictionary mapping hashed_key -> ApiKeyMetadata
         """
-        if not self.keys_file.exists():
+        backup_file = self.keys_file.with_suffix(".bak")
+        if not self.keys_file.exists() and not backup_file.exists():
             logger.info("No existing keys file found, starting fresh")
             return {}
 
@@ -215,6 +216,8 @@ class AuthStorage:
                             hashed_key: self._deserialize_key_metadata(key_data)
                             for hashed_key, key_data in keys_data.items()
                         }
+                        # Restore the validated snapshot before normal writes rotate backups.
+                        self.keys_file.write_text(json.dumps(data), encoding="utf-8")
                         logger.info(f"Successfully loaded {len(keys)} keys from backup")
                         return keys
                     except Exception as backup_error:
@@ -464,7 +467,10 @@ class AuthStorage:
         """
         with self._lock:
             for file_path in [self.keys_file, self.audit_logs_file, self.stats_file]:
-                if file_path.exists():
-                    file_path.unlink()
-                    logger.info(f"Deleted: {file_path}")
+                # Backups also contain auth data and must not resurrect cleared keys on recovery.
+                for stored_path in (file_path, file_path.with_suffix(".bak"), file_path.with_suffix(".tmp")):
+                    if stored_path.exists():
+                        stored_path.unlink()
+                        logger.info(f"Deleted: {stored_path}")
+            self._dirty = False
             logger.info("All auth storage cleared")

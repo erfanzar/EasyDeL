@@ -118,6 +118,7 @@ class ReasoningMixin:
         current_token_ids: list[int] | None = None,
         delta_token_ids: list[int] | None = None,
         request=None,
+        final: bool = False,
     ) -> DeltaMessage | None:
         """Extract reasoning from streaming response chunks.
 
@@ -130,6 +131,9 @@ class ReasoningMixin:
             current_token_ids: Token IDs including the new delta.
             delta_token_ids: Token IDs corresponding to the new text.
             request: Optional request context forwarded to the parser.
+            final: Flush unresolved delimiter prefixes after this delta, including
+                an empty final snapshot. Empty decoded updates without this flag
+                retain buffered text because generation may still be in progress.
 
         Returns:
             A :class:`DeltaMessage` carrying ``reasoning_content`` and/or
@@ -139,7 +143,33 @@ class ReasoningMixin:
             return None
 
         parser = self.reasoning_parsers[model_name]
+        if final and delta_text:
+            delta = self.extract_reasoning_streaming(
+                model_name,
+                previous_text,
+                current_text,
+                delta_text,
+                previous_token_ids,
+                current_token_ids,
+                delta_token_ids,
+                request,
+            )
+            tail = parser.finalize_streaming(current_text, current_token_ids or [], request)
+            if tail is None:
+                return delta
+            if delta is None:
+                return tail
+            return delta.model_copy(
+                update={
+                    "content": (delta.content or "") + (tail.content or "") or None,
+                    "reasoning_content": (delta.reasoning_content or "") + (tail.reasoning_content or "") or None,
+                }
+            )
         try:
+            if not delta_text:
+                if final:
+                    return parser.finalize_streaming(current_text, current_token_ids or [], request)
+                return None
             delta = parser.extract_reasoning_streaming(
                 previous_text=previous_text,
                 current_text=current_text,

@@ -24,9 +24,13 @@ This module provides:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import pickle
+import tempfile
 import typing as tp
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,6 +43,37 @@ if tp.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _JSON_ENCODED_ARROW_COLUMNS = frozenset({"tools"})
+
+
+class _SpoolSource(ShardedDataSource[dict]):
+    """Replay trusted in-process rows from a temporary file without retaining them in RAM."""
+
+    def __init__(self, source: ShardedDataSource, spool: tp.BinaryIO):
+        self._spool = spool
+        for name in source.shard_names:
+            for row in source.open_shard(name):
+                pickle.dump(row, spool, protocol=pickle.HIGHEST_PROTOCOL)
+
+    @property
+    def shard_names(self) -> tuple[str]:
+        """Expose the spool as one ordered shard."""
+        return ("spool",)
+
+    def num_shards(self) -> int:
+        """Return the single temporary shard count."""
+        return 1
+
+    def open_shard(self, shard_name: str) -> Iterator[dict]:
+        """Rewind and replay exactly the rows captured from the original source."""
+        if shard_name != "spool":
+            raise KeyError(shard_name)
+        self._spool.seek(0)
+        while True:
+            try:
+                row = pickle.load(self._spool)
+            except EOFError:
+                return
+            yield row
 
 
 def _json_default(value: tp.Any) -> tp.Any:
@@ -144,7 +179,12 @@ def _row_keys(rows: list[dict[str, tp.Any]]) -> list[str]:
     return keys
 
 
-def _rows_to_arrow_table(rows: list[dict[str, tp.Any]], pa: tp.Any) -> tp.Any:
+def _rows_to_arrow_table(
+    rows: list[dict[str, tp.Any]],
+    pa: tp.Any,
+    schema: tp.Any = None,
+    use_fixed_size_lists: bool = True,
+) -> tp.Any:
     """Build an Arrow table while keeping token arrays typed and metadata stable.
 
     PyArrow cannot infer a nested schema for tool/function metadata
@@ -160,12 +200,25 @@ def _rows_to_arrow_table(rows: list[dict[str, tp.Any]], pa: tp.Any) -> tp.Any:
         rows: Buffer of row dicts collected by the writer.
         pa: ``pyarrow`` module reference; passed in instead of imported
             so the helper does not depend on the caller's import path.
+        schema: Optional dataset-wide schema. Missing fields become null columns
+            and every batch uses its declared types, including empty batches.
+        use_fixed_size_lists: Whether equal-length numeric rows may infer a
+            fixed-size list. Disable for batches belonging to a streaming writer.
 
     Returns:
         pyarrow.Table: Table whose columns mirror :func:`_row_keys`,
         with mixed/nested columns coerced to JSON-text columns when
         direct array construction fails.
     """
+    if schema is not None:
+        columns = []
+        for field in schema:
+            values = [row.get(field.name) for row in rows]
+            if pa.types.is_string(field.type):
+                values = [_json_encode_metadata_value(value) for value in values]
+            columns.append(pa.array(values, type=field.type))
+        return pa.Table.from_arrays(columns, schema=schema)
+
     columns = {}
     for key in _row_keys(rows):
         values = [row.get(key) for row in rows]
@@ -175,7 +228,12 @@ def _rows_to_arrow_table(rows: list[dict[str, tp.Any]], pa: tp.Any) -> tp.Any:
 
         fixed_size_column = _try_fixed_size_numeric_list(values, pa)
         if fixed_size_column is not None:
-            columns[key] = fixed_size_column
+            # Variable list widths must not discard the compact, lossless scalar dtype.
+            columns[key] = (
+                fixed_size_column
+                if use_fixed_size_lists
+                else fixed_size_column.cast(pa.list_(fixed_size_column.type.value_type))
+            )
             continue
 
         try:
@@ -199,8 +257,8 @@ def _try_fixed_size_numeric_list(values: list[tp.Any], pa: tp.Any) -> tp.Any | N
     output. Falls back gracefully (returns ``None``) when shapes
     mismatch, dtypes are non-numeric, or NumPy is unavailable —
     callers then take the generic :func:`pyarrow.array` path. Large
-    integer dtypes are downcast to ``int32`` to keep token id arrays
-    compact.
+    integer dtypes are downcast to ``int32`` only when all values fit,
+    keeping bounded token id arrays compact without corrupting arbitrary IDs.
 
     Args:
         values: Column values for one row buffer key.
@@ -224,7 +282,9 @@ def _try_fixed_size_numeric_list(values: list[tp.Any], pa: tp.Any) -> tp.Any | N
         if dtype.kind not in {"b", "i", "u", "f"}:
             return None
         if dtype.kind in {"i", "u"} and dtype.itemsize > 4:
-            dtype = np.dtype("int32")
+            bounds = np.iinfo(np.int32)
+            if all(array.size == 0 or (array.min() >= bounds.min and array.max() <= bounds.max) for array in arrays):
+                dtype = np.dtype("int32")
         elif dtype.kind == "b":
             dtype = np.dtype("bool")
         stacked = np.asarray(arrays, dtype=dtype)
@@ -366,7 +426,7 @@ class DatasetWriter:
     fields are configuration storage.
     """
 
-    def _prepare_output_dir(self, fs, path: str, suffix: str) -> None:
+    def _prepare_output_dir(self, fs, path: str, suffix: str | tuple[str, ...]) -> None:
         """Enforce the ``overwrite`` contract before any shard is written.
 
         Pre-existing ``shard-*{suffix}`` files in the target are fatal when
@@ -414,6 +474,7 @@ class DatasetWriter:
         num_shards: int | None = None,
         compression: str | None = None,
         overwrite: bool = False,
+        shard_column: str | None = None,
     ):
         """Capture the writer's output settings without performing any I/O.
 
@@ -430,20 +491,175 @@ class DatasetWriter:
             compression: Codec name forwarded to the subclass-specific
                 writer (``"snappy"``, ``"gzip"``, …); semantics depend
                 on the format.
-            overwrite: Whether to clobber existing files at
-                ``output_path``. Currently advisory — concrete writers
-                may not all enforce this.
+            overwrite: Whether to replace existing shards at ``output_path``.
+            shard_column: Optional column used for stable hash partitioning. Without
+                ``num_shards``, a size-estimation pass determines the bucket count.
         """
         self.output_path = output_path
         self.max_shard_size = max_shard_size
         self.num_shards = num_shards
-        if num_shards is not None:
-            logger.warning(
-                "num_shards is advisory only: streaming writers rotate by max_shard_size and cannot "
-                "target an exact shard count without knowing the total size up front."
-            )
+        if num_shards is not None and num_shards < 1:
+            raise ValueError("num_shards must be positive")
         self.compression = compression
         self.overwrite = overwrite
+        self.shard_column = shard_column
+
+    def _partition_schema(self, source: ShardedDataSource, pa: tp.Any) -> tuple[tp.Any, int]:
+        """Discover one dataset schema and size using bounded buffers of a reopenable source.
+
+        Variable-size lists, null promotion, and the union of optional fields must be
+        known before opening any fixed-schema Arrow/Parquet writer. This also gives
+        empty partitions the same schema as populated partitions. Incompatible nested
+        metadata retains the existing JSON-text fallback, consistently across batches.
+        """
+        schema = pa.schema([])
+        json_columns = set(_JSON_ENCODED_ARROW_COLUMNS)
+        rows = []
+        size = total_size = 0
+        limit = max(1, min(self.max_shard_size, 1024 * 1024))
+
+        def merge_buffer():
+            nonlocal schema
+            normalized = [
+                {key: _json_encode_metadata_value(value) if key in json_columns else value for key, value in row.items()}
+                for row in rows
+            ]
+            incoming = _rows_to_arrow_table(normalized, pa, use_fixed_size_lists=False).schema
+            for column in incoming:
+                if pa.types.is_string(column.type) and _contains_nested_metadata(row.get(column.name) for row in rows):
+                    json_columns.add(column.name)
+            fields = dict.fromkeys([*schema.names, *incoming.names])
+            merged = []
+            for name in fields:
+                if name in json_columns:
+                    merged.append(pa.field(name, pa.string()))
+                    continue
+                old = schema.field(name) if name in schema.names else None
+                new = incoming.field(name) if name in incoming.names else None
+                if old is None or new is None:
+                    merged.append(new if old is None else old)
+                    continue
+                try:
+                    merged.append(
+                        pa.unify_schemas([pa.schema([old]), pa.schema([new])], promote_options="permissive")[0]
+                    )
+                except (pa.ArrowInvalid, pa.ArrowTypeError):
+                    if not any(pa.types.is_nested(field.type) for field in (old, new)):
+                        raise
+                    json_columns.add(name)
+                    merged.append(pa.field(name, pa.string()))
+            schema = pa.schema(merged)
+
+        for name in source.shard_names:
+            for row in source.open_shard(name):
+                rows.append(row)
+                row_size = estimate_row_size(row)
+                total_size += row_size
+                size += row_size
+                if size >= limit:
+                    merge_buffer()
+                    rows = []
+                    size = 0
+        if rows:
+            merge_buffer()
+        return schema, total_size
+
+    def _write_partitioned(self, source: ShardedDataSource, format: str) -> WriteStats:  # noqa: A002
+        """Write partitions while preserving one-shot sources during discovery passes."""
+        if format != "jsonl" or self.num_shards is None:
+            # Schema discovery and automatic partition sizing must see exactly
+            # the rows later written, even when the input cannot be reopened.
+            # A local spool bounds memory and preserves Python/NumPy row types.
+            with tempfile.TemporaryFile(dir="/tmp") as spool:
+                return self._write_replayable_partitions(_SpoolSource(source, spool), format)
+        return self._write_replayable_partitions(source, format)
+
+    def _write_replayable_partitions(self, source: ShardedDataSource, format: str) -> WriteStats:  # noqa: A002
+        """Write a fixed number of partitions from a replayable source."""
+        import fsspec
+
+        schema = None
+        total_size = None
+        if format != "jsonl":
+            import pyarrow as pa
+
+            schema, total_size = self._partition_schema(source, pa)
+        count = self.num_shards
+        if count is None:
+            # Stable key routing needs the final bucket count up front. Sources are reopenable;
+            # estimate the total in a memory-bounded first pass instead of retaining all rows.
+            if total_size is None:
+                total_size = sum(
+                    estimate_row_size(row) for name in source.shard_names for row in source.open_shard(name)
+                )
+            count = max((total_size + max(self.max_shard_size, 1) - 1) // max(self.max_shard_size, 1), 1)
+        fs, path = fsspec.core.url_to_fs(self.output_path)
+        suffix = "." + format
+        if format == "jsonl":
+            suffix += ".gz" if self.compression == "gzip" else ""
+        else:
+            import pyarrow as pa
+            import pyarrow.ipc as ipc
+            import pyarrow.parquet as pq
+
+            options = ipc.IpcWriteOptions(compression=self.compression) if format == "arrow" else None
+        fs.makedirs(path, exist_ok=True)
+        self._prepare_output_dir(fs, path, (".jsonl", ".jsonl.gz") if format == "jsonl" else suffix)
+        stats = WriteStats()
+        buffers = [[] for _ in range(count)]
+        sizes = [0] * count
+        writers = {}
+        paths = [f"{path}/shard-{index:05d}{suffix}" for index in range(count)]
+        buffer_limit = max(self.max_shard_size // count, 1)
+
+        with ExitStack() as stack:
+
+            def flush(index: int, final: bool = False):
+                rows = buffers[index]
+                if not rows and (index in writers or not final):
+                    return
+                if format == "jsonl":
+                    if index not in writers:
+                        handle = stack.enter_context(fs.open(paths[index], "wb"))
+                        if self.compression == "gzip":
+                            import gzip
+
+                            handle = stack.enter_context(gzip.GzipFile(fileobj=handle, mode="wb"))
+                        writers[index] = handle
+                    for row in rows:
+                        encoded = json.dumps(row, ensure_ascii=False, default=_json_default) + "\n"
+                        writers[index].write(encoded.encode("utf-8"))
+                else:
+                    table = _rows_to_arrow_table(rows, pa, schema=schema)
+                    if index not in writers:
+                        handle = stack.enter_context(fs.open(paths[index], "wb"))
+                        if format == "parquet":
+                            writer = pq.ParquetWriter(handle, table.schema, compression=self.compression)
+                        else:
+                            writer = ipc.new_file(handle, table.schema, options=options)
+                        writers[index] = stack.enter_context(writer)
+                    writers[index].write_table(table)
+                buffers[index] = []
+                sizes[index] = 0
+
+            for name in source.shard_names:
+                for row in source.open_shard(name):
+                    if self.shard_column is not None:
+                        key = json.dumps(row[self.shard_column], sort_keys=True, default=_json_default).encode()
+                        index = int.from_bytes(hashlib.sha256(key).digest()[:8], "big") % count
+                    else:
+                        index = stats.num_examples % count
+                    buffers[index].append(row)
+                    sizes[index] += estimate_row_size(row)
+                    stats.num_examples += 1
+                    if sizes[index] >= buffer_limit:
+                        flush(index)
+            for index in range(count):
+                flush(index, final=True)
+        stats.num_shards = count
+        stats.output_paths = [self._shard_uri(name) for name in paths]
+        stats.total_bytes = sum(fs.info(name).get("size", 0) for name in paths)
+        return stats
 
     def write(self, source: ShardedDataSource) -> WriteStats:
         """Abstract: walk ``source`` and produce sharded files in this writer's format.
@@ -493,6 +709,8 @@ class ParquetWriter(DatasetWriter):
         import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
         import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
 
+        if self.num_shards is not None or self.shard_column is not None:
+            return self._write_partitioned(source, "parquet")
         fs, path = fsspec.core.url_to_fs(self.output_path)
         fs.makedirs(path, exist_ok=True)
         self._prepare_output_dir(fs, path, ".parquet")
@@ -520,7 +738,7 @@ class ParquetWriter(DatasetWriter):
                 return
 
             if current_rows:
-                table = _rows_to_arrow_table(current_rows, pa)
+                table = _rows_to_arrow_table(current_rows, pa, use_fixed_size_lists=False)
 
                 shard_path = f"{path}/shard-{current_shard:05d}.parquet"
                 with fs.open(shard_path, "wb") as f:
@@ -574,6 +792,9 @@ class ArrowWriter(DatasetWriter):
         import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
         import pyarrow.ipc as ipc  # pyright: ignore[reportMissingTypeStubs]
 
+        if self.num_shards is not None or self.shard_column is not None:
+            return self._write_partitioned(source, "arrow")
+        options = ipc.IpcWriteOptions(compression=self.compression)
         fs, path = fsspec.core.url_to_fs(self.output_path)
         fs.makedirs(path, exist_ok=True)
         self._prepare_output_dir(fs, path, ".arrow")
@@ -598,11 +819,11 @@ class ArrowWriter(DatasetWriter):
             if not current_rows:
                 return
 
-            table = _rows_to_arrow_table(current_rows, pa)
+            table = _rows_to_arrow_table(current_rows, pa, use_fixed_size_lists=False)
 
             shard_path = f"{path}/shard-{current_shard:05d}.arrow"
             with fs.open(shard_path, "wb") as f:
-                writer = ipc.new_file(f, table.schema)
+                writer = ipc.new_file(f, table.schema, options=options)
                 writer.write_table(table)
                 writer.close()
 
@@ -655,9 +876,11 @@ class JsonlWriter(DatasetWriter):
         """
         import fsspec  # pyright: ignore[reportMissingTypeStubs]
 
+        if self.num_shards is not None or self.shard_column is not None:
+            return self._write_partitioned(source, "jsonl")
         fs, path = fsspec.core.url_to_fs(self.output_path)
         fs.makedirs(path, exist_ok=True)
-        self._prepare_output_dir(fs, path, ".jsonl")
+        self._prepare_output_dir(fs, path, (".jsonl", ".jsonl.gz"))
 
         stats = WriteStats()
         current_shard = 0
@@ -724,6 +947,7 @@ def create_writer(
     num_shards: int | None = None,
     compression: str | None = None,
     overwrite: bool = False,
+    shard_column: str | None = None,
 ) -> DatasetWriter:
     """Build the appropriate :class:`DatasetWriter` for a given format string.
 
@@ -744,7 +968,9 @@ def create_writer(
         compression: Codec name forwarded to the writer; semantics
             depend on the format. ``None`` lets each writer pick its
             sensible default.
-        overwrite: Forwarded to the writer; advisory.
+        overwrite: Whether existing shards may be replaced.
+        shard_column: Optional column used for deterministic hash partitioning;
+            ``None`` uses round-robin routing when ``num_shards`` is set.
 
     Returns:
         DatasetWriter: A configured :class:`ParquetWriter`,
@@ -762,6 +988,7 @@ def create_writer(
             num_shards=num_shards,
             compression=compression or "snappy",
             overwrite=overwrite,
+            shard_column=shard_column,
         )
     elif format == "arrow":
         return ArrowWriter(
@@ -770,6 +997,7 @@ def create_writer(
             num_shards=num_shards,
             compression=compression,
             overwrite=overwrite,
+            shard_column=shard_column,
         )
     elif format == "jsonl":
         return JsonlWriter(
@@ -778,6 +1006,7 @@ def create_writer(
             num_shards=num_shards,
             compression=compression,
             overwrite=overwrite,
+            shard_column=shard_column,
         )
     else:
         raise ValueError(f"Unsupported format: {format}")
@@ -867,9 +1096,14 @@ class SaveStage(BaseStage):
                 output_path=save_path,
                 format=save_format,
                 max_shard_size=self._stage_config.max_shard_size,
-                num_shards=self._stage_config.num_shards,
+                num_shards=(
+                    ds_config.num_shards
+                    if ds_config is not None and ds_config.num_shards is not None
+                    else self._stage_config.num_shards
+                ),
                 compression=self._stage_config.compression,
                 overwrite=self._stage_config.overwrite,
+                shard_column=ds_config.shard_column if ds_config is not None else None,
             )
 
             stats = writer.write(source)

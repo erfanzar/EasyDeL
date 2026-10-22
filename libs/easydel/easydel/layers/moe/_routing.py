@@ -42,12 +42,34 @@ import typing as tp
 
 import jax
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Float, Int
 
 ScoreFn = tp.Literal["sigmoid", "softmax", "none"]
 GroupScore = tp.Literal["topk_sum", "max"]
 
-__all__ = ("moe_group_topk_select",)
+__all__ = ("fp32_router_logits", "moe_group_topk_select")
+
+
+def fp32_router_logits(hidden_states: Array, weight: Array, hidden_size: int) -> Float[Array, "tokens experts"]:
+    """Router projection in float32, flattened to ``[tokens, experts]`` and tagged ``moe_router_logits``.
+
+    The GLM routers keep this matmul in fp32 whatever the activation dtype: the gap between selected and rejected
+    experts can fall below bfloat16 resolution near initialisation. Default matmul precision.
+
+    Args:
+        hidden_states: Token activations whose last axis is ``hidden_size``.
+        weight: Router weight ``[hidden_size, num_experts]`` (any dtype).
+        hidden_size: Model width used to flatten ``hidden_states``.
+
+    Returns:
+        fp32 logits ``[tokens, num_experts]``.
+    """
+    hidden_states = hidden_states.reshape(-1, hidden_size)
+    return checkpoint_name(
+        jnp.matmul(hidden_states.astype(jnp.float32), weight.astype(jnp.float32)),
+        "moe_router_logits",
+    )
 
 
 def _score(gate_logits: Array, score_fn: ScoreFn) -> Array:

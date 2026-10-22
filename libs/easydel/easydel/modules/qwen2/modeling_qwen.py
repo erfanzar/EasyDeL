@@ -64,7 +64,7 @@ from easydel.layers import (
     gated_mlp_forward,
 )
 from easydel.layers import RMSNorm as RMSNorm
-from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseEmbeddingModule, BaseSequenceClassificationModule
 
 from .qwen_configuration import Qwen2Config
@@ -243,67 +243,6 @@ class Qwen2Attention(UnifiedAttention):
             layout=qkv_layout,
         )
 
-    def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Build the query projection with Qwen2's configured bias.
-
-        Qwen2 attaches a learned bias to every QKV projection (in
-        contrast to Llama, which omits it). This override wires that
-        bias on for the ``Q`` ``ColumnParallelLinear`` while keeping
-        the rest of the construction inherited from
-        :class:`UnifiedAttention`.
-
-        Returns:
-            ColumnParallelLinear: Q projection mapping
-            ``hidden_size`` → ``num_attention_heads * head_dim``.
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=bool(getattr(config, "attention_bias", True)),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-        )
-
-    def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Build the key projection with Qwen2's configured bias.
-
-        Output dim follows GQA: ``num_key_value_heads * head_dim``.
-
-        Returns:
-            ColumnParallelLinear: K projection.
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=bool(getattr(config, "attention_bias", True)),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-        )
-
-    def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Build the value projection with Qwen2's configured bias.
-
-        Returns:
-            ColumnParallelLinear: V projection mapping
-            ``hidden_size`` → ``num_key_value_heads * head_dim``.
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=bool(getattr(config, "attention_bias", True)),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-        )
-
     def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
         """Build the output projection without bias.
 
@@ -344,25 +283,6 @@ class Qwen2Attention(UnifiedAttention):
             rotary_dim=config.hidden_size // config.num_attention_heads,
             base=config.rope_theta,
             dtype=dtype,
-        )
-
-    def _create_attention_performer(self, config: Qwen2Config, rngs: spx.Rngs):
-        """Create the FlexibleAttention performer with Qwen2 settings.
-
-        Threads ``config.attention_dropout`` and the canonical
-        ``head_dim**-0.5`` softmax scale through to the shared
-        attention dispatcher.
-
-        Returns:
-            FlexibleAttentionModule: Attention dispatcher used by this
-            layer; selects an appropriate kernel based on the active
-            ``attention_type`` and ``sliding_window`` settings.
-        """
-        return FlexibleAttentionModule(
-            rngs=rngs,
-            base_config=config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=config.attention_dropout,
         )
 
 
@@ -637,6 +557,8 @@ class Qwen2Model(EasyDeLBaseModule):
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
         sequence_length = inputs_embeds.shape[1]
 
+        output_attentions = self.config.output_attentions if output_attentions is None else output_attentions
+        output_hidden_states = self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
         assert sequence_length <= self.config.max_position_embeddings, (
@@ -939,8 +861,30 @@ class Qwen2ForSequenceClassification(BaseSequenceClassificationModule[Qwen2Model
         Raises:
             ValueError: If config.pad_token_id is None and batch_size > 1.
         """
-        transformer_outputs = self.model(
+        if not apply_lm_head:
+            outputs = self.model(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                mask_info=mask_info,
+                position_ids=position_ids,
+                mode=mode,
+                past_key_values=past_key_values,
+                cache_metadata=cache_metadata,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+            )
+            return SequenceClassifierOutput(
+                logits=None,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                aux_loss=self.compute_router_aux_loss(outputs, attention_mask=attention_mask),
+            )
+        # Pooling (attention-mask aware), cache pass-through and aux loss all live in the shared base forward.
+        return super().forward(
             input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             mask_info=mask_info,
             position_ids=position_ids,
@@ -949,34 +893,6 @@ class Qwen2ForSequenceClassification(BaseSequenceClassificationModule[Qwen2Model
             cache_metadata=cache_metadata,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            inputs_embeds=inputs_embeds,
-        )
-
-        hidden_states = transformer_outputs.last_hidden_state
-        logits = self.score(hidden_states)
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]
-        else:
-            batch_size = inputs_embeds.shape[0]
-
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
-        else:
-            if input_ids is not None:
-                sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-            else:
-                sequence_lengths = -1
-
-        pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-        return SequenceClassifierOutput(
-            logits=pooled_logits,
-            past_key_values=past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
         )
 
     def get_encoder(self):

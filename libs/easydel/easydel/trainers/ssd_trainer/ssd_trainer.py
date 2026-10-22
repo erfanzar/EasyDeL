@@ -29,9 +29,10 @@ from easydel.utils.helpers import capture_time
 from ..base_trainer import TrainerConfigureFunctionOutput
 from ..group_relative_policy_optimization import GRPOTrainer
 from ..metrics import _host_mean_float, _host_scalar_float
-from ..sdft_trainer import _zero_reward_func
+from ..model_loading import zero_reward_func
 from ..training_utils import (
     compile_trainer_step,
+    resolve_straight_through_emulator,
 )
 from ._fn import ssd_step
 from .ssd_config import SSDConfig
@@ -69,7 +70,7 @@ class SSDTrainer(GRPOTrainer):
         super().__init__(
             arguments=arguments,
             model=model,
-            reward_funcs=_zero_reward_func,
+            reward_funcs=zero_reward_func,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             processing_class=processing_class,
@@ -87,6 +88,13 @@ class SSDTrainer(GRPOTrainer):
         """
         mesh = self.model.mesh
         empty_sharding = replicated_named_sharding(mesh)
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_group_size=self.arguments.quantization_group_size,
+            quantization_bits=self.arguments.quantization_bits,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
         self._train_shared_fn_static_args = (
             self.arguments.loss_config,
             self.scheduler,
@@ -94,7 +102,7 @@ class SSDTrainer(GRPOTrainer):
             self.arguments.gradient_accumulation_steps,
             True,
             self.arguments.logprob_vocab_chunk_size,
-            None,
+            straight_through_emulator,
         )
         self._eval_shared_fn_static_args = (
             self.arguments.loss_config,
@@ -103,7 +111,7 @@ class SSDTrainer(GRPOTrainer):
             self.arguments.gradient_accumulation_steps,
             False,
             self.arguments.logprob_vocab_chunk_size,
-            None,
+            straight_through_emulator,
         )
         static_argnums = tuple(range(2, 9))
         sharded_training_step_function = compile_trainer_step(

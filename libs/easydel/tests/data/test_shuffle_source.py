@@ -4,12 +4,15 @@ import itertools
 from collections.abc import Iterator, Sequence
 from typing import ClassVar
 
+import pytest
 from easydel.data import ShuffledShardedSource
 from easydel.data.core.config import WeightSchedulePoint
 from easydel.data.core.protocols import ShardedDataSource, ShardInfo
 from easydel.data.transforms.base import ExpandTransform, Transform
 from easydel.data.transforms.mixture import MixedShardedSource, WeightScheduler
 from easydel.data.transforms.source import TransformedShardedSource
+
+pytestmark = pytest.mark.cpu_ok
 
 
 class ListSource(ShardedDataSource[dict]):
@@ -499,14 +502,13 @@ def _wrapper_factories(source: ShardedDataSource) -> dict[str, ShardedDataSource
     from easydel.data.core.protocols import MappedShardedDataSource
     from easydel.data.execution.pipeline import (
         _ArrayFieldsOnlyShardedSource,
-        _DropFieldsShardedSource,
         _ParallelTransformedShardedSource,
         _ProgressBarShardedSource,
     )
     from easydel.data.sources.base import CompositeShardedSource
 
     return {
-        "drop_fields": _DropFieldsShardedSource(source, frozenset({"x"})),
+        "drop_fields": source.drop_fields(["x"]),
         "array_fields_only": _ArrayFieldsOnlyShardedSource(source),
         "progress_bar": _ProgressBarShardedSource(source, update_interval=10),
         "parallel_identity": _ParallelTransformedShardedSource(source, _Identity(), num_workers=1),

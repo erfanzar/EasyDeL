@@ -67,6 +67,7 @@ Example:
 
 from __future__ import annotations
 
+import inspect
 import typing as tp
 from collections import OrderedDict
 
@@ -97,6 +98,81 @@ logger = get_logger("eSurge-ModelExecutor")
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
     from easydel.infra.etils import MpMdSchedulers
+
+
+def resolve_lm_logit_postprocess(model: "EasyDeLBaseModule") -> tp.Callable[[jax.Array], jax.Array] | None:
+    """Resolve the model's final logit post-processing for stage-local LM heads.
+
+    The split pipeline-parallel LM-head executables only hold the exported
+    projection module, so they cannot call ``model.compute_lm_logits``. Models
+    whose ``compute_lm_logits`` applies extra logic on top of the projection
+    expose it through an optional ``get_lm_logit_postprocess()`` method returning
+    a *pure* ``logits -> logits`` callable (it must close over scalars or
+    parameter-free modules only, never over large arrays). That hook is
+    authoritative. Models without the hook have no extra post-processing;
+    configuration attributes alone cannot specify the family's transform order.
+
+    Args:
+        model: Live bound model.
+
+    Returns:
+        A ``logits -> logits`` callable, or ``None`` when no post-processing applies.
+    """
+    hook = getattr(model, "get_lm_logit_postprocess", None)
+    if callable(hook):
+        return hook()
+    return None
+
+
+def _project_stage_lm_head(
+    lm_head_graphdef: tp.Any,
+    head_state: tp.Any,
+    hidden: jax.Array,
+    *,
+    uses_tied_projection: bool,
+    postprocess: tp.Callable[[jax.Array], jax.Array] | None,
+    scope: str,
+    tied_precision: tp.Any = None,
+) -> jax.Array:
+    """Project hidden rows through the exported stage-local LM head and post-process.
+
+    Shared by the split ``compile_lm_head`` and ``get_pipeline_lm_head`` jits so the
+    tied/untied projection and the logit post-processing live in one place.
+
+    Args:
+        lm_head_graphdef: Graph definition of the exported projection module.
+        head_state: State of the exported projection module.
+        hidden: ``[rows, hidden_dim]`` hidden rows.
+        uses_tied_projection: Whether the projection is the tied embedding.
+        postprocess: Optional ``logits -> logits`` callable.
+        scope: ``jax.named_scope`` prefix for the emitted sub-scopes.
+        tied_precision: Matmul precision of the model's own tied LM head, so the
+            split tied projection matches the full forward path numerically.
+
+    Returns:
+        ``[rows, vocab]`` logits.
+    """
+    with jax.named_scope(f"{scope}/project"):
+        projection = spx.bind(lm_head_graphdef, head_state)
+        if uses_tied_projection:
+            attend = getattr(projection, "attend", None)
+            if attend is None:
+                weight = projection.weight.value
+                logits = jnp.dot(hidden, weight.T, precision=tied_precision)
+            elif "precision" in inspect.signature(attend).parameters:
+                logits = attend(hidden, precision=tied_precision)
+            else:
+                logits = attend(hidden)
+        else:
+            native_forward = getattr(projection, "native_forward", None)
+            if native_forward is None:
+                logits = projection(hidden)
+            else:
+                logits = native_forward(hidden)
+    with jax.named_scope(f"{scope}/logit_postprocess"):
+        if postprocess is not None:
+            logits = postprocess(logits)
+    return logits
 
 
 class ModelStepExecutor:
@@ -138,6 +214,8 @@ class ModelStepExecutor:
         ... )
     """
 
+    supports_cache_groups = True
+
     def __init__(
         self,
         *,
@@ -158,6 +236,8 @@ class ModelStepExecutor:
         enable_spec_recurrent_commit: bool = False,
         input_sharding: jax.sharding.Sharding | None = None,
         slot_indexed_state: bool = False,
+        cache_group_configs: tuple[RaggedPagesCacheConfig | UnifiedAttentionCacheConfig, ...] = (),
+        layer_to_cache_group: tuple[int, ...] = (),
     ) -> None:
         """Initialize the ModelStepExecutor.
 
@@ -186,12 +266,24 @@ class ModelStepExecutor:
                 the compiled steps thread ``recurrent_state_indices`` from the
                 batch metadata into the model's cache metadata even without
                 SPMD DP, so the model can address per-request slot state.
+            cache_group_configs: Independent pool configurations in runtime group
+                order, fixed before compilation. Empty preserves single-pool inputs.
+            layer_to_cache_group: Static model-layer to pool-index ownership mapping.
         """
         self.model = model
         self.mesh = mesh
         self.metadata = metadata
         self.max_num_reqs = int(max_num_reqs)
         self.graphdef = graphdef
+        self.cache_group_configs = tuple(cache_group_configs)
+        self.layer_to_cache_group = tuple(layer_to_cache_group)
+        if self.cache_group_configs:
+            if not self.layer_to_cache_group or any(
+                index < 0 or index >= len(self.cache_group_configs) for index in self.layer_to_cache_group
+            ):
+                raise ValueError("Grouped cache configs require a valid layer_to_cache_group mapping")
+        elif self.layer_to_cache_group:
+            raise ValueError("layer_to_cache_group requires cache_group_configs")
         self._metadata_version = metadata.version
         self._use_slot_mapping = self._metadata_version == "v2"
         self._empty_sharding = empty_sharding
@@ -284,9 +376,7 @@ class ModelStepExecutor:
         self._pipeline_kv_carry_map_cache: dict[tuple[int, tuple[tp.Hashable, ...]], dict[int, dict[int, int]]] = {}
         self._lm_head_graphdef: tp.Any | None = None
         self._lm_head_state: tp.Any | None = None
-        self._lm_head_clip_cap: float | None = None
-        self._lm_head_logit_scale: float | None = None
-        self._lm_head_soft_cap: float | None = None
+        self._lm_head_postprocess: tp.Callable[[jax.Array], jax.Array] | None = None
         if self._uses_mpmd_mesh():
             self.refresh_lm_head_state(
                 graphdef=graphdef,
@@ -383,24 +473,131 @@ class ModelStepExecutor:
         if not self._uses_spmd_dp():
             return jnp.expand_dims(flat, 0)
         dp_size = int(getattr(self.metadata, "data_parallel_size", 1))
-        return flat.reshape((dp_size, int(flat.shape[0]) // dp_size))
+        return flat.reshape((dp_size, int(flat.shape[0]) // dp_size, *flat.shape[1:]))
 
-    @staticmethod
-    def _model_side_inputs(metadata: BatchMetadata) -> dict[str, tp.Any]:
-        """Model-declared per-token side inputs carried by ``metadata`` as forward kwargs (empty for other models).
+    def _model_side_inputs(self, metadata: BatchMetadata) -> dict[str, tp.Any]:
+        """Batch model-declared per-token side inputs in the same layout as token IDs.
 
-        Each ``[T, ...]`` array becomes ``[1, T, ...]`` under its declared name (``multimodal/side_inputs.py``).
+        Rank-major DP views each ``[T, ...]`` payload as ``[dp, T / dp, ...]``;
+        the single-rank path retains the existing ``[1, T, ...]`` contract.
         """
         side = metadata.model_side_inputs
         if not side:
             return {}
-        return {name: jnp.expand_dims(value, 0) for name, value in side.items()}
+        return {name: self._as_model_batch(value) for name, value in side.items()}
 
     def _flatten_model_hidden(self, hidden_states: jax.Array) -> jax.Array:
         """Flatten model hidden states back to token-major rows."""
         if not self._uses_spmd_dp():
             return hidden_states.squeeze(0)
         return hidden_states.reshape((-1, hidden_states.shape[-1]))
+
+    def _build_cache_metadata(self, metadata: BatchMetadata, num_reqs_max_model_len: int) -> RaggedPagesMetadata:
+        """Build the per-step :class:`RaggedPagesMetadata` from packed batch metadata.
+
+        Shared by the backbone, fused PP and fused SPMD step builders so the
+        cache-metadata construction cannot drift between them.
+
+        Args:
+            metadata: Device-resident packed batch metadata for the step.
+            num_reqs_max_model_len: Request-row cap for the context/query arrays.
+
+        Returns:
+            The cache metadata consumed by the paged attention layers.
+        """
+        use_spmd_dp = self._uses_spmd_dp()
+        return RaggedPagesMetadata(
+            pages_tables=metadata.pages_tables,
+            context_lens=(
+                metadata.rank_context_lens[:num_reqs_max_model_len]
+                if use_spmd_dp
+                else metadata.seq_lens[:num_reqs_max_model_len]
+            ),
+            query_start_loc=(
+                metadata.rank_query_start_loc if use_spmd_dp else metadata.query_start_loc[: num_reqs_max_model_len + 1]
+            ),
+            num_seqs=jnp.array([metadata.num_requests], dtype=jnp.int32),
+            num_slices_per_kv_cache_update_page=self.metadata.num_slices_per_kv_cache_update_page,
+            page_size=self.metadata.page_size,
+            request_distribution=metadata.rank_request_distribution,
+            slot_mapping=metadata.slot_mapping,
+            num_kv_update_slices=metadata.num_kv_update_slices,
+            spec_recurrent_commit=metadata.spec_recurrent_commit,
+            recurrent_state_indices=(
+                metadata.rank_recurrent_state_indices if (use_spmd_dp or self._slot_indexed_state) else None
+            ),
+            version=self._metadata_version,
+            cache_groups=metadata.cache_groups,
+            layer_to_cache_group=metadata.layer_to_cache_group,
+        )
+
+    def _prepare_model_call(
+        self,
+        model: "EasyDeLBaseModule",
+        metadata: BatchMetadata,
+        *,
+        scope: str,
+    ) -> tuple[dict[str, tp.Any], jax.Array, dict[str, tp.Any]]:
+        """Assemble the model-forward inputs shared by every compiled step builder.
+
+        Builds the external side inputs (model side inputs, vision pixel values,
+        DeepStack embeds), resolves the position ids (mrope vs. flat) and the
+        token/embedding inputs (optionally overriding embeddings with the
+        prefill-embed rows).
+
+        Args:
+            model: Bound model (used to compute embeddings for prefill overrides).
+            metadata: Device-resident packed batch metadata for the step.
+            scope: ``jax.named_scope`` prefix; the embedding preparation runs in
+                ``<scope>/prepare_inputs``.
+
+        Returns:
+            ``(model_inputs, position_ids, external_inputs)``.
+
+        Raises:
+            ValueError: If ``deepstack_visual_embeds`` is set without ``visual_pos_masks``.
+        """
+        external_inputs: dict[str, tp.Any] = self._model_side_inputs(metadata)
+        if metadata.pixel_values is not None or metadata.pixel_values_videos is not None:
+            external_inputs.update(
+                dict(
+                    pixel_values=metadata.pixel_values,
+                    image_grid_thw=metadata.image_grid_thw,
+                    pixel_values_videos=metadata.pixel_values_videos,
+                    video_grid_thw=metadata.video_grid_thw,
+                )
+            )
+        if metadata.deepstack_visual_embeds is not None:
+            if metadata.visual_pos_masks is None:
+                raise ValueError("`visual_pos_masks` must be provided when `deepstack_visual_embeds` is set.")
+            external_inputs.update(
+                dict(
+                    visual_pos_masks=self._as_model_batch(metadata.visual_pos_masks),
+                    deepstack_visual_embeds=list(metadata.deepstack_visual_embeds),
+                )
+            )
+
+        input_ids_view = metadata.model_input_ids
+        use_prefill_embeds = metadata.prefill_embeds is not None and metadata.prefill_embeds_mask is not None
+        if metadata.mrope_position_ids is not None:
+            # mRoPE keeps its coordinate axis first: [3, T] -> [3, dp, T / dp].
+            positions = metadata.mrope_position_ids
+            dp_size = int(getattr(self.metadata, "data_parallel_size", 1))
+            position_ids = positions.reshape((positions.shape[0], dp_size, positions.shape[1] // dp_size))
+        else:
+            position_ids = self._as_model_batch(metadata.position_ids_buf)
+
+        with jax.named_scope(f"{scope}/prepare_inputs"):
+            model_inputs: dict[str, tp.Any]
+            if use_prefill_embeds:
+                base_embeds = model.compute_embedding(self._as_model_batch(input_ids_view))
+                override = self._as_model_batch(metadata.prefill_embeds).astype(base_embeds.dtype)
+                mask = self._as_model_batch(metadata.prefill_embeds_mask)[..., None]
+                inputs_embeds = jnp.where(mask, override, base_embeds)
+                model_inputs = {"input_ids": None, "inputs_embeds": inputs_embeds}
+            else:
+                model_inputs = {"input_ids": self._as_model_batch(input_ids_view)}
+        return model_inputs, position_ids, external_inputs
 
     def clear_runtime_graph_args(self) -> None:
         """Drop cached graph-state call arguments."""
@@ -565,19 +762,16 @@ class ModelStepExecutor:
             tuple(sorted(leaf_sigs)),
         )
 
-    def _metadata_sharding_template(self, *, include_vlm: bool = False) -> BatchMetadata:
+    def _metadata_sharding_template(self) -> BatchMetadata:
         """Build the BatchMetadata sharding tree for compiled model steps.
 
         Materializes a :class:`BatchMetadata` whose array leaves are filled
         with replicated shardings (``self._empty_sharding``) and whose optional
         v2/spec/VLM fields are populated only when the executor needs them.
         Used as the ``in_shardings`` template for the backbone / model-step
-        jits so every metadata leaf has a fixed placement.
-
-        Args:
-            include_vlm: Currently unused — VLM leaves are left ``None`` since
-                they are not part of the compiled signature for text-only
-                buckets.
+        jits so every metadata leaf has a fixed placement. VLM leaves are left
+        ``None`` since they are not part of the compiled signature for
+        text-only buckets.
 
         Returns:
             BatchMetadata pytree populated with sharding placeholders.
@@ -606,6 +800,27 @@ class ModelStepExecutor:
             image_grid_thw=None,
             pixel_values_videos=None,
             video_grid_thw=None,
+            cache_groups=tuple(
+                RaggedPagesMetadata(
+                    pages_tables=self._empty_sharding,
+                    context_lens=self._empty_sharding,
+                    query_start_loc=self._empty_sharding,
+                    num_seqs=self._empty_sharding,
+                    slot_mapping=self._empty_sharding if config.version == "v2" else None,
+                    position_ids=self._input_sharding if use_spmd_dp else self._empty_sharding,
+                    request_distribution=self._empty_sharding,
+                    num_kv_update_slices=self._empty_sharding if config.version == "v2" else None,
+                    spec_recurrent_commit=self._empty_sharding if self.enable_spec_recurrent_commit else None,
+                    recurrent_state_indices=(
+                        self._empty_sharding if (use_spmd_dp or self._slot_indexed_state) else None
+                    ),
+                    version=config.version,
+                    num_slices_per_kv_cache_update_page=config.num_slices_per_kv_cache_update_page,
+                    page_size=config.page_size,
+                )
+                for config in getattr(self, "cache_group_configs", ())
+            ),
+            layer_to_cache_group=getattr(self, "layer_to_cache_group", ()),
         )
 
     def _uses_mpmd_mesh(self) -> bool:
@@ -689,24 +904,30 @@ class ModelStepExecutor:
             return None
         return NamedSharding(stage_mesh, PartitionSpec())
 
-    def _uses_tied_lm_head(self) -> bool:
-        """Check whether the loaded model exposes a tied-embedding LM head.
+    def _uses_tied_lm_head(self, model: "EasyDeLBaseModule | None" = None) -> bool:
+        """Resolve the same projection policy as the model's full LM-head path.
 
-        Inspects ``self.model.config`` (and its nested text config when
-        present) for either of the standard tied-embedding flags
-        ``tie_word_embeddings`` / ``share_input_output_layers``. Both
-        sub-configs are scanned because some HF wrappers only set the
-        flag on the inner text config.
+        The model-owned resolver accounts for constructor-level tying and config
+        key precedence. Its answer is authoritative, including ``False``. Only
+        older models without that capability use the historical config fallback.
+
+        Args:
+            model: Optional freshly bound model during a weight/graph refresh.
+                Defaults to the executor's model.
 
         Returns:
-            ``True`` when at least one matching flag is truthy on either
-            config; ``False`` otherwise (untied head).
+            Whether split heads must export the input embedding projection.
         """
-        configs = [self.model.config]
-        get_text_config = getattr(self.model.config, "get_text_config", None)
+        model = self.model if model is None else model
+        resolver = getattr(model, "_tie_embeddings_enabled", None)
+        if callable(resolver):
+            return bool(resolver())
+
+        configs = [model.config]
+        get_text_config = getattr(model.config, "get_text_config", None)
         if callable(get_text_config):
             text_config = get_text_config()
-            if text_config is not self.model.config:
+            if text_config is not model.config:
                 configs.append(text_config)
 
         for config in configs:
@@ -714,6 +935,28 @@ class ModelStepExecutor:
                 if hasattr(config, key) and bool(getattr(config, key)):
                     return True
         return False
+
+    def _lm_head_input_dim(self) -> int:
+        """Resolve the projected backbone width from the selected vocabulary head.
+
+        The transformer width need not equal the final backbone output width
+        (for example, OPT projects to ``word_embed_proj_dim``). Prefer the
+        selected head's logical input metadata, which also works for quantized
+        weights, then its canonical weight shape. Older/custom head modules
+        without either retain the text-config fallback.
+        """
+        tied = self._uses_tied_lm_head()
+        getter = getattr(self.model, "get_embedding" if tied else "get_lm_head", None)
+        projection = getter() if callable(getter) else None
+        width = getattr(projection, "features" if tied else "in_features", None)
+        if width is None:
+            weight = getattr(getattr(projection, "weight", None), "value", None)
+            shape = getattr(weight, "shape", ())
+            if len(shape) == 2:
+                width = shape[-1] if tied else shape[0]
+        if width is None:
+            width = self.model.config.get_text_config().hidden_size
+        return int(width)
 
     def _model_uses_hybrid_linear_attention(self) -> bool:
         """Detect checkpoints that mix full attention and linear attention layers.
@@ -867,60 +1110,30 @@ class ModelStepExecutor:
         )
 
     def _refresh_lm_head_postprocess(self, model: "EasyDeLBaseModule") -> None:
-        """Capture model-level logit post-processing parameters into instance state.
+        """Capture the model's final logit post-processing into instance state.
 
-        Compile-time inputs to the dedicated LM-head jit. Reads three
-        scalars off the live bound model (re-derived after every weight
-        refresh because they may depend on weights):
+        Compile-time input to the dedicated split LM-head jits, which only hold
+        the exported projection and so cannot call ``model.compute_lm_logits``.
+        The post-processing is resolved by :func:`resolve_lm_logit_postprocess`:
+        the model's optional ``get_lm_logit_postprocess()`` hook is authoritative
+        (so families overriding ``compute_lm_logits`` get the same logits as on
+        the SPMD and fused PP paths). Only the model-owned contract establishes
+        the transformations and their order. Re-derived after every weight refresh.
 
-        * ``_lm_head_clip_cap`` — symmetric ``±cap`` clip applied to
-          logits, when the model exposes a ``_logit_cap_feature``.
-        * ``_lm_head_logit_scale`` — multiplicative scaling, taken as
-          the product of any of ``logit_scale``,
-          ``output_multiplier_scale``, and ``base_model.lm_head_multiplier``.
-        * ``_lm_head_soft_cap`` — Gemma-style ``cap * tanh(logits / cap)``
-          soft cap, sourced from ``config.final_logit_softcapping`` (or
-          its nested text config).
-
-        These three are then closed over by the :meth:`compile_lm_head`
-        jit so the head's compiled output already includes the
-        post-processing — no extra eager pass is needed during sampling.
+        The resulting callable is stored as ``_lm_head_postprocess`` and passed
+        as a static JIT argument by both split wrappers on every dispatch. A
+        successful refresh therefore selects a new compiled transform even when
+        tying and projection shape stay unchanged, including for retained wrappers.
+        Postprocessing stays fused into the stage-local projection executable.
 
         Args:
             model: Live :class:`EasyDeLBaseModule` bound from the
                 current ``(graphdef, graphstate, graphother)``.
         """
-        clip_feature = getattr(model, "_logit_cap_feature", None)
-        self._lm_head_clip_cap = getattr(clip_feature, "cap_value", None)
-
-        scale = None
-        for attr in ("logit_scale", "output_multiplier_scale"):
-            value = getattr(model, attr, None)
-            if value is not None:
-                scale = float(value) if scale is None else scale * float(value)
-        base_model = getattr(model, "base_model", None)
-        multiplier = getattr(base_model, "lm_head_multiplier", None)
-        if multiplier is not None:
-            scale = float(multiplier) if scale is None else scale * float(multiplier)
-        self._lm_head_logit_scale = scale
-
-        configs = [getattr(model, "config", None)]
-        config = configs[0]
-        get_text_config = getattr(config, "get_text_config", None)
-        if callable(get_text_config):
-            configs.append(get_text_config())
-        elif hasattr(config, "text_config"):
-            configs.append(config.text_config)
-        self._lm_head_soft_cap = next(
-            (
-                float(cap)
-                for cfg in configs
-                if cfg is not None
-                for cap in (getattr(cfg, "final_logit_softcapping", None),)
-                if cap is not None
-            ),
-            None,
-        )
+        postprocess = resolve_lm_logit_postprocess(model)
+        # Hooks may return unhashable callable objects. The identity-hashable
+        # adapter is a static JIT policy token, renewed on every refresh.
+        self._lm_head_postprocess = None if postprocess is None else lambda logits: postprocess(logits)
 
     def refresh_lm_head_state(self, *, graphdef: tp.Any, graphstate: tp.Any, graphother: tp.Any) -> None:
         """Re-export the LM-head sub-graph and place it on the final-stage mesh.
@@ -946,24 +1159,110 @@ class ModelStepExecutor:
            in :meth:`compile_lm_head` can close over a small, correctly-
            sharded state.
 
+        Models may expose ``get_lm_head_projection()`` returning an exportable
+        small ``spx.Module`` implementing the complete hidden-to-logits map,
+        including every parameterized vocabulary and ordered transformation.
+        In that mode both split entry points call the exported module directly;
+        the embedding-attend shortcut and scalar postprocessing are bypassed.
+        This capability preserves composite heads without retaining the backbone.
+
         No-op on SPMD meshes — there's no "final stage" to materialize
         the head on.
         """
         if not self._uses_mpmd_mesh():
             return
-        self._lm_head_uses_tied_projection = self._uses_tied_lm_head()
+        with self.model.mesh:
+            model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=False))
+        uses_tied_projection = self._uses_tied_lm_head(model)
+        projection_factory = getattr(model, "get_lm_head_projection", None)
+        projection_is_complete = callable(projection_factory)
+        if uses_tied_projection != self._lm_head_uses_tied_projection or projection_is_complete != getattr(
+            self, "_lm_head_projection_is_complete", False
+        ):
+            # Cached split closures capture both the projection kind and owning
+            # stage. A graph refresh changing that policy needs new executables
+            # and placement templates, not just new projection weights.
+            self.clear_cache()
+            self._can_fuse_pipeline_model_step = (
+                not uses_tied_projection and not self._model_uses_hybrid_linear_attention()
+            )
+        self._lm_head_uses_tied_projection = uses_tied_projection
+        self._lm_head_projection_is_complete = projection_is_complete
+        # The tied precision only feeds the embedding-attend shortcut; a complete
+        # model-owned projection carries its own precision.
+        tied_precision = (
+            self._resolve_tied_lm_head_precision(model) if uses_tied_projection and not projection_is_complete else None
+        )
+        if tied_precision != getattr(self, "_lm_head_tied_precision", None):
+            # Only the split LM-head closures bake the tied matmul precision in
+            # (the fused pipeline step is never used for tied heads), so drop
+            # just those compiled variants instead of every backbone executable.
+            for cache_name in ("_lm_head_cache", "_pipeline_lm_head_cache"):
+                cache = getattr(self, cache_name, None)
+                if cache is not None:
+                    cache.clear()
+        self._lm_head_tied_precision = tied_precision
         stage_mesh = self._lm_head_stage_mesh()
         mesh_context = stage_mesh if stage_mesh is not None else self.model.mesh
         with mesh_context:
-            model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=False))
-            self._refresh_lm_head_postprocess(model)
-            if self._lm_head_uses_tied_projection:
-                projection = model.get_embedding()
+            if projection_is_complete:
+                # The model owns every parameterized projection as well as its
+                # ordered transforms. Export the whole small head subgraph,
+                # not just get_lm_head() (which can omit auxiliary vocabularies).
+                projection = projection_factory()
+                self._lm_head_postprocess = None
             else:
-                projection = model.get_lm_head()
+                self._refresh_lm_head_postprocess(model)
+                projection = model.get_embedding() if self._lm_head_uses_tied_projection else model.get_lm_head()
+                # A joint-vocabulary contract cannot be satisfied by exporting
+                # just its text head. Validate the selected module rather than
+                # assuming get_lm_head/get_embedding is the complete projection.
+                # In particular, never serve text-only logits after a refresh
+                # to a model whose complete projection has not been exposed.
+                text_config = getattr(model.config, "get_text_config", lambda: model.config)()
+                expected_vocab = getattr(text_config, "total_vocab_size", None)
+                if expected_vocab is not None:
+                    width_attr = "num_embeddings" if uses_tied_projection else "out_features"
+                    projection_vocab = getattr(projection, width_attr, None)
+                    if projection_vocab is None:
+                        weight = getattr(getattr(projection, "weight", None), "value", None)
+                        shape = getattr(weight, "shape", ())
+                        if len(shape) == 2:
+                            projection_vocab = shape[0] if uses_tied_projection else shape[-1]
+                    if projection_vocab != expected_vocab:
+                        self.clear_cache()
+                        self._lm_head_graphdef = None
+                        self._lm_head_state = None
+                        self._lm_head_postprocess = None
+                        raise ValueError(
+                            f"{type(model).__name__} declares {expected_vocab} joint-vocabulary logits, "
+                            f"but its selected split projection exposes {projection_vocab}. "
+                            "Implement get_lm_head_projection() with the complete hidden-to-logits map; "
+                            "exporting only the text projection would silently discard vocabulary logits."
+                        )
             lm_head_graphdef, lm_head_state = spx.export(projection)
         self._lm_head_graphdef = lm_head_graphdef
         self._lm_head_state = self._stage_local_lm_head_state(lm_head_state)
+
+    @staticmethod
+    def _resolve_tied_lm_head_precision(model: "EasyDeLBaseModule") -> tp.Any:
+        """Return the matmul precision the model's full tied LM-head path uses.
+
+        The full path projects through the LM-head linear with the tied
+        embedding as its kernel, so that linear's ``precision`` is the
+        authoritative one; fall back to the model-level precision.
+        """
+        head = None
+        get_head = getattr(model, "get_lm_head", None)
+        if callable(get_head):
+            try:
+                head = get_head()
+            except (AttributeError, NotImplementedError):
+                head = None
+        precision = getattr(head, "precision", None)
+        if precision is None:
+            precision = getattr(model, "precision", None)
+        return precision
 
     def _compile_mode(self) -> str:
         """Return the cache-key suffix that identifies the active compile path.
@@ -988,10 +1287,6 @@ class ModelStepExecutor:
     def _cache_put(self, key: tuple[int, int, str, str], value: tp.Any) -> None:
         """Store a compiled fused-step variant under ``key`` in ``self._cache``."""
         self._cache_store(self._cache, key, value)
-
-    def _cache_get(self, key: tuple[int, int, str, str]) -> tp.Any:
-        """Fetch a compiled fused-step variant by ``key`` from ``self._cache``."""
-        return self._cache_lookup(self._cache, key)
 
     def cache_keys(self) -> list:
         """Concatenated key list across the backbone and LM-head caches.
@@ -1251,7 +1546,7 @@ class ModelStepExecutor:
         if self._lm_head_graphdef is None or self._lm_head_state is None:
             raise ValueError("eSurge PP lm_head state was not initialized.")
 
-        hidden_dim = int(self.model.config.get_text_config().hidden_size)
+        hidden_dim = self._lm_head_input_dim()
         dtype = self.model.dtype
         dummy_parts = []
         dummy_indices = []
@@ -1268,18 +1563,19 @@ class ModelStepExecutor:
         logits_sharding = self._lm_head_replicated_sharding()
         lm_head_state = self._lm_head_state
         lm_head_graphdef = self._lm_head_graphdef
-        clip_cap = self._lm_head_clip_cap
-        logit_scale = self._lm_head_logit_scale
-        soft_cap = self._lm_head_soft_cap
-        uses_tied_projection = self._lm_head_uses_tied_projection
+        uses_tied_projection = self._lm_head_uses_tied_projection and not getattr(
+            self, "_lm_head_projection_is_complete", False
+        )
         mesh_context = stage_mesh if stage_mesh is not None else self.model.mesh
 
         jit_kwargs = {}
         if logits_sharding is not None:
             jit_kwargs["out_shardings"] = logits_sharding
 
-        @jax.jit(**jit_kwargs)
-        def _stage_lm_head_from_parts(head_state_, hidden_parts_, index_parts_):
+        tied_precision = getattr(self, "_lm_head_tied_precision", None)
+
+        @jax.jit(static_argnums=(3, 4), **jit_kwargs)
+        def _stage_lm_head_from_parts(head_state_, hidden_parts_, index_parts_, head_graphdef, postprocess):
             """Per-PP-stage compiled LM head consuming microbatch hidden parts.
 
             The PP backbone produces one ``hidden_parts_[i]`` tensor per
@@ -1287,8 +1583,9 @@ class ModelStepExecutor:
             relevant rows via ``index_parts_[i]``, concatenates and pads them
             to ``padded_num_reqs``, applies the LM head projection (handling
             tied weights and ``native_forward`` overrides), and applies the
-            optional ``clip_cap`` / ``logit_scale`` / ``soft_cap``
-            post-processing before returning the logits. Runs inside the
+            model's final logit post-processing (see
+            :func:`resolve_lm_logit_postprocess`) before returning the
+            logits. Runs inside the
             stage submesh so logits sharding matches the LM-head placement.
             """
             with mesh_context:
@@ -1304,33 +1601,23 @@ class ModelStepExecutor:
                             hs_ = jnp.pad(hs_, ((0, pad_rows), (0, 0)))
                         hs_ = hs_[: int(padded_num_reqs)]
 
-                    with jax.named_scope("easydel/esurge/pp_lm_head_from_parts/project"):
-                        projection = spx.bind(lm_head_graphdef, head_state_)
-                        if uses_tied_projection:
-                            attend = getattr(projection, "attend", None)
-                            if attend is None:
-                                weight = projection.weight.value
-                                logits = jnp.dot(hs_, weight.T)
-                            else:
-                                logits = attend(hs_)
-                        else:
-                            native_forward = getattr(projection, "native_forward", None)
-                            if native_forward is None:
-                                logits = projection(hs_)
-                            else:
-                                logits = native_forward(hs_)
-                    with jax.named_scope("easydel/esurge/pp_lm_head_from_parts/logit_postprocess"):
-                        if clip_cap is not None:
-                            cap = jnp.array(clip_cap, dtype=logits.dtype)
-                            logits = jnp.clip(logits, -cap, cap)
-                        if logit_scale is not None:
-                            logits = logits * jnp.array(logit_scale, dtype=logits.dtype)
-                        if soft_cap is not None:
-                            cap = jnp.array(soft_cap, dtype=logits.dtype)
-                            logits = cap * jax.nn.tanh(logits / cap)
-                    return logits
+                    return _project_stage_lm_head(
+                        head_graphdef,
+                        head_state_,
+                        hs_,
+                        uses_tied_projection=uses_tied_projection,
+                        postprocess=postprocess,
+                        tied_precision=tied_precision,
+                        scope="easydel/esurge/pp_lm_head_from_parts",
+                    )
 
-        _ = _stage_lm_head_from_parts(lm_head_state, tuple(dummy_parts), tuple(dummy_indices))
+        _ = _stage_lm_head_from_parts(
+            lm_head_state,
+            tuple(dummy_parts),
+            tuple(dummy_indices),
+            lm_head_graphdef,
+            self._lm_head_postprocess,
+        )
 
         def wrapped_lm_head_from_parts(graphstate_, graphother_, hidden_parts_, index_parts_):
             """Trace-friendly wrapper that re-binds the live LM-head state.
@@ -1353,7 +1640,13 @@ class ModelStepExecutor:
             # these are no-ops.
             hidden_parts_ = tuple(self._place_lm_head_hidden(part) for part in hidden_parts_)
             index_parts_ = tuple(self._place_lm_head_index(idx) for idx in index_parts_)
-            return _stage_lm_head_from_parts(self._lm_head_state, hidden_parts_, index_parts_)
+            return _stage_lm_head_from_parts(
+                self._lm_head_state,
+                hidden_parts_,
+                index_parts_,
+                self._lm_head_graphdef,
+                self._lm_head_postprocess,
+            )
 
         self._cache_store(self._pipeline_lm_head_cache, key, wrapped_lm_head_from_parts)
         return wrapped_lm_head_from_parts
@@ -1988,9 +2281,9 @@ class ModelStepExecutor:
             inputs: Reserved for symmetry with :meth:`compile_backbone`;
                 the LM head only consumes pre-gathered hidden states, so
                 ``inputs`` is unused here.
-            hidden_dim: Override for the hidden-size dimension of the
-                dummy input. ``None`` reads it from the model's text
-                config.
+            hidden_dim: Override for the input width of the dummy hidden
+                states. ``None`` infers the selected vocabulary projection's
+                input width, falling back to the model's text config.
             dtype: dtype of the dummy hidden states. ``None`` reads
                 ``self.model.dtype``.
         """
@@ -2002,7 +2295,7 @@ class ModelStepExecutor:
 
         graphstate_arg, graphother_arg = self._graph_call_args(graphstate, graphother)
         if hidden_dim is None:
-            hidden_dim = int(self.model.config.get_text_config().hidden_size)
+            hidden_dim = self._lm_head_input_dim()
         if dtype is None:
             dtype = self.model.dtype
         # Input is pre-gathered: [padded_num_reqs, hidden_dim]
@@ -2030,52 +2323,42 @@ class ModelStepExecutor:
 
             mesh_context = stage_mesh if stage_mesh is not None else self.model.mesh
             lm_head_graphdef = self._lm_head_graphdef
-            clip_cap = self._lm_head_clip_cap
-            logit_scale = self._lm_head_logit_scale
-            soft_cap = self._lm_head_soft_cap
-            uses_tied_projection = self._lm_head_uses_tied_projection
+            uses_tied_projection = self._lm_head_uses_tied_projection and not getattr(
+                self, "_lm_head_projection_is_complete", False
+            )
 
-            @jax.jit(**jit_kwargs)
-            def _stage_lm_head(head_state_, hs_):
+            tied_precision = getattr(self, "_lm_head_tied_precision", None)
+
+            @jax.jit(static_argnums=(2, 3), **jit_kwargs)
+            def _stage_lm_head(head_state_, hs_, head_graphdef, postprocess):
                 """Run the exported LM-head projection on its owning PP stage."""
                 with mesh_context:
                     with jax.named_scope("easydel/esurge/pp_lm_head"):
-                        with jax.named_scope("easydel/esurge/pp_lm_head/project"):
-                            projection = spx.bind(lm_head_graphdef, head_state_)
-                            if uses_tied_projection:
-                                attend = getattr(projection, "attend", None)
-                                if attend is None:
-                                    weight = projection.weight.value
-                                    logits = jnp.dot(hs_, weight.T)
-                                else:
-                                    logits = attend(hs_)
-                            else:
-                                native_forward = getattr(projection, "native_forward", None)
-                                if native_forward is None:
-                                    logits = projection(hs_)
-                                else:
-                                    logits = native_forward(hs_)
-                        with jax.named_scope("easydel/esurge/pp_lm_head/logit_postprocess"):
-                            if clip_cap is not None:
-                                cap = jnp.array(clip_cap, dtype=logits.dtype)
-                                logits = jnp.clip(logits, -cap, cap)
-                            if logit_scale is not None:
-                                logits = logits * jnp.array(logit_scale, dtype=logits.dtype)
-                            if soft_cap is not None:
-                                cap = jnp.array(soft_cap, dtype=logits.dtype)
-                                logits = cap * jax.nn.tanh(logits / cap)
-                        return logits
+                        return _project_stage_lm_head(
+                            head_graphdef,
+                            head_state_,
+                            hs_,
+                            uses_tied_projection=uses_tied_projection,
+                            postprocess=postprocess,
+                            tied_precision=tied_precision,
+                            scope="easydel/esurge/pp_lm_head",
+                        )
 
             if hidden_sharding is not None:
                 dummy_hs = jax.device_put(dummy_hs, hidden_sharding)
-            jax.block_until_ready(_stage_lm_head(lm_head_state, dummy_hs))
+            jax.block_until_ready(_stage_lm_head(lm_head_state, dummy_hs, lm_head_graphdef, self._lm_head_postprocess))
 
             def wrapped_lm_head(graphstate_, graphother_, hs_):
                 """Stage-local MPMD LM-head wrapper using the live projected state."""
                 del graphstate_, graphother_
                 if self._lm_head_state is None:
                     raise ValueError("eSurge PP lm_head state was not initialized.")
-                return _stage_lm_head(self._lm_head_state, self._place_lm_head_hidden(hs_))
+                return _stage_lm_head(
+                    self._lm_head_state,
+                    self._place_lm_head_hidden(hs_),
+                    self._lm_head_graphdef,
+                    self._lm_head_postprocess,
+                )
 
             self._cache_store(self._lm_head_cache, key, wrapped_lm_head)
             return
@@ -2121,7 +2404,7 @@ class ModelStepExecutor:
 
         hidden_out_sharding = self._empty_sharding
         if self._uses_mpmd_mesh():
-            hidden_size = int(self.model.config.get_text_config().hidden_size)
+            hidden_size = self._lm_head_input_dim()
             hidden_out_sharding = self._lm_head_hidden_sharding((1, hidden_size)) or hidden_out_sharding
 
         backbone_out_shardings = BackboneOutputs(
@@ -2182,77 +2465,13 @@ class ModelStepExecutor:
             with self.model.mesh:
                 with jax.named_scope("easydel/esurge/backbone_step"):
                     model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=False))
-                    input_ids_view = metadata.model_input_ids
-                    position_ids_view = metadata.position_ids_buf
 
                     with jax.named_scope("easydel/esurge/backbone_step/cache_metadata"):
-                        cache_metadata = RaggedPagesMetadata(
-                            pages_tables=metadata.pages_tables,
-                            context_lens=(
-                                metadata.rank_context_lens[:num_reqs_max_model_len]
-                                if self._uses_spmd_dp()
-                                else metadata.seq_lens[:num_reqs_max_model_len]
-                            ),
-                            query_start_loc=(
-                                metadata.rank_query_start_loc
-                                if self._uses_spmd_dp()
-                                else metadata.query_start_loc[: num_reqs_max_model_len + 1]
-                            ),
-                            num_seqs=jnp.array([metadata.num_requests], dtype=jnp.int32),
-                            num_slices_per_kv_cache_update_page=self.metadata.num_slices_per_kv_cache_update_page,
-                            page_size=self.metadata.page_size,
-                            request_distribution=metadata.rank_request_distribution,
-                            slot_mapping=metadata.slot_mapping,
-                            num_kv_update_slices=metadata.num_kv_update_slices,
-                            spec_recurrent_commit=metadata.spec_recurrent_commit,
-                            recurrent_state_indices=(
-                                metadata.rank_recurrent_state_indices
-                                if (self._uses_spmd_dp() or self._slot_indexed_state)
-                                else None
-                            ),
-                            version=self._metadata_version,
-                        )
+                        cache_metadata = self._build_cache_metadata(metadata, num_reqs_max_model_len)
 
-                    external_inputs: dict[str, tp.Any] = self._model_side_inputs(metadata)
-                    if metadata.pixel_values is not None or metadata.pixel_values_videos is not None:
-                        external_inputs.update(
-                            dict(
-                                pixel_values=metadata.pixel_values,
-                                image_grid_thw=metadata.image_grid_thw,
-                                pixel_values_videos=metadata.pixel_values_videos,
-                                video_grid_thw=metadata.video_grid_thw,
-                            )
-                        )
-                    if metadata.deepstack_visual_embeds is not None:
-                        if metadata.visual_pos_masks is None:
-                            raise ValueError(
-                                "`visual_pos_masks` must be provided when `deepstack_visual_embeds` is set."
-                            )
-                        external_inputs.update(
-                            dict(
-                                visual_pos_masks=jnp.expand_dims(metadata.visual_pos_masks, 0),
-                                deepstack_visual_embeds=list(metadata.deepstack_visual_embeds),
-                            )
-                        )
-
-                    use_prefill_embeds = metadata.prefill_embeds is not None and metadata.prefill_embeds_mask is not None
-                    use_mrope = metadata.mrope_position_ids is not None
-
-                    if use_mrope:
-                        position_ids = jnp.expand_dims(metadata.mrope_position_ids, 1)
-                    else:
-                        position_ids = self._as_model_batch(position_ids_view)
-
-                    with jax.named_scope("easydel/esurge/backbone_step/prepare_inputs"):
-                        model_inputs: dict[str, tp.Any]
-                        if use_prefill_embeds:
-                            base_embeds = model.compute_embedding(self._as_model_batch(input_ids_view))
-                            override = jnp.expand_dims(metadata.prefill_embeds, 0).astype(base_embeds.dtype)
-                            mask = jnp.expand_dims(metadata.prefill_embeds_mask, 0)[..., None]
-                            inputs_embeds = jnp.where(mask, override, base_embeds)
-                            model_inputs = {"input_ids": None, "inputs_embeds": inputs_embeds}
-                        else:
-                            model_inputs = {"input_ids": self._as_model_batch(input_ids_view)}
+                    model_inputs, position_ids, external_inputs = self._prepare_model_call(
+                        model, metadata, scope="easydel/esurge/backbone_step"
+                    )
 
                     with jax.named_scope("easydel/esurge/backbone_step/model_forward"):
                         with set_inference_mode():
@@ -2326,7 +2545,7 @@ class ModelStepExecutor:
         metadata_sharding = self._metadata_sharding_template()
 
         kv_pages_sharding = spx.extract_sharding_structure(kv_pages_template, mesh=self.mesh)
-        hidden_size = int(self.model.config.get_text_config().hidden_size)
+        hidden_size = self._lm_head_input_dim()
         hidden_out_sharding = self._lm_head_hidden_sharding((max(1, max_num_reqs), hidden_size)) or self._empty_sharding
         logits_out_sharding = self._lm_head_replicated_sharding() or self._empty_sharding
         model_step_out_shardings = ModelStepOutputs(
@@ -2368,77 +2587,13 @@ class ModelStepExecutor:
             with self.model.mesh:
                 with jax.named_scope("easydel/esurge/pp_model_step"):
                     model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=False))
-                    input_ids_view = metadata.model_input_ids
-                    position_ids_view = metadata.position_ids_buf
 
                     with jax.named_scope("easydel/esurge/pp_model_step/cache_metadata"):
-                        cache_metadata = RaggedPagesMetadata(
-                            pages_tables=metadata.pages_tables,
-                            context_lens=(
-                                metadata.rank_context_lens[:num_reqs_max_model_len]
-                                if self._uses_spmd_dp()
-                                else metadata.seq_lens[:num_reqs_max_model_len]
-                            ),
-                            query_start_loc=(
-                                metadata.rank_query_start_loc
-                                if self._uses_spmd_dp()
-                                else metadata.query_start_loc[: num_reqs_max_model_len + 1]
-                            ),
-                            num_seqs=jnp.array([metadata.num_requests], dtype=jnp.int32),
-                            num_slices_per_kv_cache_update_page=self.metadata.num_slices_per_kv_cache_update_page,
-                            page_size=self.metadata.page_size,
-                            request_distribution=metadata.rank_request_distribution,
-                            slot_mapping=metadata.slot_mapping,
-                            num_kv_update_slices=metadata.num_kv_update_slices,
-                            spec_recurrent_commit=metadata.spec_recurrent_commit,
-                            recurrent_state_indices=(
-                                metadata.rank_recurrent_state_indices
-                                if (self._uses_spmd_dp() or self._slot_indexed_state)
-                                else None
-                            ),
-                            version=self._metadata_version,
-                        )
+                        cache_metadata = self._build_cache_metadata(metadata, num_reqs_max_model_len)
 
-                    external_inputs: dict[str, tp.Any] = self._model_side_inputs(metadata)
-                    if metadata.pixel_values is not None or metadata.pixel_values_videos is not None:
-                        external_inputs.update(
-                            dict(
-                                pixel_values=metadata.pixel_values,
-                                image_grid_thw=metadata.image_grid_thw,
-                                pixel_values_videos=metadata.pixel_values_videos,
-                                video_grid_thw=metadata.video_grid_thw,
-                            )
-                        )
-                    if metadata.deepstack_visual_embeds is not None:
-                        if metadata.visual_pos_masks is None:
-                            raise ValueError(
-                                "`visual_pos_masks` must be provided when `deepstack_visual_embeds` is set."
-                            )
-                        external_inputs.update(
-                            dict(
-                                visual_pos_masks=jnp.expand_dims(metadata.visual_pos_masks, 0),
-                                deepstack_visual_embeds=list(metadata.deepstack_visual_embeds),
-                            )
-                        )
-
-                    use_prefill_embeds = metadata.prefill_embeds is not None and metadata.prefill_embeds_mask is not None
-                    use_mrope = metadata.mrope_position_ids is not None
-
-                    if use_mrope:
-                        position_ids = jnp.expand_dims(metadata.mrope_position_ids, 1)
-                    else:
-                        position_ids = self._as_model_batch(position_ids_view)
-
-                    with jax.named_scope("easydel/esurge/pp_model_step/prepare_inputs"):
-                        model_inputs: dict[str, tp.Any]
-                        if use_prefill_embeds:
-                            base_embeds = model.compute_embedding(self._as_model_batch(input_ids_view))
-                            override = jnp.expand_dims(metadata.prefill_embeds, 0).astype(base_embeds.dtype)
-                            mask = jnp.expand_dims(metadata.prefill_embeds_mask, 0)[..., None]
-                            inputs_embeds = jnp.where(mask, override, base_embeds)
-                            model_inputs = {"input_ids": None, "inputs_embeds": inputs_embeds}
-                        else:
-                            model_inputs = {"input_ids": self._as_model_batch(input_ids_view)}
+                    model_inputs, position_ids, external_inputs = self._prepare_model_call(
+                        model, metadata, scope="easydel/esurge/pp_model_step"
+                    )
 
                     with jax.named_scope("easydel/esurge/pp_model_step/model_forward"):
                         with set_inference_mode():
@@ -2539,76 +2694,13 @@ class ModelStepExecutor:
                         graphstate = jax.tree_util.tree_unflatten(graphstate_treedef, graphstate)
                         graphother = jax.tree_util.tree_unflatten(graphother_treedef, graphother)
                     model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=False))
-                    input_ids_view = metadata.model_input_ids
-                    position_ids_view = metadata.position_ids_buf
 
                     with jax.named_scope("easydel/esurge/spmd_model_step/cache_metadata"):
-                        cache_metadata = RaggedPagesMetadata(
-                            pages_tables=metadata.pages_tables,
-                            context_lens=(
-                                metadata.rank_context_lens[:num_reqs_max_model_len]
-                                if self._uses_spmd_dp()
-                                else metadata.seq_lens[:num_reqs_max_model_len]
-                            ),
-                            query_start_loc=(
-                                metadata.rank_query_start_loc
-                                if self._uses_spmd_dp()
-                                else metadata.query_start_loc[: num_reqs_max_model_len + 1]
-                            ),
-                            num_seqs=jnp.array([metadata.num_requests], dtype=jnp.int32),
-                            num_slices_per_kv_cache_update_page=self.metadata.num_slices_per_kv_cache_update_page,
-                            page_size=self.metadata.page_size,
-                            request_distribution=metadata.rank_request_distribution,
-                            slot_mapping=metadata.slot_mapping,
-                            num_kv_update_slices=metadata.num_kv_update_slices,
-                            spec_recurrent_commit=metadata.spec_recurrent_commit,
-                            recurrent_state_indices=(
-                                metadata.rank_recurrent_state_indices
-                                if (self._uses_spmd_dp() or self._slot_indexed_state)
-                                else None
-                            ),
-                            version=self._metadata_version,
-                        )
+                        cache_metadata = self._build_cache_metadata(metadata, num_reqs_max_model_len)
 
-                    external_inputs: dict[str, tp.Any] = self._model_side_inputs(metadata)
-                    if metadata.pixel_values is not None or metadata.pixel_values_videos is not None:
-                        external_inputs.update(
-                            dict(
-                                pixel_values=metadata.pixel_values,
-                                image_grid_thw=metadata.image_grid_thw,
-                                pixel_values_videos=metadata.pixel_values_videos,
-                                video_grid_thw=metadata.video_grid_thw,
-                            )
-                        )
-                    if metadata.deepstack_visual_embeds is not None:
-                        if metadata.visual_pos_masks is None:
-                            raise ValueError(
-                                "`visual_pos_masks` must be provided when `deepstack_visual_embeds` is set."
-                            )
-                        external_inputs.update(
-                            dict(
-                                visual_pos_masks=jnp.expand_dims(metadata.visual_pos_masks, 0),
-                                deepstack_visual_embeds=list(metadata.deepstack_visual_embeds),
-                            )
-                        )
-
-                    use_prefill_embeds = metadata.prefill_embeds is not None and metadata.prefill_embeds_mask is not None
-                    use_mrope = metadata.mrope_position_ids is not None
-
-                    if use_mrope:
-                        position_ids = jnp.expand_dims(metadata.mrope_position_ids, 1)
-                    else:
-                        position_ids = self._as_model_batch(position_ids_view)
-
-                    with jax.named_scope("easydel/esurge/spmd_model_step/prepare_inputs"):
-                        if use_prefill_embeds:
-                            base_embeds = model.compute_embedding(self._as_model_batch(input_ids_view))
-                            override = jnp.expand_dims(metadata.prefill_embeds, 0).astype(base_embeds.dtype)
-                            mask = jnp.expand_dims(metadata.prefill_embeds_mask, 0)[..., None]
-                            inputs_embeds = jnp.where(mask, override, base_embeds)
-                            model_inputs = {"input_ids": None, "inputs_embeds": inputs_embeds}
-                        else:
-                            model_inputs = {"input_ids": self._as_model_batch(input_ids_view)}
+                    model_inputs, position_ids, external_inputs = self._prepare_model_call(
+                        model, metadata, scope="easydel/esurge/spmd_model_step"
+                    )
 
                     main_hidden_enabled = bool(self.main_hidden_enabled)
                     if main_hidden_enabled:

@@ -123,14 +123,16 @@ class KimiK2ToolParser(ToolParser):
         self.tool_call_end_token: str = "<|tool_call_end|>"
 
         self.tool_call_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>.+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>.*?)\s*<\|tool_call_end\|>"
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^<>\s]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>.*?)\s*<\|tool_call_end\|>",
+            re.DOTALL,
         )
 
         self.stream_tool_call_portion_regex = re.compile(
-            r"(?P<tool_call_id>.+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>.*)"
+            r"(?P<tool_call_id>[^<>\s]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>.*)",
+            re.DOTALL,
         )
 
-        self.stream_tool_call_name_regex = re.compile(r"(?P<tool_call_id>.+:\d+)\s*")
+        self.stream_tool_call_name_regex = re.compile(r"(?P<tool_call_id>[^<>\s]+:\d+)\s*")
 
         if not self.model_tokenizer:
             raise ValueError("The model tokenizer must be passed to the ToolParser constructor during construction.")
