@@ -79,6 +79,21 @@ if typing.TYPE_CHECKING:
 
 logger = get_logger("eSurgeScheduler")
 
+_RECURRENT_LAYER_TYPES = frozenset({"linear_attention", "kda_linear_attention", "parallel_hybrid", "hybrid"})
+
+
+def _runner_has_recurrent_state(runner: typing.Any) -> bool:
+    """Whether the runner's model keeps per-request recurrent (linear-attention/SSM) state."""
+    flag = getattr(runner, "_has_recurrent_layers", None)
+    if flag is not None:
+        return bool(flag)
+    config = getattr(getattr(runner, "model", None), "config", None)
+    if config is None:
+        return False
+    text_config = config.get_text_config() if hasattr(config, "get_text_config") else config
+    layer_types = getattr(text_config, "layer_types", None) or ()
+    return any(str(layer_type).lower() in _RECURRENT_LAYER_TYPES for layer_type in layer_types)
+
 
 class Scheduler(SchedulerInterface):
     """Main request scheduler for the eSurge inference engine.
@@ -319,6 +334,11 @@ class Scheduler(SchedulerInterface):
             # per-slot recurrence, so page-hash reuse would desynchronize the
             # cache from the stream. Force prefix caching off for this family.
             logger.warning("Disabling prefix caching: compressed-window cache models must process every prompt token.")
+            enable_prefix_caching = False
+        elif enable_prefix_caching and _runner_has_recurrent_state(runner):
+            # Page hashes only cover attention KV; the linear-attention/SSM state for a cached prefix is not stored,
+            # so a prefix hit would start those layers from empty state.
+            logger.warning("Disabling prefix caching: recurrent (linear-attention/SSM) state is not prefix-cacheable.")
             enable_prefix_caching = False
 
         if max_num_batched_tokens is None:
