@@ -755,6 +755,7 @@ class Trainer(BaseTrainer):
                         # PoSE (text-only): host-side position_ids skip, once per microbatch
                         # before the forward (no-op unless arguments.pose.enabled).
                         batch = self._apply_pose_to_batch(batch, current_step)
+                        batch = self._apply_randomized_yarn_to_batch(batch, current_step)
                         # Vision encoder: run the tower out of band on the vision-bearing
                         # rows and swap in precomputed features, once per microbatch before
                         # the forward (no-op unless arguments.process_encoder.enabled).
@@ -1258,12 +1259,7 @@ class Trainer(BaseTrainer):
                 state = state.replace(graphdef=base_graphdef)
             else:
                 with capture_time() as _put_dispatch_time:
-                    _result = self.sharded_training_step_function(
-                        state,
-                        batch,
-                        *self._train_shared_fn_extra_args,
-                        *self._train_shared_fn_static_args,
-                    )
+                    _result = self._dispatch_train_step(state, batch)
                 self._last_step_put_dispatch_seconds = float(_put_dispatch_time())
                 with capture_time() as _device_sync_time:
                     state, metrics = jax.block_until_ready(_result)
@@ -1311,6 +1307,25 @@ class Trainer(BaseTrainer):
                 logger.error(str(annotated_exception))
                 return state, metrics, annotated_exception
             raise
+
+    def _dispatch_train_step(self, state, batch):
+        """Dispatch one optimizer step and return its ``(state, metrics)`` outputs without blocking.
+
+        One execution of ``sharded_training_step_function`` by default; under
+        ``gradient_accumulation_mode="execution"`` the trainer's ``_execution_accumulation`` driver runs the
+        per-microbatch grad executions and the apply execution instead.
+        """
+        execution_accumulation = getattr(self, "_execution_accumulation", None)
+        if execution_accumulation is not None:
+            return execution_accumulation.run(
+                state, batch, tuple(self._train_shared_fn_extra_args), tuple(self._train_shared_fn_static_args)
+            )
+        return self.sharded_training_step_function(
+            state,
+            batch,
+            *self._train_shared_fn_extra_args,
+            *self._train_shared_fn_static_args,
+        )
 
     def _finalize_training(self, output, run_exception):
         """

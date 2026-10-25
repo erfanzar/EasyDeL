@@ -246,7 +246,7 @@ logger = get_logger(__name__)
 
 
 def _optimizer_state_shardings_from_params(
-    tx: optax.GradientTransformation,
+    tx: optax.GradientTransformation | None,
     opt_state: tp.Any,
     param_shardings: tp.Any,
     replicated: jax.sharding.NamedSharding,
@@ -254,15 +254,20 @@ def _optimizer_state_shardings_from_params(
     """Mirror parameter shardings onto optimizer slots.
 
     ``optax.tree_map_params`` is the preferred path, but it requires custom
-    pytree aux data to match between placeholder init and real init. Some local
-    optimizers keep per-parameter routing metadata (for example ``layer_ids``)
-    as aux data, so placeholder init has empty aux while real init has one id
-    per parameter. In that case, keep the optimizer metadata intact and mirror
-    any subtree shaped like the parameter tree by structure.
+    pytree aux data to match between placeholder init and real init, and the
+    companion sharding tree to zip leafwise against the state. Optimizers that
+    keep per-parameter routing metadata as aux data (for example
+    ``layer_ids``), and optax's ``masked``/``multi_transform`` wrappers (used by
+    Muon) whose branches replace foreign parameters with ``MaskedNode``, make
+    it raise. In that case, and when no ``tx`` is bound (a state fresh from a
+    checkpoint load), every slot leaf whose path ends with a parameter's full
+    path takes that parameter's sharding; a leaf the optimizer already placed
+    on this mesh keeps its own ``NamedSharding``; everything else (counters,
+    coefficients) is replicated.
 
     Args:
         tx: The optax gradient transformation whose state should receive
-            shardings.
+            shardings, or ``None`` to use only the path-suffix mirror.
         opt_state: A live ``tx.init`` pytree to be annotated.
         param_shardings: A NamedSharding pytree shaped like ``graphstate``
             (parameter shardings to mirror onto opt-state slots).
@@ -318,7 +323,7 @@ def _optimizer_state_shardings_from_params(
             logger.warning("Adjusted %d optimizer-state shardings to match slot shapes.", adjusted["count"])
         return sanitized
 
-    if hasattr(optax, "tree_map_params"):
+    if tx is not None and hasattr(optax, "tree_map_params"):
         try:
             slot_shardings = optax.tree_map_params(
                 tx,
@@ -330,41 +335,50 @@ def _optimizer_state_shardings_from_params(
             )
             return _sanitize_slot_shardings(slot_shardings)
         except ValueError as exc:
-            # jax phrases a treedef mismatch differently across versions:
-            # "Mismatch custom node data" before 0.10, "different pytree
-            # metadata" / "pytree structure error" from 0.10 on. Matching only
-            # the old wording means that on current jax the exception escapes
-            # instead of falling through to the structural path below, so any
-            # optimizer whose pytree node definition carries value-dependent
-            # static aux_data fails here rather than being handled.
+            # Treedef-mismatch wording varies across jax/optax versions.
             _mismatch_markers = (
                 "Mismatch custom node data",
                 "different pytree metadata",
                 "pytree structure error",
+                "Expected named tuple",
+                "Dict key mismatch",
             )
             if not any(m in str(exc) for m in _mismatch_markers):
                 raise
 
-    param_treedef = jax.tree_util.tree_structure(param_shardings, is_leaf=_is_sharding_leaf)
+    # Optax wrappers only prefix a slot's path, so match slots to params by path suffix.
+    param_path_shardings: dict[tuple, jax.sharding.NamedSharding] = {}
+    for path, sharding in jax.tree_util.tree_flatten_with_path(param_slot_shardings, is_leaf=_is_sharding_leaf)[0]:
+        param_path_shardings[tuple(path)] = sharding
+    suffix_lengths = sorted({len(path) for path in param_path_shardings}, reverse=True)
 
-    def _matches_param_tree(value: tp.Any) -> bool:
-        """Return whether ``value`` has the same tree structure as ``param_shardings``."""
-        try:
-            return jax.tree_util.tree_structure(value) == param_treedef
-        except Exception:
-            return False
+    def _param_sharding_for_slot_path(path: tuple) -> jax.sharding.NamedSharding | None:
+        """Return the owning parameter's sharding when ``path`` ends with a full parameter path."""
+        path = tuple(path)
+        for n in suffix_lengths:
+            if len(path) >= n:
+                hit = param_path_shardings.get(path[-n:])
+                if hit is not None:
+                    return hit
+        return None
 
-    def _state_sharding(value: tp.Any) -> tp.Any:
-        """Pick the right sharding subtree for one optimizer-state slot."""
-        if _matches_param_tree(value):
-            return param_slot_shardings
+    def _sharding_by_path(path: tuple, leaf: tp.Any) -> jax.sharding.NamedSharding:
+        """Pick a slot leaf's sharding: owning parameter's, else the leaf's own on this mesh, else replicated.
+
+        The middle case covers optimizers that lay out non-parameter-shaped
+        state themselves (for example factored preconditioner statistics placed
+        on a per-leaf ``NamedSharding``); flattening those to replicated would
+        materialize them on every device.
+        """
+        hit = _param_sharding_for_slot_path(path)
+        if hit is not None:
+            return hit
+        own = getattr(leaf, "sharding", None)
+        if isinstance(own, jax.sharding.NamedSharding) and own.mesh == replicated.mesh:
+            return own
         return replicated
 
-    slot_shardings = jax.tree_util.tree_map(
-        _state_sharding,
-        opt_state,
-        is_leaf=_matches_param_tree,
-    )
+    slot_shardings = jax.tree_util.tree_map_with_path(_sharding_by_path, opt_state)
     return _sanitize_slot_shardings(slot_shardings)
 
 
@@ -2081,7 +2095,9 @@ class EasyDeLState(_PyTreeNode):
         graphother = self.model.apply_sharding_for_tree(self.graphother, mesh=mesh)
 
         opt_state = self.opt_state
-        if opt_state is not None and self.tx is not None and hasattr(optax, "tree_map_params"):
+        # Also for a tx-less state (fresh from ``load_state``): the mirror falls back to the
+        # path-suffix match, so loaded slots are placed before a trainer binds its optimizer.
+        if opt_state is not None:
             param_shardings = spx.extract_sharding_structure(graphstate, mesh=mesh)
             opt_shardings = _optimizer_state_shardings_from_params(self.tx, opt_state, param_shardings, replicated)
             opt_state = _materialize_replicated_setup_scalars(opt_state, opt_shardings)

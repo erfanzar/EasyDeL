@@ -42,6 +42,7 @@ from easydel.utils import flags
 from ...config import normalize_draft_schedule, resolve_num_draft_tokens
 from ...core.binary_search import apply_topk_mask, apply_topp_mask
 from ..executors.model_executor import resolve_lm_logit_postprocess
+from .penalties import HistoryCountCache, VerifyPenaltyRows, history_penalty_params, penalized_verify_argmax
 from .support import build_target_kv_pairs, gather_paged_kv
 
 if typing.TYPE_CHECKING:
@@ -465,6 +466,12 @@ class DrafterSpeculation:
         # ``(row offset, first position, token count)`` there; refreshed every step by ``observe_window_hidden``.
         self._whole_block_hidden: jax.Array | None = None
         self._whole_block_window: dict[str, tuple[int, int, int]] = {}
+        # History penalties on the greedy verify path: committed-history token counts per penalised request
+        # (advanced incrementally) and the requests whose sampler device count row needs a rewrite before the
+        # next plain-sampler step (see ``sync_penalty_counts``).
+        self._history_counts = HistoryCountCache()
+        self._penalty_counts_stale: set[str] = set()
+        self.num_penalized_verify_rows = 0
 
     def _stable_drafter_row(self, req_id: str, fallback_row: int) -> int:
         """Return this request's lifetime-stable row in the pooled MTP cache.
@@ -504,6 +511,8 @@ class DrafterSpeculation:
         """Free the stable drafter rows of requests the scheduler finished."""
         finished = getattr(scheduler_output, "finished_req_ids", None) or ()
         for rid in finished:
+            self._history_counts.drop(str(rid))
+            self._penalty_counts_stale.discard(str(rid))
             row = self._mtp_row_by_req.pop(str(rid), None)
             if row is None:
                 continue
@@ -627,6 +636,8 @@ class DrafterSpeculation:
         self._mtp_row_capacity = 0
         self._whole_block_hidden = None
         self._whole_block_window.clear()
+        self._history_counts.clear()
+        self._penalty_counts_stale.clear()
         self.live_num_draft_tokens = int(self.num_draft_tokens)
         if self.drafter is not None:
             try:
@@ -656,9 +667,11 @@ class DrafterSpeculation:
     def is_spec_request(self, req_state: CachedRequestState | None) -> bool:
         """Return whether ``req_state`` is eligible for speculative decoding.
 
-        Requests using sampling penalties, ``n > 1``, or no attached drafter
-        fall back to the standard single-token decode path because the runner's
-        spec-verify kernels don't support those features yet.
+        Requests with ``n > 1``, sampled (``temperature > 0``) requests carrying
+        a presence/frequency/repetition penalty, and runs without a drafter fall
+        back to the standard single-token decode path. Greedy requests with
+        history penalties speculate: their verify rows are penalised exactly
+        like the sampler would penalise them.
 
         Args:
             req_state: Cached request state to inspect.
@@ -673,13 +686,173 @@ class DrafterSpeculation:
         sampling_params = req_state.sampling_params
         if getattr(sampling_params, "n", 1) != 1:
             return False
-        if getattr(sampling_params, "presence_penalty", 0.0) != 0.0:
-            return False
-        if getattr(sampling_params, "frequency_penalty", 0.0) != 0.0:
-            return False
-        if getattr(sampling_params, "repetition_penalty", 1.0) != 1.0:
+        # Sampled verification uses the drafter's unpenalised q, so penalties are only speculated greedily.
+        if self.uses_history_penalties(req_state) and not self.is_greedy_request(req_state):
             return False
         return True
+
+    @staticmethod
+    def uses_history_penalties(req_state: CachedRequestState | None) -> bool:
+        """Return whether ``req_state`` carries a presence, frequency or repetition penalty.
+
+        Args:
+            req_state: Cached request state to inspect, or ``None``.
+
+        Returns:
+            ``True`` when any history penalty would change the request's logits (repetition is multiplicative,
+            so ``1.0`` is its inactive value).
+        """
+        if req_state is None:
+            return False
+        return history_penalty_params(req_state.sampling_params) is not None
+
+    def verify_penalty_rows(
+        self,
+        *,
+        meta: _SpecVerifyMetadata,
+        req_state: CachedRequestState | None,
+        offset: int,
+        num_rows: int,
+        draft_prefix: int = 0,
+    ) -> VerifyPenaltyRows | None:
+        """Penalty state of ``num_rows`` consecutive verify logit rows of one request.
+
+        Logit row ``offset + i`` predicts absolute position ``start_pos + real_count + draft_prefix + i``, so its
+        count state is the committed history ``[0, start_pos + real_count)`` plus the drafts
+        ``[0, draft_prefix + i)``: exactly the state the non-speculative sampler would hold at that position.
+
+        Args:
+            meta: Verify metadata of the request's window.
+            req_state: The request's cached state (sampling params and committed tokens).
+            offset: First logit row of the request.
+            num_rows: Number of consecutive logit rows.
+            draft_prefix: Drafts already preceding the first row.
+
+        Returns:
+            The rows' penalty state, or ``None`` when the request carries no history penalty.
+        """
+        if req_state is None:
+            return None
+        params = history_penalty_params(req_state.sampling_params)
+        if params is None:
+            return None
+        history_ids, history_counts = self._history_counts.counts(
+            str(meta.request_id),
+            req_state.get_token_id,
+            int(meta.start_pos) + int(meta.real_count),
+        )
+        return VerifyPenaltyRows(
+            offset=int(offset),
+            num_rows=int(num_rows),
+            history_ids=history_ids,
+            history_counts=history_counts,
+            draft_tokens=tuple(int(t) for t in meta.buffer_draft_tokens),
+            presence_penalty=params[0],
+            frequency_penalty=params[1],
+            repetition_penalty=params[2],
+            draft_prefix=int(draft_prefix),
+        )
+
+    def penalized_verify_argmaxes(
+        self,
+        logits: jax.Array,
+        entries: typing.Sequence[tuple[_SpecVerifyMetadata, int, int]],
+    ) -> np.ndarray | None:
+        """Greedy verify argmaxes with every penalised request's history penalties applied.
+
+        Returns ``None`` when no entry carries a penalty, so the caller keeps its plain device argmax unchanged.
+        Otherwise the penalty is applied on device to the penalised rows only and one int per logit row is read
+        back; unpenalised rows keep their plain argmax.
+
+        Args:
+            logits: Verify logits ``[rows, vocab]`` (left on device).
+            entries: ``(verify_meta, offset, count)`` locating each request's verify rows in ``logits``.
+
+        Returns:
+            ``[rows]`` int64 argmax ids, or ``None`` when no request is penalised.
+        """
+        rows: list[VerifyPenaltyRows] = []
+        for meta, offset, count in entries:
+            spec = self.verify_penalty_rows(
+                meta=meta,
+                req_state=self._runner.requests.get(str(meta.request_id)),
+                offset=int(offset),
+                num_rows=int(count),
+            )
+            if spec is not None:
+                rows.append(spec)
+        if not rows:
+            return None
+        self.num_penalized_verify_rows += sum(int(spec.num_rows) for spec in rows)
+        return penalized_verify_argmax(logits, rows)
+
+    def penalized_replay_token(
+        self,
+        *,
+        meta: _SpecVerifyMetadata,
+        req_state: CachedRequestState | None,
+        hidden_row: jax.Array,
+        draft_prefix: int,
+    ) -> int | None:
+        """Penalised greedy token predicted from a replay forward's hidden row.
+
+        Replay forwards run the sampler with the device count state of the verify step, which no longer matches
+        the replayed prefix, so their sampled token cannot be used for a penalised request. The hidden row is
+        projected through the LM head and penalised with the replayed prefix's own counts instead.
+
+        Args:
+            meta: Verify metadata of the request's window.
+            req_state: The request's cached state.
+            hidden_row: Replay hidden state ``[hidden]`` of the last replayed position.
+            draft_prefix: Number of drafts included in the replayed prefix.
+
+        Returns:
+            The penalised greedy token, or ``None`` when the request carries no history penalty.
+        """
+        spec = self.verify_penalty_rows(meta=meta, req_state=req_state, offset=0, num_rows=1, draft_prefix=draft_prefix)
+        if spec is None:
+            return None
+        logits = self.project_hidden_rows(jnp.asarray(hidden_row)[None, :])
+        self.num_penalized_verify_rows += 1
+        return int(penalized_verify_argmax(logits, [spec])[0])
+
+    def sync_penalty_counts(self, scheduler_output: SchedulerOutput) -> None:
+        """Keep the sampler's device token counts exact for penalised speculative requests.
+
+        The sampler increments a request's device count row with the token it sampled. In a step that verifies
+        or drafts a request, that token is not what the request emits (accepted drafts plus a corrected token),
+        replays sample again, and full rebuilds may count materialised drafts, so the row drifts. Such requests
+        are marked stale; before a step that runs one of them through the plain sampler path (scheduled without
+        drafts), its row is rewritten from the committed history. Must run after the step's row reordering.
+
+        Args:
+            scheduler_output: The step's scheduler decision.
+        """
+        if self.drafter is None:
+            return
+        runner = self._runner
+        scheduled_spec = scheduler_output.scheduled_spec_decode_tokens or {}
+        rows: list[tuple[int, np.ndarray, np.ndarray]] = []
+        for rid, num_scheduled in scheduler_output.num_scheduled_tokens.items():
+            rid = str(rid)
+            if int(num_scheduled) <= 0:
+                continue
+            req_state = runner.requests.get(rid)
+            if not self.uses_history_penalties(req_state):
+                continue
+            spec_eligible = self.is_spec_request(req_state)
+            drafts = scheduled_spec.get(rid) or []
+            verifies = spec_eligible and bool(drafts) and all(int(t) >= 0 for t in drafts)
+            if rid in self._penalty_counts_stale and not verifies:
+                row = runner.sequence_buffer.req_id_to_index.get(rid)
+                if row is not None:
+                    ids, counts = self._history_counts.counts(rid, req_state.get_token_id, int(req_state.num_tokens))
+                    rows.append((int(row), ids, counts))
+                    self._penalty_counts_stale.discard(rid)
+            if spec_eligible:
+                self._penalty_counts_stale.add(rid)
+        if rows:
+            runner.executor_manager.overwrite_sampler_penalty_rows(rows)
 
     def filtered_log_probs(
         self,

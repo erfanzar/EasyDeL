@@ -68,6 +68,7 @@ def test_public_lm_preserves_configured_outputs_and_final_hidden_state(
         frequencies=None,
         norm=lambda value: normalized,
         _layer_scan_trace=lambda *args, **kwargs: True,
+        _layer_scan_kwargs=lambda *args, **kwargs: {},
         _layer_stage_context=lambda *args, **kwargs: nullcontext(),
         _layer_cache_view_at=lambda *args, **kwargs: None,
         _layer_cache_view_update=lambda views, *args, **kwargs: views,

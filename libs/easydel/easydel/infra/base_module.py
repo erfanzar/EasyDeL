@@ -212,6 +212,31 @@ def _is_reusable_context(value: tp.Any) -> bool:
     return hasattr(value, "__enter__") and hasattr(value, "__exit__")
 
 
+def _pin_fp32_parameters(module: tp.Any) -> None:
+    """Cast floating leaves matching ``type(module).fp32_param_patterns`` to float32 in place.
+
+    Runs after construction (eager, ``lazy_init`` and ``sequential_init`` alike), so every load path
+    starts from a float32 template for pinned leaves. Shardings of concrete arrays are preserved.
+
+    Args:
+        module: A freshly constructed :class:`EasyDeLBaseModule`.
+    """
+    from easydel.utils.parameters_transformation import fp32_param_pattern_matches
+
+    patterns = tuple(type(module).fp32_param_patterns)
+    for path, var in spx.iter_variables(module):
+        if not fp32_param_pattern_matches(path, patterns):
+            continue
+        value = var.value
+        dtype = getattr(value, "dtype", None)
+        if dtype is None or not jnp.issubdtype(dtype, jnp.floating) or dtype == jnp.float32:
+            continue
+        if isinstance(value, jax.ShapeDtypeStruct):
+            var.value = jax.ShapeDtypeStruct(value.shape, jnp.float32, sharding=value.sharding)
+        else:
+            var.value = value.astype(jnp.float32)
+
+
 _parameter_init_device: ContextVar[jax.Device | None] = ContextVar("parameter_init_device", default=None)
 
 
@@ -708,6 +733,30 @@ class EasyDeLLayerStackMixin:
             or self._pipeline_stage_count() > 1
         )
 
+    def _layer_scan_kwargs(self: Self, scope: str | None = None) -> dict[str, tp.Any]:
+        """Return the ``ModuleList.scan`` lowering options configured for one scan scope.
+
+        Args:
+            scope: ``"text"``, ``"vision"`` or ``"audio"``. ``None`` infers it from this module's
+                config class name, so towers built from a vision/audio sub-config pick up that scope.
+
+        Returns:
+            Keyword arguments to spread into ``layers.scan(...)``. With ``layer_scan_options=None`` the
+            training text scans of an fsdp-sharded model get ``prefetch_axes=("fsdp",)``; an explicit
+            mapping (``{}`` included) replaces that default.
+        """
+        from easydel.utils.inference_mode import is_inference_mode
+
+        from .layer_scan import auto_layer_scan_kwargs, infer_layer_scan_scope, resolve_layer_scan_kwargs
+
+        config = self.config
+        if scope is None:
+            scope = infer_layer_scan_scope(config)
+        options = getattr(config, "layer_scan_options", None)
+        if options is None:
+            return auto_layer_scan_kwargs(getattr(config, "mesh", None), scope, inference=is_inference_mode())
+        return resolve_layer_scan_kwargs(options, scope)
+
     def _mark_layer_stage_boundary(
         self: Self,
         hidden_states: tp.Any,
@@ -893,6 +942,7 @@ class EasyDeLBaseModule(
     _model_type: str | None
     _parameter_transform_rules: tp.ClassVar[list[ParameterTransformRule]] = []
     _hf_flattened_wrapper: tp.ClassVar[str | None] = None
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ()
 
     def __init_subclass__(cls, **kwargs: tp.Any) -> None:
         """Wrap subclass ``__init__`` to install parameter-init sharding context.
@@ -928,6 +978,9 @@ class EasyDeLBaseModule(
             config = _resolve_init_config(original_init, self, args, kwargs)
             with _parameter_init_sharding_context(config):
                 original_init(self, *args, **kwargs)
+            owner = next(klass for klass in type(self).__mro__ if "__init__" in klass.__dict__)
+            if owner is cls and type(self).fp32_param_patterns:
+                _pin_fp32_parameters(self)
 
         init_with_parameter_sharding._easydel_init_sharding_wrapped = True
         with contextlib.suppress(Exception):
@@ -2972,6 +3025,7 @@ class EasyDeLBaseModule(
             hf_flattened_wrappers=self._get_hf_flattened_wrappers(),
             checkpoint_key_normalizer=self._get_checkpoint_key_normalizer(),
             hf_model_type=getattr(self.config, "model_type", None),
+            fp32_param_patterns=tuple(self.fp32_param_patterns),
         )
         if shard_fns is not None:
             kwargs["shard_fns"] = shard_fns
@@ -3610,8 +3664,97 @@ class EasyDeLBaseModule(
             >>> print(logits.shape)
             (2, 128, 32000)  # (batch, seq, vocab)
         """
-        w = self.get_embedding().weight.value.T if self._tie_embeddings_enabled() else None
-        return tp.cast(Array, self.get_lm_head()(hidden_states, w=w))
+        head = self.get_lm_head()
+        w = self._tied_lm_head_weight(head)
+        return tp.cast(Array, head(hidden_states, w=w))
+
+    def _lm_head_kernel_spec(self: Self, head: tp.Any, shape: tuple[int, ...]) -> PartitionSpec | None:
+        """Resolve the LM head's intended kernel :class:`PartitionSpec`.
+
+        Resolution order: the head's ``weight`` variable sharding metadata (present even
+        when the tied kernel is unused), then an explicit ``sharding_layout``, then the
+        layout implied by its ``_direction`` marker. Every path goes through the config's
+        ``RuntimeShardingResolver``, so axes that do not divide ``shape`` are dropped.
+
+        Args:
+            head: The LM head module whose kernel layout the tied weight must match.
+            shape: Kernel-oriented shape ``(in_features, out_features)``.
+
+        Returns:
+            PartitionSpec | None: The head kernel's partition spec, or ``None`` when no
+            layout can be resolved (the failure reason is logged once).
+        """
+        head_name = type(head).__name__
+        try:
+            resolver = self.config.runtime_sharding_resolver.with_mesh(self.config.mesh)
+        except Exception as exc:
+            logger.warn_once(f"tied LM-head: no sharding resolver/mesh available for {head_name}: {exc!r}")
+            return None
+        metadata = getattr(getattr(head, "weight", None), "metadata", None)
+        if metadata:
+            try:
+                spec = resolver.resolve_metadata(metadata, shape=shape)
+            except Exception as exc:
+                logger.warn_once(f"tied LM-head: resolving {head_name}.weight metadata failed: {exc!r}")
+                spec = None
+            if spec is not None:
+                return spec
+        layout = getattr(head, "sharding_layout", None)
+        if layout is None:
+            direction = getattr(head, "_direction", None)
+            if direction == "column":
+                layout = spx.common_types.ColumnWise
+            elif direction == "row":
+                layout = spx.common_types.RowWise
+        if layout is None:
+            return None
+        try:
+            return resolver.resolve_layout(layout, shape=shape)
+        except Exception as exc:
+            logger.warn_once(f"tied LM-head: resolving {head_name} layout {layout!r} failed: {exc!r}")
+            return None
+
+    def _tied_lm_head_weight(self: Self, head: tp.Any) -> Array | None:
+        """Return the tied-embedding LM-head weight resharded to the head kernel's layout.
+
+        The embedding is stored over ``(vocab, hidden)`` with the hidden dimension on the
+        tensor axis, so its transpose arrives over ``(hidden, vocab)`` with the
+        *contracting* dimension tensor-sharded. Left unconstrained, GSPMD can lower the
+        projection as partial full-vocab matmuls plus a tensor-axis all-reduce and
+        materialize replicated ``[batch, seq, vocab]`` logits on every device.
+        Constraining the transposed weight to the head kernel's own (column-parallel)
+        layout makes the tied path produce the same vocab-sharded logits as an untied
+        kernel.
+
+        Args:
+            head: The LM head module whose kernel layout the tied weight must match.
+
+        Returns:
+            Array | None: The transposed (and, when a layout resolves, sharding-constrained)
+            embedding matrix, or ``None`` when weight tying is disabled.
+        """
+        if not self._tie_embeddings_enabled():
+            return None
+        w = tp.cast(Array, self.get_embedding().weight.value.T)
+        if getattr(w, "shape", None) is None:
+            return w
+        spec = self._lm_head_kernel_spec(head, tuple(w.shape))
+        if spec is None:
+            logger.warn_once(
+                f"tied LM-head weight could not be resharded: no partition spec resolved for "
+                f"{type(head).__name__} at shape {tuple(w.shape)}; the transposed embedding keeps its "
+                "row-parallel layout and GSPMD may materialize replicated full-vocab logits."
+            )
+            return w
+        return tp.cast(
+            Array,
+            spx.with_sharding_constraint(
+                w,
+                spec,
+                mesh=self.config.mesh,
+                metadata=getattr(getattr(head, "weight", None), "metadata", None),
+            ),
+        )
 
     def make_lm_head_fn(self, vocab_shard_stage: int | None = None) -> "Callable[[Array], Array]":
         """Return a trace-safe callable that projects hidden states to logits.
@@ -3643,10 +3786,11 @@ class EasyDeLBaseModule(
             A callable ``fn(hidden_states) -> logits`` that preserves
             all model-specific projection semantics.
         """
-        del vocab_shard_stage  # Kept for compatibility; 0.3.0 did not constrain the LM-head weight here.
+        # Kept for signature compatibility; the tied-weight reshard is stage-aware through the
+        # head weight's own metadata.
+        del vocab_shard_stage
         head = self.get_lm_head()
-
-        w = self.get_embedding().weight.value.T if self._tie_embeddings_enabled() else None
+        w = self._tied_lm_head_weight(head)
 
         _native_forward = getattr(head, "native_forward", None)
 

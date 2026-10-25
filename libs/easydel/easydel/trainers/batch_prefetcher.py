@@ -159,18 +159,36 @@ class TrainBatchPrefetcher:
                 self._fetch_cond.wait()
             if self._closed:
                 raise _PrefetcherClosed
-            try:
-                with capture_time() as fetch_time:
-                    raw_batch, self._data_iter = self._fetch_fn(self._data_iter, self._dataloader)
-                fetch_seconds = float(fetch_time())
-                iter_snapshot = self._data_iter
-                if isinstance(iter_snapshot, collections.abc.Iterator):
-                    self._undelivered[ticket] = copy.deepcopy(raw_batch)
-            finally:
-                # Advance the turn even on a failed fetch so later tickets
-                # don't deadlock waiting for one that will never complete.
+            data_iter = self._data_iter
+        # Fetch without the lock; ticket order alone serialises access to the iterator.
+        try:
+            with capture_time() as fetch_time:
+                raw_batch, next_iter = self._fetch_fn(data_iter, self._dataloader)
+            fetch_seconds = float(fetch_time())
+            record_replay = isinstance(next_iter, collections.abc.Iterator)
+            replay_copy = copy.deepcopy(raw_batch) if record_replay else None
+        except BaseException:
+            # Advance the turn even on a failed fetch so later tickets don't deadlock waiting for
+            # one that will never complete. ``_data_iter`` is left where it was.
+            with self._fetch_cond:
                 self._next_fetch_ticket = ticket + 1
                 self._fetch_cond.notify_all()
+            raise
+        with self._fetch_cond:
+            # Publish the advanced iterator and the raw replay copy even when ``close()`` ran
+            # during the fetch: the source has moved, so the row must be replayed exactly once,
+            # in ticket order, by :attr:`data_iter`.
+            self._data_iter = next_iter
+            if record_replay:
+                self._undelivered[ticket] = replay_copy
+            self._next_fetch_ticket = ticket + 1
+            self._fetch_cond.notify_all()
+            closed = self._closed
+        iter_snapshot = next_iter
+        if closed:
+            # Nobody will consume this batch; skip collation so ``close()`` joins after at most
+            # one in-flight ``_fetch_fn`` call.
+            raise _PrefetcherClosed
         with capture_time() as collate_time:
             batch = self._data_collator(raw_batch)
         return batch, fetch_seconds, float(collate_time()), (ticket, iter_snapshot)
@@ -285,7 +303,5 @@ class TrainBatchPrefetcher:
             self._fetch_cond.notify_all()
         for future in pending:
             future.cancel()
-        # No producer may advance the source after it is handed back to a
-        # caller. Fetching tasks hold _fetch_cond, so all raw rows are recorded
-        # before closure; finish collating tasks outside that lock.
+        # Joining in-flight fetches guarantees every fetched row is recorded for replay.
         self._executor.shutdown(wait=True, cancel_futures=True)

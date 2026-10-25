@@ -139,6 +139,21 @@ def quick_gelu(x):
     return x * jax.nn.sigmoid(1.702 * x)
 
 
+def relu2(x):
+    """Squared ReLU activation: ``relu(x) ** 2``.
+
+    Used by ungated MoE experts and MLPs of some hybrid models (for example
+    Nemotron-H); exposed under the HuggingFace name ``"relu2"``.
+
+    Args:
+        x: Input array (any shape, any floating dtype).
+
+    Returns:
+        Array of the same shape and dtype as ``x``.
+    """
+    return jnp.square(jax.nn.relu(x))
+
+
 # Registry of activation functions by name.
 #
 # Maps activation function names to their implementations.
@@ -146,6 +161,7 @@ def quick_gelu(x):
 ACT2FN = {
     "gelu": partial(jax.nn.gelu, approximate=False),
     "relu": jax.nn.relu,
+    "relu2": relu2,
     "silu": jax.nn.silu,
     "swish": jax.nn.silu,
     "gelu_new": partial(jax.nn.gelu, approximate=True),

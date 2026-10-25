@@ -1287,6 +1287,7 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, 0),
             trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs("vision"),
         )
         return tp.cast(Array, self.merger(hidden_states))
 
@@ -1544,6 +1545,7 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 

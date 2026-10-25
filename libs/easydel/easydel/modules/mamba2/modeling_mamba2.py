@@ -913,6 +913,7 @@ class Mamba2Model(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, all_hidden_states, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm_f(hidden_states)
 

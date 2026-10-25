@@ -289,6 +289,36 @@ def update_token_counts(
     return token_counts.at[safe_rows, safe_tokens].add(increments)
 
 
+def overwrite_token_count_rows(
+    token_counts: jax.Array,
+    *,
+    row_indices: jax.Array,
+    token_ids: jax.Array,
+    counts: jax.Array,
+) -> jax.Array:
+    """Replace whole count rows with exact sparse histories.
+
+    Each listed row is cleared and then receives ``counts[i, j]`` at token
+    ``token_ids[i, j]``. Row indices outside ``token_counts`` are dropped, so
+    callers pad ``row_indices`` with an out-of-range value; padding entries
+    inside a real row carry a zero count.
+
+    Args:
+        token_counts: Existing count matrix [max_num_reqs, vocab_size].
+        row_indices: Global request rows to overwrite [rows].
+        token_ids: Distinct token ids per row [rows, width].
+        counts: Count of each token id [rows, width].
+
+    Returns:
+        Count matrix with the listed rows replaced.
+    """
+    row_indices = row_indices.astype(jnp.int32)
+    cleared = token_counts.at[row_indices].set(0, mode="drop")
+    return cleared.at[row_indices[:, None], token_ids.astype(jnp.int32)].add(
+        counts.astype(token_counts.dtype), mode="drop"
+    )
+
+
 def apply_history_penalties(
     logits: jax.Array,
     *,

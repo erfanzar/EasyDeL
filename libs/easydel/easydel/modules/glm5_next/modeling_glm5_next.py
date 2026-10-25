@@ -2622,7 +2622,7 @@ class Glm5NextTextModel(_Glm5NextIndexerCacheMixin, EasyDeLBaseModule):
             )
 
         initial = (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0, None, None)
-        final = self.layers.scan(_layer_loop, initial, trace=trace_layers)
+        final = self.layers.scan(_layer_loop, initial, trace=trace_layers, **self._layer_scan_kwargs("text"))
         hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _, _, indexer_aux_loss = final
 
         # Unweighted mean over mHC streams, then final norm.

@@ -34,6 +34,7 @@ from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 
+from ..assistant_only_mask import AssistantOnlyMaskMixin
 from ..model_loading import apply_chat_template_path, apply_tokenizer_overrides, reject_string_model_id
 from ..prompt_transforms import SFTPreprocessTransform
 from ..trainer import Trainer
@@ -41,7 +42,6 @@ from ..trainer._fn import evaluation_step, training_step
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_utils import (
     compile_trainer_step,
-    normalize_completion_masks_and_labels,
     resolve_mask_prompt,
     resolve_straight_through_emulator,
 )
@@ -57,7 +57,7 @@ logger = get_logger(__name__)
 
 
 @Registry.register("trainer", "sft")
-class SFTTrainer(Trainer):
+class SFTTrainer(AssistantOnlyMaskMixin, Trainer):
     """Supervised Fine-Tuning trainer for language models.
 
     Implements standard supervised fine-tuning for both base and instruction-tuned
@@ -337,5 +337,4 @@ class SFTTrainer(Trainer):
             ``(processed_batch, auxiliary_metrics)``.
         """
         batch, infos = super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
-
-        return normalize_completion_masks_and_labels(batch, assistant_mask_fallback_on_empty=True), infos
+        return self._apply_assistant_supervision(batch, infos), infos

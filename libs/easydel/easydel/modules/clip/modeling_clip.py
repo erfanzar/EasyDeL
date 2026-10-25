@@ -714,6 +714,7 @@ class CLIPEncoder(EasyDeLLayerStackMixin, spx.Module):
             or output_attentions
             or not self.config.scan_layers
             or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs(),
         )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)

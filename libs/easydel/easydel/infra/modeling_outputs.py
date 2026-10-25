@@ -99,6 +99,8 @@ import collections
 import typing as tp
 from dataclasses import fields, is_dataclass
 
+import jax
+import numpy as np
 from eformer.pytree import auto_pytree
 from jax.core import Tracer
 from jaxtyping import Array
@@ -111,26 +113,22 @@ else:
 
 
 def _is_array(array):
-    """Check if an object is a JAX array or tracer.
+    """Check if an object is an array the output dataclass must keep whole.
 
-    This function is used internally to detect JAX arrays and tracers
-    during output validation. Tracers are returned during JAX
-    transformations like jit and grad.
+    ``ModelOutput.__post_init__`` treats a lone first field that is not an array as a generic
+    iterable of ``(key, value)`` pairs and calls ``iter()`` on it. A concrete ``jax.Array`` must
+    never take that path: JAX's array iterator requires the array to be fully replicated or fully
+    addressable, which a sharded output on a multi-process mesh cannot satisfy, and on a single
+    process it slices every row of the output for nothing. An empty array would also be silently
+    dropped from the output.
 
     Args:
         array: The object to check.
 
     Returns:
-        bool: True if the object is a JAX Tracer, False otherwise.
-
-    Note:
-        This function currently only checks for Tracer instances.
-        Regular JAX arrays (DeviceArray) return False, which may be
-        intentional for the validation logic in ModelOutput.__post_init__.
+        bool: True for JAX tracers, concrete JAX arrays and NumPy arrays, False otherwise.
     """
-    if isinstance(array, Tracer):
-        return True
-    return False
+    return isinstance(array, (Tracer, jax.Array, np.ndarray))
 
 
 class ModelOutput(collections.OrderedDict):

@@ -64,6 +64,39 @@ if tp.TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def fp32_param_pattern_matches(path: str | tp.Sequence[tp.Any], patterns: tp.Sequence[str] | None) -> bool:
+    """Whether a parameter path matches any fp32-pinned pattern.
+
+    A pattern is a dotted run of path segments (``"router.weight"``, ``"A_log"``); it matches when those
+    segments appear contiguously in ``path``. Matching is on whole segments only, so ``"router"`` does not
+    match ``"routers"`` and the same rule applies to HF keys, EasyDeL key tuples and native checkpoint keys.
+
+    Args:
+        path: Dotted or ``/``-separated key string, or a key tuple.
+        patterns: Dotted segment patterns declared by the model (``fp32_param_patterns``).
+
+    Returns:
+        ``True`` when at least one pattern matches.
+    """
+    if not patterns:
+        return False
+    if isinstance(path, str):
+        segments = tuple(segment for segment in re.split(r"[./\\]", path) if segment)
+    else:
+        segments = tuple(str(part) for part in path)
+    for pattern in patterns:
+        wanted = tuple(segment for segment in str(pattern).split(".") if segment)
+        width = len(wanted)
+        if width and any(segments[i : i + width] == wanted for i in range(len(segments) - width + 1)):
+            return True
+    return False
+
+
+def fp32_pinned_dtype(path: str | tp.Sequence[tp.Any], default: tp.Any, patterns: tp.Sequence[str] | None) -> tp.Any:
+    """Return ``jnp.float32`` for a pinned ``path``, otherwise ``default``."""
+    return jnp.float32 if fp32_param_pattern_matches(path, patterns) else default
+
+
 class ExpertMergeSpec(tp.NamedTuple):
     """How per-expert checkpoint tensors merge into one stacked expert tensor.
 
@@ -386,9 +419,6 @@ class DtypeHandler:
         return tensor
 
 
-#: dtypes NumPy can represent directly. Anything else (bfloat16, the float8
-#: family) has to cross the torch->JAX boundary as raw bytes, because
-#: ``torch.Tensor.numpy()`` refuses to materialize them at all.
 _NUMPY_REPRESENTABLE = frozenset(
     jnp.dtype(d)
     for d in (
@@ -1193,7 +1223,8 @@ class StateDictConverter:
         if config.get("_preserve_dtype", False):
             array = TensorConverter.to_jax_preserving_dtype(tensor)
         else:
-            array = TensorConverter.convert_pytorch_to_jnp(tensor, config["dtype"])
+            target_dtype = fp32_pinned_dtype(key_tuple, config["dtype"], config.get("fp32_param_patterns"))
+            array = TensorConverter.convert_pytorch_to_jnp(tensor, target_dtype)
         return [(key_tuple, array)]
 
     @staticmethod
@@ -1214,6 +1245,7 @@ class StateDictConverter:
         uses_tie_word_embedding: bool = False,
         consolidated_moe_keys: set[str] | None = None,
         reform_param: dict | None = None,
+        fp32_param_patterns: tp.Sequence[str] | None = None,
         **kwargs,
     ) -> dict[str, tp.Any]:
         """Base conversion from a PyTorch state dict to EasyDeL nested dict format.
@@ -1239,6 +1271,8 @@ class StateDictConverter:
             consolidated_moe_keys: Set of keys that were consolidated from
                 per-expert weights.
             reform_param: Optional parameter splitting/merging rules.
+            fp32_param_patterns: Dotted segment patterns of leaves kept in float32 regardless of
+                ``dtype`` (see :func:`fp32_param_pattern_matches`).
 
         Returns:
             Nested EasyDeL parameter dictionary.
@@ -1256,6 +1290,7 @@ class StateDictConverter:
             "dtype": dtype,
             "consolidated_moe_keys": consolidated_moe_keys or set(),
             "reform_param": reform_param,
+            "fp32_param_patterns": tuple(fp32_param_patterns or ()),
         }
 
         with jax.default_device(device) if device is not None and shard_fns is None else contextlib.nullcontext():

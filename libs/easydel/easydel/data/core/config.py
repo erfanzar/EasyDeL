@@ -256,12 +256,21 @@ class SourceStageConfig:
         dask_storage_options (dict[str, Any] | None): Forwarded verbatim to
             ``fsspec``/``dask`` readers as ``storage_options``; carries
             credentials, project ids, request timeouts, etc.
+        metadata_cache_dir (str | None): Directory or URI prefix for durable
+            Parquet footer-metadata caches (shard-info cache and row-group
+            index / byte-size sidecars). Restarts then skip the footer walk.
+            ``None`` disables them.
+        process_index (int | None): This process's index in a multi-host job;
+            only index ``0`` (or ``None``, unknown) writes shared remote cache
+            objects. Pass it explicitly (e.g. ``jax.process_index()``).
     """
 
     streaming: bool = True
     cloud_max_retries: int = 3
     cloud_retry_delay: float = 1.0
     dask_storage_options: dict[str, Any] | None = None
+    metadata_cache_dir: str | None = None
+    process_index: int | None = None
 
 
 @dataclass
@@ -366,8 +375,12 @@ class WeightSchedulePoint:
 
         Raises:
             ValueError: If the values in ``weights`` do not sum to ``1.0``
-                within ``1e-6`` tolerance.
+                within ``1e-6`` tolerance, or if any weight is negative.
         """
+        negative = {k: v for k, v in self.weights.items() if v < 0}
+        if negative:
+            # A negative weight can pass the sum check (e.g. {a: 1.5, b: -0.5}) but corrupts block arithmetic.
+            raise ValueError(f"Schedule weights must be non-negative, got {negative}")
         total = sum(self.weights.values())
         if abs(total - 1.0) > 1e-6:
             raise ValueError(f"Weights must sum to 1.0, got {total}")
@@ -396,21 +409,31 @@ class MixStageConfig:
             from a single dataset before the mixer rerolls the next source;
             larger blocks improve throughput at the cost of mixing
             granularity.
-        stop_strategy (Literal["restart", "first_exhausted", "all_exhausted"]):
+        stop_strategy (Literal["restart", "first_exhausted", "all_exhausted", "error"]):
             What the mixer does when a constituent dataset runs out —
             recycle it (``"restart"``), terminate immediately
-            (``"first_exhausted"``), or wait until every dataset is
-            exhausted (``"all_exhausted"``).
+            (``"first_exhausted"``), wait until every dataset is
+            exhausted (``"all_exhausted"``), or raise (``"error"``, for
+            protocols where repeating data means the config is wrong).
         seed (int | None): RNG seed for the mixer's per-block sampler;
             making mixing deterministic across runs/processes when set.
+        reshuffle_on_restart (bool): Visit a restarted constituent's shards
+            in a fresh deterministic per-epoch permutation instead of
+            replaying the identical order. Only meaningful with
+            ``stop_strategy="restart"``.
+        attach_dataset_ids (bool): Stamp the integer dataset-attribution
+            column (``easydel.data.DATASET_ID_FIELD``) on every mixed row so
+            trainers can split metrics or losses per source.
     """
 
     weights: dict[str, float] | None = None
     weight_schedule: list[WeightSchedulePoint] | None = None
     weight_schedule_type: Literal["step", "linear", "cosine"] = "step"
     block_size: int = 1000
-    stop_strategy: Literal["restart", "first_exhausted", "all_exhausted"] = "restart"
+    stop_strategy: Literal["restart", "first_exhausted", "all_exhausted", "error"] = "restart"
     seed: int | None = None
+    reshuffle_on_restart: bool = False
+    attach_dataset_ids: bool = False
 
     def __post_init__(self):
         """Verify ``weights`` (if provided) forms a valid probability vector.
@@ -593,6 +616,12 @@ class SaveStageConfig:
             created during the upload.
         hub_token (str | None): Authentication token for the Hub upload;
             ``None`` falls back to ``HF_TOKEN`` / cached credentials.
+        row_group_size (int | None): Parquet only: explicit rows per row
+            group. ``None`` derives it from ``row_group_target_bytes``.
+        row_group_target_bytes (int): Parquet only: target uncompressed bytes
+            per row group (default 64 MiB) when ``row_group_size`` is ``None``.
+            Bounded row groups keep the loader's per-row decode and shuffle
+            pool memory bounded.
     """
 
     enabled: bool = False
@@ -606,6 +635,8 @@ class SaveStageConfig:
     hub_repo_id: str | None = None
     hub_private: bool = False
     hub_token: str | None = None
+    row_group_size: int | None = None
+    row_group_target_bytes: int = 64 * 1024 * 1024
 
 
 @dataclass

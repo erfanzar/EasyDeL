@@ -138,6 +138,7 @@ def test_cohere_backbone_output_flags_follow_config_and_explicit_override(monkey
         norm=lambda x: x,
         frequencies=None,
         _layer_scan_trace=lambda *args, **kwargs: True,
+        _layer_scan_kwargs=lambda *args, **kwargs: {},
         _layer_stage_context=lambda *args, **kwargs: nullcontext(),
         _layer_cache_view_at=lambda *args, **kwargs: None,
         _layer_cache_view_update=lambda *args, **kwargs: None,

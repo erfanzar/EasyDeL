@@ -51,6 +51,7 @@ def test_epoch_boundaries_replay_prefetched_rows_including_idle_buckets(monkeypa
         _execute_train_step=execute,
         _runtime_batch_summary=lambda batch: batch,
         _apply_pose_to_batch=lambda batch, step: batch,
+        _apply_randomized_yarn_to_batch=lambda batch, step: batch,
         _apply_process_encoder_to_batch=lambda batch, step: batch,
         on_step_start=lambda state, step: state,
         on_step_end=lambda state, metrics, step: (state, metrics),

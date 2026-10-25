@@ -134,6 +134,7 @@ def test_qwen3_config_selected_output_histories_and_explicit_overrides(monkeypat
         frequencies=None,
         norm=lambda h: h,
         _layer_scan_trace=lambda *args, **kwargs: True,
+        _layer_scan_kwargs=lambda *args, **kwargs: {},
         _layer_stage_context=lambda *args, **kwargs: nullcontext(),
         _layer_cache_view_at=lambda *args, **kwargs: None,
         _layer_cache_view_update=lambda cv, *args, **kwargs: cv,

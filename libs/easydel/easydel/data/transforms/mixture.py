@@ -28,6 +28,7 @@ import itertools
 import logging
 import math
 import typing as tp
+import zlib
 from dataclasses import dataclass
 
 import numpy as np
@@ -43,6 +44,18 @@ logger = logging.getLogger(__name__)
 # Sentinel returned by probe draws in `_empty_constituents`; mixed rows are dicts,
 # so a private object() can never collide with a real example.
 _PROBE_EMPTY = object()
+
+STOP_STRATEGIES: tuple[str, ...] = ("restart", "first_exhausted", "all_exhausted", "error")
+
+DATASET_ID_FIELD = "_dataset_id"
+
+ASSISTANT_ONLY_FIELD = "_assistant_only"
+
+DATASET_ID_TOKEN_FIELD = "dataset_ids"
+
+ASSISTANT_ONLY_TOKEN_FIELD = "assistant_only_mask"
+
+DEFAULT_DRAW_LOG_INTERVAL = 262_144
 
 
 def largest_remainder_counts(weights: np.ndarray, block_size: int) -> np.ndarray:
@@ -250,9 +263,23 @@ class MixedShardedSource(ShardedDataSource[dict]):
     the surviving positive-weight sources until each is exhausted.
     Zero-weight sources are excluded; a schedule stops when no currently
     eligible source can yield, since its emitted-row counter cannot then
-    advance to a future schedule knot. Optional :class:`WeightScheduler`
-    integration replaces the static weights with curriculum-driven
-    weights at each block.
+    advance to a future schedule knot. ``"error"`` raises
+    :class:`RuntimeError` on the first exhaustion, for protocols where
+    repeating data means the configuration is wrong. Optional
+    :class:`WeightScheduler` integration replaces the static weights with
+    curriculum-driven weights at each block.
+
+    With ``reshuffle_on_restart=True`` every restart of a constituent visits
+    its shards in a fresh deterministic permutation seeded by
+    ``(seed, crc32(name), epoch)`` instead of replaying the identical
+    order; row order inside a shard is unchanged, so pair it with a
+    downstream shuffle buffer for row-level decorrelation. Epoch 0 always
+    uses canonical shard order and seeked resume reproduces the permuted
+    epochs exactly.
+
+    The realized per-source draw counts and restart counts of the most
+    recently started stream are readable live as :attr:`last_draw_counts`
+    and :attr:`last_epochs`.
     """
 
     def __init__(
@@ -263,6 +290,9 @@ class MixedShardedSource(ShardedDataSource[dict]):
         seed: int | None = None,
         stop_strategy: str = "restart",
         weight_scheduler: WeightScheduler | None = None,
+        reshuffle_on_restart: bool = False,
+        attach_dataset_ids: bool = False,
+        draw_log_interval: int = DEFAULT_DRAW_LOG_INTERVAL,
     ):
         """Validate inputs, normalise weights, and capture state without iterating.
 
@@ -279,21 +309,45 @@ class MixedShardedSource(ShardedDataSource[dict]):
                 ``seed + block_idx`` so iteration is deterministic
                 yet uncorrelated across blocks. ``None`` uses NumPy
                 default randomness (non-deterministic).
-            stop_strategy: ``"restart"``, ``"first_exhausted"``, or
-                ``"all_exhausted"``; see class docstring.
+            stop_strategy: One of :data:`STOP_STRATEGIES` (``"restart"``,
+                ``"first_exhausted"``, ``"all_exhausted"``, ``"error"``);
+                see class docstring.
             weight_scheduler: Optional :class:`WeightScheduler`. When
                 set, ``weights`` are recomputed per block from the
-                scheduler instead of using the static map.
+                scheduler instead of using the static map. Its dataset
+                names must equal the source names exactly.
+            reshuffle_on_restart: Visit a restarted constituent's shards in
+                a fresh deterministic per-epoch permutation. Only meaningful
+                with ``stop_strategy="restart"``. An unseeded mixer draws its
+                seed once at construction and records it in
+                :class:`MixedShardState`, so resume stays exact.
+            attach_dataset_ids: Stamp :data:`DATASET_ID_FIELD` (the
+                constituent's position in ``sources``) on every emitted
+                row, next to ``"__source__"``.
+            draw_log_interval: Emit an INFO line with the realized
+                per-source draw counts every this many emitted rows;
+                ``0`` disables it.
 
         Raises:
-            ValueError: When ``weights`` keys don't match
-                ``sources`` keys, or the weights sum to a non-positive
-                value.
+            ValueError: When ``weights`` keys don't match ``sources`` keys,
+                a weight is negative, the weights sum to a non-positive
+                value, ``stop_strategy`` is unknown, the scheduler names
+                differ from the sources, or a positive-weight source would
+                receive zero rows per block (starvation).
         """
         if not sources:
             raise ValueError("No datasets to mix")
         if not isinstance(block_size, (int, np.integer)) or block_size <= 0:
             raise ValueError("block_size must be a positive integer")
+        if stop_strategy not in STOP_STRATEGIES:
+            raise ValueError(f"stop_strategy must be one of {STOP_STRATEGIES}, got {stop_strategy!r}")
+        if weight_scheduler is not None and set(weight_scheduler.dataset_names) != set(sources.keys()):
+            raise ValueError(
+                "weight_scheduler dataset names must match source names exactly; schedule has "
+                f"{sorted(weight_scheduler.dataset_names)}, sources are {sorted(sources.keys())}."
+            )
+        if int(draw_log_interval) < 0:
+            raise ValueError("draw_log_interval must be >= 0")
         self._sources = sources
         self._names = list(sources.keys())
         self._block_size = block_size
@@ -302,6 +356,12 @@ class MixedShardedSource(ShardedDataSource[dict]):
         self._seed = seed if seed is not None else int(np.random.SeedSequence().entropy)
         self._stop_strategy = stop_strategy
         self._weight_scheduler = weight_scheduler
+        self._reshuffle_on_restart = bool(reshuffle_on_restart)
+        self._attach_dataset_ids = bool(attach_dataset_ids)
+        self._dataset_ids = {name: index for index, name in enumerate(self._names)}
+        self._draw_log_interval = int(draw_log_interval)
+        self.last_draw_counts: dict[str, int] = dict.fromkeys(self._names, 0)
+        self.last_epochs: dict[str, int] = dict.fromkeys(self._names, 0)
 
         if weights is None:
             n = len(self._names)
@@ -313,10 +373,36 @@ class MixedShardedSource(ShardedDataSource[dict]):
             extra = set(weights.keys()) - set(self._names)
             if extra:
                 raise ValueError(f"Weight keys must match source names. Extra: {sorted(extra)}")
+            negative = {name: weights[name] for name in self._names if float(weights[name]) < 0}
+            if negative:
+                # A negative weight can pass a positive-sum check but corrupts block arithmetic.
+                raise ValueError(f"Mixture weights must be non-negative; got {negative}.")
             total = float(sum(weights[name] for name in self._names))
             if total <= 0:
                 raise ValueError("Sum of mixture weights must be > 0.")
             self._weights = {name: float(weights[name]) / total for name in self._names}
+
+        # Starvation only excludes a source permanently under the recycling strategies.
+        base_counts = self._compute_counts(self._weights)
+        if self._stop_strategy in ("restart", "error"):
+            self._raise_if_starved(self._weights, base_counts, what="static weights")
+            if weight_scheduler is not None:
+                # User-specified knots are validated; transient interpolated values between knots are not.
+                for point in weight_scheduler._schedule:
+                    self._raise_if_starved(point.weights, self._compute_counts(point.weights), what=f"knot {point.step}")
+        for name in self._names if weight_scheduler is None else ():
+            exact = self._weights[name] * float(block_size)
+            if exact > 0:
+                rel_bias = abs(base_counts[name] - exact) / exact
+                if rel_bias > 0.02:
+                    logger.warning(
+                        "Mixture rounding bias: source %r gets %d rows/block vs exact %.3f (%.1f%% relative, "
+                        "same sign every block). Raise block_size to shrink it.",
+                        name,
+                        base_counts[name],
+                        exact,
+                        100.0 * rel_bias,
+                    )
 
     @property
     def shard_names(self) -> "Sequence[str]":
@@ -370,6 +456,28 @@ class MixedShardedSource(ShardedDataSource[dict]):
         counts_arr = largest_remainder_counts(ws, self._block_size)
 
         return {name: int(counts_arr[i]) for i, name in enumerate(self._names)}
+
+    def _raise_if_starved(self, weights: dict[str, float], counts: dict[str, int], *, what: str) -> None:
+        """Refuse a weight vector under which a positive-weight source gets zero rows per block.
+
+        Largest-remainder rounding gives a source with ``weight * block_size < 1`` zero rows in every
+        block, which under a recycling strategy is silent, permanent exclusion of that dataset.
+
+        Args:
+            weights: Per-dataset weights (any positive scale).
+            counts: The rounded per-block counts for ``weights``.
+            what: Label for the error message (``"static weights"`` or a schedule knot).
+
+        Raises:
+            ValueError: When at least one positive-weight source rounds to zero rows.
+        """
+        starved = [name for name in self._names if float(weights.get(name, 0)) > 0 and counts.get(name, 0) == 0]
+        if starved:
+            raise ValueError(
+                f"Mixture starvation ({what}): sources {starved} would receive ZERO rows per block "
+                f"(weight * block_size < 1 at block_size={self._block_size}). Raise block_size, raise the "
+                "weight, or drop the source."
+            )
 
     def _block_source_ids(self, block_idx: int, examples_emitted: int, excluded: set[str] | None = None) -> list[str]:
         """Build a deterministic block, redistributing finite mixes over live sources.
@@ -540,8 +648,10 @@ class MixedShardedSource(ShardedDataSource[dict]):
         Ordinary iteration disables marker allocation; checkpoint capture enables it.
         """
 
-        def constituent(source):
-            for shard_index, shard_name in enumerate(source.shard_names):
+        def constituent(source, name, epoch):
+            canonical = {shard_name: index for index, shard_name in enumerate(source.shard_names)}
+            for shard_name in self._epoch_shard_order(source, name=name, epoch=epoch):
+                shard_index = canonical[shard_name]
                 rows = iter(source.open_shard(shard_name))
                 try:
                     for row_index, example in enumerate(rows):
@@ -551,7 +661,15 @@ class MixedShardedSource(ShardedDataSource[dict]):
                     if close is not None:
                         close()
 
-        iters = {name: constituent(source) for name, source in self._sources.items()}
+        epochs: dict[str, int] = dict.fromkeys(self._names, 0)
+        draw_counts: dict[str, int] = dict.fromkeys(self._names, 0)
+        if not capture_state:
+            # Live, per-stream accounting: readable while the stream runs, describing the most recently
+            # started consumer stream of this instance (checkpoint replays do not overwrite it).
+            self.last_draw_counts = draw_counts
+            self.last_epochs = epochs
+        next_log_rows = self._draw_log_interval if not capture_state else 0
+        iters = {name: constituent(source, name, 0) for name, source in self._sources.items()}
         block_idx = 0
         examples_emitted = 0
         dead: set[str] = set()
@@ -570,9 +688,16 @@ class MixedShardedSource(ShardedDataSource[dict]):
                     if item is None:
                         if self._stop_strategy == "first_exhausted":
                             return
+                        if self._stop_strategy == "error":
+                            raise RuntimeError(
+                                f"Mixture constituent '{name}' exhausted after {examples_emitted} emitted examples "
+                                "(stop_strategy='error'). If repeating this dataset is intended, use "
+                                "stop_strategy='restart'."
+                            )
                         if self._stop_strategy == "restart":
                             iters[name].close()
-                            iters[name] = constituent(self._sources[name])
+                            epochs[name] += 1
+                            iters[name] = constituent(self._sources[name], name, epochs[name])
                             item = next(iters[name], None)
                         if item is None:
                             dead.add(name)
@@ -590,14 +715,37 @@ class MixedShardedSource(ShardedDataSource[dict]):
                         if capture_state
                         else None
                     )
-                    yield {**example, "__source__": name}, state
+                    # Counted before the yield so a consumer stopping mid-block still sees exact counts.
+                    draw_counts[name] += 1
+                    yield self._tag(example, name), state
                     examples_emitted += 1
                 if len(dead) == len(self._names):
                     return
                 block_idx += 1
+                if next_log_rows and examples_emitted >= next_log_rows:
+                    next_log_rows = examples_emitted + self._draw_log_interval
+                    self._log_draws(block_idx, examples_emitted, draw_counts, epochs)
         finally:
             for stream in iters.values():
                 stream.close()
+
+    def _tag(self, example: dict, name: str) -> dict:
+        """Return a copy of ``example`` carrying its provenance (``__source__`` and optionally the dataset id)."""
+        tagged = {**example, "__source__": name}
+        if self._attach_dataset_ids:
+            tagged[DATASET_ID_FIELD] = self._dataset_ids[name]
+        return tagged
+
+    @staticmethod
+    def _log_draws(block_idx: int, rows: int, draw_counts: dict[str, int], epochs: dict[str, int]) -> None:
+        """Log the realized per-source draw counts and restart counts of a running stream."""
+        logger.info(
+            "mixture draws after %d blocks (%d rows): %s | source epochs: %s",
+            block_idx,
+            rows,
+            dict(sorted(draw_counts.items())),
+            {k: v for k, v in sorted(epochs.items()) if v},
+        )
 
     def open_shard_at_row(self, _shard_name: str, row: int) -> "Iterator[dict]":
         """Open the virtual mixed shard after ``row`` emitted examples."""
@@ -643,7 +791,13 @@ class MixedShardedSource(ShardedDataSource[dict]):
             return
 
         offsets = self._source_offsets_for_row(row)
-        iters = {name: self._chain_shards_at_row(self._sources[name], offsets[name]) for name in self._names}
+        # Each constituent's seek records the epoch (restart count) it landed in, so post-resume restarts
+        # continue the epoch sequence (and, with reshuffle_on_restart, the permutation sequence).
+        epochs: dict[str, int] = dict.fromkeys(self._names, 0)
+        iters = {
+            name: self._chain_shards_at_row(self._sources[name], offsets[name], name=name, epochs=epochs)
+            for name in self._names
+        }
 
         block_idx, partial = divmod(row, self._block_size)
         dead: set[str] = set()
@@ -660,14 +814,13 @@ class MixedShardedSource(ShardedDataSource[dict]):
                     continue
                 try:
                     example = next(iters[name])
-                    example["__source__"] = name
-                    yield example
+                    yield self._tag(example, name)
                 except StopIteration:
-                    iters[name] = self._chain_shards(self._sources[name])
+                    epochs[name] += 1
+                    iters[name] = self._chain_epoch(self._sources[name], name=name, epoch=epochs[name])
                     try:
                         example = next(iters[name])
-                        example["__source__"] = name
-                        yield example
+                        yield self._tag(example, name)
                     except StopIteration:
                         logger.warning(f"Dataset '{name}' is empty")
                         dead.add(name)
@@ -676,6 +829,43 @@ class MixedShardedSource(ShardedDataSource[dict]):
                 return
 
             block_idx += 1
+
+    def _epoch_shard_order(self, source: ShardedDataSource, *, name: str, epoch: int) -> list[str]:
+        """Shard visit order for one epoch (restart count) of one constituent.
+
+        Epoch 0 always uses canonical order. Later epochs return a deterministic permutation seeded by
+        ``(seed, crc32(name), epoch)`` when ``reshuffle_on_restart`` is set, canonical order otherwise.
+
+        Args:
+            source: The constituent source.
+            name: Constituent name (part of the permutation seed).
+            epoch: 0-based restart count.
+
+        Returns:
+            list[str]: Shard names in visit order.
+        """
+        shard_names = list(source.shard_names)
+        if not self._reshuffle_on_restart or epoch <= 0 or len(shard_names) < 2:
+            return shard_names
+        rng = np.random.default_rng((int(self._seed), zlib.crc32(name.encode("utf-8")), int(epoch)))
+        rng.shuffle(shard_names)
+        return shard_names
+
+    def _chain_epoch(self, source: ShardedDataSource, *, name: str, epoch: int) -> "Iterator[dict]":
+        """Chain ``source`` for one epoch, in that epoch's shard order.
+
+        Canonical-order epochs go through :meth:`_chain_shards` so subclasses overriding it keep
+        working; permuted epochs open the shards in :meth:`_epoch_shard_order`.
+        """
+        if not self._reshuffle_on_restart or epoch <= 0:
+            return self._chain_shards(source)
+        return self._chain_ordered(source, self._epoch_shard_order(source, name=name, epoch=epoch))
+
+    @staticmethod
+    def _chain_ordered(source: ShardedDataSource, order: list[str]) -> "Iterator[dict]":
+        """Yield every row of the shards in ``order``, one shard after another."""
+        for shard_name in order:
+            yield from source.open_shard(shard_name)
 
     def _chain_shards(self, source: ShardedDataSource) -> "Iterator[dict]":
         """Chain every shard of ``source`` into one continuous iterator.
@@ -690,11 +880,31 @@ class MixedShardedSource(ShardedDataSource[dict]):
         for shard_name in source.shard_names:
             yield from source.open_shard(shard_name)
 
-    def _chain_shards_at_row(self, source: ShardedDataSource, row: int) -> "Iterator[dict]":
-        """Chain ``source`` shards starting at a global row offset."""
+    def _chain_shards_at_row(
+        self,
+        source: ShardedDataSource,
+        row: int,
+        *,
+        name: str = "",
+        epochs: dict[str, int] | None = None,
+    ) -> "Iterator[dict]":
+        """Chain ``source`` shards starting at a global (possibly wrapped) row offset.
+
+        Args:
+            source: The constituent source.
+            row: Rows of this constituent consumed before the resume point (may exceed one pass).
+            name: Constituent name; seeds per-epoch shard permutations.
+            epochs: Optional dict updated with ``epochs[name] = <epoch the seek landed in>`` once known.
+        """
         row = max(int(row), 0)
         shard_names = list(source.shard_names)
+
+        def _record(epoch: int) -> None:
+            if epochs is not None:
+                epochs[name] = int(epoch)
+
         if row == 0:
+            _record(0)
             yield from self._chain_shards(source)
             return
 
@@ -712,6 +922,7 @@ class MixedShardedSource(ShardedDataSource[dict]):
         if known_rows is None or not getattr(source, "delivers_all_metadata_rows", False):
             # Skip delivered rows lazily: ordinary seeks must not count the
             # entire dataset just to learn a restart period they never cross.
+            _record(0)
             stream = self._chain_shards(source)
             consumed = 0
             try:
@@ -723,10 +934,13 @@ class MixedShardedSource(ShardedDataSource[dict]):
                             return
                         # We crossed the end of one delivered cycle. Only now
                         # is its true length known; restart at the residual
-                        # offset rather than trusting physical row metadata.
+                        # offset (in that epoch's shard order) rather than
+                        # trusting physical row metadata.
                         stream.close()
-                        stream = self._chain_shards(source)
-                        for _ in range(row % consumed):
+                        epoch, residual = divmod(row, consumed)
+                        _record(epoch)
+                        stream = self._chain_epoch(source, name=name, epoch=epoch)
+                        for _ in range(residual):
                             next(stream)
                         break
                     consumed += 1
@@ -737,14 +951,21 @@ class MixedShardedSource(ShardedDataSource[dict]):
 
         rows_by_shard, total_rows = known_rows
         if total_rows <= 0:
+            _record(0)
             return
 
+        epoch = 0
         if self._stop_strategy == "restart":
-            row %= total_rows
+            epoch, row = divmod(row, total_rows)
+        _record(epoch)
 
+        # Apply this epoch's shard order to both the seek arithmetic and the visit order, so a resume
+        # into a reshuffled epoch lands on exactly the row the original stream would produce next.
+        rows_map = dict(rows_by_shard)
+        order = self._epoch_shard_order(source, name=name, epoch=epoch)
         remaining = row
         started = False
-        for shard_name, rows in rows_by_shard:
+        for shard_name, rows in ((shard, rows_map[shard]) for shard in order):
             if not started:
                 if remaining >= rows:
                     remaining -= rows
@@ -866,6 +1087,8 @@ class MixStage(BaseStage):
             seed=self._stage_config.seed if self._stage_config.seed is not None else context.seed,
             stop_strategy=self._stage_config.stop_strategy,
             weight_scheduler=weight_scheduler,
+            reshuffle_on_restart=self._stage_config.reshuffle_on_restart,
+            attach_dataset_ids=self._stage_config.attach_dataset_ids,
         )
 
         logger.info(f"Mixed {len(data)} datasets with block_size={self._stage_config.block_size}")
@@ -878,6 +1101,7 @@ def block_mixture_interleave(
     block_size: int = 1000,
     seed: int | None = 42,
     stop: str = "restart",
+    attach_dataset_ids: bool = False,
 ):
     """Create a deterministic block-based mixture of multiple datasets.
 
@@ -892,14 +1116,20 @@ def block_mixture_interleave(
             Keys must match dataset keys. If None, datasets are mixed equally.
         block_size: Number of examples per block.
         seed: Random seed for deterministic shuffling within blocks.
-        stop: Strategy when a dataset is exhausted - "restart" to loop the dataset
-            or "first_exhausted" to stop iteration.
+        stop: Strategy when a dataset is exhausted: ``"restart"`` loops it forever (ratios preserved);
+            ``"first_exhausted"`` ends the stream at the first exhaustion; ``"all_exhausted"`` keeps
+            recycling exhausted datasets until every dataset has finished at least once; ``"error"``
+            raises :class:`RuntimeError` so a run can never silently train off-ratio.
+        attach_dataset_ids: Stamp :data:`DATASET_ID_FIELD` (the dataset's position in ``datasets``)
+            on every yielded dict row.
 
     Returns:
         IterableDataset that yields examples from the mixed datasets.
 
     Raises:
-        ValueError: If no datasets are provided or weight keys don't match dataset keys.
+        ValueError: If no datasets are provided, weight keys don't match dataset keys, a weight is
+            negative, the weights do not have a positive finite sum, ``stop`` is unknown, or a
+            positive-weight dataset would receive zero rows per block (starvation).
 
     Example:
         >>> mixed = block_mixture_interleave(
@@ -927,6 +1157,8 @@ def block_mixture_interleave(
 
     if n == 0:
         raise ValueError("No datasets to mix")
+    if stop not in STOP_STRATEGIES:
+        raise ValueError(f"stop must be one of {STOP_STRATEGIES}, got {stop!r}")
 
     if weights is not None:
         if not isinstance(weights, dict):
@@ -938,12 +1170,25 @@ def block_mixture_interleave(
         if extra:
             raise ValueError(f"Weight keys must match dataset keys. Extra: {extra}")
         ws = np.array([weights[name] for name in dataset_names], dtype=np.float64)
+        if (ws < 0).any() or not np.isfinite(ws).all() or ws.sum() <= 0:
+            # Negative weights make blocks emit != block_size rows; zero/NaN sums floor-cast to garbage.
+            raise ValueError(f"Mixture weights must be non-negative with a positive sum; got {weights}.")
         ws = ws / ws.sum()
     else:
         ws = np.ones(n, dtype=np.float64) / n
 
     # Largest-remainder rounding, shared with MixedShardedSource._compute_counts.
     counts = largest_remainder_counts(ws, block_size)
+    starved = [dataset_names[i] for i in range(n) if ws[i] > 0 and counts[i] == 0]
+    if starved:
+        # weight * block_size < 1 gives ZERO rows in every block: silent, permanent exclusion.
+        raise ValueError(
+            f"Mixture starvation: datasets {starved} would receive ZERO rows per block "
+            f"(weight * block_size < 1 at block_size={block_size}). Raise block_size, raise the weight, "
+            "or drop the dataset."
+        )
+    # Zero-weight datasets never draw, so they cannot gate all_exhausted termination.
+    positive = {i for i in range(n) if counts[i] > 0}
 
     def gen():
         """Inline closure that drives the deterministic block-based interleaver.
@@ -955,20 +1200,38 @@ def block_mixture_interleave(
         per-block ordering with a seed of ``seed + block_idx`` so
         each block is reproducible independently. End-of-source is
         handled per the ``stop`` flag: ``"restart"`` recycles the
-        constituent (raising ``ValueError`` if it's truly empty),
-        anything else terminates the whole generator.
+        constituent forever; ``"all_exhausted"`` recycles it but ends
+        the stream once every drawn constituent has exhausted at least
+        once; ``"error"`` raises; ``"first_exhausted"`` ends the stream
+        at the first exhaustion.
 
         Yields:
             Any: Each yielded example is whatever the underlying
             datasets produced (typically dict rows).
 
         Raises:
-            ValueError: When ``stop="restart"`` is requested and one
-                of the constituent datasets has zero examples (so it
-                cannot legitimately be restarted).
+            ValueError: When a recycling strategy (``"restart"`` /
+                ``"all_exhausted"``) meets a constituent with zero
+                examples (it cannot legitimately be restarted).
+            RuntimeError: When ``stop="error"`` and any constituent
+                exhausts.
         """
         iters = [iter(ds) for ds in datasets_list]
+        exhausted: set[int] = set()
         block_idx = 0
+
+        def _tag(example, i):
+            if attach_dataset_ids and isinstance(example, dict):
+                return {**example, DATASET_ID_FIELD: i}
+            return example
+
+        def _recycle(i):
+            iters[i] = iter(datasets_list[i])
+            try:
+                return next(iters[i])
+            except StopIteration as e:
+                raise ValueError(f"Dataset at index {i} is empty and cannot be restarted") from e
+
         while True:
             block_rng = np.random.default_rng(seed + block_idx if seed is not None else None)
             ids = []
@@ -977,15 +1240,21 @@ def block_mixture_interleave(
             block_rng.shuffle(ids)
             for i in ids:
                 try:
-                    yield next(iters[i])
+                    yield _tag(next(iters[i]), i)
                 except StopIteration:
                     if stop == "restart":
-                        iters[i] = iter(datasets_list[i])
-                        try:
-                            yield next(iters[i])
-                        except StopIteration as e:
-                            raise ValueError(f"Dataset at index {i} is empty and cannot be restarted") from e
-                    else:
+                        yield _tag(_recycle(i), i)
+                    elif stop == "error":
+                        raise RuntimeError(
+                            f"stop_strategy='error': dataset {dataset_names[i]!r} exhausted during block "
+                            f"{block_idx}; refusing to continue with a drifted mixture."
+                        ) from None
+                    elif stop == "all_exhausted":
+                        exhausted.add(i)
+                        if exhausted >= positive:
+                            return
+                        yield _tag(_recycle(i), i)
+                    else:  # first_exhausted
                         return
             block_idx += 1
 

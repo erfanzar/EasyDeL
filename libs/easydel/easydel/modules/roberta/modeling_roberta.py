@@ -1148,6 +1148,7 @@ class RobertaEncoder(EasyDeLLayerStackMixin, spx.Module):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, all_cross_attentions, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)

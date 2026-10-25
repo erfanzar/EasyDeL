@@ -1670,6 +1670,7 @@ class DeepseekV41Model(EngramModelMixin, EasyDeLBaseModule):
                 0,
             ),
             trace=True,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(manifold_collapse(pre_mix, hidden_streams))
         main_hidden = None

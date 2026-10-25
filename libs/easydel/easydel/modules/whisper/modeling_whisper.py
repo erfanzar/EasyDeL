@@ -951,6 +951,7 @@ class WhisperEncoder(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, all_hidden_states, all_attentions, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("audio"),
         )
         hidden_states = checkpoint_name(self.layer_norm(hidden_states), "model_output")
         # HF parity: num_layers + 1 states (layer inputs, then the post-norm
@@ -1214,6 +1215,7 @@ class WhisperDecoder(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_self_attns, all_cross_attentions, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = checkpoint_name(self.layer_norm(hidden_states), "model_output")
         # HF parity: num_layers + 1 states (layer inputs, then the post-norm

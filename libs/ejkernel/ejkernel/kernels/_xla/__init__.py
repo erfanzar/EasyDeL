@@ -68,6 +68,8 @@ Available Operations:
     Losses:
         - fused_cross_entropy: Fused cross-entropy loss
         - fused_kl_divergence: Fused KL-divergence loss
+        - fused_cakld_tv: Fused dynamic-CAKLD + TV distillation loss
+        - fused_renyi_entropy: Fused per-row Renyi entropy
 
     State Space Models:
         - state_space_v1: Mamba1-style SSM
@@ -101,11 +103,14 @@ from .compressed_window_attention import compressed_window_attention
 from .compressed_window_decode import compressed_window_decode
 from .decode_attention import decode_attention
 from .deepseek_attn import deepseek_attn
+from .dsa_sparse_attention import dsa_sparse_attention
 from .flash_attention import flash_attention
 from .flash_mla import flash_mla
+from .fused_cakld_tv import fused_cakld_tv
 from .fused_conv_decode import fused_conv_decode
 from .fused_cross_entropy import fused_cross_entropy
 from .fused_kl_divergence import fused_kl_divergence
+from .fused_renyi_entropy import fused_renyi_entropy
 from .gated_delta_rule import gated_delta_rule
 from .gated_delta_rule_grouped_decode import gated_delta_rule_grouped_decode
 from .gdn_compute_schedule_v2 import compute_schedule_table_v2
@@ -114,11 +119,14 @@ from .gla import recurrent_gla
 from .grouped_matmul import grouped_matmul
 from .grouped_matmul_quant import grouped_matmul_quant, grouped_matmul_w8a8
 from .grouped_matmulv3 import grouped_matmulv3
+from .indexer_scores import indexer_scores
+from .kda_chunk import kda_chunk
 from .kda_chunk_local import kda_chunk_local
 from .kernel_delta_attention import kda, kda_decay, kernel_delta_attention
 from .lightning_attn import lightning_attn
 from .mean_pooling import mean_pooling
 from .mhc_coefficients import mhc_coefficients
+from .mhc_fused import mhc_collapse, mhc_expand
 from .multi_latent_ragged_page_attention import multi_latent_ragged_page_attention
 from .multi_latent_ragged_page_attention_v2 import multi_latent_ragged_page_attention_v2
 from .native_sparse_attention import apply_native_sparse_attention
@@ -140,6 +148,7 @@ from .recurrent import recurrent
 from .reduce_scatter import reduce_scatter
 from .reduce_scatter_matmul import reduce_scatter_matmul
 from .ring_attention import ring_attention
+from .row_permute import row_permute
 from .rwkv4 import rwkv4
 from .rwkv6 import rwkv6
 from .rwkv7 import rwkv7, rwkv7_mul
@@ -166,11 +175,14 @@ __all__ = [
     "compute_schedule_table_v2",
     "decode_attention",
     "deepseek_attn",
+    "dsa_sparse_attention",
     "flash_attention",
     "flash_mla",
+    "fused_cakld_tv",
     "fused_conv_decode",
     "fused_cross_entropy",
     "fused_kl_divergence",
+    "fused_renyi_entropy",
     "gated_delta_rule",
     "gated_delta_rule_grouped_decode",
     "gdn_spec_window_states",
@@ -178,13 +190,17 @@ __all__ = [
     "grouped_matmul_quant",
     "grouped_matmul_w8a8",
     "grouped_matmulv3",
+    "indexer_scores",
     "kda",
+    "kda_chunk",
     "kda_chunk_local",
     "kda_decay",
     "kernel_delta_attention",
     "lightning_attn",
     "mean_pooling",
     "mhc_coefficients",
+    "mhc_collapse",
+    "mhc_expand",
     "multi_latent_ragged_page_attention",
     "multi_latent_ragged_page_attention_v2",
     "page_attention",
@@ -206,6 +222,7 @@ __all__ = [
     "reduce_scatter",
     "reduce_scatter_matmul",
     "ring_attention",
+    "row_permute",
     "rwkv4",
     "rwkv6",
     "rwkv7",

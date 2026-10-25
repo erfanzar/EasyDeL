@@ -24,11 +24,13 @@ import json
 import typing as tp
 import warnings
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 # Re-export base classes from data_managers
 from easydel.data.transforms.base import Example, ExpandTransform, Transform
+from easydel.data.transforms.mixture import ASSISTANT_ONLY_FIELD, DATASET_ID_FIELD
 
+from ._assistant_tracker import assistant_tracker_lock
 from .prompt_utils import apply_chat_template as apply_conversational_template
 from .prompt_utils import (
     maybe_apply_chat_template,
@@ -50,6 +52,11 @@ _TOKENIZED_FIELDS = {
     "image_sizes",
     "completion_mask",
     "assistant_masks",
+    # Per-row sideband carriers stamped by the mixture builders. They must survive
+    # purification so the packing collator / trainer can read them; the trainer pops
+    # both before any model call. Imported, not spelled, so the names cannot drift.
+    ASSISTANT_ONLY_FIELD,
+    DATASET_ID_FIELD,
     "prompt_input_ids",
     "prompt_attention_mask",
     "chosen_input_ids",
@@ -1427,18 +1434,31 @@ class SFTPreprocessTransform(Transform):
         tools = resolve_example_tools(result)
 
         try:
-            with self._temporary_truncation_side():
-                processed = self._tokenizer.apply_chat_template(
-                    messages,
-                    return_dict=True,
-                    return_attention_mask=True,
-                    return_assistant_tokens_mask=self._return_assistant_tokens_mask,
-                    truncation=self._truncation,
-                    max_length=self._max_length,
-                    padding=self._tokenizer_padding(),
-                    pad_to_multiple_of=self._pad_to_multiple_of,
-                    tools=tools,
-                )
+            with self._assistant_tracker_guard(), self._temporary_truncation_side():
+                if self._return_assistant_tokens_mask:
+                    # HF's mask stops at the first truncated span; render untruncated and cut everything together.
+                    processed = self._tokenizer.apply_chat_template(
+                        messages,
+                        return_dict=True,
+                        return_attention_mask=True,
+                        return_assistant_tokens_mask=True,
+                        truncation=False,
+                        padding=False,
+                        tools=tools,
+                    )
+                    processed = self._truncate_and_pad_masked_row(processed)
+                else:
+                    processed = self._tokenizer.apply_chat_template(
+                        messages,
+                        return_dict=True,
+                        return_attention_mask=True,
+                        return_assistant_tokens_mask=False,
+                        truncation=self._truncation,
+                        max_length=self._max_length,
+                        padding=self._tokenizer_padding(),
+                        pad_to_multiple_of=self._pad_to_multiple_of,
+                        tools=tools,
+                    )
             result.update(processed)
         except Exception:
             # Fallback if chat template fails - try without tools first
@@ -1465,6 +1485,58 @@ class SFTPreprocessTransform(Transform):
 
         result = self._pad_row_to_multiple(result)
         return purify_example(result)
+
+    def _assistant_tracker_guard(self) -> tp.ContextManager[tp.Any]:
+        """Return the lock serialising assistant-mask renders, or a no-op when no mask is requested.
+
+        HF's Jinja ``AssistantTracker`` is process-global and not thread-safe; concurrent renders either
+        raise or silently return an empty assistant mask. The lock is fetched per call rather than stored on
+        ``self`` because it is not picklable and transforms are shipped to worker processes.
+
+        Returns:
+            The shared re-entrant tracker lock when ``return_assistant_tokens_mask`` is in use, otherwise a
+            null context.
+        """
+        if not self._return_assistant_tokens_mask:
+            return nullcontext()
+        return assistant_tracker_lock()
+
+    def _truncate_and_pad_masked_row(self, processed: tp.Mapping[str, tp.Any]) -> dict[str, tp.Any]:
+        """Apply this transform's truncation and padding to an untruncated masked render.
+
+        Every per-token field (``input_ids``, ``attention_mask``, ``assistant_masks`` and any other list of
+        the same length) is cut on the same side: ``keep_end`` drops the head, ``keep_start`` the tail.
+        Padding then follows the tokenizer's ``padding_side`` using ``pad_token_id`` (or 0).
+        ``pad_to_multiple_of`` is left to :meth:`_pad_row_to_multiple`.
+
+        Args:
+            processed: Untruncated, unpadded ``apply_chat_template`` output.
+
+        Returns:
+            A new dict with all per-token fields truncated and padded consistently.
+        """
+        row = {key: (list(value) if isinstance(value, (list, tuple)) else value) for key, value in processed.items()}
+        ids = row.get("input_ids")
+        if not isinstance(ids, list):
+            return row
+        length = len(ids)
+        per_token = [key for key, value in row.items() if isinstance(value, list) and len(value) == length]
+        if self._truncation and self._max_length and length > self._max_length:
+            if self._truncation_mode == "keep_end":
+                cut = slice(length - self._max_length, None)
+            else:
+                cut = slice(0, self._max_length)
+            for key in per_token:
+                row[key] = row[key][cut]
+        if self._tokenizer_padding() in ("max_length", True) and self._max_length:
+            pad_len = self._max_length - len(row["input_ids"])
+            if pad_len > 0:
+                pad_id = getattr(self._tokenizer, "pad_token_id", 0) or 0
+                left = getattr(self._tokenizer, "padding_side", "right") == "left"
+                for key in per_token:
+                    fill = [pad_id if key == "input_ids" else 0] * pad_len
+                    row[key] = fill + row[key] if left else row[key] + fill
+        return row
 
     def _simple_format_messages(self, messages: list) -> str:
         """Simple fallback formatting when chat template fails.

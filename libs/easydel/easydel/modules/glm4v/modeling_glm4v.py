@@ -924,6 +924,7 @@ class Glm4vVisionModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, 0),
             trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs("vision"),
         )
         hidden_states = self.post_layernorm(hidden_states)
 
@@ -1332,6 +1333,7 @@ class Glm4vTextModel(EasyDeLBaseModule):
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:

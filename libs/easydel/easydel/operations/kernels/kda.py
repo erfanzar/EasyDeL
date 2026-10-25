@@ -50,6 +50,8 @@ import numpy as np
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from ejkernel.kernels import Backend, Platform, kernel_registry  # pyright: ignore[reportMissingTypeStubs]
+from ejkernel.modules.operations import KdaChunkConfig  # pyright: ignore[reportMissingTypeStubs]
+from ejkernel.modules.operations import kda_chunk as ejkernel_kda_chunk  # pyright: ignore[reportMissingTypeStubs]
 from jax import lax
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float
@@ -872,6 +874,94 @@ def _chunk_kda_per_channel_fwd(
     )
 
 
+KDA_CHUNK_IMPLS = ("scan", "kda_chunk")
+
+
+def _chunk_kda_per_channel_fused(
+    query: Float[Array, "batch num_heads seq_len head_dim"],
+    key: Float[Array, "batch num_heads seq_len head_dim"],
+    value: Float[Array, "batch num_heads seq_len d_state"],
+    beta: Float[Array, "batch num_heads seq_len"],
+    decay: Float[Array, "batch num_heads seq_len head_dim"],
+    chunk_size: int = 64,
+    initial_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
+    use_qk_l2norm: bool = True,
+    segment_ids: Array | None = None,
+    kernel_mesh=None,
+    kernel_lead_specs: tuple | None = None,
+    continue_initial_state: bool = False,
+    precision: str = "highest",
+    cfg: KdaChunkConfig | None = None,
+) -> tuple[
+    Float[Array, "batch num_heads seq_len d_state"],
+    Float[Array, "batch num_heads head_dim d_state"],
+]:
+    """Per-channel chunked KDA through the fused ejkernel ``kda_chunk`` operation.
+
+    Same contract as :func:`_chunk_kda_per_channel_fwd` (packed ``segment_ids`` with negative padding,
+    ``continue_initial_state``). The Mosaic kernel cannot be SPMD-partitioned, so on TPU it runs directly on one
+    device, under ``shard_map`` over ``kernel_lead_specs = (batch_axes, head_axes)`` on a multi-device mesh, or
+    falls back to the ejkernel XLA implementation when neither is safe (see :func:`run_mosaic_kernel`).
+
+    Args:
+        query: ``(batch, num_heads, seq_len, head_dim)``.
+        key: ``(batch, num_heads, seq_len, head_dim)``.
+        value: ``(batch, num_heads, seq_len, d_state)``.
+        beta: ``(batch, num_heads, seq_len)``.
+        decay: Per-channel log-decay ``(batch, num_heads, seq_len, head_dim)``.
+        chunk_size: Chunk length (a power of two in ``[8, 128]`` for the Pallas kernel).
+        initial_state: Optional ``(batch, num_heads, head_dim, d_state)``.
+        use_qk_l2norm: L2-normalise queries and keys.
+        segment_ids: Optional packed ids ``(batch, seq_len)``; negative ids are padding.
+        kernel_mesh: Optional mesh for the kernel's ``shard_map``.
+        kernel_lead_specs: Optional ``(batch_axes, head_axes)`` of the inputs.
+        continue_initial_state: Cached-continuation segment semantics.
+        precision: ``"highest"`` or ``"default"`` for the non-inverse dots (the chunk inverse stays HIGHEST).
+        cfg: Optional ejkernel :class:`KdaChunkConfig` (``block_h``, ``backward``, ``bwd_reduce``).
+
+    Returns:
+        tuple: ``(outputs, final_state)`` float32.
+    """
+    seq_len = query.shape[2]
+    seg = None
+    if segment_ids is not None:
+        seg = normalize_packed_segment_ids(segment_ids, seq_len, pad_from_last=False).astype(jnp.int32)
+    arrays = (query, key, value, beta, decay, initial_state, seg)
+    present = tuple(i for i, a in enumerate(arrays) if a is not None)
+    args = tuple(arrays[i] for i in present)
+
+    def call(*local, platform=None):
+        full = [None] * len(arrays)
+        for i, a in zip(present, local, strict=True):
+            full[i] = a
+        return ejkernel_kda_chunk(
+            *full,
+            chunk_size=chunk_size,
+            use_qk_l2norm=use_qk_l2norm,
+            continue_initial_state=continue_initial_state,
+            precision=precision,
+            platform=platform,
+            cfg=cfg,
+        )
+
+    if jax.default_backend() != "tpu":
+        return call(*args, platform="xla")
+
+    def fallback(reason):
+        logger.warning_once(f"kda_chunk: {reason}; using the XLA implementation.")
+        return call(*args, platform="xla")
+
+    def specs():
+        if kernel_lead_specs is None:
+            return None
+        b_axes, h_axes = kernel_lead_specs
+        bhld = PartitionSpec(b_axes, h_axes, None, None)
+        full = (bhld, bhld, bhld, PartitionSpec(b_axes, h_axes, None), bhld, bhld, PartitionSpec(b_axes, None))
+        return tuple(full[i] for i in present), (bhld, bhld)
+
+    return run_mosaic_kernel(call, fallback, args, mesh=kernel_mesh, specs=specs)
+
+
 def _chunked_scan_per_channel_rows(
     query: Float[Array, "rows heads seq_len head_dim"],
     key: Float[Array, "rows heads seq_len head_dim"],
@@ -1260,8 +1350,6 @@ def _single_step_kda_per_channel_fwd_bthd(
     return output.astype(input_dtype)[:, None, :, :], new_state
 
 
-#: Longest per-row window (tokens) that :func:`kda_packed_rows_forward` advances with the per-token decode recurrence
-#: instead of the chunked prefill kernel. Speculative-decoding verify windows (``1 + num_draft_tokens``) fall here.
 _SHORT_WINDOW_MAX = 8
 
 
@@ -1427,7 +1515,6 @@ def kda_packed_rows_forward(
 
     q_r, k_r, v_r, b_r, g_r = mask(q_r), mask(k_r), mask(v_r), mask(b_r), mask(g_r)
 
-    # ---- speculative candidate rows ---------------------------------------
     # The pool may hold ``C`` candidate rows per request row after the live rows (prefix-major). Apply a pending
     # commit (accepted prefix -> live row) first, then work on the live rows only.
     pool_leaves = (cache_view.q_conv_state, cache_view.k_conv_state, cache_view.v_conv_state, cache_view.recurrent_state)
@@ -1454,7 +1541,6 @@ def kda_packed_rows_forward(
         context_before = jnp.asarray(context_lens, dtype=jnp.int32)[:rows] - lens
     spec_mask = (lens >= 2) & (lens <= cand) & (context_before > 0)
 
-    # ---- causal depthwise conv per row ---------------------------------
     conv_states = base_leaves[:3]
     cand_conv = []
     if context_lens is None:
@@ -1486,7 +1572,6 @@ def kda_packed_rows_forward(
             c_idx = jnp.clip(jnp.arange(cand)[:, None] + jnp.arange(d_conv)[None, :], 0, stream.shape[1] - 1)
             cand_conv.append(stream[:, c_idx].transpose(1, 0, 3, 2))  # [cand, rows, d, d_conv]
 
-    # ---- delta rule per row --------------------------------------------
     num_heads = b_r.shape[-1]
     head_k = q_r.shape[-1] // num_heads
     head_v = v_r.shape[-1] // num_heads
@@ -1673,6 +1758,8 @@ class KernelDeltaAttnOp(OperationImpl):
         chunk_size: int = 64,
         per_channel_decay: bool = False,
         continue_initial_state: bool = False,
+        chunk_impl: str = "scan",
+        chunk_precision: str = "highest",
         **kwargs,
     ) -> KDAOutput:
         """Forward pass for KDA attention.
@@ -1699,11 +1786,22 @@ class KernelDeltaAttnOp(OperationImpl):
                 preserve incoming state into the first valid segment and over padding.
                 Real within-chunk segment changes still reset memory. False keeps
                 the packed-training reset behavior.
+            chunk_impl: Per-channel chunked (multi-token) implementation, one of
+                :data:`KDA_CHUNK_IMPLS`: ``"scan"`` (default, the XLA chunk scan) or
+                ``"kda_chunk"`` (fused ejkernel kernel: Pallas TPU forward + backward,
+                its ``block_h`` / ``backward`` / ``bwd_reduce`` taken from the
+                ``"kda_chunk"`` entry of ``OperationMetadata.operation_configs``).
+            chunk_precision: Precision of the non-inverse dots on the ``"kda_chunk"``
+                path: ``"highest"`` (default) or ``"default"`` (bf16 MXU passes).
             **kwargs: Additional ignored arguments
 
         Returns:
             KDAOutput containing attention outputs and updated states
         """
+        if chunk_impl not in KDA_CHUNK_IMPLS:
+            raise ValueError(f"chunk_impl must be one of {KDA_CHUNK_IMPLS}, got {chunk_impl!r}")
+        if chunk_precision not in ("highest", "default"):
+            raise ValueError(f"chunk_precision must be 'highest' or 'default', got {chunk_precision!r}")
         per_channel = per_channel_decay or (decay is not None and decay.ndim == 4)
         if per_channel and decay is None:
             # The per-channel kernels have no zero-decay fallback (zero decay
@@ -1727,6 +1825,11 @@ class KernelDeltaAttnOp(OperationImpl):
                 query = with_sharding_constraint(arr=query, sharding=query_spec, mesh=mesh)
                 key = with_sharding_constraint(arr=key, sharding=shardings.key, mesh=mesh)
                 value = with_sharding_constraint(arr=value, sharding=shardings.value, mesh=mesh)
+                if segment_ids is not None and segment_ids.ndim == 2 and len(tuple(query_spec)) > 0:
+                    # Match the query's batch sharding once so the chunk loop never reshards the ids.
+                    segment_ids = with_sharding_constraint(
+                        arr=segment_ids, sharding=PartitionSpec(next(iter(query_spec)), None), mesh=mesh
+                    )
 
         runtime_dtype = self.metadata.runtime_dtype
         query = query.astype(runtime_dtype)
@@ -1798,6 +1901,10 @@ class KernelDeltaAttnOp(OperationImpl):
                         "kernel_mesh": mesh,
                         "continue_initial_state": continue_initial_state,
                     }
+                    if chunk_impl == "kda_chunk":
+                        chunk_fwd = _chunk_kda_per_channel_fused
+                        extra["precision"] = chunk_precision
+                        extra["cfg"] = self.metadata.get_operation_config("kda_chunk")
                     if shardings is not None and mesh is not None:
 
                         def _eff(axes):
@@ -1889,6 +1996,8 @@ class KernelDeltaAttnOp(OperationImpl):
         chunk_size: int = 64,
         per_channel_decay: bool = False,
         continue_initial_state: bool = False,
+        chunk_impl: str = "scan",
+        chunk_precision: str = "highest",
         **kwargs,
     ) -> KDAOutput:
         """Execute the KDA operation.
@@ -1914,6 +2023,8 @@ class KernelDeltaAttnOp(OperationImpl):
                 preserve incoming state into the first valid segment and over padding.
                 Real within-chunk segment changes still reset memory. False keeps
                 the packed-training reset behavior.
+            chunk_impl: ``"scan"`` (default) or ``"kda_chunk"``; see :meth:`forward_native`.
+            chunk_precision: ``"highest"`` (default) or ``"default"``; see :meth:`forward_native`.
             **kwargs: Additional arguments
 
         Returns:
@@ -1933,6 +2044,8 @@ class KernelDeltaAttnOp(OperationImpl):
             chunk_size=chunk_size,
             per_channel_decay=per_channel_decay,
             continue_initial_state=continue_initial_state,
+            chunk_impl=chunk_impl,
+            chunk_precision=chunk_precision,
             **kwargs,
         )
 

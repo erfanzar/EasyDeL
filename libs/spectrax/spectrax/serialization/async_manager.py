@@ -41,7 +41,7 @@ from spectrax._internal.logging import LazyLogger, get_logger
 from spectrax._version import __version__
 from spectrax.serialization.serialization import leaf_key_paths
 
-from . import _fs, fsspec_utils
+from . import _fs, _ocdbt, fsspec_utils
 from ._compat import PyTree
 from .serialization import tree_serialize_leaves
 
@@ -114,11 +114,41 @@ def _cast_floating_leaves(arrays: list, dtype) -> list:
     Returns:
         The leaves, with floating-point ones cast and the rest as-is.
     """
+    dtypes = dtype if isinstance(dtype, list) else [dtype] * len(arrays)
     cast = []
-    for leaf in arrays:
+    for leaf, leaf_dtype in zip(arrays, dtypes, strict=True):
         array = jnp.asarray(leaf)
-        cast.append(array.astype(dtype) if jnp.issubdtype(array.dtype, jnp.floating) else array)
+        if leaf_dtype is not None and jnp.issubdtype(array.dtype, jnp.floating):
+            array = array.astype(leaf_dtype)
+        cast.append(array)
     return cast
+
+
+def _resolve_target_dtypes(dtype, keys: tp.Sequence[str]):
+    """Resolve a load ``dtype`` argument against the checkpoint keys.
+
+    Args:
+        dtype: ``None``, a single dtype, or a callable ``key -> dtype | None`` giving a per-leaf
+            target (``None`` keeps the stored dtype).
+        keys: Dotted checkpoint keys, one per array.
+
+    Returns:
+        ``dtype`` unchanged when it is ``None`` or a dtype, otherwise a list aligned with ``keys``.
+    """
+    if dtype is None:
+        return None
+    try:
+        jnp.dtype(dtype)
+        return dtype
+    except TypeError:
+        if not callable(dtype):
+            raise
+    return [dtype(key) for key in keys]
+
+
+def _select_dtypes(dtypes, indices: tp.Sequence[int]):
+    """Slice a per-key dtype list by ``indices``; a single dtype or ``None`` passes through."""
+    return [dtypes[index] for index in indices] if isinstance(dtypes, list) else dtypes
 
 
 def _treedef_to_b64(treedef) -> str:
@@ -476,6 +506,43 @@ def _index_arrays_for_prefix(root: str, prefix: str) -> list[dict[str, object]]:
     return [entry for entry in arrays if isinstance(entry, dict)]
 
 
+def _ocdbt_read_specs(
+    root: str,
+    prefix: str,
+    relpaths: list[str],
+    *,
+    recorded_backend: str | None = None,
+) -> list[dict[str, object]] | None:
+    """Return OCDBT read specs when the checkpoint records the prefix as OCDBT-backed.
+
+    Args:
+        root: Checkpoint directory.
+        prefix: Tree prefix.
+        relpaths: Array paths relative to *root*.
+        recorded_backend: Backend from the structure sidecar; authoritative when given, since
+            it is written by every save while the index may be skipped (``write_index=False``).
+
+    Returns:
+        One read spec per relative path, or ``None`` for the per-array zarr layout.
+    """
+    if recorded_backend is not None:
+        backend = str(recorded_backend)
+    else:
+        index_data = None
+        index_path = _fs.joinpath(root, "tensorstore_index.json")
+        if _fs.exists(index_path, refresh=True):
+            try:
+                index_data = json.loads(_fs.read_text(index_path))
+            except Exception:
+                index_data = None
+        backend = _ocdbt.backend_for_prefix(index_data, prefix)
+    if backend != "ocdbt":
+        return None
+    if not _ocdbt.manifest_exists(root, prefix):
+        raise FileNotFoundError(f"OCDBT store for prefix={prefix!r} is missing: {_ocdbt.store_dir(root, prefix)}")
+    return [_ocdbt.read_spec(root, prefix, relpath) for relpath in relpaths]
+
+
 def _compile_sharding_rules(
     sharding_rules: tp.Sequence[tuple[str, NamedSharding]] | None,
 ) -> list[tuple[tp.Any, NamedSharding]] | None:
@@ -657,6 +724,7 @@ class AsyncCheckpointManager:
         show_progress: bool,
         progress_every: int,
         tensorstore_metadata: list[dict[str, object] | None] | None = None,
+        specs: list[dict[str, object]] | None = None,
     ) -> list[jax.Array]:
         """Deserialize arrays from TensorStore paths with optional fast-load controls.
 
@@ -684,6 +752,8 @@ class AsyncCheckpointManager:
                 TensorStore metadata reads for that path.
             show_progress: Whether process 0 should render a progress bar.
             progress_every: Refresh progress every N completed tensors.
+            specs: Optional TensorStore specs, one per path, used instead of
+                path-derived specs (OCDBT entries live in a shared store).
 
         Returns:
             Loaded JAX arrays in the same order as ``paths``.
@@ -697,10 +767,12 @@ class AsyncCheckpointManager:
             or tensorstore_cache_gb is not None
             or tensorstore_assume_metadata
             or show_progress
+            or specs is not None
         )
+        per_path_dtypes = target_dtype if isinstance(target_dtype, list) else [target_dtype] * len(paths)
         if not use_custom_path:
             target_dtypes = None
-            if target_dtype is not None:
+            if any(leaf_target is not None for leaf_target in per_path_dtypes):
                 # Same per-leaf guard the custom path applies through
                 # ``_leaf_target_dtype``: the requested dtype only casts
                 # floating leaves. Integer leaves (packed quantized codes,
@@ -709,9 +781,14 @@ class AsyncCheckpointManager:
                 # manager tree-maps over the dtypes list and a ``None`` entry
                 # would change its pytree structure.
                 target_dtypes = []
-                for storage_dtype in storage_dtypes or [None] * len(paths):
-                    leaf_dtype = _leaf_target_dtype(target_dtype, storage_dtype)
+                for leaf_target, storage_dtype in zip(
+                    per_path_dtypes, storage_dtypes or [None] * len(paths), strict=True
+                ):
+                    leaf_dtype = _leaf_target_dtype(leaf_target, storage_dtype)
                     target_dtypes.append(storage_dtype if leaf_dtype is None else leaf_dtype)
+                if any(entry is None for entry in target_dtypes):
+                    # Unknown stored dtype for a keep-stored leaf: read as stored, the caller casts afterwards.
+                    target_dtypes = None
             return list(
                 self.global_manager.deserialize_with_paths(
                     shardings=shardings,  # pyright: ignore[reportArgumentType]
@@ -770,19 +847,23 @@ class AsyncCheckpointManager:
                 storage_dtype = storage_dtypes[index]
                 metadata = tensorstore_metadata[index]
                 assume_metadata = bool(tensorstore_assume_metadata and metadata is not None)
-                spec = _tensorstore_spec_for_load(
-                    paths[index],
-                    sharding=shardings[index],
-                    shape=shape,
-                    storage_dtype=storage_dtype,
-                    assume_metadata=assume_metadata,
-                    metadata=metadata,
-                )
+                if specs is not None:
+                    spec = dict(specs[index])
+                    assume_metadata = False
+                else:
+                    spec = _tensorstore_spec_for_load(
+                        paths[index],
+                        sharding=shardings[index],
+                        shape=shape,
+                        storage_dtype=storage_dtype,
+                        assume_metadata=assume_metadata,
+                        metadata=metadata,
+                    )
                 array = await array_serialization.async_deserialize(
                     shardings[index],  # pyright: ignore[reportArgumentType]
                     spec,
                     global_shape=shape,
-                    dtype=_leaf_target_dtype(target_dtype, storage_dtype),
+                    dtype=_leaf_target_dtype(per_path_dtypes[index], storage_dtype),
                     byte_limiter=byte_limiter,
                     context=context if context is not None else array_serialization.TS_CONTEXT,
                     assume_metadata=assume_metadata,
@@ -810,7 +891,7 @@ class AsyncCheckpointManager:
 
             return [array for array in results if array is not None]
 
-        return asyncio.run(_run())
+        return _ocdbt.run_sync(_run)
 
     def save_pytree(
         self,
@@ -822,6 +903,8 @@ class AsyncCheckpointManager:
         dtype: jnp.dtype | None = None,
         extras: dict | None = None,
         write_index: bool = True,
+        ocdbt: bool = False,
+        ocdbt_options: _ocdbt.OcdbtSaveOptions | None = None,
     ) -> str:
         """Save a PyTree with exact structure and prefix via TensorStore.
 
@@ -846,6 +929,10 @@ class AsyncCheckpointManager:
                 structure JSON file.
             write_index: Whether to write/update ``tensorstore_index.json``.
                 Defaults to ``True``.
+            ocdbt: Write the prefix as one coalesced OCDBT store instead of one
+                zarr store per array. Loads detect the layout from the checkpoint.
+            ocdbt_options: OCDBT write tuning (data-file size, TensorStore
+                concurrency). Ignored unless *ocdbt* is ``True``.
 
         Returns:
             The checkpoint directory path (same as *path* but normalized to a
@@ -886,7 +973,7 @@ class AsyncCheckpointManager:
         nonarray_indices = [i for i, m in enumerate(arr_mask) if not m]
         nonarray_payload = {str(i): base64.b64encode(pickle.dumps(leaves[i])).decode("utf-8") for i in nonarray_indices}
 
-        backend = "tensorstore"
+        backend = "ocdbt" if ocdbt else "tensorstore"
         array_relpaths: list[str] = []
 
         tree_serialize_leaves(
@@ -895,6 +982,8 @@ class AsyncCheckpointManager:
             manager=self.global_manager,
             prefix=prefix,
             write_index=write_index and write_shared_files,
+            ocdbt=ocdbt,
+            ocdbt_options=ocdbt_options,
         )
 
         self.global_manager.wait_until_finished()
@@ -972,7 +1061,7 @@ class AsyncCheckpointManager:
         shardings: dict[str, tp.Callable] | None = None,
         sharding_rules: tp.Sequence[tuple[str, NamedSharding]] | None = None,
         partition_rules: tp.Sequence[tuple[str, PartitionSpec]] | None = None,
-        dtype: jnp.dtype | None = None,
+        dtype: jnp.dtype | tp.Callable[[str], tp.Any] | None = None,
         template: PyTree | None = None,
         strict_shapes: bool = True,
         key_aliases: KeyAliases | None = None,
@@ -1007,7 +1096,8 @@ class AsyncCheckpointManager:
             sharding_rules: Optional sequence of ``(regex_pattern,
                 NamedSharding)`` pairs. For each array key the first matching
                 pattern determines its sharding (fallback is fully replicated).
-            dtype: Optional dtype to cast loaded arrays to.
+            dtype: Optional dtype to cast loaded floating arrays to, or a callable
+                ``key -> dtype | None`` giving a per-array target (``None`` keeps the stored dtype).
             template: Optional PyTree template for shape coercion. When given,
                 loaded arrays are matched against the template leaves by key;
                 shape mismatches trigger ``ValueError`` if *strict_shapes* is
@@ -1129,15 +1219,16 @@ class AsyncCheckpointManager:
                 stored if stored is not None else _dtype_from_index(recorded)
                 for stored, recorded in zip(storage_dtypes, struct_dtypes, strict=True)
             ]
+        ocdbt_specs = _ocdbt_read_specs(root, prefix, relpaths, recorded_backend=struct.get("backend"))
         tensorstore_metadata = (
             _zarr_metadata_for_paths(abs_paths, workers=tensorstore_metadata_workers)
-            if tensorstore_assume_metadata
+            if tensorstore_assume_metadata and ocdbt_specs is None
             else None
         )
 
         missing = (
             []
-            if tensorstore_assume_metadata
+            if tensorstore_assume_metadata or ocdbt_specs is not None
             else _missing_zarr_metadata(abs_paths, workers=tensorstore_metadata_workers)
         )
         if missing:
@@ -1165,13 +1256,14 @@ class AsyncCheckpointManager:
             sharding_rules=sharding_rules,
         )
 
+        target_dtypes = _resolve_target_dtypes(dtype, array_keys)
         if chunk_size is None or chunk_size <= 0:
             array_leaves = self._deserialize_with_paths(
                 shardings=apply_shardings,
                 paths=abs_paths,
                 shapes=saved_shapes,
                 storage_dtypes=storage_dtypes,
-                target_dtype=dtype,
+                target_dtype=target_dtypes,
                 concurrent_gb=concurrent_gb,
                 tensorstore_io_concurrency=tensorstore_io_concurrency,
                 tensorstore_copy_concurrency=tensorstore_copy_concurrency,
@@ -1180,6 +1272,7 @@ class AsyncCheckpointManager:
                 show_progress=show_progress,
                 progress_every=progress_every,
                 tensorstore_metadata=tensorstore_metadata,
+                specs=ocdbt_specs,
             )
             expected_arrays = sum(arr_mask)
             if len(array_leaves) != expected_arrays:
@@ -1187,8 +1280,8 @@ class AsyncCheckpointManager:
                     f"Loaded {len(array_leaves)} arrays but structure expects {expected_arrays}. "
                     "Index or structure may be stale."
                 )
-            if dtype is not None:
-                array_leaves = _cast_floating_leaves(array_leaves, dtype)
+            if target_dtypes is not None:
+                array_leaves = _cast_floating_leaves(array_leaves, target_dtypes)
             if callback is not None:
                 array_leaves = [callback(arr, key) for arr, key in zip(array_leaves, array_keys, strict=False)]
         else:
@@ -1210,7 +1303,7 @@ class AsyncCheckpointManager:
                     paths=chunk_paths,
                     shapes=[saved_shapes[index] for index in chunk_indices],
                     storage_dtypes=[storage_dtypes[index] for index in chunk_indices],
-                    target_dtype=dtype,
+                    target_dtype=_select_dtypes(target_dtypes, chunk_indices),
                     concurrent_gb=concurrent_gb,
                     tensorstore_io_concurrency=tensorstore_io_concurrency,
                     tensorstore_copy_concurrency=tensorstore_copy_concurrency,
@@ -1223,9 +1316,10 @@ class AsyncCheckpointManager:
                         if tensorstore_metadata is not None
                         else None
                     ),
+                    specs=[ocdbt_specs[index] for index in chunk_indices] if ocdbt_specs is not None else None,
                 )
-                if dtype is not None:
-                    chunk_arrays = _cast_floating_leaves(chunk_arrays, dtype)
+                if target_dtypes is not None:
+                    chunk_arrays = _cast_floating_leaves(chunk_arrays, _select_dtypes(target_dtypes, chunk_indices))
                 if callback is not None:
                     chunk_arrays = [callback(arr, key) for arr, key in zip(chunk_arrays, chunk_keys, strict=False)]
                 for index, array in zip(chunk_indices, chunk_arrays, strict=True):
@@ -1332,7 +1426,7 @@ class AsyncCheckpointManager:
         prefix: str,
         shardings: dict[str, tp.Callable] | None = None,
         sharding_rules: tp.Sequence[tuple[str, NamedSharding]] | None = None,
-        dtype: jnp.dtype | None = None,
+        dtype: jnp.dtype | tp.Callable[[str], tp.Any] | None = None,
         template: PyTree | None = None,
         strict_shapes: bool = True,
         key_aliases: KeyAliases | None = None,
@@ -1363,7 +1457,8 @@ class AsyncCheckpointManager:
                 destination shardings.
             sharding_rules: Optional sequence of ``(regex, NamedSharding)``
                 rules. The first matching rule supplies an array's sharding.
-            dtype: Optional dtype to cast loaded arrays to.
+            dtype: Optional dtype to cast loaded floating arrays to, or a callable
+                ``key -> dtype | None`` giving a per-array target (``None`` keeps the stored dtype).
             template: Optional PyTree template used to restore non-array leaves
                 and coerce loaded arrays into expected shapes.
             strict_shapes: Whether template shape mismatches should raise.
@@ -1429,15 +1524,16 @@ class AsyncCheckpointManager:
         abs_paths = [_fs.joinpath(root, relpath) for relpath in relpaths]
         saved_shapes = [_shape_from_index(info.get("shape")) for info in arrays_info]
         storage_dtypes = [_dtype_from_index(info.get("dtype")) for info in arrays_info]
+        ocdbt_specs = _ocdbt_read_specs(root, prefix, relpaths)
         tensorstore_metadata = (
             _zarr_metadata_for_paths(abs_paths, workers=tensorstore_metadata_workers)
-            if tensorstore_assume_metadata
+            if tensorstore_assume_metadata and ocdbt_specs is None
             else None
         )
 
         missing = (
             []
-            if tensorstore_assume_metadata
+            if tensorstore_assume_metadata or ocdbt_specs is not None
             else _missing_zarr_metadata(abs_paths, workers=tensorstore_metadata_workers)
         )
         if missing:
@@ -1457,13 +1553,14 @@ class AsyncCheckpointManager:
         )
 
         array_leaves = []
+        target_dtypes = _resolve_target_dtypes(dtype, array_keys)
         if chunk_size is None or chunk_size <= 0:
             array_leaves = self._deserialize_with_paths(
                 shardings=apply_shardings,
                 paths=abs_paths,
                 shapes=saved_shapes,
                 storage_dtypes=storage_dtypes,
-                target_dtype=dtype,
+                target_dtype=target_dtypes,
                 concurrent_gb=concurrent_gb,
                 tensorstore_io_concurrency=tensorstore_io_concurrency,
                 tensorstore_copy_concurrency=tensorstore_copy_concurrency,
@@ -1472,20 +1569,22 @@ class AsyncCheckpointManager:
                 show_progress=show_progress,
                 progress_every=progress_every,
                 tensorstore_metadata=tensorstore_metadata,
+                specs=ocdbt_specs,
             )
-            if dtype is not None:
-                array_leaves = _cast_floating_leaves(array_leaves, dtype)
+            if target_dtypes is not None:
+                array_leaves = _cast_floating_leaves(array_leaves, target_dtypes)
             if callback is not None:
                 array_leaves = [callback(arr, key) for arr, key in zip(array_leaves, array_keys, strict=False)]
         else:
             for start in range(0, len(abs_paths), chunk_size):
                 end = min(start + chunk_size, len(abs_paths))
+                chunk_dtypes = _select_dtypes(target_dtypes, range(start, end))
                 chunk_arrays = self._deserialize_with_paths(
                     shardings=apply_shardings[start:end],
                     paths=abs_paths[start:end],
                     shapes=saved_shapes[start:end],
                     storage_dtypes=storage_dtypes[start:end],
-                    target_dtype=dtype,
+                    target_dtype=chunk_dtypes,
                     concurrent_gb=concurrent_gb,
                     tensorstore_io_concurrency=tensorstore_io_concurrency,
                     tensorstore_copy_concurrency=tensorstore_copy_concurrency,
@@ -1494,9 +1593,10 @@ class AsyncCheckpointManager:
                     show_progress=show_progress,
                     progress_every=progress_every,
                     tensorstore_metadata=tensorstore_metadata[start:end] if tensorstore_metadata is not None else None,
+                    specs=ocdbt_specs[start:end] if ocdbt_specs is not None else None,
                 )
-                if dtype is not None:
-                    chunk_arrays = _cast_floating_leaves(chunk_arrays, dtype)
+                if chunk_dtypes is not None:
+                    chunk_arrays = _cast_floating_leaves(chunk_arrays, chunk_dtypes)
                 if callback is not None:
                     chunk_arrays = [
                         callback(arr, key) for arr, key in zip(chunk_arrays, array_keys[start:end], strict=False)

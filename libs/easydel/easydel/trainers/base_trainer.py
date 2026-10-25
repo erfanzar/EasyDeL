@@ -85,6 +85,7 @@ from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import CompilationTracker
 from easydel.trainers.pose import apply_pose_to_batch, validate_pose_target_max_pos
 from easydel.trainers.process_encoder import EncoderProcessor, validate_process_encoder
+from easydel.trainers.randomized_yarn import apply_randomized_yarn_to_batch, validate_randomized_yarn_target
 from easydel.utils import Timers, is_remote_path, readme_generator
 from easydel.utils.lazy_import import is_package_available
 from easydel.utils.traversals import specs_to_name_sharding
@@ -395,6 +396,10 @@ class BaseTrainer(BaseTrainerProtocol):
     _has_buckets = False
     _user_data_collator = False
     _encoder_processor = None
+    _data_lane_resume_cursor = None
+    # Trainers mixing in ``AssistantOnlyMaskMixin`` consume the per-dataset sideband carriers; every other
+    # trainer has them dropped in ``_preprocess_batch_input`` before the model call.
+    consumes_assistant_only_carriers: tp.ClassVar[bool] = False
     _RUNTIME_MODEL_OVERRIDE_STATE_ATTRS: tp.ClassVar[frozenset[str]] = frozenset(
         {
             "model_state",
@@ -609,6 +614,10 @@ class BaseTrainer(BaseTrainerProtocol):
                     actual_step = int(jax.device_get(resumed_state.step))
                     logger.info(f"Successfully resumed from checkpoint at step {actual_step}")
                     self._load_auxiliary_states(checkpoint_path)
+                    # Read before an optional `remove_ckpt_after_load` deletes the directory.
+                    from .data_lanes import read_lane_cursor
+
+                    self._data_lane_resume_cursor = read_lane_cursor(checkpoint_path, jax.process_index())
                 except Exception as e:
                     raise RuntimeError(
                         f"Failed to resume from checkpoint {checkpoint_path} ({type(e).__name__}: {e}). "
@@ -640,6 +649,7 @@ class BaseTrainer(BaseTrainerProtocol):
         self.finetune = finetune
         self.processing_class = processing_class
         self._pose_image_token_id, self._pose_pad_id = self._setup_pose()
+        self._setup_randomized_yarn()
 
         if self.data_collator is None and getattr(self.arguments, "use_data_collator", True):
             base_collator = self.create_collect_function(
@@ -774,6 +784,12 @@ class BaseTrainer(BaseTrainerProtocol):
             if out_of_range:
                 raise ValueError(
                     f"pose.only_buckets {out_of_range} out of range for {len(self._buckets)} configured bucket(s)."
+                )
+        ryarn = getattr(self.arguments, "randomized_yarn", None)
+        if ryarn is not None and ryarn.enabled and ryarn.only_buckets is not None:
+            if not self._has_buckets or any(b >= len(self._buckets) for b in ryarn.only_buckets):
+                raise ValueError(
+                    f"randomized_yarn.only_buckets {ryarn.only_buckets} does not match the configured training buckets."
                 )
 
         # Resolve constructor/argument buckets first: their accumulation overrides
@@ -2822,6 +2838,13 @@ class BaseTrainer(BaseTrainerProtocol):
         batch = self._apply_user_data_collator(batch)
         # Purify batch to keep only JAX-compatible array fields
         batch = self._purify_batch(batch)
+        if not self.consumes_assistant_only_carriers and isinstance(batch, dict):
+            # Per-dataset sideband carriers (assistant-only choice, dataset attribution) are host-side metadata;
+            # trainers that do not assemble masks from them drop them so the model never receives them.
+            from .assistant_only_mask import SIDEBAND_CARRIER_FIELDS
+
+            for key in SIDEBAND_CARRIER_FIELDS:
+                batch.pop(key, None)
         batch = self._apply_model_host_batch_transform(batch)
         return batch, {}
 
@@ -2895,6 +2918,41 @@ class BaseTrainer(BaseTrainerProtocol):
         return apply_pose_to_batch(
             batch,
             config=pose,
+            step=step,
+            seed=self.arguments.shuffle_seed_train,
+            image_token_id=self._pose_image_token_id,
+            pad_id=self._pose_pad_id,
+        )
+
+    def _setup_randomized_yarn(self) -> None:
+        """Validate ``randomized_yarn`` against the RoPE table and resolve the image/pad ids it shares with PoSE."""
+        ryarn = getattr(self.arguments, "randomized_yarn", None)
+        if ryarn is None or not ryarn.enabled:
+            return
+        who = type(self._model).__name__
+        config = self._model.config
+        validate_randomized_yarn_target(ryarn, model_max_freq_pos=config.granted_freq_max_position_embedding, who=who)
+        if hasattr(config, "image_token_id"):
+            self._pose_image_token_id = config.image_token_id
+        elif hasattr(config, "vision_config"):
+            raise ValueError(
+                f"randomized_yarn.enabled on multimodal {who} but its config exposes no image_token_id to "
+                "exclude image documents (would corrupt mRoPE)."
+            )
+        processor = self.processing_class
+        tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        self._pose_pad_id = getattr(tokenizer, "pad_token_id", None)
+
+    def _apply_randomized_yarn_to_batch(self, batch: tp.Any, step: int) -> tp.Any:
+        """Host-side, pre-forward Randomized YaRN on ``position_ids`` (no-op unless enabled)."""
+        ryarn = getattr(self.arguments, "randomized_yarn", None)
+        if ryarn is None or not ryarn.enabled or not isinstance(batch, dict):
+            return batch
+        if not ryarn.applies_to_bucket(self._bucket_for_step if self._has_buckets else None):
+            return batch
+        return apply_randomized_yarn_to_batch(
+            batch,
+            config=ryarn,
             step=step,
             seed=self.arguments.shuffle_seed_train,
             image_token_id=self._pose_image_token_id,
@@ -2977,6 +3035,9 @@ class BaseTrainer(BaseTrainerProtocol):
             """
             if key == "labels" or key.endswith("_labels"):
                 return -100
+            if key in ("assistant_only_mask", "dataset_ids"):
+                # -1 is the inert "inherit / unattributed" value; 0 would mean "opted out" / dataset 0.
+                return -1
             if np.issubdtype(array.dtype, np.bool_):
                 return False
             return 0
@@ -5921,6 +5982,14 @@ class BaseTrainer(BaseTrainerProtocol):
             # Compile per-bucket step fns now that the flavor's configure_functions
             # has set up its compiled-fn signature / static-arg shape.
             self._compile_bucket_step_functions()
+            if (
+                getattr(self.arguments, "gradient_accumulation_mode", "scan") == "execution"
+                and int(getattr(self.arguments, "gradient_accumulation_steps", 1) or 1) > 1
+                and getattr(self, "_execution_accumulation", None) is None
+            ):
+                raise ValueError(
+                    f"{type(self).__name__} does not support gradient_accumulation_mode='execution'; use 'scan'."
+                )
         self.timer.log("configure functions and sharding them")
         self._runtime_trace("_configure_functions.compiled")
         self._runtime_trace("_configure_generation_function.begin")
@@ -6460,10 +6529,70 @@ class BaseTrainer(BaseTrainerProtocol):
             TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
                                             maximum number of training and evaluation steps.
         """
+        if (
+            self.arguments.parquetra_train_datasets
+            or self.arguments.arrayrecord_train_datasets
+            or (self.arguments.arrayrecord_train_files)
+        ):
+            return self._configure_grain_lane_dataloader()
+        if self.arguments.parquetra_assistant_only or self.arguments.arrayrecord_assistant_only:
+            raise ValueError(
+                "`parquetra_assistant_only` / `arrayrecord_assistant_only` are set but no grain lane is selected "
+                "(`parquetra_train_datasets` / `arrayrecord_train_*`); the flags would be silently ignored."
+            )
         if self.arguments.use_grain:
             return self._configure_grain_dataloader()
         else:
             return self._configure_tfds_dataloader()
+
+    def _configure_grain_lane_dataloader(self) -> TrainerConfigureDataloaderOutput:
+        """Build the random-access parquet or ArrayRecord training lane (see :mod:`.data_lanes`).
+
+        Evaluation datasets are not served by these lanes; ``dataset_eval`` keeps its usual loader.
+        """
+        from .data_lanes import configure_arrayrecord_lane, configure_parquetra_lane
+
+        if self.arguments.parquetra_train_datasets:
+            loader, steps = configure_parquetra_lane(self)
+            label = "parquetra"
+        else:
+            loader, steps = configure_arrayrecord_lane(self)
+            label = "arrayrecord"
+        self._set_dataset_size_metadata(
+            is_train=True,
+            resolution=_ResolvedStepCount(int(steps), None, False, label, False, False),
+        )
+        dataloader_eval, max_evaluation_steps = None, 0
+        if self.dataset_eval is not None and self.arguments.do_eval:
+            fallback = self._configure_grain_dataloader() if self.arguments.use_grain else None
+            if fallback is not None:
+                dataloader_eval, max_evaluation_steps = fallback.dataloader_eval, fallback.max_evaluation_steps
+        return TrainerConfigureDataloaderOutput(
+            dataloader_train=loader,
+            max_training_steps=int(steps),
+            dataloader_eval=dataloader_eval,
+            max_evaluation_steps=max_evaluation_steps,
+        )
+
+    def _save_data_lane_state(self, checkpoint_dir: str, step: int) -> None:
+        """Persist the packed-lane cursor for ``step`` next to a checkpoint (one file per host)."""
+        from .data_lanes import PackedParquetLoader, write_lane_cursor
+
+        loader = getattr(self, "dataloader_train", None)
+        if not isinstance(loader, PackedParquetLoader):
+            return
+        cursor = loader.cursor_at(int(step))
+        if cursor is None:
+            logger.warning(
+                "packed lane: no cursor recorded for step %d; a resume from this checkpoint will use the "
+                "seed-shifted stream.",
+                step,
+            )
+            return
+        try:
+            write_lane_cursor(checkpoint_dir, jax.process_index(), cursor)
+        except Exception as exc:
+            logger.warning(f"packed lane: failed to write the data cursor into {checkpoint_dir}: {exc}")
 
     def configure_model(self) -> TrainerConfigureModelOutput:
         """
@@ -6649,6 +6778,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 save_directory=full_path,
                 merge_lora_before_save=merge_lora_before_save,
             )
+            self._save_data_lane_state(full_path, step)
             if jax.process_index() == 0:
                 metadata_path = ePath(full_path) / "metadata.json"
                 if metadata_path.exists():
@@ -7201,7 +7331,8 @@ class BaseTrainer(BaseTrainerProtocol):
                 # the static positional arguments supplied by normal trainer steps.
             return function
 
-        if self.dataloader_train is not None:
+        # Execution-mode GA never calls the scan step; compiling it would allocate the stacked program it avoids.
+        if self.dataloader_train is not None and getattr(self, "_execution_accumulation", None) is None:
             self.sharded_training_step_function = compile_function(
                 self.sharded_training_step_function,
                 self.dataloader_train,

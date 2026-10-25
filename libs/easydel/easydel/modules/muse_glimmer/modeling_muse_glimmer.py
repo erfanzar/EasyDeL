@@ -1090,6 +1090,7 @@ class MuseGlimmerTextModel(EasyDeLBaseModule):
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
 
         hidden_states = self.norm(hidden_states)
@@ -1667,6 +1668,7 @@ class MuseGlimmerVisionModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, 0),
             trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs("vision"),
         )
 
         reverse_indices = jnp.asarray(np.argsort(window_index))

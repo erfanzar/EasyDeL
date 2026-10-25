@@ -15,8 +15,16 @@ class _Head:
     native_forward = __call__
 
 
+class _Transposed(str):
+    """Stand-in transposed embedding: compares as its label and exposes a kernel shape."""
+
+    shape = (4, 8)
+
+
 class _ProjectionModel:
     _tie_embeddings_enabled = EasyDeLBaseModule._tie_embeddings_enabled
+    _lm_head_kernel_spec = EasyDeLBaseModule._lm_head_kernel_spec
+    _tied_lm_head_weight = EasyDeLBaseModule._tied_lm_head_weight
     apply_lm_head = EasyDeLBaseModule.apply_lm_head
     make_lm_head_fn = EasyDeLBaseModule.make_lm_head_fn
 
@@ -32,7 +40,7 @@ class _ProjectionModel:
         return self.head
 
     def get_embedding(self):
-        return SimpleNamespace(weight=SimpleNamespace(value=SimpleNamespace(T="embedding-transpose")))
+        return SimpleNamespace(weight=SimpleNamespace(value=SimpleNamespace(T=_Transposed("embedding-transpose"))))
 
 
 @pytest.mark.cpu_ok

@@ -896,6 +896,7 @@ class GiddModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, all_hidden_states, all_attentions, 0),
             trace=True,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
 

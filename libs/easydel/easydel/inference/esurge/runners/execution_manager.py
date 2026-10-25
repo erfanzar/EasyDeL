@@ -842,6 +842,14 @@ class ExecutionManager:
         """
         self.sampler_runtime.invalidate_sampler_penalty_state(token_ids_cpu, seq_lens_cpu)
 
+    def overwrite_sampler_penalty_rows(self, rows) -> None:
+        """Delegate to :meth:`SamplerRuntime.overwrite_sampler_penalty_rows`.
+
+        Args:
+            rows: ``(global_row, token_ids, counts)`` per sequence-buffer row to overwrite.
+        """
+        self.sampler_runtime.overwrite_sampler_penalty_rows(rows)
+
     def _prepare_compact_sampler_window(self, **kwargs) -> tuple[int, int, int]:
         """Delegate to :meth:`SamplerRuntime._prepare_compact_sampler_window`."""
         return self.sampler_runtime._prepare_compact_sampler_window(**kwargs)

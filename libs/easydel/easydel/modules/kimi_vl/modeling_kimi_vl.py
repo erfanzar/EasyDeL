@@ -737,6 +737,7 @@ class MoonVitEncoder(EasyDeLLayerStackMixin, spx.Module):
             _layer_loop,
             (hidden_states, 0),
             trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs("vision"),
         )
         return checkpoint_name(self.final_layernorm(hidden_states), "model_output")
 

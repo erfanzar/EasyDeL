@@ -35,6 +35,7 @@ import pickle
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from easydel.infra.modeling_outputs import (
     AttentionLayerOutput,
@@ -309,3 +310,44 @@ def test_modeloutput_integer_indexing_out_of_range_raises():
     out = BaseModelOutput(last_hidden_state=jnp.zeros((1,)))
     with pytest.raises(IndexError):
         _ = out[5]
+
+
+@pytest.mark.parametrize("make_array", [jnp.zeros, np.zeros], ids=["jax", "numpy"])
+def test_modeloutput_keeps_empty_lone_array_first_field(make_array):
+    """A lone empty array is still the first field; it must not be consumed as an empty (key, value) iterable."""
+    arr = make_array((0, 3))
+    out = BaseModelOutput(last_hidden_state=arr)
+
+    assert out.last_hidden_state is arr
+    assert out["last_hidden_state"] is arr
+    assert list(out.keys()) == ["last_hidden_state"]
+
+
+def test_modeloutput_does_not_iterate_lone_numpy_first_field():
+    """A lone ndarray first field is stored whole without ever being iterated."""
+
+    class NoIterArray(np.ndarray):
+        def __iter__(self):
+            raise AssertionError("ModelOutput must not iterate an array first field")
+
+    arr = np.zeros((2, 3)).view(NoIterArray)
+    out = BaseModelOutput(last_hidden_state=arr)
+
+    assert out.last_hidden_state is arr
+    assert out[0] is arr
+
+
+def test_modeloutput_keeps_sharded_lone_first_field_without_gathering():
+    """A lone array sharded over four devices stays the first field and keeps its sharding."""
+    devices = jax.devices()
+    if len(devices) < 4:
+        pytest.skip("needs 4 devices")
+    mesh = jax.sharding.Mesh(np.array(devices[:4]), ("x",))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("x"))
+    arr = jax.device_put(jnp.arange(0, dtype=jnp.float32).reshape(0, 2), sharding)
+    assert len(arr.sharding.device_set) == 4
+    out = BaseModelOutput(last_hidden_state=arr)
+
+    assert out.last_hidden_state is arr
+    assert out["last_hidden_state"].sharding == sharding
+    assert list(out.keys()) == ["last_hidden_state"]

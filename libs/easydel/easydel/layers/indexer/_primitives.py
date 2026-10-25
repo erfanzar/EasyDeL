@@ -31,6 +31,7 @@ from jaxtyping import Array, Bool, Float, Int
 __all__ = (
     "indices_to_bool_mask",
     "is_vacuous_selection",
+    "mask_to_indices",
     "ste_score_proxy",
     "topk_select",
     "topk_selection_mask",
@@ -120,6 +121,39 @@ def topk_selection_mask(
     from easydel.operations.kernels._mask_info import topk_selection_mask as selection_mask
 
     return selection_mask(scores=scores, values=values, indices=indices)
+
+
+def mask_to_indices(mask: Bool[Array, "... n"], k: int) -> Int[Array, "... k"]:
+    """Compact a boolean selection into ``-1``-padded indices without a sort.
+
+    The inverse of :func:`indices_to_bool_mask` for a selection of at most
+    ``k`` items per row: selected positions are written in ascending index
+    order (not score order) and the remaining slots hold ``-1``. Selected
+    positions beyond the ``k``-th are dropped. Under jit the scatter is dead
+    code when the caller only consumes the mask.
+
+    Args:
+        mask: Boolean selection ``[..., n]``.
+        k: Static output width, non-negative.
+
+    Returns:
+        Int32 indices ``[..., k]``.
+
+    Raises:
+        ValueError: If ``k`` is negative.
+    """
+    if k < 0:
+        raise ValueError("Selection width must be non-negative.")
+    shape = mask.shape[:-1]
+    width = mask.shape[-1]
+    rows = math.prod(shape)
+    flat = mask.reshape(rows, width).astype(jnp.bool_)
+    # Slot of each selected position; unselected positions target slot k, which is out of range and dropped.
+    slot = jnp.where(flat, jnp.cumsum(flat, axis=-1, dtype=jnp.int32) - 1, k)
+    index = jnp.broadcast_to(jnp.arange(width, dtype=jnp.int32), flat.shape)
+    out = jnp.full((rows, k), -1, dtype=jnp.int32)
+    out = out.at[jnp.arange(rows)[:, None], slot].set(index, mode="drop")
+    return out.reshape(*shape, k)
 
 
 def indices_to_bool_mask(

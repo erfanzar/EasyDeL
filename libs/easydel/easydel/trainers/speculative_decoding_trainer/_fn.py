@@ -36,7 +36,6 @@ import optax  # pyright: ignore[reportMissingTypeStubs]
 import spectrax as spx
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from spectrax import with_sharding_constraint
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
@@ -44,6 +43,7 @@ from easydel.infra.loss_utils import LossConfig, LossMetrics
 from ..training_utils import (
     ScheduledLossAdapter,
     bind_scheduled_module,
+    constrain_batch_sharding,
     constrain_scheduled_batch,
     filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
@@ -447,6 +447,104 @@ def _masked_sum(value: jax.Array, weights: jax.Array) -> jax.Array:
     return jnp.sum(value.astype(jnp.float32) * weights.astype(jnp.float32))
 
 
+_POOLED_NUM_PREFIX = "_pooled_num/"
+_POOLED_DEN_PREFIX = "_pooled_den/"
+_POOLED_ACCURACY_FIELD = "accuracy"
+
+
+def _ratio_value(numerator: jax.Array, count: jax.Array) -> jax.Array:
+    """Return ``numerator / count`` in float32, or NaN when ``count`` is zero.
+
+    Args:
+        numerator: Masked sum.
+        count: Unclamped denominator.
+
+    Returns:
+        The float32 ratio; NaN marks "no observation" rather than a measured 0.
+    """
+    numerator = jnp.asarray(numerator, dtype=jnp.float32)
+    count = jnp.asarray(count, dtype=jnp.float32)
+    has_observation = count > 0.0
+    ratio = numerator / jnp.where(has_observation, count, jnp.asarray(1.0, dtype=jnp.float32))
+    return jnp.where(has_observation, ratio, jnp.asarray(jnp.nan, dtype=jnp.float32))
+
+
+def _pooled_ratio(
+    metrics: dict[str, jax.Array],
+    name: str,
+    numerator: jax.Array,
+    count: jax.Array,
+    *,
+    emit_value: bool = True,
+) -> jax.Array:
+    """Record ratio metric ``name`` together with its ``(numerator, count)`` pair.
+
+    The pair rides in ``metrics`` under reserved prefixes so the step can pool
+    the ratio over all gradient-accumulation microbatches with
+    :func:`_finalize_pooled_metrics`.
+
+    Args:
+        metrics: Destination mapping (mutated).
+        name: Public metric name.
+        numerator: Masked sum.
+        count: Unclamped denominator (mask sum).
+        emit_value: Whether to also store the per-call ratio under ``name``.
+
+    Returns:
+        The per-call ratio (NaN when ``count`` is zero).
+    """
+    numerator = jnp.asarray(numerator, dtype=jnp.float32)
+    count = jnp.asarray(count, dtype=jnp.float32)
+    value = _ratio_value(numerator, count)
+    if emit_value:
+        metrics[name] = value
+    metrics[_POOLED_NUM_PREFIX + name] = numerator
+    metrics[_POOLED_DEN_PREFIX + name] = count
+    return value
+
+
+def _finalize_pooled_metrics(metrics: LossMetrics) -> LossMetrics:
+    """Replace pooled ratio metrics by the ratio of their accumulated pairs and strip the pairs.
+
+    ``minibatch_call`` (without ``microbatch_weight_fn``) scales every metric
+    leaf by the same ``1/K``, so the accumulated numerator and denominator of a
+    pair divide to the ratio over the whole step.  Averaging the per-microbatch
+    ratios instead would count a microbatch with an empty denominator as an
+    observed 0 and bias sparse buckets toward 0.
+
+    Args:
+        metrics: Step metrics whose ``other_metrics`` may carry pooled pairs.
+
+    Returns:
+        Metrics with pooled ratios (NaN for an empty step denominator), the
+        ``accuracy`` field pooled when its pair is present, and no reserved keys.
+
+    Raises:
+        KeyError: If a numerator has no matching denominator.
+    """
+    other = metrics.other_metrics
+    if not other:
+        return metrics
+    numerators: dict[str, jax.Array] = {}
+    denominators: dict[str, jax.Array] = {}
+    out: dict[str, jax.Array] = {}
+    for key, value in other.items():
+        if key.startswith(_POOLED_NUM_PREFIX):
+            numerators[key[len(_POOLED_NUM_PREFIX) :]] = value
+        elif key.startswith(_POOLED_DEN_PREFIX):
+            denominators[key[len(_POOLED_DEN_PREFIX) :]] = value
+        else:
+            out[key] = value
+    accuracy = metrics.accuracy
+    for name, numerator in numerators.items():
+        value = _ratio_value(numerator, denominators[name])
+        if name == _POOLED_ACCURACY_FIELD:
+            accuracy = value
+        else:
+            out[name] = value
+    return metrics.replace(other_metrics=out, accuracy=accuracy)
+
+
 def _loss_mask_from_batch(batch: collections.abc.Mapping[str, tp.Any]) -> jax.Array | None:
     """Resolve the token mask used by speculative and block-drafter losses.
 
@@ -454,7 +552,8 @@ def _loss_mask_from_batch(batch: collections.abc.Mapping[str, tp.Any]) -> jax.Ar
         batch: Training batch mapping.
 
     Returns:
-        The active-token mask, or ``None`` if no mask can be inferred.
+        The active-token mask, all-ones when the batch only carries
+        ``input_ids``, or ``None`` if no mask can be inferred.
     """
     loss_mask = _first_present(batch.get("completion_mask"), batch.get("loss_mask"), batch.get("assistant_masks"))
     if loss_mask is not None:
@@ -462,7 +561,14 @@ def _loss_mask_from_batch(batch: collections.abc.Mapping[str, tp.Any]) -> jax.Ar
     labels = batch.get("labels")
     if labels is not None:
         return (labels != -100).astype(jnp.float32)
-    return batch.get("attention_mask")
+    attention_mask = batch.get("attention_mask")
+    if attention_mask is not None:
+        return attention_mask
+    input_ids = batch.get("input_ids")
+    if input_ids is not None:
+        # Fixed-length pretokenized rows: every position is active, and block drafters need a mask to sample anchors.
+        return jnp.ones_like(input_ids, dtype=jnp.float32)
+    return None
 
 
 def _aligned_step_components(
@@ -498,7 +604,7 @@ def _aligned_step_components(
             Must be non-negative.
 
     Returns:
-        Dictionary of numerators and denominator containing:
+        Dictionary of numerators and the unclamped active-token count containing:
         ``weight_sum``, ``kl_num``, ``ce_num``, ``accuracy_num``,
         ``accept_rate_num``, ``acceptance_num``, ``target_prob_num``.
 
@@ -531,7 +637,6 @@ def _aligned_step_components(
         aligned_labels = hard_labels[:, mask_slice]
         weights = weights * (aligned_labels != -100).astype(jnp.float32)
 
-    denom = jnp.maximum(jnp.sum(weights), jnp.asarray(1.0, dtype=jnp.float32))
     temp = jnp.asarray(temperature, dtype=jnp.float32)
     teacher_log_probs = jax.nn.log_softmax(teacher / temp, axis=-1)
     teacher_probs = jnp.exp(teacher_log_probs)
@@ -559,7 +664,7 @@ def _aligned_step_components(
         correct = (draft_top == safe_labels).astype(jnp.float32)
 
     return {
-        "weight_sum": denom,
+        "weight_sum": jnp.sum(weights),
         "kl_num": _masked_sum(kl, weights),
         "ce_num": _masked_sum(ce, weights),
         "accuracy_num": _masked_sum(correct, weights),
@@ -651,8 +756,14 @@ def _deepspec_block_loss(output: tp.Any, config: tp.Any) -> tuple[jax.Array, Los
     ce_loss = _masked_sum(ce_tokens, loss_weight_mask) / ce_den
 
     draft_top = jnp.argmax(block_logits, axis=-1).astype(jnp.int32)
-    accuracy = _masked_sum((draft_top == safe_targets).astype(jnp.float32), eval_mask) / jnp.maximum(
-        jnp.sum(eval_mask), jnp.asarray(1.0, dtype=jnp.float32)
+    eval_count = jnp.sum(eval_mask)
+    pooled: dict[str, jax.Array] = {}
+    accuracy = _pooled_ratio(
+        pooled,
+        _POOLED_ACCURACY_FIELD,
+        _masked_sum((draft_top == safe_targets).astype(jnp.float32), eval_mask),
+        eval_count,
+        emit_value=False,
     )
 
     aligned_target_logits = _lookup_output_path(output, "aligned_target_logits")
@@ -707,32 +818,55 @@ def _deepspec_block_loss(output: tp.Any, config: tp.Any) -> tuple[jax.Array, Los
     valid_blocks = (jnp.sum(eval_mask, axis=-1) > 0).astype(jnp.float32)
     if block_keep_mask is not None:
         valid_blocks = valid_blocks * block_keep_mask.astype(jnp.float32)
-    block_den = jnp.maximum(jnp.sum(valid_blocks), jnp.asarray(1.0, dtype=jnp.float32))
+    block_count = jnp.sum(valid_blocks)
     valid_accept_rate = accept_rate * eval_mask
     expected_draft_accepted = jnp.sum(jnp.cumprod(valid_accept_rate, axis=-1), axis=-1)
-    tau_probabilistic = _masked_sum(expected_draft_accepted + 1.0, valid_blocks) / block_den
-
-    active_den = jnp.maximum(jnp.sum(eval_mask), jnp.asarray(1.0, dtype=jnp.float32))
-    per_step = {}
+    _pooled_ratio(pooled, "tau_probabilistic", _masked_sum(expected_draft_accepted + 1.0, valid_blocks), block_count)
+    _pooled_ratio(pooled, "draft_accept_rate", _masked_sum(accept_rate, eval_mask), eval_count)
     for step in range(block_size):
         step_mask = eval_mask[:, :, step]
-        step_den = jnp.maximum(jnp.sum(step_mask), jnp.asarray(1.0, dtype=jnp.float32))
-        per_step[f"draft_step{step + 1}_accept_rate"] = _masked_sum(accept_rate[:, :, step], step_mask) / step_den
+        _pooled_ratio(
+            pooled,
+            f"draft_step{step + 1}_accept_rate",
+            _masked_sum(accept_rate[:, :, step], step_mask),
+            jnp.sum(step_mask),
+        )
+
+    if aligned_target_logits is not None:
+        greedy_match = (draft_top == jnp.argmax(aligned_target_logits, axis=-1)).astype(jnp.float32)
+        prefix_eligible = jnp.cumprod(eval_mask, axis=-1)
+        prefix_survival = jnp.cumprod(greedy_match * eval_mask, axis=-1)
+        greedy_accepted_len = jnp.sum(prefix_survival, axis=-1)
+        _pooled_ratio(pooled, "greedy_top1_match", _masked_sum(greedy_match, eval_mask), eval_count)
+        _pooled_ratio(pooled, "tau_greedy", _masked_sum(greedy_accepted_len + 1.0, valid_blocks), block_count)
+        for step in range(block_size):
+            survival_mask = prefix_eligible[:, :, step]
+            _pooled_ratio(
+                pooled,
+                f"greedy_survival_step{step + 1}",
+                _masked_sum(prefix_survival[:, :, step], survival_mask),
+                jnp.sum(survival_mask),
+            )
+            conditional_mask = survival_mask if step == 0 else survival_mask * prefix_survival[:, :, step - 1]
+            _pooled_ratio(
+                pooled,
+                f"greedy_conditional_step{step + 1}",
+                _masked_sum(greedy_match[:, :, step], conditional_mask),
+                jnp.sum(conditional_mask),
+            )
 
     other_metrics = {
         "spec_ce_loss": ce_loss,
         "deepspec_block_ce_loss": ce_loss,
         "deepspec_block_l1_loss": l1_loss,
         "deepspec_block_confidence_loss": confidence_loss,
-        "draft_accept_rate": _masked_sum(accept_rate, eval_mask) / active_den,
-        "tau_probabilistic": tau_probabilistic,
         "draft_steps": jnp.asarray(block_size, dtype=jnp.int32),
-        **per_step,
+        **pooled,
         **confidence_metrics,
     }
     return total_loss, LossMetrics(
         loss=total_loss,
-        weight_sum=jnp.sum(eval_mask),
+        weight_sum=eval_count,
         accuracy=accuracy,
         other_metrics=other_metrics,
     )
@@ -801,12 +935,13 @@ def speculative_draft_loss(
             temperature=temperature,
             target_offset=int(draft_target_offset) + step,
         )
-        denom = components["weight_sum"]
+        step_count = components["weight_sum"]
+        denom = jnp.maximum(step_count, jnp.asarray(1.0, dtype=jnp.float32))
         step_kl_loss = components["kl_num"] / denom
         step_ce_loss = components["ce_num"] / denom
         per_step[f"draft_step{step + 1}_kl_loss"] = step_kl_loss
-        per_step[f"draft_step{step + 1}_accept_rate"] = components["accept_rate_num"] / denom
-        per_step[f"draft_step{step + 1}_acceptance_match"] = components["acceptance_num"] / denom
+        _pooled_ratio(per_step, f"draft_step{step + 1}_accept_rate", components["accept_rate_num"], step_count)
+        _pooled_ratio(per_step, f"draft_step{step + 1}_acceptance_match", components["acceptance_num"], step_count)
         if use_weighted_steps:
             step_weight = jnp.asarray(float(step_loss_decay) ** step, dtype=jnp.float32)
             alpha_value = jnp.asarray(alpha, dtype=jnp.float32)
@@ -821,20 +956,23 @@ def speculative_draft_loss(
     ce_loss = totals["ce_num"] / denom
     alpha_value = jnp.asarray(alpha, dtype=jnp.float32)
     total_loss = weighted_loss if use_weighted_steps else alpha_value * kl_loss + (1.0 - alpha_value) * ce_loss
+    other_metrics: dict[str, jax.Array] = {
+        "spec_kl_loss": kl_loss,
+        "spec_ce_loss": ce_loss,
+        "draft_steps": jnp.asarray(steps, dtype=jnp.int32),
+        "draft_step_loss_decay": jnp.asarray(step_loss_decay or 0.0, dtype=jnp.float32),
+        **per_step,
+    }
+    count = totals["weight_sum"]
+    _pooled_ratio(other_metrics, "draft_accept_rate", totals["accept_rate_num"], count)
+    _pooled_ratio(other_metrics, "draft_acceptance_match", totals["acceptance_num"], count)
+    _pooled_ratio(other_metrics, "target_prob_of_draft", totals["target_prob_num"], count)
+    accuracy = _pooled_ratio(other_metrics, _POOLED_ACCURACY_FIELD, totals["accuracy_num"], count, emit_value=False)
     metrics = LossMetrics(
         loss=total_loss,
-        weight_sum=totals["weight_sum"],
-        accuracy=totals["accuracy_num"] / denom,
-        other_metrics={
-            "spec_kl_loss": kl_loss,
-            "spec_ce_loss": ce_loss,
-            "draft_accept_rate": totals["accept_rate_num"] / denom,
-            "draft_acceptance_match": totals["acceptance_num"] / denom,
-            "target_prob_of_draft": totals["target_prob_num"] / denom,
-            "draft_steps": jnp.asarray(steps, dtype=jnp.int32),
-            "draft_step_loss_decay": jnp.asarray(step_loss_decay or 0.0, dtype=jnp.float32),
-            **per_step,
-        },
+        weight_sum=count,
+        accuracy=accuracy,
+        other_metrics=other_metrics,
     )
     return total_loss, metrics
 
@@ -1130,7 +1268,8 @@ def speculative_decoding_step(
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
     )
-    batch = with_sharding_constraint(batch, partition_spec, mesh=drafter_state.model.mesh, ignore_mpmd=True)
+    # Per-leaf placement: a tree-wide spec replicates rank-1 / rank-3 leaves (e.g. mRoPE position ids) across dp.
+    batch = constrain_batch_sharding(batch, partition_spec, mesh=drafter_state.model.mesh, ignore_mpmd=True)
     batch = dict(batch)
 
     def loss_fn(tree, minibatch):
@@ -1188,6 +1327,7 @@ def speculative_decoding_step(
             minibatch_size=minibatch_size,
             grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
         )
+        metrics = _finalize_pooled_metrics(metrics)
         drafter_state = update_state_respectfully(
             state=drafter_state,
             gradients=gradients,
@@ -1202,7 +1342,7 @@ def speculative_decoding_step(
         return drafter_state, metrics
 
     _, metrics = loss_fn(tree=drafter_state.graphstate, minibatch=batch)
-    return metrics
+    return _finalize_pooled_metrics(metrics)
 
 
 def _prepare_speculative_scheduled_batch(call) -> dict[str, tp.Any]:

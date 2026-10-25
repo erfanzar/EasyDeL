@@ -300,5 +300,25 @@ def test_ep_carries_batch_flag_ignored_when_inapplicable():
         assert flagged.dispatch_buffer_bytes == base.dispatch_buffer_bytes
 
 
+def test_ep_carries_batch_sp_bound_refuses_only_when_sp_is_non_trivial():
+    """``sp_is_ep_bound`` folds nothing at sp=1, so it must not disable ep-carries-batch there."""
+    sp1 = {"dp": 1, "fsdp": 64, "ep": 4, "tp": 4, "sp": 1}
+    sp2 = {"dp": 1, "fsdp": 32, "ep": 4, "tp": 4, "sp": 2}
+
+    base1 = _estimate(sp1, TOKENS_8K_BUCKET, sp_is_ep_bound=True)
+    flagged1 = _estimate(sp1, TOKENS_8K_BUCKET, sp_is_ep_bound=True, ep_carries_batch=True)
+    assert flagged1.local_tokens * 4 == base1.local_tokens
+    assert "ep_carries_batch=True" in flagged1.summary
+    assert "set moe_ep_carries_batch=True" in base1.summary
+    assert "set moe_ep_carries_batch=True" not in flagged1.summary
+
+    base2 = _estimate(sp2, TOKENS_8K_BUCKET, sp_is_ep_bound=True)
+    flagged2 = _estimate(sp2, TOKENS_8K_BUCKET, sp_is_ep_bound=True, ep_carries_batch=True)
+    assert flagged2.local_tokens == base2.local_tokens
+    assert flagged2.dispatch_buffer_bytes == base2.dispatch_buffer_bytes
+    assert "ep_carries_batch=False" in flagged2.summary
+    assert "set moe_ep_carries_batch=True" not in base2.summary
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-s"])

@@ -946,6 +946,7 @@ class RwkvModel(EasyDeLBaseModule):
             or output_attentions
             or not self.config.scan_layers
             or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = checkpoint_name(self.ln_out(hidden_states), "model_output")
 

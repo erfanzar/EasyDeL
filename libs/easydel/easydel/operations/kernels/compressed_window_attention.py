@@ -20,12 +20,15 @@ operation — the *training / prefill* forward (differentiable, tiled-flash with
 :class:`CompressedWindowDecodeAttn`. DeepSeek-V4 builds the shared-KV axis
 (``K == V``: the sliding-window token KVs concatenated with the compressed
 entries) and the additive bias (sliding-window causal + compressed-entry causal
-+ Lightning-Indexer top-k gating, all as a stop-gradient structural mask), so
++ Lightning-Indexer top-k gating, all as an additive structural mask), so
 this adapter is a pure attention primitive: it maps EasyDeL dtype / backend /
 sharding onto the ejkernel op and returns an :class:`AttentionOutput`.
 
 ``jax.grad`` flows to the query, the shared KV (both its key and value roles),
-and the per-head sinks; the bias carries no learnable signal. The single shared
+the per-head sinks and the bias (its cotangent is the head-summed
+softmax-backward term, so a straight-through indexer score riding on the bias
+trains). On TPU the default backward is the tiled flash Pallas backward; pass
+``backward="reference"`` for forward-mode AD. The single shared
 KV head is replicated across the tensor-parallel axis while the query/output
 heads are sharded (the natural head-parallel layout), so each device runs the
 kernel over its local heads without in-kernel collectives.
@@ -92,6 +95,8 @@ class CompressedWindowAttn(OperationImpl):
         platform: str | None = None,
         token_valid: Array | None = None,
         entry_topk: Array | None = None,
+        causal: bool = False,
+        backward: str | None = None,
         **ignores,
     ) -> AttentionOutput:
         """Run compressed-window full-sequence attention via the ejkernel op.
@@ -125,6 +130,11 @@ class CompressedWindowAttn(OperationImpl):
                 padded) replacing the entry columns of ``bias`` (pass a zero-width
                 ``bias``); no ``[q_len, entries]`` selection bias is built here.
                 Requires ``token_valid``.
+            causal: Promise that ``bias`` closes every key past the diagonal; the
+                TPU kernel then skips token tiles above it (exact). Ignored by XLA.
+            backward: TPU differentiation rule, ``"flash"`` (tiled Pallas
+                backward) or ``"reference"`` (custom JVP, supports forward-mode
+                AD); ``None`` uses the ejkernel default (``"flash"``).
             **ignores: Ignored keyword arguments (interface parity).
 
         Returns:
@@ -156,6 +166,8 @@ class CompressedWindowAttn(OperationImpl):
             platform=resolved,
             window=int(window),
             token_kv_len=int(token_kv_len),
+            causal=bool(causal),
+            backward=backward,
             **sharding,
         )
         return AttentionOutput(attention_weights=None, attention_outputs=out)
@@ -192,6 +204,8 @@ class CompressedWindowAttn(OperationImpl):
         platform: str | None = None,
         token_valid: Array | None = None,
         entry_topk: Array | None = None,
+        causal: bool = False,
+        backward: str | None = None,
         **ignores,
     ) -> AttentionOutput:
         """Dispatch to the backend-specific forward.
@@ -207,6 +221,8 @@ class CompressedWindowAttn(OperationImpl):
             platform: Per-call platform override.
             token_valid: Optional per-key token validity (implicit token mask).
             entry_topk: Optional selected entry ids (implicit selection mask).
+            causal: Causal-bias promise (TPU tile skip).
+            backward: TPU differentiation rule (``"flash"`` / ``"reference"``).
             **ignores: Ignored keyword arguments.
 
         Returns:
@@ -223,5 +239,7 @@ class CompressedWindowAttn(OperationImpl):
             platform=platform,
             token_valid=token_valid,
             entry_topk=entry_topk,
+            causal=causal,
+            backward=backward,
             **ignores,
         )

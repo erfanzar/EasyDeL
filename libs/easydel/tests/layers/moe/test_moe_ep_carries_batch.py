@@ -72,6 +72,7 @@ def _build_gptoss_block(
     ep_carries_batch: bool,
     ring: bool = False,
     fsdp_is_ep_bound: bool = False,
+    sp_is_ep_bound: bool = False,
     moe_chunk_size: int | None = None,
     num_experts: int = 8,
     seed: int = 123,
@@ -98,7 +99,7 @@ def _build_gptoss_block(
     config.add_basic_configurations(
         use_ring_of_experts=ring,
         fsdp_is_ep_bound=fsdp_is_ep_bound,
-        sp_is_ep_bound=False,
+        sp_is_ep_bound=sp_is_ep_bound,
         moe_ep_carries_batch=ep_carries_batch,
         moe_chunk_size=moe_chunk_size,
     )
@@ -110,9 +111,7 @@ def _input(batch: int = 8, hidden_size: int = 32):
     return jax.random.normal(jax.random.PRNGKey(0), (batch, 4, hidden_size), dtype=jnp.float32)
 
 
-# ---------------------------------------------------------------------------
 # Config-level lever: PartitionAxis.batch_axis gains the ep axis.
-# ---------------------------------------------------------------------------
 
 
 def test_config_extends_activation_batch_axis_with_ep():
@@ -166,6 +165,53 @@ def test_batch_axis_names_resolution():
     assert batch_axes(folded) == ("dp",)
 
 
+@pytest.mark.parametrize(
+    ("dims", "expected_active"),
+    [
+        pytest.param((1, 1, 2, 2, 1, 1), True, id="sp1-bound-active"),
+        pytest.param((1, 1, 1, 2, 1, 2), False, id="sp2-bound-refused"),
+    ],
+)
+def test_sp_bound_gate_and_planner_agree(dims, expected_active):
+    """``sp_is_ep_bound`` only disqualifies ep-carries-batch when the sp axis is non-trivial.
+
+    The module gate and the layout planner must report the same decision on the same four-device mesh.
+    """
+    from easydel.layers.moe import estimate_moe_layout
+    from easydel.layers.moe._communication_utils import DP, resolve_eformer_axis
+
+    if jax.device_count() < 4:
+        pytest.skip("needs at least 4 devices")
+
+    block = _build_gptoss_block(sharding_axis_dims=dims, ep_carries_batch=True, sp_is_ep_bound=True)
+    with block.config.mesh:
+        expert_mesh = block._active_auto_expert_mesh(arr=None)
+        module_active = bool(block._ep_carries_batch_active(expert_mesh))
+        batch_axes = block._moe_batch_axis_names(expert_mesh, resolve_eformer_axis(DP, block.runtime_sharding_resolver))
+
+    sizes = dict(zip(("pp", "dp", "fsdp", "ep", "tp", "sp"), dims, strict=True))
+    estimate_kwargs = dict(
+        tokens_per_device=64,
+        num_experts_per_tok=2,
+        hidden_size=32,
+        num_experts=8,
+        expert_params_bytes=1 << 20,
+        dtype_bytes=4,
+        fsdp_is_ep_bound=False,
+        sp_is_ep_bound=True,
+        use_ring_of_experts=False,
+        chunk_size=None,
+    )
+    mesh_sizes = {k: v for k, v in sizes.items() if k != "pp"}
+    off = estimate_moe_layout(mesh_sizes, ep_carries_batch=False, **estimate_kwargs)
+    on = estimate_moe_layout(mesh_sizes, ep_carries_batch=True, **estimate_kwargs)
+    planner_active = on.local_tokens != off.local_tokens
+
+    assert module_active is expected_active
+    assert planner_active is expected_active
+    assert ("ep" in batch_axes) is expected_active
+
+
 def test_knob_inactive_is_bit_identical():
     """knob=True on an ep=1 mesh must produce bit-identical outputs to knob=False.
 
@@ -189,9 +235,7 @@ def test_knob_inactive_is_bit_identical():
     assert bool(jnp.array_equal(logits_on, logits_off))
 
 
-# ---------------------------------------------------------------------------
 # Pure logic: a2a parameters, traffic matrix, buffer bound, chunk group sizes.
-# ---------------------------------------------------------------------------
 
 
 def test_all_to_all_params_batch_sharded_hand_reference():
@@ -352,7 +396,6 @@ def test_ep_batch_dispatch_simulation_matches_dense_reference():
             for j in range(k):
                 ref[s, t] += w_top[t, j] * (X[s, t] @ W[sel[t, j]])
 
-    # --- per-shard permute (pure, no collective) ---
     shard_state = []
     for s in range(ep):
         xs, sorted_sel, weights, group_sizes, _sorted_experts = permute(
@@ -443,9 +486,7 @@ def test_ep_batch_dispatch_simulation_matches_dense_reference():
         np.testing.assert_allclose(np.asarray(out)[0], ref[s], rtol=1e-5, atol=1e-5)
 
 
-# ---------------------------------------------------------------------------
 # End-to-end module traces (fwd + bwd) on the fake 8-device mesh.
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("chunk", [None, 4], ids=["unchunked", "chunked"])

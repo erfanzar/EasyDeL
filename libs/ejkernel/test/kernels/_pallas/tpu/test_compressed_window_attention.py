@@ -203,7 +203,11 @@ def test_pallas_forward_mode_jvp_matches_xla():
     q, kv, bias, sinks = _inputs(1, 8, 128, 128, 140, jnp.float32, use_sinks=True, seed=41)
     tangents = tuple(jnp.ones_like(x) * 0.01 for x in (q, kv, bias, sinks))
     scale = 128**-0.5
-    _, p_tan = jax.jvp(lambda a, b, c, d: pallas_impl(a, b, c, d, softmax_scale=scale), (q, kv, bias, sinks), tangents)
+    _, p_tan = jax.jvp(
+        lambda a, b, c, d: pallas_impl(a, b, c, d, softmax_scale=scale, backward="reference"),
+        (q, kv, bias, sinks),
+        tangents,
+    )
     _, x_tan = jax.jvp(lambda a, b, c, d: xla_impl(a, b, c, d, softmax_scale=scale), (q, kv, bias, sinks), tangents)
     assert jnp.isfinite(p_tan).all()
     assert float(jnp.max(jnp.abs(p_tan - x_tan))) < 2e-4
@@ -225,7 +229,7 @@ def test_tiled_training_ad_with_partial_query_tile(dtype, use_sinks):
     tangents = tuple(jnp.asarray(rng.normal(size=x.shape) * 0.01, x.dtype) for x in args)
 
     def pallas(a, b, c, d):
-        return pallas_impl(a, b, c, d if use_sinks else None, softmax_scale=128**-0.5)
+        return pallas_impl(a, b, c, d if use_sinks else None, softmax_scale=128**-0.5, backward="reference")
 
     def reference(a, b, c, d):
         return xla_impl(a, b, c, d if use_sinks else None, softmax_scale=128**-0.5)
@@ -276,7 +280,7 @@ def test_pallas_fully_masked_rows_compiled_output_and_jvp(layout, dtype, use_sin
     tangents = tuple(jnp.asarray(rng.normal(size=x.shape) * 0.01, x.dtype) for x in args)
 
     def pallas(a, b, c, d):
-        return pallas_impl(a, b, c, d if use_sinks else None, softmax_scale=128**-0.5, **options)
+        return pallas_impl(a, b, c, d if use_sinks else None, softmax_scale=128**-0.5, backward="reference", **options)
 
     def reference(a, b, c, d):
         return xla_impl(a, b, c, d if use_sinks else None, softmax_scale=128**-0.5)

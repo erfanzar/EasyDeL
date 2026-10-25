@@ -1432,6 +1432,7 @@ class Llama4TextModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
 
@@ -2365,6 +2366,7 @@ class Llama4VisionEncoder(EasyDeLLayerStackMixin, spx.Module):
             or output_attentions
             or not self.config.scan_layers
             or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs("vision"),
         )
         if output_hidden_states:
             assert encoder_states is not None

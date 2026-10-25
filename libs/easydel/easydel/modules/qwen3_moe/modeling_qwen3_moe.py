@@ -768,6 +768,7 @@ class Qwen3MoeModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
         if output_hidden_states:

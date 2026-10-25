@@ -61,6 +61,12 @@ class TextDatasetInformCfg(TypedDict, total=False):
             for renaming.
         preprocessing_fn: Preprocessing function applied to each example
             before tokenization.
+        assistant_only: Per-dataset assistant-only loss choice (``True`` opt
+            in, ``False`` opt out, absent/``None`` inherit the trainer flag).
+        parquet_access: Parquet reader for this inform (``"stream"``,
+            ``"random_access"``, ``"rowgroup_shuffle"``); inherits the mixture.
+        group_pool_size: Open row groups interleaved by ``rowgroup_shuffle``.
+        metadata_cache_dir: Durable parquet footer / row-group sidecar root.
     """
 
     name: NotRequired[str | None]
@@ -78,6 +84,10 @@ class TextDatasetInformCfg(TypedDict, total=False):
     format_callback: NotRequired[tp.Callable[[dict[str, Any]], dict[str, Any]] | None]
     format_fields: NotRequired[dict[str, str] | None]
     preprocessing_fn: NotRequired[tp.Callable[[dict[str, Any]], dict[str, Any]] | None]
+    assistant_only: NotRequired[bool | None]
+    parquet_access: NotRequired[Literal["stream", "random_access", "rowgroup_shuffle"]]
+    group_pool_size: NotRequired[int]
+    metadata_cache_dir: NotRequired[str | None]
 
 
 class VisualDatasetInformCfg(TypedDict, total=False):
@@ -226,6 +236,14 @@ class DatasetMixtureCfg(TypedDict, total=False):
         stop_strategy: Strategy when a dataset source is exhausted (e.g.,
             "restart", "stop").
         mixture_weights: Per-dataset sampling weights. None for uniform mixing.
+        reshuffle_on_restart: Visit a restarted constituent's shards in a fresh
+            per-epoch permutation (sharded lane).
+        attach_dataset_ids: Stamp ``_dataset_id`` (inform position) on rows.
+        assistant_only: Mixture-wide default per-dataset assistant-only choice.
+        parquet_access: Default parquet reader (``"stream"``,
+            ``"random_access"``, ``"rowgroup_shuffle"``).
+        group_pool_size: Default open row groups for ``rowgroup_shuffle``.
+        metadata_cache_dir: Durable parquet footer / row-group sidecar root.
     """
 
     informs: Required[list[TextDatasetInformCfg | VisualDatasetInformCfg]]
@@ -263,6 +281,13 @@ class DatasetMixtureCfg(TypedDict, total=False):
     mixture_block_size: NotRequired[int]
     stop_strategy: NotRequired[str]
     mixture_weights: NotRequired[dict[str, float] | None]
+    # Sharded-source lane extras (easydel.infra.elarge.builders.build_sharded_source).
+    reshuffle_on_restart: NotRequired[bool]
+    attach_dataset_ids: NotRequired[bool]
+    assistant_only: NotRequired[bool | None]
+    parquet_access: NotRequired[Literal["stream", "random_access", "rowgroup_shuffle"]]
+    group_pool_size: NotRequired[int]
+    metadata_cache_dir: NotRequired[str | None]
 
 
 class DataMixtureCfg(DatasetMixtureCfg, total=False):

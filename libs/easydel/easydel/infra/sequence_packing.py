@@ -107,6 +107,55 @@ def packed_segment_ids_from_mask_info(mask_info: MaskInfo | None, target_length:
     return normalize_packed_segment_ids(q_segment_ids, target_length, pad_from_last=False).astype(jnp.int32)
 
 
+def _depthwise_kernel(kernel: Array, channels: int) -> Array:
+    """Return a depthwise conv kernel in ``[channels, kernel_size]`` layout."""
+    kernel = jnp.asarray(kernel)
+    if kernel.ndim == 3:
+        kernel = kernel.squeeze(1).T
+    if kernel.shape[0] != channels:
+        raise ValueError(f"Depthwise kernel channels ({kernel.shape[0]}) must match inputs ({channels}).")
+    return kernel
+
+
+def _initial_window_segment(
+    segment_ids: Array,
+    *,
+    has_initial_state: bool,
+    initial_segment_id: Array | int | None,
+) -> Array:
+    """Return the per-row segment id the incoming conv window belongs to (``-1`` means a fresh window)."""
+    batch_size, seq_len = segment_ids.shape
+    if initial_segment_id is not None:
+        return jnp.broadcast_to(jnp.asarray(initial_segment_id, dtype=segment_ids.dtype), (batch_size,))
+    if has_initial_state and seq_len > 0:
+        # A caller-supplied window continues into the first valid token instead of being zeroed.
+        valid_tokens = segment_ids >= 0
+        first_valid = jnp.argmax(valid_tokens, axis=1)
+        first_segment = jnp.take_along_axis(segment_ids, first_valid[:, None], axis=1)[:, 0]
+        return jnp.where(jnp.any(valid_tokens, axis=1), first_segment, -1).astype(segment_ids.dtype)
+    return jnp.full((batch_size,), -1, dtype=segment_ids.dtype)
+
+
+def _conv_compute_dtype(inputs: Array, kernel: Array, output_dtype: jnp.dtype | None) -> jnp.dtype:
+    """Return the dtype the conv window product and bias/activation run in."""
+    compute_dtype = jnp.promote_types(inputs.dtype, kernel.dtype)
+    if output_dtype is not None:
+        compute_dtype = jnp.promote_types(compute_dtype, output_dtype)
+    return compute_dtype
+
+
+def _shift_tokens(values: Array, shift: int, fill_value: tp.Any) -> Array:
+    """Return ``out[:, t] = values[:, t - shift]`` along the token axis, ``fill_value`` where ``t < shift``."""
+    if shift == 0:
+        return values
+    seq_len = values.shape[1]
+    if shift >= seq_len:
+        return jnp.full_like(values, fill_value)
+    pad_width = [(0, 0)] * values.ndim
+    pad_width[1] = (shift, 0)
+    return jnp.pad(values[:, : seq_len - shift], pad_width, constant_values=fill_value)
+
+
 def segmented_depthwise_causal_conv1d(
     inputs: Array,
     kernel: Array,
@@ -120,10 +169,25 @@ def segmented_depthwise_causal_conv1d(
 ) -> tuple[Array, Array]:
     """Run a causal depthwise conv that resets its window at packed boundaries.
 
+    The window semantics are those of a token-serial rolling window: a valid token whose segment id
+    differs from the previous token's (or that follows padding which itself follows a valid token)
+    starts a fresh, zeroed window; padding tokens (negative ids) emit zeros and leave the window
+    untouched; padding before the first valid token of a row does not break the continuation of
+    ``initial_state``.
+
+    The computation is closed form and fully parallel over the token axis (no serial loop): tap
+    ``j`` of token ``t`` reads ``inputs[t - j]`` only when every token in ``(t - j, t]`` continues the
+    same valid segment run. When the first run of a row continues ``initial_state``, its first
+    ``kernel_size - 1`` tokens additionally read the cached window, added as one precomputed
+    per-row vector per run position. The final state is gathered at the last valid token of each
+    row, so trailing padding does not roll it. Results match the token-serial reference up to
+    floating-point summation order (outputs); the returned state is an exact copy of input values.
+
     Args:
         inputs: Token-major stream ``[batch, seq_len, channels]``.
-        kernel: Depthwise kernel in ``[channels, kernel_size]`` layout.
-        segment_ids: Packed segment ids ``[batch, seq_len]``; ``-1`` means pad.
+        kernel: Depthwise kernel in ``[channels, kernel_size]`` layout (a ``[kernel_size, 1,
+            channels]`` conv weight is also accepted).
+        segment_ids: Packed segment ids ``[batch, seq_len]``; negative ids mean pad.
         bias: Optional per-channel bias.
         initial_state: Optional rolling conv state ``[batch, channels, kernel]``
             carried over from a previous chunk. Unless ``initial_segment_id``
@@ -139,34 +203,128 @@ def segmented_depthwise_causal_conv1d(
 
     Returns:
         ``(outputs, final_state)`` in ``[batch, seq_len, channels]`` and
-        ``[batch, channels, kernel]`` layouts.
+        ``[batch, channels, kernel]`` layouts. ``final_state`` has the dtype of
+        ``initial_state`` (``inputs`` when no state is given).
+
+    Raises:
+        ValueError: If the kernel channel count does not match ``inputs``.
     """
     batch_size, seq_len, channels = inputs.shape
-    kernel = jnp.asarray(kernel)
-    if kernel.ndim == 3:
-        kernel = kernel.squeeze(1).T
-    if kernel.shape[0] != channels:
-        raise ValueError(f"Depthwise kernel channels ({kernel.shape[0]}) must match inputs ({channels}).")
+    kernel = _depthwise_kernel(kernel, channels)
+    kernel_size = kernel.shape[-1]
+    segment_ids = normalize_packed_segment_ids(segment_ids, seq_len, pad_from_last=False)
+    has_initial_state = initial_state is not None
+    state_dtype = initial_state.dtype if has_initial_state else inputs.dtype
+    compute_dtype = _conv_compute_dtype(inputs, kernel, output_dtype)
+    zero_state = jnp.zeros((batch_size, channels, kernel_size), dtype=state_dtype)
+
+    if seq_len == 0:
+        outputs = jnp.zeros((batch_size, 0, channels), dtype=output_dtype or compute_dtype)
+        return outputs, (initial_state if has_initial_state else zero_state)
+
+    valid = segment_ids >= 0
+    if seq_len > 1:
+        continues_previous = valid[:, 1:] & valid[:, :-1] & (segment_ids[:, 1:] == segment_ids[:, :-1])
+        same_prev = jnp.concatenate([jnp.zeros((batch_size, 1), dtype=jnp.bool_), continues_previous], axis=1)
+    else:
+        same_prev = jnp.zeros_like(valid)
+
+    # keep[j][t]: token t - j is inside token t's window (j < run length of t).
+    keep = [valid]
+    for j in range(1, kernel_size):
+        keep.append(keep[-1] & _shift_tokens(same_prev, j - 1, False))
+
+    # The rolling window stores tokens in the state dtype before the compute-dtype reduction.
+    x_state = inputs.astype(state_dtype)
+    x = x_state.astype(compute_dtype)
+    taps = kernel.astype(compute_dtype)
+    zero = jnp.zeros((), dtype=compute_dtype)
+    # Products round in the compute dtype (as the window product does); the tap sum accumulates in at
+    # least fp32 and rounds once, like a reduction over the window axis.
+    accum_dtype = jnp.promote_types(compute_dtype, jnp.float32)
+    conv = None
+    for j in range(kernel_size - 1, -1, -1):
+        tap = jnp.where(keep[j][..., None], _shift_tokens(x, j, 0), zero) * taps[:, kernel_size - 1 - j]
+        tap = tap.astype(accum_dtype)
+        conv = tap if conv is None else conv + tap
+
+    any_valid = jnp.any(valid, axis=1)
+    if has_initial_state:
+        initial_window = _initial_window_segment(
+            segment_ids, has_initial_state=True, initial_segment_id=initial_segment_id
+        )
+        first_valid = jnp.argmax(valid, axis=1)
+        first_segment = jnp.take_along_axis(segment_ids, first_valid[:, None], axis=1)[:, 0]
+        continues_state = any_valid & (first_segment == initial_window)
+        run_start = valid & ~same_prev
+        first_run = valid & (jnp.cumsum(run_start.astype(jnp.int32), axis=1) == 1)
+        continued_run = first_run & continues_state[:, None]
+        state_c = initial_state.astype(compute_dtype)
+        for n in range(1, kernel_size):
+            # After n tokens of a continued run, slots [0, K - n) still hold initial_state[:, :, n:].
+            at_n = continued_run & keep[n - 1] & ~keep[n]
+            carried = jnp.sum((taps[None, :, : kernel_size - n] * state_c[:, :, n:]).astype(accum_dtype), axis=-1)
+            conv = conv + jnp.where(at_n[..., None], carried[:, None, :], jnp.zeros((), dtype=accum_dtype))
+
+    conv = conv.astype(compute_dtype)
+    if bias is not None:
+        conv = conv + jnp.asarray(bias, dtype=conv.dtype)
+    if activation is not None:
+        conv = activation(conv)
+    outputs = jnp.where(valid[..., None], conv, jnp.zeros_like(conv))
+    if output_dtype is not None:
+        outputs = outputs.astype(output_dtype)
+
+    # Final window: the run ending at the last valid token (padding never rolls the window).
+    last_valid = (seq_len - 1) - jnp.argmax(valid[:, ::-1], axis=1)
+    run_length = sum(jnp.take_along_axis(k, last_valid[:, None], axis=1)[:, 0].astype(jnp.int32) for k in keep)
+    slots = []
+    for i in range(kernel_size):
+        back = kernel_size - 1 - i
+        index = jnp.maximum(last_valid - back, 0)
+        token = jnp.take_along_axis(x_state, index[:, None, None], axis=1)[:, 0]
+        slot = jnp.where((back < run_length)[:, None], token, jnp.zeros((), dtype=state_dtype))
+        if has_initial_state:
+            last_in_continued_run = jnp.take_along_axis(continued_run, last_valid[:, None], axis=1)[:, 0]
+            state_index = jnp.minimum(i + run_length, kernel_size - 1)
+            carried_slot = jnp.take_along_axis(initial_state, state_index[:, None, None], axis=-1)[..., 0]
+            use_carried = last_in_continued_run & (back >= run_length)
+            slot = jnp.where(use_carried[:, None], carried_slot, slot)
+        slots.append(slot)
+    final_state = jnp.stack(slots, axis=-1)
+    fallback_state = initial_state if has_initial_state else zero_state
+    final_state = jnp.where(any_valid[:, None, None], final_state, fallback_state)
+    return outputs, final_state
+
+
+def _segmented_depthwise_causal_conv1d_scan(
+    inputs: Array,
+    kernel: Array,
+    segment_ids: Array,
+    *,
+    bias: Array | None = None,
+    initial_state: Array | None = None,
+    initial_segment_id: Array | int | None = None,
+    activation: tp.Callable[[Array], Array] | None = None,
+    output_dtype: jnp.dtype | None = None,
+) -> tuple[Array, Array]:
+    """Token-serial reference for :func:`segmented_depthwise_causal_conv1d` (one ``lax.scan`` step per token).
+
+    Same arguments and return values as :func:`segmented_depthwise_causal_conv1d`. Kept as the
+    semantic definition the closed form is tested against; it is far slower on long sequences.
+    """
+    batch_size, seq_len, channels = inputs.shape
+    kernel = _depthwise_kernel(kernel, channels)
     kernel_size = kernel.shape[-1]
     segment_ids = normalize_packed_segment_ids(segment_ids, seq_len, pad_from_last=False)
     has_initial_state = initial_state is not None
     if initial_state is None:
         initial_state = jnp.zeros((batch_size, channels, kernel_size), dtype=inputs.dtype)
-    if initial_segment_id is not None:
-        last_segment = jnp.broadcast_to(jnp.asarray(initial_segment_id, dtype=segment_ids.dtype), (batch_size,))
-    elif has_initial_state and seq_len > 0:
-        # A caller-supplied window continues into the first valid token instead of being zeroed.
-        valid_tokens = segment_ids >= 0
-        first_valid = jnp.argmax(valid_tokens, axis=1)
-        first_segment = jnp.take_along_axis(segment_ids, first_valid[:, None], axis=1)[:, 0]
-        last_segment = jnp.where(jnp.any(valid_tokens, axis=1), first_segment, -1).astype(segment_ids.dtype)
-    else:
-        last_segment = jnp.full((batch_size,), -1, dtype=segment_ids.dtype)
+    last_segment = _initial_window_segment(
+        segment_ids, has_initial_state=has_initial_state, initial_segment_id=initial_segment_id
+    )
     bias_value = 0 if bias is None else jnp.asarray(bias)
-
-    compute_dtype = jnp.promote_types(inputs.dtype, kernel.dtype)
-    if output_dtype is not None:
-        compute_dtype = jnp.promote_types(compute_dtype, output_dtype)
+    compute_dtype = _conv_compute_dtype(inputs, kernel, output_dtype)
 
     def _step(carry, step_inputs):
         state, prev_segment, seen_valid = carry

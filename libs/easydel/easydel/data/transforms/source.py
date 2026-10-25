@@ -375,9 +375,7 @@ class ShuffledShardedSource(ShardedDataSource[dict]):
             return
 
         if not self._source.delivers_all_metadata_rows:
-            # Shard boundaries below are derived from num_rows metadata; a source
-            # whose iteration may deliver fewer rows (e.g. the parquet decode-memory
-            # guard skipping oversized row groups) would leave the seek misaligned.
+            # Shard boundaries below come from num_rows metadata, which a lossy source would not match.
             logger.warning(
                 "Cannot seek shuffled source through %s by row metadata because its iteration may "
                 "deliver fewer rows than num_rows; falling back to sequential skip of %d rows.",

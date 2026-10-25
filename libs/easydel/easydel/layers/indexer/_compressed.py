@@ -42,6 +42,7 @@ from easydel.layers.norms import RMSNorm
 from ._paged import slot_entry_topk
 from ._primitives import topk_selection_mask
 from ._selection import BaseIndexer, IndexerSelection, SelectionSpec, top_k_values_indices
+from ._shared_key import check_scoring_kernel, fused_head_scores
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,8 @@ class CompressedIndexerConfig:
         compress_rate: Source tokens per emitted entry.
         rms_norm_eps: Epsilon for the compressed-key RMSNorm.
         initializer_range: Standard deviation of projection initializers.
+        scoring_kernel: Dense multi-query scoring path: ``"xla"`` (default, dense einsum) or ``"pallas"`` (the
+            registered ``indexer_scores`` operation; fused Pallas kernel on TPU). Decode keeps the dense path.
     """
 
     hidden_size: int
@@ -67,6 +70,10 @@ class CompressedIndexerConfig:
     compress_rate: int
     rms_norm_eps: float = 1e-6
     initializer_range: float = 0.02
+    scoring_kernel: str = "xla"
+
+    def __post_init__(self):
+        check_scoring_kernel(self.scoring_kernel)
 
 
 class CompressedIndexerAdapter(tp.Protocol):
@@ -123,6 +130,7 @@ class CompressedIndexerScorer(spx.Module):
         self.softmax_scale = config.index_head_dim**-0.5
         self.weights_scaling = config.index_n_heads**-0.5
         self.precision = precision
+        self.scoring_kernel = config.scoring_kernel
         self.weights_proj = ColumnParallelLinear(
             config.hidden_size,
             config.index_n_heads,
@@ -134,7 +142,7 @@ class CompressedIndexerScorer(spx.Module):
             rngs=rngs,
         )
 
-    def forward(self, q: Array, compressed_kv: Array, hidden_states: Array) -> Array:
+    def forward(self, q: Array, compressed_kv: Array, hidden_states: Array, mesh_source: object | None = None) -> Array:
         """Score queries against compressed indexer keys (fp32).
 
         Args:
@@ -142,10 +150,15 @@ class CompressedIndexerScorer(spx.Module):
             compressed_kv: Compressed indexer keys ``[B, T, D_i]``.
             hidden_states: Hidden states ``[B, S, D_model]`` for the per-head
                 weighting.
+            mesh_source: Mesh / resolver provider for the fused path on a multi-device mesh.
 
         Returns:
             Per-query index scores ``[B, S, T]`` (fp32).
         """
+        if self.scoring_kernel == "pallas" and q.shape[1] > 1:
+            # sum_h w_h * relu(q.k) * sm == sum_h (w_h * sm) * relu(q.k) since sm > 0.
+            weights = self.weights_proj(hidden_states).astype(jnp.float32) * (self.weights_scaling * self.softmax_scale)
+            return fused_head_scores(q, compressed_kv, weights, precision=self.precision, mesh_source=mesh_source)
         scores = jnp.einsum(
             "bshd,btd->bsht",
             q.astype(jnp.float32),
@@ -307,7 +320,7 @@ class CompressedIndexer(BaseIndexer):
         batch, seq_len, _ = hidden_states.shape
         q = self.q_b_proj(q_residual).reshape(batch, seq_len, self.num_heads, self.head_dim)
         q = self.compressor_adapter.rotate_queries(q, position_ids, hidden_states.dtype)
-        return self.scorer(q, compressed, hidden_states)
+        return self.scorer(q, compressed, hidden_states, mesh_source=self.mesh_source)
 
     def _select_causal(self, index_scores: Array, position_ids: Array, compressed_len: int) -> IndexerSelection:
         """:meth:`_select_causal_top_k` as a full selection (indices and mask)."""

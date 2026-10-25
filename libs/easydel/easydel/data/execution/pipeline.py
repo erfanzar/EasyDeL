@@ -46,7 +46,7 @@ from ..core.protocols import PipelineContext, PipelineStage, ShardedDataSource
 from ..core.types import DatasetMixture, TextDatasetInform
 from ..sources import create_source, load_for_inform
 from ..transforms.base import ExpandTransform
-from ..transforms.mixture import MixStage, block_mixture_interleave
+from ..transforms.mixture import ASSISTANT_ONLY_FIELD, DATASET_ID_FIELD, MixStage, block_mixture_interleave
 from ..transforms.pack import PackStage, pack_constant_length, pack_pre_tokenized
 from ..transforms.source import TransformedShardedSource
 from ..transforms.tokenize import TokenizeStage
@@ -1346,6 +1346,21 @@ class _ProgressBarShardedSource(ShardedDataSource[dict]):
         return self._source.get_shard_info(shard_name)
 
 
+def _stamp_sideband(example: dict, values: dict[str, int]) -> dict:
+    """Return ``example`` extended with constant per-dataset sideband columns.
+
+    Module-level (not a closure) so ``datasets`` can fingerprint and pickle it.
+
+    Args:
+        example: One source row.
+        values: ``{column: value}`` to stamp, e.g. ``{DATASET_ID_FIELD: 2}``.
+
+    Returns:
+        dict: A new row carrying the original keys plus ``values``.
+    """
+    return {**example, **values}
+
+
 def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
     """Build a unified dataset from a DatasetMixture configuration.
 
@@ -1394,6 +1409,10 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
     per_ds = []
     per_ds_by_name = {}
     content_target = mixture.text_target_field
+    # Sideband attribution columns. Either column is stamped on EVERY inform (uniform batch schema:
+    # ragged keys are silently dropped by list collation) and whitelisted through ``to_target``.
+    stamp_dataset_ids = bool(getattr(mixture, "attach_dataset_ids", False))
+    stamp_assistant_only = any(getattr(inform, "assistant_only", None) is not None for inform in mixture.informs)
 
     for index, inform in enumerate(mixture.informs):
         ds = load_for_inform(inform, mixture)
@@ -1453,9 +1472,19 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
                 cols_to_remove = list(set(ex0.keys()) - set(after.keys()))
                 ds = ds.map(fmt, batched=False, remove_columns=cols_to_remove or None)
 
+        sideband: dict[str, int] = {}
+        if stamp_dataset_ids:
+            sideband[DATASET_ID_FIELD] = int(index)
+        if stamp_assistant_only:
+            choice = getattr(inform, "assistant_only", None)
+            sideband[ASSISTANT_ONLY_FIELD] = -1 if choice is None else int(bool(choice))
+        if sideband:
+            ds = ds.map(_stamp_sideband, batched=False, fn_kwargs={"values": sideband})
+
         if isinstance(inform, TextDatasetInform):
             keep = {content_target}
-            addl = getattr(inform, "additional_fields", None) or []
+            addl = list(getattr(inform, "additional_fields", None) or [])
+            addl.extend(name for name in sideband if name not in addl)
             keep.update(addl)
 
             content_field = inform.content_field
@@ -1575,6 +1604,11 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
             from datasets import interleave_datasets  # pyright: ignore[reportMissingTypeStubs]
 
             stop_strategy = getattr(mixture, "stop_strategy", "first_exhausted")
+            if stop_strategy == "error":
+                raise ValueError(
+                    "stop_strategy='error' is not supported on the HF interleave path; "
+                    "use block_mixture=True (the block mixer implements it)."
+                )
             if stop_strategy == "restart":
                 logger.warning(
                     "stop_strategy='restart' is not supported by datasets.interleave_datasets; "
@@ -1609,6 +1643,11 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
             mixed = concatenate_datasets(per_ds)
         else:
             stop_strategy = getattr(mixture, "stop_strategy", "restart")
+            if stop_strategy == "error":
+                raise ValueError(
+                    "stop_strategy='error' is not supported for materialized weighted mixtures; "
+                    "use streaming=True with block_mixture=True (the block mixer implements it)."
+                )
             if stop_strategy not in {"first_exhausted", "all_exhausted", "restart"}:
                 raise ValueError(f"Unknown mixture stop_strategy: {stop_strategy!r}")
             # A materialized dataset represents one finite epoch. Restart

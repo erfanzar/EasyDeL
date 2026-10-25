@@ -34,6 +34,8 @@ class _Projection:
 
 class _HostModel:
     _tie_embeddings_enabled = EasyDeLBaseModule._tie_embeddings_enabled
+    _lm_head_kernel_spec = EasyDeLBaseModule._lm_head_kernel_spec
+    _tied_lm_head_weight = EasyDeLBaseModule._tied_lm_head_weight
     apply_lm_head = EasyDeLBaseModule.apply_lm_head
 
     def __init__(self, flags, constructor_tie):

@@ -2780,6 +2780,10 @@ class eSurgeRunner:
             # Keep the plain-recurrent conv/GDR/SSM device state (indexed by
             # physical buffer row) in lockstep with condense/reorder row moves.
             self._sync_recurrent_rows(prev_recurrent_row_owner)
+        if self.drafter is not None:
+            # Rows are final for this step: rewrite the sampler's device token counts of penalised speculative
+            # requests that now take the plain sampler path (their counts drift during verify steps).
+            self.spec.sync_penalty_counts(scheduler_output)
 
         if not scheduler_output.total_num_scheduled_tokens:
             if pending_pre_async_results is not None and pre_async_repair_pending:
@@ -3584,7 +3588,6 @@ class eSurgeRunner:
                 rng_after_verify=rng_after_verify,
             )
 
-            # --- Batched greedy verify pre-pass -------------------------------
             # Project + argmax the verify rows of EVERY greedy spec request in
             # this window together: ONE LM-head matmul over the pooled
             # ``[sum(k+1), H]`` hidden rows and ONE device->host argmax transfer,
@@ -3673,7 +3676,6 @@ class eSurgeRunner:
                     _project_start = time.time()
                     _gathered_hidden = hidden_states_for_spec[_idx_arr]
                     total_spec_project_time += time.time() - _project_start
-                    # --- DRAFT-IN-VERIFY (fused) --------------------------------
                     # Fold the greedy argmax, the acceptance compare, and the K
                     # recursive MTP draft forwards into ONE compiled program:
                     # the separate drafter dispatch (and the host round-trip
@@ -3699,6 +3701,11 @@ class eSurgeRunner:
                         and self.spec.can_draft_in_verify()
                         and all(
                             self.spec.can_batch_draft(self.requests.get(str(_meta2.request_id)))
+                            for (_rp2, _off2, _cnt2, _meta2) in _pending_bv
+                        )
+                        # The fused program has no history counts, so penalised windows take the two-dispatch flow.
+                        and not any(
+                            self.spec.uses_history_penalties(self.requests.get(str(_meta2.request_id)))
                             for (_rp2, _off2, _cnt2, _meta2) in _pending_bv
                         )
                     ):
@@ -3739,7 +3746,16 @@ class eSurgeRunner:
                         _batched_logits = self.spec.project_hidden_rows(_gathered_hidden)
                         total_spec_project_time += time.time() - _project_start
                         _argmax_start = time.time()
-                        _batched_argmax = np.asarray(jnp.argmax(_batched_logits, axis=-1)).astype(np.int64)
+                        # Penalised requests get the sampler's history-penalty transform on their verify rows
+                        # (on device, only the argmaxes come back); ``None`` keeps the plain argmax.
+                        _penalized_argmax = self.spec.penalized_verify_argmaxes(
+                            _batched_logits,
+                            [(_meta2, int(_off2), int(_cnt2)) for (_rp2, _off2, _cnt2, _meta2) in _pending_bv],
+                        )
+                        if _penalized_argmax is not None:
+                            _batched_argmax = np.asarray(_penalized_argmax).astype(np.int64)
+                        else:
+                            _batched_argmax = np.asarray(jnp.argmax(_batched_logits, axis=-1)).astype(np.int64)
                         total_spec_argmax_sync_time += time.time() - _argmax_start
                         for _rp, _off, _cnt, _meta in _pending_bv:
                             verify_meta_by_row[_rp] = _meta
@@ -3751,7 +3767,6 @@ class eSurgeRunner:
                                 gathered_hidden=_gathered_hidden,
                                 batched_logits=_batched_logits,
                             )
-            # --- Early batched-draft dispatch --------------------------------
             # Every input the batched drafter needs (per-request accepted count,
             # corrected token, seed position, seed hidden row) is derivable from
             # the pre-pass argmaxes, so ENQUEUE the drafter's device work here —
@@ -3901,9 +3916,17 @@ class eSurgeRunner:
                         total_spec_project_time += time.time() - project_timer_start
                         if greedy_spec:
                             _argmax_start = time.time()
-                            projected_target_tokens = (
-                                np.asarray(jnp.argmax(logits_rows, axis=-1)).astype(np.int64).tolist()
+                            # A lone (or otherwise unpooled) penalised request is penalised here too.
+                            _penalized_argmax = self.spec.penalized_verify_argmaxes(
+                                logits_rows,
+                                [(verify_meta, 0, int(logits_rows.shape[0]))],
                             )
+                            if _penalized_argmax is not None:
+                                projected_target_tokens = np.asarray(_penalized_argmax).astype(np.int64).tolist()
+                            else:
+                                projected_target_tokens = (
+                                    np.asarray(jnp.argmax(logits_rows, axis=-1)).astype(np.int64).tolist()
+                                )
                             total_spec_argmax_sync_time += time.time() - _argmax_start
                             for draft_idx, draft_token in enumerate(draft_tokens_for_verify):
                                 if int(projected_target_tokens[draft_idx]) != int(draft_token):
@@ -3929,6 +3952,14 @@ class eSurgeRunner:
                                     int(row_pos),
                                     prefix_len=int(real_count + accepted),
                                 )
+                                _penalized_token = self.spec.penalized_replay_token(
+                                    meta=verify_meta,
+                                    req_state=req_state,
+                                    hidden_row=replay_hidden,
+                                    draft_prefix=int(accepted),
+                                )
+                                if _penalized_token is not None:
+                                    corrected_token = _penalized_token
                                 hidden_rows = hidden_rows.at[accepted].set(replay_hidden)
                                 recurrent_state_advanced_by_suffix = True
                         else:
@@ -3976,6 +4007,14 @@ class eSurgeRunner:
                         if greedy_spec:
                             for draft_idx, draft_token in enumerate(draft_tokens_for_verify):
                                 target_token, target_hidden = _replay_prefix_sample(row_pos, real_count + draft_idx)
+                                _penalized_token = self.spec.penalized_replay_token(
+                                    meta=verify_meta,
+                                    req_state=req_state,
+                                    hidden_row=target_hidden,
+                                    draft_prefix=int(draft_idx),
+                                )
+                                if _penalized_token is not None:
+                                    target_token = _penalized_token
                                 corrected_token = int(target_token)
                                 seed_hidden = target_hidden
                                 if want_trace_logits:
@@ -3985,6 +4024,14 @@ class eSurgeRunner:
                                 accepted += 1
                             if accepted == len(draft_tokens_for_verify):
                                 corrected_token, seed_hidden = _replay_prefix_sample(row_pos, real_count + accepted)
+                                _penalized_token = self.spec.penalized_replay_token(
+                                    meta=verify_meta,
+                                    req_state=req_state,
+                                    hidden_row=seed_hidden,
+                                    draft_prefix=int(accepted),
+                                )
+                                if _penalized_token is not None:
+                                    corrected_token = _penalized_token
                         else:
                             draft_fulls = self.spec.draft_full_log_probs_by_req.pop(str(rid), None)
                             if draft_fulls is not None and int(draft_fulls.shape[0]) >= len(draft_tokens_for_verify):

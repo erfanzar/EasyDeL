@@ -29,6 +29,7 @@ from spectrax._internal.logging import LazyLogger, get_logger
 
 from . import _fs
 from ._compat import PyTree, flatten_dict
+from ._ocdbt import OcdbtSaveOptions
 from .async_manager import AsyncCheckpointManager
 
 logger: LazyLogger = get_logger("Checkpointer")
@@ -71,6 +72,8 @@ class Checkpointer:
         *,
         manager: AsyncCheckpointManager | None = None,
         delete_old_temp_checkpoints: bool = True,
+        ocdbt: bool = False,
+        ocdbt_options: OcdbtSaveOptions | None = None,
     ) -> None:
         """Create a :class:`Checkpointer`.
 
@@ -85,6 +88,10 @@ class Checkpointer:
                 created if ``None``.
             delete_old_temp_checkpoints: Whether to queue deletion of prior
                 temporary checkpoints found at startup.
+            ocdbt: Default layout for saves: ``True`` writes one coalesced OCDBT
+                store per prefix instead of one zarr store per array.
+            ocdbt_options: Default OCDBT write tuning (data-file size, TensorStore
+                concurrency).
 
         Raises:
             ValueError: If *step_policies* is not sorted by ``until`` or if a
@@ -107,6 +114,8 @@ class Checkpointer:
                 raise ValueError("Step policies must be sorted by 'until' value")
 
         self._manager = manager or AsyncCheckpointManager()
+        self.ocdbt = bool(ocdbt)
+        self.ocdbt_options = ocdbt_options
 
         if jax.process_index() == 0:
             self._checkpoint_cleanup_worker_queue: queue.Queue[str] = queue.Queue(maxsize=-1)
@@ -253,6 +262,8 @@ class Checkpointer:
         extras: dict | None = None,
         temporary: bool = False,
         write_index: bool = True,
+        ocdbt: bool | None = None,
+        ocdbt_options: OcdbtSaveOptions | None = None,
     ) -> str:
         """Save a PyTree under a specific prefix with treedef preserved.
 
@@ -268,6 +279,8 @@ class Checkpointer:
             extras: Optional extra metadata.
             temporary: If ``True``, mark as temporary in metadata.
             write_index: Whether to write the TensorStore index file.
+            ocdbt: Write the OCDBT layout; ``None`` uses the checkpointer default.
+            ocdbt_options: OCDBT write tuning; ``None`` uses the checkpointer default.
 
         Returns:
             Full checkpoint directory path.
@@ -298,6 +311,8 @@ class Checkpointer:
             dtype=dtype,
             extras=merged_extras,
             write_index=write_index,
+            ocdbt=self.ocdbt if ocdbt is None else bool(ocdbt),
+            ocdbt_options=ocdbt_options if ocdbt_options is not None else self.ocdbt_options,
         )
 
         if step is not None:
@@ -314,7 +329,7 @@ class Checkpointer:
         discover_latest: bool = True,
         discover_raise: bool = True,
         sharding_rules: tp.Sequence[tuple[str, NamedSharding]] | None = None,
-        dtype: jnp.dtype | None = None,
+        dtype: jnp.dtype | tp.Callable[[str], tp.Any] | None = None,
         load_treedef: bool = True,
         callback: tp.Callable[[jax.Array, str], jax.Array] | None = None,
         template: PyTree | None = None,
@@ -343,7 +358,8 @@ class Checkpointer:
             discover_raise: If ``True``, raise when no checkpoint is found.
             sharding_rules: Optional sequence of ``(regex, NamedSharding)``
                 pairs for sharding inference.
-            dtype: Optional dtype to cast loaded arrays to.
+            dtype: Optional dtype to cast loaded floating arrays to, or a callable
+                ``key -> dtype | None`` giving a per-array target (``None`` keeps the stored dtype).
             load_treedef: If ``False``, flatten the loaded tree to a
                 dotted-string dict.
             callback: Optional per-array callback ``fn(array, key) -> array``.

@@ -2597,6 +2597,128 @@ def update_state_respectfully(
         return state
 
 
+def slice_host_minibatch(batch: tp.Any, batch_size: int, start_index: int, minibatch_size: int) -> tp.Any:
+    """Host-side twin of :func:`_slice_batch_for_scheduled_step` for execution-mode accumulation.
+
+    Same per-leaf rule (the leaf's batch axis is resolved by key, shared keys pass through), but numpy
+    leaves are basic-sliced (views, no device transfer) and ``jax.Array`` leaves keep their own sharding.
+
+    Args:
+        batch: Host batch (dict of numpy arrays or jax arrays).
+        batch_size: The full batch's leading dimension.
+        start_index: First row of the microbatch.
+        minibatch_size: Rows per microbatch.
+
+    Returns:
+        The microbatch, same structure as ``batch``.
+    """
+    start = int(start_index)
+    stop = start + int(minibatch_size)
+
+    def _slice_leaf(path, arr):
+        if not hasattr(arr, "shape") or len(arr.shape) == 0:
+            return arr
+        key = next((entry.key for entry in reversed(path) if isinstance(entry, tu.DictKey)), None)
+        if key in SHARED_GENERATION_MODEL_INPUT_KEYS:
+            return arr
+        axis = infer_prompt_batch_axis(arr, batch_size, key=key)
+        if axis is None:
+            return arr
+        if isinstance(arr, jax.Array):
+            out = lax.slice_in_dim(arr, start, stop, axis=axis)
+            sharding = getattr(arr, "sharding", None)
+            return out if sharding is None else jax.device_put(out, sharding)
+        index = [slice(None)] * arr.ndim
+        index[axis] = slice(start, stop)
+        return arr[tuple(index)]
+
+    return jax.tree_util.tree_map_with_path(_slice_leaf, batch)
+
+
+def zero_gradient_accumulator(graphstate: tp.Any) -> dict[str, tp.Any]:
+    """Fresh execution-mode accumulator: fp32 zeros shaped like ``graphstate`` plus weight / count scalars.
+
+    Args:
+        graphstate: The parameter tree (arrays or ``ShapeDtypeStruct``s).
+
+    Returns:
+        ``{"grads": fp32 zeros, "weight": f32 0, "count": i32 0}``.
+    """
+    return {
+        "grads": jax.tree_util.tree_map(lambda x: jnp.zeros(tuple(x.shape), jnp.float32), graphstate),
+        "weight": jnp.zeros((), jnp.float32),
+        "count": jnp.zeros((), jnp.int32),
+    }
+
+
+def accumulate_microbatch(
+    accumulator: dict[str, tp.Any],
+    graphstate: tp.Any,
+    minibatch: tp.Any,
+    grad_fn: tp.Callable[[tp.Any, tp.Any], tuple[tuple[jax.Array, tp.Any], tp.Any]],
+    microbatch_weight_fn: tp.Callable[[tp.Any, tp.Any], jax.Array] | None,
+) -> tuple[dict[str, tp.Any], tp.Any, jax.Array]:
+    """Add one microbatch's ``w * grads`` (fp32) into ``accumulator``.
+
+    ``w`` is ``microbatch_weight_fn(graphstate, minibatch)`` (the same callable :func:`minibatch_call` takes)
+    or ``1`` when it is ``None``, so dividing by the summed weight reproduces :func:`minibatch_call`.
+
+    Returns:
+        ``(accumulator, step_metrics, weight)``; the metrics are the microbatch's own.
+    """
+    if microbatch_weight_fn is None:
+        weight = jnp.ones((), jnp.float32)
+    else:
+        weight = jnp.asarray(microbatch_weight_fn(graphstate, minibatch), jnp.float32).reshape(())
+    (_, step_metrics), step_grads = grad_fn(graphstate, minibatch)
+    grads = jax.tree_util.tree_map(lambda a, g: a + g.astype(jnp.float32) * weight, accumulator["grads"], step_grads)
+    new_acc = {"grads": grads, "weight": accumulator["weight"] + weight, "count": accumulator["count"] + 1}
+    return new_acc, step_metrics, weight
+
+
+def fold_microbatch_metrics(acc_metrics: tp.Any, step_metrics: tp.Any, weight: jax.Array) -> tp.Any:
+    """Fold one microbatch's metrics as ``acc + w * m`` in fp32; ``LossMetrics.weight_sum`` is summed plainly.
+
+    Args:
+        acc_metrics: Running fold (``None`` for the first microbatch).
+        step_metrics: The microbatch's metrics.
+        weight: The microbatch weight returned by :func:`accumulate_microbatch`.
+
+    Returns:
+        The updated fold.
+    """
+    weight = jnp.asarray(weight, jnp.float32)
+    if acc_metrics is None:
+        out = jax.tree_util.tree_map(lambda s: jnp.asarray(s, jnp.float32) * weight, step_metrics)
+        prev_weight_sum = jnp.zeros((), jnp.float32)
+    else:
+        out = jax.tree_util.tree_map(lambda a, s: a + jnp.asarray(s, jnp.float32) * weight, acc_metrics, step_metrics)
+        prev_weight_sum = getattr(acc_metrics, "weight_sum", None)
+    if isinstance(step_metrics, LossMetrics) and step_metrics.weight_sum is not None:
+        out = out.replace(weight_sum=prev_weight_sum + jnp.asarray(step_metrics.weight_sum, jnp.float32))
+    return out
+
+
+def finalize_accumulation(
+    accumulator: dict[str, tp.Any], acc_metrics: tp.Any, graphstate: tp.Any
+) -> tuple[tp.Any, tp.Any]:
+    """Divide the accumulated sums by the summed weight; gradients are cast back to the parameter dtypes.
+
+    A zero summed weight divides by one (every weighted term is then zero).
+
+    Returns:
+        ``(gradients, metrics)``.
+    """
+    total = accumulator["weight"]
+    norm = jnp.where(total > 0, total, jnp.float32(1.0))
+    grads = jax.tree_util.tree_map(lambda g, p: (g / norm).astype(p.dtype), accumulator["grads"], graphstate)
+    weight_sum = getattr(acc_metrics, "weight_sum", None) if isinstance(acc_metrics, LossMetrics) else None
+    metrics = jax.tree_util.tree_map(lambda m: m / norm, acc_metrics)
+    if weight_sum is not None:
+        metrics = metrics.replace(weight_sum=weight_sum)
+    return grads, metrics
+
+
 def minibatch_call(
     state: EasyDeLState,
     batch: dict,

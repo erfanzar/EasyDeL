@@ -6,8 +6,11 @@
 
 from __future__ import annotations
 
+import functools
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 import spectrax as spx
 from spectrax.core.containers import (
@@ -701,3 +704,109 @@ def test_modulelist_scan_inside_fori_loop_covers_every_layer():
         expected = layer(expected)
     out = spx.fori_loop(0, 1, lambda _i, m, carry: m.layers.scan(lambda layer, c: layer(c), carry), holder, x)
     assert jnp.allclose(out, expected, atol=1e-5)
+
+
+class CachedConfig:
+    """Plain config object exposing a ``functools.cached_property``."""
+
+    def __init__(self, width: int):
+        """Initialize with width."""
+        self.width = width
+
+    @functools.cached_property
+    def derived(self) -> int:
+        """Value that lands in the instance ``__dict__`` once read."""
+        return self.width * 2
+
+
+class CachedConfigBlock(Module):
+    """Block holding a config object as a static/opaque field."""
+
+    def __init__(self, cfg: CachedConfig):
+        """Initialize with cfg, weight."""
+        super().__init__()
+        self.cfg = cfg
+        self.weight = Parameter(jnp.asarray(1.0, dtype=jnp.float32))
+
+    def forward(self, x):
+        """Run the forward pass."""
+        return x + self.weight.value
+
+
+@pytest.mark.parametrize("populated", [0, 1, 2])
+def test_modulelist_scan_plan_ignores_populated_cached_property(populated):
+    """A read ``cached_property`` on a held object must not split one layer into its own scan segment."""
+    cfgs = [CachedConfig(3) for _ in range(3)]
+    assert cfgs[populated].derived == 6
+    assert "derived" in vars(cfgs[populated])
+    layers = ModuleList([CachedConfigBlock(cfg) for cfg in cfgs])
+
+    plan = _build_scan_plan_from_modules(list(layers), context="test")
+
+    assert plan.lowering == "single_template"
+    assert [segment.length for segment in plan.segments] == [3]
+
+
+def test_modulelist_scan_plan_still_splits_on_real_config_difference():
+    """Ignoring cached values must not hide genuinely different public attributes."""
+    layers = ModuleList(
+        [CachedConfigBlock(CachedConfig(3)), CachedConfigBlock(CachedConfig(3)), CachedConfigBlock(CachedConfig(5))]
+    )
+
+    plan = _build_scan_plan_from_modules(list(layers), context="test")
+
+    assert [segment.length for segment in plan.segments] == [2, 1]
+
+
+def _concrete_index_makers():
+    """Index constructors that must all be treated as concrete."""
+    return [
+        pytest.param(int, id="python-int"),
+        pytest.param(np.int32, id="np-int32"),
+        pytest.param(np.int64, id="np-int64"),
+        pytest.param(lambda i: jnp.asarray(i, dtype=jnp.int32), id="jax-scalar"),
+    ]
+
+
+@pytest.mark.parametrize("make_idx", _concrete_index_makers())
+def test_modulelist_getitem_accepts_concrete_index_types(make_idx):
+    """Concrete integer-like indices return the stored module itself."""
+    layers = ModuleList([IndexedBlock(i) for i in range(3)])
+    for i in range(3):
+        assert layers[make_idx(i)] is layers[i]
+
+
+@pytest.mark.parametrize("make_idx", _concrete_index_makers())
+def test_stacked_modulelist_getitem_accepts_concrete_index_types(make_idx):
+    """Stacked containers bind the requested row for every concrete index type."""
+    layers = ModuleList([IndexedBlock(i) for i in range(3)]).stack()
+    for i in range(3):
+        assert float(layers[make_idx(i)].weight.value) == float(i + 1)
+
+
+def test_modulelist_getitem_traced_index_under_jit():
+    """A traced index takes the dynamic path and selects the right layer."""
+    layers = ModuleList([_linear(i) for i in range(3)])
+    expected = [layer.weight.value for layer in layers]
+
+    @jax.jit
+    def pick(i):
+        return layers[i].weight.value
+
+    for i in range(3):
+        assert jnp.allclose(pick(jnp.asarray(i)), expected[i])
+
+
+def test_stacked_modulelist_getitem_traced_index_under_jit_and_fori_loop():
+    """Stacked traced indexing works under ``jax.jit`` and ``spx.fori_loop``."""
+    layers = ModuleList([IndexedBlock(i) for i in range(3)]).stack()
+
+    @jax.jit
+    def pick(i):
+        return layers[i].weight.value
+
+    assert [float(pick(jnp.asarray(i))) for i in range(3)] == [1.0, 2.0, 3.0]
+
+    x = jnp.asarray(0.0, dtype=jnp.float32)
+    out = spx.fori_loop(0, 3, lambda i, m, carry: m[i](carry), layers, x)
+    assert float(out) == 6.0

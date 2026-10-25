@@ -56,6 +56,7 @@ from .blocksparse_attention import blocksparse_attention as blocksparse_attentio
 from .compressed_window_attention import compressed_window_attention
 from .compressed_window_decode import compressed_window_decode
 from .deepseek_attn import deepseek_attn
+from .dsa_sparse_attention import dsa_sparse_attention
 from .flash_attention import flash_attention
 from .flash_mla import flash_mla
 from .fused_conv_decode import fused_conv_decode
@@ -68,8 +69,11 @@ from .grouped_matmul import grouped_matmul
 from .grouped_matmul_channelwise import grouped_matmul_channelwise
 from .grouped_matmulv2 import grouped_matmulv2
 from .grouped_matmulv3 import grouped_matmulv3
+from .indexer_scores import indexer_scores
+from .kda_chunk import kda_chunk
 from .kda_chunk_local import kda_chunk_local
 from .mhc_coefficients import mhc_coefficients
+from .mhc_fused import mhc_collapse, mhc_expand
 from .multi_latent_ragged_page_attention import multi_latent_ragged_page_attention
 from .multi_latent_ragged_page_attention_v2 import multi_latent_ragged_page_attention_v2
 from .page_attention import page_attention
@@ -84,6 +88,7 @@ from .ragged_page_attention_v3 import ragged_page_attention_v3
 from .reduce_scatter import reduce_scatter
 from .reduce_scatter_matmul import reduce_scatter_matmul
 from .ring_attention import ring_attention
+from .row_permute import row_permute
 from .sinkhorn_knopp import sinkhorn_knopp
 from .sparse_multi_latent_ragged_page_attention import sparse_multi_latent_ragged_page_attention
 from .sparse_selected_attention import sparse_selected_attention
@@ -97,6 +102,7 @@ __all__ = (
     "compressed_window_attention",
     "compressed_window_decode",
     "deepseek_attn",
+    "dsa_sparse_attention",
     "flash_attention",
     "flash_mla",
     "fused_conv_decode",
@@ -109,8 +115,12 @@ __all__ = (
     "grouped_matmul_channelwise",
     "grouped_matmulv2",
     "grouped_matmulv3",
+    "indexer_scores",
+    "kda_chunk",
     "kda_chunk_local",
     "mhc_coefficients",
+    "mhc_collapse",
+    "mhc_expand",
     "multi_latent_ragged_page_attention",
     "multi_latent_ragged_page_attention_v2",
     "page_attention",
@@ -125,6 +135,7 @@ __all__ = (
     "reduce_scatter",
     "reduce_scatter_matmul",
     "ring_attention",
+    "row_permute",
     "sinkhorn_knopp",
     "sparse_multi_latent_ragged_page_attention",
     "sparse_selected_attention",

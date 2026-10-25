@@ -556,6 +556,7 @@ class Qwen3Model(EasyDeLBaseModule):
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states: Float[Array, "batch seq_len hidden_dim"] = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")

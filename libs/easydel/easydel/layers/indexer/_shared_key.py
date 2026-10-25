@@ -35,16 +35,101 @@ from easydel.layers.linears import ColumnParallelLinear
 from easydel.layers.norms import RMSNorm
 
 from ._paged import bounded_block_max_topk, slot_entry_topk
-from ._selection import IndexerSelection
+from ._selection import IndexerSelection, _score_row_layout
 
 __all__ = (
+    "SCORING_KERNELS",
     "IndexerScoreInputs",
     "SharedKeyIndexer",
     "SharedKeyIndexerConfig",
+    "fused_head_scores",
     "select_candidate_blocks",
     "selection_bias",
     "shared_key_scores",
 )
+
+SCORING_KERNELS = ("xla", "pallas")
+
+
+def check_scoring_kernel(scoring_kernel: str) -> str:
+    """Validate a ``scoring_kernel`` setting.
+
+    Args:
+        scoring_kernel: Requested scoring path.
+
+    Returns:
+        The validated value.
+
+    Raises:
+        ValueError: When it is not one of :data:`SCORING_KERNELS`.
+    """
+    if scoring_kernel not in SCORING_KERNELS:
+        raise ValueError(f"scoring_kernel must be one of {SCORING_KERNELS}, got {scoring_kernel!r}.")
+    return scoring_kernel
+
+
+def fused_head_scores(
+    q: Float[Array, "batch seq heads dim"],
+    keys: Float[Array, "batch entries dim"],
+    weights: Float[Array, "batch seq heads"],
+    *,
+    precision: jax.lax.PrecisionLike = None,
+    mesh_source: object | None = None,
+) -> Float[Array, "batch seq entries"]:
+    """``sum_h weights[b, s, h] * relu(q[b, s, h] . keys[b, t])`` (fp32) through the ``indexer_scores`` operation.
+
+    Operands are contracted in fp32 at ``precision``, the same contract as the dense XLA expression. On TPU the
+    ejkernel Pallas kernel keeps the per-head logits in VMEM. A Mosaic call cannot be GSPMD-partitioned, so on a
+    multi-device mesh the kernel runs under ``shard_map`` with the score-row layout resolved from ``mesh_source`` (an
+    object exposing ``mesh`` and ``runtime_sharding_resolver``, e.g. a model config): batch / query rows follow the
+    activation partition, heads and keys stay whole on every device (the output is head-summed). Inside a fully
+    manual region the kernel runs per device directly. Without a resolvable layout on a multi-device mesh, and off
+    TPU, the operation's XLA reference runs and GSPMD partitions it.
+
+    Args:
+        q: Index queries ``[B, S, H, D]``.
+        keys: Index keys ``[B, T, D]``.
+        weights: Per-head weights ``[B, S, H]`` with every positive scale folded in.
+        precision: Contraction precision.
+        mesh_source: Optional mesh / resolver provider.
+
+    Returns:
+        fp32 scores ``[B, S, T]``, differentiable in all three operands.
+    """
+    # Imported lazily: ``easydel.operations`` imports ``easydel.layers``.
+    from easydel.operations.kernels.indexer_scores import indexer_scores_op
+
+    op = indexer_scores_op()
+    query = jnp.swapaxes(q.astype(jnp.float32), 1, 2)  # [B, H, S, D]
+    head_w = jnp.swapaxes(weights.astype(jnp.float32), 1, 2)[..., None]  # [B, H, S, 1]
+    keys = keys.astype(jnp.float32)
+
+    def native() -> Array:
+        return op.forward_native(query, keys, head_w, precision=precision).scores
+
+    def per_device() -> Array:
+        return op(query, keys, head_w, precision=precision).scores
+
+    if jax.default_backend() != "tpu":
+        return native()
+    ambient = jax.sharding.get_abstract_mesh()
+    if not ambient.empty and ambient.manual_axes:
+        auto = [name for name in ambient.axis_names if name not in ambient.manual_axes and ambient.shape[name] > 1]
+        return native() if auto else per_device()
+    batch, seq = q.shape[:2]
+    mesh, spec = _score_row_layout(mesh_source, (batch, seq, keys.shape[1]))
+    if mesh is None:
+        return per_device() if jax.device_count() == 1 else native()
+    if mesh.size == 1:
+        return per_device()
+    rows_b, rows_s = spec[0], spec[1]
+    in_specs = (
+        PartitionSpec(rows_b, None, rows_s, None),
+        PartitionSpec(rows_b, None, None),
+        PartitionSpec(rows_b, None, rows_s, None),
+    )
+    out_specs = PartitionSpec(rows_b, rows_s, None)
+    return op(query, keys, head_w, precision=precision, mesh=mesh, in_specs=in_specs, out_specs=out_specs).scores
 
 
 def select_candidate_blocks(
@@ -87,6 +172,9 @@ def shared_key_scores(
     positions: Int[Array, "batch seq"],
     ratio: int,
     precision: jax.lax.PrecisionLike = None,
+    *,
+    scoring_kernel: str = "xla",
+    mesh_source: object | None = None,
 ) -> Float[Array, "batch seq entries"]:
     """Differentiable shared-key indexer scores ``sum_h relu(q_h . k_t) * w_h`` (``-inf`` beyond each query's reach).
 
@@ -100,12 +188,17 @@ def shared_key_scores(
         positions: Query positions ``[B, S]``.
         ratio: Source tokens per entry (query ``s`` reaches entries ``< (s + 1) // ratio``).
         precision: Matmul precision.
+        scoring_kernel: ``"xla"`` (dense einsum) or ``"pallas"`` (:func:`fused_head_scores` for more than one query).
+        mesh_source: Mesh / resolver provider for the fused path on a multi-device mesh.
 
     Returns:
         fp32 scores ``[B, S, T]``.
     """
-    logits = jnp.einsum("bshd,btd->bsht", q.astype(jnp.float32), index_k.astype(jnp.float32), precision=precision)
-    scores = jnp.sum(jax.nn.relu(logits) * weights[..., None], axis=2)
+    if check_scoring_kernel(scoring_kernel) == "pallas" and q.shape[1] > 1:
+        scores = fused_head_scores(q, index_k, weights, precision=precision, mesh_source=mesh_source)
+    else:
+        logits = jnp.einsum("bshd,btd->bsht", q.astype(jnp.float32), index_k.astype(jnp.float32), precision=precision)
+        scores = jnp.sum(jax.nn.relu(logits) * weights[..., None], axis=2)
     compress_lens = entry_reach(positions, ratio)
     reachable = jnp.arange(index_k.shape[1], dtype=jnp.int32)[None, None, :] < compress_lens[..., None]
     return jnp.where(reachable, scores, -jnp.inf)
@@ -124,10 +217,21 @@ class IndexerScoreInputs(tp.NamedTuple):
     positions: Array
     ratio: int
     precision: tp.Any = None
+    scoring_kernel: str = "xla"
+    mesh_source: tp.Any = None
 
     def rows(self, q: Array, weights: Array, positions: Array) -> Array:
         """Scores of a query slice (the slice of :attr:`q` / :attr:`weights` / :attr:`positions` given)."""
-        return shared_key_scores(q, weights, self.index_k, positions, self.ratio, self.precision)
+        return shared_key_scores(
+            q,
+            weights,
+            self.index_k,
+            positions,
+            self.ratio,
+            self.precision,
+            scoring_kernel=self.scoring_kernel,
+            mesh_source=self.mesh_source,
+        )
 
     def dense(self) -> Array:
         """Full ``[B, S, T]`` scores."""
@@ -194,6 +298,9 @@ class SharedKeyIndexerConfig:
         candidate_block_size: Entries per candidate block.
         rms_norm_eps: Epsilon of the index-key RMSNorm.
         initializer_range: Standard deviation of the projection initializers.
+        scoring_kernel: Dense multi-query scoring of the differentiable scores (``return_scores``): ``"xla"``
+            (default, dense einsum) or ``"pallas"`` (the registered ``indexer_scores`` operation; fused Pallas
+            kernel on TPU). Selection keeps the context-bounded selectors either way.
     """
 
     hidden_size: int
@@ -210,8 +317,10 @@ class SharedKeyIndexerConfig:
     candidate_block_size: int = 1
     rms_norm_eps: float = 1e-6
     initializer_range: float = 0.02
+    scoring_kernel: str = "xla"
 
     def __post_init__(self):
+        check_scoring_kernel(self.scoring_kernel)
         if self.ratio < 1:
             raise ValueError(f"ratio must be >= 1, got {self.ratio}.")
         if self.index_n_heads < 1 or self.index_head_dim < 1 or self.index_topk < 1:
@@ -260,6 +369,7 @@ class SharedKeyIndexer(spx.Module):
         self.uses_candidates = config.uses_candidates
         self.candidate_topk_blocks = config.candidate_topk_blocks
         self.candidate_block_size = config.candidate_block_size
+        self.scoring_kernel = config.scoring_kernel
         kwargs = dict(
             use_bias=False,
             dtype=dtype,
@@ -357,7 +467,17 @@ class SharedKeyIndexer(spx.Module):
         else:
             topk, published = self._select(sel_q, sel_w, keys, compress_lens, cand, kernel_mesh)
         if return_scores:
-            return topk, published, IndexerScoreInputs(q, weights, index_k, positions, self.ratio, self.precision)
+            scores = IndexerScoreInputs(
+                q,
+                weights,
+                index_k,
+                positions,
+                self.ratio,
+                self.precision,
+                scoring_kernel=self.scoring_kernel,
+                mesh_source=getattr(self, "mesh_source", None),
+            )
+            return topk, published, scores
         return topk, published
 
     def _select(
@@ -446,4 +566,13 @@ class SharedKeyIndexer(spx.Module):
         self, q: Array, weights: Array, index_k: Array, positions: Int[Array, "batch seq"]
     ) -> Float[Array, "batch seq entries"]:
         """Differentiable dense scores ``[B, S, T]`` (``-inf`` beyond reach); see :func:`shared_key_scores`."""
-        return shared_key_scores(q, weights, index_k, positions, self.ratio, self.precision)
+        return shared_key_scores(
+            q,
+            weights,
+            index_k,
+            positions,
+            self.ratio,
+            self.precision,
+            scoring_kernel=self.scoring_kernel,
+            mesh_source=getattr(self, "mesh_source", None),
+        )

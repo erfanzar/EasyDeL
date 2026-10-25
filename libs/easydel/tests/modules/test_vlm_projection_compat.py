@@ -28,6 +28,8 @@ def test_inherited_projection_and_trace_safe_projection_resolve_the_same_weights
         apply_lm_head = wrapper.apply_lm_head
         make_lm_head_fn = EasyDeLBaseModule.make_lm_head_fn
         _tie_embeddings_enabled = EasyDeLBaseModule._tie_embeddings_enabled
+        _tied_lm_head_weight = EasyDeLBaseModule._tied_lm_head_weight
+        _lm_head_kernel_spec = EasyDeLBaseModule._lm_head_kernel_spec
         config = SimpleNamespace(tie_word_embeddings=config_tie)
         _tie_embeddings_feature = SimpleNamespace(tie=constructor_tie)
 

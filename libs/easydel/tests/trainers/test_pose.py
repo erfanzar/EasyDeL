@@ -331,3 +331,100 @@ def test_valid_end_lt2_row_and_short_trailing_segment_skipped():
     apply_pose_to_positions(pos, config=cfg, step=0, rng=rng, tokens=tokens, labels=labels, pad_id=0)
     # row0 untouched; row1 seg(0,3): split=1,base=0,gap=2 -> [0,3,4]; trailing pos[3]=0 untouched
     assert pos.tolist() == [[0, 1, 2, 3], [0, 3, 4, 0]]
+
+
+def test_log_uniform_gap_scripted():
+    """log_uniform: gap = int(exp(log(gap_min) + u*(log(max_gap+1) - log(gap_min)))), drawn via random()."""
+    cfg = PoSEConfig(
+        enabled=True,
+        p_pose=1.0,
+        target_max_pos=70,
+        min_chunk_frac=0.5,
+        max_chunk_frac=0.5,
+        gap_mode="log_uniform",
+        gap_min=2,
+    )
+    pos = np.array([[0, 1, 2, 3, 4, 5]], dtype=np.int64)
+    # max_gap=70-0-6=64; u=0.5 -> sqrt(2*65)=11.40 -> gap=11; split=3 -> second_start=14
+    apply_pose_to_positions(pos, config=cfg, step=0, rng=_ScriptedRNG(randoms=[0.0, 0.5]))
+    assert pos.tolist() == [[0, 1, 2, 14, 15, 16]]
+
+
+def test_log_uniform_falls_back_to_uniform_below_gap_min():
+    cfg = PoSEConfig(
+        enabled=True,
+        p_pose=1.0,
+        target_max_pos=16,
+        min_chunk_frac=0.5,
+        max_chunk_frac=0.5,
+        gap_mode="log_uniform",
+        gap_min=12,
+    )
+    pos = np.array([[0, 1, 2, 3, 4, 5]], dtype=np.int64)
+    # max_gap=10 < gap_min=12 -> uniform integers draw (scripted 4) -> second_start=3+4=7
+    apply_pose_to_positions(pos, config=cfg, step=0, rng=_ScriptedRNG(randoms=[0.0], integers=[4]))
+    assert pos.tolist() == [[0, 1, 2, 7, 8, 9]]
+
+
+def test_explicit_gap_mode_overrides_bias_large_gap():
+    cfg = PoSEConfig(
+        enabled=True,
+        p_pose=1.0,
+        target_max_pos=16,
+        min_chunk_frac=0.5,
+        max_chunk_frac=0.5,
+        bias_large_gap=True,
+        gap_mode="uniform",
+    )
+    assert cfg.resolved_gap_mode() == "uniform"
+    pos = np.array([[0, 1, 2, 3, 4, 5]], dtype=np.int64)
+    apply_pose_to_positions(pos, config=cfg, step=0, rng=_ScriptedRNG(randoms=[0.0], integers=[2]))
+    assert pos.tolist() == [[0, 1, 2, 5, 6, 7]]
+    assert PoSEConfig(bias_large_gap=False).resolved_gap_mode() == "uniform"
+    assert PoSEConfig().resolved_gap_mode() == "biased"
+
+
+def test_log_uniform_gaps_spread_evenly_over_octaves():
+    """Real RNG: gap lengths land with roughly equal mass per octave of [gap_min, max_gap]."""
+    cfg = PoSEConfig(
+        enabled=True,
+        p_pose=1.0,
+        target_max_pos=1024 + 8,
+        min_chunk_frac=0.5,
+        max_chunk_frac=0.5,
+        gap_mode="log_uniform",
+        gap_min=4,
+    )
+    rng = np.random.default_rng(0)
+    gaps = []
+    for _ in range(4000):
+        pos = np.arange(8, dtype=np.int64)[None, :]
+        apply_pose_to_positions(pos, config=cfg, step=0, rng=rng)
+        gaps.append(int(pos[0, 4] - 4))
+    gaps = np.asarray(gaps)
+    assert gaps.min() >= 4 and gaps.max() <= 1024
+    octaves = np.histogram(np.log2(gaps), bins=[2, 4, 6, 8, 10])[0]
+    assert np.all(np.abs(octaves - len(gaps) / 4) < 0.1 * len(gaps) / 4), octaves
+
+
+def test_gap_mode_validation():
+    with pytest.raises(ValueError, match="gap_mode"):
+        PoSEConfig(gap_mode="exponential")
+    with pytest.raises(ValueError, match="gap_min"):
+        PoSEConfig(gap_min=0)
+    with pytest.raises(ValueError, match="gap_min"):
+        PoSEConfig(enabled=True, p_pose=0.5, target_max_pos=64, gap_mode="log_uniform", gap_min=64)
+    cfg = PoSEConfig(enabled=True, p_pose=0.5, target_max_pos=64, gap_mode="log_uniform", gap_min=8)
+    assert PoSEConfig.from_dict(cfg.to_dict()) == cfg
+
+
+def test_apply_pose_to_batch_returns_writable_copy_of_read_only_positions():
+    cfg = PoSEConfig(enabled=True, p_pose=1.0, target_max_pos=64)
+    positions = np.tile(np.arange(8, dtype=np.int64), (2, 1))
+    positions.flags.writeable = False
+    batch = apply_pose_to_batch(
+        {"position_ids": positions}, config=cfg, step=0, seed=0, image_token_id=None, pad_id=None
+    )
+    assert batch["position_ids"] is not positions
+    assert batch["position_ids"].max() < 64
+    np.testing.assert_array_equal(positions, np.tile(np.arange(8), (2, 1)))

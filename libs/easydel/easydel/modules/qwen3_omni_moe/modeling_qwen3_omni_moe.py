@@ -660,6 +660,7 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, 0),
             trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs("audio"),
         )
         hidden_states = self.ln_post(hidden_states)
 
@@ -1337,6 +1338,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, 0),
             trace=not self.config.scan_layers or self._pipeline_stage_count() > 1 or bool(self.deepstack_visual_indexes),
+            **self._layer_scan_kwargs("vision"),
         )
         return typing.cast(Array, self.merger(hidden_states)), deepstack_features
 
@@ -2565,6 +2567,7 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
 
@@ -2987,6 +2990,7 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
 
@@ -3710,6 +3714,7 @@ class Qwen3OmniMoeCode2WavTransformerModel(EasyDeLLayerStackMixin, spx.Module):
             _layer_loop,
             (hidden_states, 0),
             trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
 
@@ -4120,6 +4125,7 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_self_attentions, all_router_logits, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
 
@@ -4575,6 +4581,7 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 

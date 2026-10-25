@@ -97,6 +97,33 @@ class SpeculativeStrategy(typing.Protocol):
         """Whether speculative decoding should use the greedy path."""
         ...
 
+    def uses_history_penalties(self, req_state: CachedRequestState | None) -> bool:
+        """Whether the request carries a presence, frequency or repetition penalty."""
+        ...
+
+    def penalized_verify_argmaxes(
+        self,
+        logits: jax.Array,
+        entries: typing.Sequence[tuple[_SpecVerifyMetadata, int, int]],
+    ) -> typing.Any:
+        """Greedy verify argmaxes with history penalties applied, or ``None`` when nothing is penalised."""
+        ...
+
+    def penalized_replay_token(
+        self,
+        *,
+        meta: _SpecVerifyMetadata,
+        req_state: CachedRequestState | None,
+        hidden_row: jax.Array,
+        draft_prefix: int,
+    ) -> int | None:
+        """Penalised greedy token from a replay hidden row, or ``None`` when the request is unpenalised."""
+        ...
+
+    def sync_penalty_counts(self, scheduler_output: SchedulerOutput) -> None:
+        """Rewrite drifted sampler token counts of penalised speculative requests."""
+        ...
+
     def cache_replay_required(self) -> bool:
         """Whether rejected drafts require an explicit KV replay."""
         ...
@@ -293,6 +320,25 @@ class NullSpeculation:
         """Always ``False``: mirrors the drafter-gated greedy check."""
         del req_state
         return False
+
+    def uses_history_penalties(self, req_state: CachedRequestState | None) -> bool:
+        """Always ``False``: no verify path exists to penalise."""
+        del req_state
+        return False
+
+    def sync_penalty_counts(self, scheduler_output: SchedulerOutput) -> None:
+        """No-op: without speculation the sampler's own counts stay exact."""
+        del scheduler_output
+
+    def penalized_verify_argmaxes(self, *args: typing.Any, **kwargs: typing.Any) -> typing.NoReturn:
+        """Unreachable without a drafter; fails loudly."""
+        del args, kwargs
+        self._unsupported("penalized_verify_argmaxes")
+
+    def penalized_replay_token(self, *args: typing.Any, **kwargs: typing.Any) -> typing.NoReturn:
+        """Unreachable without a drafter; fails loudly."""
+        del args, kwargs
+        self._unsupported("penalized_replay_token")
 
     def cache_replay_required(self) -> bool:
         """Always ``False``: no speculative KV to replay."""

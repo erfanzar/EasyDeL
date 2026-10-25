@@ -63,6 +63,9 @@ def compressed_window_attention(
     token_kv_len: int = 0,
     token_valid: Array | None = None,
     entry_topk: Array | None = None,
+    backward: str = "flash",
+    causal: bool = False,
+    vmem_capacity_bytes: int | None = None,
 ) -> Float[Array, "batch num_heads q_len head_dim"]:
     """Sink-augmented shared-KV full-sequence attention with a bias (XLA).
 
@@ -97,11 +100,15 @@ def compressed_window_attention(
             zero-width ``bias``). Requires ``token_valid``. With a sink this runs
             the sparse ``O(S * (window + k))`` attend; without one the selection is
             expanded to the dense mask.
+        backward: Accepted and ignored (interface parity; plain autodiff here).
+        causal: Accepted and ignored (interface parity; the dense reference masks
+            via ``bias`` regardless). Not ``del``'d, which would mark it unsupported.
+        vmem_capacity_bytes: Accepted and ignored (interface parity; Pallas tiling).
 
     Returns:
         Attention output ``[batch, num_heads, q_len, head_dim]``.
     """
-    del fwd_params  # window / token_kv_len are supported no-ops for the dense path
+    del fwd_params  # window / token_kv_len / backward / causal / vmem_capacity_bytes are supported no-ops here
     if entry_topk is not None:
         if token_valid is None:
             raise ValueError("entry_topk requires token_valid (the implicit token mask).")

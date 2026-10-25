@@ -31,6 +31,7 @@ from ._config import IndexerConfig, IndexerKind
 from ._primitives import indices_to_bool_mask, visible_causal_mask
 from ._rope import apply_indexer_rope, truncate_cos_sin
 from ._selection import BaseIndexer, IndexerSelection, SelectionSpec, top_k_indices
+from ._shared_key import fused_head_scores
 
 __all__ = ("IndexerLayerNorm", "IndexerOutput", "SparseIndexer")
 
@@ -604,6 +605,35 @@ class SparseIndexer(BaseIndexer):
         weights = self.weights_proj(hidden_states).astype(jnp.float32) * (self.n_heads**-0.5)
         return jnp.einsum("bsh,bshn->bsn", weights, scores, precision=self.precision)
 
+    def _uses_fused_scoring(self, query: Array) -> bool:
+        """Whether this call scores through the ``indexer_scores`` operation (opt-in, multi-query calls only)."""
+        return self.config.scoring_kernel == "pallas" and query.shape[1] > 1
+
+    def _fused_scores(
+        self,
+        query: Float[Array, "batch seq heads head_dim"],
+        keys: Float[Array, "batch n head_dim"],
+        hidden_states: Float[Array, "batch seq hidden"],
+    ) -> Float[Array, "batch seq n"]:
+        """Head-reduced relu scores ``[batch, seq, n]`` through :func:`fused_head_scores`.
+
+        ``sum_h w_h * relu(sm * q_h . k) == sum_h (w_h * sm) * relu(q_h . k)`` because ``sm > 0``, so the softmax
+        scale folds into the head weights (all ones for ``head_reduction="uniform"``).
+
+        Args:
+            query: Roped indexer queries.
+            keys: Candidate keys (tokens or pool summaries).
+            hidden_states: Layer input for the learned head weights.
+
+        Returns:
+            fp32 scores equal to the dense ``_reduce_heads(relu(scale * q.k))`` path.
+        """
+        if self.config.head_reduction == "uniform":
+            weights = jnp.full(query.shape[:3], self.softmax_scale, jnp.float32)
+        else:
+            weights = self.weights_proj(hidden_states).astype(jnp.float32) * (self.n_heads**-0.5 * self.softmax_scale)
+        return fused_head_scores(query, keys, weights, precision=self.precision, mesh_source=self.mesh_source)
+
     def _select_token(
         self,
         hidden_states: Float[Array, "batch seq hidden"],
@@ -633,11 +663,14 @@ class SparseIndexer(BaseIndexer):
             keys_f32 = keys_f32[..., : self.head_dim]
         keys_f32 = keys_f32.astype(jnp.float32)
 
-        scores = jnp.einsum("bshd,btd->bsht", query.astype(jnp.float32), keys_f32, precision=self.precision)
-        scores = scores * self.softmax_scale
-        if self.config.score_activation == "relu":
-            scores = jax.nn.relu(scores)
-        index_scores = self._reduce_heads(scores, hidden_states)
+        if self._uses_fused_scoring(query):
+            index_scores = self._fused_scores(query, keys_f32, hidden_states)
+        else:
+            scores = jnp.einsum("bshd,btd->bsht", query.astype(jnp.float32), keys_f32, precision=self.precision)
+            scores = scores * self.softmax_scale
+            if self.config.score_activation == "relu":
+                scores = jax.nn.relu(scores)
+            index_scores = self._reduce_heads(scores, hidden_states)
 
         valid_candidates = None
         if pairwise_mask is not None:
@@ -756,13 +789,16 @@ class SparseIndexer(BaseIndexer):
         pool_keys, pool_indices, pool_valid = self._pooled_states(packed_state, key_segment_ids)
         num_pools = pool_keys.shape[1]
 
-        scores = jnp.einsum(
-            "bshd,bpd->bshp", query.astype(jnp.float32), pool_keys.astype(jnp.float32), precision=self.precision
-        )
-        scores = scores * self.softmax_scale
-        if self.config.score_activation == "relu":
-            scores = jax.nn.relu(scores)
-        index_scores = self._reduce_heads(scores, hidden_states)
+        if self._uses_fused_scoring(query):
+            index_scores = self._fused_scores(query, pool_keys.astype(jnp.float32), hidden_states)
+        else:
+            scores = jnp.einsum(
+                "bshd,bpd->bshp", query.astype(jnp.float32), pool_keys.astype(jnp.float32), precision=self.precision
+            )
+            scores = scores * self.softmax_scale
+            if self.config.score_activation == "relu":
+                scores = jax.nn.relu(scores)
+            index_scores = self._reduce_heads(scores, hidden_states)
 
         # A pool is selectable only when its final token is visible
         # (causality + padding).

@@ -183,8 +183,7 @@ class ShardedDataSource(ABC, Generic[T_co]):
         checkpoint resume) counts DELIVERED examples but locates shard
         boundaries with ``ShardInfo.num_rows`` metadata; the two only
         agree when iteration cannot skip data. Sources whose decoders
-        may drop rows (e.g. the Parquet decode-memory guard skipping
-        oversized row groups) override this to ``False`` so wrappers
+        may drop rows override this to ``False`` so wrappers
         fall back to exact sequential replay instead of trusting
         metadata that iteration will not match.
 

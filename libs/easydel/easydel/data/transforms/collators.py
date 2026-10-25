@@ -92,11 +92,49 @@ import typing as tp
 
 import numpy as np
 
+from .mixture import ASSISTANT_ONLY_FIELD, ASSISTANT_ONLY_TOKEN_FIELD, DATASET_ID_FIELD, DATASET_ID_TOKEN_FIELD
+
 PositionIdFn = tp.Callable[..., tuple[tp.Any, tp.Any]]
 
 
 def _resolve_embed_dtype(embed_dtype: tp.Any) -> np.dtype:
     return np.dtype(embed_dtype)
+
+
+def _scalar_sideband(value: tp.Any, field: str) -> tp.Any:
+    """Unwrap a 0-d array and refuse every non-scalar sideband value.
+
+    A list or 1-d array would broadcast silently over a window slice and mis-attribute it, and
+    ``int(bool([False]))`` would flip an opt-out into an opt-in, so non-scalars fail loudly.
+    """
+    if isinstance(value, (list, tuple, str, bytes, dict)):
+        raise TypeError(f"{field} must be a scalar, got {type(value).__name__}: {value!r}")
+    if isinstance(value, np.ndarray):
+        if value.ndim != 0:
+            raise TypeError(f"{field} must be a scalar, got array shape {value.shape}")
+        value = value.item()
+    return value
+
+
+def _assistant_only_value(value: tp.Any) -> int:
+    """Map a row's tri-state assistant-only choice to ``1`` (opt in), ``0`` (opt out) or ``-1`` (inherit).
+
+    ``bool(-1)`` is ``True``, so a naive ``bool()`` would turn inherit into opt-in; ints are domain-checked.
+    """
+    value = _scalar_sideband(value, ASSISTANT_ONLY_FIELD)
+    if isinstance(value, (bool, np.bool_)):
+        return 1 if value else 0
+    if isinstance(value, (int, np.integer)) and int(value) in (-1, 0, 1):
+        return int(value)
+    raise TypeError(f"{ASSISTANT_ONLY_FIELD} must be a bool or -1/0/1, got {value!r}")
+
+
+def _dataset_id_value(value: tp.Any) -> int:
+    """Validate a row's integer dataset id (``-1`` = unattributed)."""
+    value = _scalar_sideband(value, DATASET_ID_FIELD)
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"{DATASET_ID_FIELD} must be a scalar int, got {value!r}")
+    return int(value)
 
 
 def _as_list(value: tp.Any) -> list[tp.Any]:
@@ -391,6 +429,7 @@ def collate_packed_embeds(
     embed_dim: int | None = None,
     embed_dtype: tp.Any = np.float32,
     position_id_fn: PositionIdFn | None = None,
+    rows_per_window: int | None = None,
 ) -> dict:
     """Packed TRAINING-STATIC MATERIALIZER: turn one batch's per-window row assignments into a
     constant ``(n_windows, seq_len)`` batch on EVERY call (so the pod compiles the step once).
@@ -430,9 +469,69 @@ def collate_packed_embeds(
     The per-row admission guards (``len(input_ids) <= seq_len`` and ``embed_rows <= max_embed_rows``)
     live on the packer (:meth:`EmbedsWindowPacker.push`); the defensive per-window capacity assert
     below catches a hand-built ``packs`` whose rows overflow ``seq_len``.
+
+    Embed layouts. ``rows_per_window=None`` (default) keeps the FLAT layout above. An int ``K``
+    selects the WINDOW-BLOCKED layout: window ``i`` owns rows ``[i*K, i*K + real_i)`` of an
+    ``(n_windows*K, embed_dim)`` buffer, each block's tail left as pad, and ``image_embed_positions``
+    / ``image_embed_mask`` are rebased to the same indices. It needs ``max_embed_rows ==
+    n_windows * K`` and ``1 <= K <= seq_len`` (a window has only ``seq_len`` token slots, so a larger
+    ``K`` is unreachable padding). Blocked reserves ``K`` rows for EVERY window, so it costs
+    ``max(counts) / mean(counts)`` times the flat buffer; it exists for consumers that gather embeds
+    per window (batch-local index, shardable along the batch axis). No model merge in this tree reads
+    the blocked layout yet, so it is opt-in.
+
+    Sideband arrays. Two per-token ``(n_windows, seq_len)`` int32 arrays are always emitted:
+    ``assistant_only_mask`` (:data:`~easydel.data.transforms.mixture.ASSISTANT_ONLY_TOKEN_FIELD`; a
+    row's ``_assistant_only`` tri-state broadcast over its tokens, ``-1`` = inherit, also on padding)
+    and ``dataset_ids`` (:data:`~easydel.data.transforms.mixture.DATASET_ID_TOKEN_FIELD`; a row's
+    ``_dataset_id`` broadcast over its tokens, ``-1`` = unattributed / padding). Rows without the
+    fields leave the ``-1`` init; non-scalar values raise :class:`TypeError`.
+
+    Args:
+        packs: Per-window row lists (at most ``n_windows`` windows).
+        pad_id: Token id used for padding; must differ from ``image_token_id``.
+        seq_len: Static window length.
+        max_embed_rows: Static row count of the ``image_embeds`` buffer.
+        n_windows: Static number of windows (leading batch dimension).
+        image_token_id: Image placeholder token id.
+        embed_dim: Explicit embedding width (required for all-text batches without row metadata).
+        embed_dtype: Output dtype of ``image_embeds``.
+        position_id_fn: Model helper computing per-example 3D M-RoPE positions for image rows.
+        rows_per_window: ``None`` for the flat embed layout, or the per-window block size ``K`` of
+            the window-blocked layout.
+
+    Returns:
+        dict: Static-shape batch arrays (see keys in the body).
+
+    Raises:
+        ValueError: On a blocked-layout contract violation (``K`` out of range, ``max_embed_rows``
+            mismatch, a window overflowing its block, or a row whose placeholder count differs from
+            its decoded embed rows).
+        TypeError: On a non-scalar or out-of-domain sideband value.
     """
     assert pad_id != image_token_id, "pad_id must not collide with the image placeholder id"
     resolved_dtype = _resolve_embed_dtype(embed_dtype)
+
+    blocked = rows_per_window is not None
+    if blocked:
+        if isinstance(rows_per_window, bool) or not isinstance(rows_per_window, (int, np.integer)):
+            raise ValueError(f"rows_per_window must be an int or None, got {rows_per_window!r}")
+        rows_per_window = int(rows_per_window)
+        if rows_per_window < 1:
+            raise ValueError(f"rows_per_window must be >= 1, got {rows_per_window}")
+        if max_embed_rows != n_windows * rows_per_window:
+            raise ValueError(
+                f"window-blocked layout requires max_embed_rows == n_windows * rows_per_window "
+                f"({n_windows} * {rows_per_window} = {n_windows * rows_per_window}), got {max_embed_rows}; "
+                "a consumer deriving K from the buffer would otherwise silently re-block the batch."
+            )
+        if rows_per_window > seq_len:
+            raise ValueError(
+                f"rows_per_window={rows_per_window} exceeds seq_len={seq_len}. A window holds {seq_len} token "
+                f"positions, so it can carry at most {seq_len} image placeholders; the extra rows are unreachable "
+                "padding in every batch. Use max(placeholders per window) for a dense buffer; K == seq_len is the "
+                "upper bound."
+            )
 
     # Partition homogeneity (best-effort; no-op when rows lack the path-only Hive keys -- see module
     # docstring). Keep source/area_bucket: decoded embeds + the scatter assume one teacher/resolution
@@ -463,14 +562,18 @@ def collate_packed_embeds(
     attention_mask = np.zeros((n_windows, seq_len), dtype=np.int32)
     labels = np.full((n_windows, seq_len), -100, dtype=np.int32)
     segment_ids = np.full((n_windows, seq_len), -1, dtype=np.int32)
+    assistant_only_mask = np.full((n_windows, seq_len), -1, dtype=np.int32)
+    dataset_ids = np.full((n_windows, seq_len), -1, dtype=np.int32)
     position_ids = np.zeros((3, n_windows, seq_len), dtype=np.int32)
 
     embeds_list, grids = [], []
     image_embed_positions = np.zeros((max_embed_rows, 2), dtype=np.int32)
     image_embed_mask = np.zeros((max_embed_rows,), dtype=np.int32)
     embed_cursor = 0
+    window_embed_counts = [0] * n_windows
     for wi, pack in enumerate(packs):
         offset = 0
+        window_cursor = 0
         for seg_idx, r in enumerate(pack):
             ids = np.asarray(r["input_ids"], dtype=np.int32)
             length = ids.shape[0]
@@ -483,6 +586,10 @@ def collate_packed_embeds(
             attention_mask[wi, window_slice] = np.asarray(r["attention_mask"], dtype=np.int32)
             labels[wi, window_slice] = np.asarray(r["labels"], dtype=np.int32)
             segment_ids[wi, window_slice] = seg_idx
+            if r.get(ASSISTANT_ONLY_FIELD) is not None:
+                assistant_only_mask[wi, window_slice] = _assistant_only_value(r[ASSISTANT_ONLY_FIELD])
+            if r.get(DATASET_ID_FIELD) is not None:
+                dataset_ids[wi, window_slice] = max(_dataset_id_value(r[DATASET_ID_FIELD]), -1)
 
             # Per-example reset 3D M-RoPE: run the caller's model helper on THIS example alone,
             # then drop the result into the window slice. The generic collator only marks image
@@ -509,13 +616,32 @@ def collate_packed_embeds(
                 example_positions = np.arange(length, dtype=np.int32).reshape(1, 1, -1).repeat(3, axis=0)
             position_ids[:, wi, window_slice] = np.asarray(example_positions)[:, 0, :]
 
-            embeds_list.append(_decode_row_embeds(r, resolved_embed_dim, resolved_dtype, image_token_id=image_token_id))
+            decoded = _decode_row_embeds(r, resolved_embed_dim, resolved_dtype, image_token_id=image_token_id)
+            embeds_list.append(decoded)
             grids.append(grid)
             place_positions = np.flatnonzero(ids == image_token_id).astype(np.int32, copy=False)
             n_place = place_positions.shape[0]
-            image_embed_positions[embed_cursor : embed_cursor + n_place, 0] = wi
-            image_embed_positions[embed_cursor : embed_cursor + n_place, 1] = offset + place_positions
-            image_embed_mask[embed_cursor : embed_cursor + n_place] = 1
+            if blocked:
+                # The blocked scatter slices embeds per window, so a per-row placeholder/embed drift that
+                # cancels across the batch would shift every later block; refuse it per row.
+                if int(decoded.shape[0]) != int(n_place):
+                    raise ValueError(
+                        f"window {wi} segment {seg_idx}: {n_place} image placeholders but {decoded.shape[0]} "
+                        "decoded embed rows; the window-blocked layout would mis-attach every later block."
+                    )
+                if window_cursor + n_place > rows_per_window:
+                    raise ValueError(
+                        f"window {wi} carries {window_cursor + n_place} embed rows > rows_per_window "
+                        f"{rows_per_window}; an overflow would gather into the NEXT window's block."
+                    )
+                dest = wi * rows_per_window + window_cursor
+            else:
+                dest = embed_cursor
+            image_embed_positions[dest : dest + n_place, 0] = wi
+            image_embed_positions[dest : dest + n_place, 1] = offset + place_positions
+            image_embed_mask[dest : dest + n_place] = 1
+            window_cursor += n_place
+            window_embed_counts[wi] += int(decoded.shape[0])
             embed_cursor += n_place
             offset += length
 
@@ -535,7 +661,18 @@ def collate_packed_embeds(
     )
     assert n_real <= max_embed_rows, f"decoded embed rows {n_real} exceed max_embed_rows {max_embed_rows}"
     padded = np.zeros((max_embed_rows, resolved_embed_dim), dtype=resolved_dtype)
-    padded[:n_real] = all_embeds
+    if blocked:
+        # all_embeds is in window order (rows appended with windows outermost): scatter each window's
+        # contiguous run to its block start and leave the block tails as pad.
+        cursor = 0
+        for wi, count in enumerate(window_embed_counts):
+            if count:
+                base = wi * rows_per_window
+                padded[base : base + count] = all_embeds[cursor : cursor + count]
+                cursor += count
+        assert cursor == n_real, f"blocked scatter consumed {cursor} of {n_real} embed rows"
+    else:
+        padded[:n_real] = all_embeds
     grid_thw = np.concatenate(grids, axis=0) if grids else np.zeros((0, 3), np.int32)
 
     return {
@@ -543,6 +680,8 @@ def collate_packed_embeds(
         "attention_mask": attention_mask,
         "labels": labels,
         "segment_ids": segment_ids,
+        ASSISTANT_ONLY_TOKEN_FIELD: assistant_only_mask,
+        DATASET_ID_TOKEN_FIELD: dataset_ids,
         "position_ids": position_ids,
         "image_embeds": padded,
         "image_embed_positions": image_embed_positions,

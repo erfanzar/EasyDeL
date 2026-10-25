@@ -199,4 +199,4 @@ def test_parquet_guard_and_projection_participate_in_reader_identity(tmp_path, s
     projected = ParquetShardedSource(str(path), columns=["text"], max_row_group_bytes=100_000_000)
     assert _collect(_tokenize(projected, tokenizer, cache)) == first
     assert tokenizer.calls == 2
-    assert _collect(_tokenize(ParquetShardedSource(str(path), max_row_group_bytes=1), tokenizer, cache)) == []
+    assert _collect(_tokenize(ParquetShardedSource(str(path), max_row_group_bytes=1), tokenizer, cache)) == first

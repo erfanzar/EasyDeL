@@ -148,15 +148,8 @@ TENSORSTORE_INDEX_NAME = "tensorstore_index.json"
 CONFIG_NAME = "config.json"
 
 
-#: Sentinel: this key was a quantization scale, already consumed alongside its
-#: weight. Distinct from ``None`` ("not quantized, pass through unchanged").
 _QUANT_CONSUMED = object()
 
-#: Arrays per read batch when quantizing at load. The callback that converts
-#: weights runs once per batch, so this caps how much dense weight is resident
-#: at once; large enough to keep the reads parallel, small enough that a
-#: stacked MoE expert tensor times this count still fits beside the quantized
-#: model being built.
 _QUANTIZED_LOAD_CHUNK_SIZE = 16
 
 
@@ -1202,6 +1195,17 @@ class EasyBridgeMixin(PushToHubMixin):
         # including its config/card. Keep all prefixes there while recording the step
         # in Checkpointer's standard discovery metadata.
         checkpoint_options = {"step": int(step), "destination": "."} if step is not None else {}
+        fp32_patterns = tuple(getattr(self, "fp32_param_patterns", ()) or ())
+        if float_dtype is not None and fp32_patterns:
+            from easydel.utils.parameters_transformation import fp32_pinned_dtype
+
+            def _cast_unpinned(path, x):
+                if not hasattr(x, "dtype") or not jnp.issubdtype(x.dtype, jnp.floating):
+                    return x
+                return x.astype(fp32_pinned_dtype(tree_path_to_string(path, sep="."), float_dtype, fp32_patterns))
+
+            state_dict = jax.tree_util.tree_map_with_path(_cast_unpinned, state_dict)
+            float_dtype = None
         output_model_file = Checkpointer(
             base_path=str(save_directory),
             save_interval=None,
@@ -1881,6 +1885,14 @@ class EasyBridgeMixin(PushToHubMixin):
             sharding_rules = resolve_shardings() if callable(resolve_shardings) else None
             load_pytree_params = inspect.signature(Checkpointer.load_pytree).parameters
             load_pytree_extraargs = {key: value for key, value in extraargs.items() if key in load_pytree_params}
+            from easydel.utils.parameters_transformation import fp32_pinned_dtype
+
+            fp32_patterns = tuple(getattr(model, "fp32_param_patterns", ()) or ())
+
+            def _pinned_load_dtype(key: str):
+                return fp32_pinned_dtype(key, param_dtype, fp32_patterns)
+
+            load_dtype = _pinned_load_dtype if fp32_patterns else param_dtype
             with _phase_timer("  load: Checkpointer.load_pytree"):
                 state, _ = Checkpointer(
                     base_path=str(resolved_archive_file),
@@ -1888,7 +1900,7 @@ class EasyBridgeMixin(PushToHubMixin):
                     step_policies=[],
                 ).load_pytree(
                     mesh=mesh,
-                    dtype=param_dtype,  # legacy
+                    dtype=load_dtype,  # legacy
                     sharding_rules=sharding_rules,
                     prefix="model",
                     discover_latest=False,
@@ -2236,14 +2248,16 @@ class EasyBridgeMixin(PushToHubMixin):
 
             cpu_device = _checkpoint_cpu_device()
 
-            def _convert(x):
+            def _convert(x, target_dtype=param_dtype):
                 """Normalize a single checkpoint leaf to JAX with target dtype.
 
                 Args:
                     x: A checkpoint leaf (NumPy or JAX array, possibly other).
+                    target_dtype: Floating dtype for this leaf (``float32`` for
+                        ``fp32_param_patterns`` leaves, ``param_dtype`` otherwise).
 
                 Returns:
-                    Any: A JAX array cast to ``param_dtype`` if it is
+                    Any: A JAX array cast to ``target_dtype`` if it is
                     floating-point and differs from the target; non-array
                     leaves pass through.
                 """
@@ -2253,8 +2267,8 @@ class EasyBridgeMixin(PushToHubMixin):
                 dtype = getattr(x, "dtype", None)
                 if dtype is None:
                     return x
-                if jnp.issubdtype(dtype, jnp.inexact) and dtype != param_dtype:
-                    return x.astype(param_dtype)
+                if jnp.issubdtype(dtype, jnp.inexact) and dtype != target_dtype:
+                    return x.astype(target_dtype)
                 return x
 
             with _phase_timer("  load: dtype-cast leaves"):
@@ -2267,7 +2281,7 @@ class EasyBridgeMixin(PushToHubMixin):
                         if isinstance(k, tuple) and k and str(k[-1]) == "quant_kernel":
                             new_v = v
                         else:
-                            new_v = _convert(v)
+                            new_v = _convert(v, fp32_pinned_dtype(k, param_dtype, fp32_patterns))
                         state[k] = new_v
                         # JAX is async; force completion so the old buffer can be freed
                         # before converting the next leaf to reduce peak memory.
@@ -2870,7 +2884,8 @@ class EasyBridgeMixin(PushToHubMixin):
                 torch_loader=cls.get_torch_loader(),
                 clear_fn=_clear,
                 kwargs=kwargs,
-                param_dtype=param_dtype,
+                # fp32-pinned leaves must reach the converter un-rounded; it casts the rest itself.
+                param_dtype=jnp.float32 if getattr(module, "fp32_param_patterns", ()) else param_dtype,
             )
         else:
             ckpt_info = cls._resolve_streaming_checkpoint(
@@ -3607,6 +3622,7 @@ class EasyBridgeMixin(PushToHubMixin):
             "dtype": model.param_dtype,
             "consolidated_moe_keys": consolidated_moe_keys,
             "reform_param": reform_param,
+            "fp32_param_patterns": tuple(getattr(model, "fp32_param_patterns", ()) or ()),
         }
 
         parameters_flat: dict[tuple, tp.Any] = {}
@@ -4676,6 +4692,7 @@ class EasyBridgeMixin(PushToHubMixin):
             "dtype": model.param_dtype,
             "consolidated_moe_keys": consolidated_moe_keys,
             "reform_param": reform_param,
+            "fp32_param_patterns": tuple(getattr(model, "fp32_param_patterns", ()) or ()),
         }
 
         def _chunk_shape_for(

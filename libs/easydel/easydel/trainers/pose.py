@@ -32,10 +32,15 @@ table must cover ``target_max_pos`` (see :func:`validate_pose_target_max_pos`).
 RNG: a threaded :class:`numpy.random.Generator` consumed in a fixed per-document order —
 (1) Bernoulli gate, (2) split point, (3) gap — so a given ``(seed, step)`` is reproducible.
 The caller creates one generator per microbatch (e.g. ``np.random.default_rng(seed + step)``).
+
+The document-segmentation helpers (:func:`valid_sequence_end`, :func:`document_segment_ranges`,
+:func:`seq_lens_from_segment_ids`, :func:`extract_position_batch`) are shared with
+:mod:`easydel.trainers.randomized_yarn` so both augmentations agree on what a document is.
 """
 
 from __future__ import annotations
 
+import collections.abc
 import math
 from dataclasses import asdict, dataclass
 from itertools import pairwise
@@ -43,6 +48,7 @@ from itertools import pairwise
 import numpy as np
 
 IGNORE_INDEX = -100
+POSE_GAP_MODES = ("uniform", "biased", "log_uniform")
 
 
 @dataclass
@@ -63,11 +69,17 @@ class PoSEConfig:
             (``min_chunk = ceil(L * min_chunk_frac)``).
         max_chunk_frac: Upper bound of the split point (``max_chunk = floor(L * max_chunk_frac)``).
         bias_large_gap: When ``True`` warp the uniform gap draw toward large gaps via
-            ``g = 1 - (1 - u)**2``; otherwise draw the gap uniformly.
+            ``g = 1 - (1 - u)**2``; otherwise draw the gap uniformly. Ignored when
+            ``gap_mode`` is set.
         only_buckets: Optional list of training-bucket indices (see
             ``TrainingArguments.buckets``) PoSE applies to; steps routed to any other
             bucket are left untouched. ``None`` (default) applies PoSE on every step.
             Requires the trainer to have training buckets configured (validated there).
+        gap_mode: ``"uniform"`` on ``[0, max_gap]``, ``"biased"`` (the ``bias_large_gap`` warp) or
+            ``"log_uniform"`` (``exp(U(log gap_min, log(max_gap + 1)))``: equal probability per octave of
+            skip length). ``None`` (default) derives ``"biased"`` / ``"uniform"`` from ``bias_large_gap``.
+        gap_min: Smallest skip drawn by ``"log_uniform"`` (``>= 1``); a document whose ``max_gap`` is below
+            it falls back to a uniform draw on ``[0, max_gap]``. Unused by the other modes.
     """
 
     enabled: bool = False
@@ -79,6 +91,8 @@ class PoSEConfig:
     max_chunk_frac: float = 0.75
     bias_large_gap: bool = True
     only_buckets: list[int] | None = None
+    gap_mode: str | None = None
+    gap_min: int = 1
 
     def __post_init__(self) -> None:
         if self.max_p_pose is None:
@@ -99,6 +113,16 @@ class PoSEConfig:
             )
         if self.enabled and self.target_max_pos <= 1:
             raise ValueError(f"pose.target_max_pos must be > 1 when pose.enabled=true, got {self.target_max_pos}.")
+        if self.gap_mode is not None and self.gap_mode not in POSE_GAP_MODES:
+            raise ValueError(f"pose.gap_mode must be one of {POSE_GAP_MODES} or None, got {self.gap_mode!r}.")
+        self.gap_min = int(self.gap_min)
+        if self.gap_min < 1:
+            raise ValueError(f"pose.gap_min must be >= 1, got {self.gap_min}.")
+        if self.enabled and self.resolved_gap_mode() == "log_uniform" and self.gap_min >= self.target_max_pos:
+            raise ValueError(
+                f"pose.gap_min={self.gap_min} must be below pose.target_max_pos={self.target_max_pos} "
+                "for log_uniform gaps."
+            )
         if self.only_buckets is not None:
             buckets = list(self.only_buckets)
             if not buckets:
@@ -106,6 +130,12 @@ class PoSEConfig:
             if any(not isinstance(b, int) or isinstance(b, bool) or b < 0 for b in buckets):
                 raise ValueError(f"pose.only_buckets entries must be non-negative ints, got {self.only_buckets}.")
             self.only_buckets = buckets
+
+    def resolved_gap_mode(self) -> str:
+        """The effective gap mode (``gap_mode`` or the one ``bias_large_gap`` implies)."""
+        if self.gap_mode is not None:
+            return self.gap_mode
+        return "biased" if self.bias_large_gap else "uniform"
 
     def applies_to_bucket(self, bucket_index: int | None) -> bool:
         """Whether PoSE should run on a step routed to ``bucket_index``.
@@ -145,27 +175,46 @@ def current_pose_probability(config: PoSEConfig, step: int) -> float:
     return config.p_pose + progress * (config.max_p_pose - config.p_pose)
 
 
-def validate_pose_target_max_pos(config: PoSEConfig, *, model_max_freq_pos: int | None, who: str) -> None:
+def validate_rope_table_covers(target_max_pos: int, *, model_max_freq_pos: int | None, who: str, feature: str) -> None:
     """Fail loudly if ``target_max_pos`` exceeds the model's RoPE frequency-table length.
 
     RoPE cos/sin are a fixed precomputed table gathered by ``position_ids``; a position
-    ``>= len(table)`` indexes out of bounds (silently wraps under XLA). The table length is
-    ``config.granted_freq_max_position_embedding`` (``freq_max_position_embeddings`` or
-    ``max_position_embeddings``) — pass that as ``model_max_freq_pos``. When PoSE is enabled
-    the model config must set it ``>= target_max_pos``.
+    ``>= len(table)`` indexes out of bounds and clamps to the last row, collapsing relative
+    angles. The table length is ``config.granted_freq_max_position_embedding``.
+
+    Args:
+        target_max_pos: Exclusive ceiling on the positions the augmentation emits.
+        model_max_freq_pos: The model's RoPE table length (``None`` / ``<= 0`` skips the check).
+        who: Model name used in the error message.
+        feature: Config name used in the error message (``"pose"`` / ``"randomized_yarn"``).
+
+    Raises:
+        ValueError: When the table is shorter than ``target_max_pos``.
     """
-    if not config.enabled or model_max_freq_pos is None or model_max_freq_pos <= 0:
+    if model_max_freq_pos is None or model_max_freq_pos <= 0:
         return
-    if config.target_max_pos > model_max_freq_pos:
+    if target_max_pos > model_max_freq_pos:
         raise ValueError(
-            "pose.target_max_pos must be <= the model RoPE frequency-table length to avoid "
+            f"{feature}.target_max_pos must be <= the model RoPE frequency-table length to avoid "
             "out-of-bounds RoPE indexing, but got "
-            f"pose.target_max_pos={config.target_max_pos}, {who} freq table={model_max_freq_pos}. "
+            f"{feature}.target_max_pos={target_max_pos}, {who} freq table={model_max_freq_pos}. "
             "Raise freq_max_position_embeddings (or max_position_embeddings) to >= target_max_pos."
         )
 
 
-def _sample_valid_end(
+def validate_pose_target_max_pos(config: PoSEConfig, *, model_max_freq_pos: int | None, who: str) -> None:
+    """Fail loudly if ``target_max_pos`` exceeds the model's RoPE frequency-table length.
+
+    Pass ``config.granted_freq_max_position_embedding`` (``freq_max_position_embeddings`` or
+    ``max_position_embeddings``) as ``model_max_freq_pos``. When PoSE is enabled the model
+    config must set it ``>= target_max_pos``.
+    """
+    if not config.enabled:
+        return
+    validate_rope_table_covers(config.target_max_pos, model_max_freq_pos=model_max_freq_pos, who=who, feature="pose")
+
+
+def valid_sequence_end(
     sample_idx: int,
     seq_len: int,
     tokens: np.ndarray | None,
@@ -185,7 +234,7 @@ def _sample_valid_end(
     return int(non_tail[-1]) + 1 if non_tail.size > 0 else 0
 
 
-def _sample_segment_ranges(
+def document_segment_ranges(
     sample_idx: int,
     valid_end: int,
     positions: np.ndarray,
@@ -241,6 +290,88 @@ def _sample_segment_ranges(
     return list(pairwise(boundaries))
 
 
+def seq_lens_from_segment_ids(segment_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-row document lengths from packed ``segment_ids`` ``[B, S]`` (contiguous-equal runs).
+
+    Returns ``(seq_lens[B, max_segs], seq_lens_num[B])`` for the core's ``seq_lens`` path. Every
+    run (including any trailing padding run) becomes a segment; the core then caps them at
+    ``valid_end`` so the padded tail is dropped.
+    """
+    rows: list[list[int]] = []
+    for row in segment_ids:
+        change = (np.flatnonzero(np.diff(row)) + 1).tolist()
+        bounds = [0, *change, len(row)]
+        rows.append([bounds[i + 1] - bounds[i] for i in range(len(bounds) - 1)])
+    max_segs = max((len(r) for r in rows), default=1)
+    seq_lens = np.zeros((len(rows), max_segs), dtype=np.int64)
+    seq_lens_num = np.zeros(len(rows), dtype=np.int64)
+    for b, lens in enumerate(rows):
+        seq_lens[b, : len(lens)] = lens
+        seq_lens_num[b] = len(lens)
+    return seq_lens, seq_lens_num
+
+
+_sample_valid_end = valid_sequence_end
+_sample_segment_ranges = document_segment_ranges
+_seq_lens_from_segment_ids = seq_lens_from_segment_ids
+
+
+def extract_position_batch(batch: collections.abc.Mapping, *, feature: str) -> tuple[np.ndarray, dict]:
+    """Writable host copy of ``batch["position_ids"]`` plus the arrays a position augmentation reads.
+
+    ``np.asarray`` of a ``jax.Array`` is a read-only view, so the positions are copied with ``np.array``;
+    the caller writes the result back into the batch.
+
+    Args:
+        batch: Collated batch with ``position_ids`` (``[B, S]`` or mRoPE ``[axes, B, S]``).
+        feature: Config name used in error messages.
+
+    Returns:
+        ``(positions, inputs)`` where ``inputs`` holds ``tokens`` / ``labels`` / ``seq_lens`` /
+        ``seq_lens_num`` (``None`` when absent).
+
+    Raises:
+        ValueError: When ``position_ids`` is missing or not rank 2 / 3.
+    """
+    if "position_ids" not in batch:
+        raise ValueError(
+            f"{feature}.enabled but the collated batch has no 'position_ids' to transform "
+            "(the packed collator is expected to emit them)."
+        )
+    positions = np.array(batch["position_ids"])
+    if positions.ndim not in (2, 3):
+        raise ValueError(f"batch position_ids must be rank-2 [B,S] or rank-3 [axes,B,S], got {positions.ndim}.")
+    seq_lens = seq_lens_num = None
+    if "segment_ids" in batch:
+        seq_lens, seq_lens_num = seq_lens_from_segment_ids(np.asarray(batch["segment_ids"]))
+    inputs = {
+        "tokens": np.asarray(batch["input_ids"]) if "input_ids" in batch else None,
+        "labels": np.asarray(batch["labels"]) if "labels" in batch else None,
+        "seq_lens": seq_lens,
+        "seq_lens_num": seq_lens_num,
+    }
+    return positions, inputs
+
+
+def position_axes(positions: np.ndarray) -> list[np.ndarray]:
+    """The rank-2 ``[B, S]`` views to augment: every mRoPE axis of a rank-3 array, else the array itself."""
+    return [positions[axis] for axis in range(positions.shape[0])] if positions.ndim == 3 else [positions]
+
+
+def _draw_gap(config: PoSEConfig, rng: np.random.Generator, max_gap: int) -> int:
+    """Draw one skip length in ``[0, max_gap]`` under ``config``'s gap mode."""
+    mode = config.resolved_gap_mode()
+    if mode == "biased":
+        u = rng.random()
+        u = 1.0 - (1.0 - u) * (1.0 - u)  # concave warp toward large gaps
+        return int(u * (max_gap + 1))
+    if mode == "log_uniform" and max_gap >= config.gap_min:
+        u = rng.random()
+        lo, hi = math.log(config.gap_min), math.log(max_gap + 1)
+        return min(max(int(math.exp(lo + u * (hi - lo))), config.gap_min), max_gap)
+    return int(rng.integers(0, max_gap + 1))  # uniform, inclusive
+
+
 def apply_pose_to_positions(
     positions: np.ndarray,
     *,
@@ -280,10 +411,10 @@ def apply_pose_to_positions(
         return
 
     for sample_idx in range(positions.shape[0]):
-        valid_end = _sample_valid_end(sample_idx, seq_len, tokens, labels, pad_id, ignore_index)
+        valid_end = valid_sequence_end(sample_idx, seq_len, tokens, labels, pad_id, ignore_index)
         if valid_end < 2:
             continue
-        segment_ranges = _sample_segment_ranges(
+        segment_ranges = document_segment_ranges(
             sample_idx, valid_end, positions, seq_lens, seq_lens_num, cu_seqlens, cu_seqlens_num
         )
         sample_pos = positions[sample_idx]
@@ -319,38 +450,11 @@ def apply_pose_to_positions(
             if max_gap <= 0:
                 continue
 
-            if config.bias_large_gap:
-                u = rng.random()
-                u = 1.0 - (1.0 - u) * (1.0 - u)  # concave warp toward large gaps
-                gap = int(u * (max_gap + 1))
-            else:
-                gap = int(rng.integers(0, max_gap + 1))  # uniform, inclusive
-
+            gap = _draw_gap(config, rng, max_gap)
             second_start = base + split_idx + gap
             second_len = segment_len - split_idx
             sample_pos[start : start + split_idx] = base + np.arange(split_idx, dtype=sample_pos.dtype)
             sample_pos[start + split_idx : end] = second_start + np.arange(second_len, dtype=sample_pos.dtype)
-
-
-def _seq_lens_from_segment_ids(segment_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Per-row document lengths from packed ``segment_ids`` ``[B, S]`` (contiguous-equal runs).
-
-    Returns ``(seq_lens[B, max_segs], seq_lens_num[B])`` for the core's ``seq_lens`` path. Every
-    run (including any trailing padding run) becomes a segment; the core then caps them at
-    ``valid_end`` so the padded tail is dropped.
-    """
-    rows: list[list[int]] = []
-    for row in segment_ids:
-        change = (np.flatnonzero(np.diff(row)) + 1).tolist()
-        bounds = [0, *change, len(row)]
-        rows.append([bounds[i + 1] - bounds[i] for i in range(len(bounds) - 1)])
-    max_segs = max((len(r) for r in rows), default=1)
-    seq_lens = np.zeros((len(rows), max_segs), dtype=np.int64)
-    seq_lens_num = np.zeros(len(rows), dtype=np.int64)
-    for b, lens in enumerate(rows):
-        seq_lens[b, : len(lens)] = lens
-        seq_lens_num[b] = len(lens)
-    return seq_lens, seq_lens_num
 
 
 def apply_pose_to_batch(
@@ -363,7 +467,7 @@ def apply_pose_to_batch(
     pad_id: int | None,
     ignore_index: int = IGNORE_INDEX,
 ) -> dict:
-    """Text-only PoSE on a collated training batch, mutating ``batch["position_ids"]`` in place.
+    """Text-only PoSE on a collated training batch, replacing ``batch["position_ids"]``.
 
     Host-side, per-microbatch, run before the forward (KD: mutate once so teacher+student share
     the positions). Handles both 3-D mRoPE ``[3, B, S]`` and 1-D ``[B, S]`` ``position_ids``; for
@@ -378,35 +482,17 @@ def apply_pose_to_batch(
     """
     if not config.enabled or current_pose_probability(config, step) <= 0.0:
         return batch
-    if "position_ids" not in batch:
-        raise ValueError(
-            "pose.enabled but the collated batch has no 'position_ids' to transform "
-            "(the packed collator is expected to emit them)."
+    positions, inputs = extract_position_batch(batch, feature="pose")
+    for axis_positions in position_axes(positions):
+        apply_pose_to_positions(
+            axis_positions,
+            config=config,
+            step=step,
+            rng=np.random.default_rng(seed + step),
+            pad_id=pad_id,
+            ignore_index=ignore_index,
+            image_token_id=image_token_id,
+            **inputs,
         )
-    positions = np.asarray(batch["position_ids"])
-    tokens = np.asarray(batch["input_ids"]) if "input_ids" in batch else None
-    labels = np.asarray(batch["labels"]) if "labels" in batch else None
-    seq_lens = seq_lens_num = None
-    if "segment_ids" in batch:
-        seq_lens, seq_lens_num = _seq_lens_from_segment_ids(np.asarray(batch["segment_ids"]))
-
-    common = dict(
-        config=config,
-        step=step,
-        tokens=tokens,
-        labels=labels,
-        pad_id=pad_id,
-        ignore_index=ignore_index,
-        seq_lens=seq_lens,
-        seq_lens_num=seq_lens_num,
-        image_token_id=image_token_id,
-    )
-    if positions.ndim == 3:  # mRoPE [axes, B, S] — identical skip on every axis
-        for axis in range(positions.shape[0]):
-            apply_pose_to_positions(positions[axis], rng=np.random.default_rng(seed + step), **common)
-    elif positions.ndim == 2:  # 1-D [B, S]
-        apply_pose_to_positions(positions, rng=np.random.default_rng(seed + step), **common)
-    else:
-        raise ValueError(f"batch position_ids must be rank-2 [B,S] or rank-3 [axes,B,S], got {positions.ndim}.")
     batch["position_ids"] = positions
     return batch

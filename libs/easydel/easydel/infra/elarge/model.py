@@ -2025,6 +2025,13 @@ class eLargeModel:
             "speculative_decoding",
         }:
             resolved_drop_fields = ("tools",)
+        # Per-dataset sideband carriers are run-local metadata (a dataset id is a position in THIS mixture), so
+        # they never belong in an exported dataset.
+        from easydel.data.transforms.mixture import ASSISTANT_ONLY_FIELD, DATASET_ID_FIELD
+
+        resolved_drop_fields = tuple(
+            dict.fromkeys((*(resolved_drop_fields or ()), ASSISTANT_ONLY_FIELD, DATASET_ID_FIELD))
+        )
         common_kwargs = {
             "output_format": resolved_format,
             "max_shard_size": max_shard_size or save_cfg.get("max_shard_size", "500MB"),
@@ -2993,7 +3000,17 @@ class eLargeModel:
                 trainer_kwargs[key] = value
 
         with phase_timer(f"build_trainer.init.{trainer_type}", tag="eLargeModel"):
-            return trainer_class(**trainer_kwargs)
+            trainer = trainer_class(**trainer_kwargs)
+
+        # Label the per-dataset census with the mixture's own names, from the same walk that assigns the ids.
+        # The grain lanes set their own (sorted-name) map while configuring their loader; keep it.
+        if getattr(trainer, "_dataset_id_names", None) is None:
+            from .builders import resolve_dataset_id_names
+
+            names = resolve_dataset_id_names(self._config.get("mixture", {}) or {})
+            if names:
+                trainer._dataset_id_names = dict(enumerate(names))
+        return trainer
 
     def eval(
         self,

@@ -105,8 +105,9 @@ def test_parquet_guard_is_per_source_and_available_in_dataset_config(tmp_path):
     rows = [{"text": "payload" * 10}, {"text": "different" * 10}]
     pq.write_table(pa.Table.from_pylist(rows), path, row_group_size=1)
     guarded = create_source(DatasetConfig(str(path), max_row_group_bytes=1))
-    assert list(guarded.open_shard(guarded.shard_names[0])) == []
-    assert not guarded.delivers_all_metadata_rows
+    assert list(guarded.open_shard(guarded.shard_names[0])) == rows
+    assert list(guarded.open_shard_at_row(guarded.shard_names[0], 1)) == rows[1:]
+    assert guarded.delivers_all_metadata_rows
     unguarded = ParquetShardedSource(str(path), max_row_group_bytes=0)
     assert list(unguarded.open_shard(unguarded.shard_names[0])) == rows
     assert list(unguarded.open_shard_at_row(unguarded.shard_names[0], 1)) == rows[1:]

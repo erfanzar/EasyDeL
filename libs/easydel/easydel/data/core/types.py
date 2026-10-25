@@ -272,11 +272,19 @@ class TextDatasetInform(BaseDatasetInform):
         preprocessing_fn (Callable[[dict[str, Any]], dict[str, Any]] | None):
             Optional per-row transform applied before mixing. Receives
             and returns the row dict.
+        assistant_only (bool | None): Per-dataset assistant-only masking
+            choice. ``None`` inherits the trainer's global flag;
+            ``True``/``False`` override it for this dataset only. When any
+            inform of a mixture sets it, ``build_dataset`` stamps the
+            tri-state column ``easydel.data.ASSISTANT_ONLY_FIELD``
+            (``1``/``0``/``-1``) on every row of every inform so batch
+            schemas stay uniform.
     """
 
     content_field: str | None = "content"
     additional_fields: list[str] | None = None
     preprocessing_fn: tp.Callable[[dict[str, tp.Any]], dict[str, tp.Any]] | None = None
+    assistant_only: bool | None = None
 
 
 @auto_pytree
@@ -391,7 +399,14 @@ class DatasetMixture:
             block when :attr:`block_mixture` is on.
         stop_strategy (str): What the mixer does when a dataset is
             exhausted — ``"restart"`` (recycle), ``"first_exhausted"``
-            (terminate immediately), or ``"all_exhausted"``.
+            (terminate immediately), ``"all_exhausted"`` (recycle until
+            every dataset has finished at least once), or ``"error"``
+            (raise on the first exhaustion; requires
+            :attr:`block_mixture` on the streaming path).
+        attach_dataset_ids (bool): Stamp the integer attribution column
+            ``easydel.data.DATASET_ID_FIELD`` (the inform's position in
+            :attr:`informs`) on every row so trainers can split metrics or
+            losses per source.
         mixture_weights (dict[str, float] | None): Per-dataset weights
             keyed by dataset identifier (the constituent's
             ``data_files`` path or explicit name). ``None`` falls back
@@ -453,6 +468,7 @@ class DatasetMixture:
     block_mixture: bool = True
     mixture_block_size: int = 2048
     stop_strategy: str = "restart"
+    attach_dataset_ids: bool = False
 
     mixture_weights: dict[str, float] | None = None
     use_fast_loader: bool = field(default=False, kw_only=True)

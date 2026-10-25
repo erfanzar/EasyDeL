@@ -95,6 +95,7 @@ from .etils import (
     EasyDeLGradientCheckPointers,
     EasyDeLPlatforms,
 )
+from .layer_scan import normalize_layer_scan_options
 from .sharding import AxisPolicy, LogicalAxisRules, MeshLike, PipelineStageRankResolver, RuntimeShardingResolver
 
 if tp.TYPE_CHECKING:
@@ -550,9 +551,20 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             non-MoE activation memory by the ep degree at the cost of two
             ragged all-to-alls per MoE layer. Only takes effect when
             ``ep > 1``, ``use_ring_of_experts=False``,
-            ``fsdp_is_ep_bound=False`` and ``sp_is_ep_bound=False``, on the
-            SPMD stage-mesh path, with ``n_routed_experts`` divisible by ep
+            ``fsdp_is_ep_bound=False`` and either ``sp_is_ep_bound=False`` or
+            a size-1 sp axis, on the SPMD stage-mesh path, with ``n_routed_experts`` divisible by ep
             and the batch divisible by ``dp*fsdp*ep``. Default ``False``.
+        moe_batch_axes_follow_resolver: Name the fused-MoE ``shard_map`` batch
+            axes in the runtime resolver's ``HiddenStateSharding`` order (fsdp
+            mapped to ep when ``fsdp_is_ep_bound``) so the block-boundary specs
+            match the residual stream and GSPMD emits no whole-shard
+            collective-permute at MoE entry/exit. Default ``False``.
+        layer_scan_options: Lowering options for lowered repeated-layer scans
+            (``block_scan``, ``barrier``, ``prefetch_axes``, ``prefetch_exclude``,
+            ``prefetch_defer_dw``, ``unroll``); top-level keys apply to every scan,
+            ``"text"`` / ``"vision"`` / ``"audio"`` keys hold per-tower overrides.
+            ``None`` prefetches fsdp-sharded weights in training text scans when fsdp > 1;
+            ``{}`` keeps the plain lowering (see :mod:`easydel.infra.layer_scan`).
         quantization_config: Quantization config applied to linear layers.
             ``None`` disables weight quantization.
         operation_configs: Mapping from ejkernel operation name to a
@@ -625,6 +637,8 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     moe_chunk_size: NotRequired[int | None]
     moe_fsdp_shard_expert_weights: NotRequired[bool]
     moe_ep_carries_batch: NotRequired[bool]
+    moe_batch_axes_follow_resolver: NotRequired[bool]
+    layer_scan_options: NotRequired[dict[str, tp.Any] | None]
     quantization_config: NotRequired[QuantizationConfig | None]
     operation_configs: NotRequired[dict[str, BaseOperationConfig] | None]
     mask_max_position_embeddings: NotRequired[int]
@@ -713,6 +727,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_fsdp_shard_expert_weights: Shard MoE expert weights over FSDP at rest and gather at use.
         moe_ep_carries_batch: Shard the token batch over the expert axis and dispatch tokens to their
             expert-owning shard (MaxText-style "ep carries batch"; default ``False``).
+        moe_batch_axes_follow_resolver: Order the fused-MoE batch axes like the runtime resolver's
+            hidden-state spec (no block-boundary relayout; default ``False``).
+        layer_scan_options: Per-scope ``ModuleList.scan`` lowering options (default ``None``).
         **kwargs: Forwarded to `PretrainedConfig`.
 
     Raises:
@@ -1247,6 +1264,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_chunk_size: int | None = None,
         moe_fsdp_shard_expert_weights: bool = False,
         moe_ep_carries_batch: bool = False,
+        moe_batch_axes_follow_resolver: bool = False,
+        layer_scan_options: dict[str, tp.Any] | None = None,
         operation_configs: dict[str, BaseOperationConfig] | None = None,
         **kwargs,
     ):
@@ -1398,6 +1417,11 @@ class EasyDeLBaseConfig(PretrainedConfig):
             self, "moe_fsdp_shard_expert_weights", moe_fsdp_shard_expert_weights
         )
         self.moe_ep_carries_batch = bool(getattr(self, "moe_ep_carries_batch", moe_ep_carries_batch))
+        self.moe_batch_axes_follow_resolver = bool(
+            getattr(self, "moe_batch_axes_follow_resolver", moe_batch_axes_follow_resolver)
+        )
+        self.layer_scan_options = getattr(self, "layer_scan_options", layer_scan_options)
+        normalize_layer_scan_options(self.layer_scan_options)
         self._maybe_extend_batch_axis_for_ep()
         self.operation_configs = (
             operation_configs if operation_configs is not None else getattr(self, "operation_configs", None)
@@ -2042,6 +2066,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "moe_chunk_size",
             "moe_fsdp_shard_expert_weights",
             "moe_ep_carries_batch",
+            "moe_batch_axes_follow_resolver",
+            "layer_scan_options",
             "use_fused_mlp",
             "collective_matmul_impl",
             "fcm_max_ratio",
@@ -2053,11 +2079,49 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 setattr(self, key, getattr(config, key))
         self._coerce_runtime_dtype_fields()
 
+    def _static_mesh_axis_size(self, axis_name: str) -> int | None:
+        """Return a mesh axis size known without building a mesh.
+
+        Prefers an already attached mesh, otherwise reads ``sharding_axis_dims`` /
+        ``sharding_axis_names``. An auto-filled (``-1``) or missing axis yields ``None``.
+
+        Args:
+            axis_name: Physical mesh axis name (for example ``"sp"``).
+
+        Returns:
+            int | None: The axis size, or ``None`` when it cannot be determined statically.
+        """
+        mesh = getattr(self, "_hidden_mesh", None)
+        if mesh is not None:
+            shape = getattr(mesh, "shape", None)
+            try:
+                sizes = dict(shape) if shape is not None else {}
+            except (TypeError, ValueError):
+                sizes = {}
+            if axis_name in sizes:
+                return int(sizes[axis_name])
+        dims = getattr(self, "sharding_axis_dims", None)
+        names = getattr(self, "sharding_axis_names", None)
+        if isinstance(dims, dict):
+            dims = list(dims.values())
+        if isinstance(names, dict):
+            names = list(names.values())
+        if dims is None or names is None:
+            return None
+        names = tuple(names)
+        dims = tuple(dims)
+        if axis_name not in names or len(names) != len(dims):
+            return None
+        size = int(dims[names.index(axis_name)])
+        return None if size < 1 else size
+
     def _maybe_extend_batch_axis_for_ep(self) -> None:
         """Extend the activation batch axis with the expert axis for ep-carried batch.
 
-        When ``moe_ep_carries_batch`` is enabled (and neither fsdp nor sp is
-        folded into expert parallelism), the token batch of *every*
+        When ``moe_ep_carries_batch`` is enabled and the layout passes
+        :func:`easydel.layers.moe._layout_planner.ep_carries_batch_inactive_reason`
+        (fsdp not folded into the expert axis, sp folded only when sp has size
+        1, no ring/expert-tensor mode), the token batch of *every*
         activation — not just the fused-MoE ``shard_map`` — should shard over
         the expert axis: non-MoE layers then hold ``B/(dp*fsdp*ep)`` tokens
         per core and the reshard at the MoE boundary disappears. Every
@@ -2076,13 +2140,29 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         if not getattr(self, "moe_ep_carries_batch", False):
             return
-        if getattr(self, "fsdp_is_ep_bound", True) or getattr(self, "sp_is_ep_bound", True):
+        # Lazy import: easydel.layers.moe depends on this config.
+        from easydel.layers.moe._layout_planner import ep_carries_batch_inactive_reason
+
+        partition_axis = self.partition_axis
+        ep_name = getattr(partition_axis, "expert_parallel_axis", "ep") if partition_axis is not None else "ep"
+        sp_name = getattr(partition_axis, "sequence_parallel_axis", "sp") if partition_axis is not None else "sp"
+        ep_size = self._static_mesh_axis_size(ep_name)
+        sp_size = self._static_mesh_axis_size(sp_name)
+        reason = ep_carries_batch_inactive_reason(
+            # Unknown sizes keep the permissive ep assumption and the conservative sp assumption.
+            ep=2 if ep_size is None else ep_size,
+            sp=2 if sp_size is None else sp_size,
+            fsdp_is_ep_bound=bool(getattr(self, "fsdp_is_ep_bound", True)),
+            sp_is_ep_bound=bool(getattr(self, "sp_is_ep_bound", True)),
+            use_ring_of_experts=bool(getattr(self, "use_ring_of_experts", False)),
+            use_expert_tensor_mode=bool(getattr(self, "use_expert_tensor_mode", False)),
+        )
+        if reason is not None:
             logger.warn_once(
-                "moe_ep_carries_batch=True requires fsdp_is_ep_bound=False and sp_is_ep_bound=False; "
-                "the activation batch axis keeps its (fsdp, dp) layout."
+                f"moe_ep_carries_batch=True is inactive: {reason}; the activation batch axis keeps its "
+                "(fsdp, dp) layout."
             )
             return
-        partition_axis = self.partition_axis
         if not isinstance(partition_axis, PartitionAxis):
             return
         ep_axis = getattr(partition_axis, "expert_parallel_axis", None)
@@ -2154,6 +2234,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_chunk_size: int | None = NOT_GIVEN,
         moe_fsdp_shard_expert_weights: bool = NOT_GIVEN,
         moe_ep_carries_batch: bool = NOT_GIVEN,
+        moe_batch_axes_follow_resolver: bool = NOT_GIVEN,
+        layer_scan_options: dict[str, tp.Any] | None = NOT_GIVEN,
         **kwargs,
     ):
         """
@@ -2227,6 +2309,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 (default ``False``).
             moe_ep_carries_batch: Shard the token batch over the expert axis and dispatch tokens to
                 their expert-owning shard (MaxText-style "ep carries batch"; default ``False``).
+            moe_batch_axes_follow_resolver: Order the fused-MoE batch axes like the runtime resolver's
+                hidden-state spec (default ``False``).
+            layer_scan_options: Per-scope ``ModuleList.scan`` lowering options (default ``None``).
             **kwargs: Extra attributes to attach to this config and any defined ``sub_configs``.
         """
 
@@ -2309,6 +2394,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "moe_chunk_size", None, moe_chunk_size)
         set_attrs_smartly(self, "moe_fsdp_shard_expert_weights", False, moe_fsdp_shard_expert_weights)
         set_attrs_smartly(self, "moe_ep_carries_batch", False, moe_ep_carries_batch)
+        set_attrs_smartly(self, "moe_batch_axes_follow_resolver", False, moe_batch_axes_follow_resolver)
+        set_attrs_smartly(self, "layer_scan_options", None, layer_scan_options)
+        normalize_layer_scan_options(self.layer_scan_options)
         self._maybe_extend_batch_axis_for_ep()
 
         for key_, value_ in kwargs.items():

@@ -1578,6 +1578,101 @@ def _extract_dataset_name(inform_cfg: Mapping[str, Any], fallback_index: int = 0
     return f"dataset_{fallback_index}"
 
 
+PARQUET_ACCESS_MODES: tuple[str, ...] = ("stream", "random_access", "rowgroup_shuffle")
+
+
+def _inform_or_mixture(inform_cfg: Mapping[str, Any], mixture_cfg: Mapping[str, Any], key: str, default: Any) -> Any:
+    """Return ``inform_cfg[key]`` when set, else ``mixture_cfg[key]``, else ``default``."""
+    value = inform_cfg.get(key)
+    if value is None:
+        value = mixture_cfg.get(key)
+    return default if value is None else value
+
+
+def _create_parquet_source(
+    files: list[str],
+    columns: list[str] | None,
+    inform_cfg: Mapping[str, Any],
+    mixture_cfg: Mapping[str, Any],
+) -> "ShardedDataSource":
+    """Build the parquet reader selected by ``parquet_access`` (per inform, else mixture-wide).
+
+    * ``"stream"`` (default): :class:`ParquetShardedSource`, file order.
+    * ``"rowgroup_shuffle"``: :class:`RowGroupShuffledParquetSource`, a seeded permutation over every
+      ``(file, row_group)`` pair with within-group row shuffling; the seed is ``mixture.seed`` plus a stable
+      hash of the inform name so informs do not share a permutation.
+    * ``"random_access"``: :class:`ParquetRandomAccessSource` (row-level random access, exact O(log) seek).
+
+    ``mixture.metadata_cache_dir`` enables durable footer / row-group sidecars; the sidecar writer is elected
+    with ``jax.process_index()`` read once here, at build time.
+
+    Raises:
+        ValueError: On an unknown ``parquet_access`` value.
+    """
+    import zlib
+
+    from easydel.data.sources import ParquetShardedSource
+
+    access = str(_inform_or_mixture(inform_cfg, mixture_cfg, "parquet_access", "stream"))
+    if access not in PARQUET_ACCESS_MODES:
+        raise ValueError(f"parquet_access must be one of {PARQUET_ACCESS_MODES}, got {access!r}")
+    cache_dir = _inform_or_mixture(inform_cfg, mixture_cfg, "metadata_cache_dir", None)
+    process_index = None
+    if cache_dir:
+        import jax
+
+        process_index = int(jax.process_index())
+    common = {"columns": columns, "metadata_cache_dir": cache_dir, "process_index": process_index}
+    if access == "stream":
+        return ParquetShardedSource(files, **common)
+    if access == "random_access":
+        from easydel.data.sources import ParquetRandomAccessSource
+
+        return ParquetRandomAccessSource(files, **common)
+    from easydel.data.sources import RowGroupShuffledParquetSource
+
+    base_seed = int(mixture_cfg.get("seed", 42) or 0)
+    name_key = str(inform_cfg.get("name") or inform_cfg.get("data_files") or "")
+    return RowGroupShuffledParquetSource(
+        files,
+        seed=base_seed + zlib.crc32(name_key.encode("utf-8")) % 100_000,
+        group_pool_size=int(_inform_or_mixture(inform_cfg, mixture_cfg, "group_pool_size", 1)),
+        **common,
+    )
+
+
+def resolve_dataset_id_names(mixture_cfg: Mapping[str, Any], *, warn: bool = False) -> list[str]:
+    """Ordered inform names, positionally aligned with the ``_dataset_id`` the builder stamps.
+
+    Duplicate names are uniquified by position (``name-<i>``), exactly as :func:`build_sharded_source` names
+    its sources, so index ``i`` of the result labels ``_dataset_id == i``.
+
+    Args:
+        mixture_cfg: The ``mixture`` block of an eLarge config.
+        warn: Log the duplicate-name warning (the builder passes ``True`` once per build).
+
+    Returns:
+        list[str]: Names in inform order.
+    """
+    names: list[str] = []
+    taken: set[str] = set()
+    for i, inform_cfg in enumerate(mixture_cfg.get("informs", []) or []):
+        name = _extract_dataset_name(inform_cfg, fallback_index=i)
+        if name in taken:
+            unique = f"{name}-{i}"
+            if warn:
+                logger.warning(
+                    "Duplicate dataset name '%s' detected in mixture config; using '%s' for the later source. "
+                    "Set `mixture.informs[].name` explicitly to avoid ambiguity.",
+                    name,
+                    unique,
+                )
+            name = unique
+        taken.add(name)
+        names.append(name)
+    return names
+
+
 def _create_source_from_inform(
     inform_cfg: Mapping[str, Any],
     mixture_cfg: Mapping[str, Any],
@@ -1629,7 +1724,6 @@ def _create_source_from_inform(
     from easydel.data.sources import (
         ArrowShardedSource,
         HuggingFaceShardedSource,
-        ParquetShardedSource,
         TextShardedSource,
         create_source,
         expand_data_files,
@@ -1742,7 +1836,7 @@ def _create_source_from_inform(
         # delimiters, including compressed filename suffixes and type inference.
         source = create_source(DatasetConfig(data_files=files, type=source_type or None))
     elif source_type == "parquet":
-        source = ParquetShardedSource(files, columns=_projection_columns())
+        source = _create_parquet_source(files, _projection_columns(), inform_cfg, mixture_cfg)
     elif source_type == "arrow":
         source = ArrowShardedSource(files)
     elif source_type in ("txt", "text"):
@@ -1833,20 +1927,22 @@ def build_sharded_source(cfg_like: eLMConfig | Mapping[str, Any]) -> "ShardedDat
     if not mixture_cfg or not mixture_cfg.get("informs"):
         return None
 
+    from easydel.data.transforms.field_ops import AddField
+    from easydel.data.transforms.mixture import ASSISTANT_ONLY_FIELD, DATASET_ID_FIELD
+
     sources: dict[str, "ShardedDataSource"] = {}
     content_target = mixture_cfg.get("text_target_field", "text")
+    informs = list(mixture_cfg.get("informs", []) or [])
+    inform_names = resolve_dataset_id_names(mixture_cfg, warn=True)
+    # Per-dataset assistant-only choice: when any inform (or the mixture) sets it, EVERY inform is stamped with
+    # the tri-state (1 / 0 / -1 = inherit) so batch schemas stay uniform across sources.
+    stamp_assistant_only = mixture_cfg.get("assistant_only") is not None or any(
+        inform.get("assistant_only") is not None for inform in informs
+    )
+    attach_dataset_ids = bool(mixture_cfg.get("attach_dataset_ids", False))
 
-    for i, inform_cfg in enumerate(mixture_cfg.get("informs", [])):
-        name = _extract_dataset_name(inform_cfg, fallback_index=i)
-        if name in sources:
-            unique_name = f"{name}-{i}"
-            logger.warning(
-                "Duplicate dataset name '%s' detected in mixture config; using '%s' for the later source. "
-                "Set `mixture.informs[].name` explicitly to avoid ambiguity.",
-                name,
-                unique_name,
-            )
-            name = unique_name
+    for i, inform_cfg in enumerate(informs):
+        name = inform_names[i]
         source = _create_source_from_inform(inform_cfg, mixture_cfg)
         if inform_cfg.get("filter_fn") is not None:
             source = source.filter(inform_cfg["filter_fn"])
@@ -1872,9 +1968,20 @@ def build_sharded_source(cfg_like: eLMConfig | Mapping[str, Any]) -> "ShardedDat
         if content_field != content_target:
             source = source.transform(RenameFields({content_field: content_target}))
 
+        if stamp_assistant_only:
+            choice = _inform_or_mixture(inform_cfg, mixture_cfg, "assistant_only", None)
+            source = source.transform(AddField(ASSISTANT_ONLY_FIELD, -1 if choice is None else int(bool(choice))))
+        if attach_dataset_ids:
+            # Stamped per inform (not by the mixer) so a single-inform config is attributed too; the id is the
+            # inform's position, matching `resolve_dataset_id_names`.
+            source = source.transform(AddField(DATASET_ID_FIELD, int(i)))
+
         sources[name] = source
 
-    if len(sources) > 1:
+    reshuffle_on_restart = bool(mixture_cfg.get("reshuffle_on_restart", False))
+    # reshuffle_on_restart is implemented by the mixer's per-epoch shard permutation, so a single-inform config
+    # with the flag set still routes through a one-constituent MixedShardedSource.
+    if len(sources) > 1 or reshuffle_on_restart:
         weights = _mixture_weights(mixture_cfg, list(sources))
 
         source = MixedShardedSource(
@@ -1883,6 +1990,7 @@ def build_sharded_source(cfg_like: eLMConfig | Mapping[str, Any]) -> "ShardedDat
             block_size=mixture_cfg.get("mixture_block_size", 2048),
             seed=mixture_cfg.get("seed", 42),
             stop_strategy=mixture_cfg.get("stop_strategy", "restart"),
+            reshuffle_on_restart=reshuffle_on_restart,
         )
     else:
         source = next(iter(sources.values()))

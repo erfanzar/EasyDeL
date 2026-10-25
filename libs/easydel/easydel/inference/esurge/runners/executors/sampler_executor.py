@@ -80,7 +80,12 @@ from numpy.typing import DTypeLike
 
 from easydel.utils import ejit
 
-from ...core.sampler import apply_history_penalties_from_counts, build_history_token_counts, update_token_counts
+from ...core.sampler import (
+    apply_history_penalties_from_counts,
+    build_history_token_counts,
+    overwrite_token_count_rows,
+    update_token_counts,
+)
 from ...core.sampler import sample_tokens as sample_tokens_fn
 from ...core.sampling_metadata import SamplingMetadata
 from ..execution_types import StepFunctionInputs
@@ -739,6 +744,18 @@ class SamplerRuntime:
 
         self._rebuild_penalty_counts = _rebuild_penalty_counts
 
+        @jax.jit
+        def _overwrite_penalty_rows(
+            token_counts: jax.Array, row_indices: jax.Array, token_ids: jax.Array, counts: jax.Array
+        ) -> jax.Array:
+            """Jitted :func:`overwrite_token_count_rows` over the live count matrix."""
+            with jax.named_scope("easydel/esurge/sampler/overwrite_penalty_rows"):
+                return overwrite_token_count_rows(
+                    token_counts, row_indices=row_indices, token_ids=token_ids, counts=counts
+                )
+
+        self._overwrite_penalty_rows = _overwrite_penalty_rows
+
         @partial(jax.jit, static_argnames=("padded_num_reqs",))
         def _scatter_sampler_outputs(
             sampled_tokens: jax.Array,
@@ -833,6 +850,45 @@ class SamplerRuntime:
         self._sampler_token_counts = self._rebuild_penalty_counts(token_history, seq_lens)
         self._sampler_penalty_state_dirty = False
         self._sampler_penalty_state_ready = True
+
+    def overwrite_sampler_penalty_rows(self, rows: tp.Sequence[tuple[int, numpy.ndarray, numpy.ndarray]]) -> None:
+        """Replace individual device count rows with exact host-side histories.
+
+        The sampler increments a row's counts with the token it sampled. A
+        speculative verify step emits the accepted drafts plus a corrected
+        token instead, so the row of a penalised request drifts after such a
+        step. This rewrites only the listed rows (sparse ``(token, count)``
+        entries) without a full ``[max_num_reqs, max_model_len]`` rebuild.
+        A pending full rebuild runs first, so the patched rows are not
+        overwritten by it afterwards.
+
+        Args:
+            rows: ``(global_row, token_ids, counts)`` per row to overwrite;
+                ``token_ids`` are distinct ids and ``counts`` their counts.
+        """
+        if not rows:
+            return
+        self._ensure_sampler_penalty_state()
+        num_rows = 1 << (max(1, len(rows)) - 1).bit_length()
+        width = 1 << (max(1, max(int(numpy.asarray(ids).size) for _row, ids, _counts in rows)) - 1).bit_length()
+        row_indices = numpy.full((num_rows,), self.max_num_reqs, dtype=numpy.int32)
+        token_ids = numpy.zeros((num_rows, width), dtype=numpy.int32)
+        counts = numpy.zeros((num_rows, width), dtype=numpy.uint32)
+        for i, (row, ids, row_counts) in enumerate(rows):
+            ids = numpy.asarray(ids, dtype=numpy.int64).reshape(-1)
+            row_counts = numpy.asarray(row_counts, dtype=numpy.int64).reshape(-1)
+            keep = (ids >= 0) & (ids < self._sampler_vocab_size) & (row_counts > 0)
+            n = int(keep.sum())
+            row_indices[i] = int(row)
+            token_ids[i, :n] = ids[keep]
+            counts[i, :n] = row_counts[keep]
+        payload = (row_indices, token_ids, counts)
+        if host_payload_broadcast_needed(self.host_payloads_replicated):
+            payload = multihost_utils.broadcast_one_to_all(payload)
+        row_indices_dev, token_ids_dev, counts_dev = _device_put_tree_uniform(payload, self._sampler_sharding)
+        self._sampler_token_counts = self._overwrite_penalty_rows(
+            self._sampler_token_counts, row_indices_dev, token_ids_dev, counts_dev
+        )
 
     def _prepare_compact_sampler_window(
         self,

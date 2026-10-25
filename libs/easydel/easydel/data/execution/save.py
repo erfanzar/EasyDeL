@@ -414,6 +414,29 @@ class WriteStats:
     output_paths: list[str] = field(default_factory=list)
 
 
+DEFAULT_ROW_GROUP_TARGET_BYTES = 64 * 1024 * 1024
+
+
+def _parquet_row_group_size(rows: list, approx_bytes: int, row_group_size: int | None, target_bytes: int) -> int:
+    """Rows per Parquet row group for one buffered write.
+
+    Args:
+        rows: The buffered rows about to be written.
+        approx_bytes: :func:`estimate_row_size` total of ``rows``.
+        row_group_size: Explicit rows per group; wins when set.
+        target_bytes: Target uncompressed bytes per group used otherwise.
+
+    Returns:
+        int: Rows per group (``>= 1``).
+    """
+    if row_group_size is not None:
+        return int(row_group_size)
+    if not rows:
+        return 1
+    avg_row_bytes = max(1, approx_bytes // len(rows))
+    return max(1, int(target_bytes) // avg_row_bytes)
+
+
 class DatasetWriter:
     """Abstract base for the format-specific writers used by the save stage.
 
@@ -475,6 +498,8 @@ class DatasetWriter:
         compression: str | None = None,
         overwrite: bool = False,
         shard_column: str | None = None,
+        row_group_size: int | None = None,
+        row_group_target_bytes: int = DEFAULT_ROW_GROUP_TARGET_BYTES,
     ):
         """Capture the writer's output settings without performing any I/O.
 
@@ -494,12 +519,28 @@ class DatasetWriter:
             overwrite: Whether to replace existing shards at ``output_path``.
             shard_column: Optional column used for stable hash partitioning. Without
                 ``num_shards``, a size-estimation pass determines the bucket count.
+            row_group_size: Explicit rows per Parquet row group (Parquet only).
+                ``None`` derives it from ``row_group_target_bytes`` and each
+                buffer's own size estimate, the preferred mode: a fixed row
+                count cannot suit both ~20 KB text rows and multi-MB rows.
+            row_group_target_bytes: Target uncompressed bytes per Parquet row
+                group when ``row_group_size`` is ``None`` (Parquet only).
+
+        Raises:
+            ValueError: On a non-positive ``num_shards``, ``row_group_size`` or
+                ``row_group_target_bytes``.
         """
         self.output_path = output_path
         self.max_shard_size = max_shard_size
         self.num_shards = num_shards
         if num_shards is not None and num_shards < 1:
             raise ValueError("num_shards must be positive")
+        if row_group_size is not None and int(row_group_size) < 1:
+            raise ValueError(f"row_group_size must be >= 1 when set (got {row_group_size}).")
+        if int(row_group_target_bytes) < 1:
+            raise ValueError(f"row_group_target_bytes must be >= 1 (got {row_group_target_bytes}).")
+        self.row_group_size = None if row_group_size is None else int(row_group_size)
+        self.row_group_target_bytes = int(row_group_target_bytes)
         self.compression = compression
         self.overwrite = overwrite
         self.shard_column = shard_column
@@ -638,7 +679,15 @@ class DatasetWriter:
                         else:
                             writer = ipc.new_file(handle, table.schema, options=options)
                         writers[index] = stack.enter_context(writer)
-                    writers[index].write_table(table)
+                    if format == "parquet":
+                        writers[index].write_table(
+                            table,
+                            row_group_size=_parquet_row_group_size(
+                                rows, sizes[index], self.row_group_size, self.row_group_target_bytes
+                            ),
+                        )
+                    else:
+                        writers[index].write_table(table)
                 buffers[index] = []
                 sizes[index] = 0
 
@@ -739,10 +788,15 @@ class ParquetWriter(DatasetWriter):
 
             if current_rows:
                 table = _rows_to_arrow_table(current_rows, pa, use_fixed_size_lists=False)
+                # Bound the row group so the loader's per-row decode and its K-group pool stay
+                # bounded; see DEFAULT_ROW_GROUP_TARGET_BYTES.
+                row_group_size = _parquet_row_group_size(
+                    current_rows, current_size, self.row_group_size, self.row_group_target_bytes
+                )
 
                 shard_path = f"{path}/shard-{current_shard:05d}.parquet"
                 with fs.open(shard_path, "wb") as f:
-                    pq.write_table(table, f, compression=self.compression)
+                    pq.write_table(table, f, compression=self.compression, row_group_size=row_group_size)
 
                 shard_info = fs.info(shard_path)
                 stats.total_bytes += shard_info.get("size", 0)
@@ -948,6 +1002,8 @@ def create_writer(
     compression: str | None = None,
     overwrite: bool = False,
     shard_column: str | None = None,
+    row_group_size: int | None = None,
+    row_group_target_bytes: int = DEFAULT_ROW_GROUP_TARGET_BYTES,
 ) -> DatasetWriter:
     """Build the appropriate :class:`DatasetWriter` for a given format string.
 
@@ -971,6 +1027,10 @@ def create_writer(
         overwrite: Whether existing shards may be replaced.
         shard_column: Optional column used for deterministic hash partitioning;
             ``None`` uses round-robin routing when ``num_shards`` is set.
+        row_group_size: Parquet only: explicit rows per row group; ``None``
+            derives it from ``row_group_target_bytes``.
+        row_group_target_bytes: Parquet only: target uncompressed bytes per row
+            group used when ``row_group_size`` is ``None``.
 
     Returns:
         DatasetWriter: A configured :class:`ParquetWriter`,
@@ -989,6 +1049,8 @@ def create_writer(
             compression=compression or "snappy",
             overwrite=overwrite,
             shard_column=shard_column,
+            row_group_size=row_group_size,
+            row_group_target_bytes=row_group_target_bytes,
         )
     elif format == "arrow":
         return ArrowWriter(
@@ -1104,6 +1166,10 @@ class SaveStage(BaseStage):
                 compression=self._stage_config.compression,
                 overwrite=self._stage_config.overwrite,
                 shard_column=ds_config.shard_column if ds_config is not None else None,
+                row_group_size=getattr(self._stage_config, "row_group_size", None),
+                row_group_target_bytes=getattr(
+                    self._stage_config, "row_group_target_bytes", DEFAULT_ROW_GROUP_TARGET_BYTES
+                ),
             )
 
             stats = writer.write(source)
@@ -1189,6 +1255,8 @@ def save_dataset(
     num_shards: int | None = None,
     compression: str | None = None,
     overwrite: bool = False,
+    row_group_size: int | None = None,
+    row_group_target_bytes: int = DEFAULT_ROW_GROUP_TARGET_BYTES,
 ) -> WriteStats:
     """One-call helper: write a sharded source to disk without setting up a pipeline.
 
@@ -1208,6 +1276,10 @@ def save_dataset(
         num_shards: Optional fixed shard count; overrides
             ``max_shard_size``.
         compression: Codec name forwarded to the writer.
+        overwrite: Whether existing shards may be replaced.
+        row_group_size: Parquet only: explicit rows per row group.
+        row_group_target_bytes: Parquet only: target uncompressed bytes per
+            row group when ``row_group_size`` is ``None``.
 
     Returns:
         WriteStats: Aggregated statistics (rows, shards, bytes,
@@ -1220,6 +1292,8 @@ def save_dataset(
         num_shards=num_shards,
         compression=compression,
         overwrite=overwrite,
+        row_group_size=row_group_size,
+        row_group_target_bytes=row_group_target_bytes,
     )
     return writer.write(source)
 
@@ -1231,6 +1305,8 @@ def save_iterator(
     max_shard_size: str | int = "500MB",
     compression: str | None = None,
     overwrite: bool = False,
+    row_group_size: int | None = None,
+    row_group_target_bytes: int = DEFAULT_ROW_GROUP_TARGET_BYTES,
 ) -> WriteStats:
     """Persist an arbitrary iterator-of-rows by adapting it as a single-shard source.
 
@@ -1248,6 +1324,10 @@ def save_iterator(
         max_shard_size: Soft size cap per shard; same syntax as
             :func:`parse_size`.
         compression: Codec name forwarded to the writer.
+        overwrite: Whether existing shards may be replaced.
+        row_group_size: Parquet only: explicit rows per row group.
+        row_group_target_bytes: Parquet only: target uncompressed bytes per
+            row group when ``row_group_size`` is ``None``.
 
     Returns:
         WriteStats: Aggregated statistics from the underlying
@@ -1310,4 +1390,13 @@ def save_iterator(
             return self._it
 
     source = IteratorSource(iterator)
-    return save_dataset(source, output_path, format, max_shard_size, compression=compression, overwrite=overwrite)
+    return save_dataset(
+        source,
+        output_path,
+        format,
+        max_shard_size,
+        compression=compression,
+        overwrite=overwrite,
+        row_group_size=row_group_size,
+        row_group_target_bytes=row_group_target_bytes,
+    )

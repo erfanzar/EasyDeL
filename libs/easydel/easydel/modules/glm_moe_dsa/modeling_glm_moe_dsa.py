@@ -1810,7 +1810,7 @@ class GlmMoeDsaModel(_GlmMoeDsaIndexerCacheMixin, EasyDeLBaseModule):
             initial = (*initial, None)
         if aux_active:
             initial = (*initial, jnp.zeros((), dtype=jnp.float32))
-        final = self.layers.scan(_layer_loop, initial, trace=trace_layers)
+        final = self.layers.scan(_layer_loop, initial, trace=trace_layers, **self._layer_scan_kwargs("text"))
         hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = final[:6]
         hidden_states = self.norm(hidden_states)
 

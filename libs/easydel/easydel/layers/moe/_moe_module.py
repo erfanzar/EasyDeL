@@ -96,12 +96,44 @@ from ._communication_utils import (
     sort_activations,
     unpermute,
 )
-from ._layout_planner import validate_moe_layout
+from ._layout_planner import ep_carries_batch_inactive_reason, validate_moe_layout
 
 if typing.TYPE_CHECKING:
     from easydel.infra.base_config import EasyDeLBaseConfig
 
 logger = get_logger(__name__)
+
+
+def _default_ffn_activation(
+    act_fn: Callable[[jax.Array], jax.Array],
+) -> Callable[[jax.Array, jax.Array | None], jax.Array]:
+    """Return the default expert activation for ``act_fn``.
+
+    Gated experts compute ``act_fn(w0) * w1`` (SwiGLU-style); ungated experts (no up
+    projection, ``w1 is None``) compute ``act_fn(w0)``.
+
+    Args:
+        act_fn: Pointwise activation applied to the gate (or sole up) projection.
+
+    Returns:
+        A callable ``(w0, w1) -> intermediate``.
+    """
+
+    def ffn_activation(x0: jax.Array, x1: jax.Array | None) -> jax.Array:
+        """Default expert activation: ``act_fn(x0) * x1``, or ``act_fn(x0)`` when ``x1`` is ``None``.
+
+        Args:
+            x0: Gate-projection output (the sole up projection for ungated experts).
+            x1: Up-projection output, or ``None`` for ungated experts.
+
+        Returns:
+            Element-wise activation output with the shape of ``x0``.
+        """
+        if x1 is None:
+            return act_fn(x0)
+        return act_fn(x0) * x1
+
+    return ffn_activation
 
 
 def _channelwise_grouped_platform(rows, codes, activation_bits, *, force_xla=False):
@@ -567,7 +599,8 @@ class BaseMoeModule(spx.Module, ABC):
 
         * non-ring only — ring-of-experts all-gathers the batch over ep, the
           exact opposite placement;
-        * ``fsdp_is_ep_bound`` / ``sp_is_ep_bound`` must be ``False`` — the
+        * ``fsdp_is_ep_bound`` must be ``False`` and ``sp_is_ep_bound`` must be
+          ``False`` or the sp axis of size 1 (the fold is then a no-op) — the
           folded 3-D expert mesh absorbs those axes into ep and has no
           distinct fsdp axis to co-shard the batch with;
         * ``use_expert_tensor_mode`` swaps ep onto tp and has no expert axis
@@ -589,21 +622,31 @@ class BaseMoeModule(spx.Module, ABC):
         """
         if not bool(getattr(self.config, "moe_ep_carries_batch", False)):
             return False
-        if self.config.use_ring_of_experts or self.config.use_expert_tensor_mode:
-            return False
-        if self.config.fsdp_is_ep_bound or self.config.sp_is_ep_bound:
-            return False
         axis_names = expert_mesh.jax_mesh.axis_names
+        axis_sizes = dict(expert_mesh.jax_mesh.shape)
         ep_axis_name = resolve_eformer_axis(EP, self.runtime_sharding_resolver)
         fsdp_axis_name = resolve_eformer_axis(FSDP, self.runtime_sharding_resolver)
+        sp_axis_name = resolve_eformer_axis(SP, self.runtime_sharding_resolver)
         # Stage-mesh path only: the folded 3-D expert mesh has no distinct
         # fsdp axis, and MPMD stages (pp > 1) always fold.
         if not (isinstance(ep_axis_name, str) and ep_axis_name in axis_names):
             return False
         if not (isinstance(fsdp_axis_name, str) and fsdp_axis_name in axis_names):
             return False
-        ep_size = int(expert_mesh.shape[ep_axis_name])
-        if ep_size <= 1:
+        ep_size = int(axis_sizes[ep_axis_name])
+        sp_size = int(axis_sizes.get(sp_axis_name, 1)) if isinstance(sp_axis_name, str) else 1
+        # Static layout conditions are shared with the layout planner so the two cannot disagree.
+        if (
+            ep_carries_batch_inactive_reason(
+                ep=ep_size,
+                sp=sp_size,
+                fsdp_is_ep_bound=bool(self.config.fsdp_is_ep_bound),
+                sp_is_ep_bound=bool(self.config.sp_is_ep_bound),
+                use_ring_of_experts=bool(self.config.use_ring_of_experts),
+                use_expert_tensor_mode=bool(self.config.use_expert_tensor_mode),
+            )
+            is not None
+        ):
             return False
         if self.n_routed_experts % ep_size != 0:
             logger.warn_once(
@@ -674,6 +717,81 @@ class BaseMoeModule(spx.Module, ABC):
             ):
                 batch_axis_names += (ep_axis_name,)
         return batch_axis_names
+
+    def _resolver_batch_axis_order(
+        self,
+        batch_axis_names: tuple[str, ...],
+        shape: tuple[int, ...],
+    ) -> tuple[str, ...]:
+        """Reorder ``batch_axis_names`` to the runtime resolver's hidden-state batch order.
+
+        The residual stream is pinned to ``HiddenStateSharding`` (batch over e.g. ``(fsdp, dp)``) while the fused
+        MoE names its batch ``(dp, fsdp)``. Both give each device the same per-shard shape but a different global
+        row (flattened index ``d * fsdp + f`` against ``f * dp + d``), so GSPMD inserts a whole-shard
+        collective-permute at the block entry and exit. Naming the axes in the resolver's order makes the specs
+        coincide; only which rows a device holds changes, never the per-row values.
+
+        Args:
+            batch_axis_names: Batch axes of the fused-MoE ``shard_map`` (after any divisibility trim).
+            shape: Global shape ``[B, S, H]`` of the block input, passed to the resolver.
+
+        Returns:
+            The same names: those the resolver places first in its order, the rest appended in their old order.
+        """
+        try:
+            spec = self.runtime_sharding_resolver.resolve(dynamic_axes=common_types.HiddenStateSharding, shape=shape)
+        except Exception as err:
+            logger.warn_once(f"moe_batch_axes_follow_resolver: resolver failed for {shape} ({err}); order unchanged.")
+            return batch_axis_names
+        entry = next(iter(spec), None)
+        order = () if entry is None else ((entry,) if isinstance(entry, str) else tuple(entry))
+        if self.config.fsdp_is_ep_bound:
+            # Bound fsdp devices are named by the expert axis inside the dispatch.
+            fsdp_name = resolve_eformer_axis(FSDP, self.runtime_sharding_resolver)
+            ep_name = resolve_eformer_axis(EP, self.runtime_sharding_resolver)
+            if ep_name in batch_axis_names and fsdp_name not in batch_axis_names:
+                order = tuple(ep_name if name == fsdp_name else name for name in order)
+        reordered = tuple(name for name in order if name in batch_axis_names)
+        reordered += tuple(name for name in batch_axis_names if name not in reordered)
+        if reordered != tuple(batch_axis_names):
+            logger.info_once(f"fused MoE batch axes {tuple(batch_axis_names)} -> {reordered} (resolver order)")
+        return reordered
+
+    @staticmethod
+    def _divisible_batch_axes(
+        batch_axis_names: tuple[str, ...],
+        expert_mesh: spx.SpxMesh,
+        batch_size: int,
+    ) -> tuple[str, ...]:
+        """Longest prefix of ``batch_axis_names`` whose mesh-size product divides ``batch_size``.
+
+        The fused-MoE ``shard_map`` requires the batch to divide the product of its batch axes. A one-request
+        decode step or a small batch on an fsdp-dominant mesh does not, so the trailing axes that break
+        divisibility are dropped and replicate the (small) batch instead: redundant compute, identical result.
+
+        Args:
+            batch_axis_names: Candidate batch axes in priority order (dp first).
+            expert_mesh: Active expert mesh supplying the axis sizes.
+            batch_size: Static global batch size of the block input.
+
+        Returns:
+            The kept axis names; empty means a fully replicated batch.
+        """
+        sizes = dict(expert_mesh.jax_mesh.shape)
+        kept: tuple[str, ...] = ()
+        product = 1
+        for name in batch_axis_names:
+            candidate = product * int(sizes.get(name, 1))
+            if batch_size % candidate != 0:
+                break
+            kept += (name,)
+            product = candidate
+        if kept != tuple(batch_axis_names):
+            logger.info_once(
+                f"fused MoE: batch {batch_size} does not divide over {tuple(batch_axis_names)} "
+                f"(sizes {[int(sizes.get(n, 1)) for n in batch_axis_names]}); placing it over {kept or 'no axis'}."
+            )
+        return kept
 
     def get_moe_spec(
         self,
@@ -850,6 +968,7 @@ class BaseMoeModule(spx.Module, ABC):
             chunk_size=chunk_size,
             fsdp_shard_expert_weights=bool(getattr(self.config, "moe_fsdp_shard_expert_weights", False)),
             ep_carries_batch=bool(ep_carries_batch),
+            sp_is_ep_bound=bool(self.config.sp_is_ep_bound),
         )
 
     def _replicate_and_sort_tokens(
@@ -1243,6 +1362,47 @@ class BaseMoeModule(spx.Module, ABC):
         constrained_weights = jnp.where(weight_sum > 0, constrained_weights / weight_sum, constrained_weights)
         return selected_experts, constrained_weights
 
+    @staticmethod
+    def _validate_expert_kernels(
+        *,
+        wi_kernel: tp.Any,
+        wu_kernel: tp.Any,
+        gate_up_kernel: tp.Any,
+        wu_bias: tp.Any,
+        gate_up_bias: tp.Any,
+        gated: bool,
+    ) -> None:
+        """Check that the expert kernels match the requested FFN form.
+
+        Ungated experts must be requested explicitly (``gated=False``) so a gated
+        model that accidentally passes ``wu_kernel=None`` fails loudly instead of
+        silently dropping its up projection.
+
+        Args:
+            wi_kernel: Gate (or sole up, when ungated) projection kernel.
+            wu_kernel: Up projection kernel; must be ``None`` when ungated.
+            gate_up_kernel: Fused gate/up kernel; gated experts only.
+            wu_bias: Up projection bias; must be ``None`` when ungated.
+            gate_up_bias: Fused gate/up bias; gated experts only.
+            gated: Whether the experts are gated (``act(x @ wi) * (x @ wu)``).
+
+        Raises:
+            ValueError: If the kernels do not describe the requested FFN form.
+        """
+        if gated:
+            if gate_up_kernel is None and (wi_kernel is None or wu_kernel is None):
+                raise ValueError(
+                    "Gated MoE requires either gate_up_kernel or both wi_kernel and wu_kernel "
+                    "(pass gated=False for ungated experts with a single up projection)."
+                )
+            return
+        if gate_up_kernel is not None or gate_up_bias is not None:
+            raise ValueError("Ungated MoE (gated=False) cannot take a fused gate_up_kernel/gate_up_bias.")
+        if wi_kernel is None:
+            raise ValueError("Ungated MoE (gated=False) requires wi_kernel (the expert up projection).")
+        if wu_kernel is not None or wu_bias is not None:
+            raise ValueError("Ungated MoE (gated=False) requires wu_kernel=None and wu_bias=None.")
+
     def _sparse_moe_call(
         self,
         hidden_state: jax.Array,  # [B, S, H]
@@ -1261,6 +1421,7 @@ class BaseMoeModule(spx.Module, ABC):
         *,
         act_fn: Callable[[jax.Array], jax.Array],
         layer_idx: int | None = None,
+        gated: bool = True,
     ):
         """Fused MoE path using grouped matmul and shard_map.
 
@@ -1305,7 +1466,10 @@ class BaseMoeModule(spx.Module, ABC):
             wu_bias: Optional bias for W_u. Shape: [E, H].
             wd_bias: Optional bias for W_d. Shape: [E, M].
             ffn_activation: Optional custom activation combining (w0, w1) -> output.
+                For ungated experts it is called as ``ffn_activation(w0, None)``.
             act_fn: Activation used when `ffn_activation` is not provided.
+            gated: ``False`` selects ungated experts (``wu_kernel=None``):
+                ``out = wd(act(x @ wi))``. See :meth:`moe_call`.
 
         Returns:
             Tuple `(output, router_logits)` where:
@@ -1313,8 +1477,8 @@ class BaseMoeModule(spx.Module, ABC):
             - router_logits: Pre-softmax router logits for auxiliary losses. Shape: [B*S, E].
 
         Raises:
-            ValueError: If neither ``gate_up_kernel`` nor both ``wi_kernel`` and
-                ``wu_kernel`` are given, if ``use_expert_tensor_mode`` is set
+            ValueError: If the expert kernels do not match ``gated`` (see
+                :meth:`_validate_expert_kernels`), if ``use_expert_tensor_mode`` is set
                 while the tensor-parallel size is greater than 1, or if
                 ``use_ring_of_experts`` is set with an expert count that the
                 expert-parallel size does not divide.
@@ -1351,8 +1515,14 @@ class BaseMoeModule(spx.Module, ABC):
             >>> # logits.shape = (1024, 8)  # batch*seq, n_experts
         """
 
-        if gate_up_kernel is None and (wi_kernel is None or wu_kernel is None):
-            raise ValueError("MoE requires either gate_up_kernel or both wi_kernel and wu_kernel.")
+        self._validate_expert_kernels(
+            wi_kernel=wi_kernel,
+            wu_kernel=wu_kernel,
+            gate_up_kernel=gate_up_kernel,
+            wu_bias=wu_bias,
+            gate_up_bias=gate_up_bias,
+            gated=gated,
+        )
         # Resolve routing-strategy defaults (e.g. TOP_K weight renormalization) the same
         # way the dense/standard paths do — the fused default path previously read the raw
         # self.moe_hooks and silently skipped the default refine/select hook, so TOP_K MoE
@@ -1559,26 +1729,12 @@ class BaseMoeModule(spx.Module, ABC):
         # both — otherwise dp=1/fsdp-dominant training meshes replicate the
         # whole global batch into every shard of the region below.
         batch_axis_names = self._moe_batch_axis_names(expert_mesh, dp_axis_name, ep_carries_batch=ep_carries_batch)
-        # Shape-aware batch sanitization, INFERENCE TRACES ONLY: serving-style
-        # packed batches can be smaller than the batch mesh group (eSurge
-        # packs EVERY window — decode and prefill — as [1, N] tokens; with
-        # fsdp>1 the ('dp','fsdp') batch spec cannot divide B=1 and shard_map
-        # hard-errors). The batch placement must be dropped CONSISTENTLY
-        # across x [B,S,H], gate logits [B*S,E], and the output — a partial
-        # drop would pair replicated activations with sharded logits inside
-        # the body. Batch-replicated execution is numerically identical, just
-        # redundant across those shards. The drop is gated to inference
-        # traces (eSurge compiles run under ``set_inference_mode()``; pure-
-        # decode buckets additionally force decode-mode specs): a TRAINING
-        # batch that cannot divide the batch group keeps the loud shard_map
-        # error, because silently replicating it would multiply per-shard
-        # compute without any signal to the user.
-        _batch_group = 1
-        _mesh_axis_sizes = dict(expert_mesh.jax_mesh.shape)
-        for _axis_name in batch_axis_names:
-            _batch_group *= int(_mesh_axis_sizes.get(_axis_name, 1))
-        if _batch_group > 1 and _BS % _batch_group != 0 and (is_inference_mode() or inference_mode_forces_decode()):
-            batch_axis_names = ()
+        # Inference only: small serving batches keep the longest divisible prefix of batch axes;
+        # training batches that don't divide must still fail loudly.
+        if is_inference_mode() or inference_mode_forces_decode():
+            batch_axis_names = self._divisible_batch_axes(batch_axis_names, expert_mesh, int(_BS))
+        if bool(getattr(self.config, "moe_batch_axes_follow_resolver", False)):
+            batch_axis_names = self._resolver_batch_axis_order(batch_axis_names, tuple(hidden_state.shape))
         batch_axes = (
             batch_axis_names if len(batch_axis_names) > 1 else (batch_axis_names[0] if batch_axis_names else None)
         )
@@ -1603,18 +1759,7 @@ class BaseMoeModule(spx.Module, ABC):
             output_ps = jax.sharding.PartitionSpec(batch_axes, None, tensor_axis_name)
 
         if ffn_activation is None:
-
-            def ffn_activation(x0: jax.Array, x1: jax.Array) -> jax.Array:
-                """Default SwiGLU-style FFN activation: ``act_fn(x0) * x1``.
-
-                Args:
-                    x0: Gate-projection output.
-                    x1: Up-projection output.
-
-                Returns:
-                    Element-wise ``act_fn(x0) * x1``, same shape as inputs.
-                """
-                return act_fn(x0) * x1
+            ffn_activation = _default_ffn_activation(act_fn)
 
         # Generate weight sharding specs using helper function
         use_expert_tensor = self.config.use_expert_tensor_mode
@@ -2245,17 +2390,21 @@ class BaseMoeModule(spx.Module, ABC):
                         layer_w0 = layer_w0 + wi_bias[selected_experts]
                     layer_w0 = _mask_dispatch_tail(layer_w0, group_sizes)
 
-                    layer_w1 = _expert_gmm(
-                        x_rows,
-                        wu_kernel,
-                        activation_bits=wu_activation_bits,
-                        grouped_platform=wu_grouped_platform,
-                    )
+                    if wu_kernel is None:
+                        # Ungated experts (``gated=False``, validated at entry): a single up projection.
+                        layer_w1 = None
+                    else:
+                        layer_w1 = _expert_gmm(
+                            x_rows,
+                            wu_kernel,
+                            activation_bits=wu_activation_bits,
+                            grouped_platform=wu_grouped_platform,
+                        )
 
-                    layer_w1 = checkpoint_name(layer_w1, "mlp_up")
-                    if wu_bias is not None:
-                        layer_w1 = layer_w1 + wu_bias[selected_experts]
-                    layer_w1 = _mask_dispatch_tail(layer_w1, group_sizes)
+                        layer_w1 = checkpoint_name(layer_w1, "mlp_up")
+                        if wu_bias is not None:
+                            layer_w1 = layer_w1 + wu_bias[selected_experts]
+                        layer_w1 = _mask_dispatch_tail(layer_w1, group_sizes)
 
                 intermediate_layer = _mask_dispatch_tail(ffn_activation(layer_w0, layer_w1), group_sizes)
 
@@ -2738,6 +2887,7 @@ class BaseMoeModule(spx.Module, ABC):
         act_fn: Callable[[jax.Array], jax.Array],
         output_metrics: bool = False,
         layer_idx: int | None = None,
+        gated: bool = True,
     ):
         """Dispatch to the configured MoE execution path with auto-configured hooks.
 
@@ -2758,6 +2908,21 @@ class BaseMoeModule(spx.Module, ABC):
 
             User-provided hooks on ``self.moe_hooks`` are preserved and override
             the defaults.
+
+        **Routing scores seen by hooks:** the fused and dense engines both hand
+        ``before_topk`` and ``select_hook`` the *normalized* gate scores — the
+        output of ``normalize_gate_logits`` when the model sets it, otherwise
+        the float32 softmax of the (``after_gate``-processed) logits. Raw
+        logits are only returned as the auxiliary output.
+
+        **Ungated experts:** ``gated=False`` with ``wi_kernel`` set and
+        ``wu_kernel=None`` computes ``wd(act(x @ wi))`` per expert (for
+        example squared-ReLU experts, ``act_fn=ACT2FN["relu2"]``);
+        ``ffn_activation`` is then called as ``ffn_activation(w0, None)``.
+        The flag is explicit so a gated model that omits ``wu_kernel`` fails
+        instead of silently dropping its up projection. It applies to the
+        fused and dense engines; the standard engine runs ``expert_layer``,
+        which defines its own FFN.
 
         Args:
             hidden_state: Input hidden states fed to the expert FFNs.
@@ -2794,6 +2959,10 @@ class BaseMoeModule(spx.Module, ABC):
             layer_idx: Optional owning layer index for expert-load recording and
                 standard-path logging. Fused recording defaults to self.layer_idx
                 when available.
+            gated: ``True`` (default) for gated experts
+                ``wd(act(x @ wi) * (x @ wu))``; ``False`` for ungated experts
+                with a single up projection (requires ``wu_kernel=None`` and no
+                fused ``gate_up_kernel``).
 
         Returns:
             Tuple ``(output, aux)`` where ``output`` has shape ``[B, S, H]``
@@ -2802,7 +2971,8 @@ class BaseMoeModule(spx.Module, ABC):
             the standard path).
 
         Raises:
-            ValueError: If ``wd_kernel`` is ``None``.
+            ValueError: If ``wd_kernel`` is ``None``, or if the expert kernels
+                do not match ``gated`` (fused and dense engines).
             NotImplementedError: If ``self.module_moe_method`` is not one of
                 the three known :class:`MoEMethods` values.
         """
@@ -2850,6 +3020,7 @@ class BaseMoeModule(spx.Module, ABC):
                         ffn_activation=ffn_activation,
                         hooks=hooks,
                         layer_idx=getattr(self, "layer_idx", None) if layer_idx is None else layer_idx,
+                        gated=gated,
                     )
                 case MoEMethods.DENSE_MOE:
                     logger.warn_once(
@@ -2870,6 +3041,7 @@ class BaseMoeModule(spx.Module, ABC):
                         act_fn=act_fn,
                         ffn_activation=ffn_activation,
                         hooks=hooks,
+                        gated=gated,
                     )
                 case _:
                     raise NotImplementedError()
@@ -2893,6 +3065,7 @@ class BaseMoeModule(spx.Module, ABC):
         act_fn: Callable[[jax.Array], jax.Array],
         capacity_factor: float | None = None,
         output_metrics: bool = False,
+        gated: bool = True,
     ):
         """Dense MoE forward pass using per-token batched matmuls.
 
@@ -2936,11 +3109,14 @@ class BaseMoeModule(spx.Module, ABC):
             wu_bias: Optional bias for W_u. Shape: [E, M].
             wd_bias: Optional bias for W_d. Shape: [E, H].
             ffn_activation: Optional custom activation combining (w0, w1) -> output.
-                If None, uses act_fn(w0) * w1 (gated activation).
+                If None, uses act_fn(w0) * w1 (gated activation), or act_fn(w0)
+                for ungated experts (called as ``ffn_activation(w0, None)``).
             act_fn: Activation function used when ffn_activation is not provided.
             capacity_factor: If provided, applies soft capacity constraints
                 to limit tokens per expert.
             output_metrics: If True, returns MoeMetrics instead of router logits.
+            gated: ``False`` selects ungated experts (``wu_kernel=None``). See
+                :meth:`moe_call`.
 
         Returns:
             Tuple of (output, metrics_or_logits) where:
@@ -2952,8 +3128,14 @@ class BaseMoeModule(spx.Module, ABC):
             This method is slower than fused MoE but useful for debugging
             and as a fallback when grouped matmul kernels are unavailable.
         """
-        if gate_up_kernel is None and (wi_kernel is None or wu_kernel is None):
-            raise ValueError("MoE requires either gate_up_kernel or both wi_kernel and wu_kernel.")
+        self._validate_expert_kernels(
+            wi_kernel=wi_kernel,
+            wu_kernel=wu_kernel,
+            gate_up_kernel=gate_up_kernel,
+            wu_bias=wu_bias,
+            gate_up_bias=gate_up_bias,
+            gated=gated,
+        )
         hooks = self._configure_hooks_for_routing_strategy() if hooks is None else hooks
 
         hidden_state = hidden_state.astype(self.dtype)
@@ -3004,18 +3186,7 @@ class BaseMoeModule(spx.Module, ABC):
         # unnormalized weights), exactly as on the fused path.
 
         if ffn_activation is None:
-
-            def ffn_activation(x0: jax.Array, x1: jax.Array) -> jax.Array:
-                """Default SwiGLU-style FFN activation: ``act_fn(x0) * x1``.
-
-                Args:
-                    x0: Gate-projection output.
-                    x1: Up-projection output.
-
-                Returns:
-                    Element-wise ``act_fn(x0) * x1``, same shape as inputs.
-                """
-                return act_fn(x0) * x1
+            ffn_activation = _default_ffn_activation(act_fn)
 
         precision = getattr(self, "precision", None)
         if hooks.refine_inputs_hook is not None:
@@ -3038,10 +3209,14 @@ class BaseMoeModule(spx.Module, ABC):
             if wi_bias is not None:
                 w0 = w0 + jnp.take(wi_bias.astype(self.dtype), experts, axis=0)
 
-            wu_sel = jnp.take(wu_kernel.astype(self.dtype), experts, axis=0)
-            w1 = jnp.einsum("tkh,tkhm->tkm", hidden_expanded, wu_sel, precision=precision)
-            if wu_bias is not None:
-                w1 = w1 + jnp.take(wu_bias.astype(self.dtype), experts, axis=0)
+            if wu_kernel is None:
+                # Ungated experts (``gated=False``, validated at entry): a single up projection.
+                w1 = None
+            else:
+                wu_sel = jnp.take(wu_kernel.astype(self.dtype), experts, axis=0)
+                w1 = jnp.einsum("tkh,tkhm->tkm", hidden_expanded, wu_sel, precision=precision)
+                if wu_bias is not None:
+                    w1 = w1 + jnp.take(wu_bias.astype(self.dtype), experts, axis=0)
 
         intermediate = ffn_activation(w0, w1)
         if hooks.before_wo is not None:

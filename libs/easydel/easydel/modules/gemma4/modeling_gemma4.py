@@ -1283,6 +1283,7 @@ class Gemma4VisionEncoder(EasyDeLLayerStackMixin, spx.Module):
             or output_attentions
             or not self.config.scan_layers
             or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs("vision"),
         )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -3383,6 +3384,7 @@ class Gemma4TextModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, all_hidden_states, all_attentions, 0),
             trace=True,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")

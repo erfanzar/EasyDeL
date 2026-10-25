@@ -273,6 +273,9 @@ def sample_anchor_positions(
     loss_mask: jax.Array,
     *,
     num_anchors: int,
+    salt: jax.Array | None = None,
+    fold_batch_index: bool = True,
+    label_horizon: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Select DSpark/DFlash anchor positions from supervised token spans.
 
@@ -283,25 +286,47 @@ def sample_anchor_positions(
     Args:
         loss_mask: Float supervision mask shaped ``[batch, seq]`` (values > 0.5 are supervised).
         num_anchors: Number of anchor positions to sample per batch.
+        salt: Optional per-row ``[batch]`` integer salt folded into the ranking so
+            anchors can vary with row content or step.  ``None`` keeps the fixed order.
+        fold_batch_index: Whether the local batch-row index is folded into the
+            ranking.  Pass ``False`` (with a ``salt``) for anchors that do not
+            depend on how rows are split into microbatches.
+        label_horizon: Number of consecutive supervised, in-bounds positions
+            required after an anchor.  ``1`` is the default rule; ``block_size``
+            only keeps anchors whose whole block is supervised.
 
     Returns:
         Tuple of ``(anchors, keep)`` where ``anchors`` is an int32 array of shape
         ``[batch, num_anchors]`` and ``keep`` is a boolean array of the same shape
         indicating which anchors are valid.
+
+    Raises:
+        ValueError: If ``label_horizon < 1``.
     """
     batch_size, seq_len = loss_mask.shape
-    num_candidates = max(seq_len - 1, 0)
+    horizon = int(label_horizon)
+    if horizon < 1:
+        raise ValueError(f"`label_horizon` must be >= 1, got {label_horizon}.")
+    num_candidates = max(seq_len - horizon, 0)
     if num_candidates == 0:
         anchors = jnp.zeros((batch_size, int(num_anchors)), dtype=jnp.int32)
         return anchors, jnp.zeros_like(anchors, dtype=bool)
 
-    valid = (loss_mask[:, :num_candidates] > 0.5) & (loss_mask[:, 1 : num_candidates + 1] > 0.5)
+    valid = loss_mask[:, :num_candidates] > 0.5
+    for offset in range(1, horizon + 1):
+        valid = valid & (loss_mask[:, offset : offset + num_candidates] > 0.5)
     candidate_ids = jnp.broadcast_to(jnp.arange(num_candidates, dtype=jnp.int32)[None, :], (batch_size, num_candidates))
-    batch_ids = jnp.arange(batch_size, dtype=jnp.uint32)[:, None]
     candidate_hash = candidate_ids.astype(jnp.uint32)
     scores = (candidate_hash ^ jnp.uint32(0x9E3779B9)) * jnp.uint32(0x85EBCA6B)
     scores = (scores ^ (scores >> jnp.uint32(13))) * jnp.uint32(0xC2B2AE35)
-    scores = scores ^ (scores >> jnp.uint32(16)) ^ (batch_ids * jnp.uint32(0x27D4EB2D))
+    scores = scores ^ (scores >> jnp.uint32(16))
+    if fold_batch_index:
+        batch_ids = jnp.arange(batch_size, dtype=jnp.uint32)[:, None]
+        scores = scores ^ (batch_ids * jnp.uint32(0x27D4EB2D))
+    if salt is not None:
+        row_salt = jnp.asarray(salt).astype(jnp.uint32).reshape(batch_size, 1)
+        salted = (row_salt ^ jnp.uint32(0x94D049BB)) * jnp.uint32(0xBF58476D)
+        scores = scores ^ salted ^ (salted >> jnp.uint32(11))
     invalid_score = jnp.array(jnp.iinfo(jnp.uint32).max, dtype=jnp.uint32)
     sorted_order = jnp.argsort(jnp.where(valid, scores, invalid_score), axis=1)
     sorted_candidates = jnp.take_along_axis(candidate_ids, sorted_order, axis=1)
@@ -393,6 +418,7 @@ def create_dspark_attention_mask(
     block_keep_mask: jax.Array,
     seq_len: int,
     block_size: int,
+    segment_ids: jax.Array | None = None,
 ) -> jax.Array:
     """Create DSpark's block attention mask as a dense JAX boolean array.
 
@@ -405,6 +431,9 @@ def create_dspark_attention_mask(
         block_keep_mask: Boolean mask of shape ``[batch, num_blocks]`` indicating active blocks.
         seq_len: Length of the target context sequence.
         block_size: Number of tokens per block.
+        segment_ids: Optional ``[batch, seq_len]`` packing segment ids.  When set,
+            a block only attends to context in its anchor's own document, so
+            packed documents never read each other.  ``None`` keeps the unpacked mask.
 
     Returns:
         Boolean attention mask of shape ``[batch, num_blocks * block_size, seq_len + num_blocks *
@@ -417,6 +446,12 @@ def create_dspark_attention_mask(
 
     context_idx = jnp.arange(seq_len)
     context_allowed = context_idx[None, None, :] < anchor_for_q[:, :, None]
+    if segment_ids is not None:
+        anchor_segment = jnp.take_along_axis(segment_ids, anchor_positions, axis=1)
+        segment_for_q = jnp.take_along_axis(
+            anchor_segment, jnp.broadcast_to(q_block[None, :], (batch_size, q_idx.size)), 1
+        )
+        context_allowed = context_allowed & (segment_ids[:, None, :] == segment_for_q[:, :, None])
 
     draft_idx = jnp.arange(num_blocks * int(block_size))
     draft_block = draft_idx // int(block_size)

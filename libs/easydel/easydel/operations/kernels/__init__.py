@@ -113,6 +113,7 @@ from .blocksparse_attention import BlockSparseAttn
 from .compressed_window_attention import CompressedWindowAttn
 from .compressed_window_decode import CompressedWindowDecodeAttn
 from .decode_attention import AutoRegressiveDecodeAttn
+from .dsa_pool_sparse_attention import DsaPoolSparseAttn
 from .flash_attention import FlashAttn
 from .fused_mlp import FusedMlpOp
 from .gated_delta_rule import GatedDeltaRuleOp, GatedDeltaRuleOutput
@@ -120,6 +121,7 @@ from .gated_pool_compress import GatedPoolCompressOp, GatedPoolCompressOutput, g
 from .gdn_compute_schedule_v2 import GDNComputeScheduleV2, GDNComputeScheduleV2Config, compute_schedule_table_v2
 from .glm_moe_dsa_indexer import GlmMoeDsaIndexerOp, GlmMoeDsaIndexerOutput
 from .indexer_distill import IndexerDistillKLOp, IndexerDistillKLOutput, LazyIndexerScores, indexer_distill_kl_op
+from .indexer_scores import IndexerScoresOp, IndexerScoresOutput, indexer_scores_op
 from .inference_conv1d import (
     RaggedCausalConv1D,
     ragged_causal_conv1d,
@@ -143,6 +145,7 @@ __all__ = (
     "BlockSparseAttn",
     "CompressedWindowAttn",
     "CompressedWindowDecodeAttn",
+    "DsaPoolSparseAttn",
     "FlashAttn",
     "FusedMlpOp",
     "GDNComputeScheduleV2",
@@ -155,6 +158,8 @@ __all__ = (
     "GlmMoeDsaIndexerOutput",
     "IndexerDistillKLOp",
     "IndexerDistillKLOutput",
+    "IndexerScoresOp",
+    "IndexerScoresOutput",
     "KDAOutput",
     "KernelDeltaAttnOp",
     "LazyIndexerScores",
@@ -176,6 +181,7 @@ __all__ = (
     "fused_kda_gate",
     "gated_pool_compress_op",
     "indexer_distill_kl_op",
+    "indexer_scores_op",
     "kda_packed_rows_forward",
     "packed_ssm1_fwd",
     "packed_ssm2_fwd",

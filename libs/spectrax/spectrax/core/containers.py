@@ -13,6 +13,7 @@ directly, producing paths like ``"blocks.0.fc.weight"``.
 
 from __future__ import annotations
 
+import functools
 import inspect
 import types
 from collections.abc import Iterable, Iterator, Mapping
@@ -21,13 +22,13 @@ from typing import ClassVar, TypeVar, cast, overload
 
 import jax
 import jax.numpy as jnp
-from jax._src.core import is_concrete
 
 from ..sharding.mesh import current_mesh
 from .graph import GraphDef, ModuleNode, VarNode, iter_variables, strip_pipeline_stage_metadata
 from .module import Module, Opaque, _bump_graph_epoch, _graph_epoch
 from .paths import str_to_path
 from .registry import resolve_class
+from .scan_prefetch import barrier_array_leaves
 from .sharding import Sharding, normalize_sharding
 from .stage_assignment import PIPELINE_STAGE_METADATA_KEY
 from .state import State, _nested_set
@@ -45,6 +46,21 @@ __all__ = [
 
 M = TypeVar("M", bound=Module)
 P = TypeVar("P", bound=Parameter)
+
+
+def _is_concrete_index(idx: object) -> bool:
+    """Return whether ``idx`` is a concrete value rather than a JAX tracer.
+
+    Python ints, NumPy integers and concrete JAX scalars are concrete; only tracers need the dynamic path. This
+    relies on the public ``jax.core.Tracer`` type instead of the private ``jax._src.core.is_concrete``.
+
+    Args:
+        idx: Index passed to a container ``__getitem__``.
+
+    Returns:
+        ``False`` for tracers, ``True`` otherwise.
+    """
+    return not isinstance(idx, jax.core.Tracer)
 
 
 def _stack_module_states(items: list[Module], *, context: str) -> tuple[GraphDef, State]:
@@ -265,11 +281,14 @@ def _scan_normalize_value(value: object, *, _depth: int = 0, _seen: set[int] | N
             )
         attrs = getattr(value, "__dict__", None)
         if isinstance(attrs, dict):
+            # A ``functools.cached_property`` lands in the instance dict once read, so two modules holding equal
+            # objects would key differently depending on whether anyone read it yet (e.g. ``Mesh.shape_tuple``).
+            cls = type(value)
             public_attrs = tuple(
                 sorted(
                     (k, _scan_normalize_value(v, _depth=_depth + 1, _seen=_seen))
                     for k, v in attrs.items()
-                    if not k.startswith("_")
+                    if not k.startswith("_") and not isinstance(getattr(cls, k, None), functools.cached_property)
                 )
             )
             return ("object", type(value).__module__, type(value).__qualname__, public_attrs)
@@ -1112,6 +1131,7 @@ def _scan_segment_with_explicit_unroll(
     *,
     shared: dict[tuple[str, str], Variable] | None = None,
     indexed: bool = False,
+    barrier: bool = False,
 ):
     """Run one segment with the direct layer-wise ``lax.scan`` lowering.
 
@@ -1132,6 +1152,7 @@ def _scan_segment_with_explicit_unroll(
             :func:`_shared_segment_variables`); their current values seed
             the carry.
         indexed: Pass the absolute layer index as the first argument of ``fn``.
+        barrier: Apply :func:`barrier_array_leaves` to each layer's ``(carry, layer state)``.
 
     Returns:
         ``(final_carry, final_shared, layer_writes)`` where ``final_shared``
@@ -1156,6 +1177,8 @@ def _scan_segment_with_explicit_unroll(
         user_carry, shared_values = loop_carry
         index, layer_state = xs if indexed else (None, xs)
         layer_state = _apply_scan_state_constraints(layer_state, constraint_specs)
+        if barrier:
+            user_carry, layer_state = barrier_array_leaves((user_carry, layer_state))
         if shared_values:
             layer_state = layer_state.overlay(_keyed_values_to_state(shared_values))
         live = bind(gdef, layer_state)
@@ -1173,6 +1196,305 @@ def _scan_segment_with_explicit_unroll(
         unroll=effective_unroll,
     )
     return carry, shared_final, writes
+
+
+@dataclass(frozen=True)
+class _ScanBlock:
+    """A periodic run of segments lowered as one ``lax.scan`` over its repeats.
+
+    Attributes:
+        start: Inclusive first layer index of the run.
+        stop: Exclusive last layer index of the run.
+        blocks: Number of repeats of the period.
+        positions: One segment template per period position; its ``stacked`` leaves carry leading
+            ``[blocks, length, ...]`` axes.
+        members: Per position, the original segment of every repeat (used to write layer writes back).
+    """
+
+    start: int
+    stop: int
+    blocks: int
+    positions: tuple[_ScanSegment, ...]
+    members: tuple[tuple[_ScanSegment, ...], ...]
+
+
+def _group_periodic_segments(
+    segments: tuple[_ScanSegment, ...],
+    foldable: tuple[bool, ...] | None = None,
+) -> list[_ScanSegment | _ScanBlock]:
+    """Fold maximal periodic runs of segments into :class:`_ScanBlock` items.
+
+    A run ``segments[i : i + p * b]`` is periodic with period ``p >= 2`` when every position has the same
+    ``(family_id, length)`` across ``b >= 2`` repeats and the period holds at least two families (a single-family
+    period is already one segment). At each start the run covering the most layers wins.
+
+    Args:
+        segments: The plan's segments in execution order.
+        foldable: Per segment, whether it may join a block (segments carrying shared variables may not).
+
+    Returns:
+        Segments and blocks in execution order.
+    """
+    n = len(segments)
+    if n < 4:
+        return list(segments)
+    if foldable is None:
+        foldable = (True,) * n
+
+    def signature(lo: int, hi: int) -> tuple[tuple[int, int, bool], ...]:
+        return tuple((seg.family_id, seg.length, ok) for seg, ok in zip(segments[lo:hi], foldable[lo:hi], strict=True))
+
+    out: list[_ScanSegment | _ScanBlock] = []
+    i = 0
+    while i < n:
+        best: tuple[int, int] | None = None
+        for p in range(2, (n - i) // 2 + 1):
+            sig = signature(i, i + p)
+            if not all(ok for _, _, ok in sig) or len({fid for fid, _, _ in sig}) < 2:
+                continue
+            b = 1
+            while i + (b + 1) * p <= n and signature(i + b * p, i + (b + 1) * p) == sig:
+                b += 1
+            if b >= 2 and (best is None or p * b > best[0] * best[1]):
+                best = (p, b)
+        if best is None:
+            out.append(segments[i])
+            i += 1
+            continue
+        p, b = best
+        positions, members = [], []
+        for j in range(p):
+            reps = tuple(segments[i + k * p + j] for k in range(b))
+            stacked = jax.tree.map(lambda *vs: jnp.stack(vs, axis=0), *[r.stacked for r in reps])
+            positions.append(
+                _ScanSegment(
+                    start=reps[0].start,
+                    stop=reps[0].stop,
+                    gdef=reps[0].gdef,
+                    stacked=stacked,
+                    family_id=reps[0].family_id,
+                )
+            )
+            members.append(reps)
+        out.append(
+            _ScanBlock(
+                start=segments[i].start,
+                stop=segments[i + b * p - 1].stop,
+                blocks=b,
+                positions=tuple(positions),
+                members=tuple(members),
+            )
+        )
+        i += b * p
+    return out
+
+
+def _scan_block_with_explicit_unroll(block: _ScanBlock, fn, carry, bind, unroll: int | None, *, barrier: bool = False):
+    """Lower a :class:`_ScanBlock` as an outer ``lax.scan`` over blocks whose body runs every position.
+
+    A length-1 position runs inline; a longer one runs its own inner ``lax.scan``.
+
+    Args:
+        block: The block to lower.
+        fn: ``(module, carry) -> carry``.
+        carry: Initial carry.
+        bind: :func:`spectrax.bind`.
+        unroll: Inner-scan unroll factor (``None`` selects the default).
+        barrier: Apply :func:`barrier_array_leaves` to each layer's ``(carry, layer state)``.
+
+    Returns:
+        ``(final_carry, writes)`` where ``writes[j]`` maps each written ``(collection, path)`` of position ``j`` to
+        values stacked on leading ``[blocks, length]`` axes.
+    """
+
+    def make_step(pos: _ScanSegment):
+        specs = _scan_state_constraint_specs(pos.gdef)
+
+        def step(c, layer_state):
+            layer_state = _apply_scan_state_constraints(layer_state, specs)
+            if barrier:
+                c, layer_state = barrier_array_leaves((c, layer_state))
+            live = bind(pos.gdef, layer_state)
+            snapshot = _layer_write_snapshot(live)
+            c = fn(live, c)
+            return c, _layer_writes(snapshot)
+
+        return step
+
+    steps = tuple(make_step(pos) for pos in block.positions)
+
+    def body(c, block_states):
+        writes = []
+        for pos, step, pos_state in zip(block.positions, steps, block_states, strict=True):
+            if pos.length == 1:
+                c, w = step(c, jax.tree.map(lambda x: x[0], pos_state))
+                w = jax.tree.map(lambda x: x[None], w)
+            else:
+                c, w = jax.lax.scan(step, c, pos_state, unroll=_scan_effective_unroll(unroll, pos.length))
+            writes.append(w)
+        return c, tuple(writes)
+
+    return jax.lax.scan(body, carry, tuple(pos.stacked for pos in block.positions))
+
+
+def _scan_with_weight_prefetch(
+    positions: tuple[_ScanSegment, ...],
+    blocks: int,
+    fn,
+    carry,
+    bind,
+    *,
+    barrier: bool,
+    axes: tuple[str, ...],
+    exclude: tuple[str, ...],
+    defer_dw: bool,
+):
+    """Lower ``blocks`` repeats of ``positions`` through :mod:`spectrax.core.scan_prefetch`.
+
+    Returns ``None`` (the caller falls back to the plain lowering) when no leaf qualifies for prefetch, when there
+    is a single layer, or when a layer writes variables (the prefetch loop has no write-back path).
+
+    Args:
+        positions: Segment templates; ``stacked`` leaves are ``[blocks, length, ...]`` when ``blocks > 1``.
+        blocks: Number of repeats (``1`` for a lone segment).
+        fn: ``(module, carry) -> carry``.
+        carry: Initial carry.
+        bind: :func:`spectrax.bind`.
+        barrier: Per-layer optimization barrier.
+        axes: Mesh axes to gather over.
+        exclude: State keys never prefetched.
+        defer_dw: See :func:`spectrax.core.scan_prefetch.scan_with_weight_prefetch`.
+
+    Returns:
+        The final carry, or ``None``.
+    """
+    from .scan_prefetch import convert_layer, log_plan, logger, plan_position, scan_with_weight_prefetch
+
+    plans, leaves = [], []
+    for pos in positions:
+        plan, pos_leaves = plan_position(
+            pos.gdef,
+            pos.stacked,
+            _scan_state_constraint_specs(pos.gdef),
+            pos.length,
+            axes,
+            exclude=exclude,
+            block_axis=blocks > 1,
+        )
+        plans.append(plan)
+        leaves.append(pos_leaves)
+    if not any(plan.pf_idx for plan in plans) or blocks * sum(plan.length for plan in plans) <= 1:
+        return None
+    carry = jax.tree_util.tree_map(jnp.asarray, carry)
+    wrote: list[str] = []
+
+    def apply(gdef, state, c):
+        live = bind(gdef, state)
+        snapshot = _layer_write_snapshot(live)
+        out = fn(live, c)
+        wrote.extend(path for _kind, path in _layer_writes(snapshot))
+        return out
+
+    layers = [convert_layer(plan, lv, apply, carry) for plan, lv in zip(plans, leaves, strict=True)]
+    if wrote:
+        logger.warning(
+            "weight prefetch disabled for layers %d-%d: they write variables %s",
+            positions[0].start,
+            positions[-1].stop,
+            sorted(set(wrote)),
+        )
+        return None
+    log_plan(plans, axes)
+    return scan_with_weight_prefetch(plans, leaves, layers, blocks, carry, barrier=barrier, defer_dw=defer_dw)
+
+
+def _lower_scan_plan(
+    segments: tuple[_ScanSegment, ...],
+    fn,
+    carry,
+    bind,
+    unroll: int | None,
+    *,
+    shared: list[dict[tuple[str, str], Variable]],
+    write_back,
+    block_scan: bool,
+    barrier: bool,
+    prefetch_axes,
+    prefetch_exclude,
+    prefetch_defer_dw: bool,
+):
+    """Run every segment of a scan plan with the requested lowering options.
+
+    Args:
+        segments: Plan segments in execution order.
+        fn: ``(module, carry) -> carry``.
+        carry: Initial carry.
+        bind: :func:`spectrax.bind`.
+        unroll: ``lax.scan`` unroll factor (ignored by the prefetch lowering).
+        shared: Per segment, its carried shared variables.
+        write_back: ``(segment, shared, shared_final, writes) -> None``.
+        block_scan: Fold periodic runs of segments into block scans.
+        barrier: Per-layer optimization barrier.
+        prefetch_axes: Mesh axes for next-layer weight prefetch, or ``None``.
+        prefetch_exclude: State keys never prefetched.
+        prefetch_defer_dw: Group replicated-leaf gradient all-reduces per block (prefetch lowering only).
+
+    Returns:
+        The final carry.
+    """
+    if isinstance(prefetch_axes, str):
+        prefetch_axes = (prefetch_axes,)
+    axes = tuple(prefetch_axes or ())
+    exclude = (prefetch_exclude,) if isinstance(prefetch_exclude, str) else tuple(prefetch_exclude or ())
+    shared_of = {seg.start: s for seg, s in zip(segments, shared, strict=True)}
+    if block_scan:
+        items = _group_periodic_segments(segments, tuple(not s for s in shared))
+    else:
+        items = list(segments)
+    for item in items:
+        if isinstance(item, _ScanBlock):
+            out = None
+            if axes:
+                out = _scan_with_weight_prefetch(
+                    item.positions,
+                    item.blocks,
+                    fn,
+                    carry,
+                    bind,
+                    barrier=barrier,
+                    axes=axes,
+                    exclude=exclude,
+                    defer_dw=prefetch_defer_dw,
+                )
+            if out is not None:
+                carry = out
+                continue
+            carry, writes = _scan_block_with_explicit_unroll(item, fn, carry, bind, unroll, barrier=barrier)
+            for members, pos_writes in zip(item.members, writes, strict=True):
+                for k, member in enumerate(members):
+                    write_back(member, {}, {}, {key: value[k] for key, value in pos_writes.items()})
+            continue
+        seg_shared = shared_of[item.start]
+        if axes and not seg_shared:
+            out = _scan_with_weight_prefetch(
+                (item,),
+                1,
+                fn,
+                carry,
+                bind,
+                barrier=barrier,
+                axes=axes,
+                exclude=exclude,
+                defer_dw=prefetch_defer_dw,
+            )
+            if out is not None:
+                carry = out
+                continue
+        carry, shared_final, writes = _scan_segment_with_explicit_unroll(
+            item, fn, carry, bind, unroll, shared=seg_shared, barrier=barrier
+        )
+        write_back(item, seg_shared, shared_final, writes)
+    return carry
 
 
 def _write_back_item_writes(
@@ -1471,7 +1793,7 @@ class ModuleList(_ListContainer):
         """
         if isinstance(idx, slice):
             return type(self)(self._spx_items[idx])
-        if not is_concrete(idx):
+        if not _is_concrete_index(idx):
             return self._get_traced(idx)
         return self._spx_items[idx]
 
@@ -1496,7 +1818,19 @@ class ModuleList(_ListContainer):
         _install_item_write_through(live, idx, _item_variable_tables(self._spx_items))
         return live
 
-    def scan(self, fn, init_carry, *, trace: bool = False, unroll: int | None = None):
+    def scan(
+        self,
+        fn,
+        init_carry,
+        *,
+        trace: bool = False,
+        unroll: int | None = None,
+        block_scan: bool = False,
+        barrier: bool = False,
+        prefetch_axes: str | tuple[str, ...] | None = None,
+        prefetch_exclude: str | tuple[str, ...] = (),
+        prefetch_defer_dw: bool = False,
+    ):
         """Scan over modules: ``fn(module, carry) -> new_carry``.
 
         Two execution modes:
@@ -1531,6 +1865,25 @@ class ModuleList(_ListContainer):
             unroll: Optional explicit unroll factor for
                 :func:`jax.lax.scan`. ``None`` selects SpectraX's
                 default of ``1``.
+            block_scan: Fold a periodic run of segments (for example
+                ``[A, B, B, B] * n``) into one outer ``lax.scan`` over the
+                repeats, so fewer loop bodies are compiled. Values and
+                gradients may differ from the default at float rounding level.
+            barrier: Put a ``jax.lax.optimization_barrier`` over each
+                layer's ``(carry, parameters)``; values are unchanged.
+            prefetch_axes: Mesh axes (e.g. ``("fsdp",)``) over which the
+                next layer's 2-D sharded weights are all-gathered while the
+                current layer runs (:mod:`spectrax.core.scan_prefetch`).
+                Requires reverse-mode differentiation only; ``unroll`` is
+                ignored on that path and segments whose layers write
+                variables, carry a shared RNG, or have no qualifying leaf
+                fall back to the plain lowering.
+            prefetch_exclude: State keys (e.g. ``"experts"``) whose leaves
+                are never prefetched.
+            prefetch_defer_dw: With ``prefetch_axes`` and ``barrier``, keep
+                replicated leaves' gradients out of the cotangent barrier and
+                unroll inner reverse loops so their all-reduces can be
+                combined per block.
 
         Returns:
             The final carry after the last layer runs.
@@ -1559,14 +1912,25 @@ class ModuleList(_ListContainer):
             plan = _build_cached_scan_plan_from_exports(self, exports, context="ModuleList.scan")
 
         tables = _item_variable_tables(self._spx_items)
-        carry = init_carry
-        for segment in plan.segments:
-            shared = _shared_segment_variables(tables, segment.start, segment.stop)
-            carry, shared_final, writes = _scan_segment_with_explicit_unroll(
-                segment, fn, carry, bind, unroll, shared=shared
-            )
-            _write_back_item_writes(tables, segment, shared, shared_final, writes)
-        return carry
+        shared = [_shared_segment_variables(tables, seg.start, seg.stop) for seg in plan.segments]
+
+        def write_back(segment, seg_shared, shared_final, writes):
+            _write_back_item_writes(tables, segment, seg_shared, shared_final, writes)
+
+        return _lower_scan_plan(
+            plan.segments,
+            fn,
+            init_carry,
+            bind,
+            unroll,
+            shared=shared,
+            write_back=write_back,
+            block_scan=block_scan,
+            barrier=barrier,
+            prefetch_axes=prefetch_axes,
+            prefetch_exclude=prefetch_exclude,
+            prefetch_defer_dw=prefetch_defer_dw,
+        )
 
     def stack(self) -> StackedModuleList:
         """Return a stacked view optimized for repeated-layer scans.
@@ -1885,7 +2249,7 @@ class StackedModuleList(Module):
         graph_defs = getattr(self, "_spx_item_gdefs", ())
         if not graph_defs:
             raise IndexError("Cannot index an empty StackedModuleList")
-        if is_concrete(idx):
+        if _is_concrete_index(idx):
             gdef = graph_defs[int(idx)]
         elif self._spx_item_gdef is not None:
             gdef = self._spx_item_gdef
@@ -1956,7 +2320,19 @@ class StackedModuleList(Module):
         """
         raise RuntimeError("StackedModuleList is not callable; iterate, index, or scan it.")
 
-    def scan(self, fn, init_carry, *, trace: bool = False, unroll: int | None = None):
+    def scan(
+        self,
+        fn,
+        init_carry,
+        *,
+        trace: bool = False,
+        unroll: int | None = None,
+        block_scan: bool = False,
+        barrier: bool = False,
+        prefetch_axes: str | tuple[str, ...] | None = None,
+        prefetch_exclude: str | tuple[str, ...] = (),
+        prefetch_defer_dw: bool = False,
+    ):
         """Scan over pre-stacked modules: ``fn(module, carry) -> new_carry``.
 
         Same semantics as :meth:`ModuleList.scan` but skips the
@@ -1972,6 +2348,11 @@ class StackedModuleList(Module):
             trace: ``True`` to use the Python-loop path; ``False`` to
                 lower to ``lax.scan``.
             unroll: Optional explicit ``lax.scan`` unroll factor.
+            block_scan: See :meth:`ModuleList.scan`.
+            barrier: See :meth:`ModuleList.scan`.
+            prefetch_axes: See :meth:`ModuleList.scan`.
+            prefetch_exclude: See :meth:`ModuleList.scan`.
+            prefetch_defer_dw: See :meth:`ModuleList.scan`.
 
         Returns:
             The final carry, or ``init_carry`` unchanged when the
@@ -1993,11 +2374,23 @@ class StackedModuleList(Module):
         stacked = self._stacked_state()
         plan = _build_cached_scan_plan_from_stacked(self, graph_defs, stacked, context="StackedModuleList.scan")
 
-        carry = init_carry
-        for segment in plan.segments:
-            carry, _shared, writes = _scan_segment_with_explicit_unroll(segment, fn, carry, bind, unroll)
+        def write_back(segment, _seg_shared, _shared_final, writes):
             self._write_back_segment_writes(segment, writes)
-        return carry
+
+        return _lower_scan_plan(
+            plan.segments,
+            fn,
+            init_carry,
+            bind,
+            unroll,
+            shared=[{} for _ in plan.segments],
+            write_back=write_back,
+            block_scan=block_scan,
+            barrier=barrier,
+            prefetch_axes=prefetch_axes,
+            prefetch_exclude=prefetch_exclude,
+            prefetch_defer_dw=prefetch_defer_dw,
+        )
 
     def fori_loop(self, fn, init_carry):
         """``fori_loop`` over pre-stacked modules: ``fn(i, module, carry) -> new_carry``.

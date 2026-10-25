@@ -937,6 +937,7 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
             trace=not self.config.scan_layers
             or self._pipeline_stage_count() > 1
             or bool(self.config.deepstack_visual_indexes),
+            **self._layer_scan_kwargs("vision"),
         )
         hidden_states = self.merger(hidden_states)
         return hidden_states, deepstack_feature_lists
@@ -1517,6 +1518,7 @@ class Qwen3VLTextModel(DeepStackVisualMixin, EasyDeLBaseModule):
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")

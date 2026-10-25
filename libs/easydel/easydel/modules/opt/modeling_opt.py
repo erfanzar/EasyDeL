@@ -853,6 +853,7 @@ class OPTDecoder(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_self_attns, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         if self.final_layer_norm is not None:
             hidden_state = checkpoint_name(self.final_layer_norm(hidden_states), "model_output")

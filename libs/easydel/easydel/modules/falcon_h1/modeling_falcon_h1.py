@@ -1408,6 +1408,7 @@ class FalconH1Model(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, all_hidden_states, all_attentions, past_key_values, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.final_layernorm(hidden_states)
         if output_hidden_states:

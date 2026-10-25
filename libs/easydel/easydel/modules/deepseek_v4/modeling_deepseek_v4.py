@@ -2431,6 +2431,7 @@ class DeepseekV4Model(EasyDeLBaseModule):
             _layer_loop,
             (hidden_streams, all_hidden_states, all_router_logits, () if output_dspark_hidden else None, None, 0),
             trace=True,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(self.hc_head(hidden_streams))
 
