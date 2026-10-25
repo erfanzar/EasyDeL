@@ -384,6 +384,47 @@ _TRANSFORMER_OPTION_NAMES = (
 )
 
 
+def _stacked_layer_paths(model: tp.Any) -> tuple[tuple, ...]:
+    """Return the module paths of every ``StackedModuleList`` in ``model``.
+
+    Args:
+        model: Module tree, typically freshly built by ``lazy_init``.
+
+    Returns:
+        Tuple paths (attribute names) of the stacked layer containers.
+    """
+    from spectrax.core.paths import str_to_path
+
+    if not isinstance(model, spx.Module):
+        return ()
+    return tuple(str_to_path(path) for path, _ in spx.iter_modules(model, select=nn.StackedModuleList) if path)
+
+
+def _restack_layer_containers(model: tp.Any, paths: tuple[tuple, ...]) -> tp.Any:
+    """Replace the ``ModuleList`` at each path with its stacked equivalent.
+
+    Args:
+        model: Fully materialized model built with ``scan_layers=False``.
+        paths: Container paths that the ``scan_layers=True`` build stacks.
+
+    Returns:
+        The same model with those containers stacked.
+
+    Raises:
+        TypeError: If a path does not resolve to a ``ModuleList`` reachable by attribute names.
+    """
+    for path in sorted(paths, key=len, reverse=True):
+        parent = model
+        for key in path[:-1]:
+            parent = parent[key] if isinstance(key, int) else getattr(parent, key)
+        name = path[-1]
+        child = getattr(parent, name, None) if isinstance(name, str) else None
+        if not isinstance(child, nn.ModuleList):
+            raise TypeError(f"cannot re-stack layer container at {'.'.join(map(str, path))}: got {type(child)}")
+        setattr(parent, name, child.stack())
+    return model
+
+
 def _checkpoint_transformer_options(transformer: tp.Any) -> tuple[tp.Any, ...]:
     """Extract the conversion options shared by both streaming loaders.
 
@@ -2919,6 +2960,21 @@ class EasyBridgeMixin(PushToHubMixin):
             precision=precision,
             rngs=spx.Rngs(0),
         )
+        # HF conversion fuses and shards by per-layer leaf names, which a stacked layer
+        # container hides; convert into the unstacked layout and re-stack afterwards.
+        stacked_layer_paths = _stacked_layer_paths(model)
+        if stacked_layer_paths:
+            ed_config.scan_layers = False
+            try:
+                model = module.lazy_init(
+                    config=ed_config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=spx.Rngs(0),
+                )
+            finally:
+                ed_config.scan_layers = True
         model.generation_config = generation_config
 
         _clear()
@@ -3004,6 +3060,8 @@ class EasyBridgeMixin(PushToHubMixin):
         # abstract and merge_model_and_tree (parameters only) never fills them. Concretize the
         # remaining meta leaves now so the model is fully materialized and safe to serialize.
         model = model.materialize_meta_state()
+        if stacked_layer_paths:
+            model = _restack_layer_containers(model, stacked_layer_paths)
         logger.debug("model and parameters pytree merged.")
 
         model = model.quantize(

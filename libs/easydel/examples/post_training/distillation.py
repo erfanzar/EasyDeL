@@ -111,7 +111,7 @@ def main():
                 "tokenizer": args.model,
                 "task": "auto-bind",
             },
-            "teacher": {
+            "teacher_model": {
                 "name_or_path": args.teacher_model,
                 "tokenizer": args.teacher_model,
                 "task": "auto-bind",

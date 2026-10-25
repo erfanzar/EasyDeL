@@ -990,10 +990,10 @@ class PPOTrainer(Trainer):
             one entry per reward function.
         """
         batch = self._apply_user_data_collator(batch)
-        reward_batch = self._extract_reward_batch_sidechannels(batch)
+        reward_sidechannels = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)
-        if reward_batch:
-            reward_batch = {**batch, **reward_batch}
+        if reward_sidechannels:
+            reward_batch = {**batch, **reward_sidechannels}
         else:
             reward_batch = batch
         with capture_time() as preprocessing_time_fn:
@@ -1112,6 +1112,12 @@ class PPOTrainer(Trainer):
                 else completions
             )
 
+            reward_batch = self._completion_aligned_reward_batch(
+                reward_batch,
+                reward_sidechannels,
+                prompt_count=prompt_ids.shape[0],
+                completion_count=completion_ids.shape[0],
+            )
             rewards_per_func = jnp.full((completion_ids.shape[0], len(self.reward_funcs)), jnp.nan, dtype="f4")
             with capture_time() as rewarding_time_fn:
                 for i, (reward_func, reward_processing_class) in enumerate(

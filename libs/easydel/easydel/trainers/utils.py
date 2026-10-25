@@ -46,6 +46,7 @@ from ml_collections import ConfigDict  # pyright: ignore[reportMissingTypeStubs]
 from ml_collections.config_dict import placeholder  # pyright: ignore[reportMissingTypeStubs]
 
 from easydel.infra.utils import ProcessingClassType
+from easydel.trainers._reward_sideband import is_reward_sideband
 from easydel.trainers.training_utils import GENERATION_MODEL_INPUT_KEYS, SHARED_GENERATION_MODEL_INPUT_KEYS
 
 logger = get_logger(__name__)
@@ -1692,7 +1693,7 @@ class GRPODataCollatorTFDS:
                         f"Found mixed presence for `{key}` across one batch."
                     )
                 continue
-            if key == "tools":
+            if key == "tools" or any(is_reward_sideband(value) for value in values):
                 batch[key] = values
                 continue
             try:
@@ -1898,7 +1899,7 @@ class GRPODataCollatorGrain:
         }
         for key, value in feature.items():
             if key not in {"input_ids", "attention_mask"} and value is not None:
-                if key == "tools":
+                if key == "tools" or is_reward_sideband(value):
                     batch[key] = value
                     continue
                 try:

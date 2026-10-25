@@ -31,6 +31,7 @@ from easydel.data.transforms.base import Example, ExpandTransform, Transform
 from easydel.data.transforms.mixture import ASSISTANT_ONLY_FIELD, DATASET_ID_FIELD
 
 from ._assistant_tracker import assistant_tracker_lock
+from ._reward_sideband import is_reward_sideband
 from .prompt_utils import apply_chat_template as apply_conversational_template
 from .prompt_utils import (
     maybe_apply_chat_template,
@@ -125,6 +126,9 @@ def preprocess_dataset_with_num_proc(dataset: tp.Any, transform: tp.Callable, nu
     source = dataset if isinstance(dataset, ShardedDataSource) else HFDatasetShardedSource(dataset)
     result = BaseTrainer._preprocess_source(context, source, transform)
     return result._dataset if isinstance(dataset, Dataset) else result
+
+
+_GRPO_CONSUMED_TEXT_FIELDS = frozenset({"prompt", "chosen", "rejected", "messages", "conversations", "completion"})
 
 
 def purify_example(example: dict, keep_fields: set[str] | None = None) -> dict:
@@ -353,8 +357,12 @@ class GRPOPreprocessTransform(Transform):
         result["input_ids"] = input_ids
         result["attention_mask"] = attention_mask
 
-        # Preserve per-example sideband metadata such as `tools` for reward functions.
-        keep_fields = {"tools"} if "tools" in result else None
+        # Reward functions read per-example metadata (gold `answer`, `tools`, ...) from `batch`.
+        keep_fields = {
+            key
+            for key, value in result.items()
+            if key == "tools" or (key not in _GRPO_CONSUMED_TEXT_FIELDS and is_reward_sideband(value))
+        }
         return purify_example(result, keep_fields=keep_fields)
 
     def _resolve_prompt_pad_length(self, prompt_length: int) -> int | None:

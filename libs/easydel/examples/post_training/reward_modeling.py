@@ -101,8 +101,8 @@ def main():
             "model": {
                 "name_or_path": args.model,
                 "tokenizer": args.model,
-                "task": "seq-cls",
-                "num_labels": 1,
+                "task": "sequence-classification",
+                "extra_kwargs": {"num_labels": 1},
             },
             "loader": {
                 "dtype": "bfloat16",

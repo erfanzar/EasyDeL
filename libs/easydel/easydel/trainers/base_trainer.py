@@ -91,6 +91,7 @@ from easydel.utils.lazy_import import is_package_available
 from easydel.utils.traversals import specs_to_name_sharding
 
 from . import fused_optimizers as _fused_optimizers  # noqa: F401  registers fused_adamw/fused_lion/fused_rmsprop
+from ._reward_sideband import is_reward_sideband
 from .buckets import (
     BucketRule,
     CycleBucketRule,
@@ -677,7 +678,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     values = [item.get(key) for item in per_example]
                     if any(v is None for v in values):
                         continue
-                    if key == "tools":
+                    if key == "tools" or any(is_reward_sideband(v) for v in values):
                         stacked[key] = values
                         continue
                     try:
@@ -1802,34 +1803,94 @@ class BaseTrainer(BaseTrainerProtocol):
 
     @staticmethod
     def _extract_reward_batch_sidechannels(batch: tp.Any) -> dict[str, tp.Any]:
-        """Preserve non-numeric batch metadata needed by callable reward functions.
+        """Preserve non-numeric batch columns needed by callable reward functions.
 
-        Currently extracts the ``tools`` field if present, converting JAX
-        / NumPy arrays back to Python lists so they survive transport into
-        a Python reward callback.
+        ``_purify_batch`` keeps only numeric arrays, so string or structured
+        columns (gold ``answer``, ``verification_info``, ``tools``, ...) would
+        never reach a reward function. They are returned here as one Python
+        value per example.
 
         Args:
             batch: The current batch (dict, list of dicts, or other shape).
 
         Returns:
-            A dict with extracted side-channel metadata (e.g.
-            ``{"tools": [...]}``); empty when nothing relevant is found.
+            A dict mapping each non-numeric column to a per-example list;
+            empty when there is none.
         """
+
+        def _is_numeric(values) -> bool:
+            def _numeric_dtype(arr) -> bool:
+                return bool(np.issubdtype(arr.dtype, np.number) or arr.dtype == np.bool_)
+
+            try:
+                arr = np.asarray(values)
+            except (ValueError, TypeError):
+                arr = None
+            if arr is not None and arr.dtype != object:
+                return _numeric_dtype(arr)
+            # Ragged numeric rows (unpadded token ids) are still numeric columns.
+            try:
+                return bool(values) and all(v is not None and _numeric_dtype(np.asarray(v)) for v in values)
+            except (ValueError, TypeError):
+                return False
+
         if isinstance(batch, dict):
-            if "tools" not in batch:
-                return {}
-            tools = batch["tools"]
-            if isinstance(tools, tuple):
-                tools = list(tools)
-            elif isinstance(tools, (np.ndarray, jax.Array)):
-                tools = np.asarray(jax.device_get(tools), dtype=object).tolist()
-            return {"tools": tools}
+            out = {}
+            for key, value in batch.items():
+                if isinstance(value, tuple):
+                    value = list(value)
+                elif isinstance(value, (np.ndarray, jax.Array)):
+                    if _is_numeric(value) and key != "tools":
+                        continue
+                    value = np.asarray(jax.device_get(value), dtype=object).tolist()
+                if isinstance(value, list) and (key == "tools" or not _is_numeric(value)):
+                    out[key] = value
+            return out
 
         if isinstance(batch, (list, tuple)) and batch and isinstance(batch[0], dict):
-            tools = [example.get("tools") for example in batch]
-            if any(tool is not None for tool in tools):
-                return {"tools": tools}
+            out = {}
+            for key in batch[0]:
+                values = [example.get(key) for example in batch]
+                if all(v is None for v in values):
+                    continue
+                if key == "tools" or not _is_numeric(values):
+                    out[key] = values
+            return out
         return {}
+
+    @staticmethod
+    def _completion_aligned_reward_batch(
+        reward_batch: dict[str, tp.Any],
+        sidechannels: dict[str, tp.Any],
+        *,
+        prompt_count: int,
+        completion_count: int,
+    ) -> dict[str, tp.Any]:
+        """Repeat prompt-level side-channel columns so they line up with the generated completions.
+
+        Args:
+            reward_batch: Purified batch merged with the side channels.
+            sidechannels: Columns returned by ``_extract_reward_batch_sidechannels``.
+            prompt_count: Number of prompts in the batch.
+            completion_count: Number of completions scored (``prompt_count * G``).
+
+        Returns:
+            ``reward_batch`` with each side-channel column expanded to one row per completion.
+        """
+        if not sidechannels:
+            return reward_batch
+        from .reward_protocol import align_reward_sidechannels
+
+        try:
+            aligned = align_reward_sidechannels(
+                {key: reward_batch[key] for key in sidechannels if key in reward_batch},
+                prompt_count=int(prompt_count),
+                completion_count=int(completion_count),
+            )
+        except ValueError as exc:
+            logger.warn_once(f"reward side-channel columns left prompt-aligned: {exc}")
+            return reward_batch
+        return {**reward_batch, **aligned}
 
     @staticmethod
     def _peek_first_example(dataset: tp.Any) -> tp.Any | None:

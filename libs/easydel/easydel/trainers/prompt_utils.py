@@ -1017,6 +1017,13 @@ def extract_prompt(example: dict[str, Sequence]) -> dict[str, Sequence]:
     # Exhaustion is a complete prefix, not an examined-but-unmatched element.
     if idx < limit and idx > 0 and example["chosen"][idx - 1] == " ":
         idx -= 1
+    # Identical message lists: an empty assistant completion cannot be rendered, so keep the final turn.
+    if (
+        idx > 0
+        and idx == len(example["chosen"]) == len(example["rejected"])
+        and isinstance(example["chosen"][idx - 1], Mapping)
+    ):
+        idx -= 1
     return {
         "prompt": example["chosen"][:idx],
         "chosen": example["chosen"][idx:],

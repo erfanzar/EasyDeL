@@ -42,6 +42,11 @@ pytestmark = pytest.mark.cpu_ok
             [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}],
             [{"role": "user", "content": "q"}],
         ),
+        (
+            [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}],
+            [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}],
+            [{"role": "user", "content": "q"}],
+        ),
     ],
 )
 def test_shared_prompt_preserves_complete_prefix_and_distinct_suffixes(chosen, rejected, prompt):

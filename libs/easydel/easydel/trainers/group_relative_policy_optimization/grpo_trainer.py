@@ -1662,10 +1662,10 @@ class GRPOTrainer(Trainer):
                 return cached
 
         batch = self._apply_user_data_collator(batch)
-        reward_batch = self._extract_reward_batch_sidechannels(batch)
+        reward_sidechannels = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)
-        if reward_batch:
-            reward_batch = {**batch, **reward_batch}
+        if reward_sidechannels:
+            reward_batch = {**batch, **reward_sidechannels}
         else:
             reward_batch = batch
         with capture_time() as preprocessing_time_fn:
@@ -1919,6 +1919,12 @@ class GRPOTrainer(Trainer):
                 tool_calls=tool_call_records,
             )
 
+            reward_batch = self._completion_aligned_reward_batch(
+                reward_batch,
+                reward_sidechannels,
+                prompt_count=prompt_ids.shape[0],
+                completion_count=prompt_ids.shape[0] * generation_factor,
+            )
             rewards_per_func = jnp.full(
                 (prompt_ids.shape[0] * generation_factor, len(self.reward_funcs)),
                 jnp.nan,
