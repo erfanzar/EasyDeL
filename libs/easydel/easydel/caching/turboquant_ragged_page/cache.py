@@ -305,6 +305,20 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
             constants=constants,
         )
 
+    def reset(self) -> "TurboQuantRaggedPagesCacheView":
+        """Zero all compressed KV buffers without replacing quantization constants."""
+        names = (
+            "kv_pages",
+            "key_indices_pages",
+            "key_signs_pages",
+            "key_norms_pages",
+            "value_indices_pages",
+            "value_norms_pages",
+        )
+        return self.replace(
+            **{name: None if getattr(self, name) is None else jnp.zeros_like(getattr(self, name)) for name in names}
+        )
+
     @classmethod
     def init_all_layers(
         cls,

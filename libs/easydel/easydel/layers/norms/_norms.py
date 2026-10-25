@@ -74,12 +74,14 @@ Initializer = jax.nn.initializers.Initializer
 PromoteDtypeFn = tp.Callable[..., tuple]
 
 
-def promote_dtype(values, *, dtype=None):
+def promote_dtype(values, *, dtype=None, inexact=None):
     """Cast a tuple of arrays to a shared dtype, preserving ``None`` values.
 
     Args:
         values: Iterable of arrays (or ``None`` placeholders) to promote.
         dtype: Target dtype. If ``None``, the values are returned unchanged.
+        inexact: Reserved compatibility argument for embedding dtype promoters.
+            Explicit ``dtype`` casts retain the existing behavior regardless of this value.
 
     Returns:
         Tuple of arrays cast to ``dtype`` (or ``None`` for any input that was
@@ -163,7 +165,7 @@ def _compute_stats(x, axes, dtype, axis_name, axis_index_groups, use_fast_varian
     """Compute mean and variance for batch / layer normalization.
 
     Supports masked statistics (for variable-length sequences) and
-    cross-replica aggregation via ``jax.lax.pmean`` when ``axis_name`` is
+    count-weighted cross-replica aggregation via ``jax.lax.psum`` when ``axis_name`` is
     provided. The "fast" variance path uses ``E[x^2] - E[x]^2`` while the
     safe path uses the centered formulation ``E[(x - mean)^2]``.
 
@@ -185,34 +187,35 @@ def _compute_stats(x, axes, dtype, axis_name, axis_index_groups, use_fast_varian
         so they can be broadcast against ``x``.
     """
     axes = _canonicalize_axes(x.ndim, axes)
-    if mask is not None:
-        mask = jnp.expand_dims(mask, axis=tuple(range(x.ndim - mask.ndim)))
-        denom = jnp.sum(mask, axis=axes, keepdims=True)
-        mean = jnp.sum(x * mask, axis=axes, keepdims=True, dtype=dtype) / jnp.maximum(denom, 1.0)
-        if use_fast_variance:
-            var = jnp.sum(jnp.square(x) * mask, axis=axes, keepdims=True, dtype=dtype) / jnp.maximum(
-                denom, 1.0
-            ) - jnp.square(mean)
-        else:
-            var = jnp.sum(jnp.square(x - mean) * mask, axis=axes, keepdims=True, dtype=dtype) / jnp.maximum(denom, 1.0)
+    stats_dtype = dtype if dtype is not None else jnp.promote_types(x.dtype, jnp.float32)
+    values = x.astype(stats_dtype)
+    valid = jnp.ones(x.shape, dtype=jnp.bool_) if mask is None else jnp.broadcast_to(mask, x.shape)
+
+    def aggregate(value):
+        total = jnp.sum(value, axis=axes, keepdims=True, dtype=stats_dtype)
+        if axis_name is not None:
+            total = jax.lax.psum(total, axis_name, axis_index_groups=axis_index_groups)
+        return total
+
+    # Aggregate counts as well as moments: replicas may contain different
+    # numbers of valid elements, including entirely masked local batches.
+    denom = jnp.maximum(aggregate(valid.astype(stats_dtype)), 1.0)
+    mean = aggregate(jnp.where(valid, values, 0)) / denom
+    if use_fast_variance:
+        var = aggregate(jnp.where(valid, jnp.square(values), 0)) / denom - jnp.square(mean)
     else:
-        mean = jnp.mean(x, axis=axes, keepdims=True, dtype=dtype)
-        if use_fast_variance:
-            var = jnp.mean(jnp.square(x), axis=axes, keepdims=True, dtype=dtype) - jnp.square(mean)
-        else:
-            var = jnp.var(x, axis=axes, keepdims=True, dtype=dtype)
-    if axis_name is not None:
-        mean = jax.lax.pmean(mean, axis_name, axis_index_groups=axis_index_groups)
-        var = jax.lax.pmean(var, axis_name, axis_index_groups=axis_index_groups)
-    return mean, var
+        # Center on the GLOBAL mean before reducing; averaging local
+        # variances discards the variance between replica means.
+        var = aggregate(jnp.where(valid, jnp.square(values - mean), 0)) / denom
+    return mean, jnp.maximum(var, 0)
 
 
 def _normalize(x, mean, var, scale, bias, reduction_axes, feature_axes, dtype, epsilon):
     """Apply per-element normalization and (optional) affine transformation.
 
     Implements ``y = ((x - mean) / sqrt(var + epsilon)) * scale + bias``.
-    Reduction and feature axes are accepted for API symmetry with the rest of
-    the spectrax/flax normalization stack but are not used directly.
+    Statistics retain their reduction dimensions. Affine parameters are
+    reshaped onto the declared feature axes, including non-trailing axes.
 
     Args:
         x: Input tensor.
@@ -230,10 +233,12 @@ def _normalize(x, mean, var, scale, bias, reduction_axes, feature_axes, dtype, e
     """
     x = jnp.asarray(x, dtype=dtype) if dtype is not None else x
     y = (x - mean) * jax.lax.rsqrt(var + epsilon)
+    feature_axes = _canonicalize_axes(x.ndim, feature_axes)
+    param_shape = tuple(x.shape[i] if i in feature_axes else 1 for i in range(x.ndim))
     if scale is not None:
-        y = y * scale
+        y = y * scale.reshape(param_shape)
     if bias is not None:
-        y = y + bias
+        y = y + bias.reshape(param_shape)
     return y
 
 
@@ -712,8 +717,8 @@ class BatchNorm(spx.Module):
         """
         feature_shape = (num_features,)
         replicated_sharding = sharding_for_layout(Replicated)
-        self.mean = spx.Parameter(jnp.zeros(feature_shape, jnp.float32), sharding=replicated_sharding)
-        self.var = spx.Parameter(jnp.ones(feature_shape, jnp.float32), sharding=replicated_sharding)
+        self.mean = spx.Buffer(jnp.zeros(feature_shape, jnp.float32), sharding=replicated_sharding)
+        self.var = spx.Buffer(jnp.ones(feature_shape, jnp.float32), sharding=replicated_sharding)
 
         self.weight: spx.Parameter | None
         if use_scale:
@@ -775,12 +780,12 @@ class BatchNorm(spx.Module):
         Returns:
             Normalized array with the same shape as the input.
         """
-        use_running_average = first_from(
-            use_running_average,
-            self.use_running_average,
-            error_msg="""No `use_running_average` argument was provided to BatchNorm
-        as either a forward argument, class attribute, or spx flag.""",
-        )
+        use_running_average = first_from(use_running_average, self.use_running_average)
+        if use_running_average is None:
+            raise ValueError(
+                "No `use_running_average` argument was provided to BatchNorm as either a forward argument "
+                "or a class attribute."
+            )
         feature_axes = _canonicalize_axes(x.ndim, self.axis)
         reduction_axes = tuple(i for i in range(x.ndim) if i not in feature_axes)
 
@@ -788,6 +793,10 @@ class BatchNorm(spx.Module):
         scale = self.weight[...] if self.weight is not None else None
         bias = self.bias[...] if self.bias is not None else None
         x, mean, var, scale, bias = self.promote_dtype((x, self.mean[...], self.var[...], scale, bias), dtype=self.dtype)
+        if len(feature_axes) == 1:
+            # Per-feature vectors must broadcast along the feature axis, wherever it sits in ``x``.
+            param_shape = tuple(x.shape[i] if i in feature_axes else 1 for i in range(x.ndim))
+            mean, var, scale, bias = (None if a is None else a.reshape(param_shape) for a in (mean, var, scale, bias))
         if not use_running_average:
             mean, var = _compute_stats(
                 x,
@@ -798,15 +807,13 @@ class BatchNorm(spx.Module):
                 use_fast_variance=self.use_fast_variance,
                 mask=mask,
             )
-            if self.mean._can_update or self.var._can_update:
-                stop_gradient = jax.lax.stop_gradient
-            else:
-
-                def stop_gradient(x):
-                    return x
-
-            self.mean[...] = stop_gradient(self.momentum * self.mean[...] + (1 - self.momentum) * mean)
-            self.var[...] = stop_gradient(self.momentum * self.var[...] + (1 - self.momentum) * var)
+            # spectrax ``Variable`` cells have no item assignment or ``_can_update``; running statistics are
+            # written through ``.value`` and are never differentiated.
+            stop_gradient = jax.lax.stop_gradient
+            new_mean = self.momentum * self.mean[...] + (1 - self.momentum) * mean.reshape(-1)
+            new_var = self.momentum * self.var[...] + (1 - self.momentum) * var.reshape(-1)
+            self.mean.value = stop_gradient(new_mean).astype(self.mean[...].dtype)
+            self.var.value = stop_gradient(new_var).astype(self.var[...].dtype)
 
         return _normalize(
             x,
@@ -1017,7 +1024,7 @@ class LayerNorm(spx.Module):
         )
 
 
-def rms_norm(x: Float[Array, "... dim"], eps: float = 1e-6) -> Float[Array, "... dim"]:
+def rms_norm(x: Float[Array, "... dim"], eps: float = 1e-6, *, upcast: bool = False) -> Float[Array, "... dim"]:
     """Scale-free RMS normalisation over the trailing axis.
 
     ``x * rsqrt(mean(x**2, -1) + eps)``, computed in float32 and cast back.
@@ -1031,10 +1038,14 @@ def rms_norm(x: Float[Array, "... dim"], eps: float = 1e-6) -> Float[Array, "...
     Args:
         x: Input array; normalised along its last axis.
         eps: Added to the mean square before the reciprocal square root.
+        upcast: Multiply in float32 too and cast the product back (the Mamba / Muse-Glimmer convention) instead of
+            casting the scale to ``x.dtype`` first. Identical for float32 inputs.
 
     Returns:
         Normalised array, same shape and dtype as ``x``.
     """
+    if upcast:
+        return rms_norm(x.astype(jnp.float32), eps=eps).astype(x.dtype)
     # The scale is reduced in float32 and cast back *before* multiplying, which
     # is the HF convention every existing caller follows. Multiplying in float32
     # and casting the product instead diverges by ~1.6e-2 in bfloat16, so this

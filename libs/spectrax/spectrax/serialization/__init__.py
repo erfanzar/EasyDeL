@@ -13,6 +13,7 @@ Provides efficient checkpoint saving and loading built on top of JAX's
 - Structured PyTree saves with treedef recovery
 """
 
+from ._ocdbt import OcdbtSaveOptions
 from .async_manager import AsyncCheckpointManager
 from .checkpointer import (
     Checkpointer,
@@ -26,6 +27,7 @@ __all__ = (
     "AsyncCheckpointManager",
     "CheckpointInterval",
     "Checkpointer",
+    "OcdbtSaveOptions",
     "find_latest_checkpoint",
     "read_checkpoint_metadata",
     "tree_deserialize_leaves",

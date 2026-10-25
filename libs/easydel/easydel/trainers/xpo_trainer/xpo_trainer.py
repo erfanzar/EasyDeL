@@ -39,7 +39,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.helpers import capture_time
 
-from .._shared import drop_optimizer_state
+from .._shared import copy_frozen_policy, drop_optimizer_state
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
 from ..metrics import _host_mean_float
 from ..trainer_protocol import TrainerConfigureFunctionOutput
@@ -172,7 +172,7 @@ class XPOTrainer(GRPOTrainer):
                 than a single function/model.
         """
 
-        reference_state = (
+        self._provided_reference_state = (
             _ensure_state(reference_model, trainable_selector=arguments.trainable_selector)
             if reference_model is not None
             else None
@@ -183,7 +183,11 @@ class XPOTrainer(GRPOTrainer):
         self.loss_type_id = 0 if arguments.loss_type == "sigmoid" else 1
 
         if reward_funcs is not None:
-            reward_funcs_list = reward_funcs if isinstance(reward_funcs, list) else [reward_funcs]
+            reward_funcs_list = (
+                list(reward_funcs)
+                if isinstance(reward_funcs, collections.abc.Sequence) and not isinstance(reward_funcs, str | bytes)
+                else [reward_funcs]
+            )
             if len(reward_funcs_list) != 1:
                 raise ValueError("XPOTrainer only supports a single reward function/model.")
             reward_funcs = reward_funcs_list
@@ -197,8 +201,19 @@ class XPOTrainer(GRPOTrainer):
             processing_class=processing_class,
             reward_processing_classes=reward_processing_classes,
         )
-        if reference_state is not None:
-            self.ref_state = drop_optimizer_state(reference_state)
+        # Only ref_state owns the frozen reference after initialization. In
+        # particular, do not retain an explicit state's old optimizer slots.
+        self._provided_reference_state = None
+
+    def _create_reference_state(self, model: EasyDeLState) -> EasyDeLState:
+        """Resolve XPO's reference before GRPO configures auxiliary forwards.
+
+        Unlike GRPO, XPO consumes reference scores even when beta is zero,
+        and its exploration schedule is independent of beta.
+        """
+        if self._provided_reference_state is not None:
+            return drop_optimizer_state(self._provided_reference_state)
+        return copy_frozen_policy(model)
 
     def _get_reward_processing_classes(self) -> list[ProcessingClassType | None]:
         """Normalize reward processing classes to a list aligned to reward functions.
@@ -637,8 +652,10 @@ class XPOTrainer(GRPOTrainer):
             if eos_id is not None:
                 eos_ids = eos_id if isinstance(eos_id, (list, tuple)) else [eos_id]
                 eos_tensor = jnp.asarray(eos_ids)
-                policy_eos = jnp.isin(policy_completion_ids, eos_tensor).any(axis=1)
-                ref_eos = jnp.isin(ref_completion_ids, eos_tensor).any(axis=1)
+                policy_eos = (jnp.isin(policy_completion_ids, eos_tensor) & policy_completion_mask.astype(bool)).any(
+                    axis=1
+                )
+                ref_eos = (jnp.isin(ref_completion_ids, eos_tensor) & ref_completion_mask.astype(bool)).any(axis=1)
                 penalty = self.arguments.missing_eos_penalty
                 policy_scores = policy_scores - jnp.where(policy_eos, 0.0, penalty)
                 ref_scores = ref_scores - jnp.where(ref_eos, 0.0, penalty)
@@ -699,10 +716,9 @@ class XPOTrainer(GRPOTrainer):
         """Forward the *live* reference state alongside the shared training step.
 
         Resolved per call rather than captured once at compile time: the
-        reference state is rebound after ``configure_functions`` runs -- by an
-        explicitly supplied ``reference_state`` and by
-        :meth:`GRPOTrainer.on_step_end`'s optional periodic sync -- and a cached
-        tuple would keep feeding the loss the original deep copy.
+        reference state can be rebound by :meth:`GRPOTrainer.on_step_end`'s
+        optional periodic sync, and a cached tuple would keep feeding the
+        loss the original frozen state.
         """
         return (self.ref_state,)
 

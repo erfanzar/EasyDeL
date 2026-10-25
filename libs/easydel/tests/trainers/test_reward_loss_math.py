@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from easydel.trainers.model_loading import disable_state_dropout
 from easydel.trainers.reward_trainer._fn import _reward_pair_loss, _reward_scores_from_logits
 from easydel.trainers.reward_trainer.reward_config import RewardConfig
 from easydel.trainers.reward_trainer.reward_trainer import RewardTrainer
@@ -48,6 +49,7 @@ def test_binary_reward_logits_use_positive_log_odds():
     np.testing.assert_allclose(np.asarray(rewards), np.asarray(jnp.array([1.0, -2.5])), rtol=1e-6, atol=1e-6)
 
 
+@pytest.mark.cpu_ok
 def test_reward_config_matches_trl_data_knobs_and_validation():
     cfg = RewardConfig(
         pad_to_multiple_of=8,
@@ -63,7 +65,9 @@ def test_reward_config_matches_trl_data_knobs_and_validation():
         RewardConfig(pad_to_multiple_of=0)
     with pytest.warns(FutureWarning, match="pad_token"):
         RewardConfig(pad_token="<pad>")
-    assert RewardConfig(activation_offloading=True).activation_offloading is True
+    assert RewardConfig().activation_offloading is False
+    with pytest.raises(ValueError, match="activation_offloading"):
+        RewardConfig(activation_offloading=True)
 
 
 def test_reward_tokenizer_overrides_and_chat_template_path(tmp_path):
@@ -84,6 +88,7 @@ def test_reward_tokenizer_overrides_and_chat_template_path(tmp_path):
     assert tokenizer.chat_template == "{{ messages[0]['content'] }}"
 
 
+@pytest.mark.cpu_ok
 def test_reward_disable_dropout_puts_model_in_eval_mode():
     class Model:
         def __init__(self):
@@ -94,6 +99,7 @@ def test_reward_disable_dropout_puts_model_in_eval_mode():
 
     state = SimpleNamespace(model=Model())
 
-    RewardTrainer._disable_state_dropout(state)
+    updated_state = disable_state_dropout(state)
 
+    assert updated_state is state
     assert state.model.eval_calls == 1

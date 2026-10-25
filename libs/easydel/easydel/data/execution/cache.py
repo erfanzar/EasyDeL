@@ -541,8 +541,11 @@ class DiskCache(CacheLayer):
         compressed = self._compress(serialized)
         data_path.write_bytes(compressed)
 
-        if metadata:
+        if metadata is not None:
             meta_path.write_text(json.dumps(metadata.to_dict()))
+        else:
+            # A replacement payload must not inherit the old entry's provenance.
+            meta_path.unlink(missing_ok=True)
 
     def contains(self, key: str) -> bool:
         """Check whether a key exists on disk and is still within TTL.
@@ -609,6 +612,8 @@ class TreeCacheManager:
         memory_size: int = 100,
         disk_expiry: int | None = 86400,  # 24 hours
         compression: str = "none",
+        cache_type: str = "hierarchical",
+        hash_fn: str = "combined",
     ):
         """Construct the underlying memory and disk layers and order them.
 
@@ -621,22 +626,33 @@ class TreeCacheManager:
                 disables expiry. Defaults to 24 hours.
             compression: Codec for the disk layer payloads —
                 ``"none"``, ``"gzip"``, ``"lz4"`` or ``"zstd"``.
+            cache_type: ``"memory"``, ``"disk"``, or ``"hierarchical"`` (both).
+                Memory-only caches do not create any directories.
+            hash_fn: Source-key strategy advertised to cache consumers: ``"content"``,
+                ``"path"``, or ``"combined"``.
         """
         if "://" in str(cache_dir):
             raise ValueError(
                 f"cache_dir {cache_dir!r} looks like a remote URI; pathlib would silently collapse "
                 "it into a local './gs:/...' directory. The data cache only supports local paths."
             )
+        if cache_type not in {"memory", "disk", "hierarchical"}:
+            raise ValueError(f"Unknown cache_type: {cache_type!r}")
+        if hash_fn not in {"content", "path", "combined"}:
+            raise ValueError(f"Unknown hash_fn: {hash_fn!r}")
+        self.hash_fn = hash_fn
         self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-
         self._memory = MemoryCache(max_size=memory_size)
-        self._disk = DiskCache(
-            cache_dir=self.cache_dir,
-            compression=compression,
-            expiry_seconds=disk_expiry,
+        self._disk = (
+            DiskCache(cache_dir=self.cache_dir, compression=compression, expiry_seconds=disk_expiry)
+            if cache_type != "memory"
+            else None
         )
-        self._layers = [self._memory, self._disk]
+        self._layers: list[CacheLayer] = []
+        if cache_type != "disk":
+            self._layers.append(self._memory)
+        if self._disk is not None:
+            self._layers.append(self._disk)
 
     def get(self, key: str) -> tuple[tp.Any, CacheMetadata | None] | None:
         """Get from cache, checking layers from fastest to slowest.
@@ -798,10 +814,11 @@ class TreeCacheManager:
         """
         return {
             "memory": self._memory.stats,
-            "disk": {
-                "cache_dir": str(self.cache_dir),
-                "compression": self._disk.compression,
-            },
+            "disk": (
+                {"cache_dir": str(self.cache_dir), "compression": self._disk.compression}
+                if self._disk is not None
+                else None
+            ),
         }
 
 

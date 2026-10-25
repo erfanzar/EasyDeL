@@ -55,6 +55,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
+from easydel.infra.sequence_packing import token_attention_mask_from_mask_info
 from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
@@ -64,7 +65,7 @@ from easydel.layers import (
     dense_gate_up_layout,
     gated_mlp_forward,
 )
-from easydel.layers.attention import UnifiedAttention
+from easydel.layers.attention import FlattenedQKNormMixin, UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .olmo2_configuration import Olmo2Config
@@ -164,7 +165,7 @@ class Olmo2MLP(spx.Module):
         return gated_mlp_forward(self, hidden_states)
 
 
-class Olmo2Attention(UnifiedAttention):
+class Olmo2Attention(FlattenedQKNormMixin, UnifiedAttention):
     """Multi-head attention layer with Q/K normalization for OLMo-2 models.
 
     Extends UnifiedAttention with RMSNorm-based query and key normalization
@@ -208,62 +209,6 @@ class Olmo2Attention(UnifiedAttention):
             causal=True,
             use_qk_norm=True,  # Enable Q/K normalization
         )
-
-    def _create_k_norm(self, config: Olmo2Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: spx.Rngs):
-        """Create key normalization layer using RMSNorm.
-
-        Args:
-            config (Olmo2Config): Model configuration with normalization parameters.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            rngs (spx.Rngs): Random number generator state.
-
-        Returns:
-            RMSNorm: Normalization layer for key projections with dimension
-                matching num_key_value_heads * head_dim.
-        """
-        return RMSNorm(
-            dim=self.config.num_key_value_heads * self.head_dim,
-            eps=config.rms_norm_eps,
-            dtype=param_dtype,
-            rngs=rngs,
-        )
-
-    def _create_q_norm(self, config: Olmo2Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: spx.Rngs):
-        """Create query normalization layer using RMSNorm.
-
-        Args:
-            config (Olmo2Config): Model configuration with normalization parameters.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            rngs (spx.Rngs): Random number generator state.
-
-        Returns:
-            RMSNorm: Normalization layer for query projections with dimension
-                matching num_attention_heads * head_dim.
-        """
-        return RMSNorm(
-            dim=self.config.num_attention_heads * self.head_dim,
-            eps=config.rms_norm_eps,
-            dtype=param_dtype,
-            rngs=rngs,
-        )
-
-    def _preprocess_qkv(self, query_states, key_states, value_states):
-        """Apply Q/K normalization before attention computation.
-
-        Normalizes query and key projections using RMSNorm to improve
-        training stability in OLMo-2 models. Value states are passed through unchanged.
-
-        Args:
-            query_states: Query projections before normalization.
-            key_states: Key projections before normalization.
-            value_states: Value projections (unchanged).
-
-        Returns:
-            Tuple of (normalized_query, normalized_key, value_states).
-        """
-        return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
 class Olmo2DecoderLayer(spx.Module):
@@ -679,6 +624,7 @@ class Olmo2Model(EasyDeLBaseModule):
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
@@ -820,37 +766,18 @@ class Olmo2ForCausalLM(BaseCausalLMModule[Olmo2Model, Olmo2Config]):
             For generation, typically only the last token's logits are needed:
             `next_token_logits = outputs.logits[:, -1, :]`
         """
-        outputs = self.model(
+        return super().forward(
             input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             mask_info=mask_info,
             position_ids=position_ids,
             mode=mode,
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
-            inputs_embeds=inputs_embeds,
+            apply_lm_head=apply_lm_head,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-        )
-
-        hidden_states = outputs.last_hidden_state
-
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-
-        lm_logits = None
-        if apply_lm_head:
-            lm_logits = self.compute_lm_logits(hidden_states)
-
-        return CausalLMOutput(
-            logits=lm_logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            past_key_values=outputs.past_key_values,
         )
 
     def get_encoder(self):
@@ -983,8 +910,12 @@ class Olmo2ForSequenceClassification(BaseSequenceClassificationModule[Olmo2Model
             with padding, the last non-padded token is automatically selected using the
             pad_token_id from the configuration.
         """
-        transformer_outputs = self.model(
+        if attention_mask is None and mask_info is not None:
+            sequence_length = input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
+            attention_mask = token_attention_mask_from_mask_info(mask_info, sequence_length)
+        return super().forward(
             input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             mask_info=mask_info,
             position_ids=position_ids,
@@ -993,34 +924,6 @@ class Olmo2ForSequenceClassification(BaseSequenceClassificationModule[Olmo2Model
             cache_metadata=cache_metadata,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            inputs_embeds=inputs_embeds,
-        )
-
-        hidden_states = transformer_outputs.last_hidden_state
-        logits = self.score(hidden_states)
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]
-        else:
-            batch_size = inputs_embeds.shape[0]
-
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
-        else:
-            if input_ids is not None:
-                sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-            else:
-                sequence_lengths = -1
-
-        pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-        return SequenceClassifierOutput(
-            logits=pooled_logits,
-            past_key_values=past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
         )
 
     def get_encoder(self):

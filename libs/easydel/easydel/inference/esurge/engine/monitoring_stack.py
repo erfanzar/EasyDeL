@@ -922,7 +922,9 @@ providers:
             try:
                 from ..monitoring import start_monitoring_server
 
-                self._monitoring_server = start_monitoring_server(prometheus_port=prometheus_port, update_interval=1.0)
+                self._monitoring_server = start_monitoring_server(
+                    prometheus_port=prometheus_port, update_interval=1.0, owner=self
+                )
                 host_for_logs = dashboard_host or "0.0.0.0"
                 urls["prometheus"] = f"http://{host_for_logs}:{prometheus_port}/metrics"
                 self._info(f" Prometheus metrics: {urls['prometheus']}")
@@ -963,7 +965,7 @@ providers:
                 from ..monitoring import start_console_monitor
 
                 self._info(" Starting console monitor...")
-                start_console_monitor(refresh_rate=1.0)
+                start_console_monitor(refresh_rate=1.0, owner=self)
             except ImportError:
                 self._info(" Console monitor unavailable (install rich)")
             except Exception as e:
@@ -989,22 +991,18 @@ providers:
             return
         self._info("Stopping eSurge monitoring services...")
 
-        if self._monitoring_server:
-            try:
-                self._monitoring_server.stop()
-                self._info(" Prometheus server stopped")
-            except Exception as e:
-                self._info(f" Error stopping Prometheus server: {e}")
-            self._monitoring_server = None
-
+        # Release only this stack's service leases. Other stacks and direct
+        # process-wide users retain their services; the last release still
+        # closes listeners and clears singletons for a clean restart.
         try:
-            from .. import monitoring as _mon_module
+            from ..monitoring import stop_monitoring as _stop_global_monitoring
 
-            if _mon_module._console_monitor is not None:
-                _mon_module._console_monitor.stop()
-                _mon_module._console_monitor = None
-        except Exception:
-            pass
+            _stop_global_monitoring(owner=self)
+            if self._monitoring_server:
+                self._info(" Prometheus monitoring released")
+        except Exception as e:
+            self._info(f" Error stopping monitoring services: {e}")
+        self._monitoring_server = None
 
         self._stop_grafana_service()
 

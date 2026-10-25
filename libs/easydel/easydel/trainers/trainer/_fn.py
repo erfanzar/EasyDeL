@@ -39,9 +39,6 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import CausalLMLossStrategy, ForCausalLMLoss, LossConfig, LossMetrics
 from easydel.modules._base.causal_lm_module import BaseCausalLMModule
-from easydel.modules.cohere.modeling_cohere import CohereForCausalLM
-from easydel.modules.gemma.modeling_gemma import GemmaForCausalLM
-from easydel.modules.gemma2.modeling_gemma2 import Gemma2ForCausalLM
 
 from ..training_utils import (
     ScheduledLossAdapter,
@@ -62,18 +59,20 @@ logger = get_logger(__name__)
 
 def _dft_causal_lm_metrics(logits: jax.Array, labels: jax.Array, ignore_index: int = -100) -> LossMetrics:
     """Compute the DFT SFT loss from logits and causal-LM labels."""
-    shift_logits = logits[:, :-1, :]
+    # DFT's detached probability weights and all reductions must retain fp32
+    # precision even when the model emits bf16/fp16 activations.
+    shift_logits = logits[:, :-1, :].astype(jnp.float32)
     shift_labels = labels[:, 1:]
     loss_mask = shift_labels != ignore_index
     safe_labels = jnp.where(loss_mask, shift_labels, 0)
     log_probs = jax.nn.log_softmax(shift_logits, axis=-1)
     token_logps = jnp.take_along_axis(log_probs, safe_labels[..., None], axis=-1).squeeze(-1)
     per_token_loss = -jax.lax.stop_gradient(jnp.exp(token_logps)) * token_logps
-    weights = loss_mask.astype(logits.dtype)
-    weight_sum = jnp.sum(weights)
+    weights = loss_mask.astype(jnp.float32)
+    weight_sum = jnp.sum(weights, dtype=jnp.float32)
     loss = jnp.sum(per_token_loss * weights) / jnp.maximum(weight_sum, 1.0)
     predictions = jnp.argmax(shift_logits, axis=-1)
-    accuracy = jnp.sum((predictions == safe_labels).astype(logits.dtype) * weights) / jnp.maximum(weight_sum, 1.0)
+    accuracy = jnp.sum((predictions == safe_labels).astype(jnp.float32) * weights) / jnp.maximum(weight_sum, 1.0)
     return LossMetrics(loss=loss, weight_sum=weight_sum, accuracy=accuracy)
 
 
@@ -471,16 +470,14 @@ def _model_uses_causal_lm_loss(call) -> bool:
     return getattr(loss_fn, "__name__", None) == "ForCausalLMLoss"
 
 
-# These exact classes' forward bodies return only logits/hidden states/cache. Their
-# backbones have no router/MTP aux output; Gemma2's softcap and Cohere's logit
-# scaling act on logits, not on the training objective. Do not accept subclasses
-# through this exception: they may override an auxiliary hook or backbone.
-_CE_ONLY_CAUSAL_LM_CLASSES = frozenset((GemmaForCausalLM, Gemma2ForCausalLM, CohereForCausalLM))
-
-
 def _has_reviewed_ce_only_forward(model_type: type) -> bool:
-    """Accept the inherited CLM forward or an exactly reviewed CE-only head."""
-    return model_type.forward is BaseCausalLMModule.forward or model_type in _CE_ONLY_CAUSAL_LM_CLASSES
+    """Accept inherited CLM forwards or explicit, concrete-class CE-only opt-ins.
+
+    A custom head may declare ``_ce_only_forward = True`` only when its forward
+    adds no auxiliary objective. Do not inherit this opt-in: a subclass can
+    change its backbone or auxiliary hooks without overriding ``forward``.
+    """
+    return model_type.forward is BaseCausalLMModule.forward or bool(model_type.__dict__.get("_ce_only_forward", False))
 
 
 def _make_base_spmd_weight(call):

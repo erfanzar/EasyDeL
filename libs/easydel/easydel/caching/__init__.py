@@ -66,6 +66,7 @@ Note:
 
 from ._abstracts import OperationsMetadata, unwrap_metadata
 from ._metadatabuilder import AttentionMetadataBuilder
+from .budget import PagedCacheBudget, cap_paged_cache_pages, compute_paged_cache_budget
 from .compressed_window import (
     CompressedWindowCache,
     CompressedWindowCacheConfig,
@@ -81,7 +82,16 @@ from .hybrid import (
 )
 from .kda import KDACache, KDACacheConfig, KDACacheView, KDAMetadata
 from .mla_ragged_page import MLARaggedPagesCache, MLARaggedPagesCacheConfig, MLARaggedPagesCacheView
-from .ragged_page import RaggedPagesCache, RaggedPagesCacheConfig, RaggedPagesCacheView, RaggedPagesMetadata
+from .ragged_page import (
+    RaggedPagesCache,
+    RaggedPagesCacheConfig,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    canonicalize_dtype,
+    dtype_to_string,
+    resolve_ragged_cache_layout,
+    resolve_v3_kv_head_layout,
+)
 from .recurrent import (
     RecurrentCache,
     RecurrentCacheConfig,
@@ -114,6 +124,7 @@ __all__ = (
     "MLARaggedPagesCacheConfig",
     "MLARaggedPagesCacheView",
     "OperationsMetadata",
+    "PagedCacheBudget",
     "ParallelHybridCacheView",
     "RaggedPagesCache",
     "RaggedPagesCacheConfig",
@@ -133,5 +144,11 @@ __all__ = (
     "UnifiedAttentionCache",
     "UnifiedAttentionCacheConfig",
     "UnifiedAttentionCacheView",
+    "canonicalize_dtype",
+    "cap_paged_cache_pages",
+    "compute_paged_cache_budget",
+    "dtype_to_string",
+    "resolve_ragged_cache_layout",
+    "resolve_v3_kv_head_layout",
     "unwrap_metadata",
 )

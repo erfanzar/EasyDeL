@@ -233,36 +233,6 @@ class PipelineStageRuntime:
         logged_key = (str(mode), prepare_cache_key)
         if logged_key in self._logged_plan_keys:
             return
-        cache = getattr(executor, "_prepare_cache", None)
-        if not isinstance(cache, dict):
-            return
-        entry = cache.get(prepare_cache_key)
-        if entry is None:
-            return
-        self._logged_plan_keys.add(logged_key)
-
-        arg_offsets = tuple(getattr(entry, "arg_offsets", ()))
-        arg_leaf_counts = tuple(getattr(entry, "arg_leaf_counts", ()))
-        invar_plans = tuple(getattr(entry, "invar_plans", ()))
-        state = getattr(entry, "state", {})
-        fn_outvar_map = state.get("fn_outvar_map", ()) if isinstance(state, dict) else ()
-        donated_by_stage = tuple(state.get("donate_argnums_per_stage", ())) if isinstance(state, dict) else ()
-
-        def _arg_span(argnum: int) -> range:
-            """Return the leaf index range that ``argnum`` occupies in the flattened plan.
-
-            Helper used by the audit log to map argument positions
-            (``kv_argnum`` / ``metadata_argnum``) into contiguous index spans
-            inside SpectraX's flattened invar plans, so dynamic-slot counts can
-            be partitioned per logical argument. Returns an empty range when
-            the requested argument index lies outside the recorded offsets.
-            """
-            if argnum >= len(arg_offsets) or argnum >= len(arg_leaf_counts):
-                return range(0, 0)
-            start = int(arg_offsets[argnum])
-            count = int(arg_leaf_counts[argnum])
-            return range(start, start + count)
-
         if isinstance(prepare_cache_key, tuple) and len(prepare_cache_key) >= 1 and prepare_cache_key[0] == "model_step":
             kv_argnum = 2
             metadata_argnum = 3
@@ -270,36 +240,12 @@ class PipelineStageRuntime:
             kv_argnum = 3
             metadata_argnum = 4
 
-        kv_span = _arg_span(kv_argnum)
-        metadata_span = _arg_span(metadata_argnum)
-        kv_indices = set(kv_span)
-        metadata_indices = set(metadata_span)
-        dynamic_kv_slots: list[int] = []
-        dynamic_metadata_slots: list[int] = []
-        dynamic_slots: list[int] = []
-        stage_slots: list[int] = []
-        prev_slots: list[int] = []
-        total_invars: list[int] = []
-
-        for plan in invar_plans:
-            plan_dynamic = tuple(getattr(plan, "dynamic_slots", ()))
-            dynamic_slots.append(len(plan_dynamic))
-            dynamic_kv_slots.append(sum(1 for _, orig_idx in plan_dynamic if int(orig_idx) in kv_indices))
-            dynamic_metadata_slots.append(sum(1 for _, orig_idx in plan_dynamic if int(orig_idx) in metadata_indices))
-            stage_slots.append(len(tuple(getattr(plan, "stage_slots", ()))))
-            prev_slots.append(len(tuple(getattr(plan, "prev_slots", ()))))
-            total_invars.append(len(tuple(getattr(plan, "template", ()))))
-
-        kv_outputs_by_stage: dict[int | str, int] = {}
-        for mapping in tuple(fn_outvar_map)[: len(kv_indices)]:
-            if not mapping:
-                continue
-            owner = mapping[0]
-            if isinstance(owner, int):
-                key: int | str = int(owner)
-            else:
-                key = str(owner)
-            kv_outputs_by_stage[key] = kv_outputs_by_stage.get(key, 0) + 1
+        summary = executor.get_prepared_plan_summary(
+            prepare_cache_key, kv_argnum=kv_argnum, metadata_argnum=metadata_argnum
+        )
+        if summary is None:
+            return
+        self._logged_plan_keys.add(logged_key)
 
         logger.debug(
             "PP plan audit mode=%s key=%s arg_leaf_counts=%s kv_arg=%d metadata_arg=%d stages=%d "
@@ -308,18 +254,18 @@ class PipelineStageRuntime:
             "total_invars/stage=%s donate_argnums/stage=%s kv_outputs_by_stage=%s",
             mode,
             prepare_cache_key,
-            arg_leaf_counts,
+            summary["arg_leaf_counts"],
             kv_argnum,
             metadata_argnum,
-            len(invar_plans),
-            len(kv_indices),
-            len(metadata_indices),
-            dynamic_slots,
-            dynamic_kv_slots,
-            dynamic_metadata_slots,
-            stage_slots,
-            prev_slots,
-            total_invars,
-            donated_by_stage,
-            kv_outputs_by_stage,
+            summary["num_stages"],
+            summary["kv_leaves"],
+            summary["metadata_leaves"],
+            list(summary["dynamic_slots"]),
+            list(summary["dynamic_kv_slots"]),
+            list(summary["dynamic_metadata_slots"]),
+            list(summary["stage_slots"]),
+            list(summary["prev_slots"]),
+            list(summary["total_invars"]),
+            summary["donated_by_stage"],
+            summary["kv_outputs_by_stage"],
         )

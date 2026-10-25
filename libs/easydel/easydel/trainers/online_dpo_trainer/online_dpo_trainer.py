@@ -29,6 +29,13 @@ from easydel.utils.helpers import capture_time
 
 from ..direct_preference_optimization_trainer import DPOTrainer
 from ..metrics import _host_mean_float, _host_scalar_float
+from ..reward_protocol import (
+    align_reward_sidechannels,
+    normalize_reward_state,
+    render_reward_texts,
+    resolve_reward_weights,
+    reward_model_forward,
+)
 from ..trainer import Trainer
 from .online_dpo_config import OnlineDPOConfig
 
@@ -85,7 +92,7 @@ class OnlineDPOTrainer(DPOTrainer):
         """
         if not isinstance(arguments, OnlineDPOConfig):
             raise TypeError(f"arguments must be OnlineDPOConfig, got {type(arguments)}")
-        reward_func_list = reward_funcs if isinstance(reward_funcs, list) else [reward_funcs]
+        reward_func_list = list(reward_funcs) if isinstance(reward_funcs, list) else [reward_funcs]
         if not reward_func_list:
             raise ValueError("`reward_funcs` must contain at least one callable or EasyDeL reward state.")
         for reward_func in reward_func_list:
@@ -104,11 +111,19 @@ class OnlineDPOTrainer(DPOTrainer):
             raise ValueError("The number of reward processing classes must match the number of reward functions.")
         if arguments.reward_weights is not None and len(arguments.reward_weights) != len(reward_func_list):
             raise ValueError("`reward_weights` must match the number of reward functions.")
+        # Install one consistent forward signature for every reward state,
+        # including states constructed by other trainers with a custom apply_fn.
+        for index, reward_func in enumerate(reward_func_list):
+            if isinstance(reward_func, EasyDeLBaseModule):
+                reward_func = reward_func.to_state(trainable_selector=arguments.trainable_selector)
+            if isinstance(reward_func, EasyDeLState):
+                reward_func = normalize_reward_state(reward_func, forward=self._reward_model_forward)
+            reward_func_list[index] = reward_func
         self.reward_funcs = reward_func_list
         self.reward_processing_classes = reward_processing_class_list
         self.reward_func_names = [getattr(func, "__name__", None) or type(func).__name__ for func in reward_func_list]
         self.reward_weights = jnp.asarray(
-            arguments.reward_weights if arguments.reward_weights is not None else [1.0] * len(reward_func_list),
+            resolve_reward_weights(reward_func_list, arguments.reward_weights),
             dtype=jnp.float32,
         )
         super().__init__(
@@ -120,6 +135,16 @@ class OnlineDPOTrainer(DPOTrainer):
             eval_dataset=eval_dataset,
             data_collator=data_collator,
         )
+
+    @staticmethod
+    def _bound_reward_forward(graphdef, graphstate, graphother, batch, *, apply_fn):
+        """Adapt a graphdef-bound custom reward forward without changing its behavior."""
+        return apply_fn(graphstate, graphother, batch)
+
+    @staticmethod
+    def _reward_model_forward(graphdef, graphstate, graphother, batch):
+        """Run a reward state with the same graphdef-first signature for all rewards."""
+        return reward_model_forward(graphdef, graphstate, graphother, batch)
 
     @staticmethod
     def _online_prompt_collator(examples: list[dict[str, object]]) -> dict[str, object]:
@@ -237,6 +262,9 @@ class OnlineDPOTrainer(DPOTrainer):
         Python reward callables receive prompts, completions, completion ids, and
         any original batch side channels accepted by their signature.
         """
+        source_prompts = batch.get("prompt", batch.get("input_ids"))
+        prompt_count = len(source_prompts) if source_prompts is not None else max(len(completions) // 2, 1)
+        batch = align_reward_sidechannels(batch, prompt_count=prompt_count, completion_count=len(completions))
         sidechannels = {
             key: value
             for key, value in batch.items()
@@ -247,7 +275,9 @@ class OnlineDPOTrainer(DPOTrainer):
             if isinstance(reward_func, EasyDeLState):
                 if reward_processing_class is None:
                     raise ValueError("EasyDeLState reward functions require a matching reward processing class.")
-                texts = [f"{prompt}{completion}" for prompt, completion in zip(prompts, completions, strict=False)]
+                texts = render_reward_texts(
+                    prompts, completions, reward_processing_class, tools=self._reward_chat_template_tools()
+                )
                 reward_inputs = dict(
                     reward_processing_class(
                         texts,

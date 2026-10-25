@@ -98,7 +98,7 @@ class RwkvCausalLMOutput(ModelOutput):
     attentions: tuple[Array, ...] | None = None
 
 
-def init_state(hidden_size: int, batch_size: int | None = None):
+def init_state(hidden_size: int, batch_size: int | None = None, attention_hidden_size: int | None = None):
     """Create zeroed RWKV recurrent state tensors for a given hidden size.
 
     RWKV is recurrent over the sequence dimension but can be vectorized over
@@ -111,23 +111,36 @@ def init_state(hidden_size: int, batch_size: int | None = None):
     Args:
         hidden_size: Per-channel dimensionality of the RWKV state.
         batch_size: Optional batch axis. When ``None`` the returned arrays
-            are 1-D ``(hidden_size,)``; when set, they are 2-D
-            ``(batch_size, hidden_size)``.
+            are 1-D; when set, they have a leading batch axis.
+        attention_hidden_size: Width of the three WKV accumulators. Defaults
+            to hidden_size. Previous-hidden states always use hidden_size.
 
     Returns:
         Tuple ``(time_mix_state, channel_mix_state)`` where
         ``time_mix_state`` is itself a 4-tuple of arrays and
         ``channel_mix_state`` is a single array.
     """
-    if batch_size is None:
-        zeros = jnp.zeros((hidden_size,))
-        min_values = jnp.full((hidden_size,), -1e38, dtype=jnp.float32)
-    else:
-        zeros = jnp.zeros((batch_size, hidden_size))
-        min_values = jnp.full((batch_size, hidden_size), -1e38, dtype=jnp.float32)
-    time_mix_state = (zeros, zeros, zeros, min_values)
+    attention_hidden_size = hidden_size if attention_hidden_size is None else attention_hidden_size
+    leading_shape = () if batch_size is None else (batch_size,)
+    zeros = jnp.zeros((*leading_shape, hidden_size))
+    accumulators = jnp.zeros((*leading_shape, attention_hidden_size), dtype=jnp.float32)
+    min_values = jnp.full((*leading_shape, attention_hidden_size), -1e38, dtype=jnp.float32)
+    time_mix_state = (zeros, accumulators, accumulators, min_values)
     channel_mix_state = zeros
     return time_mix_state, channel_mix_state
+
+
+def _init_global_state(config, batch_size, dtype=jnp.float32):
+    """Allocate per-layer previous-hidden states and fp32 WKV accumulators."""
+    state = [
+        jnp.zeros(
+            (batch_size, config.hidden_size if i < 2 else config.attention_hidden_size, config.num_hidden_layers),
+            dtype=dtype if i < 2 else jnp.float32,
+        )
+        for i in range(5)
+    ]
+    state[4] = state[4] - 1e30
+    return state
 
 
 def rwkv_linear_attention(
@@ -145,10 +158,11 @@ def rwkv_linear_attention(
     of values using exponential decay over time steps, with a
     log-sum-exp normaliser for stability.
 
-    This is the pedagogical Python-loop reference implementation. The
+    This is the pedagogical Python-loop reference implementation (valid
+    JAX: functional ``.at[].set`` updates, no in-place writes). The
     runtime-fused path used by :class:`RwkvSelfAttention` is
     ``jax.lax.scan``-based and lives inside the layer's ``forward``;
-    this helper is retained for clarity / debugging.
+    this helper is retained for clarity / debugging and numerical checks.
 
     Args:
         time_decay: Time-decay parameter controlling how quickly past
@@ -181,15 +195,15 @@ def rwkv_linear_attention(
     time_decay = -jnp.exp(time_decay)
 
     for current_index in range(current_sequence_length):
-        current_key = key[:, current_index].float()
-        current_value = value[:, current_index]
+        current_key = key[:, current_index].astype(jnp.float32)
+        current_value = value[:, current_index].astype(jnp.float32)
 
         max_for_output = jnp.maximum(max_state, current_key + time_first)
         e1 = jnp.exp(max_state - max_for_output)
         e2 = jnp.exp(current_key + time_first - max_for_output)
         numerator = e1 * num_state + e2 * current_value
         denominator = e1 * den_state + e2
-        output[:, current_index] = (numerator / denominator).astype(output.dtype)
+        output = output.at[:, current_index].set((numerator / denominator).astype(output.dtype))
 
         max_for_state = jnp.maximum(max_state + time_decay, current_key)
         e1 = jnp.exp(max_state + time_decay - max_for_state)
@@ -652,7 +666,7 @@ class SingleStandRwkvBlock(spx.Module):
             rngs=rngs,
         )
 
-    def forward(self, hidden, state=None, use_cache: bool = False, output_attentions: bool = False):
+    def forward(self, hidden, state=None, use_cache: bool = False, output_attentions: bool = False, rescale_factor=1.0):
         """Forward pass through the RWKV block.
 
         Applies pre-normalization followed by time mixing (attention),
@@ -665,6 +679,8 @@ class SingleStandRwkvBlock(spx.Module):
             use_cache (bool, optional): Whether to use and update the cache. Defaults to False.
             output_attentions (bool, optional): Whether to return attention weights.
                 Defaults to False.
+            rescale_factor: Divisor for both residual branch outputs during inference.
+                Implements projection rescaling without mutating checkpoint weights.
 
         Returns:
             tuple: Tuple containing:
@@ -674,7 +690,11 @@ class SingleStandRwkvBlock(spx.Module):
         """
         uses_global_state = isinstance(state, list)
         if state is None:
-            state = init_state(self.config.hidden_size, batch_size=hidden.shape[0])
+            state = init_state(
+                self.config.hidden_size,
+                batch_size=hidden.shape[0],
+                attention_hidden_size=self.config.attention_hidden_size,
+            )
 
         if uses_global_state:
             ffd_state = state[0][:, :, self.layer_id]
@@ -693,10 +713,11 @@ class SingleStandRwkvBlock(spx.Module):
             self.ln1(hidden),
             state=self_state,
         )
+        attention = attention / rescale_factor
         hidden = checkpoint_name(hidden + attention, "residual")
 
         feed_forward, ffd_state = self.feed_forward(self.ln2(hidden), state=ffd_state)
-        hidden = checkpoint_name(hidden + feed_forward, "layer_output")
+        hidden = checkpoint_name(hidden + feed_forward / rescale_factor, "layer_output")
         if self.config.use_sharding_constraint:
             hidden = apply_logical_sharding(
                 hidden,
@@ -705,12 +726,13 @@ class SingleStandRwkvBlock(spx.Module):
             )
 
         if uses_global_state:
-            state[0] = state[0].at[:, :, self.layer_id].set(ffd_state)
-            state[1] = state[1].at[:, :, self.layer_id].set(self_state[0])
-            state[2] = state[2].at[:, :, self.layer_id].set(self_state[1])
-            state[3] = state[3].at[:, :, self.layer_id].set(self_state[2])
-            state[4] = state[4].at[:, :, self.layer_id].set(self_state[3])
-            outputs = (hidden, state)
+            # Never write scan-local values into the caller's Python list.
+            # The model threads this new list through the scan carry.
+            next_state = [
+                previous.at[:, :, self.layer_id].set(current)
+                for previous, current in zip(state, (ffd_state, *self_state), strict=True)
+            ]
+            outputs = (hidden, next_state)
         else:
             outputs = (hidden, (self_state, ffd_state))
         if output_attentions:
@@ -871,13 +893,7 @@ class RwkvModel(EasyDeLBaseModule):
             inputs_embeds = checkpoint_name(self.embeddings(input_ids), "embeddings")
 
         if use_cache and state is None:
-            shape = (
-                inputs_embeds.shape[0],
-                self.config.hidden_size,
-                self.config.num_hidden_layers,
-            )
-            state = [jnp.zeros(shape, dtype=inputs_embeds.dtype if i <= 1 else jnp.float32) for i in range(5)]
-            state[4] -= 1e30
+            state = _init_global_state(self.config, inputs_embeds.shape[0], inputs_embeds.dtype)
 
         hidden_states = inputs_embeds
 
@@ -891,17 +907,22 @@ class RwkvModel(EasyDeLBaseModule):
             hidden states, optionally accumulates per-layer hidden states
             / time-mix attention weights, and returns the updated carry.
             """
-            hidden_states, all_hidden_states, all_self_attentions, idx = carry
+            hidden_states, layer_state, all_hidden_states, all_self_attentions, idx = carry
+            rescale_factor = 1.0
+            if self.layers_are_rescaled and self.config.rescale_every > 0:
+                rescale_factor = jnp.exp2(jnp.asarray(idx // self.config.rescale_every, dtype=hidden_states.dtype))
             with self._layer_stage_context(idx, layers=self.blocks):
-                hidden_states, _state, attentions = block(
+                hidden_states, next_state, attentions = block(
                     hidden_states,
-                    state=state,
+                    state=layer_state,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
+                    rescale_factor=rescale_factor,
                 )
 
-            if self.layers_are_rescaled and self.config.rescale_every > 0 and (idx + 1) % self.config.rescale_every == 0:
-                hidden_states = hidden_states / 2
+            if self.layers_are_rescaled and self.config.rescale_every > 0:
+                # ``idx`` is a tracer under ``lax.scan``; select instead of branching in Python.
+                hidden_states = jnp.where((idx + 1) % self.config.rescale_every == 0, hidden_states / 2, hidden_states)
             hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.blocks)
 
             if output_hidden_states:
@@ -910,15 +931,22 @@ class RwkvModel(EasyDeLBaseModule):
             if output_attentions:
                 all_self_attentions = (*all_self_attentions, attentions)
 
-            return hidden_states, all_hidden_states, all_self_attentions, idx + 1
+            return (
+                hidden_states,
+                next_state if layer_state is not None else None,
+                all_hidden_states,
+                all_self_attentions,
+                idx + 1,
+            )
 
-        hidden_states, all_hidden_states, all_self_attentions, _ = self.blocks.scan(
+        hidden_states, state, all_hidden_states, all_self_attentions, _ = self.blocks.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_self_attentions, 0),
+            (hidden_states, state, all_hidden_states, all_self_attentions, 0),
             trace=output_hidden_states
             or output_attentions
             or not self.config.scan_layers
             or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = checkpoint_name(self.ln_out(hidden_states), "model_output")
 
@@ -931,6 +959,33 @@ class RwkvModel(EasyDeLBaseModule):
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
         )
+
+    def train(self, mode: bool = True):
+        """Set training mode and enable configured activation rescaling in evaluation.
+
+        Args:
+            mode: Whether to train. Evaluation enables ``config.rescale_every``.
+
+        Returns:
+            This model for chaining.
+        """
+        self.rescale_layers(not mode)
+        return super().train(mode)
+
+    def rescale_layers(self, rescaled: bool = True) -> None:
+        """Toggle inference rescaling without modifying stored checkpoint weights.
+
+        Each block's residual branch outputs are divided by
+        ``2 ** (block_index // config.rescale_every)``, equivalent to rescaling
+        its output projections. Hidden states are halved at each configured
+        boundary. Evaluation enables this automatically, while training disables
+        it. Call outside compiled forwards to change the mode.
+
+        Args:
+            rescaled: Whether to enable rescaling. ``rescale_every <= 0`` always
+                disables the feature.
+        """
+        self.layers_are_rescaled = bool(rescaled) and self.config.rescale_every > 0
 
     def get_embedding(self):
         """Return the input token embedding (post token-shift).
@@ -1096,13 +1151,7 @@ class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):  # type: ignor
         del inputs_embeds
 
         if state is None:
-            shape = (
-                input_ids.shape[0],
-                self.config.hidden_size,
-                self.config.num_hidden_layers,
-            )
-            state = [jnp.zeros(shape, dtype=jnp.float32) for _ in range(5)]
-            state[4] = state[4] - 1e30
+            state = _init_global_state(self.config, input_ids.shape[0], self.dtype)
 
         model_inputs: dict[str, tp.Any] = {"state": state}
         if attention_mask is not None:

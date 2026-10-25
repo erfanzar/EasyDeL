@@ -24,11 +24,14 @@ import json
 import typing as tp
 import warnings
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 # Re-export base classes from data_managers
 from easydel.data.transforms.base import Example, ExpandTransform, Transform
+from easydel.data.transforms.mixture import ASSISTANT_ONLY_FIELD, DATASET_ID_FIELD
 
+from ._assistant_tracker import assistant_tracker_lock
+from ._reward_sideband import is_reward_sideband
 from .prompt_utils import apply_chat_template as apply_conversational_template
 from .prompt_utils import (
     maybe_apply_chat_template,
@@ -50,6 +53,11 @@ _TOKENIZED_FIELDS = {
     "image_sizes",
     "completion_mask",
     "assistant_masks",
+    # Per-row sideband carriers stamped by the mixture builders. They must survive
+    # purification so the packing collator / trainer can read them; the trainer pops
+    # both before any model call. Imported, not spelled, so the names cannot drift.
+    ASSISTANT_ONLY_FIELD,
+    DATASET_ID_FIELD,
     "prompt_input_ids",
     "prompt_attention_mask",
     "chosen_input_ids",
@@ -77,6 +85,50 @@ _TOKENIZED_FIELDS = {
     "reference_chosen_log_probs",
     "reference_rejected_log_probs",
 }
+
+
+def preprocess_dataset_with_num_proc(dataset: tp.Any, transform: tp.Callable, num_proc: int | None) -> tp.Any:
+    """Preprocess datasets through the trainers' shared source boundary.
+
+    The default ``None`` leaves preprocessing to the trainer. Explicit worker
+    counts use process-backed mapping for materialized HF datasets, including
+    wrapped datasets, and retain lazy transforms for streaming/custom sources.
+    Named evaluation datasets are processed independently.
+
+    Args:
+        dataset: HuggingFace dataset, sharded source, mapping of datasets, or None.
+        transform: Per-row preprocessing callable.
+        num_proc: Optional positive number of worker processes.
+
+    Returns:
+        Preprocessed datasets, or the original input when no workers are configured.
+
+    Raises:
+        ValueError: If the worker count is invalid.
+    """
+    if num_proc is None or dataset is None:
+        return dataset
+    from types import SimpleNamespace
+
+    from datasets import Dataset
+
+    from easydel.data.core.protocols import ShardedDataSource
+    from easydel.data.sources.hf_wrapper import HFDatasetShardedSource
+
+    from .base_trainer import BaseTrainer
+
+    # Reuse both validation and mapping without constructing a model/trainer.
+    context = SimpleNamespace(arguments=SimpleNamespace(dataset_num_proc=num_proc))
+    workers = BaseTrainer._dataset_preprocess_workers(context)
+    context._dataset_preprocess_workers = lambda: workers
+    if isinstance(dataset, dict):
+        return {key: preprocess_dataset_with_num_proc(value, transform, workers) for key, value in dataset.items()}
+    source = dataset if isinstance(dataset, ShardedDataSource) else HFDatasetShardedSource(dataset)
+    result = BaseTrainer._preprocess_source(context, source, transform)
+    return result._dataset if isinstance(dataset, Dataset) else result
+
+
+_GRPO_CONSUMED_TEXT_FIELDS = frozenset({"prompt", "chosen", "rejected", "messages", "conversations", "completion"})
 
 
 def purify_example(example: dict, keep_fields: set[str] | None = None) -> dict:
@@ -305,8 +357,12 @@ class GRPOPreprocessTransform(Transform):
         result["input_ids"] = input_ids
         result["attention_mask"] = attention_mask
 
-        # Preserve per-example sideband metadata such as `tools` for reward functions.
-        keep_fields = {"tools"} if "tools" in result else None
+        # Reward functions read per-example metadata (gold `answer`, `tools`, ...) from `batch`.
+        keep_fields = {
+            key
+            for key, value in result.items()
+            if key == "tools" or (key not in _GRPO_CONSUMED_TEXT_FIELDS and is_reward_sideband(value))
+        }
         return purify_example(result, keep_fields=keep_fields)
 
     def _resolve_prompt_pad_length(self, prompt_length: int) -> int | None:
@@ -555,6 +611,15 @@ class BCOPreprocessTransform(ExpandTransform):
         self._pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
         self._embedding_tokenizer = embedding_tokenizer
         self._tools = tools
+        self._unpaired_transform = KTOPreprocessTransform(
+            tokenizer=tokenizer,
+            max_prompt_length=max_prompt_length,
+            max_completion_length=max_completion_length,
+            add_special_tokens=add_special_tokens,
+            label_pad_token_id=label_pad_token_id,
+            embedding_tokenizer=embedding_tokenizer,
+            tools=tools,
+        )
 
     def __call__(self, example: Example) -> Iterator[Example]:
         """Process example and yield one or more tokenized examples.
@@ -628,77 +693,8 @@ class BCOPreprocessTransform(ExpandTransform):
         )
 
     def _tokenize_unpaired(self, example: dict) -> dict:
-        """Tokenize a single unpaired example.
-
-        Args:
-            example: Dict with prompt, completion, label fields.
-
-        Returns:
-            Tokenized example with prompt_input_ids, completion_input_ids, etc.
-
-        Raises:
-            KeyError: If required fields (prompt, completion, label) are missing.
-        """
-        result = maybe_convert_to_chatml(dict(example))
-        result = maybe_apply_chat_template(
-            result,
-            self._tokenizer,
-            resolve_example_tools(result, self._tools),
-        )
-
-        # Strict field access - will raise KeyError if missing
-        prompt = result["prompt"]
-        completion = result["completion"]
-        label = result["label"]
-
-        # Tokenize prompt and completion separately
-        prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
-        completion_ids = self._tokenizer(completion, add_special_tokens=False)["input_ids"]
-
-        bos_token_id = self._tokenizer.bos_token_id
-        eos_token_id = self._tokenizer.eos_token_id
-
-        if self._add_special_tokens and bos_token_id is not None:
-            prompt_ids = [bos_token_id, *prompt_ids]
-
-        if eos_token_id is not None:
-            completion_ids = [*completion_ids, eos_token_id]
-
-        # Truncate prompt (from left, keep most recent context)
-        if self._max_prompt_length is not None:
-            prompt_ids = prompt_ids[-self._max_prompt_length :]
-
-        # Truncate completion (from right)
-        if self._max_completion_length is not None:
-            completion_ids = completion_ids[: self._max_completion_length]
-
-        full_ids = prompt_ids + completion_ids
-        prompt_len = len(prompt_ids)
-
-        # Create labels: mask prompt tokens with label_pad_token_id
-        full_labels = [self._label_pad_token_id] * prompt_len + completion_ids
-
-        # Create attention masks (all 1s for actual tokens)
-        prompt_mask = [1] * len(prompt_ids)
-        full_mask = [1] * len(full_ids)
-
-        result["prompt_input_ids"] = prompt_ids
-        result["prompt_attention_mask"] = prompt_mask
-        result["completion_input_ids"] = full_ids
-        result["completion_attention_mask"] = full_mask
-        result["completion_labels"] = full_labels
-        result["label"] = bool(label)
-
-        if self._embedding_tokenizer is not None:
-            emb_tokenized = self._embedding_tokenizer(
-                prompt,
-                truncation=True,
-                add_special_tokens=False,
-            )
-            result["embedding_input_ids"] = emb_tokenized["input_ids"]
-            result["embedding_attention_mask"] = emb_tokenized["attention_mask"]
-
-        return purify_example(result)
+        """Use the shared KTO unpaired-preference tokenizer for each BCO branch."""
+        return self._unpaired_transform(example)
 
     def __repr__(self) -> str:
         """Return a debug-friendly representation including the length caps."""
@@ -913,6 +909,19 @@ class ORPOPreprocessTransform(DPOPreprocessTransform):
         ...     max_completion_length=256,
         ... )
     """
+
+    def __call__(self, example: Example) -> Example:
+        """Reject empty preference targets instead of creating undefined log odds."""
+        if self._max_completion_length is not None and self._max_completion_length <= 0:
+            raise ValueError("ORPO requires a positive max_completion_length.")
+        result = super().__call__(example)
+        for branch in ("chosen", "rejected"):
+            if not any(
+                label != self._label_pad_token_id and bool(active)
+                for label, active in zip(result[f"{branch}_labels"], result[f"{branch}_attention_mask"], strict=True)
+            ):
+                raise ValueError(f"ORPO {branch} sequence has no scoreable completion labels.")
+        return result
 
     def __repr__(self) -> str:
         """Return a debug-friendly representation including the length caps."""
@@ -1433,18 +1442,31 @@ class SFTPreprocessTransform(Transform):
         tools = resolve_example_tools(result)
 
         try:
-            with self._temporary_truncation_side():
-                processed = self._tokenizer.apply_chat_template(
-                    messages,
-                    return_dict=True,
-                    return_attention_mask=True,
-                    return_assistant_tokens_mask=self._return_assistant_tokens_mask,
-                    truncation=self._truncation,
-                    max_length=self._max_length,
-                    padding=self._tokenizer_padding(),
-                    pad_to_multiple_of=self._pad_to_multiple_of,
-                    tools=tools,
-                )
+            with self._assistant_tracker_guard(), self._temporary_truncation_side():
+                if self._return_assistant_tokens_mask:
+                    # HF's mask stops at the first truncated span; render untruncated and cut everything together.
+                    processed = self._tokenizer.apply_chat_template(
+                        messages,
+                        return_dict=True,
+                        return_attention_mask=True,
+                        return_assistant_tokens_mask=True,
+                        truncation=False,
+                        padding=False,
+                        tools=tools,
+                    )
+                    processed = self._truncate_and_pad_masked_row(processed)
+                else:
+                    processed = self._tokenizer.apply_chat_template(
+                        messages,
+                        return_dict=True,
+                        return_attention_mask=True,
+                        return_assistant_tokens_mask=False,
+                        truncation=self._truncation,
+                        max_length=self._max_length,
+                        padding=self._tokenizer_padding(),
+                        pad_to_multiple_of=self._pad_to_multiple_of,
+                        tools=tools,
+                    )
             result.update(processed)
         except Exception:
             # Fallback if chat template fails - try without tools first
@@ -1471,6 +1493,58 @@ class SFTPreprocessTransform(Transform):
 
         result = self._pad_row_to_multiple(result)
         return purify_example(result)
+
+    def _assistant_tracker_guard(self) -> tp.ContextManager[tp.Any]:
+        """Return the lock serialising assistant-mask renders, or a no-op when no mask is requested.
+
+        HF's Jinja ``AssistantTracker`` is process-global and not thread-safe; concurrent renders either
+        raise or silently return an empty assistant mask. The lock is fetched per call rather than stored on
+        ``self`` because it is not picklable and transforms are shipped to worker processes.
+
+        Returns:
+            The shared re-entrant tracker lock when ``return_assistant_tokens_mask`` is in use, otherwise a
+            null context.
+        """
+        if not self._return_assistant_tokens_mask:
+            return nullcontext()
+        return assistant_tracker_lock()
+
+    def _truncate_and_pad_masked_row(self, processed: tp.Mapping[str, tp.Any]) -> dict[str, tp.Any]:
+        """Apply this transform's truncation and padding to an untruncated masked render.
+
+        Every per-token field (``input_ids``, ``attention_mask``, ``assistant_masks`` and any other list of
+        the same length) is cut on the same side: ``keep_end`` drops the head, ``keep_start`` the tail.
+        Padding then follows the tokenizer's ``padding_side`` using ``pad_token_id`` (or 0).
+        ``pad_to_multiple_of`` is left to :meth:`_pad_row_to_multiple`.
+
+        Args:
+            processed: Untruncated, unpadded ``apply_chat_template`` output.
+
+        Returns:
+            A new dict with all per-token fields truncated and padded consistently.
+        """
+        row = {key: (list(value) if isinstance(value, (list, tuple)) else value) for key, value in processed.items()}
+        ids = row.get("input_ids")
+        if not isinstance(ids, list):
+            return row
+        length = len(ids)
+        per_token = [key for key, value in row.items() if isinstance(value, list) and len(value) == length]
+        if self._truncation and self._max_length and length > self._max_length:
+            if self._truncation_mode == "keep_end":
+                cut = slice(length - self._max_length, None)
+            else:
+                cut = slice(0, self._max_length)
+            for key in per_token:
+                row[key] = row[key][cut]
+        if self._tokenizer_padding() in ("max_length", True) and self._max_length:
+            pad_len = self._max_length - len(row["input_ids"])
+            if pad_len > 0:
+                pad_id = getattr(self._tokenizer, "pad_token_id", 0) or 0
+                left = getattr(self._tokenizer, "padding_side", "right") == "left"
+                for key in per_token:
+                    fill = [pad_id if key == "input_ids" else 0] * pad_len
+                    row[key] = fill + row[key] if left else row[key] + fill
+        return row
 
     def _simple_format_messages(self, messages: list) -> str:
         """Simple fallback formatting when chat template fails.
@@ -1550,11 +1624,21 @@ class SFTPreprocessTransform(Transform):
         result["attention_mask"] = tokens["attention_mask"]
 
         if self._mask_prompt:
-            prompt_len = min(len(prompt_ids), len(tokens["input_ids"]))
-            seq_len = len(tokens["input_ids"])
-            # Mask: 0 for prompt tokens, 1 for completion tokens, 0 for padding
-            completion_mask = [0] * prompt_len + [1] * (seq_len - prompt_len)
-            completion_mask = [m * a for m, a in zip(completion_mask, tokens["attention_mask"], strict=True)]
+            # Work in unpadded token coordinates. Left truncation discards prompt
+            # tokens first; left padding shifts the retained boundary again.
+            retained_length = sum(tokens["attention_mask"])
+            removed_left = 0
+            if self._truncation and self._truncation_mode == "keep_end":
+                full_ids = self._tokenizer(full_text, add_special_tokens=False, truncation=False, padding=False)[
+                    "input_ids"
+                ]
+                removed_left = max(len(full_ids) - retained_length, 0)
+            prompt_len = max(len(prompt_ids) - removed_left, 0)
+            token_index = 0
+            completion_mask = []
+            for active in tokens["attention_mask"]:
+                completion_mask.append(int(bool(active) and token_index >= prompt_len))
+                token_index += int(bool(active))
             result["completion_mask"] = completion_mask
 
         result = self._pad_row_to_multiple(result)

@@ -97,7 +97,7 @@ class TokenBudgetManager:
         """
         return self._remaining
 
-    def begin_cycle(self, cache_manager: CacheManager, num_running_requests: int) -> int:
+    def begin_cycle(self, cache_manager: CacheManager, num_running_requests: int, running_token_demand: int = 0) -> int:
         """Refresh the budget using latest KV cache statistics.
 
         This method should be called at the beginning of each scheduling cycle
@@ -106,12 +106,16 @@ class TokenBudgetManager:
 
         The budget is calculated as the minimum of:
             - Configured max_batch_tokens
-            - Available KV cache capacity minus safety margin
+            - Available KV cache capacity minus safety margin, floored by
+              pending running-request work so allocation/preemption can progress
 
         Args:
             cache_manager: The cache manager instance to query for page availability.
             num_running_requests: Number of currently running requests (used to
                 calculate total safety margin).
+            running_token_demand: Pending work of already admitted requests. This
+                progress floor keeps decode and allocation/preemption reachable
+                even with no free pages; actual page allocation remains authoritative.
 
         Returns:
             int: The available token budget for this scheduling cycle.
@@ -123,7 +127,7 @@ class TokenBudgetManager:
         free_pages = cache_manager.page_pool.get_num_free_pages()
         available_tokens = free_pages * self.page_size
         reserved_tokens = num_running_requests * self.safety_margin_tokens
-        capacity = max(0, available_tokens - reserved_tokens)
+        capacity = max(0, available_tokens - reserved_tokens, running_token_demand)
         if self.max_batch_tokens is None:
             self._remaining = capacity
         else:

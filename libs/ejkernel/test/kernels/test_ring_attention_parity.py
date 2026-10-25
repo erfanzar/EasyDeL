@@ -21,6 +21,7 @@ import pytest
 from ejkernel.kernels._pallas.tpu.ring_attention import _interface as pallas_interface
 from ejkernel.kernels._registry import kernel_registry
 from ejkernel.kernels._xla.ring_attention import _interface as xla_interface
+from jax import lax
 
 
 class TestFeatureParity:
@@ -56,6 +57,7 @@ class TestFeatureParity:
             "fwd_params",
             "bwd_params",
             "fused_backward",
+            "precision",
         ]
 
         assert list(xla_sig.parameters) == canonical
@@ -77,6 +79,8 @@ class TestFeatureParity:
         assert xla_sig.parameters["fwd_params"].default is None
         assert xla_sig.parameters["bwd_params"].default is None
         assert xla_sig.parameters["fused_backward"].default is False
+        assert xla_sig.parameters["precision"].default is lax.Precision.DEFAULT
+        assert pallas_sig.parameters["precision"].default is lax.Precision.DEFAULT
 
         assert kernel_registry.validate_signatures("ring_attention")
 

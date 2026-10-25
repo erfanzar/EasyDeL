@@ -110,7 +110,7 @@ class _StudentState:
         return _StudentModule(tree)
 
 
-def _run_single_minibatch(state, batch, minibatch_size, grad_fn):
+def _run_single_minibatch(state, batch, minibatch_size, grad_fn, **_kwargs):
     assert "_teacher_logits" not in batch
     assert "_teacher_hidden_state" not in batch
     batch_size = int(batch["input_ids"].shape[0])
@@ -163,7 +163,7 @@ def test_distillation_step_uses_precomputed_teacher_logits(monkeypatch):
         "_teacher_logits": jnp.stack((input_ids * 0.5 + 0.1, input_ids * -0.25 - 0.2), axis=-1),
     }
 
-    def run_single_minibatch_with_teacher(state, batch, minibatch_size, grad_fn):
+    def run_single_minibatch_with_teacher(state, batch, minibatch_size, grad_fn, **_kwargs):
         batch_size = int(batch["input_ids"].shape[0])
         minibatch = jax.tree_util.tree_map(
             lambda x: x[:minibatch_size] if hasattr(x, "shape") and x.ndim > 0 and x.shape[0] == batch_size else x,

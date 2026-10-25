@@ -84,6 +84,11 @@ class IndexerConfig:
         select_tail: Always append the current incomplete tail pool's raw
             token indices to the selection (``pool`` kind only).
         initializer_range: Std of the normal initializer for projections.
+        scoring_kernel: Dense multi-query scoring path. ``"xla"`` (default) materialises the per-head
+            ``[B, S, H, T]`` logits as XLA ops; ``"pallas"`` routes training / prefill scoring (more than one query
+            per row) through the registered ``indexer_scores`` operation, which on TPU keeps the per-head logits in
+            VMEM (under ``shard_map`` on a multi-device mesh) and elsewhere runs the ejkernel XLA reference.
+            Requires ``score_activation="relu"``. Decode steps keep the dense path.
     """
 
     kind: str = IndexerKind.TOKEN
@@ -103,10 +108,15 @@ class IndexerConfig:
     kpool_size: int = 1
     select_tail: bool = False
     initializer_range: float = 0.02
+    scoring_kernel: str = "xla"
 
     def __post_init__(self):
         if self.kind not in (IndexerKind.TOKEN, IndexerKind.POOL):
             raise ValueError(f"IndexerConfig.kind must be 'token' or 'pool', got {self.kind!r}.")
+        if self.scoring_kernel not in ("xla", "pallas"):
+            raise ValueError(f"scoring_kernel must be 'xla' or 'pallas', got {self.scoring_kernel!r}.")
+        if self.scoring_kernel == "pallas" and self.score_activation != "relu":
+            raise ValueError("scoring_kernel='pallas' fuses a per-head relu; it requires score_activation='relu'.")
         if self.score_activation not in ("none", "relu"):
             raise ValueError(f"score_activation must be 'none' or 'relu', got {self.score_activation!r}.")
         if self.head_reduction not in ("weighted", "uniform"):

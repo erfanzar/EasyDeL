@@ -65,7 +65,7 @@ import os
 import typing
 from typing import Literal
 
-from jax import shard_map
+from jax import lax, shard_map
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Float, Int
 
@@ -155,6 +155,7 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
         in_specs: tuple[PartitionSpec, ...] | None = None,
         out_specs: PartitionSpec | None = None,
         check_vma: bool = False,
+        precision: lax.PrecisionLike = lax.Precision.DEFAULT,
     ):
         """Create a shard_map wrapper specifically for ring attention.
 
@@ -183,6 +184,7 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             in_specs: Input partition specs
             out_specs: Output partition spec
             check_vma: Check for virtual memory access
+            precision: JAX contraction precision; non-default requests use XLA.
 
         Returns:
             Tuple of (shard_map_fn, call_args)
@@ -252,6 +254,7 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
                 fused_backward=fused_backward,
                 platform=platform,
                 cfg=cfg,
+                precision=precision,
             )
 
         call_args = (
@@ -313,6 +316,7 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
         platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: RingAttentionConfig,
+        precision: lax.PrecisionLike = lax.Precision.DEFAULT,
     ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
         """Execute ring attention with distributed KV processing.
 
@@ -335,6 +339,8 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
             axis_name: Name of the axis for collective operations (required for multi-device)
             fused_backward: Whether to use fused backward kernel
+            precision: JAX contraction precision in the forward and Q/K/V VJP.
+                Non-default requests use the registered XLA ring implementation.
             platform: Optional platform override ("triton", "pallas", "cuda", "xla")
             cfg: Kernel configuration object
 
@@ -354,6 +360,14 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             >>> with mesh:
             ...     out = ring_attention(q, k, v, axis_name='sp')
         """
+
+        # Fused backends do not expose JAX's contraction-precision control.
+        # Preserve their existing DEFAULT path, and honor explicit precision
+        # through the registered XLA ring (including its collective/VJP path).
+        precision_kwargs = {}
+        if precision not in (lax.Precision.DEFAULT, "default"):
+            platform = "xla"
+            precision_kwargs["precision"] = precision
 
         if platform is not None:
             cfg = RingAttentionConfig(
@@ -383,6 +397,7 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             fwd_params=cfg.fwd_params,
             bwd_params=cfg.bwd_params,
             fused_backward=fused_backward,
+            **precision_kwargs,
         )
 
     def heuristic_cfg(self, inv: Invocation[RingAttentionConfig, Array]) -> RingAttentionConfig:
@@ -565,6 +580,7 @@ def ring_attention(
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
     out_specs: PartitionSpec | None = None,
+    precision: lax.PrecisionLike = lax.Precision.DEFAULT,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Execute ring attention with automatic optimization.
 
@@ -592,6 +608,9 @@ def ring_attention(
         mesh: JAX device mesh for shard_map execution (optional)
         in_specs: Input partition specs for shard_map (optional)
         out_specs: Output partition spec for shard_map (optional)
+        precision: JAX contraction precision for forward and backward products.
+            Defaults to ``lax.Precision.DEFAULT`` and retains existing backend
+            selection. Non-default precision uses the registered XLA ring.
 
     Returns:
         Attention output with same shape as query
@@ -655,6 +674,7 @@ def ring_attention(
         softmax_scale=softmax_scale,
         axis_name=axis_name,
         fused_backward=fused_backward,
+        precision=precision,
         platform=platform,
         method=method,
         mesh=mesh,

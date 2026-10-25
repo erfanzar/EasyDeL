@@ -49,7 +49,6 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     MoeCausalLMOutput,
@@ -174,115 +173,21 @@ class Xerxes2Attention(UnifiedAttention):
             rngs (spx.Rngs): Random number generator state.
         """
 
-        if not self.use_mla_lora:
-            setattr(
-                self,
-                self.projection_mapping["mla_q_proj"],
-                ColumnParallelLinear(
-                    config.hidden_size,
-                    config.num_attention_heads * self.q_head_dim,
-                    rngs=rngs,
-                    use_bias=False,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                    precision=precision,
-                ),
-            )
-        else:
-            setattr(
-                self,
-                self.projection_mapping["mla_q_a_proj"],
-                ColumnParallelLinear(
-                    config.hidden_size,
-                    config.q_lora_dim,
-                    rngs=rngs,
-                    use_bias=False,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                    precision=precision,
-                ),
-            )
+        self._build_mla_projections(config, dtype, param_dtype, precision, rngs)
+        # The shared projection layout is identical, but Xerxes2 checkpoints
+        # carry centered LayerNorms (including bias), not RMSNorm scales.
+        # Specialize only those slots without duplicating projection builders.
+        if self.use_mla_lora:
             setattr(
                 self,
                 self.projection_mapping["mla_q_a_layernorm"],
-                LayerNorm(
-                    config.q_lora_dim,
-                    rngs=rngs,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                ),
+                LayerNorm(config.q_lora_dim, rngs=rngs, dtype=dtype, param_dtype=param_dtype),
             )
-            setattr(
-                self,
-                self.projection_mapping["mla_q_b_proj"],
-                ColumnParallelLinear(
-                    config.q_lora_dim,
-                    config.num_attention_heads * self.q_head_dim,
-                    rngs=rngs,
-                    use_bias=False,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                    precision=precision,
-                ),
-            )
-
-        setattr(
-            self,
-            self.projection_mapping["mla_kv_a_proj_with_mqa"],
-            ColumnParallelLinear(
-                config.hidden_size,
-                config.kv_lora_dim + config.qk_rope_head_dim,
-                rngs=rngs,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
         setattr(
             self,
             self.projection_mapping["mla_kv_a_layernorm"],
-            LayerNorm(
-                config.kv_lora_dim,
-                rngs=rngs,
-                dtype=dtype,
-                param_dtype=param_dtype,
-            ),
+            LayerNorm(config.kv_lora_dim, rngs=rngs, dtype=dtype, param_dtype=param_dtype),
         )
-        setattr(
-            self,
-            self.projection_mapping["mla_kv_b_proj"],
-            ColumnParallelLinear(
-                config.kv_lora_dim,
-                config.num_attention_heads * (config.qk_nope_head_dim + config.vhead_dim),
-                rngs=rngs,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-        setattr(
-            self,
-            self.projection_mapping["output_projection"],
-            RowParallelLinear(
-                config.num_attention_heads * self.v_head_dim,
-                config.hidden_size,
-                rngs=rngs,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-        self.rotary = self._create_rotary(config, dtype)
-        self.attention_performer = self._create_attention_performer(config, rngs)
 
     def _create_attention_performer(self, config, rngs):
         """Create attention performer module with YaRN scaling.
@@ -942,6 +847,8 @@ class Xerxes2Model(EasyDeLBaseModule):
             extra=output_router_logits or needs_trace_cache,
         )
         cache_views = views if trace_layers else None
+        # Materialize the cached property outside the nested scan trace.
+        frequencies = self.frequencies
 
         def _run_layer(block, carry):
             """Apply a single decoder layer inside the layer-stack scan.
@@ -964,7 +871,7 @@ class Xerxes2Model(EasyDeLBaseModule):
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     output_router_logits=output_router_logits,
-                    frequencies=self.frequencies,
+                    frequencies=frequencies,
                 )
             hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
             cv = self._layer_cache_view_update(
@@ -985,6 +892,7 @@ class Xerxes2Model(EasyDeLBaseModule):
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
 
@@ -1143,33 +1051,7 @@ class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):  # ty
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
-            aux_loss_fn=self._compute_aux_loss,
         )
-
-    def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute auxiliary load balancing loss for MoE layers.
-
-        Calculates the auxiliary loss that encourages balanced expert utilization
-        across all MoE layers, scaled by the router_aux_loss_coef.
-
-        Args:
-            outputs: Model outputs containing router_logits from MoE layers.
-            attention_mask: Attention mask to exclude padding tokens from loss computation.
-
-        Returns:
-            Auxiliary loss value if router_logits are available, None otherwise.
-        """
-        if outputs.router_logits is None or len(outputs.router_logits) == 0:
-            return None
-
-        aux_loss = auxiliary_load_balancing_loss_func(
-            gate_logits=outputs.router_logits,
-            num_experts=self.config.num_experts,
-            top_k=self.config.num_experts_per_tok,
-            attention_mask=attention_mask,
-        )
-
-        return aux_loss * self.config.router_aux_loss_coef
 
     def create_transformer_cache_config(self, batch_size: int, max_length: int, **kwargs):
         """Create cache configuration for MLA-based key-value caching.
@@ -1186,12 +1068,6 @@ class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):  # ty
             TransformerCacheConfig: Configuration for initializing the KV cache
                 with MLA-specific key_dim (qk_rope + qk_nope) and value_dim (vhead_dim).
         """
-        head_dim = getattr(self.config, "head_dim", None)
-        if head_dim is None:
-            head_dim = self.config.hidden_size // self.config.num_attention_heads
-        num_key_value_heads = getattr(self.config, "num_key_value_heads", None)
-        if num_key_value_heads is None:
-            num_key_value_heads = self.config.num_attention_heads
         return TransformerCacheConfig.create(
             num_hidden_layers=self.config.num_hidden_layers,
             batch_size=batch_size,

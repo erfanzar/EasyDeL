@@ -79,9 +79,9 @@ from easydel.layers import (
     gated_mlp_forward,
     moe_down_projection_reform_param,
     moe_fused_gate_up_reform_param,
-    split_fused_gate_up_projection,
 )
 from easydel.layers.attention import UnifiedAttention
+from easydel.layers.mlp import moe_gated_expert_forward
 from easydel.layers.moe import moe_group_topk_select
 from easydel.modules._base import BaseCausalLMModule
 
@@ -265,9 +265,7 @@ class HyV3MLPStack(spx.Module):
         Returns:
             Expert outputs in the same grouped layout as the input.
         """
-        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
-        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
+        return moe_gated_expert_forward(self, hidden_states, group_sizes, sorted_experts)
 
 
 class HyV3TopKRouter(spx.Module):
@@ -911,8 +909,11 @@ class HyV3Model(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
 
         return MoeModelOutput(
             last_hidden_state=hidden_states,

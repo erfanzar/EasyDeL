@@ -23,63 +23,7 @@ from easydel.infra.factory import register_config
 from easydel.modules.qwen3_next.qwen3_next_configuration import Qwen3NextConfig
 from easydel.modules.qwen3_vl.qwen3_vl_configuration import Qwen3VLVisionConfig
 
-
-def _hf_supports_mrope_rope_type() -> bool:
-    """Probe whether the installed transformers exposes the ``"mrope"`` validator.
-
-    Multimodal RoPE was added to ``transformers.modeling_rope_utils``
-    after the original Qwen2-VL release; older installations only know
-    about ``"default"``/``"linear"``/``"dynamic"``/etc. and reject
-    ``rope_type="mrope"`` during config validation.
-
-    This helper imports ``modeling_rope_utils`` defensively (returning
-    ``False`` on any import error so EasyDeL stays usable without
-    transformers) and reports whether the global
-    ``ROPE_VALIDATION_FUNCTIONS`` mapping contains an ``"mrope"`` key.
-
-    Returns:
-        ``True`` iff the installed ``transformers`` version recognises
-        ``rope_type="mrope"``; ``False`` otherwise.
-    """
-    try:
-        from transformers import modeling_rope_utils
-    except Exception:
-        return False
-
-    validators = getattr(modeling_rope_utils, "ROPE_VALIDATION_FUNCTIONS", None)
-    return isinstance(validators, Mapping) and "mrope" in validators
-
-
-def _normalize_rope_scaling_for_mrope(rope_scaling: dict | None) -> dict | None:
-    """Patch a Qwen3.5 ``rope_scaling`` dict for HF cross-version use.
-
-    When a Qwen3.5 config carries multimodal-RoPE keys
-    (``mrope_section`` / ``mrope_interleaved``) but no explicit
-    ``rope_type``, this helper picks the right value depending on
-    whether the installed HF version recognises ``"mrope"``:
-
-    - Modern HF: stamp ``rope_type``/``type`` to ``"mrope"`` so the
-      validator picks the dedicated mRoPE schema.
-    - Older HF: stamp them to ``"default"`` to avoid validation
-      errors while still preserving the mRoPE-specific keys (which
-      the old validator ignores).
-
-    Returns:
-        A new dict with normalised keys, the original mapping
-        unchanged when no mRoPE keys are present, or ``None`` when the
-        input was ``None``.
-    """
-    if not isinstance(rope_scaling, dict):
-        return rope_scaling
-    normalized = dict(rope_scaling)
-    has_mrope_keys = "mrope_section" in normalized or "mrope_interleaved" in normalized
-    if has_mrope_keys:
-        rope_type = normalized.get("rope_type", normalized.get("type"))
-        if rope_type in (None, "default", "mrope"):
-            target_rope_type = "mrope" if _hf_supports_mrope_rope_type() else "default"
-            normalized["rope_type"] = target_rope_type
-            normalized["type"] = target_rope_type
-    return normalized
+from .rope_utils import normalize_rope_scaling_for_mrope
 
 
 def _has_hf_qwen3_5_text_impl() -> bool:
@@ -228,7 +172,7 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
 
         See class docstring for detailed parameter descriptions.
         """
-        rope_scaling = _normalize_rope_scaling_for_mrope(rope_scaling or rope_parameters)
+        rope_scaling = normalize_rope_scaling_for_mrope(rope_scaling or rope_parameters)
         if rope_theta is None and isinstance(rope_scaling, dict):
             rope_theta = rope_scaling.get("rope_theta")
         if rope_theta is None:

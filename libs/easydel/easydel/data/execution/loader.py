@@ -47,33 +47,37 @@ logger = logging.getLogger(__name__)
 
 
 def collate_batch(examples: list[dict]) -> dict[str, np.ndarray]:
-    """Stack a list of identically-keyed example dicts into a batched dict-of-arrays.
+    """Stack example dicts into a batched dict-of-arrays without dropping fields.
 
-    For each key, attempts a vectorised :func:`numpy.stack` along axis 0;
-    when that fails (heterogeneous shapes/dtypes — e.g. variable-length
-    token lists in unpacked data), falls back to a numpy object array
-    so the values are still preserved in batch shape without raising.
+    Fields follow their first-seen order across all rows. Fully present
+    fields use :func:`numpy.stack` along axis 0 when possible. Missing or
+    explicitly null values produce a one-dimensional object array with
+    one slot per row and ``None`` in the missing slots. Ragged fields
+    also fall back to object arrays.
 
     Args:
-        examples: List of per-row dicts. All entries are assumed to
-            share the same key set; only ``examples[0].keys()`` is
-            consulted for which fields to materialise. An empty list
-            short-circuits to an empty dict.
+        examples: List of per-row dicts, which may have different key
+            sets. An empty list short-circuits to an empty dict.
 
     Returns:
         dict[str, np.ndarray]: Mapping from each key to either a stacked
         array (when all values are array-compatible) or an object array
-        (fallback for ragged/unstackable values).
+        (for optional or ragged/unstackable values).
     """
     if not examples:
         return {}
 
-    keys = examples[0].keys()
+    keys = dict.fromkeys(key for example in examples for key in example)
     batch = {}
 
     for key in keys:
-        values = [ex[key] for ex in examples]
-        # Stack if they're arrays, otherwise create object array
+        values = [ex.get(key) for ex in examples]
+        if any(value is None for value in values):
+            # Explicit allocation keeps an optional array/list value in one
+            # row slot rather than letting NumPy infer nested dimensions.
+            batch[key] = np.empty(len(values), dtype=object)
+            batch[key][:] = values
+            continue
         try:
             batch[key] = np.stack(values, axis=0)
         except (ValueError, TypeError):
@@ -156,7 +160,14 @@ def _prefetch_worker_body(source, buffer: Queue, stop_event: Event, sentinel) ->
     except Exception as e:
         _put_interruptible(buffer, stop_event, e)
     finally:
-        _put_interruptible(buffer, stop_event, sentinel)
+        try:
+            close = getattr(source, "close", None)
+            if close is not None:
+                close()
+        except Exception as error:
+            _put_interruptible(buffer, stop_event, error)
+        finally:
+            _put_interruptible(buffer, stop_event, sentinel)
 
 
 class PrefetchIterator:
@@ -196,30 +207,7 @@ class PrefetchIterator:
         self._sentinel = object()
         self._worker = None
         self._started = False
-
-    def _prefetch_worker(self):
-        """Background-thread body that drains the source into the prefetch queue.
-
-        Iterates the source in a loop, pushing each item onto the
-        buffer. Cooperatively checks ``self._stop_event`` so the
-        producer can be torn down on demand. Exceptions from the
-        source are captured and forwarded onto the queue so the
-        consumer can re-raise them in its own context. A sentinel
-        object is always pushed last (in the ``finally`` block) so
-        the consumer terminates cleanly regardless of how the source
-        ended.
-        """
-        _prefetch_worker_body(self._source, self._buffer, self._stop_event, self._sentinel)
-
-    def _put_interruptible(self, item) -> bool:
-        """Blocking queue put that gives up once :meth:`close` was requested.
-
-        Returns:
-            bool: ``True`` when the item was enqueued; ``False`` when the
-            stop event fired first (the consumer is gone, nobody will drain
-            the queue, and blocking forever would leak this thread).
-        """
-        return _put_interruptible(self._buffer, self._stop_event, item)
+        self._finished = False
 
     def _start(self):
         """Lazily spawn the producer thread on the first call to :meth:`__next__`.
@@ -273,6 +261,8 @@ class PrefetchIterator:
             Exception: Whatever exception type the upstream source
                 raised; transparently propagated through the queue.
         """
+        if self._finished:
+            raise StopIteration
         self._start()
 
         while True:
@@ -284,12 +274,15 @@ class PrefetchIterator:
                     # Producer is gone and left nothing (not even the
                     # sentinel, which the finally block should push):
                     # nothing more will ever arrive.
+                    self.close()
                     raise StopIteration from None
                 continue
 
         if item is self._sentinel:
+            self.close()
             raise StopIteration
         if isinstance(item, Exception):
+            self.close()
             raise item
         return item
 
@@ -301,6 +294,7 @@ class PrefetchIterator:
         even if the join times out the worker will not block process
         exit.
         """
+        self._finished = True
         self._stop_event.set()
         if self._worker is not None:
             self._worker.join(timeout=1.0)
@@ -375,10 +369,11 @@ class ShardingSpec:
         # spec) would collapse PP submeshes back to the full mesh, the same
         # bug class as init_tx had.
         result = {}
-        for key, arr in batch.items():
-            spec = self.partition_specs.get(key, PartitionSpec())
-            sharding = spx.get_corrected_named_sharding(tuple(arr.shape), spec, raise_mesh_error=False)
-            result[key] = jax.device_put(arr, sharding)
+        with spx.sharding.use_mesh(self.mesh):
+            for key, arr in batch.items():
+                spec = self.partition_specs.get(key, PartitionSpec())
+                sharding = spx.get_corrected_named_sharding(tuple(arr.shape), spec, raise_mesh_error=False)
+                result[key] = jax.device_put(arr, sharding)
 
         return result
 
@@ -448,6 +443,9 @@ class AsyncDataLoader(AsyncDataset[dict]):
         sharding_map: "Mapping[str, NamedSharding] | None" = None,
         seed: int | None = None,
         collate_fn: "tp.Callable[[list[dict]], dict] | None" = None,
+        prefetch_to_device: bool = False,
+        context: PipelineContext | None = None,
+        dataset_name: str = "dataset",
     ):
         """Capture loader configuration without performing any I/O.
 
@@ -477,6 +475,11 @@ class AsyncDataLoader(AsyncDataset[dict]):
             collate_fn: Optional per-batch collation override forwarded
                 to :func:`batch_iterator`; ``None`` uses
                 :func:`collate_batch` (unchanged default behaviour).
+            prefetch_to_device: Move batches onto the default JAX device when no
+                explicit ``sharding_map`` is supplied. With prefetch enabled,
+                placement happens on the producer thread.
+            context: Optional shared state for consumption metrics and step/epoch counters.
+            dataset_name: Dataset label used in context metrics and progress output.
         """
         self._source = source
         self._batch_size = batch_size
@@ -488,6 +491,9 @@ class AsyncDataLoader(AsyncDataset[dict]):
         self._sharding_map = sharding_map
         self._seed = seed
         self._collate_fn = collate_fn
+        self._prefetch_to_device = prefetch_to_device
+        self._context = context
+        self._dataset_name = dataset_name
         self._exhausted = False
         self._epoch_counter = 0
 
@@ -591,15 +597,36 @@ class AsyncDataLoader(AsyncDataset[dict]):
 
         if self._sharding_map:
             batches = (preshard_batch(b, self._sharding_map) for b in batches)
+        elif self._prefetch_to_device:
+            import jax
+
+            batches = (jax.device_put(batch) for batch in batches)
 
         if self._prefetch_enabled:
-            return PrefetchIterator(
+            batches = PrefetchIterator(
                 batches,
                 buffer_size=self._prefetch_buffer_size,
                 num_workers=self._prefetch_workers,
             )
 
+        if self._context is not None:
+            return self._track_batches(batches)
         return batches
+
+    def _track_batches(self, batches: Iterator[dict]) -> Iterator[dict]:
+        """Observe consumption and advance shared counters on the consumer thread."""
+        context = self._context
+        self._exhausted = False
+        try:
+            for batch in context.observe_rows(batches, "load", self._dataset_name):
+                context.update_step(context.step + 1)
+                yield batch
+            self._exhausted = True
+            context.update_epoch(context.epoch + 1)
+        finally:
+            close = getattr(batches, "close", None)
+            if close is not None:
+                close()
 
     def _shuffle_stream(
         self,
@@ -751,6 +778,9 @@ class LoadStage(BaseStage):
                 drop_last=self._stage_config.drop_last,
                 seed=context.seed,
                 collate_fn=self._stage_config.collate_fn,
+                prefetch_to_device=self._stage_config.prefetch_to_device,
+                context=context,
+                dataset_name=ds_name,
             )
             result[ds_name] = loader
             logger.info(f"Created loader for '{ds_name}' with batch_size={self._stage_config.batch_size}")
@@ -805,7 +835,6 @@ def create_data_iterator(
         Wrapped in a generator with prefetching when ``prefetch`` is
         ``True``.
     """
-    del prefetch_workers  # unused, kept for API compatibility
     if shuffle:
         try:
             dataset = dataset.shuffle(buffer_size=shuffle_buffer or 10000, seed=seed)
@@ -842,82 +871,6 @@ def create_data_iterator(
         it = _batched(it, batch_size)
 
     if prefetch:
-        _SENTINEL = object()
-        buffer = Queue(maxsize=prefetch_buffer)
-        stop_event = Event()
-
-        def prefetch_worker(source_iter, buf, stop_evt):
-            """Background-thread body for the prefetch helper inside :func:`create_data_iterator`.
-
-            Mirrors :meth:`PrefetchIterator._prefetch_worker`: pushes
-            each produced item onto the queue, captures and forwards
-            any source-side exception, and finally pushes a
-            module-local ``_SENTINEL`` so the consumer terminates.
-
-            Args:
-                source_iter: Iterator to drain; advanced one item per
-                    iteration of the loop.
-                buf: ``Queue`` shared with the consumer, used for both
-                    items and exception propagation.
-                stop_evt: ``Event`` polled cooperatively before each
-                    push so the worker can exit early on consumer
-                    teardown.
-            """
-            try:
-                for item in source_iter:
-                    if stop_evt.is_set():
-                        break
-                    buf.put(item)
-            except Exception as e:
-                buf.put(e)
-            finally:
-                buf.put(_SENTINEL)
-
-        worker = Thread(
-            target=prefetch_worker,
-            args=(it, buffer, stop_event),
-            daemon=True,
-        )
-
-        def _gen():
-            """Inline generator that drains the prefetch queue and re-raises errors.
-
-            Reads from ``buffer`` with a 60-second blocking ``get``.
-            Treats the captured ``_SENTINEL`` as end-of-stream and
-            transparently re-raises any :class:`Exception` instance
-            it pulls off the queue (forwarded by ``prefetch_worker``).
-            Always sets ``stop_event`` and joins the worker on exit
-            via ``finally`` so consumer shutdown is clean even on
-            early break.
-
-            Yields:
-                Any: The next item from the prefetch worker.
-
-            Raises:
-                Exception: Whatever exception the source raised,
-                    transparently forwarded.
-            """
-            worker.start()
-            try:
-                while True:
-                    try:
-                        item = buffer.get(timeout=60.0)
-                    except Empty:
-                        if not worker.is_alive():
-                            # Producer died without leaving a sentinel:
-                            # nothing more will ever arrive.
-                            break
-                        continue
-
-                    if item is _SENTINEL:
-                        break
-                    if isinstance(item, Exception):
-                        raise item
-                    yield item
-            finally:
-                stop_event.set()
-                worker.join(timeout=1.0)
-
-        return _gen()
+        return PrefetchIterator(it, buffer_size=prefetch_buffer, num_workers=prefetch_workers)
 
     return it

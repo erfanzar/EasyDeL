@@ -82,8 +82,9 @@ class vWhisperInferenceConfig:
         generation_config (GenerationConfig | None): Hugging Face
             GenerationConfig object for fine-grained control over
             text generation. If None, uses the model's default config.
-        logits_processor: Reserved for custom logits processors.
-            Currently not used but available for future extensions.
+        logits_processor: Optional custom logits processors forwarded to
+            the model's generation routine alongside its forced-token and
+            timestamp processors.
         return_timestamps (bool | None): Whether to include word or
             segment timestamps in the output. Useful for subtitle
             generation. If None, determined by the generation config.
@@ -97,6 +98,8 @@ class vWhisperInferenceConfig:
             language name. If None, language is auto-detected.
         is_multilingual (bool | None): Whether the model supports
             multiple languages. If None, determined from the model.
+            When set, it overrides the generation config's
+            ``is_multilingual`` when building the forced decoder tokens.
 
     Example:
         Basic configuration for English transcription::
@@ -148,11 +151,11 @@ class vWhisperInferenceConfig:
     batch_size: int | None = 1
     max_length: int | None = None
     generation_config: GenerationConfig | None = None
-    logits_processor = None
-    return_timestamps = None
-    task = None
-    language = None
-    is_multilingual = None
+    logits_processor: tp.Any = None
+    return_timestamps: bool | None = None
+    task: str | None = None
+    language: str | None = None
+    is_multilingual: bool | None = None
 
     def __hash__(self):
         """Compute a hash value for the configuration.

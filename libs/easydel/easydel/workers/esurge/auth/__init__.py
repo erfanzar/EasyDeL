@@ -31,7 +31,7 @@ Example:
         # Create auth manager
         auth_manager = EnhancedApiKeyManager(
             require_api_key=True,
-            admin_key="your-admin-key",
+            admin_key="your-admin-key-at-least-16-chars",
         )
 
         # Generate a new API key
@@ -52,7 +52,7 @@ Example:
         from easydel.workers.esurge.auth import AuthWorkerManager
 
         # Start auth worker
-        manager = AuthWorkerManager(admin_key="your-admin-key")
+        manager = AuthWorkerManager(admin_key="your-admin-key-at-least-16-chars")
         client = manager.start()
 
         # Use client for auth operations

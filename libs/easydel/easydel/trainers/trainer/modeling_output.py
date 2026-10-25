@@ -26,6 +26,8 @@ import typing as tp
 import spectrax as spx
 from eformer.pytree import auto_pytree
 
+from ..trainer_protocol import TrainerOutput as BaseTrainerOutput
+
 if tp.TYPE_CHECKING:
     from easydel.infra.base_state import EasyDeLState
 else:
@@ -34,8 +36,8 @@ CallFN: tp.TypeAlias = tp.Any | collections.abc.Mapping[str, tp.Callable] | dict
 
 
 @auto_pytree
-class TrainerOutput:
-    """Output from a training run.
+class TrainerOutput(BaseTrainerOutput):
+    """Backward-compatible constructor for the canonical training output schema.
 
     Contains the final model state and metadata from the training process,
     including checkpointing information and utility functions for state manipulation.
@@ -49,9 +51,30 @@ class TrainerOutput:
         checkpoint_path: Full path to the checkpoint directory.
     """
 
-    state: EasyDeLState
-    mesh: spx.SpxMesh | None
-    checkpoint_manager: tp.Any
-    shard_fns: CallFN | None = None
-    last_save_file_name: str | None = None
-    checkpoint_path: str | None = None
+    def __init__(
+        self,
+        state: EasyDeLState,
+        mesh: spx.SpxMesh | None,
+        checkpoint_manager: tp.Any,
+        shard_fns: CallFN | None = None,
+        last_save_file_name: str | None = None,
+        checkpoint_path: str | None = None,
+    ):
+        """Preserve the legacy positional ordering while sharing the output fields.
+
+        Args:
+            state: Final model state.
+            mesh: Training mesh, if any.
+            checkpoint_manager: Manager for handling model checkpoints.
+            shard_fns: Optional parameter-sharding functions.
+            last_save_file_name: Most recently saved checkpoint file.
+            checkpoint_path: Checkpoint directory path.
+        """
+        super().__init__(
+            state=state,
+            mesh=mesh,
+            last_save_file_name=last_save_file_name,
+            checkpoint_path=checkpoint_path,
+            checkpoint_manager=checkpoint_manager,
+            shard_fns=shard_fns,
+        )

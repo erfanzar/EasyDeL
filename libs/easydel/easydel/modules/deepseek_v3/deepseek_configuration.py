@@ -29,8 +29,6 @@ from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
 from easydel.layers import RopeConfig
 
-DEEPSEEK_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
-
 
 @register_config("deepseek_v3")
 class DeepseekV3Config(EasyDeLBaseConfig):

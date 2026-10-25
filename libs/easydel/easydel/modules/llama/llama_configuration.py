@@ -188,12 +188,21 @@ class LlamaConfig(EasyDeLBaseConfig):
         )
 
 
+@register_config("vision_llama")
 class VisionLlamaConfig(LlamaConfig):
     """Configuration for Llama models extended with a discrete vision token vocabulary.
 
     Inherits all text decoder parameters from ``LlamaConfig`` and adds vision-specific
     settings for models that encode images as discrete tokens (e.g., for image generation
     or vision-language tasks with tokenized visual inputs).
+
+    Text token IDs retain their usual ``[0, vocab_size)`` namespace. Vision
+    codebook IDs are offset by ``vocab_size``, occupying
+    ``[vocab_size, vocab_size + vision_vocab_size)`` in inputs and output logits.
+    ``sample_mode="all"`` generates over both vocabularies with the requested
+    generation strategy. ``"random"`` uses categorical sampling over the same
+    joint vocabulary by default. ``"text"`` and ``"vision"`` restrict generation
+    to the respective token namespace. Forward/training logits always cover both.
 
     Args:
         vision_vocab_size (`int`, *optional*, defaults to 8448):
@@ -205,6 +214,8 @@ class VisionLlamaConfig(LlamaConfig):
         **kwargs:
             Additional arguments passed to ``LlamaConfig``.
     """
+
+    model_type = "vision_llama"
 
     def __init__(
         self,
@@ -224,7 +235,30 @@ class VisionLlamaConfig(LlamaConfig):
                 Defaults to "all".
             **kwargs: Additional arguments passed to LlamaConfig parent class.
         """
+        # Early public configs serialized the inherited Llama model_type.
+        # Explicit VisionLlamaConfig reloads must select the vision registration,
+        # rather than letting PreTrainedConfig install an instance-level 'llama'.
+        kwargs.pop("model_type", None)
         super().__init__(**kwargs)
+        if vision_vocab_size <= 0:
+            raise ValueError("vision_vocab_size must be positive")
+        self.validate_sample_mode(sample_mode)
         self.vision_vocab_size = vision_vocab_size
         self.tie_vision_embeddings = tie_vision_embeddings
         self.sample_mode = sample_mode
+
+    @staticmethod
+    def validate_sample_mode(sample_mode: str) -> None:
+        """Validate the supported joint-vocabulary generation strategies."""
+        if sample_mode not in ("all", "random", "text", "vision"):
+            raise ValueError(f"Unsupported sample_mode {sample_mode!r}; expected all, random, text or vision")
+
+    @property
+    def vision_token_offset(self) -> int:
+        """Offset converting local vision codebook IDs into joint token IDs."""
+        return self.vocab_size
+
+    @property
+    def total_vocab_size(self) -> int:
+        """Number of joint text/vision logits, keeping text checkpoint shapes unchanged."""
+        return self.vocab_size + self.vision_vocab_size

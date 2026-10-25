@@ -61,7 +61,6 @@ References:
 
 from __future__ import annotations
 
-import math
 import typing as tp
 
 import jax
@@ -79,7 +78,7 @@ from easydel.caching import TransformerCacheView
 from easydel.caching.transformer import TransformerMetadata
 
 from .._attention_outputs import AttentionOutput
-from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry, axis_entry_shard_factor
+from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
 from .._operation_meta import normalize_head_sinks
 from ..requirements import (
     CacheType,
@@ -89,9 +88,6 @@ from ..requirements import (
 )
 from ._mask_info import align_mask_info_to_qkv_specs
 from .vanilla_attention import VanillaAttn
-
-if tp.TYPE_CHECKING:
-    pass
 
 logger = get_logger("EasyDeL-BlockSparseAttn")
 
@@ -385,21 +381,9 @@ class BlockSparseAttn(OperationImpl):
         # Repair: block-repeat the KV heads by the minimal factor that makes
         # the count divisible by the shard factor (lcm expansion). Blocked
         # ``jnp.repeat`` keeps the global q->kv mapping intact.
-        num_kv_heads: int = key_transposed.shape[1]
-        head_shard_factor = 1
-        if query_sharding is not None and len(query_sharding) > 1:
-            head_shard_factor = axis_entry_shard_factor(self.metadata.mesh, query_sharding[1])
-        if head_shard_factor > 1 and num_kv_heads > 1 and num_kv_heads % head_shard_factor != 0:
-            kv_head_reps = head_shard_factor // math.gcd(num_kv_heads, head_shard_factor)
-            logger.debug(
-                "Expanding KV heads %d -> %d so the KV-head axis shards evenly with the "
-                "query-head axis (%d-way); required for correct in-shard GQA regrouping.",
-                num_kv_heads,
-                num_kv_heads * kv_head_reps,
-                head_shard_factor,
-            )
-            key_transposed = jnp.repeat(key_transposed, kv_head_reps, axis=1)
-            value_transposed = jnp.repeat(value_transposed, kv_head_reps, axis=1)
+        key_transposed, value_transposed = self.expand_kv_heads_for_shard(
+            key_transposed, value_transposed, head_axis=1, query_sharding=query_sharding, query_head_axis=1
+        )
 
         key_sharding = self.create_stable_sharding(
             shardings.key,

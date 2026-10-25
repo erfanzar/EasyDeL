@@ -28,8 +28,8 @@ from easydel.utils.helpers import capture_time
 from .._shared import drop_optimizer_state
 from ..group_relative_policy_optimization import GRPOTrainer
 from ..metrics import _host_scalar_float
-from ..model_loading import disable_state_dropout, reject_string_model_id
-from ..sdft_trainer import _zero_reward_func
+from ..model_loading import disable_state_dropout, reject_string_model_id, zero_reward_func
+from ..training_utils import extract_generation_model_kwargs, repeat_prompt_aligned_model_kwargs
 from .minillm_config import MiniLLMConfig
 
 
@@ -86,7 +86,7 @@ class MiniLLMTrainer(GRPOTrainer):
         super().__init__(
             arguments=arguments,
             model=model,
-            reward_funcs=reward_funcs if reward_funcs is not None else _zero_reward_func,
+            reward_funcs=reward_funcs if reward_funcs is not None else zero_reward_func,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             processing_class=processing_class,
@@ -132,13 +132,20 @@ class MiniLLMTrainer(GRPOTrainer):
         rewards = ((teacher_logps - student_logps) / temperature) * completion_mask
         if single_step_decomposition or gamma <= 0.0:
             return rewards
-        positions = jnp.arange(rewards.shape[1], dtype=jnp.float32)
-        gamma_pow = jnp.power(jnp.asarray(gamma, dtype=jnp.float32), positions)
-        discounted = rewards * gamma_pow[None, :]
-        advantages = jnp.flip(jnp.cumsum(jnp.flip(discounted, axis=1), axis=1), axis=1)
+
+        def discounted_suffix(values):
+            def accumulate(carry, value):
+                total = value + jnp.asarray(gamma, dtype=values.dtype) * carry
+                return total, total
+
+            _, suffix = jax.lax.scan(
+                accumulate, jnp.zeros((values.shape[0],), dtype=values.dtype), values.T, reverse=True
+            )
+            return suffix.T
+
+        advantages = discounted_suffix(rewards)
         if length_normalization:
-            lengths = completion_mask.astype(jnp.float32) * gamma_pow[None, :]
-            lengths = jnp.flip(jnp.cumsum(jnp.flip(lengths, axis=1), axis=1), axis=1)
+            lengths = discounted_suffix(completion_mask.astype(jnp.float32))
             advantages = advantages / jnp.maximum(lengths, 1e-4)
         return advantages * completion_mask
 
@@ -166,14 +173,20 @@ class MiniLLMTrainer(GRPOTrainer):
         generation_factor = int(completion_ids.shape[0]) // max(int(prompt_ids.shape[0]), 1)
         generation_factor = max(generation_factor, 1)
         input_ids = jnp.concatenate([prompt_ids.repeat(generation_factor, 0), completion_ids], axis=-1)
-        attention_mask = jnp.concatenate([prompt_mask.repeat(generation_factor, 0), completion_mask], axis=-1)
+        completion_attention_mask = model_batch.get("completion_attention_mask", completion_mask)
+        attention_mask = jnp.concatenate([prompt_mask.repeat(generation_factor, 0), completion_attention_mask], axis=-1)
         prompt_len = int(prompt_ids.shape[-1])
+        scoring_model_kwargs = repeat_prompt_aligned_model_kwargs(
+            extract_generation_model_kwargs(model_batch),
+            generation_factor,
+            prompt_batch_size=prompt_ids.shape[0],
+        )
         with capture_time() as minillm_teacher_time_fn:
             teacher_logps = self.compute_state_logps(
                 self.teacher_state,
                 input_ids,
                 attention_mask,
-                None,
+                scoring_model_kwargs,
                 prompt_length=prompt_len,
                 logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
             )
@@ -182,7 +195,7 @@ class MiniLLMTrainer(GRPOTrainer):
                 state,
                 input_ids,
                 attention_mask,
-                None,
+                scoring_model_kwargs,
                 prompt_length=prompt_len,
                 logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
             )
@@ -201,7 +214,6 @@ class MiniLLMTrainer(GRPOTrainer):
         model_batch = {
             **model_batch,
             "advantages": advantages + rkl_advantage,
-            "minillm_teacher_per_token_logps": teacher_logps,
         }
         metrics = {
             **metrics,

@@ -51,27 +51,14 @@ from easydel.axis import ATTN_DP
 from easydel.caching import OperationsMetadata, RaggedPagesMetadata, unwrap_metadata
 from easydel.caching.unified_attention import UnifiedAttentionCacheView
 from easydel.infra.sharding import axis_index, mesh_axis_size, normalize_axis_names
-from easydel.utils.helpers import check_bool_flag
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import CacheType, ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
+from ._paged_common import ENABLE_DP_LOCAL_PAGE_PATH, dp_page_axis
 
-ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
-
-
-def _dp_page_axis(cache_view: UnifiedAttentionCacheView):
-    """Resolve the logical page axis for the active cache view.
-
-    Args:
-        cache_view: Unified-attention cache view carrying DP metadata.
-
-    Returns:
-        Any: ``ATTN_DP`` when the data-parallel size exceeds 1; otherwise
-        ``ct.EMPTY`` (replicated KV pages).
-    """
-    dp_size = max(1, int(getattr(cache_view.metadata, "data_parallel_size", 1)))
-    return ATTN_DP if dp_size > 1 else ct.EMPTY
+# Alias for callers importing the private helper under its adapter-local name.
+_dp_page_axis = dp_page_axis
 
 
 @OperationRegistry.register
@@ -209,6 +196,20 @@ class UnifiedAttn(OperationImpl):
             - The KV cache must already contain the current step's K/V values for query tokens.
             - Cache updates are handled separately via `cache_view.concatenate_to_cache()`.
         """
+        if not ignore.get("normalize_output", True) or (
+            ignore.get("dropout_prob", 0.0) > 0 and not ignore.get("deterministic", True)
+        ):
+            return OperationRegistry.create("paged_attention_reference", self.metadata)(
+                query=query,
+                cache_view=cache_view,
+                cache_metadata=cache_metadata,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                sliding_window=sliding_window,
+                logits_soft_cap=logits_soft_cap,
+                softmax_aux=softmax_aux,
+                **ignore,
+            )
         if jax.default_backend() != "gpu":
             raise NotImplementedError("UnifiedAttn currently requires a GPU backend (Triton).")
 
@@ -238,7 +239,7 @@ class UnifiedAttn(OperationImpl):
         query_ragged = query_in.reshape(-1, *query_in.shape[-2:])
         qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query_ragged.shape)
 
-        page_axis = _dp_page_axis(cache_view)
+        page_axis = dp_page_axis(cache_view)
         kv_pages_spec = resolve(
             axes=[page_axis, ct.EMPTY, ct.KV_HEAD, ct.EMPTY],
             mode=ct.MODE_PREFILL,

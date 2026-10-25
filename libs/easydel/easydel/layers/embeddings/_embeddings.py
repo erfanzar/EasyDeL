@@ -58,31 +58,11 @@ from jax import numpy as jnp
 from spectrax.common_types import ColumnWise
 
 from easydel.infra.sharding import TensorLayout, sharding_for_layout
+from easydel.layers.norms import promote_dtype as _promote_dtype
 
 Dtype = jnp.dtype | type
 Initializer = jax.nn.initializers.Initializer
 PromoteDtypeFn = tp.Callable[..., tuple]
-
-
-def _promote_dtype(values, *, dtype=None, inexact=None):
-    """Cast a tuple of arrays to a common dtype.
-
-    Used by :class:`Embed` to align embedding weights with the queried
-    inputs before performing the lookup or matrix multiply.
-
-    Args:
-        values: Iterable of arrays (or array-like values) to promote.
-        dtype: Target dtype. If ``None``, the values are returned unchanged.
-        inexact: Unused; kept for compatibility with the upstream ``flax``/
-            ``spectrax`` ``promote_dtype`` signature.
-
-    Returns:
-        Tuple of arrays cast to ``dtype`` if it was provided, otherwise the
-        original ``values`` argument unchanged.
-    """
-    if dtype is None:
-        return values
-    return tuple(jnp.asarray(v, dtype=dtype) for v in values)
 
 
 default_embed_init = jax.nn.initializers.variance_scaling(1.0, "fan_in", "normal", out_axis=0)
@@ -229,7 +209,7 @@ class Embed(spx.Module):
             return jnp.broadcast_to(embedding, (*inputs.shape, self.features))
         return jnp.take(embedding, inputs, axis=0)
 
-    def attend(self, query: Array) -> Array:
+    def attend(self, query: Array, precision: jax.lax.PrecisionLike = None) -> Array:
         """Compute attention scores between query vectors and embeddings.
 
         Performs a batched inner product between query vectors and all embedding
@@ -240,6 +220,8 @@ class Embed(spx.Module):
         Args:
             query: Array of query vectors with shape (..., features), where the
                 last dimension must match the embedding feature dimension.
+            precision: Optional matmul precision for the projection. ``None``
+                keeps JAX's default; tied LM heads pass the head's precision.
 
         Returns:
             Array of shape (..., num_embeddings) containing the dot product
@@ -253,4 +235,4 @@ class Embed(spx.Module):
             >>> probs = jax.nn.softmax(logits, axis=-1)
         """
         query, embedding = self.promote_dtype((query, self.weight.value), dtype=self.dtype)
-        return jnp.dot(query, embedding.T)
+        return jnp.dot(query, embedding.T, precision=precision)

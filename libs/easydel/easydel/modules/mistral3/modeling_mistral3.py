@@ -28,6 +28,8 @@ Exports:
     - ``Mistral3ForConditionalGeneration``: full model with LM head for generation.
 """
 
+from dataclasses import dataclass
+
 import jax
 import jax.numpy as jnp
 import spectrax as spx
@@ -48,7 +50,7 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, ModelOutput, VLMCausalLMOutput
+from easydel.infra.modeling_outputs import BaseModelOutput, VLMCausalLMOutput
 from easydel.infra.utils import ACT2FN
 from easydel.layers import ParallelLinear, RMSNorm, RowParallelLinear
 from easydel.modules._base import BaseVisionLanguageModule
@@ -66,47 +68,33 @@ class Mistral3ModelOutput(BaseModelOutput):
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
-@auto_pytree
-class Mistral3CausalLMOutputWithPast(ModelOutput):
-    """
-    Base class for Mistral3 causal language model (or autoregressive) outputs.
-
-    Args:
-        loss (`Array` of shape `(1,)`, *optional*, returned when `labels` is provided):
-            Language modeling loss (for next-token prediction).
-        logits (`Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
-            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        past_key_values (`tuple(tuple(Array))`, *optional*, returned when `use_cache=True` is
-            passed or when `config.use_cache=True`):
-            Tuple of `tuple(Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
-            `(batch_size, num_heads, sequence_length, embed_size_per_head)`)
-
-            Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
-            `past_key_values` input) to speed up sequential decoding.
-        hidden_states (`tuple(Array)`, *optional*, returned when `output_hidden_states=True` is passed or when
-            `config.output_hidden_states=True`):
-            Tuple of `Array` (one for the output of the embeddings, if the model has an embedding layer, +
-            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
-
-            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-        attentions (`tuple(Array)`, *optional*, returned when `output_attentions=True` is passed
-            or when `config.output_attentions=True`):
-            Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
-            sequence_length)`.
-
-            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
-            heads.
-        image_hidden_states (`Array`, *optional*):
-            A `Array` of size (batch_size * num_patches, num_images, sequence_length, hidden_size)`.
-            image_hidden_states of the model produced by the vision encoder and after projecting the last hidden state.
-    """
+@dataclass
+class _Mistral3LegacyOutputFields:
+    """Seed dataclass field order for the public loss-first output contract."""
 
     loss: Array | None = None
-    logits: Array = None
+    logits: Array | None = None
     past_key_values: TransformerCache | None = None
-    hidden_states: tuple[Array] | None = None
-    attentions: tuple[Array] | None = None
-    image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
+    hidden_states: tuple[Array, ...] | None = None
+    attentions: tuple[Array, ...] | None = None
+    image_hidden_states: Array | None = None
+
+
+@auto_pytree
+class Mistral3CausalLMOutputWithPast(VLMCausalLMOutput, _Mistral3LegacyOutputFields):
+    """Mistral3 autoregressive output, compatible with the shared VLM output.
+
+    Retains the public loss-first positional constructor while supporting
+    the shared output's additional fields, including last_hidden_state when
+    the language-model head is disabled. Dictionary and iterable construction
+    follow the inherited ModelOutput contract.
+    Returned by :class:`Mistral3ForConditionalGeneration`.
+    """
+
+    # Dataclasses gather base fields in reverse MRO: the legacy mixin seeds
+    # their order, then the shared VLM base supplies their current definitions
+    # and appends extra fields. ModelOutput therefore sees loss as its first
+    # field too, without a constructor or post-init compatibility adapter.
 
 
 class Mistral3PatchMerger(spx.Module):
@@ -157,7 +145,8 @@ class Mistral3PatchMerger(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        hidden_size = config.vision_config.hidden_size
+        num_feature_layers = 1 if isinstance(config.vision_feature_layer, int) else len(config.vision_feature_layer)
+        hidden_size = config.vision_config.hidden_size * num_feature_layers
         self.spatial_merge_size = config.spatial_merge_size
         self.patch_size = self.config.vision_config.patch_size
         self.merging_layer = ParallelLinear(
@@ -171,46 +160,96 @@ class Mistral3PatchMerger(spx.Module):
             kernel_init=jax.nn.initializers.normal(0.02),
         )
 
-    def forward(self, image_features: jax.Array, image_sizes: jax.Array) -> jax.Array:
-        """Merge neighboring patches spatially.
-
-        Takes flattened patch tokens and merges them in spatial neighborhoods defined
-        by spatial_merge_size, reducing the total token count while preserving
-        semantic information.
+    def forward(
+        self,
+        image_features: jax.Array,
+        image_sizes: jax.Array,
+        *,
+        patch_lengths: jax.Array | None = None,
+        patch_grid_sizes: jax.Array | None = None,
+        patch_attention_mask: jax.Array | None = None,
+        return_attention_mask: bool = False,
+    ) -> jax.Array | tuple[jax.Array, jax.Array]:
+        """Merge complete spatial blocks in a packed, possibly padded patch stream.
 
         Args:
-            image_features (jax.Array): Flattened image patch features of shape
-                (num_patches, hidden_dim).
-            image_sizes (jax.Array): Original image sizes as (height, width) pairs
-                for proper spatial reconstruction.
+            image_features: Flattened image patches, shape (capacity, hidden_dim).
+                Genuine patches form an image-ordered, row-major prefix.
+            image_sizes: Original (height, width) pixel pairs. Concrete sizes retain
+                the legacy ragged output shape; traced sizes use a fixed capacity.
+            patch_lengths: Genuine patch count per image, excluding capacity padding.
+            patch_grid_sizes: Genuine (height, width) patch counts from the vision
+                tower. When omitted, inferred from image_sizes and patch_size.
+            patch_attention_mask: Valid patches, shape (1, capacity) or (capacity,).
+            return_attention_mask: Also return a validity mask for merged rows.
+                Defaults to False, retaining the array-only public return value.
 
         Returns:
-            jax.Array: Merged patch features with reduced spatial resolution,
-                shape (num_merged_patches, hidden_dim).
+            Projected patches of shape (merged_capacity, hidden_dim), with valid
+            complete blocks in a prefix and zeros elsewhere. Concrete image sizes
+            set merged_capacity to the exact complete-block count; runtime geometry
+            uses capacity // spatial_merge_size**2. When requested, also returns a
+            boolean mask of shape (merged_capacity,).
         """
-        image_sizes = [
-            (image_size[0] // self.patch_size, image_size[1] // self.patch_size) for image_size in image_sizes
-        ]
-
-        tokens_per_image = [h * w for h, w in image_sizes]
-        d = image_features.shape[-1]
         k = self.spatial_merge_size
-        split_indices = jnp.cumsum(jnp.array(tokens_per_image[:-1]))
-        image_features_split = jnp.split(image_features, split_indices, axis=0)
-        permuted_tensors = []
-        for image_tokens, (h, w) in zip(image_features_split, image_sizes, strict=False):
-            image_grid = image_tokens.reshape(h, w, d)
-            grid = image_grid.reshape(h // k, k, w // k, k, d)
-            # Channel order must match HF's ``F.unfold`` (channel-major: ``(c, ki, kj)``)
-            # because ``merging_layer`` weights are loaded without permutation.
-            grid = grid.transpose(0, 2, 4, 1, 3)
-            num_new_tokens = (h // k) * (w // k)
-            merged_tokens = grid.reshape(num_new_tokens, d * k * k)
-            permuted_tensors.append(merged_tokens)
-
-        image_features = jnp.concatenate(permuted_tensors, axis=0)
-        image_features = self.merging_layer(image_features)
-        return image_features
+        capacity, d = image_features.shape
+        # A runtime grid must not become a Python split/reshape dimension. Only
+        # statically known input sizes can determine the exact ragged output size.
+        concrete_sizes = image_sizes is not None and not any(
+            isinstance(value, jax.core.Tracer) for value in jax.tree.leaves(image_sizes)
+        )
+        if concrete_sizes:
+            merged_capacity = sum(
+                (int(height) // self.patch_size // k) * (int(width) // self.patch_size // k)
+                for height, width in jax.device_get(image_sizes)
+            )
+        else:
+            merged_capacity = capacity // (k * k)
+        grids = jnp.asarray(patch_grid_sizes if patch_grid_sizes is not None else image_sizes, dtype=jnp.int32)
+        if patch_grid_sizes is None:
+            grids = grids // self.patch_size
+        lengths = jnp.asarray(patch_lengths, dtype=jnp.int32) if patch_lengths is not None else jnp.prod(grids, -1)
+        if grids.ndim != 2 or grids.shape[-1] != 2 or lengths.shape != grids.shape[:1]:
+            raise ValueError("Patch geometry must have shapes (num_images, 2) and (num_images,)")
+        if grids.shape[0] == 0 or capacity == 0 or merged_capacity == 0:
+            merged = jnp.zeros((merged_capacity, d * k * k), dtype=image_features.dtype)
+            valid = jnp.zeros((merged_capacity,), dtype=jnp.bool_)
+        else:
+            merged_lengths = jnp.prod(grids // k, axis=-1)
+            merged_ends = jnp.cumsum(merged_lengths)
+            rows = jnp.arange(merged_capacity, dtype=jnp.int32)
+            image_index = jnp.minimum(jnp.sum(rows[:, None] >= merged_ends[None, :], axis=-1), grids.shape[0] - 1)
+            merged_starts = merged_ends - merged_lengths
+            patch_starts = jnp.cumsum(lengths) - lengths
+            local_rows = rows - merged_starts[image_index]
+            merged_width = jnp.maximum(grids[image_index, 1] // k, 1)
+            top = (local_rows // merged_width) * k
+            left = (local_rows % merged_width) * k
+            offsets = jnp.arange(k * k, dtype=jnp.int32)
+            indices = (
+                patch_starts[image_index, None]
+                + (top[:, None] + offsets[None, :] // k) * grids[image_index, 1, None]
+                + left[:, None]
+                + offsets[None, :] % k
+            )
+            valid = (rows < merged_ends[-1]) & jnp.all(
+                (indices >= patch_starts[image_index, None])
+                & (indices < (patch_starts + lengths)[image_index, None])
+                & (indices < capacity),
+                axis=-1,
+            )
+            if patch_attention_mask is not None:
+                patch_mask = jnp.asarray(patch_attention_mask, dtype=jnp.bool_).reshape(-1)
+                if patch_mask.shape != (capacity,):
+                    raise ValueError("patch_attention_mask must have one entry per patch capacity row")
+                valid &= jnp.all(jnp.take(patch_mask, indices, axis=0, mode="clip"), axis=-1)
+            patches = jnp.take(image_features, indices, axis=0, mode="clip")
+            # HF unfold is channel-major (channel, block_row, block_column);
+            # checkpoint merging_layer weights must not be permuted.
+            merged = patches.transpose(0, 2, 1).reshape(merged_capacity, d * k * k)
+            merged = jnp.where(valid[:, None], merged, 0)
+        image_features = jnp.where(valid[:, None], self.merging_layer(merged), 0)
+        return (image_features, valid) if return_attention_mask else image_features
 
 
 class Mistral3MultiModalProjector(spx.Module):
@@ -262,8 +301,9 @@ class Mistral3MultiModalProjector(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
+        num_feature_layers = 1 if isinstance(config.vision_feature_layer, int) else len(config.vision_feature_layer)
         self.norm = RMSNorm(
-            config.vision_config.hidden_size,
+            config.vision_config.hidden_size * num_feature_layers,
             eps=config.get_text_config().rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -300,26 +340,46 @@ class Mistral3MultiModalProjector(spx.Module):
             rngs=rngs,
         )
 
-    def forward(self, image_features: jax.Array, image_sizes: jax.Array) -> jax.Array:
-        """Project vision features into language model space.
-
-        Applies RMS normalization, patch merging, and a two-layer MLP projection
-        to transform vision tower outputs into the language model's embedding space.
+    def forward(
+        self,
+        image_features: jax.Array,
+        image_sizes: jax.Array,
+        *,
+        patch_lengths: jax.Array | None = None,
+        patch_grid_sizes: jax.Array | None = None,
+        patch_attention_mask: jax.Array | None = None,
+        return_attention_mask: bool = False,
+    ) -> jax.Array | tuple[jax.Array, jax.Array]:
+        """Project genuine spatial patch blocks into language model space.
 
         Args:
-            image_features (jax.Array): Vision encoder output features of shape
-                (num_patches, vision_hidden_dim).
-            image_sizes (jax.Array): Original image sizes as (height, width) pairs.
+            image_features: Packed vision features, shape (capacity, vision_hidden_dim).
+            image_sizes: Original (height, width) pixel pairs.
+            patch_lengths: Genuine patch counts per image from the vision tower.
+            patch_grid_sizes: Genuine (height, width) patch counts per image.
+            patch_attention_mask: Valid patches, shape (1, capacity) or (capacity,).
+            return_attention_mask: Also return merged-row validity. Defaults to False.
 
         Returns:
-            jax.Array: Projected features of shape (num_merged_patches, text_hidden_dim).
+            Features of shape (merged_capacity, text_hidden_dim). Concrete sizes
+            retain the exact ragged shape; runtime sizes produce a valid prefix
+            followed by zeros, including when projection linears have biases.
+            When requested, also returns the boolean merged-row validity mask.
         """
         image_features = self.norm(image_features)
-        image_features = self.patch_merger(image_features, image_sizes)
+        image_features, valid = self.patch_merger(
+            image_features,
+            image_sizes,
+            patch_lengths=patch_lengths,
+            patch_grid_sizes=patch_grid_sizes,
+            patch_attention_mask=patch_attention_mask,
+            return_attention_mask=True,
+        )
         hidden_states = checkpoint_name(self.linear_1(image_features), name="projector_linear1")
         hidden_states = self.act(hidden_states)
         hidden_states = checkpoint_name(self.linear_2(hidden_states), name="projector_linear2")
-        return hidden_states
+        hidden_states = jnp.where(valid[:, None], hidden_states, 0)
+        return (hidden_states, valid) if return_attention_mask else hidden_states
 
 
 @register_module(TaskType.BASE_MODULE, config=Mistral3Config, model_type="mistral3")
@@ -394,7 +454,9 @@ class Mistral3Model(EasyDeLBaseModule):
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
         self.vision_feature_layer = config.vision_feature_layer
 
-    def get_image_features(self, pixel_values: Array, image_sizes: Array) -> Array:
+    def get_image_features(
+        self, pixel_values: Array, image_sizes: Array, *, return_valid_length: bool = False
+    ) -> Array | tuple[Array, Array]:
         """Extract and project image features from pixel values.
 
         Processes images through the vision tower, selects features from the specified
@@ -405,9 +467,13 @@ class Mistral3Model(EasyDeLBaseModule):
                 (batch, channels, height, width).
             image_sizes (Array): Original image sizes as (height, width) pairs
                 for proper patch merging.
+            return_valid_length (bool): Also return the number of genuine projected
+                rows for merging capacity-padded features. Defaults to False.
 
         Returns:
-            Array: Projected image features ready for merging with text embeddings.
+            Array: Projected image features of shape (merged_capacity, hidden_dim),
+                with genuine rows first and any runtime-capacity padding zeroed.
+                Optionally also returns the scalar integer genuine-row count.
         """
         image_features = self.vision_tower(pixel_values, output_hidden_states=True, image_sizes=image_sizes)
         if isinstance(self.vision_feature_layer, int):
@@ -417,14 +483,25 @@ class Mistral3Model(EasyDeLBaseModule):
                 [image_features.hidden_states[layer_idx] for layer_idx in self.vision_feature_layer],
                 axis=-1,
             )
-        image_features = self.multi_modal_projector(selected_image_feature.squeeze(0), image_sizes)
-        return image_features.squeeze(0)
+        projected = self.multi_modal_projector(
+            selected_image_feature.squeeze(0),
+            image_sizes,
+            patch_lengths=getattr(image_features, "patch_lengths", None),
+            patch_grid_sizes=getattr(image_features, "patch_grid_sizes", None),
+            patch_attention_mask=getattr(image_features, "patch_attention_mask", None),
+            return_attention_mask=return_valid_length,
+        )
+        if return_valid_length:
+            features, valid = projected
+            return features, jnp.sum(valid, dtype=jnp.int32)
+        return projected
 
     def compute_embedding(
         self,
         input_ids: Int[Array, "batch seq_len"] | None,
         *,
         image_features: Array | None = None,
+        image_features_valid_length: Array | int | None = None,
         pixel_values: Array | None = None,
         image_sizes: Array | None = None,
         **kwargs,
@@ -439,6 +516,9 @@ class Mistral3Model(EasyDeLBaseModule):
             image_features (Array | None, optional): Pre-computed image features.
                 If None and pixel_values is provided, features are computed.
                 Defaults to None.
+            image_features_valid_length (Array | int | None, optional): Number of
+                genuine rows in capacity-padded precomputed features. None requires
+                every row to correspond to an image placeholder. Defaults to None.
             pixel_values (Array | None, optional): Raw image pixel values.
                 Used to compute image_features if not provided. Defaults to None.
             image_sizes (Array | None, optional): Original image sizes for patch merging.
@@ -466,7 +546,9 @@ class Mistral3Model(EasyDeLBaseModule):
         if image_features is None and pixel_values is not None:
             if image_sizes is None:
                 raise ValueError("`image_sizes` must be provided when `pixel_values` is not None.")
-            image_features = self.get_image_features(pixel_values, image_sizes)
+            image_features, image_features_valid_length = self.get_image_features(
+                pixel_values, image_sizes, return_valid_length=True
+            )
 
         if image_features is not None:
             multimodal_embeddings = image_features.reshape(-1, image_features.shape[-1]).astype(inputs_embeds.dtype)
@@ -475,6 +557,7 @@ class Mistral3Model(EasyDeLBaseModule):
                 inputs_embeds=inputs_embeds,
                 multimodal_embeddings=multimodal_embeddings,
                 placeholder_token_id=image_token_id,
+                multimodal_embeddings_valid_length=image_features_valid_length,
             )
 
         return inputs_embeds
@@ -547,13 +630,19 @@ class Mistral3Model(EasyDeLBaseModule):
             raise ValueError("`input_ids` must be provided when `pixel_values` is not None.")
 
         image_features = None
+        image_features_valid_length = None
         if pixel_values is not None:
-            image_features = self.get_image_features(pixel_values, image_sizes)
+            if image_sizes is None:
+                raise ValueError("`image_sizes` must be provided when `pixel_values` is not None.")
+            image_features, image_features_valid_length = self.get_image_features(
+                pixel_values, image_sizes, return_valid_length=True
+            )
 
         if inputs_embeds is None:
             inputs_embeds = self.compute_embedding(
                 input_ids,
                 image_features=image_features,
+                image_features_valid_length=image_features_valid_length,
             )
         outputs = self.language_model(
             attention_mask=attention_mask,
@@ -765,8 +854,10 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
         self,
         pixel_values: Float[Array, "batch channels height width"],
         image_sizes: Array | None = None,
+        *,
+        return_valid_length: bool = False,
         **kwargs,
-    ) -> Float[Array, "batch num_patches hidden"]:
+    ) -> Array | tuple[Array, Array]:
         """Extract and project image features from pixel values.
 
         Mistral3 uses a patch merger that requires image_sizes to handle
@@ -775,12 +866,17 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
         Args:
             pixel_values: Input image pixel values
             image_sizes: Original sizes of the images (height, width) for patch merging
+            return_valid_length: Also return the genuine projected-row count for
+                merging capacity-padded features. Defaults to False.
             **kwargs: Additional arguments (unused)
 
         Returns:
-            Projected image features ready for merging with text embeddings
+            Projected image features of shape (merged_capacity, hidden_dim),
+            optionally paired with the scalar integer genuine-row count.
         """
-        return self.base_model.get_image_features(pixel_values=pixel_values, image_sizes=image_sizes)
+        return self.base_model.get_image_features(
+            pixel_values=pixel_values, image_sizes=image_sizes, return_valid_length=return_valid_length
+        )
 
     def compute_embedding(self, input_ids, *args, **kwargs):
         """Compute combined text and image embeddings.
@@ -814,7 +910,7 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         **lm_kwargs,
-    ) -> VLMCausalLMOutput:
+    ) -> Mistral3CausalLMOutputWithPast:
         """Forward pass for the Mistral3 model.
 
         Args:
@@ -874,7 +970,7 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
             lm_logits = self.compute_lm_logits(hidden_states)
             lm_logits = self.apply_logit_cap(lm_logits)
 
-        return VLMCausalLMOutput(
+        return Mistral3CausalLMOutputWithPast(
             logits=lm_logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,

@@ -39,6 +39,27 @@ def resolve_platform(platform: str | None, default: str) -> str | None:
     return str(chosen).lower()
 
 
+def configured_platform(metadata: tp.Any, impl_name: str) -> str:
+    """Return the platform named by the adapter's ejkernel operation config.
+
+    The default platform of a compressed-window adapter comes from the operation config registered under
+    ``impl_name`` in ``OperationMetadata.operation_configs`` (``config.operation_configs``); a per-call ``platform=``
+    argument still overrides it (see :func:`resolve_platform`).
+
+    Args:
+        metadata: The adapter's :class:`~easydel.operations.OperationMetadata`.
+        impl_name: The operation's registered name (the key into ``operation_configs``).
+
+    Returns:
+        The configured platform string, or ``"auto"`` when no config / platform is set.
+    """
+    cfg = metadata.get_operation_config(impl_name)
+    if cfg is None:
+        return "auto"
+    platform = cfg.get("platform") if isinstance(cfg, dict) else getattr(cfg, "platform", None)
+    return "auto" if platform is None else str(platform)
+
+
 def _axis_names(entry: tp.Any) -> set[str]:
     """Mesh-axis names referenced by one PartitionSpec entry."""
     if entry is None:

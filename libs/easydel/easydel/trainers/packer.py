@@ -104,6 +104,9 @@ def pack_sequences(
         - Efficient for training when sequences have varying lengths
     """
 
+    if not isinstance(max_length, int) or isinstance(max_length, bool) or max_length < 1:
+        raise ValueError("max_length must be a positive integer.")
+
     def pack_examples(examples):
         """Pack a batch of examples into fixed-length sequences.
 
@@ -137,37 +140,46 @@ def pack_sequences(
             else:
                 return list(range(start_position, start_position + length))
 
-        for input_ids, attention_mask in zip(examples["input_ids"], examples["attention_mask"], strict=False):
-            seq_length = len(input_ids)
+        def flush():
+            """Emit a nonempty pack padded to exactly the requested capacity."""
+            nonlocal current_length
+            if not current_packed_input_ids:
+                return
+            padding_length = max_length - current_length
+            packed_input_ids.append(current_packed_input_ids[:] + [pad_token_id] * padding_length)
+            packed_attention_mask.append(current_packed_attention_mask[:] + [0] * padding_length)
+            packed_position_ids.append(current_packed_position_ids[:] + [0] * padding_length)
+            current_packed_input_ids.clear()
+            current_packed_attention_mask.clear()
+            current_packed_position_ids.clear()
+            current_length = 0
 
-            # If adding this sequence would exceed max_length, start a new packed sequence
-            if current_length + seq_length + 1 > max_length:
-                if current_length < max_length:
-                    padding_length = max_length - current_length
-                    current_packed_input_ids.extend([pad_token_id] * padding_length)
-                    current_packed_attention_mask.extend([0] * padding_length)
-                    current_packed_position_ids.extend([0] * padding_length)
-
-                packed_input_ids.append(current_packed_input_ids)
-                packed_attention_mask.append(current_packed_attention_mask)
-                packed_position_ids.append(current_packed_position_ids)
-
-                current_packed_input_ids = []
-                current_packed_attention_mask = []
-                current_packed_position_ids = []
-                current_length = 0
-
-            position_ids = get_position_ids(seq_length, start_position=current_length)
-
-            current_packed_input_ids.extend(input_ids)
-            current_packed_attention_mask.extend(attention_mask)
-            current_packed_position_ids.extend(position_ids)
-
-            current_packed_input_ids.append(pad_token_id)
-            current_packed_attention_mask.append(0)
-            current_packed_position_ids.append(position_ids[-1] + 1 if not reset_position_ids else 0)
-
-            current_length += seq_length + 1
+        for input_ids, attention_mask in zip(examples["input_ids"], examples["attention_mask"], strict=True):
+            if len(input_ids) != len(attention_mask):
+                raise ValueError("input_ids and attention_mask must have the same length.")
+            if not input_ids:
+                continue
+            # Keep short rows intact. Long rows stream through full-size chunks;
+            # a separator is needed only when a row leaves room in its pack.
+            if current_length and current_length + len(input_ids) + 1 > max_length:
+                flush()
+            for offset in range(0, len(input_ids), max_length):
+                chunk_ids = input_ids[offset : offset + max_length]
+                chunk_mask = attention_mask[offset : offset + max_length]
+                position_ids = get_position_ids(len(chunk_ids), start_position=current_length)
+                current_packed_input_ids.extend(chunk_ids)
+                current_packed_attention_mask.extend(chunk_mask)
+                current_packed_position_ids.extend(position_ids)
+                current_length += len(chunk_ids)
+                if current_length == max_length:
+                    flush()
+                else:
+                    current_packed_input_ids.append(pad_token_id)
+                    current_packed_attention_mask.append(0)
+                    current_packed_position_ids.append(position_ids[-1] + 1 if not reset_position_ids else 0)
+                    current_length += 1
+                    if current_length == max_length:
+                        flush()
 
         if current_packed_input_ids:
             if current_length < max_length:

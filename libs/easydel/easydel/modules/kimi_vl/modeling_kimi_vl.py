@@ -54,41 +54,13 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import VLMCausalLMOutput
 from easydel.infra.utils import auto_remat
 from easydel.layers import ParallelLinear
-from easydel.layers.attention import FlexibleAttentionModule
+from easydel.layers.attention import FlexibleAttentionModule, block_diagonal_bias
 from easydel.layers.norms import LayerNorm
+from easydel.layers.rotary import apply_rope_interleaved
 from easydel.modules._base import BaseVisionLanguageModule, torch_bicubic_resize
 
 from ..deepseek_v3.modeling_deepseek import DeepseekV3ForCausalLM
 from .kimi_vl_configuration import KimiVLConfig, MoonViTConfig
-
-
-def _create_block_diagonal_bias(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
-    """Create block-diagonal attention bias from cumulative sequence lengths.
-
-    This function creates a block-diagonal attention mask where each block
-    corresponds to one image/segment. Positions within the same segment
-    can attend to each other (bias=0), while cross-segment attention
-    is blocked (bias=-inf).
-
-    Args:
-        cu_seqlens (Array): Cumulative sequence lengths array of shape (num_segments + 1,).
-            For example, [0, 196, 392] for two 14x14 images.
-        seq_length (int): Total sequence length (sum of all segment lengths).
-        dtype (jnp.dtype): Data type for the output bias tensor.
-
-    Returns:
-        Array: Attention bias of shape (1, seq_length, seq_length) with 0 for
-            allowed positions and -inf for disallowed cross-segment positions.
-    """
-    positions = jnp.arange(seq_length)
-    starts = cu_seqlens[:-1]
-    ends = cu_seqlens[1:]
-    in_segment = (positions[:, None] >= starts[None, :]) & (positions[:, None] < ends[None, :])
-    segment_ids = jnp.argmax(in_segment.astype(jnp.int32), axis=-1)
-    same_segment = segment_ids[:, None] == segment_ids[None, :]
-    mask_value = jnp.finfo(dtype).min
-    bias = jnp.where(same_segment, 0.0, mask_value).astype(dtype)
-    return bias[None, :, :]
 
 
 def _apply_rope(
@@ -112,32 +84,11 @@ def _apply_rope(
         tuple[Array, Array]: Tuple of (rotated_queries, rotated_keys), each with
             the same shape as the input tensors.
     """
-    freqs_cis = freqs_cis[..., None, :]  # (..., 1, head_dim/2)
-
-    def _to_complex(x: Array) -> Array:
-        """Pack the last dim into ``complex64`` pairs (re, im).
-
-        The input must have an even-sized last axis; pairs of consecutive
-        floats become a single complex value, ready for elementwise
-        multiplication by the precomputed RoPE ``freqs_cis``.
-        """
-        x = x.astype(jnp.float32).reshape(*x.shape[:-1], -1, 2)
-        return jax.lax.complex(x[..., 0], x[..., 1])
-
-    def _to_real(x: Array, dtype: jnp.dtype) -> Array:
-        """Unpack a complex tensor back into interleaved real floats.
-
-        Inverse of :func:`_to_complex`. Casts the result to ``dtype`` so the
-        rotated queries / keys retain their original compute precision.
-        """
-        x = jnp.stack([jnp.real(x), jnp.imag(x)], axis=-1)
-        return x.reshape(*x.shape[:-2], -1).astype(dtype)
-
-    q_c = _to_complex(xq)
-    k_c = _to_complex(xk)
-    q_out = q_c * freqs_cis
-    k_out = k_c * freqs_cis
-    return _to_real(q_out, xq.dtype), _to_real(k_out, xk.dtype)
+    cos = jnp.real(freqs_cis)[..., None, :]
+    sin = jnp.imag(freqs_cis)[..., None, :]
+    q_out = apply_rope_interleaved(xq.astype(jnp.float32), cos, sin)
+    k_out = apply_rope_interleaved(xk.astype(jnp.float32), cos, sin)
+    return q_out.astype(xq.dtype), k_out.astype(xk.dtype)
 
 
 class Learnable2DInterpPosEmb(spx.Module):
@@ -221,6 +172,25 @@ class Learnable2DInterpPosEmb(spx.Module):
         return x + jnp.concatenate(pos_embs, axis=0).astype(x.dtype)
 
 
+class _ComputeDtypeConv2d(nn.Conv2d):
+    """Convolve in the activation dtype without changing stored parameter leaves."""
+
+    def forward(self, x: Array, **_: object) -> Array:
+        """Cast both operands and bias to the incoming compute dtype before convolution."""
+        from spectrax.functional import conv
+
+        return conv(
+            x,
+            self.weight.value.astype(x.dtype),
+            self.bias.value.astype(x.dtype) if self.use_bias else None,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+            precision=self.precision,
+        )
+
+
 class MoonVisionPatchEmbed(spx.Module):
     """Patch embedding layer for MoonViT vision transformer.
 
@@ -272,7 +242,7 @@ class MoonVisionPatchEmbed(spx.Module):
         self.dtype = dtype
         self.partition_manager = partition_manager
 
-        self.proj = nn.Conv2d(
+        self.proj = _ComputeDtypeConv2d(
             in_channels=in_dim,
             out_channels=out_dim,
             kernel_size=patch_size,
@@ -280,6 +250,7 @@ class MoonVisionPatchEmbed(spx.Module):
             padding="VALID",
             use_bias=True,
             dtype=dtype,
+            param_dtype=param_dtype,
             rngs=rngs,
             precision=precision,
         )
@@ -604,7 +575,7 @@ class MoonVitEncoderLayer(spx.Module):
         k = k[None, :, :, :]
         v = v[None, :, :, :]
 
-        bias = _create_block_diagonal_bias(cu_seqlens, seq_length, q.dtype)
+        bias = block_diagonal_bias(cu_seqlens, seq_length, q.dtype)
         bias = jnp.broadcast_to(bias, (1, self.num_heads, seq_length, seq_length))
 
         attn_out = self.attention_performer.forward(
@@ -766,6 +737,7 @@ class MoonVitEncoder(EasyDeLLayerStackMixin, spx.Module):
             _layer_loop,
             (hidden_states, 0),
             trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs("vision"),
         )
         return checkpoint_name(self.final_layernorm(hidden_states), "model_output")
 
@@ -1327,6 +1299,7 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
 
         return VLMCausalLMOutput(
             logits=outputs.logits,
+            last_hidden_state=outputs.last_hidden_state,
             past_key_values=getattr(outputs, "past_key_values", None),
             hidden_states=getattr(outputs, "hidden_states", None),
             attentions=getattr(outputs, "attentions", None),

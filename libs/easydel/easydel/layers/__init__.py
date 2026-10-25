@@ -37,23 +37,11 @@ Submodules:
         dynamic-NTK, linear scaling) and frequency computation helpers.
 """
 
-from .embeddings import Embed
-from .indexer import (
-    BaseIndexer,
-    BlockMaxIndexer,
-    BlockMaxIndexerConfig,
-    BlockTopKIndexer,
-    CompressedIndexer,
-    CompressedIndexerConfig,
-    IndexerConfig,
-    IndexerKind,
-    IndexerOutput,
-    IndexerSelection,
-    SelectionSpec,
-    SparseIndexer,
-    TokenIndexer,
-    TokenIndexerConfig,
-)
+import importlib
+import typing as tp
+
+from ._sharding import all_gather_then_dot
+from .embeddings import Embed, VisionPatchEmbed
 from .layouts import (
     FusedColumnLayout,
     FusedExpertLayout,
@@ -98,7 +86,7 @@ from .linears import (
     RowParallelMoELinear,
     eLoRA,
 )
-from .mlp import clamped_swiglu, gated_mlp_forward, swiglu_oai
+from .mlp import clamped_swiglu, gated_mlp_forward, moe_gated_expert_forward, swiglu_oai
 from .moe import (
     BaseMoeModule,
     MoeFusedHooks,
@@ -169,6 +157,72 @@ from .rotary import (
     labeled_rope_cos_sin,
 )
 
+if tp.TYPE_CHECKING:
+    from .indexer import (
+        BaseIndexer,
+        BlockMaxIndexer,
+        BlockMaxIndexerConfig,
+        BlockTopKIndexer,
+        CompressedIndexer,
+        CompressedIndexerConfig,
+        IndexerConfig,
+        IndexerKind,
+        IndexerOutput,
+        IndexerSelection,
+        SelectionSpec,
+        SparseIndexer,
+        TokenIndexer,
+        TokenIndexerConfig,
+    )
+
+# Caches import layers.quantization during initialization. Indexers depend on
+# registered operations, which in turn import the completed cache namespace.
+# Resolve these public re-exports only when requested, not when importing an
+# unrelated layer subpackage, to keep both import orders valid.
+_INDEXER_EXPORTS = frozenset(
+    {
+        "BaseIndexer",
+        "BlockMaxIndexer",
+        "BlockMaxIndexerConfig",
+        "BlockTopKIndexer",
+        "CompressedIndexer",
+        "CompressedIndexerConfig",
+        "IndexerConfig",
+        "IndexerKind",
+        "IndexerOutput",
+        "IndexerSelection",
+        "SelectionSpec",
+        "SparseIndexer",
+        "TokenIndexer",
+        "TokenIndexerConfig",
+    }
+)
+
+
+def __getattr__(name: str) -> tp.Any:
+    """Resolve shared indexer re-exports without eager operation/cache imports.
+
+    Args:
+        name: Requested module attribute.
+
+    Returns:
+        The canonical public indexer object, cached in this module's namespace.
+
+    Raises:
+        AttributeError: When ``name`` is not a public layer export.
+    """
+    if name in _INDEXER_EXPORTS:
+        value = getattr(importlib.import_module(".indexer", __name__), name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """Include lazily resolved public indexers in module introspection."""
+    return sorted(set(globals()) | _INDEXER_EXPORTS)
+
+
 __all__ = [
     "BaseIndexer",
     "BaseMoeModule",
@@ -224,7 +278,9 @@ __all__ = [
     "SparseIndexer",
     "TokenIndexer",
     "TokenIndexerConfig",
+    "VisionPatchEmbed",
     "YaRNScalingRotaryEmbedding",
+    "all_gather_then_dot",
     "apply_quantization_rules",
     "apply_rope_interleaved_partial",
     "build_fused_gate_up_projection",
@@ -265,6 +321,7 @@ __all__ = [
     "moe_down_projection_reform_param",
     "moe_fused_gate_up_reform_param",
     "moe_gate_up_fusion_reform_param",
+    "moe_gated_expert_forward",
     "normalize_segment_sizes",
     "qkv_fusion_reform_param",
     "quantize",

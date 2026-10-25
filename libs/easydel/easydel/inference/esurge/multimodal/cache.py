@@ -53,9 +53,9 @@ Example:
         >>> print(f"Cache size: {stats['size_mb']:.1f} MB")
 
 Note:
-    The cache uses MD5 hashing which is fast but not cryptographically
-    secure. This is acceptable for caching purposes where the goal is
-    to detect identical content rather than prevent tampering.
+    Keys are exhaustive BLAKE2b content hashes (shape, dtype and every byte;
+    see :func:`easydel.inference.esurge.multimodal.types.compute_content_hash`).
+    They are not meant to resist tampering, only to identify identical content.
 
 See Also:
     MultiModalManager: Uses this cache internally for vision encoding
@@ -64,23 +64,24 @@ See Also:
 
 from __future__ import annotations
 
-import hashlib
 import threading
 from collections import OrderedDict
-from typing import TYPE_CHECKING
+from typing import Any
 
 import numpy as np
 
-if TYPE_CHECKING:
-    import jax
+from .types import compute_content_hash
 
 
 class VisionEncoderCache:
-    """Thread-safe LRU cache for vision encoder outputs.
+    """Thread-safe LRU cache for vision encoder outputs and media preprocessing.
 
-    Caches vision encoder embeddings using content-based hashing to avoid
-    redundant computation when the same images are processed multiple times.
-    Implements memory-aware eviction based on embedding size.
+    Caches computed vision embeddings, including auxiliary DeepStack arrays,
+    using content-based keys to avoid redundant encoding across requests.
+    The multimodal manager also stores media preprocessing results (for example
+    ``(pixel_values, grid_thw)`` tuples) under separate keys in this shared cache.
+    Values may be arrays or tuples/lists of arrays; their memory footprint is
+    measured recursively. Implements memory-aware eviction based on value size.
 
     This cache is thread-safe and can be used from multiple threads
     concurrently (e.g., during batched inference). It uses a reentrant lock
@@ -131,21 +132,26 @@ class VisionEncoderCache:
         """
         self.capacity_bytes = capacity_mb * 1024 * 1024
         self.current_size = 0
-        self._cache: OrderedDict[str, tuple[jax.Array, int]] = OrderedDict()
+        self._cache: OrderedDict[str, tuple[Any, int]] = OrderedDict()
         self._lock = threading.RLock()
         self.hits = 0
         self.misses = 0
 
+    @staticmethod
+    def _nbytes(value: object) -> int:
+        """Size in bytes of a cached value (an array, or a tuple/list of arrays and ``None`` entries)."""
+        if value is None:
+            return 0
+        if isinstance(value, (tuple, list)):
+            return sum(VisionEncoderCache._nbytes(v) for v in value)
+        return int(value.nbytes) if hasattr(value, "nbytes") else 0
+
     def compute_hash(self, pixel_values: np.ndarray) -> str:
         """Compute content hash for image pixel values.
 
-        Uses MD5 hashing of the raw pixel data for fast content-based
-        cache lookups. Includes shape in the hash to differentiate
-        images with same content but different dimensions.
-
-        For large arrays (>1M elements), samples every 100th element
-        to speed up hashing while maintaining reasonable uniqueness
-        without the cost of hashing the entire array.
+        Hashes the shape, dtype and every byte of the raw pixel data
+        (see :func:`compute_content_hash`), so images that differ anywhere
+        never share a key.
 
         Args:
             pixel_values (np.ndarray): Image pixel values as numpy array.
@@ -154,7 +160,7 @@ class VisionEncoderCache:
                 for flat-patch formats).
 
         Returns:
-            str: 32-character hexadecimal MD5 hash string uniquely
+            str: 32-character hexadecimal hash string uniquely
                 identifying the image content and shape.
 
         Example:
@@ -163,16 +169,9 @@ class VisionEncoderCache:
             >>> if hash1 == hash2:
             ...     print("Images are identical")
         """
-        shape_bytes = np.array(pixel_values.shape, dtype=np.int32).tobytes()
-        # Sample for large arrays to avoid slow hashing
-        if pixel_values.size > 1_000_000:
-            sampled = pixel_values.flat[::100]
-            content_bytes = sampled.tobytes()
-        else:
-            content_bytes = pixel_values.tobytes()
-        return hashlib.md5(shape_bytes + content_bytes).hexdigest()
+        return compute_content_hash(pixel_values)
 
-    def get(self, hash_key: str) -> jax.Array | None:
+    def get(self, hash_key: str) -> Any | None:
         """Retrieve cached embeddings by hash key.
 
         Looks up the cache using the provided hash key. If found, the entry
@@ -188,7 +187,7 @@ class VisionEncoderCache:
                 valid hash string previously computed for the same content.
 
         Returns:
-            jax.Array | None: Cached vision encoder embeddings if found in
+            Any | None: Cached value (for example a ``(pixel_values, grid_thw)`` tuple) if found in
                 the cache, None if the key is not present.
 
         Example:
@@ -205,7 +204,7 @@ class VisionEncoderCache:
             self.hits += 1
             return self._cache[hash_key][0]
 
-    def put(self, hash_key: str, embeddings: jax.Array) -> None:
+    def put(self, hash_key: str, embeddings: Any) -> None:
         """Cache embeddings with LRU eviction.
 
         Adds embeddings to the cache with the given hash key. If adding the
@@ -223,15 +222,16 @@ class VisionEncoderCache:
 
         Args:
             hash_key (str): Content hash from compute_hash(). Should uniquely
-                identify the image content that produced these embeddings.
-            embeddings (jax.Array): Vision encoder output embeddings to cache.
-                The size in bytes is determined via the nbytes attribute.
+                identify the media content that produced this value.
+            embeddings (Any): Value to cache (an array, or a tuple/list of arrays
+                and ``None`` entries). The size in bytes is measured recursively
+                via the ``nbytes`` attribute of each array.
 
         Example:
             >>> embeddings = vision_encoder(pixel_values)
             >>> cache.put(hash_key, embeddings)
         """
-        size_bytes = embeddings.nbytes if hasattr(embeddings, "nbytes") else 0
+        size_bytes = self._nbytes(embeddings)
 
         if size_bytes > self.capacity_bytes:
             return

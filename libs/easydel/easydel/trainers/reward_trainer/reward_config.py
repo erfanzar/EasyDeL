@@ -148,6 +148,10 @@ class RewardConfig(TrainingArguments):
         max_sequence_length: int | None,
         quantization_block: int | None,
     ):
+        if self.activation_offloading:
+            raise ValueError("`activation_offloading=True` is not supported by EasyDeL RewardTrainer.")
+        if self.dataset_num_proc is not None and self.dataset_num_proc <= 0:
+            raise ValueError("`dataset_num_proc` must be positive when set.")
         if self.pad_to_multiple_of is not None and self.pad_to_multiple_of <= 0:
             raise ValueError("`pad_to_multiple_of` must be a positive integer when set.")
         if self.pad_token is not None:

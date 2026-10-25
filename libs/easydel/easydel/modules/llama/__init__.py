@@ -60,6 +60,7 @@ Example:
 
 from .llama_configuration import LlamaConfig, VisionLlamaConfig
 from .modeling_llama import LlamaForCausalLM, LlamaForSequenceClassification, LlamaModel
+from .modeling_vision_llama import VisionLlamaForCausalLM, VisionLlamaModel
 
 __all__ = (
     "LlamaConfig",
@@ -67,4 +68,6 @@ __all__ = (
     "LlamaForSequenceClassification",
     "LlamaModel",
     "VisionLlamaConfig",
+    "VisionLlamaForCausalLM",
+    "VisionLlamaModel",
 )

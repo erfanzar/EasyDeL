@@ -731,15 +731,9 @@ def create_kv_cache_specs_from_config(
         detail_chunks = detail.chunks
         if mask_type == AttnMaskType.LINEAR:
             mask_type = AttnMaskType.FULL
-        # The ragged paged-attention kernels take a sliding window but no
-        # chunk size, and the runner feeds the FULL group's page table to every
-        # layer. A ``ChunkedLocalAttentionSpec`` group would let its manager
-        # free pages of earlier chunks while the kernel still reads them (and
-        # would be the fallback table when no FULL group exists), so chunked
-        # layers keep every page valid by grouping with full attention until
-        # the kernel can honour the chunk mask. ``size``/``chunks`` are
-        # irrelevant to ``FullAttentionSpec`` so they are dropped from the key
-        # to let geometry-equal layers merge into one group.
+        # Keep chunked layers in the conservative full-history allocation
+        # group. Chunk masking is independent of page retention; activating
+        # eviction is not necessary for correct chunked-attention outputs.
         if mask_type == AttnMaskType.CHUNK:
             mask_type = AttnMaskType.FULL
         if mask_type == AttnMaskType.FULL:

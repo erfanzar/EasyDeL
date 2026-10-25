@@ -56,14 +56,13 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.helpers import capture_time, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
 
-from .._shared import polyak_update_reference_graphstate
+from .._shared import copy_frozen_policy
 from ..group_relative_policy_optimization._fn import get_per_token_logps
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
 from ..metrics import _host_mean_float, _host_scalar_float
 from ..prompt_utils import apply_chat_template
 from ..reward_protocol import RewardProtocol
 from ..trainer_protocol import TrainerConfigureFunctionOutput
-from ..training_configurations import MetricsType
 from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
 from ._fn import sdpo_step
 from .sdpo_config import SDPOConfig
@@ -278,7 +277,16 @@ class SDPOTrainer(GRPOTrainer):
             reward_processing_classes=reward_processing_classes,
             data_tokenize_fn=data_tokenize_fn,
         )
-        self._configure_teacher_context()
+        # GRPO skips the reference state when ``beta == 0``. Features that need a frozen/EMA copy of the policy
+        # (EMA teacher regularization syncing, SDFT's ``generate_from_teacher``) would then silently do nothing, so
+        # materialize an independent copy for them.
+        needs_teacher_reference = arguments.teacher_regularization == "ema" or bool(
+            getattr(arguments, "generate_from_teacher", False)
+        )
+        if needs_teacher_reference and self.ref_state is None:
+            self.ref_state = copy_frozen_policy(self.model_state)
+            if arguments.disable_dropout:
+                (self.ref_state,) = self._disable_state_dropout(self.ref_state)
 
     @staticmethod
     def _resolve_model_context_window(config: tp.Any) -> int | None:
@@ -392,6 +400,11 @@ class SDPOTrainer(GRPOTrainer):
             compiled training step, the compiled evaluation step, the
             active mesh, and the streaming checkpoint manager.
         """
+        # Resolve the effective feedback budget / teacher prefix length BEFORE they are frozen into the static
+        # args below (this method runs inside ``super().__init__``, so resolving afterwards would leave the
+        # compiled step slicing completions at a stale ``teacher_prompt_length``).
+        self._configure_teacher_context()
+
         mesh = self.model.mesh
         empty_sharding = replicated_named_sharding(mesh)
 
@@ -602,6 +615,7 @@ class SDPOTrainer(GRPOTrainer):
         completion_prompts: list,
         completions: list,
         rewards: jax.Array,
+        generation_factor: int | None = None,
     ) -> list[str]:
         """Get feedback strings from the user-supplied ``feedback_func``.
 
@@ -610,6 +624,10 @@ class SDPOTrainer(GRPOTrainer):
                 ``G`` times (one per completion).
             completions: Decoded completion strings.
             rewards: Per-completion scalar rewards.
+            generation_factor: Completions per prompt (``G``). Only needed for
+                ``environment_feedback_only_without_solution``: when set, a failed attempt whose rollout group
+                contains a successful completion is reprompted with that solution and its environment feedback
+                is dropped.
 
         Returns:
             List of feedback separator strings, one per completion.
@@ -628,19 +646,78 @@ class SDPOTrainer(GRPOTrainer):
             completions=completions if isinstance(completions[0], str) else [str(c) for c in completions],
             rewards=rewards_list,
         )
+        solution_template = getattr(arguments, "solution_template", _FEEDBACK_TEMPLATE_SOLUTION)
+        remove_thinking = bool(getattr(arguments, "remove_thinking_from_demonstration", False))
+        feedback_only_without_solution = bool(getattr(arguments, "environment_feedback_only_without_solution", False))
+        use_successful_as_teacher = bool(getattr(arguments, "use_successful_as_teacher", True))
+
+        # Per-completion same-group demonstration (only resolved when the option that needs it is active).
+        group_solutions: list[str | None] = [None] * len(rewards_list)
+        if feedback_only_without_solution and use_successful_as_teacher and generation_factor:
+            group_size = int(generation_factor)
+            for start in range(0, len(rewards_list), group_size):
+                end = min(start + group_size, len(rewards_list))
+                group_rewards = rewards_list[start:end]
+                best = max(range(len(group_rewards)), key=group_rewards.__getitem__)
+                if group_rewards[best] > threshold:
+                    solution = str(completions[start + best])
+                    for idx in range(start, end):
+                        group_solutions[idx] = solution
+
         feedback_texts = []
-        for raw_fb, reward in zip(raw_feedbacks, rewards_list, strict=False):
+        for idx, (raw_fb, reward) in enumerate(zip(raw_feedbacks, rewards_list, strict=False)):
             is_successful = reward > threshold
+            correct_solution = None if is_successful else group_solutions[idx]
+            use_env_feedback = include_environment_feedback and not (
+                feedback_only_without_solution and correct_solution is not None
+            )
             sep = _build_feedback_separator(
                 is_successful=is_successful,
-                env_feedback=(raw_fb or "") if include_environment_feedback else "",
-                correct_solution=None,
+                env_feedback=(raw_fb or "") if use_env_feedback else "",
+                correct_solution=correct_solution,
                 dont_reprompt_on_self_success=dont_reprompt_on_self_success,
+                solution_template=solution_template,
                 feedback_template=feedback_template,
                 reprompt_template=reprompt_template,
+                remove_thinking_from_demonstration=remove_thinking,
             )
             feedback_texts.append(sep)
         return feedback_texts
+
+    def _maybe_warn_diagnostics(self, feedback_texts: list[str], rewards: jax.Array) -> None:
+        """Warn periodically when the SDPO teacher context carries no learning signal.
+
+        Controlled by ``diagnostics_warning_interval`` (every N preprocessed batches, ``0`` disables) and
+        ``diagnostics_flat_tolerance`` (fractions at or below it count as zero). Two situations are reported: no
+        sample received any feedback text (the teacher sees the same context as the student) and, without a
+        ``feedback_func``, no rollout was successful (no demonstrations are available for the self-teacher).
+
+        Args:
+            feedback_texts: Feedback separator strings, one per completion.
+            rewards: Per-completion scalar rewards.
+        """
+        arguments = getattr(self, "arguments", None)
+        interval = int(getattr(arguments, "diagnostics_warning_interval", 0) or 0)
+        if interval <= 0 or not feedback_texts:
+            return
+        self._sdpo_diagnostics_calls = getattr(self, "_sdpo_diagnostics_calls", 0) + 1
+        if self._sdpo_diagnostics_calls % interval != 0:
+            return
+        tolerance = float(getattr(arguments, "diagnostics_flat_tolerance", 1e-8))
+        threshold = float(getattr(arguments, "success_reward_threshold", 0.0))
+        feedback_fraction = sum(1 for text in feedback_texts if text) / len(feedback_texts)
+        success_fraction = float(np.mean(np.asarray(jax.device_get(rewards)) > threshold))
+        if feedback_fraction <= tolerance:
+            logger.warning(
+                "SDPO diagnostics: no completion in the last batch received teacher feedback; the self-teacher "
+                "context equals the student context, so distillation advantages will be ~0."
+            )
+        elif self.feedback_func is None and success_fraction <= tolerance:
+            logger.warning(
+                "SDPO diagnostics: no successful rollout in the last batch (success_reward_threshold=%s); the "
+                "self-teacher has no demonstrations to learn from.",
+                threshold,
+            )
 
     def _tokenize_feedback_separators(
         self,
@@ -741,10 +818,10 @@ class SDPOTrainer(GRPOTrainer):
             ``(processed_batch, metrics_dict)``.
         """
         batch = self._apply_user_data_collator(batch)
-        reward_batch = self._extract_reward_batch_sidechannels(batch)
+        reward_sidechannels = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)
-        if reward_batch:
-            reward_batch = {**batch, **reward_batch}
+        if reward_sidechannels:
+            reward_batch = {**batch, **reward_sidechannels}
         else:
             reward_batch = batch
 
@@ -840,6 +917,12 @@ class SDPOTrainer(GRPOTrainer):
                 else completions
             )
 
+            reward_batch = self._completion_aligned_reward_batch(
+                reward_batch,
+                reward_sidechannels,
+                prompt_count=prompt_ids.shape[0],
+                completion_count=prompt_ids.shape[0] * generation_factor,
+            )
             rewards_per_func = jnp.full(
                 (prompt_ids.shape[0] * generation_factor, len(self.reward_funcs)),
                 jnp.nan,
@@ -918,6 +1001,7 @@ class SDPOTrainer(GRPOTrainer):
                     completion_prompts=completion_prompts,
                     completions=completions_text,
                     rewards=rewards,
+                    generation_factor=generation_factor,
                 )
             else:
                 feedback_texts, _ = self._get_self_feedback(
@@ -925,6 +1009,7 @@ class SDPOTrainer(GRPOTrainer):
                     rewards=rewards,
                     generation_factor=generation_factor,
                 )
+            self._maybe_warn_diagnostics(feedback_texts, rewards)
 
             with capture_time() as teacher_build_time_fn:
                 feedback_ids, feedback_mask = self._tokenize_feedback_separators(feedback_texts)
@@ -998,40 +1083,3 @@ class SDPOTrainer(GRPOTrainer):
             out_batch["ref_per_token_logps"] = ref_per_token_logps
 
         return out_batch, metrics_dict
-
-    def on_step_end(
-        self,
-        state: EasyDeLState,
-        metrics: MetricsType,
-        step: int,
-    ) -> tuple[EasyDeLState, MetricsType]:
-        """Post-step hook -- syncs the reference model when requested.
-
-        When ``arguments.sync_ref_model`` is enabled and ``step`` lies on
-        a sync boundary, mixes the current policy parameters into the
-        reference model with linear coefficient
-        ``arguments.ref_model_mixup_alpha``.
-
-        Args:
-            state (EasyDeLState): Updated policy state at the end of
-                this step.
-            metrics (MetricsType): Metrics produced by the step.
-            step (int): Current global training step.
-
-        Returns:
-            tuple[EasyDeLState, MetricsType]: The (unchanged) policy
-            state and metrics; the reference model is mutated in place.
-        """
-        if (
-            self.arguments.sync_ref_model
-            and self.ref_state is not None
-            and (step % self.arguments.ref_model_sync_steps == 0)
-        ):
-            self.ref_state = self.ref_state.replace(
-                graphstate=polyak_update_reference_graphstate(
-                    self.ref_state.graphstate,
-                    state.graphstate,
-                    alpha=self.arguments.ref_model_mixup_alpha,
-                )
-            )
-        return state, metrics

@@ -357,7 +357,6 @@ def straight_through_8bit(
     return _straight_through_ejkernel(weights, mode="affine", group_size=int(group_size), bits=8)
 
 
-@ste
 def straight_through_channelwise(weights: jax.Array, bits: int = 8) -> jax.Array:
     """STE-quantize ``weights`` per output channel over the full contraction axis.
 
@@ -475,7 +474,7 @@ def straight_through(
     inference-style noise; the backward pass is identity, so gradients
     flow back to the float master weights. Dispatch order:
 
-    1. Binary / ternary → :func:`straight_through_1bit`.
+    1. Binary / ternary → sign / standard-deviation-threshold STE.
     2. ``config.jax_native`` schemes with a backing JAX dtype → cast STE.
     3. Affine / int8 / nf4 / mxfp4 / mxfp8 / nvfp8 → ejkernel STE.
 
@@ -562,8 +561,16 @@ def straight_through(
     if isinstance(dtype, str):
         dtype = QuantizationType(dtype)
 
-    if dtype in {QuantizationType.BINARY, QuantizationType.TERNARY}:
+    if dtype is QuantizationType.BINARY:
         return straight_through_1bit(array)
+    if dtype is QuantizationType.TERNARY:
+        from ._quants import quantize
+
+        @ste
+        def ternarize(weights):
+            return quantize(weights, dtype=QuantizationType.TERNARY, simulate=True)
+
+        return ternarize(array)
 
     if dtype is QuantizationType.CHANNELWISE:
         bits = config.bits if config is not None and config.bits is not None else 8

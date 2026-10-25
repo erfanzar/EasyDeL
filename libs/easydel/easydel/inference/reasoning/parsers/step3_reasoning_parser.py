@@ -49,6 +49,7 @@ class Step3ReasoningParser(BaseThinkingReasoningParser):
 
     start_token = "<think>"
     end_token = "</think>"
+    asymmetric_reasoning = True
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
         """Split the output at ``</think>``.
@@ -62,10 +63,9 @@ class Step3ReasoningParser(BaseThinkingReasoningParser):
             Tuple ``(reasoning, content)`` where ``reasoning`` is the text
             before the first ``</think>`` (with any stray ``<think>``
             literals removed) and ``content`` is the text after it. When
-            ``</think>`` is absent: if ``<think>`` is present in the output
-            it is stripped and the rest is treated as a still-unfinished
-            reasoning block (``(reasoning, None)``); otherwise the entire
-            text is treated as visible content (``(None, model_output)``).
+            ``</think>`` is absent: an explicit ``<think>`` starts an
+            unfinished reasoning block; otherwise the output is visible
+            content, preserving the stateless batch-extraction contract.
         """
         if self.end_token not in model_output:
             if self.start_token in model_output:
@@ -76,6 +76,23 @@ class Step3ReasoningParser(BaseThinkingReasoningParser):
         reasoning = parts[0].replace(self.start_token, "").strip()
         content = parts[1].strip() if len(parts) > 1 else None
         return reasoning or None, content
+
+    def extract_reasoning_final(self, model_output: str, request=None) -> tuple[str | None, str | None]:
+        """Preserve streamed reasoning without hiding markerless batch content.
+
+        A terminal-only parse has no evidence that unmarked text is reasoning.
+        Once streaming or prompt context establishes that channel, however,
+        finalization must not reclassify its unfinished text as visible content.
+        """
+        if (
+            not self._streaming_entered
+            and not self._prompt_started_reasoning
+            and not self.assume_reasoning
+            and self.start_token not in model_output
+            and self.end_token not in model_output
+        ):
+            return self.extract_reasoning(model_output, request)
+        return super().extract_reasoning_final(model_output, request)
 
     def extract_reasoning_streaming(
         self,
@@ -107,20 +124,6 @@ class Step3ReasoningParser(BaseThinkingReasoningParser):
             ``content`` on subsequent chunks; ``None`` when ``delta_text``
             is empty or only carried a stripped ``<think>`` literal.
         """
-        if not delta_text:
-            return None
-
-        if self.end_token in previous_text:
-            return DeltaMessage(content=delta_text)
-
-        if self.end_token in delta_text:
-            parts = delta_text.split(self.end_token, 1)
-            reasoning_part = parts[0].replace(self.start_token, "")
-            content_part = parts[1] if len(parts) > 1 else None
-            return DeltaMessage(
-                reasoning_content=reasoning_part if reasoning_part else None,
-                content=content_part if content_part else None,
-            )
-
-        cleaned = delta_text.replace(self.start_token, "")
-        return DeltaMessage(reasoning_content=cleaned) if cleaned else None
+        return super().extract_reasoning_streaming(
+            previous_text, current_text, delta_text, previous_token_ids, current_token_ids, delta_token_ids, request
+        )

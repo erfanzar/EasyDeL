@@ -587,9 +587,9 @@ class SequenceLengthPoolingFeature:
         Args:
             hidden_states: Sequence of hidden states of shape
                 (batch_size, sequence_length, hidden_dim).
-            input_ids: Input token IDs of shape (batch_size, sequence_length).
-                Required for "last" strategy when attention_mask is not provided,
-                used to find non-padding positions.
+            input_ids: Input token IDs of shape (batch_size, sequence_length),
+                used to find non-padding positions for "last" when no mask is
+                provided. Without either input, "last" selects the final position.
             attention_mask: Optional mask of shape (batch_size, sequence_length)
                 where 1 indicates valid tokens and 0 indicates padding.
                 Preferred over input_ids for finding sequence lengths.
@@ -599,7 +599,6 @@ class SequenceLengthPoolingFeature:
             Each sequence in the batch is represented by a single vector.
 
         Raises:
-            ValueError: If using "last" strategy without input_ids or attention_mask.
             ValueError: If an unknown pooling strategy is configured.
 
         Example:
@@ -634,7 +633,9 @@ class SequenceLengthPoolingFeature:
                 return hidden_states[jnp.arange(batch_size), last]
 
             if input_ids is None:
-                raise ValueError("input_ids required for 'last' pooling strategy")
+                # Embedding-only inputs have no padding metadata: every supplied
+                # position is valid.
+                return hidden_states[:, -1]
 
             # Find last non-padding position using the configured pad_token_id.
             # If pad_token_id is a sentinel that doesn't appear in input_ids (e.g. -1),
@@ -651,15 +652,20 @@ class SequenceLengthPoolingFeature:
             return jnp.mean(hidden_states, axis=1)
 
         elif self.strategy == "weighted_mean":
+            seq_len = hidden_states.shape[1]
+            weights = jnp.arange(1, seq_len + 1, dtype=hidden_states.dtype)[None, :, None]
             if attention_mask is not None:
-                seq_len = hidden_states.shape[1]
-                pos_weights = jnp.arange(1, seq_len + 1, dtype=hidden_states.dtype)[None, :, None]
-                mask = attention_mask[:, :, None].astype(hidden_states.dtype)
-                weights = pos_weights * mask
-                return jnp.sum(hidden_states * weights, axis=1) / jnp.clip(jnp.sum(weights, axis=1), min=1e-9)
-            return jnp.mean(hidden_states, axis=1)
+                weights = weights * attention_mask[:, :, None].astype(hidden_states.dtype)
+            return jnp.sum(hidden_states * weights, axis=1) / jnp.clip(jnp.sum(weights, axis=1), min=1e-9)
 
         elif self.strategy == "max":
+            if attention_mask is not None:
+                valid = attention_mask.astype(bool)[:, :, None]
+                lowest = jnp.finfo(hidden_states.dtype).min
+                pooled = jnp.max(jnp.where(valid, hidden_states, lowest), axis=1)
+                # A row with no attended token has nothing to pool; return zeros
+                # (as the masked mean does) instead of the sentinel minimum.
+                return jnp.where(jnp.any(valid, axis=1), pooled, jnp.zeros_like(pooled))
             return jnp.max(hidden_states, axis=1)
 
         else:

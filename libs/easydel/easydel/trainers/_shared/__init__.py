@@ -36,6 +36,9 @@ have their own MRO constraints:
   teacher/reference/target states parameters-only.
 """
 
+from ..model_loading import zero_reward_func
+from .environment import AgenticEnvironment, ResetResult, StepResult, ToolEnvWrapper, create_tool_call_parser
+from .policy_losses import clipped_ppo_policy_loss, direct_importance_sampling_mask, sao_policy_loss
 from .policy_snapshot import (
     OwnedPolicySnapshot,
     copy_frozen_policy,
@@ -47,13 +50,27 @@ from .preference_forward_helpers import (
     apply_paired_truncation,
     gather_multimodal_kwargs,
 )
+from .preference_inputs import concatenated_inputs
+from .tools import function_to_json, make_tool
 
 __all__ = [
+    "AgenticEnvironment",
     "OwnedPolicySnapshot",
+    "ResetResult",
+    "StepResult",
+    "ToolEnvWrapper",
     "apply_paired_truncation",
+    "clipped_ppo_policy_loss",
+    "concatenated_inputs",
     "copy_frozen_policy",
+    "create_tool_call_parser",
+    "direct_importance_sampling_mask",
     "drop_optimizer_state",
+    "function_to_json",
     "gather_multimodal_kwargs",
+    "make_tool",
     "normalize_logprob_vocab_chunk_size",
     "polyak_update_reference_graphstate",
+    "sao_policy_loss",
+    "zero_reward_func",
 ]

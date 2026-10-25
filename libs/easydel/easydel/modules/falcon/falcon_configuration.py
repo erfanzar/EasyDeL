@@ -175,10 +175,13 @@ class FalconConfig(EasyDeLBaseConfig):
             rope_scaling (dict | None, optional): RoPE scaling spec. Defaults to ``None``.
             bos_token_id (int, optional): Beginning-of-sequence id. Defaults to ``11``.
             eos_token_id (int, optional): End-of-sequence id. Defaults to ``11``.
-            ffn_hidden_size (int | None, optional): FFN intermediate width. ``None`` ->
-                ``4 * hidden_size``.
-            ff_factor (int | None, optional): FFN width multiplier (``ffn_hidden_size /
-                hidden_size``). Computed from ``ffn_hidden_size`` when ``None``.
+            ffn_hidden_size (int | None, optional): Exact FFN intermediate width,
+                taking precedence over ``ff_factor`` when supplied. ``None`` uses
+                ``ff_factor * hidden_size`` or ``4 * hidden_size`` by default.
+            ff_factor (int | None, optional): Legacy FFN width multiplier. Used
+                to derive the width only when ``ffn_hidden_size`` is omitted;
+                otherwise retained as configuration metadata. Computed from
+                ``ffn_hidden_size`` when ``None``.
             activation (str, optional): MLP activation function. Defaults to ``"gelu"``.
             gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Checkpointing
                 policy. Defaults to ``EasyDeLGradientCheckPointers.NONE``.
@@ -217,8 +220,10 @@ class FalconConfig(EasyDeLBaseConfig):
         self.bits = bits
         self.from_pt = False
         self.head_dim = self.hidden_size // self.num_attention_heads
+        # Explicit width takes precedence; ff_factor remains the legacy
+        # multiplier API when no width is supplied.
         if ffn_hidden_size is None:
-            ffn_hidden_size = hidden_size * 4
+            ffn_hidden_size = hidden_size * (4 if ff_factor is None else ff_factor)
         self.ffn_hidden_size = ffn_hidden_size
         if ff_factor is None:
             ff_factor = ffn_hidden_size // hidden_size

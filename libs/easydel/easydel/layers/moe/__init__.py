@@ -201,7 +201,7 @@ from ._expert_stats import (
 )
 from ._layout_planner import MoeLayoutEstimate, estimate_moe_layout, validate_moe_layout
 from ._moe_module import BaseMoeModule
-from ._routing import moe_group_topk_select
+from ._routing import fp32_router_logits, moe_group_topk_select
 
 __all__ = (
     "BaseMoeModule",
@@ -216,6 +216,7 @@ __all__ = (
     "active_expert_load_recorder",
     "balancedness",
     "estimate_moe_layout",
+    "fp32_router_logits",
     "get_moe_partition_spec",
     "moe_group_topk_select",
     "optimal_shard_loads",

@@ -47,6 +47,7 @@ Example:
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
 import typing as tp
@@ -170,6 +171,21 @@ class QuestionGenerator:
         """
         return [self.verify(q, a, m) for q, a, m in zip(questions, answers, metadatas, strict=True)]
 
+    @property
+    def last_verify_responses(self) -> list[str]:
+        """Return the latest raw verifier outputs, when the backend provides them."""
+        return list(getattr(self, "_last_verify_responses", []))
+
+    def configure_generation(
+        self,
+        generate_fn: tp.Callable,
+        *,
+        tokenizer: tp.Any = None,
+        strip_reasoning_fn: tp.Callable[[str], str] | None = None,
+    ) -> None:
+        """Attach generation services without exposing backend implementation state."""
+        self.set_generate_fn(generate_fn)
+
     def set_generate_fn(self, generate_fn: tp.Callable[[list[str]], list[str]]) -> None:
         """Inject the batched generation function from the trainer.
 
@@ -281,6 +297,20 @@ class LocalQuestionGenerator(QuestionGenerator):
         """
         self._generate_fn = generate_fn
 
+    def configure_generation(
+        self,
+        generate_fn: tp.Callable,
+        *,
+        tokenizer: tp.Any = None,
+        strip_reasoning_fn: tp.Callable[[str], str] | None = None,
+    ) -> None:
+        """Install trainer generation, tokenizer fallback, and answer preprocessing."""
+        self.set_generate_fn(generate_fn)
+        if self._tokenizer is None:
+            self._tokenizer = tokenizer
+        if strip_reasoning_fn is not None:
+            self._strip_reasoning = strip_reasoning_fn
+
     def generate(self, topic: str, seed: int | None = None) -> GeneratedQuestion:
         """Generate a single question via the batched code path.
 
@@ -325,8 +355,8 @@ class LocalQuestionGenerator(QuestionGenerator):
 
         prompts = []
         varieties = []
-        for idx, (topic, seed) in enumerate(zip(topics, seeds, strict=True)):
-            variety = _deterministic_variety(seed, idx)
+        for topic, seed in zip(topics, seeds, strict=True):
+            variety = _deterministic_variety(seed)
             varieties.append(variety)
             user_msg = (
                 f"Topic: {topic}\n"
@@ -606,8 +636,11 @@ class OpenAIQuestionGenerator(QuestionGenerator):
             user: User message content.
 
         Returns:
-            The first choice's message content, or a string describing
-            the exception when the call fails.
+            The first choice's message content.
+
+        Raises:
+            Exception: If the request fails or its response is malformed. Such
+                failures must not be interpreted as questions or reward scores.
         """
         import json
         import urllib.request
@@ -633,12 +666,12 @@ class OpenAIQuestionGenerator(QuestionGenerator):
                 "Authorization": f"Bearer {self._api_key}",
             },
         )
-        try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                data = json.loads(resp.read().decode())
-            return data["choices"][0]["message"]["content"]
-        except Exception as e:
-            return f"Error: {type(e).__name__}: {e}"
+        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            data = json.loads(resp.read().decode())
+        content = data["choices"][0]["message"]["content"]
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Chat-completions response must contain non-empty text.")
+        return content
 
 
 class CallableQuestionGenerator(QuestionGenerator):
@@ -789,6 +822,7 @@ class SelfPlayEnvironment(AgenticEnvironment):
         self._metadata = result.metadata
         self._solver_turns = []
         self._step_count = 0
+        self._final_answer = None
         return ResetResult(
             observation=self._question,
             info={"question": self._question, "topic": self._topic, **self._metadata},
@@ -806,13 +840,72 @@ class SelfPlayEnvironment(AgenticEnvironment):
             question text and whose info reflects the question metadata.
         """
         self._question = question.question
-        self._metadata = question.metadata
+        self._metadata = copy.deepcopy(question.metadata)
         self._solver_turns = []
         self._step_count = 0
+        self._final_answer = None
         return ResetResult(
             observation=self._question,
             info={"question": self._question, "topic": self._topic, **self._metadata},
         )
+
+    def reset_batch(self, environments: list[AgenticEnvironment], seeds: list[int | None]) -> list[ResetResult]:
+        """Batch question generation by backend without exposing private state."""
+        if not all(isinstance(env, SelfPlayEnvironment) for env in environments):
+            return super().reset_batch(environments, seeds)
+        groups: dict[int, list[tuple[int, SelfPlayEnvironment, int | None]]] = {}
+        for index, (env, seed) in enumerate(zip(environments, seeds, strict=True)):
+            groups.setdefault(id(env._generator), []).append((index, env, seed))
+        results: list[ResetResult | None] = [None] * len(environments)
+        for group in groups.values():
+            generator = group[0][1]._generator
+            # One stochastic question per GRPO prompt group, not per solver.
+            # Deduplicate before either local or API backend sampling occurs.
+            identities = list(dict.fromkeys((env._topic, seed) for _, env, seed in group))
+            questions = generator.generate_batch([topic for topic, _ in identities], [seed for _, seed in identities])
+            shared_questions = dict(zip(identities, questions, strict=True))
+            for index, env, seed in group:
+                env._defer_verify = True
+                results[index] = env.reset_with_question(shared_questions[(env._topic, seed)])
+        return tp.cast(list[ResetResult], results)
+
+    def finalize_batch(self, environments: list[AgenticEnvironment]) -> list[StepResult | None]:
+        """Verify terminal answers together, including manager-truncated episodes."""
+        groups: dict[int, list[tuple[int, SelfPlayEnvironment, str]]] = {}
+        results: list[StepResult | None] = [None] * len(environments)
+        for index, env in enumerate(environments):
+            if not isinstance(env, SelfPlayEnvironment):
+                continue
+            answer = env._final_answer or "\n".join(env._solver_turns)
+            if not env._verify:
+                results[index] = StepResult("", 0.0, terminated=True, info=env._make_info(0.0, answer))
+                continue
+            groups.setdefault(id(env._generator), []).append((index, env, answer))
+        for group in groups.values():
+            generator = group[0][1]._generator
+            rewards = generator.verify_batch(
+                [env._question for _, env, _ in group],
+                [answer for _, _, answer in group],
+                [env._metadata for _, env, _ in group],
+            )
+            raw_responses = generator.last_verify_responses
+            for offset, ((index, env, answer), reward) in enumerate(zip(group, rewards, strict=True)):
+                info = env._make_info(reward, answer)
+                if offset < len(raw_responses):
+                    info["verifier_response"] = raw_responses[offset]
+                results[index] = StepResult("", reward, terminated=True, info=info)
+                env._defer_verify = False
+        return results
+
+    def configure_generation(
+        self,
+        generate_fn: tp.Callable,
+        *,
+        tokenizer: tp.Any = None,
+        strip_reasoning_fn: tp.Callable[[str], str] | None = None,
+    ) -> None:
+        """Forward trainer generation services to the question backend."""
+        self._generator.configure_generation(generate_fn, tokenizer=tokenizer, strip_reasoning_fn=strip_reasoning_fn)
 
     def step(self, action: str) -> StepResult:
         """Advance the episode by one solver turn.

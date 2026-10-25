@@ -54,7 +54,10 @@ import uuid
 from collections.abc import Mapping
 from enum import StrEnum
 
+from eformer.loggings import get_logger
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+logger = get_logger("OpenAIApiModules")
 
 
 class OpenAIBaseModel(BaseModel):
@@ -65,7 +68,8 @@ class OpenAIBaseModel(BaseModel):
 
     Attributes:
         model_config: Pydantic configuration allowing extra fields.
-        field_names: Class variable caching the set of known field names.
+        field_names: Class variable caching the set of known field names
+            (including aliases) of the model class that populated it.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -74,7 +78,10 @@ class OpenAIBaseModel(BaseModel):
     @model_validator(mode="wrap")
     @classmethod
     def __log_extra_fields__(cls, data, handler):
-        """Validate and track field names for the model.
+        """Validate the model and report payload keys that are not declared fields.
+
+        Extra keys are preserved (``extra="allow"``) because clients send vendor extensions that downstream code reads
+        with ``getattr``; they are reported at debug level so unexpected keys are visible without flooding logs.
 
         Args:
             data: Input data being validated.
@@ -86,7 +93,8 @@ class OpenAIBaseModel(BaseModel):
         result = handler(data)
         if not isinstance(data, dict):
             return result
-        field_names = cls.field_names
+        # Read the cache from this class only: a plain ``cls.field_names`` would return a parent class's set.
+        field_names = cls.__dict__.get("field_names")
         if field_names is None:
             field_names = set()
             for field_name, field in cls.model_fields.items():
@@ -95,6 +103,9 @@ class OpenAIBaseModel(BaseModel):
                     field_names.add(alias)
             cls.field_names = field_names
 
+        extra_keys = [key for key in data if key not in field_names]
+        if extra_keys:
+            logger.debug(f"{cls.__name__}: payload carries undeclared fields {sorted(map(str, extra_keys))}")
         return result
 
 
@@ -462,6 +473,30 @@ class CompletionRequest(OpenAIBaseModel):
     user: str | None = None
 
 
+class ResponsesToolDefinition(FunctionDefinition):
+    """Responses function tool: the function fields live beside ``type`` on the wire."""
+
+    type: tp.Literal["function"] = "function"
+    strict: bool | None = None
+
+    @property
+    def function(self) -> FunctionDefinition:
+        """Expose a chat-compatible function view without changing Responses serialization."""
+        return FunctionDefinition.model_validate(self.model_dump(exclude={"type"}, exclude_none=True))
+
+
+class ResponsesToolChoice(OpenAIBaseModel):
+    """Flat Responses function selector, with a compatibility view for chat consumers."""
+
+    type: tp.Literal["function"] = "function"
+    name: str
+
+    @property
+    def function(self) -> ToolChoiceFunction:
+        """Return the nested selector used at chat-template boundaries."""
+        return ToolChoiceFunction(name=self.name)
+
+
 class ResponsesRequest(OpenAIBaseModel):
     """Represents a request to the OpenAI Responses API (POST /v1/responses).
 
@@ -519,9 +554,9 @@ class ResponsesRequest(OpenAIBaseModel):
     stop: str | list[str] | None = None
     n: int | None = None
 
-    tools: list[ToolDefinition] | None = None
+    tools: list[ResponsesToolDefinition | ToolDefinition] | None = None
     functions: list[FunctionDefinition] | None = None
-    tool_choice: str | ToolChoiceOption | None = None
+    tool_choice: str | ResponsesToolChoice | ToolChoiceOption | None = None
     parallel_tool_calls: bool | None = None
     reasoning: bool | ResponseReasoningConfig | None = None
 

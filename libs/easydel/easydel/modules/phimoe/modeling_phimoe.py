@@ -48,7 +48,7 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput, DecoderLayerOutput
+from easydel.infra.modeling_outputs import DecoderLayerOutput, MoeCausalLMOutput, MoeModelOutput
 from easydel.infra.utils import ACT2FN, auto_remat
 from easydel.layers import (
     ColumnParallelLinear,
@@ -62,8 +62,8 @@ from easydel.layers.attention import UnifiedAttention
 from easydel.layers.layouts import (
     moe_down_projection_reform_param,
     moe_fused_gate_up_reform_param,
-    split_fused_gate_up_projection,
 )
+from easydel.layers.mlp import moe_gated_expert_forward
 from easydel.layers.moe import BaseMoeModule
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseCausalLMModule
@@ -132,9 +132,7 @@ class PhiMoEBlockSparseTop2MLP(spx.Module):
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def forward(self, hidden_states: Array, group_sizes: Array, sorted_experts: Array | None = None) -> Array:
-        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
-        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
+        return moe_gated_expert_forward(self, hidden_states, group_sizes, sorted_experts)
 
 
 class PhiMoEAttention(UnifiedAttention):
@@ -166,14 +164,6 @@ class PhiMoEAttention(UnifiedAttention):
             rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
-        # PhiMoE router decisions are highly sensitive to attention noise.
-        # Keep attention computations in model dtype (fp32 in tests) to align
-        # routing with HF and avoid cascading top-k expert mismatches.
-        if getattr(config, "attn_dtype", None) is not None:
-            config.attn_dtype = dtype
-        if getattr(config, "attn_softmax_dtype", None) is not None:
-            config.attn_softmax_dtype = dtype
-
         super().__init__(
             config=config,
             dtype=dtype,
@@ -231,10 +221,7 @@ class PhiMoeSparseMoeBlock(BaseMoeModule):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.hidden_dim = config.hidden_size
-        self.ffn_dim = config.intermediate_size
-        self.num_experts = config.num_local_experts
-        self.top_k = config.num_experts_per_tok
+        self.rngs = rngs
         self.router_jitter_noise = config.router_jitter_noise
         self.input_jitter_noise = config.input_jitter_noise
         self.router = ColumnParallelLinear(
@@ -276,18 +263,20 @@ class PhiMoeSparseMoeBlock(BaseMoeModule):
     def forward(
         self,
         hidden_states: Array,
-        deterministic: bool = True,
+        deterministic: bool | None = None,
     ) -> tuple[Array, Array]:
         """Forward pass through the Sparse MoE block.
 
         Routes input tokens to selected experts and combines their outputs using
-        SparseMixer-style routing for deterministic mode or standard top-k softmax
-        for non-deterministic (training) mode.
+        SparseMixer routing with greedy evaluation or stochastic training-time
+        expert selection and the Heun router-gradient estimator. Input jitter is
+        applied only during training.
 
         Args:
             hidden_states (Array): Input hidden states of shape (batch, seq_len, hidden_dim).
-            deterministic (bool, optional): If True, uses SparseMixer routing with jitter
-                thresholds. If False, uses standard top-k with softmax. Defaults to True.
+            deterministic (bool | None, optional): If True, uses greedy SparseMixer
+                routing without input jitter. If False, samples experts. None follows
+                the module's train/eval state.
 
         Returns:
             tuple[Array, Array]: A tuple containing:
@@ -295,53 +284,57 @@ class PhiMoeSparseMoeBlock(BaseMoeModule):
                 - Router logits for auxiliary loss computation (batch, seq_len, num_experts).
         """
 
-        def _sparsemixer_eval(scores: Array, jitter_eps: float) -> tuple[Array, Array]:
-            """Run the inference-time SparseMixer routing for one expert slot.
+        if deterministic is None:
+            deterministic = not self.training
+        if not deterministic and self.input_jitter_noise > 0:
+            hidden_states = hidden_states * jax.random.uniform(
+                self.rngs.key("router"),
+                hidden_states.shape,
+                dtype=hidden_states.dtype,
+                minval=1.0 - self.input_jitter_noise,
+                maxval=1.0 + self.input_jitter_noise,
+            )
 
-            Implements Phi-MoE's deterministic sparse routing rule used
-            outside of training: pick the argmax expert and compute its
-            multiplier from the masked-softmax of the surviving scores
-            (those within ``jitter_eps`` of the max).
-
-            Args:
-                scores: Per-token expert scores of shape ``(tokens, num_experts)``.
-                jitter_eps: Threshold controlling which non-max scores
-                    survive the masking step.
-
-            Returns:
-                A ``(multiplier, expert_index)`` pair: routing weights of
-                shape ``(tokens, 1)`` and selected expert indices of
-                shape ``(tokens, 1)``.
-            """
-            tokens = scores.shape[0]
-            max_vals = jnp.max(scores, axis=-1, keepdims=True)
-            max_ind = jnp.argmax(scores, axis=-1, keepdims=True)
-
-            factor = jnp.maximum(jnp.abs(scores), max_vals)
-            threshold_mask = ((max_vals - scores) / factor) > (2 * jitter_eps)
-            masked_gates = jnp.where(threshold_mask, -jnp.inf, scores)
-            masked_probs = jax.nn.softmax(masked_gates, axis=-1)
-            multiplier_1 = jnp.take_along_axis(masked_probs, max_ind, axis=-1)
-
-            masked_scores = scores.at[jnp.arange(tokens), max_ind.squeeze(-1)].set(-jnp.inf)
-            max_vals_2 = jnp.max(masked_scores, axis=-1, keepdims=True)
-            max_ind_2 = jnp.argmax(masked_scores, axis=-1, keepdims=True)
-
-            factor_2 = jnp.maximum(jnp.abs(scores), max_vals_2)
-            threshold_mask_2 = ((max_vals_2 - scores) / factor_2) > (2 * jitter_eps)
-            masked_gates_2 = jnp.where(threshold_mask_2, -jnp.inf, masked_scores)
-            masked_probs_2 = jax.nn.softmax(masked_gates_2, axis=-1)
-            multiplier_2 = jnp.take_along_axis(masked_probs_2, max_ind_2, axis=-1)
-
-            multiplier = jnp.concatenate([multiplier_1, multiplier_2], axis=-1)
-            selected_experts = jnp.concatenate([max_ind, max_ind_2], axis=-1).astype(jnp.int32)
-            return multiplier, selected_experts
+        # Advance mutable RNG state outside the dispatcher's shard_map trace.
+        # The selection hook only consumes pure keys captured by the closure.
+        routing_keys = None if deterministic else jax.random.split(self.rngs.key("router"), 4)
 
         def select_hook(scores: Array, _pre_bias: Array | None, k: int) -> tuple[Array, Array]:
-            if deterministic:
-                return _sparsemixer_eval(scores, jitter_eps=float(self.router_jitter_noise))
-            values, indices = jax.lax.top_k(scores, k=k)
-            return jax.nn.softmax(values.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1), indices
+            """Select two distinct experts using Phi-MoE's SparseMixer estimator."""
+            scores = scores.astype(jnp.promote_types(scores.dtype, jnp.float32))
+            masked_scores = scores
+            multipliers, selections = [], []
+            for slot in range(k):
+                max_vals = jnp.max(masked_scores, axis=-1, keepdims=True)
+                factor = jnp.maximum(jnp.abs(scores), max_vals)
+                # Stop gradients through the discrete sparsity mask (including the
+                # undefined 0/0 comparison for a row of zero router scores).
+                threshold_mask = jax.lax.stop_gradient(((max_vals - scores) / factor) > (2 * self.router_jitter_noise))
+                masked_gates = jnp.where(threshold_mask, -jnp.inf, masked_scores)
+                probs = jax.nn.softmax(masked_gates, axis=-1)
+                greedy = jnp.argmax(masked_scores, axis=-1, keepdims=True)
+                if deterministic:
+                    selected = greedy
+                else:
+                    selected = jax.random.categorical(routing_keys[2 * slot], masked_gates)[..., None]
+                weight = jnp.take_along_axis(probs, selected, axis=-1)
+                if not deterministic:
+                    heun = jnp.where(
+                        (selected == greedy) | (jax.random.uniform(routing_keys[2 * slot + 1], weight.shape) > 0.75),
+                        1.0,
+                        0.3333,
+                    )
+                    # Match HF PhimoeMultiplier: the forward uses the Heun scale,
+                    # while d(weight)/d(scores) is weight * (one_hot - probs),
+                    # without differentiating the sampled choice or the scale.
+                    one_hot = jax.nn.one_hot(selected.squeeze(-1), scores.shape[-1], dtype=scores.dtype)
+                    gradient = jax.lax.stop_gradient(weight * (one_hot - probs))
+                    surrogate = jnp.sum(scores * gradient, axis=-1, keepdims=True)
+                    weight = jax.lax.stop_gradient(weight * heun) + (surrogate - jax.lax.stop_gradient(surrogate))
+                multipliers.append(weight)
+                selections.append(selected)
+                masked_scores = masked_scores.at[jnp.arange(scores.shape[0]), selected.squeeze(-1)].set(-jnp.inf)
+            return jnp.concatenate(multipliers, axis=-1), jnp.concatenate(selections, axis=-1).astype(jnp.int32)
 
         hooks = self.moe_hooks.replace(
             normalize_gate_logits=lambda logits: logits,
@@ -485,7 +478,9 @@ class PhiMoeDecoderLayer(spx.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, router_logits = self.mlp(hidden_states)
+        hidden_states, router_logits = self.mlp(
+            hidden_states, deterministic=not self.training or mode != common_types.MODE_TRAIN
+        )
         hidden_states = checkpoint_name(residual + hidden_states, "residual")
         hidden_states = checkpoint_name(hidden_states, "layer_output")
 
@@ -593,7 +588,7 @@ class PhiMoeModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-    ) -> BaseModelOutput:
+    ) -> MoeModelOutput:
         """Forward pass through the PhiMoE base model.
 
         Processes input tokens through embedding, all decoder layers with sliding window
@@ -622,8 +617,8 @@ class PhiMoeModel(EasyDeLBaseModule):
                 Defaults to None (uses config.output_hidden_states).
 
         Returns:
-            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
-                and updated past_key_values.
+            MoeModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                optional per-layer router_logits, and updated past_key_values.
 
         Raises:
             ValueError: If both input_ids and inputs_embeds are provided or both are None.
@@ -637,9 +632,13 @@ class PhiMoeModel(EasyDeLBaseModule):
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
 
         sequence_length = inputs_embeds.shape[1]
+        output_attentions = self.config.output_attentions if output_attentions is None else output_attentions
+        output_hidden_states = self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
+        output_router_logits = self.config.output_router_logits if output_router_logits is None else output_router_logits
 
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
+        all_router_logits = () if output_router_logits else None
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
@@ -663,7 +662,7 @@ class PhiMoeModel(EasyDeLBaseModule):
             past_key_values = TransformerCache.init_empty(len(self.layers))
 
         hidden_states = apply_logical_sharding(
-            inputs_embeds,
+            self.embed_dropout(inputs_embeds),
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
@@ -676,7 +675,7 @@ class PhiMoeModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache,
+            extra=needs_trace_cache or bool(output_router_logits),
         )
         cache_views = views if trace_layers else None
         # Hoisted out of the loop body: the caching property must not be
@@ -687,12 +686,12 @@ class PhiMoeModel(EasyDeLBaseModule):
             """Apply a single decoder layer inside the layer-stack scan.
 
             Body of ``self.layers.scan``; carry layout is ``(hidden_states,
-            cache_views, all_hidden_states, all_attentions, idx)``. Runs
+            cache_views, all_hidden_states, all_attentions, all_router_logits, idx)``. Runs
             ``block`` on the current hidden states, optionally accumulates
             per-layer hidden states / attention weights, and returns the
             updated carry tuple.
             """
-            hidden_states, cv, all_hidden_states, all_attentions, idx = carry
+            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -712,6 +711,8 @@ class PhiMoeModel(EasyDeLBaseModule):
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
+            if output_router_logits:
+                all_router_logits += (layer_outputs.router_logits,)
 
             cv = self._layer_cache_view_update(
                 cv,
@@ -721,12 +722,13 @@ class PhiMoeModel(EasyDeLBaseModule):
                 cache=past_key_values,
             )
 
-            return hidden_states, cv, all_hidden_states, all_attentions, idx + 1
+            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
 
-        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
+            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
@@ -734,10 +736,11 @@ class PhiMoeModel(EasyDeLBaseModule):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        return BaseModelOutput(
+        return MoeModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
+            router_logits=all_router_logits,
             past_key_values=past_key_values,
         )
 
@@ -813,6 +816,7 @@ class PhiMoeForCausalLM(BaseCausalLMModule[PhiMoeModel, PhiMoeConfig]):
             precision=precision,
             rngs=rngs,
             lm_head_bias=config.lm_head_bias,
+            router_aux_loss_coef=config.router_aux_loss_coef,
         )
 
     def forward(
@@ -829,7 +833,7 @@ class PhiMoeForCausalLM(BaseCausalLMModule[PhiMoeModel, PhiMoeConfig]):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_router_logits: bool | None = None,
-    ) -> CausalLMOutput:
+    ) -> MoeCausalLMOutput:
         """Forward pass through the PhiMoE causal language model.
 
         Args:
@@ -857,34 +861,27 @@ class PhiMoeForCausalLM(BaseCausalLMModule[PhiMoeModel, PhiMoeConfig]):
                 Defaults to True.
 
         Returns:
-            CausalLMOutput: Contains logits, optional hidden_states, optional attentions,
-                and updated past_key_values.
+            MoeCausalLMOutput: Contains logits, optional hidden_states, optional attentions,
+                router_logits, the coefficient-scaled auxiliary loss, and updated past_key_values.
         """
-        outputs = self.model(
+        return self.forward_moe(
             input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             mask_info=mask_info,
             position_ids=position_ids,
             mode=mode,
             past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            apply_lm_head=apply_lm_head,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
-            cache_metadata=cache_metadata,
-            inputs_embeds=inputs_embeds,
         )
-        hidden_states = outputs.last_hidden_state
-        lm_logits = None
-        if apply_lm_head:
-            lm_logits = self.compute_lm_logits(hidden_states)
 
-        return CausalLMOutput(
-            logits=lm_logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            past_key_values=outputs.past_key_values,
-        )
+    def _router_top_k(self) -> int:
+        """HF ``sparsemixer`` always routes exactly two experts, whatever ``num_experts_per_tok`` says."""
+        return 2
 
     def get_encoder(self):
         """

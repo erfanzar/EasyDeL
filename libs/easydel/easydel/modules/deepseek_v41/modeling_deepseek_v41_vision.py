@@ -49,6 +49,7 @@ from spectrax import common_types, nn
 from easydel.infra.utils import auto_remat
 from easydel.layers import ColumnParallelLinear, RMSNorm, RowParallelLinear
 from easydel.layers.attention import FlexibleAttentionModule
+from easydel.layers.rotary import apply_rope_split_half
 
 from .deepseek_v41_configuration import DeepseekV41Config
 
@@ -99,9 +100,14 @@ def vision_cos_sin(n_h: int, n_w: int, dim: int, theta: float) -> tuple[np.ndarr
 
 
 def _apply_rotary(x: Array, cos: Array, sin: Array) -> Array:
-    """Rotate-half RoPE over the full head (float32 math, result in ``x.dtype``); ``x`` is ``[N, P, H, D]``."""
-    x1, x2 = jnp.split(x.astype(jnp.float32), 2, axis=-1)
-    return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1).astype(x.dtype)
+    """Rotate-half RoPE over the full head (float32 math, result in ``x.dtype``).
+
+    ``x`` is ``[N, P, H, D]``; ``cos`` / ``sin`` are the half-width ``[P, 1, D // 2]`` grid tables. They are tiled to
+    full head width because :func:`easydel.layers.rotary.apply_rope_split_half` takes a full-width table.
+    """
+    cos = jnp.concatenate([cos, cos], axis=-1)
+    sin = jnp.concatenate([sin, sin], axis=-1)
+    return apply_rope_split_half(x, cos, sin, unsqueeze_dim=None)
 
 
 def _linear_kwargs(
@@ -354,7 +360,7 @@ class DeepseekV41Aligner(spx.Module):
         n, _, c = features.shape
         x = features.reshape(n, n_h, n_w, c)
         x = jnp.pad(x, ((0, 0), (0, -n_h % r), (0, -n_w % r), (0, 0)))
-        gh, gw = x.shape[1] // r, x.shape[2] // r
+        gh, gw = llm_grid(n_h, n_w, r)
         x = x.reshape(n, gh, r, gw, r, c).transpose(0, 1, 3, 5, 2, 4).reshape(n, gh * gw, c * r * r)
         return self.w2(jax.nn.gelu(self.w1(x), approximate=False))
 

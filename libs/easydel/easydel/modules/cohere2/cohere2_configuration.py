@@ -85,7 +85,7 @@ class Cohere2Config(EasyDeLBaseConfig):
             The number of bits to quantize the model to.
     """
 
-    model_type: str = "cohere"
+    model_type: str = "cohere2"
 
     def __init__(
         self,

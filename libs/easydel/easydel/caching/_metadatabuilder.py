@@ -366,7 +366,7 @@ class AttentionMetadataBuilder:
         request_distribution: IntVectorLike | None = None,
         num_kv_update_slices: IntVectorLike | None = None,
         version: tp.Literal["v2", "v3"] = "v3",
-        page_size: int = 128,
+        page_size: int | None = None,
         prefill_chunk_size: int = 512,
         num_slices_per_kv_cache_update_page: int | None = None,
         # Raw batch inputs (optional, for deriving ragged fields)
@@ -433,6 +433,10 @@ class AttentionMetadataBuilder:
             ...     version="v3"
             ... )
         """
+        if page_size is None:
+            page_size = int(ragged_config.page_size) if ragged_config is not None else 128
+        if num_slices_per_kv_cache_update_page is None and ragged_config is not None:
+            num_slices_per_kv_cache_update_page = int(ragged_config.num_slices_per_kv_cache_update_page)
         if pages_tables is None and block_tables is not None:
             pages_tables = block_tables
         if context_lens is None and seq_lens is not None:
@@ -484,7 +488,9 @@ class AttentionMetadataBuilder:
                 num_seqs_arr = num_seqs_arr.reshape(1)
 
         if version == "v3" and request_distribution is None:
-            request_distribution = jnp.zeros((3,), dtype=jnp.int32)
+            # Precomputed arrays may be tracers. The mixed range handles every
+            # active row without inspecting/reordering host token metadata.
+            request_distribution = jnp.stack((jnp.int32(0), jnp.int32(0), num_seqs_arr.reshape(-1)[0]))
         if version == "v2":
             if slot_mapping is None:
                 raise ValueError("version='v2' requires `slot_mapping`.")
@@ -531,7 +537,7 @@ class AttentionMetadataBuilder:
         request_distribution: IntVectorLike | None = None,
         num_kv_update_slices: IntVectorLike | None = None,
         version: tp.Literal["v2", "v3"] = "v3",
-        page_size: int = 128,
+        page_size: int | None = None,
         prefill_chunk_size: int = 512,
         num_slices_per_kv_cache_update_page: int | None = None,
         scheduled_full: IntVectorLike | None = None,
@@ -658,6 +664,38 @@ class AttentionMetadataBuilder:
             return np.asarray(jax.device_get(x))
         return np.asarray(x)
 
+    @staticmethod
+    def _request_distribution(
+        *,
+        scheduled: np.ndarray,
+        mask_reqs: np.ndarray,
+        num_computed: np.ndarray,
+        num_requests: int,
+    ) -> np.ndarray:
+        """Compute the factories' count-based v3 request distribution.
+
+        A decode schedules one token on a non-empty context; other scheduled
+        rows are prefills. Preserve the public factories' count-based contract;
+        the live eSurge preparer computes its positional dispatch separately.
+
+        Args:
+            scheduled: Scheduled token counts per request (inactive rows zeroed).
+            mask_reqs: Boolean mask of active request rows.
+            num_computed: Already computed token counts per request.
+            num_requests: Number of active requests.
+
+        Returns:
+            ``int32`` array ``[decode_count, decode_count + prefill_count, total]``.
+        """
+        active_num_computed = np.where(mask_reqs, num_computed, 0)
+        is_decode = (scheduled == 1) & (active_num_computed > 0)
+        decode_count = int(np.sum(is_decode))
+        prefill_count = int(np.sum((scheduled > 0) & (~is_decode)))
+        return np.array(
+            [decode_count, decode_count + prefill_count, num_requests],
+            dtype=np.int32,
+        )
+
     @classmethod
     def _compute_slot_mapping_v2_cpu(
         cls,
@@ -670,12 +708,23 @@ class AttentionMetadataBuilder:
         max_pages_per_req: int,
         slices_per_page: int,
         max_padded_slices: int | None,
+        pad_value: int = 0,
+        fixed_shape: bool = False,
     ) -> tuple[np.ndarray, int]:
         """Compute v2 slot_mapping and total updated pages on CPU.
 
         Generates the slot mapping array for v2-style paged cache updates.
         The slot mapping describes how to copy new KV tokens into the
         paged cache, organized as slices with (cache_start, new_kv_start, length).
+
+        Two output layouts share this one implementation:
+
+        * ``fixed_shape=False`` (default): the array is only as wide as the
+          slice count padded to ``slices_per_page`` (capped by
+          ``max_padded_slices`` when given); an empty batch yields ``[3, 1]``.
+        * ``fixed_shape=True`` with a positive ``max_padded_slices``: the array
+          is always ``[3, max_padded_slices]`` for compilation stability and
+          unused columns hold ``pad_value``.
 
         Args:
             num_requests: Number of active requests in the batch.
@@ -689,6 +738,10 @@ class AttentionMetadataBuilder:
             max_pages_per_req: Maximum pages allocated per request.
             slices_per_page: Slices per processing page (for padding alignment).
             max_padded_slices: Optional maximum padded slice count.
+            pad_value: Fill value for unused columns.
+            fixed_shape: Return exactly ``[3, max_padded_slices]`` (requires a
+                positive ``max_padded_slices``; otherwise falls back to the
+                compact layout).
 
         Returns:
             tuple: Pair of (slot_mapping, total_pages) where:
@@ -696,13 +749,20 @@ class AttentionMetadataBuilder:
                   (cache_start, new_kv_start, length) per slice
                 - total_pages: Total number of pages being updated
         """
-        if num_requests <= 0:
-            return np.zeros((3, 1), dtype=np.int32), 0
+        fixed = bool(fixed_shape) and max_padded_slices is not None and int(max_padded_slices) > 0
+        empty_width = int(max_padded_slices) if fixed else 1
 
-        scheduled_active = scheduled[:num_requests].astype(np.int32)
-        num_computed_active = num_computed_tokens[:num_requests].astype(np.int32)
+        def _empty(total: int = 0) -> tuple[np.ndarray, int]:
+            """Return an all-``pad_value`` mapping of the empty-batch width."""
+            return np.full((3, empty_width), pad_value, dtype=np.int32), total
+
+        if num_requests <= 0:
+            return _empty()
+
+        scheduled_active = scheduled[:num_requests].astype(np.int32, copy=False)
+        num_computed_active = num_computed_tokens[:num_requests].astype(np.int32, copy=False)
         if not np.any(scheduled_active):
-            return np.zeros((3, 1), dtype=np.int32), 0
+            return _empty()
 
         start_tokens = num_computed_active
         end_tokens = num_computed_active + scheduled_active
@@ -711,7 +771,7 @@ class AttentionMetadataBuilder:
         lpe = (np.maximum(end_tokens, 1) - 1) // page_size
         page_lens = np.where(scheduled_active > 0, lpe - lps + 1, 0).astype(np.int32)
         if not np.any(page_lens):
-            return np.zeros((3, 1), dtype=np.int32), 0
+            return _empty()
 
         page_cum = np.cumsum(page_lens, dtype=np.int32)
         total_pages = int(page_cum[-1])
@@ -721,10 +781,11 @@ class AttentionMetadataBuilder:
             padded_num_slices = min(int(max_padded_slices), int(padded_num_slices))
 
         padded_num_slices = max(int(padded_num_slices), 1)
-        indices = np.arange(padded_num_slices, dtype=np.int32)
-        active_positions = indices[indices < total_pages]
+        width = int(max_padded_slices) if fixed else padded_num_slices
+        indices = np.arange(width, dtype=np.int32)
+        active_positions = indices[(indices < total_pages) & (indices < padded_num_slices)]
 
-        slot_mapping = np.zeros((3, padded_num_slices), dtype=np.int32)
+        slot_mapping = np.full((3, width), pad_value, dtype=np.int32)
         if active_positions.size == 0:
             return slot_mapping, total_pages
 
@@ -769,7 +830,7 @@ class AttentionMetadataBuilder:
         num_computed_tokens: IntVectorLike,
         page_table: PageTableLike,
         version: tp.Literal["v2", "v3"],
-        page_size: int,
+        page_size: int | None,
         num_slices_per_kv_cache_update_page: int | None,
         max_num_reqs: int | None,
         max_num_tokens: int | None,
@@ -811,6 +872,10 @@ class AttentionMetadataBuilder:
             ValueError: If v2 is requested but num_slices_per_kv_cache_update_page
                 is not provided.
         """
+        if page_size is None:
+            page_size = int(ragged_config.page_size) if ragged_config is not None else 128
+        if num_slices_per_kv_cache_update_page is None and ragged_config is not None:
+            num_slices_per_kv_cache_update_page = int(ragged_config.num_slices_per_kv_cache_update_page)
         scheduled_full_np = cls._ensure_cpu_array(scheduled_full).astype(np.int32)
         active_mask_np = cls._ensure_cpu_array(active_mask_full).astype(bool)
         num_computed_np = cls._ensure_cpu_array(num_computed_tokens).astype(np.int32)
@@ -860,13 +925,11 @@ class AttentionMetadataBuilder:
         )
 
         if version == "v3":
-            active_num_computed = np.where(mask_reqs, num_computed_np[:max_num_reqs_cap], 0)
-            is_decode = (scheduled == 1) & (active_num_computed > 0)
-            decode_count = int(np.sum(is_decode))
-            prefill_count = int(np.sum((scheduled > 0) & (~is_decode)))
-            out["request_distribution"] = np.array(
-                [decode_count, decode_count + prefill_count, num_requests],
-                dtype=np.int32,
+            out["request_distribution"] = cls._request_distribution(
+                scheduled=scheduled,
+                mask_reqs=mask_reqs,
+                num_computed=num_computed_np[:max_num_reqs_cap],
+                num_requests=num_requests,
             )
 
         elif version == "v2":
@@ -907,7 +970,7 @@ class AttentionMetadataBuilder:
         num_computed_tokens: IntVectorLike,
         page_table: PageTableLike,
         version: tp.Literal["v2", "v3"],
-        page_size: int = 128,
+        page_size: int | None = None,
         num_slices_per_kv_cache_update_page: int | None = None,
         max_num_reqs: int | None = None,
         max_num_tokens: int | None = None,
@@ -1249,13 +1312,11 @@ class AttentionMetadataBuilder:
             out["min_p"] = cls._ensure_cpu_array(min_p).astype(np.float32, copy=False)[:padded_num_reqs]
 
         if version == "v3":
-            active_num_computed = np.where(mask_reqs, num_computed_np[:max_num_reqs_cap], 0)
-            is_decode = (scheduled == 1) & (active_num_computed > 0)
-            decode_count = int(np.sum(is_decode))
-            prefill_count = int(np.sum((scheduled > 0) & (~is_decode)))
-            out["request_distribution"] = np.array(
-                [decode_count, decode_count + prefill_count, num_requests],
-                dtype=np.int32,
+            out["request_distribution"] = cls._request_distribution(
+                scheduled=scheduled,
+                mask_reqs=mask_reqs,
+                num_computed=num_computed_np[:max_num_reqs_cap],
+                num_requests=num_requests,
             )
         elif version == "v2":
             if page_size is None:
@@ -1330,76 +1391,16 @@ class AttentionMetadataBuilder:
                 - total_pages: Actual number of pages being updated
         """
 
-        if max_padded_slices is None or int(max_padded_slices) <= 0:
-            return cls._compute_slot_mapping_v2_cpu(
-                num_requests=num_requests,
-                scheduled=scheduled,
-                num_computed_tokens=num_computed_tokens,
-                page_table=page_table,
-                page_size=page_size,
-                max_pages_per_req=max_pages_per_req,
-                slices_per_page=slices_per_page,
-                max_padded_slices=max_padded_slices,
-            )
-
-        max_padded_slices_i = int(max_padded_slices)
-        slot_mapping = np.full((3, max_padded_slices_i), pad_value, dtype=np.int32)
-        if num_requests <= 0:
-            return slot_mapping, 0
-
-        scheduled_active = scheduled[:num_requests].astype(np.int32, copy=False)
-        num_computed_active = num_computed_tokens[:num_requests].astype(np.int32, copy=False)
-        if not np.any(scheduled_active):
-            return slot_mapping, 0
-
-        start_tokens = num_computed_active
-        end_tokens = num_computed_active + scheduled_active
-
-        lps = start_tokens // page_size
-        lpe = (np.maximum(end_tokens, 1) - 1) // page_size
-        page_lens = np.where(scheduled_active > 0, lpe - lps + 1, 0).astype(np.int32)
-        if not np.any(page_lens):
-            return slot_mapping, 0
-
-        page_cum = np.cumsum(page_lens, dtype=np.int32)
-        total_pages = int(page_cum[-1])
-
-        padded_num_slices = ((total_pages + slices_per_page - 1) // slices_per_page) * slices_per_page
-        padded_num_slices = min(max_padded_slices_i, max(int(padded_num_slices), 1))
-
-        indices = np.arange(max_padded_slices_i, dtype=np.int32)
-        active_positions = indices[(indices < total_pages) & (indices < padded_num_slices)]
-        if active_positions.size == 0:
-            return slot_mapping, total_pages
-
-        page_cum_prev = np.concatenate(([0], page_cum[:-1]))
-        req_for_slice = np.searchsorted(page_cum, active_positions, side="right").astype(np.int32)
-        local_off = active_positions - page_cum_prev[req_for_slice]
-
-        pt = page_table[:num_requests, :max_pages_per_req].astype(np.int32, copy=False)
-        pt_flat = pt.reshape(-1)
-        gather_idx = req_for_slice * max_pages_per_req + lps[req_for_slice] + local_off
-        np.clip(gather_idx, 0, pt_flat.size - 1, out=gather_idx)
-        page_numbers = pt_flat[gather_idx]
-
-        s_mod = start_tokens % page_size
-        e_mod = ((np.maximum(end_tokens, 1) - 1) % page_size) + 1
-
-        is_first = local_off == 0
-        is_last = local_off == (page_lens[req_for_slice] - 1)
-
-        kv_local_st = np.where(is_first, s_mod[req_for_slice], 0)
-        kv_local_en = np.where(is_last, e_mod[req_for_slice], page_size)
-        slice_lens = np.maximum(kv_local_en - kv_local_st, 0).astype(np.int32)
-        kv_cache_start = kv_local_st + page_numbers * page_size
-
-        new_kv_start = np.cumsum(slice_lens, dtype=np.int32)
-        if new_kv_start.size:
-            new_kv_start = np.roll(new_kv_start, 1)
-            new_kv_start[0] = 0
-
-        slot_mapping[0, active_positions] = kv_cache_start
-        slot_mapping[1, active_positions] = new_kv_start
-        slot_mapping[2, active_positions] = slice_lens
-
-        return slot_mapping, total_pages
+        fixed = max_padded_slices is not None and int(max_padded_slices) > 0
+        return cls._compute_slot_mapping_v2_cpu(
+            num_requests=num_requests,
+            scheduled=scheduled,
+            num_computed_tokens=num_computed_tokens,
+            page_table=page_table,
+            page_size=page_size,
+            max_pages_per_req=max_pages_per_req,
+            slices_per_page=slices_per_page,
+            max_padded_slices=max_padded_slices,
+            pad_value=pad_value if fixed else 0,
+            fixed_shape=fixed,
+        )

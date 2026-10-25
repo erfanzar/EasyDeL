@@ -43,8 +43,7 @@ import numpy as np
 
 from easydel.utils.helpers import get_logger
 
-from .environment import AgenticEnvironment, ResetResult, ToolEnvWrapper
-from .self_play import SelfPlayEnvironment
+from .environment import AgenticEnvironment, ToolEnvWrapper
 
 if tp.TYPE_CHECKING:
     from easydel.infra.utils import ProcessingClassType
@@ -338,44 +337,18 @@ class RolloutManager:
                 envs.append(env_factory())
                 seeds.append(seed)
 
-        def _unwrap(env: AgenticEnvironment) -> AgenticEnvironment:
-            """Unwrap a :class:`ToolEnvWrapper` and return the inner environment.
-
-            Args:
-                env: Possibly tool-wrapped environment.
-
-            Returns:
-                The inner environment when ``env`` is a
-                :class:`ToolEnvWrapper`, otherwise ``env`` unchanged.
-            """
-            return env.env if isinstance(env, ToolEnvWrapper) else env
-
-        inner_envs = [_unwrap(e) for e in envs]
-        is_self_play = all(isinstance(e, SelfPlayEnvironment) for e in inner_envs)
-        sp_envs: list[SelfPlayEnvironment] = []
-        generator: tp.Any = None
-
-        if is_self_play:
-            sp_envs = [tp.cast(SelfPlayEnvironment, env) for env in inner_envs]
-            generator = sp_envs[0]._generator
-            for sp_env in sp_envs:
-                sp_env._defer_verify = True
-            topics = [e._topic for e in sp_envs]
-            questions = generator.generate_batch(topics, seeds)
-            for sp_env, q in zip(sp_envs, questions, strict=True):
-                sp_env.reset_with_question(q)
-            reset_results = [
-                ResetResult(
-                    observation=q.question,
-                    info={"question": q.question, "topic": sp._topic, **q.metadata},
-                )
-                for sp, q in zip(sp_envs, questions, strict=True)
-            ]
-            for env in envs:
-                if isinstance(env, ToolEnvWrapper):
-                    env._tool_calls_this_step = 0
-        else:
-            reset_results = [e.reset(seed=s) for e, s in zip(envs, seeds, strict=True)]
+        if not envs:
+            return []
+        reset_batch = getattr(envs[0], "reset_batch", None)
+        reset_results = (
+            reset_batch(envs, seeds)
+            if callable(reset_batch)
+            else [env.reset(seed=seed) for env, seed in zip(envs, seeds, strict=True)]
+        )
+        step_limits = [
+            min(self.max_steps, limit) if (limit := getattr(env, "max_steps", None)) is not None else self.max_steps
+            for env in envs
+        ]
 
         episodes: list[_EpisodeState] = []
         for env, reset_result in zip(envs, reset_results, strict=True):
@@ -423,7 +396,7 @@ class RolloutManager:
                 ]
 
             next_active: list[int] = []
-            pending_verify: list[tuple[int, str]] = []
+            pending_verify: list[int] = []
 
             for i, idx in enumerate(active_indices):
                 ep = episodes[idx]
@@ -464,12 +437,16 @@ class RolloutManager:
                     ep.episode_reward += step_result.reward
                 ep.num_steps += 1
 
-                if step_result.terminated or step_result.truncated:
+                reached_limit = ep.num_steps >= step_limits[idx]
+                ep.info.update(step_result.info)
+                if step_result.terminated or step_result.truncated or reached_limit:
                     if step_result.observation:
                         ep.turns.append(TurnRecord(role="user", content=step_result.observation))
                     ep.done = True
-                    if is_deferred:
-                        pending_verify.append((idx, sp_envs[idx]._final_answer or ""))
+                    if reached_limit and not step_result.terminated:
+                        ep.info["truncated"] = True
+                    if is_deferred or (reached_limit and not step_result.terminated):
+                        pending_verify.append(idx)
                     continue
 
                 if step_result.observation:
@@ -482,22 +459,18 @@ class RolloutManager:
                     )
                 next_active.append(idx)
 
-            if pending_verify and is_self_play:
-                if generator is None:
-                    raise RuntimeError("Self-play verification requested before generator initialization.")
-                verify_questions = [sp_envs[idx]._question for idx, _ in pending_verify]
-                verify_answers = [ans for _, ans in pending_verify]
-                verify_metas = [sp_envs[idx]._metadata for idx, _ in pending_verify]
-                rewards = generator.verify_batch(verify_questions, verify_answers, verify_metas)
-                raw_responses = getattr(generator, "_last_verify_responses", [""] * len(rewards))
-                for i, ((idx, ans), reward) in enumerate(zip(pending_verify, rewards, strict=True)):
-                    episodes[idx].episode_reward = reward
-                    if episodes[idx].step_rewards:
-                        episodes[idx].step_rewards[-1] = reward
-                    info = sp_envs[idx]._make_info(reward, ans)
-                    if i < len(raw_responses):
-                        info["verifier_response"] = raw_responses[i]
-                    episodes[idx].info.update(info)
+            if pending_verify:
+                pending_envs = [envs[idx] for idx in pending_verify]
+                finalize_batch = getattr(pending_envs[0], "finalize_batch", None)
+                final_results = finalize_batch(pending_envs) if callable(finalize_batch) else [None] * len(pending_envs)
+                for idx, result in zip(pending_verify, final_results, strict=True):
+                    if result is None:
+                        continue
+                    episode = episodes[idx]
+                    previous_reward = episode.step_rewards[-1]
+                    episode.episode_reward += result.reward - previous_reward
+                    episode.step_rewards[-1] = result.reward
+                    episode.info.update(result.info)
 
             active_indices = next_active
 
@@ -619,7 +592,12 @@ class RolloutManager:
             prompt / response masks, reward summaries, and the turn
             history copied from ``ep``.
         """
-        messages = [{"role": t.role, "content": t.content} for t in ep.turns]
+        # Train on the actual generated text, not a re-rendering of parsed
+        # metadata. Only reconstruct structured calls when no raw text exists.
+        messages = [
+            {"role": turn.role, "content": turn.content} if turn.content else turn_record_to_message(turn)
+            for turn in ep.turns
+        ]
         full_text = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,

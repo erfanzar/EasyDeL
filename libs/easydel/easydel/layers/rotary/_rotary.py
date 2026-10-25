@@ -47,6 +47,8 @@ Example:
 from __future__ import annotations
 
 import typing as tp
+from collections.abc import Mapping
+from functools import wraps
 
 import jax
 import jax.numpy as jnp
@@ -66,16 +68,63 @@ from ._compute_fns import (
     compute_yarn_inv_frequencies,
 )
 from ._modules import (
-    DeepseekScalingRotaryEmbedding,
-    DynamicNTKScalingRotaryEmbedding,
-    LinearScalingRotaryEmbedding,
-    Llama3RotaryEmbedding,
-    MultiModalRotaryEmbedding,
-    Phi3LongRoPEScaledRotaryEmbedding,
+    AVAILABLE_ROPE_TYPES,
     RotaryEmbedding,
-    YaRNScalingRotaryEmbedding,
 )
-from ._utils import _yarn_find_correction_range, _yarn_linear_ramp_mask
+
+
+class _StaticScaling(Mapping):
+    """Immutable, hashable snapshot of a public RoPE configuration mapping."""
+
+    def __init__(self, mapping):
+        def freeze(value):
+            if isinstance(value, Mapping):
+                return _StaticScaling(value)
+            if isinstance(value, (list, tuple)):
+                return tuple(freeze(item) for item in value)
+            return value
+
+        self._items = tuple(sorted((key, freeze(value)) for key, value in mapping.items()))
+        rope_type = mapping.get("rope_type", "default")
+        self._implementation = AVAILABLE_ROPE_TYPES.get(rope_type)
+
+    def __getitem__(self, key):
+        for name, value in self._items:
+            if name == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self):
+        return (key for key, _ in self._items)
+
+    def __len__(self):
+        return len(self._items)
+
+    def __hash__(self):
+        return hash((self._items, self._implementation))
+
+    def __repr__(self):
+        # ejit's persistent signature must not contain this snapshot's
+        # process-local object address.
+        return f"{type(self).__name__}({dict(self)!r}, implementation={self._implementation!r})"
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, _StaticScaling)
+            and self._items == other._items
+            and self._implementation is other._implementation
+        )
+
+
+def _hashable_rope_scaling(function):
+    """Snapshot dict/list configuration before it reaches the static JIT cache."""
+
+    @wraps(function)
+    def wrapped(head_size, rotary_dim, max_position, base, rope_scaling=None, partial_rotary_factor=1.0):
+        scaling = None if rope_scaling is None else _StaticScaling(rope_scaling)
+        return function(head_size, rotary_dim, max_position, base, scaling, partial_rotary_factor)
+
+    return wrapped
 
 
 def get_rope(
@@ -93,7 +142,8 @@ def get_rope(
     Reads ``rope_scaling["rope_type"]`` and dispatches to the matching
     :class:`spx.Module` subclass in :mod:`._modules`. Also detects the
     HuggingFace Qwen2-VL convention where ``rope_type="default"`` is paired
-    with an ``mrope_section`` field and rewrites it to ``"mrope"``. When
+    with an ``mrope_section`` field. Multimodal layout composes with the
+    requested frequency scaling rather than replacing it. When
     ``rope_scaling is None`` returns the unscaled :class:`RotaryEmbedding`.
 
     Args:
@@ -125,142 +175,74 @@ def get_rope(
     if partial_rotary_factor < 1.0:
         rotary_dim = int(rotary_dim * partial_rotary_factor)
 
-    if rope_scaling is None:
-        rotary_emb = RotaryEmbedding(
-            head_size=head_size,
-            rotary_dim=rotary_dim,
-            max_position_embeddings=max_position,
-            base=base,
-            is_neox_style=is_neox_style,
-            dtype=dtype,
+    scaling = {} if rope_scaling is None else rope_scaling
+    scaling_type = scaling.get("rope_type", "default")
+    multimodal = "mrope_section" in scaling or scaling_type == "mrope"
+    try:
+        rope_class = AVAILABLE_ROPE_TYPES[scaling_type]
+    except KeyError as error:
+        raise ValueError(
+            f"Unknown RoPE scaling type {scaling_type}. Registered rope types: {sorted(AVAILABLE_ROPE_TYPES)}."
+        ) from error
+
+    kwargs = dict(
+        head_size=head_size,
+        rotary_dim=rotary_dim,
+        max_position_embeddings=max_position,
+        base=base,
+        is_neox_style=is_neox_style,
+        dtype=dtype,
+    )
+    if multimodal:
+        # Axis layout and frequency scaling are independent. Keep both in
+        # the registered multimodal module, including direct (uncached) calls.
+        return AVAILABLE_ROPE_TYPES["mrope"](
+            **kwargs,
+            mrope_section=scaling.get("mrope_section"),
+            mrope_interleaved=scaling.get("mrope_interleaved", False),
+            repetition_style=scaling.get("repetition_style", False),
+            rope_scaling=dict(scaling),
         )
-    else:
-        scaling_type = rope_scaling["rope_type"]
-        # HuggingFace Qwen2-VL uses rope_type='default' with mrope_section for mRoPE
-        # We detect this and switch to mrope for proper multimodal rotary embedding
-        if "mrope_section" in rope_scaling.keys():
-            scaling_type = "mrope"
-
-        if scaling_type == "llama3":
-            scaling_factor = rope_scaling["factor"]
-            low_freq_factor = rope_scaling["low_freq_factor"]
-            high_freq_factor = rope_scaling["high_freq_factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
-            rotary_emb = Llama3RotaryEmbedding(
-                head_size=head_size,
-                rotary_dim=rotary_dim,
-                max_position_embeddings=max_position,
-                base=base,
-                is_neox_style=is_neox_style,
-                dtype=dtype,
-                scaling_factor=scaling_factor,
-                low_freq_factor=low_freq_factor,
-                high_freq_factor=high_freq_factor,
-                orig_max_position=original_max_position,
-            )
-        elif scaling_type == "default":
-            rotary_emb = RotaryEmbedding(
-                head_size=head_size,
-                rotary_dim=rotary_dim,
-                max_position_embeddings=max_position,
-                base=base,
-                is_neox_style=is_neox_style,
-                dtype=dtype,
-            )
-        elif scaling_type == "linear":
-            scaling_factor = rope_scaling["factor"]
-            rotary_emb = LinearScalingRotaryEmbedding(
-                head_size=head_size,
-                rotary_dim=rotary_dim,
-                max_position_embeddings=max_position,
-                base=base,
-                is_neox_style=is_neox_style,
-                scaling_factors=scaling_factor,
-                dtype=dtype,
-            )
-        elif scaling_type == "dynamic":
-            scaling_factor = rope_scaling["factor"]
-            rotary_emb = DynamicNTKScalingRotaryEmbedding(
-                head_size=head_size,
-                rotary_dim=rotary_dim,
-                max_position_embeddings=max_position,
-                base=base,
-                is_neox_style=is_neox_style,
-                scaling_factor=scaling_factor,
-                dtype=dtype,
-            )
-        elif scaling_type == "yarn":
-            scaling_factor = rope_scaling.get("factor", rope_scaling.get("scaling_factor"))
-            if scaling_factor is None:
-                raise ValueError("YaRN rope_scaling must contain 'factor' or 'scaling_factor' key")
-            original_max_position = rope_scaling.get("original_max_position_embeddings", max_position)
-            extra_kwargs = {
-                k: v
-                for k, v in rope_scaling.items()
-                if k in ("extrapolation_factor", "attn_factor", "attention_factor", "beta_fast", "beta_slow", "truncate")
-            }
-            rotary_emb = YaRNScalingRotaryEmbedding(
-                head_size=head_size,
-                rotary_dim=rotary_dim,
-                max_position_embeddings=original_max_position,
-                base=base,
-                is_neox_style=is_neox_style,
-                scaling_factor=scaling_factor,
-                dtype=dtype,
-                **extra_kwargs,
-            )
-        elif scaling_type == "deepseek_yarn":
-            scaling_factor = rope_scaling["factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
-            extra_kwargs = {
-                k: v
-                for k, v in rope_scaling.items()
-                if k in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow", "mscale", "mscale_all_dim")
-            }
-            rotary_emb = DeepseekScalingRotaryEmbedding(
-                head_size=head_size,
-                rotary_dim=rotary_dim,
-                max_position_embeddings=original_max_position,
-                base=base,
-                is_neox_style=is_neox_style,
-                scaling_factor=scaling_factor,
-                dtype=dtype,
-                **extra_kwargs,
-            )
-        elif scaling_type == "longrope":
-            short_factor = rope_scaling["short_factor"]
-            long_factor = rope_scaling["long_factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
-
-            rotary_emb = Phi3LongRoPEScaledRotaryEmbedding(
-                head_size=head_size,
-                rotary_dim=rotary_dim,
-                max_position_embeddings=max_position,
-                original_max_position_embeddings=original_max_position,
-                base=base,
-                is_neox_style=is_neox_style,
-                dtype=dtype,
-                short_factor=short_factor,
-                long_factor=long_factor,
-            )
-        elif scaling_type == "mrope":
-            rotary_emb = MultiModalRotaryEmbedding(
-                head_size=head_size,
-                rotary_dim=rotary_dim,
-                max_position_embeddings=max_position,
-                base=base,
-                is_neox_style=is_neox_style,
-                dtype=dtype,
-                mrope_section=rope_scaling.get("mrope_section"),
-                mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
-                repetition_style=rope_scaling.get("repetition_style", False),
-            )
-        else:
-            raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
-
-    return rotary_emb  # pyright: ignore[reportReturnType]
+    if scaling_type == "llama3":
+        kwargs.update(
+            scaling_factor=scaling["factor"],
+            low_freq_factor=scaling["low_freq_factor"],
+            high_freq_factor=scaling["high_freq_factor"],
+            orig_max_position=scaling["original_max_position_embeddings"],
+        )
+    elif scaling_type == "linear":
+        kwargs["scaling_factors"] = scaling["factor"]
+    elif scaling_type == "dynamic":
+        original_max_position = scaling.get("original_max_position_embeddings", max_position)
+        kwargs.update(
+            scaling_factor=scaling["factor"],
+            max_position_embeddings=original_max_position,
+            max_positions=max(int(max_position), int(original_max_position * scaling["factor"])),
+        )
+    elif scaling_type in ("yarn", "deepseek_yarn"):
+        scaling_factor = scaling.get("factor", scaling.get("scaling_factor"))
+        if scaling_factor is None:
+            raise ValueError("YaRN rope_scaling must contain 'factor' or 'scaling_factor' key")
+        kwargs.update(
+            scaling_factor=scaling_factor,
+            max_position_embeddings=scaling.get("original_max_position_embeddings", max_position),
+        )
+        extra_keys = {"extrapolation_factor", "attn_factor", "beta_fast", "beta_slow", "truncate"}
+        extra_keys.update(("mscale", "mscale_all_dim") if scaling_type == "deepseek_yarn" else ("attention_factor",))
+        kwargs.update({key: value for key, value in scaling.items() if key in extra_keys})
+    elif scaling_type == "longrope":
+        kwargs.update(
+            original_max_position_embeddings=scaling["original_max_position_embeddings"],
+            short_factor=scaling["short_factor"],
+            long_factor=scaling["long_factor"],
+        )
+    elif scaling_type != "default":
+        # Custom registered classes receive the common geometry plus their config fields.
+        kwargs.update({key: value for key, value in scaling.items() if key != "rope_type"})
+    return rope_class(**kwargs)
 
 
+@_hashable_rope_scaling
 @ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
     static_argnames=[
         "head_size",
@@ -282,10 +264,10 @@ def get_frequencies(
     """Compute the cos/sin frequency cache for the configured RoPE variant.
 
     Reads ``rope_scaling["rope_type"]`` and dispatches to the matching
-    ``compute_*_frequencies`` function in :mod:`._compute_fns`. The Qwen2-VL
-    ``rope_type="default" + mrope_section`` convention is auto-rewritten to
-    ``"mrope"`` (which falls back to the basic cache; the MRoPE module
-    performs the THW interleaving at call time). Wrapped in :func:`ejit` with
+    ``compute_*_frequencies`` function in :mod:`._compute_fns`. Multimodal
+    layout fields do not alter the requested spectrum; the MRoPE module
+    performs THW selection at call time. Explicit ``rope_type="mrope"``
+    retains the basic spectrum. Wrapped in :func:`ejit` with
     the heavy fields marked static so a JIT cache miss only happens when
     geometry changes.
 
@@ -310,6 +292,20 @@ def get_frequencies(
     if partial_rotary_factor < 1.0:
         rotary_dim = int(rotary_dim * partial_rotary_factor)
 
+    scaling_type = "default" if rope_scaling is None else rope_scaling.get("rope_type", "default")
+    rope_class = AVAILABLE_ROPE_TYPES.get(scaling_type)
+    if rope_class is None:
+        raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+    compute_frequencies = getattr(rope_class, "compute_frequencies", None)
+    if compute_frequencies is not None:
+        return compute_frequencies(
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position=max_position,
+            base=base,
+            rope_scaling=rope_scaling,
+        )
+
     if rope_scaling is None:
         frequencies = compute_basic_frequencies(
             base=base,
@@ -317,12 +313,6 @@ def get_frequencies(
             max_position_embeddings=max_position,
         )
     else:
-        scaling_type = rope_scaling["rope_type"]
-        # HuggingFace Qwen2-VL uses rope_type='default' with mrope_section for mRoPE
-        # We detect this and switch to mrope for proper multimodal rotary embedding
-        if "mrope_section" in rope_scaling.keys():
-            scaling_type = "mrope"
-
         if scaling_type == "llama3":
             scaling_factor = rope_scaling["factor"]
             low_freq_factor = rope_scaling["low_freq_factor"]
@@ -356,11 +346,13 @@ def get_frequencies(
             )
         elif scaling_type == "dynamic":
             scaling_factor = rope_scaling["factor"]
+            original_max_position = rope_scaling.get("original_max_position_embeddings", max_position)
             frequencies = compute_dynamic_frequencies(
                 rotary_dim=rotary_dim,
-                max_position_embeddings=max_position,
+                max_position_embeddings=original_max_position,
                 base=base,
                 scaling_factor=scaling_factor,
+                max_positions=max(int(max_position), int(original_max_position * scaling_factor)),
             )
         elif scaling_type == "yarn":
             scaling_factor = rope_scaling["factor"]
@@ -428,6 +420,7 @@ def get_frequencies(
                 extra_kwargs.get("attn_factor", 1),
                 attention_factor=rope_scaling.get("attention_factor"),
                 max_positions=max(int(max_position), int(original_max_position * scaling_factor)),
+                truncate=bool(rope_scaling.get("truncate", True)),
             )
         elif scaling_type == "longrope":
             short_factor = rope_scaling["short_factor"]
@@ -459,6 +452,7 @@ def get_frequencies(
     return frequencies
 
 
+@_hashable_rope_scaling
 @ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
     static_argnames=[
         "head_size",
@@ -509,7 +503,7 @@ def get_inv_frequencies(
     if rope_scaling is None:
         inv_frequencies = compute_basic_inv_frequencies(base=base, rotary_dim=rotary_dim)
     else:
-        scaling_type = rope_scaling["rope_type"]
+        scaling_type = rope_scaling.get("rope_type", "default")
 
         if scaling_type == "llama3":
             scaling_factor = rope_scaling["factor"]
@@ -525,19 +519,29 @@ def get_inv_frequencies(
                 scaling_factor=scaling_factor,
             )
 
-        elif scaling_type == "default":
+        elif scaling_type in ("default", "mrope"):
             inv_frequencies = compute_basic_inv_frequencies(base=base, rotary_dim=rotary_dim)
         elif scaling_type == "linear":
-            inv_frequencies = compute_basic_inv_frequencies(base=base, rotary_dim=rotary_dim)
+            factor = rope_scaling["factor"]
+            if isinstance(factor, (list, tuple)):
+                if len(factor) != 1:
+                    raise ValueError("A single inverse-frequency vector requires one linear scaling factor.")
+                factor = factor[0]
+            if factor <= 0:
+                raise ValueError("The linear scaling factor must be positive.")
+            inv_frequencies = compute_basic_inv_frequencies(base=base, rotary_dim=rotary_dim) / factor
         elif scaling_type == "dynamic":
             scaling_factor = rope_scaling["factor"]
-            adjusted_base = base * ((scaling_factor * max_position / max_position) - (scaling_factor - 1)) ** (
-                rotary_dim / (rotary_dim - 2)
-            )
+            original_max_position = rope_scaling.get("original_max_position_embeddings", max_position)
+            sequence_length = max(max_position, original_max_position)
+            adjusted_base = base * (
+                (scaling_factor * sequence_length / original_max_position) - (scaling_factor - 1)
+            ) ** (rotary_dim / (rotary_dim - 2))
             inv_frequencies = compute_basic_inv_frequencies(base=adjusted_base, rotary_dim=rotary_dim)
         elif scaling_type == "yarn":
             scaling_factor = rope_scaling["factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
+            # Same fallback as ``get_frequencies`` (gpt-oss style configs omit the key).
+            original_max_position = rope_scaling.get("original_max_position_embeddings", max_position)
             extra_kwargs = {
                 k: v for k, v in rope_scaling.items() if k in ("extrapolation_factor", "beta_fast", "beta_slow")
             }
@@ -563,14 +567,16 @@ def get_inv_frequencies(
             extrapolation_factor = extra_kwargs.get("extrapolation_factor", 1.0)
             beta_fast = extra_kwargs.get("beta_fast", 32)
             beta_slow = extra_kwargs.get("beta_slow", 1)
-            pos_freqs = base ** (jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim)
-            inv_freq_extrapolation = 1.0 / pos_freqs
-            inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
-            low, high = _yarn_find_correction_range(beta_fast, beta_slow, rotary_dim, base, original_max_position)
-            inv_freq_mask = (
-                1 - _yarn_linear_ramp_mask(low, high, rotary_dim // 2, dtype=jnp.float32)
-            ) * extrapolation_factor
-            inv_frequencies = inv_freq_interpolation * (1 - inv_freq_mask) + inv_freq_extrapolation * inv_freq_mask
+            inv_frequencies = compute_yarn_inv_frequencies(
+                base=base,
+                rotary_dim=rotary_dim,
+                beta_fast=beta_fast,
+                beta_slow=beta_slow,
+                max_position_embeddings=original_max_position,
+                scaling_factor=scaling_factor,
+                extrapolation_factor=extrapolation_factor,
+                truncate=bool(rope_scaling.get("truncate", True)),
+            )
         elif scaling_type == "longrope":
             short_factor = rope_scaling["short_factor"]
             long_factor = rope_scaling["long_factor"]

@@ -119,6 +119,8 @@ class FileResponseStore:
         self._conversations: OrderedDict[str, _Entry] = OrderedDict()
         self._dirty = False
         self._load_index()
+        self._evict()
+        self._flush_index()
 
         logger.info(f"Response store initialized at: {self.storage_dir}")
 
@@ -152,15 +154,21 @@ class FileResponseStore:
             data = blob
         return json.loads(data.decode("utf-8"))
 
-    def _atomic_write(self, path: Path, data: bytes) -> None:
+    def _atomic_write(self, path: Path, data: bytes, *, keep_backup: bool = False) -> None:
         """Write ``data`` to ``path`` via a temp file and rename.
 
-        Keeps the previous version under ``<path>.bak`` so a partial failure
-        does not corrupt the store.
+        The previous version is moved to ``<path>.bak`` while the swap happens so
+        a partial failure does not corrupt the store. The backup is removed once
+        the new file is in place unless ``keep_backup`` is set (used for the
+        index, whose ``.bak`` is the documented crash-recovery fallback). Record
+        files never keep a backup: they are not tracked by the index, so a
+        lingering ``.bak`` would never be evicted or counted against the LRU
+        limits.
 
         Args:
             path: Destination path.
             data: Bytes to write.
+            keep_backup: Retain ``<path>.bak`` after a successful write.
         """
         temp_path = path.with_suffix(path.suffix + ".tmp")
         backup_path = path.with_suffix(path.suffix + ".bak")
@@ -173,6 +181,20 @@ class FileResponseStore:
             path.rename(backup_path)
 
         temp_path.rename(path)
+
+        if not keep_backup:
+            backup_path.unlink(missing_ok=True)
+
+    def _unlink_record(self, directory: Path, file_name: str) -> None:
+        """Remove a record file together with any stale ``.bak`` companion.
+
+        Args:
+            directory: Records directory containing ``file_name``.
+            file_name: Record filename from the index entry.
+        """
+        path = directory / file_name
+        path.unlink(missing_ok=True)
+        path.with_suffix(path.suffix + ".bak").unlink(missing_ok=True)
 
     def _conversation_file_name(self, conversation_id: str) -> str:
         """Hash a conversation id into a filesystem-safe filename.
@@ -192,19 +214,19 @@ class FileResponseStore:
         Drops entries whose backing file has gone missing, then sorts each
         store by ``touched_at`` so the LRU ordering is preserved.
         """
-        if not self.index_file.exists():
-            self._dirty = True
-            self._flush_index()
-            return
-
-        try:
-            raw = json.loads(self.index_file.read_text(encoding="utf-8"))
-        except Exception:
-            backup = self.index_file.with_suffix(".json.bak")
-            if backup.exists():
-                raw = json.loads(backup.read_text(encoding="utf-8"))
-            else:
+        raw = {}
+        for candidate in (self.index_file, self.index_file.with_suffix(".json.bak")):
+            try:
+                raw = json.loads(candidate.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    raise ValueError("Response index must be a mapping")
+                if candidate != self.index_file:
+                    # Restore before a later write can rotate a corrupt primary over the good backup.
+                    self.index_file.write_text(json.dumps(raw), encoding="utf-8")
+                break
+            except (OSError, ValueError):
                 raw = {}
+        self._dirty = not self.index_file.exists()
 
         responses = tp.cast(dict[str, tp.Any], raw.get("responses") or {})
         conversations = tp.cast(dict[str, tp.Any], raw.get("conversations") or {})
@@ -228,7 +250,9 @@ class FileResponseStore:
                 if not isinstance(file, str) or not file:
                     continue
                 path = base_dir / file
-                if not path.exists():
+                if Path(file).name != file or path.resolve().parent != base_dir.resolve():
+                    continue
+                if not path.is_file():
                     continue
                 try:
                     created_at = float(meta.get("created_at") or 0.0)
@@ -277,7 +301,11 @@ class FileResponseStore:
             },
         }
 
-        self._atomic_write(self.index_file, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+        self._atomic_write(
+            self.index_file,
+            json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+            keep_backup=True,
+        )
         self._dirty = False
 
     def _touch(self, store: OrderedDict[str, _Entry], key: str) -> None:
@@ -303,9 +331,10 @@ class FileResponseStore:
         causes all of its records to be removed eagerly.
         """
         if self._max_stored_responses == 0:
+            self._dirty = self._dirty or bool(self._responses)
             for entry in self._responses.values():
                 try:
-                    (self.responses_dir / entry.file).unlink(missing_ok=True)
+                    self._unlink_record(self.responses_dir, entry.file)
                 except Exception:
                     pass
             self._responses.clear()
@@ -313,15 +342,16 @@ class FileResponseStore:
         while self._max_stored_responses > 0 and len(self._responses) > self._max_stored_responses:
             _key, entry = self._responses.popitem(last=False)
             try:
-                (self.responses_dir / entry.file).unlink(missing_ok=True)
+                self._unlink_record(self.responses_dir, entry.file)
             except Exception:
                 pass
             self._dirty = True
 
         if self._max_stored_conversations == 0:
+            self._dirty = self._dirty or bool(self._conversations)
             for entry in self._conversations.values():
                 try:
-                    (self.conversations_dir / entry.file).unlink(missing_ok=True)
+                    self._unlink_record(self.conversations_dir, entry.file)
                 except Exception:
                     pass
             self._conversations.clear()
@@ -329,7 +359,7 @@ class FileResponseStore:
         while self._max_stored_conversations > 0 and len(self._conversations) > self._max_stored_conversations:
             _key, entry = self._conversations.popitem(last=False)
             try:
-                (self.conversations_dir / entry.file).unlink(missing_ok=True)
+                self._unlink_record(self.conversations_dir, entry.file)
             except Exception:
                 pass
             self._dirty = True
@@ -373,8 +403,25 @@ class FileResponseStore:
             return
 
         now = time.time()
-        file_name = f"{response_id}.bin"
+        entry = self._responses.get(response_id)
+        # Keep safe legacy filenames; hash arbitrary ids rather than interpreting them as paths.
+        legacy_name = f"{response_id}.bin"
+        file_name = entry.file if entry is not None else legacy_name
         path = self.responses_dir / file_name
+        if Path(file_name).name != file_name or path.resolve().parent != self.responses_dir.resolve():
+            file_name = self._conversation_file_name(response_id)
+            path = self.responses_dir / file_name
+        if entry is None:
+            # Safe ids can equal the digest of an unsafe id (or any suffixed name).
+            # Allocate an unused path instead of assuming either namespace is unique.
+            # Existing indexed records keep their legacy filenames on update/reopen.
+            occupied = {stored.file for stored in self._responses.values()}
+            stem = Path(file_name).stem
+            suffix = 0
+            while file_name in occupied or path.exists() or path.is_symlink():
+                suffix += 1
+                file_name = f"{stem}-{suffix}.bin"
+                path = self.responses_dir / file_name
         self._atomic_write(path, self._encode(record))
 
         created_at = record.get("created_at")
@@ -404,7 +451,7 @@ class FileResponseStore:
         if entry is None:
             return False
         try:
-            (self.responses_dir / entry.file).unlink(missing_ok=True)
+            self._unlink_record(self.responses_dir, entry.file)
         except Exception:
             pass
         self._dirty = True
@@ -476,7 +523,7 @@ class FileResponseStore:
         if entry is None:
             return False
         try:
-            (self.conversations_dir / entry.file).unlink(missing_ok=True)
+            self._unlink_record(self.conversations_dir, entry.file)
         except Exception:
             pass
         self._dirty = True

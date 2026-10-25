@@ -1,8 +1,8 @@
 """Opt-in TPU4 regression for Qwen4's concrete FP8 v3 paged-QSA path.
 
-Run in a complete EasyDeL checkout/environment (not the review-file overlay):
+Run in a complete EasyDeL checkout/environment:
   JAX_PLATFORMS=tpu ENABLE_DISTRIBUTED_INIT=0 python -m pytest -q -s \
-    /Users/erfan/.xerxes-scratch/test_qwen4_fp8_cache_roundtrip.py::test_fp8_paged_cache_tp4_roundtrip
+    libs/easydel/tests/modules/test_qwen4_fp8_cache_roundtrip.py::test_fp8_paged_cache_tp4_roundtrip
 
 Collection imports neither JAX nor EasyDeL and does not initialize hardware.
 This tests the production allocator, Qwen v3 writer and gathered attention,
@@ -10,14 +10,14 @@ not the Pallas ragged kernel, indexer selection, or end-to-end model logits.
 """
 
 import os
-from types import SimpleNamespace
 
 import pytest
 
 
 @pytest.mark.skipif(
-    os.environ.get("JAX_PLATFORMS") != "tpu" or os.environ.get("ENABLE_DISTRIBUTED_INIT") != "0",
-    reason="explicit opt-in required: JAX_PLATFORMS=tpu ENABLE_DISTRIBUTED_INIT=0",
+    "tpu" not in {platform.strip() for platform in os.environ.get("JAX_PLATFORMS", "").split(",")}
+    or os.environ.get("ENABLE_DISTRIBUTED_INIT") != "0",
+    reason="explicit opt-in required: JAX_PLATFORMS must include tpu and ENABLE_DISTRIBUTED_INIT=0",
 )
 def test_fp8_paged_cache_tp4_roundtrip():
     import jax
@@ -89,7 +89,11 @@ def test_fp8_paged_cache_tp4_roundtrip():
     value = jax.device_put(jnp.asarray(values, jnp.bfloat16), replicated)
     query = jax.device_put(jnp.asarray(rng.normal(0, 0.4, (1, 1, 8, 256)), jnp.bfloat16), query_sharding)
     selected = jax.device_put(jnp.array([[[0, 1, 2, 3, 4, -1]]], jnp.int32), replicated)
-    attention = SimpleNamespace(head_dim=256)  # methods only read this scalar; view is real
+    # Keep real helper-method dispatch without initializing model parameters.
+    attention = Qwen4ExpAttention.__new__(Qwen4ExpAttention)
+    attention.head_dim = 256
+    attention.num_heads = 8
+    attention.precision = jax.lax.Precision.HIGHEST
     prefill_meta, decode_meta = metadata(4, 4), metadata(5, 1)
 
     @jax.jit

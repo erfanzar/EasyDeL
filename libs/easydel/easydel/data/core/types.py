@@ -32,6 +32,15 @@ from eformer.pytree import auto_pytree, field
 from easydel.utils.helpers import get_cache_dir
 
 
+def _uncompressed_filename(path: str) -> str:
+    """Return a lowercase filename without its supported outer compression suffix."""
+    name = str(path).lower()
+    for suffix in (".gz", ".zst", ".bz2", ".xz"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
 class DatasetType(StrEnum):
     """Enumeration of dataset container formats supported by the data layer.
 
@@ -93,12 +102,13 @@ class DatasetType(StrEnum):
             DatasetType | None: The inferred type, or ``None`` when the
             extension does not match any known reader.
         """
+        path = _uncompressed_filename(path)
         mapping = {
-            (".json", ".jsonl", ".json.gz", ".jsonl.gz", ".json.zst", ".jsonl.zst"): cls.JSON,
-            (".parquet",): cls.PARQUET,
+            (".json", ".jsonl"): cls.JSON,
+            (".parquet", ".pq"): cls.PARQUET,
             (".csv",): cls.CSV,
             (".arrow",): cls.ARROW,
-            (".tsv", ".tsv.gz"): cls.TSV,
+            (".tsv",): cls.TSV,
             (".txt",): cls.TXT,
         }
         for exts, dtype in mapping.items():
@@ -148,6 +158,10 @@ class BaseDatasetInform:
             transform.
         format_fields (dict[str, str] | None): Old-key -> new-key
             rename map applied to each row.
+        filter_fn (Callable[[dict[str, Any]], bool] | None): Predicate applied
+            to raw loaded rows before formatting and mixing.
+        max_samples (int | None): Maximum retained rows after filtering,
+            independent of the raw reader's ``num_rows`` limit.
     """
 
     name: str | None = None
@@ -158,6 +172,8 @@ class BaseDatasetInform:
     split: str = "train"
     format_callback: tp.Callable[[dict[str, tp.Any]], dict[str, tp.Any]] | None = None
     format_fields: dict[str, str] | None = None
+    filter_fn: tp.Callable[[dict[str, tp.Any]], bool] | None = field(default=None, kw_only=True)
+    max_samples: int | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
         """Normalise ``type``, infer it from file extensions, and validate splits.
@@ -180,6 +196,8 @@ class BaseDatasetInform:
             ValueError: If :attr:`type` is ``None`` and cannot be
                 inferred from :attr:`data_files`.
         """
+        if self.max_samples is not None and self.max_samples < 0:
+            raise ValueError("max_samples must be >= 0")
         if self.type is None:
             inferred_type = None
             if self.data_files:
@@ -254,11 +272,19 @@ class TextDatasetInform(BaseDatasetInform):
         preprocessing_fn (Callable[[dict[str, Any]], dict[str, Any]] | None):
             Optional per-row transform applied before mixing. Receives
             and returns the row dict.
+        assistant_only (bool | None): Per-dataset assistant-only masking
+            choice. ``None`` inherits the trainer's global flag;
+            ``True``/``False`` override it for this dataset only. When any
+            inform of a mixture sets it, ``build_dataset`` stamps the
+            tri-state column ``easydel.data.ASSISTANT_ONLY_FIELD``
+            (``1``/``0``/``-1``) on every row of every inform so batch
+            schemas stay uniform.
     """
 
     content_field: str | None = "content"
     additional_fields: list[str] | None = None
     preprocessing_fn: tp.Callable[[dict[str, tp.Any]], dict[str, tp.Any]] | None = None
+    assistant_only: bool | None = None
 
 
 @auto_pytree
@@ -314,6 +340,9 @@ class DatasetMixture:
             EasyDeL user cache directory and is auto-created.
         streaming (bool): Iterate the inputs in streaming mode rather
             than fully materialising them in RAM.
+        use_fast_loader (bool): Read files with optimized fsspec-backed sharded
+            readers when true. False (default) preserves the legacy HuggingFace
+            file builders. Hub datasets use HuggingFace in either mode.
         text_target_field (str): Canonical row key the mix re-projects
             text content onto regardless of source schema.
         image_target_field (str): Canonical row key the mix re-projects
@@ -370,7 +399,14 @@ class DatasetMixture:
             block when :attr:`block_mixture` is on.
         stop_strategy (str): What the mixer does when a dataset is
             exhausted — ``"restart"`` (recycle), ``"first_exhausted"``
-            (terminate immediately), or ``"all_exhausted"``.
+            (terminate immediately), ``"all_exhausted"`` (recycle until
+            every dataset has finished at least once), or ``"error"``
+            (raise on the first exhaustion; requires
+            :attr:`block_mixture` on the streaming path).
+        attach_dataset_ids (bool): Stamp the integer attribution column
+            ``easydel.data.DATASET_ID_FIELD`` (the inform's position in
+            :attr:`informs`) on every row so trainers can split metrics or
+            losses per source.
         mixture_weights (dict[str, float] | None): Per-dataset weights
             keyed by dataset identifier (the constituent's
             ``data_files`` path or explicit name). ``None`` falls back
@@ -432,8 +468,10 @@ class DatasetMixture:
     block_mixture: bool = True
     mixture_block_size: int = 2048
     stop_strategy: str = "restart"
+    attach_dataset_ids: bool = False
 
     mixture_weights: dict[str, float] | None = None
+    use_fast_loader: bool = field(default=False, kw_only=True)
 
     def __post_init__(self):
         """Normalise :attr:`cache_dir` to an :class:`ePath` and ensure it exists.

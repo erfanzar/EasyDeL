@@ -225,25 +225,6 @@ class SparseDistillationTrainer(Trainer):
             skip_apply_chat_template=self.arguments.skip_apply_chat_template,
         )
 
-    def _is_pretokenized(self) -> bool:
-        """Detect whether the bound training source already exposes tokenised prompts.
-
-        Peeks at the first row of the first shard and reports whether
-        an ``"input_ids"`` field is present. Defensive against missing
-        sources, empty shard lists, and shards yielding no rows.
-
-        Returns:
-            ``True`` if the first row of the first shard has
-            ``"input_ids"``; ``False`` otherwise.
-        """
-        if self._train_source is None:
-            return False
-        try:
-            sample = next(iter(self._train_source.open_shard(self._train_source.shard_names[0])))
-            return "input_ids" in sample
-        except (StopIteration, IndexError):
-            return False
-
     def create_grain_collect_function(
         self,
         max_sequence_length: int,

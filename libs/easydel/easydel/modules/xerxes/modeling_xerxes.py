@@ -24,12 +24,13 @@ Exposes :class:`XerxesModel` (transformer trunk) and the task wrapper
 """
 
 import functools
+import typing as tp
 
 import jax
-import jax.numpy as jnp
 import spectrax as spx
 from eformer.loggings import get_logger
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 from spectrax import apply_logical_sharding, common_types, nn
 
@@ -43,45 +44,25 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput, DecoderLayerOutput
+from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
 from easydel.infra.utils import auto_remat, blockwise_ffn
 from easydel.layers import (
+    BaseMoeModule,
     ColumnParallelLinear,
     Embed,
+    MoeRoutingStrategy,
     RMSNorm,
     RowParallelLinear,
     dense_gate_up_layout,
     gated_mlp_forward,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.moe import MoeFusedHooks
 from easydel.modules._base import BaseCausalLMModule
 
 from .xerxes_configuration import XerxesConfig as XerxesConfig
 
 logger = get_logger(__name__)
-
-
-class Identity(spx.Module):
-    """No-op module used as a placeholder when optional layers are disabled.
-
-    This module returns its input unchanged, serving as a pass-through
-    when certain normalization or processing layers are conditionally disabled.
-    """
-
-    def __init__(self):
-        """Initialize the Identity module (no parameters)."""
-        ...
-
-    def forward(self, x):
-        """Pass through input unchanged.
-
-        Args:
-            x: Input tensor of any shape.
-
-        Returns:
-            The input tensor unchanged.
-        """
-        return x
 
 
 class PostCross(spx.Module):
@@ -235,6 +216,7 @@ class XerxesAttention(UnifiedAttention):
         sliding_window = config.layer_sliding_window(layer_idx)
 
         self.xe_kvnorm = config.xe_kvnorm
+        self.is_cross_attention = is_cross_attention
 
         super().__init__(
             config,
@@ -244,15 +226,86 @@ class XerxesAttention(UnifiedAttention):
             rngs=rngs,
             layer_idx=layer_idx,
             attention_type="standard",
-            causal=True,
-            sliding_window=sliding_window,
+            causal=causal and not is_cross_attention,
+            sliding_window=None if is_cross_attention else sliding_window,
             use_qk_norm=True,
         )
 
         self.layer_idx = layer_idx
-        self.is_cross_attention = is_cross_attention
-        self.causal = causal
-        self.attention_softmax_in_fp32 = self.dtype is not jnp.float32
+
+    def forward(
+        self,
+        hidden_states,
+        mask_info,
+        position_ids,
+        mode,
+        cache_view=None,
+        cache_metadata=None,
+        output_attentions=False,
+        frequencies=None,
+        alibi=None,
+        key_value_states=None,
+    ):
+        """Attend to the residual stream or explicitly supplied encoder states.
+
+        Args:
+            hidden_states: Decoder queries of shape ``[batch, query_length, hidden_size]``.
+            mask_info: Self-attention or cross-attention mask.
+            position_ids: Query positions for self-attention RoPE.
+            mode: Attention execution mode.
+            cache_view: Optional self-attention KV cache.
+            cache_metadata: Optional cache metadata.
+            output_attentions: Whether to return attention weights.
+            frequencies: Optional self-attention RoPE frequencies.
+            alibi: Optional attention bias for the base attention path.
+            key_value_states: Encoder states of shape ``[batch, key_length, hidden_size]``.
+                Required when constructed with ``is_cross_attention=True``.
+
+        Returns:
+            AttentionLayerOutput containing projected attention output and optional weights.
+        """
+        if not self.is_cross_attention and key_value_states is None:
+            return super().forward(
+                hidden_states,
+                mask_info,
+                position_ids,
+                mode,
+                cache_view,
+                cache_metadata,
+                output_attentions,
+                frequencies,
+                alibi,
+            )
+        if key_value_states is None:
+            raise ValueError("Cross-attention requires key_value_states.")
+        batch, query_length = hidden_states.shape[:2]
+        key_length = key_value_states.shape[1]
+        query, _, _ = self._project_qkv(hidden_states)
+        _, key, value = self._project_qkv(key_value_states)
+        query = query.reshape(batch, query_length, self.num_heads, self.head_dim)
+        key = key.reshape(batch, key_length, self.num_key_value_heads, self.head_dim)
+        value = value.reshape(batch, key_length, self.num_key_value_heads, self.head_dim)
+        query, key, value = self._postprocess_qkv(query, key, value)
+        query, key, value = self.apply_qkv_shardings(query, key, value)
+        attentions = self.attention_performer.forward(
+            query_states=query,
+            key_states=key,
+            value_states=value,
+            mode=mode,
+            mask_info=mask_info,
+            causal=False,
+            output_attentions=output_attentions,
+            precision=self.precision,
+        )
+        output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs), pre_projection=True)
+        output = self.shard_attention_prod(self.output_projection(output))
+        if hasattr(self, "resid_dropout"):
+            output = self.resid_dropout(output)
+        return AttentionLayerOutput(
+            attention_output=output,
+            attention_weight=attentions.attention_weights if output_attentions else None,
+            cache_view=cache_view,
+        )
 
     def _create_q_norm(self, config, dtype, param_dtype, rngs):
         """Conditionally build the per-head query RMSNorm.
@@ -314,6 +367,7 @@ class XerxesAttention(UnifiedAttention):
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
+            requires_cache=not self.is_cross_attention,
         )
 
     def _postprocess_qkv(self, query_states, key_states, value_states):
@@ -342,7 +396,7 @@ class XerxesAttention(UnifiedAttention):
         return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
-class XerxesSparseMoeBlock(spx.Module):
+class XerxesSparseMoeBlock(BaseMoeModule):
     """Sparse Mixture-of-Experts block for Xerxes models.
 
     Implements a top-k routing mechanism where each token is processed by
@@ -373,6 +427,17 @@ class XerxesSparseMoeBlock(spx.Module):
             AssertionError: If config.swish_run is True (incompatible with MoE).
         """
         assert config.swish_run is False
+        super().__init__(
+            config=config,
+            n_routed_experts=config.num_local_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            routing_strategy=MoeRoutingStrategy.TOP_K,
+            moe_hooks=MoeFusedHooks(
+                normalize_gate_logits=self._routing_logits,
+                refine_weights_hook=self._selected_expert_weights,
+            ),
+        )
 
         self.config = config
         self.dtype = dtype
@@ -402,6 +467,16 @@ class XerxesSparseMoeBlock(spx.Module):
             ]
         )
 
+    @staticmethod
+    def _routing_logits(logits):
+        """Select experts using float32 logits, before any softmax normalization."""
+        return logits.astype(jnp.float32)
+
+    @staticmethod
+    def _selected_expert_weights(logits):
+        """Preserve selected-logit softmax for every top-k width, including unit top-1 weights."""
+        return jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
+
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Apply sparse MoE transformation with top-k expert routing.
 
@@ -418,27 +493,63 @@ class XerxesSparseMoeBlock(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        router_logits = self.gate(hidden_states).astype(jnp.promote_types(self.dtype, jnp.float32))
-        routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
-        routing_weights = jax.nn.softmax(routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1)
-
-        final_hidden_state = jnp.zeros_like(hidden_states)
-        for index in range(self.config.num_local_experts):
-            expert_layer_output = (
-                blockwise_ffn(
-                    self.experts[index],
-                    hidden_states,
-                    self.config.scan_mlp_chunk_size,
+        # Retain experts.<index>.* checkpoint paths. The shared fused engine
+        # consumes transient stacked views, not a second set of parameters.
+        # Quantized experts and explicitly chunked MLPs retain their module
+        # execution path, but only run the selected expert for each token.
+        needs_module_experts = self.config.use_scan_mlp or any(
+            not hasattr(projection, "weight") or spx.quantization.rule_for(projection, "dot_general") is not None
+            for expert in self.experts
+            for projection in (expert.gate_up_proj, expert.down_proj)
+        )
+        if needs_module_experts:
+            out, router_logits = self._moe_call_standard(
+                hidden_state=hidden_states,
+                gate_layer=self.gate,
+                expert_layer=self._routed_experts,
+                apply_capacity_constraint=False,
+            )
+        else:
+            gate_up_parts = [
+                expert.gate_up_proj.layout.split(
+                    expert.gate_up_proj.weight.value, config=self.config, apply_sharding=False
                 )
-                if self.config.use_scan_mlp
-                else self.experts[index](hidden_states)
+                for expert in self.experts
+            ]
+            out, router_logits = self.moe_call(
+                hidden_state=hidden_states,
+                gate_layer=self.gate,
+                expert_layer=self._routed_experts,
+                wi_kernel=jnp.stack([parts[0] for parts in gate_up_parts]),
+                wu_kernel=jnp.stack([parts[1] for parts in gate_up_parts]),
+                wd_kernel=jnp.stack([expert.down_proj.weight.value for expert in self.experts]),
+                act_fn=self.experts[0].act_fn,
             )
-            expert_layer_output_exp = (
-                jnp.sum(jnp.multiply(selected_experts == index, routing_weights), axis=-1)[:, :, None]
-                * expert_layer_output
-            )
-            final_hidden_state += expert_layer_output_exp
-        return final_hidden_state, router_logits
+        return out, router_logits.reshape(*hidden_states.shape[:2], self.config.num_local_experts)
+
+    def _routed_experts(self, hidden_states, group_sizes, sorted_experts):
+        """Evaluate only the selected legacy expert while preserving its parameter paths."""
+        branches = []
+        for expert in self.experts:
+
+            def run_expert(token, expert=expert):
+                inputs = token[None, None, :]
+                outputs = (
+                    blockwise_ffn(expert, inputs, self.config.scan_mlp_chunk_size)
+                    if self.config.use_scan_mlp
+                    else expert(inputs)
+                )
+                return outputs[0, 0]
+
+            branches.append(run_expert)
+
+        def run_token(args):
+            token, expert_index = args
+            return jax.lax.switch(expert_index, branches, token)
+
+        # lax.map (rather than vmap) keeps switch conditional: vmap would
+        # evaluate every branch and reintroduce dense all-expert computation.
+        return jax.lax.map(run_token, (hidden_states, sorted_experts))
 
 
 class XerxesDecoderLayer(spx.Module):
@@ -506,8 +617,8 @@ class XerxesDecoderLayer(spx.Module):
         self.identity = identity
         self.input_layernorm = rms()
         self.post_attention_layernorm = rms()
-        self.pre_feedforward_layernorm = Identity() if identity else rms()
-        self.post_feedforward_layernorm = Identity() if identity else rms()
+        self.pre_feedforward_layernorm = nn.Identity() if identity else rms()
+        self.post_feedforward_layernorm = nn.Identity() if identity else rms()
 
     def forward(
         self,
@@ -748,15 +859,9 @@ class XerxesModel(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
         if inputs_embeds is None:
-            if input_ids is None:
-                raise ValueError("input_ids must be provided when inputs_embeds is None.")
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
-        if inputs_embeds is None:
-            raise ValueError("inputs_embeds could not be resolved.")
         sequence_length = inputs_embeds.shape[1]
-        embedding_scale = self.embedding_scale
-        if embedding_scale is not None:
-            inputs_embeds = inputs_embeds * embedding_scale
+        inputs_embeds = inputs_embeds * self.embedding_scale
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
@@ -851,6 +956,7 @@ class XerxesModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
@@ -938,7 +1044,7 @@ class XerxesForCausalLM(BaseCausalLMModule[XerxesModel, XerxesConfig]):  # type:
             lm_head_bias=False,
         )
         identity = config.xe_kvnorm and not config.xe_moe
-        self.post_pross = Identity() if identity else PostCross()
+        self.post_pross = nn.Identity() if identity else PostCross()
 
     def forward(
         self,
@@ -1016,6 +1122,32 @@ class XerxesForCausalLM(BaseCausalLMModule[XerxesModel, XerxesConfig]):  # type:
             past_key_values=outputs.past_key_values,
         )
 
+    def get_lm_logit_postprocess(self) -> tp.Callable[[Array], Array] | None:
+        """Return the ordered logit transforms for a stage-local projection.
+
+        Matches :meth:`compute_lm_logits`: base symmetric clipping followed
+        by ``post_pross`` (identity or ``30 * tanh(logits / 30)``). The
+        callable captures only a scalar clip bound and the parameter-free
+        post-processing module, not the model or its projection weights.
+
+        Returns:
+            Pure logits-to-logits callable, or None when both transforms
+            are identity operations.
+        """
+        clip_feature = self._logit_cap_feature
+        clip_cap = None if clip_feature is None else clip_feature.cap_value
+        postprocess = self.post_pross
+        if clip_cap is None and isinstance(postprocess, nn.Identity):
+            return None
+
+        def process_logits(logits: Array) -> Array:
+            """Apply base clipping before the same module used by the full head."""
+            if clip_cap is not None:
+                logits = jnp.clip(logits, -clip_cap, clip_cap)
+            return postprocess(logits)
+
+        return process_logits
+
     def compute_lm_logits(self, hidden_states: Array) -> Array:
         """Project to vocabulary logits and apply the ``post_pross`` soft cap.
 
@@ -1028,7 +1160,7 @@ class XerxesForCausalLM(BaseCausalLMModule[XerxesModel, XerxesConfig]):  # type:
     def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
         """Trace-safe LM-head projection with the same soft cap as :meth:`compute_lm_logits`."""
         base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
-        if isinstance(self.post_pross, Identity):
+        if isinstance(self.post_pross, nn.Identity):
             return base_fn
 
         def _project(hidden_states):

@@ -170,6 +170,7 @@ class Glm5NextMTPHead(spx.Module):
             "value_heads": heads,
             "key_dim": int(cfg.qk_nope_head_dim + cfg.qk_rope_head_dim),
             "value_dim": int(cfg.v_head_dim),
+            "auxiliary_dim": 2 * int(cfg.index_head_dim) + 1,
             "max_length": self.max_cache_length,
         }
 

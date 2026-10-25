@@ -156,12 +156,16 @@ class TrainerOutput:
         mesh: Device mesh used during training
         last_save_file_name: Name of the last saved checkpoint file
         checkpoint_path: Full path to the last checkpoint
+        checkpoint_manager: Optional manager for model checkpoints.
+        shard_fns: Optional parameter-sharding functions.
     """
 
     state: EasyDeLState
     mesh: spx.SpxMesh | None
     last_save_file_name: str | None = None
     checkpoint_path: str | None = None
+    checkpoint_manager: tp.Any = None
+    shard_fns: tp.Any = None
 
 
 class BaseTrainerProtocol(metaclass=ABCMeta):

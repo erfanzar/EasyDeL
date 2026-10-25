@@ -50,7 +50,6 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     MoeCausalLMOutput,
@@ -67,10 +66,10 @@ from easydel.layers import (
     MoeRoutingStrategy,
     RMSNorm,
     RowParallelMoELinear,
-    moe_fused_gate_up_reform_param,
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import UnifiedAttention
+from easydel.layers.layouts import mixtral_moe_reform_param
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .mixtral_configuration import MixtralConfig as MixtralConfig
@@ -128,21 +127,8 @@ class MixtralAttention(UnifiedAttention):
             layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
-            sliding_window=config.sliding_window,
+            sliding_window=config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None,
         )
-
-    def _create_rotary(self, config: MixtralConfig, dtype: jnp.dtype):
-        """Build the rotary embedding for this attention layer.
-
-        Args:
-            config (MixtralConfig): Model configuration providing ``rope_theta`` and
-                any optional ``rope_scaling`` settings.
-            dtype (jnp.dtype): Computation dtype for the rotary tables.
-
-        Returns:
-            Rotary module configured with this layer's head dimension.
-        """
-        return config.get_basic_rope(dtype, self.head_dim)
 
 
 class MixtralMoEMlp(spx.Module):
@@ -196,7 +182,11 @@ class MixtralMoEMlp(spx.Module):
             in_features=config.hidden_size,
             out_features=2 * config.intermediate_size,
             rngs=rngs,
-            kernel_init=jax.nn.initializers.normal(),
+            kernel_init=(
+                jax.nn.initializers.normal(config.initializer_range)
+                if config.initialization_of_moe or not config.moe_checkpoint_loading
+                else jax.nn.initializers.zeros
+            ),
             use_bias=False,
             partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
@@ -209,7 +199,11 @@ class MixtralMoEMlp(spx.Module):
             out_features=config.hidden_size,
             rngs=rngs,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(),
+            kernel_init=(
+                jax.nn.initializers.normal(config.initializer_range)
+                if config.initialization_of_moe or not config.moe_checkpoint_loading
+                else jax.nn.initializers.zeros
+            ),
             partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
@@ -316,7 +310,11 @@ class MixtralSparseMoeBlock(BaseMoeModule):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            kernel_init=jax.nn.initializers.normal(),
+            kernel_init=(
+                jax.nn.initializers.normal(config.initializer_range)
+                if config.initialization_of_moe or not config.moe_checkpoint_loading
+                else jax.nn.initializers.zeros
+            ),
         )
 
         self.experts = MixtralMoEMlp(
@@ -448,21 +446,7 @@ class MixtralDecoderLayer(spx.Module):
 
     @property
     def reform_param(self):
-        return {
-            "mlp.gate.weight$": {
-                "splits": [{"name": "block_sparse_moe.gate.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
-                "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-            },
-            "mlp.experts.down_proj$": {
-                "splits": [{"name": "block_sparse_moe.experts.w2.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
-                "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-            },
-            **moe_fused_gate_up_reform_param(
-                config=self.config,
-                target_prefix="block_sparse_moe.experts.gate_up_proj",
-                source_prefix="mlp.experts.gate_up_proj",
-            ),
-        }
+        return mixtral_moe_reform_param(config=self.config)
 
     def forward(
         self,
@@ -733,6 +717,9 @@ class MixtralModel(EasyDeLBaseModule):
             extra=output_router_logits or needs_trace_cache,
         )
         cache_views = views if trace_layers else None
+        # Hoisted out of the loop body: the caching property must not be
+        # first materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
 
         def _run_layer(block, carry):
             """Body of the Mixtral decoder scan with sparse-MoE FFNs.
@@ -757,7 +744,7 @@ class MixtralModel(EasyDeLBaseModule):
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     output_router_logits=output_router_logits,
-                    frequencies=self.frequencies,
+                    frequencies=frequencies,
                 )
             hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
             cv = self._layer_cache_view_update(
@@ -778,8 +765,11 @@ class MixtralModel(EasyDeLBaseModule):
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
 
         return MoeModelOutput(
             last_hidden_state=hidden_states,
@@ -924,28 +914,7 @@ class MixtralForCausalLM(BaseCausalLMModule[MixtralModel, MixtralConfig]):  # ty
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
-            aux_loss_fn=self._compute_aux_loss,
         )
-
-    def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute auxiliary load balancing loss from router logits.
-
-        Args:
-            outputs: Model outputs containing router_logits from MoE layers.
-            attention_mask: Attention mask to exclude padding tokens from loss computation.
-
-        Returns:
-            Optional auxiliary loss value for load balancing, or None if router_logits unavailable.
-        """
-        if outputs.router_logits is None or len(outputs.router_logits) == 0:
-            return None
-        aux_loss = auxiliary_load_balancing_loss_func(
-            gate_logits=outputs.router_logits,
-            num_experts=self.config.num_local_experts,
-            top_k=self.config.num_experts_per_tok,
-            attention_mask=attention_mask,
-        )
-        return aux_loss * self.config.router_aux_loss_coef
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=MixtralConfig, model_type="mixtral")
@@ -1063,32 +1032,20 @@ class MixtralForSequenceClassification(BaseSequenceClassificationModule[MixtralM
         else:
             batch_size = inputs_embeds.shape[0]
 
-        if self.config.pad_token_id is None and batch_size != 1:
+        if self.config.pad_token_id is None and attention_mask is None and batch_size != 1:
             raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
+
+        if input_ids is None and attention_mask is None:
+            pooled_logits = logits[:, -1]
         else:
-            if input_ids is not None:
-                sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-            else:
-                sequence_lengths = -1
+            pooled_logits = self.pool_sequence(logits, input_ids=input_ids, attention_mask=attention_mask)
 
-        pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-        aux_loss = None
-        if output_router_logits and transformer_outputs.router_logits is not None:
-            aux_loss = auxiliary_load_balancing_loss_func(
-                gate_logits=transformer_outputs.router_logits,
-                num_experts=self.config.num_local_experts,
-                top_k=self.config.num_experts_per_tok,
-                attention_mask=attention_mask,
-            )
-            aux_loss = aux_loss * self.config.router_aux_loss_coef
+        # Router logits are only present when requested (call-time flag or config default).
+        aux_loss = self.compute_router_aux_loss(transformer_outputs, attention_mask=attention_mask)
 
         return SequenceClassifierOutput(
             logits=pooled_logits,
-            past_key_values=past_key_values,
+            past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
             aux_loss=aux_loss,

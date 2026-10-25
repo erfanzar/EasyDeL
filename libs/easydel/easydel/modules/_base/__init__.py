@@ -129,6 +129,7 @@ from ._vlm_features import (
     VisionEncoderFeature,
     flatten_mrope_position_ids_for_text,
     mrope_position_ids_from_mm_token_types,
+    pixel_unshuffle_grid,
     torch_bicubic_resize,
 )
 
@@ -138,6 +139,7 @@ from .conditional_generation_module import BaseConditionalGenerationModule
 from .embedding_module import BaseEmbeddingModule
 from .image_classification_module import BaseImageClassificationModule
 from .question_answering_module import BaseQuestionAnsweringModule
+from .qwen_vl import DeepStackVisualMixin, QwenVLMultimodalMixin
 from .sequence_classification_module import BaseSequenceClassificationModule
 from .token_classification_module import BaseTokenClassificationModule
 from .vision_language_module import BaseVisionLanguageModule
@@ -154,11 +156,13 @@ __all__ = [
     "BaseTaskModule",
     "BaseTokenClassificationModule",
     "BaseVisionLanguageModule",
+    "DeepStackVisualMixin",
     "EncoderDecoderProtocol",
     "GradientCheckpointingFeature",
     "LogitCapFeature",
     "MultiDimensionalRoPEFeature",
     "MultiModalMergeFeature",
+    "QwenVLMultimodalMixin",
     "RouterAuxLossFeature",
     "SequenceLengthPoolingFeature",
     "TieEmbeddingsFeature",
@@ -176,5 +180,6 @@ __all__ = [
     "create_token_classification_class",
     "flatten_mrope_position_ids_for_text",
     "mrope_position_ids_from_mm_token_types",
+    "pixel_unshuffle_grid",
     "torch_bicubic_resize",
 ]

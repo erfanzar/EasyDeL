@@ -50,7 +50,6 @@ import typing as tp
 from functools import partial
 
 import jax
-import jax.numpy as jnp
 import spectrax as spx
 from ejkernel.loggings import get_logger
 from ejkernel.modules.operations import (  # pyright: ignore[reportMissingTypeStubs]
@@ -58,6 +57,7 @@ from ejkernel.modules.operations import (  # pyright: ignore[reportMissingTypeSt
 )
 from ejkernel.quantization import dequantize as ej_dequantize  # pyright: ignore[reportMissingTypeStubs]
 from ejkernel.quantization import prepack_quantized_weights  # pyright: ignore[reportMissingTypeStubs]
+from jax import numpy as jnp
 from jax import shard_map
 from spectrax.common_types import ColumnWise, Replicated, RowWise
 
@@ -69,16 +69,12 @@ from easydel.infra.sharding import (
     sanitize_partition_spec_for_shape,
     sharding_for_layout,
 )
-from easydel.layers.quantization._configs import QuantizationType, resolve_ejkernel_quant_params
+from easydel.layers.quantization._configs import QuantizationConfig, QuantizationType, resolve_ejkernel_quant_params
 from easydel.layers.quantization._quants import quantize
 
 from ._linear import ColumnParallelLinear, Dtype, Initializer, PrecisionLike, RowParallelLinear
 
 logger = get_logger(__name__)
-
-if tp.TYPE_CHECKING:
-    from easydel.layers.quantization._configs import QuantizationConfig
-
 
 Array = jax.Array
 Axis = int
@@ -810,6 +806,9 @@ class ParallelLinearQuantized(spx.Module):
         qmm_policy_table: dict[str, tp.Any] | None = None,
         qmm_allow_input_all_gather: bool = False,
         layout: tp.Any | None = None,
+        scale: float | tp.Literal["fan_in", "fan_out"] = 1.0,
+        sharding_layout: tp.Any | None = None,
+        bias_sharding_layout: tp.Any | None = None,
         rngs: spx.Rngs,
     ):
         """Initialize a quantized parallel linear layer.
@@ -864,6 +863,15 @@ class ParallelLinearQuantized(spx.Module):
                 fused activations TP-interleave-aware; dropping it silently
                 falls back to a contiguous split, which scrambles Q/K/V under
                 tensor parallelism.
+            scale: Output scaling applied after the matmul and before the
+                bias, exactly like :class:`ParallelLinear` (a float, or
+                ``"fan_in"`` / ``"fan_out"``). :meth:`ParallelLinear.to_quantized`
+                forwards the dense layer's resolved scale so quantizing a
+                ``scale="fan_in"`` layer does not change its activations.
+            sharding_layout: Optional explicit layout for the quantized kernel
+                (and its scales / zero-points). Defaults to the row/column
+                layout derived from ``_direction``.
+            bias_sharding_layout: Optional explicit layout for the dense bias.
             rngs: SpecTrax random number generators for initialization.
 
         Raises:
@@ -892,6 +900,15 @@ class ParallelLinearQuantized(spx.Module):
         self.qmm_policy_table = qmm_policy_table
         self.qmm_allow_input_all_gather = bool(qmm_allow_input_all_gather)
         self.layout = layout
+        if scale == "fan_in":
+            resolved_scale = float(in_features) ** -0.5
+        elif scale == "fan_out":
+            resolved_scale = float(self.out_features_sum) ** -0.5
+        else:
+            resolved_scale = float(scale)
+        self.output_scale: float = resolved_scale
+        self.sharding_layout = TensorLayout.from_any(sharding_layout)
+        self.bias_sharding_layout = TensorLayout.from_any(bias_sharding_layout)
         # `rngs` is deliberately NOT retained. spx treats module attributes as
         # state, so holding the Rngs object puts PRNG leaves into the exported
         # State; under lazy init those leaves stay abstract and
@@ -911,6 +928,25 @@ class ParallelLinearQuantized(spx.Module):
             group_size=group_size,
             needs_biases=needs_biases,
         )
+        if self.sharding_layout is not None:
+            custom_axes = self.sharding_layout.axes
+            aux_layout = self.sharding_layout
+            if mode == "channelwise" and len(custom_axes) >= 2:
+                # Channelwise scales are ``[1, out]``: the contraction placement does not apply to a size-1 axis.
+                aux_layout = TensorLayout((None, custom_axes[1]), mode=self.sharding_layout.mode)
+            layout_specs["quant_kernel"] = self.sharding_layout
+            layout_specs["quant_scales"] = aux_layout
+            if needs_biases:
+                layout_specs["quant_biases"] = aux_layout
+        if self.bias_sharding_layout is not None and use_bias:
+            layout_specs["bias"] = self.bias_sharding_layout
+        runtime_config = self._runtime_config()
+        if runtime_config is not None and runtime_config.dtype not in {
+            QuantizationType.BINARY,
+            QuantizationType.TERNARY,
+        }:
+            # Binary/ternary use a dense code matmul; packed formats go through ejkernel.
+            resolve_ejkernel_quant_params(runtime_config)
 
         self.quant_kernel = spx.Parameter(
             quant_kernel,
@@ -1067,12 +1103,16 @@ class ParallelLinearQuantized(spx.Module):
         strict_fuse = self.qmm_strict_fuse if self.qmm_strict_fuse is not None else policy.get("strict_fuse")
 
         if not fuse:
-            if strict_fuse is not None:
+            # Policy entries describe fused defaults, not explicit user
+            # requests. An unfused override must work in every size bucket.
+            if self.qmm_strict_fuse is not None:
                 raise ValueError("qmm_strict_fuse requires qmm_fuse=True.")
-            if allow_dense_fallback is not None:
+            if self.qmm_allow_dense_fallback is not None:
                 raise ValueError("qmm_allow_dense_fallback requires qmm_fuse=True.")
-            if backend == "tpu" and tpu_path is not None:
+            if backend == "tpu" and self.qmm_tpu_path is not None:
                 raise ValueError("qmm_tpu_path requires qmm_fuse=True.")
+            if platform_requested in {None, "auto"}:
+                kwargs["platform"] = "xla"
             return kwargs
 
         if allow_dense_fallback is not None:
@@ -1155,28 +1195,69 @@ class ParallelLinearQuantized(spx.Module):
         )
         return wq, scales, None
 
-    def _quantize_runtime(self, array: jax.Array):
-        """Quantize activations at runtime if configured.
+    def _runtime_config(self) -> QuantizationConfig | None:
+        """Return the quantization config of the runtime format, or ``None`` when it equals the stored one.
 
-        Some quantization configurations support quantizing input activations
-        in addition to weights. This method applies that quantization if
-        config.runtime_dtype is set.
-
-        Args:
-            array: Input activation array to potentially quantize.
+        ``QuantizationConfig.runtime_dtype`` documents "weights are stored in ``dtype`` but computed in
+        ``runtime_dtype``". The runtime format uses that format's own default group size / bit-width.
 
         Returns:
-            Quantized array if runtime_dtype is configured, otherwise
-            returns the input unchanged.
+            A :class:`QuantizationConfig` for the runtime format, or ``None`` when ``runtime_dtype`` is unset or
+            identical to the storage ``dtype``.
         """
-        if self.config.runtime_dtype is not None:
-            return quantize(
-                array=array,
-                dtype=self.config.runtime_dtype,
-                group_size=self.config.group_size,
-                simulate=False,
-            )
-        return array
+        runtime = self.config.runtime_dtype
+        if runtime is None:
+            return None
+        runtime = QuantizationType(runtime)
+        if runtime == QuantizationType(self.config.dtype):
+            return None
+        return QuantizationConfig(dtype=runtime)
+
+    def _runtime_weights(
+        self,
+        kernel_value: jax.Array,
+        scale_value: jax.Array,
+        bias_value: jax.Array | None,
+        mode: str,
+        group_size: int,
+        bits: int,
+        needs_biases: bool,
+    ):
+        """Re-pack the stored weights into the configured runtime format.
+
+        When ``config.runtime_dtype`` differs from the storage ``dtype`` the stored codes are dequantized and
+        re-quantized into the runtime format, which then drives the quantized matmul. With no distinct runtime
+        format the inputs are returned unchanged.
+
+        Args:
+            kernel_value: Stored quantized kernel.
+            scale_value: Stored scales.
+            bias_value: Stored per-group zero-points (affine) or ``None``.
+            mode: Stored quantization mode.
+            group_size: Stored effective group size.
+            bits: Stored bit-width.
+            needs_biases: Whether the stored mode carries zero-points.
+
+        Returns:
+            ``(kernel, scales, biases, mode, group_size, bits, needs_biases)`` describing the weights the matmul
+            should consume.
+        """
+        runtime_cfg = self._runtime_config()
+        if runtime_cfg is None:
+            return kernel_value, scale_value, bias_value, mode, group_size, bits, needs_biases
+        dense = self._dequantize_array(kernel_value, scale_value, bias_value)
+        r_mode, r_group, r_bits, r_needs = resolve_ejkernel_quant_params(runtime_cfg)
+        if r_mode == "channelwise":
+            codes, scales, _ = channelwise_quantize_array(dense, r_bits)
+            return codes, scales, None, r_mode, r_group, r_bits, r_needs
+        r_group = _effective_ejkernel_group_size(r_mode, r_group, tuple(dense.shape))
+        packed = prepack_quantized_weights_jit(dense, group_size=r_group, bits=r_bits, mode=r_mode)
+        if r_needs:
+            wq, scales, biases = packed
+        else:
+            wq, scales = packed
+            biases = None
+        return wq, scales, biases, r_mode, r_group, r_bits, r_needs
 
     def _dequantize_array(self, wq: jax.Array, scale: jax.Array, bias: jax.Array | None):
         """Dequantize weights back to full precision for computation.
@@ -1198,6 +1279,8 @@ class ParallelLinearQuantized(spx.Module):
                 for dequantization.
         """
         mode, group_size, bits, _ = self._resolve_ejkernel_params()
+        if mode == "channelwise":
+            return (wq.astype(jnp.float32) * scale.astype(jnp.float32)).astype(self.param_dtype)
         array = ej_dequantize(
             wq,
             scale,
@@ -1250,6 +1333,9 @@ class ParallelLinearQuantized(spx.Module):
                 kernel_init=self.kernel_init,
                 bias_init=self.bias_init,
                 layout=getattr(self, "layout", None),
+                scale=getattr(self, "output_scale", 1.0),
+                sharding_layout=getattr(self, "sharding_layout", None),
+                bias_sharding_layout=getattr(self, "bias_sharding_layout", None),
                 rngs=r,
             ),
             rngs,
@@ -1648,6 +1734,14 @@ class ParallelLinearQuantized(spx.Module):
         if self.dtype is not None:
             inputs = inputs.astype(self.dtype)
 
+        runtime_config = self._runtime_config() if w is None else None
+        if runtime_config is not None and runtime_config.dtype in {QuantizationType.BINARY, QuantizationType.TERNARY}:
+            dense_kernel = self._dequantize_array(
+                self.quant_kernel.value, self.quant_scales.value, self.quant_biases.value
+            )
+            # These formats have ordinary integer codes rather than ejkernel's packed representation.
+            w = quantize(dense_kernel, config=runtime_config).astype(self.dtype or dense_kernel.dtype)
+
         if w is not None:
             kernel = w.astype(self.dtype) if self.dtype is not None else w
             subscript = "...ik,...kj->...ij" if inputs.ndim > 1 else "...k,...kj->...j"
@@ -1660,6 +1754,10 @@ class ParallelLinearQuantized(spx.Module):
             mode, group_size, bits, needs_biases = self._resolve_ejkernel_params()
             if needs_biases and bias_value is None:
                 raise ValueError("Affine quantization requires quant_biases; re-quantize the module weights.")
+
+            kernel_value, scale_value, bias_value, mode, group_size, bits, needs_biases = self._runtime_weights(
+                kernel_value, scale_value, bias_value, mode, group_size, bits, needs_biases
+            )
 
             if mode == "channelwise":
                 from ejkernel.modules import channelwise_quantized_matmul as _cw_qmm
@@ -1690,6 +1788,9 @@ class ParallelLinearQuantized(spx.Module):
 
             if self.dtype is not None:
                 out = out.astype(self.dtype)
+
+        if self.output_scale != 1.0:
+            out = out * self.output_scale
 
         bias_value: jax.Array | None = self.bias.value if self.use_bias else None
         if self.use_bias and bias_value is not None:

@@ -97,9 +97,11 @@ from ._utils import (
     apply_rope_split_half,
     cos_sin_from_inv_frequencies,
     gather_mla_cos_sin,
+    rope_scaling_from_rope_parameters,
     rotate_half,
     yarn_get_mscale,
 )
+from ._vision import vision_grid_pos_embed_interpolate, vision_grid_rotary_embeddings
 
 __all__ = (
     "DeepseekScalingRotaryEmbedding",
@@ -134,6 +136,9 @@ __all__ = (
     "get_rope",
     "labeled_rope_cos_sin",
     "partial_rope_frequencies",
+    "rope_scaling_from_rope_parameters",
     "rotate_half",
+    "vision_grid_pos_embed_interpolate",
+    "vision_grid_rotary_embeddings",
     "yarn_get_mscale",
 )

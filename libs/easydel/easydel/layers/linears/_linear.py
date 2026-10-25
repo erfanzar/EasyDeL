@@ -53,6 +53,7 @@ from jaxtyping import Array, Shaped
 from spectrax.common_types import ColumnWise, Replicated, RowWise, SRowWise
 
 from easydel.infra.sharding import TensorLayout, sharding_for_layout
+from easydel.layers.norms import promote_dtype
 from easydel.layers.quantization._configs import QuantizationConfig
 
 if tp.TYPE_CHECKING:
@@ -71,26 +72,6 @@ class FusedProjectionLayout(tp.Protocol):
         config: "EasyDeLBaseConfig | None" = None,
         include_bias: bool = False,
     ) -> dict: ...
-
-
-def promote_dtype(values, *, dtype=None):
-    """Cast a tuple of arrays to a shared dtype.
-
-    Lightweight replacement for ``flax.linen.dtypes.promote_dtype`` that simply
-    forwards everything through ``jnp.asarray`` when a target dtype is given.
-
-    Args:
-        values: Iterable of arrays (or array-like values) to be promoted.
-        dtype: Target dtype to cast all values to. If ``None``, the inputs are
-            returned unchanged.
-
-    Returns:
-        Tuple of arrays cast to ``dtype`` if specified, otherwise the original
-        ``values`` argument unchanged.
-    """
-    if dtype is None:
-        return values
-    return tuple(jnp.asarray(v, dtype=dtype) for v in values)
 
 
 if tp.TYPE_CHECKING:
@@ -258,6 +239,8 @@ class ParallelLinear(spx.Module):
                 return x
 
         self._scale_operator: tp.Callable[[Array], Array] = _scale_operator
+        # The resolved numeric scale is kept so quantized twins (``to_quantized``) can reproduce the output scaling.
+        self.output_scale: float = scale_computed
         self.in_features: int = in_features
         self.out_features: int | collections.abc.Sequence[int] = out_features
         self.layout: FusedProjectionLayout | None = layout
@@ -487,6 +470,9 @@ class ParallelLinear(spx.Module):
             lambda rngs: firend(
                 in_features=self.in_features,
                 out_features=self.out_features,
+                # The resolved output scale (``scale="fan_in"`` etc.) must survive quantization, otherwise the
+                # quantized layer silently changes the activations by ``in_features ** -0.5``.
+                scale=getattr(self, "output_scale", 1.0),
                 use_bias=self.use_bias,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
@@ -497,6 +483,8 @@ class ParallelLinear(spx.Module):
                 # Fused projections rely on the layout for TP-interleave-aware
                 # activation splits; it must survive quantization.
                 layout=self.layout,
+                sharding_layout=self.sharding_layout,
+                bias_sharding_layout=self.bias_sharding_layout,
                 **kwargs,
                 rngs=rngs,
             ),

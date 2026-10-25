@@ -42,6 +42,7 @@ import jax
 import jax.numpy as jnp
 import spectrax as spx
 from eformer.loggings import get_logger
+from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -82,18 +83,40 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
-from easydel.layers.indexer import IndexerSelection, TokenIndexer, TokenIndexerConfig, paged_token_select
-from easydel.layers.moe import moe_group_topk_select
-from easydel.layers.rotary import apply_rope_interleaved, yarn_get_mscale
-from easydel.modules._base import BaseCausalLMModule
-from easydel.operations.kernels.dsa_sparse_attention import (
-    sparse_selected_training_attention,
+from easydel.layers.indexer import (
+    IndexerLayerNorm,
+    IndexerSelection,
+    TokenIndexer,
+    TokenIndexerConfig,
+    indexer_distillation_loss,
+    paged_token_select,
     use_sparse_training_attention,
 )
+from easydel.layers.moe import fp32_router_logits, moe_group_topk_select
+from easydel.layers.rotary import apply_rope_interleaved, apply_rope_split_half, yarn_get_mscale
+from easydel.modules._base import BaseCausalLMModule
+from easydel.operations.kernels.dsa_sparse_attention import sparse_selected_training_attention
 
 from .glm_moe_dsa_configuration import GlmMoeDsaConfig
 
 logger = get_logger(__name__)
+
+# Public family name, shared with the common implementation.
+GlmMoeDsaLayerNorm = IndexerLayerNorm
+
+
+@auto_pytree
+class _GlmMoeDsaAttentionOutput(AttentionLayerOutput):
+    """Attention output carrying the optional unscaled indexer warm-up loss."""
+
+    indexer_aux_loss: Array | None = None
+
+
+@auto_pytree
+class _GlmMoeDsaDecoderOutput(DecoderLayerOutput):
+    """Decoder output carrying the optional unscaled indexer warm-up loss."""
+
+    indexer_aux_loss: Array | None = None
 
 
 class GlmMoeDsaMLP(spx.Module):
@@ -186,61 +209,6 @@ class GlmMoeDsaMLP(spx.Module):
             Transformed hidden states with the same shape as input.
         """
         return gated_mlp_forward(self, hidden_states)
-
-
-class GlmMoeDsaLayerNorm(spx.Module):
-    """Standard Layer Normalisation with ``kernel``/``bias`` parameter names matching HF checkpoints.
-
-    Args:
-        hidden_size: Feature dimension to normalise over.
-        eps: Epsilon for numerical stability.
-        dtype: Computation dtype.
-        param_dtype: Parameter storage dtype.
-        rngs: PRNG key container.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        *,
-        rngs: spx.Rngs,
-    ):
-        """Initialize a LayerNorm with HF-compatible ``weight``/``bias`` names.
-
-        Args:
-            hidden_size: Feature dim to normalise over.
-            eps: Numerical stability epsilon.
-            dtype: Computation dtype.
-            param_dtype: Parameter dtype.
-            rngs: Random number generator collection (unused but kept for
-                signature compatibility with sibling modules).
-        """
-        self.hidden_size = hidden_size
-        self.eps = eps
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.weight = spx.Parameter(jnp.ones((hidden_size,), dtype=param_dtype))
-        self.bias = spx.Parameter(jnp.zeros((hidden_size,), dtype=param_dtype))
-
-    def forward(self, hidden_states: Float[Array, "... hidden_size"]) -> Float[Array, "... hidden_size"]:
-        """Apply LayerNorm in fp32 and return in the input dtype.
-
-        Args:
-            hidden_states: Tensor whose last axis has length ``hidden_size``.
-
-        Returns:
-            Normalised tensor with the same shape and dtype as the input.
-        """
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.astype(jnp.float32)
-        mean = jnp.mean(hidden_states, axis=-1, keepdims=True)
-        variance = jnp.mean((hidden_states - mean) ** 2, axis=-1, keepdims=True)
-        normed = (hidden_states - mean) * jax.lax.rsqrt(variance + self.eps)
-        out = normed * self.weight.value.astype(jnp.float32) + self.bias.value.astype(jnp.float32)
-        return out.astype(input_dtype)
 
 
 class GlmMoeDsaMLPStack(spx.Module):
@@ -415,11 +383,7 @@ class GlmMoeDsaTopKRouter(spx.Module):
         Returns:
             Router logits of shape ``(tokens, n_routed_experts)``.
         """
-        hidden_states = hidden_states.reshape(-1, self.config.hidden_size)
-        return checkpoint_name(
-            jnp.matmul(hidden_states.astype(jnp.float32), self.weight.value.astype(jnp.float32)),
-            "moe_router_logits",
-        )
+        return fp32_router_logits(hidden_states, self.weight.value, self.config.hidden_size)
 
 
 class GlmMoeDsaMoE(BaseMoeModule):
@@ -582,10 +546,53 @@ class GlmMoeDsaIndexer(TokenIndexer):
             rngs=rngs,
             base_config=config,
             norm_factory=partial(
-                GlmMoeDsaLayerNorm, config.index_head_dim, eps=1e-6, rngs=rngs, dtype=dtype, param_dtype=param_dtype
+                IndexerLayerNorm, config.index_head_dim, eps=1e-6, rngs=rngs, dtype=dtype, param_dtype=param_dtype
             ),
         )
         self.config = config
+
+    def distillation_scores(self, hidden_states, q_resid, position_ids, frequencies, visible):
+        """Return differentiable stateless pre-top-k scores, with unreachable tokens at ``-inf``.
+
+        The shared token indexer exposes selections only. Reproduce its fp32
+        prefix-RoPE, per-head ReLU and learned head weighting here, using the
+        same parameters. Inputs are detached so only indexer parameters train.
+
+        Args:
+            hidden_states: Layer inputs ``[B, S, hidden]``.
+            q_resid: Optional low-rank query inputs ``[B, S, rank]``.
+            position_ids: RoPE positions ``[B, S]``.
+            frequencies: Optional concatenated half-width cosine/sine table.
+            visible: Boolean causal/padding/segment reachability ``[B, S, S]``.
+
+        Returns:
+            Float32 indexer scores ``[B, S, S]`` before hard selection.
+        """
+        hidden_states = jax.lax.stop_gradient(hidden_states)
+        q_input = hidden_states if q_resid is None else jax.lax.stop_gradient(q_resid)
+        query = self.wq_b(q_input).reshape(*hidden_states.shape[:2], self.index_n_heads, self.index_head_dim)
+        key = self.k_norm(self.wk(hidden_states))
+        weights = self.kernels_proj(hidden_states).astype(jnp.float32) * (self.index_n_heads**-0.5)
+        query, key = query.astype(jnp.float32), key.astype(jnp.float32)
+        if frequencies is not None:
+            cos, sin = jnp.split(frequencies[position_ids], 2, axis=-1)
+            rope_dim = min(self.indexer_config.rope_dim, self.index_head_dim, cos.shape[-1] * 2)
+            rope_dim -= rope_dim % 2
+            if rope_dim > 0:
+                cos, sin = cos[..., : rope_dim // 2], sin[..., : rope_dim // 2]
+                q_pe, k_pe = query[..., :rope_dim], key[..., :rope_dim]
+                if self.indexer_rope_interleave:
+                    q_pe = apply_rope_interleaved(q_pe, cos[..., None, :], sin[..., None, :])
+                    k_pe = apply_rope_interleaved(k_pe, cos, sin)
+                else:
+                    cos, sin = jnp.concatenate((cos, cos), -1), jnp.concatenate((sin, sin), -1)
+                    q_pe = apply_rope_split_half(q_pe, cos, sin, unsqueeze_dim=-2)
+                    k_pe = apply_rope_split_half(k_pe, cos, sin, unsqueeze_dim=None)
+                query = jnp.concatenate((q_pe, query[..., rope_dim:]), -1)
+                key = jnp.concatenate((k_pe, key[..., rope_dim:]), -1)
+        scores = jnp.einsum("bshd,btd->bsht", query, key, precision=self.precision) * self.softmax_scale
+        scores = jnp.einsum("bsht,bsh->bst", jax.nn.relu(scores), weights, precision=self.precision)
+        return jnp.where(visible, scores, -jnp.inf)
 
 
 class GlmMoeDsaAttention(UnifiedAttention):
@@ -892,8 +899,9 @@ class GlmMoeDsaAttention(UnifiedAttention):
 
         Returns:
             :class:`AttentionLayerOutput` with the projected attention
-            output, optional attention weights, and the (possibly
-            updated) cache view.
+            output, optional attention weights, the (possibly updated) cache
+            view, and the unscaled indexer warm-up loss when enabled on a
+            stateless full-indexer layer.
         """
         bsz, q_len, _ = hidden_states.shape
         _use_mla_ragged = isinstance(cache_view, MLARaggedPagesCacheView) or (
@@ -998,9 +1006,9 @@ class GlmMoeDsaAttention(UnifiedAttention):
         if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
             sliding_window_for_kernel = None
 
-        indexer_mask = None
-        if mask_info is not None:
-            indexer_mask = pairwise_attention_mask_from_mask_info(mask_info, q_len, q_len)
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info, input_ids=None, inputs_embeds=hidden_states, attention_mask=None
+        )
 
         indexer_cached_keys = None
         if cache_view is not None and hasattr(cache_view, "recurrent_state"):
@@ -1028,6 +1036,8 @@ class GlmMoeDsaAttention(UnifiedAttention):
         )
 
         shared_indexer = self.config.indexer_types[self.layer_idx] == "shared"
+        aux_active = cache_view is None and not shared_indexer and self.config.indexer_aux_loss_coef > 0.0
+        indexer_aux_loss = None
         if shared_indexer:
             if previous_topk_indices is None:
                 raise ValueError("A shared GLM-MoE-DSA indexer requires a preceding full layer's top-k selection.")
@@ -1053,17 +1063,99 @@ class GlmMoeDsaAttention(UnifiedAttention):
             )
             cache_view = cache_view.replace(indexer_token_pages=token_pages)
             indexer_output = None
-        else:
+        elif isinstance(cache_view, TransformerCacheView):
+            # Ask the owning cache for its attention-time layout before the
+            # operation writes the rotated current keys. Placeholder rows are
+            # overwritten at the exact physical slots supplied below.
+            aligned_keys, index_mask, _ = cache_view.update_auxiliary(
+                jnp.zeros((bsz, q_len, self.index_head_dim), dtype=jnp.float32),
+                mask_info,
+                cache_metadata,
+                causal=self.causal,
+                mode=mode,
+                runtime_sharding_resolver=self.config.runtime_sharding_resolver,
+            )
+            pairwise_mask = index_mask.get_or_compute_attention_mask(dtype=jnp.bool_)[:, 0]
+            slots = index_mask.q_positions - index_mask.kv_positions[:, :1]
+            query_valid = jnp.any(pairwise_mask, axis=-1)
+            slots = jnp.where(query_valid, slots, -1)
+            query_segments, key_segments = index_mask.get_or_compute_segment_ids()
             indexer_output = self.indexer(
                 hidden_states=hidden_states,
                 q_resid=q_resid,
                 position_ids=position_ids,
                 frequencies=freq_array,
-                attention_mask=indexer_mask,
+                attention_mask=pairwise_mask,
+                cached_keys=aligned_keys,
+                use_cache=True,
+                cache_positions=slots,
+                key_valid_mask=jnp.any(pairwise_mask, axis=-2),
+                query_positions=index_mask.q_positions,
+                key_positions=index_mask.kv_positions,
+                segment_ids=query_segments,
+                key_segment_ids=key_segments,
+            )
+            # Use the same public append for persistent storage: sliding block
+            # attention contains the old tail plus current rows, while its
+            # stored state must retain only the final fixed-capacity window.
+            current_keys = jnp.take_along_axis(indexer_output.cached_keys, jnp.maximum(slots, 0)[..., None], axis=1)
+            _, _, cache_view = cache_view.update_auxiliary(
+                current_keys,
+                mask_info,
+                cache_metadata,
+                causal=self.causal,
+                mode=mode,
+                runtime_sharding_resolver=self.config.runtime_sharding_resolver,
+            )
+            topk_indices = indexer_output.topk_indices
+        else:
+            indexer_output = self.indexer(
+                hidden_states=jax.lax.stop_gradient(hidden_states) if aux_active else hidden_states,
+                q_resid=jax.lax.stop_gradient(q_resid) if aux_active and q_resid is not None else q_resid,
+                position_ids=position_ids,
+                frequencies=freq_array,
+                attention_mask=pairwise_attention_mask_from_mask_info(mask_info, q_len, q_len),
                 cached_keys=indexer_cached_keys,
                 use_cache=cache_view is not None,
             )
             topk_indices = indexer_output.topk_indices
+
+        if aux_active:
+            # Train against dense causal MLA attention, not the hard top-k subset.
+            # Physical token order supplies causality even when packed RoPE positions reset.
+            positions = jnp.broadcast_to(jnp.arange(q_len, dtype=jnp.int32), (bsz, q_len))
+            visible = positions[:, None, :] <= positions[:, :, None]
+            pairwise = pairwise_attention_mask_from_mask_info(mask_info, q_len, q_len)
+            if pairwise is not None:
+                visible = visible & pairwise
+            q_segments, key_segments = mask_info.get_or_compute_segment_ids()
+            if q_segments.ndim == 3:
+                q_segments = q_segments[:, 0]
+            if key_segments.ndim == 3:
+                key_segments = key_segments[:, 0]
+            visible = visible & (q_segments[:, :, None] >= 0) & (key_segments[:, None, :] >= 0)
+            visible = visible & (q_segments[:, :, None] == key_segments[:, None, :])
+            scores = self.indexer.distillation_scores(hidden_states, q_resid, position_ids, freq_array, visible)
+            indexer_aux_loss = indexer_distillation_loss(
+                query_states.transpose(0, 2, 1, 3),
+                key_states.transpose(0, 2, 1, 3),
+                scores,
+                scaling=self.attention_performer.softmax_scale,
+                precision=self.precision,
+                entry_valid=jnp.any(visible, axis=-2),
+                q_positions=positions,
+                entry_positions=positions,
+                q_segment_ids=q_segments,
+                entry_segment_ids=key_segments,
+            )
+
+        if topk_indices is not None and indexer_output is not None and indexer_output.topk_mask is not None:
+            # Legacy indexer calls preserve raw top-k filler indices when fewer
+            # than k keys are visible. Only topk_mask carries their validity.
+            # Shared layers receive indices alone, so encode that validity before
+            # handing the selection off rather than resurrecting masked keys.
+            selected_valid = jnp.take_along_axis(indexer_output.topk_mask, jnp.maximum(topk_indices, 0), axis=-1)
+            topk_indices = jnp.where((topk_indices >= 0) & selected_valid, topk_indices, -1)
 
         if (
             indexer_output is not None
@@ -1103,15 +1195,6 @@ class GlmMoeDsaAttention(UnifiedAttention):
             mla_kwargs["sparse_chunk_size"] = 1
         elif topk_indices is not None:
             kv_len = key_states.shape[1]
-            topk_kv_len = (
-                kv_len
-                if shared_indexer
-                else (
-                    int(indexer_output.cached_keys.shape[1])
-                    if indexer_output.cached_keys is not None
-                    else int(hidden_states.shape[1])
-                )
-            )
             if _use_mla_ragged:
                 # Reached only without paged indexer state (cache built without indexer pages, or
                 # rank-major DP metadata). The indexer then sees only the current step, so the
@@ -1123,23 +1206,41 @@ class GlmMoeDsaAttention(UnifiedAttention):
                     "diverges from the reference once the context exceeds index_topk=%s tokens.",
                     self.index_topk,
                 )
-            elif topk_kv_len == kv_len and mask_info is not None:
+            else:
                 topk_mask = None if shared_indexer else indexer_output.topk_mask
                 if topk_mask is None or topk_mask.shape[-1] != kv_len:
                     topk_mask = IndexerSelection(topk_indices).to_mask(kv_len)
                 attention_mask = pairwise_attention_mask_from_mask_info(mask_info, q_len, kv_len)
                 combined_mask = topk_mask if attention_mask is None else attention_mask & topk_mask
-                if attention_mask is not None:
-                    mask_info = mask_info.replace(attention_mask=combined_mask[:, None, :, :])
+                # Token selection already applies absolute-position causality,
+                # including selections reused by shared layers. An absolute
+                # history mask may not be tagged causal by the cache: a second
+                # chunk-relative triangle would hide valid continuation keys.
+                mask_info = mask_info.replace(
+                    attention_mask=combined_mask[:, None, :, :],
+                    causal_mask_baked_in=mask_info.causal_mask_baked_in or self.causal,
+                )
+                causal_for_kernel = False
 
-        if combined_mask is not None and use_sparse_training_attention(
-            self,
-            topk_indices,
-            cache_view,
-            mask_info,
-            output_attentions,
-            sliding_window_for_kernel,
-            seq_len=q_len,
+        # The sparse training operation has no dropout/RNG contract. Match the
+        # dispatcher's effective training state before allowing that fast path.
+        deterministic = self.attention_performer.deterministic
+        if deterministic is None:
+            deterministic = mode != common_types.MODE_TRAIN or not self.attention_performer.training
+        attention_dropout_active = not deterministic and self.attention_performer.dropout_prob > 0.0
+        if (
+            combined_mask is not None
+            and not attention_dropout_active
+            and use_sparse_training_attention(
+                topk_indices=topk_indices,
+                cache_view=cache_view,
+                mask_info=mask_info,
+                output_attentions=output_attentions,
+                sliding_window=sliding_window_for_kernel,
+                softmax_aux=self.get_softmax_aux(),
+                sparse_training=getattr(self.config, "dsa_sparse_training", None),
+                seq_len=q_len,
+            )
         ):
             # Training/no-cache: same per-head q/k/v and top-k mask as the dense path, but a
             # tile-skipping flash kernel instead of materialized [B, H, S, S] masked scores.
@@ -1158,7 +1259,12 @@ class GlmMoeDsaAttention(UnifiedAttention):
             attn_output = self.shard_attention_prod(attn_heads.astype(hidden_states.dtype).reshape(bsz, q_len, -1))
             attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
             attn_output = self.shard_attention_prod(attn_output)
-            result = AttentionLayerOutput(attention_output=attn_output, attention_weight=None, cache_view=cache_view)
+            result = _GlmMoeDsaAttentionOutput(
+                attention_output=attn_output,
+                attention_weight=None,
+                cache_view=cache_view,
+                indexer_aux_loss=indexer_aux_loss,
+            )
             return (result, topk_indices) if return_topk_indices else result
 
         softmax_aux = self._softmax_aux()
@@ -1176,6 +1282,7 @@ class GlmMoeDsaAttention(UnifiedAttention):
             causal=causal_for_kernel,
             sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
+            output_attentions=output_attentions,
             **mla_kwargs,
         )
 
@@ -1219,10 +1326,11 @@ class GlmMoeDsaAttention(UnifiedAttention):
         attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
         attn_output = self.shard_attention_prod(attn_output)
 
-        result = AttentionLayerOutput(
+        result = _GlmMoeDsaAttentionOutput(
             attention_output=attn_output,
             attention_weight=attentions.attention_weights if output_attentions else None,
             cache_view=cache_view,
+            indexer_aux_loss=indexer_aux_loss,
         )
         return (result, topk_indices) if return_topk_indices else result
 
@@ -1409,17 +1517,27 @@ class GlmMoeDsaDecoderLayer(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        result = DecoderLayerOutput(
+        result = _GlmMoeDsaDecoderOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
             cache_view=attn_outputs.cache_view,
             router_logits=router_logits,
+            indexer_aux_loss=attn_outputs.indexer_aux_loss,
         )
         return (result, topk_indices) if return_topk_indices else result
 
 
+class _GlmMoeDsaIndexerCacheMixin:
+    """Allocate position-aligned token indexer features with ordinary MLA KV."""
+
+    def create_transformer_cache_config(self, batch_size, max_length, pad_token_id=None, layer_idx=None):
+        """Retain standard geometry and request persistent float32 indexer keys."""
+        config = super().create_transformer_cache_config(batch_size, max_length, pad_token_id, layer_idx)
+        return config.replace(auxiliary_dim=self.config.get_text_config().index_head_dim)
+
+
 @register_module(TaskType.BASE_MODULE, config=GlmMoeDsaConfig, model_type="glm_moe_dsa")
-class GlmMoeDsaModel(EasyDeLBaseModule):
+class GlmMoeDsaModel(_GlmMoeDsaIndexerCacheMixin, EasyDeLBaseModule):
     """GLM-MoE-DSA base transformer model (no language-model head).
 
     Stacks an embedding layer, ``num_hidden_layers`` decoder layers
@@ -1558,7 +1676,9 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
         Returns:
             :class:`MoeModelOutput` with the final hidden state, optional
             collections of intermediate states/attentions/router logits,
-            and the (updated) KV cache.
+            and the (updated) KV cache. ``indexer_aux_loss`` is the unscaled
+            per-full-indexer-layer sum only for stateless forwards with a
+            positive ``indexer_aux_loss_coef``; otherwise it is ``None``.
 
         Raises:
             ValueError: If neither/both of ``input_ids``/``inputs_embeds``
@@ -1612,6 +1732,7 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
         views = past_key_values.views if past_key_values is not None else None
         has_cache_views = views is not None and any(v is not None for v in views)
         needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        aux_active = not has_cache_views and self.config.indexer_aux_loss_coef > 0.0
         # Router-logit aggregation grows a Python tuple per layer, which
         # lax.scan cannot carry — collecting it forces the trace path too.
         has_shared_indexers = "shared" in self.config.indexer_types
@@ -1635,6 +1756,8 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
             scan and collects optional outputs requested by the outer
             ``forward``.
             """
+            if aux_active:
+                carry, indexer_aux = carry[:-1], carry[-1]
             if has_shared_indexers:
                 hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx, prev_topk = carry
             else:
@@ -1674,12 +1797,20 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
             )
 
             result = (hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1)
-            return (*result, prev_topk) if has_shared_indexers else result
+            if has_shared_indexers:
+                result = (*result, prev_topk)
+            if aux_active:
+                if layer_outputs.indexer_aux_loss is not None:
+                    indexer_aux = indexer_aux + layer_outputs.indexer_aux_loss
+                result = (*result, indexer_aux)
+            return result
 
         initial = (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0)
         if has_shared_indexers:
             initial = (*initial, None)
-        final = self.layers.scan(_layer_loop, initial, trace=trace_layers)
+        if aux_active:
+            initial = (*initial, jnp.zeros((), dtype=jnp.float32))
+        final = self.layers.scan(_layer_loop, initial, trace=trace_layers, **self._layer_scan_kwargs("text"))
         hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = final[:6]
         hidden_states = self.norm(hidden_states)
 
@@ -1692,11 +1823,12 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
             attentions=all_attentions,
             router_logits=all_router_logits,
             past_key_values=past_key_values,
+            indexer_aux_loss=final[-1] if aux_active else None,
         )
 
 
 @register_module(TaskType.CAUSAL_LM, config=GlmMoeDsaConfig, model_type="glm_moe_dsa")
-class GlmMoeDsaForCausalLM(BaseCausalLMModule[GlmMoeDsaModel, GlmMoeDsaConfig]):  # type: ignore
+class GlmMoeDsaForCausalLM(_GlmMoeDsaIndexerCacheMixin, BaseCausalLMModule[GlmMoeDsaModel, GlmMoeDsaConfig]):  # type: ignore
     """GLM-MoE-DSA model with a causal language-modelling head.
 
     Wraps :class:`GlmMoeDsaModel` and adds a linear LM head (no bias) that

@@ -44,9 +44,9 @@ References:
 """
 
 import jax
-import jax.numpy as jnp
 from eformer.pytree import auto_pytree
 from ejkernel.modules import state_space_v1  # pyright: ignore[reportMissingTypeStubs]
+from jax import numpy as jnp
 from jaxtyping import Array, Float
 
 from easydel.caching import RecurrentCacheView
@@ -104,7 +104,102 @@ def _single_step_ssm1_fwd(
     return y, ssm_state_new
 
 
-def _packed_ssm1_fwd(
+def _reference_ssm1_fwd(
+    hidden_states: Array,
+    A_real: Array,
+    B: Array,
+    C: Array,
+    D: Array,
+    discrete_time_step: Array,
+    *,
+    ssm_state: Array | None = None,
+    valid: Array | None = None,
+    reset: Array | None = None,
+    gate: Array | None = None,
+    act_fn=None,
+    use_associative_scan: bool = False,
+) -> tuple[Array, Array]:
+    """Run float32 affine SSM transitions with either reference scan algorithm.
+
+    Args:
+        hidden_states: Inputs [batch, length, intermediate_size].
+        A_real: Real transition coefficients [intermediate_size, state_size].
+        B: Input coefficients [batch, length, state_size].
+        C: Output coefficients [batch, length, state_size].
+        D: Skip coefficients [intermediate_size].
+        discrete_time_step: Positive steps [batch, length, intermediate_size].
+        ssm_state: Optional initial state [batch, intermediate_size, state_size].
+        valid: Optional [batch, length] mask; invalid cells are identity transitions.
+        reset: Optional [batch, length] mask resetting state before a valid token.
+        gate: Optional output gate [batch, length, intermediate_size].
+        act_fn: Activation applied to the output gate, when provided.
+        use_associative_scan: Compose affine transitions in parallel instead of
+            applying the recurrence sequentially.
+
+    Returns:
+        Float32 outputs and final recurrent state; an empty sequence keeps its initial state.
+    """
+    batch, length, intermediate = hidden_states.shape
+    state0 = (
+        jnp.zeros((batch, intermediate, A_real.shape[-1]), dtype=jnp.float32)
+        if ssm_state is None
+        else ssm_state.astype(jnp.float32)
+    )
+    if length == 0:
+        return jnp.zeros(hidden_states.shape, dtype=jnp.float32), state0
+
+    x = hidden_states.astype(jnp.float32)
+    b = B.astype(jnp.float32)
+    c = C.astype(jnp.float32)
+    dt = discrete_time_step.astype(jnp.float32)
+    if valid is not None:
+        # Padding may contain arbitrary values (including NaNs). Mask operands
+        # before discretizing, so padding cannot contaminate a prefix or its gradients.
+        x = jnp.where(valid[..., None], x, 0.0)
+        b = jnp.where(valid[..., None], b, 0.0)
+        c = jnp.where(valid[..., None], c, 0.0)
+        dt = jnp.where(valid[..., None], dt, 0.0)
+    transition = jnp.exp(dt[..., None] * A_real.astype(jnp.float32)[None, None, :, :])
+    update = dt[..., None] * b[:, :, None, :] * x[..., None]
+    if reset is not None:
+        transition = jnp.where(reset[..., None, None], 0.0, transition)
+    if valid is not None:
+        transition = jnp.where(valid[..., None, None], transition, 1.0)
+        update = jnp.where(valid[..., None, None], update, 0.0)
+
+    if use_associative_scan:
+
+        def compose(left, right):
+            a_left, b_left = left
+            a_right, b_right = right
+            return a_right * a_left, a_right * b_left + b_right
+
+        prefix_a, prefix_b = jax.lax.associative_scan(compose, (transition, update), axis=1)
+        states = prefix_a * state0[:, None, :, :] + prefix_b
+        final_state = states[:, -1]
+        outputs = jnp.sum(states * c[:, :, None, :], axis=-1) + D.astype(jnp.float32)[None, None, :] * x
+    else:
+
+        def step(state, values):
+            a_t, b_t, c_t, x_t = values
+            next_state = a_t * state + b_t
+            y_t = jnp.sum(next_state * c_t[:, None, :], axis=-1) + D.astype(jnp.float32)[None, :] * x_t
+            return next_state, y_t
+
+        final_state, outputs = jax.lax.scan(step, state0, tuple(v.swapaxes(0, 1) for v in (transition, update, c, x)))
+        outputs = outputs.swapaxes(0, 1)
+
+    if gate is not None and act_fn is not None:
+        gate = gate.astype(jnp.float32)
+        if valid is not None:
+            gate = jnp.where(valid[..., None], gate, 0.0)
+        outputs = outputs * act_fn(gate)
+    if valid is not None:
+        outputs = jnp.where(valid[..., None], outputs, 0.0)
+    return outputs, final_state
+
+
+def packed_ssm1_fwd(
     hidden_states: Float[Array, "slots width intermediate_size"],
     A_real: Float[Array, "intermediate_size ssm_state_size"],
     B: Float[Array, "slots width ssm_state_size"],
@@ -113,27 +208,44 @@ def _packed_ssm1_fwd(
     discrete_time_step: Float[Array, "slots width intermediate_size"],
     valid: Array,
     ssm_state: Float[Array, "slots intermediate_size ssm_state_size"],
+    *,
+    use_associative_scan: bool = False,
 ) -> tuple[Float[Array, "slots width intermediate_size"], Float[Array, "slots intermediate_size ssm_state_size"]]:
     """Run the SSM1 recurrence across slot-major packed grids.
 
     Invalid (padding) cells are identity transitions: they emit zero and keep
     the incoming state, allowing each slot to have an independent ragged length.
+
+    Args:
+        hidden_states: Inputs shaped [slots, width, intermediate_size].
+        A_real: Negative real transition coefficients [intermediate_size, state_size].
+        B: Input coefficients [slots, width, state_size].
+        C: Output coefficients [slots, width, state_size].
+        D: Skip coefficients [intermediate_size].
+        discrete_time_step: Positive steps [slots, width, intermediate_size].
+        valid: Boolean validity mask [slots, width].
+        ssm_state: Initial recurrent state [slots, intermediate_size, state_size].
+        use_associative_scan: Compose affine transitions in parallel when True;
+            otherwise use the sequential recurrence.
+
+    Returns:
+        Outputs in the input layout and final float32 recurrent states.
     """
-    state0 = ssm_state.astype(jnp.float32)
-
-    def step(state, values):
-        x, b, c, dt, is_valid = values
-        y, updated = _single_step_ssm1_fwd(x, A_real, b, c, D, dt, state)
-        next_state = jnp.where(is_valid[:, None, None], updated, state)
-        y = jnp.where(is_valid[:, None], y, jnp.zeros_like(y))
-        return next_state, y
-
-    final_state, outputs = jax.lax.scan(
-        step,
-        state0,
-        tuple(v.swapaxes(0, 1) for v in (hidden_states, B, C, discrete_time_step, valid)),
+    return _reference_ssm1_fwd(
+        hidden_states,
+        A_real,
+        B,
+        C,
+        D,
+        discrete_time_step,
+        valid=valid,
+        ssm_state=ssm_state,
+        use_associative_scan=use_associative_scan,
     )
-    return outputs.swapaxes(0, 1), final_state
+
+
+# Compatibility for existing model callers; new callers use the public helper.
+_packed_ssm1_fwd = packed_ssm1_fwd
 
 
 def _segmented_ssm1_fwd(
@@ -148,53 +260,36 @@ def _segmented_ssm1_fwd(
     gate: Float[Array, "batch seq_len intermediate_size"] | None = None,
     ssm_state: Float[Array, "batch intermediate_size ssm_state_size"] | None = None,
     act_fn=None,
+    use_associative_scan: bool = False,
 ) -> tuple[Float[Array, "batch seq_len intermediate_size"], Float[Array, "batch intermediate_size ssm_state_size"]]:
-    """Reference SSM1 scan that resets recurrent state at packed boundaries."""
-    batch_size, seq_len, intermediate_size = hidden_states.shape
-    state_size = A_real.shape[-1]
+    """Run either reference scan, resetting state between packed documents.
+
+    The first valid token continues a supplied initial state, including after
+    leading padding. Padding preserves state but separates subsequent document
+    runs; a valid token after interior padding therefore starts a new run.
+    """
+    seq_len = hidden_states.shape[1]
     segment_ids = normalize_packed_segment_ids(segment_ids, seq_len, pad_from_last=False)
-    if ssm_state is None:
-        ssm_state = jnp.zeros((batch_size, intermediate_size, state_size), dtype=jnp.float32)
-    else:
-        ssm_state = ssm_state.astype(jnp.float32)
-    previous_segment = jnp.full((batch_size,), -1, dtype=segment_ids.dtype)
-
-    gate_seq = None if gate is None else gate.swapaxes(0, 1)
-
-    def _step(carry, step_inputs):
-        state, prev_segment = carry
-        x_t, b_t, c_t, dt_t, segment_t = step_inputs[:5]
-        gate_t = None if gate_seq is None else step_inputs[5]
-        valid = segment_t >= 0
-        new_segment = valid & (segment_t != prev_segment)
-        state = jnp.where(new_segment[:, None, None], jnp.zeros_like(state), state)
-        y_t, next_state = _single_step_ssm1_fwd(
-            hidden_states=x_t,
-            A=A_real,
-            B=b_t,
-            C=c_t,
-            D=D,
-            dt=dt_t,
-            ssm_state=state,
-        )
-        if gate_t is not None and act_fn is not None:
-            y_t = y_t * act_fn(gate_t)
-        y_t = jnp.where(valid[:, None], y_t, jnp.zeros_like(y_t))
-        next_state = jnp.where(valid[:, None, None], next_state, jnp.zeros_like(next_state))
-        next_segment = jnp.where(valid, segment_t, -1)
-        return (next_state, next_segment), y_t
-
-    scan_inputs = (
-        hidden_states.swapaxes(0, 1),
-        B.swapaxes(0, 1),
-        C.swapaxes(0, 1),
-        discrete_time_step.swapaxes(0, 1),
-        segment_ids.swapaxes(0, 1),
+    valid = segment_ids >= 0
+    previous = jnp.concatenate((jnp.full_like(segment_ids[:, :1], -1), segment_ids[:, :-1]), axis=1)
+    # The initial state belongs to the first valid document. Further boundaries
+    # (including an intervening pad) reset it, not the first token of a chunk.
+    seen_before = jnp.cumsum(valid.astype(jnp.int32), axis=1) - valid.astype(jnp.int32) > 0
+    reset = valid & seen_before & (segment_ids != previous)
+    return _reference_ssm1_fwd(
+        hidden_states,
+        A_real,
+        B,
+        C,
+        D,
+        discrete_time_step,
+        valid=valid,
+        reset=reset,
+        gate=gate,
+        ssm_state=ssm_state,
+        act_fn=act_fn,
+        use_associative_scan=use_associative_scan,
     )
-    if gate_seq is not None:
-        scan_inputs = (*scan_inputs, gate_seq)
-    (final_state, _), outputs = jax.lax.scan(_step, (ssm_state, previous_segment), scan_inputs)
-    return outputs.swapaxes(0, 1), final_state
 
 
 @auto_pytree
@@ -284,13 +379,16 @@ class SSM1Op(OperationImpl):
         ssm_state: Float[Array, "batch intermediate_size ssm_state_size"] | None = None,
         segment_ids: Array | None = None,
         activation: str = "silu",
+        use_associative_scan: bool | None = None,
+        use_mambapy: bool = False,
         **kwargs,
     ) -> SSM1Output:
-        """Forward pass for SSM1 operation using ejKernel.
+        """Forward pass for SSM1 with automatic or explicit reference scan selection.
 
-        Delegates to ejkernel.modules.operations.state_space_v1 for the core
-        SSM computation, which provides optimized implementations with automatic
-        platform selection.
+        Both associative and sequential non-mambapy calls use the registered
+        ejkernel state_space_v1 path. An explicit use_mambapy request selects
+        the JAX reference independently of the scan algorithm; it does not require
+        the PyTorch mambapy package. Packed boundaries use a reset-aware scan.
 
         Args:
             hidden_states: Input after conv and activation [batch, seq_len, d]
@@ -302,7 +400,15 @@ class SSM1Op(OperationImpl):
             gate: Optional gating tensor [batch, seq_len, d]
             conv_state: Optional conv state for caching
             ssm_state: Optional SSM state for caching
+            segment_ids: Optional document ids; negative ids mark identity padding.
+                The first valid document continues ssm_state; subsequent runs reset.
             activation: Activation function name for gating
+            use_associative_scan: True selects parallel affine composition, False
+                selects the sequential recurrence, and None preserves automatic
+                ejkernel selection (sequential for segmented inputs).
+            use_mambapy: Select the JAX Mamba Python-reference path instead of
+                ejkernel. Defaults to associative scan unless explicitly overridden.
+            **kwargs: Additional backend-compatible arguments.
 
         Returns:
             SSM1Output with outputs and updated states
@@ -316,7 +422,8 @@ class SSM1Op(OperationImpl):
 
         act_fn = ACT2FN.get(activation, jax.nn.silu) if gate is not None else None
 
-        if segment_ids is not None and hidden_states.shape[1] > 1:
+        associative = bool(use_associative_scan) if use_associative_scan is not None else bool(use_mambapy)
+        if segment_ids is not None:
             y, new_ssm_state = _segmented_ssm1_fwd(
                 hidden_states=hidden_states,
                 A_real=A_real,
@@ -328,6 +435,27 @@ class SSM1Op(OperationImpl):
                 gate=gate,
                 ssm_state=ssm_state,
                 act_fn=act_fn,
+                use_associative_scan=associative,
+            )
+            return SSM1Output(
+                attention_outputs=y.astype(dtype),
+                attention_weights=None,
+                conv_state=conv_state,
+                ssm_state=new_ssm_state.astype(dtype),
+            )
+
+        if use_mambapy or hidden_states.shape[1] == 0:
+            y, new_ssm_state = _reference_ssm1_fwd(
+                hidden_states,
+                A_real,
+                B,
+                C,
+                D,
+                discrete_time_step,
+                ssm_state=ssm_state,
+                gate=gate,
+                act_fn=act_fn,
+                use_associative_scan=associative,
             )
             return SSM1Output(
                 attention_outputs=y.astype(dtype),
@@ -349,6 +477,7 @@ class SSM1Op(OperationImpl):
             initial_state=ssm_state,
             conv_state=conv_state,
             act_fn=act_fn,
+            use_associative_scan=use_associative_scan,
         )
 
         return SSM1Output(
@@ -383,6 +512,8 @@ class SSM1Op(OperationImpl):
         ssm_state: Float[Array, "batch intermediate_size ssm_state_size"] | None = None,
         segment_ids: Array | None = None,
         activation: str = "silu",
+        use_associative_scan: bool | None = None,
+        use_mambapy: bool = False,
         **kwargs,
     ) -> SSM1Output:
         """Execute the SSM1 operation.
@@ -399,7 +530,12 @@ class SSM1Op(OperationImpl):
             gate: Optional gate tensor
             conv_state: Optional conv state
             ssm_state: Optional SSM state
+            segment_ids: Optional document ids, with negative ids marking padding.
             activation: Activation function name
+            use_associative_scan: True for parallel affine composition, False for
+                sequential recurrence, None for automatic kernel selection.
+            use_mambapy: Use the JAX Mamba reference instead of the optimized kernel.
+            **kwargs: Additional backend-compatible arguments.
 
         Returns:
             SSM1Output with outputs and states
@@ -416,6 +552,8 @@ class SSM1Op(OperationImpl):
             ssm_state=ssm_state,
             segment_ids=segment_ids,
             activation=activation,
+            use_associative_scan=use_associative_scan,
+            use_mambapy=use_mambapy,
             **kwargs,
         )
 

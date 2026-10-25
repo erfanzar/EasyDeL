@@ -167,7 +167,9 @@ class Internlm2ToolParser(ToolParser):
             return None
 
         new_delta = current_text[last_pos:]
-        text, action = new_delta.split("<|action_start|><|plugin|>")
+        # maxsplit=1: a later action marker stays inside `action` and is cut off by the
+        # <|action_end|> split below instead of breaking the two-name unpack.
+        text, action = new_delta.split("<|action_start|><|plugin|>", 1)
 
         if len(text) > 0:
             self.position = self.position + len(text)
@@ -275,14 +277,18 @@ class Internlm2ToolParser(ToolParser):
         text = model_output
         tools = request.tools
         if "<|action_start|><|plugin|>" in text:
-            text, action = text.split("<|action_start|><|plugin|>")
+            text, action = text.split("<|action_start|><|plugin|>", 1)
             action = action.split("<|action_end|>".strip())[0]
             action = action[action.find("{") :]
-            action_dict = json.loads(action)
-            name, parameters = (
-                action_dict["name"],
-                json.dumps(action_dict.get("parameters", action_dict.get("arguments", {})), ensure_ascii=False),
-            )
+            try:
+                action_dict = json.loads(action)
+                name, parameters = (
+                    action_dict["name"],
+                    json.dumps(action_dict.get("parameters", action_dict.get("arguments", {})), ensure_ascii=False),
+                )
+            except (ValueError, KeyError, TypeError, AttributeError):
+                logger.exception("Failed to parse InternLM2 action as a tool call")
+                return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
             if not tools or name not in [t.function.name for t in tools]:
                 return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=text)

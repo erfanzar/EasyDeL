@@ -51,6 +51,7 @@ from ejkernel.ops import (
 from ejkernel.ops.config.persistent import PersistentCache
 
 from ..base import detect_platform
+from ._pooled_bias import expand_pooled_bias
 from .configs import CompressedWindowAttentionConfig
 
 
@@ -91,13 +92,16 @@ class CompressedWindowAttention(Kernel[CompressedWindowAttentionConfig, Array]):
         cfg: CompressedWindowAttentionConfig,
         token_valid: Array | None = None,
         entry_topk: Array | None = None,
+        bias_pool: Float[Array, "batch q_len num_pools"] | None = None,
+        bias_tails: Array | None = None,
     ) -> Float[Array, "batch num_heads q_len head_dim"]:
         """Execute compressed-window full-sequence attention.
 
         Args:
             query: Rotated queries ``[batch, num_heads, q_len, head_dim]``.
             kv: Shared key/value axis ``[batch, kv_len, head_dim]`` (``K == V``).
-            bias: Additive fp32 mask ``[batch, q_len, kv_len]`` (head-broadcast).
+            bias: Additive fp32 mask ``[batch, q_len, kv_len]`` (head-broadcast), or ``None`` when the bias
+                arrives pooled.
             softmax_aux: Optional per-head sink logits ``[num_heads]``.
             softmax_scale: Logit scale; defaults to ``head_dim ** -0.5``.
             platform: Optional platform override.
@@ -106,9 +110,16 @@ class CompressedWindowAttention(Kernel[CompressedWindowAttentionConfig, Array]):
                 ``bias`` then holds only the compressed-entry columns.
             entry_topk: Optional selected entry ids ``[batch, q_len, k]`` replacing
                 the entry columns of ``bias`` (requires ``token_valid``).
+            bias_pool: Optional per-pool bias ``[batch, q_len, num_pools]`` (``cfg.bias_kpool`` keys per pool),
+                expanded here to the per-key bias, so under ``shard_map`` the replicated input (and its
+                head-axis cotangent reduction) is the pooled one.
+            bias_tails: Optional ``[batch, q_len, T]`` int tail key ids opened individually (``-1`` = none).
 
         Returns:
             Attention output ``[batch, num_heads, q_len, head_dim]``.
+
+        Raises:
+            ValueError: If neither ``bias`` nor ``bias_pool`` is given, or ``bias_pool`` lacks ``cfg.bias_kpool``.
         """
         cfg_backend = getattr(cfg, "backend", Backend.ANY)
         if platform is not None:
@@ -118,7 +129,18 @@ class CompressedWindowAttention(Kernel[CompressedWindowAttentionConfig, Array]):
                 backend=Backend.ANY if platform == "xla" else cfg_backend,
                 window=getattr(cfg, "window", 0),
                 token_kv_len=getattr(cfg, "token_kv_len", 0),
+                backward=getattr(cfg, "backward", "flash"),
+                causal=getattr(cfg, "causal", False),
+                bias_kpool=getattr(cfg, "bias_kpool", 0),
+                bias_closed=getattr(cfg, "bias_closed", None),
             )
+        if bias is None:
+            if bias_pool is None:
+                raise ValueError("compressed_window_attention needs `bias` or `bias_pool`.")
+            kpool = int(getattr(cfg, "bias_kpool", 0) or 0)
+            if kpool <= 0:
+                raise ValueError("`bias_pool` needs cfg.bias_kpool > 0 (keys per pool).")
+            bias = expand_pooled_bias(bias_pool, kpool, kv.shape[1], bias_tails, getattr(cfg, "bias_closed", None))
         impl = self.get_impl(cfg)
         return impl(
             query=query,
@@ -131,6 +153,8 @@ class CompressedWindowAttention(Kernel[CompressedWindowAttentionConfig, Array]):
             token_kv_len=getattr(cfg, "token_kv_len", 0),
             token_valid=token_valid,
             entry_topk=entry_topk,
+            backward=getattr(cfg, "backward", "flash"),
+            causal=getattr(cfg, "causal", False),
         )
 
     def heuristic_cfg(self, inv: Invocation[CompressedWindowAttentionConfig, Array]) -> CompressedWindowAttentionConfig:
@@ -157,15 +181,19 @@ class CompressedWindowAttention(Kernel[CompressedWindowAttentionConfig, Array]):
         check_vma: bool = False,
         token_valid: Array | None = None,
         entry_topk: Array | None = None,
+        bias_pool: Array | None = None,
+        bias_tails: Array | None = None,
     ):
         """Build a ``shard_map`` wrapper for head-parallel (TP) execution.
 
         The single shared KV head is replicated across the tensor-parallel axis
         and the query/output heads are sharded, so each device runs the kernel
         over its local heads with no in-kernel collectives. The wrapper is
-        differentiable (``shard_map`` composes with ``jax.grad``). When
-        ``token_valid`` is given it is a fifth ``shard_map`` operand and
-        ``in_specs`` must carry a fifth spec for it.
+        differentiable (``shard_map`` composes with ``jax.grad``). Optional
+        operands (``token_valid``, ``entry_topk``, ``bias_pool``, ``bias_tails``)
+        ride after the four fixed ones in that order, each only when given, and
+        ``in_specs`` carries one spec per operand. A pooled bias is expanded
+        inside the body, so the replicated operand is the ``[B, S, P]`` pool.
 
         Args:
             query: Queries ``[batch, num_heads, q_len, head_dim]``.
@@ -182,6 +210,8 @@ class CompressedWindowAttention(Kernel[CompressedWindowAttentionConfig, Array]):
             check_vma: Whether to check for valid memory access patterns.
             token_valid: Optional per-key token validity ``[batch, token_kv_len]``.
             entry_topk: Optional selected entry ids ``[batch, q_len, k]``.
+            bias_pool: Optional per-pool bias ``[batch, q_len, num_pools]`` (``bias`` is then ``None``).
+            bias_tails: Optional ``[batch, q_len, T]`` tail key ids of the pooled bias.
 
         Returns:
             Tuple ``(shard_map_fn, call_args)``.
@@ -192,7 +222,12 @@ class CompressedWindowAttention(Kernel[CompressedWindowAttentionConfig, Array]):
         # Optional array operands ride after the four fixed ones, in this order, only when given.
         extras = [
             (name, value)
-            for name, value in (("token_valid", token_valid), ("entry_topk", entry_topk))
+            for name, value in (
+                ("token_valid", token_valid),
+                ("entry_topk", entry_topk),
+                ("bias_pool", bias_pool),
+                ("bias_tails", bias_tails),
+            )
             if value is not None
         ]
         n_operands = 4 + len(extras)
@@ -243,7 +278,7 @@ _compressed_window_attention_executor: Executor[CompressedWindowAttentionConfig,
 def compressed_window_attention(
     query: Float[Array, "batch num_heads q_len head_dim"],
     kv: Float[Array, "batch kv_len head_dim"],
-    bias: Float[Array, "batch q_len kv_len"],
+    bias: Float[Array, "batch q_len kv_len"] | None,
     softmax_aux: Float[Array, "num_heads"] | None = None,
     /,
     *,
@@ -257,6 +292,12 @@ def compressed_window_attention(
     out_specs: PartitionSpec | None = None,
     token_valid: Array | None = None,
     entry_topk: Array | None = None,
+    causal: bool | None = None,
+    backward: str | None = None,
+    bias_pool: Float[Array, "batch q_len num_pools"] | None = None,
+    bias_tails: Array | None = None,
+    bias_kpool: int = 0,
+    bias_closed: float | None = None,
 ) -> Float[Array, "batch num_heads q_len head_dim"]:
     """Fused differentiable shared-KV sink-augmented attention (DeepSeek-V4).
 
@@ -267,9 +308,10 @@ def compressed_window_attention(
 
     where the sink column's probability mass is dropped before weighting the
     values and the single shared KV head is broadcast over all query heads. The
-    Pallas TPU kernel streams the KV axis in tiles (``make_async_copy``
-    double-buffering) with an online softmax; ``jax.grad`` flows to ``query``,
-    ``kv`` and ``softmax_aux`` (``bias`` is a stop-gradient structural mask).
+    Pallas TPU kernel streams the KV axis in tiles with an online softmax;
+    ``jax.grad`` flows to ``query``, ``kv``, ``softmax_aux`` and ``bias`` (the
+    bias cotangent is the head-summed softmax-backward term, so a
+    straight-through indexer score riding on the bias trains).
 
     Args:
         query: Rotated queries ``[batch, num_heads, q_len, head_dim]``.
@@ -304,32 +346,57 @@ def compressed_window_attention(
             long sequences run a sparse ``O(S * (window + k))`` attend in both
             directions. ``in_specs`` takes one more spec for it (after
             ``token_valid``).
+        causal: Promise that ``bias`` closes every key ``j > s + (token_kv_len - q_len)``; the Pallas kernels then
+            skip the token tiles above each q-block's diagonal in both directions (exact). Ignored by XLA.
+            ``None`` takes ``cfg.causal`` (default ``False``).
+        backward: Pallas differentiation rule, ``"flash"`` (tiled Pallas backward) or ``"reference"`` (custom JVP;
+            needed for forward-mode AD). ``None`` takes ``cfg.backward`` (default ``"flash"``). Ignored by XLA.
+        bias_pool: Optional pooled bias ``[batch, q_len, num_pools]`` in place of ``bias`` (pass ``bias=None``):
+            key ``n`` takes pool ``n // bias_kpool``'s value and ``bias_tails`` keys are opened individually. It is
+            expanded inside the ``shard_map`` body, and its cotangent is the pool-sum of the per-key one.
+        bias_tails: Optional ``[batch, q_len, T]`` int tail key ids (``-1`` = none) of the pooled bias.
+        bias_kpool: Keys per pool of ``bias_pool`` (required with it).
+        bias_closed: Closed-pool sentinel of ``bias_pool`` (``None`` = ``finfo(dtype).min``).
 
     Returns:
         Attention output ``[batch, num_heads, q_len, head_dim]``.
+
+    Raises:
+        ValueError: On inconsistent implicit-mask, top-k or pooled-bias arguments.
     """
     if token_valid is not None and (not window or int(token_kv_len) != query.shape[2]):
         raise ValueError("token_valid requires window > 0 and token_kv_len == q_len.")
     if entry_topk is not None and token_valid is None:
         raise ValueError("entry_topk requires token_valid (the implicit token mask).")
+    pooled = bias_pool is not None
+    if pooled and bias is not None:
+        raise ValueError("pass either `bias` or `bias_pool`, not both.")
+    if not pooled and bias is None:
+        raise ValueError("compressed_window_attention needs `bias` or `bias_pool`.")
+    if pooled and int(bias_kpool or getattr(cfg, "bias_kpool", 0) or 0) <= 0:
+        raise ValueError("`bias_pool` needs `bias_kpool` > 0.")
+    if pooled and (token_valid is not None or entry_topk is not None):
+        raise ValueError("`bias_pool` is a dense per-key bias; it cannot be combined with token_valid / entry_topk.")
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:
         method = "shard_map"
-    if window and cfg is None:
-        cfg = CompressedWindowAttentionConfig(
-            platform=platform or "auto",
-            backend="any",
-            window=int(window),
-            token_kv_len=int(token_kv_len),
-        )
-    elif window and cfg is not None:
-        cfg = CompressedWindowAttentionConfig(
-            fwd_params=cfg.fwd_params,
-            platform=cfg.platform,
-            backend=cfg.backend,
-            window=int(window),
-            token_kv_len=int(token_kv_len),
-        )
+    # Always pass a config carrying this call's flags: with ``cfg=None`` the executor would reuse the config cached
+    # for the first call of the same argument shapes, silently applying another call's window / causal / pooling.
+    base = cfg if cfg is not None else CompressedWindowAttentionConfig(platform=platform or "auto", backend="any")
+    cfg = CompressedWindowAttentionConfig(
+        fwd_params=base.fwd_params,
+        platform=base.platform,
+        backend=base.backend,
+        window=int(window) if window else int(getattr(base, "window", 0)),
+        token_kv_len=int(token_kv_len) if window else int(getattr(base, "token_kv_len", 0)),
+        backward=str(backward) if backward is not None else getattr(base, "backward", "flash"),
+        causal=bool(causal) if causal is not None else bool(getattr(base, "causal", False)),
+        bias_kpool=int(bias_kpool or getattr(base, "bias_kpool", 0) or 0) if pooled else 0,
+        bias_closed=(bias_closed if bias_closed is not None else getattr(base, "bias_closed", None)) if pooled else None,
+    )
+    if cfg.backward not in ("flash", "reference"):
+        raise ValueError(f"backward must be 'flash' or 'reference', got {cfg.backward!r}")
+    extra = {"bias_pool": bias_pool, "bias_tails": bias_tails} if pooled else {}
     return _compressed_window_attention_executor(
         CompressedWindowAttention(),
         query=query,
@@ -345,4 +412,5 @@ def compressed_window_attention(
         _cfg=cfg,
         token_valid=token_valid,
         entry_topk=entry_topk,
+        **extra,
     )

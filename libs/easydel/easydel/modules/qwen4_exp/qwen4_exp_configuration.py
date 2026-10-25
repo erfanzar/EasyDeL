@@ -135,6 +135,8 @@ class Qwen4ExpTextConfig(EasyDeLBaseConfig):
         full_attention_interval: Every Nth layer is sparse-full attention.
         linear_*: GatedDeltaNet dims (key/value heads, head dims, conv kernel).
         indexer_*: QSA indexer dims (None disables QSA).
+        indexer_aux_loss_coef: Non-negative stateless QSA indexer distillation weight. Defaults to 0.0
+            (disabled). The backbone reports the unscaled per-layer sum; task heads apply this weight once.
         hc_count / hc_lowrank: Hyper-connection stream count / mixer rank.
         ple_*: PLE layer ids (1-indexed), embed width, conv kernel.
         ngram_*: Hashed n-gram table sizing (size, heads, vocab base, divisor,
@@ -179,6 +181,7 @@ class Qwen4ExpTextConfig(EasyDeLBaseConfig):
         indexer_head_dim: int | None = 128,
         indexer_budget: int | None = 2048,
         indexer_compress_ratio: int | None = 4,
+        indexer_aux_loss_coef: float = 0.0,
         hc_count: int = 4,
         hc_lowrank: int = 320,
         ple_layer_ids: list[int] | None = None,
@@ -312,6 +315,9 @@ class Qwen4ExpTextConfig(EasyDeLBaseConfig):
         self.indexer_head_dim = indexer_head_dim
         self.indexer_budget = indexer_budget
         self.indexer_compress_ratio = indexer_compress_ratio
+        if not indexer_aux_loss_coef >= 0:
+            raise ValueError(f"indexer_aux_loss_coef must be non-negative, got {indexer_aux_loss_coef}.")
+        self.indexer_aux_loss_coef = float(indexer_aux_loss_coef)
 
         if hc_count <= 1:
             raise ValueError(f"Qwen4-Exp requires hc_count > 1, got {hc_count}.")
@@ -493,6 +499,8 @@ class Qwen4ExpConfig(EasyDeLBaseConfig):
         video_token_id: Video placeholder token. Defaults to 248057.
         vision_start_token_id / vision_end_token_id: Vision delimiters.
         language_model_only: Skip the vision tower (text-only serving).
+        indexer_aux_loss_coef: Optional non-negative override of the text config's indexer warm-up weight.
+            None preserves the nested value (whose default is 0.0).
         tie_word_embeddings: Tied embeddings. Defaults to False.
     """
 
@@ -512,6 +520,7 @@ class Qwen4ExpConfig(EasyDeLBaseConfig):
         vision_start_token_id: int = 248053,
         vision_end_token_id: int = 248054,
         language_model_only: bool = False,
+        indexer_aux_loss_coef: float | None = None,
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
@@ -533,6 +542,11 @@ class Qwen4ExpConfig(EasyDeLBaseConfig):
             self.text_config = self.sub_configs["text_config"]()
         else:
             self.text_config = text_config
+
+        if indexer_aux_loss_coef is not None:
+            if not indexer_aux_loss_coef >= 0:
+                raise ValueError(f"indexer_aux_loss_coef must be non-negative, got {indexer_aux_loss_coef}.")
+            self.text_config.indexer_aux_loss_coef = float(indexer_aux_loss_coef)
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id

@@ -314,9 +314,8 @@ def coerce_stream_delta_message(
     1. If the input is ``None`` and ``fallback_text`` is non-empty, a
        text-only delta is synthesized.
     2. ``default_role`` is applied when the delta lacks a role.
-    3. When ``tool_calls`` are present, ``content`` is forced to ``None`` to
-       match the OpenAI streaming spec (which does not allow both in the same
-       chunk).
+    3. Tool-call deltas are normalized independently of parser-certified
+       ``content``, so mixed text/tool updates preserve both payloads.
 
     Args:
         delta_message: Raw delta object emitted by the engine or a parser.
@@ -358,8 +357,6 @@ def coerce_stream_delta_message(
 
     normalized_delta_tool_calls = normalize_delta_tool_calls(normalized.tool_calls)
     normalized.tool_calls = normalized_delta_tool_calls
-    if normalized_delta_tool_calls:
-        normalized.content = None
     return normalized
 
 
@@ -608,6 +605,7 @@ def iter_chat_completion_stream_responses(
     model: str,
     completion_id: str | None = None,
     created: int | None = None,
+    usage_callback: tp.Callable[[int, int], None] | None = None,
 ) -> tp.Iterator[ChatCompletionStreamResponse]:
     """Convert a stream of engine output snapshots into OpenAI Chat Completion SSE chunks.
 
@@ -634,6 +632,11 @@ def iter_chat_completion_stream_responses(
         model: Model identifier embedded in each emitted chunk.
         completion_id: Stable ``id`` shared by every chunk; generated when omitted.
         created: Unix timestamp shared by every chunk; defaults to the current time.
+        usage_callback: Optional observer of cumulative prompt and completion
+            token counts, called once per consumed engine snapshot before
+            filtering invisible deltas or yielding its chunks. Counts are not
+            increments; terminal wire usage remains unchanged. Observer errors
+            propagate to the caller.
 
     Yields:
         :class:`ChatCompletionStreamResponse` chunks, with the final chunk
@@ -654,6 +657,8 @@ def iter_chat_completion_stream_responses(
     sent_role = False
 
     for output in outputs:
+        if usage_callback is not None:
+            usage_callback(prompt_token_count_from_output(output), int(output.num_generated_tokens or 0))
         last_output = output
         if not prompt_tokens:
             prompt_tokens = prompt_token_count_from_output(output)
@@ -1016,9 +1021,8 @@ class ResponsesStreamAccumulator:
           ``response.output_item.added`` (on first sight) and
           ``response.function_call_arguments.delta`` events.
         - **Text deltas** are appended to the message item and emitted as
-          ``response.output_text.delta`` events. Text is suppressed once a
-          tool-call delta has been seen (matching OpenAI behavior where
-          content and tool calls are mutually exclusive in a single chunk).
+          ``response.output_text.delta`` events, independently of any
+          function-call items carried by the same or earlier snapshots.
 
         Args:
             output: One engine output snapshot.
@@ -1091,9 +1095,6 @@ class ResponsesStreamAccumulator:
                 )
             )
 
-        if self.saw_function_call_delta:
-            delta_text = ""
-
         if delta_text:
             frames.extend(self._ensure_message_item())
             assert self.message_state is not None
@@ -1156,7 +1157,7 @@ class ResponsesStreamAccumulator:
         """
         frames: list[StreamEventFrame] = []
         primary_output = self._primary_output(last_output)
-        full_text = last_output.accumulated_text or ""
+        full_text = last_output.accumulated_text or self.message_text_accum
         reasoning_text_final = last_output.reasoning_content or (
             primary_output.reasoning_content if primary_output else None
         )
@@ -1164,9 +1165,6 @@ class ResponsesStreamAccumulator:
         tool_calls_payload = normalize_tool_calls(
             last_output.tool_calls or (primary_output.tool_calls if primary_output else None)
         )
-        if tool_calls_payload or self.saw_function_call_delta:
-            full_text = ""
-
         if (
             self.include_reasoning_summary
             and not self.reasoning_text_accum
@@ -1256,7 +1254,7 @@ class ResponsesStreamAccumulator:
             )
             state.done = True
 
-        if should_emit_responses_message_item(full_text, normalized_tool_calls):
+        if self.message_state is not None or should_emit_responses_message_item(full_text, normalized_tool_calls):
             frames.extend(self._ensure_message_item())
             assert self.message_state is not None
             self.message_text_accum = full_text
@@ -1316,6 +1314,7 @@ def iter_responses_stream_frames(
     include_reasoning_summary: bool = False,
     final_response_overrides: ResponsesFinalizationOptions | dict[str, tp.Any] | None = None,
     created_at: int | None = None,
+    usage_callback: tp.Callable[[int, int], None] | None = None,
 ) -> tp.Iterator[StreamEventFrame]:
     """Convert a stream of engine output snapshots into Responses API SSE event frames.
 
@@ -1336,6 +1335,11 @@ def iter_responses_stream_frames(
             the completed :class:`ResponsesResponse`.
         created_at: Unix timestamp embedded in the skeleton response;
             defaults to the current time.
+        usage_callback: Optional observer of cumulative prompt and completion
+            token counts, called once per consumed engine snapshot before
+            producing its frames, including snapshots without visible deltas.
+            Counts are not increments; terminal wire usage remains unchanged.
+            Observer errors propagate to the caller.
 
     Yields:
         :class:`StreamEventFrame` objects covering the entire response
@@ -1358,6 +1362,8 @@ def iter_responses_stream_frames(
     prompt_tokens = 0
     last_output = None
     for output in outputs:
+        if usage_callback is not None:
+            usage_callback(prompt_token_count_from_output(output), int(output.num_generated_tokens or 0))
         last_output = output
         if not prompt_tokens:
             prompt_tokens = prompt_token_count_from_output(output)

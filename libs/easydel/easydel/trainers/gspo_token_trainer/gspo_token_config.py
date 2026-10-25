@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from easydel.utils import Registry
+from easydel.utils.compiling_utils import hash_fn
 
 from ..group_sequence_policy_optimization import GSPOConfig
 
@@ -32,6 +33,8 @@ class GSPOTokenConfig(GSPOConfig):
     ``importance_sampling_level='sequence_token'`` so the alias cannot silently
     drift into another objective.
     """
+
+    __hash__ = hash_fn
 
     trainer_prefix: str | None = field(default="GSPOToken")
     importance_sampling_level: str = field(default="sequence_token")

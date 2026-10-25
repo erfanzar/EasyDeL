@@ -148,6 +148,9 @@ class TaskType(StrEnum):
         SEQUENCE_CLASSIFICATION: Models that classify entire input sequences
             into predefined categories, such as sentiment analysis or topic
             classification.
+        TOKEN_CLASSIFICATION: Models that assign a category to each input token,
+            such as named-entity recognition and token tagging.
+        QUESTION_ANSWERING: Models that predict answer spans within an input context.
         AUDIO_CLASSIFICATION: Models specialized for classifying audio inputs
             into categories like speech emotion recognition or sound event
             detection.
@@ -190,11 +193,53 @@ class TaskType(StrEnum):
     SPEECH_SEQUENCE_TO_SEQUENCE = "speech-sequence-to-sequence"
     ZERO_SHOT_IMAGE_CLASSIFICATION = "zero-shot-image-classification"
     SEQUENCE_CLASSIFICATION = "sequence-classification"
+    TOKEN_CLASSIFICATION = "token-classification"
+    QUESTION_ANSWERING = "question-answering"
     AUDIO_CLASSIFICATION = "audio-classification"
     IMAGE_CLASSIFICATION = "image-classification"
     EMBEDDING = "embedding"
     ANY_TO_ANY = "any-to-any"
     AUTO_BIND = "auto-bind"
+
+
+TASK_ALIASES: dict[str, TaskType] = {
+    "causal_lm": TaskType.CAUSAL_LM,
+    "lm": TaskType.CAUSAL_LM,
+    "seq2seq": TaskType.SEQUENCE_TO_SEQUENCE,
+    "sequence_to_sequence": TaskType.SEQUENCE_TO_SEQUENCE,
+    "speech_seq2seq": TaskType.SPEECH_SEQUENCE_TO_SEQUENCE,
+    "image_text_to_text": TaskType.IMAGE_TEXT_TO_TEXT,
+    "zero_shot_image_classification": TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION,
+    "diffusion_lm": TaskType.DIFFUSION_LM,
+    "sequence_classification": TaskType.SEQUENCE_CLASSIFICATION,
+    "embedding": TaskType.EMBEDDING,
+    "base": TaskType.BASE_MODULE,
+}
+"""Legacy task aliases shared by model loading and eLarge configuration."""
+
+
+def normalize_task(t: TaskType | str | None) -> TaskType | None:
+    """Resolve task enums, legacy aliases, and canonical task strings.
+
+    Args:
+        t: Task enum, string specification, or None. Strings ignore surrounding
+            whitespace and case, and accept either hyphens or underscores.
+
+    Returns:
+        The corresponding TaskType, or None for absent or unrecognized input.
+    """
+    if t is None:
+        return None
+    if isinstance(t, TaskType):
+        return t
+    key = str(t).strip().lower()
+    alias = TASK_ALIASES.get(key.replace("-", "_"))
+    if alias is not None:
+        return alias
+    try:
+        return TaskType(key.replace("_", "-"))
+    except ValueError:
+        return None
 
 
 @auto_pytree

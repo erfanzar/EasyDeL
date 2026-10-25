@@ -36,7 +36,7 @@ from typing import TypeVar, cast
 import jax
 
 from ..core.graph import bind, export, live_variables
-from ..core.module import Module, _graph_epoch, _set_inside_transform
+from ..core.module import Module, _graph_epoch, _inside_transform, _set_inside_transform
 from ..core.selector import SelectorSugar, as_selector
 from ..core.state import State
 from .split_merge import (
@@ -207,11 +207,12 @@ def value_and_grad(
             snapshot = [(var.kind, path, var, var._value) for path, var in live_variables(m)]
             spliced = list(other)
             spliced.insert(idx, m)
+            prev_inside_transform = _inside_transform()
             _set_inside_transform(True)
             try:
                 out = fn(*spliced, **kw)
             finally:
-                _set_inside_transform(False)
+                _set_inside_transform(prev_inside_transform)
             changed: dict[str, dict[str, object]] = {}
             for kind, path, var, initial in snapshot:
                 if var._value is not initial and (kind, path) not in target_keys:

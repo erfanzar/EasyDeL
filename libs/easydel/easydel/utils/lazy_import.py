@@ -131,6 +131,7 @@ class LazyModule(ModuleType):
         """
         super().__init__(name)
 
+        self._backend_import_structure = import_structure
         self._object_missing_backend: dict[str, tuple[str, ...]] = {}
         if any(isinstance(key, frozenset) for key in import_structure.keys()):
             self._modules = set[str]()
@@ -141,10 +142,13 @@ class LazyModule(ModuleType):
 
             for _backends, module in import_structure.items():
                 self._modules = self._modules.union(set(module.keys()))
+                missing_backends = tuple(sorted(backend for backend in _backends if not is_package_available(backend)))
 
                 for key, values in module.items():
                     for value in values:
                         self._class_to_module[value] = key
+                        if missing_backends:
+                            self._object_missing_backend[value] = missing_backends
                     _import_structure.setdefault(key, []).extend(values)
 
                 self.__all__.extend(list(module.keys()) + list(chain(*module.values())))
@@ -255,7 +259,10 @@ class LazyModule(ModuleType):
         Returns:
             A ``(class, args)`` tuple suitable for ``pickle`` to call.
         """
-        return (self.__class__, (self._name, self.__file__, self._import_structure))
+        return (
+            self.__class__,
+            (self._name, self.__file__, self._backend_import_structure, self.__spec__, self._objects),
+        )
 
 
 def is_package_available(package_name: str) -> bool:

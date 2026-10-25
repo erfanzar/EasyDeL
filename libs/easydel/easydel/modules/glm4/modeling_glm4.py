@@ -51,180 +51,43 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
+from easydel.infra.utils import auto_remat, blockwise_ffn
 from easydel.layers import (
-    ColumnParallelLinear,
     Embed,
     RMSNorm,
-    RowParallelLinear,
-    dense_gate_up_layout,
     gated_mlp_forward,
 )
-from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
+from easydel.modules.glm.modeling_glm import GlmAttention, GlmMLP
 
 from .glm4_configuration import Glm4Config
 
 
-class Glm4MLP(spx.Module):
+class Glm4MLP(GlmMLP):
     """Gated MLP with a fused ``[gate; up]`` first projection (GLM-4 layout).
 
-    Same fused-projection design as :class:`GlmMLP` (see that class for the
-    rationale): the gate and up projections share a single
-    ``(hidden, 2 * intermediate)`` weight named ``gate_up_proj`` to match
-    the HF GLM-4 checkpoint layout, with the trailing axis split at apply
-    time. The activation is applied to the gate half only and the result
-    is multiplied by the up half before the RowParallel ``down_proj``
-    contracts back to ``hidden_size``.
+    Identical to :class:`~easydel.modules.glm.modeling_glm.GlmMLP` (the HF GLM-4
+    checkpoint stores the same pre-fused ``gate_up_proj`` tensor), so the
+    implementation is shared; this subclass keeps the GLM-4 public name and
+    accepts a :class:`Glm4Config`.
     """
-
-    def __init__(
-        self,
-        config: Glm4Config,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: spx.Rngs,
-    ):
-        """Initialize GLM-4 MLP block.
-
-        Args:
-            config (Glm4Config): Model configuration with MLP parameters.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
-                Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-        """
-        self.config = config
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.gate_up_proj = ColumnParallelLinear(
-            config.hidden_size,
-            (config.intermediate_size, config.intermediate_size),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-            # HF GLM-4 checkpoints store gate_up_proj pre-fused (one tensor).
-            layout=dense_gate_up_layout(config.intermediate_size, source_is_fused=True),
-        )
-        self.down_proj = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-        self.act_fn = ACT2FN[self.config.hidden_act]
-
-    @property
-    def reform_param(self) -> dict:
-        """Checkpoint rules for the pre-fused HF ``gate_up_proj`` tensor."""
-        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config, include_bias=False)
 
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Apply gated feedforward transformation.
-
-        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
-        supported layouts through the ejkernel fused MLP kernels and runs
-        the legacy composition otherwise.
-
-        Args:
-            hidden_states: Input tensor [batch, seq_len, hidden_dim]
-
-        Returns:
-            Transformed hidden states [batch, seq_len, hidden_dim]
-        """
+        """Apply the shared gated MLP, including its named checkpoint activations."""
         return gated_mlp_forward(self, hidden_states)
 
 
-class Glm4Attention(UnifiedAttention):
+class Glm4Attention(GlmAttention):
     """Causal GQA attention with biasless output projection (GLM-4).
 
-    Same configuration as :class:`GlmAttention` — the only override is
-    :meth:`_create_o_proj` which forces the output projection to be
-    biasless to match the GLM-4 checkpoint layout (Q/K/V keep their
-    biases). RoPE is partial: only the first
-    ``partial_rotary_factor * head_dim`` channels are rotated, configured
-    via ``Glm4Config``.
+    Identical to :class:`~easydel.modules.glm.modeling_glm.GlmAttention`: GPT-J
+    (interleaved even/odd) partial RoPE, matching HF's
+    ``Glm4Attention.apply_rotary_pos_emb``, and a biasless ``o_proj`` while
+    Q/K/V keep their biases. Shared implementation; this subclass keeps the
+    GLM-4 public name and accepts a :class:`Glm4Config`.
     """
-
-    def __init__(
-        self,
-        config: Glm4Config,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: spx.Rngs,
-        layer_idx: int,
-    ):
-        """Initialize GLM-4 attention layer with grouped-query attention support.
-
-        Args:
-            config (Glm4Config): Model configuration with attention parameters.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-            layer_idx (int): Index of this layer in the model.
-        """
-        self.layer_idx = layer_idx
-        super().__init__(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-            layer_idx=layer_idx,
-        )
-
-    def _create_rotary(self, config: Glm4Config, dtype: jnp.dtype):
-        """GLM-4 rotates adjacent channel pairs (GPT-J interleaved), not Neox halves.
-
-        HF's ``Glm4Attention.apply_rotary_pos_emb`` expands cos/sin with
-        ``repeat_interleave(2)`` and pairs even/odd lanes, so the partial
-        RoPE (``partial_rotary_factor`` of each head) must use the GPT-J
-        layout. ``get_basic_rope`` shrinks ``rotary_dim`` by
-        ``config.partial_rotary_factor`` internally.
-        """
-        return config.get_basic_rope(
-            dtype=dtype,
-            head_size=self.head_dim,
-            rotary_dim=self.head_dim,
-            base=getattr(config, "rope_theta", 10000.0),
-            is_neox_style=False,
-        )
-
-    def _create_o_proj(
-        self,
-        config: Glm4Config,
-        dtype: jnp.dtype,
-        param_dtype: jnp.dtype,
-        precision: jax.lax.PrecisionLike,
-        rngs: spx.Rngs,
-    ) -> RowParallelLinear:
-        """GLM-4 output projection has no bias (unlike q/k/v projections)."""
-        return RowParallelLinear(
-            self.num_heads * self.head_dim,
-            config.hidden_size,
-            rngs=rngs,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
-            precision=precision,
-        )
 
 
 class Glm4DecoderLayer(spx.Module):
@@ -604,6 +467,7 @@ class Glm4Model(EasyDeLBaseModule):
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
@@ -734,5 +598,5 @@ class Glm4ForSequenceClassification(BaseSequenceClassificationModule[Glm4Model, 
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            score_bias=False,
+            score_head_bias=False,
         )

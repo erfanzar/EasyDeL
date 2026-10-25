@@ -41,6 +41,7 @@ import numpy as np
 import spectrax as spx
 from eformer.loggings import get_logger
 
+from easydel.data.transforms.mixture import DATASET_ID_FIELD, DATASET_ID_TOKEN_FIELD
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.sharding import replicated_named_sharding
@@ -48,6 +49,8 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 
 from .._shared import drop_optimizer_state
+from ..assistant_only_mask import AssistantOnlyMaskMixin
+from ..execution_accumulation import build_execution_accumulation
 from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import SFTPreprocessTransform
 from ..trainer import Trainer
@@ -56,6 +59,13 @@ from ..training_utils import compile_trainer_step, resolve_straight_through_emul
 from ..utils import DataCollatorForCompletionOnlyLM
 from ._fn import distillation_step
 from .distillation_config import DistillationConfig
+from .loss_groups import (
+    LOSS_GROUP_IDS_KEY,
+    LOSS_TOKEN_WEIGHTS_KEY,
+    loss_group_ids_from_dataset_ids,
+    loss_group_token_weights,
+    loss_supervision_mask,
+)
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
@@ -66,7 +76,7 @@ logger = get_logger(__name__)
 
 
 @Registry.register("trainer", "distillation")
-class DistillationTrainer(Trainer):
+class DistillationTrainer(AssistantOnlyMaskMixin, Trainer):
     """Knowledge distillation trainer for model compression.
 
     Transfers knowledge from a frozen teacher to a trainable student by minimising
@@ -110,6 +120,8 @@ class DistillationTrainer(Trainer):
 
     teacher_state: EasyDeLState
     arguments: DistillationConfig  # type hinting
+    # Distillation only folds `assistant_masks` into a MISSING completion_mask (no all-zero fallback).
+    _assistant_mask_fallback_on_empty: tp.ClassVar[bool] = False
 
     def __init__(
         self,
@@ -173,21 +185,47 @@ class DistillationTrainer(Trainer):
 
         self.arguments = arguments
         student_model = self._resolve_student_model(student_model)
-        teacher_model = self._resolve_teacher_model(
-            teacher_model=teacher_model,
-            teacher_model_revision=arguments.teacher_model_revision,
-        )
+        teacher_cached = bool(getattr(arguments, "teacher_from_cache", False))
+        if teacher_cached and teacher_model is not None:
+            raise ValueError(
+                "`teacher_from_cache=True` and a `teacher_model` were both given: the cached mode never runs the "
+                "teacher. Pass `teacher_model=None`, or disable `teacher_from_cache`."
+            )
+        if not teacher_cached:
+            teacher_model = self._resolve_teacher_model(
+                teacher_model=teacher_model,
+                teacher_model_revision=arguments.teacher_model_revision,
+            )
 
         if not isinstance(student_model, EasyDeLState):
             student_model = student_model.to_state(trainable_selector=arguments.trainable_selector)
-        if not isinstance(teacher_model, EasyDeLState):
+        if teacher_model is not None and not isinstance(teacher_model, EasyDeLState):
             teacher_model.eval()
             teacher_model = teacher_model.to_state()
         if arguments.disable_dropout:
             student_model = disable_state_dropout(student_model)
-            teacher_model = disable_state_dropout(teacher_model)
+            if teacher_model is not None:
+                teacher_model = disable_state_dropout(teacher_model)
 
-        self.teacher_state = drop_optimizer_state(teacher_model)
+        self.teacher_state = None if teacher_model is None else drop_optimizer_state(teacher_model)
+        self._teacher_cache_reader = None
+        if teacher_cached:
+            from easydel.data.teacher_cache import TeacherCacheReader
+
+            expect: dict[str, tp.Any] = {"segment_align": int(arguments.teacher_cache_segment_align)}
+            if arguments.teacher_cache_teacher_uri:
+                expect["teacher_uri"] = arguments.teacher_cache_teacher_uri
+            if arguments.teacher_cache_tokenizer:
+                expect["tokenizer"] = arguments.teacher_cache_tokenizer
+            self._teacher_cache_reader = TeacherCacheReader(
+                arguments.teacher_cache_path, expect=expect, topk=int(arguments.teacher_cache_topk or 0)
+            )
+            logger.info(
+                "offline teacher cache: %d records, cache k=%d, training k=%d.",
+                len(self._teacher_cache_reader),
+                self._teacher_cache_reader.k_cache,
+                self._teacher_cache_reader.topk,
+            )
 
         super().__init__(
             arguments=arguments,
@@ -370,9 +408,11 @@ class DistillationTrainer(Trainer):
             float(self.arguments.mtp_kd_weight),
             int(self.arguments.mtp_draft_tokens),
             bool(self.arguments.teacher_matched_compilation),
+            *self._teacher_cache_static_args(),
+            self._num_loss_groups(),
         )
 
-        static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26)
+        static_argnums = tuple(range(3, 3 + len(self._train_shared_fn_static_args)))
         # Bucketed training compiles one distillation step per bucket via the
         # BaseTrainer hooks below; they need this flavor's static-arg layout.
         self._bucket_static_argnums = static_argnums
@@ -385,7 +425,7 @@ class DistillationTrainer(Trainer):
         if self.arguments.mpmd_scheduler is None:
             sharded_training_step_function = spx.jit(
                 distillation_step,
-                in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
+                in_shardings=(self.state_shardings, empty_sharding, self._teacher_in_shardings()),
                 out_shardings=(self.state_shardings, empty_sharding),
                 donate_argnums=(0,),
                 static_argnums=static_argnums,
@@ -394,7 +434,7 @@ class DistillationTrainer(Trainer):
         else:
             sharded_training_step_function = compile_trainer_step(
                 distillation_step,
-                in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
+                in_shardings=(self.state_shardings, empty_sharding, self._teacher_in_shardings()),
                 out_shardings=(self.state_shardings, empty_sharding),
                 donate_argnums=(0,),
                 static_argnums=static_argnums,
@@ -403,6 +443,14 @@ class DistillationTrainer(Trainer):
                 arguments=self.arguments,
             )
         self._runtime_trace("train.compile_wrapper.end")
+        self._execution_accumulation = build_execution_accumulation(
+            self,
+            step_fn=distillation_step,
+            in_shardings=(self.state_shardings, empty_sharding, self._teacher_in_shardings()),
+            static_argnums=static_argnums,
+            empty_sharding=empty_sharding,
+            jit_options=_step_jit_options,
+        )
 
         self._eval_shared_fn_static_args = (
             self.arguments.loss_config,
@@ -429,6 +477,8 @@ class DistillationTrainer(Trainer):
             float(self.arguments.mtp_kd_weight),
             int(self.arguments.mtp_draft_tokens),
             bool(self.arguments.teacher_matched_compilation),
+            *self._teacher_cache_static_args(),
+            self._num_loss_groups(),
         )
 
         # The eval step may run under `eval_config_overrides` (e.g. vanilla
@@ -441,7 +491,7 @@ class DistillationTrainer(Trainer):
         if self.arguments.mpmd_scheduler is None:
             sharded_evaluation_step_function = spx.jit(
                 distillation_step,
-                in_shardings=(self.eval_state_shardings, empty_sharding, eval_teacher_state.shardings),
+                in_shardings=(self.eval_state_shardings, empty_sharding, self._teacher_in_shardings(eval_teacher_state)),
                 out_shardings=empty_sharding,
                 static_argnums=static_argnums,
                 **_step_jit_options,
@@ -449,7 +499,7 @@ class DistillationTrainer(Trainer):
         else:
             sharded_evaluation_step_function = compile_trainer_step(
                 distillation_step,
-                in_shardings=(self.eval_state_shardings, empty_sharding, eval_teacher_state.shardings),
+                in_shardings=(self.eval_state_shardings, empty_sharding, self._teacher_in_shardings(eval_teacher_state)),
                 out_shardings=empty_sharding,
                 static_argnums=static_argnums,
                 mesh=self.model.mesh,
@@ -461,10 +511,11 @@ class DistillationTrainer(Trainer):
         sharded_training_step_function.static_argnums_ = static_argnums
         sharded_evaluation_step_function.static_argnums_ = static_argnums
 
-        # Teacher is frozen: it contributes a forward pass only, no backward.
-        teacher_forward_flops = self.teacher_state.model.flops_per_token(
-            include_loss=False,
-            include_backward=False,
+        # Teacher is frozen: it contributes a forward pass only, no backward (none at all when cached).
+        teacher_forward_flops = (
+            0.0
+            if self.teacher_state is None
+            else self.teacher_state.model.flops_per_token(include_loss=False, include_backward=False)
         )
         self._extra_forward_flops_per_token = teacher_forward_flops
         self._extra_backward_flops_per_token = 0.0
@@ -615,42 +666,136 @@ class DistillationTrainer(Trainer):
             information dict.
         """
         batch, infos = super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
-
-        if "assistant_masks" in batch:
-            if "completion_mask" not in batch:
-                batch["completion_mask"] = batch["assistant_masks"]
-            # Keep assistant mask only as training-time supervision metadata;
-            # model forwards must not receive this key.
-            batch.pop("assistant_masks", None)
-
-        attention_mask = batch.get("attention_mask")
-        completion_mask = batch.get("completion_mask")
-
-        if completion_mask is not None:
-            completion_mask_np = np.asarray(completion_mask)
-            if attention_mask is not None:
-                completion_mask_np = completion_mask_np * np.asarray(attention_mask)
-            completion_dtype = (
-                np.asarray(attention_mask).dtype if attention_mask is not None else completion_mask_np.dtype
-            )
-            batch["completion_mask"] = completion_mask_np.astype(completion_dtype, copy=False)
-
-            if "labels" not in batch and "input_ids" in batch:
-                labels = np.asarray(batch["input_ids"]).astype(np.int32, copy=True)
-                labels[completion_mask_np == 0] = -100
-                if attention_mask is not None:
-                    labels[np.asarray(attention_mask) == 0] = -100
-                batch["labels"] = labels
-
-        if "labels" in batch and "completion_mask" not in batch:
-            labels_np = np.asarray(batch["labels"])
-            if (labels_np == -100).any():
-                completion_mask_np = (labels_np != -100).astype(np.int32)
-                if attention_mask is not None:
-                    completion_mask_np = completion_mask_np * np.asarray(attention_mask)
-                batch["completion_mask"] = completion_mask_np
-
+        infos = dict(infos)
+        group_source = None
+        if self._num_loss_groups() and isinstance(batch, dict):
+            group_source = (batch.get(DATASET_ID_TOKEN_FIELD), batch.get(DATASET_ID_FIELD))
+        # Without per-dataset carriers this is the legacy rule (assistant_masks fill a missing
+        # completion_mask, masks AND attention, labels synthesised from the mask, or the mask recovered
+        # from -100 labels); with carriers the per-dataset assembly of AssistantOnlyMaskMixin runs.
+        batch = self._apply_assistant_supervision(batch, infos)
+        if group_source is not None:
+            batch = self._attach_loss_groups(batch, infos, *group_source, is_train=is_train)
+        if getattr(self, "_teacher_cache_reader", None) is not None and isinstance(batch, dict):
+            batch = self._join_teacher_cache(batch, infos)
         return batch, infos
+
+    def _num_loss_groups(self) -> int:
+        """Number of loss groups (``0`` when ``loss_group_weights`` is unset)."""
+        weights = getattr(getattr(self, "arguments", None), "loss_group_weights", None)
+        return len(weights) if weights else 0
+
+    def _attach_loss_groups(
+        self,
+        batch: dict[str, tp.Any],
+        infos: dict[str, tp.Any],
+        token_ids: tp.Any,
+        row_ids: tp.Any,
+        *,
+        is_train: bool,
+    ) -> dict[str, tp.Any]:
+        """Add ``loss_group_ids`` (and, in training, fp32 ``loss_token_weights``) for the full step batch.
+
+        Raises:
+            ValueError: When the batch carries no dataset attribution or a supervised token has no group.
+        """
+        input_ids = np.asarray(batch.get("input_ids", batch.get("inputs_embeds")))
+        if token_ids is not None:
+            dataset_ids = np.asarray(token_ids)
+        elif row_ids is not None:
+            rows = np.asarray(row_ids).reshape(-1).astype(np.int64)
+            dataset_ids = np.repeat(rows[:, None], int(input_ids.shape[1]), axis=1)
+        else:
+            raise ValueError(
+                "`loss_group_weights` is set but the batch carries no dataset attribution (per-token "
+                f"`{DATASET_ID_TOKEN_FIELD}` or per-row `{DATASET_ID_FIELD}`)."
+            )
+        group_ids = loss_group_ids_from_dataset_ids(
+            dataset_ids,
+            num_groups=self._num_loss_groups(),
+            dataset_map=getattr(self.arguments, "loss_group_dataset_map", None),
+        )
+        loss_config = getattr(self.arguments, "loss_config", None)
+        shift_tokens = bool(getattr(loss_config, "shift_tokens", True)) if loss_config is not None else True
+        supervised = loss_supervision_mask(batch, shift_tokens=shift_tokens)
+        token_weights, stats = loss_group_token_weights(
+            group_ids,
+            supervised,
+            self.arguments.loss_group_weights,
+            max_multiplier=getattr(self.arguments, "loss_group_max_multiplier", None),
+        )
+        batch[LOSS_GROUP_IDS_KEY] = group_ids
+        if is_train:
+            batch[LOSS_TOKEN_WEIGHTS_KEY] = token_weights
+        for g in range(self._num_loss_groups()):
+            for name, vec in stats.items():
+                infos[f"loss_group/{g}/{name}"] = float(vec[g])
+        return batch
+
+    def _teacher_cache_static_args(self) -> tuple[bool, int, bool]:
+        """Trailing static args of :func:`distillation_step` for the offline-teacher-cache mode."""
+        return (
+            bool(getattr(self.arguments, "teacher_from_cache", False)),
+            int(getattr(self.arguments, "teacher_cache_topk", 0) or 0),
+            bool(getattr(self.arguments, "teacher_cache_add_tail", True)),
+        )
+
+    def _teacher_in_shardings(self, teacher_state: EasyDeLState | None = None):
+        """Input sharding of the teacher-state argument (``None`` when the teacher is served from a cache)."""
+        state = self.teacher_state if teacher_state is None else teacher_state
+        return None if state is None else state.shardings
+
+    def _join_teacher_cache(self, batch: dict[str, tp.Any], infos: dict[str, tp.Any]) -> dict[str, tp.Any]:
+        """Add the cached teacher top-k tensors for every document of a host-side batch.
+
+        Documents are located by the collator's layout sidecar (``teacher_layout_keys`` /
+        ``teacher_layout_span``) when present, otherwise derived from ``segment_ids`` (packed: one document per
+        contiguous segment) or ``attention_mask`` (unpacked: the real tokens of each row). Records are joined by
+        row content (:func:`easydel.data.teacher_cache.row_key`); a missing record raises
+        :class:`~easydel.data.teacher_cache.TeacherCacheMiss` -- there is no live-teacher fallback.
+        """
+        from easydel.data.teacher_cache import (
+            KEY_BYTES,
+            LAYOUT_KEYS_FIELD,
+            LAYOUT_SPAN_FIELD,
+            key_to_array,
+            row_key,
+        )
+
+        reader = self._teacher_cache_reader
+        input_ids = np.asarray(batch["input_ids"])
+        n_windows, seq_len = int(input_ids.shape[0]), int(input_ids.shape[1])
+        keys = batch.pop(LAYOUT_KEYS_FIELD, None)
+        span = batch.pop(LAYOUT_SPAN_FIELD, None)
+        if keys is None or span is None:
+            docs: list[list[tuple[int, int]]] = []
+            segment_ids = batch.get("segment_ids")
+            attention = batch.get("attention_mask")
+            for w in range(n_windows):
+                row_docs: list[tuple[int, int]] = []
+                if segment_ids is not None:
+                    seg = np.asarray(segment_ids)[w]
+                    valid = np.flatnonzero(seg >= 0)
+                    if valid.size:
+                        bounds = np.flatnonzero(np.diff(seg[valid]) != 0) + 1
+                        for part in np.split(valid, bounds):
+                            row_docs.append((int(part[0]), int(part[-1]) - int(part[0]) + 1))
+                else:
+                    real = np.flatnonzero(np.ones(seq_len) if attention is None else np.asarray(attention)[w] > 0)
+                    if real.size:
+                        row_docs.append((int(real[0]), int(real[-1]) - int(real[0]) + 1))
+                docs.append(row_docs)
+            slots = max(max((len(d) for d in docs), default=0), 1)
+            keys = np.zeros((n_windows, slots, KEY_BYTES), dtype=np.uint8)
+            span = np.zeros((n_windows, slots, 2), dtype=np.int32)
+            for w, row_docs in enumerate(docs):
+                for d, (off, n) in enumerate(row_docs):
+                    keys[w, d] = key_to_array(row_key(input_ids[w, off : off + n]))
+                    span[w, d] = (off, n)
+        filled = reader.fill_windows(np.asarray(keys), np.asarray(span), seq_len=seq_len, input_ids=input_ids)
+        batch.update(filled)
+        infos["teacher_cache_documents"] = float(int((np.asarray(span)[..., 1] > 0).sum()))
+        return batch
 
     @property
     def _train_shared_fn_extra_args(self) -> tuple[EasyDeLState]:
@@ -689,7 +834,7 @@ class DistillationTrainer(Trainer):
         """
         super()._configure_eval_config_override()
         self._eval_teacher_state = None
-        if self._eval_graphdef is None:
+        if self._eval_graphdef is None or self.teacher_state is None:
             return
         teacher_graphdef = self._build_config_override_graphdef(
             model=self.teacher_state.model,
@@ -729,7 +874,7 @@ class DistillationTrainer(Trainer):
         """Extend the base compile kwargs with the teacher-state input sharding."""
         kwargs = super()._bucket_step_compile_kwargs(i)
         state_shardings, empty_sharding = kwargs["in_shardings"]
-        kwargs["in_shardings"] = (state_shardings, empty_sharding, self.teacher_state.shardings)
+        kwargs["in_shardings"] = (state_shardings, empty_sharding, self._teacher_in_shardings())
         return kwargs
 
     def _compile_one_bucket_step(self, i: int):

@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
+from functools import cached_property
 from uuid import uuid4
 
 from eformer.loggings import get_logger
@@ -74,8 +75,8 @@ class FunctionGemmaToolParser(ToolParser):
         tool_call_end_token: Token marking function call end.
         tool_call_regex: Regex pattern for extracting function calls.
         arg_regex: Regex pattern for extracting parameter key-value pairs.
-        tool_call_start_token_ids: Encoded token IDs for start token.
-        tool_call_end_token_ids: Encoded token IDs for end token.
+        tool_call_start_token_ids: Lazily encoded token IDs for the start marker.
+        tool_call_end_token_ids: Lazily encoded token IDs for the end marker.
         buffered_delta_text: Buffer for handling partial tokens.
     """
 
@@ -106,20 +107,25 @@ class FunctionGemmaToolParser(ToolParser):
             re.DOTALL,
         )
 
-        if self.model_tokenizer:
-            self.tool_call_start_token_ids = self.model_tokenizer.encode(
-                self.tool_call_start_token,
-                add_special_tokens=False,
-            )
-            self.tool_call_end_token_ids = self.model_tokenizer.encode(
-                self.tool_call_end_token,
-                add_special_tokens=False,
-            )
-        else:
-            self.tool_call_start_token_ids = []
-            self.tool_call_end_token_ids = []
-
         self.buffered_delta_text = ""
+
+    @cached_property
+    def tool_call_start_token_ids(self) -> list[int]:
+        """Encoded opening marker, resolved only when a consumer requests token IDs."""
+        return (
+            self.model_tokenizer.encode(self.tool_call_start_token, add_special_tokens=False)
+            if self.model_tokenizer
+            else []
+        )
+
+    @cached_property
+    def tool_call_end_token_ids(self) -> list[int]:
+        """Encoded closing marker, resolved only when a consumer requests token IDs."""
+        return (
+            self.model_tokenizer.encode(self.tool_call_end_token, add_special_tokens=False)
+            if self.model_tokenizer
+            else []
+        )
 
     def _scan_escape_token(self, text: str, index: int) -> tuple[int, bool]:
         """Advance across a configured escape token if present at ``index``.

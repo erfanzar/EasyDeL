@@ -39,24 +39,43 @@ class WindowPlanner:
     bucket list, sequence-buffer row ids) as explicit arguments.
 
     Attributes:
-        num_tokens_paddings: Token compile-bucket ladder (ascending).
+        num_tokens_paddings: Configured token compile-bucket ladder.
         max_num_seq_buckets: Configured request-count compile buckets.
     """
 
     def __init__(
         self,
         *,
-        num_tokens_paddings: list[int],
+        num_tokens_paddings: list[int] | None = None,
         max_num_seq_buckets: list[int],
     ) -> None:
-        """Capture the static bucket ladders.
+        """Capture the configured bucket ladders.
 
         Args:
-            num_tokens_paddings: Token compile-bucket sizes (ascending).
+            num_tokens_paddings: Token compile-bucket sizes (ascending). Runtime overrides can be supplied
+                to ``get_token_bucket`` when the runner rewrites its ladder.
             max_num_seq_buckets: Request-count compile bucket sizes.
         """
-        self.num_tokens_paddings = list(num_tokens_paddings)
+        self.num_tokens_paddings = list(num_tokens_paddings or [])
         self.max_num_seq_buckets = list(max_num_seq_buckets)
+
+    def get_token_bucket(self, num_tokens: int, active_buckets: list[int] | None = None) -> int:
+        """Select a token compile bucket, preferring the live runtime ladder when supplied.
+
+        Args:
+            num_tokens: Number of scheduled tokens.
+            active_buckets: Runtime token buckets, or ``None`` to use the configured ladder.
+
+        Returns:
+            Smallest sufficient bucket, or the largest bucket when the count exceeds the ladder.
+
+        Raises:
+            ValueError: If no token buckets were configured or supplied.
+        """
+        buckets = self.num_tokens_paddings if active_buckets is None else active_buckets
+        if not buckets:
+            raise ValueError("At least one token compile bucket is required")
+        return next((bucket for bucket in buckets if num_tokens <= bucket), buckets[-1])
 
     @staticmethod
     def get_token_paddings(min_token_size: int, max_token_size: int, padding_gap: int) -> list[int]:

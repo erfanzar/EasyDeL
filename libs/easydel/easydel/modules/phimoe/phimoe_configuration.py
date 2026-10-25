@@ -20,74 +20,14 @@ architectural choices and adds router-related hyperparameters such
 as ``num_local_experts``, ``num_experts_per_tok``, ``router_jitter_noise``,
 and ``output_router_logits``.
 
-Also includes a small monkey-patch helper that backfills HF's modern
-rotary mscale attributes onto older Phi-MoE checkpoints when they are
-missing, keeping conversion paths compatible.
+LongRoPE scale parameters from older Phi-MoE checkpoints remain supported
+by the configuration validation and EasyDeL rotary implementation.
 """
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
-
-
-def _patch_hf_phimoe_rotary_mscale() -> None:
-    """Monkey-patch HF's PhimoeRotaryEmbedding to expose modern mscale fields.
-
-    Older releases of ``transformers.models.phimoe`` do not populate
-    the ``short_mscale`` / ``long_mscale`` attributes on
-    ``PhimoeRotaryEmbedding`` instances even though those attributes
-    are referenced from EasyDeL's HF-compat code paths and from newer
-    versions of the upstream rotary code. This helper performs an
-    idempotent runtime patch:
-
-    - If the upstream module is missing or the rotary class is absent,
-      it is a no-op (we silently return so EasyDeL stays usable
-      without ``transformers`` installed).
-    - Otherwise it wraps ``__init__`` with a small adapter that calls
-      the original initializer and then backfills both attributes
-      from ``config.rope_parameters`` when they have not been set.
-    - A sentinel ``_easydel_phimoe_mscale_patch`` is attached to the
-      patched ``__init__`` so the patch only runs once per process.
-    """
-    try:
-        from transformers.utils import is_torch_available
-
-        if not is_torch_available():
-            return
-        from transformers.models.phimoe import modeling_phimoe as hf_phimoe
-    except Exception:
-        return
-
-    rotary_cls = getattr(hf_phimoe, "PhimoeRotaryEmbedding", None)
-    if rotary_cls is None:
-        return
-
-    original_init = getattr(rotary_cls, "__init__", None)
-    if original_init is None or getattr(original_init, "_easydel_phimoe_mscale_patch", False):
-        return
-
-    def _patched_init(self, config, device=None):
-        """Backfill ``short_mscale`` / ``long_mscale`` on HF Phi-MoE rotary modules.
-
-        Wraps the upstream rotary embedding ``__init__`` to populate the
-        modern ``short_mscale`` and ``long_mscale`` attributes from
-        ``config.rope_parameters`` when the original implementation did
-        not set them. This keeps EasyDeL's HF compatibility paths working
-        against older Phi-MoE checkpoints.
-        """
-        original_init(self, config, device=device)
-        rope_parameters = getattr(config, "rope_parameters", {}) or {}
-        if not hasattr(self, "short_mscale"):
-            self.short_mscale = rope_parameters.get("short_mscale", 1.0)
-        if not hasattr(self, "long_mscale"):
-            self.long_mscale = rope_parameters.get("long_mscale", 1.0)
-
-    _patched_init._easydel_phimoe_mscale_patch = True  # type: ignore[attr-defined]
-    rotary_cls.__init__ = _patched_init
-
-
-_patch_hf_phimoe_rotary_mscale()
 
 
 @register_config("phimoe")
@@ -310,10 +250,10 @@ class PhiMoeConfig(EasyDeLBaseConfig):
             raise ValueError(
                 f"`rope_scaling`'s short_factor field must be a list of numbers, got {rope_scaling_short_factor}"
             )
-        if not len(rope_scaling_short_factor) == self.hidden_size // self.num_attention_heads // 2:
+        if not len(rope_scaling_short_factor) == self.head_dim // 2:
             raise ValueError(
                 f"`rope_scaling`'s short_factor field must have length "
-                f"{self.hidden_size // self.num_attention_heads // 2}, got {len(rope_scaling_short_factor)}"
+                f"{self.head_dim // 2}, got {len(rope_scaling_short_factor)}"
             )
         if not (
             isinstance(rope_scaling_long_factor, list)
@@ -322,10 +262,10 @@ class PhiMoeConfig(EasyDeLBaseConfig):
             raise ValueError(
                 f"`rope_scaling`'s long_factor field must be a list of numbers, got {rope_scaling_long_factor}"
             )
-        if not len(rope_scaling_long_factor) == self.hidden_size // self.num_attention_heads // 2:
+        if not len(rope_scaling_long_factor) == self.head_dim // 2:
             raise ValueError(
                 f"`rope_scaling`'s long_factor field must have length "
-                f"{self.hidden_size // self.num_attention_heads // 2}, got {len(rope_scaling_long_factor)}"
+                f"{self.head_dim // 2}, got {len(rope_scaling_long_factor)}"
             )
         if not isinstance(rope_scaling_short_mscale, int | float):
             raise ValueError(f"`rope_scaling`'s short_mscale field must be a number, got {rope_scaling_short_mscale}")

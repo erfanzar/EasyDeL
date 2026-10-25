@@ -28,10 +28,12 @@ import json
 import typing as tp
 from functools import partial
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import jax
 import numpy as np
 import spectrax as spx
+from eformer.paths import UniversalPath, ePath, is_remote_path
 from jax import numpy as jnp
 from jax.sharding import NamedSharding
 from spectrax import with_sharding_constraint
@@ -48,8 +50,8 @@ from easydel.utils.helpers import (  # pyright: ignore[reportPrivateLocalImportU
 )
 
 from .._shared import copy_frozen_policy, polyak_update_reference_graphstate
-from ..agentic_moshpit.environment import ToolEnvWrapper, create_tool_call_parser
-from ..agentic_moshpit.tools import function_to_json, make_tool
+from .._shared.environment import ToolEnvWrapper, create_tool_call_parser
+from .._shared.tools import function_to_json, make_tool
 from ..metrics import _host_mean_float, _host_scalar_float
 from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import GRPOPreprocessTransform
@@ -407,8 +409,8 @@ class GRPOTrainer(Trainer):
         if not isinstance(model, EasyDeLState):
             model = model.to_state(trainable_selector=arguments.trainable_selector)
 
-        if arguments.beta != 0.0:
-            self.ref_state = copy_frozen_policy(model)
+        self.ref_state = self._create_reference_state(model)
+        if self.ref_state is not None:
             if arguments.disable_dropout:
                 model, self.ref_state = self._disable_state_dropout(model, self.ref_state)
         else:
@@ -437,8 +439,7 @@ class GRPOTrainer(Trainer):
         if pad_token_id is None and hasattr(self.processing_class, "tokenizer"):
             pad_token_id = getattr(self.processing_class.tokenizer, "pad_token_id", None)
         self.padding_value = 0 if pad_token_id is None else int(pad_token_id)
-        if not isinstance(reward_funcs, list):
-            reward_funcs = [reward_funcs]
+        reward_funcs = list(reward_funcs) if isinstance(reward_funcs, list) else [reward_funcs]
         self.reward_funcs = reward_funcs
         if reward_processing_classes is None:
             reward_processing_classes = [None] * len(reward_funcs)
@@ -449,9 +450,6 @@ class GRPOTrainer(Trainer):
                 raise ValueError("The number of reward processing classes must match the number of reward functions.")
 
         empty_sharding = replicated_named_sharding(model.model.mesh)
-        if not isinstance(reward_processing_classes, list):
-            raise TypeError(f"reward_processing_classes must be a list, got {type(reward_processing_classes)}")
-
         for i, (reward_processing_class, reward_func) in enumerate(
             zip(reward_processing_classes, reward_funcs, strict=False)
         ):
@@ -459,6 +457,7 @@ class GRPOTrainer(Trainer):
             if isinstance(reward_func, EasyDeLBaseModule | EasyDeLState):
                 if isinstance(reward_func, EasyDeLBaseModule):
                     reward_func = reward_func.to_state(trainable_selector=arguments.trainable_selector)
+                if reward_func.apply_fn is None:
                     sharding = reward_func.shardings
 
                     def apply_fn(gd, gs, gt, batch):
@@ -485,7 +484,10 @@ class GRPOTrainer(Trainer):
                             mesh=module.mesh,
                             ignore_mpmd=True,
                         )
-                        call_kwargs = filter_kwargs_for_callable(getattr(module, "forward", module), batch)
+                        # SpectraX's default __call__ dispatches to forward, but
+                        # reward modules may override __call__ directly.
+                        reward_callable = module.forward if type(module).__call__ is spx.Module.__call__ else module
+                        call_kwargs = filter_kwargs_for_callable(reward_callable, batch)
                         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
                         return module(**call_kwargs)
 
@@ -497,6 +499,22 @@ class GRPOTrainer(Trainer):
                         out_shardings=empty_sharding,
                     )
                     reward_func = reward_func.replace(apply_fn=apply_fn)
+                else:
+                    # Preserve user forwards and adapt graphdef-bound forwards
+                    # (including PPO's) to the graphdef-first reward interface.
+                    apply_fn = reward_func.apply_fn
+                    try:
+                        signature = inspect.signature(apply_fn)
+                    except (TypeError, ValueError):
+                        signature = None
+                    if signature is not None:
+                        try:
+                            signature.bind(None, None, None, None)
+                        except TypeError:
+                            signature.bind(None, None, None)
+                            reward_func = reward_func.replace(
+                                apply_fn=partial(self._bound_reward_forward, apply_fn=apply_fn)
+                            )
 
                 if reward_processing_class is None:
                     reward_model_name = reward_func.model.config._name_or_path
@@ -551,6 +569,15 @@ class GRPOTrainer(Trainer):
             processing_class=processing_class,
         )
         self._setup_completion_hub_logging()
+
+    def _create_reference_state(self, model: EasyDeLState) -> EasyDeLState | None:
+        """Resolve the frozen reference before auxiliary forwards are configured."""
+        return copy_frozen_policy(model) if self.arguments.beta != 0.0 else None
+
+    @staticmethod
+    def _bound_reward_forward(graphdef, graphstate, graphother, batch, *, apply_fn):
+        """Adapt a graphdef-bound custom reward forward without replacing its behavior."""
+        return apply_fn(graphstate, graphother, batch)
 
     @staticmethod
     def _resolve_group_reduction(reward_funcs: list[RewardFunc]) -> str:
@@ -1039,8 +1066,11 @@ class GRPOTrainer(Trainer):
 
         save_root = self.arguments._get_save_directory(create=True)
         if save_root is None:
+            # Completion logging does not require a model-specific checkpoint name.
+            save_root = getattr(self.arguments, "save_directory", None)
+        if save_root is None:
             return
-        completion_log_dir = Path(str(save_root)) / "completions"
+        completion_log_dir = ePath(str(save_root)) / "completions"
         completion_log_dir.mkdir(parents=True, exist_ok=True)
         self._completion_log_dir = completion_log_dir
 
@@ -1050,6 +1080,12 @@ class GRPOTrainer(Trainer):
 
         from huggingface_hub import CommitScheduler, create_repo
 
+        if is_remote_path(completion_log_dir):
+            self._completion_hub_staging = TemporaryDirectory(prefix="easydel-completions-")
+            completion_log_dir = Path(self._completion_hub_staging.name)
+        else:
+            completion_log_dir = Path(str(completion_log_dir))
+        self._completion_hub_dir = completion_log_dir
         create_repo(repo_id, repo_type="dataset", exist_ok=True)
         self._completion_commit_scheduler = CommitScheduler(
             repo_id=repo_id,
@@ -1059,7 +1095,7 @@ class GRPOTrainer(Trainer):
             allow_patterns=["*.parquet"],
         )
 
-    def _write_completion_log_rows(self, rows: list[dict[str, object]], *, step: int | None) -> Path | None:
+    def _write_completion_log_rows(self, rows: list[dict[str, object]], *, step: int | None) -> UniversalPath | None:
         """Write completion rows as parquet and trigger the optional Hub scheduler."""
         if int(jax.process_index()) != 0 or not rows:
             return None
@@ -1081,8 +1117,13 @@ class GRPOTrainer(Trainer):
             }
             for row in rows
         ]
-        path = Path(completion_log_dir) / f"step-{step_value:08d}-process-{int(jax.process_index()):05d}.parquet"
-        pd.DataFrame(enriched_rows).to_parquet(path, index=False)
+        filename = f"step-{step_value:08d}-process-{int(jax.process_index()):05d}.parquet"
+        path = ePath(str(completion_log_dir)) / filename
+        parquet_bytes = pd.DataFrame(enriched_rows).to_parquet(index=False)
+        path.write_bytes(parquet_bytes)
+        hub_dir = getattr(self, "_completion_hub_dir", None)
+        if hub_dir is not None and is_remote_path(path):
+            (hub_dir / filename).write_bytes(parquet_bytes)
 
         scheduler = getattr(self, "_completion_commit_scheduler", None)
         trigger = getattr(scheduler, "trigger", None)
@@ -1115,6 +1156,14 @@ class GRPOTrainer(Trainer):
 
         completion_rows: list[list[int]] = []
         completion_mask_rows: list[list[int]] = []
+        sampling_logps = getattr(results, "sampling_per_token_logps", None)
+        sampling_rows = None
+        if sampling_logps is not None:
+            host_sampling_logps = np.asarray(jax.device_get(sampling_logps), dtype=np.float32)
+            sampling_rows = [
+                row[mask.astype(bool)].tolist()
+                for row, mask in zip(host_sampling_logps, host_completion_mask, strict=True)
+            ]
         for ids, mask in zip(host_completion_ids, host_completion_mask, strict=True):
             active = [int(token) for token, keep in zip(ids.tolist(), mask.tolist(), strict=True) if keep]
             completion_rows.append(active)
@@ -1153,6 +1202,8 @@ class GRPOTrainer(Trainer):
                 observation_tokens = observation_tokens[:remaining]
                 completion_rows[idx].extend(observation_tokens)
                 completion_mask_rows[idx].extend([0] * len(observation_tokens))
+                if sampling_rows is not None:
+                    sampling_rows[idx].extend([0.0] * len(observation_tokens))
                 raw_texts[idx] = f"{raw_texts[idx]}{observation_text}"
                 visible_texts[idx] = f"{visible_texts[idx]}{observation_text}"
 
@@ -1188,6 +1239,11 @@ class GRPOTrainer(Trainer):
                 target_len=len(loop_indices),
             )
 
+            followup_logps = getattr(followup_results, "sampling_per_token_logps", None)
+            if followup_logps is None:
+                sampling_rows = None
+            else:
+                followup_logps = np.asarray(jax.device_get(followup_logps), dtype=np.float32)
             next_active: list[int] = []
             for row, idx in enumerate(loop_indices):
                 remaining = max_completion_length - len(completion_rows[idx])
@@ -1200,6 +1256,9 @@ class GRPOTrainer(Trainer):
                 ][:remaining]
                 completion_rows[idx].extend(active_tokens)
                 completion_mask_rows[idx].extend([1] * len(active_tokens))
+                if sampling_rows is not None:
+                    sampled = followup_logps[row][followup_mask[row].astype(bool)][:remaining]
+                    sampling_rows[idx].extend(sampled.tolist())
                 if row < len(followup_raw):
                     raw_texts[idx] = f"{raw_texts[idx]}{followup_raw[row]}"
                 if row < len(followup_visible):
@@ -1213,12 +1272,14 @@ class GRPOTrainer(Trainer):
 
         padded_ids = []
         padded_masks = []
+        padded_attention_masks = []
         for ids, mask in zip(completion_rows, completion_mask_rows, strict=True):
             ids = ids[:max_completion_length]
             mask = mask[:max_completion_length]
             pad_len = max_completion_length - len(ids)
             padded_ids.append([*ids, *([pad_token_id] * pad_len)])
             padded_masks.append([*mask, *([0] * pad_len)])
+            padded_attention_masks.append([*([1] * len(ids)), *([0] * pad_len)])
 
         completion_ids = jnp.asarray(np.asarray(padded_ids, dtype=np.int32))
         completion_mask = jnp.asarray(np.asarray(padded_masks, dtype=np.int32))
@@ -1226,14 +1287,30 @@ class GRPOTrainer(Trainer):
         generation_factor = max(generation_factor, 1)
         prompt_rows = results.prompt_ids.repeat(generation_factor, 0)
         sequences = jnp.concatenate([prompt_rows, completion_ids], axis=-1)
+        sampling_updates = {}
+        if hasattr(results, "sampling_per_token_logps"):
+            sampling_updates["sampling_per_token_logps"] = (
+                None
+                if sampling_rows is None
+                else jnp.asarray(
+                    np.asarray(
+                        [
+                            [*row[:max_completion_length], *([0.0] * max(0, max_completion_length - len(row)))]
+                            for row in sampling_rows
+                        ],
+                        dtype=np.float32,
+                    )
+                )
+            )
         return (
             results._replace(
                 sequences=sequences,
                 completion_ids=completion_ids,
-                completion_mask=completion_mask,
+                completion_mask=jnp.asarray(np.asarray(padded_attention_masks, dtype=np.int32)),
                 text=visible_texts,
                 raw_text=raw_texts,
                 tool_calls=tool_call_records,
+                **sampling_updates,
             ),
             completion_mask,
         )
@@ -1530,6 +1607,25 @@ class GRPOTrainer(Trainer):
             checkpoint_manager=checkpoint_manager,
         )
 
+    def _esurge_importance_sampling_ratio(self, policy_logps, sampling_logps, completion_mask):
+        """Correct rollout/learner drift at token or sequence granularity."""
+        log_ratio = policy_logps.astype(jnp.float32) - sampling_logps.astype(jnp.float32)
+        mode = self.arguments.esurge_importance_sampling_mode
+        cap = float(self.arguments.esurge_importance_sampling_cap)
+        if mode.startswith("sequence_"):
+            log_ratio = jnp.sum(jnp.where(completion_mask > 0, log_ratio, 0.0), axis=-1, keepdims=True)
+        if mode.endswith("_truncate"):
+            ratio = jnp.exp(jnp.minimum(log_ratio, jnp.log(cap)))
+        else:
+            ratio = jnp.where(log_ratio <= jnp.log(cap), jnp.exp(jnp.minimum(log_ratio, jnp.log(cap))), 0.0)
+        if mode.startswith("token_"):
+            ratio = jnp.where(completion_mask > 0, ratio, 1.0)
+        return jax.lax.stop_gradient(ratio)
+
+    def _select_rollout_indices(self, completion_ids, completion_mask, rewards, generation_factor):
+        """Optionally select completion rows before computing final advantages."""
+        return None
+
     def _preprocess_batch_input(
         self,
         state: EasyDeLState,
@@ -1566,10 +1662,10 @@ class GRPOTrainer(Trainer):
                 return cached
 
         batch = self._apply_user_data_collator(batch)
-        reward_batch = self._extract_reward_batch_sidechannels(batch)
+        reward_sidechannels = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)
-        if reward_batch:
-            reward_batch = {**batch, **reward_batch}
+        if reward_sidechannels:
+            reward_batch = {**batch, **reward_sidechannels}
         else:
             reward_batch = batch
         with capture_time() as preprocessing_time_fn:
@@ -1603,6 +1699,8 @@ class GRPOTrainer(Trainer):
             generation_time = generation_time_fn()
 
             completion_mask = self._make_attn_mask(completion_ids)
+            if results.completion_mask is not None:
+                completion_mask = completion_mask * results.completion_mask
             results, completion_mask = self._maybe_run_tool_call_generation_loop(
                 state=state,
                 results=results,
@@ -1610,6 +1708,9 @@ class GRPOTrainer(Trainer):
             )
             completion_ids = results.completion_ids
             completion_prompts = results.completion_prompts
+            completion_attention_mask = results.completion_mask
+            if completion_attention_mask is None:
+                completion_attention_mask = self._make_attn_mask(completion_ids)
             if self.arguments.mask_truncated_completions:
                 eos_tokens = jnp.asarray(self._eos_token_id).reshape(-1)
                 has_eos = jnp.any(jnp.isin(completion_ids, eos_tokens), axis=1)
@@ -1637,7 +1738,7 @@ class GRPOTrainer(Trainer):
                 repeated_prompt_model_kwargs,
                 model_callable=getattr(state.model, "forward", state.model),
             )
-            prompt_completion_mask = jnp.concatenate([ridmask, completion_mask], -1)
+            prompt_completion_mask = jnp.concatenate([ridmask, completion_attention_mask], -1)
             old_per_token_logps = None
 
             with capture_time() as token_logps_time_fn:
@@ -1691,7 +1792,12 @@ class GRPOTrainer(Trainer):
             loss_type = getattr(self, "loss_type", getattr(self.arguments, "loss_type", None))
             dppo_divergence_type = getattr(self.arguments, "divergence_type", None) if loss_type == "dppo" else None
             needs_dppo_topk = dppo_divergence_type in {"topk_tv", "topk_kl"}
-            if is_train and (self._generation_reuse_span() > 1 or needs_dppo_topk):
+            rollout_logps = getattr(results, "sampling_per_token_logps", None)
+            needs_esurge_correction = (
+                bool(getattr(self.arguments, "esurge_importance_sampling_correction", False))
+                and rollout_logps is not None
+            )
+            if is_train and (self._generation_reuse_span() > 1 or needs_dppo_topk or needs_esurge_correction):
                 with capture_time() as old_token_logps_time_fn:
                     if needs_dppo_topk:
                         (
@@ -1716,6 +1822,11 @@ class GRPOTrainer(Trainer):
                             logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
                         )
                 old_token_logps_time = old_token_logps_time_fn()
+            importance_sampling_ratio = None
+            if is_train and needs_esurge_correction:
+                importance_sampling_ratio = self._esurge_importance_sampling_ratio(
+                    old_per_token_logps, rollout_logps, completion_mask
+                )
 
             raw_completions_text = self._coerce_generation_texts(
                 results.raw_text,
@@ -1785,8 +1896,8 @@ class GRPOTrainer(Trainer):
             )
             completion_ids_records = self._coerce_generation_metadata_list(
                 [
-                    row[: int(length)]
-                    for row, length in zip(host_completion_ids.tolist(), completion_token_lengths, strict=False)
+                    row[mask.astype(bool)].tolist()
+                    for row, mask in zip(host_completion_ids, host_completion_mask, strict=True)
                 ],
                 target_len=target_len,
             )
@@ -1808,6 +1919,12 @@ class GRPOTrainer(Trainer):
                 tool_calls=tool_call_records,
             )
 
+            reward_batch = self._completion_aligned_reward_batch(
+                reward_batch,
+                reward_sidechannels,
+                prompt_count=prompt_ids.shape[0],
+                completion_count=prompt_ids.shape[0] * generation_factor,
+            )
             rewards_per_func = jnp.full(
                 (prompt_ids.shape[0] * generation_factor, len(self.reward_funcs)),
                 jnp.nan,
@@ -1888,9 +2005,12 @@ class GRPOTrainer(Trainer):
             prompt_mask = self._all_gather(prompt_mask)
             completion_ids = self._all_gather(completion_ids)
             completion_mask = self._all_gather(completion_mask)
+            completion_attention_mask = self._all_gather(completion_attention_mask)
             ref_per_token_logps = self._all_gather(ref_per_token_logps)
             if old_per_token_logps is not None:
                 old_per_token_logps = self._all_gather(old_per_token_logps)
+            if importance_sampling_ratio is not None:
+                importance_sampling_ratio = self._all_gather(importance_sampling_ratio)
             if sampling_topk_indices is not None:
                 sampling_topk_indices = self._all_gather(sampling_topk_indices)
             if sampling_topk_logps is not None:
@@ -1918,6 +2038,37 @@ class GRPOTrainer(Trainer):
                     arguments=self.arguments,
                     group_reduction=getattr(self, "_group_reduction", "mean"),
                 )
+                with capture_time() as filter_time_fn:
+                    selected_indices = self._select_rollout_indices(
+                        completion_ids, completion_mask, rewards, generation_factor
+                    )
+                    if selected_indices is not None:
+                        completion_ids = completion_ids[selected_indices]
+                        completion_mask = completion_mask[selected_indices]
+                        completion_attention_mask = completion_attention_mask[selected_indices]
+                        ref_per_token_logps = ref_per_token_logps[selected_indices]
+                        rewards_per_func = rewards_per_func[selected_indices]
+                        if old_per_token_logps is not None:
+                            old_per_token_logps = old_per_token_logps[selected_indices]
+                        if importance_sampling_ratio is not None:
+                            importance_sampling_ratio = importance_sampling_ratio[selected_indices]
+                        if sampling_topk_indices is not None:
+                            sampling_topk_indices = sampling_topk_indices[selected_indices]
+                        if sampling_topk_logps is not None:
+                            sampling_topk_logps = sampling_topk_logps[selected_indices]
+                        if difficulty_weights is not None:
+                            difficulty_weights = difficulty_weights[selected_indices]
+                        generation_factor = completion_ids.shape[0] // max(prompt_mask.shape[0], 1)
+                        rewards, advantages, std_rewards, is_std_zero = _compute_rewards_and_advantages(
+                            rewards_per_func=rewards_per_func,
+                            reward_weights=reward_weights,
+                            generation_factor=generation_factor,
+                            scale_rewards=self.scale_rewards,
+                            multi_objective_aggregation=self.multi_objective_aggregation,
+                            arguments=self.arguments,
+                            group_reduction=getattr(self, "_group_reduction", "mean"),
+                        )
+                filter_time = filter_time_fn()
             grouped_comp_time = grouped_comp_time_fn()
         preprocessing_time = preprocessing_time_fn()
         completion_length = jnp.sum(completion_mask, -1)
@@ -1926,6 +2077,7 @@ class GRPOTrainer(Trainer):
             "reward_std": _host_scalar_float(jnp.nanmean(std_rewards)),
             "completion_length": _host_mean_float(completion_length),
             "grouped_comp_time": grouped_comp_time,
+            "filter_time": filter_time,
             "rewarding_time": rewarding_time,
             "token_logps_time": token_logps_time,
             "old_token_logps_time": old_token_logps_time,
@@ -1963,11 +2115,14 @@ class GRPOTrainer(Trainer):
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
+            "completion_attention_mask": completion_attention_mask,
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
             "num_items_in_batch": jnp.sum(completion_mask),
             **scoring_prompt_model_kwargs,
         }
+        if importance_sampling_ratio is not None:
+            model_batch["importance_sampling_ratio"] = importance_sampling_ratio
         if old_per_token_logps is not None:
             model_batch["old_per_token_logps"] = old_per_token_logps
             model_batch["sampling_per_token_logps"] = old_per_token_logps

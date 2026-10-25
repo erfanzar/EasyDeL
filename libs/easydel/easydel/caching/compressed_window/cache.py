@@ -549,6 +549,7 @@ class CompressedWindowCache(BaseCache):
     __str__ = __repr__
 
 
+@auto_pytree
 class CompressedWindowMetadata(BaseRunTimeMetadata):
     """Runtime-metadata placeholder for compressed sliding-window caches.
 

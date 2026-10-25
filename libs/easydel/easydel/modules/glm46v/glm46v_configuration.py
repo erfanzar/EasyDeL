@@ -78,6 +78,8 @@ class Glm46VConfig(EasyDeLBaseConfig):
     """
 
     model_type = "glm46v"
+    # The vision stem consumes flattened spatio-temporal patches, not NCHW images.
+    esurge_flat_patch_inputs = True
     sub_configs: typing.ClassVar = {"vision_config": Glm4vVisionConfig, "text_config": Glm4vTextConfig}
     keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
 

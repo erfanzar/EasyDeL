@@ -80,8 +80,8 @@ class TPOTrainer(DPOTrainer):
             train_dataset: Raw or pretokenized triple-preference training data.
             eval_dataset: Optional raw or pretokenized triple-preference eval
                 data.
-            data_collator: Optional external collator passed through to DPO
-                setup before TPO installs its default triple collators.
+            data_collator: Optional external collator used instead of the default
+                triple-preference collators during dataloader construction.
 
         Raises:
             ValueError: If ``arguments`` is missing.
@@ -93,6 +93,10 @@ class TPOTrainer(DPOTrainer):
             raise TypeError(f"arguments must be TPOConfig, got {type(arguments)}")
         if isinstance(model, str):
             reject_string_model_id(model, role="policy model")
+        # The base trainer resolves collators while building the dataloaders inside ``super().__init__``,
+        # so the triple-preference collators must be reachable through the collate hooks (below) rather than
+        # being assigned after construction. A user-supplied collator takes precedence over the defaults.
+        self._tpo_user_data_collator = data_collator
         super().__init__(
             arguments=arguments,
             model=model,
@@ -102,25 +106,66 @@ class TPOTrainer(DPOTrainer):
             eval_dataset=eval_dataset,
             data_collator=data_collator,
         )
-        include_reference = arguments.tpo_alpha != 0.0
-        self.input_data_collator_tfds = DataCollatorForTriplePreferenceTFDS(
+
+    def _build_triple_collator(self, collator_cls: type) -> tp.Callable:
+        """Build a triple-preference collator, honoring a user-supplied ``data_collator``.
+
+        Args:
+            collator_cls: Either :class:`DataCollatorForTriplePreferenceTFDS` or
+                :class:`DataCollatorForTriplePreferenceGrain`.
+
+        Returns:
+            The user-supplied collator when one was given, otherwise a new ``collator_cls`` configured from
+            the TPO arguments (the reference fields are included when ``tpo_alpha != 0``).
+        """
+        if self._tpo_user_data_collator is not None:
+            return self._tpo_user_data_collator
+        arguments = self.arguments
+        return collator_cls(
             max_prompt_length=arguments.max_prompt_length,
             max_completion_length=arguments.max_completion_length,
             pad_token_id=self.padding_value,
             label_pad_token_id=arguments.label_pad_token_id,
             is_encoder_decoder=arguments.is_encoder_decoder,
             pad_to_multiple_of=arguments.pad_to_multiple_of,
-            include_reference=include_reference,
+            include_reference=arguments.tpo_alpha != 0.0,
         )
-        self.input_data_collator_grain = DataCollatorForTriplePreferenceGrain(
-            max_prompt_length=arguments.max_prompt_length,
-            max_completion_length=arguments.max_completion_length,
-            pad_token_id=self.padding_value,
-            label_pad_token_id=arguments.label_pad_token_id,
-            is_encoder_decoder=arguments.is_encoder_decoder,
-            pad_to_multiple_of=arguments.pad_to_multiple_of,
-            include_reference=include_reference,
-        )
+
+    def create_grain_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
+    ) -> tp.Callable:
+        """Return the triple-preference Grain collator (or the user-supplied collator).
+
+        Args:
+            max_sequence_length: Accepted for interface parity; the collator is configured from the TPO arguments.
+            truncation_mode: Accepted for interface parity.
+
+        Returns:
+            The collator used by the Grain dataloaders. It emits ``reference_input_ids`` /
+            ``reference_attention_mask`` whenever ``tpo_alpha != 0``.
+        """
+        self.input_data_collator_grain = self._build_triple_collator(DataCollatorForTriplePreferenceGrain)
+        return self.input_data_collator_grain
+
+    def create_tfds_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
+    ) -> tp.Callable:
+        """Return the triple-preference TFDS collator (or the user-supplied collator).
+
+        Args:
+            max_sequence_length: Accepted for interface parity; the collator is configured from the TPO arguments.
+            truncation_mode: Accepted for interface parity.
+
+        Returns:
+            The collator used by the TFDS dataloaders. It emits ``reference_input_ids`` /
+            ``reference_attention_mask`` whenever ``tpo_alpha != 0``.
+        """
+        self.input_data_collator_tfds = self._build_triple_collator(DataCollatorForTriplePreferenceTFDS)
+        return self.input_data_collator_tfds
 
     def _get_preprocess_transform(self) -> TPOPreprocessTransform | None:
         """Return TPO preprocessing unless the source is already tokenized.

@@ -170,11 +170,6 @@ class EncoderBinding:
     feature_valid_length_kwarg: str | None = None
 
 
-def _unwrap(model: tp.Any) -> tp.Any:
-    """Return the object that owns the VLM surface, descending one ``base_model`` hop."""
-    return model
-
-
 def find_vision_tower_attr(model: tp.Any) -> str | None:
     """Locate the attribute holding ``model``'s vision tower, or ``None``.
 
@@ -506,6 +501,12 @@ def _genuine_feature_length(features: tp.Any, selection: VisionSelection) -> int
     """
     padded = selection.padded_rows != selection.selected_rows
     if isinstance(features, list | tuple):
+        # A structured encoder result (e.g. final per-image embeddings plus
+        # DeepStack residuals) is not a per-image array list. Preserve the entire
+        # in-model path unless the consumer supplies a complete output adapter;
+        # flattening it would silently discard or misinterpret residuals.
+        if any(not hasattr(part, "shape") for part in features):
+            return None
         if padded and len(features) != selection.padded_rows:
             return None
         parts = features[: selection.selected_rows] if padded else features
@@ -608,8 +609,9 @@ class EncoderProcessor:
         raw_features = self._encode(model, packed)
         valid_length = _genuine_feature_length(raw_features, selection)
         if valid_length is None:
-            # An already-flat padded output has lost the image boundaries. Dividing
-            # by padded_rows would guess incorrectly for variable-sized images.
+            # Structured outputs need all auxiliary residuals at the merge site.
+            # Already-flat padded outputs have lost image boundaries. Neither can
+            # be interpreted as a flat feature buffer without guessing or loss.
             return batch
         features = flatten_features(raw_features)
 

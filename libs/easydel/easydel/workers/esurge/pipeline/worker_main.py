@@ -61,8 +61,26 @@ import time
 from collections import OrderedDict
 from collections.abc import Iterable
 
-import zmq
-from transformers import AutoTokenizer
+
+def _configure_worker_environment() -> None:
+    """Isolate tokenizer subprocesses from the model process's JAX settings.
+
+    These are requirements, not defaults: a distributed model process normally
+    already has accelerator placement and distributed initialization enabled.
+    Apply them before third-party imports or the flag registry can import JAX.
+    """
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    os.environ["JAX_PLATFORM_NAME"] = "cpu"
+    os.environ["ENABLE_DISTRIBUTED_INIT"] = "0"
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
+
+if __name__ == "__main__":
+    _configure_worker_environment()
+
+# Third-party imports must follow subprocess environment isolation.
+import zmq  # noqa: E402
+from transformers import AutoTokenizer  # noqa: E402
 
 
 class FastIncrementalDecoder:
@@ -273,8 +291,10 @@ def _tokenizer_worker(endpoint: str, tokenizer_path: str, tokenizer_kwargs: dict
             loading; mutated in place to seed ``trust_remote_code``
             when missing.
     """
+    from easydel.utils import flags
+
     if "trust_remote_code" not in tokenizer_kwargs.keys():
-        tokenizer_kwargs["trust_remote_code"] = os.getenv("ESURGE_WORKER_TRUST_REMOTE_CODE", "1") in ["1", "on", "yes"]
+        tokenizer_kwargs["trust_remote_code"] = flags.get_bool(flags.ESURGE_WORKER_TRUST_REMOTE_CODE)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_kwargs)
     ctx = zmq.Context()
     socket = ctx.socket(zmq.REP)
@@ -282,21 +302,24 @@ def _tokenizer_worker(endpoint: str, tokenizer_path: str, tokenizer_kwargs: dict
     try:
         while True:
             message = socket.recv_pyobj()
-            cmd = message.get("cmd")
-            if cmd == "tokenize":
-                prompt = message["prompt"]
-                encoded = tokenizer(prompt, return_tensors=None)
-                token_ids = encoded["input_ids"]
-                if token_ids and isinstance(token_ids[0], list):
-                    token_ids = token_ids[0]
-                socket.send_pyobj({"status": "ok", "tokens": list(token_ids)})
-            elif cmd == "drain":
-                socket.send_pyobj({"status": "ok"})
-            elif cmd == "shutdown":
-                socket.send_pyobj({"status": "ok"})
-                break
-            else:
-                socket.send_pyobj({"status": "error", "message": f"Unknown cmd {cmd}"})
+            try:
+                cmd = message.get("cmd")
+                if cmd == "tokenize":
+                    prompt = message["prompt"]
+                    encoded = tokenizer(prompt, return_tensors=None)
+                    token_ids = encoded["input_ids"]
+                    if token_ids and isinstance(token_ids[0], list):
+                        token_ids = token_ids[0]
+                    socket.send_pyobj({"status": "ok", "tokens": list(token_ids)})
+                elif cmd == "drain":
+                    socket.send_pyobj({"status": "ok"})
+                elif cmd == "shutdown":
+                    socket.send_pyobj({"status": "ok"})
+                    break
+                else:
+                    socket.send_pyobj({"status": "error", "message": f"Unknown cmd {cmd}"})
+            except Exception as error:
+                socket.send_pyobj({"status": "error", "message": str(error), "exception_type": type(error).__name__})
     finally:
         socket.close(0)
         ctx.term()
@@ -337,13 +360,12 @@ def _detokenizer_worker(
         max_states: Maximum number of concurrent per-request decoder
             states retained in memory; older entries are evicted FIFO.
     """
+    from easydel.utils import flags
+
     if "trust_remote_code" not in tokenizer_kwargs.keys():
-        tokenizer_kwargs["trust_remote_code"] = os.getenv("ESURGE_WORKER_TRUST_REMOTE_CODE", "1") in ["1", "on", "yes"]
+        tokenizer_kwargs["trust_remote_code"] = flags.get_bool(flags.ESURGE_WORKER_TRUST_REMOTE_CODE)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_kwargs)
-    try:
-        context_window = int(os.getenv("ESURGE_DETOKENIZER_CONTEXT_WINDOW", "4"))
-    except ValueError:
-        context_window = 4
+    context_window = flags.get_int(flags.ESURGE_DETOKENIZER_CONTEXT_WINDOW)
     decoder = FastIncrementalDecoder(tokenizer, context_window=context_window)
 
     ctx = zmq.Context()
@@ -386,10 +408,20 @@ def _detokenizer_worker(
                     if token_offset != len(state_tokens):
                         full_tokens = message.get("tokens")
                         if full_tokens is None:
-                            raise RuntimeError(
-                                "Detokenizer delta stream lost synchronization: "
-                                f"request_id={rid!r} offset={token_offset} stored={len(state_tokens)}"
+                            # Reply with an error (the client resends the full token list on its next call)
+                            # instead of raising, which would kill the worker loop and hang every caller.
+                            if not state_tokens:
+                                states.pop(rid, None)
+                            socket.send_pyobj(
+                                {
+                                    "status": "error",
+                                    "message": (
+                                        "Detokenizer delta stream lost synchronization: "
+                                        f"request_id={rid!r} offset={token_offset} stored={len(state_tokens)}"
+                                    ),
+                                }
                             )
+                            continue
                         state_tokens[:] = list(full_tokens)
                     else:
                         state_tokens.extend(token_delta)
@@ -404,6 +436,7 @@ def _detokenizer_worker(
                     if pc:
                         state["prompt_context"] = pc
 
+                previously_emitted = state["previous_text"]
                 last_idx = min(state["last_index"], len(generated_tokens))
                 new_tokens = generated_tokens[last_idx:]
                 detokstart = time.time()
@@ -444,7 +477,7 @@ def _detokenizer_worker(
                             )
                         except TypeError:
                             full_decoded = tokenizer.decode(generated_tokens, skip_special_tokens=skip_special)
-                        delta = _compute_suffix_delta(full_decoded, accumulated)
+                        delta = _compute_suffix_delta(full_decoded, previously_emitted)
                         accumulated = full_decoded
                         states.pop(rid, None)
                     result = {
@@ -499,9 +532,7 @@ def main():
     parser.add_argument("--max-states", type=int, default=1 << 16)
     args = parser.parse_args()
 
-    os.environ.setdefault("JAX_PLATFORMS", "cpu")
-    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-    os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
+    _configure_worker_environment()
 
     tokenizer_kwargs = json.loads(args.tokenizer_kwargs) if args.tokenizer_kwargs else {}
     if args.mode == "tokenizer":

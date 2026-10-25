@@ -33,8 +33,10 @@ Example:
 from __future__ import annotations
 
 import itertools
+import math
 import re
 from collections.abc import Mapping, Sequence
+from numbers import Integral
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict, Unpack
 
 from ejkernel.modules.operations import KernelTilePolicy, normalize_kernel_tile_policy
@@ -47,7 +49,6 @@ if TYPE_CHECKING:
 else:
     MpMdSchedulers: type[object] = object
 
-LONG_PREFILL_TRS: int = 2048
 ESURGE_MIN_TOKEN_PAD: int = 16
 PPMicrobatchPolicy: TypeAlias = int | Literal["auto"] | None
 
@@ -133,7 +134,10 @@ def _validate_esurge_runtime_config(self):
         ValueError: If any of ``max_model_len``, ``min_input_pad``,
             ``min_token_pad``, ``max_num_seqs``, ``max_num_batched_tokens``, or
             ``long_prefill_token_threshold`` violates positivity /
-            non-negativity invariants, or if the kernel-tile policy string is
+            non-negativity invariants, if ``token_safety_margin`` is not a
+            non-negative integer or ``None``, if ``spec_debug_max_traces`` is
+            not a non-negative integer, if ``spec_adaptive_conf_threshold`` is
+            not finite and in ``[0, 1]``, or if the kernel-tile policy string is
             invalid.
     """
     if self.max_model_len <= 0:
@@ -156,6 +160,30 @@ def _validate_esurge_runtime_config(self):
             raise ValueError(f"max_num_batched_tokens must be positive, got {self.max_num_batched_tokens}")
     if self.long_prefill_token_threshold is not None and self.long_prefill_token_threshold < 0:
         raise ValueError(f"long_prefill_token_threshold must be non-negative, got {self.long_prefill_token_threshold}")
+    if self.token_safety_margin is not None:
+        if (
+            isinstance(self.token_safety_margin, bool)
+            or not isinstance(self.token_safety_margin, Integral)
+            or self.token_safety_margin < 0
+        ):
+            raise ValueError(
+                f"token_safety_margin must be a non-negative integer or None, got {self.token_safety_margin!r}"
+            )
+        self.token_safety_margin = int(self.token_safety_margin)
+    if (
+        isinstance(self.spec_debug_max_traces, bool)
+        or not isinstance(self.spec_debug_max_traces, Integral)
+        or self.spec_debug_max_traces < 0
+    ):
+        raise ValueError("spec_debug_max_traces must be a non-negative integer")
+    self.spec_debug_max_traces = int(self.spec_debug_max_traces)
+    try:
+        confidence = float(self.spec_adaptive_conf_threshold)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("spec_adaptive_conf_threshold must be finite and in [0, 1]") from exc
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        raise ValueError("spec_adaptive_conf_threshold must be finite and in [0, 1]")
+    self.spec_adaptive_conf_threshold = confidence
     self.pp_microbatch_count = _normalize_pp_microbatch_policy(
         self.pp_microbatch_count,
         field_name="pp_microbatch_count",
@@ -185,7 +213,12 @@ def _validate_esurge_runtime_config(self):
         "runner_verbose": False,
         "overlap_execution": True,
         "sampler_metrics": False,
+        "spec_debug_max_traces": 0,
+        "spec_adaptive_conf_threshold": 0.0,
         "long_prefill_token_threshold": None,
+        "chunked_prefill_enabled": False,
+        "token_safety_margin": None,
+        "include_finished_set": False,
         "enable_window_aware_runtime_cap": False,
         "mpmd_scheduler": None,
         "pp_microbatch_count": "auto",
@@ -274,10 +307,25 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
         sampler_metrics: When ``True``, the sampler emits per-step
             log-probability tensors so downstream code can record token-level
             metrics. Adds an extra D2H copy each step.
+        spec_debug_max_traces: Non-negative integer budget for speculative
+            verification traces retained by the runner. Defaults to ``0``
+            (capture disabled). The engine constructor may override this value.
+        spec_adaptive_conf_threshold: Finite draft early-exit confidence
+            threshold in ``[0, 1]``. Defaults to ``0.0`` (fixed-length drafting).
+            The engine constructor may override this value, including with zero.
         long_prefill_token_threshold: Token count above which a single
             prompt is split into multiple chunked-prefill steps to avoid
             blocking decode requests. ``None`` disables chunked prefill;
             value must be non-negative.
+        chunked_prefill_enabled: Allow waiting prompts to span multiple
+            scheduler steps when they exceed the remaining step token budget.
+            Defaults to ``False``.
+        token_safety_margin: Non-negative number of KV-cache tokens reserved
+            per running request by the token-budget manager. ``None`` disables
+            that manager; ``0`` enables cache-aware budgeting without an extra
+            reserve.
+        include_finished_set: Track finished request IDs per client in
+            scheduler outputs. Defaults to ``False``.
         enable_window_aware_runtime_cap: When ``True``, the runner derives
             the runtime request cap from per-attention-type page demand
             inferred from the live cache metadata, instead of trusting the
@@ -305,13 +353,18 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
     max_num_seqs: NotRequired[int]
     max_num_seq_buckets: NotRequired[list[int] | tuple[int, ...] | None]
     async_scheduling: NotRequired[bool]
-    max_num_batched_tokens: NotRequired[int | None | _Empty]
+    max_num_batched_tokens: NotRequired[int | _Empty | None]
     use_aot_forward: NotRequired[bool]
     compile_runner: NotRequired[bool]
     runner_verbose: NotRequired[bool]
     overlap_execution: NotRequired[bool]
     sampler_metrics: NotRequired[bool]
+    spec_debug_max_traces: NotRequired[int]
+    spec_adaptive_conf_threshold: NotRequired[float]
     long_prefill_token_threshold: NotRequired[int | None]
+    chunked_prefill_enabled: NotRequired[bool]
+    token_safety_margin: NotRequired[int | None]
+    include_finished_set: NotRequired[bool]
     enable_window_aware_runtime_cap: NotRequired[bool]
     mpmd_scheduler: NotRequired[MpMdSchedulers | None]
     pp_microbatch_count: NotRequired[PPMicrobatchPolicy]

@@ -106,7 +106,6 @@ See Also:
 from collections.abc import Callable
 from typing import cast
 
-import jax.numpy as jnp
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Float, Int
@@ -121,6 +120,7 @@ from easydel.caching import (
     UnifiedAttentionCacheView,
 )
 from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput
+from easydel.infra.utils import blockwise_ffn as _blockwise_ffn
 
 
 class BaseDecoderLayer:
@@ -182,6 +182,7 @@ class BaseDecoderLayer:
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         checkpoint_names: tuple[str, str] = ("norm", "residual"),
+        checkpoint_norm: bool = True,
     ) -> tuple[Float[Array, "batch seq_len hidden_dim"], AttentionLayerOutput]:
         """Run the pre-LN attention sub-block: ``h = h + attn(norm(h))``.
 
@@ -226,6 +227,8 @@ class BaseDecoderLayer:
             checkpoint_names: ``(norm_name, residual_name)`` labels passed
                 to :func:`checkpoint_name`; the SpecTrax remat policy keys
                 off these names.
+            checkpoint_norm: When ``False`` the normalised activation is not
+                tagged (families such as Llama that never named it).
 
         Returns:
             ``(updated_hidden_states, attn_outputs)`` where
@@ -239,7 +242,9 @@ class BaseDecoderLayer:
         residual_name: str
         norm_name, residual_name = checkpoint_names
 
-        normed: Float[Array, "batch_size seq_len hidden_dim"] = checkpoint_name(norm_module(hidden_states), norm_name)
+        normed: Float[Array, "batch_size seq_len hidden_dim"] = norm_module(hidden_states)
+        if checkpoint_norm:
+            normed = checkpoint_name(normed, norm_name)
 
         attn_outputs: AttentionLayerOutput = attention_module(
             normed,
@@ -267,6 +272,7 @@ class BaseDecoderLayer:
         use_scan: bool = False,
         scan_chunk_size: int = 1024,
         checkpoint_names: tuple[str, str] = ("norm", "residual"),
+        checkpoint_norm: bool = True,
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Run the pre-LN MLP sub-block: ``h = h + mlp(norm(h))``.
 
@@ -291,6 +297,8 @@ class BaseDecoderLayer:
                 ``use_scan=True``. Defaults to 1024.
             checkpoint_names: ``(norm_name, residual_name)`` labels passed
                 to :func:`checkpoint_name` for remat policy targeting.
+            checkpoint_norm: When ``False`` the normalised activation is not
+                tagged (families such as Llama that never named it).
 
         Returns:
             Updated hidden-states tensor of shape
@@ -300,7 +308,9 @@ class BaseDecoderLayer:
         residual_name: str
         norm_name, residual_name = checkpoint_names
 
-        normed: Float[Array, "batch_size seq_len hidden_dim"] = checkpoint_name(norm_module(hidden_states), norm_name)
+        normed: Float[Array, "batch_size seq_len hidden_dim"] = norm_module(hidden_states)
+        if checkpoint_norm:
+            normed = checkpoint_name(normed, norm_name)
 
         # Apply MLP (with optional scan)
         mlp_output: Float[Array, "batch_size seq_len hidden_dim"]
@@ -489,22 +499,4 @@ def blockwise_ffn(
         The mlp_module should be stateless or handle batched computation
         correctly, as different chunks are processed independently.
     """
-    seq_len: int = inputs.shape[1]
-
-    # If sequence is shorter than chunk size, process directly
-    if seq_len <= chunk_size:
-        mlp_out: Float[Array, "batch_size seq_len hidden_dim"] = mlp_module(inputs)
-        return mlp_out
-
-    num_chunks: int = (seq_len + chunk_size - 1) // chunk_size
-    outputs: list[Float[Array, "batch_size chunk_seq_len hidden_dim"]] = []
-
-    for i in range(num_chunks):
-        start_idx: int = i * chunk_size
-        end_idx: int = min((i + 1) * chunk_size, seq_len)
-        chunk: Float[Array, "batch_size chunk_seq_len hidden_dim"] = inputs[:, start_idx:end_idx, :]
-        chunk_output: Float[Array, "batch_size chunk_seq_len hidden_dim"] = mlp_module(chunk)
-        outputs.append(chunk_output)
-
-    concatenated: Float[Array, "batch_size seq_len hidden_dim"] = jnp.concatenate(outputs, axis=1)
-    return concatenated
+    return _blockwise_ffn(mlp_module, inputs, chunk_size)

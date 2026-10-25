@@ -33,6 +33,7 @@ members keep serving.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import threading
 import typing
 from collections import OrderedDict
@@ -119,11 +120,9 @@ class PrefixAffinityMap:
 
 
 def _member_alive(member) -> bool:
-    """Best-effort liveness for local engines and remote handles alike."""
+    """Read public liveness metadata, assuming unknown engine-shaped members are alive."""
     alive = getattr(member, "alive", None)
-    if alive is not None:
-        return bool(alive)
-    return bool(getattr(member, "_generation_alive", True))
+    return True if alive is None else bool(alive)
 
 
 def _member_pending_prefill_tokens(member) -> int:
@@ -391,21 +390,54 @@ class RoutedEngine:
         self._release(member_index)
         return result
 
-    def iter_chat_completion_stream(self, *, messages: list[dict], **kwargs):
-        """Route an OpenAI chat-completion stream to one member."""
-        member_index = self._route_for_key(self._chat_routing_key(messages))
-        yield from self._released_iterator(
-            self.members[member_index].iter_chat_completion_stream(messages=messages, **kwargs),
-            member_index,
-        )
+    @staticmethod
+    def _stream_usage_kwargs(stream_fn, usage_callback) -> dict[str, typing.Any]:
+        """Forward optional progress to supporting members, preserving legacy signatures."""
+        if usage_callback is None:
+            return {}
+        try:
+            parameters = inspect.signature(stream_fn).parameters
+        except (TypeError, ValueError):
+            return {}
+        # As on the API server, generic **kwargs is not an advertisement:
+        # a legacy adapter may pass it through to a member without this API.
+        parameter = parameters.get("usage_callback")
+        if parameter is not None and parameter.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            return {"usage_callback": usage_callback}
+        return {}
 
-    def iter_responses_stream(self, *, messages: list[dict], **kwargs):
-        """Route an OpenAI Responses-API stream to one member."""
+    def iter_chat_completion_stream(
+        self,
+        *,
+        messages: list[dict],
+        usage_callback: typing.Callable[[int, int], None] | None = None,
+        **kwargs,
+    ):
+        """Route chat chunks and optional cumulative usage progress to one member."""
         member_index = self._route_for_key(self._chat_routing_key(messages))
-        yield from self._released_iterator(
-            self.members[member_index].iter_responses_stream(messages=messages, **kwargs),
-            member_index,
-        )
+        try:
+            stream_fn = self.members[member_index].iter_chat_completion_stream
+            yield from stream_fn(messages=messages, **kwargs, **self._stream_usage_kwargs(stream_fn, usage_callback))
+        finally:
+            self._release(member_index)
+
+    def iter_responses_stream(
+        self,
+        *,
+        messages: list[dict],
+        usage_callback: typing.Callable[[int, int], None] | None = None,
+        **kwargs,
+    ):
+        """Route Responses frames and optional cumulative usage progress to one member."""
+        member_index = self._route_for_key(self._chat_routing_key(messages))
+        try:
+            stream_fn = self.members[member_index].iter_responses_stream
+            yield from stream_fn(messages=messages, **kwargs, **self._stream_usage_kwargs(stream_fn, usage_callback))
+        finally:
+            self._release(member_index)
 
     def abort_request(self, request_id: str) -> None:
         """Cancel a request wherever it landed (no-op on non-owners)."""

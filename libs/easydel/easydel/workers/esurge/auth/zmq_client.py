@@ -14,9 +14,9 @@
 
 """ZeroMQ REQ-socket client for the eSurge auth worker subprocess.
 
-Provides :class:`AuthWorkerClient` plus thin client-side mirrors of the
-worker's domain exceptions (:class:`PermissionDenied`,
-:class:`RateLimitExceeded`, :class:`QuotaExceeded`). The client is
+Provides :class:`AuthWorkerClient` and re-exports the worker's shared
+domain exceptions (:class:`PermissionDenied`, :class:`RateLimitExceeded`,
+:class:`QuotaExceeded`). The client is
 designed to be created once per FastAPI worker and shared across
 request handlers; every method serialises send/recv behind a per-client
 lock so concurrent calls remain wire-safe.
@@ -35,43 +35,21 @@ import typing as tp
 
 import zmq
 
-from .auth_models import ApiKeyMetadata, ApiKeyPermissions, ApiKeyRole, ApiKeyStatus, QuotaConfig, RateLimitConfig
+from .auth_manager import PermissionDenied, QuotaExceeded, RateLimitExceeded
+from .auth_models import (
+    ApiKeyMetadata,
+    ApiKeyPermissions,
+    ApiKeyRole,
+    ApiKeyStatus,
+    AuditLogEntry,
+    QuotaConfig,
+    RateLimitConfig,
+)
 
-
-class PermissionDenied(Exception):
-    """Client-side mirror of the auth worker's ``PermissionDenied``.
-
-    Re-raised by :meth:`AuthWorkerClient._request` whenever the worker
-    returns ``status == "error"`` with ``exception_type == "PermissionDenied"``,
-    so callers can distinguish authorisation failures from rate-limit
-    and quota errors using a normal ``except`` clause without touching
-    the worker's internal exception classes.
-    """
-
-    pass
-
-
-class RateLimitExceeded(Exception):
-    """Client-side mirror of the auth worker's ``RateLimitExceeded``.
-
-    Re-raised by :meth:`AuthWorkerClient._request` when the worker
-    reports a rate-limit breach. The message string mirrors the
-    server-side message and identifies the window
-    (e.g. ``"... 60 requests/minute"``).
-    """
-
-    pass
-
-
-class QuotaExceeded(Exception):
-    """Client-side mirror of the auth worker's ``QuotaExceeded``.
-
-    Re-raised by :meth:`AuthWorkerClient._request` when the worker
-    detects that a lifetime or monthly quota would be breached. Use this
-    to surface 429/402-style errors back to API callers.
-    """
-
-    pass
+# ``PermissionDenied`` / ``RateLimitExceeded`` / ``QuotaExceeded`` are the very classes raised by
+# :class:`EnhancedApiKeyManager` (and caught by the API server), re-exported here so that
+# ``except`` clauses behave identically for the in-process manager and for this client.
+__all__ = ["AuthWorkerClient", "PermissionDenied", "QuotaExceeded", "RateLimitExceeded"]
 
 
 class AuthWorkerClient:
@@ -222,6 +200,9 @@ class AuthWorkerClient:
         endpoint: str | None = None,
         model: str | None = None,
         requested_tokens: int = 0,
+        stream: bool = False,
+        uses_tools: bool = False,
+        reservation_id: str | None = None,
     ) -> ApiKeyMetadata:
         """Run the worker's full authorisation pipeline for a request.
 
@@ -240,6 +221,12 @@ class AuthWorkerClient:
                 key's ``allowed_models``.
             requested_tokens: Projected token cost; checked against
                 both per-request ceiling and rate limit / quota windows.
+            stream: Whether the request asks for a streaming response;
+                rejected when the key has ``enable_streaming=False``.
+            uses_tools: Whether the request uses function / tool calling;
+                rejected when the key has ``enable_function_calling=False``.
+            reservation_id: Optional stable id to reconcile completion/cancellation.
+                Omitted ids retain legacy FIFO accounting.
 
         Returns:
             ApiKeyMetadata: Live metadata for the authorising key with
@@ -258,6 +245,9 @@ class AuthWorkerClient:
                 "endpoint": endpoint,
                 "model": model,
                 "requested_tokens": requested_tokens,
+                "stream": stream,
+                "uses_tools": uses_tools,
+                "reservation_id": reservation_id,
             }
         )
         return self._deserialize_metadata(resp["metadata"])
@@ -267,6 +257,7 @@ class AuthWorkerClient:
         raw_key: str | None,
         prompt_tokens: int,
         completion_tokens: int,
+        reservation_id: str | None = None,
     ) -> None:
         """Tell the worker to bump per-key counters after a served request.
 
@@ -274,6 +265,7 @@ class AuthWorkerClient:
             raw_key: Raw API key used for the served request.
             prompt_tokens: Input tokens consumed.
             completion_tokens: Output tokens generated.
+            reservation_id: Optional id passed at authorization for exact reconciliation.
         """
         self._request(
             {
@@ -281,8 +273,19 @@ class AuthWorkerClient:
                 "raw_key": raw_key,
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
+                "reservation_id": reservation_id,
             }
         )
+
+    def release_reservation(self, raw_key: str | None, reservation_id: str | None = None) -> bool:
+        """Release an admission after failure/cancellation without charging usage."""
+        return self._request({"cmd": "release_reservation", "raw_key": raw_key, "reservation_id": reservation_id})[
+            "success"
+        ]
+
+    def flush(self) -> None:
+        """Persist pending authentication state without stopping the worker."""
+        self._request({"cmd": "flush"})
 
     def revoke_key(self, key_id: str, revoked_by: str | None = None) -> bool:
         """Permanently disable a key via the worker.
@@ -398,6 +401,7 @@ class AuthWorkerClient:
         tags: list[str] | None = None,
         metadata: dict[str, tp.Any] | None = None,
         updated_by: str | None = None,
+        clear_expiry: bool = False,
     ) -> bool:
         """Apply a partial update to a managed key via the worker.
 
@@ -419,6 +423,7 @@ class AuthWorkerClient:
             tags: New tag list (full replacement).
             metadata: User-metadata patch merged into the existing dict.
             updated_by: Optional actor recorded in the worker audit log.
+            clear_expiry: Remove expiration, taking precedence over ``expires_in_days``.
 
         Returns:
             bool: ``True`` when the key existed and was updated.
@@ -437,6 +442,7 @@ class AuthWorkerClient:
                 "tags": tags,
                 "metadata": metadata,
                 "updated_by": updated_by,
+                "clear_expiry": clear_expiry,
             }
         )
         return resp["success"]
@@ -457,16 +463,16 @@ class AuthWorkerClient:
             The new raw key must be returned to the caller immediately.
         """
         resp = self._request({"cmd": "rotate_key", "key_id": key_id, "rotated_by": rotated_by})
-        if resp.get("status") == "ok" and "raw_key" in resp:
-            return resp["raw_key"], self._deserialize_metadata(resp["metadata"])
-        return None
+        if resp.get("raw_key") is None or resp.get("metadata") is None:
+            return None
+        return resp["raw_key"], self._deserialize_metadata(resp["metadata"])
 
     def get_audit_logs(
         self,
         limit: int = 100,
         key_id: str | None = None,
         action: str | None = None,
-    ) -> list[dict]:
+    ) -> list[AuditLogEntry]:
         """Fetch newest-first audit-log entries from the worker.
 
         Args:
@@ -476,13 +482,13 @@ class AuthWorkerClient:
                 ``action`` slug (e.g. ``"request_authorized"``).
 
         Returns:
-            list[dict]: Raw audit-log dicts ordered newest-first; the
-            client does not deserialise them into
-            :class:`AuditLogEntry` so consumers can inspect or stream
-            them directly.
+            list[AuditLogEntry]: Audit-log entries ordered newest-first,
+            rebuilt from the wire payload so the result matches
+            :meth:`EnhancedApiKeyManager.get_audit_logs` (callers can use
+            ``entry.as_dict()`` regardless of where the manager lives).
         """
         resp = self._request({"cmd": "get_audit_logs", "limit": limit, "key_id": key_id, "action": action})
-        return resp["logs"]
+        return [AuditLogEntry(**entry) for entry in resp["logs"]]
 
     def get_statistics(self) -> dict[str, tp.Any]:
         """Fetch aggregate auth statistics from the worker.

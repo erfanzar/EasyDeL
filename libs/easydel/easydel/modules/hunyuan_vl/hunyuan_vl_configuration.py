@@ -404,6 +404,7 @@ class HunYuanVLTextConfig(EasyDeLBaseConfig):
             )
 
         self.rope_scaling = {
+            **rope,
             "rope_type": rope_type,
             "type": rope_type,
             "mrope_section": mrope_section,

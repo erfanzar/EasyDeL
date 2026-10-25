@@ -406,12 +406,12 @@ class PartitionAxis:
             }
 
     @classmethod
-    def _lookup_semantic_mapping(cls, semantic_axis: str) -> AxisRule | None:
+    def _lookup_semantic_mapping(cls, semantic_axis: str) -> AxisRule:
         """Look up a symbolic axis name in the registry, then in the built-ins.
 
         Runtime-registered axes shadow built-in ones with the same
-        name. Returns ``None`` if the axis is not known at all (the
-        caller is expected to treat this as an unknown-axis error).
+        name. Returns ``NOT_GIVEN`` if the axis is not known at all;
+        ``None`` is a valid registered rule meaning replication.
 
         Args:
             semantic_axis: Semantic axis value consumed by this operation.
@@ -421,7 +421,7 @@ class PartitionAxis:
         """
         if semantic_axis in cls._REGISTERED_SEMANTIC_MAP:
             return cls._REGISTERED_SEMANTIC_MAP[semantic_axis]
-        return cls._SEMANTIC_MAP.get(semantic_axis)
+        return cls._SEMANTIC_MAP.get(semantic_axis, ct.NOT_GIVEN)
 
     @classmethod
     def _lookup_generation_mapping(cls, semantic_axis: str) -> AxisRule:
@@ -483,7 +483,7 @@ class PartitionAxis:
             if hasattr(self, axis_rule):
                 return getattr(self, axis_rule)
             mapped = self._lookup_semantic_mapping(axis_rule)
-            if mapped is not None:
+            if mapped is not ct.NOT_GIVEN:
                 visited = set() if _visited is None else set(_visited)
                 if axis_rule in visited:
                     raise ValueError(f"Cyclic semantic axis registration detected at '{axis_rule}'.")
@@ -633,12 +633,12 @@ class PartitionAxis:
                         standard_rule.append(None)
                         continue
                     sub_mapped = self._lookup_semantic_mapping(sub_axis)
-                    if sub_mapped is None:
+                    if sub_mapped is ct.NOT_GIVEN:
                         raise ValueError(f"Unknown semantic axis name: '{sub_axis}'")
                     standard_rule.append(sub_mapped)
             else:
                 standard_rule = self._lookup_semantic_mapping(axis_name)
-                if standard_rule is None:
+                if standard_rule is ct.NOT_GIVEN:
                     raise ValueError(f"Unknown semantic axis name: '{axis_name}'")
 
             target_rule = standard_rule

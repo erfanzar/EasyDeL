@@ -149,6 +149,7 @@ class StateSpaceV1(Kernel[StateSpaceV1Config, Array]):
         act_fn: Callable[[jax.Array], jax.Array] | None = None,
         platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
+        use_associative_scan: bool | None = None,
         cfg: StateSpaceV1Config,
     ) -> tuple[
         Float[Array, "batch seq_len intermediate_size"],
@@ -177,8 +178,11 @@ class StateSpaceV1(Kernel[StateSpaceV1Config, Array]):
             conv_state: Optional convolution state for caching (passed through)
                 Shape: [batch, intermediate_size, d_conv]
             act_fn: Optional activation function for gating (e.g., jax.nn.silu)
-            platform: Optional platform override
-            cfg: Kernel configuration object
+            platform: Optional platform override.
+            use_associative_scan: True selects a registered XLA affine-prefix
+                scan independently of cfg/platform; False selects the sequential
+                scan; None preserves automatic backend selection.
+            cfg: Kernel tile/backend configuration object (unchanged by caller).
 
         Returns:
             Tuple of:
@@ -192,6 +196,11 @@ class StateSpaceV1(Kernel[StateSpaceV1Config, Array]):
         cfg_block_e = int(getattr(cfg, "block_e", 128))
         cfg_backend = getattr(cfg, "backend", "any")
 
+        # Algorithm selection is independent of platform/tile selection. The
+        # parallel prefix has a registered XLA implementation; native GPU scan
+        # kernels remain available for automatic/sequential invocations.
+        if use_associative_scan is True:
+            platform = "xla"
         if platform is not None:
             cfg = StateSpaceV1Config(
                 block_d=cfg_block_d,
@@ -216,6 +225,7 @@ class StateSpaceV1(Kernel[StateSpaceV1Config, Array]):
             act_fn=act_fn,
             block_d=cfg_block_d,
             block_e=cfg_block_e,
+            use_associative_scan=use_associative_scan,
         )
 
     @staticmethod
@@ -314,6 +324,7 @@ def state_space_v1(
     act_fn: Callable[[jax.Array], jax.Array] | None = None,
     platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: StateSpaceV1Config | None = None,
+    use_associative_scan: bool | None = None,
 ) -> tuple[
     Float[Array, "batch seq_len intermediate_size"],
     Float[Array, "batch intermediate_size ssm_state_size"],
@@ -346,7 +357,10 @@ def state_space_v1(
         act_fn: Optional activation function for gating (e.g., jax.nn.silu).
             If gate is provided but act_fn is None, defaults to jax.nn.silu.
         platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
-        cfg: Optional kernel configuration
+        cfg: Optional kernel tile/backend configuration.
+        use_associative_scan: True selects the registered XLA parallel affine
+            prefix, False selects sequential recurrence, and None preserves
+            automatic backend selection. Independent of tile/backend config.
 
     Returns:
         Tuple of:
@@ -384,5 +398,6 @@ def state_space_v1(
         conv_state=conv_state,
         act_fn=act_fn,
         platform=platform,
+        use_associative_scan=use_associative_scan,
         _cfg=cfg,
     )

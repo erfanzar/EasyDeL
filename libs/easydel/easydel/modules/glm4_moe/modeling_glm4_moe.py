@@ -77,7 +77,7 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import UnifiedAttention
-from easydel.layers.moe import moe_group_topk_select
+from easydel.layers.moe import fp32_router_logits, moe_group_topk_select
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .glm4_moe_configuration import Glm4MoeConfig
@@ -283,6 +283,11 @@ class Glm4MoeTopKRouter(spx.Module):
     optionally re-normalised (``norm_topk_prob``) and scaled by
     ``routed_scaling_factor`` before consumption.
 
+    The logit projection and public :meth:`get_selected_experts` API share
+    their parameters with the MoE block. Both expert-selection entry points
+    delegate to :func:`easydel.layers.moe.moe_group_topk_select` so grouped
+    routing and the live correction bias follow the same implementation.
+
     The router projection itself is a single fp32 matmul against
     ``self.weight`` of shape ``(hidden_size, n_routed_experts)`` — kept in
     fp32 regardless of the activation dtype because tiny gating logit
@@ -335,39 +340,32 @@ class Glm4MoeTopKRouter(spx.Module):
         )
 
     def get_selected_experts(self, scores):
-        """Select top-k experts using grouped routing strategy.
+        """Select top-k expert indices from already-activated router scores.
 
-        Performs two-stage selection: first selects top groups based on sum
-        of top-2 scores per group, then selects top-k experts from those groups.
+        Uses the same grouped selector as the MoE forward path, including the
+        live correction bias. Scores are not activated a second time.
 
         Args:
-            scores: Router scores of shape [batch_size, n_routed_experts].
+            scores: Per-expert scores of shape ``[num_tokens, n_routed_experts]``.
 
         Returns:
-            Selected expert indices of shape [batch_size, top_k].
+            Expert indices of shape ``[num_tokens, top_k]``.
         """
-        scores_for_choice = scores + self.e_score_correction_bias.value
-        batch_size = scores_for_choice.shape[0]
-        group_scores = scores_for_choice.reshape(batch_size, self.n_group, self.n_routed_experts // self.n_group)
-        top2_per_group = jax.lax.top_k(group_scores, k=2)[0]
-        group_scores_sum = jnp.sum(top2_per_group, axis=-1)
-        scores_for_choice = jnp.where(
-            jax.nn.one_hot(
-                jax.lax.top_k(
-                    group_scores_sum,
-                    k=self.topk_group,
-                )[-1],
-                self.n_group,
-                dtype=scores.dtype,
-            )[:, :, None]
-            .repeat(self.n_routed_experts // self.n_group, axis=2)
-            .reshape(batch_size, self.n_routed_experts),
-            scores_for_choice,
-            0.0,
+        _, indices = moe_group_topk_select(
+            scores,
+            None,
+            self.top_k,
+            n_routed_experts=self.n_routed_experts,
+            score_fn="none",
+            e_score_correction_bias=self.e_score_correction_bias.value,
+            n_group=self.n_group,
+            topk_group=self.topk_group,
+            group_topk_k=min(2, self.n_routed_experts // max(self.n_group, 1)),
+            group_score="topk_sum",
+            norm_topk_prob=self.norm_topk_prob,
+            routed_scaling_factor=self.routed_scaling_factor,
         )
-        _, selected_experts = jax.lax.top_k(scores_for_choice, k=self.top_k)
-
-        return selected_experts
+        return indices
 
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -380,11 +378,7 @@ class Glm4MoeTopKRouter(spx.Module):
         Returns:
             Router logits [batch * seq_len, n_routed_experts].
         """
-        hidden_states = hidden_states.reshape(-1, self.config.hidden_size)
-        return checkpoint_name(
-            jnp.matmul(hidden_states.astype(jnp.float32), self.weight.value.astype(jnp.float32)),
-            name="moe_router_logits",
-        )
+        return fp32_router_logits(hidden_states, self.weight.value, self.config.hidden_size)
 
 
 class Glm4MoeMoE(BaseMoeModule):
@@ -969,6 +963,7 @@ class Glm4MoeModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
 
@@ -1109,5 +1104,5 @@ class Glm4MoeForSequenceClassification(BaseSequenceClassificationModule[Glm4MoeM
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            score_bias=False,
+            score_head_bias=False,
         )

@@ -79,16 +79,24 @@ class _BaseWorkerClient:
     simply queues on the lock.
     """
 
-    def __init__(self, endpoint: str):
-        """Connect a REQ socket to ``endpoint`` under a thread lock.
-
-        Args:
-            endpoint: ZMQ endpoint URI of the worker process.
-        """
+    def __init__(self, endpoint: str, request_timeout: float = 30.0):
+        """Connect to the worker with a bounded request deadline in seconds."""
+        if request_timeout <= 0:
+            raise ValueError("request_timeout must be positive")
         self._context = zmq.Context.instance()
-        self._socket = self._context.socket(zmq.REQ)
-        self._socket.connect(endpoint)
-        self._lock = threading.Lock()
+        self._endpoint = endpoint
+        self._request_timeout_ms = max(1, int(request_timeout * 1000))
+        self._lock = threading.RLock()
+        self._socket = self._connect_socket()
+
+    def _connect_socket(self):
+        """Create a fresh REQ socket, including after an interrupted round trip."""
+        socket = self._context.socket(zmq.REQ)
+        socket.setsockopt(zmq.SNDTIMEO, self._request_timeout_ms)
+        socket.setsockopt(zmq.RCVTIMEO, self._request_timeout_ms)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.connect(self._endpoint)
+        return socket
 
     def _request(self, payload: dict) -> dict:
         """Send one REQ/REP round-trip under the client lock.
@@ -102,8 +110,14 @@ class _BaseWorkerClient:
             responsible for inspecting ``status`` and raising on errors.
         """
         with self._lock:
-            self._socket.send_pyobj(payload)
-            return self._socket.recv_pyobj()
+            try:
+                self._socket.send_pyobj(payload)
+                return self._socket.recv_pyobj()
+            except zmq.Again as error:
+                self._socket.close(0)
+                self._socket = self._connect_socket()
+                # Do not replay commands: the worker may already have applied them.
+                raise TimeoutError(f"Worker request timed out: {payload.get('cmd')}") from error
 
     def close(self):
         """Close the local REQ socket without sending a shutdown command.
@@ -124,7 +138,7 @@ class TokenizerWorkerClient(_BaseWorkerClient):
     and :meth:`shutdown` for lifecycle control.
     """
 
-    def __init__(self, endpoint: str):
+    def __init__(self, endpoint: str, request_timeout: float = 30.0):
         """Initialize the tokenizer client.
 
         Args:
@@ -135,7 +149,7 @@ class TokenizerWorkerClient(_BaseWorkerClient):
         """
         if not endpoint:
             raise ValueError("Tokenizer worker endpoint must be provided.")
-        super().__init__(endpoint)
+        super().__init__(endpoint, request_timeout=request_timeout)
 
     def tokenize(self, request_id: str, prompt: str) -> list[int]:
         """Encode a single text prompt into token ids on the worker.
@@ -196,7 +210,7 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
     the streaming ``delta_text``.
     """
 
-    def __init__(self, endpoint: str):
+    def __init__(self, endpoint: str, request_timeout: float = 30.0):
         """Initialize the detokenizer client.
 
         Args:
@@ -207,7 +221,7 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
         """
         if not endpoint:
             raise ValueError("Detokenizer worker endpoint must be provided.")
-        super().__init__(endpoint)
+        super().__init__(endpoint, request_timeout=request_timeout)
         self._sent_lengths: dict[str, int] = {}
 
     def decode(
@@ -254,35 +268,43 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
         Raises:
             RuntimeError: When the worker reports ``status != "ok"``.
         """
-        prev_sent = int(self._sent_lengths.get(request_id, 0))
-        total_tokens = len(generated_tokens)
-        if prev_sent < 0 or prev_sent > total_tokens:
-            prev_sent = 0
-        token_delta = generated_tokens[prev_sent:]
+        # Keep token bookkeeping and the round-trip atomic with respect to drain/reset.
+        with self._lock:
+            prev_sent = int(self._sent_lengths.get(request_id, 0))
+            total_tokens = len(generated_tokens)
+            if prev_sent < 0 or prev_sent > total_tokens:
+                prev_sent = 0
+            token_delta = generated_tokens[prev_sent:]
 
-        msg = {
-            "cmd": "decode",
-            "request_id": request_id,
-            "tokens_delta": token_delta,
-            "token_offset": prev_sent,
-            "total_tokens": total_tokens,
-            "finished": finished,
-            "skip_special_tokens": skip_special_tokens,
-            "spaces_between_special_tokens": spaces_between_special_tokens,
-        }
-        if prev_sent == 0 or finished:
-            msg["tokens"] = generated_tokens
-        if prompt_context:
-            msg["prompt_context"] = prompt_context
-        resp = self._request(msg)
-        if resp.get("status") != "ok":
-            raise RuntimeError(resp.get("message", "Detokenizer worker failed"))
-        if finished:
-            self._sent_lengths.pop(request_id, None)
-        else:
-            self._sent_lengths[request_id] = total_tokens
-        result_payload = resp["result"]
-        return DetokenizerResult(**result_payload)
+            msg = {
+                "cmd": "decode",
+                "request_id": request_id,
+                "tokens_delta": token_delta,
+                "token_offset": prev_sent,
+                "total_tokens": total_tokens,
+                "finished": finished,
+                "skip_special_tokens": skip_special_tokens,
+                "spaces_between_special_tokens": spaces_between_special_tokens,
+            }
+            if prev_sent == 0 or finished:
+                msg["tokens"] = generated_tokens
+            if prompt_context:
+                msg["prompt_context"] = prompt_context
+            try:
+                resp = self._request(msg)
+            except TimeoutError:
+                self._sent_lengths.pop(request_id, None)
+                raise
+            if resp.get("status") != "ok":
+                # Resend full tokens next time so a lost worker state can be rebuilt.
+                self._sent_lengths.pop(request_id, None)
+                raise RuntimeError(resp.get("message", "Detokenizer worker failed"))
+            if finished:
+                self._sent_lengths.pop(request_id, None)
+            else:
+                self._sent_lengths[request_id] = total_tokens
+            result_payload = resp["result"]
+            return DetokenizerResult(**result_payload)
 
     def reset(self, request_id: str) -> None:
         """Drop per-request state on both client and worker.
@@ -293,16 +315,24 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
         Args:
             request_id: The request id whose state should be cleared.
         """
-        self._sent_lengths.pop(request_id, None)
-        self._request({"cmd": "reset", "request_id": request_id})
+        with self._lock:
+            self._request({"cmd": "reset", "request_id": request_id})
+            self._sent_lengths.pop(request_id, None)
 
     def drain(self) -> None:
         """Flush every per-request decoder state on the worker.
 
         Used during pause / resume cycles when the engine needs the
         worker to forget all in-flight decoding before reconfiguring.
+        The client-side sent-length bookkeeping is cleared as well so the
+        next ``decode`` for a still-in-flight request resends its full
+        token list and the worker can rebuild its state from scratch.
         """
-        self._request({"cmd": "drain"})
+        with self._lock:
+            resp = self._request({"cmd": "drain"})
+            if resp.get("status") != "ok":
+                raise RuntimeError(resp.get("message", "Detokenizer worker failed to drain"))
+            self._sent_lengths.clear()
 
     def shutdown(self) -> None:
         """Send ``shutdown`` to the worker then close the local socket.

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import jaxtyping
 from beartype import beartype
+from jax import lax
 
 from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
 
@@ -45,8 +46,8 @@ def ring_attention(
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
     q_position_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_position_ids: Int[Array, "batch seq_len_k"] | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
-    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "sink_heads num_sinks"] | None = None,
+    bias: Float[Array, "bias_batch bias_heads bias_seq_len_q bias_seq_len_k"] | None = None,
     mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     chunk_size: int | None = None,
@@ -57,6 +58,7 @@ def ring_attention(
     fwd_params: FwdParams | None = None,
     bwd_params: BwdParams | None = None,
     fused_backward: bool = False,
+    precision: lax.PrecisionLike = lax.Precision.DEFAULT,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Ring attention using Triton block-sparse attention kernels.
     Distributes attention computation across devices using a ring topology,
@@ -81,11 +83,11 @@ def ring_attention(
         kv_position_ids: Optional position indices for keys/values [batch, seq_len_k].
             Used to determine relative positions for causal/sliding window masking.
             If None, defaults to sequential positions 0..seq_len_k-1.
-        softmax_aux: Optional attention sink logits of shape [num_sinks].
-            Contributes to the softmax normalizer without producing output values,
-            useful for streaming attention or attention sinks.
-        bias: Optional attention bias tensor [batch, num_heads, seq_len_q, seq_len_k].
-            Note: Currently not supported in Triton ring_attention (raises NotImplementedError).
+        softmax_aux: Optional shared [num_sinks] or per-head
+            [sink_heads, num_sinks] attention sink logits. Contributes to the
+            softmax normalizer without producing output values.
+        bias: Optional attention bias with independently broadcast batch, head,
+            query, and key dimensions. Supported by the XLA precision fallback.
         mask_builder: Optional callable to build custom sparse mask patterns.
             Currently unused in this implementation.
         sliding_window: Sliding window size for local attention. Can be:
@@ -109,6 +111,10 @@ def ring_attention(
         bwd_params: Backward pass kernel parameters (block sizes, warps, stages).
             If None, uses default BwdParams(q_blocksize=128, kv_blocksize=128).
         fused_backward: Whether to use fused backward pass. Currently unused.
+        precision: JAX contraction precision. Explicit non-default precision
+            uses the registered XLA ring implementation because the fused
+            Triton kernel does not expose this control. DEFAULT retains the
+            existing Triton dispatch.
     Returns:
         Attention output tensor of shape [batch, seq_len_q, num_heads, head_dim].
     Raises:
@@ -138,6 +144,29 @@ def ring_attention(
         ...     axis_name="sp",
         ... )
     """
+    if precision not in (lax.Precision.DEFAULT, "default"):
+        return kernel_registry.get("ring_attention", platform=Platform.XLA, backend=Backend.ANY)(
+            query=query,
+            key=key,
+            value=value,
+            q_segment_ids=q_segment_ids,
+            kv_segment_ids=kv_segment_ids,
+            q_position_ids=q_position_ids,
+            kv_position_ids=kv_position_ids,
+            softmax_aux=softmax_aux,
+            bias=bias,
+            mask_builder=mask_builder,
+            sliding_window=sliding_window,
+            chunk_size=chunk_size,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            softmax_scale=softmax_scale,
+            axis_name=axis_name,
+            fwd_params=fwd_params,
+            bwd_params=bwd_params,
+            fused_backward=fused_backward,
+            precision=precision,
+        )
     return _ring_attention_impl(
         query,
         key,

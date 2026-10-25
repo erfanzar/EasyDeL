@@ -68,33 +68,33 @@ class DeepSeekV32ToolParser(ToolParser):
         </｜DSML｜function_calls>
 
     Attributes:
-        prev_tool_call_arr (list[dict]): Previous tool calls for streaming state.
         dsml_token (str): Base DSML token identifier.
-        dsml_start_check (str): Start pattern for DSML detection.
+        dsml_start_check (str): Prefix used to recognize DSML markup.
+        invoke_start_prefix (str): Prefix of a named invocation tag.
+        current_tool_id (int): Zero-based index of the latest emitted tool call.
+        failed_count (int): Failed parsing or conversion attempts in this response.
+        invoke_index (int): Index of the latest emitted invocation.
+        header_sent (bool): Whether any tool header has been emitted.
+        current_function_name (str | None): Function in the latest invocation.
+        current_param_name (str | None): Parameter in the latest parameter tag.
+        current_param_value (str): Raw value in the latest parameter tag.
+        param_count (int): Number of parameters in the latest invocation.
+        in_param (bool): Whether a parameter tag is currently open.
+        in_function (bool): Whether an invocation is currently open.
+        json_started (bool): Whether a function-call section has started.
+        json_closed (bool): Whether the function-call section has closed.
+        accumulated_params (dict): Parameters of the latest completed invocation.
+        streaming_request (ChatCompletionRequest | None): Active streaming request.
+        prev_tool_call_arr (list[dict]): Previous tool calls for streaming state.
         tool_call_start_token (str): Token marking function_calls start.
         tool_call_end_token (str): Token marking function_calls end.
-        invoke_start_prefix (str): Prefix for invoke tag start.
         invoke_end_token (str): Token marking invoke end.
         parameter_prefix (str): Prefix for parameter tag.
         parameter_end_token (str): Token marking parameter end.
         current_tool_name_sent (bool): Whether current tool name was sent.
-        current_tool_id (str | None): Current tool call ID.
         streamed_args_for_tool (list[str]): Streamed arguments per tool.
         is_tool_call_started (bool): Whether tool call parsing has started.
-        failed_count (int): Count of failed parsing attempts.
         current_tool_index (int): Index of current tool being processed.
-        invoke_index (int): Index of current invoke block.
-        header_sent (bool): Whether the tool header was sent.
-        current_function_name (str | None): Name of current function.
-        current_param_name (str | None): Name of current parameter.
-        current_param_value (str): Value of current parameter.
-        param_count (int): Count of parameters processed.
-        in_param (bool): Whether currently inside a parameter tag.
-        in_function (bool): Whether currently inside a function invoke.
-        json_started (bool): Whether JSON output has started.
-        json_closed (bool): Whether JSON output has closed.
-        accumulated_params (dict): Accumulated parameter key-value pairs.
-        streaming_request (ChatCompletionRequest | None): Current streaming request.
         tool_call_complete_regex (re.Pattern): Regex for complete tool calls.
         invoke_complete_regex (re.Pattern): Regex for complete invoke blocks.
         parameter_complete_regex (re.Pattern): Regex for complete parameters.
@@ -122,35 +122,20 @@ class DeepSeekV32ToolParser(ToolParser):
 
         self.prev_tool_call_arr: list[dict] = []
 
-        self.dsml_token: str = "｜DSML｜"
-        self.dsml_start_check: str = "<" + self.dsml_token
-        self.tool_call_start_token: str = "<｜DSML｜function_calls>"
-        self.tool_call_end_token: str = "</｜DSML｜function_calls>"
-        self.invoke_start_prefix: str = "<｜DSML｜invoke name="
+        self.dsml_token = "｜DSML｜"
+        self.dsml_start_check = "<" + self.dsml_token
+        self.invoke_start_prefix = self.dsml_start_check + "invoke name="
+        self.tool_call_start_token: str = self.dsml_start_check + "function_calls>"
+        self.tool_call_end_token: str = "</" + self.dsml_token + "function_calls>"
         self.invoke_end_token: str = "</｜DSML｜invoke>"
         self.parameter_prefix: str = "<｜DSML｜parameter name="
         self.parameter_end_token: str = "</｜DSML｜parameter>"
 
         self.current_tool_name_sent: bool = False
-        # Override base class type - we use string IDs for tool calls
-        self.current_tool_id: str | None = None
         self.streamed_args_for_tool: list[str] = []
         self.is_tool_call_started: bool = False
-        self.failed_count: int = 0
 
         self.current_tool_index: int = 0
-        self.invoke_index: int = 0
-        self.header_sent: bool = False
-        self.current_function_name: str | None = None
-        self.current_param_name: str | None = None
-        self.current_param_value: str = ""
-        self.param_count: int = 0
-        self.in_param: bool = False
-        self.in_function: bool = False
-        self.json_started: bool = False
-        self.json_closed: bool = False
-        self.accumulated_params: dict = {}
-        self.streaming_request: ChatCompletionRequest | None = None
 
         self._reset_streaming_state()
 
@@ -204,6 +189,21 @@ class DeepSeekV32ToolParser(ToolParser):
         self.is_tool_call_started = False
         self.prev_tool_call_arr.clear()
         self.streamed_args_for_tool.clear()
+        self.current_tool_id = -1
+        self.current_tool_name_sent = False
+        self.failed_count = 0
+        self.invoke_index = 0
+        self.header_sent = False
+        self.current_function_name: str | None = None
+        self.current_param_name: str | None = None
+        self.current_param_value = ""
+        self.param_count = 0
+        self.in_param = False
+        self.in_function = False
+        self.json_started = False
+        self.json_closed = False
+        self.accumulated_params: dict = {}
+        self.streaming_request: ChatCompletionRequest | None = None
 
     def _parse_invoke_params(self, invoke_str: str) -> dict | None:
         """Parse parameters from an invoke block string.
@@ -235,7 +235,7 @@ class DeepSeekV32ToolParser(ToolParser):
             model_output: Complete text output from the model containing
                 potential tool calls in DSML format.
             request: Original chat completion request with tool definitions.
-                Used for context but not directly accessed in this method.
+                Used to coerce parameter values to their schema types.
 
         Returns:
             ExtractedToolCallInformation: Contains:
@@ -258,13 +258,13 @@ class DeepSeekV32ToolParser(ToolParser):
 
             for tool_call_match in self.tool_call_complete_regex.findall(model_output):
                 for invoke_name, invoke_content in self.invoke_complete_regex.findall(tool_call_match):
-                    param_dict = self._parse_invoke_params(invoke_content)
+                    param_dict = self._parse_invoke_params(invoke_content) or {}
+                    # Same schema-driven typing as the streaming path so both modes agree.
+                    converted = self._convert_params_with_schema(invoke_name, param_dict, request, invoke_content)
                     tool_calls.append(
                         ToolCall(
                             type="function",
-                            function=FunctionCall(
-                                name=invoke_name, arguments=json.dumps(param_dict, ensure_ascii=False)
-                            ),
+                            function=FunctionCall(name=invoke_name, arguments=json.dumps(converted, ensure_ascii=False)),
                         )
                     )
 
@@ -277,45 +277,9 @@ class DeepSeekV32ToolParser(ToolParser):
             return ExtractedToolCallInformation(tools_called=True, tool_calls=tool_calls, content=content)
 
         except Exception:
+            self.failed_count += 1
             logger.exception("Error extracting tool calls")
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
-
-    def _extract_name(self, name_str: str) -> str:
-        """Extract name from a potentially quoted string.
-
-        Removes surrounding quotes (single or double) from a string
-        if present, returning the unquoted content.
-
-        Args:
-            name_str: The string potentially wrapped in quotes.
-
-        Returns:
-            str: The string with surrounding quotes removed, or
-                the original string if no quotes present.
-        """
-        name_str = name_str.strip()
-        if (name_str.startswith('"') and name_str.endswith('"')) or (
-            name_str.startswith("'") and name_str.endswith("'")
-        ):
-            return name_str[1:-1]
-        return name_str
-
-    def _extract_param_name(self, input_str: str) -> str:
-        """Extract parameter name from an attribute string.
-
-        Finds the parameter name within a string that may contain
-        attribute definitions like 'name="param_name"'.
-
-        Args:
-            input_str: String containing parameter name definition.
-
-        Returns:
-            str: The extracted parameter name, or the original
-                string if extraction fails.
-        """
-        start = input_str.find('"') + 1
-        end = input_str.find('"', start)
-        return input_str[start:end] if start > 0 and end > start else input_str
 
     def _convert_param_value(self, value: str, param_type: str) -> Any:
         """Convert parameter value to the correct Python type.
@@ -367,18 +331,22 @@ class DeepSeekV32ToolParser(ToolParser):
         function_name: str,
         param_dict: dict[str, str],
         request: ChatCompletionRequest | None,
+        invoke_body: str = "",
     ) -> dict[str, Any]:
         """Convert raw string parameter values using the tool schema types.
 
         Looks up each parameter's expected type from the tool definition in
         the request, then delegates to ``_convert_param_value`` for type
-        coercion. Parameters without a matching schema entry default to string.
+        coercion. Without a matching schema type, the DSML ``string`` attribute
+        determines whether a value remains a string or is decoded as JSON.
 
         Args:
             function_name: Name of the function whose schema to look up.
             param_dict: Raw parameter name-to-value mapping (all strings).
             request: The chat completion request containing tool definitions,
                 or None if unavailable.
+            invoke_body: Original parameter markup. Without a schema, ``string="false"``
+                values are decoded as JSON and ``string="true"`` values remain strings.
 
         Returns:
             Dictionary mapping parameter names to their type-converted values.
@@ -396,12 +364,28 @@ class DeepSeekV32ToolParser(ToolParser):
                         param_config = schema["properties"]
                     break
 
+        string_flags = dict(re.findall(r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>', invoke_body))
         converted: dict[str, Any] = {}
         for name, value in param_dict.items():
-            param_type = "string"
-            if name in param_config and isinstance(param_config[name], dict):
-                param_type = param_config[name].get("type", "string")
-            converted[name] = self._convert_param_value(value, param_type)
+            schema = param_config.get(name)
+            param_type = schema.get("type") if isinstance(schema, dict) else None
+            if isinstance(param_type, list):
+                # Do not discard union nullability: DSML distinguishes JSON null
+                # from the literal string "null" with its explicit string flag.
+                if "null" in param_type and string_flags.get(name) == "false" and value.strip() == "null":
+                    converted[name] = None
+                    continue
+                param_type = next((kind for kind in param_type if kind != "null"), None)
+            if isinstance(param_type, str):
+                # A schema-typed string, including the literal "null", stays a string.
+                converted[name] = value if param_type == "string" else self._convert_param_value(value, param_type)
+            elif string_flags.get(name) == "false":
+                try:
+                    converted[name] = json.loads(value)
+                except (ValueError, TypeError):
+                    converted[name] = value
+            else:
+                converted[name] = value
         return converted
 
     def _extract_delta_tool_calls(
@@ -431,12 +415,17 @@ class DeepSeekV32ToolParser(ToolParser):
         while len(complete_invokes) > self.current_tool_index:
             invoke_name, invoke_body = complete_invokes[self.current_tool_index]
             param_dict = self._parse_invoke_params(invoke_body) or {}
-            converted = self._convert_params_with_schema(invoke_name, param_dict, request)
+            converted = self._convert_params_with_schema(invoke_name, param_dict, request, invoke_body)
             args_json = json.dumps(converted, ensure_ascii=False)
             idx = self.current_tool_index
             self.current_tool_index += 1
             self.prev_tool_call_arr.append({"name": invoke_name, "arguments": converted})
             self.streamed_args_for_tool.append(args_json)
+            self.current_tool_id = idx
+            self.invoke_index = idx
+            self.header_sent = True
+            self.current_tool_name_sent = True
+            self.accumulated_params = converted
             delta_tool_calls.append(
                 DeltaToolCall(
                     index=idx,
@@ -481,6 +470,7 @@ class DeepSeekV32ToolParser(ToolParser):
         """
         if not previous_text:
             self._reset_streaming_state()
+        self.streaming_request = request
         content_before = None
         if self.is_tool_call_started:
             pass
@@ -491,7 +481,33 @@ class DeepSeekV32ToolParser(ToolParser):
         else:
             return DeltaMessage(content=delta_text) if delta_text else None
 
-        delta_tool_calls = self._extract_delta_tool_calls(current_text, request)
+        self.json_started = self.is_tool_call_started
+        self.json_closed = self.tool_call_end_token in current_text
+        invoke_start = current_text.rfind(self.dsml_start_check + "invoke")
+        self.in_function = invoke_start > current_text.rfind(self.invoke_end_token)
+        if invoke_start >= 0:
+            invoke_text = current_text[invoke_start:]
+            name_match = re.match(re.escape(self.dsml_start_check) + r'invoke\s+name="([^"]+)"', invoke_text)
+            self.current_function_name = name_match.group(1) if name_match else None
+            self.param_count = len(self.parameter_complete_regex.findall(invoke_text))
+            param_start = invoke_text.rfind(self.parameter_prefix)
+            self.in_param = param_start > invoke_text.rfind(self.parameter_end_token)
+            self.current_param_name = None
+            self.current_param_value = ""
+            if param_start >= 0:
+                parameter_text = invoke_text[param_start:]
+                param_match = re.match(re.escape(self.parameter_prefix) + r'"([^"]+)"', parameter_text)
+                self.current_param_name = param_match.group(1) if param_match else None
+                _, separator, value_text = parameter_text.partition(">")
+                if separator:
+                    self.current_param_value = value_text.split(self.parameter_end_token, 1)[0]
+                self.param_count += int(self.in_param)
+        try:
+            delta_tool_calls = self._extract_delta_tool_calls(current_text, request)
+        except Exception:
+            self.failed_count += 1
+            logger.exception("Error extracting streaming DSML tool calls")
+            return None
 
         if delta_tool_calls or content_before:
             return DeltaMessage(content=content_before, tool_calls=delta_tool_calls)

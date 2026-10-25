@@ -429,13 +429,18 @@ class PaliGemmaModel(EasyDeLBaseModule):
         # (image + text prefix) onto the causal mask; suffix tokens stay causal.
         if token_type_ids is not None:
             token_type_ids = jnp.asarray(token_type_ids, dtype=jnp.int32)
-            prefix_groups = (token_type_ids == 0).astype(jnp.int32)
+            # Relax only causal ordering, never caller visibility (pairwise
+            # restrictions, packed-document boundaries, or MaskInfo-only padding).
+            visibility = mask_info.get_or_compute_attention_mask(dtype=jnp.bool_)
             if attention_mask is not None:
-                # Padded positions must not join the bidirectional block (the union
-                # would otherwise re-open them past the padding mask).
-                prefix_groups = prefix_groups * jnp.asarray(attention_mask, dtype=jnp.int32)
+                visibility &= MaskInfo.from_attention_mask(attention_mask).get_or_compute_attention_mask()
+            q_prefix = ((token_type_ids == 0) & jnp.any(visibility, axis=(1, 3))).astype(jnp.int32)
+            kv_prefix = ((token_type_ids == 0) & jnp.any(visibility, axis=(1, 2))).astype(jnp.int32)
             causal_mask_info = mask_info.apply_causal()
-            mask_info = causal_mask_info.apply_token_type_ids(prefix_groups)
+            prefix_mask_info = causal_mask_info.apply_token_type_ids((q_prefix, kv_prefix), zero_policy="both")
+            mask_info = prefix_mask_info.replace(
+                attention_mask=visibility & prefix_mask_info.get_or_compute_attention_mask(dtype=jnp.bool_)
+            )
             # Causal is baked into the mask; attention kernels must not re-apply it.
             object.__setattr__(mask_info, "_causal_baked", True)
 

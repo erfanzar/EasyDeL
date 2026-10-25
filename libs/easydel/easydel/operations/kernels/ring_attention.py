@@ -59,8 +59,6 @@ References:
     - https://arxiv.org/abs/2310.01889
 """
 
-import math
-
 import jax
 from ejkernel.modules import ring_attention  # pyright: ignore[reportMissingTypeStubs]
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
@@ -69,10 +67,10 @@ from jax import random as jr
 from jaxtyping import Array, Float
 from spectrax import common_types
 
-from easydel.caching import TransformerCacheView
+from easydel.caching import RaggedPagesCacheView, TransformerCacheView, UnifiedAttentionCacheView
 
 from .._attention_outputs import AttentionOutput
-from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry, axis_entry_shard_factor
+from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
 from .._operation_meta import normalize_head_sinks
 from ..requirements import (
     CacheType,
@@ -122,13 +120,21 @@ class RingAttn(OperationImpl):
     ) -> OperationRequirements:
         """Returns requirements for RingAttn.
 
-        Ring attention requires basic metadata and uses TransformerCacheView
-        for KV-cache management.
+        Dense calls retain their transformer-cache contract. Paged serving
+        additionally requires request boundaries, context lengths and page tables;
+        the registered paged adapter updates KV and invokes the actual ring kernel.
         """
         return OperationRequirements.create(
             name="ring",
             required_metadata=MetadataField.basic(),
-            supported_cache=CacheType.TRANSFORMER | CacheType.HYBRID,
+            optional_metadata=(
+                MetadataField.CONTEXT_LENS
+                | MetadataField.QUERY_START_LOC
+                | MetadataField.PAGES_TABLES
+                | MetadataField.SLOT_MAPPING
+                | MetadataField.REQUEST_DISTRIBUTION
+            ),
+            supported_cache=CacheType.TRANSFORMER | CacheType.HYBRID | CacheType.RAGGED_PAGES,
             cache_view_class=TransformerCacheView,
         )
 
@@ -182,13 +188,32 @@ class RingAttn(OperationImpl):
             AttentionOutput: ``attention_outputs`` of shape ``(B, seq_len_q,
             num_heads, head_dim)``. ``attention_weights`` is ``None``.
         """
+        cache_view = ignore.pop("cache_view", None)
+        cache_metadata = ignore.pop("cache_metadata", None)
+        if isinstance(cache_view, (RaggedPagesCacheView, UnifiedAttentionCacheView)):
+            paged = OperationRegistry.create("paged_attention_reference", self.metadata)
+            return paged(
+                query=query,
+                key=key,
+                value=value,
+                cache_view=cache_view,
+                cache_metadata=cache_metadata,
+                dense_impl="ring",
+                softmax_aux=softmax_aux,
+                mask_info=mask_info,
+                logits_soft_cap=logits_soft_cap,
+                softmax_scale=softmax_scale,
+                sliding_window=sliding_window,
+                causal=causal,
+                **ignore,
+            )
         query_dim: int = query.shape[-1]
         key_dim: int = key.shape[-1]
         value_dim: int = value.shape[-1]
         dims_incompatible: bool = not (query_dim == key_dim == value_dim)
 
         if dims_incompatible:
-            vanilla_attn: VanillaAttn = VanillaAttn(self.metadata)
+            vanilla_attn: VanillaAttn = OperationRegistry.create("vanilla", self.metadata)
             fallback_output: AttentionOutput = vanilla_attn(
                 query=query,
                 key=key,
@@ -204,6 +229,7 @@ class RingAttn(OperationImpl):
             )
             return fallback_output
 
+        pairwise_mask = None if mask_info is None else getattr(mask_info, "_attention_mask", None)
         # Canonical sink layouts: shared sinks stay 1-D ``(S,)`` (every ring kernel reads
         # 1-D as shared); per-query-head sinks become 2-D ``(Hq, S)`` so they are never
         # mistaken for shared ones. Never ``reshape(-1)``: that flattens multi-sink rows.
@@ -244,25 +270,10 @@ class RingAttn(OperationImpl):
             preserved_indices=[0, 1, 2],
         )
 
-        # GQA + shard_map consistency (same defect class as BlockSparseAttn):
-        # the ring kernels regroup query heads onto KV heads *inside each
-        # shard* with the blocked mapping ``local_h // (local_q / local_kv)``.
-        # That only matches the global GQA grouping when the KV-head axis is
-        # sharded by exactly the same factor as the query-head axis. When the
-        # KV head count is not divisible by the query-head shard factor, the
-        # spec sanitizer silently replicates the KV heads while query heads
-        # stay sharded, and shards attend query heads to the wrong KV head.
-        # Repair: block-repeat KV heads by the minimal (lcm) factor so the
-        # count divides evenly; blocked ``jnp.repeat`` preserves the global
-        # q->kv mapping. Layout here is BTHD, so the head axis is index 2.
-        num_kv_heads: int = key.shape[2]
-        head_shard_factor = 1
-        if query_sharding is not None and len(query_sharding) > 2:
-            head_shard_factor = axis_entry_shard_factor(self.metadata.mesh, query_sharding[2])
-        if head_shard_factor > 1 and num_kv_heads > 1 and num_kv_heads % head_shard_factor != 0:
-            kv_head_reps = head_shard_factor // math.gcd(num_kv_heads, head_shard_factor)
-            key = jnp.repeat(key, kv_head_reps, axis=2)
-            value = jnp.repeat(value, kv_head_reps, axis=2)
+        # Preserve the global GQA grouping within each BTHD head shard.
+        key, value = self.expand_kv_heads_for_shard(
+            key, value, head_axis=2, query_sharding=query_sharding, query_head_axis=2
+        )
 
         key_sharding = self.create_stable_sharding(
             shardings.key,
@@ -291,12 +302,45 @@ class RingAttn(OperationImpl):
             layout="bthd",
         )
 
+        dense_bias = ignore.get("bias")
+        if pairwise_mask is not None:
+            # ejkernel's ring wrapper only consumes segment IDs/positions from
+            # MaskInfo. Pairwise causal, sliding and custom masks are NOT
+            # equivalence relations and cannot be converted to segment IDs.
+            # Preserve them losslessly through the kernel's additive bias input.
+            if pairwise_mask.ndim == 2:
+                pairwise_mask = pairwise_mask[:, None, None, :]
+            elif pairwise_mask.ndim == 3:
+                pairwise_mask = pairwise_mask[:, None, :, :]
+            pairwise_mask = pairwise_mask[..., : query.shape[1], : key.shape[1]].astype(jnp.bool_)
+            # Hard exclusions must remain -inf, not the smallest finite logit.
+            # Otherwise causal/segment/window masking can remove every allowed
+            # key and the online softmax assigns mass to a pairwise-masked key.
+            # The XLA ring handles empty rows with zero output and zero QKV VJP.
+            mask_bias = jnp.where(pairwise_mask, 0.0, -jnp.inf)
+            dense_bias = mask_bias if dense_bias is None else jnp.where(pairwise_mask, dense_bias, mask_bias)
+            # Strip only the dense representation; never derive segment IDs
+            # from its row/column patterns. Explicit segments remain independent.
+            q_segments = getattr(mask_info, "_q_segment_ids", None)
+            kv_segments = getattr(mask_info, "_kv_segment_ids", None)
+            mask_info = mask_info.replace(
+                _attention_mask=None,
+                q_segment_ids=q_segments if q_segments is not None else jnp.zeros(query.shape[:2], dtype=jnp.int32),
+                kv_segment_ids=kv_segments if kv_segments is not None else jnp.zeros(key.shape[:2], dtype=jnp.int32),
+            )
+        if mask_info is not None and mask_info.causal_mask_baked_in:
+            causal_computed = False
+        if mask_info is not None and mask_info.sliding_window_baked_in:
+            sliding_window = None
+        if dense_bias is not None:
+            dense_bias = jnp.broadcast_to(dense_bias, (query.shape[0], query.shape[2], query.shape[1], key.shape[1]))
+        bias_sharding = self.create_stable_sharding(getattr(shardings, "bias", None), dep=dense_bias, tensor=dense_bias)
         outputs: Float[Array, "batch seq_len_q num_heads head_dim"] = ring_attention(
             query,
             key,
             value,
             softmax_aux,
-            None,
+            dense_bias,
             axis_name=self.metadata.sequence_axis_name,
             mask_info=mask_info,
             logits_soft_cap=logits_soft_cap,
@@ -304,17 +348,19 @@ class RingAttn(OperationImpl):
             sliding_window=sliding_window,
             causal=causal_computed,
             fused_backward=fused_backward,
+            precision=ignore.get("precision", jax.lax.Precision.DEFAULT),
             cfg=self.metadata.get_operation_config("ring"),
-            # The Pallas TPU ring kernel only accepts rank-1 (shared) sinks, so per-head
-            # 2-D sinks are served by the XLA ring kernel, which reads them per head.
-            platform="xla" if per_head_sinks else None,
+            # The Pallas splash ring path cannot represent additive pairwise
+            # bias or per-head sinks. The registered XLA ring supports both,
+            # including ring collectives; do not select a non-ring mechanism.
+            platform="xla" if per_head_sinks or dense_bias is not None else None,
             mesh=self.metadata.mesh,
             in_specs=(
                 query_sharding,
                 key_sharding,
                 value_sharding,
                 softmax_aux_sharding,
-                None,
+                bias_sharding,
             ),
             out_specs=output_sharding,
         )
@@ -435,6 +481,37 @@ class RingAttn(OperationImpl):
             fused_backward=fused_backward,
             causal=causal,
             **ignore,
+        )
+
+
+@OperationRegistry.register
+class RingPagedAttn(RingAttn):
+    """Ring serving adapter with paged allocation and continuous-batch metadata.
+
+    ``ring`` keeps the transformer allocation default. Serving
+    builders select ``ring_paged`` to allocate paged KV and supply request/page
+    metadata; both use the same registered ring calculation after request-local
+    page gathers. No paged mechanism is silently substituted for ring attention.
+    """
+
+    @classmethod
+    def get_impl_name(cls):
+        return "ring_paged"
+
+    @classmethod
+    def get_requirements(cls, mode=ExecutionMode.MIXED):
+        return OperationRequirements.create(
+            name=cls.get_impl_name(),
+            required_metadata=(
+                MetadataField.basic()
+                | MetadataField.CONTEXT_LENS
+                | MetadataField.QUERY_START_LOC
+                | MetadataField.PAGES_TABLES
+            ),
+            optional_metadata=MetadataField.SLOT_MAPPING | MetadataField.REQUEST_DISTRIBUTION,
+            supported_cache=CacheType.RAGGED_PAGES,
+            preferred_cache=CacheType.RAGGED_PAGES,
+            cache_view_class=RaggedPagesCacheView,
         )
 
 

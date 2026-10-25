@@ -50,30 +50,16 @@ from jaxtyping import Array, Float
 from spectrax import common_types as ct
 from spectrax import with_sharding_constraint
 
-from easydel.axis import ATTN_DP
 from easydel.caching import OperationsMetadata, RaggedPagesMetadata, UnifiedAttentionCacheView, unwrap_metadata
-from easydel.utils.helpers import check_bool_flag
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationRegistry
 from .._operation_meta import normalize_head_sinks
 from ..requirements import CacheType, ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
+from ._paged_common import ENABLE_DP_LOCAL_PAGE_PATH, dp_page_axis
 
-ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
-
-
-def _dp_page_axis(cache_view: UnifiedAttentionCacheView):
-    """Resolve the logical page axis for the active cache view.
-
-    Args:
-        cache_view: Unified-attention cache view carrying the DP metadata.
-
-    Returns:
-        Any: ``ATTN_DP`` when the cache reports ``data_parallel_size > 1``,
-        else ``ct.EMPTY`` (replicated pages).
-    """
-    dp_size = max(1, int(getattr(cache_view.metadata, "data_parallel_size", 1)))
-    return ATTN_DP if dp_size > 1 else ct.EMPTY
+# Backward-compatible alias for callers importing the former adapter helper.
+_dp_page_axis = dp_page_axis
 
 
 def _localize_block_tables_for_dp_pages(
@@ -270,18 +256,67 @@ class PagedFlashAttn(OperationImpl):
         key_cache = cache_view.key_cache.astype(dtype)
         value_cache = cache_view.value_cache.astype(dtype)
         dp_size = max(1, int(getattr(cache_view.metadata, "data_parallel_size", 1)))
-        page_axis = _dp_page_axis(cache_view)
-        block_tables = _localize_block_tables_for_dp_pages(
-            block_tables.astype(jnp.int32),
-            num_pages=int(key_cache.shape[0]),
-            dp_size=dp_size,
+        rows, num_pages = int(block_tables.shape[0]), int(key_cache.shape[0])
+        use_local_pages = (
+            ENABLE_DP_LOCAL_PAGE_PATH
+            and dp_size > 1
+            and rows > 0
+            and rows % dp_size == 0
+            and num_pages > 0
+            and num_pages % dp_size == 0
         )
+        # Global IDs require a replicated pool. Decide localization and page
+        # sharding together, including when row/page geometry is incompatible.
+        page_axis = dp_page_axis(cache_view) if use_local_pages else ct.EMPTY
+        block_tables = block_tables.astype(jnp.int32)
+        if use_local_pages:
+            block_tables = _localize_block_tables_for_dp_pages(
+                block_tables,
+                num_pages=num_pages,
+                dp_size=dp_size,
+            )
         if bias is not None:
             bias = bias.astype(dtype)
 
         model_mode = self.get_mode(query=query, BTHD=True)
-        is_decode_mode = model_mode == ct.MODE_DECODE
-        causal_computed = causal if not is_decode_mode else False
+        context_lens = getattr(cache_metadata, "context_lens", None)
+        if context_lens is None:
+            raise ValueError("PagedFlashAttn requires `context_lens` to mask unused cache slots.")
+        batch, q_len = query.shape[:2]
+        kv_len = block_tables.shape[1] * key_cache.shape[1]
+        lengths = jnp.asarray(context_lens, jnp.int32).reshape(batch, 1)
+        kv_positions = jnp.arange(kv_len, dtype=jnp.int32)[None, None, :]
+        q_positions = lengths - q_len + jnp.arange(q_len, dtype=jnp.int32)[None, :]
+        if mask_info is not None and mask_info.q_positions is not None:
+            q_positions = jnp.broadcast_to(jnp.asarray(mask_info.q_positions, jnp.int32), (batch, q_len))
+        visible = (kv_positions < lengths[:, :, None]) & (q_positions[:, :, None] >= 0)
+        if causal:
+            visible = visible & (kv_positions <= q_positions[:, :, None])
+        if sliding_window is not None:
+            if isinstance(sliding_window, int):
+                left = right = max(sliding_window - 1, 0)
+            else:
+                left, right = sliding_window
+            visible = visible & (kv_positions >= q_positions[:, :, None] - left)
+            visible = visible & (kv_positions <= q_positions[:, :, None] + right)
+        visible = visible[:, None, :, :]
+        if mask_info is not None:
+            existing = jnp.asarray(mask_info.get_or_compute_attention_mask(dtype=jnp.bool_), jnp.bool_)
+            if existing.ndim == 2:
+                existing = existing[:, None, None, :]
+            elif existing.ndim == 3:
+                existing = existing[:, None, :, :]
+            if existing.shape[-1] < kv_len:
+                existing = jnp.pad(
+                    existing, ((0, 0), (0, 0), (0, 0), (0, kv_len - existing.shape[-1])), constant_values=True
+                )
+            visible = visible & existing[..., :q_len, :kv_len]
+        # The kernel sees padded page-table width, not each request's length.
+        # Bake causal/window terms in absolute coordinates rather than letting
+        # dense bottom-right alignment use that padded width as the KV length.
+        mask_info = MaskInfo(_attention_mask=visible)
+        causal_computed = False
+        sliding_window = None
 
         softmax_aux, _ = normalize_head_sinks(
             softmax_aux,
@@ -327,6 +362,12 @@ class PagedFlashAttn(OperationImpl):
         # every request's rows and the paged kernel rejected the batch mismatch (r14 S07-2).
         batch_axis = query_sharding[0] if query_sharding is not None and len(query_sharding) else None
         block_tables_sharding = PartitionSpec(batch_axis, None)
+        head_axis = query_sharding[2] if query_sharding is not None and len(query_sharding) > 2 else None
+        mask_info = mask_info.replace(
+            batch_axis_name=batch_axis,
+            qheads_axis_name=head_axis,
+            sequence_axis_name=None,
+        )
 
         attn: Float[Array, "batch seq_len_q num_heads head_dim"] = flash_attention(
             query,
@@ -346,7 +387,9 @@ class PagedFlashAttn(OperationImpl):
             logits_soft_cap=logits_soft_cap,
             normalize_output=normalize_output,
             precision=precision,
-            logits_dtype=jnp.bfloat16,
+            # The ejkernel CUDA / CuTe / Triton flash kernels accumulate logits in fp32 only; follow the
+            # configured softmax dtype (fp32 by default) instead of forcing a lower precision.
+            logits_dtype=self.metadata.runtime_softmax_dtype or jnp.float32,
             cfg=self.metadata.get_operation_config("paged_flash_attention"),
             mesh=self.metadata.mesh,
             in_specs=(

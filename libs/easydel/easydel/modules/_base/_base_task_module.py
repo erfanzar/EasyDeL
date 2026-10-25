@@ -66,6 +66,9 @@ See Also:
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from copy import deepcopy
+from numbers import Number
+from types import CodeType, FunctionType, MethodType
 from typing import Any, Generic, TypeVar, cast
 
 import jax
@@ -79,6 +82,7 @@ from spectrax import apply_logical_sharding, common_types
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
+from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 
 from ._features import (
     GradientCheckpointingFeature,
@@ -423,6 +427,167 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
             return self._logit_cap_feature.apply(logits)
         return logits
 
+    def _snapshot_logit_cap(self, apply_cap: Callable) -> Callable:
+        """Rebind a custom cap to a parameter-free snapshot of its settings.
+
+        Scalar instance settings and attributes referenced by the callback (or
+        its helper methods) are copied. This never deep-copies the backbone to
+        detach a bound method. Keeping the original class allows inherited helpers and
+        zero-argument ``super()`` in existing overrides to keep working.
+
+        Args:
+            apply_cap: Existing custom clipping function or bound method.
+
+        Returns:
+            An independent clipping callback with no live model capture.
+
+        Raises:
+            TypeError: A custom cap depends on parameterized state rather than
+                scalar settings or parameter-free components.
+        """
+        snapshot = object.__new__(type(self))
+        memo = {id(self): snapshot}
+        captured_names = set()
+
+        def check_parameter_free(value, seen):
+            """Reject parameters before copying, without allocating arrays."""
+            if id(value) in seen:
+                return
+            seen.add(id(value))
+            if isinstance(value, (spx.Variable, jax.Array)) or (
+                hasattr(value, "shape") and hasattr(value, "dtype") and not isinstance(value, (Number, type))
+            ):
+                raise TypeError("Custom logit caps must capture only scalar settings or parameter-free components")
+            if isinstance(value, (str, bytes, Number, type)) or value is None:
+                return
+            if isinstance(value, MethodType):
+                check_parameter_free(value.__self__, seen)
+                check_parameter_free(value.__func__, seen)
+            elif isinstance(value, FunctionType):
+                for cell in value.__closure__ or ():
+                    check_parameter_free(cell.cell_contents, seen)
+                check_parameter_free(value.__defaults__, seen)
+                check_parameter_free(value.__kwdefaults__, seen)
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    check_parameter_free(key, seen)
+                    check_parameter_free(item, seen)
+            elif isinstance(value, (tuple, list, set, frozenset)):
+                for item in value:
+                    check_parameter_free(item, seen)
+            elif hasattr(value, "__dict__") and not isinstance(value, type):
+                for item in vars(value).values():
+                    check_parameter_free(item, seen)
+
+        def attribute_names(code):
+            """Include settings used inside comprehensions and nested functions."""
+            yield from code.co_names
+            for constant in code.co_consts:
+                if isinstance(constant, CodeType):
+                    yield from attribute_names(constant)
+                elif isinstance(constant, str):
+                    # getattr(self, "setting", default) does not list setting
+                    # in co_names, but it still depends on its current value.
+                    yield constant
+
+        def capture(value):
+            """Copy settings and rebind methods/closures referring to this owner."""
+            if id(value) in memo:
+                return memo[id(value)]
+            if isinstance(value, MethodType) and value.__self__ is self:
+                result = MethodType(capture(value.__func__), snapshot)
+            elif isinstance(value, FunctionType):
+                # Helpers and super() can introduce additional scalar settings.
+                for name in attribute_names(value.__code__):
+                    if name not in captured_names and hasattr(self, name):
+                        captured_names.add(name)
+                        descriptor = next((vars(base)[name] for base in type(self).__mro__ if name in vars(base)), None)
+                        if isinstance(descriptor, property):
+                            # A read-only property cannot be assigned, and its
+                            # resolved value is not its storage. Copy the getter's
+                            # dependencies and let the original descriptor run.
+                            if descriptor.fget is not None:
+                                capture(descriptor.fget)
+                        else:
+                            object.__setattr__(snapshot, name, capture(getattr(self, name)))
+                if "super" in value.__code__.co_names:
+                    for base in type(self).__mro__[1:]:
+                        inherited = vars(base).get(value.__name__)
+                        if isinstance(inherited, FunctionType) and inherited is not value:
+                            capture(inherited)
+                closure = None
+                if value.__closure__ is not None:
+                    closure = tuple(make_cell(capture(cell.cell_contents)) for cell in value.__closure__)
+                result = FunctionType(
+                    value.__code__, value.__globals__, value.__name__, capture(value.__defaults__), closure
+                )
+                result.__kwdefaults__ = capture(value.__kwdefaults__)
+            else:
+                check_parameter_free(value, set())
+                result = deepcopy(value, memo)
+            memo[id(value)] = result
+            return result
+
+        def make_cell(value):
+            """Create a replacement closure cell without retaining its old owner."""
+            return (lambda: value).__closure__[0]
+
+        # Runtime-computed getattr names cannot be discovered from bytecode.
+        # Preserve scalar instance settings as well, without traversing/copying
+        # the model's backbone, parameters, or unrelated feature objects.
+        for name, value in vars(self).items():
+            if isinstance(value, (str, bytes, Number)) or value is None:
+                captured_names.add(name)
+                object.__setattr__(snapshot, name, value)
+        return capture(apply_cap)
+
+    def get_base_lm_logit_postprocess(self) -> Callable[[Array], Array] | None:
+        """Capture the clipping stage, including existing custom overrides.
+
+        Family-owned :meth:`get_lm_logit_postprocess` hooks can compose this
+        stage before or after their scaling/soft-capping, matching their
+        full-logit path. The standard implementation captures only its scalar
+        cap. Existing ``apply_logit_cap`` overrides remain authoritative, but
+        are rebound to snapshots of their scalar settings/parameter-free
+        components rather than retaining the live model and its parameters.
+
+        Returns:
+            A clipping callable, or ``None`` for identity.
+        """
+        apply_cap = getattr(self, "apply_logit_cap", None)
+        if callable(apply_cap) and getattr(apply_cap, "__func__", None) is not BaseTaskModule.apply_logit_cap:
+            return BaseTaskModule._snapshot_logit_cap(self, apply_cap)
+        if self._logit_cap_feature is None:
+            return None
+        cap = self._logit_cap_feature.cap_value
+
+        def _clip(logits: Array) -> Array:
+            """Apply the captured symmetric logit cap."""
+            return jnp.clip(logits, -cap, cap)
+
+        return _clip
+
+    def get_lm_logit_postprocess(self) -> Callable[[Array], Array] | None:
+        """Capture the complete post-projection transform for split LM heads.
+
+        The ordinary task head projects first and then applies
+        :meth:`apply_logit_cap` in :meth:`compute_lm_logits`. This hook
+        reproduces that stage, including existing custom overrides. The
+        standard clipping implementation captures only the scalar cap.
+        ``None`` explicitly declares an identity transform, not permission
+        for a caller to infer transformations from configuration attributes.
+
+        Subclasses adding transformations in ``apply_lm_head`` or
+        ``compute_lm_logits`` must override this hook with their complete
+        ordered transform, composing :meth:`get_base_lm_logit_postprocess`
+        where their full-logit path applies base clipping. Such callables
+        must capture only scalar settings or parameter-free components.
+
+        Returns:
+            A pure logits-to-logits callable, or ``None`` for identity.
+        """
+        return self.get_base_lm_logit_postprocess()
+
     def make_lm_head_fn(self, vocab_shard_stage: int | None = None) -> Callable[[Array], Array]:
         """Trace-safe LM-head projection with logit capping.
 
@@ -437,11 +602,15 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         takes effect through this subclass too.
         """
         base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
-        _cap = self.apply_logit_cap
+        # Share the same clipping authority as split heads, including custom
+        # overrides; the ordinary stage captures only its scalar cap.
+        cap_fn = self.get_base_lm_logit_postprocess()
+        if cap_fn is None:
+            return base_fn
 
         def _project(hidden_states: Array) -> Array:
             """Trace-safe LM-head projection composed with logit capping."""
-            return _cap(base_fn(hidden_states))
+            return cap_fn(base_fn(hidden_states))
 
         return _project
 
@@ -591,7 +760,7 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
             logits = logits[:, :seq_len, :]
         return self._constrain_lm_logits(logits)
 
-    def compute_router_aux_loss(self, outputs) -> Any:
+    def compute_router_aux_loss(self, outputs, attention_mask=None) -> Any:
         """Compute router auxiliary loss for MoE models if configured.
 
         For Mixture-of-Experts (MoE) models, this method computes an auxiliary
@@ -599,8 +768,9 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         the router from collapsing to always select the same few experts.
 
         Args:
-            outputs: Model outputs object that may contain `all_router_losses`
-                attribute with per-layer router loss values.
+            outputs: Model outputs containing per-layer ``all_router_losses``
+                or raw ``router_logits`` from which to compute load balancing.
+            attention_mask: Optional mask excluding padding from router-logit loss.
 
         Returns:
             The weighted sum of router losses multiplied by router_aux_loss_coef,
@@ -623,10 +793,81 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
             return None
 
         router_losses = getattr(outputs, "all_router_losses", None)
-        if router_losses is None:
+        if router_losses is not None:
+            return self._router_aux_loss_feature.compute_loss(router_losses)
+
+        # Most MoE backbones expose logits, not precomputed per-layer losses.
+        router_logits = getattr(outputs, "router_logits", None)
+        if router_logits is None:
+            return None
+        if not isinstance(router_logits, (tuple, list)):
+            router_logits = (router_logits,)
+        router_logits = tuple(logits for logits in router_logits if logits is not None)
+        if not router_logits:
             return None
 
-        return self._router_aux_loss_feature.compute_loss(router_losses)
+        loss = auxiliary_load_balancing_loss_func(
+            gate_logits=router_logits,
+            num_experts=router_logits[0].shape[-1],
+            top_k=self._router_top_k(),
+            attention_mask=attention_mask,
+        )
+        return loss * self._router_aux_loss_feature.coef
+
+    def _router_top_k(self) -> int:
+        """Experts routed per token, used by the router load-balancing loss.
+
+        Plain text MoE configs carry ``num_experts_per_tok`` directly; only the multimodal wrappers nest it under
+        ``get_text_config()``. Families whose config names the value differently (or whose router ignores it)
+        override this.
+        """
+        get_text_config = getattr(self.config, "get_text_config", None)
+        text_config = get_text_config() if callable(get_text_config) else self.config
+        return getattr(text_config, "num_experts_per_tok", 1)
+
+    def compute_indexer_aux_loss(self, outputs) -> Any:
+        """Scale the backbone's sparse-attention indexer warm-up loss by ``indexer_aux_loss_coef``.
+
+        Backbones with a trainable indexer report the unscaled per-layer sum of
+        :func:`easydel.layers.indexer.indexer_distillation_loss` as ``outputs.indexer_aux_loss``. The coefficient is
+        read from the model config (or its text config for multimodal wrappers).
+
+        Args:
+            outputs: Backbone outputs, possibly carrying ``indexer_aux_loss``.
+
+        Returns:
+            ``indexer_aux_loss_coef * outputs.indexer_aux_loss``, or ``None`` when the backbone reports no indexer
+            loss or the coefficient is zero.
+        """
+        indexer_aux = getattr(outputs, "indexer_aux_loss", None)
+        if indexer_aux is None:
+            return None
+        coef = getattr(self.config, "indexer_aux_loss_coef", None)
+        if coef is None:
+            get_text_config = getattr(self.config, "get_text_config", None)
+            text_config = get_text_config() if callable(get_text_config) else None
+            coef = getattr(text_config, "indexer_aux_loss_coef", None)
+        coef = float(coef or 0.0)
+        if coef == 0.0:
+            return None
+        return coef * indexer_aux
+
+    def compute_aux_loss(self, outputs, attention_mask=None) -> Any:
+        """Total auxiliary loss: router load balancing (:meth:`compute_router_aux_loss`) plus the indexer warm-up
+        (:meth:`compute_indexer_aux_loss`).
+
+        Args:
+            outputs: Backbone outputs.
+            attention_mask: Optional mask excluding padding from the router-logit loss.
+
+        Returns:
+            The summed auxiliary loss, or ``None`` when neither term is present.
+        """
+        router = self.compute_router_aux_loss(outputs, attention_mask=attention_mask)
+        indexer = self.compute_indexer_aux_loss(outputs)
+        if indexer is None:
+            return router
+        return indexer if router is None else router + indexer
 
     def pool_sequence(self, hidden_states, input_ids=None, attention_mask=None):
         """Pool sequence of hidden states to a single vector.

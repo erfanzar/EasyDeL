@@ -26,7 +26,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec, Sharding, SingleDev
 from spectrax._internal.logging import get_logger
 from spectrax._version import __version__
 
-from . import _fs, fsspec_utils
+from . import _fs, _ocdbt, fsspec_utils
 
 logger = get_logger(__name__)
 
@@ -170,6 +170,8 @@ def tree_serialize_leaves(
     prefix: str | None = None,
     commit_callback: Callable | None = None,
     write_index: bool = True,
+    ocdbt: bool = False,
+    ocdbt_options: _ocdbt.OcdbtSaveOptions | None = None,
 ):
     """Serialize a pytree's leaves to TensorStore format.
 
@@ -183,8 +185,13 @@ def tree_serialize_leaves(
             creates a new one.
         prefix: Optional prefix for organizing arrays (e.g., ``"model"``,
             ``"optimizer"``).
-        commit_callback: Optional callback to run after committing the checkpoint.
+        commit_callback: Optional callback run on process 0 once every process's
+            arrays are committed (JAX's ``on_commit_callback`` contract).
         write_index: Whether to write an index file for the checkpoint.
+        ocdbt: Write the prefix as one coalesced OCDBT store instead of one zarr
+            store per array. The OCDBT write is synchronous and committed on return.
+        ocdbt_options: Write tuning for the OCDBT layout (data-file size, TensorStore
+            concurrency). Ignored unless *ocdbt* is ``True``.
 
     Returns:
         ``None``
@@ -242,7 +249,20 @@ def tree_serialize_leaves(
     if commit_callback is None:
         commit_callback = lambda: logger.info("Committed checkpoint to Tensorstore")  # noqa
 
-    manager.serialize_with_paths(arrays, paths, on_commit_callback=commit_callback)
+    if ocdbt:
+        # GlobalAsyncCheckpointManager never commits a transaction, so the OCDBT write bypasses it.
+        manager.wait_until_finished()
+        _ocdbt.save_prefix(
+            checkpoint_dir,
+            prefix,
+            [info["path"] for info in array_info],
+            arrays,
+            options=ocdbt_options,
+        )
+        if jax.process_index() == 0:
+            commit_callback()
+    else:
+        manager.serialize_with_paths(arrays, paths, on_commit_callback=commit_callback)
 
     if manager_was_none:
         manager.wait_until_finished()
@@ -269,6 +289,7 @@ def tree_serialize_leaves(
         else:
             index_data["arrays"] = array_info
 
+        _ocdbt.record_backend(index_data, prefix, ocdbt)
         _fs.write_text(index_path, json.dumps(index_data, indent=2))
 
 
@@ -449,6 +470,16 @@ def tree_deserialize_leaves(
         else:
             array_info = index_data.get("arrays", [])
 
+        is_ocdbt = _ocdbt.backend_for_prefix(index_data, prefix) == "ocdbt"
+        relpaths_to_load = [info["path"] for info in array_info]
+
+        def _read(chunk_shardings, start, end):
+            """Deserialize ``array_info[start:end]`` with the layout the index records."""
+            if is_ocdbt:
+                specs = [_ocdbt.read_spec(checkpoint_dir, prefix, rel) for rel in relpaths_to_load[start:end]]
+                return manager.deserialize(chunk_shardings, specs)
+            return manager.deserialize_with_paths(shardings=chunk_shardings, paths=paths_to_load[start:end])
+
         paths_to_load = []
         keys = []
         apply_tree_shardings = []
@@ -491,7 +522,7 @@ def tree_deserialize_leaves(
         result = {}
         if paths_to_load:
             if chunk_size is None or chunk_size <= 0:
-                deser_leaves = manager.deserialize_with_paths(shardings=apply_tree_shardings, paths=paths_to_load)
+                deser_leaves = _read(apply_tree_shardings, 0, len(paths_to_load))
                 for key, array in zip(keys, deser_leaves, strict=False):
                     if callback is not None:
                         array = callback(array, key)
@@ -505,10 +536,9 @@ def tree_deserialize_leaves(
             else:
                 for start in range(0, len(paths_to_load), chunk_size):
                     end = min(start + chunk_size, len(paths_to_load))
-                    chunk_paths = paths_to_load[start:end]
                     chunk_shardings = apply_tree_shardings[start:end]
                     chunk_keys = keys[start:end]
-                    deser_leaves = manager.deserialize_with_paths(shardings=chunk_shardings, paths=chunk_paths)
+                    deser_leaves = _read(chunk_shardings, start, end)
                     manager.wait_until_finished()
                     for key, array in zip(chunk_keys, deser_leaves, strict=False):
                         if callback is not None:

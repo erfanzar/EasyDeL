@@ -28,7 +28,11 @@ from typing import Any
 import numpy as np
 
 try:
-    from mistral_common.tokens.tokenizers.mistral import ChatCompletionRequest, MistralTokenizer, SpecialTokenPolicy  # type:ignore #noqa
+    from mistral_common.tokens.tokenizers.mistral import (  # type:ignore
+        ChatCompletionRequest,
+        MistralTokenizer,
+        SpecialTokenPolicy,
+    )
 except ImportError:
     ChatCompletionRequest = MistralTokenizer = SpecialTokenPolicy = None
 
@@ -80,18 +84,19 @@ class Mistral3Tokenizer:
     def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
         """Encode a single string into a list of token ids.
 
-        Maps the ``add_special_tokens`` flag to both the ``bos`` and ``eos``
-        arguments of the underlying Mistral tokenizer (HuggingFace's
-        single-flag semantics are not exposed by ``mistral-common``).
+        Maps the ``add_special_tokens`` flag to the ``bos`` argument of the
+        underlying Mistral tokenizer. EOS is never appended: prompts are fed
+        to a generative model, which must not see an end-of-sequence token
+        after the last prompt token (matching HuggingFace Mistral tokenizers).
 
         Args:
             text: The input text to encode.
-            add_special_tokens: Whether to prepend BOS and append EOS.
+            add_special_tokens: Whether to prepend BOS.
 
         Returns:
             list[int]: The encoded token ids.
         """
-        return self.tokenizer.encode(text, bos=add_special_tokens, eos=add_special_tokens)
+        return self.tokenizer.encode(text, bos=add_special_tokens, eos=False)
 
     def decode(self, token_ids: list[int], skip_special_tokens: bool = True) -> str:
         """Decode a list of token ids back into a string.
@@ -125,36 +130,39 @@ class Mistral3Tokenizer:
             conversation: List of role/content message dicts describing the
                 conversation (Mistral chat schema).
             tokenize: When ``False``, returns the formatted string;
-                when ``True``, tokenizes the formatted text via
-                :meth:`__call__`.
-            add_special_tokens: Whether to add BOS/EOS during tokenization
-                (only used when ``tokenize=True``).
-            padding: Padding behaviour forwarded to :meth:`__call__`.
-            truncation: Truncation behaviour forwarded to :meth:`__call__`.
-            max_length: Maximum length forwarded to :meth:`__call__`.
+                when ``True``, returns the token ids produced by the chat
+                completion encoder (the templated text is *not* re-encoded,
+                so no second BOS and no trailing EOS are added).
+            add_special_tokens: When ``False``, the leading BOS emitted by the
+                chat template is dropped (only used when ``tokenize=True``).
+            padding: Padding behaviour, same as :meth:`__call__`.
+            truncation: Truncation behaviour, same as :meth:`__call__`.
+            max_length: Maximum length, same as :meth:`__call__`.
             return_tensors: Tensor format for the tokenized output
                 (e.g. ``"np"``); ignored when ``tokenize=False``.
-            **kwargs: Extra keyword arguments forwarded to :meth:`__call__`.
+            **kwargs: Reserved for HF compatibility (currently unused).
 
         Returns:
             str | list[int] | dict[str, Any]: The templated string when
-            ``tokenize=False``; otherwise the tokenizer output dictionary
-            from :meth:`__call__`.
+            ``tokenize=False``; otherwise the same output dictionary shape as
+            :meth:`__call__`.
         """
         tokenized = self.mistral_tokenizer.encode_chat_completion(ChatCompletionRequest(messages=conversation))
-        formatted_text = tokenized.text
 
         if not tokenize:
-            return formatted_text
+            return tokenized.text
 
-        return self.__call__(
-            formatted_text,
+        tokens = list(tokenized.tokens)
+        if not add_special_tokens and tokens and tokens[0] == self.bos_token_id:
+            tokens = tokens[1:]
+
+        return self._build_output(
+            [tokens],
             padding=padding,
             truncation=truncation,
             max_length=max_length,
             return_tensors=return_tensors,
-            add_special_tokens=add_special_tokens,
-            **kwargs,
+            is_single_input=True,
         )
 
     def __call__(
@@ -184,7 +192,7 @@ class Mistral3Tokenizer:
                 is enabled or ``padding="max_length"``.
             return_tensors: When ``"np"``, returns numpy arrays; otherwise
                 returns plain Python lists.
-            add_special_tokens: Whether to prepend BOS / append EOS.
+            add_special_tokens: Whether to prepend BOS (EOS is not appended).
             **kwargs: Reserved for HF compatibility (currently unused).
 
         Returns:
@@ -205,11 +213,51 @@ class Mistral3Tokenizer:
             return {"input_ids": [], "attention_mask": []}
 
         batch_token_ids = [self.encode(txt, add_special_tokens=add_special_tokens) for txt in batch_texts]
+        return self._build_output(
+            batch_token_ids,
+            padding=padding,
+            truncation=truncation,
+            max_length=max_length,
+            return_tensors=return_tensors,
+            is_single_input=is_single_input,
+        )
 
-        if truncation and max_length:
+    def _build_output(
+        self,
+        batch_token_ids: list[list[int]],
+        padding: bool | str,
+        truncation: bool | str,
+        max_length: int | None,
+        return_tensors: str | None,
+        is_single_input: bool,
+    ) -> dict[str, Any]:
+        """Apply truncation / padding to token ids and package the result.
+
+        Args:
+            batch_token_ids: Already-encoded token ids, one list per sequence.
+            padding: Padding strategy (see :meth:`__call__`).
+            truncation: Truncation strategy (see :meth:`__call__`).
+            max_length: Maximum length for truncation / ``"max_length"`` padding.
+            return_tensors: ``"np"`` for numpy arrays, otherwise Python lists.
+            is_single_input: Whether the batch came from a single string, in
+                which case the batch dimension is squeezed for list output.
+
+        Returns:
+            dict[str, Any]: ``{"input_ids": ..., "attention_mask": ...}``.
+
+        Raises:
+            ValueError: On invalid padding configuration.
+        """
+        if truncation not in (False, True, "do_not_truncate", "longest_first", "only_first", "only_second"):
+            raise ValueError(f"Unsupported truncation strategy: {truncation!r}")
+        if padding not in (False, True, "do_not_pad", "longest", "max_length"):
+            raise ValueError(f"Unsupported padding strategy: {padding!r}")
+        truncate = truncation is not False and truncation != "do_not_truncate"
+        pad = padding is not False and padding != "do_not_pad"
+        if truncate and max_length is not None:
             batch_token_ids = [tokens[:max_length] for tokens in batch_token_ids]
 
-        if padding:
+        if pad:
             if self.pad_token_id is None:
                 raise ValueError(
                     "Padding is enabled, but the tokenizer does not have a `pad_token_id`. You can set one manually."

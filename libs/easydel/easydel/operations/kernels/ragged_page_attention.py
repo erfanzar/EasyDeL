@@ -76,7 +76,6 @@ References:
     - EasyDeL serving documentation
 """
 
-import os
 from functools import partial
 
 import jax
@@ -87,6 +86,13 @@ from ejkernel.modules import (  # pyright: ignore[reportMissingTypeStubs]
     ragged_page_attention_v3,
 )
 from ejkernel.modules.operations.configs import RaggedPageAttentionv3Config
+from ejkernel.quantization.turboquant import (
+    turboquant_compress_keys,
+    turboquant_compress_values,
+    turboquant_dequantize_values,
+    unpack_signs,
+)
+from ejkernel.types import MaskInfo
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jax.sharding import PartitionSpec as Ps
@@ -94,13 +100,14 @@ from jaxtyping import Array, DTypeLike, Float
 from spectrax import common_types as ct
 
 from easydel.axis import ATTN_DP
-from easydel.caching import RaggedPagesCacheView, RaggedPagesMetadata
+from easydel.caching import RaggedPagesCacheView, RaggedPagesMetadata, UnifiedAttentionCacheView, unwrap_metadata
+from easydel.caching.mla_ragged_page import MLARaggedPagesCacheView
+from easydel.caching.ragged_page.cache import HEAD_DIM_ALIGNMENT, align_to_multiple, kv_pair_shares_head_dim_axis
 from easydel.caching.turboquant_ragged_page import TurboQuantRaggedPagesCacheView
 from easydel.infra.sharding import axis_index, mesh_axis_size, normalize_axis_names
-from easydel.utils.helpers import check_bool_flag
 
 from .._attention_outputs import AttentionOutput
-from .._operation_impl import OperationImpl, OperationRegistry
+from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
 from ..requirements import (
     CacheType,
     ExecutionMode,
@@ -108,35 +115,12 @@ from ..requirements import (
     OperationRequirements,
     RequirementsBuilder,
 )
+from ._paged_common import ENABLE_DP_LOCAL_PAGE_PATH, dp_page_axis, request_distribution_bounds
 
 logger = get_logger(__name__)
-USE_SHARDMAP = True
-ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
 
-
-def _request_distribution_bounds(scheduled: Array, context_lens: Array) -> Array:
-    """Build the v3 request distribution ``[decode_end, prefill_end, total]``.
-
-    Args:
-        scheduled: ``int32[num_requests]`` count of scheduled tokens per
-            request.
-        context_lens: ``int32[num_requests]`` total context length per
-            request.
-
-    Returns:
-        Array: ``int32[3]`` distribution vector indexing decode requests,
-        prefill requests and the total active request count for the v3
-        kernel.
-    """
-    scheduled = jnp.asarray(scheduled, dtype=jnp.int32)
-    context_lens = jnp.asarray(context_lens, dtype=jnp.int32)
-
-    has_tokens = scheduled > 0
-    total = jnp.sum(has_tokens).astype(jnp.int32)
-    is_decode = (scheduled == 1) & (context_lens > 1) & has_tokens
-    decode = jnp.sum(is_decode).astype(jnp.int32)
-    prefill_count = jnp.sum(has_tokens & (~is_decode)).astype(jnp.int32)
-    return jnp.stack((decode, decode + prefill_count, total)).astype(jnp.int32)
+# Alias for callers importing the private helper under its adapter-local name.
+_request_distribution_bounds = request_distribution_bounds
 
 
 def _chunk_prefill_size_from_cfg(cfg) -> int | None:
@@ -278,13 +262,6 @@ def _default_tpu_rpa_v3_cfg(
     """
     if jax.default_backend() != "tpu":
         return cfg
-    # Opt into ejkernel's autotuner: when EASYDEL_RPA_AUTOTUNE is truthy, skip
-    # this static block-size heuristic and leave num_queries_per_block /
-    # num_kv_pages_per_block unset so ragged_page_attention_v3's Executor
-    # (cache_miss_fallback="autotune") searches the candidate space and keeps
-    # only configs that actually fit the 16MB TPU scoped-VMEM limit.
-    if os.getenv("EASYDEL_RPA_AUTOTUNE", "1").strip().lower() in ("1", "true", "yes", "on"):
-        return cfg
     if _cfg_value(cfg, "num_kv_pages_per_block") is not None or _cfg_value(cfg, "num_queries_per_block") is not None:
         return cfg
 
@@ -365,17 +342,8 @@ def _tpu_mixed_request_distribution(request_distribution: Array, cfg) -> Array:
     )
 
 
-def _dp_page_axis(cache_view: RaggedPagesCacheView):
-    """Resolve the logical page axis for the active cache view.
-
-    Args:
-        cache_view: Ragged-pages cache view carrying DP metadata.
-
-    Returns:
-        Any: ``ATTN_DP`` when ``data_parallel_size > 1`` else ``ct.EMPTY``.
-    """
-    dp_size = max(1, int(getattr(cache_view.metadata, "data_parallel_size", 1)))
-    return ATTN_DP if dp_size > 1 else ct.EMPTY
+# Alias for callers importing the private helper under its adapter-local name.
+_dp_page_axis = dp_page_axis
 
 
 def _kv_axis(cache_view: RaggedPagesCacheView, sharded_axis: str):
@@ -466,6 +434,441 @@ def _runtime_sharding_resolver(metadata, cache_view):
     return resolver
 
 
+@OperationRegistry.register
+class PagedReferenceAttn(OperationImpl):
+    """Paged-cache adapter for key-based dropout and true ring attention.
+
+    Request-local gathers preserve page-table addressing, ragged query boundaries
+    and absolute causal positions. Only one request's dense KV is materialized at
+    a time; the attention calculation still goes through the operation registry.
+    Global page indexing lets JAX preserve DP/TP ownership through gather/scatter
+    instead of assuming that physical page ids are local to a device shard.
+    """
+
+    @classmethod
+    def get_impl_name(cls):
+        return "paged_attention_reference"
+
+    @classmethod
+    def get_requirements(cls, mode=ExecutionMode.MIXED):
+        return OperationRequirements.create(
+            name=cls.get_impl_name(),
+            required_metadata=(
+                MetadataField.basic()
+                | MetadataField.CONTEXT_LENS
+                | MetadataField.QUERY_START_LOC
+                | MetadataField.PAGES_TABLES
+            ),
+            optional_metadata=MetadataField.SLOT_MAPPING | MetadataField.REQUEST_DISTRIBUTION,
+            supported_cache=CacheType.RAGGED_PAGES,
+            cache_view_class=None,  # Both interleaved and split-page views are accepted below.
+        )
+
+    def forward_native(
+        self,
+        query,
+        key=None,
+        value=None,
+        cache_view=None,
+        cache_metadata=None,
+        softmax_scale=None,
+        logits_soft_cap=None,
+        sliding_window=None,
+        softmax_aux=None,
+        deterministic=True,
+        dropout_rng=None,
+        dropout_prob=0.0,
+        normalize_output=True,
+        causal=True,
+        precision=None,
+        compute_dtype=None,
+        dense_impl="vanilla",
+        chunk_size=None,
+        bias=None,
+        mask_info=None,
+        alibi_slopes=None,
+        queries_nope=None,
+        queries_pe=None,
+        keys_values=None,
+        keys_pe=None,
+        **ignore,
+    ):
+        """Update paged KV and attend within each scheduled request.
+
+        Inputs may be BTHD or packed THD. Metadata context lengths include the
+        current scheduled tokens; rank-major DP boundaries retain each rank's
+        padded token capacity. Omit both key and value to read a populated cache
+        without writing it. ``dense_impl='ring'`` invokes the registered ring
+        kernel on each request, not an alias to another mechanism. Active dropout
+        uses vanilla's key-aware weight dropout; the same key is folded with the
+        request row so repeated calls are reproducible. Masks and bias may use
+        BTHD batch-local or packed query rows and request-relative KV columns.
+        Segment-only masks and ragged-v3 ALiBi slopes are also preserved.
+        MLA views accept the same explicit ``queries_nope``, ``queries_pe``,
+        ``keys_values`` and ``keys_pe`` operands as the MLA kernels. Their shared
+        latent and RoPE components retain independently aligned cache offsets;
+        attention returns the latent value width for the caller's absorbed V
+        projection. Cache-only calls may supply a concatenated latent/RoPE query.
+        """
+        mla_pages = isinstance(cache_view, MLARaggedPagesCacheView)
+        if mla_pages:
+            latent_dim = cache_view.metadata.kv_lora_rank
+            rope_dim = cache_view.metadata.qk_rope_head_dim
+            rope_offset = align_to_multiple(latent_dim, HEAD_DIM_ALIGNMENT)
+            if queries_nope is not None or queries_pe is not None:
+                if queries_nope is None or queries_pe is None:
+                    raise ValueError("MLA requires both queries_nope and queries_pe.")
+                query = jnp.concatenate((queries_nope, queries_pe), axis=-1)
+            if query.shape[-1] != latent_dim + rope_dim:
+                raise ValueError("MLA queries must contain the latent and RoPE dimensions.")
+            if keys_values is not None or keys_pe is not None:
+                if keys_values is None or keys_pe is None:
+                    raise ValueError("MLA requires both keys_values and keys_pe for cache updates.")
+                # MLA pages store one shared latent/position row per token,
+                # not the alternating K/V head layout of ordinary ragged pages.
+                latent = keys_values.reshape(-1, latent_dim)
+                positional = keys_pe.reshape(query.size // (query.shape[-2] * query.shape[-1]), rope_dim)
+                key = jnp.concatenate((latent, positional), axis=-1)[:, None, :]
+                value = latent[:, None, :]
+            elif key is not None and value is not None:
+                # The generic cache-concatenation path supplies combined K and
+                # V placeholders. Values are the shared latent, not that whole row.
+                value = key[..., :latent_dim]
+        if not isinstance(cache_view, (RaggedPagesCacheView, UnifiedAttentionCacheView)):
+            raise TypeError("PagedReferenceAttn requires a ragged-pages or unified-attention cache view.")
+        if not 0.0 <= dropout_prob < 1.0:
+            raise ValueError("dropout_prob must be in [0, 1).")
+        if not deterministic and dropout_prob > 0 and dropout_rng is None:
+            raise ValueError("dropout_rng is required for attention-weight dropout.")
+        if chunk_size is not None and chunk_size <= 0:
+            raise ValueError("chunk_size must be positive.")
+        runtime = unwrap_metadata(cache_metadata, "ragged")
+        if hasattr(runtime, "for_layer"):
+            runtime = runtime.for_layer(cache_view.layer_index)
+        if runtime is None:
+            raise ValueError("PagedReferenceAttn requires paged runtime metadata.")
+        q = query.reshape(-1, *query.shape[-2:])
+        if (key is None) != (value is None):
+            raise ValueError("Provide both key and value, or neither for a populated-cache read.")
+        update_cache = key is not None
+        split_pages = isinstance(cache_view, UnifiedAttentionCacheView)
+        compressed_pages = isinstance(cache_view, TurboQuantRaggedPagesCacheView)
+        if update_cache:
+            k = key.reshape(-1, *key.shape[-2:])
+            v = value.reshape(-1, *value.shape[-2:])
+            if not (q.shape[0] == k.shape[0] == v.shape[0]) or k.shape[1] != v.shape[1]:
+                raise ValueError("Paged Q/K/V must describe the same packed tokens and matching KV-head counts.")
+            if mla_pages:
+                if k.shape[1:] != (1, latent_dim + rope_dim) or v.shape[1:] != (1, latent_dim):
+                    raise ValueError("MLA cache updates require one shared latent/RoPE row per token.")
+            else:
+                k, v = _repeat_kv_heads_to_cache_width(k, v, cache_view)
+            num_kv_heads, key_dim, value_dim = k.shape[1], k.shape[-1], v.shape[-1]
+        else:
+            num_kv_heads = 1 if mla_pages else int(cache_view.metadata.num_kv_heads)
+            key_dim = query.shape[-1]
+            value_dim = (
+                latent_dim
+                if mla_pages
+                else cache_view.value_cache.shape[-1]
+                if split_pages
+                else int(cache_view.metadata.v_headdim)
+            )
+        if compressed_pages and (key_dim != cache_view.metadata.k_headdim or value_dim != cache_view.metadata.v_headdim):
+            raise ValueError("TurboQuant KV head dimensions must match the cache configuration.")
+        output_dtype = compute_dtype or self.metadata.runtime_dtype or query.dtype
+        starts = runtime.query_start_loc
+        contexts = runtime.context_lens.reshape(-1)
+        num_requests = contexts.shape[0]
+        if num_requests == 0 or q.shape[0] == 0:
+            return AttentionOutput(
+                attention_outputs=jnp.zeros((*query.shape[:-1], value_dim), dtype=output_dtype),
+                attention_weights=None,
+                cache_view=cache_view,
+            )
+        tables = runtime.pages_tables.reshape(num_requests, -1)
+        if starts.ndim == 2:
+            # eSurge packs a fixed token capacity per DP rank, not just the
+            # active tokens. Offset rank-local boundaries by that capacity;
+            # retaining the gaps is essential for idle ranks and padded rows.
+            ranks, boundaries = starts.shape
+            if ranks * (boundaries - 1) != num_requests or q.shape[0] % ranks:
+                raise ValueError("Rank-major boundaries must match request rows and equal rank token capacities.")
+            rank_offsets = jnp.arange(ranks, dtype=starts.dtype)[:, None] * (q.shape[0] // ranks)
+            request_starts = (starts[:, :-1] + rank_offsets).reshape(-1)
+            request_ends = (starts[:, 1:] + rank_offsets).reshape(-1)
+        else:
+            starts = starts.reshape(-1)
+            if starts.shape[0] != num_requests + 1:
+                raise ValueError("query_start_loc must contain one boundary per request plus the final boundary.")
+            request_starts, request_ends = starts[:-1], starts[1:]
+        scheduled = request_ends - request_starts
+        token_ids = jnp.arange(q.shape[0], dtype=jnp.int32)
+        rows = jnp.minimum(jnp.searchsorted(request_ends, token_ids, side="right"), num_requests - 1)
+        positions = contexts[rows] - scheduled[rows] + token_ids - request_starts[rows]
+        active_tokens = (
+            (token_ids >= request_starts[rows])
+            & (token_ids < request_ends[rows])
+            & (scheduled[rows] > 0)
+            & (positions >= 0)
+        )
+        paired_dim = (
+            not split_pages
+            and not compressed_pages
+            and not mla_pages
+            and cache_view.metadata.is_v3
+            and kv_pair_shares_head_dim_axis(key_dim)
+        )
+        if compressed_pages:
+            # TurboQuant inherits the ragged view but its kv_pages is a scalar
+            # placeholder. Never flatten or overwrite it as dense KV storage.
+            num_pages, page_size = cache_view.key_indices_pages.shape[:2]
+            constants = cache_view.constants
+        else:
+            if mla_pages:
+                pages = cache_view.flattened_kv_pages()
+                # Packing groups adjacent tokens, not heads. Preserve any
+                # rounded-up physical page rows while exposing logical rows only.
+                flat = pages.reshape(pages.shape[0], -1, pages.shape[-1])
+                key_pages = flat[:, : cache_view.metadata.page_size, None, :]
+                value_pages = key_pages[..., :latent_dim]
+            elif split_pages:
+                key_pages, value_pages = cache_view.key_cache, cache_view.value_cache
+            else:
+                flat = cache_view.flattened_kv_pages()
+                key_pages = flat[..., :key_dim] if paired_dim else flat[:, :, 0::2, :key_dim]
+                value_pages = flat[..., key_dim : key_dim + value_dim] if paired_dim else flat[:, :, 1::2, :value_dim]
+            num_pages, page_size = key_pages.shape[:2]
+        logical_pages = positions // page_size
+        in_table = (logical_pages >= 0) & (logical_pages < tables.shape[1])
+        physical_pages = tables[rows, jnp.clip(logical_pages, 0, tables.shape[1] - 1)]
+        active_tokens &= in_table & (physical_pages >= 0) & (physical_pages < num_pages)
+        # OOB scatter destinations are dropped, not clamped to a real request's page.
+        destinations = jnp.where(active_tokens, physical_pages, num_pages)
+        offsets = positions % page_size
+        if update_cache and compressed_pages:
+            compressed = (
+                *turboquant_compress_keys(
+                    k, constants.rotation_matrix, constants.key_codebook, constants.qjl_projection
+                ),
+                *turboquant_compress_values(v, constants.rotation_matrix, constants.value_codebook),
+            )
+            names = (
+                "key_indices_pages",
+                "key_signs_pages",
+                "key_norms_pages",
+                "value_indices_pages",
+                "value_norms_pages",
+            )
+            cache_view = cache_view.replace(
+                **{
+                    name: getattr(cache_view, name)
+                    .at[destinations, offsets]
+                    .set(data.astype(getattr(cache_view, name).dtype), mode="drop")
+                    for name, data in zip(names, compressed, strict=True)
+                }
+            )
+        elif update_cache and mla_pages:
+            flat = flat.at[destinations, offsets, :latent_dim].set(v[:, 0].astype(flat.dtype), mode="drop")
+            flat = flat.at[destinations, offsets, rope_offset : rope_offset + rope_dim].set(
+                k[:, 0, latent_dim:].astype(flat.dtype), mode="drop"
+            )
+            cache_view = cache_view.replace(kv_pages=flat.reshape(cache_view.kv_pages.shape))
+            key_pages = flat[:, :page_size, None, :]
+            value_pages = key_pages[..., :latent_dim]
+        elif update_cache and split_pages:
+            key_pages = key_pages.at[destinations, offsets].set(k.astype(key_pages.dtype), mode="drop")
+            value_pages = value_pages.at[destinations, offsets].set(v.astype(value_pages.dtype), mode="drop")
+            cache_view = cache_view.replace(key_cache=key_pages, value_cache=value_pages)
+        elif update_cache:
+            combined = (
+                jnp.concatenate((k, v), axis=-1)
+                if paired_dim
+                else jnp.stack((k, v), axis=2).reshape(k.shape[0], 2 * k.shape[1], k.shape[-1])
+            )
+            flat = flat.at[destinations, offsets, : combined.shape[1], : combined.shape[2]].set(
+                combined.astype(flat.dtype), mode="drop"
+            )
+            cache_view = cache_view.replace(kv_pages=flat.reshape(cache_view.kv_pages.shape))
+            key_pages = flat[..., :key_dim] if paired_dim else flat[:, :, 0::2, :key_dim]
+            value_pages = flat[..., key_dim : key_dim + value_dim] if paired_dim else flat[:, :, 1::2, :value_dim]
+        # Storage-head alignment can add padding heads; never expose these as GQA heads.
+        if not compressed_pages:
+            key_pages, value_pages = key_pages[:, :, :num_kv_heads], value_pages[:, :, :num_kv_heads]
+        dense_name = "vanilla" if not deterministic and dropout_prob > 0 else dense_impl
+        if not normalize_output:
+            dense_name = "vanilla"
+        dense = OperationRegistry.create(dense_name, self.metadata)
+        kv_positions = jnp.arange(tables.shape[1] * page_size, dtype=jnp.int32)
+        initial = jnp.zeros((q.shape[0], q.shape[1], value_dim), dtype=output_dtype)
+        # Pairwise visibility and document membership are independent constraints.
+        # MaskInfo.attention_mask returns the explicit mask preferentially; using
+        # that property alone silently drops segment IDs when both are supplied.
+        supplied_mask = None if mask_info is None else getattr(mask_info, "_attention_mask", None)
+        q_segments = None if mask_info is None else getattr(mask_info, "_q_segment_ids", None)
+        kv_segments = None if mask_info is None else getattr(mask_info, "_kv_segment_ids", None)
+        if q_segments is not None or kv_segments is not None:
+            if q_segments is not None and q_segments.ndim == 3 and q_segments.shape[-1] == 1:
+                q_segments = q_segments[..., 0]
+            if kv_segments is not None and kv_segments.ndim == 3 and kv_segments.shape[-1] == 1:
+                kv_segments = kv_segments[..., 0]
+            if q_segments is None:
+                q_segments = kv_segments[..., : query.shape[-3]]
+            if kv_segments is None:
+                kv_segments = q_segments
+            segment_mask = (
+                (q_segments[:, :, None] >= 0)
+                & (kv_segments[:, None, :] >= 0)
+                & (q_segments[:, :, None] == kv_segments[:, None, :])
+            )[:, None, :, :]
+        else:
+            segment_mask = None
+        if alibi_slopes is not None and alibi_slopes.shape != (q.shape[1],):
+            raise ValueError(f"alibi_slopes must have shape ({q.shape[1]},).")
+
+        def request_pairwise(tensor, row, *, is_mask=False):
+            """Map BTHD or request-local BHQK features to the packed query axis."""
+            if tensor is None:
+                return None
+            if tensor.ndim == 2:
+                tensor = tensor[:, None, None, :] if is_mask else tensor[None, None, :, :]
+            elif tensor.ndim == 3:
+                tensor = tensor[:, None, :, :] if is_mask else tensor[None, :, :, :]
+            if tensor.ndim != 4:
+                raise ValueError("Paged mask/bias must be broadcastable BHQK tensors.")
+            if (
+                query.ndim == 4
+                and query.shape[0] > 1
+                and tensor.shape[0] in (1, query.shape[0])
+                and tensor.shape[-2] in (1, query.shape[1])
+            ):
+                tensor = jnp.broadcast_to(tensor, (query.shape[0], tensor.shape[1], query.shape[1], tensor.shape[-1]))
+                tensor = tensor.transpose(1, 0, 2, 3).reshape(1, tensor.shape[1], q.shape[0], tensor.shape[-1])
+            elif tensor.shape[0] != 1:
+                if tensor.shape[0] != num_requests:
+                    raise ValueError("Paged mask/bias batch must match query batches or request rows.")
+                tensor = jax.lax.dynamic_slice_in_dim(tensor, row, 1, axis=0)
+                if tensor.shape[-2] not in (1, q.shape[0]):
+                    local_rows = jnp.clip(token_ids - request_starts[row], 0, tensor.shape[-2] - 1)
+                    tensor = jnp.take(tensor, local_rows, axis=-2)
+            tensor = tensor[..., : q.shape[0], : kv_positions.shape[0]]
+            if tensor.shape[-1] not in (1, kv_positions.shape[0]) and tensor.shape[-1] < kv_positions.shape[0]:
+                tensor = jnp.pad(tensor, ((0, 0), (0, 0), (0, 0), (0, kv_positions.shape[0] - tensor.shape[-1])))
+            return tensor
+
+        def attend_request(row, outputs):
+            page_ids = tables[row]
+            page_valid = (page_ids >= 0) & (page_ids < num_pages)
+            ids = jnp.clip(page_ids, 0, num_pages - 1)
+            if compressed_pages:
+                # Reconstruct only this request's pages and retain the QJL
+                # residual estimator: centroid*norm + signs@S*residual_norm*c.
+                # Inverse rotation gives dense keys with the same q dot k scores.
+                norms = cache_view.key_norms_pages[ids].astype(jnp.float32)
+                keys = turboquant_dequantize_values(
+                    cache_view.key_indices_pages[ids], norms[..., 0], constants.key_codebook, constants.rotation_matrix
+                )
+                signs = unpack_signs(cache_view.key_signs_pages[ids])
+                factor = jnp.sqrt(jnp.float32(jnp.pi / 2)) / jnp.float32(constants.qjl_dim)
+                correction = (signs @ constants.qjl_projection) @ constants.rotation_matrix
+                keys = keys + correction * (norms[..., 1] * factor)[..., None]
+                values = turboquant_dequantize_values(
+                    cache_view.value_indices_pages[ids],
+                    cache_view.value_norms_pages[ids],
+                    constants.value_codebook,
+                    constants.rotation_matrix,
+                )
+                keys = keys.reshape(1, -1, num_kv_heads, key_dim)
+                values = values.reshape(1, -1, num_kv_heads, value_dim)
+            elif mla_pages:
+                # Remove independent component padding only after the request
+                # gather; never concatenate/copy the entire MLA page pool.
+                stored = key_pages[ids].reshape(1, -1, 1, flat.shape[-1])
+                values = stored[..., :latent_dim]
+                keys = jnp.concatenate((values, stored[..., rope_offset : rope_offset + rope_dim]), axis=-1)
+            else:
+                keys = key_pages[ids].reshape(1, -1, num_kv_heads, key_dim)
+                values = value_pages[ids].reshape(1, -1, num_kv_heads, value_dim)
+            query_valid = active_tokens & (rows == row)
+            valid_kv = (kv_positions < contexts[row]) & jnp.repeat(page_valid, page_size)
+            # Unallocated/padded cells may contain arbitrary values. Mask their
+            # operands before matmuls so zero attention cannot multiply a NaN.
+            keys = jnp.where(valid_kv[None, :, None, None], keys, 0.0)
+            values = jnp.where(valid_kv[None, :, None, None], values, 0.0)
+            request_queries = jnp.where(query_valid[:, None, None], q, 0.0)[None, ...]
+            visible = query_valid[:, None] & valid_kv[None, :]
+            if causal:
+                visible &= kv_positions[None, :] <= positions[:, None]
+            if sliding_window is not None:
+                left, right = sliding_window if isinstance(sliding_window, tuple) else (max(sliding_window - 1, 0),) * 2
+                visible &= (kv_positions[None, :] >= positions[:, None] - left) & (
+                    kv_positions[None, :] <= positions[:, None] + right
+                )
+            if chunk_size is not None:
+                visible &= kv_positions[None, :] // chunk_size == positions[:, None] // chunk_size
+            visibility = visible[None, None, :, :]
+            extra_mask = request_pairwise(supplied_mask, row, is_mask=True)
+            if extra_mask is not None:
+                visibility = visibility & extra_mask.astype(jnp.bool_)
+            document_mask = request_pairwise(segment_mask, row, is_mask=True)
+            if document_mask is not None:
+                visibility = visibility & document_mask
+            request_bias = request_pairwise(bias, row)
+            if alibi_slopes is not None:
+                # Match ragged-v3's slope_h * absolute_key_position contract,
+                # including its effect on sink normalization.
+                alibi_bias = alibi_slopes[None, :, None, None].astype(jnp.float32) * kv_positions[None, None, None, :]
+                request_bias = alibi_bias if request_bias is None else request_bias + alibi_bias
+            request_mask = MaskInfo(
+                _attention_mask=visibility,
+                q_positions=positions[None, :],
+                kv_positions=kv_positions[None, :],
+                causal_mask_baked_in=True,
+                sliding_window_baked_in=True,
+            )
+            request_key = None if dropout_rng is None else jax.random.fold_in(dropout_rng, row)
+            result = dense(
+                query=request_queries,
+                key=keys,
+                value=values,
+                mask_info=request_mask,
+                bias=request_bias,
+                causal=False,
+                sliding_window=None,
+                softmax_scale=softmax_scale,
+                softmax_aux=softmax_aux,
+                logits_soft_cap=logits_soft_cap,
+                deterministic=deterministic,
+                dropout_prob=dropout_prob,
+                dropout_rng=request_key,
+                normalize_output=normalize_output,
+                precision=precision,
+                compute_dtype=compute_dtype,
+            )
+            return jnp.where(query_valid[:, None, None], result.attention_outputs[0].astype(output_dtype), outputs)
+
+        def step(row, outputs):
+            return jax.lax.cond(
+                scheduled[row] > 0, lambda result: attend_request(row, result), lambda result: result, outputs
+            )
+
+        outputs = jax.lax.fori_loop(0, num_requests, step, initial)
+        return AttentionOutput(
+            attention_outputs=outputs.reshape(*query.shape[:-1], value_dim),
+            attention_weights=None,
+            cache_view=cache_view,
+        )
+
+    def forward_cpu(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
+    def forward_tpu(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
+    def forward_gpu(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
+
 class _RaggedPageAttn(OperationImpl):
     """Common base for ragged paged-attention operators (v2 / v3).
 
@@ -499,7 +902,20 @@ class _RaggedPageAttn(OperationImpl):
             distribution, ...) come in per-call via the ``cache_view`` and
             ``cache_metadata`` arguments rather than living on the
             instance.
+        autotune (bool): Leave unspecified v3 block sizes to ejkernel's autotuner.
+            Set to False to use the static TPU serving heuristic instead.
     """
+
+    def __init__(self, metadata: OperationMetadata, *, autotune: bool = True) -> None:
+        """Configure ragged paged attention.
+
+        Args:
+            metadata: Runtime metadata, including explicit ejkernel config overrides.
+            autotune: Use ejkernel autotuning for unspecified v3 block sizes. False
+                selects the static TPU heuristic; explicit block sizes always win.
+        """
+        super().__init__(metadata)
+        self.autotune = autotune
 
     @classmethod
     def get_impl_name(cls) -> str | tuple[str]:
@@ -584,7 +1000,7 @@ class _RaggedPageAttn(OperationImpl):
         resolver = _runtime_sharding_resolver(self.metadata, cache_view)
         resolve = resolver.resolve
         num_seqs_flat: Array = cache_metadata.num_seqs.reshape(-1)
-        page_axis = _dp_page_axis(cache_view)
+        page_axis = dp_page_axis(cache_view)
         kv_page_axis = _kv_axis(cache_view, ct.HEAD)
         qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
 
@@ -668,7 +1084,7 @@ class _RaggedPageAttn(OperationImpl):
 
         resolver = _runtime_sharding_resolver(self.metadata, cache_view)
         resolve = resolver.resolve
-        page_axis = _dp_page_axis(cache_view)
+        page_axis = dp_page_axis(cache_view)
         kv_token_axis = _kv_axis(cache_view, ct.KV_HEAD)
 
         qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
@@ -831,7 +1247,7 @@ class _RaggedPageAttn(OperationImpl):
 
         resolver = _runtime_sharding_resolver(self.metadata, cache_view)
         resolve = resolver.resolve
-        page_axis = _dp_page_axis(cache_view)
+        page_axis = dp_page_axis(cache_view)
 
         sinks_axis = None
         if softmax_aux is not None:
@@ -985,7 +1401,7 @@ class _RaggedPageAttn(OperationImpl):
         resolve = resolver.resolve
         request_distribution = cache_metadata.request_distribution
         use_rank_major_dp = getattr(request_distribution, "ndim", 0) == 2
-        page_axis = _dp_page_axis(cache_view)
+        page_axis = dp_page_axis(cache_view)
         kv_token_axis = _kv_axis(cache_view, ct.KV_HEAD)
         kv_page_axis = _kv_axis(cache_view, ct.HEAD)
         q_token_axis = ATTN_DP if use_rank_major_dp else ct.EMPTY
@@ -1020,14 +1436,15 @@ class _RaggedPageAttn(OperationImpl):
 
         platform = "pallas" if jax.default_backend() == "tpu" else "auto"
         cfg = self.metadata.get_operation_config("ragged_page_attention_v3")
-        cfg = _default_tpu_rpa_v3_cfg(
-            cfg,
-            query=query,
-            key=key,
-            kv_pages=kv_pages,
-            context_lens=cache_metadata.context_lens,
-            pages_tables=cache_metadata.pages_tables,
-        )
+        if not self.autotune:
+            cfg = _default_tpu_rpa_v3_cfg(
+                cfg,
+                query=query,
+                key=key,
+                kv_pages=kv_pages,
+                context_lens=cache_metadata.context_lens,
+                pages_tables=cache_metadata.pages_tables,
+            )
         common_call_kwargs = dict(
             softmax_scale=softmax_scale,
             logits_soft_cap=logits_soft_cap,
@@ -1239,6 +1656,22 @@ class _RaggedPageAttn(OperationImpl):
             AttentionOutput: Contains attention outputs [total_tokens, num_q_heads, head_dim].
                 Attention weights are not computed.
         """
+        if not ignore.get("normalize_output", True) or (
+            ignore.get("dropout_prob", 0.0) > 0 and not ignore.get("deterministic", True)
+        ):
+            return OperationRegistry.create("paged_attention_reference", self.metadata)(
+                query=query,
+                key=key,
+                value=value,
+                cache_view=cache_view,
+                cache_metadata=cache_metadata,
+                softmax_scale=softmax_scale,
+                logits_soft_cap=logits_soft_cap,
+                sliding_window=sliding_window,
+                softmax_aux=softmax_aux,
+                compute_dtype=compute_dtype,
+                **ignore,
+            )
         fn = self.forward_v3 if self.get_impl_name() == "ragged_page_attention_v3" else self.forward_v2
         return fn(
             query=query,
@@ -1372,10 +1805,15 @@ class _RaggedPageAttn(OperationImpl):
         if is_4d:
             batch, sequence, head, dim = query.shape
 
-        # Reshape query to ragged format [total_tokens, num_heads, head_dim]
-        query_reshaped = query.reshape(-1, *query.shape[-2:])
-        key_reshaped = key.reshape(-1, *key.shape[-2:])
-        value_reshaped = value.reshape(-1, *value.shape[-2:])
+        # The reference adapter needs the original BTHD layout to map batched
+        # masks/bias onto packed query rows. Flattening only Q/K/V here loses
+        # that batch-to-row relationship before the dropout redirect runs.
+        use_reference = not ignore.get("normalize_output", True) or (
+            ignore.get("dropout_prob", 0.0) > 0 and not ignore.get("deterministic", True)
+        )
+        query_reshaped = query if use_reference else query.reshape(-1, *query.shape[-2:])
+        key_reshaped = key if use_reference else key.reshape(-1, *key.shape[-2:])
+        value_reshaped = value if use_reference else value.reshape(-1, *value.shape[-2:])
 
         output: AttentionOutput = super().__call__(
             query=query_reshaped,

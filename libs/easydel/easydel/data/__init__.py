@@ -143,7 +143,9 @@ from .sources import (
     HFDatasetShardedSource,
     HuggingFaceShardedSource,
     JsonShardedSource,
+    ParquetRandomAccessSource,
     ParquetShardedSource,
+    RowGroupShuffledParquetSource,
     TextShardedSource,
     create_source,
     expand_data_files,
@@ -193,6 +195,7 @@ from .transforms import (
     report_packing_stats,
     tokenize_dataset_config,
 )
+from .transforms.mixture import ASSISTANT_ONLY_FIELD, DATASET_ID_FIELD, STOP_STRATEGIES
 
 # Trainer-specific transforms (lazy import from trainers to avoid circular imports)
 _TRAINER_TRANSFORMS = {
@@ -207,6 +210,9 @@ _TRAINER_TRANSFORMS = {
 }
 
 __all__ = [
+    "ASSISTANT_ONLY_FIELD",
+    "DATASET_ID_FIELD",
+    "STOP_STRATEGIES",
     "AddField",
     "ArrowShardedSource",
     "ArrowWriter",
@@ -267,6 +273,7 @@ __all__ = [
     "PackedSequence",
     "PackedShardedSource",
     "PackingStats",
+    "ParquetRandomAccessSource",
     "ParquetShardedSource",
     "ParquetWriter",
     "Pipeline",
@@ -278,6 +285,7 @@ __all__ = [
     "RenameFields",
     "ResumeState",
     "RewardPreprocessTransform",
+    "RowGroupShuffledParquetSource",
     "SFTPreprocessTransform",
     "SaveStage",
     "SaveStageConfig",

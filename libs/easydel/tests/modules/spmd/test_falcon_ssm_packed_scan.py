@@ -2,8 +2,8 @@
 
 import jax.numpy as jnp
 import pytest
-from easydel.operations.kernels.ssm1 import _packed_ssm1_fwd, _single_step_ssm1_fwd
-from easydel.operations.kernels.ssm2 import _packed_ssm2_fwd, _single_step_ssm2_fwd
+from easydel.operations.kernels.ssm1 import _single_step_ssm1_fwd, packed_ssm1_fwd
+from easydel.operations.kernels.ssm2 import _single_step_ssm2_fwd, packed_ssm2_fwd
 
 
 @pytest.mark.parametrize("lengths", [(3, 1, 2), (1, 0, 2)])
@@ -30,7 +30,7 @@ def test_falcon_mamba_packed_scan_matches_single_token_reference(lengths):
     d = jnp.ones((channels,), dtype=jnp.float32)
     init = jnp.arange(slots * channels * state_size, dtype=jnp.float32).reshape(slots, channels, state_size) / 20
 
-    actual_y, actual_state = _packed_ssm1_fwd(x, a, b, c, d, dt, valid, init)
+    actual_y, actual_state = packed_ssm1_fwd(x, a, b, c, d, dt, valid, init)
     expected_y = jnp.zeros_like(actual_y)
     expected_state = init
     for slot, length in enumerate(lengths):
@@ -79,7 +79,7 @@ def test_falcon_h1_packed_scan_matches_single_token_reference(lengths):
         / 30
     )
 
-    actual_y, actual_state = _packed_ssm2_fwd(x, a, b, c, d, dt, valid, init, groups)
+    actual_y, actual_state = packed_ssm2_fwd(x, a, b, c, d, dt, valid, init, groups)
     expected_y = jnp.zeros_like(actual_y)
     expected_state = init
     for slot, length in enumerate(lengths):

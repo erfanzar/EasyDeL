@@ -19,6 +19,24 @@ runtime metadata for EasyDeL's ragged page attention cache. The cache
 layout is shared with Pallas/JAX kernels in the ``ejkernel`` backend.
 """
 
-from .cache import RaggedPagesCache, RaggedPagesCacheConfig, RaggedPagesCacheView, RaggedPagesMetadata
+from .cache import (
+    RaggedPagesCache,
+    RaggedPagesCacheConfig,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    canonicalize_dtype,
+    dtype_to_string,
+    resolve_ragged_cache_layout,
+    resolve_v3_kv_head_layout,
+)
 
-__all__ = ("RaggedPagesCache", "RaggedPagesCacheConfig", "RaggedPagesCacheView", "RaggedPagesMetadata")
+__all__ = (
+    "RaggedPagesCache",
+    "RaggedPagesCacheConfig",
+    "RaggedPagesCacheView",
+    "RaggedPagesMetadata",
+    "canonicalize_dtype",
+    "dtype_to_string",
+    "resolve_ragged_cache_layout",
+    "resolve_v3_kv_head_layout",
+)

@@ -290,10 +290,11 @@ class OpenELMConfig(EasyDeLBaseConfig):
         Raises:
             ValueError: If the configuration parameters are invalid or inconsistent.
         """
-        if self.num_gqa_groups is not None:
-            head_multiple_of = self.num_gqa_groups
-        else:
-            head_multiple_of = 2
+        if self.num_gqa_groups is None:
+            self.num_gqa_groups = 1
+        if not isinstance(self.num_gqa_groups, int) or self.num_gqa_groups < 1:
+            raise ValueError("num_gqa_groups must be a positive integer or None")
+        head_multiple_of = self.num_gqa_groups
 
         qkv_multipliers = self.qkv_multipliers
         if isinstance(self.qkv_multipliers, Number):

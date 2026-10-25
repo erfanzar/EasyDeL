@@ -397,7 +397,10 @@ class GatedDeltaRuleOp(OperationImpl):
             new_tokens,
             kernel,
             output_dtype=output_dtype,
-            activation=activation,
+            # This compatibility API uses None for identity; ejkernel uses
+            # None for its configured default (SiLU), and "none" for identity.
+            activation="none" if activation is None else activation,
+            d_conv=conv_state.shape[-1],
             platform="xla",
         )
 
@@ -506,7 +509,7 @@ class GatedDeltaRuleOp(OperationImpl):
                 )
             else:
                 adaptive_chunk = min(max(16, seq_len), 64)
-                adaptive_chunk = 1 << (adaptive_chunk.bit_length() - 1) if isinstance(adaptive_chunk, int) else 64
+                adaptive_chunk = 1 << (adaptive_chunk.bit_length() - 1)
                 kernel_cfg = GatedDeltaRuleConfig(
                     platform="xla",
                     backend="any",

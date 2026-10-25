@@ -161,6 +161,8 @@ class CacheRequirements:
         Returns:
             True if the cache type is supported.
         """
+        if cache_type == CacheType.NONE:
+            return not self.requires_cache
         return self.supported.is_compatible_with(cache_type)
 
 

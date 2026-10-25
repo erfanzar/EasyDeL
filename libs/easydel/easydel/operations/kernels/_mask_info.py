@@ -25,6 +25,34 @@ from __future__ import annotations
 
 import typing as tp
 
+import jax
+from jax import numpy as jnp
+from jaxtyping import Array
+
+
+def topk_selection_mask(scores: Array, values: Array, indices: Array) -> Array:
+    """Convert a ``lax.top_k`` result to its boolean selection mask without scatter.
+
+    Args:
+        scores: Ranked scores ``[..., n]``.
+        values: Descending selected scores ``[..., k]``, with ``k >= 1``.
+        indices: Selected indices of the same shape as ``values``.
+
+    Returns:
+        Boolean mask ``[..., n]`` matching the indices, including IEEE total-order ties.
+    """
+
+    def order_key(x):
+        bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.int32)
+        return jnp.where(bits < 0, bits ^ jnp.int32(0x7FFFFFFF), bits)
+
+    keys = order_key(scores)
+    value_keys = order_key(values)
+    kth = value_keys[..., -1:]
+    tie_cut = jnp.max(jnp.where(value_keys == kth, indices, -1), axis=-1, keepdims=True)
+    position = jax.lax.broadcasted_iota(jnp.int32, scores.shape, scores.ndim - 1)
+    return (keys > kth) | ((keys == kth) & (position <= tie_cut))
+
 
 def _spec_axis(spec: tp.Any, index: int) -> tp.Any:
     """Safely look up an axis name in a ``PartitionSpec``-like sequence.

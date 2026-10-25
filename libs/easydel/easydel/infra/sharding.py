@@ -51,8 +51,6 @@ from spectrax.runtime.types.mesh import MpMdMesh
 from spectrax.sharding import current_axis_rules as spx_current_axis_rules
 from spectrax.sharding import logical_axis_rules as spx_logical_axis_rules
 
-_HAS_SPECTRAX_MESH_TYPES = True
-
 MeshLike: tp.TypeAlias = spx.SpxMesh | Mesh | MpMdMesh
 OptionalMesh: tp.TypeAlias = MeshLike | None
 StageMesh: tp.TypeAlias = Mesh | None
@@ -482,19 +480,6 @@ def mesh_axis_size(mesh: OptionalMesh | tp.Any, axis_name: tp.Any) -> int:
         return 1
 
 
-def _mesh_axis_size(mesh: MeshLike, axis_name: str) -> int:
-    """Internal alias for :func:`mesh_axis_size`.
-
-    Args:
-        mesh: A JAX/SpectraX mesh-like object.
-        axis_name: Axis name to look up.
-
-    Returns:
-        int: The mesh size along ``axis_name``, or ``1`` if missing.
-    """
-    return mesh_axis_size(mesh, axis_name)
-
-
 def _mesh_partition_product(mesh: MeshLike, axis_spec: AxisEntry) -> int:
     """Internal alias for :func:`mesh_partition_product`.
 
@@ -536,9 +521,9 @@ def _resolve_named_sharding_mesh(mesh: MeshLike) -> tuple[Mesh, MpMdMesh | None]
         tuple: ``(base JAX mesh, mpmd mesh or None)``. For non-SpectraX
         meshes ``(mesh, None)`` is returned.
     """
-    if _HAS_SPECTRAX_MESH_TYPES and isinstance(mesh, spx.SpxMesh):
+    if isinstance(mesh, spx.SpxMesh):
         return mesh.jax_mesh, mesh.mpmd_mesh
-    if _HAS_SPECTRAX_MESH_TYPES and isinstance(mesh, MpMdMesh):
+    if isinstance(mesh, MpMdMesh):
         return mesh.jax_mesh, mesh
     return tp.cast(Mesh, mesh), None
 
@@ -564,9 +549,9 @@ def _stage_local_mesh(
     """
     assignment = metadata_stage_assignment(metadata)
     if assignment is None:
-        if _HAS_SPECTRAX_MESH_TYPES and isinstance(mesh, spx.SpxMesh):
+        if isinstance(mesh, spx.SpxMesh):
             return mesh.jax_mesh
-        if _HAS_SPECTRAX_MESH_TYPES and isinstance(mesh, MpMdMesh):
+        if isinstance(mesh, MpMdMesh):
             return mesh.jax_mesh
         return tp.cast(Mesh, mesh)
 
@@ -585,23 +570,11 @@ def _stage_local_mesh(
 
 def is_mpmd_mesh(mesh: OptionalMesh) -> bool:
     """Return whether a mesh is a SpectraX MPMD mesh wrapper."""
-    if mesh is None or not _HAS_SPECTRAX_MESH_TYPES:
+    if mesh is None:
         return False
     if isinstance(mesh, spx.SpxMesh):
         return bool(mesh.is_mpmd)
     return isinstance(mesh, MpMdMesh)
-
-
-def _is_mpmd_mesh(mesh: OptionalMesh) -> bool:
-    """Internal alias for :func:`is_mpmd_mesh`.
-
-    Args:
-        mesh: A mesh-like object or ``None``.
-
-    Returns:
-        bool: ``True`` if *mesh* is a SpectraX MPMD wrapper.
-    """
-    return is_mpmd_mesh(mesh)
 
 
 def sanitize_partition_spec_for_shape(

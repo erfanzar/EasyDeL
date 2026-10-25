@@ -24,6 +24,7 @@ from __future__ import annotations
 import functools
 import itertools
 import typing as tp
+import weakref
 from dataclasses import dataclass
 
 import jax
@@ -65,16 +66,29 @@ def _e8m0_to_f32(scale: Array) -> Array:
     return jax.lax.bitcast_convert_type(bits, jnp.float32)
 
 
-#: Host-resident fp8 engram tables, ``key -> (weight uint8 [rows, head_dim], scale uint8 [rows, head_dim // 32])``.
-#: Kept outside the module tree on purpose: a spectrax Variable would be passed into every jit as an argument (or
-#: captured as a constant), and a plain attribute becomes GraphDef metadata. The module stores only its string key.
-_HOST_TABLES: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+class _HostTable:
+    """Shared host allocation owned by modules, their GraphDefs and compiled callbacks.
+
+    This opaque handle is not a Variable: arrays never become JIT operands or
+    embedded constants. GraphDef rebinding shares the handle instead of copying
+    the allocation, and callbacks retain it for the lifetime of an executable.
+    """
+
+    def __init__(self, weight: np.ndarray, scale: np.ndarray):
+        self.weight, self.scale = weight, scale
+
+    def __iter__(self):
+        return iter((self.weight, self.scale))
+
+
+#: Weak lookup only: the last module/GraphDef/executable owner releases its allocation.
+_HOST_TABLES: weakref.WeakValueDictionary[str, _HostTable] = weakref.WeakValueDictionary()
 _HOST_TABLE_IDS = itertools.count()
 
 
-def _gather_host_rows(key: str, ids) -> tuple[np.ndarray, np.ndarray]:
-    """NumPy row gather from the registered host table ``key`` (runs inside ``jax.pure_callback``)."""
-    weight, scale = _HOST_TABLES[key]
+def _gather_host_rows(key: str | _HostTable, ids) -> tuple[np.ndarray, np.ndarray]:
+    """NumPy row gather from a key or an executable-owned host-table handle."""
+    weight, scale = _HOST_TABLES[key] if isinstance(key, str) else key
     ids = np.asarray(ids)
     flat = ids.reshape(-1)
     return (
@@ -97,7 +111,7 @@ def _unpack_u8(words: Array, width: int) -> Array:
     return rows[..., :width]
 
 
-def _gather_host_rows_packed(key: str, ids) -> tuple[np.ndarray, np.ndarray]:
+def _gather_host_rows_packed(key: str | _HostTable, ids) -> tuple[np.ndarray, np.ndarray]:
     """:func:`_gather_host_rows` with both outputs packed into uint32 words (the ``pure_callback`` body)."""
     weight, scale = _gather_host_rows(key, ids)
     return _pack_u32(weight), _pack_u32(scale)
@@ -405,15 +419,28 @@ class GatedEngram(spx.Module):
             raise ValueError(f"scale must be uint8 e8m0 bytes; got {s.dtype}.")
         if getattr(self, "_host_table_key", None) is None:
             self._host_table_key = f"gated-engram-{next(_HOST_TABLE_IDS)}"
-        _HOST_TABLES[self._host_table_key] = (w, s)
+        handle = _HOST_TABLES.get(self._host_table_key)
+        if handle is None:
+            handle = _HostTable(w, s)
+        else:
+            # Reloads remain visible to already rebound modules and executables.
+            handle.weight, handle.scale = w, s
+        self._host_table_handle = handle
+        _HOST_TABLES[self._host_table_key] = handle
         self.embed.weight.kind = "buffers"
         self.embed.scale.kind = "buffers"
         self.embed.weight.value = jnp.zeros((1, features), jnp.float8_e4m3fn)
         self.embed.scale.value = jnp.ones((1, n_scale), jnp.uint8)
 
     def release_host_table(self) -> None:
-        """Drop this module's host table from the registry (modules rebound from its GraphDef share it)."""
-        _HOST_TABLES.pop(getattr(self, "_host_table_key", None), None)
+        """Release this module's ownership without invalidating live rebound modules or executables.
+
+        The allocation and weak registry entry disappear when their last owner
+        is released or collected. A subsequent install on this module gets a
+        new key, leaving other owners' tables unchanged.
+        """
+        self._host_table_handle = None
+        self._host_table_key = None
 
     def set_table(self, weight, scale, mesh: jax.sharding.Mesh | None = None) -> None:
         """Install the fp8 table: row-shard ``weight`` / ``scale`` into this module's memory kind.
@@ -506,7 +533,12 @@ class GatedEngram(spx.Module):
             jax.ShapeDtypeStruct((*ids.shape, -(-scale_width // 4)), jnp.uint32),
         )
         weight_words, scale_words = jax.pure_callback(
-            functools.partial(_gather_host_rows_packed, key), shapes, ids, vmap_method="sequential"
+            # Capture the allocation owner, not only its registry key: an
+            # executable must keep working after its source model is collected.
+            functools.partial(_gather_host_rows_packed, _HOST_TABLES[key]),
+            shapes,
+            ids,
+            vmap_method="sequential",
         )
         return _unpack_u8(weight_words, weight_width), _unpack_u8(scale_words, scale_width)
 

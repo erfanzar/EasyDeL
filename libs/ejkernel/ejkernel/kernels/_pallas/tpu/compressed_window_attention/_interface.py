@@ -37,15 +37,18 @@ def compressed_window_attention(
     token_kv_len: int = 0,
     token_valid: Array | None = None,
     entry_topk: Array | None = None,
+    backward: str = "flash",
+    causal: bool = False,
+    vmem_capacity_bytes: int | None = None,
 ) -> Float[Array, "batch num_heads q_len head_dim"]:
     """Tiled-flash sink-augmented shared-KV attention (Pallas TPU, differentiable).
 
     Registered under ``"compressed_window_attention"`` for ``Platform.PALLAS`` /
     ``Backend.TPU``. Signature matches the XLA reference (which it must match in
     value and gradient); see that impl for argument semantics. Streams the KV
-    axis in tiles via ``pltpu.make_async_copy`` double-buffering with an online
-    softmax, and is differentiable via a ``custom_vjp`` (dense-reference
-    backward this pass).
+    axis in tiles with an online softmax; the default ``backward="flash"`` is a
+    ``custom_vjp`` over tiled Pallas dQ / dKV kernels, ``"reference"`` a
+    ``custom_jvp`` through the tiled reference math (forward-mode AD).
 
     Args:
         query: Rotated queries ``[batch, num_heads, q_len, head_dim]``.
@@ -61,6 +64,11 @@ def compressed_window_attention(
             the token-region window / causal / padding mask is built in-kernel.
         entry_topk: Optional selected entry ids ``[batch, q_len, k]`` replacing
             the entry columns of ``bias`` (requires ``token_valid``).
+        backward: ``"flash"`` (tiled Pallas backward) or ``"reference"``.
+        causal: Promise that ``bias`` closes every key past the diagonal; token
+            tiles above it are skipped in both directions (exact).
+        vmem_capacity_bytes: VMEM capacity used to size the tiles; ``None``
+            queries the local TPU (``pltpu.get_tpu_info()``).
 
     Returns:
         Attention output ``[batch, num_heads, q_len, head_dim]``.
@@ -76,4 +84,7 @@ def compressed_window_attention(
         token_kv_len=token_kv_len,
         token_valid=token_valid,
         entry_topk=entry_topk,
+        backward=backward,
+        causal=causal,
+        vmem_capacity_bytes=vmem_capacity_bytes,
     )

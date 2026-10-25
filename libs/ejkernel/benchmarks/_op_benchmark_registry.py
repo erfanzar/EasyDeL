@@ -912,6 +912,56 @@ def _cfgs_mhc_coefficients():
     return _limit_configs(configs)
 
 
+def _gen_mhc_collapse_inputs(config: dict[str, Any]):
+    """Residual streams ``[batch, seq, hc, width]`` plus the gate predictor of one mHC site."""
+    batch, seq, hc, width = (
+        config.get("batch", 1),
+        config.get("seq", 4096),
+        config.get("hc", 4),
+        config.get("width", 1024),
+    )
+    mix = (2 + hc) * hc
+    k_x, k_fn, k_base = jax.random.split(jax.random.PRNGKey(config.get("seed", 0)), 3)
+    x = jax.random.normal(k_x, (batch, seq, hc, width)).astype(_as_jax_dtype(config.get("dtype", "bfloat16")))
+    fn = (jax.random.normal(k_fn, (mix, hc, width)) * 0.02).astype(_as_jax_dtype(config.get("fn_dtype", "float32")))
+    base = jax.random.normal(k_base, (mix,)) * 0.1
+    return x, fn, base, jnp.ones((3,), jnp.float32)
+
+
+def _cfgs_mhc_collapse():
+    """``[1, S, 4, 1024]`` bf16 streams with an fp32 and a bf16 predictor."""
+    configs = [
+        dict(config, dtype="bfloat16")
+        for config in _grid(batch=[1], seq=[4096, 16384, 32768], hc=[4], width=[1024], fn_dtype=["float32", "bfloat16"])
+    ]
+    return _limit_configs(configs)
+
+
+def _gen_mhc_expand_inputs(config: dict[str, Any]):
+    """Streams, sub-layer output and fp32 gates (``post`` in ``(0, 2)``, row-stochastic ``comb``)."""
+    batch, seq, hc, width = (
+        config.get("batch", 1),
+        config.get("seq", 4096),
+        config.get("hc", 4),
+        config.get("width", 1024),
+    )
+    dtype = _as_jax_dtype(config.get("dtype", "bfloat16"))
+    k_x, k_o, k_p, k_c = jax.random.split(jax.random.PRNGKey(config.get("seed", 0)), 4)
+    x = jax.random.normal(k_x, (batch, seq, hc, width)).astype(dtype)
+    out = jax.random.normal(k_o, (batch, seq, width)).astype(dtype)
+    post = 2.0 * jax.nn.sigmoid(jax.random.normal(k_p, (batch, seq, hc)))
+    comb = jax.nn.softmax(jax.random.normal(k_c, (batch, seq, hc, hc)), axis=-1)
+    return x, out, post, comb
+
+
+def _cfgs_mhc_expand():
+    """``[1, S, 4, 1024]`` bf16 streams."""
+    configs = [
+        dict(config, dtype="bfloat16") for config in _grid(batch=[1], seq=[4096, 16384, 32768], hc=[4], width=[1024])
+    ]
+    return _limit_configs(configs)
+
+
 def _cfgs_topk():
     """Router, DSA, and vocabulary/filter top-k workloads."""
     configs = [
@@ -2446,6 +2496,28 @@ def _mhc_coefficients_wrapper(op_fn: Callable[..., Any], platform: str):
     return _fn
 
 
+def _mhc_collapse_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Pin the platform; return every output (fp32) so the backward covers gates and collapse."""
+
+    def _fn(x, fn, base, scale):
+        """Concatenate ``post``, the flattened ``comb`` and ``collapsed`` into one fp32 array."""
+        post, comb, collapsed = op_fn(x, fn, base, scale, platform=platform)
+        flat = comb.reshape(*comb.shape[:-2], -1)
+        return jnp.concatenate([post, flat, collapsed.astype(jnp.float32)], axis=-1)
+
+    return _fn
+
+
+def _mhc_expand_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Pin the platform for the mHC residual write."""
+
+    def _fn(x, out, post, comb):
+        """New streams for the given gates."""
+        return op_fn(x, out, post, comb, platform=platform)
+
+    return _fn
+
+
 def _sinkhorn_knopp_wrapper(op_fn: Callable[..., Any], platform: str):
     """Keep iteration count and denominator epsilon static for each platform."""
 
@@ -3863,6 +3935,24 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         configs=_cfgs_mhc_coefficients(),
         wrapper_factory=_mhc_coefficients_wrapper,
         static_kwargs=["hc_mult", "n_iters", "eps"],
+        bench_bwd=True,
+    ),
+    "mhc_collapse": OpBenchmarkSpec(
+        op_name="mhc_collapse",
+        algorithm="mhc_collapse",
+        op_fn=ops.mhc_collapse,
+        input_generator=_gen_mhc_collapse_inputs,
+        configs=_cfgs_mhc_collapse(),
+        wrapper_factory=_mhc_collapse_wrapper,
+        bench_bwd=True,
+    ),
+    "mhc_expand": OpBenchmarkSpec(
+        op_name="mhc_expand",
+        algorithm="mhc_expand",
+        op_fn=ops.mhc_expand,
+        input_generator=_gen_mhc_expand_inputs,
+        configs=_cfgs_mhc_expand(),
+        wrapper_factory=_mhc_expand_wrapper,
         bench_bwd=True,
     ),
     "sinkhorn_knopp": OpBenchmarkSpec(

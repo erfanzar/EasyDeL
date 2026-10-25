@@ -26,7 +26,7 @@ back-reference).
 
 from __future__ import annotations
 
-import os
+import math
 import time
 import typing
 from bisect import bisect_left
@@ -41,6 +41,9 @@ from easydel.utils import flags
 
 from ...config import normalize_draft_schedule, resolve_num_draft_tokens
 from ...core.binary_search import apply_topk_mask, apply_topp_mask
+from ..executors.model_executor import resolve_lm_logit_postprocess
+from .penalties import HistoryCountCache, VerifyPenaltyRows, history_penalty_params, penalized_verify_argmax
+from .support import build_target_kv_pairs, gather_paged_kv
 
 if typing.TYPE_CHECKING:
     from easydel.inference.speculative import DrafterProtocol
@@ -73,7 +76,7 @@ class _SpecVerifyMetadata:
         return len(self.buffer_draft_tokens)
 
 
-def _window_hidden_row(
+def window_hidden_row(
     hidden_states: jax.Array,
     *,
     row_pos: int,
@@ -81,23 +84,28 @@ def _window_hidden_row(
     token_index: int,
     total_window_tokens: int,
     padded_reqs: int,
+    output_layout: typing.Literal["tokens", "requests"] | None = None,
 ) -> jax.Array:
-    """Return the hidden row for a window token, tolerating old gathered outputs."""
+    """Select a token or request row using an explicit layout when available.
+
+    ``None`` falls back to a shape heuristic. Runner
+    executions supply their bucket's layout, since active token counts alone
+    cannot distinguish full outputs from padded gathered request rows.
+    """
     hidden_len = int(hidden_states.shape[0])
     full_index = int(token_offset) + int(token_index)
+    if output_layout is not None:
+        if output_layout not in ("tokens", "requests"):
+            raise ValueError(f"Unknown hidden output layout: {output_layout!r}")
+        index = full_index if output_layout == "tokens" else int(row_pos)
+        if not 0 <= index < hidden_len:
+            raise IndexError(f"Hidden row {index} is outside the {output_layout} output of length {hidden_len}.")
+        return hidden_states[index]
     if hidden_len >= int(total_window_tokens) and 0 <= full_index < hidden_len:
         return hidden_states[full_index]
     if hidden_len >= int(padded_reqs) and 0 <= int(row_pos) < hidden_len:
         return hidden_states[int(row_pos)]
     return hidden_states[min(max(full_index, 0), hidden_len - 1)]
-
-
-def _copy_kv_tree(kv_pages: typing.Any) -> typing.Any:
-    """Return a deep copy of every device array leaf in a KV-pages pytree."""
-    return jax.tree_util.tree_map(
-        lambda leaf: jnp.array(leaf, copy=True) if isinstance(leaf, jax.Array) else leaf,
-        kv_pages,
-    )
 
 
 # Device-array fields carried by a recurrent cache view. These are the only
@@ -249,7 +257,7 @@ def _window_exceeds_limit_impl(
 _window_exceeds_limit = jax.jit(_window_exceeds_limit_impl, static_argnums=(3,))
 
 
-def _snapshot_recurrent_state(kv_pages: typing.Any) -> typing.Any:
+def snapshot_recurrent_state(kv_pages: typing.Any) -> typing.Any:
     """Snapshot only the recurrent leaves of a hybrid KV cache for spec rollback.
 
     Speculative rollback for hybrid models only needs the recurrent leaves
@@ -309,7 +317,7 @@ def _restore_recurrent_state(live_kv_pages: typing.Any, snapshot: typing.Any) ->
 
     Keeps every full-attention/paged view of ``live_kv_pages`` (the post-forward
     cache) as-is and splices back fresh copies of the recurrent leaves captured by
-    :func:`_snapshot_recurrent_state`. The snapshot leaves are re-copied (one
+    :func:`snapshot_recurrent_state`. The snapshot leaves are re-copied (one
     fused dispatch) on every restore so a single snapshot survives the KV-buffer
     donation performed by each replay forward (one snapshot may feed several
     replay calls within a verify window).
@@ -318,7 +326,7 @@ def _restore_recurrent_state(live_kv_pages: typing.Any, snapshot: typing.Any) ->
         live_kv_pages: The current (post-forward) cache whose attention pages are
             reused verbatim.
         snapshot: ``(layout, copied_arrays)`` from
-            :func:`_snapshot_recurrent_state`; ``None`` returns ``live_kv_pages``
+            :func:`snapshot_recurrent_state`; ``None`` returns ``live_kv_pages``
             unchanged.
 
     Returns:
@@ -367,6 +375,8 @@ class DrafterSpeculation:
         drafter: DrafterProtocol,
         num_draft_tokens: int,
         draft_schedule: list[tuple[int, int, int]] | None = None,
+        debug_max_traces: int = 0,
+        adaptive_conf_threshold: float = 0.0,
     ) -> None:
         """Initialize the drafter-backed strategy.
 
@@ -383,7 +393,15 @@ class DrafterSpeculation:
                 ``(start, end, k)`` live-concurrency ranges resolved once per
                 scheduler step via :meth:`resolve_step_draft_budget`. ``None``
                 keeps the static count at every concurrency.
+            debug_max_traces: Maximum verify-window debug traces to retain;
+                zero disables trace capture.
+            adaptive_conf_threshold: Top-1 confidence threshold for early-exit
+                drafting, in [0, 1]. Zero keeps fixed-length drafting.
         """
+        if int(debug_max_traces) < 0:
+            raise ValueError("debug_max_traces must be nonnegative")
+        if not math.isfinite(float(adaptive_conf_threshold)) or not 0.0 <= float(adaptive_conf_threshold) <= 1.0:
+            raise ValueError("adaptive_conf_threshold must be finite and in [0, 1]")
         self._runner = runner
         self.drafter = drafter
         self.num_draft_tokens = int(num_draft_tokens)
@@ -402,7 +420,8 @@ class DrafterSpeculation:
         # Windows rolled back by :meth:`_commit_compressed_window_without_replay` (no replay forward).
         self.num_replay_free_commits = 0
         self.debug_traces: list[dict[str, typing.Any]] = []
-        self.debug_max_traces = int(os.environ.get("EASYDEL_SPEC_DECODE_DEBUG_STEPS", "0") or 0)
+        self.debug_max_traces = int(debug_max_traces)
+        self.adaptive_conf_threshold = float(adaptive_conf_threshold)
         self.draft_full_log_probs_by_req: dict[str, jax.Array] = {}
         self._filter_sample_fns: dict[tuple, typing.Callable] = {}
         self._verify_sample_fns: dict[tuple, typing.Callable] = {}
@@ -447,6 +466,12 @@ class DrafterSpeculation:
         # ``(row offset, first position, token count)`` there; refreshed every step by ``observe_window_hidden``.
         self._whole_block_hidden: jax.Array | None = None
         self._whole_block_window: dict[str, tuple[int, int, int]] = {}
+        # History penalties on the greedy verify path: committed-history token counts per penalised request
+        # (advanced incrementally) and the requests whose sampler device count row needs a rewrite before the
+        # next plain-sampler step (see ``sync_penalty_counts``).
+        self._history_counts = HistoryCountCache()
+        self._penalty_counts_stale: set[str] = set()
+        self.num_penalized_verify_rows = 0
 
     def _stable_drafter_row(self, req_id: str, fallback_row: int) -> int:
         """Return this request's lifetime-stable row in the pooled MTP cache.
@@ -486,6 +511,8 @@ class DrafterSpeculation:
         """Free the stable drafter rows of requests the scheduler finished."""
         finished = getattr(scheduler_output, "finished_req_ids", None) or ()
         for rid in finished:
+            self._history_counts.drop(str(rid))
+            self._penalty_counts_stale.discard(str(rid))
             row = self._mtp_row_by_req.pop(str(rid), None)
             if row is None:
                 continue
@@ -609,6 +636,8 @@ class DrafterSpeculation:
         self._mtp_row_capacity = 0
         self._whole_block_hidden = None
         self._whole_block_window.clear()
+        self._history_counts.clear()
+        self._penalty_counts_stale.clear()
         self.live_num_draft_tokens = int(self.num_draft_tokens)
         if self.drafter is not None:
             try:
@@ -638,9 +667,11 @@ class DrafterSpeculation:
     def is_spec_request(self, req_state: CachedRequestState | None) -> bool:
         """Return whether ``req_state`` is eligible for speculative decoding.
 
-        Requests using sampling penalties, ``n > 1``, or no attached drafter
-        fall back to the standard single-token decode path because the runner's
-        spec-verify kernels don't support those features yet.
+        Requests with ``n > 1``, sampled (``temperature > 0``) requests carrying
+        a presence/frequency/repetition penalty, and runs without a drafter fall
+        back to the standard single-token decode path. Greedy requests with
+        history penalties speculate: their verify rows are penalised exactly
+        like the sampler would penalise them.
 
         Args:
             req_state: Cached request state to inspect.
@@ -655,13 +686,173 @@ class DrafterSpeculation:
         sampling_params = req_state.sampling_params
         if getattr(sampling_params, "n", 1) != 1:
             return False
-        if getattr(sampling_params, "presence_penalty", 0.0) != 0.0:
-            return False
-        if getattr(sampling_params, "frequency_penalty", 0.0) != 0.0:
-            return False
-        if getattr(sampling_params, "repetition_penalty", 1.0) != 1.0:
+        # Sampled verification uses the drafter's unpenalised q, so penalties are only speculated greedily.
+        if self.uses_history_penalties(req_state) and not self.is_greedy_request(req_state):
             return False
         return True
+
+    @staticmethod
+    def uses_history_penalties(req_state: CachedRequestState | None) -> bool:
+        """Return whether ``req_state`` carries a presence, frequency or repetition penalty.
+
+        Args:
+            req_state: Cached request state to inspect, or ``None``.
+
+        Returns:
+            ``True`` when any history penalty would change the request's logits (repetition is multiplicative,
+            so ``1.0`` is its inactive value).
+        """
+        if req_state is None:
+            return False
+        return history_penalty_params(req_state.sampling_params) is not None
+
+    def verify_penalty_rows(
+        self,
+        *,
+        meta: _SpecVerifyMetadata,
+        req_state: CachedRequestState | None,
+        offset: int,
+        num_rows: int,
+        draft_prefix: int = 0,
+    ) -> VerifyPenaltyRows | None:
+        """Penalty state of ``num_rows`` consecutive verify logit rows of one request.
+
+        Logit row ``offset + i`` predicts absolute position ``start_pos + real_count + draft_prefix + i``, so its
+        count state is the committed history ``[0, start_pos + real_count)`` plus the drafts
+        ``[0, draft_prefix + i)``: exactly the state the non-speculative sampler would hold at that position.
+
+        Args:
+            meta: Verify metadata of the request's window.
+            req_state: The request's cached state (sampling params and committed tokens).
+            offset: First logit row of the request.
+            num_rows: Number of consecutive logit rows.
+            draft_prefix: Drafts already preceding the first row.
+
+        Returns:
+            The rows' penalty state, or ``None`` when the request carries no history penalty.
+        """
+        if req_state is None:
+            return None
+        params = history_penalty_params(req_state.sampling_params)
+        if params is None:
+            return None
+        history_ids, history_counts = self._history_counts.counts(
+            str(meta.request_id),
+            req_state.get_token_id,
+            int(meta.start_pos) + int(meta.real_count),
+        )
+        return VerifyPenaltyRows(
+            offset=int(offset),
+            num_rows=int(num_rows),
+            history_ids=history_ids,
+            history_counts=history_counts,
+            draft_tokens=tuple(int(t) for t in meta.buffer_draft_tokens),
+            presence_penalty=params[0],
+            frequency_penalty=params[1],
+            repetition_penalty=params[2],
+            draft_prefix=int(draft_prefix),
+        )
+
+    def penalized_verify_argmaxes(
+        self,
+        logits: jax.Array,
+        entries: typing.Sequence[tuple[_SpecVerifyMetadata, int, int]],
+    ) -> np.ndarray | None:
+        """Greedy verify argmaxes with every penalised request's history penalties applied.
+
+        Returns ``None`` when no entry carries a penalty, so the caller keeps its plain device argmax unchanged.
+        Otherwise the penalty is applied on device to the penalised rows only and one int per logit row is read
+        back; unpenalised rows keep their plain argmax.
+
+        Args:
+            logits: Verify logits ``[rows, vocab]`` (left on device).
+            entries: ``(verify_meta, offset, count)`` locating each request's verify rows in ``logits``.
+
+        Returns:
+            ``[rows]`` int64 argmax ids, or ``None`` when no request is penalised.
+        """
+        rows: list[VerifyPenaltyRows] = []
+        for meta, offset, count in entries:
+            spec = self.verify_penalty_rows(
+                meta=meta,
+                req_state=self._runner.requests.get(str(meta.request_id)),
+                offset=int(offset),
+                num_rows=int(count),
+            )
+            if spec is not None:
+                rows.append(spec)
+        if not rows:
+            return None
+        self.num_penalized_verify_rows += sum(int(spec.num_rows) for spec in rows)
+        return penalized_verify_argmax(logits, rows)
+
+    def penalized_replay_token(
+        self,
+        *,
+        meta: _SpecVerifyMetadata,
+        req_state: CachedRequestState | None,
+        hidden_row: jax.Array,
+        draft_prefix: int,
+    ) -> int | None:
+        """Penalised greedy token predicted from a replay forward's hidden row.
+
+        Replay forwards run the sampler with the device count state of the verify step, which no longer matches
+        the replayed prefix, so their sampled token cannot be used for a penalised request. The hidden row is
+        projected through the LM head and penalised with the replayed prefix's own counts instead.
+
+        Args:
+            meta: Verify metadata of the request's window.
+            req_state: The request's cached state.
+            hidden_row: Replay hidden state ``[hidden]`` of the last replayed position.
+            draft_prefix: Number of drafts included in the replayed prefix.
+
+        Returns:
+            The penalised greedy token, or ``None`` when the request carries no history penalty.
+        """
+        spec = self.verify_penalty_rows(meta=meta, req_state=req_state, offset=0, num_rows=1, draft_prefix=draft_prefix)
+        if spec is None:
+            return None
+        logits = self.project_hidden_rows(jnp.asarray(hidden_row)[None, :])
+        self.num_penalized_verify_rows += 1
+        return int(penalized_verify_argmax(logits, [spec])[0])
+
+    def sync_penalty_counts(self, scheduler_output: SchedulerOutput) -> None:
+        """Keep the sampler's device token counts exact for penalised speculative requests.
+
+        The sampler increments a request's device count row with the token it sampled. In a step that verifies
+        or drafts a request, that token is not what the request emits (accepted drafts plus a corrected token),
+        replays sample again, and full rebuilds may count materialised drafts, so the row drifts. Such requests
+        are marked stale; before a step that runs one of them through the plain sampler path (scheduled without
+        drafts), its row is rewritten from the committed history. Must run after the step's row reordering.
+
+        Args:
+            scheduler_output: The step's scheduler decision.
+        """
+        if self.drafter is None:
+            return
+        runner = self._runner
+        scheduled_spec = scheduler_output.scheduled_spec_decode_tokens or {}
+        rows: list[tuple[int, np.ndarray, np.ndarray]] = []
+        for rid, num_scheduled in scheduler_output.num_scheduled_tokens.items():
+            rid = str(rid)
+            if int(num_scheduled) <= 0:
+                continue
+            req_state = runner.requests.get(rid)
+            if not self.uses_history_penalties(req_state):
+                continue
+            spec_eligible = self.is_spec_request(req_state)
+            drafts = scheduled_spec.get(rid) or []
+            verifies = spec_eligible and bool(drafts) and all(int(t) >= 0 for t in drafts)
+            if rid in self._penalty_counts_stale and not verifies:
+                row = runner.sequence_buffer.req_id_to_index.get(rid)
+                if row is not None:
+                    ids, counts = self._history_counts.counts(rid, req_state.get_token_id, int(req_state.num_tokens))
+                    rows.append((int(row), ids, counts))
+                    self._penalty_counts_stale.discard(rid)
+            if spec_eligible:
+                self._penalty_counts_stale.add(rid)
+        if rows:
+            runner.executor_manager.overwrite_sampler_penalty_rows(rows)
 
     def filtered_log_probs(
         self,
@@ -1207,30 +1398,7 @@ class DrafterSpeculation:
         if bool(getattr(self.drafter, "needs_main_hidden", False)):
             # DSpark: model-step rows are ``last_hidden | main_hidden``; the LM head only sees the first part.
             hidden_rows = hidden_rows[..., : int(self._runner.model.config.get_text_config().hidden_size)]
-        num_rows = int(hidden_rows.shape[0])
-        model_executor = self._runner.executor_manager._model_executor
-        try:
-            lm_head_fn = model_executor.get_lm_head(padded_num_reqs=num_rows)
-        except KeyError:
-            graphdef, graphstate, graphother, inputs = self._runner.executor_manager.get_compile_configurations(
-                self._runner.executor_manager.kv_pages,
-                self._runner.executor_manager.rng_key,
-                self._runner.max_num_reqs,
-                self._runner.max_num_reqs,
-                self._runner.max_num_reqs,
-                self._runner.metadata,
-            )
-            model_executor.compile_lm_head(
-                padded_num_reqs=num_rows,
-                graphdef=graphdef,
-                graphstate=graphstate,
-                graphother=graphother,
-                inputs=inputs,
-                dtype=hidden_rows.dtype,
-            )
-            lm_head_fn = model_executor.get_lm_head(padded_num_reqs=num_rows)
-        graphstate_arg, graphother_arg = model_executor.runtime_graph_args()
-        return lm_head_fn(graphstate_arg, graphother_arg, hidden_rows)
+        return self._runner.executor_manager.project_hidden_rows(hidden_rows)
 
     def cache_group_index_for_layer(self, layer_idx: int) -> int | None:
         """Resolve the eSurge page-table group that owns a target layer's K/V.
@@ -1285,27 +1453,18 @@ class DrafterSpeculation:
         page_size = int(
             getattr(getattr(view, "metadata", None), "page_size", self._runner.page_size) or self._runner.page_size
         )
-        page_size = max(1, page_size)
-        pages_needed = min(int(page_table_cpu.shape[1]), max(1, (int(kv_len) + page_size - 1) // page_size))
-        if pages_needed <= 0:
-            return None
-        kv_len = min(int(kv_len), pages_needed * page_size)
-
-        page_ids_cpu = np.zeros((pages_needed,), dtype=np.int32)
-        row = np.asarray(page_table_cpu[int(req_idx), :pages_needed], dtype=np.int32)
-        page_ids_cpu[: row.shape[0]] = row
-        page_ids = jnp.asarray(page_ids_cpu, dtype=jnp.int32)
-        token_offsets = jnp.arange(int(kv_len), dtype=jnp.int32)
-        page_indices = page_ids[token_offsets // page_size]
-        offsets = token_offsets % page_size
-
         key_pages = getattr(view, "key_pages", None)
         value_pages = getattr(view, "value_pages", None)
-        if key_pages is None or value_pages is None:
+        if key_pages is None or value_pages is None or int(page_table_cpu.shape[1]) == 0:
             return None
-        keys = key_pages[page_indices, offsets][None, ...]
-        values = value_pages[page_indices, offsets][None, ...]
-        return keys, values
+        return gather_paged_kv(
+            key_pages,
+            value_pages,
+            page_table_cpu,
+            batch_index=int(req_idx),
+            kv_len=int(kv_len),
+            page_size=page_size,
+        )
 
     def target_kv_payload_for_drafter(
         self,
@@ -1354,39 +1513,26 @@ class DrafterSpeculation:
         kv_len = int(self._runner.max_model_len)
         target_context_len = max(1, min(kv_len, int(seed_position) + 1))
 
-        pairs: list[tuple[jax.Array, jax.Array] | None] = []
-        for target_layer_idx in layer_mapping:
-            if target_layer_idx < 0 or target_layer_idx >= len(views):
-                pairs.append(None)
+        layer_mapping = list(layer_mapping)
+        layer_to_group: dict[int, int] = {}
+        for layer in layer_mapping:
+            if not 0 <= int(layer) < len(views):
                 continue
-            view = views[int(target_layer_idx)]
-            if view is None:
-                pairs.append(None)
-                continue
-            raw_view = getattr(view, "transformer", view)
-            k = getattr(raw_view, "key", None)
-            v = getattr(raw_view, "value", None)
-            if k is not None and v is not None:
-                pairs.append(
-                    (
-                        k[int(req_idx) : int(req_idx) + 1, :kv_len],
-                        v[int(req_idx) : int(req_idx) + 1, :kv_len],
-                    )
-                )
-                continue
-
-            group_idx = self.cache_group_index_for_layer(int(target_layer_idx))
-            if group_idx is None:
-                pairs.append(None)
-                continue
-            pairs.append(
-                self.gather_paged_kv_for_request(
-                    raw_view,
-                    group_idx=group_idx,
-                    req_idx=int(req_idx),
-                    kv_len=kv_len,
-                )
-            )
+            view = getattr(views[int(layer)], "transformer", views[int(layer)])
+            if getattr(view, "key_pages", None) is not None:
+                group = self.cache_group_index_for_layer(int(layer))
+                if group is not None:
+                    layer_to_group[int(layer)] = group
+        page_table = getattr(self._runner.sequence_buffer, "page_table", None)
+        pairs = build_target_kv_pairs(
+            target_cache,
+            layer_mapping,
+            page_tables=getattr(page_table, "page_tables", page_table),
+            layer_to_group=layer_to_group,
+            batch_index=int(req_idx),
+            kv_len=kv_len,
+            page_size=int(getattr(self._runner, "page_size", 1)),
+        )
 
         if not any(pair is not None for pair in pairs):
             return None
@@ -1422,30 +1568,24 @@ class DrafterSpeculation:
             return False
         if not callable(getattr(self.drafter, "rollback_to", None)):
             return False
-        env = os.environ.get("EASYDEL_MTP_PERSIST_KV", "").strip()
-        if env in ("0", "1"):
-            return env == "1"
+        override = flags.get_str(flags.EASYDEL_MTP_PERSIST_KV)
+        if isinstance(override, str) and override.strip():
+            return flags.get_bool(flags.EASYDEL_MTP_PERSIST_KV)
         return bool(getattr(self.drafter, "persist_kv", False))
 
     def _adaptive_conf_threshold(self) -> float:
         """Return the adaptive (early-exit) draft confidence threshold.
 
-        Read from ``EASYDEL_SPEC_ADAPTIVE_CONF`` (a top-1 softmax-probability
-        threshold). Default ``"0"`` means OFF: :meth:`draft_next` uses the fixed-K
-        Python draft loop exactly as before. A positive value routes greedy,
-        non-prefix drafts through :meth:`Qwen3_5MTPDrafter.draft_adaptive`, whose
-        on-device ``while_loop`` drafts up to ``num_draft_tokens`` but stops
-        early once the MTP's confidence drops below this threshold — spending deep
-        drafts only while the drafter is confident. Values ``<= 0`` (or an
-        unparseable value) keep the feature off.
+        Configured by ``adaptive_conf_threshold`` (a top-1 softmax-probability
+        threshold). Zero means OFF: :meth:`draft_next` uses the fixed-K Python
+        draft loop. A positive value routes greedy, non-prefix drafts through
+        :meth:`Qwen3_5MTPDrafter.draft_adaptive`, whose on-device ``while_loop``
+        stops early once confidence drops below this threshold.
 
         Returns:
-            The parsed threshold, or ``0.0`` when unset / invalid.
+            The configured threshold; zero disables early exit.
         """
-        try:
-            return float(os.environ.get("EASYDEL_SPEC_ADAPTIVE_CONF", "0") or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
+        return self.adaptive_conf_threshold
 
     def draft_next(
         self,
@@ -2112,28 +2252,15 @@ class DrafterSpeculation:
             return False
         if bool(getattr(self.drafter, "requires_target_kv_cache", False)):
             return False
-        # The fused program's default verify projection is the raw shared LM
-        # head (``apply_lm_head`` math). The two-dispatch path projects through
-        # ``compute_lm_logits``, which additionally applies logit caps / scales
-        # / soft caps when a model configures them. Those never coexist with an
-        # inline MTP head today (Qwen3.5 family has none), but gate the fused
-        # path off rather than silently diverging if a future family does —
-        # unless a test/deployment injected its own projection hook.
+        # The default fused projection is the raw shared LM head. Use the
+        # split executor's authoritative contract, including model-owned hooks,
+        # rather than a second list of attributes that can miss transforms.
+        # An explicit projection override owns its postprocessing and remains
+        # eligible; a hook returning None declares an identity transformation.
         if self.draft_in_verify_project_fn() is None:
             model = getattr(self._runner, "model", None)
-            if getattr(model, "_logit_cap_feature", None) is not None:
+            if resolve_lm_logit_postprocess(model) is not None:
                 return False
-            for attr in ("logit_scale", "output_multiplier_scale"):
-                if getattr(model, attr, None) is not None:
-                    return False
-            if getattr(getattr(model, "base_model", None), "lm_head_multiplier", None) is not None:
-                return False
-            cfg = getattr(model, "config", None)
-            get_text_config = getattr(cfg, "get_text_config", None)
-            text_cfg = get_text_config() if callable(get_text_config) else cfg
-            for c in {id(cfg): cfg, id(text_cfg): text_cfg}.values():
-                if getattr(c, "final_logit_softcapping", None) is not None:
-                    return False
         return True
 
     def draft_in_verify_project_fn(self) -> typing.Callable | None:
@@ -2556,7 +2683,7 @@ class DrafterSpeculation:
         if candidate_count <= 0 or prefix_len <= 0 or prefix_len > candidate_count:
             return False
         if defer:
-            self._runner._pending_spec_recurrent_commit_by_req[str(req_id)] = prefix_len
+            self._runner.queue_speculative_recurrent_commit(str(req_id), prefix_len)
             return True
         return self.commit_recurrent_candidate_state(
             row_pos=int(row_pos),
@@ -2687,7 +2814,7 @@ class DrafterSpeculation:
             if num_tokens_static > int(num_tokens_static_original):
                 num_tokens_static = int(num_tokens_static_original)
 
-        commit_scheduled_full_cpu = self._runner._scheduled_full_cpu.copy()
+        commit_scheduled_full_cpu = self._runner.scheduled_token_counts_cpu.copy()
         commit_scheduled_full_cpu.fill(0)
         commit_scheduled_full_cpu[: len(commit_scheduled_list)] = np.asarray(commit_scheduled_list, dtype=np.int32)
 
@@ -2698,7 +2825,11 @@ class DrafterSpeculation:
         self._runner.executor_manager.execute(
             num_tokens=num_tokens_static,
             scheduled_full_cpu=commit_scheduled_full_cpu,
-            model_side_inputs_cpu=self._runner._side_inputs_for_execute(
+            cache_group_inputs=self._runner.cache_group_inputs_for_execute(
+                window_row_indices_cpu=window_row_indices,
+                num_computed_tokens_cpu=num_computed_tokens_window_cpu,
+            ),
+            model_side_inputs_cpu=self._runner.side_inputs_for_execute(
                 token_ids_cpu=token_ids_window_cpu,
                 num_computed_tokens_cpu=num_computed_tokens_window_cpu,
                 scheduled_full_cpu=commit_scheduled_full_cpu,
@@ -2706,7 +2837,7 @@ class DrafterSpeculation:
                 num_tokens_static=num_tokens_static,
             ),
             req_num_tokens_full_cpu=commit_req_num_tokens,
-            active_mask_full_cpu=self._runner._active_mask_full_cpu,
+            active_mask_full_cpu=self._runner.active_request_mask_cpu,
             window_row_indices_cpu=window_row_indices,
             recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
             input_ids_buf=self._runner.input_ids_buf,
@@ -2764,11 +2895,11 @@ class DrafterSpeculation:
         any other window row.
         """
         suffix_timer_start = time.time()
-        suffix_scheduled = self._runner._scheduled_full_cpu.copy()
+        suffix_scheduled = self._runner.scheduled_token_counts_cpu.copy()
         suffix_scheduled.fill(0)
         suffix_scheduled[int(row_pos)] = int(suffix_len)
 
-        suffix_active = self._runner._active_mask_full_cpu.copy()
+        suffix_active = self._runner.active_request_mask_cpu.copy()
         suffix_active.fill(False)
         suffix_active[int(row_pos)] = True
 
@@ -2789,7 +2920,11 @@ class DrafterSpeculation:
         out_tokens_suffix, _, _, _, hidden_suffix, _, _ = self._runner.executor_manager.execute(
             num_tokens=suffix_num_tokens_static,
             scheduled_full_cpu=suffix_scheduled,
-            model_side_inputs_cpu=self._runner._side_inputs_for_execute(
+            cache_group_inputs=self._runner.cache_group_inputs_for_execute(
+                window_row_indices_cpu=window_row_indices_cpu,
+                num_computed_tokens_cpu=suffix_num_computed,
+            ),
+            model_side_inputs_cpu=self._runner.side_inputs_for_execute(
                 token_ids_cpu=token_ids_window_cpu,
                 num_computed_tokens_cpu=suffix_num_computed,
                 scheduled_full_cpu=suffix_scheduled,
@@ -2822,15 +2957,18 @@ class DrafterSpeculation:
             wait_for_outputs=True,
         )
         suffix_token = int(np.asarray(out_tokens_suffix)[int(row_pos)])
-        suffix_hidden = _window_hidden_row(
+        suffix_hidden = window_hidden_row(
             hidden_suffix,
             row_pos=int(row_pos),
             token_offset=0,
             token_index=max(0, int(suffix_len) - 1),
             total_window_tokens=int(suffix_len),
             padded_reqs=int(padded_num_reqs),
+            output_layout=self._runner.executor_manager.hidden_state_layout(
+                hidden_suffix, num_tokens=suffix_num_tokens_static, padded_num_reqs=int(padded_num_reqs)
+            ),
         )
-        self._runner._spec_suffix_time_acc += time.time() - suffix_timer_start
+        self._runner.record_speculative_execution_time(suffix=time.time() - suffix_timer_start)
         return suffix_token, suffix_hidden
 
     def replay_prefix_sample(
@@ -2872,11 +3010,11 @@ class DrafterSpeculation:
         replay_timer_start = time.time()
         if pre_step_kv_pages is None:
             raise RuntimeError("Speculative replay requires a pre-step KV snapshot.")
-        replay_scheduled = self._runner._scheduled_full_cpu.copy()
+        replay_scheduled = self._runner.scheduled_token_counts_cpu.copy()
         replay_scheduled.fill(0)
         replay_scheduled[int(row_pos)] = int(prefix_len)
 
-        replay_active = self._runner._active_mask_full_cpu.copy()
+        replay_active = self._runner.active_request_mask_cpu.copy()
         replay_active.fill(False)
         replay_active[int(row_pos)] = True
 
@@ -2889,7 +3027,11 @@ class DrafterSpeculation:
         out_tokens_replay, _, _, _, hidden_replay, _, _ = self._runner.executor_manager.execute(
             num_tokens=num_tokens_static,
             scheduled_full_cpu=replay_scheduled,
-            model_side_inputs_cpu=self._runner._side_inputs_for_execute(
+            cache_group_inputs=self._runner.cache_group_inputs_for_execute(
+                window_row_indices_cpu=window_row_indices_cpu,
+                num_computed_tokens_cpu=num_computed_tokens_window_cpu,
+            ),
+            model_side_inputs_cpu=self._runner.side_inputs_for_execute(
                 token_ids_cpu=token_ids_window_cpu,
                 num_computed_tokens_cpu=num_computed_tokens_window_cpu,
                 scheduled_full_cpu=replay_scheduled,
@@ -2922,17 +3064,22 @@ class DrafterSpeculation:
             wait_for_outputs=True,
         )
         replay_token = int(np.asarray(out_tokens_replay)[int(row_pos)])
-        replay_hidden = _window_hidden_row(
+        # Only this row is active in the replay. Its prefix is packed from
+        # token zero, not at its offset in the original multi-row verify window.
+        replay_hidden = window_hidden_row(
             hidden_replay,
             row_pos=int(row_pos),
-            token_offset=int(window_token_offsets[int(row_pos)]),
+            token_offset=0,
             token_index=int(prefix_len) - 1,
-            total_window_tokens=int(total_scheduled),
+            total_window_tokens=int(prefix_len),
             padded_reqs=int(padded_num_reqs),
+            output_layout=self._runner.executor_manager.hidden_state_layout(
+                hidden_replay, num_tokens=int(num_tokens_static), padded_num_reqs=int(padded_num_reqs)
+            ),
         )
         if rng_after_verify is not None:
             self._runner.executor_manager.rng_key = rng_after_verify
-        self._runner._spec_replay_time_acc += time.time() - replay_timer_start
+        self._runner.record_speculative_execution_time(replay=time.time() - replay_timer_start)
         return replay_token, replay_hidden
 
     def replay_prefix_sequential(
@@ -2979,8 +3126,8 @@ class DrafterSpeculation:
         self._runner.executor_manager.kv_pages = _restore_recurrent_state(
             self._runner.executor_manager.kv_pages, pre_step_kv_pages
         )
-        replay_scheduled = self._runner._scheduled_full_cpu.copy()
-        replay_active = self._runner._active_mask_full_cpu.copy()
+        replay_scheduled = self._runner.scheduled_token_counts_cpu.copy()
+        replay_active = self._runner.active_request_mask_cpu.copy()
         replay_num_computed = np.asarray(num_computed_tokens_window_cpu).copy()
         replay_req_num_tokens = np.asarray(num_computed_tokens_window_cpu).copy()
         one_token_idx = bisect_left(self._runner.num_tokens_paddings, 1)
@@ -3001,7 +3148,11 @@ class DrafterSpeculation:
             out_tokens_replay, _, _, _, hidden_replay, _, _ = self._runner.executor_manager.execute(
                 num_tokens=one_token_static,
                 scheduled_full_cpu=replay_scheduled,
-                model_side_inputs_cpu=self._runner._side_inputs_for_execute(
+                cache_group_inputs=self._runner.cache_group_inputs_for_execute(
+                    window_row_indices_cpu=window_row_indices_cpu,
+                    num_computed_tokens_cpu=replay_num_computed,
+                ),
+                model_side_inputs_cpu=self._runner.side_inputs_for_execute(
                     token_ids_cpu=token_ids_window_cpu,
                     num_computed_tokens_cpu=replay_num_computed,
                     scheduled_full_cpu=replay_scheduled,
@@ -3034,18 +3185,21 @@ class DrafterSpeculation:
                 wait_for_outputs=True,
             )
             replay_token = int(np.asarray(out_tokens_replay)[int(row_pos)])
-            replay_hidden = _window_hidden_row(
+            replay_hidden = window_hidden_row(
                 hidden_replay,
                 row_pos=int(row_pos),
                 token_offset=0,
                 token_index=0,
                 total_window_tokens=1,
                 padded_reqs=int(padded_num_reqs),
+                output_layout=self._runner.executor_manager.hidden_state_layout(
+                    hidden_replay, num_tokens=one_token_static, padded_num_reqs=int(padded_num_reqs)
+                ),
             )
 
         if rng_after_verify is not None:
             self._runner.executor_manager.rng_key = rng_after_verify
-        self._runner._spec_replay_time_acc += time.time() - replay_timer_start
+        self._runner.record_speculative_execution_time(replay=time.time() - replay_timer_start)
         if replay_hidden is None:
             raise RuntimeError("Speculative sequential replay did not produce hidden state.")
         return replay_token, replay_hidden

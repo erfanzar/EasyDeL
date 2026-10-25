@@ -47,129 +47,77 @@ Example:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import time
 import typing as tp
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass, field
-from enum import StrEnum
 from http import HTTPStatus
 
-import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
+# The server scaffolding (status enum, metrics, endpoint/error models and the error-response helper) is shared with
+# the eSurge API server; it is re-exported here so ``easydel.inference.oai_proxies.<name>`` keeps working.
+from .inference_engine_interface import (
+    TIMEOUT_KEEP_ALIVE,  # noqa: F401  (re-export)
+    BaseInferenceApiServer,
+    EndpointConfig,
+    ErrorResponse,  # noqa: F401  (re-export)
+    ServerMetrics,
+    ServerStatus,
+    create_error_response,
+)
 from .openai_api_modules import ChatCompletionRequest, CompletionRequest, ResponsesRequest
 
-TIMEOUT_KEEP_ALIVE = 5.0
+# ``ResponsesRequest`` fields that the OpenAI SDK's ``responses.create`` accepts as keyword arguments. Everything else
+# (EasyDeL sampling extensions such as ``top_k``/``min_p``, chat-style ``messages``, legacy ``functions``, and any
+# arbitrary extra field) is forwarded through ``extra_body`` instead of raising ``TypeError`` inside the SDK.
+_RESPONSES_SDK_PARAMS = frozenset(
+    {
+        "model",
+        "input",
+        "instructions",
+        "store",
+        "previous_response_id",
+        "max_output_tokens",
+        "temperature",
+        "top_p",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "reasoning",
+        "stream",
+        "truncation",
+        "include",
+        "metadata",
+        "extra_headers",
+        "extra_query",
+        "timeout",
+    }
+)
 
 
-class ServerStatus(StrEnum):
-    """Server status enumeration.
+def _backend_error_status(error: BaseException) -> int:
+    """Map an ``openai.APIError`` to the HTTP status the proxy should answer with.
 
-    Represents the operational state of an inference proxy server.
-
-    Attributes:
-        STARTING: Server is initializing and not yet ready.
-        READY: Server is ready to accept and process requests.
-        BUSY: Server is processing requests at capacity.
-        ERROR: Server encountered an error condition.
-        SHUTTING_DOWN: Server is gracefully shutting down.
-    """
-
-    STARTING = "starting"
-    READY = "ready"
-    BUSY = "busy"
-    ERROR = "error"
-    SHUTTING_DOWN = "shutting_down"
-
-
-@dataclass
-class ServerMetrics:
-    """Server performance metrics.
-
-    Tracks key performance indicators for the inference proxy server.
-
-    Attributes:
-        total_requests: Total number of requests received since server start.
-        successful_requests: Number of requests completed successfully.
-        failed_requests: Number of requests that failed with errors.
-        total_tokens_generated: Total tokens generated across all requests.
-        average_tokens_per_second: Average token generation speed.
-        uptime_seconds: Time in seconds since server started.
-        start_time: Unix timestamp when the server was started.
-    """
-
-    total_requests: int = 0
-    successful_requests: int = 0
-    failed_requests: int = 0
-    total_tokens_generated: int = 0
-    average_tokens_per_second: float = 0.0
-    uptime_seconds: float = 0.0
-    start_time: float = field(default_factory=time.time)
-
-
-class EndpointConfig(BaseModel):
-    """Configuration for a FastAPI endpoint.
-
-    Defines the structure for registering API endpoints on the server.
-
-    Attributes:
-        path: URL path for the endpoint (e.g., "/v1/chat/completions").
-        handler: Callable that handles requests to this endpoint.
-        methods: List of HTTP methods supported (e.g., ["GET", "POST"]).
-        summary: Brief description of the endpoint for API documentation.
-        tags: Tags for grouping endpoints in API documentation.
-        response_model: Pydantic model for response validation.
-    """
-
-    path: str
-    handler: tp.Callable
-    methods: list[str]
-    summary: str | None = None
-    tags: list[str] | None = None
-    response_model: tp.Any = None
-
-
-class ErrorResponse(BaseModel):
-    """Standard error response model.
-
-    Provides a consistent error response format across all API endpoints.
-
-    Attributes:
-        error: Dictionary containing error message and type information.
-        request_id: Optional unique identifier for tracking the request.
-        timestamp: Unix timestamp when the error occurred.
-    """
-
-    error: dict[str, str]
-    request_id: str | None = None
-    timestamp: float = Field(default_factory=time.time)
-
-
-def create_error_response(status_code: HTTPStatus, message: str, request_id: str | None = None) -> JSONResponse:
-    """Create a standardized JSON error response.
+    Only ``APIStatusError`` subclasses carry ``status_code``; connection and timeout errors do not, so reading the
+    attribute unconditionally would raise ``AttributeError`` from inside the handler.
 
     Args:
-        status_code: HTTP status code for the error response.
-        message: Human-readable error message describing the issue.
-        request_id: Optional unique identifier for request tracking.
+        error: The exception raised by the OpenAI client.
 
     Returns:
-        JSONResponse containing the error details with appropriate HTTP status code.
-
-    Example:
-        >>> response = create_error_response(
-        ...     HTTPStatus.NOT_FOUND,
-        ...     "Model not found",
-        ...     request_id="req_123"
-        ... )
+        The backend's HTTP status when it produced one, ``504`` for timeouts and ``502`` for any other
+        backend failure (for example an unreachable server).
     """
-    error_response = ErrorResponse(error={"message": message, "type": status_code.name}, request_id=request_id)
-    return JSONResponse(content=error_response.model_dump(), status_code=status_code.value)
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return status
+    if "timeout" in type(error).__name__.lower():
+        return HTTPStatus.GATEWAY_TIMEOUT.value
+    return HTTPStatus.BAD_GATEWAY.value
 
 
 class InferenceApiRouter:
@@ -359,15 +307,7 @@ class InferenceApiRouter:
         Iterates through the endpoint configurations and adds each
         route to the FastAPI app.
         """
-        for endpoint in self._endpoints:
-            self.app.add_api_route(
-                path=endpoint.path,
-                endpoint=endpoint.handler,
-                methods=endpoint.methods,
-                summary=endpoint.summary,
-                tags=endpoint.tags,
-                response_model=endpoint.response_model,
-            )
+        BaseInferenceApiServer._register_endpoints(self)
 
     @staticmethod
     def _add_repetition_penalty(params: dict[str, tp.Any], repetition_penalty: float | None) -> None:
@@ -384,6 +324,76 @@ class InferenceApiRouter:
         if repetition_penalty is None or repetition_penalty == 1.0:
             return
         params["extra_body"] = {"repetition_penalty": repetition_penalty}
+
+    @staticmethod
+    def _server_root(base_url: str | None) -> str | None:
+        """Return the server root for a client ``base_url`` that may end in ``/v1``.
+
+        Args:
+            base_url: OpenAI-client base URL (for example ``http://localhost:8000/v1``) or ``None``.
+
+        Returns:
+            ``base_url`` without trailing slashes and without a trailing ``/v1`` segment, or ``None``.
+        """
+        if not base_url:
+            return None
+        root = base_url.rstrip("/")
+        if root.endswith("/v1"):
+            root = root[: -len("/v1")]
+        return root.rstrip("/")
+
+    @property
+    def server_root_url(self) -> str | None:
+        """Server root used for the non-OpenAI endpoints (``/metrics``, ``/v1/tools*``).
+
+        EasyDeL serves those endpoints at the server root, while ``base_url`` is the OpenAI-client base URL that
+        normally ends in ``/v1``; the suffix is stripped so the proxied URLs resolve correctly.
+
+        Returns:
+            The backend root URL, or ``None`` when no ``base_url`` was configured.
+        """
+        return self._server_root(getattr(self, "base_url", None))
+
+    def build_oai_params_from_responses_request(self, request: ResponsesRequest) -> dict[str, tp.Any]:
+        """Build ``client.responses.create`` keyword arguments from a Responses request.
+
+        Fields the OpenAI SDK accepts are passed as keyword arguments. EasyDeL-only fields
+        (``top_k``, ``min_p``, ``repetition_penalty`` ...) and arbitrary extras are forwarded through
+        ``extra_body`` so the SDK does not raise ``TypeError``. Chat-style ``messages`` are used as ``input``
+        when no ``input`` is given, and ``max_tokens`` / ``max_completion_tokens`` fill ``max_output_tokens``.
+
+        Args:
+            request: The Responses API request to convert.
+
+        Returns:
+            Dictionary of keyword arguments for ``responses.create``.
+        """
+        dumped = request.model_dump(exclude_none=True)
+
+        if dumped.get("input") is None and dumped.get("messages"):
+            dumped["input"] = dumped["messages"]
+        if dumped.get("max_output_tokens") is None:
+            for alias in ("max_completion_tokens", "max_tokens"):
+                if dumped.get(alias) is not None:
+                    dumped["max_output_tokens"] = dumped[alias]
+                    break
+        if dumped.get("repetition_penalty") == 1.0:
+            dumped.pop("repetition_penalty")
+
+        params: dict[str, tp.Any] = {}
+        extra_body: dict[str, tp.Any] = dict(dumped.pop("extra_body", None) or {})
+        for key, value in dumped.items():
+            if key in ("messages", "max_tokens", "max_completion_tokens"):
+                continue  # already folded into ``input`` / ``max_output_tokens``
+            if key == "reasoning" and not isinstance(value, dict):
+                extra_body[key] = value  # bare boolean is an EasyDeL extension; the SDK expects a config object
+            elif key in _RESPONSES_SDK_PARAMS:
+                params[key] = value
+            else:
+                extra_body[key] = value
+        if extra_body:
+            params["extra_body"] = extra_body
+        return params
 
     def build_oai_params_from_request(
         self,
@@ -538,7 +548,7 @@ class InferenceApiRouter:
 
         try:
             self.metrics.total_requests += 1
-            params = request.model_dump(exclude_none=True)
+            params = self.build_oai_params_from_responses_request(request)
             if not bool(params.get("stream", False)):
                 response = await self.client.responses.create(**params)
                 self.metrics.successful_requests += 1
@@ -576,7 +586,7 @@ class InferenceApiRouter:
 
         except self.openai_module.APIError as e:
             self.metrics.failed_requests += 1
-            raise HTTPException(status_code=e.status_code, detail=str(e)) from e
+            raise HTTPException(status_code=_backend_error_status(e), detail=str(e)) from e
         except HTTPException:
             self.metrics.failed_requests += 1
             raise
@@ -631,7 +641,7 @@ class InferenceApiRouter:
 
         except self.openai_module.APIError as e:
             self.metrics.failed_requests += 1
-            raise HTTPException(status_code=e.status_code, detail=str(e)) from e
+            raise HTTPException(status_code=_backend_error_status(e), detail=str(e)) from e
         except Exception as e:
             self.metrics.failed_requests += 1
             return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
@@ -716,7 +726,7 @@ class InferenceApiRouter:
 
         except self.openai_module.APIError as e:
             self.metrics.failed_requests += 1
-            raise HTTPException(status_code=e.status_code, detail=str(e)) from e
+            raise HTTPException(status_code=_backend_error_status(e), detail=str(e)) from e
         except Exception as e:
             self.metrics.failed_requests += 1
             return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
@@ -846,7 +856,7 @@ class InferenceApiRouter:
                 import aiohttp
 
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(f"{self.base_url}/metrics") as response:
+                    async with session.get(f"{self.server_root_url}/metrics") as response:
                         if response.status == 200:
                             backend_metrics = await response.json()
             except Exception:
@@ -987,7 +997,7 @@ class InferenceApiRouter:
                 import aiohttp
 
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(f"{self.base_url}/v1/tools") as response:
+                    async with session.get(f"{self.server_root_url}/v1/tools") as response:
                         if response.status == 200:
                             return JSONResponse(await response.json(), status_code=200)
             except Exception:
@@ -1031,7 +1041,7 @@ class InferenceApiRouter:
                 body = await request.json()
 
                 async with aiohttp.ClientSession() as session:
-                    async with session.post(f"{self.base_url}/v1/tools/execute", json=body) as response:
+                    async with session.post(f"{self.server_root_url}/v1/tools/execute", json=body) as response:
                         response_data = await response.json()
                         return JSONResponse(response_data, status_code=response.status)
             except Exception as e:
@@ -1069,29 +1079,15 @@ class InferenceApiRouter:
             When reload=True, workers is forced to 1.
             SSL requires both ssl_keyfile and ssl_certfile to be provided.
         """
-        uvicorn_config = {
-            "app": self.app,
-            "host": host,
-            "port": port,
-            "workers": workers if not reload else 1,
-            "log_level": log_level,
-            "timeout_keep_alive": TIMEOUT_KEEP_ALIVE,
-            "reload": reload,
-            "server_header": False,
-            "date_header": True,
-        }
-
-        try:
-            import uvloop
-
-            asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-        except ImportError:
-            pass
-
-        if ssl_keyfile and ssl_certfile:
-            uvicorn_config["ssl_keyfile"] = ssl_keyfile
-            uvicorn_config["ssl_certfile"] = ssl_certfile
-
-        uvicorn.run(**uvicorn_config)
+        BaseInferenceApiServer.run(
+            self,
+            host=host,
+            port=port,
+            workers=workers,
+            log_level=log_level,
+            ssl_keyfile=ssl_keyfile,
+            ssl_certfile=ssl_certfile,
+            reload=reload,
+        )
 
     fire = run

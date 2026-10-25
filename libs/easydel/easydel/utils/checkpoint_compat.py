@@ -236,7 +236,10 @@ def rename_legacy_checkpoint_leaves(
                 if new_key != key:
                     legacy_count += 1
                 continue
-        renamed[key] = value
+        # Legacy values take precedence even when the modern spelling appears
+        # later in the input mapping. Model-declared legacy names stay distinct.
+        if key not in renamed:
+            renamed[key] = value
     if legacy_count:
         logger.info(
             f"Renamed {legacy_count} legacy .kernel/.embedding/.scale checkpoint "

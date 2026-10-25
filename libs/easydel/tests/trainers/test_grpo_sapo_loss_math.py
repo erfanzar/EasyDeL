@@ -272,21 +272,31 @@ def test_grpo_config_accepts_off_policy_and_bias_correction_knobs():
         GRPOConfig(ref_model_sync_steps=0)
 
 
+@pytest.mark.cpu_ok
 def test_grpo_esurge_generation_knobs_validate():
     cfg = GRPOConfig(
         cast_lm_head_to_fp32=True,
-        use_transformers_paged=True,
         use_esurge_generation=True,
         esurge_hbm_utilization=0.7,
         esurge_importance_sampling_mode="sequence_mask",
     )
+    assert cfg.cast_lm_head_to_fp32 is True
+    assert cfg.use_transformers_paged is False
     assert cfg.use_esurge_generation is True
     assert cfg.esurge_hbm_utilization == 0.7
+    assert cfg.esurge_importance_sampling_mode == "sequence_mask"
     with pytest.raises(ValueError, match="log_completions_hub_repo"):
         GRPOConfig(log_completions_hub_repo="repo")
     assert GRPOConfig(log_completions=True, log_completions_hub_repo="repo").log_completions_hub_repo == "repo"
     with pytest.raises(ValueError, match="esurge_importance_sampling_mode"):
         GRPOConfig(esurge_importance_sampling_mode="bad")
+
+
+@pytest.mark.cpu_ok
+@pytest.mark.parametrize("use_esurge_generation", [False, True])
+def test_grpo_transformers_paged_backend_is_rejected(use_esurge_generation):
+    with pytest.raises(ValueError, match=r"use_transformers_paged=True.*unsupported"):
+        GRPOConfig(use_transformers_paged=True, use_esurge_generation=use_esurge_generation)
 
 
 def test_grpo_disable_dropout_puts_policy_reference_and_reward_models_in_eval_mode():

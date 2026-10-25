@@ -164,7 +164,7 @@ def create_causal_lm_class(
         dtype = dtype or jnp.bfloat16
         param_dtype = param_dtype or jnp.bfloat16
 
-        super(type(self), self).__init__(
+        super(cls, self).__init__(
             config=config,
             base_model_class=base_model_class,
             base_model_name=base_model_name,
@@ -257,7 +257,7 @@ def create_sequence_classification_class(
         dtype = dtype or jnp.bfloat16
         param_dtype = param_dtype or jnp.bfloat16
 
-        super(type(self), self).__init__(
+        super(cls, self).__init__(
             config=config,
             base_model_class=base_model_class,
             base_model_name=base_model_name,
@@ -345,7 +345,7 @@ def create_token_classification_class(
         dtype = dtype or jnp.bfloat16
         param_dtype = param_dtype or jnp.bfloat16
 
-        super(type(self), self).__init__(
+        super(cls, self).__init__(
             config=config,
             base_model_class=base_model_class,
             base_model_name=base_model_name,
@@ -363,7 +363,9 @@ def create_token_classification_class(
             "__init__": __init__,
             "__module__": base_model_class.__module__,
             "__qualname__": class_name,
-            "_task_type": TaskType.TOKEN_CLASSIFICATION,
+            # ``TaskType`` has no TOKEN_CLASSIFICATION member yet; fall back to an
+            # unregistered class instead of raising AttributeError at creation time.
+            "_task_type": getattr(TaskType, "TOKEN_CLASSIFICATION", None),
             "_model_type": model_type,
             "_config_class": config_class,
         },
@@ -433,7 +435,7 @@ def create_question_answering_class(
         dtype = dtype or jnp.bfloat16
         param_dtype = param_dtype or jnp.bfloat16
 
-        super(type(self), self).__init__(
+        super(cls, self).__init__(
             config=config,
             base_model_class=base_model_class,
             base_model_name=base_model_name,
@@ -451,7 +453,8 @@ def create_question_answering_class(
             "__init__": __init__,
             "__module__": base_model_class.__module__,
             "__qualname__": class_name,
-            "_task_type": TaskType.QUESTION_ANSWERING,
+            # ``TaskType`` has no QUESTION_ANSWERING member yet; see token classification above.
+            "_task_type": getattr(TaskType, "QUESTION_ANSWERING", None),
             "_model_type": model_type,
             "_config_class": config_class,
         },
@@ -521,7 +524,7 @@ def create_conditional_generation_class(
         dtype = dtype or jnp.bfloat16
         param_dtype = param_dtype or jnp.bfloat16
 
-        super(type(self), self).__init__(
+        super(cls, self).__init__(
             config=config,
             base_model_class=base_model_class,
             base_model_name=base_model_name,
@@ -613,7 +616,7 @@ def create_image_classification_class(
         dtype = dtype or jnp.bfloat16
         param_dtype = param_dtype or jnp.bfloat16
 
-        super(type(self), self).__init__(
+        super(cls, self).__init__(
             config=config,
             base_model_class=base_model_class,
             base_model_name=base_model_name,
@@ -686,7 +689,7 @@ def create_embedding_class(
         dtype = dtype or _jnp.bfloat16
         param_dtype = param_dtype or _jnp.bfloat16
 
-        super(type(self), self).__init__(
+        super(cls, self).__init__(
             config=config,
             base_model_class=base_model_class,
             base_model_name=base_model_name,
@@ -716,8 +719,6 @@ def create_embedding_class(
 AUTO_MODEL_FACTORY_REGISTRY: dict[TaskType, callable] = {
     TaskType.CAUSAL_LM: create_causal_lm_class,
     TaskType.SEQUENCE_CLASSIFICATION: create_sequence_classification_class,
-    # TaskType.TOKEN_CLASSIFICATION: create_token_classification_class,  # Not yet in TaskType enum
-    # TaskType.QUESTION_ANSWERING: create_question_answering_class,  # Not yet in TaskType enum
     TaskType.SEQUENCE_TO_SEQUENCE: create_conditional_generation_class,
     TaskType.IMAGE_CLASSIFICATION: create_image_classification_class,
     TaskType.EMBEDDING: create_embedding_class,
@@ -737,6 +738,15 @@ Note:
     TOKEN_CLASSIFICATION and QUESTION_ANSWERING are not yet in the TaskType
     enum but their factory functions are available for direct use.
 """
+
+# Register the token-classification / QA factories as soon as ``TaskType`` grows the members.
+for _member_name, _member_factory in (
+    ("TOKEN_CLASSIFICATION", create_token_classification_class),
+    ("QUESTION_ANSWERING", create_question_answering_class),
+):
+    _member = getattr(TaskType, _member_name, None)
+    if _member is not None:
+        AUTO_MODEL_FACTORY_REGISTRY[_member] = _member_factory
 
 
 def create_task_model_class(

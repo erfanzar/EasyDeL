@@ -43,7 +43,6 @@ import jax
 import numpy
 from eformer.loggings import ProgressLogger, get_logger
 from eformer.pytree import key_path_to_str
-from jax import numpy as jnp
 
 from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
 
@@ -394,7 +393,7 @@ class CompileOrchestrator:
         )
         if model_out is not None and not self._manager.model.mesh.is_mpmd:
             self._manager.kv_pages = model_out.kv_pages
-        if self._manager.use_aot_forward:
+        if self._manager.use_aot_forward and self._manager._debug_mode:
             warm_args = (graphstate, graphother, inputs)
             self._manager._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_model_step"] = _tree_hash(warm_args)
 
@@ -429,11 +428,9 @@ class CompileOrchestrator:
             graphother=graphother,
             inputs=inputs,
         )
-        if model_out is not None and not self._manager.model.mesh.is_mpmd:
+        if model_out is not None:
             self._manager.kv_pages = model_out.kv_pages
-        elif model_out is not None:
-            self._manager.kv_pages = model_out.kv_pages
-        if self._manager.use_aot_forward:
+        if self._manager.use_aot_forward and self._manager._debug_mode:
             warm_args = (graphstate, graphother, inputs)
             self._manager._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_pp_model_step"] = _tree_hash(
                 warm_args
@@ -482,11 +479,9 @@ class CompileOrchestrator:
             inputs=inputs,
             use_pipeline_runtime=use_pipeline_runtime,
         )
-        if backbone_out is not None and not self._manager.model.mesh.is_mpmd:
+        if backbone_out is not None:
             self._manager.kv_pages = backbone_out.kv_pages
-        elif backbone_out is not None:
-            self._manager.kv_pages = backbone_out.kv_pages
-        if self._manager.use_aot_forward:
+        if self._manager.use_aot_forward and self._manager._debug_mode:
             warm_args = (graphstate, graphother, inputs)
             self._manager._debug_baselines[f"{num_tokens}_hash_in_backbone"] = _tree_hash(warm_args)
 
@@ -583,19 +578,31 @@ class CompileOrchestrator:
                 metadata=inputs.batch_metadata,
                 greedy=True,
             )
-        if self._manager.use_aot_forward:
-            vocab_size = self._manager.model.config.get_text_config().vocab_size
-            dummy_logits = jnp.zeros(
-                (padded_num_reqs, vocab_size),
-                dtype=self._manager.model.dtype,
-                out_sharding=self._manager._sampler_sharding,
+        if self._manager.use_aot_forward and self._manager._debug_mode:
+            # ExecutionManager diagnoses the compact *host* window, not the
+            # six packed device arguments consumed by the executable. Keep this
+            # baseline on precisely that ABI (including Python scalar counts).
+            i32 = numpy.zeros(padded_num_reqs, dtype=numpy.int32)
+            f32 = numpy.ones(padded_num_reqs, dtype=numpy.float32)
+            sampler_inputs = (
+                int(padded_num_reqs),
+                int(padded_num_reqs),
+                int(num_tokens),
+                i32,  # gather positions
+                i32,  # sampling seeds
+                i32,  # scatter positions
+                i32,  # window rows
+                i32,  # scheduled
+                i32,  # sequence lengths
+                numpy.ones(padded_num_reqs, dtype=numpy.bool_),
+                f32,  # temperature
+                f32,  # top-p
+                i32,  # top-k
+                f32,  # min-p
+                f32,  # frequency penalty
+                f32,  # presence penalty
+                f32,  # repetition penalty
             )
-            sampler_args = (
-                jnp.ones((6, padded_num_reqs), dtype=jnp.float32, out_sharding=self._manager._sampler_sharding),
-                jnp.zeros((7, padded_num_reqs), dtype=jnp.int32, out_sharding=self._manager._sampler_sharding),
-                jnp.array([padded_num_reqs, num_tokens], dtype=jnp.int32, out_sharding=self._manager._sampler_sharding),
-                dummy_logits,
-                jax.device_put(inputs.rng_key, self._manager._sampler_sharding),
-                self._manager._sampler_zero_token_counts,
+            self._manager._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_sampler"] = _tree_hash(
+                sampler_inputs
             )
-            self._manager._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_sampler"] = _tree_hash(sampler_args)

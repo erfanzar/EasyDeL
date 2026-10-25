@@ -116,9 +116,25 @@ class RequestRegistry:
         self.output_lock = threading.RLock()
         self.output_event = threading.Event()
         self.max_outputs = max_outputs
+        self._output_leases: set[str] = set()
+
+    def retain_output(self, request_id: str) -> None:
+        """Protect an admitted consumer's result until it acknowledges completion."""
+        with self.output_lock:
+            self._output_leases.add(request_id)
+
+    def release_output(self, request_id: str) -> None:
+        """Release a consumer's protection; subsequent retention may evict it."""
+        with self.output_lock:
+            self._output_leases.discard(request_id)
+
+    def output_is_retained(self, request_id: str) -> bool:
+        """Return whether a consumer still needs this request's terminal result."""
+        with self.output_lock:
+            return request_id in self._output_leases
 
     def register(self, request_id: str, record: RequestRecord, output: RequestOutput) -> threading.Event:
-        """Register a new request's record, output, and wake event.
+        """Register a request's tracking state, output, and wake event atomically.
 
         Args:
             request_id: Engine request id.
@@ -129,20 +145,27 @@ class RequestRegistry:
             The per-request wake event streaming waiters block on.
         """
         event = threading.Event()
-        with self.request_lock:
+        with self.request_lock, self.output_lock:
             self.events[request_id] = event
             self.records[request_id] = record
-        with self.output_lock:
             self.outputs[request_id] = output
         return event
 
     def get_record(self, request_id: str) -> RequestRecord | None:
         """Return the record for ``request_id``, or ``None``."""
-        return self.records.get(request_id)
+        with self.request_lock:
+            return self.records.get(request_id)
 
     def get_output(self, request_id: str) -> RequestOutput | None:
         """Return the output for ``request_id``, or ``None``."""
-        return self.outputs.get(request_id)
+        with self.output_lock:
+            return self.outputs.get(request_id)
+
+    def remove(self, request_id: str) -> None:
+        """Drop the record and event for ``request_id`` (output retained)."""
+        with self.request_lock:
+            self.records.pop(request_id, None)
+            self.events.pop(request_id, None)
 
     def signal(self, request_id: str) -> None:
         """Wake the request's waiter (if any) and the global output event."""
@@ -176,17 +199,33 @@ class RequestRegistry:
             event.clear()
         return result
 
-    def remove(self, request_id: str) -> None:
-        """Drop the record and event for ``request_id`` (output retained)."""
-        with self.request_lock:
-            self.records.pop(request_id, None)
-            self.events.pop(request_id, None)
-
     def track_finished(self, request_id: str) -> None:
-        """Record a finished request id and evict the oldest retained outputs."""
+        """Record a finished request id and evict the oldest retained outputs (FIFO).
+
+        Outputs leased by active consumers are protected until acknowledgement.
+        For unleased history, ``max_outputs=None`` keeps every output and
+        ``max_outputs <= 0`` drops the finished output immediately; otherwise
+        the id is appended once and the oldest outputs beyond the cap are evicted.
+
+        Args:
+            request_id: Id of the request that just finished.
+        """
+        max_outputs = self.max_outputs
+        if max_outputs is None:
+            return
         with self.output_lock:
+            # Retention caps apply to unconsumed history, never to a result
+            # whose active generate/stream caller has yet to see termination.
+            if request_id in self._output_leases:
+                return
+            if max_outputs <= 0:
+                self.outputs.pop(request_id, None)
+                return
+            if request_id in self.finished_ids:
+                return
             self.finished_ids.append(request_id)
-            if self.max_outputs is not None:
-                while len(self.finished_ids) > self.max_outputs:
-                    evicted = self.finished_ids.popleft()
-                    self.outputs.pop(evicted, None)
+            while len(self.finished_ids) > max_outputs:
+                evicted = self.finished_ids.popleft()
+                if evicted in self._output_leases:
+                    continue
+                self.outputs.pop(evicted, None)

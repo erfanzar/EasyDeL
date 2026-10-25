@@ -215,9 +215,7 @@ class CacheManager:
                 - The number of computed tokens.
         """
 
-        if not self.enable_caching or (
-            request.sampling_params is not None and request.sampling_params.prompt_logprobs is not None
-        ):
+        if not self.enable_caching:
             return self.create_empty_page_list(), 0
 
         page_hashes = self.req_to_page_hashes[request.request_id]
@@ -225,6 +223,10 @@ class CacheManager:
             assert self.page_size is not None
             page_hashes = hash_request_tokens(hash, self.page_size, request)
             self.req_to_page_hashes[request.request_id] = page_hashes
+
+        if request.sampling_params is not None and request.sampling_params.prompt_logprobs is not None:
+            # Still publish under the request's proper multimodal identity.
+            return self.create_empty_page_list(), 0
 
         max_cache_hit_length = request.num_tokens - 1
         computed_pages, num_new_computed_tokens = self.coordinator.find_longest_cache_hit(

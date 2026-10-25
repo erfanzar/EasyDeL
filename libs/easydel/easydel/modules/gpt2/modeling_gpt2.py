@@ -38,6 +38,7 @@ from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 from spectrax import apply_logical_sharding, common_types, nn
+from spectrax.common_types import ColumnWise, Replicated, RowWise, SRowWise
 
 from easydel.caching import (
     HybridCache,
@@ -56,6 +57,7 @@ from easydel.infra.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     DecoderLayerOutput,
 )
+from easydel.infra.sharding import sharding_for_layout
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import Embed
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
@@ -119,12 +121,28 @@ class Conv1D(spx.Module):
             sharding_axis: Optional axis name driving tensor parallelism.
             rngs: Random number generator collection.
         """
+        if sharding_axis not in (None, "column", "row"):
+            raise ValueError(f"`sharding_axis` must be None, 'column' or 'row', got {sharding_axis!r}.")
+        # The stored kernel is ``[out, in]`` (OpenAI layout), i.e. transposed relative to the
+        # ``[in, out]`` layouts ``ColumnParallelLinear``/``RowParallelLinear`` use. A column-parallel
+        # projection therefore shards the leading (output) axis over TP and a row-parallel one
+        # shards the trailing (input) axis over TP.
+        weight_sharding = None
+        bias_sharding = None
+        if sharding_axis == "column":
+            weight_sharding = sharding_for_layout(RowWise)
+            bias_sharding = sharding_for_layout(SRowWise)
+        elif sharding_axis == "row":
+            weight_sharding = sharding_for_layout(ColumnWise)
+            bias_sharding = sharding_for_layout(Replicated)
+
         self.weight = ArrayParam.bound(
             shape=(out_features, in_features),
             dtype=param_dtype,
             init_method="normal",
             init_kwargs={"stddev": 0.02},
             key=rngs.parameters,
+            sharding=weight_sharding,
         )
 
         self.bias = (
@@ -133,6 +151,7 @@ class Conv1D(spx.Module):
                 dtype=param_dtype,
                 init_method="zeros",
                 key=rngs.parameters,
+                sharding=bias_sharding,
             )
             if use_bias
             else None
@@ -160,7 +179,7 @@ class Conv1D(spx.Module):
             across all leading axes when present).
         """
         inputs = jnp.asarray(inputs, self.dtype)
-        bias = self.bias.value
+        bias = self.bias.value if self.bias is not None else None
         kernel = self.weight.value.transpose().astype(self.dtype)
         if self.dot_general is not None:
             dot_general = self.dot_general
@@ -308,12 +327,25 @@ class GPT2Attention(UnifiedAttention):
 
     def _create_attention_performer(self, config: GPT2Config, rngs: spx.Rngs) -> FlexibleAttentionModule:
         """Use GPT-2 specific attention dropout setting."""
-        return FlexibleAttentionModule(
+        # HF GPT-2 semantics: ``scale_attn_weights`` divides the scores by sqrt(head_dim) and
+        # ``scale_attn_by_inverse_layer_idx`` additionally divides them by ``layer_idx + 1``.
+        softmax_scale = self.head_dim**-0.5 if getattr(config, "scale_attn_weights", True) else 1.0
+        if getattr(config, "scale_attn_by_inverse_layer_idx", False):
+            softmax_scale = softmax_scale / float(self.layer_idx + 1)
+        performer = FlexibleAttentionModule(
             rngs=rngs,
             dropout_prob=config.attn_pdrop,
             base_config=config,
-            softmax_scale=self.head_dim**-0.5,
+            softmax_scale=softmax_scale,
         )
+        if getattr(config, "reorder_and_upcast_attn", False):
+            # Flash, SDPA and Ring read their compute dtype from operation metadata, not the
+            # per-call compute_dtype kwarg. Bind the override after auto backend resolution;
+            # this metadata is shared by the registered prefill/decode ops and their fallbacks.
+            # Keep the model/cache configuration and the selected backends unchanged.
+            performer.metadata.runtime_dtype = jnp.float32
+            performer.metadata.runtime_softmax_dtype = jnp.float32
+        return performer
 
     def _split_heads(self, hidden_states):
         """Reshape ``[batch, seq, embed]`` into ``[batch, seq, heads, head_dim]``.
@@ -422,6 +454,13 @@ class GPT2Attention(UnifiedAttention):
                 mask_info=mask_info,
             )
 
+        output_dtype = query.dtype
+        if getattr(self.config, "reorder_and_upcast_attn", False):
+            # HF ``reorder_and_upcast_attn``: run the score/softmax/value product in float32.
+            query = query.astype(jnp.float32)
+            key = key.astype(jnp.float32)
+            value = value.astype(jnp.float32)
+
         attn = self.attention_performer.forward(
             query_states=query,
             key_states=key,
@@ -432,8 +471,11 @@ class GPT2Attention(UnifiedAttention):
             cache_view=cache_view,
             mask_info=mask_info,
             causal=self.causal,
+            output_attentions=output_attentions,
+            precision=self.precision,
+            compute_dtype=jnp.float32 if getattr(self.config, "reorder_and_upcast_attn", False) else None,
         )
-        attn_output = self.shard_attention_prod(self._merge_heads(attn.attention_outputs))
+        attn_output = self.shard_attention_prod(self._merge_heads(attn.attention_outputs.astype(output_dtype)))
         attn_output = checkpoint_name(self.c_proj(attn_output), "attn_output")
         attn_output = self.shard_attention_prod(attn_output)
         attn_output = self.resid_dropout(attn_output)
@@ -619,7 +661,9 @@ class GPT2Block(spx.Module):
                 config=config,
                 layer_idx=layer_idx,
                 dtype=dtype,
-                causal=True,
+                param_dtype=param_dtype,
+                precision=precision,
+                causal=False,
                 is_cross_attention=True,
                 rngs=rngs,
             )
@@ -916,7 +960,14 @@ class GPT2Model(EasyDeLBaseModule):
         encoder_mask_info = None
         if encoder_attention_mask is not None:
             if encoder_attention_mask.ndim == 2:
-                encoder_mask_info = MaskInfo.from_segments(encoder_attention_mask)
+                # Encoder padding is independent of the decoder query positions:
+                # every decoder token may attend to every non-padding encoder key.
+                encoder_mask_info = MaskInfo.from_attention_mask(
+                    jnp.broadcast_to(
+                        encoder_attention_mask[:, None, None, :].astype(jnp.bool_),
+                        (encoder_attention_mask.shape[0], 1, sequence_length, encoder_attention_mask.shape[1]),
+                    )
+                )
             else:
                 encoder_mask_info = MaskInfo.from_attention_mask(encoder_attention_mask)
         if position_ids is None:
@@ -990,7 +1041,7 @@ class GPT2Model(EasyDeLBaseModule):
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            if encoder_hidden_states is not None:
+            if output_attentions and encoder_hidden_states is not None:
                 all_cross_attentions += (layer_outputs.cross_attention,)
 
             cv = self._layer_cache_view_update(
@@ -1007,6 +1058,7 @@ class GPT2Model(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, all_cross_attentions, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -1015,6 +1067,8 @@ class GPT2Model(EasyDeLBaseModule):
         )
 
         hidden_states = checkpoint_name(self.ln_f(hidden_states), "model_output")
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,

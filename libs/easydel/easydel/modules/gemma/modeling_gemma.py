@@ -82,18 +82,19 @@ class GemmaRMSNorm(RMSNorm):
     """Gemma RMSNorm (HF ``GemmaRMSNorm``): ``(1 + w)`` scale, statistics and scale in float32, one cast.
 
     Zero-initialised ``weight`` (HF init, so the effective scale ``1 + w`` starts at 1) of size ``hidden_size`` stored
-    in ``dtype``; the output is cast to ``dtype``. The math is :class:`easydel.layers.norms.RMSNorm` with
+    in ``param_dtype`` (defaults to ``dtype``); the output is cast to ``dtype``. The math is
+    :class:`easydel.layers.norms.RMSNorm` with
     ``fp32_scale=True``.
     """
 
     kernel_init = staticmethod(jax.nn.initializers.zeros)
 
-    def __init__(self, config: GemmaConfig, dtype: jnp.dtype = jnp.float32):
+    def __init__(self, config: GemmaConfig, dtype: jnp.dtype = jnp.float32, param_dtype: jnp.dtype | None = None):
         super().__init__(
             config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=dtype,
-            param_dtype=dtype,
+            param_dtype=dtype if param_dtype is None else param_dtype,
             scale_offset=1.0,
             fp32_scale=True,
             output_dtype=dtype,
@@ -318,8 +319,8 @@ class GemmaDecoderLayer(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        self.input_layernorm = GemmaRMSNorm(self.config, dtype=self.dtype)
-        self.post_attention_layernorm = GemmaRMSNorm(self.config, dtype=self.dtype)
+        self.input_layernorm = GemmaRMSNorm(self.config, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.post_attention_layernorm = GemmaRMSNorm(self.config, dtype=self.dtype, param_dtype=self.param_dtype)
         self.self_attn = GemmaAttention(
             config=config,
             dtype=dtype,
@@ -504,7 +505,7 @@ class GemmaModel(EasyDeLBaseModule):
             self.layers = self.layers.stack()
         final_layer_idx = max(0, self.config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
-            self.norm = GemmaRMSNorm(self.config, dtype=self.dtype)
+            self.norm = GemmaRMSNorm(self.config, dtype=self.dtype, param_dtype=self.param_dtype)
 
     def forward(
         self,
@@ -647,6 +648,7 @@ class GemmaModel(EasyDeLBaseModule):
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
@@ -716,6 +718,8 @@ class GemmaForCausalLM(BaseCausalLMModule[GemmaModel, GemmaConfig]):
     _task_type = TaskType.CAUSAL_LM
     _model_type = "gemma"
     _config_class = GemmaConfig
+    # This concrete forward adds no auxiliary objective to the causal-LM loss.
+    _ce_only_forward = True
 
     def __init__(
         self,
@@ -860,10 +864,11 @@ class GemmaForSequenceClassification(BaseSequenceClassificationModule[GemmaModel
 
     Adds a single ``Linear(hidden_size -> num_labels)`` classification head on
     top of :class:`GemmaModel`. The head is fed the *last non-pad* token's
-    hidden state (``pooling_strategy="last"``) — i.e., the wrapper finds the
-    final position before ``config.pad_token_id`` and gathers from
-    ``last_hidden_state`` at that index. With no pad token configured, the
-    forward asserts ``batch == 1`` and uses position ``-1`` directly.
+    hidden state (``pooling_strategy="last"``). An explicit ``attention_mask``
+    selects the rightmost valid position, including for embedding-only inputs
+    and batches with no configured padding token. Without a mask, the shared
+    pooling feature uses ``config.pad_token_id`` when token IDs are available
+    and otherwise selects the final supplied position.
 
     Attributes:
         config: Source ``GemmaConfig``; ``num_labels`` and ``pad_token_id``
@@ -961,23 +966,7 @@ class GemmaForSequenceClassification(BaseSequenceClassificationModule[GemmaModel
 
         hidden_states = transformer_outputs.last_hidden_state
         logits = self.score(hidden_states)
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]
-        else:
-            batch_size = inputs_embeds.shape[0]
-
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
-        else:
-            if input_ids is not None:
-                sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-            else:
-                sequence_lengths = -1
-
-        pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
+        pooled_logits = self.pool_sequence(logits, input_ids=input_ids, attention_mask=attention_mask)
 
         return SequenceClassifierOutput(
             logits=pooled_logits,

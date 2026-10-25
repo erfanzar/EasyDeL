@@ -30,8 +30,6 @@ from __future__ import annotations
 
 import typing as tp
 
-import numpy as np
-
 from ._runtime import normalize_segment_sizes
 
 
@@ -116,7 +114,6 @@ def torch_deinterleave_segments_for_tp(
     shape = tuple(tensor.shape)
     view_shape = (*shape[:dim], tp_size, local_total, *shape[dim + 1 :])
     packed = tensor.reshape(*view_shape)
-    tuple(np.cumsum(local_sizes)[:-1].tolist())
     local_parts = torch.split(packed, local_sizes, dim=dim + 1)
     outputs = []
     for part, size in zip(local_parts, segment_sizes, strict=True):

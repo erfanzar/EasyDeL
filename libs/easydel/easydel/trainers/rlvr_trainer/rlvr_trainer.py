@@ -37,12 +37,12 @@ Inspired by the RLVR paradigm from DeepSeek-R1 and Alibaba's ROLL.
 from __future__ import annotations
 
 import typing as tp
+from copy import copy
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
-from easydel.utils.helpers import get_logger
 
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
 from ..reward_protocol import RewardProtocol
@@ -58,8 +58,6 @@ if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset
 
     from easydel.data.core.protocols import ShardedDataSource
-
-logger = get_logger(__name__)
 
 RewardFunc = EasyDeLBaseModule | EasyDeLState | RewardProtocol | tp.Callable[[list, list], list[float]]
 
@@ -190,32 +188,35 @@ class RLVRTrainer(GRPOTrainer):
         external_rewards = self._coerce_reward_func_list(reward_funcs)
         external_rewards.extend(self._coerce_reward_func_list(external_reward_funcs))
 
+        verifier_count = len(verifiers)
         if external_rewards:
             verifiers.extend(external_rewards)
             if external_reward_weights is not None:
                 user_weights = list(external_reward_weights)
+            elif arguments.reward_weights is not None and len(arguments.reward_weights) == len(verifiers):
+                # GRPO's reward_weights describes the complete ensemble. Also retain the legacy
+                # external-only form when the number of weights matches only the external rewards.
+                weights = list(arguments.reward_weights[:verifier_count])
+                user_weights = list(arguments.reward_weights[verifier_count:])
             else:
-                user_weights = list(arguments.reward_weights or [1.0] * len(external_rewards))
+                user_weights = list(
+                    arguments.reward_weights if arguments.reward_weights is not None else [1.0] * len(external_rewards)
+                )
             if len(user_weights) != len(external_rewards):
                 raise ValueError(
                     "The number of external reward weights must match the number of external reward functions."
                 )
             weights.extend(user_weights)
+        elif arguments.reward_weights is not None:
+            if len(arguments.reward_weights) != verifier_count:
+                raise ValueError("The number of reward weights must match the number of configured verifiers.")
+            weights = list(arguments.reward_weights)
 
         if not verifiers:
-            if arguments.answer_key:
-                verifiers = [MathVerifier(answer_key=arguments.answer_key)]
-                weights = [1.0]
-                logger.warning(
-                    "No verifiers configured and no reward_funcs provided. "
-                    "Falling back to MathVerifier with answer_key='%s'.",
-                    arguments.answer_key,
-                )
-            else:
-                raise ValueError(
-                    "RLVR requires at least one verifier or external reward function. "
-                    "Set `answer_key`, `format_pattern`, or pass external rewarders."
-                )
+            raise ValueError(
+                "RLVR requires at least one verifier or external reward function. "
+                "Set `answer_key`, `format_pattern`, or pass external rewarders."
+            )
 
         reward_processing_classes = self._merge_reward_processing_classes(
             verifier_count=len(verifiers) - len(external_rewards),
@@ -224,6 +225,8 @@ class RLVRTrainer(GRPOTrainer):
             external_reward_processing_classes=external_reward_processing_classes,
         )
 
+        # Do not mutate a caller-owned config or rerun its normalization via dataclasses.replace.
+        arguments = copy(arguments)
         arguments.reward_weights = weights
 
         super().__init__(

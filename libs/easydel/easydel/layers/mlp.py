@@ -51,6 +51,7 @@ from __future__ import annotations
 import typing as tp
 
 import jax
+import spectrax as spx
 from ejkernel.modules import fused_mlp as ejkernel_fused_mlp
 from ejkernel.modules import resolve_mlp_combine
 from ejkernel.modules.operations.fused_mlp import resolve_dense_sharded_plan
@@ -61,15 +62,45 @@ from spectrax import apply_logical_sharding, common_types
 
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.sharding import inference_mode_forces_decode
-from easydel.layers.layouts import split_fused_gate_up_projection, tensor_parallel_size
-from easydel.layers.linears import W4A4_FUSED_PAIR_MIN_PACKED_BYTES, ParallelLinearQuantized
+from easydel.layers.layouts import dense_gate_up_layout, split_fused_gate_up_projection, tensor_parallel_size
+from easydel.layers.linears import (
+    W4A4_FUSED_PAIR_MIN_PACKED_BYTES,
+    ColumnParallelLinear,
+    ParallelLinearQuantized,
+    RowParallelLinear,
+)
 from easydel.utils.helpers import check_bool_flag
 from easydel.utils.inference_mode import is_inference_mode
 
 if tp.TYPE_CHECKING:
     from easydel.infra.base_config import EasyDeLBaseConfig
 
-__all__ = ["gated_mlp_forward"]
+__all__ = ["GatedMLP", "gated_mlp_forward", "moe_gated_expert_forward"]
+
+
+def moe_gated_expert_forward(
+    experts,
+    hidden_states: jax.Array,
+    group_sizes: jax.Array,
+    sorted_experts: jax.Array | None = None,
+) -> jax.Array:
+    """Shared forward of a fused gate/up expert stack: ``down(act(gate) * up)`` over grouped tokens.
+
+    Args:
+        experts: Expert-stack module with ``config``, ``act_fn``, a fused ``gate_up_proj`` and ``down_proj`` (both
+            ParallelMoELinear layers taking ``(x, group_sizes, sorted_experts)``).
+        hidden_states: Routed tokens.
+        group_sizes: Tokens per expert.
+        sorted_experts: Optional sorted expert ids.
+
+    Returns:
+        Expert outputs, same leading shape as ``hidden_states``.
+    """
+    gate_up = experts.gate_up_proj(hidden_states, group_sizes, sorted_experts)
+    # The fused kernel is TP-interleaved; the config-aware split keeps gate and up columns apart for tp > 1.
+    gate, up = split_fused_gate_up_projection(gate_up, config=experts.config)
+    return experts.down_proj(experts.act_fn(gate) * up, group_sizes, sorted_experts)
+
 
 #: Remat policies that select residuals by ``checkpoint_name``. The ejkernel
 #: fused route replaces the checkpoint_name-tagged composition with a
@@ -265,6 +296,10 @@ def _dense_fused_call(mlp, config, x2d: jax.Array, specs) -> jax.Array | None:
         return None
     if isinstance(gate_up_proj, ParallelLinearQuantized) or isinstance(down_proj, ParallelLinearQuantized):
         return None
+    # Dense fusion reads the master weights directly; only the projections'
+    # forwards implement their quantized forward/backward contraction rules.
+    if any(spx.quantization.rule_for(proj, "dot_general") is not None for proj in (gate_up_proj, down_proj)):
+        return None
     if getattr(gate_up_proj, "bias", None) is not None or getattr(down_proj, "bias", None) is not None:
         return None
     declared = _declared_combine(mlp)
@@ -317,6 +352,12 @@ def _quantized_fused_call(mlp, config, x2d: jax.Array) -> jax.Array | None:
         return None
     if getattr(gate_up_proj, "use_bias", False) or getattr(down_proj, "use_bias", False):
         return None
+    if getattr(gate_up_proj, "output_scale", 1.0) != 1.0 or getattr(down_proj, "output_scale", 1.0) != 1.0:
+        return None  # The fused kernel has no output scale; compose the linears so each applies its own.
+    for proj in (gate_up_proj, down_proj):
+        runtime_cfg = getattr(proj, "_runtime_config", None)
+        if runtime_cfg is not None and runtime_cfg() is not None:
+            return None  # A distinct runtime format re-packs weights per call; only the linear's own forward does.
     declared = _declared_combine(mlp)
     act, act_params = declared if declared is not None else (_act_name(config, mlp), ())
     if act is None or _mesh_supported(config) is None:
@@ -513,6 +554,86 @@ def gated_mlp_forward(
         partition_manager=config.runtime_sharding_resolver,
     )
     return checkpoint_name(out, "mlp_output")
+
+
+class GatedMLP(spx.Module):
+    """Parameterized dense gated MLP with fused gate/up checkpoint layout.
+
+    Projections live directly under ``gate_up_proj`` and ``down_proj`` so
+    model-specific subclasses keep their existing parameter paths. The shared
+    forward preserves fused-kernel dispatch, logical sharding, and remat tags.
+    """
+
+    def __init__(
+        self,
+        config: EasyDeLBaseConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        intermediate_size: int | None = None,
+        kernel_init: jax.nn.initializers.Initializer | None = None,
+    ):
+        """Initialize bias-free column/row-parallel gated projections.
+
+        Args:
+            config: Configuration providing ``hidden_size``, ``intermediate_size``,
+                ``hidden_act``, ``initializer_range``, and runtime sharding settings.
+            dtype: Activation computation dtype.
+            param_dtype: Parameter storage dtype.
+            precision: Matmul precision.
+            rngs: Random number streams, consumed by gate/up then down projection.
+            intermediate_size: Optional intermediate-width override. A false value
+                falls back to ``config.intermediate_size`` for compatibility.
+            kernel_init: Initializer for both projections. Defaults to
+                ``normal(config.initializer_range)``; supply a different initializer
+                explicitly for submodels with a different initialization contract.
+        """
+        from easydel.infra.utils import ACT2FN
+
+        self.config = config
+        intermediate_size = intermediate_size or config.intermediate_size
+        if kernel_init is None:
+            kernel_init = jax.nn.initializers.normal(config.initializer_range)
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (intermediate_size, intermediate_size),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=kernel_init,
+            precision=precision,
+            rngs=rngs,
+            layout=dense_gate_up_layout(intermediate_size),
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            config.hidden_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=kernel_init,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        """Checkpoint rules fusing gate/up weights without adding a path prefix."""
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
+
+    def forward(self, hidden_states: jax.Array) -> jax.Array:
+        """Apply the gated MLP with shared fused/unfused dispatch.
+
+        Args:
+            hidden_states: Input activations ``[..., hidden_size]``.
+
+        Returns:
+            Transformed activations with the same shape as the input.
+        """
+        return gated_mlp_forward(self, hidden_states)
 
 
 def clamped_swiglu(gate, up, *, limit: float, act_fn):

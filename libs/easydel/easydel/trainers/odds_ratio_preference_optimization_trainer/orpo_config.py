@@ -176,6 +176,10 @@ class ORPOConfig(TrainingArguments):
 
         if self.max_completion_length is None and self.max_length is not None and self.max_prompt_length is not None:
             self.max_completion_length = self.max_length - self.max_prompt_length
+        if self.max_completion_length is not None and self.max_completion_length <= 0:
+            raise ValueError("ORPO requires a positive max_completion_length; reserve completion tokens in max_length.")
+        if self.max_length is not None and self.max_length < 2 and not self.is_encoder_decoder:
+            raise ValueError("Decoder-only ORPO requires max_length >= 2 for a causally scoreable completion.")
         self.logprob_vocab_chunk_size = normalize_logprob_vocab_chunk_size(self.logprob_vocab_chunk_size)
         if self.generate_during_eval:
             self.generation_interval = self.generation_interval or self.evaluation_steps or 1

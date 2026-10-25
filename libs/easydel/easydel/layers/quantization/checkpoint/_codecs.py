@@ -131,6 +131,20 @@ def decode_awq_int4(
     return dequantize_with_scale(codes, scales, zero_point=zeros, dtype=dtype, channel_axis=-1)
 
 
+def _unpack_gptq_codes(packed: Array, bits: int, axis: int) -> Array:
+    """Unpack GPTQ's little-endian bitstream, including crossing 3-bit lanes."""
+    words = jnp.moveaxis(packed.astype(jnp.uint32), axis, -1)
+    bit_positions = jnp.arange(words.shape[-1] * 32 // bits, dtype=jnp.uint32) * bits
+    word_index, shift = bit_positions // 32, bit_positions % 32
+    low = jnp.take(words, word_index, axis=-1) >> shift
+    high = jnp.take(words, jnp.minimum(word_index + 1, words.shape[-1] - 1), axis=-1)
+    # JAX masks shifts to the word width on some backends. Avoid a shift
+    # by 32 and explicitly mask the unused high half of aligned lanes.
+    high = jnp.where(shift + bits > 32, high << ((32 - shift) % 32), 0)
+    codes = ((low | high) & ((1 << bits) - 1)).astype(jnp.uint8)
+    return jnp.moveaxis(codes, -1, axis)
+
+
 def decode_gptq_int4(
     qweight: Array,
     scales: Array,
@@ -139,8 +153,9 @@ def decode_gptq_int4(
     g_idx: Array | None = None,
     zero_point_offset: int = 1,
     dtype: jnp.dtype = jnp.float32,
+    bits: int = 4,
 ) -> Array:
-    """Decode a GPTQ ``uint4`` weight.
+    """Decode a GPTQ weight (legacy name; defaults to four-bit source lanes).
 
     GPTQ differs from AWQ in two ways that silently corrupt weights if
     confused: it packs ``qweight`` along the **input** axis
@@ -160,25 +175,31 @@ def decode_gptq_int4(
         zero_point_offset: Added to the stored zero-points. GPTQ stores
             ``zero - 1``.
         dtype: Output dtype.
+        bits: Source bit width: 2, 3, 4 or 8. Three-bit lanes crossing word
+            boundaries are reconstructed before dequantization.
 
     Returns:
         Dense weight in ``[in, out]`` layout.
     """
-    codes = unpack_uint32_to_uint4(qweight.astype(jnp.uint32), axis=0, awq_order=False)
+    if bits not in (2, 3, 4, 8):
+        raise ValueError(f"Unsupported GPTQ source bit width: {bits}.")
+    codes = _unpack_gptq_codes(qweight, bits, axis=-2)
+    if g_idx is not None:
+        codes = codes[..., : g_idx.shape[-1], :]
 
     zeros = None
     if qzeros is not None:
-        zeros = unpack_uint32_to_uint4(qzeros.astype(jnp.uint32), axis=-1, awq_order=False)
+        zeros = _unpack_gptq_codes(qzeros, bits, axis=-1)[..., : scales.shape[-1]]
         zeros = zeros.astype(jnp.float32) + float(zero_point_offset)
 
     if g_idx is not None:
         # Act-order: each row picks its own group, so scales cannot be
         # expanded by repetition and must be gathered per row.
         row_index = g_idx.astype(jnp.int32)
-        row_scales = jnp.take(scales.astype(jnp.float32), row_index, axis=0)
+        row_scales = jnp.take(scales.astype(jnp.float32), row_index, axis=-2)
         values = codes.astype(jnp.float32)
         if zeros is not None:
-            values = values - jnp.take(zeros, row_index, axis=0)
+            values = values - jnp.take(zeros, row_index, axis=-2)
         return (values * row_scales).astype(dtype)
 
     # GPTQ unpacks along the input axis, leaving [in, out]: output channels

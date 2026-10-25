@@ -122,17 +122,18 @@ class LossForwardPlan:
 def _resolve_module_vocab_size(module: tp.Any) -> int:
     """Resolve vocab size for text and multimodal configs.
 
-    Some configs expose ``vocab_size`` on the root config, while others keep it
-    on ``text_config`` or behind ``get_text_config()``. Models may also cache it
-    directly on ``self.vocab_size``.
+    A config's explicit ``total_vocab_size`` describes a joint output vocabulary
+    and takes precedence over its text-only ``vocab_size``. Otherwise preserve
+    the root config, module, and nested text-config lookup order.
     """
 
+    config = getattr(module, "config", None)
     candidates: list[tp.Any] = [
-        getattr(getattr(module, "config", None), "vocab_size", None),
+        getattr(config, "total_vocab_size", None),
+        getattr(config, "vocab_size", None),
         getattr(module, "vocab_size", None),
     ]
 
-    config = getattr(module, "config", None)
     if config is not None:
         get_text_config = getattr(config, "get_text_config", None)
         if callable(get_text_config):
@@ -157,7 +158,7 @@ def _resolve_module_vocab_size(module: tp.Any) -> int:
 
     raise AttributeError(
         f"Could not resolve vocabulary size from module {type(module).__name__}; "
-        "expected one of `config.vocab_size`, `config.text_config.vocab_size`, "
+        "expected one of `config.total_vocab_size`, `config.vocab_size`, `config.text_config.vocab_size`, "
         "`config.get_text_config().vocab_size`, or `module.vocab_size`."
     )
 
@@ -382,12 +383,15 @@ class LossConfig:
             If None, uses the default for the specific loss function.
         num_classification_labels: Alias for num_labels for sequence classification.
         classification_problem_type: Alias for problem_type.
-        chunk_vocab_size: If set, enables vocabulary-dimension chunking with this
-            chunk size. Reduces memory for large vocabularies.
+        chunk_vocab_size: If set, cross-entropy streams the vocabulary axis in
+            chunks of this size (two-pass log-sum-exp). Reduces memory for large
+            vocabularies. Takes precedence over the automatic vocab-parallel path.
         chunk_token_size: If set, enables token-dimension chunking with this
             chunk size. Reduces memory for long sequences.
-        chunk_block_size: If set, enables blockwise processing with this block
-            size. Alternative memory optimization strategy (default=None).
+        chunk_block_size: If set, the dense cross-entropy streams the vocabulary
+            axis in blocks of this size with an online log-sum-exp (takes
+            precedence over ``chunk_vocab_size``). Same applicability as
+            ``chunk_vocab_size`` (default=None).
         compute_dtype: Data type for computation. One of "fp32" or "bf16".
             If None, uses the input dtype.
         cross_entropy_platform: Optional ejkernel backend override for sparse
@@ -935,8 +939,15 @@ def auxiliary_load_balancing_loss_func(
     else:
         raise TypeError(f"gate_logits must be a JAX array, tuple/list of JAX arrays, or None. Got {type(gate_logits)}")
 
-    routing_weights = jax.nn.softmax(concatenated_gate_logits, axis=-1)
-    _, selected_experts = jax.lax.top_k(routing_weights, k=top_k)
+    # Softmax can round distinct logits to equal probabilities, even in fp32.
+    # Select from the original logits so expert assignments retain their ordering.
+    # The TPU token-sharded k=1 lowering can return zero indices for every token.
+    # Request two candidates then retain the first to avoid that lowering while
+    # preserving native top-k ordering (including low-index ties) and sharding.
+    selection_k = 2 if top_k == 1 and num_experts > 1 else top_k
+    _, selected_experts = jax.lax.top_k(concatenated_gate_logits, k=selection_k)
+    selected_experts = selected_experts[..., :top_k]
+    routing_weights = jax.nn.softmax(concatenated_gate_logits.astype(jnp.float32), axis=-1)
     expert_mask = jax.nn.one_hot(selected_experts, num_classes=num_experts, dtype=compute_dtype)
 
     if attention_mask is None:
@@ -1056,6 +1067,8 @@ def _ejkernel_cross_entropy(
             and int(ce_mesh.shape["tp"]) > 1
             and (config.label_smoothing or 0.0) == 0.0
             and (_eff_z_loss or 0.0) == 0.0
+            and config.chunk_block_size is None
+            and config.chunk_vocab_size is None
         ):
             _pm = spx.PartitionManager(paxis=paxis)
             _logit_spec = _pm.resolve([BATCH, LENGTH, VOCAB], MODE_TRAIN)
@@ -1082,14 +1095,33 @@ def _ejkernel_cross_entropy(
         else:
             ce_mesh = None
 
+    # Explicit chunking takes precedence over automatic vocab-parallel dispatch. Flatten token axes for
+    # the block kernel, then restore per-token output shapes for reduction="none".
+    chunk_kwargs: dict[str, tp.Any] = {}
+    chunk_size = config.chunk_block_size if config.chunk_block_size is not None else config.chunk_vocab_size
+    if chunk_size is not None:
+        if int(chunk_size) <= 0:
+            raise ValueError(f"Cross-entropy chunk size must be positive, got {chunk_size}")
+        chunk_kwargs = {
+            "chunk_size": min(int(chunk_size), source.shape[-1]),
+            "chunk_strategy": "block" if config.chunk_block_size is not None else "vocab",
+        }
+        if config.chunk_block_size is not None:
+            source = source.reshape(-1, source.shape[-1])
+            target = target.reshape(-1)
+            weights = weights.reshape(-1)
+
     out = _fused_ce(
         source.astype(compute_dtype),
         target.astype(jnp.int32),
         weights.astype(jnp.float32),
+        **chunk_kwargs,
         ignore_index=config.ignore_index,
         label_smoothing=config.label_smoothing,
         z_loss=(config.z_loss if z_loss is None else z_loss),
-        reduction=reduction,
+        # Chunk kernels return z_loss as a sum even for mean reduction. Request
+        # sums explicitly and normalize both outputs below for one stable contract.
+        reduction="sum" if chunk_kwargs and reduction == "mean" else reduction,
         platform=(None if platform == "auto" else platform),
         mesh=ce_mesh,
         in_specs=ce_in_specs,
@@ -1100,7 +1132,14 @@ def _ejkernel_cross_entropy(
         # Drop the masked padding rows so the per-token loss matches the caller's [*leading] shape.
         total_loss = total_loss[tuple(slice(0, d) for d in _orig_leading)]
     total_z_loss = out.z_loss.astype(compute_dtype)
+    if chunk_kwargs and reduction == "none":
+        total_loss = total_loss.reshape(_orig_leading)
+        total_z_loss = total_z_loss.reshape(_orig_leading)
     weight_sum = out.weight_sum.astype(compute_dtype)
+    if chunk_kwargs and reduction == "mean":
+        denominator = jnp.maximum(out.weight_sum, 1e-8)
+        total_loss = (out.loss / denominator).astype(compute_dtype)
+        total_z_loss = (out.z_loss / denominator).astype(compute_dtype)
     if out.accuracy is not None:
         accuracy = out.accuracy.astype(compute_dtype)
     elif reduction != "none" and target.ndim == source.ndim - 1:
@@ -1220,41 +1259,54 @@ def fixed_cross_entropy(
         loss_factor == SLNF.NO_WEIGHT_NUM_REAL_TARGET_TOKENS
         or loss_factor == SLNF.NO_WEIGHT_NUM_REAL_TARGET_TOKENS.value
     ):
-        loss, accuracy = cross_entropy_loss_and_accuracy(
-            source.astype(compute_dtype), target, mask.astype(compute_dtype)
+        # Unit weights (the validity mask) through the same fused kernel as every other mode, so
+        # ``label_smoothing`` / ``z_loss`` / chunking apply identically regardless of the normalizer. The kernel
+        # returns token SUMs; dividing by the number of real target tokens gives the unweighted mean.
+        total_loss, total_z_loss, weight_sum, accuracy = _ejkernel_cross_entropy(
+            source,
+            target,
+            mask.astype(compute_dtype),
+            config,
+            compute_dtype,
+            config.cross_entropy_platform or "xla",
+            paxis=paxis,
         )
-        weight_sum = jnp.sum(mask.astype(compute_dtype))
-        # ``cross_entropy_loss_and_accuracy`` has no z_loss support, so this branch silently dropped
-        # ``config.z_loss``. Fold in the standard term -- ``z_loss * mean(logsumexp(logits)**2)`` over the
-        # same valid tokens as the CE -- so this normalization mode honors z_loss too. No-op when z_loss==0.
-        if (config.z_loss or 0.0) > 0.0:
-            _zm = mask.astype(jnp.float32)
-            _lse = jax.nn.logsumexp(source.astype(jnp.float32), axis=-1)
-            total_z_loss = (config.z_loss * jnp.sum((_lse**2) * _zm) / jnp.maximum(jnp.sum(_zm), 1e-8)).astype(
-                compute_dtype
-            )
-            loss = loss + total_z_loss
+        denom = jnp.maximum(weight_sum, 1e-8)
+        total_loss = total_loss / denom
+        total_z_loss = total_z_loss / denom
+        if num_items_in_batch is not None:
+            # As in the other normalization modes, batch-level normalization is
+            # applied after the real-token mean, not instead of it.
+            extra_denom = jnp.where(num_items_in_batch == 0, 1, num_items_in_batch)
+        elif config.divide_weight_sum:
+            extra_denom = denom
         else:
-            total_z_loss = jnp.array(0.0, compute_dtype)
+            extra_denom = 1
+        loss = total_loss / extra_denom
 
     else:
-        if batch is None:
-            # Named factors read the targets (and derive weights from them when none are given);
-            # constant / None factors return the given ``decoder_loss_weights`` unchanged. Always pass
-            # the real mask as the weights: it keeps token id 0 valid, and an empty batch gave
-            # constant / None factors ``loss_weights=None`` and crashed on ``None.dtype`` (r13 S10-1).
-            batch = {"decoder_target_tokens": target, "decoder_loss_weights": mask.astype(compute_dtype)}
+        # Resolve dynamic normalizers from exactly the same effective weights
+        # used by the kernel, without mutating the caller's batch. In particular
+        # ignored targets and invisible tokens cannot inflate the denominator.
+        effective_batch = dict(batch or {})
+        caller_weights = effective_batch.get("decoder_loss_weights")
+        effective_weights = mask.astype(compute_dtype)
+        if caller_weights is not None:
+            effective_weights = effective_weights * jnp.asarray(caller_weights, dtype=compute_dtype)
+        effective_batch["decoder_target_tokens"] = target
+        effective_batch["decoder_loss_weights"] = effective_weights
 
-        loss_normalizing_factor, loss_weights = get_factor_and_weight(config.loss_normalizing_factor, batch)
+        loss_normalizing_factor, loss_weights = get_factor_and_weight(config.loss_normalizing_factor, effective_batch)
 
         # All sparse-target cross-entropy runs on the ejkernel fused kernel: it streams the
         # vocab softmax in tiles (no [..., V] one-hot / log-softmax materialization), exploits a
         # per-block sparse early-exit on masked (zero-weight) rows, and provides an analytic
         # gradient matching the native softmax-minus-target VJP. It runs in compute_dtype (the
         # input dtype by default — no forced fp32). This subsumes the former dense and
-        # vocab-/token-/block-chunked CE paths; the chunk_* config knobs no longer affect it
-        # (chunk_token_size still sizes the distinct LM-head chunking). The kernel returns a
-        # SUM-reduced loss, so divide by the normalizing factor here.
+        # vocab-/token-/block-chunked CE paths; ``chunk_block_size`` / ``chunk_vocab_size`` select the
+        # kernel's streamed-vocab mode (see ``_ejkernel_cross_entropy``) and ``chunk_token_size`` still
+        # sizes the distinct LM-head chunking. The kernel returns a SUM-reduced loss, so divide by the
+        # normalizing factor here.
         total_loss, total_z_loss, weight_sum, accuracy = _ejkernel_cross_entropy(
             source, target, loss_weights, config, compute_dtype, config.cross_entropy_platform or "xla", paxis=paxis
         )
@@ -1434,6 +1486,8 @@ def causal_lm_loss_chunked_lm_head(
                 "decoder_loss_weights must match labels or shifted labels, "
                 f"got {shift_loss_weights.shape}, labels {labels.shape}, shifted {shift_labels.shape}."
             )
+        if shift_attn_m is not None:
+            shift_loss_weights = shift_loss_weights * shift_attn_m.astype(jnp.float32)
         global_loss_batch["decoder_loss_weights"] = shift_loss_weights
     else:
         if shift_attn_m is not None:

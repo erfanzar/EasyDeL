@@ -37,24 +37,21 @@ import contextlib
 import functools
 import gc
 import inspect
-import os
 import re
 import typing as tp
 import warnings
 from collections.abc import Mapping
 
 import jax
-import jax.extend
 import ml_dtypes
 import numpy as np
 from eformer.loggings import get_logger
-from jax import dlpack
 from jax import numpy as jnp
 from tqdm.autonotebook import tqdm
 
 from easydel.utils.helpers import check_bool_flag
 
-from .analyze_memory import SMPMemoryMonitor
+from . import flags
 from .traversals import unflatten_dict
 
 if tp.TYPE_CHECKING:
@@ -64,8 +61,40 @@ if tp.TYPE_CHECKING:
     from easydel.infra.base_module import EasyDeLBaseModule
 
 
-mem_ops = SMPMemoryMonitor(5)
 logger = get_logger(__name__)
+
+
+def fp32_param_pattern_matches(path: str | tp.Sequence[tp.Any], patterns: tp.Sequence[str] | None) -> bool:
+    """Whether a parameter path matches any fp32-pinned pattern.
+
+    A pattern is a dotted run of path segments (``"router.weight"``, ``"A_log"``); it matches when those
+    segments appear contiguously in ``path``. Matching is on whole segments only, so ``"router"`` does not
+    match ``"routers"`` and the same rule applies to HF keys, EasyDeL key tuples and native checkpoint keys.
+
+    Args:
+        path: Dotted or ``/``-separated key string, or a key tuple.
+        patterns: Dotted segment patterns declared by the model (``fp32_param_patterns``).
+
+    Returns:
+        ``True`` when at least one pattern matches.
+    """
+    if not patterns:
+        return False
+    if isinstance(path, str):
+        segments = tuple(segment for segment in re.split(r"[./\\]", path) if segment)
+    else:
+        segments = tuple(str(part) for part in path)
+    for pattern in patterns:
+        wanted = tuple(segment for segment in str(pattern).split(".") if segment)
+        width = len(wanted)
+        if width and any(segments[i : i + width] == wanted for i in range(len(segments) - width + 1)):
+            return True
+    return False
+
+
+def fp32_pinned_dtype(path: str | tp.Sequence[tp.Any], default: tp.Any, patterns: tp.Sequence[str] | None) -> tp.Any:
+    """Return ``jnp.float32`` for a pinned ``path``, otherwise ``default``."""
+    return jnp.float32 if fp32_param_pattern_matches(path, patterns) else default
 
 
 class ExpertMergeSpec(tp.NamedTuple):
@@ -294,12 +323,8 @@ def resolve_expert_merge(
     return None
 
 
-EASYDEL_PREFERRED_HOST_COPY_INDEX = int(
-    os.getenv("EASYDEL_PREFERRED_HOST_COPY_INDEX", os.getenv("EASYDEL_PERFRED_HOST_COPY_INDEX", "0"))
-)
-_preferred_host_copy_raw = str(
-    os.getenv("EASYDEL_PREFERRED_HOST_COPY", os.getenv("EASYDEL_PERFRED_HOST_COPY", "cpu"))
-).lower()
+EASYDEL_PREFERRED_HOST_COPY_INDEX = flags.get_int(flags.EASYDEL_PREFERRED_HOST_COPY_INDEX)
+_preferred_host_copy_raw = str(flags.get_str(flags.EASYDEL_PREFERRED_HOST_COPY)).lower()
 EASYDEL_PREFERRED_HOST_COPY: str | None = None if _preferred_host_copy_raw == "none" else _preferred_host_copy_raw
 
 
@@ -381,26 +406,19 @@ class DtypeHandler:
             return tensor
 
         dtype = DtypeHandler.get_dtype(dtype)
-        float_dtypes = (
-            jnp.bfloat16,
-            jnp.float16,
-            jnp.float32,
-            jnp.float64,
-            jnp.float8_e4m3fn,
-            jnp.float8_e4m3fnuz,
-            jnp.float8_e4m3b11fnuz,
-            jnp.float8_e5m2,
-            jnp.float8_e5m2fnuz,
-        )
-
-        if getattr(tensor, "dtype", None) in float_dtypes:
-            tensor = tensor.astype(dtype)
+        source_dtype = getattr(tensor, "dtype", None)
+        if source_dtype is None:
+            return tensor
+        if str(source_dtype).startswith("torch."):
+            if tensor.is_floating_point():
+                torch = TensorConverter.get_torch()
+                return tensor.to(dtype=getattr(torch, str(jnp.dtype(dtype))))
+            return tensor
+        if jnp.issubdtype(source_dtype, jnp.floating):
+            return tensor.astype(dtype)
         return tensor
 
 
-#: dtypes NumPy can represent directly. Anything else (bfloat16, the float8
-#: family) has to cross the torch->JAX boundary as raw bytes, because
-#: ``torch.Tensor.numpy()`` refuses to materialize them at all.
 _NUMPY_REPRESENTABLE = frozenset(
     jnp.dtype(d)
     for d in (
@@ -506,8 +524,8 @@ class TensorConverter:
 
         When ``EASY_SAFE_TRANSFER`` is enabled (the default) the data is
         moved through NumPy, which is slower but avoids DLPack edge cases.
-        Otherwise a zero-copy DLPack transfer is used when the JAX backend
-        is CPU/GPU and CUDA is available.
+        Otherwise a zero-copy DLPack transfer is used for CPU arrays, or
+        GPU arrays when CUDA is available and host transfer is not forced.
 
         Args:
             x: JAX array to transfer.
@@ -532,28 +550,23 @@ class TensorConverter:
             from torch import cuda
             from torch.utils import dlpack as dlpack_pt
 
-            platform = jax.extend.backend.get_backend()
-            cpu_force = not cuda.is_available()
-
-            if (
-                platform in ["cpu", "gpu"]
-                and not cpu_force
-                and not check_bool_flag("EASYDEL_FORCE_TORCH_USE_CPU", False)
-            ):
-                dl_pack_jax = dlpack.to_dlpack(
-                    x,
-                    stream=True if (platform == "gpu" and not cpu_force) else None,
-                    src_device=next(iter(x.devices())),
-                )
-            else:
-                dl_pack_jax = dlpack.to_dlpack(
-                    jax.device_put(
-                        jax.device_get(x),
-                        jax.devices(EASYDEL_PREFERRED_HOST_COPY)[EASYDEL_PREFERRED_HOST_COPY_INDEX],
-                    ),
-                    stream=None,
-                )
-            return dlpack_pt.from_dlpack(dl_pack_jax)
+            devices = x.devices()
+            platform = next(iter(devices)).platform
+            force_cpu = check_bool_flag("EASYDEL_FORCE_TORCH_USE_CPU", False)
+            compatible_platform = platform == "cpu" or (platform == "gpu" and cuda.is_available() and not force_cpu)
+            # DLPack represents one device buffer, not a distributed array.
+            # Gather fully addressable multi-device arrays through the staging
+            # path below before handing torch a single-device buffer.
+            if len(devices) == 1 and compatible_platform:
+                # Let torch negotiate the stream through the array's __dlpack__
+                # protocol (the capsule-based jax.dlpack.to_dlpack is unavailable).
+                return dlpack_pt.from_dlpack(x)
+            host_platform = "cpu" if force_cpu or not cuda.is_available() else EASYDEL_PREFERRED_HOST_COPY
+            host_array = jax.device_put(
+                jax.device_get(x),
+                jax.devices(host_platform)[EASYDEL_PREFERRED_HOST_COPY_INDEX],
+            )
+            return dlpack_pt.from_dlpack(host_array)
 
     @staticmethod
     def pytorch_to_jax(x: tp.Any) -> jnp.ndarray:
@@ -1184,9 +1197,10 @@ class StateDictConverter:
 
         if "weight" in key and not config.get("_reform_processed", False):
             is_embedding = any(layer_name in key for layer_name in config.get("embedding_layer_names", []))
+            is_layernorm = any(layer_name in key for layer_name in config.get("layernorm_names", []))
             is_moe_expert = key in config.get("consolidated_moe_keys", set())
             ndim = len(tensor.shape)
-            if not is_embedding and not is_moe_expert:
+            if not is_embedding and not is_layernorm and not is_moe_expert:
                 if ndim == 2:
                     tensor = tensor.permute(1, 0)
                 elif ndim == 3:
@@ -1204,20 +1218,13 @@ class StateDictConverter:
 
         key_tuple = tuple(int(n) if n.isdigit() else n for n in new_key.split("."))
 
-        # Do not drop tied LM-head weights during conversion.
-        # Some EasyDeL module graphs still materialize `lm_head.kernel` even when
-        # logits use tied embeddings at runtime; dropping this leaf causes noisy
-        # "missing parameter" warnings during merge.
-        #
-        # Keeping it here preserves graph/tree key parity without changing tied
-        # runtime behavior (`apply_lm_head` still uses embedding weights when tied).
-        # if config["uses_tie_word_embedding"] and config["lm_head_name"] and key_tuple[0] == config["lm_head_name"]:
-        #     return None
-
+        # Keep explicit LM-head leaves even for tied models. Missing tied heads
+        # are materialized against the target graph by the bridge after conversion.
         if config.get("_preserve_dtype", False):
             array = TensorConverter.to_jax_preserving_dtype(tensor)
         else:
-            array = TensorConverter.convert_pytorch_to_jnp(tensor, config["dtype"])
+            target_dtype = fp32_pinned_dtype(key_tuple, config["dtype"], config.get("fp32_param_patterns"))
+            array = TensorConverter.convert_pytorch_to_jnp(tensor, target_dtype)
         return [(key_tuple, array)]
 
     @staticmethod
@@ -1238,6 +1245,7 @@ class StateDictConverter:
         uses_tie_word_embedding: bool = False,
         consolidated_moe_keys: set[str] | None = None,
         reform_param: dict | None = None,
+        fp32_param_patterns: tp.Sequence[str] | None = None,
         **kwargs,
     ) -> dict[str, tp.Any]:
         """Base conversion from a PyTorch state dict to EasyDeL nested dict format.
@@ -1263,6 +1271,8 @@ class StateDictConverter:
             consolidated_moe_keys: Set of keys that were consolidated from
                 per-expert weights.
             reform_param: Optional parameter splitting/merging rules.
+            fp32_param_patterns: Dotted segment patterns of leaves kept in float32 regardless of
+                ``dtype`` (see :func:`fp32_param_pattern_matches`).
 
         Returns:
             Nested EasyDeL parameter dictionary.
@@ -1277,13 +1287,10 @@ class StateDictConverter:
         config = {
             "embedding_layer_names": set(embedding_layer_names or []),
             "layernorm_names": set(layernorm_names or []),
-            "moe_block_names": set(moe_block_names or []),
-            "moe_names": set(moe_names or []),
-            "lm_head_name": lm_head_name,
-            "uses_tie_word_embedding": uses_tie_word_embedding,
             "dtype": dtype,
             "consolidated_moe_keys": consolidated_moe_keys or set(),
             "reform_param": reform_param,
+            "fp32_param_patterns": tuple(fp32_param_patterns or ()),
         }
 
         with jax.default_device(device) if device is not None and shard_fns is None else contextlib.nullcontext():
@@ -1325,7 +1332,8 @@ class StateDictConverter:
                                 logger.debug(strm)
                                 parameters_dict[key_tuple] = jax_array
                     except Exception as e:
-                        logger.error(f"Error processing key {key}: {e!s}")
+                        e.add_note(f"While converting checkpoint parameter {key!r} to EasyDeL.")
+                        raise
                     pbar.update(1)
 
             if remove_state_dict:
@@ -1660,7 +1668,6 @@ class StateDictConverter:
             raise ValueError("moe_block_path cannot be None")
 
         new_state_dict = {}
-        processed_keys = set()
         expected_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
         sibling_expert_parents = {
             path.rsplit(".", 1)[0] for path in moe_path or [] if f".{expected_expert_name}." in path
@@ -1690,7 +1697,6 @@ class StateDictConverter:
                                 new_key = f"{block_path}.{expected_expert_name}.{expert_idx}.{moe_name}.weight"
                                 new_state_dict[new_key] = expert_tensor
 
-                            processed_keys.add(key)
                             break
 
             if not is_stacked_moe:
@@ -1705,7 +1711,6 @@ class StateDictConverter:
                                 expert_tensor = tensor_transform(expert_tensor)
                             new_key = f"{expert_parent}.{expert_idx}.{moe_name}.weight"
                             new_state_dict[new_key] = expert_tensor
-                        processed_keys.add(key)
                         is_stacked_moe = True
 
             if not is_stacked_moe:
@@ -1754,9 +1759,10 @@ class StateDictConverter:
         """Convert an EasyDeL module's parameters to a PyTorch state dict.
 
         Flattens the module's parameter tree, transposes weight axes back
-        to PyTorch conventions, renames keys (``.kernel`` -> ``.weight``,
-        ``.embedding`` -> ``.weight``, ``.scale`` -> ``.weight``), and
-        un-stacks MoE expert weights if present.
+        to PyTorch conventions, preserves model-declared parameter names, and
+        un-stacks MoE expert weights if present. Legacy checkpoint leaf names
+        are normalized when loading against the target graph, not by rewriting
+        substrings in current model paths.
 
         Args:
             module: EasyDeL module whose parameters will be exported.
@@ -1782,19 +1788,22 @@ class StateDictConverter:
         md = BaseMoeModule
         moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(module, md)]
 
-        # spectrax names every leaf ".weight" (no kernel/embedding/scale distinction), so the
-        # export transpose must detect dense weights by module type, exactly like the load path:
-        # transpose 2D+ weights EXCEPT embeddings (and layernorm scales, which are 1D and skip the
-        # permute branches anyway). This feeds correctly-oriented tensors to the qkv/gate-up split.
-        embedding_names = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(module, Embed)]
-        try:
-            from flax import nnx as _nnx
+        # SpectraX uses ".weight" for dense, embedding, and normalization leaves.
+        # Discover layout-preserving module types rather than inferring from rank:
+        # normalization parameters can be multidimensional, including square matrices.
+        from easydel.layers.norms import BatchNorm, LayerNorm, RMSNorm, RMSNormGated
 
-            embedding_names += [
-                ".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(module, _nnx.Embed)
-            ]
-        except Exception:
-            pass
+        embedding_paths = {".".join(map(str, pa)) for pa, _ in traversals.iter_module_search(module, Embed)}
+        # Automatically discovered paths identify the module owning a parameter,
+        # not substrings: `norm` must not exempt `norm_projection.weight`, and a
+        # root normalization module (path "") must not exempt its dense children.
+        layernorm_paths = {
+            ".".join(map(str, pa))
+            for norm_type in (BatchNorm, LayerNorm, RMSNorm, RMSNormGated)
+            for pa, _ in traversals.iter_module_search(module, norm_type)
+        }
+        # Explicit declarations retain their public, substring-based semantics.
+        layernorm_names = list(kwargs.get("layernorm_names") or [])
 
         moe_names = list(set([names.split(".")[-1] for names in moe_path])) if moe_path else None
         moe_block_names = list(set([names.split(".")[-1] for names in moe_block_path])) if moe_block_path else None
@@ -1816,14 +1825,23 @@ class StateDictConverter:
         # and own the complete inverse. Applying the generic permute first
         # double-transforms (e.g. conv1d weights exported in runtime layout).
         inverse_split_names: list[tuple[str, bool]] = []
+        # Mirror of the load path's ``_preserve_dtype``: leaves owned by a rule
+        # with ``preserve_dtype`` (exact integer tables such as DeepSeek-V4's
+        # ``tid2eid``, quantized codes) must not be cast to the export dtype.
+        preserve_dtype_names: list[tuple[str, bool]] = []
         for rule_key, rule in (kwargs.get("reform_param", None) or {}).items():
-            if "splits" in rule and rule.get("inverse_spliter") is not None:
-                anchored = rule_key.endswith("$")
+            if "splits" not in rule:
+                continue
+            anchored = rule_key.endswith("$")
+            if rule.get("inverse_spliter") is not None:
                 for split in rule["splits"]:
                     inverse_split_names.append((split["name"], anchored))
+            if rule.get("preserve_dtype", False):
+                for split in rule["splits"]:
+                    preserve_dtype_names.append((split["name"], anchored))
 
-        def _consumed_by_inverse_spliter(key: str) -> bool:
-            for split_name, anchored in inverse_split_names:
+        def _matches_split_names(key: str, names: list[tuple[str, bool]]) -> bool:
+            for split_name, anchored in names:
                 match_index = key.find(split_name)
                 if match_index == -1:
                     continue
@@ -1847,26 +1865,27 @@ class StateDictConverter:
                     tensor = tensor.materialize()
                 if hasattr(tensor, "value") and hasattr(tensor.value, "materialize"):
                     tensor = tensor.value.materialize()
-                if tensor.dtype != DtypeHandler.get_dtype(dtype):
+                if tensor.dtype != DtypeHandler.get_dtype(dtype) and not _matches_split_names(key, preserve_dtype_names):
                     tensor = tensor.astype(DtypeHandler.get_dtype(dtype))
                 tensor = TensorConverter.jax_to_pytorch(jax.block_until_ready(tensor))
                 is_stacked_moe = key in stacked_moe_keys
-                is_embedding = any(emb in key for emb in embedding_names)
-                key = key.replace(".kernel", ".weight").replace(".embedding", ".weight").replace(".scale", ".weight")
+                owner_path = key.rpartition(".")[0]
+                is_embedding = owner_path in embedding_paths
+                is_layernorm = owner_path in layernorm_paths or any(norm in key for norm in layernorm_names)
 
-                # Transpose dense weights JAX [in, out] -> torch [out, in] (higher-rank
-                # analogues). Skip embeddings (kept [vocab, hidden]); 1D layernorm scales hit
-                # no permute branch. Keyed on module type, not the (now uniform) ".weight" name.
+                # Transpose weight parameters only, symmetric with process_tensor on import.
+                # Raw parameters (tokens, positions, multidimensional biases) retain HF layout.
+                # Preserve embedding and normalization layouts at every rank, matching import.
                 # Dense tensors consumed by a splits rule's inverse_spliter are left in raw
                 # EasyDeL layout — the rule owns the complete inverse transform. Stacked MoE
                 # weights are NOT exempt: apply_moe_transformations_reverse un-stacks them
                 # (deleting the stacked key) before the splits-inverse pass runs, so their
                 # inverse_spliter never fires and the stacked permute must still apply.
-                if not is_embedding:
+                if "weight" in key and not is_embedding and not is_layernorm:
                     if is_stacked_moe:
                         if tensor.ndim == 3:
                             tensor = tensor.permute(0, 2, 1)
-                    elif not _consumed_by_inverse_spliter(key):
+                    elif not _matches_split_names(key, inverse_split_names):
                         if tensor.ndim == 2:
                             tensor = tensor.permute(1, 0)
                         elif tensor.ndim == 3:

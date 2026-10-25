@@ -145,82 +145,27 @@ else:
 Cfg = TypeVar("BaseModuleCfg", bound=EasyDeLBaseConfig)
 
 
-def apply_rotary_pos_emb(
-    q: Float[Array, "batch_size num_heads seq_len head_dim"],
-    k: Float[Array, "batch_size num_kv_heads seq_len head_dim"],
-    cos: Float[Array, "max_seq_len head_dim"],
-    sin: Float[Array, "max_seq_len head_dim"],
-    position_ids: Int[Array, "batch_size seq_len"],
-) -> tuple[
-    Float[Array, "batch_size num_heads seq_len head_dim"],
-    Float[Array, "batch_size num_kv_heads seq_len head_dim"],
-]:
-    """Apply rotary position embeddings to query and key tensors.
-
-    Implements the RoPE (Rotary Position Embedding) algorithm that encodes
-    position information by rotating query and key vectors based on their
-    absolute positions in the sequence.
-
-    The rotation is performed using the formula:
-        rotated = x * cos + rotate_half(x) * sin
-
-    where rotate_half splits the last dimension and swaps halves with negation.
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
+    """Apply split-half rotary embeddings to query and key tensors.
 
     Args:
-        q: Query tensor with shape [batch_size, num_heads, seq_len, head_dim].
-        k: Key tensor with shape [batch_size, num_kv_heads, seq_len, head_dim].
-        cos: Precomputed cosine values with shape [max_seq_len, head_dim].
-        sin: Precomputed sine values with shape [max_seq_len, head_dim].
-        position_ids: Position indices with shape [batch_size, seq_len] used
-            to gather the appropriate cos/sin values for each position.
+        q: Queries ``[batch, heads, seq, dim]``.
+        k: Keys ``[batch, kv_heads, seq, dim]``.
+        cos: Cosine lookup table ``[max_seq_len, dim]``.
+        sin: Sine lookup table ``[max_seq_len, dim]``.
+        position_ids: Lookup positions ``[batch, seq]``.
 
     Returns:
-        Tuple containing:
-            - q_embed: Rotated query tensor with same shape as input q.
-            - k_embed: Rotated key tensor with same shape as input k.
-
-    Note:
-        The rotation preserves the inner product structure such that
-        q_i^T * k_j depends on the relative position (i - j), enabling
-        the model to learn position-aware attention patterns.
-
-    Example:
-        >>> cos, sin = compute_rope_frequencies(max_len=4096, dim=64)
-        >>> q_rotated, k_rotated = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+        Rotated query and key tensors, preserving their shapes.
     """
-    cos_gathered: Float[Array, "batch_size seq_len head_dim"] = cos[position_ids]
-    sin_gathered: Float[Array, "batch_size seq_len head_dim"] = sin[position_ids]
-    cos_expanded: Float[Array, "batch_size 1 seq_len head_dim"] = jnp.expand_dims(cos_gathered, axis=1)
-    sin_expanded: Float[Array, "batch_size 1 seq_len head_dim"] = jnp.expand_dims(sin_gathered, axis=1)
+    cos = cos[position_ids][:, None, :, :]
+    sin = sin[position_ids][:, None, :, :]
 
-    def rotate_half(
-        x: Float[Array, "batch_size num_heads_any seq_len head_dim"],
-    ) -> Float[Array, "batch_size num_heads_any seq_len head_dim"]:
-        """Rotate the second half of the head dim into the first (and negate).
+    def rotate(x):
+        half = x.shape[-1] // 2
+        return x * cos + jnp.concatenate((-x[..., half:], x[..., :half]), axis=-1) * sin
 
-        Concretely returns ``concat([-x[..., half:], x[..., :half]], axis=-1)``,
-        the standard rotate-half helper used by RoPE so that complex
-        multiplication ``(a + bi)(cos + i sin)`` falls out of two
-        real-valued multiplies.
-
-        Args:
-            x: Tensor whose last axis has even length ``head_dim``.
-
-        Returns:
-            Tensor of the same shape with the second half (negated)
-            concatenated in front of the first half.
-        """
-        half_dim: int = x.shape[-1] // 2
-        x1: Float[Array, "batch_size num_heads_any seq_len half_head_dim"] = x[..., :half_dim]
-        x2: Float[Array, "batch_size num_heads_any seq_len half_head_dim"] = x[..., half_dim:]
-        rotated: Float[Array, "batch_size num_heads_any seq_len head_dim"] = jnp.concatenate((-x2, x1), axis=-1)
-        return rotated
-
-    q_rotated: Float[Array, "batch_size num_heads seq_len head_dim"] = rotate_half(q)
-    k_rotated: Float[Array, "batch_size num_kv_heads seq_len head_dim"] = rotate_half(k)
-    q_embed: Float[Array, "batch_size num_heads seq_len head_dim"] = (q * cos_expanded) + (q_rotated * sin_expanded)
-    k_embed: Float[Array, "batch_size num_kv_heads seq_len head_dim"] = (k * cos_expanded) + (k_rotated * sin_expanded)
-    return q_embed, k_embed
+    return rotate(q), rotate(k)
 
 
 class UnifiedAttention(AttentionModule, Generic[Cfg]):
@@ -520,7 +465,9 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             )
 
         if hasattr(config, "resid_pdrop") and config.resid_pdrop > 0:
-            self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
+            # Training-mode dropout draws its key from the stashed Rngs; without
+            # it every forward with resid_pdrop > 0 raises outside eval().
+            self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
 
     def _build_mla_projections(
         self,
@@ -682,122 +629,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             return {}
         include_bias = any(bool(getattr(self.config, attr, False)) for attr in ("attention_bias", "qkv_bias", "bias"))
         return qkv_proj.build_reform_param(qkv_attr, config=self.config, include_bias=include_bias)
-
-    def _create_q_proj(
-        self,
-        config: Cfg,
-        dtype: DTypeLike,
-        param_dtype: DTypeLike,
-        precision: jax.lax.Precision,
-        rngs: PRNGKeyArray,
-    ) -> ColumnParallelLinear:
-        """Create query projection layer.
-
-        Creates a column-parallel linear layer for projecting input hidden
-        states to query representations.
-
-        Args:
-            config: Model configuration containing hidden_size and attention settings.
-            dtype: Data type for computation.
-            param_dtype: Data type for parameters.
-            precision: JAX precision setting for matrix operations.
-            rngs: Random number generators for parameter initialization.
-
-        Returns:
-            ColumnParallelLinear layer mapping hidden_size to num_heads * head_dim.
-
-        Note:
-            Override this method to customize query projection (e.g., different
-            initialization, bias settings, or quantization).
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            self.num_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=getattr(config, "attention_bias", False),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
-            precision=precision,
-        )
-
-    def _create_k_proj(
-        self,
-        config: Cfg,
-        dtype: DTypeLike,
-        param_dtype: DTypeLike,
-        precision: jax.lax.Precision,
-        rngs: PRNGKeyArray,
-    ) -> ColumnParallelLinear:
-        """Create key projection layer.
-
-        Creates a column-parallel linear layer for projecting input hidden
-        states to key representations.
-
-        Args:
-            config: Model configuration containing hidden_size and attention settings.
-            dtype: Data type for computation.
-            param_dtype: Data type for parameters.
-            precision: JAX precision setting for matrix operations.
-            rngs: Random number generators for parameter initialization.
-
-        Returns:
-            ColumnParallelLinear layer mapping hidden_size to
-            num_key_value_heads * head_dim.
-
-        Note:
-            For GQA (Grouped Query Attention), num_key_value_heads may be
-            smaller than num_heads.
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=getattr(config, "attention_bias", False),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
-            precision=precision,
-        )
-
-    def _create_v_proj(
-        self,
-        config: Cfg,
-        dtype: DTypeLike,
-        param_dtype: DTypeLike,
-        precision: jax.lax.Precision,
-        rngs: PRNGKeyArray,
-    ) -> ColumnParallelLinear:
-        """Create value projection layer.
-
-        Creates a column-parallel linear layer for projecting input hidden
-        states to value representations.
-
-        Args:
-            config: Model configuration containing hidden_size and attention settings.
-            dtype: Data type for computation.
-            param_dtype: Data type for parameters.
-            precision: JAX precision setting for matrix operations.
-            rngs: Random number generators for parameter initialization.
-
-        Returns:
-            ColumnParallelLinear layer mapping hidden_size to
-            num_key_value_heads * head_dim.
-
-        Note:
-            For GQA (Grouped Query Attention), num_key_value_heads may be
-            smaller than num_heads, matching the key projection.
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=getattr(config, "attention_bias", False),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
-            precision=precision,
-        )
 
     def _create_o_proj(
         self,
@@ -1194,50 +1025,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             rngs=rngs,
         )
 
-    def _create_v_norm(self, config: Cfg, dtype: DTypeLike, param_dtype: DTypeLike, rngs: spx.Rngs) -> RMSNorm:
-        """Build the per-head value RMSNorm (used by a small subset of models).
-
-        Override for custom V normalization (LayerNorm vs RMSNorm, custom eps).
-
-        Args:
-            config: Owning model config; ``rms_norm_eps`` is consulted.
-            dtype: Compute dtype for the norm.
-            param_dtype: Storage dtype for the norm scale.
-            rngs: SpecTrax RNGs supplying the parameter initializer key.
-
-        Returns:
-            :class:`RMSNorm` normalising the last axis of size ``head_dim``.
-        """
-        return RMSNorm(
-            self.head_dim,
-            eps=getattr(config, "rms_norm_eps", 1e-6),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
-
-    def _create_o_norm(self, config: Cfg, dtype: DTypeLike, param_dtype: DTypeLike, rngs: spx.Rngs) -> RMSNorm:
-        """Build a normalization layer over the attention output (rare).
-
-        Override for custom output normalization.
-
-        Args:
-            config: Owning model config; ``rms_norm_eps`` is consulted.
-            dtype: Compute dtype for the norm.
-            param_dtype: Storage dtype for the norm scale.
-            rngs: SpecTrax RNGs supplying the parameter initializer key.
-
-        Returns:
-            :class:`RMSNorm` normalising the last axis of size ``head_dim``.
-        """
-        return RMSNorm(
-            self.head_dim,
-            eps=getattr(config, "rms_norm_eps", 1e-6),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
-
     @property
     def query_projection(self) -> ColumnParallelLinear:
         """Get query projection layer.
@@ -1588,10 +1375,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
             causal_for_kernel = False
 
-        sliding_window_for_kernel = self.sliding_window
-        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
-            sliding_window_for_kernel = None
-
         (
             key_states,
             value_states,
@@ -1606,8 +1389,16 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             cache_view=cache_view,
             cache_metadata=cache_metadata,
             mask_info=mask_info,
-            sliding_window=sliding_window_for_kernel,
+            sliding_window=self.sliding_window,
+            causal=self.causal,
         )
+
+        # A caller-baked mask may contain a different window. Concatenate must
+        # intersect it with the configured window before redundant kernel-side
+        # masking can be suppressed, using the final mask's baked-in flag.
+        sliding_window_for_kernel = self.sliding_window
+        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+            sliding_window_for_kernel = None
 
         softmax_aux = self._softmax_aux()
 
@@ -1644,6 +1435,28 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             attention_weight=attentions.attention_weights if output_attentions else None,
             cache_view=cache_view,
         )
+
+    def _postprocess_mla_queries(
+        self,
+        q_nope: Float[Array, "batch heads seq_len nope_dim"],
+        q_pe: Float[Array, "batch heads seq_len rope_dim"],
+        position_ids: Int[Array, "batch seq_len"],
+    ) -> tuple[Array, Array]:
+        """Transform both MLA query components after RoPE and before weight absorption.
+
+        Subclasses can apply position-dependent query temperatures here without
+        duplicating either the standard or the weight-absorbed attention path.
+        The default leaves both query components unchanged.
+
+        Args:
+            q_nope: Non-positional query components in compute dtype.
+            q_pe: Rotary-transformed positional query components in compute dtype.
+            position_ids: Query positions, including any cache offset.
+
+        Returns:
+            Transformed ``(q_nope, q_pe)`` with the input shapes and dtypes.
+        """
+        return q_nope, q_pe
 
     def forward_mla(
         self,
@@ -1758,6 +1571,8 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
                 q_pe = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
                 k_pe = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
 
+        q_nope, q_pe = self._postprocess_mla_queries(q_nope, q_pe, position_ids)
+
         causal_for_kernel = self.causal
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
             causal_for_kernel = False
@@ -1821,6 +1636,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
                 cache_view=cache_view,
                 cache_metadata=cache_metadata,
                 mask_info=mask_info,
+                causal=self.causal,
             )
 
             softmax_aux = self._softmax_aux()
@@ -1846,9 +1662,11 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
                 output_attentions=output_attentions,
             )
 
-            # Kernel output: [total_tokens, N, kv_lora_rank]
-            # Project through W_v to get [total_tokens, N, v_head_dim]
-            attn_out = attentions.attention_outputs
+            # Native MLA kernels return [total_tokens, N, kv_lora_rank],
+            # while the stochastic paged adapter preserves [B, S, N, kv_lora_rank].
+            # Normalize both layouts before applying the absorbed V projection.
+            attn_out = attentions.attention_outputs.reshape(bsz * q_len, self.num_heads, self.kv_lora_rank)
+            # Project through W_v to get [total_tokens, N, v_head_dim].
             attn_out = jnp.einsum(
                 "tna,anh->tnh",
                 attn_out.astype(jnp.float32),
@@ -1889,6 +1707,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
                 cache_view=cache_view,
                 cache_metadata=cache_metadata,
                 mask_info=mask_info,
+                causal=self.causal,
             )
 
             softmax_aux = self._softmax_aux()
@@ -1911,6 +1730,9 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
 
             attn_out = attentions.attention_outputs
             attn_output = self._merge_heads(attn_out)
+
+        if attentions.cache_view is not None:
+            cache_view = attentions.cache_view
 
         attn_output = self.shard_attention_prod(attn_output, pre_projection=True)
         attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
@@ -2005,6 +1827,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             cache_view=cache_view,
             cache_metadata=cache_metadata,
             mask_info=mask_info,
+            causal=self.causal,
         )
 
         if alibi is not None:

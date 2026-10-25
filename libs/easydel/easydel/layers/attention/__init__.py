@@ -37,10 +37,12 @@ from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 
 from ._compressed_window import CompressedWindowAttention, WindowRingDraftAttentionMixin
 from ._decoder_base import BaseDecoderLayer, blockwise_ffn
+from ._flat_qk_norm import FlattenedQKNormMixin
 from ._flexible import (
     AttentionMechanisms,
     AttentionModule,
     FlexibleAttentionModule,
+    SoftCappedAttentionModule,
     block_diagonal_bias,
     get_optimal_config,
     tpu_version_check,
@@ -52,8 +54,10 @@ __all__ = (
     "AttentionModule",
     "BaseDecoderLayer",
     "CompressedWindowAttention",
+    "FlattenedQKNormMixin",
     "FlexibleAttentionModule",
     "MaskInfo",
+    "SoftCappedAttentionModule",
     "UnifiedAttention",
     "WindowRingDraftAttentionMixin",
     "block_diagonal_bias",

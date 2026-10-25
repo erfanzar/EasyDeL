@@ -52,13 +52,10 @@ from easydel.infra.modeling_outputs import MoeCausalLMOutput
 from easydel.modules._base import (
     BaseCausalLMModule,
     BaseVisionLanguageModule,
-    flatten_mrope_position_ids_for_text,
-    mrope_position_ids_from_mm_token_types,
 )
-from easydel.modules.qwen3_5.modeling_qwen3_5 import (
-    Qwen3_5MTPHead,
-    Qwen3_5MTPOutput,
-)
+from easydel.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5MTPHead
+from easydel.modules.qwen3_5.mtp import Qwen3_5MTPMixin, Qwen3_5VisionMTPMixin
+from easydel.modules.qwen3_5.multimodal import qwen3_5_multimodal_forward
 from easydel.modules.qwen3_next.modeling_qwen3_next import (
     Qwen3NextForCausalLM,
     Qwen3NextModel,
@@ -105,129 +102,9 @@ class Qwen3_5MoeTextModel(Qwen3NextModel):
     """
 
 
-class _Qwen3_5MoeMTPMixin:
-    """Shared Multi-Token-Prediction (MTP) methods for the Qwen3.5-MoE causal-LM classes.
-
-    Mirrors the qwen3_5 implementation and reuses :class:`Qwen3_5MTPHead` directly.
-    The MoE model's depth-1 MTP block is structurally identical to one decoder layer
-    (full attention + FFN); the FFN is built as a :class:`Qwen3NextSparseMoeBlock`
-    (routed experts + shared expert + gate) by passing ``use_moe_mlp=True`` to the
-    head, matching the ``mtp.*.mlp.experts`` / ``shared_expert`` / ``gate`` tensors
-    in the Qwen3.5-MoE checkpoint (see :func:`_mtp_mlp_is_moe`). Subclasses set
-    ``self.mtp`` in ``__init__`` and may override the three hooks below (text vs
-    vision-language). See ``easydel.modules.qwen3_5.modeling_qwen3_5`` for the
-    canonical docstrings.
-    """
-
-    # hooks: text and vision-language variants differ only in these three
-    def _mtp_embed(self, token_ids_i4):
-        return self.model.get_embedding()(token_ids_i4)
-
-    def _mtp_frequencies(self):
-        return getattr(self.model, "frequencies", None)
-
-    def _mtp_loss_coef(self) -> float:
-        return float(getattr(self.config, "mtp_loss_coef", 0.0))
-
-    # shared MTP API (model-agnostic; uses self.mtp + the hooks)
-    def has_mtp(self) -> bool:
-        return self.mtp is not None
-
-    def compute_mtp_outputs(
-        self,
-        outputs,
-        input_ids,
-        attention_mask=None,
-        mask_info=None,
-        position_ids=None,
-        mode=None,
-        mtp_past_key_values=None,
-        cache_metadata=None,
-    ) -> Qwen3_5MTPOutput | None:
-        if self.mtp is None:
-            return None
-        next_input_ids = jnp.concatenate(
-            [input_ids[:, 1:], jnp.zeros((input_ids.shape[0], 1), dtype=input_ids.dtype)], axis=-1
-        )
-        return self.mtp(
-            prev_hidden_states=outputs.last_hidden_state,
-            next_token_embeds=self._mtp_embed(next_input_ids.astype("i4")),
-            mask_info=mask_info,
-            position_ids=position_ids,
-            mode=mode,
-            past_key_values=mtp_past_key_values,
-            cache_metadata=cache_metadata,
-            frequencies=self._mtp_frequencies(),
-            attention_mask=attention_mask,
-        )
-
-    def compute_mtp_logits(self, mtp_output: Qwen3_5MTPOutput):
-        # prepare_lm_head_inputs lives on BaseCausalLMModule (text path); the
-        # vision-language MRO lacks it, so fall back to the raw hidden state there.
-        h = mtp_output.last_hidden_state
-        if hasattr(self, "prepare_lm_head_inputs"):
-            h = self.prepare_lm_head_inputs(h)
-        return self.compute_lm_logits(h)
-
-    def compute_mtp_chain(self, outputs, input_ids, n_steps: int, attention_mask=None):
-        """Recursively apply the depth-1 MTP head ``n_steps`` times, teacher-forced;
-        returns ``(n_steps, B, S, vocab)``. See qwen3_5's ``compute_mtp_chain``."""
-        if self.mtp is None or n_steps < 1:
-            return None
-        b = input_ids.shape[0]
-        frequencies = self._mtp_frequencies()
-        prev_hidden = outputs.last_hidden_state
-        step_logits: list = []
-        for k in range(1, n_steps + 1):
-            shifted = jnp.concatenate([input_ids[:, k:], jnp.zeros((b, k), dtype=input_ids.dtype)], axis=-1)
-            mtp_out = self.mtp(
-                prev_hidden_states=prev_hidden,
-                next_token_embeds=self._mtp_embed(shifted.astype("i4")),
-                frequencies=frequencies,
-                attention_mask=attention_mask,
-            )
-            prev_hidden = mtp_out.last_hidden_state
-            step_logits.append(self.compute_mtp_logits(mtp_out))
-        return jnp.stack(step_logits, axis=0)
-
-    def compute_mtp_loss(self, mtp_logits, labels, attention_mask=None, ignore_index: int = -100):
-        batch_size = labels.shape[0]
-        pad = jnp.full((batch_size, 2), ignore_index, dtype=labels.dtype)
-        shifted_labels = jnp.concatenate([labels[:, 2:], pad], axis=-1)
-        if attention_mask is not None:
-            mask_shifted = jnp.concatenate(
-                [attention_mask[:, 2:], jnp.zeros((batch_size, 2), dtype=attention_mask.dtype)], axis=-1
-            )
-            shifted_labels = jnp.where(mask_shifted.astype(jnp.bool_), shifted_labels, ignore_index)
-        logits = mtp_logits.astype(jnp.float32)
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
-        nll = -jnp.take_along_axis(log_probs, jnp.maximum(shifted_labels, 0)[..., None], axis=-1).squeeze(-1)
-        valid = (shifted_labels != ignore_index).astype(jnp.float32)
-        return jnp.sum(nll * valid) / jnp.maximum(jnp.sum(valid), 1.0)
-
-    def _maybe_add_mtp_aux_loss(self, outputs, input_ids, attention_mask, mode):
-        if self.mtp is None or input_ids is None:
-            return outputs
-        coef = self._mtp_loss_coef()
-        if coef <= 0.0:
-            return outputs
-        if mode in (common_types.MODE_DECODE, common_types.MODE_PREFILL, common_types.MODE_INSERT):
-            return outputs
-        if getattr(outputs, "last_hidden_state", None) is None:
-            return outputs
-        mtp_output = self.compute_mtp_outputs(outputs, input_ids=input_ids, attention_mask=attention_mask, mode=mode)
-        if mtp_output is None:
-            return outputs
-        mtp_logits = self.compute_mtp_logits(mtp_output)
-        mtp_loss = self.compute_mtp_loss(mtp_logits, input_ids, attention_mask) * coef
-        existing = getattr(outputs, "aux_loss", None)
-        new_aux = mtp_loss if existing is None else existing + mtp_loss
-        return outputs.replace(aux_loss=new_aux, mtp_logits=mtp_logits)
-
-
 @register_module(TaskType.CAUSAL_LM, config=Qwen3_5MoeTextConfig, model_type="qwen3_5_moe")
 @register_module(TaskType.CAUSAL_LM, config=Qwen3_5MoeTextConfig, model_type="qwen3_5_moe_text")
-class Qwen3_5MoeForCausalLM(_Qwen3_5MoeMTPMixin, Qwen3NextForCausalLM):
+class Qwen3_5MoeForCausalLM(Qwen3_5MTPMixin, Qwen3NextForCausalLM):
     """Qwen3.5-MoE text causal language model.
 
     Wraps :class:`Qwen3_5MoeTextModel` with a linear LM head for next-token
@@ -324,7 +201,9 @@ class Qwen3_5MoeForCausalLM(_Qwen3_5MoeMTPMixin, Qwen3NextForCausalLM):
                 else (inputs_embeds.shape[1] if inputs_embeds is not None else None)
             )
             mtp_mode = common_types.MODE_DECODE if seq_len == 1 else common_types.MODE_PREFILL
-        return self._maybe_add_mtp_aux_loss(outputs, input_ids, attention_mask, mtp_mode)
+        return self._maybe_add_mtp_aux_loss(
+            outputs, input_ids, attention_mask, mtp_mode, mask_info=mask_info, position_ids=position_ids
+        )
 
 
 @register_module(TaskType.BASE_MODULE, config=Qwen3_5MoeConfig, model_type="qwen3_5_moe")
@@ -452,6 +331,8 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
         cache_position: jax.Array | None = None,  # compatibility no-op
         rope_deltas: jax.Array | None = None,  # compatibility no-op
         mm_token_type_ids: jax.Array | None = None,
+        image_embeds: jax.Array | None = None,
+        output_router_logits: bool | None = None,
         **kwargs,
     ) -> Qwen3VLMoeModelOutputWithPast:
         """Forward pass through the Qwen3.5-MoE multimodal model.
@@ -482,6 +363,9 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
                 use deepstack mergers).
             deepstack_visual_embeds: Compatibility no-op.
             pixel_values: Packed image pixel values for the vision tower.
+            image_embeds: Pre-computed post-vision image embeddings, scattered at
+                image placeholders when pixel_values is None. Requires image_grid_thw
+                for correct 3-D mRoPE, and bypasses the vision tower.
             pixel_values_videos: Packed video pixel values for the vision tower.
             image_grid_thw: Per-image ``(T, H, W)`` grid dimensions.
             video_grid_thw: Per-video ``(T, H, W)`` grid dimensions.
@@ -492,6 +376,8 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
             rope_deltas: Compatibility no-op (overwritten internally).
             mm_token_type_ids: Per-token modality ids
                 (0=text, 1=image, 2=video) used for mRoPE construction.
+            output_router_logits: Return decoder router logits; None uses
+                the text configuration default.
             **kwargs: Forward-compatibility sink; ignored.
 
         Returns:
@@ -505,59 +391,10 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
             ValueError: If neither or both of ``input_ids`` and
                 ``inputs_embeds`` are provided.
         """
-        del rope_deltas, kwargs
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-        if inputs_embeds is None:
-            inputs_embeds = self.compute_embedding(input_ids)
-
-        image_embeds = None
-        video_embeds = None
-        if pixel_values is not None:
-            image_embeds_tuple, _deepstack_image_embeds = self.get_image_features(
-                pixel_values,
-                image_grid_thw,
-                image_max_grid_size,
-            )
-            image_embeds = jnp.concatenate(image_embeds_tuple, axis=0).astype(inputs_embeds.dtype)
-        if pixel_values_videos is not None:
-            video_embeds_tuple, _deepstack_video_embeds = self.get_video_features(
-                pixel_values_videos,
-                video_grid_thw,
-                video_max_grid_size,
-            )
-            video_embeds = jnp.concatenate(video_embeds_tuple, axis=0).astype(inputs_embeds.dtype)
-        if image_embeds is not None or video_embeds is not None:
-            inputs_embeds = self.compute_embedding(
-                input_ids,
-                inputs_embeds=inputs_embeds,
-                image_embeds=image_embeds,
-                video_embeds=video_embeds,
-            )
-
-        rope_deltas = None
-        if position_ids is None:
-            if mm_token_type_ids is not None:
-                position_ids, rope_deltas = mrope_position_ids_from_mm_token_types(
-                    input_ids=input_ids,
-                    mm_token_type_ids=mm_token_type_ids,
-                    image_grid_thw=image_grid_thw,
-                    video_grid_thw=video_grid_thw,
-                    attention_mask=attention_mask,
-                    spatial_merge_size=self.config.vision_config.spatial_merge_size,
-                )
-            else:
-                position_ids, rope_deltas = self.get_rope_index(
-                    input_ids=input_ids,
-                    image_grid_thw=image_grid_thw if pixel_values is not None else None,
-                    video_grid_thw=video_grid_thw if pixel_values_videos is not None else None,
-                    attention_mask=attention_mask,
-                )
-
-        position_ids = flatten_mrope_position_ids_for_text(self.config.text_config, position_ids)
-
-        outputs = self.language_model(
-            input_ids=None,
+        return qwen3_5_multimodal_forward(
+            self,
+            output_class=Qwen3VLMoeModelOutputWithPast,
+            input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             mask_info=mask_info,
@@ -567,20 +404,21 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
             cache_metadata=cache_metadata,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-        )
-
-        return Qwen3VLMoeModelOutputWithPast(
-            last_hidden_state=outputs.last_hidden_state,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            rope_deltas=rope_deltas,
+            pixel_values=pixel_values,
+            image_embeds=image_embeds,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            image_max_grid_size=image_max_grid_size,
+            video_max_grid_size=video_max_grid_size,
+            mm_token_type_ids=mm_token_type_ids,
+            output_router_logits=output_router_logits,
         )
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Qwen3_5MoeConfig, model_type="qwen3_5_moe")
 class Qwen3_5MoeForConditionalGeneration(
-    _Qwen3_5MoeMTPMixin, BaseVisionLanguageModule[Qwen3_5MoeModel, Qwen3_5MoeConfig]
+    Qwen3_5VisionMTPMixin, BaseVisionLanguageModule[Qwen3_5MoeModel, Qwen3_5MoeConfig]
 ):
     """Qwen3.5-MoE multimodal conditional generation model.
 
@@ -661,37 +499,9 @@ class Qwen3_5MoeForConditionalGeneration(
         else:
             self.mtp = None
 
-    # MTP hooks for the multimodal trunk (override the mixin defaults).
-    def _mtp_embed(self, token_ids_i4):
-        return self.model.get_input_embeddings()(token_ids_i4)
-
-    def _mtp_frequencies(self):
-        return getattr(self.model.language_model, "frequencies", None)
-
-    def _mtp_loss_coef(self) -> float:
-        return float(getattr(self.config.text_config, "mtp_loss_coef", 0.0))
-
     def forward(self, *args, **kwargs):
         """Vision-language forward with the MTP auxiliary loss folded into ``aux_loss``."""
-        outputs = super().forward(*args, **kwargs)
-        if self.mtp is None:
-            return outputs
-        input_ids = kwargs.get("input_ids")
-        if input_ids is None and args:
-            input_ids = args[0]
-        attention_mask = kwargs.get("attention_mask")
-        mode = kwargs.get("mode")
-        past_key_values = kwargs.get("past_key_values")
-        cache_metadata = kwargs.get("cache_metadata")
-        if mode is None and (past_key_values is not None or cache_metadata is not None):
-            inputs_embeds = kwargs.get("inputs_embeds")
-            seq_len = (
-                input_ids.shape[1]
-                if input_ids is not None
-                else (inputs_embeds.shape[1] if inputs_embeds is not None else None)
-            )
-            mode = common_types.MODE_DECODE if seq_len == 1 else common_types.MODE_PREFILL
-        return self._maybe_add_mtp_aux_loss(outputs, input_ids, attention_mask, mode)
+        return self._vision_forward_with_mtp(super().forward, *args, **kwargs)
 
     def get_input_embeddings(self):
         """Return the shared text token embedding layer.

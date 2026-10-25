@@ -102,7 +102,7 @@ from easydel.utils import flags
 from ..multimodal.side_inputs import empty_side_inputs, prefill_embeds_dtype
 from ..utils import model_uses_mrope
 from .async_types import DeviceInputTokenHandoff
-from .execution_types import ModelStepOutputs, StepFunctionInputs
+from .execution_types import CacheGroupInputs, ModelStepOutputs, StepFunctionInputs
 from .executors import BatchMetadataPreparer, ModelStepExecutor, SamplerExecutor, SamplerRuntime
 from .executors.compile_orchestrator import CompileOrchestrator, _tree_hash, _tree_hash_diff
 from .executors.pipeline_microbatch import PipelineMicrobatchExecutor
@@ -426,6 +426,11 @@ class ExecutionManager:
         full_hidden_state_max_tokens: int = 0,
         speculative_recurrent_state_tokens: int = 0,
         speculative_trace_tokens: int = 0,
+        debug_mode: bool | None = None,
+        cache_group_configs: tuple[RaggedPagesCacheConfig | UnifiedAttentionCacheConfig, ...] = (),
+        layer_to_cache_group: tuple[int, ...] = (),
+        host_payloads_replicated: bool = False,
+        request_seeds: tp.Mapping[int, int] | None = None,
     ):
         """Initialize the executor manager.
 
@@ -458,6 +463,16 @@ class ExecutionManager:
             speculative_trace_tokens: Verify-window width for which per-slot
                 caches keep projection traces (replay-free speculative rollback
                 of compressed-window caches). Zero allocates none.
+            debug_mode: When true, every ``execute`` hashes the model/sampler inputs and diffs them against the
+                compile-time baselines (recompilation diagnostics). ``None`` uses the module default ``DEBUG_MODE``.
+            cache_group_configs: Independent pool configurations in runtime group order. Empty retains the
+                single-table API. Supply these before compilation so warmup and runtime have identical PyTrees.
+            layer_to_cache_group: Static model-layer to group-index mapping; required with grouped configs.
+            host_payloads_replicated: Whether this manager's coordinator already replicates host payloads.
+                Independent managers retain their own synchronization policy. Update this property between steps
+                if the coordinator is initialized after the manager.
+            request_seeds: Live mapping of global sequence-buffer rows to request seeds. Retained without copying
+                so row moves and removals are visible to the sampler.
         """
         if metadata is None:
             raise ValueError("ExecutionManager requires a paged cache config `metadata`.")
@@ -468,6 +483,7 @@ class ExecutionManager:
         logger.info(f"initializing eSurge-ExecutionManager {_attn_mech} (cache={_cache_ver}, max_tokens={_max_tok})")
         self.model = model
         self.mesh = model.mesh
+        self.host_payloads_replicated = host_payloads_replicated
 
         self.use_aot_forward = use_aot_forward
         self.full_hidden_state_max_tokens = max(0, int(full_hidden_state_max_tokens))
@@ -502,6 +518,9 @@ class ExecutionManager:
             )
         self.max_num_tokens = max_num_tokens if max_num_tokens is not None else max_model_len
         self.metadata = metadata
+        self.cache_group_configs = tuple(cache_group_configs)
+        self.layer_to_cache_group = tuple(layer_to_cache_group)
+        self._validate_cache_group_mapping()
         self._metadata_version = metadata.version
         self._use_slot_mapping = metadata.version == "v2"
         self._use_request_distribution = not self._use_slot_mapping
@@ -543,6 +562,7 @@ class ExecutionManager:
         self.rng_key = jax.device_put(jax.random.PRNGKey(0), self._sampler_sharding)
 
         self._debug_baselines = {}
+        self._debug_mode = DEBUG_MODE if debug_mode is None else bool(debug_mode)
 
         self._batch_preparer = BatchMetadataPreparer(
             metadata=self.metadata,
@@ -554,6 +574,9 @@ class ExecutionManager:
             enable_spec_recurrent_commit=self.enable_spec_recurrent_commit_metadata,
             input_sharding=self._input_sharding,
             slot_indexed_state=self._slot_indexed_state,
+            cache_group_configs=self.cache_group_configs,
+            layer_to_cache_group=self.layer_to_cache_group,
+            host_payloads_replicated=self.host_payloads_replicated,
         )
         self._model_executor = ModelStepExecutor(
             model=self.model,
@@ -572,6 +595,8 @@ class ExecutionManager:
             enable_spec_recurrent_commit=self.enable_spec_recurrent_commit_metadata,
             input_sharding=self._input_sharding,
             slot_indexed_state=self._slot_indexed_state,
+            cache_group_configs=self.cache_group_configs,
+            layer_to_cache_group=self.layer_to_cache_group,
         )
         self._sampler_vocab_size = int(self.model.config.get_text_config().vocab_size)
         self._sampler_executor = SamplerExecutor(
@@ -592,6 +617,8 @@ class ExecutionManager:
             min_input_pad=self._sampler_min_input_pad,
             sampler_sharding=self._sampler_sharding,
             empty_sharding=self._empty_sharding,
+            host_payloads_replicated=self.host_payloads_replicated,
+            request_seeds=request_seeds,
         )
         self._req_num_tokens_placeholder = jnp.zeros(
             (self.max_num_reqs,),
@@ -605,6 +632,26 @@ class ExecutionManager:
         self._pp_microbatch: PipelineMicrobatchExecutor | None = None
         if self.pipeline_plan is not None and self.pipeline_plan.is_enabled:
             self._pp_microbatch = PipelineMicrobatchExecutor(self)
+
+    @property
+    def host_payloads_replicated(self) -> bool:
+        """Whether this manager's coordinator guarantees identical host payloads."""
+        return self._host_payloads_replicated
+
+    @host_payloads_replicated.setter
+    def host_payloads_replicated(self, enabled: bool) -> None:
+        """Update preparation and sampling policy together, between scheduler steps.
+
+        Existing grouped and asynchronous preparers inherit the change through
+        the batch preparer's policy setter. No other manager is affected.
+        """
+        self._host_payloads_replicated = bool(enabled)
+        preparer = getattr(self, "_batch_preparer", None)
+        if preparer is not None:
+            preparer.host_payloads_replicated = self._host_payloads_replicated
+        sampler = getattr(self, "sampler_runtime", None)
+        if sampler is not None:
+            sampler.host_payloads_replicated = self._host_payloads_replicated
 
     def _init_operations_cache_with_retry(self, *, quantizer: tp.Any, masking_details: tp.Any) -> tp.Any:
         """Allocate the model's operations cache, shrinking pages on PP HBM-OOM.
@@ -700,6 +747,88 @@ class ExecutionManager:
         if self._pp_microbatch is not None:
             self._pp_microbatch.clear_cache()
 
+    @property
+    def main_hidden_enabled(self) -> bool:
+        """Whether model steps include the auxiliary DSpark main-hidden rows."""
+        return bool(self._model_executor.main_hidden_enabled)
+
+    def set_main_hidden_enabled(self, enabled: bool = True) -> None:
+        """Configure DSpark main-hidden output before compiling model steps.
+
+        Args:
+            enabled: Whether model steps also return the backbone's main hidden rows.
+
+        Raises:
+            RuntimeError: If changing the output layout after model compilation.
+        """
+        enabled = bool(enabled)
+        if enabled == self._model_executor.main_hidden_enabled:
+            return
+        if self._model_executor.cache_keys():
+            raise RuntimeError("Configure main-hidden output before compiling model steps")
+        self._model_executor.main_hidden_enabled = enabled
+
+    def project_hidden_rows(self, hidden_rows: jax.Array) -> jax.Array:
+        """Project hidden rows through the LM head, compiling a missing row bucket.
+
+        Uses the executor's live runtime graph arguments, including packed SPMD
+        arguments and stage-local MPMD state. Callers pass only the LM-head hidden
+        channels, not any auxiliary main-hidden channels returned for a drafter.
+
+        Args:
+            hidden_rows: Hidden states shaped ``[num_rows, hidden_dim]``.
+
+        Returns:
+            Vocabulary logits shaped ``[num_rows, vocab_size]``.
+
+        Raises:
+            RuntimeError: If model state has been released.
+            ValueError: If the input is not a matrix.
+        """
+        if self.model is None or self.graphstate is None or self.graphother is None:
+            raise RuntimeError("Restore model state with update_graphs before projecting hidden rows")
+        if hidden_rows.ndim != 2:
+            raise ValueError("hidden_rows must have shape [num_rows, hidden_dim]")
+        num_rows = int(hidden_rows.shape[0])
+        try:
+            lm_head_fn = self._model_executor.get_lm_head(padded_num_reqs=num_rows)
+        except KeyError:
+            # LM-head compilation consumes only graph state and hidden rows; it
+            # does not need a dummy KV cache, token buffer or batch metadata.
+            self._model_executor.compile_lm_head(
+                padded_num_reqs=num_rows,
+                graphdef=self.graphdef,
+                graphstate=self.graphstate,
+                graphother=self.graphother,
+                inputs=None,
+                hidden_dim=int(hidden_rows.shape[1]),
+                dtype=hidden_rows.dtype,
+            )
+            lm_head_fn = self._model_executor.get_lm_head(padded_num_reqs=num_rows)
+        graphstate_arg, graphother_arg = self._model_executor.runtime_graph_args()
+        return lm_head_fn(graphstate_arg, graphother_arg, hidden_rows)
+
+    def release_model_state(self, *, clear_compiled_cache: bool = False) -> None:
+        """Drop live model and runtime graph references from both executors.
+
+        The runner must ensure requests are idle before calling this method.
+        Restore state with :meth:`update_graphs` before executing again. Compiled
+        executables and their trace templates are retained by default for reuse.
+
+        Args:
+            clear_compiled_cache: Whether to also discard compiled variants.
+        """
+        if clear_compiled_cache:
+            self.clear_cache()
+        self.model = None
+        self.graphdef = None
+        self.graphstate = None
+        self.graphother = None
+        self._model_executor.model = None
+        self._model_executor.graphdef = None
+        self._model_executor.clear_runtime_graph_args()
+        self._sampler_executor.model = None
+
     def invalidate_sampler_penalty_state(
         self,
         token_ids_cpu: numpy.ndarray | None = None,
@@ -713,9 +842,13 @@ class ExecutionManager:
         """
         self.sampler_runtime.invalidate_sampler_penalty_state(token_ids_cpu, seq_lens_cpu)
 
-    def _ensure_sampler_penalty_state(self) -> None:
-        """Delegate to :meth:`SamplerRuntime._ensure_sampler_penalty_state`."""
-        self.sampler_runtime._ensure_sampler_penalty_state()
+    def overwrite_sampler_penalty_rows(self, rows) -> None:
+        """Delegate to :meth:`SamplerRuntime.overwrite_sampler_penalty_rows`.
+
+        Args:
+            rows: ``(global_row, token_ids, counts)`` per sequence-buffer row to overwrite.
+        """
+        self.sampler_runtime.overwrite_sampler_penalty_rows(rows)
 
     def _prepare_compact_sampler_window(self, **kwargs) -> tuple[int, int, int]:
         """Delegate to :meth:`SamplerRuntime._prepare_compact_sampler_window`."""
@@ -947,15 +1080,12 @@ class ExecutionManager:
 
     def _has_backbone_variant(self, num_tokens: int, *, use_pipeline_runtime: bool = True) -> bool:
         """Compatibility wrapper for checking a compiled backbone bucket."""
-        try:
-            return bool(
-                self._model_executor.has_backbone(
-                    int(num_tokens),
-                    use_pipeline_runtime=bool(use_pipeline_runtime),
-                )
+        return bool(
+            self._model_executor.has_backbone(
+                int(num_tokens),
+                use_pipeline_runtime=bool(use_pipeline_runtime),
             )
-        except TypeError:
-            return bool(self._model_executor.has_backbone(int(num_tokens)))
+        )
 
     def update_graphs(
         self,
@@ -1030,6 +1160,66 @@ class ExecutionManager:
 
         self._debug_baselines.clear()
 
+    def _validate_cache_group_mapping(self) -> None:
+        """Reject ambiguous static layouts before compiling any group-dependent PyTree."""
+        configs = self.cache_group_configs
+        mapping = self.layer_to_cache_group
+        if bool(configs) != bool(mapping):
+            raise ValueError("cache_group_configs and layer_to_cache_group must be supplied together")
+        if any(not isinstance(index, int) or index < 0 or index >= len(configs) for index in mapping):
+            raise ValueError("layer_to_cache_group contains an invalid cache group index")
+        for config in configs:
+            if int(getattr(config, "data_parallel_size", 1)) != int(getattr(self.metadata, "data_parallel_size", 1)):
+                raise ValueError("Every cache group must use the model batch's data-parallel layout")
+            if min(int(config.get_max_num_seqs()), self.max_num_reqs) != min(
+                int(self.metadata.get_max_num_seqs()), self.max_num_reqs
+            ):
+                raise ValueError("Every cache group must use the same request-row capacity")
+
+    def prepare_batch_metadata(
+        self,
+        *,
+        cache_group_inputs: tuple[CacheGroupInputs, ...] = (),
+        **kwargs,
+    ):
+        """Prepare the model batch and complete independent pool payloads.
+
+        The legacy preparer still owns token/sampler packing. Each group uses its
+        own preparer and configuration for tables, v2 slot writes, rank-major DP,
+        local positions and lengths, including normal multi-host payload broadcasts.
+        A changed window identity creates a fresh staging/cache instance even when
+        allocator versions and row counts happen to match. Only one instance per
+        group is retained, so packed-window churn cannot grow an unbounded cache.
+
+        Args:
+            cache_group_inputs: All pool inputs in static config order. Each table
+                and optional cache-local computed vector is already in the same
+                compact window-row order as the other host vectors in ``kwargs``.
+            **kwargs: Existing BatchMetadataPreparer.prepare_batch_metadata arguments.
+
+        Returns:
+            The legacy five-element preparation result, with complete grouped
+            RaggedPagesMetadata leaves and a static layer mapping on BatchMetadata.
+
+        Raises:
+            ValueError: If a configured group is absent or table/progress rows differ.
+        """
+        configs = getattr(self, "cache_group_configs", ())
+        if len(cache_group_inputs) != len(configs):
+            raise ValueError("cache_group_inputs must contain one payload per configured cache group")
+        row_count = int(kwargs["token_ids_cpu"].shape[0])
+        for group in cache_group_inputs:
+            if group.page_table_cpu.ndim != 2 or group.page_table_cpu.shape[0] != row_count:
+                raise ValueError("Every group page table must align with the compact token window rows")
+            if group.window_identity is not None and len(group.window_identity) != row_count:
+                raise ValueError("Cache group window identity must identify every compact token window row")
+            if group.num_computed_tokens_cpu is not None and group.num_computed_tokens_cpu.shape != (row_count,):
+                raise ValueError("Cache group computed progress must align with the compact token window rows")
+
+        return self._batch_preparer.prepare_batch_metadata(
+            **({"cache_group_inputs": cache_group_inputs} if configs else {}), **kwargs
+        )
+
     def execute(
         self,
         num_tokens: int,
@@ -1068,6 +1258,7 @@ class ExecutionManager:
         device_token_handoff: DeviceInputTokenHandoff | None = None,
         wait_for_outputs: bool = True,
         model_side_inputs_cpu: dict[str, numpy.ndarray] | None = None,
+        cache_group_inputs: tuple[CacheGroupInputs, ...] = (),
     ) -> tuple[
         jax.Array,
         jax.Array,
@@ -1135,6 +1326,8 @@ class ExecutionManager:
                 completion; otherwise the returned arrays may still be running.
             model_side_inputs_cpu: Optional model-declared per-token side inputs ``{name: [num_tokens, ...]}``
                 (models declaring ``esurge_side_input_specs``).
+            cache_group_inputs: Complete per-pool tables, independent versions, window identities and optional
+                cache-local progress, in the static ``cache_group_configs`` order. Empty preserves the legacy API.
 
         Returns:
             Tuple of 7 elements:
@@ -1170,6 +1363,13 @@ class ExecutionManager:
             ... )
             >>> new_state, tokens, valid, *rest = results
         """
+        if cache_group_inputs or getattr(self, "cache_group_configs", ()):
+            if len(cache_group_inputs) != len(self.cache_group_configs):
+                raise ValueError("cache_group_inputs must contain one payload per configured cache group")
+            if self._pp_microbatch is not None and not getattr(self._pp_microbatch, "supports_cache_groups", False):
+                raise NotImplementedError(
+                    "The PP microbatch executor must window every cache group before grouped execution"
+                )
         if self._verbose and num_tokens > 0:
             logger.info(
                 "[esurge-prof-exec] enter tok=%d reqs=%d wait=%s",
@@ -1178,7 +1378,18 @@ class ExecutionManager:
                 bool(wait_for_outputs),
             )
         microbatch_result = None
-        if self._pp_microbatch is not None:
+        # The wavefront path builds per-microbatch metadata without model side inputs, physical recurrent-state slots
+        # or speculative recurrent commits; a step that needs any of them must take the full-window path instead.
+        # The runner supplies recurrent_slot_indices_cpu for every model, including ordinary attention models.
+        # BatchMetadataPreparer consumes those indices only for slot-indexed state or SPMD DP, so gate on those
+        # capabilities rather than the presence of the always-allocated bookkeeping array.
+        microbatch_unsupported = (
+            bool(model_side_inputs_cpu)
+            or self._slot_indexed_state
+            or self._batch_preparer._uses_spmd_dp()
+            or spec_recurrent_commit_cpu is not None
+        )
+        if self._pp_microbatch is not None and not microbatch_unsupported:
             microbatch_result = self._pp_microbatch.try_execute(
                 num_tokens=num_tokens,
                 scheduled_full_cpu=scheduled_full_cpu,
@@ -1209,6 +1420,7 @@ class ExecutionManager:
                 video_grid_thw=video_grid_thw,
                 device_token_handoff=device_token_handoff,
                 wait_for_outputs=wait_for_outputs,
+                **({"cache_group_inputs": cache_group_inputs} if cache_group_inputs else {}),
             )
         if microbatch_result is not None:
             if self._verbose and num_tokens > 0:
@@ -1223,7 +1435,8 @@ class ExecutionManager:
             position_ids_buf,
             scheduled_full,
             active_mask_full,
-        ) = self._batch_preparer.prepare_batch_metadata(
+        ) = self.prepare_batch_metadata(
+            cache_group_inputs=cache_group_inputs,
             num_tokens_static=num_tokens,
             scheduled_full_cpu=scheduled_full_cpu,
             active_mask_full_cpu=active_mask_full_cpu,
@@ -1431,10 +1644,10 @@ class ExecutionManager:
             inputs = jax.block_until_ready(inputs)
         prep_pack_inputs_took = time.time() - prep_phase_start
         prep_took = time.time() - start_prep
-        if DEBUG_MODE:
-            model_hash = _tree_hash((self.graphstate, self.graphother, inputs))
-            model_hash_baseline = self._debug_baselines[f"{num_tokens}_hash_in_backbone"]
-            _tree_hash_diff(model_hash_baseline, model_hash)
+        if self._debug_mode:
+            model_hash_baseline = self._debug_baselines.get(f"{num_tokens}_hash_in_backbone")
+            if model_hash_baseline is not None:
+                _tree_hash_diff(model_hash_baseline, _tree_hash((self.graphstate, self.graphother, inputs)))
 
         need_penalties = bool(
             numpy.any(frequency_penalties_cpu != 0.0)
@@ -1515,10 +1728,10 @@ class ExecutionManager:
             self._sampler_repetition_penalties_cpu[:sampler_padded_num_reqs],
         )
 
-        if DEBUG_MODE:
-            sampler_hash = _tree_hash(sampler_inputs)
-            sampler_hash_baseline = self._debug_baselines[f"{num_tokens}_{sampler_padded_num_reqs}_hash_in_sampler"]
-            _tree_hash_diff(sampler_hash_baseline, sampler_hash)
+        if self._debug_mode:
+            sampler_hash_baseline = self._debug_baselines.get(f"{num_tokens}_{sampler_padded_num_reqs}_hash_in_sampler")
+            if sampler_hash_baseline is not None:
+                _tree_hash_diff(sampler_hash_baseline, _tree_hash(sampler_inputs))
 
         # Enqueue sampling immediately (it will run after the forward pass),
         # then synchronize on logits to measure forward time without an extra
@@ -1653,9 +1866,8 @@ class ExecutionManager:
             metrics,
         )
 
-    # Device-token-handoff application moved to BatchMetadataPreparer (phase
-    # 11.3); kept as a static alias because execute(), the PP microbatch
-    # executor, and tests call it as ExecutionManager._apply_device_token_handoff.
+    # Preserve the manager's existing static entry point. The shared preparer
+    # helper structurally updates handoff leaves without dropping cache groups.
     _apply_device_token_handoff = staticmethod(BatchMetadataPreparer._apply_device_token_handoff)
 
     def _greedy_valid_mask_device(self, valid_mask_cpu) -> jax.Array:
@@ -2142,6 +2354,15 @@ class ExecutionManager:
         model_side_inputs_cpu = empty_side_inputs(self.model, int(num_tokens))
 
         page_table_cpu_dummy = temp_buffer.page_table[0].page_table_cpu
+        # Every configured pool contributes the same dynamic leaves in warmup
+        # and runtime, even if its page size/slot-update layout differs.
+        cache_group_inputs = tuple(
+            CacheGroupInputs(
+                page_table_cpu=numpy.zeros((max_num_reqs, int(config.max_num_pages_per_req)), dtype=numpy.int32),
+                window_identity=tuple(range(max_num_reqs)),
+            )
+            for config in getattr(self, "cache_group_configs", ())
+        )
 
         (
             dummy_metadata,
@@ -2149,7 +2370,8 @@ class ExecutionManager:
             position_ids_buf,
             scheduled_full,
             active_mask_full,
-        ) = self._batch_preparer.prepare_batch_metadata(
+        ) = self.prepare_batch_metadata(
+            cache_group_inputs=cache_group_inputs,
             num_tokens_static=num_tokens,
             scheduled_full_cpu=scheduled_full_cpu,
             active_mask_full_cpu=active_mask_full_cpu,

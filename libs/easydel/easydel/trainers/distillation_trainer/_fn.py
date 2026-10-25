@@ -35,8 +35,6 @@ import jax
 import optax  # pyright: ignore[reportMissingTypeStubs]
 import spectrax as spx
 from ejkernel.modules.operations import fused_cross_entropy as _fused_ce
-from ejkernel.modules.operations import fused_kl_divergence as _fused_kl
-from jax import Array as JaxArray
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec
@@ -48,9 +46,11 @@ from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..training_utils import (
     ScheduledLossAdapter,
+    accumulate_microbatch,
     bind_scheduled_module,
     constrain_batch_sharding,
     filter_kwargs_for_callable,
+    finalize_accumulation,
     make_assertions_and_get_sizes,
     minibatch_call,
     register_scheduled_loss_adapter,
@@ -61,6 +61,8 @@ from ..training_utils import (
     update_metrics,
     update_state_respectfully,
 )
+from .loss_groups import LOSS_GROUP_IDS_KEY, LOSS_TOKEN_WEIGHTS_KEY
+from .loss_utils import fused_kl_vocab_parallel, resolve_kl_direction
 
 
 def _constrain_distillation_input_batch(
@@ -151,51 +153,6 @@ def _per_token_xent(
     return per_token_distill_xent, per_token_teacher_entropy
 
 
-def _kl_div_from_log_probs(log_target: Array, log_input: Array) -> Array:
-    """Return per-token ``KL(target || input)`` from log-probabilities."""
-    target_probs = jnp.exp(log_target)
-    return jnp.sum(target_probs * (log_target - log_input), axis=-1)
-
-
-def _per_token_generalized_jsd(
-    teacher_logits: Array,
-    student_logits: Array,
-    temperature: float,
-    beta: float,
-    dtype: jnp.dtype,
-) -> Array:
-    """Compute per-token generalized Jensen-Shannon distillation loss.
-
-    Uses the same convention as EasyDeL GKD:
-    ``m = (1 - beta) * p_s + beta * p_t`` and
-    ``beta * KL(p_t || m) + (1 - beta) * KL(p_s || m)``.
-    """
-    student_log_probs = jax.nn.log_softmax(student_logits.astype(jnp.float32) / temperature, axis=-1)
-    teacher_log_probs = jax.lax.stop_gradient(
-        jax.nn.log_softmax(teacher_logits.astype(jnp.float32) / temperature, axis=-1)
-    )
-    if beta <= 0.0:
-        # GKD/TRL beta->0 limit: forward KL(p_teacher || p_student).
-        return _kl_div_from_log_probs(teacher_log_probs, student_log_probs).astype(dtype)
-    if beta >= 1.0:
-        # GKD/TRL beta->1 limit: reverse KL(p_student || p_teacher).
-        return _kl_div_from_log_probs(student_log_probs, teacher_log_probs).astype(dtype)
-    beta_val = jnp.asarray(beta, dtype=jnp.float32)
-    mixture_log_probs = jax.scipy.special.logsumexp(
-        jnp.stack(
-            [
-                student_log_probs + jnp.log1p(-beta_val),
-                teacher_log_probs + jnp.log(beta_val),
-            ]
-        ),
-        axis=0,
-    )
-    kl_teacher = _kl_div_from_log_probs(teacher_log_probs, mixture_log_probs)
-    kl_student = _kl_div_from_log_probs(student_log_probs, mixture_log_probs)
-    per_token = beta_val * kl_teacher + (jnp.asarray(1.0, dtype=jnp.float32) - beta_val) * kl_student
-    return per_token.astype(dtype)
-
-
 def _per_token_topk_xent(
     teacher_logits: Array,
     student_logits: Array,
@@ -242,6 +199,61 @@ def _per_token_topk_xent(
     return xent, entropy
 
 
+def _per_token_topk_xent_from_cache(
+    student_logits: Array,
+    teacher_topk_idx: Array,
+    teacher_topk_logp: Array,
+    teacher_tail_logp: Array | None,
+    add_tail: bool,
+) -> tuple[Array, Array]:
+    """Teacher-top-k distillation cross-entropy and entropy from CACHED teacher tensors (T = 1).
+
+    The offline-teacher twin of :func:`_per_token_topk_xent`: the teacher's top-k ids and full-vocabulary
+    log-probs come from the cache, only the student side is computed here. With the cache holding the
+    teacher's exact top-k this equals :func:`_per_token_topk_xent` term by term:
+
+    * ``add_tail=True``: ``xent = -(sum_k p_k log s_k + p_T log s_T)`` with ``s_T = clip(1 - sum_k s_k)`` and
+      ``p_T = exp(teacher_tail_logp)`` when given (exact even for tiny tails), else ``clip(1 - sum_k p_k)``;
+      ``entropy = -(sum_k p_k log p_k + p_T log p_T)``.
+    * ``add_tail=False``: both distributions renormalised over the k support.
+
+    Args:
+        student_logits: ``[..., V]`` student logits.
+        teacher_topk_idx: ``[..., k]`` vocabulary ids of the teacher's top-k.
+        teacher_topk_logp: ``[..., k]`` teacher log-probs at those ids (normalised over the full vocabulary).
+        teacher_tail_logp: ``[...]`` teacher log tail mass, or ``None`` to derive it from the top-k.
+        add_tail: Tail-bucket form or support-renormalised form.
+
+    Returns:
+        ``(per_token_distill_xent, per_token_teacher_entropy)`` float32 tensors of shape ``[...]``.
+    """
+    student_log_probs = jax.nn.log_softmax(student_logits.astype(jnp.float32), axis=-1)
+    top_student_log_probs = jnp.take_along_axis(student_log_probs, teacher_topk_idx.astype(jnp.int32), axis=-1)
+    top_teacher_log_probs = jax.lax.stop_gradient(teacher_topk_logp.astype(jnp.float32))
+    if add_tail:
+        eps = jnp.asarray(1e-7, dtype=jnp.float32)
+        top_teacher_probs = jnp.exp(top_teacher_log_probs)
+        if teacher_tail_logp is not None:
+            teacher_tail_log_prob = jax.lax.stop_gradient(teacher_tail_logp.astype(jnp.float32))
+            teacher_tail_prob = jnp.exp(teacher_tail_log_prob)
+        else:
+            teacher_tail_prob = jnp.clip(1.0 - jnp.sum(top_teacher_probs, axis=-1), eps, 1.0)
+            teacher_tail_log_prob = jnp.log(teacher_tail_prob)
+        student_tail_prob = jnp.clip(1.0 - jnp.sum(jnp.exp(top_student_log_probs), axis=-1), eps, 1.0)
+        student_tail_log_prob = jnp.log(student_tail_prob)
+        xent = -(jnp.sum(top_teacher_probs * top_student_log_probs, axis=-1) + teacher_tail_prob * student_tail_log_prob)
+        entropy = -(
+            jnp.sum(top_teacher_probs * top_teacher_log_probs, axis=-1) + teacher_tail_prob * teacher_tail_log_prob
+        )
+        return xent, entropy
+    teacher_support_log_probs = jax.nn.log_softmax(top_teacher_log_probs, axis=-1)
+    student_support_log_probs = jax.nn.log_softmax(top_student_log_probs, axis=-1)
+    teacher_support_probs = jnp.exp(teacher_support_log_probs)
+    xent = -jnp.sum(teacher_support_probs * student_support_log_probs, axis=-1)
+    entropy = -jnp.sum(teacher_support_probs * teacher_support_log_probs, axis=-1)
+    return xent, entropy
+
+
 def _compute_kl_and_ce(
     student_logits: Array,
     teacher_logits: Array,
@@ -249,8 +261,12 @@ def _compute_kl_and_ce(
     safe_labels: Array,
     use_hard_labels: bool,
     temperature: float,
-) -> tuple[Array, Array, Array, Array]:
+    group_onehot: Array | None = None,
+) -> tuple[Array, ...]:
     """Reduce per-token KL/CE contributions over one chunk of logits.
+
+    With ``group_onehot`` (``[..., G]``) two more ``[G]`` outputs follow: the per-group masked KL sums and
+    mask mass.
 
     Wraps :func:`_per_token_xent` with mask-weighted summation and the
     optional hard-label cross-entropy on the student logits. Returns
@@ -296,6 +312,9 @@ def _compute_kl_and_ce(
         )
         ce_sum = jnp.sum(per_token_ce * mask_f32)
 
+    if group_onehot is not None:
+        kl_sums, mass_sums = _group_sums(per_token_distill_xent - per_token_teacher_entropy, mask_f32, group_onehot)
+        return distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum, kl_sums, mass_sums
     return distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum
 
 
@@ -525,7 +544,8 @@ def distillation_loss(
         Masking semantics follow ``loss_mask`` > ``attention_mask`` and combine
         with ``labels != -100`` when labels are provided.
     """
-    dtype = student_logits.dtype
+    # Loss mixing and reductions must retain float32 precision even for bf16 logits.
+    dtype = jnp.float32
     # The teacher is frozen in distillation: detach it so no gradient leaks into the
     # teacher branch (the fused-KL forward path only stop-grads in some temperature
     # regimes). No-op for real training where teacher params aren't trainable.
@@ -608,50 +628,23 @@ def distillation_loss(
         # Vocab-parallel KL keeps the full [B, S, V] logits sharded. The XLA backend
         # supports forward, reverse, and JSD in this mode; TileLang's TP path is
         # narrower, so EasyDeL forces platform="xla".
-        use_vocab_parallel = _vp_mesh is not None
-
         def _run_fused_kl(
             direction: str,
             *,
             beta_value: float = 0.5,
             want_entropy: bool = False,
         ):
-            if use_vocab_parallel:
-                # Passing mesh/in_specs/out_specs wraps the XLA kernel in shard_map and reduces the softmax
-                # normalizer with psum over TP, so the full unsharded [B, S, V] logits are never all-reduced.
-                # Pad leading [batch, seq] dims up to meshed-axis divisibility; padded rows carry zero weight.
-                _kl_pads = _vp_leading_pads(student_logits.shape[:-1], _vp_token_spec, _vp_mesh)
-                _kl_s, _kl_t, _kl_w = student_logits, teacher_logits, mask
-                if any(_kl_pads):
-                    if _kl_w is None:
-                        _kl_w = jnp.ones(student_logits.shape[:-1], dtype=jnp.float32)
-                    _kl_s = _pad_leading(student_logits, _kl_pads)
-                    _kl_t = _pad_leading(teacher_logits, _kl_pads)
-                    _kl_w = _pad_leading(_kl_w, _kl_pads, fill=0.0)
-                return _fused_kl(
-                    _kl_s,
-                    _kl_t,
-                    _kl_w,
-                    reduction="mean",
-                    direction=direction,
-                    temperature=temperature,
-                    beta=float(beta_value),
-                    return_teacher_entropy=want_entropy,
-                    platform="xla",
-                    mesh=_vp_mesh,
-                    in_specs=(_vp_logit_spec, _vp_logit_spec, _vp_token_spec),
-                    out_specs=PartitionSpec(),
-                )
-            return _fused_kl(
+            return fused_kl_vocab_parallel(
                 student_logits,
                 teacher_logits,
                 mask,
-                reduction="mean",
                 direction=direction,
                 temperature=temperature,
-                beta=float(beta_value),
+                beta=beta_value,
                 return_teacher_entropy=want_entropy,
-                platform="xla",  # XLA is the bandwidth-optimal KL backend on TPU (Pallas loses)
+                mesh=_vp_mesh,
+                logit_spec=_vp_logit_spec,
+                token_spec=_vp_token_spec,
             )
 
         if cakld_gamma is not None:
@@ -667,14 +660,8 @@ def distillation_loss(
             distill_xent_loss = kl_loss
             teacher_entropy_loss = jnp.zeros((), dtype=jnp.float32)
         else:
-            if beta is None:
-                direction, want_entropy = "forward", True  # KL(p_t || p_s), report entropy split
-            elif beta <= 0.0:
-                direction, want_entropy = "forward", False  # KL(p_t || p_s): GKD/TRL beta->0 limit
-            elif beta >= 1.0:
-                direction, want_entropy = "reverse", False  # KL(p_s || p_t): GKD/TRL beta->1 limit
-            else:
-                direction, want_entropy = "jsd", False
+            direction = resolve_kl_direction(beta)
+            want_entropy = beta is None
             out = _run_fused_kl(
                 direction,
                 beta_value=(0.5 if beta is None else float(beta)),
@@ -692,6 +679,8 @@ def distillation_loss(
     ce_loss = jnp.array(0.0, dtype=dtype)
     if use_hard_labels and labels is not None and alpha < 1.0:
         safe_labels = jnp.where(labels == -100, 0, labels)
+        # Binary kernel weights: the (possibly loss-group weighted) mask is applied once, below.
+        kernel_ce_weights = None if mask is None else (mask != 0).astype(dtype)
         if _vp_mesh is not None:
             # Match the KL: with a tensor-parallel-sharded vocabulary, compute the supervised CE
             # vocab-parallel too via the module op (softmax normalizer + target-logit gather via psum
@@ -707,11 +696,11 @@ def distillation_loss(
             _ce_pads = _vp_leading_pads(student_logits.shape[:-1], _vp_token_spec, _vp_mesh)
             _ce_s = student_logits
             _ce_l = safe_labels.astype(jnp.int32)
-            _ce_w = mask
+            _ce_w = kernel_ce_weights
             if any(_ce_pads):
                 _ce_s = _pad_leading(student_logits, _ce_pads)
                 _ce_l = _pad_leading(safe_labels.astype(jnp.int32), _ce_pads, fill=-100)
-                _ce_w = _pad_leading(mask, _ce_pads, fill=0.0) if mask is not None else None
+                _ce_w = _pad_leading(kernel_ce_weights, _ce_pads, fill=0.0) if mask is not None else None
             ce_out = _fused_ce(
                 _ce_s,
                 _ce_l,
@@ -732,7 +721,7 @@ def distillation_loss(
             ce_out = _fused_ce(
                 student_logits,
                 safe_labels.astype(jnp.int32),
-                mask,
+                kernel_ce_weights,
                 reduction="none",
                 ignore_index=-100,
                 platform="xla",
@@ -809,55 +798,24 @@ def mtp_distillation_loss(
             raise ValueError("`cakld_gamma` must be within [0, 1] when set.")
         if beta is not None:
             raise ValueError("`cakld_gamma` is mutually exclusive with GJSD `beta`.")
-    elif beta is None or beta <= 0.0:
-        direction = "forward"  # GKD/TRL beta->0 limit (and the classic-KD default)
-    elif beta >= 1.0:
-        direction = "reverse"  # GKD/TRL beta->1 limit
-    else:
-        direction = "jsd"
+    direction = resolve_kl_direction(beta)
 
     # Vocab-parallel KL via shard_map (same mechanism as ``distillation_loss``): keeps the vocab
     # TP-sharded so the full [B, S, V] MTP logits are never all-reduced.
     vp_mesh = _resolve_vocab_parallel_mesh(partition_manager)
 
     def _run_mtp_kl(direction: str, beta_value: float = 0.5) -> Array:
-        if vp_mesh is not None:
-            kl_weights = mtp_mask if mtp_mask is not None else jnp.ones(student_mtp_logits.shape[:-1], dtype=jnp.float32)
-            logit_spec = partition_manager.resolve([BATCH, LENGTH, VOCAB], MODE_TRAIN)
-            token_spec = partition_manager.resolve([BATCH, LENGTH], MODE_TRAIN)
-            # Pad leading [batch, seq] for shard_map divisibility; padded rows carry zero weight.
-            _pads = _vp_leading_pads(student_mtp_logits.shape[:-1], token_spec, vp_mesh)
-            _s = student_mtp_logits
-            _t = jax.lax.stop_gradient(teacher_target)
-            if any(_pads):
-                _s = _pad_leading(student_mtp_logits, _pads)
-                _t = _pad_leading(_t, _pads)
-                kl_weights = _pad_leading(kl_weights, _pads, fill=0.0)
-            out = _fused_kl(
-                _s,
-                _t,
-                kl_weights,
-                reduction="mean",
-                direction=direction,
-                temperature=temperature,
-                beta=float(beta_value),
-                platform="xla",
-                mesh=vp_mesh,
-                in_specs=(logit_spec, logit_spec, token_spec),
-                out_specs=PartitionSpec(),
-            )
-        else:
-            out = _fused_kl(
-                student_mtp_logits,
-                jax.lax.stop_gradient(teacher_target),
-                mtp_mask,
-                reduction="mean",
-                direction=direction,
-                temperature=temperature,
-                beta=float(beta_value),
-                return_teacher_entropy=False,
-                platform="xla",
-            )
+        out = fused_kl_vocab_parallel(
+            student_mtp_logits,
+            teacher_target,
+            mtp_mask,
+            direction=direction,
+            temperature=temperature,
+            beta=beta_value,
+            mesh=vp_mesh,
+            logit_spec=partition_manager.resolve([BATCH, LENGTH, VOCAB], MODE_TRAIN) if vp_mesh is not None else None,
+            token_spec=partition_manager.resolve([BATCH, LENGTH], MODE_TRAIN) if vp_mesh is not None else None,
+        )
         return out.loss.astype(dtype)
 
     if cakld_gamma is not None:
@@ -911,12 +869,7 @@ def mtp_chain_distillation_loss(
             raise ValueError("`cakld_gamma` must be within [0, 1] when set.")
         if beta is not None:
             raise ValueError("`cakld_gamma` is mutually exclusive with GJSD `beta`.")
-    elif beta is None or beta <= 0.0:
-        direction = "forward"  # GKD/TRL beta->0 limit (and the classic-KD default)
-    elif beta >= 1.0:
-        direction = "reverse"  # GKD/TRL beta->1 limit
-    else:
-        direction = "jsd"
+    direction = resolve_kl_direction(beta)
 
     # Vocab-parallel KL via shard_map keeps each step's [B, S, V] logits TP-sharded with no all-reduce.
     vp_mesh = _resolve_vocab_parallel_mesh(partition_manager)
@@ -933,40 +886,17 @@ def mtp_chain_distillation_loss(
         direction: str,
         beta_value: float = 0.5,
     ) -> Array:
-        if vp_mesh is not None:
-            kl_weights = mask if mask is not None else jnp.ones(step_logits.shape[:-1], dtype=jnp.float32)
-            _pads = _vp_leading_pads(step_logits.shape[:-1], vp_token_spec, vp_mesh)
-            _cs = step_logits
-            _ct = jax.lax.stop_gradient(target_logits)
-            if any(_pads):
-                _cs = _pad_leading(step_logits, _pads)
-                _ct = _pad_leading(_ct, _pads)
-                kl_weights = _pad_leading(kl_weights, _pads, fill=0.0)
-            out = _fused_kl(
-                _cs,
-                _ct,
-                kl_weights,
-                reduction="mean",
-                direction=direction,
-                temperature=temperature,
-                beta=float(beta_value),
-                platform="xla",
-                mesh=vp_mesh,
-                in_specs=(vp_logit_spec, vp_logit_spec, vp_token_spec),
-                out_specs=PartitionSpec(),
-            )
-        else:
-            out = _fused_kl(
-                step_logits,
-                jax.lax.stop_gradient(target_logits),
-                mask,
-                reduction="mean",
-                direction=direction,
-                temperature=temperature,
-                beta=float(beta_value),
-                return_teacher_entropy=False,
-                platform="xla",
-            )
+        out = fused_kl_vocab_parallel(
+            step_logits,
+            target_logits,
+            mask,
+            direction=direction,
+            temperature=temperature,
+            beta=beta_value,
+            mesh=vp_mesh,
+            logit_spec=vp_logit_spec,
+            token_spec=vp_token_spec,
+        )
         return out.loss.astype(dtype)
 
     for j in range(int(n_steps)):
@@ -994,9 +924,9 @@ def mtp_chain_distillation_loss(
 
 def chunked_distillation_loss(
     student_hidden: Array,
-    teacher_hidden: Array,
+    teacher_hidden: Array | None,
     student_lm_head_fn: tp.Callable[[Array], Array],
-    teacher_lm_head_fn: tp.Callable[[Array], Array],
+    teacher_lm_head_fn: tp.Callable[[Array], Array] | None,
     attention_mask: Array | None = None,
     loss_mask: Array | None = None,
     labels: Array | None = None,
@@ -1007,8 +937,26 @@ def chunked_distillation_loss(
     checkpoint_chunks: bool = True,
     z_loss: float = 0.0,
     shift_tokens: bool = True,
+    teacher_topk_idx: Array | None = None,
+    teacher_topk_logp: Array | None = None,
+    teacher_tail_logp: Array | None = None,
+    teacher_cache_add_tail: bool = True,
+    metric_group_ids: Array | None = None,
+    num_metric_groups: int = 0,
 ) -> tuple[Array, dict[str, Array]]:
     """Memory-efficient distillation loss that avoids materialising full logits.
+
+    Per-group observables: with ``metric_group_ids`` (``[B, L]`` int, unshifted like ``labels``, ``-1`` = no
+    group) and ``num_metric_groups > 0`` the components also carry ``group_kl_ratio`` / ``group_mass_ratio``
+    (``[G]``: masked per-group KL sums times ``T^2`` and mask mass, both divided by this call's normalizer), so
+    token-weighted microbatch recombination keeps their ratio equal to each group's mean token KL.
+
+    Offline-teacher mode: when ``teacher_topk_idx`` / ``teacher_topk_logp`` (and optionally
+    ``teacher_tail_logp``) are given, ``teacher_hidden`` / ``teacher_lm_head_fn`` are unused and each
+    chunk's soft term is the cached top-k (+ tail bucket when ``teacher_cache_add_tail``) cross-entropy
+    of :func:`_per_token_topk_xent_from_cache`. The cached tensors are position-aligned with the hidden
+    states (position ``t`` holds the teacher's distribution over token ``t + 1``) and are shifted with
+    them.
 
     Instead of receiving pre-computed ``[B, L, V]`` logits, this function takes
     the last hidden states from both models and their lm_head projection
@@ -1067,7 +1015,18 @@ def chunked_distillation_loss(
         ``kl_loss``, ``distill_xent_loss``, ``teacher_entropy_loss``,
         and ``ce_loss``.
     """
-    dtype = student_hidden.dtype
+    cached = teacher_topk_idx is not None
+    if cached:
+        if teacher_topk_logp is None:
+            raise ValueError("`teacher_topk_idx` was given without `teacher_topk_logp`.")
+        if tuple(teacher_topk_idx.shape[:2]) != tuple(student_hidden.shape[:2]):
+            raise ValueError(
+                f"teacher_topk_idx leading shape {tuple(teacher_topk_idx.shape[:2])} != student hidden "
+                f"{tuple(student_hidden.shape[:2])}."
+            )
+    elif teacher_hidden is None:
+        raise ValueError("chunked_distillation_loss needs `teacher_hidden` or cached teacher top-k tensors.")
+    has_tail = teacher_tail_logp is not None
 
     # Causal shift (LossConfig.shift_tokens default), applied before chunking so every downstream
     # term -- KL, hard-label CE, and the z-loss regularizer -- runs on the aligned window: position
@@ -1075,94 +1034,141 @@ def chunked_distillation_loss(
     # completion/attention mask[:, 1:]. Matches :func:`distillation_loss` and ForCausalLMLoss.
     if shift_tokens:
         student_hidden = student_hidden[:, :-1]
-        teacher_hidden = teacher_hidden[:, :-1]
+        if cached:
+            teacher_topk_idx = teacher_topk_idx[:, :-1]
+            teacher_topk_logp = teacher_topk_logp[:, :-1]
+            if has_tail:
+                teacher_tail_logp = teacher_tail_logp[:, :-1]
+        else:
+            teacher_hidden = teacher_hidden[:, :-1]
         if attention_mask is not None:
             attention_mask = attention_mask[:, 1:]
         if loss_mask is not None:
             loss_mask = loss_mask[:, 1:]
         if labels is not None:
             labels = labels[:, 1:]
+        if metric_group_ids is not None:
+            metric_group_ids = metric_group_ids[:, 1:]
+    group_metrics = metric_group_ids is not None and num_metric_groups > 0
 
     B, L = student_hidden.shape[:2]
-
-    pad_len = (-L) % chunk_size
-    if pad_len:
-        student_hidden = jnp.pad(student_hidden, ((0, 0), (0, pad_len), (0, 0)))
-        teacher_hidden = jnp.pad(teacher_hidden, ((0, 0), (0, pad_len), (0, 0)))
-        if attention_mask is not None:
-            attention_mask = jnp.pad(attention_mask, ((0, 0), (0, pad_len)))
-        if loss_mask is not None:
-            loss_mask = jnp.pad(loss_mask, ((0, 0), (0, pad_len)))
-        if labels is not None:
-            labels = jnp.pad(labels, ((0, 0), (0, pad_len)), constant_values=-100)
-
-    L_padded = L + pad_len
-
+    # fp32 mask: per-token loss weights (loss-group weighting) must not round to the model dtype.
     mask, safe_labels, has_labels = _build_mask_and_labels(
         attention_mask=attention_mask,
         loss_mask=loss_mask,
         labels=labels,
-        dtype=dtype,
-        seq_len=L_padded,
+        dtype=jnp.float32,
+        seq_len=L,
         batch_size=B,
     )
+
+    pad_len = (-L) % chunk_size
+    if pad_len:
+        student_hidden = jnp.pad(student_hidden, ((0, 0), (0, pad_len), (0, 0)))
+        if cached:
+            teacher_topk_idx = jnp.pad(teacher_topk_idx, ((0, 0), (0, pad_len), (0, 0)))
+            teacher_topk_logp = jnp.pad(teacher_topk_logp, ((0, 0), (0, pad_len), (0, 0)))
+            if has_tail:
+                teacher_tail_logp = jnp.pad(teacher_tail_logp, ((0, 0), (0, pad_len)))
+        else:
+            teacher_hidden = jnp.pad(teacher_hidden, ((0, 0), (0, pad_len), (0, 0)))
+        mask = jnp.pad(mask, ((0, 0), (0, pad_len)))
+        safe_labels = jnp.pad(safe_labels, ((0, 0), (0, pad_len)))
+        if group_metrics:
+            metric_group_ids = jnp.pad(metric_group_ids, ((0, 0), (0, pad_len)), constant_values=-1)
+
+    L_padded = L + pad_len
 
     _use_hard = use_hard_labels and has_labels and alpha < 1.0
 
     n_chunks = L_padded // chunk_size
     s_chunks = student_hidden.reshape(B, n_chunks, chunk_size, -1).transpose(1, 0, 2, 3)
-    t_chunks = teacher_hidden.reshape(B, n_chunks, chunk_size, -1).transpose(1, 0, 2, 3)
+    if cached:
+        teacher_chunks: tuple[Array, ...] = (
+            teacher_topk_idx.reshape(B, n_chunks, chunk_size, -1).transpose(1, 0, 2, 3),
+            teacher_topk_logp.reshape(B, n_chunks, chunk_size, -1).transpose(1, 0, 2, 3),
+        )
+        if has_tail:
+            teacher_chunks = (*teacher_chunks, teacher_tail_logp.reshape(B, n_chunks, chunk_size).transpose(1, 0, 2))
+    else:
+        teacher_chunks = (teacher_hidden.reshape(B, n_chunks, chunk_size, -1).transpose(1, 0, 2, 3),)
     m_chunks = mask.reshape(B, n_chunks, chunk_size).transpose(1, 0, 2)
     l_chunks = safe_labels.reshape(B, n_chunks, chunk_size).transpose(1, 0, 2)
+    if group_metrics:
+        teacher_chunks = (
+            *teacher_chunks,
+            metric_group_ids.astype(jnp.int32).reshape(B, n_chunks, chunk_size).transpose(1, 0, 2),
+        )
 
-    def _chunk_kl_ce(s_h, t_h, m, sl):
+    def _chunk_kl_ce(s_h, m, sl, *teacher_chunk):
         """Project one hidden-state chunk and reduce it to scalar loss terms."""
+        group_onehot = None
+        if group_metrics:
+            *teacher_chunk, g_ids = teacher_chunk
+            group_onehot = (g_ids[..., None] == jnp.arange(num_metric_groups, dtype=jnp.int32)).astype(jnp.float32)
         with jax.named_scope("easydel/trainer/distillation/chunked_loss/student_lm_head"):
             s_logits = checkpoint_name(student_lm_head_fn(s_h), "distill_student_lm_head_logits")
-        with jax.named_scope("easydel/trainer/distillation/chunked_loss/teacher_lm_head"):
-            t_logits = checkpoint_name(
-                jax.lax.stop_gradient(teacher_lm_head_fn(t_h)),
-                "distill_teacher_lm_head_logits",
+        mask_f32 = m.astype(jnp.float32)
+        group_sums: tuple[Array, ...] = ()
+        if cached:
+            per_xent, per_entropy = _per_token_topk_xent_from_cache(
+                s_logits,
+                teacher_chunk[0],
+                teacher_chunk[1],
+                teacher_chunk[2] if has_tail else None,
+                teacher_cache_add_tail,
             )
-        distill_xent, teacher_entropy, ce, ms = _compute_kl_and_ce(
-            student_logits=s_logits,
-            teacher_logits=t_logits,
-            mask=m,
-            safe_labels=sl,
-            use_hard_labels=_use_hard,
-            temperature=temperature,
-        )
+            distill_xent = jnp.sum(per_xent * mask_f32)
+            teacher_entropy = jnp.sum(per_entropy * mask_f32)
+            ms = jnp.sum(mask_f32)
+            ce = jnp.zeros((), dtype=jnp.float32)
+            if _use_hard:
+                per_ce = optax.softmax_cross_entropy_with_integer_labels(s_logits.astype(jnp.float32), sl)
+                ce = jnp.sum(per_ce * mask_f32)
+            if group_metrics:
+                group_sums = _group_sums(per_xent - per_entropy, mask_f32, group_onehot)
+        else:
+            with jax.named_scope("easydel/trainer/distillation/chunked_loss/teacher_lm_head"):
+                t_logits = checkpoint_name(
+                    jax.lax.stop_gradient(teacher_lm_head_fn(teacher_chunk[0])),
+                    "distill_teacher_lm_head_logits",
+                )
+            distill_xent, teacher_entropy, ce, ms, *group_sums = _compute_kl_and_ce(
+                student_logits=s_logits,
+                teacher_logits=t_logits,
+                mask=m,
+                safe_labels=sl,
+                use_hard_labels=_use_hard,
+                temperature=temperature,
+                group_onehot=group_onehot,
+            )
+            group_sums = tuple(group_sums)
         # z-loss on the raw (T=1) student logits: sum over valid tokens of
         # logsumexp^2, normalized once at the end alongside the KL terms.
         if z_loss:
             lse = jax.nn.logsumexp(s_logits.astype(jnp.float32), axis=-1)
-            z_sq = jnp.sum(jnp.square(lse) * m.astype(jnp.float32))
+            z_sq = jnp.sum(jnp.square(lse) * mask_f32)
         else:
             z_sq = jnp.zeros((), dtype=jnp.float32)
-        return distill_xent, teacher_entropy, ce, ms, z_sq
+        return (distill_xent, teacher_entropy, ce, ms, z_sq, *group_sums)
 
     if checkpoint_chunks:
         _chunk_kl_ce = jax.checkpoint(_chunk_kl_ce)
 
     def _scan_body(carry, xs):
-        s_h, t_h, m, sl = xs
-        distill_xent, teacher_entropy, ce, ms, z_sq = _chunk_kl_ce(s_h, t_h, m, sl)
-        return (
-            carry[0] + distill_xent,
-            carry[1] + teacher_entropy,
-            carry[2] + ce,
-            carry[3] + ms,
-            carry[4] + z_sq,
-        ), None
+        s_h, m, sl, *teacher_chunk = xs
+        terms = _chunk_kl_ce(s_h, m, sl, *teacher_chunk)
+        return tuple(c + t for c, t in zip(carry, terms, strict=True)), None
 
     # float32 carry: the running sums reach ~1e4-1e5 where bf16 ulp is 64-512 — accumulating
     # them in the model dtype is one of the things that used to floor / flip the KL metric.
     _zero = jnp.zeros((), dtype=jnp.float32)
-    (distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum, z_sq_sum), _ = jax.lax.scan(
-        _scan_body,
-        (_zero, _zero, _zero, _zero, _zero),
-        (s_chunks, t_chunks, m_chunks, l_chunks),
-    )
+    init_carry: tuple[Array, ...] = (_zero, _zero, _zero, _zero, _zero)
+    if group_metrics:
+        _gzero = jnp.zeros((num_metric_groups,), jnp.float32)
+        init_carry = (*init_carry, _gzero, _gzero)
+    sums, _ = jax.lax.scan(_scan_body, init_carry, (s_chunks, m_chunks, l_chunks, *teacher_chunks))
+    distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum, z_sq_sum = sums[:5]
 
     total_loss, components = _finalize_distillation_metrics(
         distill_xent_sum=distill_xent_sum,
@@ -1177,7 +1183,41 @@ def chunked_distillation_loss(
         z_value = (jnp.asarray(z_loss, jnp.float32) * z_sq_sum / jnp.maximum(mask_sum, 1.0)).astype(total_loss.dtype)
         total_loss = total_loss + z_value
         components = {**components, "z_loss": z_value}
+    if group_metrics:
+        components = {**components, **_group_ratio_components(sums[5], sums[6], mask_sum, temperature)}
     return total_loss, components
+
+
+def _group_sums(per_token_kl: Array, mask_f32: Array, group_onehot: Array) -> tuple[Array, Array]:
+    """Per-group masked sums of the token KL and of the mask (float32 ``[G]`` each)."""
+    kl = per_token_kl.astype(jnp.float32) * mask_f32
+    hi = jax.lax.Precision.HIGHEST
+    return (
+        jnp.einsum("...,...g->g", kl, group_onehot, precision=hi),
+        jnp.einsum("...,...g->g", mask_f32, group_onehot, precision=hi),
+    )
+
+
+def _group_ratio_components(
+    group_kl_sum: Array, group_mass_sum: Array, mask_sum: Array, temperature: float
+) -> dict[str, Array]:
+    """Per-group KL / mass sums divided by the call's loss normalizer (recombine under token-weighted GA)."""
+    norm = jnp.maximum(jnp.asarray(mask_sum, jnp.float32), jnp.float32(1.0))
+    temp_sq = jnp.float32(temperature * temperature)
+    return {"group_kl_ratio": group_kl_sum * temp_sq / norm, "group_mass_ratio": group_mass_sum / norm}
+
+
+def finalize_loss_group_metrics(metrics: LossMetrics, num_groups: int) -> LossMetrics:
+    """Replace the ``[G]`` group ratios in ``other_metrics`` with scalar ``loss_group/<g>/kl`` means."""
+    other = dict(metrics.other_metrics or {})
+    kl_ratio = other.pop("group_kl_ratio", None)
+    mass_ratio = other.pop("group_mass_ratio", None)
+    if kl_ratio is None or mass_ratio is None or num_groups <= 0:
+        return metrics
+    for g in range(num_groups):
+        mass = mass_ratio[g]
+        other[f"loss_group/{g}/kl"] = jnp.where(mass > 0, kl_ratio[g] / jnp.where(mass > 0, mass, 1.0), 0.0)
+    return metrics.replace(other_metrics=other)
 
 
 def _resolve_indices(
@@ -1236,16 +1276,18 @@ def _masked_mse(values: jax.Array, targets: jax.Array, mask: jax.Array | None) -
     """
     if values.shape != targets.shape:
         raise ValueError(f"Mismatched tensor shapes for distillation: {values.shape} vs {targets.shape}.")
-    diff = values - targets
+    diff = values.astype(jnp.float32) - targets.astype(jnp.float32)
+    squared_error = jnp.square(diff)
     if mask is not None:
-        mask = mask.astype(diff.dtype)
+        mask = mask.astype(jnp.float32)
         while mask.ndim < diff.ndim:
             mask = mask[..., None]
-        diff = diff * mask
-        denom = jnp.maximum(mask.sum(), jnp.array(1.0, dtype=diff.dtype))
+        mask = jnp.broadcast_to(mask, diff.shape)
+        squared_error = squared_error * mask
+        denom = jnp.maximum(mask.sum(), 1.0)
     else:
-        denom = jnp.array(diff.size, dtype=diff.dtype)
-    return jnp.sum(diff * diff) / denom
+        denom = jnp.maximum(jnp.asarray(diff.size, dtype=jnp.float32), 1.0)
+    return jnp.sum(squared_error) / denom
 
 
 def _build_attention_mask(attention_mask: jax.Array | None, *, dtype: jnp.dtype) -> jax.Array | None:
@@ -1280,23 +1322,6 @@ def _normalize_attention(tensor: jax.Array) -> jax.Array:
     denom = jnp.sum(tensor, axis=-1, keepdims=True)
     denom = jnp.maximum(denom, jnp.finfo(tensor.dtype).tiny)
     return tensor / denom
-
-
-def _stop_gradient_tree(tree):
-    """Apply :func:`jax.lax.stop_gradient` to every JAX array leaf.
-
-    Used to detach the teacher forward outputs from the autograd
-    graph before they enter the student loss. Python leaves are left
-    untouched so model output objects with non-array members survive.
-
-    Args:
-        tree: Pytree of JAX-array and Python-leaf mixed values.
-
-    Returns:
-        A pytree of the same shape with all JAX arrays detached from
-        the autograd graph.
-    """
-    return jax.tree_util.tree_map(lambda x: jax.lax.stop_gradient(x) if isinstance(x, JaxArray) else x, tree)
 
 
 def _distillation_forward_outputs(
@@ -1355,6 +1380,9 @@ def _distillation_forward_outputs(
     outputs = model(**call_kwargs)
 
     result: dict[str, tp.Any] = {}
+    aux_loss = getattr(outputs, "aux_loss", None)
+    if aux_loss is not None:
+        result["aux_loss"] = aux_loss
     if use_chunked:
         result["hidden_for_kl"] = outputs.last_hidden_state
     else:
@@ -1401,8 +1429,28 @@ def distillation_step(
     mtp_kd_weight: float = 0.3,
     mtp_draft_tokens: int = 1,
     teacher_matched_compilation: bool = True,
-) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
+    teacher_from_cache: bool = False,
+    teacher_cache_topk: int = 0,
+    teacher_cache_add_tail: bool = True,
+    num_loss_groups: int = 0,
+    *,
+    accumulate_into: dict[str, tp.Any] | None = None,
+    apply_accumulated: tuple[dict[str, tp.Any], LossMetrics] | None = None,
+) -> tuple[EasyDeLState, LossMetrics] | LossMetrics | tuple[dict[str, tp.Any], LossMetrics, jax.Array]:
     """Perform a single knowledge-distillation training or evaluation step.
+
+    Loss groups: when the batch carries ``loss_token_weights`` (fp32 ``[B, S]``, see
+    :mod:`easydel.trainers.distillation_trainer.loss_groups`) they multiply the loss mask, and with
+    ``num_loss_groups > 0`` plus ``loss_group_ids`` the chunked path reports ``loss_group/<g>/kl``.
+
+    Execution-mode gradient accumulation (:mod:`easydel.trainers.execution_accumulation`): with
+    ``accumulate_into`` the batch is one microbatch and the call returns ``(accumulator, metrics, weight)``;
+    with ``apply_accumulated=(accumulator, metrics)`` it divides by the summed weight and applies the optimizer.
+    Microbatches (scan and execution mode alike) are weighted by their supervised-token mass.
+
+    With ``teacher_from_cache`` the teacher is never run: the batch carries ``teacher_topk_idx`` /
+    ``teacher_topk_logp`` / ``teacher_tail_logp`` (joined host-side from an offline teacher cache),
+    ``teacher_state`` may be ``None``, and the chunked KL is the cached top-k (+ tail) KL.
 
     Runs the teacher model on the batch (with gradients stopped), then
     computes the distillation loss between student and teacher outputs.
@@ -1463,9 +1511,26 @@ def distillation_step(
             is True, returns the updated student state and loss metrics.
             When False, returns only the loss metrics.
     """
+    if apply_accumulated is not None:
+        accumulator, acc_metrics = apply_accumulated
+        gradients, metrics = finalize_accumulation(accumulator, acc_metrics, student_state.graphstate)
+        metrics = finalize_loss_group_metrics(metrics, num_loss_groups)
+        student_state = update_state_respectfully(
+            state=student_state,
+            gradients=gradients,
+            loss_config=loss_config,
+            metrics=update_metrics(
+                metrics=metrics,
+                learning_rate_fn=learning_rate_fn,
+                step=student_state.step,
+                gradients=gradients,
+            ),
+        )
+        return student_state, metrics
+
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
-        gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_accumulation_steps=1 if accumulate_into is not None else gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
     )
     batch = constrain_batch_sharding(batch, partition_spec, mesh=student_state.model.mesh)
@@ -1477,11 +1542,11 @@ def distillation_step(
     request_attentions = attention_weight != 0.0
     use_advanced_vocab_loss = beta is not None or cakld_gamma is not None or loss_top_k > 0 or loss_add_tail
     use_chunked = logits_chunk_size is not None and logits_chunk_size > 0 and not use_advanced_vocab_loss
+    if teacher_from_cache and not use_chunked:
+        raise ValueError(
+            "teacher_from_cache needs the chunked KL path (logits_chunk_size > 0, no beta/cakld/loss_top_k)."
+        )
 
-    _stage_mesh = spx.get_current_stage_mesh(
-        getattr(getattr(student_state, "model", None), "mesh", None), raise_error=False
-    )
-    _tp_parallel = _stage_mesh is not None and "tp" in _stage_mesh.axis_names and _stage_mesh.shape["tp"] > 1
     _z_loss_coef = float(getattr(loss_config, "z_loss", 0.0) or 0.0) if loss_config is not None else 0.0
     _shift_tokens = bool(getattr(loss_config, "shift_tokens", True)) if loss_config is not None else True
 
@@ -1516,10 +1581,10 @@ def distillation_step(
         if result:
             teacher_hiddens = input_batch.get("_teacher_hidden_states", input_batch.get("teacher_hidden_states"))
             if request_hidden_states and teacher_hiddens is not None:
-                result["hidden_states"] = _stop_gradient_tree(tuple(teacher_hiddens))
+                result["hidden_states"] = stop_gradient_tree(tuple(teacher_hiddens))
             teacher_attns = input_batch.get("_teacher_attentions", input_batch.get("teacher_attentions"))
             if request_attentions and teacher_attns is not None:
-                result["attentions"] = _stop_gradient_tree(tuple(teacher_attns))
+                result["attentions"] = stop_gradient_tree(tuple(teacher_attns))
             return result
 
         teacher_call_kwargs = dict(input_batch)
@@ -1585,7 +1650,7 @@ def distillation_step(
                 jax.lax.stop_gradient(teacher_state.graphstate),
             )
             del _unused_pullback
-            return _stop_gradient_tree(primal)
+            return stop_gradient_tree(primal)
 
         @functools.partial(
             jax.checkpoint,
@@ -1595,7 +1660,7 @@ def distillation_step(
         def _teacher_fwd(kw, t_graphstate):
             """Run the frozen teacher forward pass and stop-gradient outputs."""
             teacher_module = teacher_state.merge(t_graphstate)
-            return _stop_gradient_tree(_collect(teacher_module(**kw, **teacher_static_kwargs)))
+            return stop_gradient_tree(_collect(teacher_module(**kw, **teacher_static_kwargs)))
 
         return _teacher_fwd(
             teacher_call_kwargs,
@@ -1620,16 +1685,35 @@ def distillation_step(
             ``(loss, metrics)`` where ``metrics`` is a populated
             :class:`LossMetrics`.
         """
+        minibatch = dict(minibatch)
+        group_ids = minibatch.pop(LOSS_GROUP_IDS_KEY, None)
+        token_weights = minibatch.pop(LOSS_TOKEN_WEIGHTS_KEY, None)
         if is_training and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = student_state.merge(tree)
-        teacher_outputs = teacher_forward(minibatch)
+        teacher_outputs = {} if teacher_from_cache else teacher_forward(minibatch)
         call_kwargs = dict(minibatch)
         call_kwargs.pop("labels", None)
         call_kwargs.pop("completion_mask", None)
         call_kwargs.pop("assistant_masks", None)
+        cached_teacher: dict[str, tp.Any] = {}
+        for key in ("teacher_topk_idx", "teacher_topk_logp", "teacher_tail_logp"):
+            value = call_kwargs.pop(key, None)
+            if teacher_from_cache and value is not None:
+                cached_teacher[key] = value
+        if teacher_from_cache:
+            if "teacher_topk_idx" not in cached_teacher or "teacher_topk_logp" not in cached_teacher:
+                raise ValueError("teacher_from_cache is on but the batch carries no cached teacher top-k tensors.")
+            k_cache = int(cached_teacher["teacher_topk_idx"].shape[-1])
+            if teacher_cache_topk > k_cache:
+                raise ValueError(f"teacher_cache_topk={teacher_cache_topk} exceeds the cached k={k_cache}.")
+            if 0 < teacher_cache_topk < k_cache:
+                # The stored tail belongs to the full k; drop it so it is re-derived from the kept ids.
+                cached_teacher["teacher_topk_idx"] = cached_teacher["teacher_topk_idx"][..., :teacher_cache_topk]
+                cached_teacher["teacher_topk_logp"] = cached_teacher["teacher_topk_logp"][..., :teacher_cache_topk]
+                cached_teacher.pop("teacher_tail_logp", None)
         if use_chunked:
-            teacher_hidden_for_kl = teacher_outputs["hidden_for_kl"]
+            teacher_hidden_for_kl = None if teacher_from_cache else teacher_outputs["hidden_for_kl"]
             call_kwargs["apply_lm_head"] = False
         else:
             teacher_logits = teacher_outputs["logits"]
@@ -1644,14 +1728,14 @@ def distillation_step(
         student_outputs = module(**call_kwargs)
         labels = minibatch.get("labels", None)
         attention_mask = minibatch.get("attention_mask", None)
-        completion_mask = minibatch.get("completion_mask", None)
+        completion_mask = _weighted_loss_mask(minibatch.get("completion_mask", None), attention_mask, token_weights)
 
         if use_chunked:
             total_loss, loss_components = chunked_distillation_loss(
                 student_hidden=student_outputs.last_hidden_state,
                 teacher_hidden=teacher_hidden_for_kl,
                 student_lm_head_fn=module.make_lm_head_fn(),
-                teacher_lm_head_fn=teacher_state.model.make_lm_head_fn(),
+                teacher_lm_head_fn=None if teacher_from_cache else teacher_state.model.make_lm_head_fn(),
                 attention_mask=attention_mask,
                 loss_mask=completion_mask,
                 labels=labels,
@@ -1662,6 +1746,12 @@ def distillation_step(
                 checkpoint_chunks=checkpoint_kl_loss,
                 z_loss=_z_loss_coef,
                 shift_tokens=_shift_tokens,
+                teacher_topk_idx=cached_teacher.get("teacher_topk_idx"),
+                teacher_topk_logp=cached_teacher.get("teacher_topk_logp"),
+                teacher_tail_logp=cached_teacher.get("teacher_tail_logp"),
+                teacher_cache_add_tail=teacher_cache_add_tail,
+                metric_group_ids=group_ids if num_loss_groups > 0 else None,
+                num_metric_groups=num_loss_groups if group_ids is not None else 0,
             )
         else:
             # If the vocabulary is tensor-parallel-sharded, route the KL/CE through the vocab-parallel
@@ -1833,13 +1923,35 @@ def distillation_step(
         )
         return total_loss, metrics
 
+    def loss_token_mass(_tree, minibatch) -> jax.Array:
+        """The loss normalizer of ``minibatch``: weighted supervised mass after the causal shift."""
+        attention_mask = minibatch.get("attention_mask", None)
+        mask = _weighted_loss_mask(
+            minibatch.get("completion_mask", None), attention_mask, minibatch.get(LOSS_TOKEN_WEIGHTS_KEY, None)
+        )
+        if mask is None:
+            mask = attention_mask
+        ids = minibatch.get("input_ids", minibatch.get("inputs_embeds"))
+        mask = jnp.ones(tuple(ids.shape[:2]), jnp.float32) if mask is None else mask.astype(jnp.float32)
+        labels = minibatch.get("labels", None)
+        if labels is not None:
+            mask = mask * (labels != -100).astype(jnp.float32)
+        if _shift_tokens:
+            mask = mask[:, 1:]
+        return jnp.sum(mask)
+
     if is_training:
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        if accumulate_into is not None:
+            return accumulate_microbatch(accumulate_into, student_state.graphstate, batch, grad_fn, loss_token_mass)
         gradients, metrics = minibatch_call(
             state=student_state,
             batch=batch,
             minibatch_size=minibatch_size,
-            grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
+            grad_fn=grad_fn,
+            microbatch_weight_fn=loss_token_mass if gradient_accumulation_steps > 1 else None,
         )
+        metrics = finalize_loss_group_metrics(metrics, num_loss_groups)
         student_state = update_state_respectfully(
             state=student_state,
             gradients=gradients,
@@ -1854,7 +1966,18 @@ def distillation_step(
         return student_state, metrics
     else:
         _, metrics = loss_fn(tree=student_state.graphstate, minibatch=batch)
-        return metrics
+        return finalize_loss_group_metrics(metrics, num_loss_groups)
+
+
+def _weighted_loss_mask(
+    completion_mask: Array | None, attention_mask: Array | None, token_weights: Array | None
+) -> Array | None:
+    """``completion_mask`` (else ``attention_mask``) times the fp32 loss-group token weights, when given."""
+    if token_weights is None:
+        return completion_mask
+    base = completion_mask if completion_mask is not None else attention_mask
+    weights = token_weights.astype(jnp.float32)
+    return weights if base is None else base.astype(jnp.float32) * weights
 
 
 def _prepare_distillation_scheduled_batch(call) -> dict[str, tp.Any]:
@@ -1891,6 +2014,7 @@ def _distillation_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
         call,
         value_fields=(
             "partition_spec",
+            "loss_config",
             "temperature",
             "alpha",
             "hidden_state_weight",
@@ -1946,6 +2070,7 @@ def _make_distillation_scheduled_loss(call):
     teacher_state = call.get("teacher_state")
     _loss_config = call.get("loss_config")
     shift_tokens = bool(getattr(_loss_config, "shift_tokens", True)) if _loss_config is not None else True
+    z_loss_coef = float(getattr(_loss_config, "z_loss", 0.0) or 0.0) if _loss_config is not None else 0.0
 
     if hidden_state_loss != "mse":
         raise ValueError(f"Unsupported hidden state loss '{hidden_state_loss}'. Only 'mse' is available.")
@@ -2017,6 +2142,7 @@ def _make_distillation_scheduled_loss(call):
                     alpha=alpha,
                     chunk_size=int(logits_chunk_size),
                     checkpoint_chunks=checkpoint_kl_loss,
+                    z_loss=z_loss_coef,
                     shift_tokens=shift_tokens,
                 )
             else:
@@ -2040,6 +2166,32 @@ def _make_distillation_scheduled_loss(call):
                     shift_tokens=shift_tokens,
                     partition_manager=partition_manager,
                 )
+
+        if z_loss_coef and not use_chunked:
+            z_logits = student_outputs["logits"]
+            z_attention_mask = attention_mask
+            z_completion_mask = completion_mask
+            if shift_tokens:
+                z_logits = z_logits[:, :-1]
+                if z_attention_mask is not None:
+                    z_attention_mask = z_attention_mask[:, 1:]
+                if z_completion_mask is not None:
+                    z_completion_mask = z_completion_mask[:, 1:]
+            z_mask = jnp.ones(z_logits.shape[:2], dtype=jnp.float32)
+            if z_attention_mask is not None:
+                z_mask = z_mask * z_attention_mask.astype(jnp.float32)
+            if z_completion_mask is not None:
+                z_mask = z_mask * z_completion_mask.astype(jnp.float32)
+            lse = jax.nn.logsumexp(z_logits.astype(jnp.float32), axis=-1)
+            total_loss = total_loss + (
+                jnp.asarray(z_loss_coef, jnp.float32)
+                * jnp.sum(jnp.square(lse) * z_mask)
+                / jnp.maximum(jnp.sum(z_mask), 1.0)
+            ).astype(total_loss.dtype)
+
+        aux_loss = student_outputs.get("aux_loss")
+        if aux_loss is not None:
+            total_loss = total_loss + aux_loss.astype(total_loss.dtype)
 
         if request_hidden_states:
             with jax.named_scope("easydel/trainer/distillation/scheduled_loss/hidden_state_loss"):

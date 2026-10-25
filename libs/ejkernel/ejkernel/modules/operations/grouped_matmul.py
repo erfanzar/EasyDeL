@@ -97,6 +97,56 @@ from ..base import detect_platform
 from .configs import GroupedMatmulConfig
 
 
+def pad_rows_and_tile(
+    lhs: Array,
+    cfg: GroupedMatmulConfig,
+    k_size: int,
+    n_size: int,
+    *,
+    do_padding: bool,
+    existing_out: Array | None = None,
+) -> tuple[Array, Array | None, int, tuple[int, int, int] | None]:
+    """Pad ``lhs`` rows to ``cfg.block_m`` and derive ``(tm, tk, tn)`` from the PADDED row count.
+
+    The Pallas grouped matmul requires the row count it receives to be divisible by ``tm``.
+    Clamping ``tm`` with the pre-padding row count while padding the rows to ``block_m`` gives
+    ``tm = m`` for any ``m < block_m`` that does not divide ``block_m``: a 6-row decode step
+    (one request at top-6) against ``block_m = 512`` failed at trace time with
+    "512 must be divisible by x-dimension tile size (6)". Deriving ``tm`` from the padded row
+    count makes padding and tiling consistent by construction.
+
+    Args:
+        lhs: Activation rows ``[m, k]``.
+        cfg: Grouped-matmul config carrying ``block_m`` / ``block_k`` / ``block_n``.
+        k_size: Contraction size of the problem.
+        n_size: Output feature size of the problem.
+        do_padding: Whether to pad ``m`` up to a multiple of ``block_m``.
+        existing_out: Optional accumulator ``[m, n]``; padded in lockstep with ``lhs``.
+
+    Returns:
+        ``(lhs, existing_out, padded_size, tiling)``: the possibly padded ``lhs`` and
+        ``existing_out``, the number of appended rows, and ``(tm, tk, tn)`` whose ``tm`` divides
+        ``lhs.shape[0]`` when padding is on. ``tiling`` is ``None`` when ``block_k`` or
+        ``block_n`` is ``<= 0`` (the sentinel that lets the kernel's own tiler run; only
+        ``grouped_matmulv3`` accepts it).
+    """
+    m_size = lhs.shape[0]
+    padded_size = 0
+    if do_padding and m_size % cfg.block_m:
+        padded_size = cfg.block_m - m_size % cfg.block_m
+        lhs = jax.lax.pad(lhs, jnp.array(0.0, dtype=lhs.dtype), [(0, padded_size, 0), (0, 0, 0)])
+        if existing_out is not None:
+            existing_out = jax.lax.pad(
+                existing_out,
+                jnp.array(0.0, dtype=existing_out.dtype),
+                [(0, padded_size, 0), (0, 0, 0)],
+            )
+    tiling = None
+    if cfg.block_k > 0 and cfg.block_n > 0:
+        tiling = (min(cfg.block_m, lhs.shape[0]), min(cfg.block_k, k_size), min(cfg.block_n, n_size))
+    return lhs, existing_out, padded_size, tiling
+
+
 class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
     """Grouped Matrix Multiplication with custom optimization logic.
 
@@ -214,10 +264,9 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         assert in_specs is not None, "in_specs must be provided for shard_map execution"
         assert out_specs is not None, "out_specs must be provided for shard_map execution"
 
-        mSize, padded_size = lhs.shape[0], 0
-        if mSize % cfg.block_m:
-            padded_size = cfg.block_m - mSize % cfg.block_m
-            lhs = jax.lax.pad(lhs, jnp.array(0.0, dtype=lhs.dtype), [(0, padded_size, 0), (0, 0, 0)])
+        cfg = cfg or self.heuristic_cfg(None)
+
+        # Pad per shard inside ``run``: padding global rows would shift row-shard boundaries.
 
         def _wrapped_grouped_matmul(
             lhs: Float[Array, "m k"],
@@ -243,8 +292,8 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
                 interpret=interpret,
                 precision=precision,
                 platform=platform,
-                do_padding=False,
-                cfg=cfg or self.heuristic_cfg(None),
+                do_padding=do_padding,
+                cfg=cfg,
             )
             if out_shard_callback is not None:
                 out = out_shard_callback(out)
@@ -263,9 +312,8 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         )
 
         def callback(out, cfg):
-            """Strip padding rows from the output if padding was applied."""
-            if padded_size > 0:
-                out = out[:mSize]
+            """Identity: the shard-local ``run`` already stripped its row padding."""
+            del cfg
             return out
 
         return shard_map_fn, call_args, callback
@@ -366,24 +414,16 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         if cfg.bypass_xla_tiling and resolved_platform == "xla":
             ...
         else:
-            if do_padding:
-                if mSize % cfg.block_m:
-                    padded_size = cfg.block_m - mSize % cfg.block_m
-                    lhs = jax.lax.pad(lhs, jnp.array(0.0, dtype=lhs.dtype), [(0, padded_size, 0), (0, 0, 0)])
-                    if existing_out is not None:
-                        # Keep the accumulator row count in lockstep with the padded lhs.
-                        existing_out = jax.lax.pad(
-                            existing_out,
-                            jnp.array(0.0, dtype=existing_out.dtype),
-                            [(0, padded_size, 0), (0, 0, 0)],
-                        )
-            if cfg.block_k > 0 and cfg.block_n > 0:
-                tiling = (min(cfg.block_m, mSize), min(cfg.block_k, kSize), min(cfg.block_n, nSize))
-            # block_k/block_n <= 0 is a sentinel: leave tiling=None so the
-            # kernel's own tiler runs (grouped_matmulv3's calculate_tiling
-            # handles non-128-aligned contractions the fixed 128 heuristic
-            # cannot). v1/v2 kernels reject tiling=None — only use the
-            # sentinel with use_v3.
+            # Padding and the row tile come from the same (padded) shape; block_k/block_n <= 0 is the
+            # "let the kernel's own tiler run" sentinel (tiling=None, grouped_matmulv3 only).
+            lhs, existing_out, padded_size, tiling = pad_rows_and_tile(
+                lhs,
+                cfg,
+                kSize,
+                nSize,
+                do_padding=do_padding,
+                existing_out=existing_out,
+            )
 
         impl_kwargs = dict(
             lhs=lhs,

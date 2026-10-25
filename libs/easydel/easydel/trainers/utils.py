@@ -46,6 +46,7 @@ from ml_collections import ConfigDict  # pyright: ignore[reportMissingTypeStubs]
 from ml_collections.config_dict import placeholder  # pyright: ignore[reportMissingTypeStubs]
 
 from easydel.infra.utils import ProcessingClassType
+from easydel.trainers._reward_sideband import is_reward_sideband
 from easydel.trainers.training_utils import GENERATION_MODEL_INPUT_KEYS, SHARED_GENERATION_MODEL_INPUT_KEYS
 
 logger = get_logger(__name__)
@@ -294,6 +295,9 @@ def create_constant_length_dataset(
         """
         iterator = iter(dataset)
         more_examples = True
+        epoch_has_examples = False
+        pending_token_ids = []
+        pending_attention_masks = []
 
         while more_examples:
             buffer, buffer_len = [], 0
@@ -302,22 +306,31 @@ def create_constant_length_dataset(
                 if buffer_len >= max_buffer_size:
                     break
                 try:
-                    prompt = formatting_func(next(iterator))
+                    example = next(iterator)
+                    epoch_has_examples = True
+                    prompt = formatting_func(example)
                     if isinstance(prompt, list):
                         prompt = "".join(p for p in prompt)
                     buffer.append(prompt)
                     buffer_len += len(buffer[-1])
                 except StopIteration:
                     if infinite:
+                        if not epoch_has_examples:
+                            return
                         iterator = iter(dataset)
+                        epoch_has_examples = False
                         warnings.warn(
                             "The dataset reached end and the iterator is reset to the start.",
                             stacklevel=1,
                         )
+                        if buffer:
+                            break
                     else:
                         more_examples = False
                         break
 
+            if not buffer:
+                return
             if shuffle:
                 random.shuffle(buffer)
 
@@ -329,8 +342,8 @@ def create_constant_length_dataset(
             tokenized_inputs = tokens["input_ids"]
             attention_masks = tokens["attention_mask"]
             # Concatenate all tokens and attention masks
-            all_token_ids = []
-            all_attention_masks = []
+            all_token_ids = pending_token_ids
+            all_attention_masks = pending_attention_masks
             for tokenized_input, attention_mask in zip(tokenized_inputs, attention_masks, strict=False):
                 if append_concat_token:
                     tokenized_input = [*tokenized_input, concat_token_id]
@@ -347,7 +360,11 @@ def create_constant_length_dataset(
                     examples.append(input_ids)
                     examples_attention_masks.append(org_attention_masks)
 
-            if shuffle:
+            packed_length = len(examples) * seq_length
+            pending_token_ids = all_token_ids[packed_length:]
+            pending_attention_masks = all_attention_masks[packed_length:]
+
+            if shuffle and examples:
                 # Shuffle examples while keeping pairs together
                 combined = list(zip(examples, examples_attention_masks, strict=False))
                 random.shuffle(combined)
@@ -524,7 +541,8 @@ class DataCollatorForCompletionOnlyLM:
 
         if isinstance(processing_class, str):
             processing_class = AutoTokenizer.from_pretrained(processing_class)
-            self.processing_class = processing_class
+        self.processing_class = processing_class
+        self.mlm = mlm
         self.instruction_template = instruction_template
         if isinstance(instruction_template, str):
             self.instruction_token_ids = self.processing_class.encode(
@@ -612,26 +630,42 @@ class DataCollatorForCompletionOnlyLM:
         mask_labels = [1 if i in covered_indexes else 0 for i in range(len(input_tokens))]
         return mask_labels
 
-    def jax_mask_tokens(self, inputs: tp.Any, special_tokens_mask: tp.Any | None = None) -> tuple[tp.Any, tp.Any]:
+    def jax_mask_tokens(
+        self,
+        inputs: tp.Any,
+        special_tokens_mask: tp.Any | None = None,
+        mask_labels: tp.Any | None = None,
+    ) -> tuple[tp.Any, tp.Any]:
         """Prepare masked tokens inputs/labels for masked language modeling.
 
         Applies the BERT-style MLM masking recipe: ~15% of non-special
-        positions are selected, of which 80% are replaced with the
-        ``[MASK]`` token, 10% are replaced with a random vocab token,
-        and the remaining 10% are left unchanged. Non-selected positions
-        receive label ``-100`` so they do not contribute to the loss.
+        positions are selected (or exactly the whole-word positions given by
+        ``mask_labels``), of which 80% are replaced with the ``[MASK]`` token,
+        10% are replaced with a random vocab token, and the remaining 10% are
+        left unchanged. Non-selected positions receive ``ignore_index`` so
+        they do not contribute to the loss.
 
         Args:
-            inputs: NumPy-like batch of token ids (mutated in-place).
+            inputs: Batch of token ids. Copied into a mutable NumPy array, so
+                immutable JAX arrays are accepted and the argument is never
+                mutated.
             special_tokens_mask: Optional boolean mask flagging positions
                 that must never be masked (specials). When ``None``,
                 derived from the tokenizer.
+            mask_labels: Optional binary whole-word mask of the same shape as
+                ``inputs``. When given, it replaces the uniform 15% selection
+                probability, so exactly the flagged (non-special) positions are
+                selected for masking.
 
         Returns:
-            A ``(inputs, labels)`` tuple with masking applied.
+            A ``(inputs, labels)`` tuple of NumPy arrays with masking applied.
         """
+        inputs = np.array(inputs)
         labels = np.copy(inputs)
-        probability_matrix = np.full(labels.shape, 0.15)
+        if mask_labels is None:
+            probability_matrix = np.full(labels.shape, 0.15)
+        else:
+            probability_matrix = np.asarray(mask_labels).astype(np.float64)
         if special_tokens_mask is None:
             special_tokens_mask = [
                 self.processing_class.get_special_tokens_mask(val, already_has_special_tokens=True)
@@ -639,11 +673,11 @@ class DataCollatorForCompletionOnlyLM:
             ]
             special_tokens_mask = np.array(special_tokens_mask, dtype=bool)
         else:
-            special_tokens_mask = special_tokens_mask.astype(bool)
+            special_tokens_mask = np.asarray(special_tokens_mask).astype(bool)
 
         probability_matrix[special_tokens_mask] = 0
         masked_indices = np.random.binomial(1, probability_matrix, size=probability_matrix.shape).astype(bool)  # noqa
-        labels[~masked_indices] = -100
+        labels[~masked_indices] = self.ignore_index
         indices_replaced = np.random.binomial(1, 0.8, size=labels.shape).astype(bool) & masked_indices  # noqa
         inputs[indices_replaced] = self.processing_class.mask_token_id
         indices_random = (
@@ -659,10 +693,10 @@ class DataCollatorForCompletionOnlyLM:
         return inputs, labels
 
     def jax_call(self, examples: list[list[int] | tp.Any | dict[str, tp.Any]]) -> dict[str, tp.Any]:
-        """Collate and apply whole-word masking to a batch using JAX arrays.
+        """Collate causal-LM or whole-word-MLM examples using JAX arrays.
 
-        Pads the batch, generates whole-word masks, and applies random token
-        masking for MLM pre-training.
+        Pads the batch and ignores padding labels for causal LM. When ``mlm``
+        is enabled, generates whole-word masks and applies random token masking.
 
         Args:
             examples: List of examples, each either a list of token IDs or
@@ -682,6 +716,21 @@ class DataCollatorForCompletionOnlyLM:
             self.processing_class,
         )
 
+        if not self.mlm:
+            # Causal-LM labels: a copy of the inputs with padding positions ignored. Padding is derived from the
+            # example lengths (not ``pad_token_id`` equality) so a real EOS is kept even when pad == eos.
+            inputs_np = np.array(batch_input)
+            valid = np.zeros(inputs_np.shape, dtype=bool)
+            seq_len = inputs_np.shape[1]
+            left_pad = getattr(self.processing_class, "padding_side", "right") == "left"
+            for row, ids in enumerate(input_ids):
+                n = len(ids)
+                token_mask = np.asarray(examples[row].get("attention_mask", [1] * n), dtype=bool)
+                start = seq_len - n if left_pad else 0
+                valid[row, start : start + n] = token_mask
+            labels_np = np.where(valid, inputs_np, self.ignore_index)
+            return {"input_ids": jnp.asarray(inputs_np), "labels": jnp.asarray(labels_np)}
+
         mask_labels = []
         for e in examples:
             ref_tokens = []
@@ -697,19 +746,22 @@ class DataCollatorForCompletionOnlyLM:
                     if i in ref_pos:
                         ref_tokens[i] = "##" + ref_tokens[i]
             mask_labels.append(self._whole_word_mask(ref_tokens))
-        batch_mask = _collate_batch(
-            mask_labels,
-            self.processing_class,
-        )
-        inputs, labels = self.jax_mask_tokens(batch_input, batch_mask)
-        return {"input_ids": inputs, "labels": labels}
+        # Masks must be padded with zeros, not with the tokenizer's pad token ID.
+        batch_mask = np.zeros(batch_input.shape, dtype=bool)
+        left_pad = getattr(self.processing_class, "padding_side", "right") == "left"
+        for row, mask in enumerate(mask_labels):
+            start = batch_mask.shape[1] - len(mask) if left_pad else 0
+            token_mask = np.asarray(examples[row].get("attention_mask", [1] * len(mask)), dtype=bool)
+            batch_mask[row, start : start + len(mask)] = np.asarray(mask, dtype=bool) & token_mask
+        inputs, labels = self.jax_mask_tokens(batch_input, mask_labels=batch_mask)
+        return {"input_ids": jnp.asarray(inputs), "labels": jnp.asarray(labels)}
 
     def __call__(self, examples: list[list[int] | tp.Any | dict[str, tp.Any]]) -> dict[str, tp.Any]:
         """Collate examples and mask labels so loss is only on completions.
 
-        Applies whole-word MLM masking via ``jax_call``, then sets labels to
-        ``ignore_index`` for all non-completion tokens based on the response
-        (and optionally instruction) template boundaries.
+        Builds causal-LM labels (or whole-word MLM labels when enabled), then
+        sets non-completion labels to ``ignore_index``. Template boundaries are
+        found in the original tokens, before any MLM corruption or label masking.
 
         Args:
             examples: List of examples, each either a list of token IDs or
@@ -718,14 +770,22 @@ class DataCollatorForCompletionOnlyLM:
         Returns:
             dict with ``input_ids`` and ``labels`` as JAX arrays.
         """
-        batch = self.jax_call(examples)
+        # JAX arrays are immutable: edit the labels on writable NumPy copies and convert back at the end.
+        batch = {key: np.array(value) for key, value in self.jax_call(examples).items()}
+        # MLM may replace template tokens and ignore their labels, so search the original, unpadded content.
+        template_ids = np.full(batch["input_ids"].shape, self.ignore_index, dtype=batch["input_ids"].dtype)
+        left_pad = getattr(self.processing_class, "padding_side", "right") == "left"
+        for row, example in enumerate(examples):
+            ids = example["input_ids"] if isinstance(example, collections.abc.Mapping) else example
+            start = template_ids.shape[1] - len(ids) if left_pad else 0
+            template_ids[row, start : start + len(ids)] = ids
 
         if self.instruction_template is None:
             for i in range(len(examples)):
                 response_token_ids_start_idx = None
 
-                for idx in jnp.where(batch["labels"][i] == self.response_token_ids[0])[0]:
-                    if self.response_token_ids == batch["labels"][i][idx : idx + len(self.response_token_ids)].tolist():
+                for idx in np.where(template_ids[i] == self.response_token_ids[0])[0]:
+                    if self.response_token_ids == template_ids[i][idx : idx + len(self.response_token_ids)].tolist():
                         response_token_ids_start_idx = idx
 
                 if response_token_ids_start_idx is None:
@@ -746,10 +806,10 @@ class DataCollatorForCompletionOnlyLM:
                 response_token_ids_idxs = []
                 human_token_ids_idxs = []
 
-                for assistant_idx in jnp.where(batch["labels"][i] == self.response_token_ids[0])[0]:
+                for assistant_idx in np.where(template_ids[i] == self.response_token_ids[0])[0]:
                     if (
                         self.response_token_ids
-                        == batch["labels"][i][assistant_idx : assistant_idx + len(self.response_token_ids)].tolist()
+                        == template_ids[i][assistant_idx : assistant_idx + len(self.response_token_ids)].tolist()
                     ):
                         response_token_ids_idxs.append(assistant_idx + len(self.response_token_ids))
 
@@ -766,8 +826,8 @@ class DataCollatorForCompletionOnlyLM:
                 human_token_ids = self.instruction_token_ids
                 if human_token_ids is None:
                     raise RuntimeError("instruction_token_ids must not be None when using instruction_template")
-                for human_idx in jnp.where(batch["labels"][i] == human_token_ids[0])[0]:
-                    if human_token_ids == batch["labels"][i][human_idx : human_idx + len(human_token_ids)].tolist():
+                for human_idx in np.where(template_ids[i] == human_token_ids[0])[0]:
+                    if human_token_ids == template_ids[i][human_idx : human_idx + len(human_token_ids)].tolist():
                         human_token_ids_idxs.append(human_idx)
 
                 if len(human_token_ids_idxs) == 0:
@@ -796,6 +856,7 @@ class DataCollatorForCompletionOnlyLM:
                 if len(response_token_ids_idxs) < len(human_token_ids_idxs):
                     batch["labels"][i, human_token_ids_idxs[-1] :] = self.ignore_index
 
+        batch = {key: jnp.asarray(value) for key, value in batch.items()}
         if isinstance(examples[0], collections.abc.Mapping):
             _attach_tools_sidechannel(batch, examples)  # type: ignore[arg-type]
         return batch
@@ -1467,20 +1528,6 @@ class _BCODataCollatorMixin:
         """
         return pad(arrays, self.max_length, padding_value=padding_value, padding_side=side)
 
-    def _pad_optional(self, arrays: list[np.ndarray], max_length: int, padding_value: int, side: str) -> jnp.ndarray:
-        """Pad a list of arrays to an arbitrary ``max_length``.
-
-        Args:
-            arrays: List of 1-D arrays to pad and stack.
-            max_length: Target sequence length.
-            padding_value: Value used for padding.
-            side: Padding side, ``"left"`` or ``"right"``.
-
-        Returns:
-            Batched JAX array of shape ``(len(arrays), max_length)``.
-        """
-        return pad(arrays, max_length, padding_value=padding_value, padding_side=side)
-
 
 class BCODataCollatorTFDS(_BCODataCollatorMixin):
     """Data collator for BCO training with TFDS backends."""
@@ -1581,13 +1628,13 @@ class BCODataCollatorGrain(_BCODataCollatorMixin):
             self.max_length,
             padding_value=self.label_pad_token_id,
         )
-        batch["label"] = np.asarray([feature["label"]], dtype=np.bool_)
+        batch["label"] = np.asarray(feature["label"], dtype=np.bool_)
 
         if "embedding_input_ids" in feature:
             batch["embedding_input_ids"] = np.asarray(feature["embedding_input_ids"], dtype=np.int32)
             batch["embedding_attention_mask"] = np.asarray(feature["embedding_attention_mask"], dtype=np.int32)
         if "reference_logps" in feature:
-            batch["reference_logps"] = np.asarray([feature["reference_logps"]], dtype=np.float32)
+            batch["reference_logps"] = np.asarray(feature["reference_logps"], dtype=np.float32)
 
         _attach_tools_sidechannel(batch, feature)
         return batch
@@ -1646,7 +1693,7 @@ class GRPODataCollatorTFDS:
                         f"Found mixed presence for `{key}` across one batch."
                     )
                 continue
-            if key == "tools":
+            if key == "tools" or any(is_reward_sideband(value) for value in values):
                 batch[key] = values
                 continue
             try:
@@ -1852,7 +1899,7 @@ class GRPODataCollatorGrain:
         }
         for key, value in feature.items():
             if key not in {"input_ids", "attention_mask"} and value is not None:
-                if key == "tools":
+                if key == "tools" or is_reward_sideband(value):
                     batch[key] = value
                     continue
                 try:
@@ -2023,20 +2070,24 @@ class DPODataCollatorWithPaddingGrain:
     prepadded: bool = True
 
     def __call__(self, features: dict[str, tp.Any]) -> dict[str, tp.Any]:
-        """Collate a Grain-style features dict into a padded DPO batch.
+        """Pad one Grain example before batching, or an already batched column mapping.
 
         Pads ``prompt_*``, ``chosen_*`` and ``rejected_*`` ``_input_ids``,
         ``_attention_mask``, ``_labels`` and ``_pixel_values`` to the
         configured prompt/completion lengths, leaves ``*_logps`` arrays
         untouched, and optionally drops non-numeric fields when
-        ``output_arrays_only`` is set.
+        ``output_arrays_only`` is set. With ``prepadded=True``, single
+        examples retain their supplied lengths; batched encoder-decoder
+        columns are padded to the longest sequence in each column.
 
         Args:
-            features: Mapping of column name to per-example values produced
-                by the Grain data pipeline.
+            features: Mapping of column name to one example's values, as
+                supplied by Grain's map-before-batch pipeline. Batched
+                encoder-decoder columns are also supported for compatibility.
 
         Returns:
-            A new dict with the padded JAX arrays.
+            A new dict with NumPy arrays. Single-example token columns remain
+            one-dimensional so Grain's subsequent Batch adds the batch axis.
 
         Raises:
             ValueError: If padding is enabled but ``pad_token_id`` is
@@ -2057,7 +2108,15 @@ class DPODataCollatorWithPaddingGrain:
                         max_length = camax_length
 
                 if self.is_encoder_decoder:
-                    to_pad = np.array(features[k], dtype="i4")
+                    # Grain maps individual examples before Batch. A 1-D column
+                    # is one sequence, not a batch containing one row per token.
+                    values = list(features[k])
+                    single_example = not values or np.ndim(values[0]) == 0
+                    to_pad = (
+                        [np.asarray(values, dtype=np.int32)]
+                        if single_example
+                        else [np.asarray(row, dtype=np.int32) for row in values]
+                    )
 
                     if (k.startswith("prompt")) and (k.endswith("input_ids")):
                         if self.pad_token_id is None:
@@ -2075,12 +2134,12 @@ class DPODataCollatorWithPaddingGrain:
                     else:
                         raise ValueError(f"Unexpected key in batch '{k}'")
 
-                    padded_batch[k] = pad_sequence(
-                        to_pad,
-                        batch_first=False,
-                        padding_value=padding_value,
-                        max_len=None if self.prepadded else max_length,
-                    )
+                    target_length = max(row.shape[-1] for row in to_pad) if self.prepadded else max_length
+                    padded_rows = [
+                        pad_single(row, target_length, padding_value=padding_value, padding_side="left")
+                        for row in to_pad
+                    ]
+                    padded_batch[k] = padded_rows[0] if single_example else np.stack(padded_rows, axis=0)
                 else:
                     if k.endswith("_input_ids"):
                         if self.pad_token_id is None:
@@ -2178,19 +2237,21 @@ class HFDataSource(pygrain.RandomAccessDataSource):
         self.shard_options = shard_options
         self.num_threads = num_threads
 
-        if not hasattr(dataset, "n_shards"):
-            if dataset.n_shards < self.shard_options.shard_count:
-                warnings.warn(
-                    f"Dataset has {getattr(dataset, 'n_shards', 1)} shards, but {self.shard_options.shard_count} "
-                    "are expected by the dataloader. This may lead to inefficient loading or errors.",
-                    stacklevel=1,
-                )
-            self.n_shards = dataset.n_shards
-        else:
-            self.n_shards = 1
+        # Number of underlying source shards the dataset exposes (1 when unknown).
+        self.n_shards = getattr(dataset, "n_shards", 1)
+        # Every (grain shard, worker thread) pair reads a disjoint slice of the dataset, so the
+        # split world is ``shard_count * num_threads`` and every rank stays below it.
+        self.world_size = max(int(self.shard_options.shard_count), 1) * self.num_threads
+        if self.n_shards < self.world_size:
+            warnings.warn(
+                f"Dataset has {self.n_shards} shards, but {self.world_size} "
+                f"(shard_count={self.shard_options.shard_count} x num_threads={self.num_threads}) "
+                "are expected by the dataloader. This may lead to inefficient loading or errors.",
+                stacklevel=1,
+            )
         self.dataset_shards = [(self.shard_options.shard_index * self.num_threads) + i for i in range(self.num_threads)]
         self.datasets = [
-            split_dataset_by_node(dataset, world_size=self.n_shards, rank=shard_rank)
+            split_dataset_by_node(dataset, world_size=self.world_size, rank=shard_rank)
             for shard_rank in self.dataset_shards
         ]
         self.data_iters = []
@@ -2233,11 +2294,14 @@ class HFDataSource(pygrain.RandomAccessDataSource):
         try:
             return next(self.data_iters[worker_idx])
         except StopIteration as e:
-            if os.getenv("HFDATASOURCE_NONSTOP", "1") == "1":
-                self.data_iters = [iter(ds) for ds in self.datasets]
-                logger.info("reseting data-iters index to rebatch point.")
-            return next(self.data_iters[worker_idx])
-            raise IndexError(f"Iterator for worker {worker_idx} is exhausted.") from e
+            if os.getenv("HFDATASOURCE_NONSTOP", "1") != "1":
+                raise IndexError(f"Iterator for worker {worker_idx} is exhausted.") from e
+            self.data_iters[worker_idx] = iter(self.datasets[worker_idx])
+            logger.info("reseting data-iters index to rebatch point.")
+            try:
+                return next(self.data_iters[worker_idx])
+            except StopIteration as empty:
+                raise IndexError(f"Dataset shard for worker {worker_idx} is empty.") from empty
 
 
 @dataclass
@@ -2342,32 +2406,25 @@ def pad(
         Efficiently handles variable-length sequences by padding to a common length.
         Preserves dtype of input tensors.
     """
-    output_shape = tensors[0].shape[:-1]
-    current_max = tensors[0].shape[-1]
+    if padding_side not in ("left", "right"):
+        raise ValueError("padding_side must be 'left' or 'right'")
+    if not tensors:
+        raise ValueError("tensors must contain at least one array")
     if max_length is None:
-        max_length = current_max
+        max_length = max(t.shape[-1] for t in tensors)
     if not isinstance(max_length, int):
         raise TypeError(f"max_length must be an int, got {type(max_length)}")
-    x_length = max(current_max, max_length)
-    output_shape += (x_length,)
+    if max_length < 0:
+        raise ValueError("max_length must be nonnegative")
+    output_shape = (*tensors[0].shape[:-1], max_length)
     output = jnp.full((len(tensors), *output_shape), padding_value, dtype=tensors[0].dtype)
     for i, t in enumerate(tensors):
-        if padding_side == "left":
-            seq_slice = slice(output_shape[0] - t.shape[0], output_shape[0])
-        elif padding_side == "right":
-            seq_slice = slice(0, t.shape[0])
-        else:
-            raise ValueError("padding_side must be 'left' or 'right'")
-
-        slices = (i, seq_slice, *tuple(slice(0, s) for s in t.shape[1:]))
-        output = output.at[slices].set(t)
-
-    if padding_side == "left":
-        output = output[..., -max_length:]
-    elif padding_side == "right":
-        output = output[..., :max_length]
-    else:
-        raise ValueError("padding_side must be 'left' or 'right'")
+        length = min(t.shape[-1], max_length)
+        source_start = t.shape[-1] - length if padding_side == "left" else 0
+        target_start = max_length - length if padding_side == "left" else 0
+        output = output.at[i, ..., target_start : target_start + length].set(
+            t[..., source_start : source_start + length]
+        )
     return output
 
 
@@ -2441,32 +2498,23 @@ def np_pad(
     Raises:
         ValueError: If padding_side is not 'left' or 'right'.
     """
-    output_shape = tensors[0].shape[:-1]
-    current_max = tensors[0].shape[-1]
+    if padding_side not in ("left", "right"):
+        raise ValueError("padding_side must be 'left' or 'right'")
+    if not tensors:
+        raise ValueError("tensors must contain at least one array")
     if max_length is None:
-        max_length = current_max
+        max_length = max(t.shape[-1] for t in tensors)
     if not isinstance(max_length, int):
         raise TypeError(f"max_length must be an int, got {type(max_length)}")
-    x_length = max(current_max, max_length)
-    output_shape += (x_length,)
+    if max_length < 0:
+        raise ValueError("max_length must be nonnegative")
+    output_shape = (*tensors[0].shape[:-1], max_length)
     output = np.full((len(tensors), *output_shape), padding_value, dtype=tensors[0].dtype)
     for i, t in enumerate(tensors):
-        if padding_side == "left":
-            seq_slice = slice(output_shape[0] - t.shape[0], output_shape[0])
-        elif padding_side == "right":
-            seq_slice = slice(0, t.shape[0])
-        else:
-            raise ValueError("padding_side must be 'left' or 'right'")
-
-        slices = (i, seq_slice, *tuple(slice(0, s) for s in t.shape[1:]))
-        output[slices] = t
-
-    if padding_side == "left":
-        output = output[..., -max_length:]
-    elif padding_side == "right":
-        output = output[..., :max_length]
-    else:
-        raise ValueError("padding_side must be 'left' or 'right'")
+        length = min(t.shape[-1], max_length)
+        source_start = t.shape[-1] - length if padding_side == "left" else 0
+        target_start = max_length - length if padding_side == "left" else 0
+        output[i, ..., target_start : target_start + length] = t[..., source_start : source_start + length]
     return output
 
 
@@ -2488,13 +2536,15 @@ def pad_to_length(
         Array: Tensor padded or truncated to the specified length.
 
     Note:
-        If tensor is already longer than length, it will be truncated.
-        Special handling for 2D tensors.
+        If tensor is already longer than length, it is truncated (keeping the
+        leading ``length`` entries) along ``axis``, for any rank.
     """
+    if not -tensor.ndim <= axis < tensor.ndim:
+        raise ValueError(f"axis {axis} is out of bounds for a tensor of rank {tensor.ndim}")
+    axis %= tensor.ndim
     if tensor.shape[axis] >= length:
-        if tensor.ndim == 2:
-            tensor = tensor[:, :length]
-        return tensor
+        index = tuple(slice(0, length) if dim == axis else slice(None) for dim in range(tensor.ndim))
+        return tensor[index]
     else:
         pad_size = list(tensor.shape)
         pad_size[axis] = length - tensor.shape[axis]
@@ -2521,48 +2571,30 @@ def pad_sequence(
                     If False, adds padding to the left (default False).
         padding_value: Value to use for padding (default 0).
         max_len: Maximum length to pad to. If None, uses longest sequence.
+            Longer sequences are truncated from the side opposite the padding.
 
     Returns:
-        jnp.ndarray: Padded sequences as a single batched array.
+        jnp.ndarray: Padded sequences as a single ``[batch, max_len]`` array
+        whose dtype follows the input sequences.
 
     Note:
         Similar to PyTorch's pad_sequence but for JAX arrays.
         When batch_first=False, padding is added to the left.
     """
+    sequences = [jnp.asarray(seq).reshape(-1) for seq in sequences]
     max_len = max(seq.shape[-1] for seq in sequences) if max_len is None else max_len
-    padding_value = jnp.array(padding_value).reshape(1)
-    if batch_first:
-        padded_seqs = [
-            (
-                jnp.concatenate(
-                    [
-                        seq.reshape(1, -1),
-                        jnp.ones((1, max_len - seq.shape[-1])) * padding_value,
-                    ],
-                    axis=1,
-                )
-                if seq.shape[-1] < max_len
-                else seq.reshape(1, -1)
-            )
-            for seq in sequences
-        ]
-    else:
-        padded_seqs = [
-            (
-                jnp.concatenate(
-                    [
-                        jnp.ones((1, max_len - seq.shape[-1])) * padding_value,
-                        seq.reshape(1, -1),
-                    ],
-                    axis=1,
-                )
-                if seq.shape[-1] < max_len
-                else seq.reshape(1, -1)
-            )
-            for seq in sequences
-        ]
+    padded_seqs = []
+    for seq in sequences:
+        if seq.shape[-1] > max_len:
+            seq = seq[:max_len] if batch_first else seq[seq.shape[-1] - max_len :]
+        missing = max_len - seq.shape[-1]
+        if missing > 0:
+            # Build the padding in the sequence dtype so integer ids/labels stay integers.
+            filler = jnp.full((missing,), padding_value, dtype=seq.dtype)
+            seq = jnp.concatenate([seq, filler] if batch_first else [filler, seq], axis=0)
+        padded_seqs.append(seq)
 
-    return jnp.array(padded_seqs)
+    return jnp.stack(padded_seqs, axis=0)
 
 
 @contextmanager
@@ -2937,29 +2969,34 @@ class EmbeddingDataCollatorTFDS:
 
 @auto_pytree
 class EmbeddingDataCollatorGrain:
-    """Data collator for contrastive embedding training with Grain backends.
+    """Prepare single contrastive examples before Grain introduces the batch axis.
 
-    Same as ``EmbeddingDataCollatorTFDS`` but for the Grain data pipeline.
+    The legacy list-of-examples interface remains supported and returns the
+    same stacked JAX arrays as ``EmbeddingDataCollatorTFDS``.
     """
 
     pad_token_id: int = 0
     max_length: int = 512
     has_negatives: bool = False
 
-    def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, jnp.ndarray]:
-        """Stack per-example query/positive (and optionally negative) tensors.
+    def __call__(self, features: dict[str, tp.Any] | list[dict[str, tp.Any]]) -> dict[str, np.ndarray | jnp.ndarray]:
+        """Convert token columns without adding a batch dimension to one example.
 
         Args:
-            features: List of pre-tokenized example dicts.  Each example is
-                expected to contain ``query_input_ids``,
-                ``query_attention_mask``, ``positive_input_ids``,
-                ``positive_attention_mask`` and -- when
-                ``self.has_negatives`` -- the corresponding ``negative_*``
-                fields.
+            features: A tokenized example dict, or a legacy list of examples.
+                Query and positive token IDs/masks are preserved, along with
+                negative fields when ``has_negatives`` is enabled.
 
         Returns:
-            A dict mapping each present field to a stacked JAX array.
+            Single-example NumPy arrays for Grain's map-before-batch pipeline,
+            or stacked JAX arrays for a legacy list input.
         """
+        if isinstance(features, list):
+            return EmbeddingDataCollatorTFDS(
+                pad_token_id=self.pad_token_id,
+                max_length=self.max_length,
+                has_negatives=self.has_negatives,
+            )(features)
         keys = [
             "query_input_ids",
             "query_attention_mask",
@@ -2968,9 +3005,4 @@ class EmbeddingDataCollatorGrain:
         ]
         if self.has_negatives:
             keys.extend(["negative_input_ids", "negative_attention_mask"])
-
-        batch: dict[str, jnp.ndarray] = {}
-        for key in keys:
-            if key in features[0]:
-                batch[key] = jnp.array([f[key] for f in features])
-        return batch
+        return {key: np.asarray(features[key], dtype=np.int32) for key in keys if key in features}

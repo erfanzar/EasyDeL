@@ -113,11 +113,16 @@ def _promote_rotary_operands(*operands: jax.Array) -> tuple[jax.Array, ...]:
 def rope_wrapper(type: str) -> tp.Callable[[_T], _T]:  # noqa
     """Build a decorator that registers a rotary class under ``type`` in :data:`AVAILABLE_ROPE_TYPES`.
 
-    The decorator captures the class's ``__dict__`` so callers can introspect
-    the registered RoPE without instantiating it, sets simple ``__str__`` /
+    The decorator records the class itself so callers can introspect the
+    registered RoPE without instantiating it, sets simple ``__str__`` /
     ``__repr__`` returning the class name, and stashes the chosen ``type``
     name on ``cls._type`` for round-tripping. Used to populate the
     name-to-class table consumed by :func:`get_rope` / :func:`get_frequencies`.
+    A custom class receives the common geometry and its remaining config fields
+    in its constructor. To supply a custom frequency cache, define a static or
+    class method ``compute_frequencies(*, head_size, rotary_dim, max_position,
+    base, rope_scaling)`` returning the cache; built-ins use their existing
+    frequency implementations when this method is absent.
 
     Args:
         type: Registry key (e.g. ``"linear"``, ``"yarn"``, ``"llama3"``).
@@ -137,8 +142,7 @@ def rope_wrapper(type: str) -> tp.Callable[[_T], _T]:  # noqa
             The same class object, now reachable via
             ``AVAILABLE_ROPE_TYPES[type]``.
         """
-        properties = {k: v for k, v in rope.__dict__.items()}
-        AVAILABLE_ROPE_TYPES[type] = properties
+        AVAILABLE_ROPE_TYPES[type] = rope
         rope.__str__ = lambda cls: str(cls.__class__.__name__)
         rope.__repr__ = lambda cls: repr(cls.__class__.__name__)
         rope._type = type
@@ -282,6 +286,7 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         attention_scaling: float = 1.0,
         mrope_interleaved: bool = True,
         repetition_style: bool = False,
+        rope_scaling: dict[str, tp.Any] | None = None,
     ):
         """Initialize the MultiModalRotaryEmbedding module.
 
@@ -301,6 +306,8 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
                 If False, uses Qwen2-VL style chunked pattern. Defaults to True.
             repetition_style: If True, uses HuggingFace-style list repetition for
                 chunked mRoPE. Defaults to False.
+            rope_scaling: Optional frequency-scaling configuration composed with
+                the multimodal layout. Defaults to unscaled frequencies.
 
         Raises:
             ValueError: If rotary_dim is not positive.
@@ -336,6 +343,9 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         self.mrope_section = section
         self.attention_scaling = attention_scaling
         self.mrope_interleaved = mrope_interleaved
+        self.rope_scaling = None if rope_scaling is None else dict(rope_scaling)
+        if self.rope_scaling is not None and self.rope_scaling.get("rope_type", "default") in ("default", "mrope"):
+            self.rope_scaling = None
 
     def _apply_chunked_mrope(self, emb: jax.Array) -> jax.Array:
         """Apply Qwen2-VL style chunked mRoPE pattern.
@@ -397,6 +407,39 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
             out = jnp.where(take_dim, freqs[dim_idx], out)
         return out
 
+    def _merged_cos_sin(self, positions, frequencies=None):
+        """Merge the configured spectrum's half-width tables across T/H/W."""
+        if frequencies is None and self.rope_scaling is not None:
+            # Import lazily: the factory registry itself imports this module.
+            from ._rotary import get_frequencies
+
+            frequencies = get_frequencies(
+                self.head_size,
+                self.rotary_dim,
+                self.max_position_embeddings,
+                self.base,
+                self.rope_scaling,
+            )
+        if frequencies is None:
+            inv_freq = compute_basic_inv_frequencies(self.base, self.rotary_dim)
+            angles = positions[..., None].astype(jnp.float32) * inv_freq
+            cos_half, sin_half = jnp.cos(angles), jnp.sin(angles)
+        else:
+            cache = jnp.asarray(getattr(frequencies, "value", frequencies))
+            # LongRoPE caches carry a singleton leading axis.
+            if cache.ndim == 3 and cache.shape[0] == 1:
+                cache = cache[0]
+            cos_half, sin_half = jnp.split(cache[positions], 2, axis=-1)
+        if self.mrope_interleaved:
+            cos_half = self._apply_interleaved_mrope(cos_half)
+            sin_half = self._apply_interleaved_mrope(sin_half)
+            cos = jnp.concatenate([cos_half, cos_half], axis=-1)
+            sin = jnp.concatenate([sin_half, sin_half], axis=-1)
+        else:
+            cos = self._apply_chunked_mrope(jnp.concatenate([cos_half, cos_half], axis=-1))
+            sin = self._apply_chunked_mrope(jnp.concatenate([sin_half, sin_half], axis=-1))
+        return cos * self.attention_scaling, sin * self.attention_scaling
+
     def compute_cos_sin(
         self,
         positions: jax.Array,
@@ -404,8 +447,8 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
     ) -> tuple[jax.Array, jax.Array]:
         """Compute merged mRoPE cos/sin tables without applying them.
 
-        This is the frequency half of :meth:`forward` (direct-computation
-        path, no frequency cache), exposed for consumers that need the tables
+        This is the frequency half of :meth:`forward`, using the configured
+        scaled or unscaled spectrum, exposed for consumers that need tables
         themselves rather than rotated tensors -- the Qwen4 QSA indexer ropes
         queries at their own positions and pooled block keys at block-start
         positions, which a single rotate-in-place call cannot express.
@@ -423,21 +466,7 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         elif positions.ndim != 3 or positions.shape[0] != 3:
             raise ValueError(f"Position IDs must have shape (batch, seq) or (3, batch, seq); got {positions.shape}.")
 
-        inv_freq = compute_basic_inv_frequencies(self.base, self.rotary_dim)  # (rotary_dim//2,)
-        inv_freq = inv_freq[jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
-        freqs = positions[..., jnp.newaxis].astype(jnp.float32) * inv_freq  # (3, b, seq, dim/2)
-
-        if self.mrope_interleaved:
-            # Qwen3-VL style: apply interleaving on half-dim freqs, then double
-            freqs_interleaved = self._apply_interleaved_mrope(freqs)  # (b, seq, dim/2)
-            emb = jnp.concatenate([freqs_interleaved, freqs_interleaved], axis=-1)  # (b, seq, dim)
-        else:
-            # Qwen2-VL style: double first, then apply chunked pattern
-            emb = jnp.concatenate([freqs, freqs], axis=-1)  # (3, b, seq, dim)
-            emb = self._apply_chunked_mrope(emb)  # (b, seq, dim)
-
-        cos = jnp.cos(emb) * self.attention_scaling
-        sin = jnp.sin(emb) * self.attention_scaling
+        cos, sin = self._merged_cos_sin(positions)
         if not self.is_neox_style:
             # GPT-J rotates adjacent channel pairs, so table entries must be
             # adjacent duplicates rather than NeoX duplicated halves.
@@ -483,52 +512,7 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         if offsets is not None:
             positions = positions + offsets
 
-        if frequencies is not None:
-            freq_cache = getattr(frequencies, "value", frequencies)
-            # freq_cache expected shape: [max_pos, rotary_dim] containing [cos, sin] concat
-            freq_cache = jnp.asarray(freq_cache)
-            freqs_full = jnp.stack(
-                [
-                    freq_cache[positions[0]],
-                    freq_cache[positions[1]],
-                    freq_cache[positions[2]],
-                ],
-                axis=0,
-            )  # (3, b, seq, rotary_dim)
-            cos_half, sin_half = jnp.split(freqs_full, 2, axis=-1)  # each (3, b, seq, dim/2)
-
-            if self.mrope_interleaved:
-                # Qwen3-VL style: apply interleaving on half-dim freqs, then double
-                cos_interleaved = self._apply_interleaved_mrope(cos_half)  # (b, seq, dim/2)
-                sin_interleaved = self._apply_interleaved_mrope(sin_half)  # (b, seq, dim/2)
-                cos = jnp.concatenate([cos_interleaved, cos_interleaved], axis=-1)  # (b, seq, dim)
-                sin = jnp.concatenate([sin_interleaved, sin_interleaved], axis=-1)  # (b, seq, dim)
-            else:
-                # Qwen2-VL style: double first, then apply chunked pattern
-                cos_doubled = jnp.concatenate([cos_half, cos_half], axis=-1)  # (3, b, seq, dim)
-                sin_doubled = jnp.concatenate([sin_half, sin_half], axis=-1)  # (3, b, seq, dim)
-                cos = self._apply_chunked_mrope(cos_doubled)  # (b, seq, dim)
-                sin = self._apply_chunked_mrope(sin_doubled)  # (b, seq, dim)
-        else:
-            inv_freq = compute_basic_inv_frequencies(self.base, self.rotary_dim)  # (rotary_dim//2,)
-            inv_freq = inv_freq[jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
-            freqs = positions[..., jnp.newaxis].astype(jnp.float32) * inv_freq  # (3, b, seq, dim/2)
-
-            if self.mrope_interleaved:
-                # Qwen3-VL style: apply interleaving on half-dim freqs, then double
-                freqs_interleaved = self._apply_interleaved_mrope(freqs)  # (b, seq, dim/2)
-                emb = jnp.concatenate([freqs_interleaved, freqs_interleaved], axis=-1)  # (b, seq, dim)
-            else:
-                # Qwen2-VL style: double first, then apply chunked pattern
-                emb = jnp.concatenate([freqs, freqs], axis=-1)  # (3, b, seq, dim)
-                emb = self._apply_chunked_mrope(emb)  # (b, seq, dim)
-
-            cos = jnp.cos(emb)
-            sin = jnp.sin(emb)
-
-        # Apply attention scaling (typically 1.0 for standard mRoPE, can be different for advanced types)
-        cos = cos * self.attention_scaling
-        sin = sin * self.attention_scaling
+        cos, sin = self._merged_cos_sin(positions, frequencies)
 
         # HF mRoPE helpers may compute cos/sin in NeoX-style (duplicated halves) and then
         # convert to GPT-J-style (repeat_interleave) depending on the rotation style.
@@ -709,6 +693,7 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
         base: int,
         is_neox_style: bool,
         dtype: jnp.dtype,
+        max_positions: int | None = None,
     ):
         """Initialize the DynamicNTKScalingRotaryEmbedding module.
 
@@ -721,6 +706,8 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
             base: The initial base value before dynamic adjustment.
             is_neox_style: If True, uses Neox-style rotation. If False, uses GPT-J-style.
             dtype: Data type for the output embeddings.
+            max_positions: Optional cache length, independent of the original
+                context threshold. Defaults to the original context times factor.
         """
         super().__init__(
             head_size=head_size,
@@ -731,6 +718,7 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
             dtype=dtype,
         )
         self.scaling_factor = scaling_factor
+        self.max_positions = max_positions
 
     @jax.named_scope("easydel-rope-dynamic-ntk-scaling")
     def forward(
@@ -768,6 +756,7 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
                     rotary_dim=self.rotary_dim,
                     max_position_embeddings=self.max_position_embeddings,
                     scaling_factor=self.scaling_factor,
+                    max_positions=self.max_positions,
                 )
             if hasattr(frequencies, "value"):
                 frequencies = frequencies.value
@@ -930,10 +919,10 @@ class DeepseekScalingRotaryEmbedding(spx.Module):
     Same interpolation/extrapolation blend as YaRN, but the attention-magnitude
     correction is a *ratio* of two ``yarn_get_mscale`` evaluations
     (``mscale`` numerator, ``mscale_all_dim`` denominator), as used by the
-    DeepSeek-V2/V3 series. Unlike :class:`YaRNScalingRotaryEmbedding`, this
-    class implements its own ``forward`` rather than delegating to
-    :func:`apply_basic_rope` because DeepSeek's rotation uses a ``repeat``
-    layout for cos/sin that differs from the canonical concat layout.
+    DeepSeek-V2/V3 series. The cache comes from
+    :func:`compute_deepseek_frequencies` and the rotation is applied with
+    :func:`apply_basic_rope`, so ``offsets`` and the ``dtype`` cast behave
+    like every other RoPE variant.
 
     Note that this class inherits directly from :class:`spx.Module` (not
     :class:`RotaryEmbedding`) and therefore re-declares the geometric fields.
@@ -952,6 +941,7 @@ class DeepseekScalingRotaryEmbedding(spx.Module):
         beta_slow (int): YaRN slow-band boundary.
         mscale (float): Per-dim mscale exponent.
         mscale_all_dim (float): All-dim mscale exponent (denominator).
+        truncate (bool): HF YaRN ``truncate`` flag for the correction band.
     """
 
     def __init__(
@@ -969,6 +959,7 @@ class DeepseekScalingRotaryEmbedding(spx.Module):
         beta_slow: int = 1,
         mscale: float = 1,
         mscale_all_dim: float = 0,
+        truncate: bool = True,
     ):
         """Initialize the DeepseekScalingRotaryEmbedding module.
 
@@ -990,6 +981,7 @@ class DeepseekScalingRotaryEmbedding(spx.Module):
             beta_slow: YaRN parameter for low-frequency dimensions. Defaults to 1.
             mscale: Parameter for mscale calculation in yarn_get_mscale. Defaults to 1.
             mscale_all_dim: Parameter for mscale calculation. Defaults to 0.
+            truncate: HF YaRN ``truncate`` flag for the correction band. Defaults to True.
         """
         self.head_size = head_size
         self.rotary_dim = rotary_dim
@@ -1004,6 +996,7 @@ class DeepseekScalingRotaryEmbedding(spx.Module):
         self.beta_slow = beta_slow
         self.mscale = mscale
         self.mscale_all_dim = mscale_all_dim
+        self.truncate = truncate
 
     @jax.named_scope("easydel-rope-deepseek")
     def forward(
@@ -1033,46 +1026,34 @@ class DeepseekScalingRotaryEmbedding(spx.Module):
         Returns:
             A tuple of (rotated_query, rotated_key) tensors.
         """
-        if frequencies is None:
-            frequencies = compute_deepseek_frequencies(
-                self.base,
-                self.rotary_dim,
-                self.scaling_factor,
-                self.extrapolation_factor,
-                self.beta_fast,
-                self.beta_slow,
-                self.max_position_embeddings,
-                self.mscale,
-                self.mscale_all_dim,
-                self.attn_factor,
+        with jax.ensure_compile_time_eval():
+            if frequencies is None:
+                frequencies = compute_deepseek_frequencies(
+                    self.base,
+                    self.rotary_dim,
+                    self.scaling_factor,
+                    self.extrapolation_factor,
+                    self.beta_fast,
+                    self.beta_slow,
+                    self.max_position_embeddings,
+                    self.mscale,
+                    self.mscale_all_dim,
+                    self.attn_factor,
+                    truncate=self.truncate,
+                )
+            if hasattr(frequencies, "value"):
+                frequencies = frequencies.value
+            query, key = apply_basic_rope(
+                query=query,
+                key=key,
+                positions=positions,
+                frequencies=frequencies,
+                rotary_dim=self.rotary_dim,
+                is_neox_style=self.is_neox_style,
+                offsets=offsets,
+                dtype=self.dtype,
             )
-        cos, sin = jnp.split(frequencies[positions], 2, -1)
-        if offsets is not None:
-            positions += offsets
-        query_rot = query[..., : self.rotary_dim]
-        key_rot = key[..., : self.rotary_dim]
-
-        query_pass = query[..., self.rotary_dim :]
-        key_pass = key[..., self.rotary_dim :]
-
-        target_sc_shape = (query.shape[0], -1, 1, self.rotary_dim)
-        if self.is_neox_style:
-            cos = cos.repeat(2, axis=1).reshape(target_sc_shape)
-            sin = sin.repeat(2, axis=1).reshape(target_sc_shape)
-        else:
-            cos = cos.repeat_interleave(2, axis=1).reshape(target_sc_shape)
-            sin = sin.repeat_interleave(2, axis=1).reshape(target_sc_shape)
-        rotate_fn = _rotate_neox if self.is_neox_style else _rotate_gptj
-        query_rot = query_rot * cos + rotate_fn(query_rot) * sin
-        key_rot = key_rot * cos + rotate_fn(key_rot) * sin
-
-        if self.rotary_dim < self.head_size:
-            query = jnp.concatenate((query_rot, query_pass), axis=-1)
-            key = jnp.concatenate((key_rot, key_pass), axis=-1)
-        else:
-            query = query_rot
-            key = key_rot
-        return query, key
+            return query.astype(self.dtype), key.astype(self.dtype)
 
 
 @rope_wrapper("longrope")

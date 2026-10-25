@@ -84,6 +84,10 @@ class _Empty:
         """
         return "NOT_GIVEN"
 
+    def __reduce__(self) -> str:
+        """Reconstruct the canonical module-global sentinel on copy or unpickle."""
+        return "NOT_GIVEN"
+
 
 Array = jnp.ndarray
 PRNGKey = jnp.ndarray

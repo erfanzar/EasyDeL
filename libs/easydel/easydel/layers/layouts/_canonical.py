@@ -142,7 +142,13 @@ def fused_layout_param_specs(module: tp.Any) -> list[tuple[str, tuple[int, ...]]
 
         # 3. fused MoE experts: ColumnParallelMoELinear named gate_up_proj holds
         #    [gate | up] (equal halves) TP-interleaved on the output axis
-        if isinstance(sub, ParallelMoELinear) and dotted.endswith("gate_up_proj"):
+        if (
+            isinstance(sub, ParallelMoELinear)
+            and dotted.endswith("gate_up_proj")
+            and not getattr(sub, "use_expert_tensor_mode", False)
+        ):
+            # ExpertTensorMode shards experts over physical TP, leaving each
+            # expert's gate/up channels contiguous at every physical TP size.
             out = getattr(sub, "out_features", None)
             if out is None:
                 w = getattr(sub, "weight", None)

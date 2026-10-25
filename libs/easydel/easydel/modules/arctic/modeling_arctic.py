@@ -58,13 +58,12 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     MoeCausalLMOutput,
     MoeModelOutput,
-    SequenceClassifierOutput,
 )
+from easydel.infra.sequence_packing import token_attention_mask_from_mask_info
 from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     BaseMoeModule,
@@ -130,78 +129,6 @@ class ArcticAttention(UnifiedAttention):
             sliding_window=config.sliding_window,
         )
 
-    def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Create query projection layer with Arctic-specific bias configuration.
-
-        Args:
-            config: Model configuration.
-            dtype: Data type for computation.
-            param_dtype: Data type for parameters.
-            precision: Numerical precision for operations.
-            rngs: Random number generator state.
-
-        Returns:
-            ColumnParallelLinear: Query projection layer.
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=getattr(config, "attention_bias", False),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(),
-            precision=precision,
-        )
-
-    def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Create key projection layer with Arctic-specific bias configuration.
-
-        Args:
-            config: Model configuration.
-            dtype: Data type for computation.
-            param_dtype: Data type for parameters.
-            precision: Numerical precision for operations.
-            rngs: Random number generator state.
-
-        Returns:
-            ColumnParallelLinear: Key projection layer.
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=getattr(config, "attention_bias", False),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(),
-            precision=precision,
-        )
-
-    def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Create value projection layer with Arctic-specific bias configuration.
-
-        Args:
-            config: Model configuration.
-            dtype: Data type for computation.
-            param_dtype: Data type for parameters.
-            precision: Numerical precision for operations.
-            rngs: Random number generator state.
-
-        Returns:
-            ColumnParallelLinear: Value projection layer.
-        """
-        return ColumnParallelLinear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=getattr(config, "attention_bias", False),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(),
-            precision=precision,
-        )
-
     def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
         """Create output projection layer with Arctic-specific bias configuration.
 
@@ -254,6 +181,7 @@ class ArcticAttention(UnifiedAttention):
             rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
+            dropout_prob=config.attention_dropout,
         )
 
 
@@ -543,7 +471,9 @@ class ArcticMoeBlock(BaseMoeModule):
             )
 
     def forward(
-        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        token_validity: Bool[Array, "batch seq_len"] | None = None,
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Forward pass through the MoE or MLP block.
 
@@ -552,6 +482,8 @@ class ArcticMoeBlock(BaseMoeModule):
 
         Args:
             hidden_states (Array): Input tensor of shape (batch_size, seq_len, hidden_dim).
+            token_validity: Optional boolean mask of real tokens. Padding neither
+                consumes capacity nor contributes assignments when token dropping is enabled.
 
         Returns:
             tuple[Array, Array | None]: Tuple containing:
@@ -559,6 +491,57 @@ class ArcticMoeBlock(BaseMoeModule):
                 - Router logits for MoE layers, or None for standard MLP layers
         """
         if self.is_moe_layer:
+            hooks = self._configure_hooks_for_routing_strategy()
+            if self.config.moe_token_dropping:
+                factor = self.config.moe_train_capacity_factor if self.training else self.config.moe_eval_capacity_factor
+                select = hooks.select_hook
+                refine = hooks.refine_weights_hook
+                normalize = hooks.normalize_gate_logits
+
+                def normalize_valid_tokens(logits):
+                    # Encode validity in the routing scores, not in a captured
+                    # dispatch-global mask. Scores follow tokens through the
+                    # expert-axis gathers and full-block chunk selection.
+                    scores = (
+                        jax.nn.softmax(logits.astype(jnp.float32), axis=-1) if normalize is None else normalize(logits)
+                    )
+                    if token_validity is not None:
+                        scores = jnp.where(token_validity.reshape(-1, 1), scores, 0)
+                    return scores
+
+                def select_with_capacity(gate_logits, pre_bias_logits, k):
+                    """Keep at most the configured capacity of assignments per expert.
+
+                    Capacity is per dispatch shard, after any expert-axis gather,
+                    and counts assignments (including top-k) across its tokens.
+                    Mask after normalizing so dropped mass is not redistributed.
+                    """
+                    valid = jnp.any(gate_logits != 0, axis=-1)
+                    # Keep normalization finite even for fully padded rows; the
+                    # final validity mask removes these assignments entirely.
+                    safe_logits = jnp.where(valid[:, None], gate_logits, 1.0 / self.num_experts)
+                    if select is None:
+                        weights, experts = jax.lax.top_k(safe_logits, k)
+                    else:
+                        weights, experts = select(safe_logits, pre_bias_logits, k)
+                    if refine is not None:
+                        weights = refine(weights)
+                    capacity = jnp.maximum(
+                        self.config.moe_min_capacity,
+                        jnp.ceil(factor * (jnp.sum(valid) * k) / self.num_experts),
+                    )
+                    valid_routes = jnp.broadcast_to(valid[:, None], experts.shape).reshape(-1)
+                    assignments = jax.nn.one_hot(experts.reshape(-1), self.num_experts, dtype=jnp.int32)
+                    assignments = assignments * valid_routes[:, None]
+                    positions = jnp.sum(jnp.cumsum(assignments, axis=0) * assignments, axis=-1)
+                    keep = ((positions <= capacity) & valid_routes).reshape(experts.shape)
+                    return jnp.where(keep, weights, 0), experts
+
+                hooks = hooks.replace(
+                    normalize_gate_logits=normalize_valid_tokens,
+                    select_hook=select_with_capacity,
+                    refine_weights_hook=None,
+                )
             out, router_logits = self.moe_call(
                 hidden_state=hidden_states,
                 gate_layer=self.gate,
@@ -566,6 +549,7 @@ class ArcticMoeBlock(BaseMoeModule):
                 gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
                 wd_kernel=self.experts.w2.kernel_view(),
                 act_fn=self.experts.act_fn,
+                hooks=hooks,
             )
             return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")  # pyright: ignore[reportReturnType]
         if self.config.use_scan_mlp:
@@ -737,6 +721,7 @@ class ArcticDecoderLayer(spx.Module):
         )
         residual_attn = hidden_states
         router_logits = None
+        token_validity = token_attention_mask_from_mask_info(mask_info, hidden_states.shape[1])
         if self.parallel_attn_mlp_res:
             hidden_states = self.residual_layernorm(hidden_states)
             if self.config.use_scan_mlp:
@@ -750,11 +735,11 @@ class ArcticDecoderLayer(spx.Module):
             residual_residual = checkpoint_name(residual_attn + hidden_states, "residual")
             # parallel mlp moe part
             hidden_states = self.post_attention_layernorm(residual_input)
-            hidden_states, router_logits = self.block_sparse_moe(hidden_states)
+            hidden_states, router_logits = self.block_sparse_moe(hidden_states, token_validity=token_validity)
             hidden_states = checkpoint_name(residual_residual + hidden_states, "residual")
         else:
             hidden_states = self.post_attention_layernorm(hidden_states)
-            hidden_states, router_logits = self.block_sparse_moe(hidden_states)
+            hidden_states, router_logits = self.block_sparse_moe(hidden_states, token_validity=token_validity)
             hidden_states = checkpoint_name(residual_attn + hidden_states, "residual")
 
         hidden_states = apply_logical_sharding(
@@ -1029,6 +1014,7 @@ class ArcticModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_self_attns, all_router_logits, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
@@ -1085,8 +1071,8 @@ class ArcticForCausalLM(BaseCausalLMModule[ArcticModel, ArcticConfig]):  # type:
     logits. Inherits the standard generation utilities (``prepare_inputs``,
     KV-cache handling) from :class:`BaseCausalLMModule`. Because Arctic is a
     sparse MoE model, the forward pass goes through ``forward_moe`` and the
-    auxiliary load-balancing loss (computed in :meth:`_compute_aux_loss` from
-    the per-MoE-layer router logits, weighted by
+    auxiliary load-balancing loss (computed by the shared
+    :meth:`compute_router_aux_loss` from the per-MoE-layer router logits, weighted by
     ``config.router_aux_loss_coef``) is folded into the main objective.
 
     Attributes:
@@ -1180,32 +1166,7 @@ class ArcticForCausalLM(BaseCausalLMModule[ArcticModel, ArcticConfig]):  # type:
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
-            aux_loss_fn=self._compute_aux_loss,
         )
-
-    def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute auxiliary load balancing loss from router logits.
-
-        Args:
-            outputs: Model outputs containing router logits from MoE layers.
-            attention_mask: Attention mask to exclude padding tokens from loss computation.
-
-        Returns:
-            Array | None: Auxiliary loss value, or None if no valid router logits.
-        """
-        if outputs.router_logits is None or len(outputs.router_logits) == 0:
-            return None
-        # Filter out None values (from non-MoE layers based on moe_layer_frequency)
-        valid_logits = tuple(l for l in outputs.router_logits if l is not None)  # noqa: E741
-        if not valid_logits:
-            return None
-        aux_loss = auxiliary_load_balancing_loss_func(
-            gate_logits=valid_logits,
-            num_experts=self.config.num_local_experts,
-            top_k=self.config.num_experts_per_tok,
-            attention_mask=attention_mask,
-        )
-        return aux_loss
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=ArcticConfig, model_type="arctic")
@@ -1262,84 +1223,6 @@ class ArcticForSequenceClassification(BaseSequenceClassificationModule[ArcticMod
             router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
-    def forward(
-        self,
-        input_ids: Int[Array, "batch seq_len"] | None = None,
-        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        mask_info: MaskInfo | None = None,
-        position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
-        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-    ) -> SequenceClassifierOutput:
-        """Forward pass through the Arctic sequence classification model.
-
-        Processes input through the Arctic transformer and applies classification head
-        to produce class logits based on the last token representation.
-
-        Args:
-            input_ids (Array | None, optional): Input token IDs of shape (batch_size, seq_len).
-            inputs_embeds (Array | None, optional): Pre-computed input embeddings.
-            attention_mask (Array | None, optional): Attention mask for padding tokens.
-            mask_info (MaskInfo | None, optional): Advanced mask information.
-            position_ids (Array | None, optional): Position indices for tokens.
-            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode for optimization.
-            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
-                Cached key-value states.
-            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
-                Cache metadata.
-            output_attentions (bool | None, optional): Whether to return attention weights.
-            output_hidden_states (bool | None, optional): Whether to return all hidden states.
-
-        Returns:
-            SequenceClassifierOutput: Contains logits, hidden states, attentions, and auxiliary loss.
-
-        Raises:
-            ValueError: If batch size > 1 and no padding token is defined.
-        """
-        transformer_outputs = self.base_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            mask_info=mask_info,
-            position_ids=position_ids,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            inputs_embeds=inputs_embeds,
-        )
-
-        hidden_states = transformer_outputs.last_hidden_state
-        logits = self.score(hidden_states)
-
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]
-        else:
-            batch_size = inputs_embeds.shape[0]
-
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
-        else:
-            if input_ids is not None:
-                sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-            else:
-                sequence_lengths = -1
-
-        pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-        aux_loss = self.compute_router_aux_loss(transformer_outputs)
-
-        return SequenceClassifierOutput(
-            logits=pooled_logits,
-            past_key_values=past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-            aux_loss=aux_loss,
-        )
+    # ``forward`` is inherited from :class:`BaseSequenceClassificationModule`: it pools the
+    # last attended token (attention-mask aware), returns the base model's cache and folds
+    # in the MoE router auxiliary loss via ``compute_router_aux_loss``.

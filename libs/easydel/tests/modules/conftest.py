@@ -30,6 +30,28 @@ import torch
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 
 
+@pytest.fixture(autouse=True)
+def hf_dbrx_aux_loss_tensor_compat(request, monkeypatch):
+    """Normalize legacy HF DBRX scalar auxiliary losses only during DBRX parity tests."""
+    if request.path.name != "test_dbrx.py":
+        return
+    from transformers.models.dbrx import modeling_dbrx as hf_dbrx
+
+    original_loss = hf_dbrx.load_balancing_loss_func
+
+    def tensor_loss(*args, **kwargs):
+        result = original_loss(*args, **kwargs)
+        if isinstance(result, torch.Tensor):
+            return result
+        gate_logits = kwargs.get("gate_logits", args[0] if args else None)
+        if isinstance(gate_logits, tuple):
+            gate_logits = next((value for value in gate_logits if isinstance(value, torch.Tensor)), None)
+        device = gate_logits.device if isinstance(gate_logits, torch.Tensor) else None
+        return torch.tensor(float(result), device=device)
+
+    monkeypatch.setattr(hf_dbrx, "load_balancing_loss_func", tensor_loss)
+
+
 @pytest.fixture(scope="session")
 def test_seed():
     """Fixed seed for reproducible tests."""

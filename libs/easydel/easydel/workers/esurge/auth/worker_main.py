@@ -22,7 +22,9 @@ and ``shutdown``). The serving loop translates manager exceptions back
 into a wire payload (``status="error"`` with ``exception_type`` set)
 that :class:`AuthWorkerClient` re-raises locally as
 :class:`PermissionDenied`, :class:`RateLimitExceeded` or
-:class:`QuotaExceeded`.
+:class:`QuotaExceeded`. Every command is guarded, so a malformed message
+or a manager failure produces an error reply instead of killing the
+worker (which would leave blocking REQ clients hanging forever).
 
 Designed to be spawned by :class:`AuthWorkerManager` under a CPU-only
 JAX configuration (the worker does no model work) so the API server
@@ -31,8 +33,9 @@ single process even when multiple FastAPI workers serve requests.
 
 Invocation:
     The script is invoked via ``python -m
-    easydel.workers.esurge.auth.worker_main`` with the following CLI
-    options::
+    easydel.workers.esurge.auth.worker_main`` (which is how
+    :class:`AuthWorkerManager` launches it; the package-relative imports
+    require a parent package) with the following CLI options::
 
         --endpoint <zmq-endpoint>         (required)
         --require-api-key                 (flag)
@@ -52,10 +55,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 
 import zmq
 
+from easydel.workers.loggers import get_logger
+
 from .auth_manager import EnhancedApiKeyManager
+
+logger = get_logger("AuthWorker")
 
 
 def _auth_worker(
@@ -77,9 +85,10 @@ def _auth_worker(
     operations; the reply is always a dict with a ``status`` of
     ``"ok"`` or ``"error"`` plus operation-specific payload fields.
 
-    Exceptions raised by the manager during ``authorize_request`` are
-    forwarded with their ``type(e).__name__`` in ``exception_type`` so
-    :class:`AuthWorkerClient` can re-raise the matching local class.
+    Exceptions raised while handling any command (malformed message,
+    manager failure, authorisation rejection) are forwarded with their
+    ``type(e).__name__`` in ``exception_type`` so :class:`AuthWorkerClient`
+    can re-raise the matching local class; the loop keeps serving.
 
     Args:
         endpoint: ZeroMQ endpoint to bind to (e.g. ``ipc:///tmp/auth.sock``
@@ -116,10 +125,11 @@ def _auth_worker(
     try:
         while True:
             message = socket.recv_pyobj()
-            cmd = message.get("cmd")
 
-            if cmd == "generate_api_key":
-                try:
+            try:
+                cmd = message.get("cmd")
+
+                if cmd == "generate_api_key":
                     raw_key, metadata = auth_manager.generate_api_key(
                         name=message["name"],
                         role=message.get("role"),
@@ -139,26 +149,26 @@ def _auth_worker(
                             "metadata": metadata.as_dict(include_sensitive=False),
                         }
                     )
-                except Exception as e:
-                    socket.send_pyobj({"status": "error", "message": str(e)})
 
-            elif cmd == "validate_key":
-                metadata = auth_manager.validate_key(message["raw_key"])
-                socket.send_pyobj(
-                    {
-                        "status": "ok",
-                        "metadata": metadata.as_dict(include_sensitive=False) if metadata else None,
-                    }
-                )
+                elif cmd == "validate_key":
+                    metadata = auth_manager.validate_key(message["raw_key"])
+                    socket.send_pyobj(
+                        {
+                            "status": "ok",
+                            "metadata": metadata.as_dict(include_sensitive=False) if metadata else None,
+                        }
+                    )
 
-            elif cmd == "authorize_request":
-                try:
+                elif cmd == "authorize_request":
                     metadata = auth_manager.authorize_request(
                         raw_key=message["raw_key"],
                         ip_address=message.get("ip_address"),
                         endpoint=message.get("endpoint"),
                         model=message.get("model"),
                         requested_tokens=message.get("requested_tokens", 0),
+                        stream=bool(message.get("stream", False)),
+                        uses_tools=bool(message.get("uses_tools", False)),
+                        reservation_id=message.get("reservation_id"),
                     )
                     socket.send_pyobj(
                         {
@@ -166,127 +176,149 @@ def _auth_worker(
                             "metadata": metadata.as_dict(include_sensitive=False),
                         }
                     )
-                except Exception as e:
-                    socket.send_pyobj({"status": "error", "message": str(e), "exception_type": type(e).__name__})
 
-            elif cmd == "record_usage":
-                auth_manager.record_usage(
-                    raw_key=message["raw_key"],
-                    prompt_tokens=message["prompt_tokens"],
-                    completion_tokens=message["completion_tokens"],
-                )
-                socket.send_pyobj({"status": "ok"})
+                elif cmd == "record_usage":
+                    auth_manager.record_usage(
+                        raw_key=message["raw_key"],
+                        prompt_tokens=message["prompt_tokens"],
+                        completion_tokens=message["completion_tokens"],
+                        reservation_id=message.get("reservation_id"),
+                    )
+                    socket.send_pyobj({"status": "ok"})
 
-            elif cmd == "revoke_key":
-                success = auth_manager.revoke_key(
-                    key_id=message["key_id"],
-                    revoked_by=message.get("revoked_by"),
-                )
-                socket.send_pyobj({"status": "ok", "success": success})
+                elif cmd == "release_reservation":
+                    success = auth_manager.release_reservation(
+                        raw_key=message.get("raw_key"), reservation_id=message.get("reservation_id")
+                    )
+                    socket.send_pyobj({"status": "ok", "success": success})
 
-            elif cmd == "suspend_key":
-                success = auth_manager.suspend_key(
-                    key_id=message["key_id"],
-                    suspended_by=message.get("suspended_by"),
-                )
-                socket.send_pyobj({"status": "ok", "success": success})
+                elif cmd == "flush":
+                    auth_manager.flush()
+                    socket.send_pyobj({"status": "ok"})
 
-            elif cmd == "reactivate_key":
-                success = auth_manager.reactivate_key(
-                    key_id=message["key_id"],
-                    reactivated_by=message.get("reactivated_by"),
-                )
-                socket.send_pyobj({"status": "ok", "success": success})
+                elif cmd == "revoke_key":
+                    success = auth_manager.revoke_key(
+                        key_id=message["key_id"],
+                        revoked_by=message.get("revoked_by"),
+                    )
+                    socket.send_pyobj({"status": "ok", "success": success})
 
-            elif cmd == "delete_key":
-                success = auth_manager.delete_key(
-                    key_id=message["key_id"],
-                    deleted_by=message.get("deleted_by"),
-                )
-                socket.send_pyobj({"status": "ok", "success": success})
+                elif cmd == "suspend_key":
+                    success = auth_manager.suspend_key(
+                        key_id=message["key_id"],
+                        suspended_by=message.get("suspended_by"),
+                    )
+                    socket.send_pyobj({"status": "ok", "success": success})
 
-            elif cmd == "get_key_by_id":
-                metadata = auth_manager.get_key_by_id(message["key_id"])
-                socket.send_pyobj(
-                    {
-                        "status": "ok",
-                        "metadata": metadata.as_dict(include_sensitive=False) if metadata else None,
-                    }
-                )
+                elif cmd == "reactivate_key":
+                    success = auth_manager.reactivate_key(
+                        key_id=message["key_id"],
+                        reactivated_by=message.get("reactivated_by"),
+                    )
+                    socket.send_pyobj({"status": "ok", "success": success})
 
-            elif cmd == "list_keys":
-                keys = auth_manager.list_keys(
-                    role=message.get("role"),
-                    status=message.get("status"),
-                    tags=message.get("tags"),
-                )
-                socket.send_pyobj(
-                    {
-                        "status": "ok",
-                        "keys": [k.as_dict(include_sensitive=False) for k in keys],
-                    }
-                )
+                elif cmd == "delete_key":
+                    success = auth_manager.delete_key(
+                        key_id=message["key_id"],
+                        deleted_by=message.get("deleted_by"),
+                    )
+                    socket.send_pyobj({"status": "ok", "success": success})
 
-            elif cmd == "update_key":
-                success = auth_manager.update_key(
-                    key_id=message["key_id"],
-                    name=message.get("name"),
-                    description=message.get("description"),
-                    role=message.get("role"),
-                    expires_in_days=message.get("expires_in_days"),
-                    rate_limits=message.get("rate_limits"),
-                    quota=message.get("quota"),
-                    permissions=message.get("permissions"),
-                    tags=message.get("tags"),
-                    metadata=message.get("metadata"),
-                    updated_by=message.get("updated_by"),
-                )
-                socket.send_pyobj({"status": "ok", "success": success})
-
-            elif cmd == "rotate_key":
-                result = auth_manager.rotate_key(
-                    key_id=message["key_id"],
-                    rotated_by=message.get("rotated_by"),
-                )
-                if result:
-                    new_raw_key, metadata = result
+                elif cmd == "get_key_by_id":
+                    metadata = auth_manager.get_key_by_id(message["key_id"])
                     socket.send_pyobj(
                         {
                             "status": "ok",
-                            "raw_key": new_raw_key,
-                            "metadata": metadata.as_dict(include_sensitive=False),
+                            "metadata": metadata.as_dict(include_sensitive=False) if metadata else None,
                         }
                     )
+
+                elif cmd == "list_keys":
+                    keys = auth_manager.list_keys(
+                        role=message.get("role"),
+                        status=message.get("status"),
+                        tags=message.get("tags"),
+                    )
+                    socket.send_pyobj(
+                        {
+                            "status": "ok",
+                            "keys": [k.as_dict(include_sensitive=False) for k in keys],
+                        }
+                    )
+
+                elif cmd == "update_key":
+                    success = auth_manager.update_key(
+                        key_id=message["key_id"],
+                        name=message.get("name"),
+                        description=message.get("description"),
+                        role=message.get("role"),
+                        expires_in_days=message.get("expires_in_days"),
+                        rate_limits=message.get("rate_limits"),
+                        quota=message.get("quota"),
+                        permissions=message.get("permissions"),
+                        tags=message.get("tags"),
+                        metadata=message.get("metadata"),
+                        updated_by=message.get("updated_by"),
+                        clear_expiry=message.get("clear_expiry", False),
+                    )
+                    socket.send_pyobj({"status": "ok", "success": success})
+
+                elif cmd == "rotate_key":
+                    result = auth_manager.rotate_key(
+                        key_id=message["key_id"],
+                        rotated_by=message.get("rotated_by"),
+                    )
+                    if result:
+                        new_raw_key, metadata = result
+                        socket.send_pyobj(
+                            {
+                                "status": "ok",
+                                "raw_key": new_raw_key,
+                                "metadata": metadata.as_dict(include_sensitive=False),
+                            }
+                        )
+                    else:
+                        # "Not found" is a normal outcome (mirrors the in-process manager returning ``None``),
+                        # not an error: the client maps ``raw_key=None`` back to ``None``.
+                        socket.send_pyobj({"status": "ok", "raw_key": None, "metadata": None})
+
+                elif cmd == "get_audit_logs":
+                    logs = auth_manager.get_audit_logs(
+                        limit=message.get("limit", 100),
+                        key_id=message.get("key_id"),
+                        action=message.get("action"),
+                    )
+                    socket.send_pyobj(
+                        {
+                            "status": "ok",
+                            "logs": [log.as_dict() for log in logs],
+                        }
+                    )
+
+                elif cmd == "get_statistics":
+                    stats = auth_manager.get_statistics()
+                    socket.send_pyobj({"status": "ok", "statistics": stats})
+
+                elif cmd == "shutdown":
+                    auth_manager.close()
+                    socket.send_pyobj({"status": "ok"})
+                    break
+
                 else:
-                    socket.send_pyobj({"status": "error", "message": "Key not found"})
+                    socket.send_pyobj({"status": "error", "message": f"Unknown cmd {cmd}"})
 
-            elif cmd == "get_audit_logs":
-                logs = auth_manager.get_audit_logs(
-                    limit=message.get("limit", 100),
-                    key_id=message.get("key_id"),
-                    action=message.get("action"),
-                )
-                socket.send_pyobj(
-                    {
-                        "status": "ok",
-                        "logs": [log.as_dict() for log in logs],
-                    }
-                )
-
-            elif cmd == "get_statistics":
-                stats = auth_manager.get_statistics()
-                socket.send_pyobj({"status": "ok", "statistics": stats})
-
-            elif cmd == "shutdown":
-                socket.send_pyobj({"status": "ok"})
-                break
-
-            else:
-                socket.send_pyobj({"status": "error", "message": f"Unknown cmd {cmd}"})
+            except Exception as e:
+                # Never let a single bad request escape the loop: the REP socket must always answer, otherwise
+                # every blocking REQ client waiting on this worker would hang.
+                logger.error(f"Auth worker command failed: {type(e).__name__}: {e}")
+                socket.send_pyobj({"status": "error", "message": str(e), "exception_type": type(e).__name__})
 
     finally:
-        socket.close(0)
-        ctx.term()
+        try:
+            auth_manager.close()
+        finally:
+            socket.close(0)
+            ctx.term()
 
 
 def main():
@@ -302,7 +334,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--require-api-key", action="store_true")
-    parser.add_argument("--admin-key", default=None)
+    admin_group = parser.add_mutually_exclusive_group()
+    admin_group.add_argument("--admin-key", default=None)
+    admin_group.add_argument("--admin-key-stdin", action="store_true")
     audit_group = parser.add_mutually_exclusive_group()
     audit_group.add_argument("--enable-audit-logging", dest="enable_audit_logging", action="store_true")
     audit_group.add_argument("--disable-audit-logging", dest="enable_audit_logging", action="store_false")
@@ -322,7 +356,7 @@ def main():
     _auth_worker(
         endpoint=args.endpoint,
         require_api_key=args.require_api_key,
-        admin_key=args.admin_key,
+        admin_key=sys.stdin.read() if args.admin_key_stdin else args.admin_key,
         enable_audit_logging=args.enable_audit_logging,
         max_audit_entries=args.max_audit_entries,
         storage_dir=args.storage_dir,

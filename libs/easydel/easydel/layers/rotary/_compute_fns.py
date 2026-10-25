@@ -45,15 +45,16 @@ Example:
 from __future__ import annotations
 
 import math
+from numbers import Real
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from ._utils import (
     _apply_rotary_emb,
     _rotate_neox,
     _yarn_find_correction_range,
-    _yarn_get_mscale,
     _yarn_linear_ramp_mask,
     cos_sin_from_inv_frequencies,
     yarn_get_mscale,
@@ -87,6 +88,13 @@ def compute_basic_inv_frequencies(base: int, rotary_dim: int):
         ready to be outer-product'd with positions to form the rotation
         angles.
     """
+    if isinstance(base, Real):
+        # Model configuration is static even when the caller is jitted. Build
+        # this tiny spectrum in host precision rather than relying on backend
+        # constant folding: TPU's float32 power approximation can shift phases
+        # visibly after multiplying even moderately sized position indices.
+        return jnp.asarray([float(base) ** (-plane / rotary_dim) for plane in range(0, rotary_dim, 2)], jnp.float32)
+    # Preserve traced/array-valued bases, including their differentiation path.
     return 1.0 / (base ** (jnp.arange(0, rotary_dim, 2, dtype="f4") / rotary_dim))
 
 
@@ -359,19 +367,14 @@ def compute_linear_frequencies(
     Returns:
         Float32 array of shape ``(sum_i max_position_embeddings * factor_i,
         rotary_dim)`` with the concatenated ``[cos | sin]`` layout.
-
-    Raises:
-        ValueError: If the per-factor offsets list and ``scaling_factors``
-            list disagree in length (an internal-invariant safeguard).
     """
-    if not isinstance(scaling_factors, list):
+    if not isinstance(scaling_factors, (list, tuple)):
         scaling_factors = [scaling_factors]
     inv_freq = compute_basic_inv_frequencies(
         base=base,
         rotary_dim=rotary_dim,
     )
     cache_list: list[jnp.ndarray] = []
-    offsets: list[int] = []
 
     for scaling_factor in scaling_factors:
         max_len = max_position_embeddings * scaling_factor
@@ -379,18 +382,8 @@ def compute_linear_frequencies(
         t = t / scaling_factor
 
         freqs = jnp.einsum("i,j -> ij", t, inv_freq)
-        cache = jnp.concatenate([jnp.cos(freqs), jnp.sin(freqs)], axis=-1)
-        if not cache_list:
-            offset = 0
-        else:
-            last_offset = offsets[-1]
-            next_max_len = cache_list[-1].shape[0]
-            offset = last_offset + next_max_len
-        offsets.append(offset)
-        cache_list.append(cache)
+        cache_list.append(jnp.concatenate([jnp.cos(freqs), jnp.sin(freqs)], axis=-1))
 
-    if len(scaling_factors) != len(offsets):
-        raise ValueError(f"scaling_factors length ({len(scaling_factors)}) must match offsets length ({len(offsets)})")
     return jnp.concatenate(cache_list, axis=0)
 
 
@@ -400,6 +393,7 @@ def compute_dynamic_frequencies(
     rotary_dim: int,
     max_position_embeddings: int,
     scaling_factor: float,
+    max_positions: int | None = None,
 ):
     """Compute Dynamic-NTK-scaled RoPE frequencies.
 
@@ -428,21 +422,38 @@ def compute_dynamic_frequencies(
         rotary_dim: Rotary feature dimension (must be even).
         max_position_embeddings: Pre-scaling context length.
         scaling_factor: Target context-length multiplier.
+        max_positions: Optional cache length, independent of the original
+            context threshold. Defaults to the original context times factor.
 
     Returns:
-        Float32 array of shape ``(max_position_embeddings * scaling_factor,
-        rotary_dim)`` containing the ``[cos | sin]`` cache.
+        Float32 array of shape ``(max_positions, rotary_dim)`` containing
+        the ``[cos | sin]`` cache.
     """
-    max_length = int(max_position_embeddings * scaling_factor)
+    max_length = int(max_position_embeddings * scaling_factor) if max_positions is None else int(max_positions)
     times = jnp.arange(max_length, dtype=jnp.float32)
-    seq_len = jnp.maximum(times + 1.0, max_position_embeddings)
-    ntk_base = base * ((scaling_factor * seq_len / max_position_embeddings) - (scaling_factor - 1)) ** (
-        rotary_dim / (rotary_dim - 2)
-    )
-    # Keep the in-window rows bit-identical to the unscaled table.
-    bases = jnp.where(seq_len > max_position_embeddings, ntk_base, jnp.float32(base))
-    exponents = jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim
-    inv_frequencies = 1.0 / (bases[:, None] ** exponents[None, :])
+    if isinstance(base, Real) and isinstance(scaling_factor, Real):
+        # A position-indexed cache depends only on static configuration, not
+        # forward inputs. Evaluate its spectrum in host float64, then round
+        # once to float32. Factoring the two NTK powers alone is insufficient:
+        # TPU's remaining float32 power still introduces errors that positions
+        # amplify. Host constants also work inside jit without enabling JAX
+        # x64 or running host callbacks during compiled model execution.
+        seq_len = np.maximum(np.arange(max_length, dtype=np.float64) + 1, max_position_embeddings)
+        stretch = (float(scaling_factor) * seq_len / max_position_embeddings) - (float(scaling_factor) - 1)
+        planes = np.arange(0, rotary_dim, 2, dtype=np.float64)
+        unscaled = float(base) ** (-planes / rotary_dim)
+        inverse = unscaled[None, :] * stretch[:, None] ** (-planes[None, :] / (rotary_dim - 2))
+        inv_frequencies = jnp.asarray(inverse, dtype=jnp.float32)
+    else:
+        # Keep the public helper usable with traced scalar bases/factors and
+        # retain gradients for those callers. Factory configuration takes the
+        # static, accurately rounded path above.
+        seq_len = jnp.maximum(times + 1.0, max_position_embeddings)
+        stretch = (scaling_factor * seq_len / max_position_embeddings) - (scaling_factor - 1)
+        planes = jnp.arange(0, rotary_dim, 2, dtype=jnp.float32)
+        unscaled = compute_basic_inv_frequencies(base, rotary_dim)
+        inv_frequencies = unscaled[None, :] * stretch[:, None] ** (-planes[None, :] / (rotary_dim - 2))
+        inv_frequencies = jnp.where(seq_len[:, None] > max_position_embeddings, inv_frequencies, unscaled[None, :])
     frequencies = times[:, None] * inv_frequencies
     return jnp.concatenate([jnp.cos(frequencies), jnp.sin(frequencies)], -1)
 
@@ -509,7 +520,7 @@ def compute_yarn_frequencies(
     if attention_factor is not None:
         mscale = attention_factor
     else:
-        mscale = _yarn_get_mscale(scaling_factor) * attn_factor
+        mscale = yarn_get_mscale(scaling_factor) * attn_factor
     cos = jnp.cos(freqs) * mscale
     sin = jnp.sin(freqs) * mscale
     return jnp.concatenate([cos, sin], axis=-1)
@@ -701,19 +712,16 @@ def compute_deepseek_frequencies(
         ``[cos | sin]`` layout, magnitudes rescaled by the DeepSeek attention
         factor.
     """
-    pos_freqs = base ** (jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim)
-    inv_freq_extrapolation = 1.0 / pos_freqs
-    inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
-    low, high = _yarn_find_correction_range(
-        beta_fast,
-        beta_slow,
-        rotary_dim,
-        base,
-        max_position_embeddings,
+    inv_freq = compute_yarn_inv_frequencies(
+        base=base,
+        rotary_dim=rotary_dim,
+        beta_fast=beta_fast,
+        beta_slow=beta_slow,
+        max_position_embeddings=max_position_embeddings,
+        scaling_factor=scaling_factor,
+        extrapolation_factor=extrapolation_factor,
         truncate=truncate,
     )
-    inv_freq_mask = (1 - _yarn_linear_ramp_mask(low, high, rotary_dim // 2, dtype=jnp.float32)) * extrapolation_factor
-    inv_freq = inv_freq_interpolation * (1 - inv_freq_mask) + inv_freq_extrapolation * inv_freq_mask
 
     if max_positions is None:
         max_positions = max_position_embeddings * scaling_factor
@@ -805,7 +813,8 @@ def apply_basic_rope(
         query: Query tensor of shape
             ``[..., sequence_length, num_heads, head_dim]``.
         key: Key tensor with the same shape as ``query``.
-        positions: Position indices of shape ``[sequence_length]``.
+        positions: Position indices of shape ``[sequence_length]`` (shared
+            across the batch) or ``[batch_size, sequence_length]``.
         frequencies: Precomputed cos/sin cache with ``[cos | sin]`` layout
             along the last axis.
         rotary_dim: Number of channels (from index 0) to rotate. Must be
@@ -813,23 +822,26 @@ def apply_basic_rope(
         is_neox_style: When ``True`` use Neox interleaving (pair adjacent
             halves), otherwise the GPT-J pairing.
         offsets: Optional per-position offset to add before look-up.
-        dtype: Note: this argument is currently *unused*; the returned
-            arrays inherit the dtype of ``query`` / ``key``. Kept for API
-            parity with :func:`apply_phi3_rope`.
+        dtype: Output dtype, including any unrotated tail. ``None`` retains
+            each input's dtype.
 
     Returns:
         Tuple ``(query, key)`` with the same shape as the inputs.
     """
     if offsets is not None:
         positions = positions + offsets
+    # A shared sequence of positions still needs a batch axis before the
+    # rotation helper inserts the heads axis. Normalize after adding offsets
+    # so per-batch offsets may themselves supply the batch dimension.
+    if positions.ndim == 1 and query.ndim == 4:
+        positions = positions[None, :]
     cos, sin = jnp.split(frequencies[positions], 2, -1)
     if rotary_dim != query.shape[-1]:
         query_rot = _apply_rotary_emb(query[..., :rotary_dim], cos, sin, is_neox_style)
         query = jnp.concatenate((query_rot, query[..., rotary_dim:]), axis=-1)
         key_rot = _apply_rotary_emb(key[..., :rotary_dim], cos, sin, is_neox_style)
         key = jnp.concatenate((key_rot, key[..., rotary_dim:]), axis=-1)
-        return query, key
     else:
         query = _apply_rotary_emb(query, cos, sin, is_neox_style)
         key = _apply_rotary_emb(key, cos, sin, is_neox_style)
-        return query, key
+    return query.astype(dtype) if dtype is not None else query, key.astype(dtype) if dtype is not None else key

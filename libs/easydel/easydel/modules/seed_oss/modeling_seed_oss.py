@@ -613,6 +613,7 @@ class SeedOssModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
@@ -880,7 +881,8 @@ class SeedOssForSequenceClassification(BaseSequenceClassificationModule[SeedOssM
             attention_mask: Boolean mask of shape (batch, seq_len) indicating valid tokens.
             mask_info: Precomputed mask information for attention.
             position_ids: Position indices of shape (batch, seq_len).
-            segment_ids: Segment IDs for multi-segment inputs (currently unused).
+            segment_ids: Segment IDs for packed multi-segment inputs. Used to build ``mask_info``
+                when ``mask_info`` is not given.
             mode: Runtime mode (train, decode, etc.).
             past_key_values: Cached key-value states for incremental decoding.
             cache_metadata: Metadata for cache management.
@@ -896,7 +898,44 @@ class SeedOssForSequenceClassification(BaseSequenceClassificationModule[SeedOssM
             ValueError: If neither input_ids nor inputs_embeds are provided for classification.
             ValueError: If batch_size > 1 and no pad_token_id is defined in config.
         """
-        transformer_outputs = self.model(
+        if mask_info is None and segment_ids is not None:
+            # Preserve padding as well as packed boundaries: the backbone prioritizes
+            # mask_info over attention_mask, including when deriving rotary positions.
+            q_segment_ids = kv_segment_ids = segment_ids
+            if attention_mask is not None:
+                padding_info = MaskInfo.dynamic_init(attention_mask=attention_mask)
+                q_segment_ids = jnp.where(padding_info.q_segment_ids >= 0, segment_ids, -1)
+                kv_segment_ids = jnp.where(padding_info.kv_segment_ids >= 0, segment_ids, -1)
+            mask_info = MaskInfo.from_segments(q_segment_ids=q_segment_ids, kv_segment_ids=kv_segment_ids)
+            if attention_mask is not None and attention_mask.ndim > 2:
+                mask_info = mask_info.replace(
+                    attention_mask=(
+                        mask_info.get_or_compute_attention_mask() & padding_info.get_or_compute_attention_mask()
+                    )
+                )
+
+        if not apply_lm_head:
+            transformer_outputs = self.base_model(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                mask_info=mask_info,
+                position_ids=position_ids,
+                mode=mode,
+                past_key_values=past_key_values,
+                cache_metadata=cache_metadata,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+            )
+            return SequenceClassifierOutput(
+                logits=None,
+                hidden_states=transformer_outputs.hidden_states,
+                attentions=transformer_outputs.attentions,
+                past_key_values=transformer_outputs.past_key_values,
+            )
+
+        # Shared base forward: score head + attention-mask aware last-token pooling + MoE aux loss.
+        return super().forward(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -909,36 +948,26 @@ class SeedOssForSequenceClassification(BaseSequenceClassificationModule[SeedOssM
             output_hidden_states=output_hidden_states,
         )
 
-        logits = None
-        if apply_lm_head:
-            hidden_states = transformer_outputs.last_hidden_state
-            logits = self.score(hidden_states)
-            if input_ids is not None:
-                batch_size = input_ids.shape[0]
-            elif inputs_embeds is not None:
-                batch_size = inputs_embeds.shape[0]
-            else:
-                raise ValueError("Either input_ids or inputs_embeds must be provided for classification.")
+    def pool_sequence(self, hidden_states, input_ids=None, attention_mask=None):
+        """Pool tokens while preserving the embeddings-only final-token fallback.
 
-            if self.config.pad_token_id is None and batch_size != 1:
-                raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-            if self.config.pad_token_id is None:
-                sequence_lengths = -1
-            else:
-                if input_ids is not None:
-                    sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1) - 1
-                    sequence_lengths = sequence_lengths % input_ids.shape[-1]
-                else:
-                    sequence_lengths = -1
+        Args:
+            hidden_states: Per-token representations of shape (batch, seq_len, features).
+            input_ids: Optional token IDs used to identify padding.
+            attention_mask: Optional token or pairwise attention mask, preferred over token IDs.
+                For pairwise masks a query is valid if any head attends to any key.
 
-            logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-        return SequenceClassifierOutput(
-            logits=logits,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-            past_key_values=transformer_outputs.past_key_values,
-        )
+        Returns:
+            The last attended token's representation, or the final token when neither
+            token IDs nor an attention mask are available for embeddings-only inputs.
+        """
+        if input_ids is None and attention_mask is None:
+            return hidden_states[:, -1]
+        if attention_mask is not None and attention_mask.ndim > 2:
+            # Pool with 2D query validity, not the pairwise mask passed unchanged to
+            # the backbone. MaskInfo uses the same mask semantics as attention.
+            attention_mask = MaskInfo.dynamic_init(attention_mask=attention_mask).q_segment_ids >= 0
+        return super().pool_sequence(hidden_states, input_ids=input_ids, attention_mask=attention_mask)
 
     def get_encoder(self):
         """Get the encoder module.

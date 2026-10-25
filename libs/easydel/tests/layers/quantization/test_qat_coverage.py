@@ -48,18 +48,9 @@ _CONTRACTION = re.compile(r"(jnp\.einsum|jnp\.matmul|jax\.numpy\.einsum|lax\.dot
 _OWN_PARAMETER = re.compile(r"self\.([A-Za-z_][A-Za-z0-9_]*)\.value|self\.(weight|kernel)\b")
 
 _EXEMPT: dict[tuple[str, str], str] = {
-    ("modules/glm4_moe/modeling_glm4_moe.py", "weight"): (
-        "MoE router gate: produces expert routing decisions rather than features, so a rounding error "
-        "changes which expert a token reaches. Kept in float32."
-    ),
-    ("modules/glm4_moe_lite/modeling_glm4_moe_lite.py", "weight"): (
-        "MoE router gate: routing decisions, kept in float32."
-    ),
-    ("modules/glm_moe_dsa/modeling_glm_moe_dsa.py", "weight"): ("MoE router gate: routing decisions, kept in float32."),
-    ("modules/glm5_next/modeling_glm5_next.py", "weight"): (
-        "MoE router gate: fp32 logits feed sigmoid/grouped top-k expert selection and combine weights; "
-        "quantization can change the discrete expert assignment, not just feature accuracy."
-    ),
+    # The GLM-family MoE router gates (glm4_moe, glm4_moe_lite, glm_moe_dsa, glm5_next) pass
+    # ``self.weight.value`` to the shared ``easydel.layers.moe.fp32_router_logits``, which keeps the
+    # routing matmul in float32 by design; they do not contract their own parameter in place.
     ("layers/residual/_manifold.py", "hc_fn"): (
         "Learned mHC head: only hc outputs become sigmoid read gates for the final weighted stream sum. "
         "Preserve the original DeepSeek-V4 fp32 gate projection and accumulation, not a quantized feature projection."
@@ -134,9 +125,12 @@ def test_the_exemption_list_has_not_gone_stale():
 
 
 _CONV_EXEMPT: dict[str, tuple[int, str]] = {
-    "modules/mamba/modeling_mamba.py": (1, "depthwise causal conv1d"),
+    "layers/linear_attention/_depthwise_conv.py": (
+        1,
+        "ChannelMajorConv1D: the shared Mamba / FalconMamba depthwise causal conv1d (groups=features), "
+        "moved out of the two modeling files unchanged.",
+    ),
     "modules/mamba2/modeling_mamba2.py": (1, "depthwise causal conv1d"),
-    "modules/falcon_mamba/modeling_falcon_mamba.py": (1, "depthwise causal conv1d"),
     "modules/falcon_h1/modeling_falcon_h1.py": (1, "depthwise causal conv1d"),
     "modules/qwen3_next/modeling_qwen3_next.py": (2, "depthwise causal conv1d"),
     "modules/qwen4_exp/modeling_qwen4_exp.py": (

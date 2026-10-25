@@ -36,6 +36,7 @@ import logging
 import typing as tp
 from collections import Counter
 from dataclasses import dataclass
+from itertools import islice
 
 from .core.protocols import ShardedDataSource
 from .transforms.pack import FirstFitPacker, GreedyPacker, PoolPacker
@@ -161,6 +162,8 @@ class DatasetProfiler:
         eos_token_id: int = 1,
         pad_token_id: int = 0,
     ):
+        if max_rows < 0:
+            raise ValueError("max_rows must be non-negative")
         self.max_rows = max_rows
         self.seq_length = seq_length
         self.length_fields = list(length_fields or DEFAULT_LENGTH_FIELDS)
@@ -182,43 +185,46 @@ class DatasetProfiler:
         input_id_lengths: list[int] = []
         length_values: dict[str, list[int]] = {field: [] for field in self.length_fields}
 
-        for row in source.iter_shards():
-            total_rows += 1
-            if total_rows > self.max_rows:
-                total_rows = self.max_rows
-                break
+        upstream = source.iter_shards()
+        try:
+            for row in islice(upstream, self.max_rows):
+                total_rows += 1
 
-            if not isinstance(row, dict):
-                continue
+                if not isinstance(row, dict):
+                    continue
 
-            for key in row.keys():
-                field_counts[key] += 1
+                for key in row.keys():
+                    field_counts[key] += 1
 
-            for field in self.length_fields:
-                length = self._get_length(row.get(field))
-                if length is not None:
-                    length_histogram[field][length] += 1
-                    length_values[field].append(length)
+                for field in self.length_fields:
+                    length = self._get_length(row.get(field))
+                    if length is not None:
+                        length_histogram[field][length] += 1
+                        length_values[field].append(length)
 
-            input_length = self._get_length(row.get("input_ids"))
-            if input_length is not None:
-                input_id_lengths.append(input_length)
-                total_input_tokens += input_length
-
-            if row.get("truncated"):
-                truncated_rows += 1
-
-            if self._is_padded(row):
-                padded_rows += 1
-
-            if self._is_chat_template_fallback(row):
-                chat_template_fallback_rows += 1
-
-            source_id = row.get("__source__")
-            if source_id is not None:
-                source_distribution[str(source_id)] += 1
+                input_length = self._get_length(row.get("input_ids"))
                 if input_length is not None:
-                    source_token_counts[str(source_id)] += input_length
+                    input_id_lengths.append(input_length)
+                    total_input_tokens += input_length
+
+                if row.get("truncated"):
+                    truncated_rows += 1
+
+                if self._is_padded(row):
+                    padded_rows += 1
+
+                if self._is_chat_template_fallback(row):
+                    chat_template_fallback_rows += 1
+
+                source_id = row.get("__source__")
+                if source_id is not None:
+                    source_distribution[str(source_id)] += 1
+                    if input_length is not None:
+                        source_token_counts[str(source_id)] += input_length
+        finally:
+            close = getattr(upstream, "close", None)
+            if close is not None:
+                close()
 
         estimated: dict[str, float] = {}
         gaps: dict[str, float] = {}

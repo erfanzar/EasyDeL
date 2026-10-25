@@ -22,7 +22,6 @@ Functions:
     _yarn_find_correction_dim: Calculate correction dimension for YaRN scaling.
     _yarn_find_correction_range: Find correction range bounds for YaRN scaling.
     _yarn_linear_ramp_mask: Create linear ramp mask for YaRN scaling.
-    _yarn_get_mscale: Calculate mscale factor for YaRN context extension.
     _rotate_neox: Apply Neox-style rotation to tensor.
     _rotate_gptj: Apply GPT-J-style rotation to tensor.
     _apply_rotary_emb: Apply rotary embedding to input tensor.
@@ -36,10 +35,50 @@ Note:
 from __future__ import annotations
 
 import math
+import typing as tp
+from collections.abc import Mapping
+from copy import deepcopy
 
 import jax
-import jax.numpy as jnp
+from jax import numpy as jnp
 from jaxtyping import Array, Float
+
+
+def rope_scaling_from_rope_parameters(
+    rope_parameters: Mapping[str, tp.Any] | None,
+    rope_scaling: Mapping[str, tp.Any] | None,
+    default: Mapping[str, tp.Any] | None = None,
+) -> dict[str, tp.Any] | None:
+    """Normalize HF RoPE parameters into an EasyDeL scaling mapping.
+
+    Explicit ``rope_scaling`` takes precedence and retains every supplied key.
+    Otherwise the supported scaling and multimodal fields are copied from
+    ``rope_parameters``. The legacy ``type`` spelling aliases ``rope_type``;
+    an explicit ``rope_type`` always wins. Neither input is modified.
+
+    Args:
+        rope_parameters: HF-style RoPE parameters, or ``None``.
+        rope_scaling: Explicit EasyDeL scaling mapping, or ``None``.
+        default: Fallback when both inputs are absent. A deep copy is returned
+            so mutable presets (such as ``mrope_section``) remain independent.
+
+    Returns:
+        Normalized scaling dictionary, or ``None`` if both inputs and the
+        default are absent.
+    """
+    if rope_scaling is not None:
+        result = dict(rope_scaling)
+        if "type" in result and "rope_type" not in result:
+            result["rope_type"] = result["type"]
+        return result
+    if rope_parameters is None:
+        return None if default is None else deepcopy(dict(default))
+
+    from ._configs import RopeConfig
+
+    # The schema owns the supported fields and legacy aliases, including
+    # magnitude/correction overrides. Do not maintain a second lossy whitelist.
+    return RopeConfig.from_dict(dict(rope_parameters)).to_dict()
 
 
 def rotate_half(x: Array) -> Array:
@@ -208,30 +247,6 @@ def _yarn_linear_ramp_mask(  # pyright: ignore[reportUnusedFunction]
     linear_func = (jnp.arange(dim, dtype=dtype) - low) / (high - low)
     ramp_func = jnp.clip(linear_func, 0, 1)
     return ramp_func
-
-
-@jax.named_scope("easydel-rotary-yarn-get-mscale")
-def _yarn_get_mscale(scale: float = 1) -> float | Array:  # pyright: ignore[reportUnusedFunction]
-    """Compute YaRN's logits-magnitude rescale ``1 + 0.1 * log(scale)``.
-
-    YaRN proposes that, after extending the context length by ``scale``,
-    the *magnitudes* of attention logits should be amplified by a small
-    factor that grows logarithmically with the extension. This compensates
-    for the softer attention distributions that result from interpolating
-    the high-frequency rotation planes. The published constant ``0.1`` is
-    used; ``scale <= 1`` is a no-op.
-
-    Args:
-        scale: Context-length multiplier (e.g. ``8.0`` to extend an 8K
-            model to 64K). Values ``<= 1`` short-circuit to ``1.0``.
-
-    Returns:
-        Scalar magnitude multiplier applied to cos/sin in
-        :func:`compute_yarn_frequencies`.
-    """
-    if scale <= 1:
-        return 1.0
-    return 0.1 * jnp.log(scale) + 1.0
 
 
 @jax.named_scope("easydel-rotary-rotate-neox")

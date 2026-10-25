@@ -29,15 +29,151 @@ import logging
 import typing as tp
 from dataclasses import dataclass
 
-from ..core.config import RayConfig, TokenizerConfig
-from ..core.protocols import ShardedDataSource
+from ..core.config import PipelineConfig, RayConfig, TokenizerConfig, TokenizeStageConfig
+from ..core.protocols import PipelineContext, ShardedDataSource, ShardInfo
 
 if tp.TYPE_CHECKING:
     from collections.abc import Iterator
 
-import ray
-
 logger = logging.getLogger(__name__)
+
+
+def _worker_options(config: RayConfig) -> dict:
+    """Translate the documented per-worker CPU/GPU/custom resource mapping into Ray options."""
+    resources = dict(config.resources_per_worker or {})
+    options = {"num_cpus": resources.pop("CPU", 1)}
+    gpu = resources.pop("GPU", 1 if config.use_gpu else 0)
+    if gpu:
+        options["num_gpus"] = gpu
+    if "memory" in resources:
+        options["memory"] = resources.pop("memory")
+    if resources:
+        options["resources"] = resources
+    return options
+
+
+class _PipelineTokenizeWorker:
+    """Actor applying the same TokenizeStage as the local pipeline, including all dataset options."""
+
+    def __init__(self, config: PipelineConfig, stage_config: TokenizeStageConfig, dataset_name: str):
+        from ..transforms.tokenize import TokenizeStage
+
+        self._stage = TokenizeStage(stage_config)
+        self._context = PipelineContext(config=config, seed=config.seed)
+        self._name = dataset_name
+        self._rows = None
+        self._chunk_size = max(1, int(stage_config.batch_size))
+
+    def process(self, source: ShardedDataSource, shard_name: str) -> list[dict]:
+        """Open a shard and return only its first bounded output chunk."""
+        self.close()
+        transformed = self._stage.process({self._name: source}, self._context)[self._name]
+        self._rows = iter(transformed.open_shard(shard_name))
+        return self.next_chunk()
+
+    def next_chunk(self) -> list[dict]:
+        """Advance the actor-owned iterator only when the driver requests more rows."""
+        if self._rows is None:
+            return []
+        try:
+            rows = list(itertools.islice(self._rows, self._chunk_size))
+            if not rows:
+                self.close()
+            return rows
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Release the upstream iterator on exhaustion, failure, or shard replacement."""
+        rows, self._rows = self._rows, None
+        close = getattr(rows, "close", None)
+        if close is not None:
+            close()
+
+
+class RayTokenizedShardedSource(ShardedDataSource[dict]):
+    """Lazy, bounded Ray actor pool for the pipeline's normal tokenization stage.
+
+    Exposes one logical shard and preserves input shard order (and therefore deterministic row resume).
+    At most ``num_workers`` output chunks are in flight, each bounded by the tokenization batch size.
+    Each actor retains a shard iterator instead of materializing a whole shard, and the driver requests
+    another chunk only after yielding the previous one. Actors and pending tasks are released on completion,
+    errors, or early iterator close. No Ray import or cluster startup occurs until consumption.
+    """
+
+    def __init__(
+        self,
+        source: ShardedDataSource,
+        config: PipelineConfig,
+        stage_config: TokenizeStageConfig,
+        dataset_name: str,
+    ):
+        if config.ray.num_workers < 1:
+            raise ValueError("RayConfig.num_workers must be positive")
+        self._source = source
+        self._config = config
+        self._stage_config = stage_config
+        self._name = dataset_name
+
+    @property
+    def shard_names(self):
+        return [f"ray:{self._name}"]
+
+    def num_shards(self):
+        return 1
+
+    @property
+    def delivers_all_metadata_rows(self):
+        return self._source.delivers_all_metadata_rows
+
+    def get_shard_info(self, shard_name):
+        counts = [self._source.get_shard_info(name) for name in self._source.shard_names]
+        num_rows = None
+        if all(info is not None and info.num_rows is not None for info in counts):
+            num_rows = sum(info.num_rows for info in counts)
+        return ShardInfo(shard_id=0, shard_name=shard_name, num_rows=num_rows)
+
+    def open_shard(self, shard_name):
+        import ray
+
+        if shard_name not in self.shard_names:
+            raise ValueError(f"Unknown shard: {shard_name!r}")
+        if not ray.is_initialized():
+            options = {}
+            if self._config.ray.object_store_memory is not None:
+                options["object_store_memory"] = self._config.ray.object_store_memory
+            ray.init(**options)
+        actor = ray.remote(_PipelineTokenizeWorker).options(**_worker_options(self._config.ray))
+        workers = []
+        pending = []
+        names = iter(self._source.shard_names)
+        try:
+            for _ in range(self._config.ray.num_workers):
+                workers.append(actor.remote(self._config, self._stage_config, self._name))
+            for worker, name in zip(workers, names, strict=False):
+                pending.append((worker, worker.process.remote(self._source, name)))
+            while pending:
+                worker, future = pending[0]
+                rows = ray.get(future)
+                if rows:
+                    yield from rows
+                    # Keep this shard at the head until exhaustion to preserve source order.
+                    # Do not prefetch its successor while the consumer still holds this chunk.
+                    pending[0] = (worker, worker.next_chunk.remote())
+                else:
+                    pending.pop(0)
+                    name = next(names, None)
+                    if name is not None:
+                        pending.append((worker, worker.process.remote(self._source, name)))
+        finally:
+            for _worker, future in pending:
+                ray.cancel(future)
+            for worker in workers:
+                ray.kill(worker)
+
+    def open_shard_at_row(self, shard_name, row):
+        return itertools.islice(self.open_shard(shard_name), max(int(row), 0), None)
 
 
 @dataclass
@@ -85,8 +221,7 @@ class TokenizedBatch:
     metadata: list[dict] | None = None
 
 
-@ray.remote
-class RayTokenizeWorker:
+class _RayTokenizeWorker:
     """Ray actor that owns a tokenizer and serves batched tokenization RPCs.
 
     Each actor loads its own copy of the tokenizer in its constructor so
@@ -200,6 +335,37 @@ class RayTokenizeWorker:
         return results
 
 
+class RayTokenizeWorker:
+    """Lazy Ray actor factory with the usual ``.remote()`` and ``.options()`` API.
+
+    Each actor owns a tokenizer and exposes ``tokenize_batch(texts)`` and
+    ``tokenize_shard(shard_data, content_field="text")`` RPCs. Construct with
+    ``RayTokenizeWorker.remote(tokenizer_name, max_length=2048, trust_remote_code=True)``.
+    Importing this factory does not import or initialize Ray.
+    """
+
+    @classmethod
+    def remote(cls, *args, **kwargs):
+        """Construct a tokenizer actor, importing Ray only when requested."""
+        import ray
+
+        return ray.remote(_RayTokenizeWorker).remote(*args, **kwargs)
+
+    @classmethod
+    def options(cls, **kwargs):
+        """Configure a tokenizer actor's resources before calling ``remote``."""
+        import ray
+
+        return ray.remote(_RayTokenizeWorker).options(**kwargs)
+
+    @classmethod
+    def bind(cls, *args, **kwargs):
+        """Create a Ray DAG node without starting the actor."""
+        import ray
+
+        return ray.remote(_RayTokenizeWorker).bind(*args, **kwargs)
+
+
 class RayPreprocessor:
     """Driver-side coordinator that fans tokenization out across a Ray actor pool.
 
@@ -242,6 +408,8 @@ class RayPreprocessor:
 
         Honors ``object_store_memory`` from the configured ``RayConfig``.
         """
+        import ray
+
         if not ray.is_initialized():
             init_kwargs = {}
             if self._config.object_store_memory:
@@ -268,11 +436,9 @@ class RayPreprocessor:
         if self._tokenizer_config is None:
             raise ValueError("tokenizer_config is required for tokenization workers")
 
-        worker_options = {}
-        if self._config.resources_per_worker:
-            worker_options["num_cpus"] = self._config.resources_per_worker.get("CPU", 1)
-        if self._config.use_gpu:
-            worker_options["num_gpus"] = (self._config.resources_per_worker or {}).get("GPU", 1)
+        if self._config.num_workers < 1:
+            raise ValueError("RayConfig.num_workers must be positive")
+        worker_options = _worker_options(self._config)
 
         self._workers = [
             RayTokenizeWorker.options(**worker_options).remote(
@@ -310,6 +476,8 @@ class RayPreprocessor:
             sidecar fields and adding ``input_ids`` /
             ``attention_mask``.
         """
+        import ray
+
         self._create_workers()
 
         # Distribute shards across workers with a bounded in-flight window:
@@ -342,7 +510,11 @@ class RayPreprocessor:
         Safe to call multiple times; if Ray was never initialized the
         method returns without error.
         """
-        if self._initialized and ray.is_initialized():
+        if not self._initialized:
+            return
+        import ray
+
+        if ray.is_initialized():
             for worker in self._workers:
                 ray.kill(worker)
             self._workers = []
@@ -423,6 +595,8 @@ def parallel_process_shards(
         dict: Each row produced by ``process_fn`` across all shards,
         in completion order.
     """
+    import ray
+
     if not ray.is_initialized():
         ray.init()
 

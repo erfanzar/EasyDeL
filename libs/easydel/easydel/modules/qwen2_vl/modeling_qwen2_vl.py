@@ -30,9 +30,7 @@ Components:
   vision/text embeddings at placeholder positions and runs the LM.
 """
 
-import math
 import typing as tp
-from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
@@ -60,7 +58,6 @@ from easydel.infra.modeling_outputs import (
     AttentionLayerOutput,
     BaseModelOutput,
     DecoderLayerOutput,
-    ModelOutput,
     VLMCausalLMOutput,
 )
 from easydel.infra.sequence_packing import token_attention_mask_from_mask_info
@@ -70,10 +67,11 @@ from easydel.layers import (
     Embed,
     RMSNorm,
     RowParallelLinear,
-    dense_gate_up_layout,
+    build_fused_gate_up_projection,
     gated_mlp_forward,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention, block_diagonal_bias
+from easydel.layers.embeddings._vision import VisionPatchEmbed as Qwen2VLPatchEmbed
 from easydel.layers.norms import LayerNorm
 from easydel.layers.rotary import apply_rope_split_half
 from easydel.modules._base import BaseVisionLanguageModule
@@ -248,7 +246,7 @@ def get_rope_index(
 
 
 @auto_pytree
-class Qwen2VLCausalLMOutputWithPast(ModelOutput):
+class Qwen2VLCausalLMOutputWithPast(VLMCausalLMOutput):
     """Output class for Qwen2VL causal language model with past key-values.
 
     Extends ModelOutput to include rope_deltas for multi-dimensional rotary
@@ -275,6 +273,27 @@ class Qwen2VLCausalLMOutputWithPast(ModelOutput):
     attentions: tuple[Array] | None = None
     rope_deltas: Array | None = None
 
+    def __init__(
+        self,
+        loss=None,
+        logits=None,
+        past_key_values=None,
+        hidden_states=None,
+        attentions=None,
+        rope_deltas=None,
+        **kwargs,
+    ):
+        """Keep the historical positional field order while accepting shared VLM fields."""
+        super().__init__(
+            loss=loss,
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+            attentions=attentions,
+            rope_deltas=rope_deltas,
+            **kwargs,
+        )
+
 
 # The packed-vision block-diagonal mask is shared infrastructure; this family
 # had its own copy. Bind the module-level name so call sites are unchanged.
@@ -286,88 +305,6 @@ create_attention_mask = block_diagonal_bias
 # is the same algorithm, so bind the module-level name to it rather than
 # restating it. Keeping the name means call sites (and importers) are unchanged.
 merge_multimodal_embeddings = BaseVisionLanguageModule.merge_multimodal_embeddings
-
-
-class Qwen2VLPatchEmbed(spx.Module):
-    """Patch embedding layer for converting images/video frames into embeddings.
-
-    Uses 3D convolution to convert image or video patches into embeddings,
-    handling both spatial (height, width) and temporal dimensions for video input.
-    """
-
-    def __init__(
-        self,
-        patch_size: int = 14,
-        temporal_patch_size: int = 2,
-        in_channels: int = 3,
-        embed_dim: int = 1152,
-        precision: jax.lax.PrecisionLike = None,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        partition_manager=None,
-        *,
-        rngs: spx.Rngs,
-    ) -> None:
-        """Initialize the patch embedding layer.
-
-        Args:
-            patch_size (int, optional): Spatial patch size (height and width). Defaults to 14.
-            temporal_patch_size (int, optional): Temporal patch size for video frames. Defaults to 2.
-            in_channels (int, optional): Number of input channels (RGB=3). Defaults to 3.
-            embed_dim (int, optional): Output embedding dimension. Defaults to 1152.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            rngs (spx.Rngs): Random number generator state.
-        """
-        self.dtype = dtype
-        self.patch_size = patch_size
-        self.temporal_patch_size = temporal_patch_size
-        self.in_channels = in_channels
-        self.embed_dim = embed_dim
-        self.partition_manager = partition_manager
-
-        kernel_size = (temporal_patch_size, patch_size, patch_size)
-        self.proj = nn.Conv(
-            in_channels=in_channels,
-            out_channels=embed_dim,
-            kernel_size=kernel_size,
-            stride=kernel_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-            precision=precision,
-        )
-
-    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
-        """Apply patch embedding to input pixels.
-
-        Args:
-            hidden_states (Array): Input pixel values of shape
-                (num_patches * temporal * channels, patch_size, patch_size) flattened.
-
-        Returns:
-            Array: Patch embeddings of shape (num_patches, embed_dim).
-        """
-        hidden_states = jnp.transpose(
-            hidden_states.reshape(
-                -1,
-                self.in_channels,
-                self.temporal_patch_size,
-                self.patch_size,
-                self.patch_size,
-            ),
-            (0, 2, 3, 4, 1),
-        )
-        hidden_states = self.proj(hidden_states.astype(self.dtype))
-        hidden_states = hidden_states.reshape(-1, self.embed_dim)
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.partition_manager,
-        )
-        return hidden_states
 
 
 class _GeluModule(spx.Module):
@@ -601,6 +538,7 @@ class Qwen2VLVisionAttention(UnifiedAttention):
                     dim: Hidden dimension for attention.
                     num_heads: Number of attention heads.
                 """
+                self._base_config = config
                 self.hidden_size = dim
                 self.num_attention_heads = num_heads
                 self.num_key_value_heads = num_heads
@@ -613,6 +551,10 @@ class Qwen2VLVisionAttention(UnifiedAttention):
                 self.bits = getattr(config, "bits", None)
                 self.easy_method = getattr(config, "easy_method", None)
                 self.scan_mlp_chunk_size = getattr(config, "scan_mlp_chunk_size", 1024)
+
+            def __getattr__(self, name):
+                # Mesh and other derived config properties are not in __dict__.
+                return getattr(self._base_config, name)
 
         adapted_config = ConfigAdapter(config, dim, num_heads)
 
@@ -666,6 +608,7 @@ class Qwen2VLVisionAttention(UnifiedAttention):
             precision=precision,
             rngs=rngs,
         )
+        self.attention_performer = self._create_attention_performer(config, rngs)
 
     def _create_attention_performer(self, config, rngs: spx.Rngs):
         """Create attention performer for vision attention.
@@ -720,24 +663,19 @@ class Qwen2VLVisionAttention(UnifiedAttention):
         cos, sin = position_embeddings
         q = apply_rope_split_half(q, cos, sin)
         k = apply_rope_split_half(k, cos, sin)
-        # Match HF: process each segment defined by cu_seqlens separately
-        q = q.swapaxes(0, 1)[None, ...]  # (1, num_heads, seq, head_dim)
-        k = k.swapaxes(0, 1)[None, ...]
-        v = v.swapaxes(0, 1)[None, ...]
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        if lengths.ndim == 0:
-            lengths = lengths[None]
-        splits = [jnp.split(tensor, jnp.cumsum(lengths)[:-1], axis=2) for tensor in (q, k, v)]
-
-        attn_outputs = []
-        for q_chunk, k_chunk, v_chunk in zip(*splits, strict=False):
-            attn_weights = jnp.matmul(q_chunk, k_chunk.swapaxes(-1, -2)) / math.sqrt(self.head_dim)
-            attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(q_chunk.dtype)
-            attn_output = jnp.matmul(attn_weights, v_chunk)
-            attn_output = attn_output.swapaxes(1, 2)  # (1, seq_chunk, num_heads, head_dim)
-            attn_outputs.append(attn_output)
-
-        attn_output = jnp.concatenate(attn_outputs, axis=1)
+        # Keep packed shapes static: segment boundaries can be traced in jit.
+        attn_bias = block_diagonal_bias(cu_seqlens, seq_length, q.dtype)
+        attn_bias = jnp.broadcast_to(attn_bias, (1, self.num_heads, seq_length, seq_length))
+        attn_output = self.attention_performer.forward(
+            query_states=q[None, ...],
+            key_states=k[None, ...],
+            value_states=v[None, ...],
+            bias=attn_bias,
+            causal=False,
+            compute_dtype=q.dtype,
+            precision=self.precision,
+            mode=common_types.MODE_TRAIN,
+        ).attention_outputs
         attn_output = attn_output.reshape(seq_length, -1)
         attn_output = self.shard_attention_prod(attn_output)
         attn_output = self.proj(attn_output)
@@ -872,16 +810,13 @@ class Qwen2VLMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.gate_up_proj = ColumnParallelLinear(
-            config.hidden_size,
-            (config.intermediate_size, config.intermediate_size),
+        self.gate_up_proj = build_fused_gate_up_projection(
+            config=config,
+            intermediate_size=config.intermediate_size,
             dtype=dtype,
             param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            layout=dense_gate_up_layout(config.intermediate_size),
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
@@ -942,7 +877,7 @@ class Qwen2VLAttention(UnifiedAttention):
             layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
-            sliding_window=config.sliding_window if config.use_sliding_window else None,
+            sliding_window=(config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None),
         )
 
     def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
@@ -1352,6 +1287,7 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, 0),
             trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs("vision"),
         )
         return tp.cast(Array, self.merger(hidden_states))
 
@@ -1609,6 +1545,7 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
@@ -1712,7 +1649,6 @@ class Qwen2VLModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.rope_deltas = None
 
     def set_embeddings(self, value):
         """Set the token embedding layer.
@@ -1883,7 +1819,6 @@ class Qwen2VLModel(EasyDeLBaseModule):
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        return_dict: bool | None = None,
         pixel_values: Array | None = None,
         pixel_values_videos: Array | None = None,
         image_grid_thw: Array | None = None,
@@ -1916,7 +1851,6 @@ class Qwen2VLModel(EasyDeLBaseModule):
                 Defaults to None.
             output_hidden_states (bool | None, optional): Return hidden states.
                 Defaults to None.
-            return_dict (bool | None, optional): Return dict vs tuple. Defaults to None.
             pixel_values (Array | None, optional): Image pixels. Defaults to None.
             pixel_values_videos (Array | None, optional): Video pixels. Defaults to None.
             image_grid_thw (Array | None, optional): Image grid dimensions. Defaults to None.
@@ -1937,7 +1871,6 @@ class Qwen2VLModel(EasyDeLBaseModule):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if inputs_embeds is None:
             inputs_embeds = self.compute_embedding(
@@ -1950,13 +1883,24 @@ class Qwen2VLModel(EasyDeLBaseModule):
             )
 
         if position_ids is None:
-            position_ids, _rope_deltas = self.get_rope_index(
-                input_ids=input_ids,
-                image_grid_thw=image_grid_thw if pixel_values is not None else None,
-                video_grid_thw=video_grid_thw if pixel_values_videos is not None else None,
-                attention_mask=attention_mask,
-            )
-        elif position_ids.ndim == 2:
+            if input_ids is None:
+                if any(
+                    value is not None
+                    for value in (image_grid_thw, video_grid_thw, pixel_values, pixel_values_videos, image_embeds)
+                ):
+                    raise ValueError("Multimodal inputs_embeds require input_ids or explicit position_ids for mRoPE")
+                mask_info = MaskInfo.dynamic_init(
+                    mask_info=mask_info, inputs_embeds=inputs_embeds, attention_mask=attention_mask
+                )
+                position_ids = mask_info.q_position_ids
+            else:
+                position_ids, _rope_deltas = self.get_rope_index(
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw if (pixel_values is not None or image_embeds is not None) else None,
+                    video_grid_thw=video_grid_thw if pixel_values_videos is not None else None,
+                    attention_mask=attention_mask,
+                )
+        if position_ids.ndim == 2:
             batch_size, seq_length = position_ids.shape
             position_ids = jnp.broadcast_to(position_ids[None, :, :], (3, batch_size, seq_length))
 
@@ -2208,10 +2152,10 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
             rope_deltas (Array | None): Position deltas for M-RoPE of shape (batch_size, 1). Represents offset
                 added to position indices due to variable-length vision sequences. Defaults to None.
             cache_position (Array | None): Explicit cache position indices for generation. Defaults to None.
-            **kwargs: Additional keyword arguments (unused).
+            **kwargs: Additional keyword arguments forwarded to the base model.
 
         Returns:
-            VLMCausalLMOutput: Named tuple containing:
+            VLMCausalLMOutput: Named outputs containing:
                 - logits (Array | None): Language modeling logits of shape (batch_size, sequence_length, vocab_size)
                   if apply_lm_head=True, otherwise None.
                 - past_key_values (TransformerCache | RaggedPagesCache | HybridCache): Updated KV cache.
@@ -2248,6 +2192,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
             mask_info=mask_info,
             mode=mode,
             cache_metadata=cache_metadata,
+            **kwargs,
         )
 
         hidden_states = outputs.last_hidden_state
@@ -2263,7 +2208,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
             lm_logits = self.compute_lm_logits(hidden_states)
             lm_logits = self.apply_logit_cap(lm_logits)
 
-        return VLMCausalLMOutput(
+        return Qwen2VLCausalLMOutputWithPast(
             logits=lm_logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
@@ -2363,7 +2308,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
                     video_grid_thw=video_grid_thw,
                     attention_mask=attn_2d,
                 )
-            elif attn_2d is not None:
+            else:
                 attn_mask_int = attn_2d.astype(jnp.int32)
                 position_ids = jnp.cumsum(attn_mask_int, axis=-1) - 1
                 position_ids = jnp.where(attn_mask_int == 0, 1, position_ids)
@@ -2371,12 +2316,6 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
                 position_ids = jnp.broadcast_to(position_ids, (3, batch_size, _seq_length))
                 max_pos = jnp.max(position_ids)
                 rope_deltas = jnp.full((batch_size, 1), max_pos + 1 - _seq_length, dtype=jnp.int32)
-            else:
-                position_ids = jnp.broadcast_to(
-                    jnp.arange(_seq_length, dtype=jnp.int32)[None, None, :],
-                    (3, batch_size, _seq_length),
-                )
-                rope_deltas = jnp.zeros((batch_size, 1), dtype=jnp.int32)
 
         model_inputs.update(
             {
@@ -2392,28 +2331,6 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
             }
         )
         return model_inputs
-
-    def _create_required_props_from_kwargs(
-        self,
-        model_kwargs: dict[str, Array],
-    ) -> Mapping[str, dict[str, tp.Any]] | None:
-        """Create required properties from model kwargs for generation.
-
-        Extracts grid dimensions that need to be preserved across generation steps.
-
-        Args:
-            model_kwargs (dict[str, Array]): Model keyword arguments.
-
-        Returns:
-            Mapping[str, dict[str, tp.Any]] | None: Dictionary of properties
-                to preserve, or None if no relevant properties found.
-        """
-        basics = {}
-        if "image_grid_thw" in model_kwargs.keys():
-            basics.update({"image_grid_thw": {"value": jnp.array(model_kwargs["image_grid_thw"])}})
-        if "video_grid_thw" in model_kwargs.keys():
-            basics.update({"video_grid_thw": {"value": jnp.array(model_kwargs["video_grid_thw"])}})
-        return basics
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
         """Update model inputs for the next generation step.

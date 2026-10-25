@@ -169,6 +169,7 @@ if not all(device.platform == "tpu" for device in jax.devices()):
     raise SystemExit(f"Refusing mixed/non-TPU devices: {jax.devices()}")
 
 import easydel as ed  # noqa: E402
+from easydel.inference.esurge.benchmarking import zero_schedule_needs_update  # noqa: E402
 from easydel.inference.esurge.request import EngineRequest  # noqa: E402
 from easydel.inference.esurge.runners import eSurgeRunner  # noqa: E402
 from easydel.inference.esurge.scheduler import Scheduler  # noqa: E402
@@ -353,14 +354,6 @@ def generate_once(
     )
     scheduler.add_request(request)
 
-    def _zero_schedule_needs_update(scheduler_output) -> bool:
-        return bool(
-            scheduler_output.finished_req_ids
-            or scheduler_output.preempted_req_ids
-            or scheduler_output.scheduled_new_reqs
-            or scheduler_output.scheduled_cached_reqs.num_reqs
-        )
-
     def _drain_async(pending) -> None:
         future, pending_scheduler_output = pending
         model_output = runner.wait_for_execution(future)
@@ -412,7 +405,7 @@ def generate_once(
                         continue
                     _drain_async((future, prev_scheduler_output))
                     pending = None
-                    if _zero_schedule_needs_update(scheduler_output):
+                    if zero_schedule_needs_update(scheduler_output):
                         with jax.profiler.TraceAnnotation("easydel.execute_model"):
                             output = runner.execute_model(scheduler_output)
                         with jax.profiler.TraceAnnotation("easydel.scheduler.update_from_output"):
@@ -429,7 +422,7 @@ def generate_once(
             with jax.profiler.TraceAnnotation("easydel.scheduler.schedule"):
                 scheduler_output = scheduler.schedule()
             if scheduler_output.total_num_scheduled_tokens == 0:
-                if _zero_schedule_needs_update(scheduler_output):
+                if zero_schedule_needs_update(scheduler_output):
                     with jax.profiler.TraceAnnotation("easydel.execute_model"):
                         output = runner.execute_model(scheduler_output)
                     with jax.profiler.TraceAnnotation("easydel.scheduler.update_from_output"):

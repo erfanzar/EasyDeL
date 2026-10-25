@@ -49,7 +49,6 @@ Example:
     >>> output = flash_attn(query, key, value, causal=True)
 """
 
-import math
 import typing as tp
 
 import jax
@@ -66,7 +65,7 @@ from spectrax import common_types, with_sharding_constraint
 from easydel.caching import TransformerCacheView
 
 from .._attention_outputs import AttentionOutput
-from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry, axis_entry_shard_factor
+from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
 from .._operation_meta import normalize_head_sinks
 from ..requirements import (
     CacheType,
@@ -264,12 +263,20 @@ class FlashAttn(OperationImpl):
                 sliding_window=sliding_window,
                 dropout_prob=dropout_prob,
                 causal=causal,
+                normalize_output=normalize_output,
+                precision=precision,
             )
             if preserve_varlen_semantics:
                 fallback_kwargs["cum_seqlens_q"] = cum_seqlens_q
                 fallback_kwargs["cum_seqlens_k"] = cum_seqlens_k
             else:
                 fallback_kwargs.update(ignore)
+                # Flash dropout is controlled by probability/seed, not Vanilla's
+                # deterministic default. Match the XLA Flash default seed of zero.
+                fallback_kwargs["deterministic"] = dropout_prob == 0.0
+                fallback_kwargs["dropout_rng"] = (
+                    jax.random.PRNGKey(0 if dropout_seed is None else dropout_seed) if dropout_prob > 0.0 else None
+                )
             return fallback_attn(**fallback_kwargs)
 
         is_packed_attention = cum_seqlens_q is not None or cum_seqlens_k is not None
@@ -322,14 +329,9 @@ class FlashAttn(OperationImpl):
         # query-head shard factor, the KV axis is replicated while queries stay sharded and
         # shards attend to the wrong KV heads. Block-repeat KV heads by the minimal factor
         # that makes them shard evenly; blocked repeat keeps the global q->kv mapping.
-        num_kv_heads: int = key.shape[2]
-        head_shard_factor = 1
-        if query_sharding is not None and len(query_sharding) > 2:
-            head_shard_factor = axis_entry_shard_factor(self.metadata.mesh, query_sharding[2])
-        if head_shard_factor > 1 and num_kv_heads > 1 and num_kv_heads % head_shard_factor != 0:
-            kv_head_reps = head_shard_factor // math.gcd(num_kv_heads, head_shard_factor)
-            key = jnp.repeat(key, kv_head_reps, axis=2)
-            value = jnp.repeat(value, kv_head_reps, axis=2)
+        key, value = self.expand_kv_heads_for_shard(
+            key, value, head_axis=2, query_sharding=query_sharding, query_head_axis=2
+        )
         key_sharding = self.create_stable_sharding(
             shardings.key,
             tensor=key,

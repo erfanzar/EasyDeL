@@ -51,12 +51,16 @@ from ._window import (
     TRAIN_ATTEND_PLATFORM,
     block_sink_attention,
     block_token_bias,
+    entry_reach,
+    entry_visibility,
     gather_selected_entries,
     ring_decode_write,
     ring_prefill_write,
     ring_slot_positions,
     ring_visibility_bias,
     sink_attention,
+    window_token_bias,
+    window_visible,
 )
 
 __all__ = (
@@ -74,6 +78,8 @@ __all__ = (
     "block_token_bias",
     "build_packed_slot_meta",
     "compress_windows",
+    "entry_reach",
+    "entry_visibility",
     "gather_group_members",
     "gather_selected_entries",
     "grid_to_tokens",
@@ -94,4 +100,6 @@ __all__ = (
     "sink_attention",
     "tokens_to_grid",
     "trace_compressor_stream",
+    "window_token_bias",
+    "window_visible",
 )

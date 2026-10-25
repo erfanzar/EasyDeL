@@ -39,7 +39,6 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
-from uuid import uuid4
 
 import partial_json_parser  # pyright: ignore[reportMissingTypeStubs]
 from eformer.loggings import get_logger
@@ -48,15 +47,14 @@ from transformers import AutoTokenizer as AnyTokenizer
 
 from ...openai_api_modules import (
     ChatCompletionRequest,
-    DeltaFunctionCall,
     DeltaMessage,
-    DeltaToolCall,
     ExtractedToolCallInformation,
     FunctionCall,
     ToolCall,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
-from ..utils import find_common_prefix, is_complete_json, partial_json_loads
+from ..utils import is_complete_json, partial_json_loads
+from .utils import stream_json_calls
 
 logger = get_logger(__name__)
 
@@ -262,7 +260,9 @@ class OpenAIToolParser(ToolParser):
                 args = json.dumps(args, ensure_ascii=False)
             tool_calls.append(ToolCall(type="function", function=FunctionCall(name=name, arguments=args)))
 
-        return ExtractedToolCallInformation(tools_called=bool(tool_calls), tool_calls=tool_calls, content=content)
+        return ExtractedToolCallInformation(
+            tools_called=bool(tool_calls), tool_calls=tool_calls, content=content if tool_calls else model_output
+        )
 
     def extract_tool_calls_streaming(
         self,
@@ -302,15 +302,26 @@ class OpenAIToolParser(ToolParser):
             - current_tool_name_sent: Whether function name has been emitted.
             - streamed_args_for_tool: Accumulated arguments per tool.
         """
+        if not previous_text:
+            self.prev_tool_call_arr.clear()
+            self.streamed_args_for_tool.clear()
+            self._stream_tool_ids = []
         _content, json_candidate = self._extract_json_candidate(current_text)
         if json_candidate is None:
             return DeltaMessage(content=delta_text)
 
-        flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
+        flags = Allow.ALL & ~Allow.STR
         try:
             (obj, _end_idx) = partial_json_loads(json_candidate, flags)
             is_complete = is_complete_json(json_candidate)
             tool_call_arr = self._normalize_tool_call_objects(obj)
+            # Names must be complete before announcement, but argument strings
+            # retain token-by-token streaming once a stable name is available.
+            partial_obj, _ = partial_json_loads(json_candidate, Allow.ALL)
+            partial_calls = self._normalize_tool_call_objects(partial_obj)
+            for index, call in enumerate(tool_call_arr):
+                if index < len(partial_calls) and "name" in call:
+                    call["arguments"] = partial_calls[index].get("arguments")
         except partial_json_parser.core.exceptions.MalformedJSON:
             return None
         except Exception:
@@ -320,99 +331,9 @@ class OpenAIToolParser(ToolParser):
         if not tool_call_arr:
             return None
 
-        current_tool_call: dict = tool_call_arr[self.current_tool_id] if len(tool_call_arr) > 0 else {}
-
-        # Starting a new tool call (or moving to next)
-        if len(tool_call_arr) > 0 and len(tool_call_arr) > self.current_tool_id + 1:
-            if self.current_tool_id >= 0:
-                cur_arguments = current_tool_call.get("arguments")
-                if cur_arguments:
-                    cur_args_json = (
-                        cur_arguments
-                        if isinstance(cur_arguments, str)
-                        else json.dumps(cur_arguments, ensure_ascii=False)
-                    )
-                    sent = len(self.streamed_args_for_tool[self.current_tool_id])
-                    argument_diff = cur_args_json[sent:]
-                    delta = (
-                        DeltaMessage(
-                            tool_calls=[
-                                DeltaToolCall(
-                                    index=self.current_tool_id,
-                                    function=DeltaFunctionCall(arguments=argument_diff).model_dump(exclude_none=True),
-                                )
-                            ]
-                        )
-                        if argument_diff
-                        else None
-                    )
-                    if argument_diff:
-                        self.streamed_args_for_tool[self.current_tool_id] += argument_diff
-                else:
-                    delta = None
-            else:
-                delta = None
-
-            self.current_tool_id = len(tool_call_arr) - 1
-            self.current_tool_name_sent = False
-            self.streamed_args_for_tool.append("")
-            return delta
-
-        if not self.current_tool_name_sent:
-            function_name = current_tool_call.get("name")
-            if isinstance(function_name, str) and function_name:
-                self.current_tool_name_sent = True
-                return DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=self.current_tool_id,
-                            type="function",
-                            id=f"chatcmpl-tool-{uuid4()}",
-                            function=DeltaFunctionCall(name=function_name).model_dump(exclude_none=True),
-                        )
-                    ]
-                )
-            return None
-
-        cur_arguments = current_tool_call.get("arguments")
-        if cur_arguments is None:
-            return None
-
-        cur_args_json = (
-            cur_arguments if isinstance(cur_arguments, str) else json.dumps(cur_arguments, ensure_ascii=False)
+        deltas = stream_json_calls(
+            tool_call_arr, self.prev_tool_call_arr, self.streamed_args_for_tool, self._stream_tool_ids, is_complete
         )
-        sent = len(self.streamed_args_for_tool[self.current_tool_id])
-
-        prev_arguments = (
-            self.prev_tool_call_arr[self.current_tool_id].get("arguments") if self.prev_tool_call_arr else None
-        )
-        argument_diff: str | None = None
-
-        if is_complete:
-            argument_diff = cur_args_json[sent:]
-        elif prev_arguments is not None:
-            prev_args_json = (
-                prev_arguments if isinstance(prev_arguments, str) else json.dumps(prev_arguments, ensure_ascii=False)
-            )
-            if cur_args_json != prev_args_json:
-                prefix = find_common_prefix(prev_args_json, cur_args_json)
-                argument_diff = prefix[sent:]
-
-        delta = None
-        if argument_diff:
-            delta = DeltaMessage(
-                tool_calls=[
-                    DeltaToolCall(
-                        index=self.current_tool_id,
-                        function=DeltaFunctionCall(arguments=argument_diff).model_dump(exclude_none=True),
-                    )
-                ]
-            )
-            self.streamed_args_for_tool[self.current_tool_id] += argument_diff
-
-        if len(self.prev_tool_call_arr) <= self.current_tool_id:
-            self.prev_tool_call_arr.append({"arguments": cur_arguments})
-        else:
-            self.prev_tool_call_arr[self.current_tool_id] = {"arguments": cur_arguments}
-
-        return delta
+        self.current_tool_id = len(tool_call_arr) - 1
+        self.current_tool_name_sent = bool(self._stream_tool_ids and self._stream_tool_ids[-1])
+        return DeltaMessage(tool_calls=deltas) if deltas else None

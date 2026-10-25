@@ -234,6 +234,17 @@ def sdpo_step(
     """
     scope_root = "easydel/trainer/sdpo/" + ("train_step" if is_training else "eval_step")
     with jax.named_scope(scope_root + "/prepare_batch"):
+        # Align every example-dependent leaf before minibatch_call slices the
+        # completion axis. Keep accepting the public [B, P] prompt layout as well
+        # as already-expanded [B*G, P] batches.
+        batch = dict(batch)
+        prompt_rows = batch["prompt_ids"].shape[0]
+        completion_rows = batch["completion_ids"].shape[0]
+        if prompt_rows != completion_rows:
+            if num_generations <= 0 or prompt_rows * num_generations != completion_rows:
+                raise ValueError("SDPO prompt rows must match completion rows or expand by num_generations.")
+            batch["prompt_ids"] = batch["prompt_ids"].repeat(num_generations, axis=0)
+            batch["prompt_mask"] = batch["prompt_mask"].repeat(num_generations, axis=0)
         _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
             batch=batch,
             gradient_accumulation_steps=gradient_accumulation_steps,
@@ -285,6 +296,9 @@ def sdpo_step(
             teacher_ids = teacher_ids[:, : teacher_prompt_length + max_loss_completion_tokens]
             teacher_mask = teacher_mask[:, : teacher_prompt_length + max_loss_completion_tokens]
             completion_was_truncated = True
+        # The skip only removes tokens from the loss; the student must still attend to them, so keep the
+        # unskipped mask for attention and use the skipped copy for loss weighting / token counts.
+        completion_attn_mask = completion_mask
         completion_mask = _apply_completion_loss_token_skip(completion_mask, num_loss_tokens_to_skip)
 
         prompt_len = prompt_ids.shape[-1]
@@ -308,8 +322,8 @@ def sdpo_step(
             and not use_full_vocab_loss
         )
         if use_chunked_completion_loss:
-            expanded_prompt_ids = prompt_ids.repeat(num_generations, 0)
-            expanded_prompt_mask = prompt_mask.repeat(num_generations, 0)
+            expanded_prompt_ids = prompt_ids
+            expanded_prompt_mask = prompt_mask
             completion_batch_size = int(completion_ids.shape[0])
             loss_numerator = jnp.array(0.0, dtype=jnp.float32)
             advantage_num = jnp.array(0.0, dtype=jnp.float32)
@@ -326,7 +340,7 @@ def sdpo_step(
                 chunk_completion_mask = completion_mask[start:end]
                 chunk_student_input_ids = jnp.concatenate([expanded_prompt_ids[start:end], chunk_completion_ids], axis=1)
                 chunk_student_attn_mask = jnp.concatenate(
-                    [expanded_prompt_mask[start:end], chunk_completion_mask], axis=1
+                    [expanded_prompt_mask[start:end], completion_attn_mask[start:end]], axis=1
                 )
                 with jax.named_scope(scope_root + "/loss_fn/chunked/student_logps"):
                     chunk_student_logps = get_per_token_logps(
@@ -398,8 +412,8 @@ def sdpo_step(
                 other_metrics["mean_kl"] = mean_kl_num / token_denom
                 other_metrics["ref_per_token_logps"] = ref_logps_num / token_denom
         else:
-            student_input_ids = jnp.concatenate([prompt_ids.repeat(num_generations, 0), completion_ids], axis=1)
-            student_attn_mask = jnp.concatenate([prompt_mask.repeat(num_generations, 0), completion_mask], axis=1)
+            student_input_ids = jnp.concatenate([prompt_ids, completion_ids], axis=1)
+            student_attn_mask = jnp.concatenate([prompt_mask, completion_attn_mask], axis=1)
             if use_full_vocab_loss:
                 with jax.named_scope(scope_root + "/loss_fn/full_vocab_logits"):
                     student_logits = _completion_logits(

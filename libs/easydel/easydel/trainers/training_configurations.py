@@ -64,10 +64,23 @@ from easydel.infra.etils import (
 from easydel.infra.loss_utils import LossConfig
 from easydel.trainers.pose import PoSEConfig
 from easydel.trainers.process_encoder import ProcessEncoderConfig
+from easydel.trainers.randomized_yarn import RandomizedYaRNConfig
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
 
 from .metrics import LogWatcher, MetricsHistogram, compute_weight_stats, run_watchers
+from .training_utils import (
+    AFFINE_SUPPORTED_BITS as AFFINE_SUPPORTED_BITS,
+)
+from .training_utils import (
+    FIXED_QUANTIZATION_BITS_BY_MODE as FIXED_QUANTIZATION_BITS_BY_MODE,
+)
+from .training_utils import (
+    QuantizationMode as QuantizationMode,
+)
+from .training_utils import (
+    validate_quantization_bits,
+)
 from .utils import JaxDistributedConfig
 
 try:
@@ -87,24 +100,8 @@ else:
 MetricsType = dict[str, float | list | tuple | np.ndarray | Array | Tensor | None]
 logger = get_logger(__name__)
 
-QuantizationMode = tp.Literal[
-    "nf4",
-    "affine",
-    "mxfp8",
-    "nvfp8",
-    "mxfp4",
-    "nvfp4",
-]
 STE_QAT_QUANTIZATION_MODES: tuple[QuantizationMode, ...] = tp.get_args(QuantizationMode)
 STE_QAT_QUANTIZATION_MODES_DOC = ", ".join(f"'{mode}'" for mode in STE_QAT_QUANTIZATION_MODES)
-AFFINE_SUPPORTED_BITS = frozenset({2, 3, 4, 5, 6, 7, 8})
-FIXED_QUANTIZATION_BITS_BY_MODE: dict[QuantizationMode, int] = {
-    "nf4": 4,
-    "mxfp4": 4,
-    "nvfp4": 4,
-    "mxfp8": 8,
-    "nvfp8": 8,
-}
 
 
 def get_safe_arr(xs):
@@ -209,6 +206,50 @@ def _apply_training_args_legacy_aliases(data: dict[str, tp.Any]) -> dict[str, tp
 
 AVAILABLE_BACKENDS: list[str] = ["cpu", "gpu", "tpu", None]
 
+_OWN_OPTIMIZER_FIELD = {"steps": "max_training_steps", "mu_dtype": "tx_mu_dtype"}
+
+
+def _looks_like_dtype(value: tp.Any) -> bool:
+    """Return whether ``value`` can be interpreted as a dtype (and is not ``None`` or a bool)."""
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        jnp.dtype(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _same_optimizer_kwarg(own: tp.Any, extra: tp.Any) -> bool:
+    """Return whether an extra optimizer kwarg repeats the ``TrainingArguments`` value exactly.
+
+    Dtype-valued settings compare through ``jnp.dtype`` so ``jnp.float32`` and ``"float32"`` agree, and
+    plain numbers compare by value so ``1`` and ``1.0`` agree.
+
+    Args:
+        own: The value held by the ``TrainingArguments`` field.
+        extra: The value supplied through ``extra_optimizer_kwargs``.
+
+    Returns:
+        ``True`` when the two values are equivalent, ``False`` otherwise (including incomparable values).
+    """
+    try:
+        if own is extra:
+            return True
+        if _looks_like_dtype(own) and _looks_like_dtype(extra):
+            return jnp.dtype(own) == jnp.dtype(extra)
+        numeric = (int, float)
+        if (
+            isinstance(own, numeric)
+            and isinstance(extra, numeric)
+            and not isinstance(own, bool)
+            and not isinstance(extra, bool)
+        ):
+            return float(own) == float(extra)
+        return bool(own == extra)
+    except Exception:
+        return False
+
 
 @Registry.register("trainer-arguments", "base")
 @dataclass
@@ -251,6 +292,13 @@ class TrainingArguments:
     pose: PoSEConfig = field(
         default_factory=PoSEConfig,
         metadata={"help": "PoSE (positional skip-wise) position_ids augmentation; disabled by default."},
+    )
+    randomized_yarn: RandomizedYaRNConfig = field(
+        default_factory=RandomizedYaRNConfig,
+        metadata={
+            "help": "Randomized YaRN position_ids augmentation (sorted random positions under a length "
+            "curriculum); disabled by default and mutually exclusive with `pose`."
+        },
     )
     process_encoder: ProcessEncoderConfig = field(
         default_factory=ProcessEncoderConfig,
@@ -411,9 +459,175 @@ class TrainingArguments:
         default=None,
         metadata={"help": "sharding count to be used for grain dataloaders in both train and eval steps."},
     )
+    arrayrecord_train_files: str | list[str] | None = field(
+        default=None,
+        metadata={
+            "help": "Path/glob/list of msgpack-row `.array_record` files; selects the grain ArrayRecord "
+            "training lane (one source, no mixing). `arrayrecord_train_datasets` takes precedence."
+        },
+    )
+    arrayrecord_train_datasets: dict[str, str | list[str]] | None = field(
+        default=None,
+        metadata={
+            "help": "Per-dataset ArrayRecord sets `{name: glob}` for weighted mixing on the grain ArrayRecord "
+            "lane. A set directory may carry a `_MANIFEST.tsv` (`relpath<TAB>nbytes<TAB>nrows` per shard), "
+            "which skips the per-file footer reads and meters reads by compressed bytes."
+        },
+    )
+    arrayrecord_mixture_weights: dict[str, float] | None = field(
+        default=None,
+        metadata={"help": "Weights `{name: weight}` for `arrayrecord_train_datasets`; None = row-count proportional."},
+    )
+    arrayrecord_assistant_only: dict[str, bool] | None = field(
+        default=None,
+        metadata={
+            "help": "Per-dataset assistant-only loss for the ArrayRecord lane, keyed like "
+            "`arrayrecord_train_datasets` (partial dicts inherit `assistant_only_loss`; unknown keys raise)."
+        },
+    )
+    arrayrecord_num_threads: int = field(
+        default=16,
+        metadata={"help": "grain ReadOptions.num_threads shared by the ArrayRecord and parquetra lanes."},
+    )
+    arrayrecord_prefetch_buffer: int = field(
+        default=64,
+        metadata={"help": "grain ReadOptions.prefetch_buffer_size shared by the ArrayRecord and parquetra lanes."},
+    )
+    arrayrecord_read_rate_limit_mb_per_sec: float | None = field(
+        default=None,
+        metadata={
+            "help": "Per-process read-bandwidth cap (MB/s) for ArrayRecord reads, enforced by one token bucket "
+            "shared by all read threads. None or 0 disables it."
+        },
+    )
+    arrayrecord_read_rate_burst_seconds: float = field(
+        default=0.25,
+        metadata={"help": "Token-bucket capacity of the ArrayRecord read limiter, in seconds of the configured rate."},
+    )
+    parquetra_train_datasets: dict[str, str | list[str]] | None = field(
+        default=None,
+        metadata={
+            "help": "Per-dataset parquet globs `{name: glob}` for the grain random-access parquet lane: row-level "
+            "global shuffle over raw parquet, tokenized in the loader with the trainer's preprocess transform. "
+            "Mutually exclusive with the ArrayRecord lane. Requires an explicit `data_collator`."
+        },
+    )
+    parquetra_mixture_weights: dict[str, float] | None = field(
+        default=None,
+        metadata={"help": "Weights `{name: weight}` for `parquetra_train_datasets`; None = row-count proportional."},
+    )
+    parquetra_assistant_only: dict[str, bool] | None = field(
+        default=None,
+        metadata={
+            "help": "Per-dataset assistant-only loss for the parquetra lanes, keyed like "
+            "`parquetra_train_datasets` (partial dicts inherit `assistant_only_loss`; unknown keys raise)."
+        },
+    )
+    parquetra_tokenizer_id: str | None = field(
+        default=None,
+        metadata={"help": "Tokenizer id for in-loop tokenization when the trainer has no processing_class."},
+    )
+    parquetra_fast_tokenizer: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional `module:attr` import path of a factory `factory(hf_tokenizer) -> encode` where "
+            "`encode(text) -> list[int]` reproduces `hf_tokenizer(text, add_special_tokens=False)`. Rows are "
+            "rendered with the chat template and encoded by it; the first `parquetra_fast_tokenizer_verify_rows` "
+            "rows of every worker are checked against the full transform and any divergence raises. Only valid "
+            "without prompt masking."
+        },
+    )
+    parquetra_fast_tokenizer_verify_rows: int = field(
+        default=64,
+        metadata={"help": "Rows per worker the fast tokenizer must reproduce exactly before it runs unchecked."},
+    )
+    parquetra_pack_seq_len: int = field(
+        default=0,
+        metadata={
+            "help": "When > 0 the parquetra lane packs: rows are pulled from the shuffled, per-host-sharded, "
+            "weight-mixed row stream until `total_batch_size` windows of this length are full (first fit, whole "
+            "documents, never truncated). The data_collator receives one window-set per call as a flat row list in "
+            "placement order. Resume is seed-shifted: step n starts the stream a fresh build at step_start_point=n "
+            "would produce, without materializing skipped batches. Requires `max_training_steps`."
+        },
+    )
+    parquetra_pack_embed_cap: int = field(
+        default=0,
+        metadata={"help": "Max image-embed rows per packed window-set (sum of `embed_n_tok`); 0 = uncapped."},
+    )
+    parquetra_pack_misfit_patience: int = field(
+        default=10,
+        metadata={
+            "help": "The packer closes a window-set after this many rows failed to fit; they carry to the next set. "
+            "Higher = denser windows, more host work per set."
+        },
+    )
+    parquetra_mp_workers: int = field(
+        default=0,
+        metadata={
+            "help": "grain mp_prefetch worker processes for the parquetra lanes (0 = thread prefetch only). Order is "
+            "preserved, so seeked resume is unchanged."
+        },
+    )
+    parquetra_mp_worker_cpu_only: bool = field(
+        default=True,
+        metadata={
+            "help": "Configure each spawned parquetra worker process for CPU-only JAX before it unpickles the "
+            "pipeline (drops TPU_/MEGASCALE_/CLOUD_TPU_ variables and sets JAX_PLATFORMS=cpu in the CHILD only), so "
+            "a worker cannot try to claim accelerators held by the trainer. The trainer's environment is untouched."
+        },
+    )
+    parquet_metadata_cache_dir: str | None = field(
+        default=None,
+        metadata={
+            "help": "Root (local or gs://) for durable parquet footer / row-group index sidecars used by the "
+            "parquetra lanes; restarts then skip the footer scan. Only process 0 writes remote sidecars."
+        },
+    )
+    assistant_header_text: str | None = field(
+        default=None,
+        metadata={
+            "help": "Text that opens an assistant turn, used by the per-dataset assistant-only span scan. None "
+            "derives it from the tokenizer's chat template (its generation prompt)."
+        },
+    )
+    assistant_end_text: str | None = field(
+        default=None,
+        metadata={
+            "help": "Text that closes an assistant turn (its first token is the span terminator). None derives it "
+            "from the chat template (falls back to eos_token)."
+        },
+    )
+    zero_supervision_report_fraction: float | None = field(
+        default=0.05,
+        metadata={
+            "help": "Warn when more than this fraction of a batch's documents end with zero supervised tokens under "
+            "assistant-only masking. None disables the warning; the census metrics are always reported."
+        },
+    )
+    zero_supervision_abort_fraction: float | None = field(
+        default=0.5,
+        metadata={
+            "help": "Raise when more than this fraction of a batch's documents end with zero supervised tokens "
+            "while per-dataset assistant-only masking is active (a misconfiguration signal). None disables it."
+        },
+    )
+    zero_supervision_dump_limit: int = field(
+        default=3,
+        metadata={"help": "Zero-supervision documents logged (once per process) when the report threshold fires."},
+    )
     gradient_accumulation_steps: int = field(
         default=1,
         metadata={"help": "The number of steps to accumulate gradients over."},
+    )
+    gradient_accumulation_mode: str = field(
+        default="scan",
+        metadata={
+            "help": "'scan' (default): the microbatch loop is a lax.scan inside the compiled step. 'execution': "
+            "each microbatch is its own grad-program execution into a donated fp32 accumulator, followed by one "
+            "apply-program execution, so fwd/bwd and optimizer temporaries do not stack. Only trainers whose "
+            "step supports it (distillation) accept 'execution'."
+        },
     )
     ids_to_pop_from_dataset: list[str] | None = field(
         default_factory=list,
@@ -995,6 +1209,16 @@ class TrainingArguments:
         default=None,
         metadata={"help": "The maximum training time (e.g., '1d', '2h30m')."},
     )
+    host_phase_log_path: str | None = field(
+        default=None,
+        kw_only=True,
+        metadata={
+            "help": (
+                "Optional per-host timing log: a local append-only JSONL file, or a cloud prefix "
+                "containing immutable per-step JSONL chunks."
+            )
+        },
+    )
     train_on_inputs: bool = field(
         default=True,
         metadata={"help": "Whether to train on the input data."},
@@ -1255,6 +1479,14 @@ class TrainingArguments:
         """
         if self.gradient_accumulation_steps <= 0:
             raise ValueError("`gradient_accumulation_steps` can't be lower than 1.")
+        if self.gradient_accumulation_mode not in ("scan", "execution"):
+            raise ValueError(
+                f"`gradient_accumulation_mode` must be 'scan' or 'execution', got {self.gradient_accumulation_mode!r}."
+            )
+        if self.gradient_accumulation_mode == "execution" and getattr(self, "mpmd_scheduler", None) is not None:
+            raise ValueError("`gradient_accumulation_mode='execution'` is not supported with `mpmd_scheduler`.")
+        if self.training_time_limit is not None:
+            self._time_to_seconds(self.training_time_limit)
 
         self.sequence_packing = bool(self.sequence_packing)
 
@@ -1264,21 +1496,48 @@ class TrainingArguments:
             raise ValueError("`lmhead_chunksize` must be > 0 when specified.")
         if self.quantization_group_size is not None and self.quantization_group_size <= 0:
             raise ValueError("`quantization_group_size` must be > 0 when specified.")
-        if self.quantization_bits is not None and self.quantization_bits <= 0:
-            raise ValueError("`quantization_bits` must be > 0 when specified.")
-        if self.quantization_mode == "affine" and self.quantization_bits is not None:
-            if self.quantization_bits not in AFFINE_SUPPORTED_BITS:
-                bits_values = ", ".join(str(v) for v in sorted(AFFINE_SUPPORTED_BITS))
+        validate_quantization_bits(self.quantization_mode, self.quantization_bits)
+        self._validate_data_lane_config()
+
+    def _validate_data_lane_config(self) -> None:
+        """Validate the grain data-lane and assistant-only supervision fields.
+
+        Raises:
+            ValueError: On out-of-range values or when both grain lanes are configured.
+        """
+        arrayrecord_set = bool(self.arrayrecord_train_files or self.arrayrecord_train_datasets)
+        if arrayrecord_set and self.parquetra_train_datasets:
+            raise ValueError(
+                "`arrayrecord_train_*` and `parquetra_train_datasets` are mutually exclusive; set only one grain lane."
+            )
+        for name in ("zero_supervision_report_fraction", "zero_supervision_abort_fraction"):
+            value = getattr(self, name)
+            if value is not None and not (isinstance(value, int | float) and 0.0 <= float(value) <= 1.0):
+                raise ValueError(f"`{name}` must be None or within [0, 1], got {value!r}.")
+        if int(self.zero_supervision_dump_limit) < 0:
+            raise ValueError("`zero_supervision_dump_limit` must be >= 0.")
+        if int(self.arrayrecord_num_threads) < 1:
+            raise ValueError("`arrayrecord_num_threads` must be >= 1.")
+        if int(self.arrayrecord_prefetch_buffer) < 0:
+            raise ValueError("`arrayrecord_prefetch_buffer` must be >= 0.")
+        rate = self.arrayrecord_read_rate_limit_mb_per_sec
+        if rate is not None:
+            if isinstance(rate, bool) or not isinstance(rate, int | float) or rate < 0 or not np.isfinite(rate):
                 raise ValueError(
-                    f"`quantization_bits` for `affine` must be one of {{{bits_values}}}, got {self.quantization_bits}."
+                    "`arrayrecord_read_rate_limit_mb_per_sec` must be None, 0, or a positive finite number."
                 )
-        if self.quantization_mode in FIXED_QUANTIZATION_BITS_BY_MODE and self.quantization_bits is not None:
-            expected_bits = FIXED_QUANTIZATION_BITS_BY_MODE[self.quantization_mode]
-            if self.quantization_bits != expected_bits:
-                raise ValueError(
-                    f"`quantization_bits` for `{self.quantization_mode}` must be {expected_bits}, "
-                    f"got {self.quantization_bits}."
-                )
+        if float(self.arrayrecord_read_rate_burst_seconds) <= 0:
+            raise ValueError("`arrayrecord_read_rate_burst_seconds` must be > 0.")
+        if int(self.parquetra_pack_seq_len) < 0:
+            raise ValueError("`parquetra_pack_seq_len` must be >= 0.")
+        if int(self.parquetra_pack_embed_cap) < 0:
+            raise ValueError("`parquetra_pack_embed_cap` must be >= 0.")
+        if int(self.parquetra_pack_misfit_patience) < 1:
+            raise ValueError("`parquetra_pack_misfit_patience` must be >= 1.")
+        if int(self.parquetra_mp_workers) < 0:
+            raise ValueError("`parquetra_mp_workers` must be >= 0.")
+        if int(self.parquetra_fast_tokenizer_verify_rows) < 1:
+            raise ValueError("`parquetra_fast_tokenizer_verify_rows` must be >= 1.")
 
     def _setup_distributed(self):
         """
@@ -1309,7 +1568,7 @@ class TrainingArguments:
         The actual optimizer creation is deferred until training setup.
         """
         extra_optimizer_kwargs = self.extra_optimizer_kwargs if self.extra_optimizer_kwargs is not None else {}
-        self.optimizer_kwargs = {
+        own_optimizer_kwargs = {
             "learning_rate": self.learning_rate,
             "learning_rate_end": self.learning_rate_end,
             "optimizer": self.optimizer,
@@ -1320,8 +1579,27 @@ class TrainingArguments:
             "steps": self.max_training_steps,
             "clip_grad": self.clip_grad,
             "mu_dtype": self.tx_mu_dtype,
-            **extra_optimizer_kwargs,
         }
+        # Extra kwargs must not silently override TrainingArguments fields; unset tx_mu_dtype may be filled.
+        colliding = {
+            key: (own_optimizer_kwargs[key], value)
+            for key, value in extra_optimizer_kwargs.items()
+            if key in own_optimizer_kwargs
+            and not (key == "mu_dtype" and own_optimizer_kwargs[key] is None)
+            and not _same_optimizer_kwarg(own_optimizer_kwargs[key], value)
+        }
+        if colliding:
+            details = "; ".join(
+                f"extra_optimizer_kwargs[{key!r}]={extra!r} would override "
+                f"TrainingArguments.{_OWN_OPTIMIZER_FIELD.get(key, key)}={own!r}"
+                for key, (own, extra) in sorted(colliding.items())
+            )
+            raise ValueError(
+                "extra_optimizer_kwargs collides with TrainingArguments' own optimizer settings: "
+                f"{details}. Set the TrainingArguments field directly, or pass optimizer-specific settings under "
+                "a name that does not shadow a TrainingArguments field."
+            )
+        self.optimizer_kwargs = {**own_optimizer_kwargs, **extra_optimizer_kwargs}
 
     def _setup_logging(self):
         """
@@ -1491,6 +1769,14 @@ class TrainingArguments:
             self.pose = PoSEConfig()
         elif isinstance(self.pose, dict):
             self.pose = PoSEConfig.from_dict(self.pose)
+        if self.randomized_yarn is None:
+            self.randomized_yarn = RandomizedYaRNConfig()
+        elif isinstance(self.randomized_yarn, dict):
+            self.randomized_yarn = RandomizedYaRNConfig.from_dict(self.randomized_yarn)
+        if self.pose.enabled and self.randomized_yarn.enabled:
+            raise ValueError(
+                "`pose.enabled` and `randomized_yarn.enabled` are mutually exclusive: both rewrite position_ids."
+            )
         if self.process_encoder is None:
             self.process_encoder = ProcessEncoderConfig()
         elif isinstance(self.process_encoder, dict):
@@ -1610,9 +1896,11 @@ class TrainingArguments:
         Convert a human-readable time string to seconds.
 
         Supports various time formats:
+        - Days: "1d", "2day", "3days"
         - Hours: "23h", "2hour", "3hours"
         - Minutes: "50min", "30m", "45minutes"
         - Seconds: "30s", "120sec", "60seconds"
+        - Compound durations: "1d2h30m", "2 hours 30 minutes"
 
         Args:
             time_str: The time string to convert
@@ -1624,26 +1912,32 @@ class TrainingArguments:
             ValueError: If the time format is not recognized
 
         Example:
-            >>> _time_to_seconds("2h30min")  # Would need parsing enhancement
+            >>> _time_to_seconds("2h30min")
+            9000
             >>> _time_to_seconds("90min")
             5400
         """
-        match = re.match(r"(\d+)\s*(h|hour|hours|min|m|minutes|s|sec|seconds)", time_str.lower())
-        if not match:
-            raise ValueError("Invalid time format. Use `50min` for minutes, `23h` for hours, or `30s` for seconds.")
-        value, unit = match.groups()
         unit_to_seconds = {
+            "d": 86400,
+            "day": 86400,
+            "days": 86400,
             "h": 3600,
             "hour": 3600,
             "hours": 3600,
             "min": 60,
             "m": 60,
+            "minute": 60,
             "minutes": 60,
             "s": 1,
             "sec": 1,
+            "second": 1,
             "seconds": 1,
-        }.get(unit.lower())
-        return int(value) * unit_to_seconds
+        }
+        units = "|".join(sorted(unit_to_seconds, key=len, reverse=True))
+        token = rf"(\d+)\s*({units})"
+        if not isinstance(time_str, str) or re.fullmatch(rf"\s*(?:{token}\s*)+", time_str.lower()) is None:
+            raise ValueError("Invalid time format. Use a duration such as `1d`, `2h30m`, `50min`, or `30s`.")
+        return sum(int(value) * unit_to_seconds[unit] for value, unit in re.findall(token, time_str.lower()))
 
     def get_path(self) -> ePathLike:
         """Get the path to the checkpoint directory.
@@ -1753,8 +2047,11 @@ class TrainingArguments:
         if self._im_a_hidden_checkpoint_manager is not None:
             return self._im_a_hidden_checkpoint_manager
 
+        save_directory = self._get_save_directory()
+        if save_directory is None:
+            raise ValueError("A save_directory and model_name are required to create a checkpoint manager.")
         self._im_a_hidden_checkpoint_manager = Checkpointer(
-            base_path=str(self._get_save_directory()),
+            base_path=str(save_directory),
             save_interval=self.get_save_interval_timedelta(),
             step_policies=self.get_checkpoint_policies(),
         )
@@ -2104,7 +2401,7 @@ class TrainingArguments:
 
                         wandb_metrics[key] = (
                             self._create_wandb_histogram(value)
-                            if isinstance(value, float | int | list | tuple | np.generic | jax.Array)
+                            if isinstance(value, float | int | list | tuple | np.ndarray | np.generic | jax.Array)
                             else value
                         )
 
@@ -2172,15 +2469,14 @@ class TrainingArguments:
                                    None if an error occurs.
 
         Note:
-            Handles dtype conversion for bfloat16 to float32/float16 for
+            Handles dtype conversion for bfloat16 to float32 for
             compatibility with wandb. Automatically moves JAX arrays to CPU.
         """
         try:
-            if isinstance(value, jax.Array | np.generic):
+            if isinstance(value, jax.Array | np.ndarray | np.generic):
                 value = np.array(jax.device_get(value))
-                if value.dtype in [np.bfloat16]:
+                if value.dtype == jnp.bfloat16:
                     value = value.astype(np.float32)
-                value = value.astype(np.float16)
                 return wandb.Histogram(value)
             return value
         except Exception as e:
@@ -2258,6 +2554,8 @@ class TrainingArguments:
 
             if field_name == "pose" and isinstance(value, dict):
                 processed_data[field_name] = PoSEConfig.from_dict(value)
+            elif field_name == "randomized_yarn" and isinstance(value, dict):
+                processed_data[field_name] = RandomizedYaRNConfig.from_dict(value)
             elif field_name == "process_encoder" and isinstance(value, dict):
                 processed_data[field_name] = ProcessEncoderConfig.from_dict(value)
             elif field_name == "bucket_rule" and isinstance(value, dict):
@@ -2363,6 +2661,8 @@ class TrainingArguments:
         Returns:
             The checkpoint directory path, or None if no path is configured.
         """
+        if self.save_directory is None or self.model_name is None:
+            return None
         if create:
             self.ensure_checkpoint_path()
         return self.get_path()

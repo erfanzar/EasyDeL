@@ -305,6 +305,7 @@ class OwnerRequestPlane:
             return
         self._thread = threading.Thread(target=self._loop, name="eSurgePlaneIngest", daemon=True)
         self._thread.start()
+        self._info("Request plane (owner): ingest thread started (world_size=%d)", self._world_size)
 
     def shutdown(self) -> None:
         """Stop the ingest thread; id maps survive for a later restart."""
@@ -318,6 +319,7 @@ class OwnerRequestPlane:
             return
         if self._thread is thread:
             self._thread = None
+        self._info("Request plane (owner): ingest thread stopped")
 
     def reset(self) -> None:
         """Drop every remote mapping and coalesce group (weight swaps clear all requests)."""
@@ -487,9 +489,14 @@ class OwnerRequestPlane:
             self._abort_request(scheduled_abort)
 
     def _loop(self) -> None:
+        next_sweep = time.monotonic()
         while True:
+            now = time.monotonic()
+            if now >= next_sweep:
+                self._sweep_retention()
+                next_sweep = now + 1.0
             try:
-                item = self._queue.get(timeout=1.0)
+                item = self._queue.get(timeout=max(0.0, next_sweep - time.monotonic()))
             except queue.Empty:
                 self._sweep_retention()
                 continue
@@ -607,15 +614,16 @@ class OwnerRequestPlane:
     def _admit_remote_distinct(self, identity: bytes, admit: wire.Admit, requests: list[EngineRequest]) -> None:
         """Distinct path: schedule a non-coalescable remote group under ``r...`` ids.
 
-        The owner id embeds a digest of the ZMQ identity: request-plane
-        clients all report ``origin_rank=-1``, so rank+counter alone would
-        collide across two clients.
+        Workers retain their compact identity digest: their rank and
+        monotonic counter already distinguish admissions. Request-plane
+        clients all report ``origin_rank=-1``, so their complete identity
+        must distinguish otherwise identical admissions.
         """
         import zlib
 
         origin_parent = admit.request_id
         hash8 = (admit.content_hash or "00000000")[:8]
-        identity_tag = f"{zlib.crc32(identity) & 0xFFFF:04x}"
+        identity_tag = identity.hex() if admit.origin_rank < 0 else f"{zlib.crc32(identity) & 0xFFFF:04x}"
         owner_parent = f"r{admit.origin_rank}i{identity_tag}c{admit.origin_counter}-{hash8}"
         for request in requests:
             suffix = request.request_id[len(origin_parent) :]
@@ -971,50 +979,62 @@ class OriginRequestPlane:
             raise RequestPlaneError("request plane is down: the worker replay loop is not running")
 
         pending: list[tuple[str, _PendingAdmit]] = []
-        for parent_id, requests in _group_by_parent(scheduler_requests):
-            first = requests[0]
-            coalescable = _is_coalescable_id(parent_id)
-            content_hash = compute_admission_key(
-                first.prompt_token_ids,
-                first.sampling_params,
-                len(requests),
-                salt="" if coalescable else parent_id,
-            )
-            slot = _PendingAdmit()
-            with self._lock:
-                self._pending[parent_id] = slot
-                self._remote_ids.add(parent_id)
-                self._live_children[parent_id] = len(requests)
-                for request in requests:
-                    self._remote_ids.add(request.request_id)
-                    self._child_to_parent[request.request_id] = parent_id
-                coalesce_counter = next(self._coalesce_counter) if coalescable else 0
-            self._coordinator.send_to_leader(
-                wire.Admit(
-                    request_id=parent_id,
-                    origin_rank=self._rank,
-                    origin_counter=next(self._counter),
-                    content_hash=content_hash,
-                    coalescable=coalescable,
-                    coalesce_counter=coalesce_counter,
-                    n_samples=len(requests),
-                ),
-                wire.encode_payload(requests),
-            )
-            pending.append((parent_id, slot))
+        try:
+            for parent_id, requests in _group_by_parent(scheduler_requests):
+                first = requests[0]
+                coalescable = _is_coalescable_id(parent_id)
+                content_hash = compute_admission_key(
+                    first.prompt_token_ids,
+                    first.sampling_params,
+                    len(requests),
+                    salt="" if coalescable else parent_id,
+                )
+                slot = _PendingAdmit()
+                with self._lock:
+                    self._pending[parent_id] = slot
+                    self._remote_ids.add(parent_id)
+                    self._live_children[parent_id] = len(requests)
+                    for request in requests:
+                        self._remote_ids.add(request.request_id)
+                        self._child_to_parent[request.request_id] = parent_id
+                    coalesce_counter = next(self._coalesce_counter) if coalescable else 0
+                # Record before sending: a transport may enqueue and then fail.
+                pending.append((parent_id, slot))
+                self._coordinator.send_to_leader(
+                    wire.Admit(
+                        request_id=parent_id,
+                        origin_rank=self._rank,
+                        origin_counter=next(self._counter),
+                        content_hash=content_hash,
+                        coalescable=coalescable,
+                        coalesce_counter=coalesce_counter,
+                        n_samples=len(requests),
+                    ),
+                    wire.encode_payload(requests),
+                )
 
-        for parent_id, slot in pending:
-            if not slot.event.wait(self._admit_timeout_s):
-                self._forget(parent_id)
-                raise RequestPlaneError(
-                    f"owner did not acknowledge admission of {parent_id!r} within {self._admit_timeout_s}s"
-                )
-            ack = slot.ack
-            if ack is None or not ack.ok:
-                self._forget(parent_id)
-                raise RequestPlaneError(
-                    f"owner rejected admission of {parent_id!r}: {ack.error if ack else 'no ack recorded'}"
-                )
+            for parent_id, slot in pending:
+                if not slot.event.wait(self._admit_timeout_s):
+                    raise RequestPlaneError(
+                        f"owner did not acknowledge admission of {parent_id!r} within {self._admit_timeout_s}s"
+                    )
+                ack = slot.ack
+                if ack is None or not ack.ok:
+                    raise RequestPlaneError(
+                        f"owner rejected admission of {parent_id!r}: {ack.error if ack else 'no ack recorded'}"
+                    )
+        except BaseException:
+            # FIFO transport orders each cancellation after its admission,
+            # including an admission whose ACK has not arrived yet. Roll back
+            # the whole call rather than orphaning the other batch parents.
+            for parent_id, _ in pending:
+                try:
+                    self._coordinator.send_to_leader(wire.AbortReq(request_id=parent_id))
+                except Exception:
+                    logger.exception("Failed to cancel rolled-back remote admission %r", parent_id)
+                finally:
+                    self._forget(parent_id)
+            raise
 
     def _forget(self, parent_id: str) -> None:
         """Drop all plane state for one origin parent id."""
@@ -1087,6 +1107,8 @@ class OriginRequestPlane:
         with self._lock:
             pending = list(self._pending.items())
             self._pending.clear()
+        if pending:
+            self._info("Request plane (origin): failing %d pending admission(s): %s", len(pending), reason)
         for parent_id, slot in pending:
             slot.ack = wire.AdmitAck(request_id=parent_id, ok=False, error=reason)
             slot.event.set()
@@ -1094,6 +1116,11 @@ class OriginRequestPlane:
     def _handle_inbound(self, message: wire.WireMessage, payload: bytes | None) -> None:
         """Worker replay-thread handoff for plane wire messages."""
         if isinstance(message, wire.AdmitAck):
+            with self._lock:
+                slot = self._pending.pop(message.request_id, None)
+            if slot is None:
+                # Timed-out/rolled-back admissions were already cancelled.
+                return
             if message.ok and payload is not None:
                 # Coalesced catch-up replay: apply before releasing the
                 # admitting caller so it never observes a pre-replay gap.
@@ -1108,11 +1135,8 @@ class OriginRequestPlane:
                         )
                     }
                 )
-            with self._lock:
-                slot = self._pending.pop(message.request_id, None)
-            if slot is not None:
-                slot.ack = message
-                slot.event.set()
+            slot.ack = message
+            slot.event.set()
             return
         if isinstance(message, wire.OutputUpdate):
             if payload is None:

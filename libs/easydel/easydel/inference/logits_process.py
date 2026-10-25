@@ -44,33 +44,22 @@ import jax.numpy as jnp
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 
+from easydel.infra.utils import add_start_docstrings
 from easydel.utils.compiling_utils import hash_fn
 
-
-def add_start_docstrings(*docstr):
-    """
-    A decorator that prepends a given docstring section to the decorated function's docstring.
-
-    This is useful for adding standard documentation sections (like parameter descriptions)
-    to multiple functions without repetition.
-
-    Args:
-        *docstr: One or more strings that will be joined and prepended to the
-            decorated function's existing docstring.
-
-    Returns:
-        A decorator function.
-    """
-
-    def docstring_decorator(fn):
-        """Prepend the given docstring fragments to the function's existing docstring."""
-        fn.__doc__ = "".join(docstr) + (fn.__doc__ if fn.__doc__ is not None else "")
-        return fn
-
-    return docstring_decorator
-
-
 logger = get_logger(__name__)
+
+
+def _hash_processor_configuration(self) -> int:
+    """Hash dataclass callables without contradicting their generated equality.
+
+    Dataclass equality requires identical classes, but fields may be equivalent
+    numeric representations (including signed zero), mutable token lists, or
+    unhashable dynamic arrays. A class-only hash deliberately permits collisions;
+    configuration equality still distinguishes dictionary/JIT cache entries.
+    This also avoids reading device arrays just to hash a callable.
+    """
+    return hash(type(self))
 
 
 LOGITS_PROCESSOR_INPUTS_DOCSTRING = r"""
@@ -174,6 +163,8 @@ class EmptyProcessor(LogitsProcessor):
     processing is desired at that stage.
     """
 
+    __hash__ = _hash_processor_configuration
+
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         """Return scores unchanged (no-op processor).
 
@@ -222,16 +213,25 @@ class LogitsProcessorList(list):
                 (beyond the standard three) that are not provided in `**kwargs`.
         """
         for processor in self:
-            function_args = inspect.signature(processor.__call__).parameters
-            if len(function_args) > 3:
-                if not all(arg in kwargs for arg in list(function_args.keys())[2:]):
-                    raise ValueError(
-                        f"Make sure that all the required parameters: {list(function_args.keys())} for "
-                        f"{processor.__class__} are passed to the logits processor."
-                    )
-                scores = processor(input_ids, scores, cur_len, **kwargs)
-            else:
-                scores = processor(input_ids, scores, cur_len)
+            extra_args = list(inspect.signature(processor.__call__).parameters.values())[3:]
+            required = [
+                arg.name
+                for arg in extra_args
+                if arg.default is inspect.Parameter.empty
+                and arg.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+            ]
+            missing = [name for name in required if name not in kwargs]
+            if missing:
+                raise ValueError(f"Missing required parameters {missing} for logits processor {processor.__class__}.")
+            accepts_kwargs = any(arg.kind is inspect.Parameter.VAR_KEYWORD for arg in extra_args)
+            accepted = {arg.name for arg in extra_args if arg.kind is not inspect.Parameter.POSITIONAL_ONLY}
+            processor_kwargs = (
+                kwargs if accepts_kwargs else {key: value for key, value in kwargs.items() if key in accepted}
+            )
+            positional = [
+                kwargs.get(arg.name, arg.default) for arg in extra_args if arg.kind is inspect.Parameter.POSITIONAL_ONLY
+            ]
+            scores = processor(input_ids, scores, cur_len, *positional, **processor_kwargs)
         return scores
 
     __hash__ = hash_fn
@@ -250,6 +250,9 @@ class TemperatureLogitsWarper(LogitsWarper):
         temperature: The temperature value for scaling. Must be non-negative.
             A value of ``-1`` is treated as a sentinel that disables scaling.
     """
+
+    # Keep the callable hashable when auto_pytree generates dataclass equality.
+    __hash__ = _hash_processor_configuration
 
     temperature: jnp.ndarray
 
@@ -294,6 +297,8 @@ class TopPLogitsWarper(LogitsWarper):
         min_tokens_to_keep: Minimum number of tokens to retain, even if their
             cumulative probability exceeds ``top_p``. Defaults to ``1``.
     """
+
+    __hash__ = _hash_processor_configuration
 
     top_p: float
     filter_value: float = -float("Inf")
@@ -348,6 +353,8 @@ class TopKLogitsWarper(LogitsWarper):
         min_tokens_to_keep: Minimum number of tokens to retain, overriding
             ``top_k`` when ``top_k`` is smaller. Defaults to ``1``.
     """
+
+    __hash__ = _hash_processor_configuration
 
     top_k: int
     filter_value: float = -float("Inf")
@@ -406,6 +413,8 @@ class ForcedBOSTokenLogitsProcessor(LogitsProcessor):
         bos_token_id: The integer ID of the beginning-of-sequence token.
     """
 
+    __hash__ = _hash_processor_configuration
+
     bos_token_id: int
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
@@ -437,6 +446,8 @@ class ForcedEOSTokenLogitsProcessor(LogitsProcessor):
         max_length: Maximum allowed sequence length, including the prompt.
         eos_token_id: Integer ID of the end-of-sequence token.
     """
+
+    __hash__ = _hash_processor_configuration
 
     max_length: int
     eos_token_id: int
@@ -472,6 +483,8 @@ class MinLengthLogitsProcessor(LogitsProcessor):
         eos_token_id: Integer ID of the end-of-sequence token.
     """
 
+    __hash__ = _hash_processor_configuration
+
     min_length: int
     eos_token_id: int
 
@@ -496,7 +509,7 @@ class MinLengthLogitsProcessor(LogitsProcessor):
             cur_len: Current generation length.
 
         Returns:
-            Scores with EOS suppressed if cur_len < min_length, unchanged otherwise.
+            Scores with EOS suppressed if cur_len <= min_length, unchanged otherwise.
         """
         apply_penalty = 1 - jnp.clip(cur_len - self.min_length, 0, 1)
         scores = jnp.where(apply_penalty, scores.at[:, self.eos_token_id].set(-float("inf")), scores)
@@ -517,6 +530,8 @@ class SuppressTokensAtBeginLogitsProcessor(LogitsProcessor):
         begin_index: Generation step index (0-based, relative to the start of
             generation) at which to apply the suppression.
     """
+
+    __hash__ = _hash_processor_configuration
 
     begin_suppress_tokens: list
     begin_index: int
@@ -547,6 +562,8 @@ class SuppressTokensLogitsProcessor(LogitsProcessor):
     Attributes:
         suppress_tokens: Token IDs to suppress on every generation step.
     """
+
+    __hash__ = _hash_processor_configuration
 
     suppress_tokens: list
 
@@ -786,6 +803,8 @@ class PresencePenaltyLogitsProcessor(LogitsProcessor):
             tokens. Must be non-negative; ``0.0`` disables the processor.
     """
 
+    __hash__ = _hash_processor_configuration
+
     presence_penalty: float
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
@@ -804,8 +823,9 @@ class PresencePenaltyLogitsProcessor(LogitsProcessor):
             """Subtract the presence penalty from logits of present tokens."""
             org_dtype = x.dtype
             _batch_size, vocab_size = x.shape
+            valid = jnp.arange(ids.shape[1]) < jnp.asarray(cur_len)[..., None]
             one_hot_presence = jax.nn.one_hot(ids, num_classes=vocab_size, dtype=x.dtype)
-            presence_mask = jnp.sum(one_hot_presence, axis=1) > 0
+            presence_mask = jnp.sum(one_hot_presence * valid[..., None], axis=1) > 0
             penalty_values = jnp.where(presence_mask, presence_penalty, 0.0)
             x = x - penalty_values
             return x.astype(org_dtype)
@@ -833,6 +853,8 @@ class FrequencyPenaltyLogitsProcessor(LogitsProcessor):
             disables the processor.
     """
 
+    __hash__ = _hash_processor_configuration
+
     frequency_penalty: float
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
@@ -851,8 +873,9 @@ class FrequencyPenaltyLogitsProcessor(LogitsProcessor):
             """Subtract a count-proportional penalty from each token's logit."""
             org_dtype = x.dtype
             _batch_size, vocab_size = x.shape
+            valid = jnp.arange(ids.shape[1]) < jnp.asarray(cur_len)[..., None]
             one_hot_counts = jax.nn.one_hot(ids, num_classes=vocab_size, dtype=x.dtype)
-            token_counts = jnp.sum(one_hot_counts, axis=1)
+            token_counts = jnp.sum(one_hot_counts * valid[..., None], axis=1)
             penalty_values = token_counts * frequency_penalty
             x = x - penalty_values
             return x.astype(org_dtype)
@@ -889,6 +912,8 @@ class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
             values ``< 1.0`` encourage repetition.
     """
 
+    __hash__ = _hash_processor_configuration
+
     repetition_penalty: float
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
@@ -910,8 +935,9 @@ class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
             """Apply CTRL-style multiplicative repetition penalty per token."""
             org_dtype = x.dtype
             _batch_size, vocab_size = x.shape
+            valid = jnp.arange(ids.shape[1]) < jnp.asarray(cur_len)[..., None]
             one_hot_presence = jax.nn.one_hot(ids, num_classes=vocab_size, dtype=x.dtype)
-            presence_mask = jnp.sum(one_hot_presence, axis=1) > 0
+            presence_mask = jnp.sum(one_hot_presence * valid[..., None], axis=1) > 0
             positive_penalized_scores = x / repetition_penalty
             negative_penalized_scores = x * repetition_penalty
             scores_intermediate = jnp.where(x > 0, positive_penalized_scores, x)
@@ -948,6 +974,8 @@ class MinPLogitsWarper(LogitsWarper):
             probability falls below the ``min_p * P(max)`` threshold.
             Defaults to ``1``.
     """
+
+    __hash__ = _hash_processor_configuration
 
     min_p: float
     filter_value: float = -float("Inf")
@@ -1004,6 +1032,8 @@ class NoRepeatNGramLogitsProcessor(LogitsProcessor):
         ngram_size: Size of the n-gram to prevent from repeating; ``0``
             disables the processor.
     """
+
+    __hash__ = _hash_processor_configuration
 
     ngram_size: int
 

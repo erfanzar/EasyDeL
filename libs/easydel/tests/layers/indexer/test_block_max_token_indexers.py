@@ -191,8 +191,15 @@ def test_token_operation_output_matches_numpy_rope_cache_and_mask(interleave, q_
     np.testing.assert_array_equal(output.topk_indices, expected)
     np.testing.assert_allclose(output.cached_keys, keys, rtol=2e-5, atol=2e-6)
     selection = model.selection_from_output(output)
-    np.testing.assert_array_equal(selection.indices, expected)
-    assert selection.to_mask(5).shape == (1, 5, 5)
+    # Legacy raw top-k IDs retain masked filler lanes when fewer than top-k
+    # keys are eligible. The common selection API instead marks them as -1.
+    key_ids = np.arange(mask.shape[-1])
+    eligible = mask & (key_ids[None, None, :] <= positions[..., None])
+    expected_selection = np.where(np.take_along_axis(eligible, expected, axis=-1), expected, -1)
+    expected_mask = np.any((expected[..., None] == key_ids) & (expected_selection[..., None] >= 0), axis=-2)
+    np.testing.assert_array_equal(selection.indices, expected_selection)
+    np.testing.assert_array_equal(output.topk_mask, expected_mask)
+    np.testing.assert_array_equal(selection.to_mask(5), expected_mask)
     # Single-step decoding must append (not reset) the normalized, rotated keys.
     decode_mask = np.ones((1, 1, 6), dtype=bool)
     expected_decode, decode_keys = _token_reference(

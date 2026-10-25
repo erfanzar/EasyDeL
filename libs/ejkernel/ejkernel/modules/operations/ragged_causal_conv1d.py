@@ -87,7 +87,7 @@ def mesh_axis_size(mesh: object | None, axis_name: object | None) -> int:
         return 1
 
 
-def _reorder_concatenated_tensor_for_sharding(
+def reorder_conv_features_for_sharding(
     concatenated_tensor: jax.Array,
     split_sizes: tuple[int, ...],
     n_shards: int,
@@ -131,6 +131,10 @@ def _reorder_concatenated_tensor_for_sharding(
         start_offset += int(split_size)
     reordered_tensor = jnp.concatenate(split_tensors, axis=dim + 1)
     return reordered_tensor.reshape(old_shape)
+
+
+# Compatibility for callers using the original private name.
+_reorder_concatenated_tensor_for_sharding = reorder_conv_features_for_sharding
 
 
 class RaggedCausalConv1D(Kernel[RaggedCausalConv1DConfig, tuple[Array, Array]]):
@@ -497,8 +501,8 @@ def ragged_causal_conv1d_head_sharded(
         )
 
     if not pre_sharded:
-        x = _reorder_concatenated_tensor_for_sharding(x, split_sizes, int(tp_size), -1)
-        kernel = _reorder_concatenated_tensor_for_sharding(kernel, split_sizes, int(tp_size), 0)
+        x = reorder_conv_features_for_sharding(x, split_sizes, int(tp_size), -1)
+        kernel = reorder_conv_features_for_sharding(kernel, split_sizes, int(tp_size), 0)
 
     feature_spec = PartitionSpec(None, head_axis)
     state_spec = PartitionSpec(None, head_axis, None)

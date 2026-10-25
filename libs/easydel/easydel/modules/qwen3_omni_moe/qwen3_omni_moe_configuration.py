@@ -382,6 +382,18 @@ class Qwen3OmniMoeTextConfig(EasyDeLBaseConfig):
                 for i in range(self.num_hidden_layers)
             ]
 
+        if rope_scaling is None and "mrope_section" not in (self.rope_scaling or {}):
+            # Thinker always emits three-axis positions, even when constructed
+            # from defaults rather than a pretrained config. Keep HF's 24/20/20
+            # allocation at head_dim=128 and scale down for small test models.
+            half_dim = self.head_dim // 2
+            spatial = half_dim * 20 // 64
+            self.rope_scaling = {
+                "type": "mrope",
+                "rope_type": "mrope",
+                "mrope_section": [half_dim - 2 * spatial, spatial, spatial],
+                "mrope_interleaved": True,
+            }
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             rtype = self.rope_scaling["type"]
             if rtype == "mrope" or ("mrope_section" in self.rope_scaling and rtype == "default"):

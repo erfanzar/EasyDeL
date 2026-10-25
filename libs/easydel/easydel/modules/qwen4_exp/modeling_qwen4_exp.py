@@ -98,13 +98,17 @@ from easydel.layers import (
     expand_streams,
     inject_streams,
     moe_down_projection_reform_param,
-    split_fused_gate_up_projection,
 )
 from easydel.layers.compressed_window import packed_row_of_token
 from easydel.layers.embeddings import NGramEmbed
-from easydel.layers.indexer import BlockTopKIndexer
-from easydel.layers.indexer._block_topk import apply_partial_rope
-from easydel.layers.indexer._paged_block_topk import paged_block_topk
+from easydel.layers.indexer import (
+    BlockTopKIndexer,
+    apply_partial_rope,
+    indexer_distillation_loss,
+    paged_block_topk,
+    ste_score_proxy,
+)
+from easydel.layers.mlp import moe_gated_expert_forward
 from easydel.layers.norms import lowfloats
 from easydel.modules._base import (
     BaseCausalLMModule,
@@ -127,7 +131,6 @@ from .qwen4_exp_configuration import Qwen4ExpConfig, Qwen4ExpTextConfig, Qwen4Ex
 logger = get_logger(__name__)
 
 QWEN4_FULL = "qwen_sparse_attention"
-QWEN4_LINEAR = "linear_attention"
 
 
 def _dynamic_update_rows(buffer: Array, values: Array, starts: Array, axis: int = 0) -> Array:
@@ -234,6 +237,22 @@ class Qwen4ExpQSAView(TransformerCacheView):
     indexer_block_keys: Float[Array, "batch blocks idx_dim"] | None = None
     indexer_blocks_complete: Bool[Array, "batch blocks"] | None = None
 
+    def reset(self) -> "Qwen4ExpQSAView":
+        """Clear KV and every QSA sidecar when reusing the cache."""
+        view = super().reset()
+        return view.replace(
+            **{
+                name: None if getattr(self, name) is None else jnp.zeros_like(getattr(self, name))
+                for name in (
+                    "indexer_key",
+                    "indexer_visible",
+                    "mrope_positions",
+                    "indexer_block_keys",
+                    "indexer_blocks_complete",
+                )
+            }
+        )
+
     @classmethod
     def init(
         cls,
@@ -293,6 +312,9 @@ class Qwen4ExpPagedQSAView(RaggedPagesCacheView):
         index_dim = int(getattr(config, "qwen4_indexer_head_dim", 0))
         if index_dim <= 0:
             raise ValueError("Qwen4 paged QSA cache config is missing qwen4_indexer_head_dim")
+        # Older direct view callers annotate only the index width. Reserve a
+        # per-token block slot in that case; model-built configs still use the
+        # exact compression ratio supplied by init_operations_cache_config.
         base_sharding = getattr(base.kv_pages, "sharding", None)
         sidecar_sharding = None
         if isinstance(base_sharding, NamedSharding):
@@ -311,7 +333,11 @@ class Qwen4ExpPagedQSAView(RaggedPagesCacheView):
                 device=sidecar_sharding,
             ),
             indexer_block_pages=jnp.zeros(
-                (config.num_pages, config.page_size // int(config.qwen4_indexer_compress_ratio), index_dim),
+                (
+                    config.num_pages,
+                    config.page_size // int(getattr(config, "qwen4_indexer_compress_ratio", 1)),
+                    index_dim,
+                ),
                 dtype=jnp.float32,
                 device=sidecar_sharding,
             ),
@@ -359,6 +385,20 @@ class Qwen4ExpLinearView(HybridCacheView):
     ple_token_context: Int[Array, "batch ctx"] | None = None
     ple_segment_context: Int[Array, "batch ctx"] | None = None
 
+    def reset(self) -> "Qwen4ExpLinearView":
+        """Reset recurrent state and invalidate all carried PLE history."""
+        return (
+            super()
+            .reset()
+            .replace(
+                ple_conv_state=None if self.ple_conv_state is None else jnp.zeros_like(self.ple_conv_state),
+                ple_token_context=None if self.ple_token_context is None else jnp.zeros_like(self.ple_token_context),
+                ple_segment_context=None
+                if self.ple_segment_context is None
+                else jnp.full_like(self.ple_segment_context, -1),
+            )
+        )
+
     @classmethod
     def init(
         cls,
@@ -398,6 +438,20 @@ class Qwen4ExpOperationsLinearView(RecurrentCacheView):
     ple_conv_state: Float[Array, "batch channels state_len"] | None = None
     ple_token_context: Int[Array, "batch ctx"] | None = None
     ple_segment_context: Int[Array, "batch ctx"] | None = None
+
+    def reset(self) -> "Qwen4ExpOperationsLinearView":
+        """Preserve the family view while clearing recurrent and PLE state."""
+        return self.replace(
+            conv_state=None if self.conv_state is None else jnp.zeros_like(self.conv_state),
+            recurrent_state=None if self.recurrent_state is None else jnp.zeros_like(self.recurrent_state),
+            positions=jnp.zeros_like(self.positions),
+            seqlen_offset=jnp.zeros_like(self.seqlen_offset),
+            ple_conv_state=None if self.ple_conv_state is None else jnp.zeros_like(self.ple_conv_state),
+            ple_token_context=None if self.ple_token_context is None else jnp.zeros_like(self.ple_token_context),
+            ple_segment_context=None
+            if self.ple_segment_context is None
+            else jnp.full_like(self.ple_segment_context, -1),
+        )
 
     @classmethod
     def init(cls, config, layer_index=None, *, dtype=jnp.bfloat16, partition_specs=None):
@@ -523,6 +577,20 @@ class Qwen4ExpGatedDeltaNet(Qwen3NextLinearAttention):
 # ---------------------------------------------------------------------------
 # Sparse full attention (QSA)
 # ---------------------------------------------------------------------------
+
+
+@auto_pytree
+class Qwen4ExpAttentionOutput(AttentionLayerOutput):
+    """QSA attention output with an optional unscaled indexer KL."""
+
+    indexer_aux_loss: Array | None = None
+
+
+@auto_pytree
+class Qwen4ExpDecoderOutput(DecoderLayerOutput):
+    """Decoder output carrying the main layer's unscaled indexer KL."""
+
+    indexer_aux_loss: Array | None = None
 
 
 class Qwen4ExpAttention(Qwen3NextFullAttention):
@@ -652,7 +720,7 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
                 precision=self.indexer.precision,
                 kernel_mesh=None,
             )
-            expanded = self.indexer._expand_selection(
+            expanded = self.indexer.expand_selection(
                 block_ids[:, None],
                 block_ids[:, None] >= 0,
                 jnp.zeros((1,), jnp.int32),
@@ -675,10 +743,10 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
         mask_info: MaskInfo | None,
         position_ids: Array,
         cache_view: tp.Any | None,
-    ) -> tuple[Array | None, Array | None, tp.Any]:
+    ) -> tuple[Array | None, Array | None, Array | None, tp.Any]:
         """Update QSA indexer state and select visible token indices.
 
-        Returns ``(selected, mask_sel, cache_view)`` where ``selected`` holds
+        Returns ``(selected, mask_sel, score_proxy, cache_view)`` where ``selected`` holds
         the selected token indices ``[B, Q, budget + ratio - 1]`` (cached path)
         and ``mask_sel`` is a boolean mask ``[B, 1, Q, S]`` (state-free path);
         exactly one of them is ``None``.
@@ -829,13 +897,14 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
         mask_info: MaskInfo | None,
         position_ids: Array,
         cache_view: tp.Any | None,
-    ) -> tuple[Array | None, tp.Any]:
+    ) -> tuple[Array | None, Array | None, tp.Any]:
         """Compute the additive QSA selection bias ``[B, 1, Q, K]``.
 
         Full-width path used by prefill/training: the selected indices are
         scattered into a boolean mask spanning the whole buffer and broadcast
         across heads. Decode takes the gathered path instead (see
-        :meth:`_decode_gather_attention`).
+        :meth:`_decode_gather_attention`). Returns the bias, the differentiable
+        token-expanded block-score proxy (None with a cache), and the cache view.
         """
         batch = hidden_states.shape[0]
         selected, mask_sel, score_proxy, cache_view = self._indexer_select(
@@ -851,10 +920,71 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
         if score_proxy is not None:
             # Zero in the primal, identity in the tangent: preserve exact hard
             # QSA attention while allowing LM gradients into indexer scores.
-            ste = score_proxy - jax.lax.stop_gradient(score_proxy)
-            bias = bias + jnp.where(mask_sel, ste, 0.0)
+            bias = bias + ste_score_proxy(score_proxy, mask_sel)
         bias = jnp.broadcast_to(bias, (batch, self.num_heads, *bias.shape[-2:]))
-        return bias, cache_view
+        return bias, score_proxy, cache_view
+
+    def _indexer_distillation_loss(
+        self,
+        query_states: Array,
+        key_states: Array,
+        score_proxy: Array,
+        mask_info: MaskInfo | None,
+    ) -> Array:
+        """Distil attention mass over the QSA indexer's complete candidate blocks.
+
+        The proxy repeats each reachable block score at its token positions, but replaces unreachable scores
+        with zero. Recover one score per block and restore the *pre-top-k* eligibility mask, not the hard
+        selected mask. The always-attended incomplete tail has no ranking score and is excluded, exactly as
+        in ``BlockTopKIndexer.select``. Left padding shifts block origins to the first visible token, so keys
+        are rebased to that origin before passing ``entry_group`` to the shared loss. Physical token offsets
+        (not possibly non-monotonic multimodal RoPE rows) enforce causality.
+
+        Queries and keys are the actual post-QK-norm, post-partial-mRoPE attention tensors, with GQA keys
+        repeated in query-head order. The shared loss detaches the attention target; the score proxy was
+        already computed from detached hidden states. Explicit packed QSA remains unsupported by the
+        indexer; derived padding segments and invalid queries/keys are respected here.
+        """
+        batch, seq = query_states.shape[:2]
+        ratio = self.indexer.compress_ratio
+        num_blocks = (seq + ratio - 1) // ratio
+        segments = None
+        if mask_info is not None:
+            try:
+                segments, _ = mask_info.get_or_compute_segment_ids()
+            except ValueError:
+                pass
+        if segments is not None and segments.ndim == 3:
+            segments = segments[:, 0, :]
+        visible = jnp.ones((batch, seq), jnp.bool_) if segments is None else segments >= 0
+        first_visible = jnp.argmax(visible.astype(jnp.int32), axis=1)
+        offsets = first_visible[:, None] + jnp.arange(seq, dtype=jnp.int32)[None, :]
+        safe_offsets = jnp.minimum(offsets, seq - 1)
+        entry_valid = (offsets < seq) & jnp.take_along_axis(visible, safe_offsets, axis=1)
+        counts = jnp.pad(entry_valid, ((0, 0), (0, num_blocks * ratio - seq))).reshape(batch, num_blocks, ratio)
+        complete = jnp.sum(counts, axis=-1) == ratio
+        block_start = first_visible[:, None] + jnp.arange(num_blocks, dtype=jnp.int32)[None, :] * ratio
+        q_positions = jnp.broadcast_to(jnp.arange(seq, dtype=jnp.int32)[None, :], (batch, seq))
+        block_scores = jnp.take_along_axis(score_proxy[:, 0], jnp.minimum(block_start, seq - 1)[:, None, :], axis=2)
+        reachable = complete[:, None, :] & (block_start[:, None, :] + ratio - 1 <= q_positions[..., None])
+        block_scores = jnp.where(reachable & visible[..., None], block_scores, -jnp.inf)
+        keys = jnp.take_along_axis(key_states, safe_offsets[:, :, None, None], axis=1).transpose(0, 2, 1, 3)
+        keys = jnp.repeat(keys, query_states.shape[2] // key_states.shape[2], axis=1)
+        entry_segments = None if segments is None else jnp.take_along_axis(segments, safe_offsets, axis=1)
+        return indexer_distillation_loss(
+            query_states.transpose(0, 2, 1, 3),
+            keys,
+            block_scores,
+            scaling=self.attention_performer.softmax_scale,
+            sinks=self._softmax_aux(),
+            precision=self.precision,
+            entry_group=ratio,
+            entry_valid=entry_valid,
+            q_positions=q_positions,
+            entry_positions=offsets,
+            q_segment_ids=segments,
+            entry_segment_ids=entry_segments,
+        )
 
     def _write_v3_paged_kv(
         self,
@@ -886,6 +1016,12 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
             repeats = key_pages.shape[2] // key_flat.shape[1]
             key_flat = jnp.repeat(key_flat, repeats, axis=1)
             value_flat = jnp.repeat(value_flat, repeats, axis=1)
+        # v3 rounds narrow logical head dimensions up to its storage tile.
+        # Keep the padded lanes zero and strip them again when gathering.
+        if key_flat.shape[-1] > key_pages.shape[-1] or value_flat.shape[-1] > value_pages.shape[-1]:
+            raise ValueError("Qwen4 v3 cache head dimension is smaller than the projected KV width")
+        key_flat = jnp.pad(key_flat, ((0, 0), (0, 0), (0, key_pages.shape[-1] - key_flat.shape[-1])))
+        value_flat = jnp.pad(value_flat, ((0, 0), (0, 0), (0, value_pages.shape[-1] - value_flat.shape[-1])))
         key_pages = key_pages.at[target_page, offset].set(key_flat.astype(key_pages.dtype), mode="drop")
         value_pages = value_pages.at[target_page, offset].set(value_flat.astype(value_pages.dtype), mode="drop")
         if kv_pair_shares_head_dim_axis(getattr(getattr(cache_view, "metadata", None), "k_headdim", -1)):
@@ -900,8 +1036,10 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
         cache_view: Qwen4ExpPagedQSAView,
         cache_metadata: RaggedPagesMetadata | OperationsMetadata,
         selected: Array,
+        mask_info: MaskInfo | None = None,
+        bias: Array | None = None,
     ) -> Array:
-        """Gather selected logical positions from v2 physical KV pages in bounded chunks."""
+        """Gather selected KV and request restrictions in bounded chunks."""
         meta = getattr(cache_metadata, "ragged", None) or cache_metadata
         total = query_states.shape[1]
         req, _, _, _, current_valid = _paged_qsa_token_map(meta, total, cache_view.indexer_key_pages.shape[0])
@@ -914,6 +1052,14 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
         pair_in_head_dim = kv_pair_shares_head_dim_axis(getattr(getattr(cache_view, "metadata", None), "k_headdim", -1))
         kv_heads = kv_pages.shape[2] if pair_in_head_dim else kv_pages.shape[2] // 2
         groups = query_states.shape[2] // kv_heads
+        keep, selected_bias = self._gather_attention_constraints(selected, mask_info, bias, cache_metadata)
+        # Retain a singleton mask head until inside each chunk. Broadcasting
+        # across all query heads here would create an unnecessary H*Q*W table.
+        keep = keep[0].transpose(1, 0, 2)
+        if selected_bias is None:
+            selected_bias = jnp.zeros((total, 1, width), jnp.float32)
+        else:
+            selected_bias = selected_bias[0].transpose(1, 0, 2)
         chunk = min(64, total)
         padded = ((total + chunk - 1) // chunk) * chunk
         q = query_states[0].reshape(total, kv_heads, groups, self.head_dim)
@@ -922,6 +1068,8 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
         current_valid = jnp.pad(current_valid, (0, padded - total), constant_values=False)
         sel = jnp.pad(sel, ((0, padded - total), (0, 0)), constant_values=-1)
         output = jnp.zeros((padded, kv_heads, groups, self.head_dim), dtype=kv_pages.dtype)
+        keep = jnp.pad(keep, ((0, padded - total), (0, 0), (0, 0)), constant_values=False)
+        selected_bias = jnp.pad(selected_bias, ((0, padded - total), (0, 0), (0, 0)))
 
         def _attend_chunk(index, output):
             start = index * chunk
@@ -937,24 +1085,97 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
             physical = jnp.clip(physical, 0, kv_pages.shape[0] - 1)
             kv_sel = kv_pages[physical, page_offset]
             if pair_in_head_dim:
+                stored_key_width = cache_view.key_pages.shape[-1]
                 key_sel = kv_sel[..., : self.head_dim]
-                value_sel = kv_sel[..., self.head_dim : self.head_dim * 2]
+                value_sel = kv_sel[..., stored_key_width : stored_key_width + self.head_dim]
             else:
-                key_sel = kv_sel[:, :, 0::2, :]
-                value_sel = kv_sel[:, :, 1::2, :]
+                key_sel = kv_sel[:, :, 0::2, : self.head_dim]
+                value_sel = kv_sel[:, :, 1::2, : self.head_dim]
             scores = jnp.einsum(
                 "thgd,twhd->thgw",
                 q_chunk.astype(jnp.float32),
                 key_sel.astype(jnp.float32),
+                precision=self.precision,
             )
             scores = scores * (self.head_dim**-0.5)
-            scores = jnp.where(valid[:, None, None, :], scores, -1e30)
-            probs = jax.nn.softmax(scores, axis=-1)
-            out = jnp.einsum("thgw,twhd->thgd", probs.astype(value_sel.dtype), value_sel)
+            chunk_keep = jax.lax.dynamic_slice(keep, (start, 0, 0), (chunk, keep.shape[1], width))
+            chunk_keep = jnp.broadcast_to(chunk_keep, (chunk, self.num_heads, width))
+            chunk_keep = chunk_keep.reshape(chunk, kv_heads, groups, width) & valid[:, None, None, :]
+            chunk_bias = jax.lax.dynamic_slice(selected_bias, (start, 0, 0), (chunk, selected_bias.shape[1], width))
+            chunk_bias = jnp.broadcast_to(chunk_bias, (chunk, self.num_heads, width)).reshape(scores.shape)
+            scores = jnp.where(chunk_keep, scores + chunk_bias, -1e30)
+            probs = jnp.where(chunk_keep, jax.nn.softmax(scores, axis=-1), 0.0)
+            out = jnp.einsum("thgw,twhd->thgd", probs.astype(value_sel.dtype), value_sel, precision=self.precision)
             return jax.lax.dynamic_update_slice(output, out, (start, 0, 0, 0))
 
         output = jax.lax.fori_loop(0, padded // chunk, _attend_chunk, output)
         return output[:total].reshape(1, total, -1, self.head_dim)
+
+    def _gather_attention_constraints(
+        self,
+        selected: Array,
+        mask_info: MaskInfo | None = None,
+        bias: Array | None = None,
+        cache_metadata: RaggedPagesMetadata | OperationsMetadata | None = None,
+    ) -> tuple[Array, Array | None]:
+        """Gather request restrictions in the same coordinates as selected KV.
+
+        Segment-only masks are gathered without materializing a full Q-by-K
+        mask. Explicit pairwise/per-head masks and additive biases retain their
+        head dimension. Negative/out-of-range selected slots remain invalid.
+        """
+        batch, queries, width = selected.shape
+        valid = (selected >= 0)[:, None]
+        rows = jnp.arange(batch)[:, None, None, None]
+        query_rows = jnp.arange(queries)[None, None, :, None]
+
+        packed_columns = None
+        if cache_metadata is not None:
+            meta = getattr(cache_metadata, "ragged", None) or cache_metadata
+            starts = meta.query_start_loc
+            request_rows = packed_row_of_token(starts, jnp.arange(queries, dtype=jnp.int32))
+            old_lengths = meta.context_lens[: starts.shape[0] - 1] - (starts[1:] - starts[:-1])
+            packed_columns = selected + (starts[request_rows] - old_lengths[request_rows])[None, :, None]
+
+        def columns(length):
+            # Paged masks over the scheduled tokens use packed coordinates;
+            # full-context masks use each request's logical KV coordinates.
+            if packed_columns is not None and length == queries:
+                return packed_columns, packed_columns < meta.query_start_loc[request_rows][None, :, None]
+            return selected, jnp.zeros_like(selected, dtype=jnp.bool_)
+
+        def gather(table, history_value):
+            indices, history = columns(table.shape[-1])
+            heads = jnp.arange(table.shape[1])[None, :, None, None]
+            gathered = table[
+                jnp.minimum(rows, table.shape[0] - 1),
+                heads,
+                jnp.minimum(query_rows, table.shape[2] - 1),
+                jnp.clip(indices[:, None], 0, table.shape[3] - 1),
+            ]
+            return jnp.where(history[:, None], history_value, gathered), indices, history
+
+        if mask_info is not None:
+            mask = getattr(mask_info, "_attention_mask", None)
+            if mask is not None:
+                gathered, indices, history = gather(mask, True)
+                valid = valid & (history | (indices < mask.shape[-1]))[:, None] & gathered.astype(jnp.bool_)
+            q_segments = getattr(mask_info, "_q_segment_ids", None)
+            kv_segments = getattr(mask_info, "_kv_segment_ids", None)
+            if q_segments is not None and kv_segments is not None:
+                indices, history = columns(kv_segments.shape[-1])
+                kv = jnp.take_along_axis(
+                    kv_segments[:, None, :], jnp.clip(indices, 0, kv_segments.shape[-1] - 1), axis=-1
+                )
+                q = q_segments[:, :queries, None]
+                within = history | ((indices >= 0) & (indices < kv_segments.shape[-1]))
+                valid = valid & (within & (q >= 0) & (history | (q == kv)))[:, None]
+        gathered_bias = None if bias is None else gather(bias, 0.0)[0].astype(jnp.float32)
+        if gathered_bias is not None:
+            # Bias-only callers can exclude entire rows. Such a row must yield
+            # zero rather than a uniform average over forbidden values.
+            valid = valid & jnp.isfinite(gathered_bias)
+        return jnp.broadcast_to(valid, (batch, valid.shape[1], queries, width)), gathered_bias
 
     def _decode_gather_attention(
         self,
@@ -962,6 +1183,8 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
         key_states: Array,
         value_states: Array,
         selected: Array,
+        mask_info: MaskInfo | None = None,
+        bias: Array | None = None,
     ) -> Array:
         """Attend only the QSA-selected tokens for a single-token decode step.
 
@@ -979,6 +1202,8 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
             key_states: Full dense key buffer (post-concat) ``[B, S, H_kv, D]``.
             value_states: Full dense value buffer (post-concat) ``[B, S, H_kv, D]``.
             selected: Selected token indices ``[B, 1, W]``, ``-1``-padded.
+            mask_info: Effective post-concatenation cache/request restrictions.
+            bias: Effective additive bias, gathered with the selected KV rows.
 
         Returns:
             Attention output ``[B, 1, H, D]``.
@@ -994,11 +1219,20 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
         kv_heads = key_sel.shape[2]
         groups = query_states.shape[2] // kv_heads
         q = query_states[:, 0].reshape(batch, kv_heads, groups, self.head_dim)
-        scores = jnp.einsum("bhgd,bwhd->bhgw", q.astype(jnp.float32), key_sel.astype(jnp.float32))
+        scores = jnp.einsum(
+            "bhgd,bwhd->bhgw", q.astype(jnp.float32), key_sel.astype(jnp.float32), precision=self.precision
+        )
         scores = scores * (self.head_dim**-0.5)
-        scores = jnp.where(valid[:, None, None, :], scores, -1e30)
-        probs = jax.nn.softmax(scores, axis=-1)
-        out = jnp.einsum("bhgw,bwhd->bhgd", probs.astype(value_sel.dtype), value_sel)
+        keep, selected_bias = self._gather_attention_constraints(selected, mask_info, bias)
+        keep = jnp.broadcast_to(keep, (batch, self.num_heads, 1, sel.shape[-1]))
+        keep = keep.reshape(batch, kv_heads, groups, sel.shape[-1])
+        keep = keep & (sel < key_states.shape[1])[:, None, None]
+        if selected_bias is not None:
+            selected_bias = jnp.broadcast_to(selected_bias, (batch, self.num_heads, 1, sel.shape[-1]))
+            scores = scores + selected_bias.reshape(scores.shape)
+        scores = jnp.where(keep, scores, -1e30)
+        probs = jnp.where(keep, jax.nn.softmax(scores, axis=-1), 0.0)
+        out = jnp.einsum("bhgw,bwhd->bhgd", probs.astype(value_sel.dtype), value_sel, precision=self.precision)
         return out.reshape(batch, 1, -1, self.head_dim)
 
     def forward(
@@ -1033,6 +1267,13 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
         selected = None
         paged_selected = None
         indexer_bias = None
+        score_proxy = None
+        indexer_aux_active = (
+            self.indexer is not None
+            and cache_view is None
+            and cache_metadata is None
+            and getattr(self.config, "indexer_aux_loss_coef", 0.0) > 0
+        )
         if self.indexer is not None:
             if isinstance(cache_view, Qwen4ExpPagedQSAView):
                 if cache_metadata is None:
@@ -1051,7 +1292,13 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
                 # below attends them directly without the full-width bias.
                 selected, _, _, cache_view = self._indexer_select(hidden_states, mask_info, position_ids, cache_view)
             else:
-                indexer_bias, cache_view = self._indexer_bias(hidden_states, mask_info, position_ids, cache_view)
+                # Keep the LM STE enabled, but detach its input during warm-up as well: the KL and
+                # the STE can train indexer parameters without an indexer-input gradient into the backbone.
+                # At coef == 0 this is exactly the original STE path (no detach or auxiliary work).
+                indexer_inputs = jax.lax.stop_gradient(hidden_states) if indexer_aux_active else hidden_states
+                indexer_bias, score_proxy, cache_view = self._indexer_bias(
+                    indexer_inputs, mask_info, position_ids, cache_view
+                )
 
         q_multiplier = self._q_proj_multiplier()
         qkv_output = checkpoint_name(self.qkv_proj(hidden_states), "attn_qkv")
@@ -1069,6 +1316,9 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
         query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
         query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
+        indexer_aux_loss = None
+        if indexer_aux_active:
+            indexer_aux_loss = self._indexer_distillation_loss(query_states, key_states, score_proxy, mask_info)
 
         (
             key_states,
@@ -1090,15 +1340,28 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
         softmax_aux = self._softmax_aux()
         attention_weights = None
         if paged_selected is not None and softmax_aux is None:
-            getattr(cache_metadata, "ragged", None) or cache_metadata
             cache_view = self._write_v3_paged_kv(key_states, value_states, cache_view, cache_metadata)
 
             # The selected set is complete under budget and QSA-ranked above
             # it. Use the same bounded gather for prefill and decode so long
             # paged prefills cannot silently fall back to dense attention.
-            attn_output = self._paged_gather_attention(query_states, cache_view, cache_metadata, paged_selected)
+            attn_output = self._paged_gather_attention(
+                query_states,
+                cache_view,
+                cache_metadata,
+                paged_selected,
+                mask_info=mask_info,
+                bias=None if init_attention_bias is None else init_attention_bias(),
+            )
         elif selected is not None and softmax_aux is None:
-            attn_output = self._decode_gather_attention(query_states, key_states, value_states, selected)
+            attn_output = self._decode_gather_attention(
+                query_states,
+                key_states,
+                value_states,
+                selected,
+                mask_info=mask_info,
+                bias=None if init_attention_bias is None else init_attention_bias(),
+            )
         else:
             bias = indexer_bias
             if init_attention_bias is not None:
@@ -1120,6 +1383,7 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
                 causal=self.causal,
                 sliding_window=self.sliding_window,
                 softmax_aux=softmax_aux,
+                precision=self.precision,
             )
             if attentions.cache_view is not None:
                 cache_view = attentions.cache_view
@@ -1144,10 +1408,11 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
         attn_output = self.o_proj(attn_output)
         attn_output = self.shard_attention_prod(attn_output)
 
-        return AttentionLayerOutput(
+        return Qwen4ExpAttentionOutput(
             attention_output=attn_output,
             attention_weight=attention_weights if output_attentions else None,
             cache_view=cache_view,
+            indexer_aux_loss=indexer_aux_loss,
         )
 
 
@@ -1244,9 +1509,7 @@ class Qwen4ExpMLPStack(spx.Module):
 
     def forward(self, hidden_states: Array, group_sizes: Array, sorted_experts: Array | None = None) -> Array:
         """Apply the grouped per-expert SwiGLU; see BaseMoeModule dispatch."""
-        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
-        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
+        return moe_gated_expert_forward(self, hidden_states, group_sizes, sorted_experts)
 
 
 class Qwen4ExpSparseMoeBlock(BaseMoeModule):
@@ -1277,6 +1540,8 @@ class Qwen4ExpSparseMoeBlock(BaseMoeModule):
             routing_strategy=(MoeRoutingStrategy.TOP_K if config.norm_topk_prob else MoeRoutingStrategy.TOP_K_NDIV),
             load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
         )
+        if config.norm_topk_prob and self.moe_hooks.refine_weights_hook is None and self.moe_hooks.select_hook is None:
+            self.moe_hooks = self.moe_hooks.replace(refine_weights_hook=self.normalize_selected_weights)
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -1312,6 +1577,11 @@ class Qwen4ExpSparseMoeBlock(BaseMoeModule):
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
         )
+
+    @staticmethod
+    def normalize_selected_weights(weights: Array) -> Array:
+        """Normalize the selected router probabilities, including top-1."""
+        return weights / jnp.maximum(weights.sum(axis=-1, keepdims=True), 1e-8)
 
     @property
     def reform_param(self) -> dict[str, dict[str, tp.Any]]:
@@ -1505,13 +1775,16 @@ class Qwen4ExpPLELayer(spx.Module):
             )
             # Compute only new-token outputs, not the carried history's
             # outputs. Static tap slices keep one-token decode work bounded.
-            out = jnp.zeros((batch, seq_len, channels), jnp.float32)
-            for kernel_idx in range(self.conv_kernel_size):
-                start = kernel_idx * self.conv_dilation
-                shifted = x_full[:, :, start : start + seq_len].transpose(0, 2, 1)
-                source_segments = full_segments[:, start : start + seq_len]
-                valid = (segment_ids >= 0) & (source_segments == segment_ids)
-                out = out + jnp.where(valid[..., None], shifted, 0.0) * kernel[kernel_idx, 0]
+            if conv_state is None:
+                out = _packed_depthwise_causal_conv(hidden_states, kernel, segment_ids, self.conv_dilation)
+            else:
+                out = jnp.zeros((batch, seq_len, channels), jnp.float32)
+                for kernel_idx in range(self.conv_kernel_size):
+                    start = kernel_idx * self.conv_dilation
+                    shifted = x_full[:, :, start : start + seq_len].transpose(0, 2, 1)
+                    source_segments = full_segments[:, start : start + seq_len]
+                    valid = (segment_ids >= 0) & (source_segments == segment_ids)
+                    out = out + jnp.where(valid[..., None], shifted, 0.0) * kernel[kernel_idx, 0]
             state_segments = full_segments[:, -state_len:] if state_len else full_segments[:, :0]
             new_state = jnp.where(
                 ((state_segments == segment_ids[:, -1:]) & (segment_ids[:, -1:] >= 0))[:, None, :],
@@ -1978,11 +2251,12 @@ class Qwen4ExpDecoderLayer(spx.Module):
         mlp_output, router_logits = self.mlp(mixed)
         hidden_states = inject_streams(hyper_input, mlp_output, injection)
 
-        return DecoderLayerOutput(
+        return Qwen4ExpDecoderOutput(
             hidden_states=checkpoint_name(hidden_states, "layer_output"),
             attention_weight=attn_outputs.attention_weight if output_attentions else None,
             router_logits=router_logits if output_router_logits else None,
             cache_view=new_cache_view,
+            indexer_aux_loss=getattr(attn_outputs, "indexer_aux_loss", None),
         )
 
 
@@ -2308,6 +2582,8 @@ class Qwen4ExpTextModelOutputWithPast(ModelOutput):
         last_stream_state: Pre-collapse residual streams
             ``[B, S, hc * hidden]`` — the MTP head's input.
         rope_deltas: mRoPE position deltas for generation, ``[B, 1]``.
+        indexer_aux_loss: Unscaled sum of the main decoder layers' QSA indexer KL terms, or None
+            when disabled/cached. Incomplete tail blocks are not ranked and do not enter this objective.
     """
 
     last_hidden_state: Float[Array, "batch seq hidden"] | None = None
@@ -2317,11 +2593,16 @@ class Qwen4ExpTextModelOutputWithPast(ModelOutput):
     past_key_values: tp.Any = None
     router_logits: tuple | None = None
     rope_deltas: Int[Array, "batch 1"] | None = None
+    indexer_aux_loss: Array | None = None
 
 
 @auto_pytree
 class Qwen4ExpCausalLMOutputWithPast(ModelOutput):
-    """Causal-LM output with MoE router logits, MTP logits, and rope deltas."""
+    """Causal-LM output with MoE router logits, MTP logits, and rope deltas.
+
+    ``indexer_aux_loss`` is the unscaled main-backbone sum; ``aux_loss`` combines its configured
+    weight with the router objective and the separately weighted ``mtp_loss``, each exactly once.
+    """
 
     logits: Float[Array, "batch seq vocab"] | None = None
     last_hidden_state: Float[Array, "batch seq hidden"] | None = None
@@ -2334,6 +2615,7 @@ class Qwen4ExpCausalLMOutputWithPast(ModelOutput):
     past_key_values: tp.Any = None
     router_logits: tuple | None = None
     rope_deltas: Int[Array, "batch 1"] | None = None
+    indexer_aux_loss: Array | None = None
     loss: Array | None = None
 
 
@@ -2421,7 +2703,7 @@ class Qwen4ExpTextModel(EasyDeLBaseModule):
         ``compute_basic_inv_frequencies`` rather than through
         ``get_basic_frequencies`` whose width convention differs.
         """
-        from easydel.layers.rotary._compute_fns import compute_basic_inv_frequencies
+        from easydel.layers.rotary import compute_basic_inv_frequencies
 
         config = self.config
         rotary_dim = config.rotary_dim
@@ -2619,6 +2901,7 @@ class Qwen4ExpTextModel(EasyDeLBaseModule):
         frequencies = self.frequencies
 
         new_views: list = []
+        indexer_aux_loss = None
         for idx, layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -2646,6 +2929,9 @@ class Qwen4ExpTextModel(EasyDeLBaseModule):
                 all_router_logits += (layer_outputs.router_logits,)
             if views is not None:
                 new_views.append(layer_outputs.cache_view)
+            layer_aux = layer_outputs.indexer_aux_loss
+            if layer_aux is not None:
+                indexer_aux_loss = layer_aux if indexer_aux_loss is None else indexer_aux_loss + layer_aux
 
         if views is not None and any(v is not None for v in views):
             past_key_values = past_key_values.replace(views=new_views)
@@ -2662,6 +2948,7 @@ class Qwen4ExpTextModel(EasyDeLBaseModule):
             attentions=all_attentions,
             past_key_values=past_key_values,
             router_logits=all_router_logits if output_router_logits else None,
+            indexer_aux_loss=indexer_aux_loss,
         )
 
     def get_encoder(self):
@@ -2679,6 +2966,106 @@ class Qwen4ExpTextModel(EasyDeLBaseModule):
     def get_embedding(self) -> Embed:
         """Return the token embedding layer."""
         return self.embed_tokens
+
+
+def _qwen4_operations_cache_views(text, views):
+    """Adapt operation-selected cache classes to QSA and PLE state layouts."""
+    for idx, layer_type in enumerate(text.layer_types):
+        view = views.get(idx)
+        if text.qsa_enabled and layer_type == QWEN4_FULL and isinstance(view, type):
+            if issubclass(view, RaggedPagesCacheView):
+                views[idx] = Qwen4ExpPagedQSAView
+                continue
+            if issubclass(view, UnifiedAttentionCacheView):
+                raise NotImplementedError(
+                    "Qwen4 QSA serving currently requires ragged-page attention; "
+                    "unified/GPU paged caches do not preserve QSA indexer history"
+                )
+        if idx in text.ple_layer_indices_0based:
+            views[idx] = Qwen4ExpOperationsLinearView
+    return views
+
+
+def _qwen4_operations_cache_configs(text, configs):
+    """Attach QSA and PLE allocation dimensions to operation cache configs."""
+    for idx, layer_type in enumerate(text.layer_types):
+        if idx >= len(configs) or configs[idx] is None:
+            continue
+        if text.qsa_enabled and layer_type == QWEN4_FULL:
+            object.__setattr__(configs[idx], "qwen4_indexer_head_dim", text.indexer_head_dim)
+            object.__setattr__(configs[idx], "qwen4_indexer_compress_ratio", text.indexer_compress_ratio)
+        if idx in text.ple_layer_indices_0based:
+            object.__setattr__(configs[idx], "qwen4_with_ple", True)
+            object.__setattr__(configs[idx], "qwen4_ple_conv_dim", text.hidden_size * text.hc_count)
+            object.__setattr__(
+                configs[idx], "qwen4_ple_conv_state_len", (text.ple_conv_kernel_size - 1) * text.ngram_size
+            )
+            object.__setattr__(configs[idx], "qwen4_ple_context_len", text.ngram_size - 1)
+    return configs
+
+
+def _qwen4_mtp_outputs(
+    mtp, text_model, last_stream_state, next_token_ids, mask_info, position_ids, mode, past_key_values
+):
+    """Run either wrapper's MTP head with the same text defaults and cache."""
+    if mtp is None:
+        return None
+    embed_layer = mtp.embed_tokens or text_model.embed_tokens
+    embeds = embed_layer(next_token_ids.astype("i4"))
+    if mask_info is None:
+        mask_info = MaskInfo.dynamic_init(mask_info=None, input_ids=next_token_ids.astype("i4"))
+    if position_ids is None:
+        batch, seq_len = next_token_ids.shape
+        rows = jnp.arange(seq_len, dtype="i4")[None, None, :]
+        position_ids = jnp.broadcast_to(rows, (3, batch, seq_len))
+    return mtp(
+        last_stream_state,
+        embeds,
+        mask_info=mask_info,
+        position_ids=position_ids,
+        mode=mode,
+        frequencies=text_model.frequencies,
+        past_key_values=past_key_values,
+    )
+
+
+def _qwen4_mtp_training_outputs(
+    wrapper,
+    text,
+    last_stream_state,
+    input_ids,
+    labels,
+    inputs_embeds,
+    attention_mask,
+    mask_info,
+    position_ids,
+    mode,
+    past_key_values,
+    cache_metadata,
+    project_mtp,
+    compute_loss,
+):
+    """Return optional MTP logits and scaled loss for both task wrappers."""
+    coef = float(getattr(text, "mtp_loss_coef", 0.0))
+    if (
+        wrapper.mtp is None
+        or input_ids is None
+        or last_stream_state is None
+        or coef <= 0
+        or not _is_qwen4_training_call(mode, past_key_values, cache_metadata)
+    ):
+        return None, None
+    mtp_mask_info, mtp_position_ids = _resolve_qwen4_mtp_context(
+        input_ids, inputs_embeds, attention_mask, mask_info, position_ids
+    )
+    next_ids, mtp_segments = _packed_mtp_next_ids(input_ids, mtp_mask_info)
+    mtp_out = wrapper.compute_mtp_outputs(
+        last_stream_state, next_ids, mask_info=mtp_mask_info, position_ids=mtp_position_ids, mode=mode
+    )
+    mtp_logits = project_mtp(mtp_out)
+    mtp_targets = input_ids if labels is None else labels
+    mtp_loss = compute_loss(mtp_logits, mtp_targets, attention_mask, mtp_segments) * coef
+    return mtp_logits, mtp_loss
 
 
 # ---------------------------------------------------------------------------
@@ -2726,46 +3113,10 @@ class Qwen4ExpForCausalLM(BaseCausalLMModule[Qwen4ExpTextModel, Qwen4ExpTextConf
         return self.model.init_cache(batch_size, max_length, **kwargs)
 
     def get_operations_cache_view(self) -> dict[int, type]:
-        views = super().get_operations_cache_view()
-        for idx, layer_type in enumerate(self.config.layer_types):
-            view = views.get(idx)
-            if (
-                self.config.qsa_enabled
-                and layer_type == QWEN4_FULL
-                and isinstance(view, type)
-                and issubclass(view, RaggedPagesCacheView)
-            ):
-                views[idx] = Qwen4ExpPagedQSAView
-            elif (
-                self.config.qsa_enabled
-                and layer_type == QWEN4_FULL
-                and isinstance(view, type)
-                and issubclass(view, UnifiedAttentionCacheView)
-            ):
-                raise NotImplementedError(
-                    "Qwen4 QSA serving currently requires ragged-page attention; "
-                    "unified/GPU paged caches do not preserve QSA indexer history"
-                )
-            elif idx in self.config.ple_layer_indices_0based:
-                views[idx] = Qwen4ExpOperationsLinearView
-        return views
+        return _qwen4_operations_cache_views(self.config, super().get_operations_cache_view())
 
     def init_operations_cache_config(self, *args, **kwargs):
-        configs = super().init_operations_cache_config(*args, **kwargs)
-        for idx, layer_type in enumerate(self.config.layer_types):
-            if self.config.qsa_enabled and layer_type == QWEN4_FULL and idx < len(configs) and configs[idx] is not None:
-                object.__setattr__(configs[idx], "qwen4_indexer_head_dim", self.config.indexer_head_dim)
-                object.__setattr__(configs[idx], "qwen4_indexer_compress_ratio", self.config.indexer_compress_ratio)
-            if idx in self.config.ple_layer_indices_0based and idx < len(configs) and configs[idx] is not None:
-                object.__setattr__(configs[idx], "qwen4_with_ple", True)
-                object.__setattr__(configs[idx], "qwen4_ple_conv_dim", self.config.hidden_size * self.config.hc_count)
-                object.__setattr__(
-                    configs[idx],
-                    "qwen4_ple_conv_state_len",
-                    (self.config.ple_conv_kernel_size - 1) * self.config.ngram_size,
-                )
-                object.__setattr__(configs[idx], "qwen4_ple_context_len", self.config.ngram_size - 1)
-        return configs
+        return _qwen4_operations_cache_configs(self.config, super().init_operations_cache_config(*args, **kwargs))
 
     def compute_mtp_outputs(
         self,
@@ -2788,26 +3139,8 @@ class Qwen4ExpForCausalLM(BaseCausalLMModule[Qwen4ExpTextModel, Qwen4ExpTextConf
         Returns:
             The MTP output, or ``None`` when the head is disabled.
         """
-        if self.mtp is None:
-            return None
-        embed_layer = self.mtp.embed_tokens or self.model.embed_tokens
-        embeds = embed_layer(next_token_ids.astype("i4"))
-        if mask_info is None:
-            mask_info = MaskInfo.dynamic_init(mask_info=None, input_ids=next_token_ids.astype("i4"))
-        if position_ids is None:
-            # Default to contiguous text-only mRoPE rows so a bare MTP call
-            # (no reused main-pass rows) still ropes at absolute positions.
-            batch, seq_len = next_token_ids.shape
-            rows = jnp.arange(seq_len, dtype="i4")[None, None, :]
-            position_ids = jnp.broadcast_to(rows, (3, batch, seq_len))
-        return self.mtp(
-            last_stream_state,
-            embeds,
-            mask_info=mask_info,
-            position_ids=position_ids,
-            mode=mode,
-            frequencies=self.model.frequencies,
-            past_key_values=past_key_values,
+        return _qwen4_mtp_outputs(
+            self.mtp, self.model, last_stream_state, next_token_ids, mask_info, position_ids, mode, past_key_values
         )
 
     def apply_mtp_lm_head(self, mtp_output: Qwen4ExpMTPOutput) -> Array:
@@ -2870,26 +3203,24 @@ class Qwen4ExpForCausalLM(BaseCausalLMModule[Qwen4ExpTextModel, Qwen4ExpTextConf
         logits = None
         if apply_lm_head:
             logits = self.compute_lm_logits(self.prepare_lm_head_inputs(base.last_hidden_state))
-        aux_loss = self.compute_router_aux_loss(base)
-        mtp_logits = None
-        mtp_loss = None
-        training = _is_qwen4_training_call(mode, past_key_values, cache_metadata)
-        coef = float(getattr(self.config, "mtp_loss_coef", 0.0))
-        if self.mtp is not None and input_ids is not None and training and coef > 0:
-            mtp_mask_info, mtp_position_ids = _resolve_qwen4_mtp_context(
-                input_ids, inputs_embeds, attention_mask, mask_info, position_ids
-            )
-            next_ids, mtp_segments = _packed_mtp_next_ids(input_ids, mtp_mask_info)
-            mtp_out = self.compute_mtp_outputs(
-                base.last_stream_state,
-                next_ids,
-                mask_info=mtp_mask_info,
-                position_ids=mtp_position_ids,
-                mode=mode,
-            )
-            mtp_logits = self.apply_mtp_lm_head(mtp_out)
-            mtp_targets = input_ids if labels is None else labels
-            mtp_loss = self.compute_mtp_loss(mtp_logits, mtp_targets, attention_mask, mtp_segments) * coef
+        aux_loss = self.compute_aux_loss(base)
+        mtp_logits, mtp_loss = _qwen4_mtp_training_outputs(
+            self,
+            self.config,
+            base.last_stream_state,
+            input_ids,
+            labels,
+            inputs_embeds,
+            attention_mask,
+            mask_info,
+            position_ids,
+            mode,
+            past_key_values,
+            cache_metadata,
+            self.apply_mtp_lm_head,
+            self.compute_mtp_loss,
+        )
+        if mtp_loss is not None:
             aux_loss = mtp_loss if aux_loss is None else aux_loss + mtp_loss
         return Qwen4ExpCausalLMOutputWithPast(
             logits=logits,
@@ -2898,6 +3229,7 @@ class Qwen4ExpForCausalLM(BaseCausalLMModule[Qwen4ExpTextModel, Qwen4ExpTextConf
             mtp_logits=mtp_logits,
             mtp_loss=mtp_loss,
             aux_loss=aux_loss,
+            indexer_aux_loss=base.indexer_aux_loss,
             hidden_states=base.hidden_states,
             attentions=base.attentions,
             past_key_values=base.past_key_values,
@@ -3035,6 +3367,10 @@ class Qwen4ExpModel(EasyDeLBaseModule):
         """
         if self.visual is None:
             raise ValueError("Image inputs are unavailable when language_model_only=True.")
+        if image_grid_thw is not None:
+            image_grid_thw = np.asarray(image_grid_thw)
+            if image_max_grid_size is None:
+                image_max_grid_size = int(image_grid_thw[:, 1:].max())
         # The shared Qwen3 vision tower returns (merged_features, deepstack).
         # Qwen4 uses the merged features; its vision config has no DeepStack.
         features, _deepstack = self.visual(pixel_values, grid_thw=image_grid_thw, max_grid_size=image_max_grid_size)
@@ -3053,10 +3389,7 @@ class Qwen4ExpModel(EasyDeLBaseModule):
         """
         if self.visual is None:
             raise ValueError("Video inputs are unavailable when language_model_only=True.")
-        features, _deepstack = self.visual(
-            pixel_values_videos, grid_thw=video_grid_thw, max_grid_size=video_max_grid_size
-        )
-        return features
+        return self.get_image_features(pixel_values_videos, video_grid_thw, video_max_grid_size)
 
     def get_placeholder_mask(self, input_ids, inputs_embeds=None, image_features=None, video_features=None):
         """Boolean placeholder mask for image/video token positions."""
@@ -3323,45 +3656,12 @@ class Qwen4ExpForConditionalGeneration(BaseVisionLanguageModule[Qwen4ExpModel, Q
         return self.model.language_model.init_cache(batch_size, max_length, **kwargs)
 
     def get_operations_cache_view(self) -> dict[int, type]:
-        views = super().get_operations_cache_view()
-        for idx, layer_type in enumerate(self.config.text_config.layer_types):
-            view = views.get(idx)
-            if (
-                self.config.text_config.qsa_enabled
-                and layer_type == QWEN4_FULL
-                and isinstance(view, type)
-                and issubclass(view, RaggedPagesCacheView)
-            ):
-                views[idx] = Qwen4ExpPagedQSAView
-            elif (
-                self.config.text_config.qsa_enabled
-                and layer_type == QWEN4_FULL
-                and isinstance(view, type)
-                and issubclass(view, UnifiedAttentionCacheView)
-            ):
-                raise NotImplementedError(
-                    "Qwen4 QSA serving currently requires ragged-page attention; "
-                    "unified/GPU paged caches do not preserve QSA indexer history"
-                )
-            elif idx in self.config.text_config.ple_layer_indices_0based:
-                views[idx] = Qwen4ExpOperationsLinearView
-        return views
+        return _qwen4_operations_cache_views(self.config.text_config, super().get_operations_cache_view())
 
     def init_operations_cache_config(self, *args, **kwargs):
-        configs = super().init_operations_cache_config(*args, **kwargs)
-        text = self.config.text_config
-        for idx, layer_type in enumerate(text.layer_types):
-            if text.qsa_enabled and layer_type == QWEN4_FULL and idx < len(configs) and configs[idx] is not None:
-                object.__setattr__(configs[idx], "qwen4_indexer_head_dim", text.indexer_head_dim)
-                object.__setattr__(configs[idx], "qwen4_indexer_compress_ratio", text.indexer_compress_ratio)
-            if idx in text.ple_layer_indices_0based and idx < len(configs) and configs[idx] is not None:
-                object.__setattr__(configs[idx], "qwen4_with_ple", True)
-                object.__setattr__(configs[idx], "qwen4_ple_conv_dim", text.hidden_size * text.hc_count)
-                object.__setattr__(
-                    configs[idx], "qwen4_ple_conv_state_len", (text.ple_conv_kernel_size - 1) * text.ngram_size
-                )
-                object.__setattr__(configs[idx], "qwen4_ple_context_len", text.ngram_size - 1)
-        return configs
+        return _qwen4_operations_cache_configs(
+            self.config.text_config, super().init_operations_cache_config(*args, **kwargs)
+        )
 
     def compute_mtp_outputs(
         self,
@@ -3384,24 +3684,15 @@ class Qwen4ExpForConditionalGeneration(BaseVisionLanguageModule[Qwen4ExpModel, Q
         Returns:
             The MTP output, or ``None`` when the head is disabled.
         """
-        if self.mtp is None:
-            return None
-        embed_layer = self.mtp.embed_tokens or self.model.language_model.embed_tokens
-        embeds = embed_layer(next_token_ids.astype("i4"))
-        if mask_info is None:
-            mask_info = MaskInfo.dynamic_init(mask_info=None, input_ids=next_token_ids.astype("i4"))
-        if position_ids is None:
-            batch, seq_len = next_token_ids.shape
-            rows = jnp.arange(seq_len, dtype="i4")[None, None, :]
-            position_ids = jnp.broadcast_to(rows, (3, batch, seq_len))
-        return self.mtp(
+        return _qwen4_mtp_outputs(
+            self.mtp,
+            self.model.language_model,
             last_stream_state,
-            embeds,
-            mask_info=mask_info,
-            position_ids=position_ids,
-            mode=mode,
-            frequencies=self.model.language_model.frequencies,
-            past_key_values=past_key_values,
+            next_token_ids,
+            mask_info,
+            position_ids,
+            mode,
+            past_key_values,
         )
 
     def compute_mtp_logits(self, mtp_output: Qwen4ExpMTPOutput) -> Array:
@@ -3409,7 +3700,11 @@ class Qwen4ExpForConditionalGeneration(BaseVisionLanguageModule[Qwen4ExpModel, Q
         return self.apply_lm_head(mtp_output.last_hidden_state)
 
     def forward(self, *args, **kwargs):
-        """Multimodal forward with MTP loss folded into the trainer aux channel."""
+        """Multimodal forward with MTP loss folded into the trainer aux channel.
+
+        The shared VLM forward already scales the backbone's indexer KL once via ``compute_aux_loss``;
+        this override adds only the separate MTP objective.
+        """
         input_ids = kwargs.get("input_ids", args[0] if args else None)
         attention_mask = kwargs.get("attention_mask")
         labels = kwargs.pop("labels", None)
@@ -3427,30 +3722,24 @@ class Qwen4ExpForConditionalGeneration(BaseVisionLanguageModule[Qwen4ExpModel, Q
                 attention_mask,
             )
         outputs = super().forward(*args, **kwargs)
-        training = _is_qwen4_training_call(mode, kwargs.get("past_key_values"), kwargs.get("cache_metadata"))
-        coef = float(getattr(self.config.text_config, "mtp_loss_coef", 0.0))
-        if self.mtp is None or input_ids is None or not training or coef <= 0:
-            return outputs
-        if outputs.last_stream_state is None:
-            return outputs
-        mtp_mask_info, mtp_position_ids = _resolve_qwen4_mtp_context(
+        mtp_logits, mtp_loss = _qwen4_mtp_training_outputs(
+            self,
+            self.config.text_config,
+            outputs.last_stream_state,
             input_ids,
+            labels,
             kwargs.get("inputs_embeds"),
             attention_mask,
             kwargs.get("mask_info"),
             kwargs.get("position_ids"),
+            mode,
+            kwargs.get("past_key_values"),
+            kwargs.get("cache_metadata"),
+            self.compute_mtp_logits,
+            Qwen4ExpForCausalLM.compute_mtp_loss,
         )
-        next_ids, mtp_segments = _packed_mtp_next_ids(input_ids, mtp_mask_info)
-        mtp_out = self.compute_mtp_outputs(
-            outputs.last_stream_state,
-            next_ids,
-            mask_info=mtp_mask_info,
-            position_ids=mtp_position_ids,
-            mode=mode,
-        )
-        mtp_logits = self.compute_mtp_logits(mtp_out)
-        mtp_targets = input_ids if labels is None else labels
-        mtp_loss = Qwen4ExpForCausalLM.compute_mtp_loss(mtp_logits, mtp_targets, attention_mask, mtp_segments) * coef
+        if mtp_loss is None:
+            return outputs
         aux_loss = mtp_loss if outputs.aux_loss is None else outputs.aux_loss + mtp_loss
         return outputs.replace(aux_loss=aux_loss, mtp_logits=mtp_logits, mtp_loss=mtp_loss)
 

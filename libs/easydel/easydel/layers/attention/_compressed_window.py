@@ -40,7 +40,13 @@ import spectrax as spx
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Float, Int
 
-from easydel.layers.compressed_window import MASK_MIN, sink_attention
+from easydel.layers.compressed_window import (
+    ring_decode_write,
+    ring_prefill_write,
+    ring_slot_positions,
+    ring_visibility_bias,
+    sink_attention,
+)
 from easydel.layers.linears import ColumnParallelLinear, GroupedLinear, RowParallelLinear
 from easydel.layers.norms import RMSNorm, rms_norm
 from easydel.layers.rotary import apply_rope_interleaved_partial, labeled_rope_cos_sin
@@ -265,9 +271,7 @@ class WindowRingDraftAttentionMixin:
         positions = jnp.broadcast_to(positions_1d[None], (batch, positions_1d.shape[0]))
         kv = self.main_kv(main_x[:, start:, :], positions)
         ring = jnp.zeros((batch, window, kv.shape[-1]), kv.dtype)
-        if seq <= window:
-            return ring.at[:, :seq].set(kv)
-        return ring.at[:, positions_1d % window].set(kv)
+        return ring_prefill_write(ring, kv, window, start_position=start)
 
     def draft_attend(
         self,
@@ -280,7 +284,7 @@ class WindowRingDraftAttentionMixin:
         batch, block, _ = hidden_states.shape
         window = int(self.sliding_window)
         main_kv = self.main_kv(main_x, position[:, None])
-        ring = ring.at[jnp.arange(batch), position % window].set(main_kv[:, 0].astype(ring.dtype))
+        ring = ring_decode_write(ring, main_kv[:, 0], position, window)
 
         draft_positions = position[:, None] + 1 + jnp.arange(block, dtype=jnp.int32)[None, :]
         cos, sin = labeled_rope_cos_sin(self.config, self.rope_label, draft_positions, hidden_states.dtype)
@@ -288,8 +292,7 @@ class WindowRingDraftAttentionMixin:
         kv = self.project_kv(hidden_states, cos, sin)
 
         keys = jnp.concatenate([ring.astype(kv.dtype), kv], axis=1)
-        valid = jnp.arange(window)[None, :] < jnp.minimum(window, position + 1)[:, None]
-        ring_bias = jnp.where(valid, 0.0, MASK_MIN).astype(jnp.float32)
+        ring_bias = ring_visibility_bias(ring_slot_positions(position, window))
         bias = jnp.concatenate([ring_bias, jnp.zeros((batch, block), jnp.float32)], axis=1)[:, None, None, :]
         attn = self.sink_attend(q, keys, bias)
         return self.project_output(attn.transpose(0, 2, 1, 3), cos, sin), ring

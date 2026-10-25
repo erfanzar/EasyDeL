@@ -45,20 +45,38 @@ def compute_discounted_returns(
     (where response_mask transitions from 1 to 0).
 
     Args:
-        step_rewards: Per-step rewards, shape ``[num_steps]``.
+        step_rewards: Per-step rewards, shape ``[num_steps]``, or token-aligned
+            rewards with the same length as ``response_mask``. In token mode,
+            only the reward at each response boundary contributes.
         response_mask: Binary mask indicating response token positions,
-            shape ``[seq_len]``.
+            shape ``[seq_len]``; for per-step rewards it must contain one
+            contiguous response segment per step.
         gamma: Discount factor for future rewards.
 
     Returns:
         Discounted returns per step, shape ``[num_steps]``.
     """
-    num_steps = len(step_rewards)
-    returns = np.zeros(num_steps, dtype=np.float32)
+    rewards = np.asarray(step_rewards, dtype=np.float32)
+    mask = np.asarray(response_mask, dtype=bool)
+    if rewards.ndim != 1 or mask.ndim != 1:
+        raise ValueError("Rewards and response_mask must be one-dimensional.")
+    boundaries = mask & ~np.r_[mask[1:], False] if mask.size else mask
+    returns = np.zeros(len(rewards), dtype=np.float32)
     running_return = 0.0
-    for t in reversed(range(num_steps)):
-        running_return = step_rewards[t] + gamma * running_return
-        returns[t] = running_return
+    if len(rewards) == len(mask):
+        # Token-aligned rewards: discount once per response, not once per
+        # observation or generated token, and score only response boundaries.
+        for t in reversed(range(len(rewards))):
+            if boundaries[t]:
+                running_return = rewards[t] + gamma * running_return
+            if mask[t]:
+                returns[t] = running_return
+    else:
+        if np.count_nonzero(boundaries) != len(rewards):
+            raise ValueError("Per-step rewards must match the number of response segments.")
+        for t in reversed(range(len(rewards))):
+            running_return = rewards[t] + gamma * running_return
+            returns[t] = running_return
     return returns
 
 
@@ -134,7 +152,9 @@ def compute_advantages_episode(
     else:
         std_rewards = jnp.ones_like(advantages)
 
-    if scale_rewards != "none":
+    if scale_rewards == "group":
+        advantages = normalize_rewards_group(rewards, group_size)
+    elif scale_rewards != "none":
         advantages = jnp.where(
             jnp.isclose(std_rewards, 0.0),
             0.0,
@@ -164,7 +184,10 @@ def compute_advantages_step(
         Per-trajectory discounted returns, shape ``[num_trajectories]``.
     """
     returns = np.array(
-        [compute_discounted_returns(sr, np.ones(len(sr)), gamma)[0] for sr in step_rewards_list],
+        [
+            compute_discounted_returns(sr, np.tile([1, 0], len(sr)), gamma)[0] if len(sr) else 0.0
+            for sr in step_rewards_list
+        ],
         dtype=np.float32,
     )
     grouped = returns.reshape(-1, group_size)
@@ -173,6 +196,47 @@ def compute_advantages_step(
     std = np.where(np.isclose(std, 0.0), 1.0, std)
     normalized = (grouped - mean) / (std + 1e-4)
     return normalized.reshape(-1)
+
+
+def compute_advantages_agentic(
+    step_rewards_list: list[np.ndarray],
+    response_masks: np.ndarray,
+    group_size: int,
+    gamma: float = 0.95,
+) -> np.ndarray:
+    """Return group-normalized credit per response segment, not per episode.
+
+    Args:
+        step_rewards_list: One reward sequence per trajectory.
+        response_masks: Batched token masks; each contiguous response run is a
+            segment. Observations and padding always receive zero advantage.
+        group_size: Number of trajectories sharing a prompt.
+        gamma: Discount applied only between response segments.
+
+    Returns:
+        Float32 advantages with the same shape as ``response_masks``.
+    """
+    masks = np.asarray(response_masks, dtype=bool)
+    if group_size <= 0 or masks.ndim != 2 or len(masks) != len(step_rewards_list) or len(masks) % group_size:
+        raise ValueError("Response masks must form complete trajectory groups.")
+    values = np.zeros(masks.shape, dtype=np.float32)
+    group_returns: list[list[float]] = [[] for _ in range(len(masks) // group_size)]
+    for row, (rewards, mask) in enumerate(zip(step_rewards_list, masks, strict=True)):
+        returns = compute_discounted_returns(rewards, np.tile([1, 0], len(rewards)), gamma)
+        starts = np.flatnonzero(mask & ~np.r_[False, mask[:-1]])
+        ends = np.flatnonzero(mask & ~np.r_[mask[1:], False]) + 1
+        if len(starts) > len(returns):
+            raise ValueError("Every response segment needs a step reward.")
+        for index, (start, end) in enumerate(zip(starts, ends, strict=True)):
+            values[row, start:end] = returns[index]
+            group_returns[row // group_size].append(float(returns[index]))
+    for group, returns in enumerate(group_returns):
+        if not returns:
+            continue
+        rows = slice(group * group_size, (group + 1) * group_size)
+        std = float(np.nanstd(returns))
+        values[rows] = np.where(masks[rows], (values[rows] - np.nanmean(returns)) / (std + 1e-4), 0.0)
+    return np.nan_to_num(values)
 
 
 def compute_advantages_gigpo(

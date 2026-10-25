@@ -42,11 +42,10 @@ from easydel.utils.helpers import get_logger
 
 from ..prompt_transforms import EmbeddingPreprocessTransform
 from ..trainer import Trainer
-from ..trainer._fn import evaluation_step
 from ..trainer.trainer import TrainerConfigureFunctionOutput
 from ..training_utils import compile_trainer_step
 from ..utils import EmbeddingDataCollatorGrain, EmbeddingDataCollatorTFDS
-from ._fn import embedding_training_step
+from ._fn import embedding_evaluation_step, embedding_training_step
 from .embedding_config import EmbeddingConfig
 
 if tp.TYPE_CHECKING:
@@ -220,6 +219,14 @@ class EmbeddingTrainer(Trainer):
         except Exception:
             return False
 
+    def _configure_eval_config_override(self):
+        """Freeze evaluation mode into a graphdef outside the readonly JIT."""
+        super()._configure_eval_config_override()
+        eval_state = self._eval_state_for_compiled_step(self.model_state)
+        module = eval_state.model
+        module.eval()
+        self._eval_graphdef, _, _ = module.split_module(trainable_selector=self.arguments.trainable_selector)
+
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Build the JIT-compiled training and evaluation step functions.
 
@@ -227,8 +234,8 @@ class EmbeddingTrainer(Trainer):
         of :func:`embedding_training_step` that captures the
         contrastive-objective knobs (loss type, temperature, margin,
         Matryoshka dims, normalisation flag) so the compiled function
-        only takes the model state and the batch. The evaluation step
-        re-uses the base trainer's :func:`evaluation_step`.
+        only takes the model state and the batch. Evaluation uses the same
+        contrastive objective with the encoder in evaluation mode.
 
         Returns:
             :class:`TrainerConfigureFunctionOutput` carrying the
@@ -264,15 +271,20 @@ class EmbeddingTrainer(Trainer):
         )
         self._runtime_trace("train.compile_wrapper.end")
 
-        self._eval_shared_fn_static_args = (
-            self.arguments.loss_config,
-            self.arguments.step_partition_spec,
+        self._eval_shared_fn_static_args = ()
+        eval_step_fn = partial(
+            embedding_evaluation_step,
+            loss_type=self._embedding_config.loss_type,
+            temperature=self._embedding_config.temperature,
+            margin=self._embedding_config.margin,
+            normalize=self._embedding_config.normalize_embeddings,
+            matryoshka_dims=self._embedding_config.matryoshka_dims,
+            partition_spec=self.arguments.step_partition_spec,
         )
         self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
-            evaluation_step,
-            static_argnums=(2, 3),
-            in_shardings=(self.state_shardings, empty_sharding),
+            eval_step_fn,
+            in_shardings=(self.eval_state_shardings, empty_sharding),
             out_shardings=empty_sharding,
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,

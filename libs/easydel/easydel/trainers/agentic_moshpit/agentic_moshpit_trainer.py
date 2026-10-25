@@ -64,12 +64,13 @@ from ..training_utils import (
 from .agentic_moshpit_config import AgenticMoshPitConfig
 from .env_manager import RolloutManager, turn_record_to_message
 from .environment import AgenticEnvironment, ToolEnvWrapper, create_tool_call_parser
-from .self_play import LocalQuestionGenerator, SelfPlayEnvironment
 from .tools import Tool, make_tool
 from .utils import (
+    compute_advantages_agentic,
     compute_advantages_episode,
     compute_advantages_gigpo,
     compute_advantages_step,
+    normalize_rewards_batch,
 )
 
 if tp.TYPE_CHECKING:
@@ -626,7 +627,7 @@ class AgenticMoshPitTrainer(GRPOTrainer):
             return env
         return ToolEnvWrapper(
             env=env,
-            tools=self._tools,
+            tools=[tool.clone_for_episode() for tool in self._tools],
             tool_call_parser=self._tool_call_parser,
             max_tool_calls_per_step=self.arguments.max_tool_calls_per_step,
         )
@@ -676,13 +677,11 @@ class AgenticMoshPitTrainer(GRPOTrainer):
                             self-play question generators.
                         """
                         env = self.env_factory()
-                        if isinstance(env, SelfPlayEnvironment):
-                            env.set_generate_fn(generate_fn)
-                            gen = env._generator
-                            if isinstance(gen, LocalQuestionGenerator):
-                                if gen._tokenizer is None:
-                                    gen._tokenizer = self.processing_class
-                                gen._strip_reasoning = self._strip_thinking
+                        env.configure_generation(
+                            generate_fn,
+                            tokenizer=self.processing_class,
+                            strip_reasoning_fn=self._strip_thinking,
+                        )
                         return self._wrap_env_with_tools(env)
 
                     trajectories = self._rollout_manager.run_grouped_episodes(
@@ -740,16 +739,21 @@ class AgenticMoshPitTrainer(GRPOTrainer):
                         gamma=self.arguments.step_reward_gamma,
                         scale_rewards=self.scale_rewards,
                     )
-                elif self.arguments.advantage_estimator in ("step_reinforce", "agentic_reinforce"):
+                elif self.arguments.advantage_estimator == "step_reinforce":
                     step_adv = compute_advantages_step(step_rewards_list, group_size, self.arguments.step_reward_gamma)
                     advantages = jnp.array(step_adv, dtype=jnp.float32)
                     std_rewards = jnp.nanstd(env_rewards) * jnp.ones_like(advantages)
+                elif self.arguments.advantage_estimator == "agentic_reinforce":
+                    advantages = jnp.asarray(
+                        compute_advantages_agentic(
+                            step_rewards_list, collated["completion_mask"], group_size, self.arguments.step_reward_gamma
+                        ),
+                        dtype=jnp.float32,
+                    )
+                    std_rewards = jnp.full((len(trajectories),), jnp.nanstd(env_rewards))
                 elif self.arguments.advantage_estimator == "reinforce":
-                    advantages = env_rewards - jnp.nanmean(env_rewards)
-                    std = jnp.nanstd(env_rewards)
-                    is_zero = jnp.isclose(std, 0.0)
-                    advantages = jnp.where(is_zero, 0.0, advantages / (std + 1e-4))
-                    std_rewards = std * jnp.ones_like(advantages)
+                    advantages = normalize_rewards_batch(env_rewards)
+                    std_rewards = jnp.nanstd(env_rewards) * jnp.ones_like(advantages)
                 else:
                     raise ValueError(f"Unknown advantage_estimator: {self.arguments.advantage_estimator}")
             advantage_time = advantage_time_fn()

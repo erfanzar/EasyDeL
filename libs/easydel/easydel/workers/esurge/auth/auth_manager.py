@@ -61,6 +61,8 @@ from .auth_storage import AuthStorage
 
 logger = get_logger("AuthManager")
 
+_MIN_API_KEY_LENGTH = 16
+
 
 class RateLimitExceeded(Exception):
     """Raised when an API key exceeds one of its sliding-window rate limits.
@@ -200,6 +202,10 @@ class EnhancedApiKeyManager:
 
         # Rate limiting tracking: key_id -> time window -> deque of timestamps
         self._rate_limit_windows: dict[str, dict[str, deque]] = defaultdict(lambda: defaultdict(deque))
+        # Pending admissions are separate from completed usage and cannot expire while work is running.
+        self._reservations: dict[str, dict[str, int]] = defaultdict(dict)
+        # Retired hashes may finish existing work after rotation, but cannot authorize new work.
+        self._retired_key_hashes: dict[str, str] = {}
         # Token usage tracking for rate limits
         self._token_usage_windows: dict[str, dict[str, deque]] = defaultdict(lambda: defaultdict(deque))
 
@@ -215,7 +221,7 @@ class EnhancedApiKeyManager:
             self._load_from_storage()
 
         # Create admin key if provided (after loading from storage)
-        if admin_key:
+        if admin_key is not None:
             self._create_initial_admin_key(admin_key)
 
     def _hash_key(self, key: str) -> str:
@@ -287,7 +293,20 @@ class EnhancedApiKeyManager:
         if self.storage and self.storage.should_auto_save():
             self._save_to_storage()
 
-    def _mark_dirty_and_save(self) -> None:
+    def flush(self) -> None:
+        """Persist current state under the lock; propagate errors to the caller."""
+        with self._lock:
+            if self.storage:
+                self.storage.save_keys(self._keys)
+                if self.enable_audit_logging:
+                    self.storage.save_audit_logs(list(self._audit_log))
+                self.storage.save_usage_stats(self.get_statistics())
+
+    def close(self) -> None:
+        """Flush pending state before an orderly embedded-server shutdown."""
+        self.flush()
+
+    def _mark_dirty_and_save(self, durable: bool = True) -> None:
         """Mark storage as dirty and possibly auto-save.
 
         Convenience helper used from every mutating method; combines
@@ -295,7 +314,11 @@ class EnhancedApiKeyManager:
         """
         if self.storage:
             self.storage.mark_dirty()
-            self._auto_save_if_needed()
+            if durable:
+                # Lifecycle changes must be durable before success is returned.
+                self.flush()
+            else:
+                self._auto_save_if_needed()
 
     def _create_initial_admin_key(self, key: str) -> None:
         """Bootstrap an admin key on first manager start.
@@ -306,23 +329,31 @@ class EnhancedApiKeyManager:
 
         Args:
             key: Raw admin key string supplied to the constructor.
+
+        Raises:
+            ValueError: If ``key`` is shorter than the 16-character minimum
+                enforced by :meth:`create_api_key`. Raised instead of being
+                logged so a server never starts with an admin key that
+                silently does not exist.
         """
+        if len(key) < _MIN_API_KEY_LENGTH:
+            raise ValueError(
+                f"admin_key must be at least {_MIN_API_KEY_LENGTH} characters long (got {len(key)}); "
+                "the admin key would otherwise never be created."
+            )
         hashed = self._hash_key(key)
         if hashed in self._keys:
             logger.info("Admin key already exists in storage, skipping creation")
             self._raw_to_hash_cache[key] = hashed
             return
 
-        try:
-            self.create_api_key(
-                raw_key=key,
-                name="Initial Admin Key",
-                role=ApiKeyRole.ADMIN,
-                created_by="system",
-            )
-            logger.info("Initial admin key created successfully")
-        except Exception as e:
-            logger.error(f"Failed to create initial admin key: {e}")
+        self.create_api_key(
+            raw_key=key,
+            name="Initial Admin Key",
+            role=ApiKeyRole.ADMIN,
+            created_by="system",
+        )
+        logger.info("Initial admin key created successfully")
 
     def _log_audit(
         self,
@@ -473,8 +504,8 @@ class EnhancedApiKeyManager:
             ValueError: If ``raw_key`` is shorter than 16 characters or
                 its hash is already registered.
         """
-        if not raw_key or len(raw_key) < 16:
-            raise ValueError("API key must be at least 16 characters long")
+        if not raw_key or len(raw_key) < _MIN_API_KEY_LENGTH:
+            raise ValueError(f"API key must be at least {_MIN_API_KEY_LENGTH} characters long")
 
         hashed_key = self._hash_key(raw_key)
 
@@ -519,10 +550,7 @@ class EnhancedApiKeyManager:
 
             logger.info(f"Created API key: {key_id} (name: {name}, role: {role.value})")
 
-            # Mark storage as dirty and auto-save if needed
-            if self.storage:
-                self.storage.mark_dirty()
-                self._auto_save_if_needed()
+            self._mark_dirty_and_save()
 
             return key_metadata
 
@@ -552,8 +580,10 @@ class EnhancedApiKeyManager:
         hashed_key = self._raw_to_hash_cache.get(raw_key)
         if hashed_key is None:
             hashed_key = self._hash_key(raw_key)
-            # Cache the result for faster subsequent lookups
-            self._raw_to_hash_cache[raw_key] = hashed_key
+            if hashed_key in self._keys:
+                # Cache only secrets that belong to a registered key: caching arbitrary presented
+                # tokens would grow this dict without bound and keep unauthenticated secrets in memory.
+                self._raw_to_hash_cache[raw_key] = hashed_key
 
         metadata = self._keys.get(hashed_key)
         if metadata is None:
@@ -571,6 +601,9 @@ class EnhancedApiKeyManager:
         endpoint: str | None = None,
         model: str | None = None,
         requested_tokens: int = 0,
+        stream: bool = False,
+        uses_tools: bool = False,
+        reservation_id: str | None = None,
     ) -> ApiKeyMetadata:
         """Run the full authorisation pipeline for an incoming request.
 
@@ -595,6 +628,12 @@ class EnhancedApiKeyManager:
                 key's ``allowed_models``.
             requested_tokens: Estimated token cost; checked against the
                 key's per-request cap and rate-limit / quota windows.
+            stream: Whether the request asks for a streaming response;
+                rejected when the key has ``enable_streaming=False``.
+            uses_tools: Whether the request uses function / tool calling;
+                rejected when the key has ``enable_function_calling=False``.
+            reservation_id: Optional request identifier for exact completion/cancellation.
+                Omitted identifiers use FIFO accounting for backward compatibility.
 
         Returns:
             ApiKeyMetadata: The authorising key's metadata, with
@@ -602,71 +641,101 @@ class EnhancedApiKeyManager:
 
         Raises:
             PermissionDenied: For invalid keys, IP / endpoint / model
-                rejections, or per-request token-ceiling violations.
+                rejections, streaming / function-calling restrictions, or
+                per-request token-ceiling violations.
             RateLimitExceeded: When a sliding-window limit fires.
             QuotaExceeded: When a cumulative quota is breached.
         """
-        metadata = self.validate_key(raw_key)
-        if metadata is None:
-            self._log_audit(
-                action="request_denied",
-                details={"reason": "invalid_key"},
-                ip_address=ip_address,
-                success=False,
-            )
-            raise PermissionDenied("Invalid or inactive API key")
-
-        metadata.update_last_used()
-
-        if not self._check_ip_permissions(metadata, ip_address):
-            self._log_audit(
-                action="request_denied",
-                key_id=metadata.key_id,
-                ip_address=ip_address,
-                details={"reason": "ip_blocked"},
-                success=False,
-            )
-            raise PermissionDenied(f"Access denied from IP address: {ip_address}")
-
-        if not self._check_endpoint_permissions(metadata, endpoint):
-            self._log_audit(
-                action="request_denied",
-                key_id=metadata.key_id,
-                ip_address=ip_address,
-                details={"reason": "endpoint_blocked", "endpoint": endpoint},
-                success=False,
-            )
-            raise PermissionDenied(f"Access denied to endpoint: {endpoint}")
-
-        if model and not self._check_model_permissions(metadata, model):
-            self._log_audit(
-                action="request_denied",
-                key_id=metadata.key_id,
-                ip_address=ip_address,
-                details={"reason": "model_blocked", "model": model},
-                success=False,
-            )
-            raise PermissionDenied(f"Access denied to model: {model}")
-
-        self._check_rate_limits(metadata, requested_tokens)
-
-        self._check_quotas(metadata, requested_tokens)
-
-        if metadata.permissions.max_tokens_per_request:
-            if requested_tokens > metadata.permissions.max_tokens_per_request:
-                raise PermissionDenied(
-                    f"Requested tokens ({requested_tokens}) exceeds limit ({metadata.permissions.max_tokens_per_request})"
+        # Admission and charging must be atomic for callers sharing the manager.
+        with self._lock:
+            metadata = self.validate_key(raw_key)
+            if metadata is None:
+                self._log_audit(
+                    action="request_denied",
+                    details={"reason": "invalid_key"},
+                    ip_address=ip_address,
+                    success=False,
                 )
+                raise PermissionDenied("Invalid or inactive API key")
 
-        self._log_audit(
-            action="request_authorized",
-            key_id=metadata.key_id,
-            ip_address=ip_address,
-            details={"endpoint": endpoint, "model": model},
-            success=True,
-        )
+            metadata.update_last_used()
 
-        return metadata
+            if not self._check_ip_permissions(metadata, ip_address):
+                self._log_audit(
+                    action="request_denied",
+                    key_id=metadata.key_id,
+                    ip_address=ip_address,
+                    details={"reason": "ip_blocked"},
+                    success=False,
+                )
+                raise PermissionDenied(f"Access denied from IP address: {ip_address}")
+
+            if not self._check_endpoint_permissions(metadata, endpoint):
+                self._log_audit(
+                    action="request_denied",
+                    key_id=metadata.key_id,
+                    ip_address=ip_address,
+                    details={"reason": "endpoint_blocked", "endpoint": endpoint},
+                    success=False,
+                )
+                raise PermissionDenied(f"Access denied to endpoint: {endpoint}")
+
+            if model and not self._check_model_permissions(metadata, model):
+                self._log_audit(
+                    action="request_denied",
+                    key_id=metadata.key_id,
+                    ip_address=ip_address,
+                    details={"reason": "model_blocked", "model": model},
+                    success=False,
+                )
+                raise PermissionDenied(f"Access denied to model: {model}")
+
+            if stream and not metadata.permissions.enable_streaming:
+                self._log_audit(
+                    action="request_denied",
+                    key_id=metadata.key_id,
+                    ip_address=ip_address,
+                    details={"reason": "streaming_disabled"},
+                    success=False,
+                )
+                raise PermissionDenied("Streaming responses are not permitted for this API key")
+
+            if uses_tools and not metadata.permissions.enable_function_calling:
+                self._log_audit(
+                    action="request_denied",
+                    key_id=metadata.key_id,
+                    ip_address=ip_address,
+                    details={"reason": "function_calling_disabled"},
+                    success=False,
+                )
+                raise PermissionDenied("Function calling is not permitted for this API key")
+
+            requested_tokens = max(requested_tokens, 0)
+            if metadata.permissions.max_tokens_per_request is not None:
+                if requested_tokens > metadata.permissions.max_tokens_per_request:
+                    raise PermissionDenied(
+                        f"Requested tokens ({requested_tokens}) exceeds limit ({metadata.permissions.max_tokens_per_request})"
+                    )
+
+            reservation_id = reservation_id if reservation_id is not None else secrets.token_hex(16)
+            if reservation_id in self._reservations[metadata.key_id]:
+                raise ValueError("reservation_id is already in flight")
+            self._check_rate_limits(metadata, requested_tokens)
+            self._check_quotas(metadata, requested_tokens)
+
+            # Reserve all projected budgets atomically, only after every check passes.
+            self._charge_request_windows(metadata)
+            self._reservations[metadata.key_id][reservation_id] = requested_tokens
+
+            self._log_audit(
+                action="request_authorized",
+                key_id=metadata.key_id,
+                ip_address=ip_address,
+                details={"endpoint": endpoint, "model": model},
+                success=True,
+            )
+
+            return metadata
 
     def _check_ip_permissions(self, metadata: ApiKeyMetadata, ip_address: str | None) -> bool:
         """Decide whether ``ip_address`` is permitted to use the key.
@@ -689,7 +758,7 @@ class EnhancedApiKeyManager:
             if ip_address in permissions.blocked_ip_addresses:
                 return False
 
-        if permissions.allowed_ip_addresses:
+        if permissions.allowed_ip_addresses is not None:
             return ip_address in permissions.allowed_ip_addresses
 
         return True
@@ -739,12 +808,13 @@ class EnhancedApiKeyManager:
 
         Walks the per-key request and token sliding windows
         (minute / hour / day) maintained in
-        ``_rate_limit_windows`` and ``_token_usage_windows``. For request
-        windows the call appends a timestamp on success; for token
-        windows the call only *checks* the projected total
-        (``current_used + requested_tokens``) - the actual append is
-        deferred to :meth:`record_usage` once the real token count is
-        known.
+        ``_rate_limit_windows`` and ``_token_usage_windows``. This method
+        only *checks*: request windows are charged by
+        :meth:`_charge_request_windows` once the whole authorisation
+        pipeline admits the request (so rejected requests burn no
+        budget). In-flight estimates remain reserved until :meth:`record_usage`
+        replaces them with actual token counts, or :meth:`release_reservation`
+        releases them after cancellation/failure.
 
         Args:
             metadata: Live metadata for the key being charged. Its
@@ -765,48 +835,63 @@ class EnhancedApiKeyManager:
         key_id = metadata.key_id
         requested_tokens = max(requested_tokens, 0)
 
-        if rate_limits.requests_per_minute:
+        if rate_limits.requests_per_minute is not None:
             window = self._rate_limit_windows[key_id]["requests_minute"]
             self._clean_window(window, current_time, 60)
             if len(window) >= rate_limits.requests_per_minute:
                 raise RateLimitExceeded(f"Rate limit exceeded: {rate_limits.requests_per_minute} requests/minute")
-            window.append(current_time)
 
-        if rate_limits.requests_per_hour:
+        if rate_limits.requests_per_hour is not None:
             window = self._rate_limit_windows[key_id]["requests_hour"]
             self._clean_window(window, current_time, 3600)
             if len(window) >= rate_limits.requests_per_hour:
                 raise RateLimitExceeded(f"Rate limit exceeded: {rate_limits.requests_per_hour} requests/hour")
-            window.append(current_time)
 
-        if rate_limits.requests_per_day:
+        if rate_limits.requests_per_day is not None:
             window = self._rate_limit_windows[key_id]["requests_day"]
             self._clean_window(window, current_time, 86400)
             if len(window) >= rate_limits.requests_per_day:
                 raise RateLimitExceeded(f"Rate limit exceeded: {rate_limits.requests_per_day} requests/day")
-            window.append(current_time)
 
         # Check token rate limits (pre-check using requested_tokens)
-        if rate_limits.tokens_per_minute:
+        if rate_limits.tokens_per_minute is not None:
             window = self._token_usage_windows[key_id]["tokens_minute"]
             self._clean_window(window, current_time, 60)
-            used = sum(tokens for _, tokens in window)
+            used = sum(tokens for _, tokens in window) + sum(self._reservations[key_id].values())
             if used + requested_tokens > rate_limits.tokens_per_minute:
                 raise RateLimitExceeded(f"Rate limit exceeded: {rate_limits.tokens_per_minute} tokens/minute")
 
-        if rate_limits.tokens_per_hour:
+        if rate_limits.tokens_per_hour is not None:
             window = self._token_usage_windows[key_id]["tokens_hour"]
             self._clean_window(window, current_time, 3600)
-            used = sum(tokens for _, tokens in window)
+            used = sum(tokens for _, tokens in window) + sum(self._reservations[key_id].values())
             if used + requested_tokens > rate_limits.tokens_per_hour:
                 raise RateLimitExceeded(f"Rate limit exceeded: {rate_limits.tokens_per_hour} tokens/hour")
 
-        if rate_limits.tokens_per_day:
+        if rate_limits.tokens_per_day is not None:
             window = self._token_usage_windows[key_id]["tokens_day"]
             self._clean_window(window, current_time, 86400)
-            used = sum(tokens for _, tokens in window)
+            used = sum(tokens for _, tokens in window) + sum(self._reservations[key_id].values())
             if used + requested_tokens > rate_limits.tokens_per_day:
                 raise RateLimitExceeded(f"Rate limit exceeded: {rate_limits.tokens_per_day} tokens/day")
+
+    def _charge_request_windows(self, metadata: ApiKeyMetadata) -> None:
+        """Record one admitted request in every configured request window.
+
+        Called by :meth:`authorize_request` only after all checks passed.
+
+        Args:
+            metadata: Live metadata for the admitted key.
+        """
+        rate_limits = metadata.rate_limits
+        current_time = time.time()
+        windows = self._rate_limit_windows[metadata.key_id]
+        if rate_limits.requests_per_minute is not None:
+            windows["requests_minute"].append(current_time)
+        if rate_limits.requests_per_hour is not None:
+            windows["requests_hour"].append(current_time)
+        if rate_limits.requests_per_day is not None:
+            windows["requests_day"].append(current_time)
 
     def _check_quotas(self, metadata: ApiKeyMetadata, requested_tokens: int) -> None:
         """Validate every configured cumulative quota for a key.
@@ -832,24 +917,26 @@ class EnhancedApiKeyManager:
         """
         metadata.reset_monthly_counters_if_needed()
         quota = metadata.quota
+        pending = self._reservations[metadata.key_id]
+        pending_tokens = sum(pending.values())
 
-        if quota.max_total_tokens:
+        if quota.max_total_tokens is not None:
             if (
-                metadata.total_prompt_tokens + metadata.total_completion_tokens + requested_tokens
+                metadata.total_prompt_tokens + metadata.total_completion_tokens + pending_tokens + requested_tokens
                 > quota.max_total_tokens
             ):
                 raise QuotaExceeded(f"Total token quota exceeded: {quota.max_total_tokens}")
 
-        if quota.max_total_requests:
-            if metadata.total_requests >= quota.max_total_requests:
+        if quota.max_total_requests is not None:
+            if metadata.total_requests + len(pending) >= quota.max_total_requests:
                 raise QuotaExceeded(f"Total request quota exceeded: {quota.max_total_requests}")
 
-        if quota.monthly_token_limit:
-            if metadata.monthly_tokens + requested_tokens > quota.monthly_token_limit:
+        if quota.monthly_token_limit is not None:
+            if metadata.monthly_tokens + pending_tokens + requested_tokens > quota.monthly_token_limit:
                 raise QuotaExceeded(f"Monthly token quota exceeded: {quota.monthly_token_limit}")
 
-        if quota.monthly_request_limit:
-            if metadata.monthly_requests >= quota.monthly_request_limit:
+        if quota.monthly_request_limit is not None:
+            if metadata.monthly_requests + len(pending) >= quota.monthly_request_limit:
                 raise QuotaExceeded(f"Monthly request quota exceeded: {quota.monthly_request_limit}")
 
     def _clean_window(self, window: deque, current_time: float, window_size: int) -> None:
@@ -877,6 +964,7 @@ class EnhancedApiKeyManager:
         raw_key: str | None,
         prompt_tokens: int,
         completion_tokens: int,
+        reservation_id: str | None = None,
     ) -> None:
         """Bump per-key counters after a successfully served request.
 
@@ -893,24 +981,79 @@ class EnhancedApiKeyManager:
                 back into a metadata record via :meth:`validate_key`.
             prompt_tokens: Number of input tokens consumed.
             completion_tokens: Number of output tokens generated.
+            reservation_id: Identifier passed at admission. Explicit completions are
+                idempotent; None reconciles the oldest pending legacy admission.
         """
         if not raw_key:
             return
 
-        metadata = self.validate_key(raw_key)
-        if metadata is None:
-            return
-
+        prompt_tokens = max(prompt_tokens, 0)
+        completion_tokens = max(completion_tokens, 0)
+        total_tokens = prompt_tokens + completion_tokens
         with self._lock:
+            # Complete accounting even if the key was suspended/revoked during the request.
+            metadata = self._metadata_for_accounting(raw_key)
+            if metadata is None:
+                return
+            pending = self._reservations[metadata.key_id]
+            if reservation_id is not None:
+                if reservation_id not in pending:
+                    return  # Explicit completion is idempotent, including after cancellation.
+                del pending[reservation_id]
+            elif pending:
+                # Legacy callers do not pass an id; consume their oldest admission.
+                del pending[next(iter(pending))]
+            self._forget_retired_hashes(metadata.key_id)
+            metadata.reset_monthly_counters_if_needed()
             metadata.total_requests += 1
-            metadata.total_prompt_tokens += max(prompt_tokens, 0)
-            metadata.total_completion_tokens += max(completion_tokens, 0)
+            metadata.total_prompt_tokens += prompt_tokens
+            metadata.total_completion_tokens += completion_tokens
             metadata.monthly_requests += 1
-            metadata.monthly_tokens += max(prompt_tokens + completion_tokens, 0)
+            metadata.monthly_tokens += total_tokens
+            self._record_token_rate_limit(metadata, total_tokens)
+            self._mark_dirty_and_save(durable=False)
 
-        self._record_token_rate_limit(metadata, prompt_tokens + completion_tokens)
+    def _metadata_for_accounting(self, raw_key: str) -> ApiKeyMetadata | None:
+        """Resolve a live secret or a retired hash with outstanding reservations."""
+        hashed_key = self._hash_key(raw_key)
+        metadata = self._keys.get(hashed_key)
+        if metadata is None:
+            key_id = self._retired_key_hashes.get(hashed_key)
+            if key_id is not None and self._reservations.get(key_id):
+                metadata = self.get_key_by_id(key_id)
+        return metadata
 
-        self._mark_dirty_and_save()
+    def _forget_retired_hashes(self, key_id: str) -> None:
+        """Forget rotated credentials when no work remains (or the key is deleted)."""
+        if not self._reservations.get(key_id):
+            for hashed_key, owner in list(self._retired_key_hashes.items()):
+                if owner == key_id:
+                    del self._retired_key_hashes[hashed_key]
+
+    def release_reservation(self, raw_key: str | None, reservation_id: str | None = None) -> bool:
+        """Release unconsumed quota/token budgets after failure or cancellation.
+
+        Args:
+            raw_key: Key used at admission, including an inactive key.
+            reservation_id: Admission identifier; None releases the oldest legacy admission.
+
+        Returns:
+            Whether a pending reservation was removed. Request-rate charges are retained.
+        """
+        if not raw_key:
+            return False
+        with self._lock:
+            metadata = self._metadata_for_accounting(raw_key)
+            if metadata is None:
+                return False
+            pending = self._reservations[metadata.key_id]
+            if reservation_id is None:
+                reservation_id = next(iter(pending), None)
+            if reservation_id not in pending:
+                return False
+            del pending[reservation_id]
+            self._forget_retired_hashes(metadata.key_id)
+            return True
 
     def _record_token_rate_limit(self, metadata: ApiKeyMetadata, tokens: int) -> None:
         """Append a ``(timestamp, tokens)`` entry to the active token windows.
@@ -924,17 +1067,17 @@ class EnhancedApiKeyManager:
         current_time = time.time()
         key_id = metadata.key_id
 
-        if rate_limits.tokens_per_minute:
+        if rate_limits.tokens_per_minute is not None:
             window = self._token_usage_windows[key_id]["tokens_minute"]
             self._clean_window(window, current_time, 60)
             window.append((current_time, tokens))
 
-        if rate_limits.tokens_per_hour:
+        if rate_limits.tokens_per_hour is not None:
             window = self._token_usage_windows[key_id]["tokens_hour"]
             self._clean_window(window, current_time, 3600)
             window.append((current_time, tokens))
 
-        if rate_limits.tokens_per_day:
+        if rate_limits.tokens_per_day is not None:
             window = self._token_usage_windows[key_id]["tokens_day"]
             self._clean_window(window, current_time, 86400)
             window.append((current_time, tokens))
@@ -1087,6 +1230,8 @@ class EnhancedApiKeyManager:
 
             del self._keys[hashed_key]
             del self._key_id_to_hash[key_id]
+            self._reservations.pop(key_id, None)
+            self._forget_retired_hashes(key_id)
 
             for raw_key, cached_hash in list(self._raw_to_hash_cache.items()):
                 if cached_hash == hashed_key:
@@ -1180,6 +1325,7 @@ class EnhancedApiKeyManager:
         tags: list[str] | None = None,
         metadata: dict[str, tp.Any] | None = None,
         updated_by: str | None = None,
+        clear_expiry: bool = False,
     ) -> bool:
         """Apply a partial update to a key's metadata.
 
@@ -1203,6 +1349,8 @@ class EnhancedApiKeyManager:
             tags: New tag list (full replacement).
             metadata: User metadata patch merged into the existing dict.
             updated_by: Optional actor recorded in the audit log.
+            clear_expiry: Remove the expiration when true, taking precedence
+                over ``expires_in_days``. False preserves partial-update behavior.
 
         Returns:
             bool: ``True`` when the key existed and was updated,
@@ -1223,7 +1371,10 @@ class EnhancedApiKeyManager:
             if role is not None:
                 key_meta.role = role
                 changes["role"] = role.value
-            if expires_in_days is not None:
+            if clear_expiry:
+                key_meta.expires_at = None
+                changes["expires_at"] = None
+            elif expires_in_days is not None:
                 key_meta.expires_at = time.time() + (expires_in_days * 86400)
                 changes["expires_at"] = key_meta.expires_at
             if rate_limits is not None:
@@ -1274,17 +1425,21 @@ class EnhancedApiKeyManager:
             given id is registered. The new raw key must be returned
             to the caller immediately - only its hash is retained.
         """
-        old_metadata = self.get_key_by_id(key_id)
-        if old_metadata is None:
-            return None
-
-        new_raw_key = f"sk-{secrets.token_urlsafe(48)}"
-        new_hashed_key = self._hash_key(new_raw_key)
-
         with self._lock:
+            old_metadata = self.get_key_by_id(key_id)
+            if old_metadata is None:
+                return None
+
+            new_raw_key = f"sk-{secrets.token_urlsafe(48)}"
+            new_hashed_key = self._hash_key(new_raw_key)
             old_hashed_key = self._key_id_to_hash.get(key_id)
             if old_hashed_key:
+                if self._reservations.get(key_id):
+                    self._retired_key_hashes[old_hashed_key] = key_id
                 del self._keys[old_hashed_key]
+                for cached_raw, cached_hash in list(self._raw_to_hash_cache.items()):
+                    if cached_hash == old_hashed_key:
+                        del self._raw_to_hash_cache[cached_raw]
 
             old_metadata.hashed_key = new_hashed_key
             old_metadata.key_prefix = new_raw_key[:12] + "..."
@@ -1382,6 +1537,33 @@ class EnhancedApiKeyManager:
             "keys_by_role": dict(keys_by_role),
             "audit_log_entries": len(self._audit_log),
         }
+
+    def get_persisted_statistics(self) -> dict[str, tp.Any]:
+        """Return the last aggregate statistics snapshot written to disk.
+
+        :meth:`_save_to_storage` persists :meth:`get_statistics` on every
+        flush; this exposes that snapshot (e.g. to inspect the totals as of the
+        previous run before the in-memory state diverges).
+
+        Returns:
+            dict[str, tp.Any]: The saved statistics blob, or ``{}`` when
+            persistence is disabled or nothing has been saved yet.
+        """
+        if not self.storage:
+            return {}
+        return self.storage.load_usage_stats()
+
+    def clear_persisted_data(self) -> None:
+        """Delete every persisted auth file (keys, audit logs, statistics).
+
+        Intended for explicit factory resets. Only on-disk state is removed;
+        the in-memory keys keep serving until the process restarts, and the
+        next flush will rewrite the files from memory. No-op when persistence
+        is disabled.
+        """
+        if not self.storage:
+            return
+        self.storage.clear_all()
 
     @property
     def enabled(self) -> bool:

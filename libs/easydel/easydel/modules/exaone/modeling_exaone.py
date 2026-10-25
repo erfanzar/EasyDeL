@@ -221,16 +221,13 @@ class ExaoneAttentionInner(UnifiedAttention):
         return ColumnParallelLinear(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,
+            use_bias=getattr(config, "attention_bias", False),
             rngs=rngs,
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
             precision=precision,
         )
-
-    def _get_output_proj(self):
-        """Access output projection using Exaone's naming."""
-        return self.o_proj
 
 
 class ExaoneAttention(spx.Module):
@@ -695,6 +692,7 @@ class ExaoneModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.ln_f(hidden_states)
 

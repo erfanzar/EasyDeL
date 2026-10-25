@@ -39,12 +39,13 @@ from dataclasses import dataclass
 from ejkernel.loggings import get_logger
 
 from ..core.protocols import ShardedDataSource, ShardInfo
+from ..core.types import _uncompressed_filename
 from ..utils import glob_files, with_retry
 
 if tp.TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
-    from ..core.config import DatasetConfig
+    from ..core.config import DatasetConfig, SourceStageConfig
 
 logger = get_logger(__name__)
 
@@ -58,30 +59,31 @@ _PARQUET_NESTED_FALLBACK_BATCH_SIZES = (256, 64, 16, 1)
 # reads are guaranteed to fail after wasting the full decode).
 _PARQUET_NESTED_TARGET_BATCH_BYTES = 256 * 2**20
 _PARQUET_NESTED_CHUNK_SAFE_BYTES = 1_500_000_000
-# Hard per-row-group memory guard. PyArrow decodes a row group's column chunk
-# atomically, so a reader's peak RSS is bounded below by the row group's
-# compressed+decoded size regardless of batch size. Row groups whose projected
-# payload exceeds this are SKIPPED with a loud warning instead of decoded:
-# attempting them does not raise a catchable error — it kills the host (native
-# allocator abort inside Arrow, or the kernel OOM-killer). Skipping is the only
-# graceful in-process option until such files are re-sharded into small row
-# groups. Override via EASYDEL_PARQUET_MAX_ROW_GROUP_BYTES (0 disables the guard).
+# Row groups whose projected payload exceeds this are streamed in byte-budgeted batches instead of decoded whole.
 _PARQUET_MAX_SAFE_ROW_GROUP_BYTES_DEFAULT = 24 * 2**30
 
 
 def _parquet_max_safe_row_group_bytes() -> int:
-    """Decode-memory guard threshold; env-overridable at call time.
+    """Default decode-memory guard threshold (bytes) for sources without an explicit override.
 
-    Read lazily so the documented ``EASYDEL_PARQUET_MAX_ROW_GROUP_BYTES``
-    override works even when set after ``import easydel``.
+    Per-source overrides are passed as ``ParquetShardedSource(max_row_group_bytes=...)``.
     """
-    return int(os.environ.get("EASYDEL_PARQUET_MAX_ROW_GROUP_BYTES", _PARQUET_MAX_SAFE_ROW_GROUP_BYTES_DEFAULT))
+    return _PARQUET_MAX_SAFE_ROW_GROUP_BYTES_DEFAULT
 
 
-# Mid-stream resilience for long-lived shard streams: exceptions treated as
-# transient (PyArrow's ArrowIO errors subclass OSError), and how many times a
-# stream may be reopened with NO forward progress before giving up.
-_PARQUET_TRANSIENT_IO_ERRORS = (IOError, OSError, TimeoutError, ConnectionError)
+# Errors that reopen a shard stream; aiohttp's ClientError is not an OSError, so list it explicitly.
+try:  # aiohttp is a gcsfs dependency; absent on non-GCS deployments
+    from aiohttp import ClientError as _AiohttpClientError
+
+    _PARQUET_TRANSIENT_IO_ERRORS: tuple[type[BaseException], ...] = (
+        IOError,
+        OSError,
+        TimeoutError,
+        ConnectionError,
+        _AiohttpClientError,
+    )
+except Exception:  # pragma: no cover - environment-dependent
+    _PARQUET_TRANSIENT_IO_ERRORS = (IOError, OSError, TimeoutError, ConnectionError)
 _PARQUET_STREAM_MAX_REOPENS = 4
 
 
@@ -160,7 +162,7 @@ def _detect_format(files: list[str]) -> str:
     exts_priority = [".arrow", ".parquet", ".jsonl", ".json", ".csv", ".tsv", ".pq", ".txt"]
 
     for f in files:
-        f_lower = f.lower()
+        f_lower = _uncompressed_filename(f)
         for ext in exts_priority:
             if f_lower.endswith(ext):
                 if ext in (".json", ".jsonl"):
@@ -210,7 +212,9 @@ def _coerce_example(example: tp.Any) -> dict[str, tp.Any]:
     raise TypeError(f"Expected mapping-like dataset row, got {type(example).__name__}")
 
 
-def expand_data_files(data_files: str | os.PathLike | list[str | os.PathLike]) -> list[str]:
+def expand_data_files(
+    data_files: str | os.PathLike | list[str | os.PathLike], storage_options: dict | None = None
+) -> list[str]:
     """Resolve glob patterns and bare directory paths into a sorted list of files.
 
     Each input element is processed by an inner ``expand_one`` helper:
@@ -240,6 +244,21 @@ def expand_data_files(data_files: str | os.PathLike | list[str | os.PathLike]) -
             all — e.g. typo'd glob, empty directory, missing file.
     """
     exts_priority = [".arrow", ".parquet", ".jsonl", ".json", ".csv", ".tsv", ".pq", ".txt"]
+    exts_priority = [ext + suffix for ext in exts_priority for suffix in ("", ".gz", ".zst", ".bz2", ".xz")]
+
+    def expand_glob(pattern: str) -> list[str]:
+        if not storage_options:
+            return glob_files(pattern)
+        import fsspec
+
+        fs, path = fsspec.core.url_to_fs(pattern, **storage_options)
+        matches = fs.glob(path, recursive=True)
+        protocol = fs.protocol
+        if isinstance(protocol, tuple | list):
+            protocol = protocol[0]
+        if protocol not in ("file", "local", ""):
+            return [fs.unstrip_protocol(match) for match in matches]
+        return matches
 
     def expand_one(p: str) -> list[str]:
         """Expand a single path / pattern argument into concrete file paths.
@@ -261,13 +280,13 @@ def expand_data_files(data_files: str | os.PathLike | list[str | os.PathLike]) -
         """
         p = _fix_missing_dot(p)
         if any(ch in p for ch in ("*", "?", "[")):
-            return glob_files(p)
+            return expand_glob(p)
         # Try each extension in priority order
         for ext in exts_priority:
             if p.endswith(ext):
-                return glob_files(p)
+                return expand_glob(p)
             patt = p.rstrip("/") + f"/**/*{ext}"
-            m = glob_files(patt)
+            m = expand_glob(patt)
             if m:
                 return m
         return []
@@ -328,6 +347,12 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         data_files: str | os.PathLike | list[str | os.PathLike],
         storage_options: dict | None = None,
         columns: list[str] | None = None,
+        max_row_group_bytes: int | None = None,
+        max_retries: int | None = None,
+        retry_delay: float | None = None,
+        *,
+        metadata_cache_dir: str | None = None,
+        process_index: int | None = None,
     ):
         """Resolve the shard list and capture reader settings.
 
@@ -344,12 +369,45 @@ class ParquetShardedSource(ShardedDataSource[dict]):
             columns: Optional Parquet column projection — only the
                 listed columns are read from disk. ``None`` reads all
                 columns.
+            max_row_group_bytes: Decode-memory guard threshold in bytes.
+                Row groups whose projected payload exceeds it are streamed
+                in byte-budgeted batches with a warning (PyArrow decodes a row group atomically and
+                can kill the host on oversized ones). ``0`` disables the
+                guard; ``None`` uses the built-in default (24 GiB).
+            max_retries: Number of transient-I/O retries for footer reads
+                and mid-stream reopens. ``None`` keeps the built-in budget.
+            retry_delay: Base delay in seconds for the exponential backoff
+                between retries. ``None`` keeps the built-in 1 second.
+            metadata_cache_dir: Optional directory or URI prefix (``gs://...``)
+                for durable footer-metadata caches: the shard-info cache
+                (:class:`~easydel.data.shard_info_cache.ShardInfoDiskCache`)
+                that backs :meth:`get_shard_info`, and the row-group index /
+                byte-size sidecars used by the row-group shuffle and
+                random-access sources. Restarts then skip the footer walk.
+                ``None`` (default) disables every durable cache.
+            process_index: This process's index in a multi-host job; only index
+                ``0`` (or ``None``, unknown) writes shared remote cache objects.
+                Reads are unrestricted.
         """
-        self._files = expand_data_files(data_files)
+        from ..shard_info_cache import cache_for_files
+
+        self._files = expand_data_files(data_files, storage_options=storage_options)
         self._storage_options = storage_options or {}
         self._columns = columns
+        self._max_row_group_bytes = None if max_row_group_bytes is None else int(max_row_group_bytes)
+        self._max_retries = None if max_retries is None else max(int(max_retries), 0)
+        self._retry_delay = None if retry_delay is None else max(float(retry_delay), 0.0)
+        self._metadata_cache_dir = (metadata_cache_dir or "").strip() or None
+        self._process_index = None if process_index is None else int(process_index)
         self._shard_info_cache: dict[str, ParquetShardInfo] = {}
-        self._guard_exact_cache: dict[tuple[str, int], bool] = {}
+        # Durable backing store for the dict above; inert unless ``metadata_cache_dir`` is set and
+        # fail-open in every path, so an unconfigured source reads exactly as before.
+        self._shard_info_disk = cache_for_files(
+            self._files,
+            self._storage_options,
+            root=self._metadata_cache_dir,
+            process_index=self._process_index,
+        )
         self._warned_projection_fallback = False
         self._force_single_threaded_reads = False
 
@@ -397,17 +455,32 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         )
         self._warned_projection_fallback = True
 
-    def _project_row(self, row: dict[str, tp.Any]) -> dict[str, tp.Any]:
-        """Apply the configured top-level projection to one row dict."""
-        if self._columns is None:
-            return row
+    def _guard_bytes(self) -> int:
+        """Return the effective decode-memory guard threshold for this source.
 
-        projected: dict[str, tp.Any] = {}
-        for column in self._columns:
-            key = column if column in row else column.split(".", 1)[0]
-            if key in row and key not in projected:
-                projected[key] = row[key]
-        return projected
+        The per-source ``max_row_group_bytes`` constructor argument wins; otherwise the module default
+        from :func:`_parquet_max_safe_row_group_bytes` applies.
+
+        Returns:
+            int: Threshold in bytes; ``0`` (or negative) disables the guard.
+        """
+        if self._max_row_group_bytes is not None:
+            return self._max_row_group_bytes
+        return _parquet_max_safe_row_group_bytes()
+
+    def _call_with_retries(self, fn: tp.Callable[..., tp.Any], *args: tp.Any) -> tp.Any:
+        """Call ``fn(*args)`` with this source's transient-I/O retry budget.
+
+        Args:
+            fn: Callable performing a footer/metadata read.
+            *args: Positional arguments forwarded to ``fn``.
+
+        Returns:
+            Whatever ``fn`` returns.
+        """
+        retries = 3 if self._max_retries is None else self._max_retries
+        delay = 1.0 if self._retry_delay is None else self._retry_delay
+        return with_retry(max_retries=retries, initial_delay=delay)(fn)(*args)
 
     @staticmethod
     def _table_to_rows(table: tp.Any) -> "Iterator[dict]":
@@ -675,17 +748,24 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         """
         skip_projected_read = self._uses_slow_nested_projection(self._columns)
         proj_bytes, _n_rows = self._projected_row_group_bytes(pf, rg_idx)
-        _max_safe_bytes = _parquet_max_safe_row_group_bytes()
-        if 0 < _max_safe_bytes < proj_bytes:
+        _max_safe_bytes = self._guard_bytes()
+        oversized = 0 < _max_safe_bytes < proj_bytes
+        warned = getattr(pf, "_ed_oversized_warned", None)
+        if warned is None:
+            warned = set()
+            try:
+                pf._ed_oversized_warned = warned
+            except AttributeError:
+                pass
+        if oversized and rg_idx not in warned:
+            warned.add(rg_idx)
             logger.warning(
-                f"SKIPPING parquet row group {rg_idx} ({_n_rows} rows): projected payload "
-                f"{proj_bytes / 2**30:.1f} GiB exceeds the {_max_safe_bytes / 2**30:.1f} GiB "
-                "decode-memory guard (PyArrow decodes row groups atomically; attempting this would risk "
-                "killing the host). Re-shard this file with a small row_group_size, or raise "
-                "EASYDEL_PARQUET_MAX_ROW_GROUP_BYTES to override."
+                f"Oversized parquet row group {rg_idx} ({_n_rows} rows, projected payload "
+                f"{proj_bytes / 2**30:.1f} GiB > {_max_safe_bytes / 2**30:.1f} GiB guard): streaming it in "
+                "byte-budgeted batches instead of a whole-group decode. Rewrite the file with a smaller "
+                "row_group_size for throughput."
             )
-            return
-        heavy = skip_projected_read or proj_bytes > _PARQUET_NESTED_CHUNK_SAFE_BYTES
+        heavy = oversized or skip_projected_read or proj_bytes > _PARQUET_NESTED_CHUNK_SAFE_BYTES
         use_threads = not self._force_single_threaded_reads
         if not heavy:
             try:
@@ -732,11 +812,14 @@ class ParquetShardedSource(ShardedDataSource[dict]):
             raise last_nested_error
         yield from self._iter_row_group_columns(pf, rg_idx, self._columns)
 
-    @with_retry(max_retries=3, initial_delay=1.0)  # pyright: ignore[reportUntypedFunctionDecorator]
     def get_shard_info(self, shard_name: str) -> ParquetShardInfo:
         """Get metadata about a Parquet shard including row group count.
 
-        Results are cached to avoid repeated file reads.
+        Results are cached in two layers: the per-process dict, and behind it
+        the optional durable :class:`~easydel.data.shard_info_cache.ShardInfoDiskCache`
+        (enabled by ``metadata_cache_dir``), which survives restarts. The
+        durable layer validates every hit against a live listing and fails
+        open, so its worst case is the plain footer read.
 
         Args:
             shard_name: Path or URL to the Parquet file.
@@ -746,7 +829,24 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         """
         if shard_name in self._shard_info_cache:
             return self._shard_info_cache[shard_name]
+        # The durable cache (``metadata_cache_dir``) takes its stat baseline inside this ``get``, BEFORE
+        # the footer read below, so a shard replaced mid-walk is banked against its old stat and rejected.
+        # ``shard_id`` is a property of this source's file list and is never served from it.
+        cached = self._shard_info_disk.get(shard_name)
+        if cached is not None:
+            num_rows, num_row_groups = cached
+            info = ParquetShardInfo(
+                shard_id=self._files.index(shard_name),
+                shard_name=shard_name,
+                num_rows=num_rows,
+                num_row_groups=num_row_groups,
+            )
+            self._shard_info_cache[shard_name] = info
+            return info
+        return self._call_with_retries(self._read_shard_info, shard_name)
 
+    def _read_shard_info(self, shard_name: str) -> ParquetShardInfo:
+        """Read one shard's footer metadata and cache it (no retry; see :meth:`get_shard_info`)."""
         import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
 
         with self._open_file(shard_name) as fh:
@@ -758,7 +858,8 @@ class ParquetShardedSource(ShardedDataSource[dict]):
                 num_row_groups=pf.num_row_groups,
             )
             self._shard_info_cache[shard_name] = info
-            return info
+        self._shard_info_disk.record(shard_name, info.num_rows, info.num_row_groups)
+        return info
 
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
         """Open a Parquet shard and iterate over rows.
@@ -781,64 +882,20 @@ class ParquetShardedSource(ShardedDataSource[dict]):
     def delivers_all_metadata_rows(self) -> bool:
         """Whether iteration delivers every physical row counted by ``num_rows``.
 
-        The decode-memory guard skips a row group only when its projected
-        payload exceeds the guard threshold, so exactness is a per-source
-        fact read from the file footers: ``True`` unless some row group of
-        some shard would actually be skipped. Footer results are cached per
-        shard and threshold, so repeated queries do no I/O.
+        Always ``True``: row groups above the decode-memory guard are streamed in
+        byte-budgeted batches, never skipped.
 
         Returns:
-            bool: ``True`` when the guard is disabled or no row group of any
-            shard exceeds it (delivered rows equal the metadata row count);
-            ``False`` when at least one row group would be skipped, making
-            delivered rows a strict subset of the metadata row count.
+            bool: ``True``.
         """
-        max_safe_bytes = _parquet_max_safe_row_group_bytes()
-        if max_safe_bytes <= 0:
-            return True
-        return all(self._shard_has_no_guarded_row_group(name, max_safe_bytes) for name in self._files)
-
-    def _shard_has_no_guarded_row_group(self, shard_name: str, max_safe_bytes: int) -> bool:
-        """Report whether the decode-memory guard leaves every row group of a shard readable.
-
-        Mirrors the skip predicate of :meth:`_iter_row_group_rows`
-        (``0 < max_safe_bytes < projected_bytes``) using footer metadata only.
-
-        Args:
-            shard_name: Path or URL to the Parquet file.
-            max_safe_bytes: Positive guard threshold in bytes.
-
-        Returns:
-            bool: ``True`` when no row group of the shard exceeds the guard.
-        """
-        key = (shard_name, max_safe_bytes)
-        cached = self._guard_exact_cache.get(key)
-        if cached is not None:
-            return cached
-
-        import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
-
-        with self._open_file(shard_name) as fh:
-            pf = pq.ParquetFile(fh)
-            exact = True
-            for rg_idx in range(pf.num_row_groups):
-                proj_bytes, _rg_rows = self._projected_row_group_bytes(pf, rg_idx)
-                if max_safe_bytes < proj_bytes:
-                    exact = False
-                    break
-        self._guard_exact_cache[key] = exact
-        return exact
+        return True
 
     def open_shard_at_row(self, shard_name: str, row: int) -> "Iterator[dict]":
         """Open a Parquet shard starting at a specific delivered row.
 
         Uses row group metadata to skip directly to the relevant row group,
-        avoiding sequential scanning of earlier rows. ``row`` counts rows as
-        DELIVERED by iteration — the unit every resume bookkeeping uses — so
-        row groups dropped by the decode-memory guard are excluded from the
-        count and the offset is translated to the matching physical row
-        before seeking. Transient I/O failures mid-stream resume at the next
-        unread row.
+        avoiding sequential scanning of earlier rows. Transient I/O failures
+        mid-stream resume at the next unread row.
 
         Args:
             shard_name: Path or URL to the Parquet file.
@@ -847,8 +904,6 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         Yields:
             Rows starting from the specified position.
         """
-        # The delivered->physical translation reads the footer, so it runs inside the retry
-        # boundary: a transient footer-read failure on resume is retried like any other read (r14 S13-1).
         yield from self._open_shard_resumable(shard_name, None, delivered_row=row)
 
     def _open_shard_resumable(
@@ -867,84 +922,50 @@ class ParquetShardedSource(ShardedDataSource[dict]):
 
         # ``start_row=None``: translate ``delivered_row`` to a physical row on the first attempt.
         position = None if start_row is None else int(start_row)
+        max_reopens = _PARQUET_STREAM_MAX_REOPENS if self._max_retries is None else self._max_retries
+        base_delay = 1.0 if self._retry_delay is None else self._retry_delay
         failures_without_progress = 0
         while True:
-            made_progress = False
             try:
                 if position is None:
                     position = self._physical_row_for_delivered_row(shard_name, delivered_row)
                 for abs_row, example in self._iter_shard_rows(shard_name, position):
-                    # Track the PHYSICAL row index, not the delivered count:
-                    # the decode-memory guard can skip whole row groups, and a
-                    # delivered-count position would make the post-error
-                    # reopen land too early and re-deliver rows.
                     position = abs_row + 1
-                    made_progress = True
                     failures_without_progress = 0
                     yield example
                 return
             except _PARQUET_TRANSIENT_IO_ERRORS as exc:
-                failures_without_progress = 0 if made_progress else failures_without_progress + 1
-                if failures_without_progress > _PARQUET_STREAM_MAX_REOPENS:
+                failures_without_progress += 1
+                if failures_without_progress > max_reopens:
                     raise
-                delay = min(1.0 * (2**failures_without_progress), 30.0)
+                delay = min(base_delay * (2 ** (failures_without_progress - 1)), 30.0)
                 logger.warning(
                     f"Transient I/O error streaming {shard_name!r} at row {position} "
                     f"({type(exc).__name__}: {str(exc)[:120]}); reopening at that row in {delay:.0f}s "
-                    f"(attempt {failures_without_progress}/{_PARQUET_STREAM_MAX_REOPENS})."
+                    f"(attempt {failures_without_progress}/{max_reopens})."
                 )
                 _time.sleep(delay)
 
     def _physical_row_for_delivered_row(self, shard_name: str, row: int) -> int:
         """Translate a delivered-row offset into a file-physical row index.
 
-        The decode-memory guard skips whole row groups, so the delivered
-        stream is a subset of the file's physical rows while resume
-        bookkeeping counts delivered examples. This walks the row-group
-        layout (footer metadata only, no data reads) replicating the
-        guard's skip predicate so the offset maps onto the row iteration
-        would actually deliver.
+        Every row group is delivered (oversized ones are streamed, not skipped), so the two coincide.
 
         Args:
             shard_name: Path or URL to the Parquet file.
             row: Zero-based delivered-row offset.
 
         Returns:
-            int: Physical row index whose iteration continues the
-            delivered stream at ``row``. Returns the file's total
-            physical row count when ``row`` is past the delivered end
-            (the resulting iterator yields nothing).
+            int: ``row`` clamped at zero.
         """
-        row = max(int(row), 0)
-        if row == 0:
-            return 0
-        max_safe_bytes = _parquet_max_safe_row_group_bytes()
-
-        import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
-
-        with self._open_file(shard_name) as fh:
-            pf = pq.ParquetFile(fh)
-            delivered = 0
-            physical = 0
-            for rg_idx in range(pf.num_row_groups):
-                proj_bytes, rg_rows = self._projected_row_group_bytes(pf, rg_idx)
-                rg_rows = max(int(rg_rows), 0)
-                guarded = 0 < max_safe_bytes < proj_bytes
-                if not guarded:
-                    if delivered + rg_rows > row:
-                        return physical + (row - delivered)
-                    delivered += rg_rows
-                physical += rg_rows
-        return physical
+        del shard_name
+        return max(int(row), 0)
 
     def _iter_shard_rows(self, shard_name: str, row: int) -> "Iterator[tuple[int, dict]]":
         """Single-pass ``(absolute_row_index, row)`` stream starting at ``row``.
 
         Yields the file-physical row index alongside each row so callers can
-        resume by position even when the decode-memory guard skips whole row
-        groups. A ``row`` at or past the end of the file yields nothing (the
-        old code applied the skip only to row group 0 and then replayed every
-        later row group in full — silent duplication on resume-at-end).
+        resume by position. A ``row`` at or past the end of the file yields nothing.
         """
         import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
 
@@ -1024,7 +1045,7 @@ class JsonShardedSource(ShardedDataSource[dict]):
                 elements (for arrays) or the value itself (for
                 objects).
         """
-        self._files = expand_data_files(data_files)
+        self._files = expand_data_files(data_files, storage_options=storage_options)
         self._storage_options = storage_options or {}
         self._jsonl = jsonl
 
@@ -1056,7 +1077,7 @@ class JsonShardedSource(ShardedDataSource[dict]):
         """
         import fsspec  # pyright: ignore[reportMissingTypeStubs]
 
-        return fsspec.open(path, "r", **self._storage_options)
+        return fsspec.open(path, "r", **{"compression": "infer", **self._storage_options})
 
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
         """Open a JSON/JSONL shard and iterate over records.
@@ -1146,7 +1167,7 @@ class JsonShardedSource(ShardedDataSource[dict]):
 class ArrowShardedSource(ShardedDataSource[dict]):
     """:class:`ShardedDataSource` reader for Apache Arrow IPC (Feather) files.
 
-    Each Arrow IPC file is one shard; iteration walks the file's
+    Each Arrow IPC file or stream is one shard; iteration walks its
     record batches and yields one dict per row. Cloud paths work via
     fsspec. Compared to :class:`ParquetShardedSource`, Arrow IPC is
     faster to load and lossless across PyArrow versions but lacks
@@ -1167,7 +1188,7 @@ class ArrowShardedSource(ShardedDataSource[dict]):
             storage_options: ``fsspec`` storage options forwarded on
                 every open. ``None`` uses fsspec defaults.
         """
-        self._files = expand_data_files(data_files)
+        self._files = expand_data_files(data_files, storage_options=storage_options)
         self._storage_options = storage_options or {}
 
     @property
@@ -1200,9 +1221,16 @@ class ArrowShardedSource(ShardedDataSource[dict]):
         import pyarrow.ipc as ipc  # pyright: ignore[reportMissingTypeStubs]
 
         with fsspec.open(shard_name, "rb", **self._storage_options) as fh:
-            reader = ipc.open_file(fh)
-            for batch_idx in range(reader.num_record_batches):
-                batch = reader.get_batch(batch_idx)
+            # HuggingFace datasets write IPC streams, whereas Feather and
+            # ipc.new_file use the file container with ARROW1 magic.
+            is_file = fh.read(6) == b"ARROW1"
+            fh.seek(0)
+            if is_file:
+                reader = ipc.open_file(fh)
+                batches = (reader.get_batch(index) for index in range(reader.num_record_batches))
+            else:
+                batches = ipc.open_stream(fh)
+            for batch in batches:
                 cols = batch.to_pydict()
                 if not cols:
                     continue
@@ -1251,6 +1279,7 @@ class CsvShardedSource(ShardedDataSource[dict]):
         data_files: str | os.PathLike | list[str | os.PathLike],
         storage_options: dict | None = None,
         delimiter: str = ",",
+        infer_types: bool = False,
     ):
         """Resolve the shard list and capture reader settings.
 
@@ -1262,10 +1291,14 @@ class CsvShardedSource(ShardedDataSource[dict]):
             delimiter: Field separator passed to
                 :class:`csv.DictReader`. Defaults to ``","``; pass
                 ``"\\t"`` for TSV.
+            infer_types: Infer numeric, boolean, and null columns with the
+                pandas/Arrow conversion used by HuggingFace's CSV reader.
+                False keeps string-valued rows.
         """
-        self._files = expand_data_files(data_files)
+        self._files = expand_data_files(data_files, storage_options=storage_options)
         self._storage_options = storage_options or {}
         self._delimiter = delimiter
+        self._infer_types = infer_types
 
     @property
     def shard_names(self) -> "Sequence[str]":
@@ -1297,9 +1330,17 @@ class CsvShardedSource(ShardedDataSource[dict]):
 
         import fsspec  # pyright: ignore[reportMissingTypeStubs]
 
-        with fsspec.open(shard_name, "r", **self._storage_options) as fh:
-            reader = csv.DictReader(fh, delimiter=self._delimiter)
-            yield from reader
+        with fsspec.open(shard_name, "r", **{"compression": "infer", **self._storage_options}) as fh:
+            if self._infer_types:
+                import pandas as pd
+                import pyarrow as pa
+
+                with pd.read_csv(fh, sep=self._delimiter, chunksize=10_000) as batches:
+                    for batch in batches:
+                        yield from pa.Table.from_pandas(batch, preserve_index=False).to_pylist()
+            else:
+                reader = csv.DictReader(fh, delimiter=self._delimiter)
+                yield from reader
 
     def __len__(self) -> int:
         """Total number of records across all CSV shards (cached after first call).
@@ -1353,7 +1394,7 @@ class TextShardedSource(ShardedDataSource[dict]):
                 Defaults to ``"text"`` so downstream tokenize stages
                 pick it up without configuration.
         """
-        self._files = expand_data_files(data_files)
+        self._files = expand_data_files(data_files, storage_options=storage_options)
         self._storage_options = storage_options or {}
         self._text_field = text_field
 
@@ -1386,7 +1427,7 @@ class TextShardedSource(ShardedDataSource[dict]):
         """
         import fsspec  # pyright: ignore[reportMissingTypeStubs]
 
-        with fsspec.open(shard_name, "r", **self._storage_options) as fh:
+        with fsspec.open(shard_name, "r", **{"compression": "infer", **self._storage_options}) as fh:
             for line in fh:
                 yield {self._text_field: line.rstrip("\n\r")}
 
@@ -1488,6 +1529,7 @@ class HuggingFaceShardedSource(ShardedDataSource[dict]):
         subset: str | None = None,
         streaming: bool = True,
         cache_dir: str | None = None,
+        storage_options: dict | None = None,
     ):
         """Capture the load_dataset arguments without performing any I/O.
 
@@ -1511,6 +1553,7 @@ class HuggingFaceShardedSource(ShardedDataSource[dict]):
         self._subset = subset
         self._streaming = streaming
         self._cache_dir = cache_dir
+        self._storage_options = storage_options
         self._dataset = None
 
     @property
@@ -1548,6 +1591,7 @@ class HuggingFaceShardedSource(ShardedDataSource[dict]):
                 split=self._split,
                 streaming=self._streaming,
                 cache_dir=self._cache_dir,
+                **({"storage_options": self._storage_options} if self._storage_options is not None else {}),
             )
         return self._dataset
 
@@ -1727,7 +1771,149 @@ class CompositeShardedSource(ShardedDataSource[dict]):
         return f"CompositeShardedSource(sources={len(self._sources)}, shards={len(self._shard_names)})"
 
 
-def create_source(config: "DatasetConfig") -> ShardedDataSource:
+class RetryingShardedSource(ShardedDataSource[dict]):
+    """Wrapper that reopens a shard at the next unread row after transient I/O errors.
+
+    Formats without their own resilience (JSON, CSV, Arrow, text) read through a single file handle;
+    on remote storage a dropped connection would otherwise kill the consumer. Each retryable failure
+    reopens the shard at the first row not yet delivered, so the consumer sees no duplicates and no
+    gaps. Successful progress resets the retry budget; repeated failures with no progress propagate.
+    """
+
+    def __init__(self, source: ShardedDataSource, max_retries: int = 3, retry_delay: float = 1.0):
+        """Capture the wrapped source and the retry policy.
+
+        Args:
+            source: Source whose shard reads are made resilient.
+            max_retries: Reopen attempts allowed without forward progress.
+            retry_delay: Base delay in seconds; doubles per consecutive failure (capped at 30s).
+        """
+        self._source = source
+        self._max_retries = max(int(max_retries), 0)
+        self._retry_delay = max(float(retry_delay), 0.0)
+
+    @property
+    def shard_names(self) -> "Sequence[str]":
+        """Return the wrapped source's shard names."""
+        return self._source.shard_names
+
+    def num_shards(self) -> int:
+        """Return the wrapped source's shard count."""
+        return self._source.num_shards()
+
+    def get_shard_info(self, shard_name: str) -> ShardInfo | None:
+        """Read metadata with the same retry policy as row streaming."""
+        read = with_retry(max_retries=self._max_retries, initial_delay=self._retry_delay)(self._source.get_shard_info)
+        return read(shard_name)
+
+    @property
+    def delivers_all_metadata_rows(self) -> bool:
+        """Forward the wrapped source's flag (retrying never drops or adds rows)."""
+        return self._source.delivers_all_metadata_rows
+
+    def open_shard(self, shard_name: str) -> "Iterator[dict]":
+        """Stream ``shard_name`` from the start, resuming after transient failures."""
+        yield from self._open_resumable(shard_name, 0)
+
+    def open_shard_at_row(self, shard_name: str, row: int) -> "Iterator[dict]":
+        """Stream ``shard_name`` from delivered row ``row``, resuming after transient failures."""
+        yield from self._open_resumable(shard_name, max(int(row), 0))
+
+    def _open_resumable(self, shard_name: str, position: int) -> "Iterator[dict]":
+        """Yield rows from ``position``; reopen at the next undelivered row on transient I/O errors."""
+        import time as _time
+
+        failures = 0
+        while True:
+            try:
+                rows = (
+                    self._source.open_shard(shard_name)
+                    if position == 0
+                    else self._source.open_shard_at_row(shard_name, position)
+                )
+                for example in rows:
+                    position += 1
+                    failures = 0
+                    yield example
+                return
+            except _PARQUET_TRANSIENT_IO_ERRORS as exc:
+                failures += 1
+                if failures > self._max_retries:
+                    raise
+                delay = min(self._retry_delay * (2 ** (failures - 1)), 30.0)
+                logger.warning(
+                    f"Transient I/O error streaming {shard_name!r} at row {position} "
+                    f"({type(exc).__name__}: {str(exc)[:120]}); reopening in {delay:.0f}s "
+                    f"(attempt {failures}/{self._max_retries})."
+                )
+                _time.sleep(delay)
+
+    def __len__(self) -> int:
+        """Length of the wrapped source."""
+        return len(self._source)
+
+    def __repr__(self) -> str:
+        """Return a developer-friendly representation."""
+        return f"RetryingShardedSource({self._source!r}, max_retries={self._max_retries})"
+
+
+class MaterializedShardedSource(ShardedDataSource[dict]):
+    """Non-streaming adapter: every shard of the wrapped source is loaded into RAM up front.
+
+    Implements ``streaming=False`` semantics for file-backed sources
+    (:attr:`SourceStageConfig.streaming` / :attr:`PipelineConfig.streaming`): the entire split is
+    materialised before downstream stages run, so later passes (epochs, resumes) never re-read storage.
+    """
+
+    def __init__(self, source: ShardedDataSource):
+        """Read every shard of ``source`` into memory.
+
+        Args:
+            source: Source to materialise.
+        """
+        self._names = list(source.shard_names)
+        self._rows: dict[str, list[dict]] = {name: list(source.open_shard(name)) for name in self._names}
+
+    @property
+    def shard_names(self) -> "Sequence[str]":
+        """Return the shard names of the materialised source."""
+        return self._names
+
+    def num_shards(self) -> int:
+        """Return the number of materialised shards."""
+        return len(self._names)
+
+    def get_shard_info(self, shard_name: str) -> ShardInfo | None:
+        """Return exact in-memory row counts for ``shard_name``."""
+        return ShardInfo(
+            shard_id=self._names.index(shard_name),
+            shard_name=shard_name,
+            num_rows=len(self._rows[shard_name]),
+        )
+
+    def open_shard(self, shard_name: str) -> "Iterator[dict]":
+        """Iterate the in-memory rows of ``shard_name``."""
+        return iter(self._rows[shard_name])
+
+    def open_shard_at_row(self, shard_name: str, row: int) -> "Iterator[dict]":
+        """Iterate the in-memory rows of ``shard_name`` starting at ``row`` (O(1) seek)."""
+        return itertools.islice(self._rows[shard_name], max(int(row), 0), None)
+
+    def __len__(self) -> int:
+        """Total number of in-memory rows."""
+        return sum(len(rows) for rows in self._rows.values())
+
+    def __repr__(self) -> str:
+        """Return a developer-friendly representation."""
+        return f"MaterializedShardedSource(shards={len(self._names)}, rows={len(self)})"
+
+
+def create_source(
+    config: "DatasetConfig",
+    source_config: "SourceStageConfig | None" = None,
+    streaming: bool | None = None,
+    infer_csv_types: bool = False,
+) -> ShardedDataSource:
     """Construct the right :class:`ShardedDataSource` subclass for a :class:`DatasetConfig`.
 
     Decision tree:
@@ -1741,15 +1927,36 @@ def create_source(config: "DatasetConfig") -> ShardedDataSource:
     3. Pick the file-format reader from ``config.type`` when set, or
        infer it from extensions via :func:`_detect_format`.
 
+    The optional stage settings are honoured as follows:
+
+    * ``source_config.dask_storage_options`` become the ``fsspec`` ``storage_options`` of every
+      file-backed source.
+    * ``source_config.cloud_max_retries`` / ``cloud_retry_delay`` set the transient-I/O retry budget
+      (Parquet retries internally; other cloud-backed formats are wrapped in
+      :class:`RetryingShardedSource`).
+    * streaming: ``streaming`` (typically :attr:`PipelineConfig.streaming`) and
+      ``source_config.streaming`` must both be true for streaming reads. When either is false, Hub
+      datasets are loaded non-streaming and file sources are materialised in memory per shard
+      (:class:`MaterializedShardedSource`).
+    * ``config.max_row_group_bytes`` sets the Parquet decode-memory guard.
+    * ``source_config.metadata_cache_dir`` / ``process_index`` enable the durable Parquet
+      shard-info cache (only process ``0``/unknown writes it).
+
     Args:
         config: Dataset declaration produced by the user (or
             :class:`PipelineConfig`).
+        source_config: Optional :class:`SourceStageConfig` supplying streaming, retry and storage
+            options. ``None`` uses the defaults.
+        streaming: Optional global streaming default (:attr:`PipelineConfig.streaming`). ``None``
+            means "streaming".
+        infer_csv_types: Opt into HuggingFace-compatible CSV type/null inference.
+            Defaults to False to preserve string-valued pipeline CSV rows.
 
     Returns:
         ShardedDataSource: One of :class:`ParquetShardedSource`,
         :class:`JsonShardedSource`, :class:`CsvShardedSource`,
         :class:`TextShardedSource`, :class:`ArrowShardedSource`, or
-        :class:`HuggingFaceShardedSource`.
+        :class:`HuggingFaceShardedSource` (possibly wrapped by the retry/materialise adapters).
 
     Raises:
         FileNotFoundError: When ``config.data_files`` points at no
@@ -1758,25 +1965,45 @@ def create_source(config: "DatasetConfig") -> ShardedDataSource:
     """
     data_files = config.data_files
     source_type = config.type
-    storage_options = None  # Could be added to DatasetConfig
+    storage_options = None
+    max_retries: int | None = None
+    retry_delay: float | None = None
+    metadata_cache_dir: str | None = None
+    process_index: int | None = None
+    use_streaming = True if streaming is None else bool(streaming)
+    if source_config is not None:
+        use_streaming = use_streaming and bool(source_config.streaming)
+        if source_config.dask_storage_options:
+            storage_options = dict(source_config.dask_storage_options)
+        max_retries = int(source_config.cloud_max_retries)
+        retry_delay = float(source_config.cloud_retry_delay)
+        metadata_cache_dir = getattr(source_config, "metadata_cache_dir", None)
+        process_index = getattr(source_config, "process_index", None)
+
+    def hub_source() -> ShardedDataSource:
+        kwargs = {"storage_options": storage_options} if storage_options else {}
+        result = HuggingFaceShardedSource(
+            dataset_name=data_files,
+            split=config.split,
+            subset=config.dataset_split_name,
+            streaming=use_streaming,
+            **kwargs,
+        )
+        if max_retries is not None:
+            result = RetryingShardedSource(result, max_retries=max_retries, retry_delay=retry_delay or 0.0)
+        if not use_streaming:
+            result = MaterializedShardedSource(result)
+        return result
 
     if source_type in ("huggingface", "hf"):
         if isinstance(data_files, str) and not _is_pathlike(data_files):
-            return HuggingFaceShardedSource(
-                dataset_name=data_files,
-                split=config.split,
-                subset=config.dataset_split_name,
-            )
+            return hub_source()
 
     try:
-        files = expand_data_files(data_files)
+        files = expand_data_files(data_files, storage_options=storage_options)
     except FileNotFoundError:
         if isinstance(data_files, str):
-            return HuggingFaceShardedSource(
-                dataset_name=data_files,
-                split=config.split,
-                subset=config.dataset_split_name,
-            )
+            return hub_source()
         raise
 
     # Use specified type or detect from files
@@ -1793,21 +2020,45 @@ def create_source(config: "DatasetConfig") -> ShardedDataSource:
     else:
         fmt = _detect_format(files)
 
+    source: ShardedDataSource
     if fmt == "parquet":
-        return ParquetShardedSource(files, storage_options)
-    elif fmt == "json":
-        jsonl = any(f.endswith(".jsonl") for f in files)
-        return JsonShardedSource(files, storage_options, jsonl=jsonl)
-    elif fmt == "csv":
-        delimiter = "\t" if any(str(f).lower().endswith(".tsv") for f in files) else ","
-        return CsvShardedSource(files, storage_options, delimiter=delimiter)
-    elif fmt == "txt":
-        return TextShardedSource(files, storage_options, text_field=config.content_field)
+        source = ParquetShardedSource(
+            files,
+            storage_options,
+            max_row_group_bytes=getattr(config, "max_row_group_bytes", None),
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            metadata_cache_dir=metadata_cache_dir,
+            process_index=process_index,
+        )
     else:
-        return ArrowShardedSource(files, storage_options)
+        if fmt == "json":
+            jsonl = source_type == "jsonl" or any(_uncompressed_filename(f).endswith(".jsonl") for f in files)
+            source = JsonShardedSource(files, storage_options, jsonl=jsonl)
+        elif fmt == "csv":
+            delimiter = (
+                "\t" if source_type == "tsv" or any(_uncompressed_filename(f).endswith(".tsv") for f in files) else ","
+            )
+            source = CsvShardedSource(files, storage_options, delimiter=delimiter, infer_types=infer_csv_types)
+        elif fmt == "txt":
+            source = TextShardedSource(files, storage_options, text_field=config.content_field)
+        else:
+            source = ArrowShardedSource(files, storage_options)
+        if max_retries is not None and any("://" in str(f) and not str(f).startswith("file://") for f in files):
+            source = RetryingShardedSource(
+                source,
+                max_retries=max_retries,
+                retry_delay=1.0 if retry_delay is None else retry_delay,
+            )
+
+    if not use_streaming:
+        source = MaterializedShardedSource(source)
+    return source
 
 
-def _detect_builder_and_files(data_files: str | os.PathLike | list[str | os.PathLike]) -> tuple[str, list[str]]:
+def _detect_builder_and_files(
+    data_files: str | os.PathLike | list[str | os.PathLike], storage_options: dict | None = None
+) -> tuple[str, list[str]]:
     """Legacy helper that pairs format inference with file expansion.
 
     Backward-compatibility shim used by :func:`load_for_inform`. Runs
@@ -1820,11 +2071,12 @@ def _detect_builder_and_files(data_files: str | os.PathLike | list[str | os.Path
     Args:
         data_files: Single path/pattern, list, or directory passed
             verbatim to :func:`expand_data_files`.
+        storage_options: Optional credentials and filesystem settings for expansion.
 
     Returns:
         tuple[str, list[str]]: ``(builder_name, expanded_files)``.
     """
-    files = expand_data_files(data_files)
+    files = expand_data_files(data_files, storage_options=storage_options)
     fmt = _detect_format(files)
     return fmt, files
 
@@ -1835,9 +2087,10 @@ def load_for_inform(inform, mixture):
     Used by :func:`build_dataset` (the legacy mixture API) to load
     each :class:`BaseDatasetInform` entry into either a
     :class:`datasets.Dataset` or :class:`datasets.IterableDataset`.
-    Routes Hub-style identifiers through ``load_dataset(path=name)``
-    and file-based informs through ``load_dataset(path=builder,
-    data_files=files)``. When the builtin ``parquet`` builder fails
+    Routes Hub-style identifiers through ``load_dataset(path=name)``.
+    File-based informs use optimized fsspec-backed sharded readers when
+    ``mixture.use_fast_loader`` is true, and HuggingFace's standard file
+    builders otherwise. When the builtin ``parquet`` builder fails
     on schemas containing nested ``List`` features, falls back to a
     custom streaming reader (:func:`_iter_parquet_rows`) implemented
     directly on top of fsspec/pyarrow.
@@ -1905,6 +2158,39 @@ def load_for_inform(inform, mixture):
             return dataset.take(limit)
         return dataset
 
+    def _apply_file_split(dataset):
+        """Apply HF file-builder split semantics before the independent raw-row cap.
+
+        A flat list of file paths defines only the ``train`` split. Reuse
+        HuggingFace's public instruction parser for absolute/percentage slices,
+        negative bounds, rounding, and concatenation rather than treating a
+        split expression as an unused source label. Streaming file builders
+        accept only a plain split name, so retain their validation behavior.
+        """
+        split = str(inform.split or "train")
+        if mixture.streaming:
+            if split != "train":
+                raise ValueError(f"Bad split: {split}. Available splits: ['train']")
+            return dataset
+        if split in {"train", "all"}:
+            return dataset
+
+        from datasets import ReadInstruction
+
+        instructions = ReadInstruction.from_spec(split).to_absolute({"train": len(dataset)})
+        # HF's Arrow reader uses take=-1 as a sentinel for the remaining
+        # rows, including when reversed bounds produce that exact length.
+        # Other reversed bounds select nothing; zero-width-only instructions
+        # are rejected before reading. Preserve all three distinct cases.
+        if all(instruction.from_ == instruction.to for instruction in instructions):
+            raise ValueError(f'Instruction "{split}" corresponds to no data!')
+        ranges = [
+            range(instruction.from_, len(dataset) if instruction.to - instruction.from_ == -1 else instruction.to)
+            for instruction in instructions
+        ]
+        indices = ranges[0] if len(ranges) == 1 else itertools.chain.from_iterable(ranges)
+        return dataset.select(indices)
+
     # Create source and convert to HF dataset
     if t in {"huggingface", "hf"} and isinstance(df, str) and not _is_pathlike(df):
         dataset = _load_hf_dataset(
@@ -1917,9 +2203,49 @@ def load_for_inform(inform, mixture):
         )
         return _apply_num_rows_limit(dataset)
 
-    builder, files = _detect_builder_and_files(df)
-    specified_builder = t if t in {"json", "jsonl", "csv", "parquet", "arrow"} else None
+    storage_options = getattr(mixture, "dask_storage_options", None) or {}
+    if getattr(mixture, "use_fast_loader", False):
+        from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
+
+        from ..core.config import DatasetConfig, SourceStageConfig
+
+        source = create_source(
+            DatasetConfig(
+                data_files=df,
+                type=t,
+                split=inform.split or "train",
+                content_field=getattr(inform, "content_field", None) or "text",
+            ),
+            source_config=SourceStageConfig(
+                streaming=True,
+                dask_storage_options=storage_options,
+                cloud_max_retries=mixture.cloud_max_retries,
+                cloud_retry_delay=mixture.cloud_retry_delay,
+            ),
+            infer_csv_types=True,
+        )
+
+        def rows():
+            """Yield file rows lazily, preserving the source's shard order."""
+            for shard_name in source.shard_names:
+                yield from source.open_shard(shard_name)
+
+        if mixture.streaming:
+            dataset = IterableDataset.from_generator(rows)
+        else:
+            # Dataset.from_list infers columns only from its first row. Build
+            # the complete key union before Arrow conversion so late optional
+            # fields survive filtering/formatting and additional_fields selection.
+            materialized = list(rows())
+            keys = dict.fromkeys(key for row in materialized for key in row)
+            dataset = Dataset.from_dict({key: [row.get(key) for row in materialized] for key in keys})
+        return _apply_num_rows_limit(_apply_file_split(dataset))
+
+    builder, files = _detect_builder_and_files(df, storage_options=storage_options)
+    specified_builder = t if t in {"json", "jsonl", "csv", "parquet", "arrow", "tsv", "txt"} else None
     builder = specified_builder or builder
+    is_tsv = builder in {"csv", "tsv"} and (t == "tsv" or any(_uncompressed_filename(f).endswith(".tsv") for f in files))
+    builder_kwargs = {"delimiter": "\t"} if is_tsv else {}
 
     def _iter_parquet_rows(files: list[str]):
         """Inline fallback reader: stream parquet rows directly via fsspec + pyarrow.
@@ -1941,7 +2267,7 @@ def load_for_inform(inform, mixture):
         import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
 
         for path in files:
-            with fsspec.open(path, "rb") as fh:
+            with fsspec.open(path, "rb", **storage_options) as fh:
                 pf = pq.ParquetFile(fh)
                 for rg in range(pf.num_row_groups):
                     table = pf.read_row_group(rg)
@@ -1954,12 +2280,14 @@ def load_for_inform(inform, mixture):
 
     try:
         dataset = _load_hf_dataset(
-            path="json" if builder in {"json", "jsonl"} else builder,
+            path={"jsonl": "json", "tsv": "csv", "txt": "text"}.get(builder, builder),
             data_files=files,
             split=inform.split or "train",
             cache_dir=mixture.cache_dir,
             streaming=mixture.streaming,
             num_proc=None if mixture.streaming else 1,
+            storage_options=storage_options or None,
+            **builder_kwargs,
         )
         return _apply_num_rows_limit(dataset)
     except ValueError as e:
@@ -1974,5 +2302,5 @@ def load_for_inform(inform, mixture):
                 from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
 
                 dataset = Dataset.from_generator(lambda: _iter_parquet_rows(files))
-            return _apply_num_rows_limit(dataset)
+            return _apply_num_rows_limit(_apply_file_split(dataset))
         raise

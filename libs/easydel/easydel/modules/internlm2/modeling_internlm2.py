@@ -234,12 +234,12 @@ class InternLM2Attention(UnifiedAttention):
         )
 
     def _create_attention_performer(self, config: InternLM2Config, rngs: spx.Rngs):
-        """Create attention performer with zero dropout."""
+        """Create attention performer with the configured probability dropout."""
         return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
-            dropout_prob=0.0,
+            dropout_prob=config.attention_dropout,
         )
 
 
@@ -573,10 +573,12 @@ class InternLM2Model(EasyDeLBaseModule):
             ValueError: If both input_ids and inputs_embeds are provided or both are None.
             AssertionError: If sequence_length exceeds max_position_embeddings.
         """
-        if inputs_embeds is None and input_ids is not None:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
+        if inputs_embeds is None:
             inputs_embeds = self.tok_embeddings(input_ids.astype("i4"))
-        else:
-            raise ValueError("you should specify inputs_embeds or input_ids one of them")
         sequence_length = inputs_embeds.shape[1]
 
         mask_info = MaskInfo.dynamic_init(
@@ -665,6 +667,7 @@ class InternLM2Model(EasyDeLBaseModule):
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
 

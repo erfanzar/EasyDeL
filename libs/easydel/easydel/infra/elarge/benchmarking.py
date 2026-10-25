@@ -37,6 +37,37 @@ _cached_task_manager: Any = None
 _cached_task_manager_key: tuple | None = None
 
 
+def _task_manager_key(include_path: str | list | None, include_defaults: bool) -> tuple:
+    """Return the hashable cache key identifying a TaskManager configuration.
+
+    Args:
+        include_path: Extra task directories (or ``None``).
+        include_defaults: Whether lm-eval's built-in tasks are indexed.
+
+    Returns:
+        tuple: ``(include_path, include_defaults)`` with list paths frozen into a tuple.
+    """
+    ip = tuple(include_path) if isinstance(include_path, list) else include_path
+    return (ip, include_defaults)
+
+
+def _lookup_cached_task_manager(include_path: str | list | None = None, include_defaults: bool = True) -> Any:
+    """Return the cached TaskManager only when it was built for the given configuration.
+
+    Args:
+        include_path: Extra task directories the caller is evaluating with.
+        include_defaults: Whether the caller indexes lm-eval's built-in tasks.
+
+    Returns:
+        The cached ``TaskManager`` if its key matches, otherwise ``None``.
+    """
+    if _cached_task_manager is not None and _cached_task_manager_key == _task_manager_key(
+        include_path, include_defaults
+    ):
+        return _cached_task_manager
+    return None
+
+
 def _get_or_create_task_manager(
     *,
     verbosity: str | None = None,
@@ -55,8 +86,7 @@ def _get_or_create_task_manager(
     global _cached_task_manager, _cached_task_manager_key
     resolved_logger = summary_logger if summary_logger is not None else logger
 
-    ip = tuple(include_path) if isinstance(include_path, list) else include_path
-    key = (ip, include_defaults)
+    key = _task_manager_key(include_path, include_defaults)
 
     if _cached_task_manager is not None and _cached_task_manager_key == key:
         resolved_logger.info(
@@ -342,12 +372,9 @@ def _probe_task_names(names: list[str]) -> set[str]:
     Falls back to a full TaskManager if targeted lookup isn't possible.
     """
     try:
-        global _cached_task_manager
-        if _cached_task_manager is not None:
-            all_tasks = set(getattr(_cached_task_manager, "all_tasks", []) or [])
-            return {n for n in names if n in all_tasks}
-
-        tm = _get_or_create_task_manager()
+        tm = _lookup_cached_task_manager()
+        if tm is None:
+            tm = _get_or_create_task_manager()
         all_tasks = set(getattr(tm, "all_tasks", []) or [])
         return {n for n in names if n in all_tasks}
     except Exception as exc:
@@ -564,7 +591,9 @@ def run_lm_eval_with_esurge(
         summary_logger=resolved_logger,
     )
 
-    effective_task_manager = task_manager or _cached_task_manager
+    effective_task_manager = (
+        task_manager if task_manager is not None else _lookup_cached_task_manager(include_path, include_defaults)
+    )
     apply_chat_template = maybe_disable_chat_template_for_prefilled_tasks(
         task_list,
         task_manager=effective_task_manager,

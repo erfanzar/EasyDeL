@@ -188,6 +188,8 @@ class PhiAttention(UnifiedAttention):
         self.qk_layernorm = config.qk_layernorm
         attention_config = copy.copy(config)
         attention_config.attention_bias = True
+        # The decoder owns residual dropout for both parallel branches.
+        attention_config.resid_pdrop = 0.0
         super().__init__(
             attention_config,
             dtype,
@@ -203,7 +205,6 @@ class PhiAttention(UnifiedAttention):
         self.layer_idx = layer_idx
         self.attention_dropout = config.attention_dropout
         self.partial_rotary_factor = config.partial_rotary_factor
-        self.rotary_emb_dim = int(config.partial_rotary_factor * self.head_dim)
         self.is_causal = True
 
     def _create_q_norm(self, config, dtype, param_dtype, rngs):
@@ -587,6 +588,8 @@ class PhiModel(EasyDeLBaseModule):
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
         sequence_length = inputs_embeds.shape[1]
 
+        output_attentions = self.config.output_attentions if output_attentions is None else output_attentions
+        output_hidden_states = self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
         assert sequence_length <= self.config.max_position_embeddings, (
@@ -602,7 +605,7 @@ class PhiModel(EasyDeLBaseModule):
         if position_ids is None:
             position_ids = mask_info.q_position_ids
 
-        hidden_states = inputs_embeds
+        hidden_states = self.embed_dropout(inputs_embeds)
         if mode is None:
             mode = (
                 common_types.MODE_DECODE
@@ -620,7 +623,7 @@ class PhiModel(EasyDeLBaseModule):
         views = past_key_values.views if past_key_values is not None else None
         has_cache_views = views is not None and any(v is not None for v in views)
         needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
-        frequencies = self.config.get_basic_frequencies()
+        frequencies = self.frequencies
 
         trace_layers = self._layer_scan_trace(
             trace,
@@ -670,6 +673,7 @@ class PhiModel(EasyDeLBaseModule):
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.final_layernorm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")

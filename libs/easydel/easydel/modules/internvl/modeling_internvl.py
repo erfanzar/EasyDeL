@@ -65,7 +65,8 @@ from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import ColumnParallelLinear, RowParallelLinear, dense_qkv_layout
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import LayerNorm, RMSNorm
-from easydel.modules._base import BaseVisionLanguageModule, torch_bicubic_resize
+from easydel.modules._base import BaseVisionLanguageModule, pixel_unshuffle_grid, torch_bicubic_resize
+from easydel.modules._base._vlm_features import VisionEncoderFeature
 
 from ..auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
 from .internvl_configuration import InternVLConfig, InternVLVisionConfig
@@ -765,6 +766,7 @@ class InternVLVisionEncoder(EasyDeLLayerStackMixin, spx.Module):
             or output_attentions
             or not self.config.scan_layers
             or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs("vision"),
         )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -951,7 +953,8 @@ class InternVLMultiModalProjector(spx.Module):
             rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
-        input_dim = config.vision_config.hidden_size * int(1 / config.downsample_ratio) ** 2
+        num_feature_layers = len(config.vision_feature_layer) if isinstance(config.vision_feature_layer, list) else 1
+        input_dim = config.vision_config.hidden_size * num_feature_layers * int(1 / config.downsample_ratio) ** 2
 
         self.layer_norm = LayerNorm(
             input_dim,
@@ -1088,29 +1091,21 @@ class InternVLModel(EasyDeLBaseModule):
         Raises:
             ValueError: If height or width is not divisible by the scale factor.
         """
-        batch_size, width, height, channels = vision_features.shape
-
+        _, width, height, _ = vision_features.shape
         if (height * scale_factor) % 1 != 0 or (width * scale_factor) % 1 != 0:
             raise ValueError("Height and width must be divisible by scale_factor for proper downsampling.")
-
-        vision_features = vision_features.reshape(
-            batch_size, width, int(height * scale_factor), int(channels / scale_factor)
-        )
-        # Permute dimensions to align downsampled axis correctly
-        vision_features = jnp.transpose(vision_features, (0, 2, 1, 3))
-        vision_features = vision_features.reshape(
-            batch_size, int(height * scale_factor), int(width * scale_factor), int(channels / (scale_factor**2))
-        )
-        # Swap height and width back for proper orientation
-        vision_features = jnp.transpose(vision_features, (0, 2, 1, 3))
-
-        return vision_features
+        return pixel_unshuffle_grid(vision_features, int(width * scale_factor), int(height * scale_factor))
 
     def get_image_features(self, pixel_values: Array) -> Array:
         """Extract, pixel-shuffle and project image features.
 
         Args:
             pixel_values: Input pixel values of shape (batch, channels, height, width).
+
+        Multiple selected layers are concatenated before spatial downsampling.
+        The ``full`` strategy prepends the projected CLS token: its features are
+        replicated across merge slots so it uses the existing spatial projector
+        without adding checkpoint parameters.
 
         Returns:
             Array: Projected image features of shape
@@ -1122,18 +1117,28 @@ class InternVLModel(EasyDeLBaseModule):
         if vision_feature_layer == -1:
             vision_features = vision_outputs.last_hidden_state
         else:
-            vision_features = vision_outputs.hidden_states[vision_feature_layer]
-        if self.vision_feature_select_strategy == "default":
-            vision_features = vision_features[:, 1:, :]
+            vision_features = VisionEncoderFeature(
+                vision_feature_layer=vision_feature_layer, vision_feature_select_strategy="full"
+            ).extract_features(vision_outputs.hidden_states)
 
-        # Reshape tokens back to their (square) spatial grid.
+        # CLS is not a spatial patch. Keep it separate even for the full strategy.
+        cls_features, vision_features = vision_features[:, :1, :], vision_features[:, 1:, :]
         num_tokens = vision_features.shape[1]
         feature_size = int(num_tokens**0.5)
-        batch_size = vision_features.shape[0]
-        vision_features = vision_features.reshape(batch_size, feature_size, feature_size, -1)
+        if feature_size * feature_size != num_tokens:
+            raise ValueError(f"InternVL expects a square patch grid after CLS, got {num_tokens} patch tokens.")
+        batch_size, _, channels = vision_features.shape
+        vision_features = vision_features.reshape(batch_size, feature_size, feature_size, channels)
 
         vision_features = self.pixel_shuffle(vision_features, scale_factor=self.config.downsample_ratio)
         vision_features = vision_features.reshape(batch_size, -1, vision_features.shape[-1])
+        if self.vision_feature_select_strategy == "full":
+            # A CLS feature has no 2x2 neighborhood. Replicate it across the spatial
+            # merge slots and apply the SAME projector, preserving checkpoint keys
+            # and producing one leading global token followed by spatial tokens.
+            merge_slots = int(1 / self.config.downsample_ratio) ** 2
+            cls_features = jnp.tile(cls_features, (1, 1, merge_slots))
+            vision_features = jnp.concatenate((cls_features, vision_features), axis=1)
 
         image_features = tp.cast(Array, self.multi_modal_projector(vision_features))
         return image_features
