@@ -668,8 +668,8 @@ class eLargeModel:
         method: str | None = None,
         group_size: int | None = None,
         use_qmm_best_config: bool | None = None,
-        qmm_platform_override: str | None | object = _QUANT_UNSET,
-        qmm_tpu_path_override: str | None | object = _QUANT_UNSET,
+        qmm_platform_override: str | object | None = _QUANT_UNSET,
+        qmm_tpu_path_override: str | object | None = _QUANT_UNSET,
         **kwargs,
     ) -> eLargeModel:
         """Configure quantization settings.
@@ -788,8 +788,8 @@ class eLargeModel:
         max_num_seqs: int | None = None,
         hbm_utilization: float | None = None,
         enable_window_aware_runtime_cap: bool | object = _ESURGE_UNSET,
-        tool_parser: ToolParserName | None | object = _ESURGE_UNSET,
-        reasoning_parser: ReasoningParserName | None | object = _ESURGE_UNSET,
+        tool_parser: ToolParserName | object | None = _ESURGE_UNSET,
+        reasoning_parser: ReasoningParserName | object | None = _ESURGE_UNSET,
         **kwargs,
     ) -> eLargeModel:
         """Configure eSurge inference settings.

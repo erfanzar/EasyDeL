@@ -1458,7 +1458,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         backend: str | None = None,
         eformer_craft_mesh: bool | None = None,
         axis_types: (
-            collections.abc.Sequence[AxisType | str] | AxisType | str | None | tp.Literal["auto", "explicit", "manual"]
+            collections.abc.Sequence[AxisType | str] | AxisType | str | tp.Literal["auto", "explicit", "manual"] | None
         ) = None,
     ):
         """Creates a JAX device mesh for distributed model execution.
@@ -1558,7 +1558,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
     def _build_mesh(
         self,
         axis_types: (
-            collections.abc.Sequence[AxisType | str] | AxisType | str | None | tp.Literal["auto", "explicit", "manual"]
+            collections.abc.Sequence[AxisType | str] | AxisType | str | tp.Literal["auto", "explicit", "manual"] | None
         ) = None,
     ) -> spx.SpxMesh:
         """Create a JAX mesh using the config sharding settings.

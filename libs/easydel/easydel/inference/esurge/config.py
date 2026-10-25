@@ -353,7 +353,7 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
     max_num_seqs: NotRequired[int]
     max_num_seq_buckets: NotRequired[list[int] | tuple[int, ...] | None]
     async_scheduling: NotRequired[bool]
-    max_num_batched_tokens: NotRequired[int | None | _Empty]
+    max_num_batched_tokens: NotRequired[int | _Empty | None]
     use_aot_forward: NotRequired[bool]
     compile_runner: NotRequired[bool]
     runner_verbose: NotRequired[bool]

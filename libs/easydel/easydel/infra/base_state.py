@@ -1289,7 +1289,7 @@ class EasyDeLState(_PyTreeNode):
         self: Self,
         load_directory: str | ePathLike,
         checkpointer: Checkpointer | None = None,
-        tx_template: None | optax.GradientTransformation = None,
+        tx_template: optax.GradientTransformation | None = None,
         checkpoint_load_chunk_size: int | None = None,
         checkpoint_load_concurrent_gb: int = 128,
         checkpoint_load_tensorstore_io_concurrency: int | None = 1024,
