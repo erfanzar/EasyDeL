@@ -314,14 +314,33 @@ def _recurrent_leaf_entries(views):
     return entries
 
 
+def _device_key(array: typing.Any) -> tuple[int, ...]:
+    """Sorted device ids holding ``array``; PP stages own disjoint device sets."""
+    devices = getattr(getattr(array, "sharding", None), "device_set", None)
+    if not devices:
+        return ()
+    return tuple(sorted(int(device.id) for device in devices))
+
+
+def _group_by_devices(leaves: list[tuple[int, str, typing.Any]]) -> dict[tuple[int, ...], list[int]]:
+    """Positions of ``leaves`` grouped by device set, so each jitted copy stays on one PP stage mesh."""
+    groups: dict[tuple[int, ...], list[int]] = {}
+    for position, (_idx, _name, array) in enumerate(leaves):
+        groups.setdefault(_device_key(array), []).append(position)
+    return groups
+
+
 def _bucket_leaf_arrays(entries):
-    """Group entry leaves by pool size, preserving per-entry leaf order."""
-    by_pool: dict[int, list[jax.Array]] = {}
+    """Group entry leaves by (pool size, device set), preserving per-entry leaf order.
+
+    One jitted dispatch cannot mix arrays committed to different device sets, which is what
+    pipeline-parallel stage meshes produce.
+    """
+    by_pool: dict[tuple[int, tuple[int, ...]], list[jax.Array]] = {}
     for _idx, _rec, leaves, n_slots in entries:
-        bucket = by_pool.setdefault(n_slots, [])
         for _name, arr in leaves:
             if arr is not None:
-                bucket.append(arr)
+                by_pool.setdefault((n_slots, _device_key(arr)), []).append(arr)
     return by_pool
 
 
@@ -330,20 +349,24 @@ def _write_back_leaf_results(new_views, entries, results_by_pool) -> bool:
     cursors = dict.fromkeys(results_by_pool, 0)
     changed = False
     for idx, rec, leaves, n_slots in entries:
-        results = results_by_pool.get(n_slots)
-        if results is None:
-            continue
         updates: dict[str, jax.Array] = {}
         for name, arr in leaves:
-            if arr is not None:
-                updates[name] = results[cursors[n_slots]]
-                cursors[n_slots] += 1
+            if arr is None:
+                continue
+            key = (n_slots, _device_key(arr))
+            results = results_by_pool.get(key)
+            if results is None:
+                continue
+            updates[name] = results[cursors[key]]
+            cursors[key] += 1
+        if not updates:
+            continue
         view = new_views[idx]
         if isinstance(view, ParallelHybridCacheView):
             new_views[idx] = view.replace(
                 recurrent=rec.replace(**updates),
-                conv_state=updates.get("conv_state"),
-                recurrent_state=updates.get("recurrent_state"),
+                conv_state=updates.get("conv_state", view.conv_state),
+                recurrent_state=updates.get("recurrent_state", view.recurrent_state),
             )
         else:
             new_views[idx] = rec.replace(**updates)
@@ -365,7 +388,9 @@ def _transform_recurrent_sidecars(views, make_indices):
         rec = view.recurrent if isinstance(view, ParallelHybridCacheView) else view
         if isinstance(rec, KDACacheView):
             if rec.positions is not None:
-                by_pool.setdefault(int(rec.positions.shape[0]), []).append((index, "positions", rec.positions, 0))
+                by_pool.setdefault((int(rec.positions.shape[0]), _device_key(rec.positions)), []).append(
+                    (index, "positions", rec.positions, 0)
+                )
             continue
         if not isinstance(rec, RecurrentCacheView):
             continue
@@ -377,9 +402,9 @@ def _transform_recurrent_sidecars(views, make_indices):
         ):
             array = getattr(rec, name, None)
             if array is not None:
-                by_pool.setdefault(int(array.shape[0]), []).append((index, name, array, fill))
+                by_pool.setdefault((int(array.shape[0]), _device_key(array)), []).append((index, name, array, fill))
     updates = {}
-    for n_slots, entries in by_pool.items():
+    for (n_slots, _devices), entries in by_pool.items():
         indices = make_indices(n_slots)
         if indices is None:
             continue
@@ -388,7 +413,7 @@ def _transform_recurrent_sidecars(views, make_indices):
         transform = _jit_slot_sidecar_rows(
             tuple(array.sharding for array in arrays), tuple(entry[3] for entry in entries)
         )
-        result = transform(arrays, jnp.asarray(gather, jnp.int32), jnp.asarray(keep, bool))
+        result = transform(arrays, numpy.asarray(gather, numpy.int32), numpy.asarray(keep, bool))
         for (index, name, _array, _fill), value in zip(entries, result, strict=True):
             updates.setdefault(index, {})[name] = value
     for index, values in updates.items():
@@ -2076,15 +2101,16 @@ class ExecutionManager:
         # all four must be zeroed or the next slot occupant inherits them.
         entries = _recurrent_leaf_entries(new_views)
         by_pool = _bucket_leaf_arrays(entries)
-        cleared_by_pool: dict[int, list[jax.Array]] = {}
-        for n_slots, arrays in by_pool.items():
+        cleared_by_pool: dict[tuple[int, tuple[int, ...]], list[jax.Array]] = {}
+        for key, arrays in by_pool.items():
+            n_slots = key[0]
             filtered_slots = sorted({int(s) for s in slot_indices_to_clear if 0 <= int(s) < n_slots})
             if not filtered_slots:
                 continue
             keep_np = numpy.ones((n_slots,), dtype=bool)
             keep_np[numpy.asarray(filtered_slots, dtype=numpy.int64)] = False
             transform = _jit_zero_rows(tuple(array.sharding for array in arrays))
-            cleared_by_pool[n_slots] = list(transform(arrays, jnp.asarray(keep_np)))
+            cleared_by_pool[key] = list(transform(arrays, keep_np))
 
         changed = _write_back_leaf_results(new_views, entries, cleared_by_pool) or changed
 
@@ -2115,24 +2141,30 @@ class ExecutionManager:
         num_slots = int(getattr(self, "recurrent_snapshot_slots", 0) or 0)
         if num_slots <= 0:
             raise RuntimeError("Recurrent prefix snapshots were requested but no snapshot slots are configured.")
-        shapes = [((num_slots, *array.shape[1:]), array.dtype) for _idx, _name, array in leaves]
-        shardings = [_snapshot_sharding(array) for _idx, _name, array in leaves]
-        make = jax.jit(lambda: [jnp.zeros(shape, dtype) for shape, dtype in shapes], out_shardings=shardings)
-        store = list(make())
+        store: list[typing.Any] = [None] * len(leaves)
+        for positions in _group_by_devices(leaves).values():
+            shapes = [((num_slots, *leaves[i][2].shape[1:]), leaves[i][2].dtype) for i in positions]
+            shardings = [_snapshot_sharding(leaves[i][2]) for i in positions]
+
+            def make(shapes=shapes):
+                return [jnp.zeros(shape, dtype) for shape, dtype in shapes]
+
+            for i, value in zip(positions, jax.jit(make, out_shardings=shardings)(), strict=True):
+                store[i] = value
         self._recurrent_snapshot_arrays = store
         self._recurrent_snapshot_signature = signature
         return store
 
     def _recurrent_snapshot_index_arrays(
         self, rows: list[int], slots: list[int], *, pad_rows: bool
-    ) -> tuple[jax.Array, jax.Array]:
+    ) -> tuple[numpy.ndarray, numpy.ndarray]:
         """Fixed-width row/slot index vectors; the padded side points out of range so its writes are dropped."""
-        width = int(self.max_num_reqs)
+        width = max(int(self.max_num_reqs), len(rows))
         rows_np = numpy.full((width,), _SNAPSHOT_DROP_INDEX if pad_rows else 0, dtype=numpy.int32)
         slots_np = numpy.full((width,), 0 if pad_rows else _SNAPSHOT_DROP_INDEX, dtype=numpy.int32)
         rows_np[: len(rows)] = numpy.asarray(rows, dtype=numpy.int32)
         slots_np[: len(slots)] = numpy.asarray(slots, dtype=numpy.int32)
-        return jnp.asarray(rows_np), jnp.asarray(slots_np)
+        return rows_np, slots_np
 
     def save_recurrent_snapshots(self, rows: list[int], slots: list[int]) -> None:
         """Copy the recurrent state of physical rows ``rows`` into snapshot slots ``slots``.
@@ -2147,11 +2179,15 @@ class ExecutionManager:
         leaves = _per_slot_state_leaves(list(cache.views))
         if not leaves:
             return
-        store = self._recurrent_snapshot_store(leaves)
-        rows_dev, slots_dev = self._recurrent_snapshot_index_arrays(rows, slots, pad_rows=False)
-        transform = _jit_snapshot_save(tuple(array.sharding for array in store))
-        pools = [array for _idx, _name, array in leaves]
-        self._recurrent_snapshot_arrays = list(transform(pools, store, rows_dev, slots_dev))
+        store = list(self._recurrent_snapshot_store(leaves))
+        rows_np, slots_np = self._recurrent_snapshot_index_arrays(rows, slots, pad_rows=False)
+        for positions in _group_by_devices(leaves).values():
+            snapshots = [store[i] for i in positions]
+            transform = _jit_snapshot_save(tuple(array.sharding for array in snapshots))
+            saved = transform([leaves[i][2] for i in positions], snapshots, rows_np, slots_np)
+            for i, value in zip(positions, saved, strict=True):
+                store[i] = value
+        self._recurrent_snapshot_arrays = store
 
     def restore_recurrent_snapshots(self, rows: list[int], slots: list[int]) -> None:
         """Overwrite the recurrent state of physical rows ``rows`` with snapshot slots ``slots``.
@@ -2168,13 +2204,15 @@ class ExecutionManager:
         if not leaves:
             return
         store = self._recurrent_snapshot_store(leaves)
-        rows_dev, slots_dev = self._recurrent_snapshot_index_arrays(rows, slots, pad_rows=True)
-        pools = [array for _idx, _name, array in leaves]
-        transform = _jit_snapshot_restore(tuple(array.sharding for array in pools))
-        restored = transform(pools, store, rows_dev, slots_dev)
+        rows_np, slots_np = self._recurrent_snapshot_index_arrays(rows, slots, pad_rows=True)
         updates: dict[int, dict[str, jax.Array]] = {}
-        for (idx, name, _array), value in zip(leaves, restored, strict=True):
-            updates.setdefault(idx, {})[name] = value
+        for positions in _group_by_devices(leaves).values():
+            pools = [leaves[i][2] for i in positions]
+            transform = _jit_snapshot_restore(tuple(array.sharding for array in pools))
+            restored = transform(pools, [store[i] for i in positions], rows_np, slots_np)
+            for i, value in zip(positions, restored, strict=True):
+                idx, name, _array = leaves[i]
+                updates.setdefault(idx, {})[name] = value
         _replace_per_slot_leaves(views, updates)
         self.kv_pages = HybridCache(views=views)
 
@@ -2259,14 +2297,14 @@ class ExecutionManager:
             return gather, keep
 
         by_pool = _bucket_leaf_arrays(entries)
-        moved_by_pool: dict[int, list[jax.Array]] = {}
-        for n_slots, arrays in by_pool.items():
-            gk = _gather_keep(n_slots)
+        moved_by_pool: dict[tuple[int, tuple[int, ...]], list[jax.Array]] = {}
+        for key, arrays in by_pool.items():
+            gk = _gather_keep(key[0])
             if gk is None:
                 continue
             gather, keep = gk
             transform = _jit_permute_rows(tuple(array.sharding for array in arrays))
-            moved_by_pool[n_slots] = list(transform(arrays, jnp.asarray(gather, dtype=jnp.int32), jnp.asarray(keep)))
+            moved_by_pool[key] = list(transform(arrays, numpy.asarray(gather, dtype=numpy.int32), keep))
 
         changed = _write_back_leaf_results(new_views, entries, moved_by_pool) or changed
 

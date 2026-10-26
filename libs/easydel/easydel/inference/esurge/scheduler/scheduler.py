@@ -166,6 +166,7 @@ class Scheduler(SchedulerInterface):
         use_eagle: bool = False,
         include_finished_set: bool = False,
         recurrent_prefix_snapshot_slots: int = 0,
+        recurrent_prefix_snapshot_offset: int = 0,
     ) -> None:
         """Initialize the Scheduler.
 
@@ -193,6 +194,8 @@ class Scheduler(SchedulerInterface):
             include_finished_set: Track finished request IDs per client.
             recurrent_prefix_snapshot_slots: Number of recurrent-state snapshot slots backing prefix-cache hits
                 for linear-attention/SSM models; ``0`` means the model keeps no recurrent state.
+            recurrent_prefix_snapshot_offset: First global snapshot slot owned by this scheduler (DP ranks
+                each own a disjoint block of the runner's snapshot store).
 
         Raises:
             ValueError: For unknown scheduling policy or non-positive num_pages.
@@ -270,7 +273,7 @@ class Scheduler(SchedulerInterface):
             use_eagle=self.use_eagle,
         )
         self._recurrent_snapshots: RecurrentSnapshotIndex | None = (
-            RecurrentSnapshotIndex(int(recurrent_prefix_snapshot_slots))
+            RecurrentSnapshotIndex(int(recurrent_prefix_snapshot_slots), int(recurrent_prefix_snapshot_offset))
             if self.enable_prefix_caching and int(recurrent_prefix_snapshot_slots) > 0
             else None
         )
@@ -353,7 +356,7 @@ class Scheduler(SchedulerInterface):
             if recurrent_prefix_snapshot_slots <= 0:
                 logger.warning(
                     "Disabling prefix caching: recurrent-state prefix snapshots are unavailable for this runner "
-                    "(data/pipeline parallel, speculative decoding, or cache.recurrent_prefix_snapshots=0)."
+                    "(speculative decoding, compressed-window caches, or cache.recurrent_prefix_snapshots=0)."
                 )
                 enable_prefix_caching = False
 
@@ -405,6 +408,7 @@ class Scheduler(SchedulerInterface):
                 chunked_prefill_enabled=chunked_prefill_enabled,
                 token_safety_margin=token_safety_margin,
                 include_finished_set=include_finished_set,
+                recurrent_prefix_snapshot_slots=recurrent_prefix_snapshot_slots,
             )
 
         if async_scheduling:

@@ -35,10 +35,13 @@ class RecurrentSnapshotIndex:
     taken, the least recently used ready slot is recycled.
     """
 
-    def __init__(self, num_slots: int) -> None:
+    def __init__(self, num_slots: int, slot_offset: int = 0) -> None:
         if int(num_slots) <= 0:
             raise ValueError(f"num_slots must be positive, got {num_slots}")
+        if int(slot_offset) < 0:
+            raise ValueError(f"slot_offset must be >= 0, got {slot_offset}")
         self.num_slots = int(num_slots)
+        self.slot_offset = int(slot_offset)
         self.reset()
 
     def reset(self) -> None:
@@ -46,7 +49,7 @@ class RecurrentSnapshotIndex:
         self._ready: OrderedDict[typing.Hashable, int] = OrderedDict()
         self._pending: dict[int, typing.Hashable] = {}
         self._pending_keys: set[typing.Hashable] = set()
-        self._free: list[int] = list(range(self.num_slots - 1, -1, -1))
+        self._free: list[int] = list(range(self.slot_offset + self.num_slots - 1, self.slot_offset - 1, -1))
 
     def contains(self, key: typing.Hashable) -> bool:
         """Whether ``key`` is ready or about to be written."""

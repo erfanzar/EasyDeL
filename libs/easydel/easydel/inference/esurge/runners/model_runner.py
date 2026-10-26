@@ -748,16 +748,13 @@ class eSurgeRunner:
             self.executor_manager.set_main_hidden_enabled(True)
         self.log_it = logger.info if verbose else logger.debug
         self._setup_variables()
-        # Snapshots address the plain row-indexed recurrent pool; pooled-slot (DP / compressed-window), pipeline
+        # Snapshots cover row-indexed recurrent pools (plain and PP) and rank-major DP slot pools; compressed-window
         # and speculative-candidate layouts keep prefix caching off instead.
-        snapshots_supported = (
-            self._has_recurrent_layers
-            and not self.slot_pool.is_enabled()
-            and not self.pipeline_plan.is_enabled
-            and drafter is None
-        )
+        snapshots_supported = self._has_recurrent_layers and not self._slot_indexed_state and drafter is None
         self.recurrent_prefix_snapshot_slots = int(recurrent_prefix_snapshots) if snapshots_supported else 0
-        self.executor_manager.recurrent_snapshot_slots = self.recurrent_prefix_snapshot_slots
+        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+        # Each DP rank scheduler owns its own contiguous block of snapshot slots.
+        self.executor_manager.recurrent_snapshot_slots = self.recurrent_prefix_snapshot_slots * dp_size
         self.enable_overlap_execution = enable_overlap_execution
         self.enable_sampler_metrics = enable_sampler_metrics
 
@@ -896,7 +893,14 @@ class eSurgeRunner:
         rows: list[int] = []
         slots: list[int] = []
         for req_id, slot in by_req.items():
-            row = self.sequence_buffer.req_id_to_index.get(req_id)
+            if self.slot_pool.is_enabled():
+                if self.sequence_buffer.req_id_to_index.get(req_id) is None:
+                    continue
+                row = self.slot_pool.slot_by_req.get(str(req_id))
+                if row is None:
+                    row = self.slot_pool.assign_slot(str(req_id), self.slot_pool.dp_rank_by_req.get(str(req_id)))
+            else:
+                row = self.sequence_buffer.req_id_to_index.get(req_id)
             if row is not None:
                 rows.append(int(row))
                 slots.append(int(slot))
