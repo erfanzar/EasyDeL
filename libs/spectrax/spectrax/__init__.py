@@ -109,6 +109,7 @@ from .core.errors import (
     IllegalMutationError,
     LazyInitUnderTransformError,
     SelectorError,
+    ShardingError,
     SpecTraxError,
 )
 from .core.graph import (
@@ -264,6 +265,7 @@ __all__ = [
     "Selector",
     "SelectorError",
     "Sharding",
+    "ShardingError",
     "SpecTraxError",
     "SpxMesh",
     "State",

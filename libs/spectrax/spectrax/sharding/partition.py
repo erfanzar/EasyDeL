@@ -59,6 +59,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from .._internal.logging import get_logger
 from ..common_types import MODE_TRAIN, NOT_GIVEN
 from ..core._typing import Array, ArrayLike, Initializer
+from ..core.errors import ShardingError
 from ..core.module import Module
 from ..core.selector import select
 from ..core.sharding import AxisNames, Sharding, _resolve_axis_names, normalize_sharding
@@ -66,6 +67,7 @@ from ..core.stage_assignment import current_stage_assignment, metadata_stage_ass
 from ..core.variable import Variable
 from .logical import current_axis_rules
 from .mesh import SpxMesh
+from .strict import is_strict_sharding
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
@@ -76,6 +78,7 @@ logger = get_logger("spectrax-sharding")
 
 __all__ = [
     "apply_logical_sharding",
+    "explain_partition_spec_sanitization",
     "extract_sharding_structure",
     "extract_shardings",
     "get_axes_size_in_mesh",
@@ -729,6 +732,30 @@ def sanitize_partition_spec_for_mesh_and_shape(
         A :class:`PartitionSpec` safe to pass to ``with_sharding_constraint``
         on the resolved mesh.
     """
+    return explain_partition_spec_sanitization(spec, mesh=mesh, shape=shape)[0]
+
+
+def explain_partition_spec_sanitization(
+    spec: PartitionSpec | None,
+    *,
+    mesh: "Mesh | SpxMesh | MpMdMesh | None" = None,
+    shape: tuple[int, ...] | None = None,
+) -> tuple[PartitionSpec, tuple[str, ...]]:
+    """Sanitize ``spec`` like :func:`sanitize_partition_spec_for_mesh_and_shape` and report why.
+
+    Dropping the MPMD pipeline axis is by design and is not reported.
+
+    Args:
+        spec: Spec to sanitize, or ``None`` for fully replicated.
+        mesh: The target mesh (any SpectraX or JAX flavor).
+        shape: Optional value shape used for the divisibility check.
+
+    Returns:
+        ``(sanitized_spec, reasons)``. ``reasons`` describes every axis that was
+        removed because it is missing from the mesh, the spec rank exceeds the
+        value rank, or a dimension is not divisible. It is empty when the
+        requested sharding survived unchanged.
+    """
     if spec is None:
         spec = PartitionSpec()
     elif not isinstance(spec, PartitionSpec):
@@ -759,7 +786,7 @@ def sanitize_partition_spec_for_mesh_and_shape(
     if shape is not None and len(spec) > len(shape):
         reasons.append(f"spec rank {len(spec)} exceeds value rank {len(shape)}; collapsed to fully replicated")
         _brag_spec_change(requested, PartitionSpec(), shape, mesh, reasons)
-        return PartitionSpec()
+        return PartitionSpec(), tuple(reasons)
     if shape is not None:
         axes = list(tuple(spec))
         changed = False
@@ -775,10 +802,10 @@ def sanitize_partition_spec_for_mesh_and_shape(
         if changed:
             result = PartitionSpec(*axes)
             _brag_spec_change(requested, result, shape, mesh, reasons)
-            return result
+            return result, tuple(reasons)
     if reasons:
         _brag_spec_change(requested, spec, shape, mesh, reasons)
-    return spec
+    return spec, tuple(reasons)
 
 
 def _sharding_spec(sharding: object) -> PartitionSpec:
@@ -1089,12 +1116,21 @@ def with_sharding_constraint(
         stage_mesh=stage_mesh,
         metadata=metadata,
     )
+    strict = is_strict_sharding()
     if unresolved_mpmd:
+        if strict:
+            raise ShardingError(
+                "with_sharding_constraint could not resolve the MPMD stage for a value of shape "
+                f"{tuple(getattr(arr, 'shape', ()))} on a "
+                f"{mpmd_mesh.mpmd_dim if mpmd_mesh is not None else '?'}-stage mesh. Pass stage= or stage_mesh=, "
+                "create the variable under assign_stage(...), or pass ignore_mpmd=True to skip the constraint."
+            )
         return arr
 
     sanitize_mesh = mpmd_mesh if mpmd_mesh is not None else target_mesh
-    spec = sanitize_partition_spec_for_mesh_and_shape(
-        _sharding_spec(sharding),
+    requested = _sharding_spec(sharding)
+    spec, reasons = explain_partition_spec_sanitization(
+        requested,
         mesh=sanitize_mesh,
         shape=tuple(getattr(arr, "shape", ())),
     )
@@ -1102,19 +1138,27 @@ def with_sharding_constraint(
     if target_mesh is None:
         constraint = spec
     else:
-        spec = sanitize_partition_spec_for_mesh_and_shape(
+        spec, stage_reasons = explain_partition_spec_sanitization(
             spec,
             mesh=target_mesh,
             shape=tuple(getattr(arr, "shape", ())),
         )
+        reasons = reasons + stage_reasons
         constraint = NamedSharding(target_mesh, spec)
         memory_kind = getattr(sharding, "memory_kind", None) if isinstance(sharding, NamedSharding) else None
         if memory_kind is not None and hasattr(constraint, "with_memory_kind"):
             constraint = constraint.with_memory_kind(memory_kind)
+    if strict and reasons:
+        raise ShardingError(
+            f"with_sharding_constraint: {requested} for shape {tuple(getattr(arr, 'shape', ()))} would be "
+            f"applied as {spec}: {'; '.join(reasons)}"
+        )
     try:
         return jax.lax.with_sharding_constraint(arr, constraint)
     except RuntimeError as exc:
         if "requires a non-empty mesh" in str(exc):
+            if strict:
+                raise ShardingError(f"with_sharding_constraint has no mesh to constrain on: {exc}") from exc
             return arr
         raise
 
