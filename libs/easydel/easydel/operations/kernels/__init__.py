@@ -61,6 +61,9 @@ State Space Model Operations:
     SSM2Op: Mamba-2 style state space layer with SSD kernel.
         Improved state space model with structured state decay.
 
+    packed_ssm1_fwd, packed_ssm2_fwd: Packed selective state-space scans.
+        Advance independent request slots while preserving state across padding.
+
     GatedDeltaRuleOp: Gated Delta Rule linear attention.
         Recurrent linear attention for hybrid transformer architectures.
 
@@ -110,12 +113,15 @@ from .blocksparse_attention import BlockSparseAttn
 from .compressed_window_attention import CompressedWindowAttn
 from .compressed_window_decode import CompressedWindowDecodeAttn
 from .decode_attention import AutoRegressiveDecodeAttn
+from .dsa_pool_sparse_attention import DsaPoolSparseAttn
 from .flash_attention import FlashAttn
 from .fused_mlp import FusedMlpOp
 from .gated_delta_rule import GatedDeltaRuleOp, GatedDeltaRuleOutput
 from .gated_pool_compress import GatedPoolCompressOp, GatedPoolCompressOutput, gated_pool_compress_op
 from .gdn_compute_schedule_v2 import GDNComputeScheduleV2, GDNComputeScheduleV2Config, compute_schedule_table_v2
 from .glm_moe_dsa_indexer import GlmMoeDsaIndexerOp, GlmMoeDsaIndexerOutput
+from .indexer_distill import IndexerDistillKLOp, IndexerDistillKLOutput, LazyIndexerScores, indexer_distill_kl_op
+from .indexer_scores import IndexerScoresOp, IndexerScoresOutput, indexer_scores_op
 from .inference_conv1d import (
     RaggedCausalConv1D,
     ragged_causal_conv1d,
@@ -129,8 +135,8 @@ from .paged_flash_attention import PagedFlashAttn
 from .ragged_page_attention import RaggedPageAttnV2, RaggedPageAttnV3
 from .ring_attention import RingAttn
 from .scaled_dot_product_attention import ScaledDotProductAttn
-from .ssm1 import SSM1Op, SSM1Output
-from .ssm2 import SSM2Op, SSM2Output
+from .ssm1 import SSM1Op, SSM1Output, packed_ssm1_fwd
+from .ssm2 import SSM2Op, SSM2Output, packed_ssm2_fwd
 from .unified_attention import UnifiedAttn
 from .vanilla_attention import VanillaAttn
 
@@ -139,6 +145,7 @@ __all__ = (
     "BlockSparseAttn",
     "CompressedWindowAttn",
     "CompressedWindowDecodeAttn",
+    "DsaPoolSparseAttn",
     "FlashAttn",
     "FusedMlpOp",
     "GDNComputeScheduleV2",
@@ -149,8 +156,13 @@ __all__ = (
     "GatedPoolCompressOutput",
     "GlmMoeDsaIndexerOp",
     "GlmMoeDsaIndexerOutput",
+    "IndexerDistillKLOp",
+    "IndexerDistillKLOutput",
+    "IndexerScoresOp",
+    "IndexerScoresOutput",
     "KDAOutput",
     "KernelDeltaAttnOp",
+    "LazyIndexerScores",
     "MultiLatentRaggedPageAttn",
     "PagedFlashAttn",
     "RaggedCausalConv1D",
@@ -168,7 +180,11 @@ __all__ = (
     "compute_schedule_table_v2",
     "fused_kda_gate",
     "gated_pool_compress_op",
+    "indexer_distill_kl_op",
+    "indexer_scores_op",
     "kda_packed_rows_forward",
+    "packed_ssm1_fwd",
+    "packed_ssm2_fwd",
     "ragged_causal_conv1d",
     "ragged_causal_conv1d_head_sharded",
     "reorder_conv_features_for_sharding",

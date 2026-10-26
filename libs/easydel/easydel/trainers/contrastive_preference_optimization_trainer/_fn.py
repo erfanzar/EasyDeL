@@ -38,8 +38,7 @@ from easydel.trainers._logprob_utils import (
     compute_token_logps_and_entropies_chunked,
     resolve_lmhead_chunksize,
 )
-from easydel.trainers._shared import apply_paired_truncation, gather_multimodal_kwargs
-from easydel.trainers.direct_preference_optimization_trainer._fn import concatenated_inputs
+from easydel.trainers._shared import apply_paired_truncation, concatenated_inputs, gather_multimodal_kwargs
 
 from ..training_utils import (
     ScheduledLossAdapter,

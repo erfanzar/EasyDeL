@@ -99,6 +99,8 @@ import collections
 import typing as tp
 from dataclasses import fields, is_dataclass
 
+import jax
+import numpy as np
 from eformer.pytree import auto_pytree
 from jax.core import Tracer
 from jaxtyping import Array
@@ -111,26 +113,22 @@ else:
 
 
 def _is_array(array):
-    """Check if an object is a JAX array or tracer.
+    """Check if an object is an array the output dataclass must keep whole.
 
-    This function is used internally to detect JAX arrays and tracers
-    during output validation. Tracers are returned during JAX
-    transformations like jit and grad.
+    ``ModelOutput.__post_init__`` treats a lone first field that is not an array as a generic
+    iterable of ``(key, value)`` pairs and calls ``iter()`` on it. A concrete ``jax.Array`` must
+    never take that path: JAX's array iterator requires the array to be fully replicated or fully
+    addressable, which a sharded output on a multi-process mesh cannot satisfy, and on a single
+    process it slices every row of the output for nothing. An empty array would also be silently
+    dropped from the output.
 
     Args:
         array: The object to check.
 
     Returns:
-        bool: True if the object is a JAX Tracer, False otherwise.
-
-    Note:
-        This function currently only checks for Tracer instances.
-        Regular JAX arrays (DeviceArray) return False, which may be
-        intentional for the validation logic in ModelOutput.__post_init__.
+        bool: True for JAX tracers, concrete JAX arrays and NumPy arrays, False otherwise.
     """
-    if isinstance(array, Tracer):
-        return True
-    return False
+    return isinstance(array, (Tracer, jax.Array, np.ndarray))
 
 
 class ModelOutput(collections.OrderedDict):
@@ -191,6 +189,7 @@ class ModelOutput(collections.OrderedDict):
                 f"{self.__module__}.{self.__class__.__name__} is not a dataclasss."
                 " This is a subclass of ModelOutput and so must use the @auto_pytree decorator."
             )
+        super().__setattr__("_model_output_initialized", True)
 
     def to_tuple(self) -> tuple[tp.Any]:
         """Convert the output to a tuple containing all non-None values.
@@ -268,6 +267,7 @@ class ModelOutput(collections.OrderedDict):
                 v = getattr(self, field.name)
                 if v is not None:
                     self[field.name] = v
+        super().__setattr__("_model_output_initialized", True)
 
     def __delitem__(self, *args, **kwargs):
         """Prevent item deletion to maintain output immutability.
@@ -353,10 +353,27 @@ class ModelOutput(collections.OrderedDict):
             name: The attribute name.
             value: The value to set.
         """
-        if name in self.keys() and value is not None:
-            # Don't call self.__setitem__ to avoid recursion errors
-            super().__setitem__(name, value)
         super().__setattr__(name, value)
+        declared = getattr(type(self), "__dataclass_fields__", {})
+        if getattr(self, "_model_output_initialized", False) and (name in declared or name in self):
+            self._sync_output_field(name, value)
+
+    def _sync_output_field(self, name, value):
+        """Preserve constructor order; sort declared fields on later mutation."""
+        if value is None:
+            if name in self:
+                collections.OrderedDict.__delitem__(self, name)
+        else:
+            collections.OrderedDict.__setitem__(self, name, value)
+        # Pair/dict initialization follows the caller's insertion order, while
+        # subsequent assignments retain declaration-order field synchronization.
+        if not getattr(self, "_model_output_initialized", False):
+            return
+        declared = getattr(type(self), "__dataclass_fields__", {})
+        extras = [key for key in self if key not in declared]
+        for key in (*declared, *extras):
+            if key in self:
+                collections.OrderedDict.move_to_end(self, key)
 
     def __setitem__(self, key, value):
         """Set an item and sync with attributes.
@@ -371,9 +388,8 @@ class ModelOutput(collections.OrderedDict):
         Raises:
             KeyError: If the key is not a valid field name.
         """
-        # Will raise a KeyException if needed
-        super().__setitem__(key, value)
-        # Don't call self.__setattr__ to avoid recursion errors
+        self._sync_output_field(key, value)
+        # Don't call self.__setattr__ to avoid recursion errors.
         super().__setattr__(key, value)
 
     def __reduce__(self):
@@ -1370,6 +1386,10 @@ class MoeModelOutput(ModelOutput):
     all_router_losses: tuple[Array] | None = None
     logits: Array = None
     loss: Array | None = None
+    indexer_aux_loss: Array | None = None
+    """Unscaled sum over layers of the sparse-attention indexer warm-up KL
+    (:func:`easydel.layers.indexer.indexer_distillation_loss`); set only by backbones whose config enables
+    ``indexer_aux_loss_coef > 0`` on a stateless forward, ``None`` otherwise."""
 
 
 @auto_pytree
@@ -1414,6 +1434,8 @@ class MoeCausalLMOutput(MaskedLMOutput):
     supervise the MTP head without recomputing the (large-vocab) projection."""
     mtp_loss: Array | None = None
     """Scaled MTP training loss before it is folded into ``aux_loss``."""
+    indexer_aux_loss: Array | None = None
+    """Unscaled indexer warm-up loss; ``indexer_aux_loss_coef`` times it is folded into ``aux_loss``."""
 
 
 @auto_pytree
@@ -1475,6 +1497,8 @@ class VLMCausalLMOutput(ModelOutput):
     the field on :class:`MoeCausalLMOutput` so the shared MTP code path is uniform."""
     mtp_loss: Array | None = None
     """Scaled MTP training loss before it is folded into ``aux_loss``."""
+    indexer_aux_loss: Array | None = None
+    """Unscaled indexer warm-up loss; ``indexer_aux_loss_coef`` times it is folded into ``aux_loss``."""
 
 
 @auto_pytree
@@ -1578,9 +1602,9 @@ class CLIPTextModelOutput(ModelOutput):
 class ImageClassifierOutput(ModelOutput):
     """Output class for image classification models.
 
-    Contains embeddings and hidden states for image classification tasks.
-    Despite the name similarity to ImageClassifierOutputWithNoAttention,
-    this class includes attention weights.
+    Contains classification scores, optional supervised loss, embeddings,
+    hidden states, and attention weights for image classification tasks.
+    The legacy embedding fields keep their positional order for compatibility.
 
     Attributes:
         text_embeds: The embeddings obtained by applying the projection layer
@@ -1594,6 +1618,9 @@ class ImageClassifierOutput(ModelOutput):
             one for the output of each layer). Shape varies by architecture.
         attentions: Tuple of Arrays (one for each layer). Shape of each:
             (batch_size, num_heads, sequence_length, sequence_length).
+        logits: Classification or regression scores before normalization.
+            Shape: (batch_size, config.num_labels).
+        loss: Optional scalar supervised loss when labels are provided.
 
     Example:
         >>> output = ImageClassifierOutput(
@@ -1606,6 +1633,8 @@ class ImageClassifierOutput(ModelOutput):
     last_hidden_state: Array = None
     hidden_states: tuple[Array, ...] | None = None
     attentions: tuple[Array, ...] | None = None
+    logits: Array | None = None
+    loss: Array | None = None
 
 
 @auto_pytree

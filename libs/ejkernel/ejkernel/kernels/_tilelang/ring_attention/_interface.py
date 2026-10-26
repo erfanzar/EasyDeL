@@ -19,8 +19,10 @@ distributed mesh axis. The single-device path (``axis_name is None``)
 reduces exactly to FlashAttention and forwards onto the feature-complete
 tile-lang FA kernels with every score-space argument applied natively
 (segment ids, bias, sliding window, soft cap, attention sinks). The
-multi-device ring (``axis_name`` set) and the opaque ``mask_builder``
+native multi-device ring (``axis_name`` set) and the opaque ``mask_builder``
 callback are gated with explicit errors rather than silently ignored.
+Non-default contraction precision delegates to the registered XLA ring
+implementation before native capability checks.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from typing import Any
 
 import jaxtyping
 from beartype import beartype
+from jax import lax
 from jaxtyping import Array, Float, Int
 
 from ejkernel.errors import EjkernelRuntimeError
@@ -51,8 +54,8 @@ def ring_attention(
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
     q_position_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_position_ids: Int[Array, "batch seq_len_k"] | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
-    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "sink_heads num_sinks"] | None = None,
+    bias: Float[Array, "bias_batch bias_heads bias_seq_len_q bias_seq_len_k"] | None = None,
     mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     chunk_size: int | None = None,
@@ -63,6 +66,7 @@ def ring_attention(
     fwd_params: FwdParams | None = None,
     bwd_params: BwdParams | None = None,
     fused_backward: bool = False,
+    precision: lax.PrecisionLike = lax.Precision.DEFAULT,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Single-device tile-lang ring-attention (forward + backward).
 
@@ -71,14 +75,40 @@ def ring_attention(
     already fully fused and the backward is always the split dQ/dKdV design,
     so they impose no behaviour change. Causal / sliding-window masking is by
     sequence position; ``q_position_ids`` / ``kv_position_ids`` participate
-    through that ordering.
+    through that ordering. Explicit non-default ``precision`` uses the
+    registered XLA ring implementation, which honors contraction precision
+    and accepts broadcast bias and shared or per-head attention sinks.
+    ``Precision.DEFAULT`` (or ``"default"``) preserves the native TileLang path.
 
     Raises:
-        EjkernelRuntimeError: if ``axis_name`` is set (multi-device ring
-            coordination is not yet bridged through TVM-FFI) or if
-            ``mask_builder`` is supplied (pass an explicit ``bias`` /
-            segment ids instead of an opaque callback).
+        EjkernelRuntimeError: on the native DEFAULT-precision path if
+            ``axis_name`` is set (multi-device ring coordination is not yet
+            bridged through TVM-FFI) or if ``mask_builder`` is supplied (pass
+            an explicit ``bias`` / segment ids instead of an opaque callback).
     """
+    if precision not in (lax.Precision.DEFAULT, "default"):
+        return kernel_registry.get("ring_attention", platform=Platform.XLA, backend=Backend.ANY)(
+            query=query,
+            key=key,
+            value=value,
+            q_segment_ids=q_segment_ids,
+            kv_segment_ids=kv_segment_ids,
+            q_position_ids=q_position_ids,
+            kv_position_ids=kv_position_ids,
+            softmax_aux=softmax_aux,
+            bias=bias,
+            mask_builder=mask_builder,
+            sliding_window=sliding_window,
+            chunk_size=chunk_size,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            softmax_scale=softmax_scale,
+            axis_name=axis_name,
+            fwd_params=fwd_params,
+            bwd_params=bwd_params,
+            fused_backward=fused_backward,
+            precision=precision,
+        )
     if axis_name is not None:
         raise EjkernelRuntimeError(
             "tile-lang ring_attention: multi-device ring coordination (axis_name) is not "

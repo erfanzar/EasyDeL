@@ -42,6 +42,7 @@ a router in front (``RoutedEngine``) simply stops picking this handle.
 
 from __future__ import annotations
 
+import copy
 import queue
 import threading
 import time
@@ -51,6 +52,7 @@ import uuid
 from easydel.inference.sampling_params import SamplingParams
 from easydel.workers.esurge.pipeline import WorkerManager
 
+from ..config import eSurgeContextConfig
 from ..engine.admission import RequestAdmission
 from ..engine.output_pipeline import OutputPipeline
 from ..engine.registry import RequestRegistry
@@ -381,7 +383,7 @@ class RemoteEngineHandle:
             scheduler_submit=self._plane.submit_remote,
             tokenizer_client=self._tokenizer_client,
             tokenizer=self.tokenizer,
-            context_config=_HandleContextConfig(),
+            context_config=eSurgeContextConfig.coerce_config(None),
             reserve_tokens=int(spec.reserve_tokens),
             max_model_len=int(spec.max_model_len),
             tool_parser_class=None,
@@ -591,6 +593,8 @@ class RemoteEngineHandle:
                                     index=completion.index,
                                     text=completion.text,
                                     token_ids=list(completion.token_ids),
+                                    logprobs=copy.deepcopy(completion.logprobs),
+                                    cumulative_logprob=completion.cumulative_logprob,
                                     finish_reason=completion.finish_reason,
                                     raw_text=completion.raw_text,
                                 )
@@ -690,8 +694,9 @@ class RemoteEngineHandle:
         request_id: str | None = None,
         chat_template: str | None = None,
         chat_template_kwargs: dict | None = None,
+        usage_callback: typing.Callable[[int, int], None] | None = None,
     ):
-        """Bridge :meth:`chat` snapshots into OpenAI chat-completion chunks."""
+        """Bridge chat snapshots into chunks, reporting cumulative usage before deltas."""
         from ...stream_protocol import iter_chat_completion_stream_responses
 
         outputs = self.chat(
@@ -704,7 +709,7 @@ class RemoteEngineHandle:
             chat_template=chat_template,
             chat_template_kwargs=chat_template_kwargs,
         )
-        yield from iter_chat_completion_stream_responses(outputs, model=model)
+        yield from iter_chat_completion_stream_responses(outputs, model=model, usage_callback=usage_callback)
 
     def iter_responses_stream(
         self,
@@ -721,8 +726,9 @@ class RemoteEngineHandle:
         created_at: int | None = None,
         chat_template: str | None = None,
         chat_template_kwargs: dict | None = None,
+        usage_callback: typing.Callable[[int, int], None] | None = None,
     ):
-        """Bridge :meth:`chat` snapshots into OpenAI Responses-API frames."""
+        """Bridge chat snapshots into Responses frames with cumulative usage progress."""
         from ...stream_protocol import iter_responses_stream_frames
 
         outputs = self.chat(
@@ -742,27 +748,44 @@ class RemoteEngineHandle:
             include_reasoning_summary=include_reasoning_summary,
             final_response_overrides=final_response_overrides,
             created_at=created_at,
+            usage_callback=usage_callback,
         )
 
     def abort_request(self, request_id: str) -> None:
         """Cancel a request: notify the owner, render the abort locally."""
         self._plane.notify_abort(request_id)
         with self._registry.request_lock, self._registry.output_lock:
+            record = self._registry.records.get(request_id)
+            parent_id = (record.parent_request_id or request_id) if record is not None else request_id
+            sample_index = int(record.sample_index or 0) if record is not None and request_id != parent_id else 0
             child_ids = [
                 rid
-                for rid, record in self._registry.records.items()
-                if rid == request_id or record.parent_request_id == request_id
+                for rid, child_record in self._registry.records.items()
+                if rid == request_id or child_record.parent_request_id == request_id
             ]
             for rid in child_ids:
                 self._registry.records.pop(rid, None)
-            output = self._registry.outputs.get(request_id)
+                if rid != parent_id:
+                    self._registry.events.pop(rid, None)
+            output = self._registry.outputs.get(parent_id)
             if output is not None and not output.finished:
-                output.finished = True
-                for completion in output.outputs:
+                completions = (
+                    output.outputs if request_id == parent_id else output.outputs[sample_index : sample_index + 1]
+                )
+                changed = False
+                for completion in completions:
                     if completion.finish_reason is None:
                         completion.finish_reason = "abort"
-                output.update_seq += 1
-        self._registry.signal(request_id)
+                        changed = True
+                output.finished = all(completion.finish_reason is not None for completion in output.outputs)
+                if changed:
+                    output.update_seq += 1
+        for rid in child_ids:
+            try:
+                self._detokenizer_client.reset(rid)
+            except Exception:
+                logger.debug("Failed to reset detokenizer state for %s", rid, exc_info=True)
+        self._registry.signal(parent_id)
 
     def close(self) -> None:
         """Tear down the transport, pipeline, and tokenizer workers."""
@@ -772,14 +795,3 @@ class RemoteEngineHandle:
             self._worker_manager.shutdown()
         except Exception:
             logger.debug("Remote engine handle worker shutdown failed", exc_info=True)
-
-
-class _HandleContextConfig:
-    """Default context policy for remote admissions (mirrors engine defaults)."""
-
-    auto_truncate_prompt = True
-    strict_context = False
-    truncate_mode = "left"
-    prefer_preserve_prompt = True
-    auto_cap_new_tokens = True
-    decode_truncated_prompt = False

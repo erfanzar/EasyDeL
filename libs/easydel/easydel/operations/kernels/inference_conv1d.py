@@ -47,8 +47,8 @@ from ejkernel.modules.operations import (
     ragged_causal_conv1d_head_sharded,
     ragged_causal_conv1d_op,
 )
-from ejkernel.modules.operations.ragged_causal_conv1d import (
-    _reorder_concatenated_tensor_for_sharding,
+from ejkernel.modules.operations import (
+    reorder_conv_features_for_sharding as _ejkernel_reorder_conv_features_for_sharding,
 )
 
 from .._operation_impl import OperationImpl, OperationRegistry
@@ -84,7 +84,7 @@ def reorder_conv_features_for_sharding(
     Returns:
         ``x`` with ``dim`` reordered to ``[A0 | B0 | C0 | A1 | B1 | C1 | ...]``.
     """
-    return _reorder_concatenated_tensor_for_sharding(x, tuple(split_sizes), int(n_shards), dim)
+    return _ejkernel_reorder_conv_features_for_sharding(x, tuple(split_sizes), int(n_shards), dim)
 
 
 @OperationRegistry.register

@@ -97,7 +97,7 @@ import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.paths import ePath
 
-from ._configs import DEFAULT_QUANTIZATION_PATTERN, QuantizationConfig, QuantizationType
+from ._configs import QuantizationConfig, QuantizationType, resolve_ejkernel_quant_params
 
 if tp.TYPE_CHECKING:
     from easydel.infra.base_module import EasyDeLBaseModule
@@ -150,9 +150,8 @@ def quantization_config_to_rule(
 
     Lets one configuration describe both halves of a quantized model's
     life: the discretization a run trains against, and the discretization
-    the checkpoint is later served with. The mapping is weight-only,
-    because a :class:`QuantizationConfig` describes stored weights and
-    says nothing about activations.
+    the checkpoint is later served with. Explicit W*A* presets also select
+    activation quantization; A16 and auto retain weight-only training.
 
     Args:
         config: The post-training quantization configuration.
@@ -165,20 +164,11 @@ def quantization_config_to_rule(
     Raises:
         ValueError: If ``config.dtype`` has no training-time equivalent.
     """
-    group_size = config.group_size
     dtype = config.dtype
-
-    if dtype in (QuantizationType.INT8, QuantizationType.CHANNELWISE):
-        # Channelwise is one scale per output channel over the whole
-        # contraction, which is what "no subchannel tiling" means here.
-        weight_qtype: spx.quantization.QType = "int8" if (config.bits or 8) == 8 else "int4"
+    if dtype in (QuantizationType.INT8, QuantizationType.CHANNELWISE, QuantizationType.AFFINE, QuantizationType.NF4):
+        _, group_size, bits, _ = resolve_ejkernel_quant_params(config)
+        weight_qtype = "nf4" if dtype is QuantizationType.NF4 else spx.quantization.resolve_qtype(bits)
         tile_size = None if dtype is QuantizationType.CHANNELWISE else group_size
-    elif dtype is QuantizationType.AFFINE:
-        weight_qtype = spx.quantization.resolve_qtype(config.bits or 8)
-        tile_size = group_size
-    elif dtype is QuantizationType.NF4:
-        weight_qtype = "nf4"
-        tile_size = group_size
     else:
         raise ValueError(
             f"{dtype} has no quantized-training equivalent in the rule schema. "
@@ -190,7 +180,13 @@ def quantization_config_to_rule(
         module_path=module_path,
         op_names=tuple(op_names),
         weight_qtype=weight_qtype,
+        act_qtype=(
+            spx.quantization.resolve_qtype(config.activation_bits)
+            if config.activation_policy == "explicit" and config.activation_bits in (4, 8)
+            else None
+        ),
         tile_size=tile_size,
+        weight_calibration_method=("affine" if dtype in (QuantizationType.AFFINE, QuantizationType.INT8) else "absmax"),
     )
 
 
@@ -373,18 +369,3 @@ def apply_quantization_rules(
         f"Master weights stay full precision either way, so this does not reduce parameter memory."
     )
     return model
-
-
-def _default_pattern_matches_post_training() -> bool:
-    """Report whether the training and serving default patterns agree.
-
-    Both defaults are meant to exclude the same layers; this is the
-    assertion behind that claim, kept as a function so the test suite can
-    check it rather than trusting the comment.
-
-    Returns:
-        ``True`` when both patterns exclude embeddings, norms and the
-        language-model head.
-    """
-    excluded = ("embedding", "norm", "lm_head")
-    return all(term in DEFAULT_QUANTIZATION_PATTERN for term in excluded)

@@ -67,8 +67,10 @@ class QArray:
         scale: The per-tile scale. Same rank as ``qvalue``; each axis
             either equals, is one, or divides the matching ``qvalue`` axis.
         zero_point: The quantized value representing exact floating-point
-            zero, or ``None`` for symmetric quantization. Same shape and
-            dtype rules as ``scale``/``qvalue`` respectively.
+            zero, or ``None`` for symmetric quantization. Its axes must
+            divide the corresponding ``qvalue`` axes, as for ``scale``.
+            Usually has ``qvalue``'s dtype; exact-affine unsigned integer
+            codes instead carry an unrounded floating-point zero point.
         qtype: The *logical* type of ``qvalue``, which may differ from
             ``qvalue.dtype`` — a 3-bit value is stored in an ``int4``
             element, and an ``"nf4"`` value in a ``uint4`` element.
@@ -211,7 +213,8 @@ def validate_qarray(array: QArray) -> None:
             scale or zero-point axis does not divide the matching value
             axis, if the quantized values are wider than one byte, if the
             scale is not a floating-point type, or if the zero point's
-            dtype does not match the quantized values'.
+            dtype does not match the quantized values' (except floating
+            zero points paired with unsigned exact-affine integer codes).
     """
     if not isinstance(array.qvalue, jax.Array | jnp.ndarray):
         return
@@ -238,8 +241,14 @@ def validate_qarray(array: QArray) -> None:
             raise ValueError(
                 f"zero_point {array.zero_point.shape} is not generic-broadcastable to qvalue {array.qvalue.shape}."
             )
-        if array.zero_point.dtype != array.qvalue.dtype:
-            raise ValueError(f"zero_point dtype {array.zero_point.dtype} must match qvalue dtype {array.qvalue.dtype}.")
+        exact_affine = jnp.issubdtype(array.qvalue.dtype, jnp.unsignedinteger) and jnp.issubdtype(
+            array.zero_point.dtype, jnp.floating
+        )
+        if array.zero_point.dtype != array.qvalue.dtype and not exact_affine:
+            raise ValueError(
+                f"zero_point dtype {array.zero_point.dtype} must match qvalue dtype {array.qvalue.dtype}, "
+                "or be floating point for unsigned exact-affine codes."
+            )
 
 
 def resolve_tile_size(dim: int, tile_size: int | float) -> int:

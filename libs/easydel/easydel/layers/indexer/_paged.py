@@ -52,6 +52,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.layers.compressed_window import packed_row_of_token
+from easydel.layers.rotary import apply_rope_interleaved, apply_rope_split_half
 
 if tp.TYPE_CHECKING:
     from ._indexer import SparseIndexer
@@ -60,6 +61,21 @@ if tp.TYPE_CHECKING:
 
 def _identity(x: jax.Array) -> jax.Array:
     return x
+
+
+def _token_rope_interleaved(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
+    """Interleaved (even/odd pair) RoPE with half-width ``cos`` / ``sin`` of shape ``[batch, seq, rope_dim // 2]``.
+
+    The tables gain a head axis so they broadcast over ``x`` of shape ``[batch, seq, ..., rope_dim]``.
+    """
+    return apply_rope_interleaved(x, cos[..., None, :], sin[..., None, :])
+
+
+def _token_rope_split(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
+    """Split-half (NeoX) RoPE with half-width ``cos`` / ``sin`` of shape ``[batch, seq, rope_dim // 2]``."""
+    cos = jnp.concatenate([cos, cos], axis=-1)
+    sin = jnp.concatenate([sin, sin], axis=-1)
+    return apply_rope_split_half(x, cos, sin, unsqueeze_dim=-2, compute_dtype=None)
 
 
 def _paged_pool_topk_impl(platform: str):
@@ -1031,7 +1047,6 @@ def paged_token_select(
         ValueError: On a page layout that does not match the indexer, or rank-major metadata
             without a usable ``dp_sharding``.
     """
-    op = indexer.indexer_op
     heads, dim = int(indexer.index_n_heads), int(indexer.index_head_dim)
     num_pages, _page_size, key_dim = token_pages.shape
     if key_dim != dim:
@@ -1053,7 +1068,7 @@ def paged_token_select(
         freq = jnp.asarray(freq)
         rope_dim = min(int(indexer.indexer_config.rope_dim), dim, (int(freq.shape[-1]) // 2) * 2)
         rope_dim -= rope_dim % 2
-        rope_fn = op._apply_rope_interleaved if indexer.indexer_rope_interleave else op._apply_rope_split
+        rope_fn = _token_rope_interleaved if indexer.indexer_rope_interleave else _token_rope_split
 
     core = functools.partial(
         _token_select_core,

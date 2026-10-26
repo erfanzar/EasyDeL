@@ -112,6 +112,11 @@ class DeepseekV4Config(EasyDeLBaseConfig):
         index_n_heads: Lightning Indexer query head count.
         index_head_dim: Lightning Indexer head dimension.
         index_topk: Compressed entries kept per query by the indexer.
+        indexer_aux_loss_coef: Non-negative coefficient for the CSA indexer KL
+            warm-up objective (stateless forward only). Positive values train
+            only the indexer against detached dense attention targets and
+            disable its LM-loss straight-through selection gradient. The
+            default ``0.0`` preserves the existing forward and STE path.
         num_nextn_predict_layers: MTP layer count in upstream checkpoints
             (never instantiated here; ``mtp.*`` keys are ignored).
         output_router_logits: Whether forward returns router logits.
@@ -244,6 +249,7 @@ class DeepseekV4Config(EasyDeLBaseConfig):
         compress_rate_hca: int | None = None,
         num_hash_layers: int | None = None,
         qk_rope_head_dim: int | None = None,
+        indexer_aux_loss_coef: float = 0.0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -274,6 +280,9 @@ class DeepseekV4Config(EasyDeLBaseConfig):
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
         self.index_topk = index_topk
+        self.indexer_aux_loss_coef = float(indexer_aux_loss_coef)
+        if not self.indexer_aux_loss_coef >= 0.0:
+            raise ValueError(f"indexer_aux_loss_coef must be >= 0; got {indexer_aux_loss_coef}.")
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
@@ -351,7 +360,7 @@ class DeepseekV4Config(EasyDeLBaseConfig):
         # Keep a private, normalization-proof copy: EasyDeLBaseConfig.__setattr__
         # rope backfilling treats non-layer-type-keyed dicts as flat and may add
         # top-level keys to `rope_parameters`; the modeling code reads through
-        # `v4_rope_params()` which prefers this private copy.
+        # `rope_parameters_for_label()` which prefers this private copy.
         self._v4_rope_parameters = {k: dict(v) for k, v in rope_parameters.items()}
         self.rope_parameters = rope_parameters
 
@@ -448,6 +457,7 @@ class DeepseekV4Config(EasyDeLBaseConfig):
             return sub
         raise KeyError(f"DeepSeek-V4 rope parameters for label {label!r} not found.")
 
+    # Alias for external callers (same as on ``DeepseekV41Config``).
     v4_rope_params = rope_parameters_for_label
 
 

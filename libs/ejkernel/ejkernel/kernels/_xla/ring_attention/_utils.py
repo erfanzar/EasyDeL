@@ -42,6 +42,10 @@ def _chunk_attention_bias(
     key_chunk_idx: int,
     sliding_window: int | tuple[int, int] | None = None,
     attention_sink_size: int = 0,
+    query_local_chunk_idx: int | None = None,
+    key_local_chunk_idx: int | None = None,
+    bias_query_chunk_idx: int | None = None,
+    bias_key_chunk_idx: int | None = None,
 ):
     """Compute the additive attention bias for one query-chunk × KV-chunk pair.
 
@@ -92,6 +96,16 @@ def _chunk_attention_bias(
             window.  None = no sliding-window mask.
         attention_sink_size: Number of initial KV tokens that are always
             attended to (exempt from the sliding-window mask).  0 = disabled.
+        query_local_chunk_idx: Query chunk index within this device's shard,
+            used to slice segment IDs, explicit positions, and dropout. Defaults
+            to query_chunk_idx for callers using full-sequence metadata.
+        key_local_chunk_idx: KV chunk index within the currently circulating
+            shard. Defaults to key_chunk_idx.
+        bias_query_chunk_idx: Query chunk index in the additive bias layout,
+            independent of metadata and positional offsets. Defaults to
+            query_chunk_idx.
+        bias_key_chunk_idx: KV chunk index in the additive bias layout.
+            Defaults to key_chunk_idx.
 
     Returns:
         Additive attention bias for this chunk, shape broadcastable to
@@ -99,13 +113,17 @@ def _chunk_attention_bias(
     """
     query_offset = query_chunk_idx * query_chunk_size
     key_offset = key_chunk_idx * key_chunk_size
+    query_local_offset = query_offset if query_local_chunk_idx is None else query_local_chunk_idx * query_chunk_size
+    key_local_offset = key_offset if key_local_chunk_idx is None else key_local_chunk_idx * key_chunk_size
+    bias_query_offset = query_offset if bias_query_chunk_idx is None else bias_query_chunk_idx * query_chunk_size
+    bias_key_offset = key_offset if bias_key_chunk_idx is None else bias_key_chunk_idx * key_chunk_size
     chunk_bias = jnp.zeros((1, 1, 1, 1), dtype=dtype)
     neg_inf = jnp.array(-jnp.inf, dtype=dtype)
     zero = jnp.array(0.0, dtype=dtype)
     if bias is not None:
         chunk_bias = lax.dynamic_slice(
             bias,
-            start_indices=(0, 0, query_offset, key_offset),
+            start_indices=(0, 0, bias_query_offset, bias_key_offset),
             slice_sizes=(
                 *bias.shape[:2],
                 min(bias.shape[-2], query_chunk_size),
@@ -116,12 +134,12 @@ def _chunk_attention_bias(
     if q_segment_ids is not None and kv_segment_ids is not None:
         q_seg_chunk = lax.dynamic_slice(
             q_segment_ids,
-            start_indices=(0, query_offset),
+            start_indices=(0, query_local_offset),
             slice_sizes=(q_segment_ids.shape[0], query_chunk_size),
         )
         kv_seg_chunk = lax.dynamic_slice(
             kv_segment_ids,
-            start_indices=(0, key_offset),
+            start_indices=(0, key_local_offset),
             slice_sizes=(kv_segment_ids.shape[0], key_chunk_size),
         )
 
@@ -141,12 +159,12 @@ def _chunk_attention_bias(
         if use_positions:
             q_pos_chunk = lax.dynamic_slice(
                 q_position_ids,
-                start_indices=(0, query_offset),
+                start_indices=(0, query_local_offset),
                 slice_sizes=(q_position_ids.shape[0], query_chunk_size),
             ).astype(jnp.int32)
             kv_pos_chunk = lax.dynamic_slice(
                 kv_position_ids,
-                start_indices=(0, key_offset),
+                start_indices=(0, key_local_offset),
                 slice_sizes=(kv_position_ids.shape[0], key_chunk_size),
             ).astype(jnp.int32)
             causal_mask_value = jnp.where(kv_pos_chunk[:, None, :] > q_pos_chunk[:, :, None], neg_inf, zero)
@@ -165,12 +183,12 @@ def _chunk_attention_bias(
         if use_positions:
             query_idx = lax.dynamic_slice(
                 q_position_ids,
-                start_indices=(0, query_offset),
+                start_indices=(0, query_local_offset),
                 slice_sizes=(q_position_ids.shape[0], query_chunk_size),
             ).astype(jnp.int32)[:, :, None]
             key_idx = lax.dynamic_slice(
                 kv_position_ids,
-                start_indices=(0, key_offset),
+                start_indices=(0, key_local_offset),
                 slice_sizes=(kv_position_ids.shape[0], key_chunk_size),
             ).astype(jnp.int32)[:, None, :]
         else:
@@ -202,7 +220,7 @@ def _chunk_attention_bias(
     if not deterministic and pdrop > 0.0:
         attn_dropout_slice = lax.dynamic_slice(
             attn_dropout,
-            start_indices=(0, 0, query_offset, key_offset),
+            start_indices=(0, 0, query_local_offset, key_local_offset),
             slice_sizes=(
                 *attn_dropout.shape[:2],
                 min(attn_dropout.shape[-2], query_chunk_size),

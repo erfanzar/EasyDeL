@@ -41,7 +41,6 @@ Notes:
 
 from __future__ import annotations
 
-import fnmatch
 import os
 import re
 import sys
@@ -51,6 +50,11 @@ from pathlib import Path
 import requests
 from eformer.aparser import DataClassArgumentParser
 from huggingface_hub import HfApi, hf_hub_download
+
+try:  # package import (``python -m easydel.scripts...``)
+    from ._hf_common import enable_hf_fast_transfer, matches_any_glob, read_id_list, repo_out_dir
+except ImportError:  # run directly as a script: the script directory is on ``sys.path``
+    from _hf_common import enable_hf_fast_transfer, matches_any_glob, read_id_list, repo_out_dir  # type: ignore
 
 DEFAULT_EXCLUDE_FILE_GLOBS = (
     "*.md",
@@ -139,15 +143,15 @@ class LargeWeightsArgs:
             weight extensions (``.bin``, ``.safetensors``, ``.pt``,
             …) are excluded; ``True`` allows them.
         match_repo (str): Repeatable substring filter on repo ids;
-            only repos containing one of these substrings are
-            processed.
+            only repos containing at least one of these substrings
+            are processed.
         dry_run (bool): Print the plan without performing any
             downloads.
         continue_on_error (bool): Keep going through remaining
             repos when a single repo's downloads fail.
-        enable_hf_transfer (bool): Toggle the
-            ``HF_HUB_ENABLE_HF_TRANSFER`` accelerator (requires
-            ``hf_transfer`` to be installed).
+        enable_hf_transfer (bool): Enable accelerated HF downloads
+            (``hf_transfer`` on legacy ``huggingface_hub``, the Xet
+            backend on current releases).
     """
 
     out_root: str = field(metadata={"help": "Output root directory (e.g. /mnt/gcs/weights)."})
@@ -198,7 +202,7 @@ class LargeWeightsArgs:
     )
     enable_hf_transfer: bool = field(
         default=False,
-        metadata={"help": "Enable hf_transfer accelerated HF downloads (requires `pip install hf_transfer`)."},
+        metadata={"help": "Enable accelerated HF downloads (hf_transfer on legacy hub, hf_xet on current hub)."},
     )
 
 
@@ -211,14 +215,7 @@ def _read_models_file(path: str | os.PathLike) -> list[str]:
     Returns:
         List of repository ID strings.
     """
-    text = Path(path).read_text(encoding="utf-8")
-    repo_ids: list[str] = []
-    for raw_line in text.splitlines():
-        line = raw_line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        repo_ids.append(line)
-    return repo_ids
+    return read_id_list(path)
 
 
 def _parse_collection(value: str) -> tuple[str, str]:
@@ -284,7 +281,7 @@ def _matches_any_glob(name: str, globs: tuple[str, ...]) -> bool:
     Returns:
         True if any pattern matches ``name``.
     """
-    return any(fnmatch.fnmatch(name, pattern) for pattern in globs)
+    return matches_any_glob(name, globs)
 
 
 def _should_keep_file(
@@ -331,10 +328,7 @@ def _repo_out_dir(out_root: Path, repo_id: str) -> Path:
         ``out_root/owner/name`` when ``repo_id`` contains a slash,
         otherwise ``out_root/repo_id``.
     """
-    if "/" in repo_id:
-        owner, name = repo_id.split("/", 1)
-        return out_root / owner / name
-    return out_root / repo_id
+    return repo_out_dir(out_root, repo_id)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -357,11 +351,9 @@ def main(argv: list[str] | None = None) -> int:
     (args,) = parser.parse_args_into_dataclasses(args=argv, look_for_args_file=False)
 
     if args.enable_hf_transfer:
-        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-        try:
-            import hf_transfer  # noqa: F401 # type:ignore
-        except Exception:
-            print("Warning: `hf_transfer` is not installed. Run: pip install -U hf_transfer", file=sys.stderr)
+        transfer_warning = enable_hf_fast_transfer()
+        if transfer_warning:
+            print(f"Warning: {transfer_warning}", file=sys.stderr)
 
     out_root = Path(args.out_root).expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
@@ -386,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     repo_ids = unique
 
     if args.match_repo:
-        repo_ids = [rid for rid in repo_ids if all(s in rid for s in args.match_repo)]
+        repo_ids = [rid for rid in repo_ids if any(s in rid for s in args.match_repo)]
 
     if not repo_ids:
         raise SystemExit("No repos selected. Use --repo-id/--repos-file/--collection (and optional --match-repo).")
@@ -464,8 +456,6 @@ def main(argv: list[str] | None = None) -> int:
                     token=args.token,
                     cache_dir=args.cache_dir,
                     local_dir=str(dest_dir),
-                    local_dir_use_symlinks=False,
-                    resume_download=True,
                 )
 
             ok += 1

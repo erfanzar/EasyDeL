@@ -457,6 +457,7 @@ class FalconH1Mixer(spx.Module):
         Raises:
             ValueError: If mamba_n_heads is not divisible by mamba_n_groups.
             ValueError: If intermediate_size != mamba_n_heads * mamba_d_head.
+            ValueError: If the time-step initialization bounds are not positive and ordered.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -489,6 +490,10 @@ class FalconH1Mixer(spx.Module):
         self.mamba_rms_norm = bool(config.mamba_rms_norm)
 
         self.ssm_in_multiplier = float(config.ssm_in_multiplier)
+        time_step_limit = getattr(config, "time_step_limit", None)
+        self.time_step_limit = (
+            None if time_step_limit is None else (float(time_step_limit[0]), float(time_step_limit[1]))
+        )
 
         self.conv_dim = self.intermediate_size + 2 * self.n_groups * self.ssm_state_size
         self.conv1d = Conv1D(
@@ -513,11 +518,16 @@ class FalconH1Mixer(spx.Module):
             rngs=rngs,
         )
 
+        if not 0 < config.time_step_min <= config.time_step_max:
+            raise ValueError("Expected 0 < time_step_min <= time_step_max for FalconH1.")
         self.dt_bias = ArrayParam.bound(
             shape=(self.num_heads,),
             dtype=param_dtype,
+            # ArrayParam has no inverse-softplus initializer. The mixer's
+            # resure hook replaces this placeholder during sequential_init.
             init_method="zeros",
-            key=rngs.parameters,
+            key=None,
+            value=self._initial_dt_bias(rngs.parameters),
         )
         self.A_log = ArrayParam.bound(
             shape=(self.num_heads,),
@@ -558,6 +568,40 @@ class FalconH1Mixer(spx.Module):
             base_config=config,
         )
         self.ssm_op = SSM2Op(metadata)
+
+    def _initial_dt_bias(self, key: Array) -> Array:
+        """Sample log-uniform positive steps and return their inverse softplus.
+
+        Args:
+            key: Parameter initialization PRNG key.
+
+        Returns:
+            Per-head time-step biases in the parameter storage dtype.
+        """
+        initial_dt = jnp.exp(
+            jax.random.uniform(
+                key,
+                (self.num_heads,),
+                dtype=jnp.float32,
+                minval=jnp.log(self.config.time_step_min),
+                maxval=jnp.log(self.config.time_step_max),
+            )
+        )
+        return (initial_dt + jnp.log(-jnp.expm1(-initial_dt))).astype(self.param_dtype)
+
+    def resure(self, key: Array, shard_fn: tp.Callable[[Array], Array] | None = None) -> None:
+        """Rematerialize the configured time-step bias after lazy initialization.
+
+        ``EasyDeLBaseModule.sequential_init`` calls this module hook after
+        materializing its ArrayParams. Use the same initializer as eager
+        construction instead of retaining the generic zero placeholder.
+
+        Args:
+            key: Parameter initialization PRNG key.
+            shard_fn: Optional placement function applied to the initialized bias.
+        """
+        bias = self._initial_dt_bias(key)
+        self.dt_bias.value = bias if shard_fn is None else shard_fn(bias)
 
     def forward(
         self,
@@ -626,7 +670,7 @@ class FalconH1Mixer(spx.Module):
 
         if use_packed_state_updates:
             from easydel.layers.compressed_window import grid_to_tokens, packed_row_of_token, tokens_to_grid
-            from easydel.operations.kernels.ssm2 import _packed_ssm2_fwd
+            from easydel.operations.kernels.ssm2 import packed_ssm2_fwd
 
             conv_states = cache_view.conv_state
             ssm_states = cache_view.recurrent_state.astype(jnp.float32)
@@ -659,12 +703,14 @@ class FalconH1Mixer(spx.Module):
                 num_slots, width, self.n_groups, self.ssm_state_size
             )
             dt_grid = jax.nn.softplus(dt_grid.astype(jnp.float32) + self.dt_bias.value.astype(jnp.float32))
+            if self.time_step_limit is not None:
+                dt_grid = jnp.clip(dt_grid, self.time_step_limit[0], self.time_step_limit[1])
             dt_grid = jnp.where(valid_grid[..., None], dt_grid, 0.0)
             x_grid = jnp.where(valid_grid[..., None, None], x_grid, 0.0)
             b_grid = jnp.where(valid_grid[..., None, None], b_grid, 0.0)
             c_grid = jnp.where(valid_grid[..., None, None], c_grid, 0.0)
 
-            y_grid, ssm_states = _packed_ssm2_fwd(
+            y_grid, ssm_states = packed_ssm2_fwd(
                 x_grid,
                 -jnp.exp(self.A_log.value.astype(jnp.float32)),
                 b_grid,
@@ -676,7 +722,7 @@ class FalconH1Mixer(spx.Module):
                 self.n_groups,
             )
             y_grid = y_grid.reshape(num_slots, width, self.intermediate_size)
-            token_outputs = grid_to_tokens(y_grid, token_slots, token_cols, num_slots)
+            token_outputs = grid_to_tokens(y_grid.swapaxes(0, 1), token_slots, token_cols, num_slots)
 
             lengths = jnp.sum(valid_grid, axis=1, dtype=jnp.int32)
             positions = lengths[:, None] + jnp.arange(self.conv_kernel_size, dtype=jnp.int32)[None, :]
@@ -708,40 +754,32 @@ class FalconH1Mixer(spx.Module):
 
         updated_cache_view = cache_view
 
-        # Convolution with cache support for decode mode
-        if seq_len == 1 and cache_view is not None and cache_view.conv_state is not None:
-            new_token = hidden_states_B_C[:, 0, :]  # [batch, conv_dim]
-            conv_state, _, updated_cache_view = cache_view.concatenate_to_cache(conv_state=new_token)
-
-            # This keeps decode numerically consistent with the full convolution + slice.
-            conv_out_full = self.conv1d(conv_state)[..., : self.conv_kernel_size]  # [batch, conv_dim, k]
-            conv_out = self.act(conv_out_full[:, :, self.conv_kernel_size - 1]).astype(dtype)[:, None, :]
+        initial_conv_state = cache_view.conv_state if cache_view is not None else None
+        if segment_ids is None:
+            conv_input = hidden_states_B_C.transpose(0, 2, 1)
+            conv_window = (
+                conv_input if initial_conv_state is None else jnp.concatenate((initial_conv_state, conv_input), axis=-1)
+            )
+            offset = 0 if initial_conv_state is None else initial_conv_state.shape[-1]
+            conv_out = self.conv1d(conv_window)[..., offset : offset + seq_len]
+            conv_out = self.act(conv_out.swapaxes(1, 2)).astype(dtype)
+            new_conv_state = jnp.pad(
+                conv_window, ((0, 0), (0, 0), (max(0, self.conv_kernel_size - conv_window.shape[-1]), 0))
+            )[:, :, -self.conv_kernel_size :]
         else:
-            # Prefill mode: use full convolution
-            if segment_ids is None:
-                conv_out = self.conv1d(jnp.swapaxes(hidden_states_B_C, 2, 1))[..., :seq_len]
-                conv_out = self.act(jnp.swapaxes(conv_out, 2, 1)).astype(dtype)
-            else:
-                kernel = jnp.asarray(self.conv1d.weight).squeeze(1).T
-                conv_bias = self.conv1d.bias if self.use_conv_bias else None
-                conv_out, new_conv_state = segmented_depthwise_causal_conv1d(
-                    hidden_states_B_C,
-                    kernel,
-                    segment_ids,
-                    bias=conv_bias,
-                    activation=self.act,
-                    output_dtype=dtype,
-                )
-
-            if cache_view is not None:
-                if segment_ids is None:
-                    conv_in_t = hidden_states_B_C.transpose(0, 2, 1)  # [batch, conv_dim, seq_len]
-                    if seq_len >= self.conv_kernel_size:
-                        new_conv_state = conv_in_t[:, :, -self.conv_kernel_size :]
-                    else:
-                        pad_width = self.conv_kernel_size - seq_len
-                        new_conv_state = jnp.pad(conv_in_t, ((0, 0), (0, 0), (pad_width, 0)))
-                updated_cache_view = cache_view.replace(conv_state=new_conv_state)
+            kernel = jnp.asarray(self.conv1d.weight).squeeze(1).T
+            conv_bias = self.conv1d.bias if self.use_conv_bias else None
+            conv_out, new_conv_state = segmented_depthwise_causal_conv1d(
+                hidden_states_B_C,
+                kernel,
+                segment_ids,
+                bias=conv_bias,
+                initial_state=initial_conv_state,
+                activation=self.act,
+                output_dtype=dtype,
+            )
+        if updated_cache_view is not None:
+            updated_cache_view = updated_cache_view.replace(conv_state=new_conv_state)
 
         if q_mask is not None:
             conv_out = apply_mask_to_padding_states(conv_out, q_mask)
@@ -762,6 +800,8 @@ class FalconH1Mixer(spx.Module):
         )
 
         dt = jax.nn.softplus(dt.astype(jnp.float32) + self.dt_bias.value.astype(jnp.float32))
+        if self.time_step_limit is not None:
+            dt = jnp.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
         if q_mask is not None and seq_len > 1:
             dt = dt * q_mask[:, :, None].astype(dt.dtype)
 
@@ -1368,6 +1408,7 @@ class FalconH1Model(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, all_hidden_states, all_attentions, past_key_values, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.final_layernorm(hidden_states)
         if output_hidden_states:
@@ -1544,14 +1585,34 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):  #
         """Apply Falcon-H1's LM head with muP output scaling."""
         return super().apply_lm_head(hidden_states) * self.model.lm_head_multiplier
 
+    def get_lm_logit_postprocess(self) -> tp.Callable[[Array], Array]:
+        """Capture muP scaling followed by base clipping for split LM heads.
+
+        This matches ``apply_lm_head`` followed by ``compute_lm_logits``:
+        projection, multiplication by ``model.lm_head_multiplier``, then
+        clipping. Only the scalar multiplier and scalar-only clipping
+        function are captured, never the live model or its parameters.
+        """
+        multiplier = self.model.lm_head_multiplier
+        clip_fn = self.get_base_lm_logit_postprocess()
+
+        def _postprocess(logits: Array) -> Array:
+            """Scale raw projected logits before applying the base cap."""
+            logits = logits * multiplier
+            return clip_fn(logits) if clip_fn is not None else logits
+
+        return _postprocess
+
     def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
-        """Trace-safe projection with Falcon-H1 muP lm_head_multiplier."""
-        base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
-        multiplier = self.base_model.lm_head_multiplier
+        """Trace-safe projection with muP scaling before base clipping."""
+        # BaseTaskModule's projection wrapper already clips. Start from the
+        # raw trace-safe head so scaling precedes clipping, as in the full path.
+        base_fn = EasyDeLBaseModule.make_lm_head_fn(self, vocab_shard_stage=vocab_shard_stage)
+        postprocess = self.get_lm_logit_postprocess()
 
         def _project(hidden_states):
-            """Apply the base LM head and scale by FalconH1's muP multiplier."""
-            return base_fn(hidden_states) * multiplier
+            """Project and apply FalconH1's complete ordered logit transform."""
+            return postprocess(base_fn(hidden_states))
 
         return _project
 

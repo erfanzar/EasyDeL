@@ -428,6 +428,7 @@ class KDACache(BaseCache):
     __str__ = __repr__
 
 
+@auto_pytree
 class KDAMetadata(BaseRunTimeMetadata):
     """Runtime metadata for KDA cache operations.
 

@@ -153,6 +153,7 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
     """
 
     model_type: str = "gemma3_text"
+    per_layer_rope_parameters: typing.ClassVar[bool] = True
 
     def __init__(
         self,
@@ -330,8 +331,7 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
         # nest the layer-type map inside ``full_attention`` and drop the scaling.
         if isinstance(rope_scaling, dict):
             full_attention_rope_params.update(rope_scaling)
-        if "type" in full_attention_rope_params and "rope_type" not in full_attention_rope_params:
-            full_attention_rope_params["rope_type"] = full_attention_rope_params["type"]
+            full_attention_rope_params["rope_type"] = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
         full_attention_rope_params.setdefault("type", full_attention_rope_params["rope_type"])
         full_attention_rope_params.setdefault("rope_theta", self.rope_theta)
 
@@ -459,10 +459,10 @@ class Gemma3Config(EasyDeLBaseConfig):
         elif isinstance(text_config, dict):
             text_config = Gemma3TextConfig(**text_config)
 
-        if isinstance(vision_config, dict):
-            vision_config = SiglipVisionConfig(**vision_config)
-        else:
+        if vision_config is None:
             vision_config = SiglipVisionConfig()
+        elif isinstance(vision_config, dict):
+            vision_config = SiglipVisionConfig(**vision_config)
 
         self.text_config = text_config
         self.vision_config = vision_config

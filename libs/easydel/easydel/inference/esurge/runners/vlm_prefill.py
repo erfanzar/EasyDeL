@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import inspect
 import typing
+import uuid
+import weakref
 
 import jax
 import numpy as np
@@ -38,7 +40,9 @@ from jax import numpy as jnp
 
 from easydel.utils.graph_jit import module_jit
 
+from ..multimodal.cache import VisionEncoderCache
 from ..multimodal.side_inputs import model_needs_token_types, prefill_embeds_dtype
+from ..multimodal.types import compute_content_hash
 from ..utils import model_uses_mrope
 
 if typing.TYPE_CHECKING:
@@ -79,7 +83,7 @@ def _call_visual_features(fn: typing.Callable, pixels: jax.Array, grid, max_grid
     Returns:
         ``(merged_embeds, deepstack_tuple)``.
     """
-    kwargs = {f"{prefix}_grid_thw": grid}
+    kwargs = {f"{prefix}_grid_thw": grid} if _accepts_keyword(fn, f"{prefix}_grid_thw") else {}
     if max_grid_size is not None and _accepts_keyword(fn, f"{prefix}_max_grid_size"):
         kwargs[f"{prefix}_max_grid_size"] = max_grid_size
     result = fn(pixels, **kwargs)
@@ -154,6 +158,7 @@ class VlmPrefillHelper:
         vision_patch_buckets: list[int] | None,
         max_num_batched_tokens: int,
         max_num_tokens: int,
+        vision_cache: VisionEncoderCache | None = None,
     ) -> None:
         """Initialize the helper and normalize the vision knobs.
 
@@ -165,8 +170,13 @@ class VlmPrefillHelper:
             vision_patch_buckets: Optional explicit raw patch-count buckets.
             max_num_batched_tokens: Per-step scheduler token budget.
             max_num_tokens: Largest token compile bucket.
+            vision_cache: Optional shared bounded cache for encoder outputs. Pass
+                the multimodal manager's cache to share capacity, clearing and statistics.
         """
         self.model_getter = model_getter
+        self.vision_cache = vision_cache
+        self._vision_cache_model_ref = None
+        self._vision_cache_namespace = uuid.uuid4().hex
         self.metadata = metadata
         self.compile_vision_encoder = bool(compile_vision_encoder)
         self.vision_patch_buckets = (
@@ -189,6 +199,237 @@ class VlmPrefillHelper:
                 list[np.ndarray] | None,  # deepstack_visual_embeds_cpu
             ],
         ] = {}
+
+    def reset_vision_cache(self) -> None:
+        """Invalidate encoder results after an in-place weight update without clearing other cache users."""
+        self._vision_cache_namespace = uuid.uuid4().hex
+        model = self.model_getter()
+        self._vision_cache_model_ref = weakref.ref(model) if model is not None else None
+
+    def _vision_cache_identity(self) -> str:
+        """Use a fresh namespace on model replacement without retaining released model weights."""
+        previous = self._vision_cache_model_ref() if self._vision_cache_model_ref is not None else None
+        if self.model_getter() is not previous:
+            self.reset_vision_cache()
+        return self._vision_cache_namespace
+
+    def _encoded_vision_features(self, pixels, grid, *, modality: str, encode: typing.Callable):
+        """Cache actual encoder outputs, including every deepstack leaf, not prompt-dependent merged embeddings."""
+        key = None
+        if self.vision_cache is not None:
+            key = (
+                f"encoder:{self._vision_cache_identity()}:{modality}:"
+                f"{compute_content_hash(pixels)}:{compute_content_hash(grid) if grid is not None else 'none'}"
+            )
+            cached = self.vision_cache.get(key)
+            if cached is not None:
+                return cached
+        result = encode()
+        if key is not None:
+            # Host arrays keep a bounded cache from pinning device memory between requests.
+            result = (np.asarray(jax.device_get(result[0])), tuple(np.asarray(jax.device_get(x)) for x in result[1]))
+            self.vision_cache.put(key, result)
+        return result
+
+    def _attach_feature_embeddings(self, req_state, modality: str, embeddings, deepstack=()) -> None:
+        """Retain correctly split encoder rows and auxiliary layers when the split is known."""
+        features = [f for f in getattr(req_state, "mm_features", ()) if f.modality == modality]
+        if not features:
+            return
+        if len(features) == 1:
+            lengths = [len(embeddings)]
+        elif all(getattr(f, "placeholder_range", None) is not None for f in features):
+            lengths = [f.placeholder_range.length for f in features]
+        elif all(f.grid_thw is not None for f in features):
+            merge = self.vision_spatial_merge_size() ** 2
+            lengths = [int(np.prod(f.grid_thw)) // merge for f in features]
+        else:
+            return
+        if sum(lengths) != len(embeddings):
+            return
+        offset = 0
+        for feature, length in zip(features, lengths, strict=True):
+            feature.set_cached_embeddings(embeddings[offset : offset + length])
+            feature._esurge_deepstack_embeddings = tuple(layer[offset : offset + length] for layer in deepstack)
+            feature._esurge_vision_cache_identity = self._vision_cache_identity()
+            feature._esurge_vision_grid_thw = None if feature.grid_thw is None else np.array(feature.grid_thw, copy=True)
+            offset += length
+
+    def _feature_embeddings(self, req_state, modality: str):
+        """Consume request-owned features across turns, independently of bounded shared-cache eviction."""
+        features = [f for f in getattr(req_state, "mm_features", ()) if f.modality == modality]
+        if not features or not all(f.has_cached_embeddings for f in features):
+            return None
+        for feature in features:
+            self._validate_cached_feature(feature)
+        embeddings = [f.cached_embeddings for f in features]
+        return embeddings[0] if len(embeddings) == 1 else jnp.concatenate(embeddings, axis=0)
+
+    def _validate_cached_feature(self, feature) -> None:
+        """Reject request-owned rows retained for other weights or a different media layout."""
+        identity = self._vision_cache_identity()
+        if getattr(feature, "_esurge_vision_cache_identity", identity) != identity:
+            raise ValueError("Cached vision embeddings belong to an earlier model; resubmit the raw media.")
+        cached_grid = getattr(feature, "_esurge_vision_grid_thw", None)
+        if feature.grid_thw is not None and cached_grid is not None:
+            if not np.array_equal(np.asarray(feature.grid_thw).reshape(-1, 3), np.asarray(cached_grid).reshape(-1, 3)):
+                raise ValueError("Cached vision embeddings have a different grid; resubmit the raw media.")
+
+    def _mixed_feature_embeddings(self, features, modality: str, encode_fn: typing.Callable):
+        """Assemble cached-only and raw media of one modality in feature order.
+
+        Aggregate request pixels/grids cover only raw media. Encoding that aggregate
+        and assigning it to every feature drops cached rows or poisons the per-feature
+        cache, so this path encodes raw features separately before concatenation.
+        """
+        rows = []
+        layers = []
+        grids = []
+        expected_layers = (
+            len(self.model_getter().config.vision_config.deepstack_visual_indexes)
+            if self.uses_deepstack_visuals()
+            else 0
+        )
+        for feature in features:
+            grid = feature.grid_thw
+            if grid is None:
+                grid = getattr(feature, "_esurge_vision_grid_thw", None)
+            if grid is not None:
+                grid = np.asarray(grid)
+                # Features accept a single [3] triple; encoders expect [N, 3].
+                if grid.ndim == 1 and grid.shape[0] == 3:
+                    grid = grid.reshape(1, 3)
+            if feature.pixel_values is None:
+                self._validate_cached_feature(feature)
+                embeddings = feature.cached_embeddings
+                if embeddings is None:
+                    raise ValueError(f"Missing raw {modality} data and cached embeddings.")
+                deepstack = getattr(feature, "_esurge_deepstack_embeddings", ())
+            else:
+                pixels = feature.pixel_values
+                embeddings, deepstack = self._encoded_vision_features(
+                    pixels,
+                    grid,
+                    modality=modality,
+                    encode=lambda pv=pixels, g=grid: _call_visual_features(
+                        encode_fn, jnp.asarray(pv), g, self.max_grid_size(self.static_grid_thw(g)), prefix=modality
+                    ),
+                )
+            if len(deepstack) != expected_layers or any(layer.shape != embeddings.shape for layer in deepstack):
+                raise ValueError(
+                    f"Cached {modality} embeddings are missing DeepStack residuals; resubmit the raw media."
+                )
+            rows.append(embeddings)
+            layers.append(deepstack)
+            grids.append(grid)
+        if any(grid is not None for grid in grids) and not all(grid is not None for grid in grids):
+            raise ValueError(f"Missing grid metadata for cached {modality} embeddings; resubmit the raw media.")
+        # Validate all rows before updating any feature, including when one cached
+        # image is stale or an encoder returned incomplete auxiliary layers.
+        for feature, embeddings, deepstack, grid in zip(features, rows, layers, grids, strict=True):
+            feature.set_cached_embeddings(embeddings)
+            feature._esurge_deepstack_embeddings = tuple(deepstack)
+            feature._esurge_vision_cache_identity = self._vision_cache_identity()
+            feature._esurge_vision_grid_thw = None if grid is None else np.array(grid, copy=True)
+        grid = np.concatenate([np.asarray(g).reshape(-1, 3) for g in grids], axis=0) if grids[0] is not None else None
+        return (
+            jnp.concatenate(rows, axis=0),
+            tuple(jnp.concatenate([value[i] for value in layers], axis=0) for i in range(expected_layers)),
+            grid,
+        )
+
+    def _accepts_deepstack(self, modality: str) -> bool:
+        """Opt into auxiliary caching only when the actual embedding-info entry point declares it."""
+        model = self.model_getter()
+        owner = getattr(model, "base_model", None)
+        fn = getattr(owner, "compute_embedding_with_info", None)
+        if not callable(fn):
+            fn = getattr(model, "compute_embedding_with_info", None)
+        return _declares_parameter(fn, f"deepstack_{modality}_embeds")
+
+    def _feature_deepstack(self, req_state, modality: str):
+        """Reassemble retained per-media residuals without caching prompt-dependent masks."""
+        features = [f for f in getattr(req_state, "mm_features", ()) if f.modality == modality]
+        layers = [getattr(f, "_esurge_deepstack_embeddings", ()) for f in features]
+        expected = len(self.model_getter().config.vision_config.deepstack_visual_indexes)
+        if not layers or any(len(value) != expected for value in layers):
+            raise ValueError(f"Cached {modality} embeddings are missing DeepStack residuals; resubmit the raw media.")
+        return tuple(jnp.concatenate(tuple(value[i] for value in layers), axis=0) for i in range(expected))
+
+    def eager_vision_embed_kwargs(self, req_state: CachedRequestState) -> dict[str, typing.Any] | None:
+        """Reuse encoder outputs through declared inputs, including all DeepStack residuals.
+
+        Masks, merged prompt embeddings and position ids are rebuilt by the model for
+        each prompt. Families without an explicit auxiliary injection contract retain
+        their native path rather than silently dropping their visual layers.
+        """
+        model = self.model_getter()
+        owner = getattr(model, "base_model", model)
+        embed_fn = getattr(owner, "compute_embedding", None)
+        result = {}
+        for modality, pixel_name, grid_name in (
+            ("image", "pixel_values", "image_grid_thw"),
+            ("video", "pixel_values_videos", "video_grid_thw"),
+        ):
+            pixels = getattr(req_state, pixel_name, None)
+            features = [f for f in getattr(req_state, "mm_features", ()) if f.modality == modality]
+            if pixels is None and not features:
+                continue
+            if self.uses_deepstack_visuals() and not self._accepts_deepstack(modality):
+                return None
+            parameter = next(
+                (p for p in (f"{modality}_embeds", f"{modality}_features") if _declares_parameter(embed_fn, p)),
+                None,
+            )
+            if parameter is None:
+                return None
+            grid = getattr(req_state, grid_name, None)
+            feature_grids = [
+                f.grid_thw if f.grid_thw is not None else getattr(f, "_esurge_vision_grid_thw", None) for f in features
+            ]
+            if grid is None and feature_grids and all(g is not None for g in feature_grids):
+                grid = np.concatenate([np.asarray(g).reshape(-1, 3) for g in feature_grids], axis=0)
+            mixed_features = (
+                features
+                and any(f.pixel_values is not None for f in features)
+                and (pixels is None or any(f.pixel_values is None for f in features))
+            )
+            if mixed_features:
+                encode_fn = getattr(model, f"get_{modality}_features", None)
+                if not callable(encode_fn):
+                    return None
+                embeddings, deepstack, grid = self._mixed_feature_embeddings(features, modality, encode_fn)
+            elif pixels is None:
+                embeddings = self._feature_embeddings(req_state, modality)
+                if embeddings is None:
+                    raise ValueError(f"Missing raw {modality} data and cached embeddings.")
+                deepstack = self._feature_deepstack(req_state, modality) if self.uses_deepstack_visuals() else ()
+            else:
+                if self.vision_cache is None:
+                    return None
+                encode_fn = getattr(model, f"get_{modality}_features", None)
+                if not callable(encode_fn):
+                    return None
+                embeddings, deepstack = self._encoded_vision_features(
+                    pixels,
+                    grid,
+                    modality=modality,
+                    encode=lambda fn=encode_fn, pv=pixels, g=grid, m=modality: _call_visual_features(
+                        fn, jnp.asarray(pv), g, self.max_grid_size(self.static_grid_thw(g)), prefix=m
+                    ),
+                )
+                if deepstack and not self._accepts_deepstack(modality):
+                    return None
+                self._attach_feature_embeddings(req_state, modality, embeddings, deepstack)
+            if deepstack:
+                result[f"deepstack_{modality}_embeds"] = list(deepstack)
+            result[parameter] = embeddings
+            if grid is not None:
+                result[grid_name] = grid
+            # Keep raw leaves too: some families use their presence when computing position ids.
+            if pixels is not None:
+                result[pixel_name] = pixels
+        return result or None
 
     def reset_cpu_buffers(self) -> None:
         """Drop the cached host-side scratch buffers (fresh dict)."""
@@ -427,15 +668,16 @@ class VlmPrefillHelper:
 
     def compiled_vision_embed_kwargs(self, req_state: CachedRequestState) -> dict[str, typing.Any] | None:
         """Build embed kwargs from the compiled vision path, or None to go eager."""
-        if (
-            not self.compile_vision_encoder
-            or self.vision_jit_disabled
-            or self.uses_deepstack_visuals()
-            or self.model_getter() is None
-        ):
+        if not self.compile_vision_encoder or self.vision_jit_disabled or self.model_getter() is None:
             return None
         if int(getattr(self.metadata, "data_parallel_size", 1) or 1) > 1:
             return None
+        # Aggregate pixels contain only raw media: let the eager assembler interleave
+        # cached-only rows even when there are raw pixels of the same modality.
+        for feature in getattr(req_state, "mm_features", ()):
+            pixels = req_state.pixel_values if feature.modality == "image" else req_state.pixel_values_videos
+            if pixels is None or feature.pixel_values is None:
+                return None
 
         # The compiled path hands precomputed features over as ``image_embeds`` / ``video_embeds``. A family whose
         # ``compute_embedding`` names them differently (``image_features`` in MiniMax / LLaVA / PaliGemma / ...)
@@ -449,6 +691,10 @@ class VlmPrefillHelper:
             return None
         if req_state.pixel_values_videos is not None and not _declares_parameter(embed_fn, "video_embeds"):
             return None
+        if self.uses_deepstack_visuals():
+            for modality, pixels in (("image", req_state.pixel_values), ("video", req_state.pixel_values_videos)):
+                if pixels is not None and not self._accepts_deepstack(modality):
+                    return None
 
         embed_kwargs: dict[str, typing.Any] = {}
         try:
@@ -456,13 +702,21 @@ class VlmPrefillHelper:
                 image_grid = self.static_grid_thw(req_state.image_grid_thw)
                 if image_grid is None:
                     return None
-                image_embeds, deepstack_image_embeds = self.get_image_features_jit()(
-                    jnp.asarray(req_state.pixel_values),
-                    image_grid_thw=image_grid,
-                    image_max_grid_size=self.max_grid_size(image_grid),
+                image_embeds, deepstack_image_embeds = self._encoded_vision_features(
+                    req_state.pixel_values,
+                    req_state.image_grid_thw,
+                    modality="image",
+                    encode=lambda: self.get_image_features_jit()(
+                        jnp.asarray(req_state.pixel_values),
+                        image_grid_thw=image_grid,
+                        image_max_grid_size=self.max_grid_size(image_grid),
+                    ),
                 )
                 if deepstack_image_embeds:
-                    return None
+                    if not self._accepts_deepstack("image"):
+                        return None
+                    embed_kwargs["deepstack_image_embeds"] = list(deepstack_image_embeds)
+                self._attach_feature_embeddings(req_state, "image", image_embeds, deepstack_image_embeds)
                 embed_kwargs["image_embeds"] = image_embeds
                 embed_kwargs["image_grid_thw"] = image_grid
 
@@ -470,13 +724,21 @@ class VlmPrefillHelper:
                 video_grid = self.static_grid_thw(req_state.video_grid_thw)
                 if video_grid is None:
                     return None
-                video_embeds, deepstack_video_embeds = self.get_video_features_jit()(
-                    jnp.asarray(req_state.pixel_values_videos),
-                    video_grid_thw=video_grid,
-                    video_max_grid_size=self.max_grid_size(video_grid),
+                video_embeds, deepstack_video_embeds = self._encoded_vision_features(
+                    req_state.pixel_values_videos,
+                    req_state.video_grid_thw,
+                    modality="video",
+                    encode=lambda: self.get_video_features_jit()(
+                        jnp.asarray(req_state.pixel_values_videos),
+                        video_grid_thw=video_grid,
+                        video_max_grid_size=self.max_grid_size(video_grid),
+                    ),
                 )
                 if deepstack_video_embeds:
-                    return None
+                    if not self._accepts_deepstack("video"):
+                        return None
+                    embed_kwargs["deepstack_video_embeds"] = list(deepstack_video_embeds)
+                self._attach_feature_embeddings(req_state, "video", video_embeds, deepstack_video_embeds)
                 embed_kwargs["video_embeds"] = video_embeds
                 embed_kwargs["video_grid_thw"] = video_grid
         except Exception as exc:
@@ -509,7 +771,6 @@ class VlmPrefillHelper:
         if (
             not self.compile_vision_encoder
             or self.vision_jit_disabled
-            or self.uses_deepstack_visuals()
             or model is None
             or not callable(getattr(model, "get_image_features", None))
         ):
@@ -548,6 +809,28 @@ class VlmPrefillHelper:
                 return
         logger.info("VLM vision feature precompilation finished")
 
+    def _token_type_encoder_cache(self, feature, encode: typing.Callable):
+        """Provide prompt-independent aligner rows with weight-version and content-safe reuse."""
+        identity = self._vision_cache_identity()
+        grid = feature.grid_thw
+        if grid is None:
+            grid = getattr(feature, "_esurge_vision_grid_thw", None)
+        if feature.pixel_values is None:
+            self._validate_cached_feature(feature)
+            embeddings = feature.cached_embeddings
+            if embeddings is None:
+                raise ValueError("Image feature has neither cached encoder rows nor raw pixels.")
+        else:
+            embeddings, _ = self._encoded_vision_features(
+                feature.pixel_values, grid, modality=feature.modality, encode=lambda: (encode(), ())
+            )
+        embeddings = np.asarray(jax.device_get(embeddings))
+        embeddings = embeddings.reshape(-1, embeddings.shape[-1])
+        feature.set_cached_embeddings(embeddings)
+        feature._esurge_vision_cache_identity = identity
+        feature._esurge_vision_grid_thw = None if grid is None else np.array(grid, copy=True)
+        return embeddings
+
     def _precompute_token_type_prefill(self, req_state: CachedRequestState) -> None:
         """Prepare the model-specific token-type image prefill using its declared hook.
 
@@ -561,12 +844,15 @@ class VlmPrefillHelper:
         compute_prefill_embeddings = getattr(type(model), "esurge_compute_prefill_embeddings", None)
         if compute_prefill_embeddings is None:
             raise RuntimeError("The model requires token-type prefill but declares no eSurge prefill hook.")
-        features = [f for f in req_state.mm_features if getattr(f, "pixel_values", None) is not None]
+        features = list(req_state.mm_features)
         if not features:
             req_state._vision_processed = True
             return
+        kwargs = {}
+        if _declares_parameter(compute_prefill_embeddings, "encoder_cache_provider"):
+            kwargs["encoder_cache_provider"] = self._token_type_encoder_cache
         try:
-            embeds, types = compute_prefill_embeddings(model, req_state.prompt_token_ids, features)
+            embeds, types = compute_prefill_embeddings(model, req_state.prompt_token_ids, features, **kwargs)
         except Exception as exc:
             logger.error("Image encode failed for req_id=%s: %s", req_state.req_id, exc)
             raise RuntimeError(f"Image encode failed for req_id={req_state.req_id}: {exc}") from exc
@@ -591,9 +877,11 @@ class VlmPrefillHelper:
 
         uses_mrope = model_uses_mrope(self.model_getter())
 
-        # If raw vision inputs are missing but the request is marked as "has_vision"
-        # (e.g. only cached mm_features remain), skip precompute and treat it as processed.
-        if req_state.pixel_values is None and req_state.pixel_values_videos is None:
+        if (
+            req_state.pixel_values is None
+            and req_state.pixel_values_videos is None
+            and not getattr(req_state, "mm_features", ())
+        ):
             req_state._vision_processed = True
             return
 
@@ -624,6 +912,11 @@ class VlmPrefillHelper:
                 attention_mask=attention_mask,
             )
             if compiled_result is None:
+                cached_vision_kwargs = self.eager_vision_embed_kwargs(req_state)
+                if cached_vision_kwargs is not None:
+                    embed_kwargs.update(cached_vision_kwargs)
+                elif req_state.pixel_values is None and req_state.pixel_values_videos is None:
+                    raise ValueError("This model needs raw media to rebuild vision embeddings.")
                 inputs_embeds, info = self.compute_embedding_with_info_single_pass(input_ids, embed_kwargs)
             else:
                 inputs_embeds, info = compiled_result

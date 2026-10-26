@@ -106,7 +106,7 @@ def main():
                 "tokenizer": args.student,
                 "task": "auto-bind",
             },
-            "teacher": {
+            "teacher_model": {
                 "name_or_path": args.teacher,
             },
             "loader": {

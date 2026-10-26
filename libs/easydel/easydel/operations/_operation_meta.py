@@ -50,6 +50,7 @@ from easydel.infra.sharding import (
     RuntimeShardingResolver,
     StageMesh,
     coerce_runtime_sharding_resolver,
+    mesh_axis_size,
     resolve_stage_mesh,
 )
 
@@ -275,7 +276,7 @@ class OperationMetadata:
     runtime_softmax_dtype: jax.typing.DTypeLike | None = None
 
     sequence_axis_name: str = NOT_GIVEN
-    platform: EasyDeLPlatforms = NOT_GIVEN
+    platform: EasyDeLPlatforms | None = NOT_GIVEN
     backend: EasyDeLBackends | None = NOT_GIVEN
 
     axis_policy: AxisPolicy | PartitionAxis = NOT_GIVEN
@@ -328,7 +329,7 @@ class OperationMetadata:
         self.partition_axis = self.axis_policy.to_partition_axis()
         self.set_attrs_carefully("sequence_axis_name", "sp", "sequence_axis_name", use_base_config=False)
         self.set_attrs_carefully("backend", jax.default_backend(), "backend")
-        self.set_attrs_carefully("platform", NOT_GIVEN, "platform")
+        self.set_attrs_carefully("platform", None, "platform")
         self.set_attrs_carefully("_stored_mesh", NOT_GIVEN, "mesh")
         if self.operation_configs is None and self.base_config is not None:
             self.operation_configs = getattr(self.base_config, "operation_configs", None)
@@ -444,12 +445,7 @@ class OperationMetadata:
             return 1
         resolver = self.runtime_sharding_resolver.with_mesh(mesh)
         entry = resolver.resolve(axes=[HEAD], mode=mode, shape=(num_q_heads,))[0]
-        if entry is None:
-            return 1
-        factor = 1
-        for name in entry if isinstance(entry, tuple) else (entry,):
-            factor *= int(mesh.shape[name])
-        return factor
+        return mesh_axis_size(mesh, entry)
 
     def get_shardings(
         self,

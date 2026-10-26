@@ -34,7 +34,7 @@ are proposed; the speedup is TPU-measured):
 * per-request persist-with-rollback (row-targeted, batch > 1) keeps working
   inside the loop;
 * the strategy's ``draft_next`` routes greedy drafts through the adaptive path
-  only when ``EASYDEL_SPEC_ADAPTIVE_CONF > 0`` and otherwise keeps the fixed-K
+  only when ``adaptive_conf_threshold > 0`` and otherwise keeps the fixed-K
   Python loop (default OFF).
 """
 
@@ -254,7 +254,9 @@ def test_adaptive_persist_row_targeted_batch2():
 _REQ_STATE = types.SimpleNamespace(sampling_params=SamplingParams(temperature=0.0, max_tokens=32))
 
 
-def _make_strategy(drafter: Qwen3_5MTPDrafter, n_rows: int, k: int) -> DrafterSpeculation:
+def _make_strategy(
+    drafter: Qwen3_5MTPDrafter, n_rows: int, k: int, *, adaptive_conf_threshold: float = 0.0
+) -> DrafterSpeculation:
     """A DrafterSpeculation over a stub runner exposing only the pool size.
 
     Inline-MTP ``draft_next`` (persist-with-rollback) reads only ``max_num_reqs``
@@ -263,52 +265,41 @@ def _make_strategy(drafter: Qwen3_5MTPDrafter, n_rows: int, k: int) -> DrafterSp
     bookkeeping without standing up a full runner.
     """
     runner = types.SimpleNamespace(max_num_reqs=n_rows, max_num_seqs=n_rows)
-    return DrafterSpeculation(runner=runner, drafter=drafter, num_draft_tokens=k)
+    return DrafterSpeculation(
+        runner=runner, drafter=drafter, num_draft_tokens=k, adaptive_conf_threshold=adaptive_conf_threshold
+    )
 
 
-def test_draft_next_adaptive_engages_via_env():
-    """draft_next routes greedy drafts to the adaptive loop only when the env > 0."""
+def test_draft_next_adaptive_engages_via_config(monkeypatch):
+    """Explicit thresholds preserve fixed-K parity and control early-exit length."""
     model = make_tiny_model()
     n, k = 2, 4
-    prev_conf = os.environ.get("EASYDEL_SPEC_ADAPTIVE_CONF")
-    prev_persist = os.environ.get("EASYDEL_MTP_PERSIST_KV")
-    os.environ["EASYDEL_MTP_PERSIST_KV"] = "1"  # exercise the row-targeted persist path
-    try:
-        # env OFF -> fixed-K Python loop; adaptive while_loop never built.
-        os.environ["EASYDEL_SPEC_ADAPTIVE_CONF"] = "0"
-        d_off = Qwen3_5MTPDrafter(model, num_draft_tokens=k, persist_kv=True)
-        s_off = _make_strategy(d_off, n, k)
-        off = s_off.draft_next(
-            req_id="A", row_pos=0, seed_token=5, seed_position=4, seed_hidden=_seed_hidden(0), req_state=_REQ_STATE
-        )
-        assert len(off) == k, f"env off must use the fixed-K loop (k drafts); got {len(off)}"
-        assert len(d_off._jit_adaptive) == 0, "adaptive loop must not be built when the env is off"
+    monkeypatch.setenv("EASYDEL_MTP_PERSIST_KV", "1")  # exercise the row-targeted persist path
 
-        # env ON, tiny threshold -> adaptive full length, byte-identical to fixed-K.
-        os.environ["EASYDEL_SPEC_ADAPTIVE_CONF"] = "1e-9"
-        d_on = Qwen3_5MTPDrafter(model, num_draft_tokens=k, persist_kv=True)
-        s_on = _make_strategy(d_on, n, k)
-        on = s_on.draft_next(
-            req_id="A", row_pos=0, seed_token=5, seed_position=4, seed_hidden=_seed_hidden(0), req_state=_REQ_STATE
-        )
-        assert len(d_on._jit_adaptive) == 1, "adaptive loop must run when the env > 0"
-        assert on == off, f"adaptive full-length (tiny threshold) must match fixed-K draft_next: {on} vs {off}"
+    d_off = Qwen3_5MTPDrafter(model, num_draft_tokens=k, persist_kv=True)
+    s_off = _make_strategy(d_off, n, k, adaptive_conf_threshold=0.0)
+    off = s_off.draft_next(
+        req_id="A", row_pos=0, seed_token=5, seed_position=4, seed_hidden=_seed_hidden(0), req_state=_REQ_STATE
+    )
+    assert len(off) == k, f"zero threshold must use fixed-K drafting; got {len(off)}"
 
-        # env ON, high threshold -> early exit, variable-length draft list.
-        os.environ["EASYDEL_SPEC_ADAPTIVE_CONF"] = "0.999"
-        d_hi = Qwen3_5MTPDrafter(model, num_draft_tokens=k, persist_kv=True)
-        s_hi = _make_strategy(d_hi, n, k)
-        hi = s_hi.draft_next(
-            req_id="A", row_pos=0, seed_token=5, seed_position=4, seed_hidden=_seed_hidden(0), req_state=_REQ_STATE
-        )
-        assert 1 <= len(hi) < k, f"high threshold must early-exit through draft_next; got {hi}"
-        assert hi == off[: len(hi)], "early-exit drafts must be the fixed-K prefix"
-    finally:
-        for name, prev in (("EASYDEL_SPEC_ADAPTIVE_CONF", prev_conf), ("EASYDEL_MTP_PERSIST_KV", prev_persist)):
-            if prev is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = prev
+    # A tiny positive threshold retains the full fixed-K argmax path.
+    d_on = Qwen3_5MTPDrafter(model, num_draft_tokens=k, persist_kv=True)
+    s_on = _make_strategy(d_on, n, k, adaptive_conf_threshold=1e-9)
+    on = s_on.draft_next(
+        req_id="A", row_pos=0, seed_token=5, seed_position=4, seed_hidden=_seed_hidden(0), req_state=_REQ_STATE
+    )
+    assert len(on) == k
+    assert on == off, f"adaptive full-length (tiny threshold) must match fixed-K draft_next: {on} vs {off}"
+
+    # A high threshold returns a shorter prefix, without changing token choices.
+    d_hi = Qwen3_5MTPDrafter(model, num_draft_tokens=k, persist_kv=True)
+    s_hi = _make_strategy(d_hi, n, k, adaptive_conf_threshold=0.999)
+    hi = s_hi.draft_next(
+        req_id="A", row_pos=0, seed_token=5, seed_position=4, seed_hidden=_seed_hidden(0), req_state=_REQ_STATE
+    )
+    assert 1 <= len(hi) < k, f"high threshold must early-exit through draft_next; got {hi}"
+    assert hi == off[: len(hi)], "early-exit drafts must be the fixed-K prefix"
 
 
 if __name__ == "__main__":

@@ -500,11 +500,11 @@ class FalconMlp(spx.Module):
         )
         self.dense_h_to_4h = linear(
             self.config.hidden_size,
-            self.config.ff_factor * self.config.hidden_size,
+            self.config.ffn_hidden_size,
             rngs=rngs,
         )
         self.dense_4h_to_h = linear(
-            self.config.ff_factor * self.config.hidden_size,
+            self.config.ffn_hidden_size,
             self.config.hidden_size,
             rngs=rngs,
         )
@@ -589,7 +589,7 @@ class FalconBlock(spx.Module):
         if config.num_ln_in_parallel_attn is None and config.new_decoder_architecture:
             config.num_ln_in_parallel_attn = 2
 
-        if not config.parallel_attn:
+        if not config.parallel_attn and not config.new_decoder_architecture:
             self.post_attention_layernorm = LayerNorm(
                 self.config.hidden_size,
                 epsilon=config.layer_norm_epsilon,
@@ -964,6 +964,8 @@ class FalconModel(EasyDeLBaseModule):
             threads the layer's cache view through the carry.
             """
             hidden_states, cv, all_hidden_states, all_attentions, idx = carry
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
             with self._layer_stage_context(idx, layers=self.h):
                 layer_outputs = layer(
                     hidden_states=hidden_states,
@@ -977,8 +979,6 @@ class FalconModel(EasyDeLBaseModule):
                     alibi=alibi,
                 )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.h)
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
@@ -996,6 +996,7 @@ class FalconModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.ln_f(hidden_states)
 

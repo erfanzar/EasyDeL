@@ -174,10 +174,6 @@ class OperationExecutor:
         Returns:
             OperationRequirements representing the merged needs.
 
-        Raises:
-            RuntimeError: Internal invariant violation when both per-stage
-                requirements end up ``None`` after the union step. This
-                indicates a logic error rather than user input.
         """
         prefill_reqs = None
         decode_reqs = None
@@ -201,8 +197,6 @@ class OperationExecutor:
         if prefill_reqs is None and decode_reqs is None:
             return OperationRequirements.default()
         if prefill_reqs is None:
-            if decode_reqs is None:
-                raise RuntimeError("decode_reqs must not be None when prefill_reqs is None")
             return decode_reqs
         if decode_reqs is None:
             return prefill_reqs

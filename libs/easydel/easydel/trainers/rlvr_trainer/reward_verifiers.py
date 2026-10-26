@@ -156,7 +156,7 @@ class MathVerifier:
         if completions is None:
             return [0.0]
 
-        completions_list = list(completions) if not isinstance(completions, list) else completions
+        completions_list = _to_text_list(completions)
         rewards = []
 
         gold_answers = self._get_gold_answers(batch, len(completions_list))
@@ -263,7 +263,7 @@ class CodeVerifier:
         if completions is None:
             return [0.0]
 
-        completions_list = list(completions) if not isinstance(completions, list) else completions
+        completions_list = _to_text_list(completions)
         tests = self._get_tests(batch, len(completions_list))
         rewards = []
 
@@ -387,7 +387,7 @@ class FormatVerifier:
         """
         if completions is None:
             return [0.0]
-        completions_list = list(completions) if not isinstance(completions, list) else completions
+        completions_list = _to_text_list(completions)
         rewards = []
         for c in completions_list:
             text = c if isinstance(c, str) else str(c)
@@ -453,7 +453,7 @@ class LengthPenaltyVerifier:
         """
         if completions is None:
             return [0.0]
-        completions_list = list(completions) if not isinstance(completions, list) else completions
+        completions_list = _to_text_list(completions)
         rewards = []
         for c in completions_list:
             text = c if isinstance(c, str) else str(c)
@@ -478,8 +478,23 @@ def _to_text_list(completions: tp.Any) -> list[str]:
     """
     if completions is None:
         return []
-    items = list(completions) if not isinstance(completions, list) else completions
-    return [c if isinstance(c, str) else str(c) for c in items]
+
+    def content_text(value: tp.Any) -> str:
+        """Extract chat message/text-block content without Python repr escaping."""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            if "content" in value:
+                return content_text(value["content"])
+            if value.get("type") in {"text", "output_text"}:
+                return content_text(value.get("text", ""))
+            return ""
+        if isinstance(value, (list, tuple)):
+            return "".join(content_text(part) for part in value)
+        return "" if value is None else str(value)
+
+    items = [completions] if isinstance(completions, (str, dict)) else list(completions)
+    return [content_text(c) for c in items]
 
 
 def _get_column(batch: dict[str, tp.Any] | None, key: str, n: int) -> list[tp.Any]:
@@ -512,7 +527,11 @@ def _get_column(batch: dict[str, tp.Any] | None, key: str, n: int) -> list[tp.An
         return [None] * n
     if isinstance(col, str):
         return [col] * n
-    result = list(col)
+    try:
+        result = list(col)
+    except TypeError:
+        # Includes Python numeric values and rank-zero NumPy/JAX arrays.
+        return [col] * n
     if 0 < len(result) < n and n % len(result) == 0:
         # GRPO emits prompt-major completions: each prompt's reward metadata
         # must accompany all of its generations, not only its first row.
@@ -799,6 +818,7 @@ class JSONVerifier:
     """
 
     _FENCE = re.compile(r"```(?:json)?\s*\n?(.*?)```", re.DOTALL)
+    _PARSE_FAILURE = object()
 
     def __init__(self, required_keys: tp.Sequence[str] | None = None, graded: bool = False):
         """Initialize a JSON verifier.
@@ -818,7 +838,8 @@ class JSONVerifier:
             text: Raw completion text.
 
         Returns:
-            The parsed object, or ``None`` if nothing parsed.
+            The parsed object (including ``None`` for JSON null), or the
+            private parse-failure sentinel if nothing parsed.
         """
         import json
 
@@ -837,7 +858,7 @@ class JSONVerifier:
                 return json.loads(candidate)
             except (ValueError, TypeError):
                 continue
-        return None
+        return self._PARSE_FAILURE
 
     def __call__(
         self,
@@ -859,7 +880,7 @@ class JSONVerifier:
         rewards: list[float] = []
         for text in _to_text_list(completions):
             obj = self._parse(text)
-            if obj is None:
+            if obj is self._PARSE_FAILURE:
                 rewards.append(0.0)
                 continue
             if not self._required:

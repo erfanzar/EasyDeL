@@ -682,11 +682,22 @@ class CompressedWindowAttentionConfig(BaseOperationConfig):
         token_kv_len: Length of the sliding-window token region at the front of
             the KV axis (the rest are always-visible compressed entries). Only
             used when ``window > 0``.
+        backward: Pallas differentiation rule: ``"flash"`` (default; tiled
+            Pallas backward, reverse mode only) or ``"reference"`` (custom JVP
+            through the tiled reference math; supports forward-mode AD).
+        causal: Promise that the bias closes every key past the diagonal; the
+            Pallas kernels then skip token tiles above it (exact).
+        bias_kpool: Keys per pool of a pooled bias (``bias_pool``); ``0`` = per-key bias.
+        bias_closed: Closed-pool sentinel of a pooled bias (``None`` = dtype min).
     """
 
     fwd_params: FwdParams | None = None
     window: int = 0
     token_kv_len: int = 0
+    backward: str = "flash"
+    causal: bool = False
+    bias_kpool: int = 0
+    bias_closed: float | None = None
 
     def __post_init__(self):
         """Convert dict-typed forward params to FwdParams."""
@@ -983,6 +994,41 @@ class KernelDeltaAttentionConfig(BaseOperationConfig):
     """
 
     chunk_size: int = 64
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class KdaChunkConfig(BaseOperationConfig):
+    """Configuration for the fused chunked per-channel-decay KDA (``kda_chunk``).
+
+    Args:
+        block_h: Heads per Pallas grid step (``num_heads`` must be a multiple; 1 keeps the
+            ``[cs, cs, K]`` temporaries at one head).
+        backward: ``"pallas"`` (fused reverse-sweep kernel) or ``"xla"`` (reversed-scan recompute).
+        bwd_reduce: ``"vpu"`` or ``"mxu"`` evaluation of the backward's weighted reductions (both exact).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    block_h: int = 1
+    backward: str = "pallas"
+    bwd_reduce: str = "vpu"
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RowPermuteConfig(BaseOperationConfig):
+    """Configuration for the run-table row permutation (``row_permute``).
+
+    Args:
+        chunk_rows: Source rows per streamed VMEM window of the Pallas TPU kernel (a multiple of 16).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    chunk_rows: int = 128
 
     __hash__ = hash_fn
 
@@ -1464,12 +1510,58 @@ class FusedKLDivergenceConfig(BaseOperationConfig):
 
 
 @dataclass
+class FusedCakldTvConfig(BaseOperationConfig):
+    """Configuration for the fused dynamic-CAKLD + TV distillation loss.
+
+    The only implementation is the XLA one, which does its own tiling, so there
+    are no block-size fields; the inherited ``platform`` / ``backend`` select it.
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class FusedRenyiEntropyConfig(BaseOperationConfig):
+    """Configuration for the fused per-row Renyi entropy.
+
+    The only implementation is the XLA one, which does its own tiling, so there
+    are no block-size fields; the inherited ``platform`` / ``backend`` select it.
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class MHCCoefficientsConfig(BaseOperationConfig):
     """mHC coefficient dispatch settings (pallas/TPU or xla/any).
 
     Inherited ``platform`` and ``backend`` select the implementation. The packed
     TPU path has fixed 128-token tiles and supports first-order reverse AD only.
     """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class MHCFusedConfig(BaseOperationConfig):
+    """Configuration for the mHC site operations ``mhc_collapse`` / ``mhc_expand``.
+
+    The heuristic configuration selects ``platform="xla"`` on every backend (the
+    measured faster site end to end); the Pallas TPU path runs only on request.
+
+    Args:
+        tile_rows: Pallas rows per grid step (positive multiple of 128).
+        fn_pieces: bf16 pieces an fp32 predictor / stream is split into for the
+            Pallas MXU projection (3 = fp32 accuracy, 1 = plain bf16).
+        grad_pieces: bf16 pieces of the fp32 logit cotangent in the Pallas
+            backward dots.
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    tile_rows: int = 256
+    fn_pieces: int = 3
+    grad_pieces: int = 3
 
     __hash__ = hash_fn
 
@@ -1501,5 +1593,66 @@ class TopKConfig(BaseOperationConfig):
             faster.
         backend: Backend specification (default: "any").
     """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class IndexerScoresConfig(BaseOperationConfig):
+    """Configuration for the fused Lightning-indexer scoring.
+
+    The tiles are requests: the Pallas TPU kernel rounds them up to the sublane / lane multiples (16 / 128) and
+    shrinks them until the heaviest program fits half the local VMEM (``pltpu.get_tpu_info()``). The XLA reference
+    ignores them.
+
+    Args:
+        block_q: Query tile. Default 128.
+        block_t: Entry (key) tile. Default 1024: measured best on one TPU chip at ``H = 64``, ``d = 128``,
+            ``S = 8192``, ``T = 2048`` bf16 (fwd+bwd 3.96 ms vs 6.44 / 4.84 / 5.60 ms at 256 / 512 / 2048).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    block_q: int = 128
+    block_t: int = 1024
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class DsaSparseAttentionConfig(BaseOperationConfig):
+    """Configuration for the pool-bitmap block-sparse DSA attention.
+
+    Every field is a per-pair cost option of the Pallas TPU kernels; the visited
+    pairs (and therefore the numerics, up to fp32 reassociation) never change.
+    The XLA reference validates and ignores them. Defaults are the measured-best
+    values on a v5p chip.
+
+    Args:
+        block_q: Query tile (multiple of 128). Default 256.
+        block_kv: Key tile (multiple of 128 and ``32 * kpool``). Default 512:
+            bitwise the 256 tiling and ~8% faster.
+        backward: ``"fused"`` (single-pass backward, default; -22..-36% vs the
+            two passes) or ``"two_pass"``.
+        fwd_nt: Forward ``K @ q^T`` as NT dots without the q^T scratch.
+        fwd_lean: Forward with the ``-1e30`` running-max seed (bitwise the base).
+        bwd_lean: Two-pass backward lean recompute (fp32 reassociation).
+        pool_sum: Pool-cotangent reduction, ``"reshape"`` or ``"matmul"``.
+        stale_tau: Speculative stale-max forward threshold (``None`` = off;
+            measured 1.7x slower at block density 1).
+        fused_groups: Fused-backward core groups (``None`` = automatic, 1 or 2).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    block_q: int = 256
+    block_kv: int = 512
+    backward: str = "fused"
+    fwd_nt: bool = False
+    fwd_lean: bool = False
+    bwd_lean: bool = False
+    pool_sum: str = "reshape"
+    stale_tau: float | None = None
+    fused_groups: int | None = None
 
     __hash__ = hash_fn

@@ -26,6 +26,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 
 from .._online_rl.trainer import OnlineActorCriticTrainer, RolloutProvider
+from ..agentic_rollout import CompactionController
 from ..proximal_policy_optimization_trainer.ppo_trainer import RewardFunc
 from ._fn import apply_cross_segment_gae_correction
 from .compaction_rl_config import CompactionRLConfig
@@ -90,21 +91,16 @@ class CompactionRLTrainer(OnlineActorCriticTrainer):
         if tools is not None:
             arguments.tools = list(tools)
         if compaction_controller is None:
-            try:
-                from ..agentic_rollout import CompactionController
-
-                compaction_controller = CompactionController(
-                    context_budget=arguments.context_budget,
-                    compaction_threshold=arguments.compaction_threshold,
-                    recent_pairs=arguments.recent_steps,
-                    max_compactions=arguments.max_compactions,
-                    train_summary_tokens=arguments.train_summary_tokens,
-                    summary_instruction=arguments.summary_instruction,
-                    resume_template=arguments.resume_template,
-                    failure_policy=arguments.compaction_failure_policy,
-                )
-            except ImportError:
-                compaction_controller = None
+            compaction_controller = CompactionController(
+                context_budget=arguments.context_budget,
+                compaction_threshold=arguments.compaction_threshold,
+                recent_pairs=arguments.recent_steps,
+                max_compactions=arguments.max_compactions,
+                train_summary_tokens=arguments.train_summary_tokens,
+                summary_instruction=arguments.summary_instruction,
+                resume_template=arguments.resume_template,
+                failure_policy=arguments.compaction_failure_policy,
+            )
         self.compaction_controller = compaction_controller
         self.tool_guard = tool_guard
         self.environment_factory = environment_factory

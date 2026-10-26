@@ -148,8 +148,9 @@ def attention(
     key: Float[Array, "batch kv_len num_kv_heads head_dim"],
     value: Float[Array, "batch kv_len num_kv_heads vhead_dim"],
     attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | None = None,
-    bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
-    init_bias: Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
+    bias: Float[Array, "bias_batch bias_heads bias_seq_len bias_kv_len"] | None = None,
+    init_bias: Callable[[], Float[Array, "init_bias_batch init_bias_heads init_bias_seq_len init_bias_kv_len"]]
+    | None = None,
     deterministic: bool = True,
     dropout_rng: PRNGKeyArray | None = None,
     softmax_aux: Float[Array, "num_sinks"] | None = None,
@@ -162,7 +163,7 @@ def attention(
     sliding_window: int | tuple[int, int] | None = None,
     *,
     precision: jax.lax.PrecisionLike = None,
-) -> tuple[Float[Array, "batch seq_len num_q_heads vhead_dim"], Float[Array, "batch num_heads seq_len kv_len"]]:
+) -> tuple[Float[Array, "batch seq_len num_q_heads vhead_dim"], Float[Array, "batch num_q_heads seq_len kv_len"]]:
     """Compute multi-head attention using standard JAX operations.
 
     This function implements scaled dot-product attention with support for
@@ -181,10 +182,12 @@ def attention(
         attention_mask: Optional boolean attention_mask with shape [batch, 1, seq_len, kv_len].
             True values indicate positions to attend to, False positions are masked.
             Applied together with `bias` when both are given.
-        bias: Optional attention bias with shape [batch, num_heads, seq_len, kv_len].
-            Additive bias applied to attention scores before softmax.
-        init_bias: Optional callable that returns bias tensor.
-            Used to lazily initialize bias if both attention_mask and bias are None.
+        bias: Optional attention bias with shape [bias_batch, bias_heads, bias_seq_len, bias_kv_len].
+            Batch, query and key axes independently broadcast from 1 to their
+            input sizes. The head count may be 1, num_kv_heads, or num_q_heads
+            independently of the returned attention weights. Added before softmax.
+        init_bias: Optional callable returning a bias with the same independently
+            broadcast axes as bias. Used lazily if both attention_mask and bias are None.
         deterministic: If True, disables dropout (default). If False, applies dropout.
         dropout_rng: JAX PRNG key for dropout. Required when deterministic=False
             and dropout_prob > 0.
@@ -214,9 +217,9 @@ def attention(
 
     Returns:
         A tuple containing:
-            - attention_output: Float[Array, "batch seq_len num_q_heads head_dim"]
+            - attention_output: Float[Array, "batch seq_len num_q_heads vhead_dim"]
               The attended representation.
-            - attention_weights: Float[Array, "batch num_heads seq_len kv_len"]
+            - attention_weights: Float[Array, "batch num_q_heads seq_len kv_len"]
               The attention weights after softmax and dropout.
 
     Raises:
@@ -278,6 +281,10 @@ def attention(
     if causal:
         aw = jnp.where(jnp.tril(jnp.ones((qs, ks), "b1")).reshape(1, 1, 1, qs, ks), aw, jnp.finfo(aw.dtype).min)
     if bias is not None:
+        # Batch/query/key axes broadcast independently. Expand them before
+        # splitting query heads into KV heads and GQA repetitions: reshaping
+        # the unexpanded bias would reject otherwise valid singleton axes.
+        bias = jnp.broadcast_to(bias, (b, bias.shape[1], qs, ks))
         if bias.shape[1] == (kh * num_reps):
             bias = bias.reshape(b, kh, num_reps, qs, ks)
         elif bias.shape[1] == kh:

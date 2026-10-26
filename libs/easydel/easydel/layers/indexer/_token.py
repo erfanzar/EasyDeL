@@ -112,8 +112,18 @@ class TokenIndexer(BaseIndexer):
 
     @staticmethod
     def selection_from_output(output: GlmMoeDsaIndexerOutput) -> IndexerSelection:
-        """View an already-computed operation output without updating its cache again."""
-        return IndexerSelection(output.topk_indices)
+        """View an existing output, preserving its pre-ranking visibility contract.
+
+        The legacy operation indices can include masked fillers when fewer than
+        topk keys are live. Its dense mask is authoritative for those lanes;
+        expose them as -1 through the common indexer interface as well.
+        """
+        indices, mask = output.topk_indices, output.topk_mask
+        if mask is not None:
+            valid = (indices >= 0) & (indices < mask.shape[-1])
+            live = jnp.take_along_axis(mask, jnp.clip(indices, 0, mask.shape[-1] - 1), axis=-1)
+            indices = jnp.where(valid & live, indices, -1)
+        return IndexerSelection(indices, mask=mask)
 
     def forward(
         self,
@@ -124,12 +134,41 @@ class TokenIndexer(BaseIndexer):
         attention_mask=None,
         cached_keys=None,
         use_cache=False,
+        *,
+        cache_positions=None,
+        key_valid_mask=None,
+        query_positions=None,
+        key_positions=None,
+        segment_ids=None,
+        key_segment_ids=None,
+        reset_cache=None,
     ) -> GlmMoeDsaIndexerOutput:
-        """Return legacy operation output (token IDs and optional updated key cache).
+        """Return selected token IDs and an optional updated key cache.
 
-        Multi-token prefill resets the passed cache; single-token decode
-        appends to it. Rotary transformation and mask interpretation remain
-        owned by the registered operation.
+        Args:
+            hidden_states: Current layer inputs ``[batch, seq, hidden]``.
+            q_resid: Optional low-rank query inputs; ``None`` uses hidden states.
+            position_ids: Current RoPE positions ``[batch, seq]``.
+            frequencies: Optional RoPE table.
+            attention_mask: Optional pairwise boolean/additive score mask.
+            cached_keys: Historical keys or preallocated indexed key storage.
+            use_cache: Update and return the key cache when true.
+            cache_positions: Optional physical write slots ``[batch, seq]``
+                in fixed-capacity ``cached_keys``. Multi-token continuations
+                retain history instead of resetting it in this mode.
+            key_valid_mask: Optional post-update validity ``[batch, kv]``.
+            query_positions: Optional logical causal positions ``[batch, seq]``;
+                separate from RoPE positions and physical insertion slots.
+            key_positions: Optional logical positions ``[batch, kv]`` of keys.
+            segment_ids: Optional query document identities ``[batch, seq]``.
+            key_segment_ids: Optional post-update key identities ``[batch, kv]``.
+            reset_cache: Explicit reset policy. ``None`` preserves the legacy
+                multi-token reset/single-token append behavior unless physical
+                insertion slots are supplied, in which case history is kept.
+
+        Rotary transformation, indexed writes and visibility are owned by the
+        registered operation. The owning cache retains validity and segment
+        metadata separately from the checkpoint-compatible key channels.
         """
         q_input = q_resid if q_resid is not None else hidden_states
         query_states = self.wq_b(q_input).reshape(
@@ -137,6 +176,20 @@ class TokenIndexer(BaseIndexer):
         )
         key_states = self.k_norm(self.wk(hidden_states))
         head_weights = self.kernels_proj(hidden_states).astype(jnp.float32) * (self.index_n_heads**-0.5)
+        indexed_metadata = {
+            name: value
+            for name, value in {
+                "cache_positions": cache_positions,
+                "key_valid_mask": key_valid_mask,
+                "query_positions": query_positions,
+                "key_positions": key_positions,
+                "segment_ids": segment_ids,
+                "key_segment_ids": key_segment_ids,
+            }.items()
+            if value is not None
+        }
+        if reset_cache is None:
+            reset_cache = cache_positions is None and hidden_states.shape[1] > 1
         return self.indexer_op(
             query_states=query_states,
             key_states=key_states,
@@ -149,7 +202,8 @@ class TokenIndexer(BaseIndexer):
             attention_mask=attention_mask,
             cached_keys=cached_keys,
             use_cache=use_cache,
-            reset_cache=hidden_states.shape[1] > 1,
+            reset_cache=reset_cache,
             indexer_rope_interleave=self.indexer_rope_interleave,
             precision=self.precision,
+            **indexed_metadata,
         )

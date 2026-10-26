@@ -199,7 +199,7 @@ class SDPOConfig(GRPOConfig):
     )
     diagnostics_warning_interval: int = field(
         default=10,
-        metadata={"help": "Reserved interval for SDPO diagnostics warnings. Set 0 to disable."},
+        metadata={"help": "Emit SDPO feedback-signal diagnostics every N preprocessed batches. Set 0 to disable."},
     )
     diagnostics_flat_tolerance: float = field(
         default=1e-8,
@@ -282,18 +282,38 @@ class SDPOConfig(GRPOConfig):
             raise ValueError("`diagnostics_warning_interval` must be non-negative.")
         if self.diagnostics_flat_tolerance < 0:
             raise ValueError("`diagnostics_flat_tolerance` must be non-negative.")
+        # GRPO normalizes max_length to the student prompt+completion length.
+        # Keep the caller's teacher-context cap separately so feedback allocation
+        # neither discards explicitly available space nor consumes the entire
+        # default generation budget.
+        teacher_max_length = self.max_length if self.max_length is not None else max_sequence_length
         super().__post_init__(
             max_sequence_length=max_sequence_length,
             quantization_block=quantization_block,
         )
-        # The teacher context is [prompt | feedback | completion] and all three
-        # must fit within max_length.  Rather than growing max_length (which
-        # would break even-sized allocations), shrink max_completion_length so
-        # that prompt + feedback + completion == max_length.
+        if self.max_completion_length is not None and self.max_completion_length <= 0:
+            raise ValueError("SDPO requires a positive completion budget (`max_completion_length` > 0).")
         if self.max_prompt_length is None or self.max_feedback_length is None or self.max_completion_length is None:
             return
+        if teacher_max_length is not None:
+            self.max_length = teacher_max_length
+        elif self.max_length <= self.max_prompt_length + self.max_feedback_length:
+            # An inferred cap must not erase the entire generation budget (as
+            # happens with the defaults). Otherwise retain the base derived cap
+            # and its positive completion-budget trimming.
+            self.max_length = self.max_prompt_length + self.max_completion_length + self.max_feedback_length
+        # The teacher context is [prompt | feedback | completion] and all three
+        # must fit within max_length. Rather than growing an explicit max_length
+        # (which would break allocations), shrink max_completion_length so that
+        # prompt + feedback + completion == max_length.
         teacher_total = self.max_prompt_length + self.max_feedback_length + self.max_completion_length
         if self.max_length is not None and teacher_total > self.max_length:
-            self.max_completion_length = self.max_length - self.max_prompt_length - self.max_feedback_length
+            remaining_completion_length = self.max_length - self.max_prompt_length - self.max_feedback_length
+            if remaining_completion_length <= 0:
+                raise ValueError(
+                    "`max_length` must leave a positive completion budget after "
+                    "`max_prompt_length` and `max_feedback_length`."
+                )
+            self.max_completion_length = remaining_completion_length
 
     __hash__ = hash_fn

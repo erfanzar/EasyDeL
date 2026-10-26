@@ -228,9 +228,6 @@ class MistralToolParser(ToolParser):
         """
         super().__init__(tokenizer)
 
-        if MistralTokenizer and not isinstance(self.model_tokenizer, MistralTokenizer):
-            pass
-
         self.prev_tool_call_arr: list[dict] = []
         self.current_tool_id: int = -1
         self.current_tool_name_sent: bool = False

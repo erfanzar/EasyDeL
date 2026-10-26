@@ -138,12 +138,21 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
             `lm_head_name` parameter.
         _lm_head_name (str): The name of the LM head attribute.
         base_model: The underlying transformer model.
+        _ce_only_forward (bool): Explicit opt-in for a reviewed custom forward
+            whose objective contains only token-normalized cross-entropy, with
+            no router, MTP or other auxiliary loss. Trainers read this flag from
+            the concrete class's own ``__dict__`` rather than inheriting it;
+            subclasses must repeat the declaration after reviewing their own
+            backbone and auxiliary hooks. The unmodified base ``forward`` is
+            recognized directly and does not require this opt-in.
 
     Note:
         For MoE (Mixture of Experts) models, this class automatically detects
         router outputs and computes auxiliary load balancing losses when
         `router_aux_loss_coef` is configured.
     """
+
+    _ce_only_forward: bool = False
 
     def __init__(
         self,
@@ -165,6 +174,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         lm_head_class: spx.Module = ColumnParallelLinear,
         lm_head_sharding_layout: object | None = None,
         lm_head_bias_sharding_layout: object | None = None,
+        lm_head_input_dim: int | None = None,
     ):
         """Initialize the Causal LM module.
 
@@ -212,6 +222,10 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
                 to LM head classes that support it.
             lm_head_bias_sharding_layout: Optional explicit bias layout
                 forwarded to LM head classes that support it.
+            lm_head_input_dim: Input width of the LM head. Defaults to
+                config.hidden_size when None. Set this to the backbone's
+                output width when it projects hidden states to a different
+                dimension, such as OPT's word_embed_proj_dim.
 
         Example:
             Creating a model with weight tying::
@@ -282,7 +296,8 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
 
             Returns:
                 spx.Module: A freshly built LM head projecting
-                ``config.hidden_size`` to ``config.vocab_size``.
+                ``lm_head_input_dim`` (or ``config.hidden_size`` when None)
+                to ``config.vocab_size``.
             """
             head_kwargs = {
                 "dtype": dtype,
@@ -296,7 +311,11 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
                 head_kwargs["sharding_layout"] = lm_head_sharding_layout
             if lm_head_bias_sharding_layout is not None:
                 head_kwargs["bias_sharding_layout"] = lm_head_bias_sharding_layout
-            return lm_head_class(config.hidden_size, config.vocab_size, **head_kwargs)
+            return lm_head_class(
+                config.hidden_size if lm_head_input_dim is None else lm_head_input_dim,
+                config.vocab_size,
+                **head_kwargs,
+            )
 
         lm_head = self._create_task_head_on_last_stage(_build_lm_head)
         setattr(self, lm_head_name, lm_head)
@@ -417,7 +436,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         if apply_lm_head:
             lm_logits = self.compute_lm_logits(self.prepare_lm_head_inputs(outputs.last_hidden_state))
 
-        aux_loss = self.compute_router_aux_loss(outputs)
+        aux_loss = self.compute_aux_loss(outputs, attention_mask=attention_mask)
 
         # Return MoeCausalLMOutput for MoE models, CausalLMOutput otherwise
         if aux_loss is not None or hasattr(outputs, "all_router_losses"):
@@ -430,6 +449,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
                 aux_loss=aux_loss,
                 router_logits=getattr(outputs, "router_logits", None),
                 all_router_losses=getattr(outputs, "all_router_losses", None),
+                indexer_aux_loss=getattr(outputs, "indexer_aux_loss", None),
             )
         else:
             return CausalLMOutput(
@@ -546,8 +566,11 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
             common_types.MODE_INSERT,
         ]:
             aux_loss = aux_loss_fn(outputs, attention_mask)
+            indexer_aux = self.compute_indexer_aux_loss(outputs)
+            if indexer_aux is not None:
+                aux_loss = indexer_aux if aux_loss is None else aux_loss + indexer_aux
         else:
-            aux_loss = self.compute_router_aux_loss(outputs)
+            aux_loss = self.compute_aux_loss(outputs, attention_mask=attention_mask)
 
         return MoeCausalLMOutput(
             aux_loss=aux_loss,
@@ -557,46 +580,8 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
             attentions=outputs.attentions,
             router_logits=getattr(outputs, "router_logits", None),
             past_key_values=outputs.past_key_values,
+            indexer_aux_loss=getattr(outputs, "indexer_aux_loss", None),
         )
-
-    def apply_lm_head(self, hidden_states: Array) -> Array:
-        """Apply the language modeling head to hidden states.
-
-        Projects hidden states to vocabulary logits, optionally using tied
-        embeddings (transposed input embedding matrix as the projection).
-
-        The method automatically detects weight tying configuration from
-        multiple possible config attribute names for compatibility with
-        different model implementations.
-
-        Args:
-            hidden_states: Hidden state tensor with shape
-                (batch_size, sequence_length, hidden_size).
-
-        Returns:
-            Array: Vocabulary logits with shape
-                (batch_size, sequence_length, vocab_size).
-
-        Note:
-            Weight tying is detected from config attributes in this order:
-            1. tie_word_embeddings
-            2. use_lm_head
-            3. share_input_output_layers
-
-            When weight tying is enabled, the transposed embedding matrix
-            is passed to the LM head's forward method via the `w` parameter.
-        """
-        tie_embeddings = next(
-            (
-                getattr(self.config, key)
-                for key in ["tie_word_embeddings", "use_lm_head", "share_input_output_layers"]
-                if hasattr(self.config, key)
-            ),
-            False,
-        )
-        w = self.get_embedding().weight.value.T if tie_embeddings else None
-        lm_head = getattr(self, self._lm_head_name)
-        return lm_head(hidden_states, w=w)
 
     def prepare_lm_head_inputs(self, hidden_states: Array) -> Array:
         """Apply the shared pre-LM-head hidden-state transform.
@@ -633,25 +618,6 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
                 partition_manager=self.config.runtime_sharding_resolver,
             ),
         )
-
-    def compute_lm_logits(self, hidden_states: Array) -> Array:
-        """Project hidden states to logits using the shared LM-head path.
-
-        Thin override that delegates to
-        :meth:`BaseTaskModule.compute_lm_logits`, which handles optional
-        token-chunked projection (``config.lmhead_chunksize``) and applies
-        :meth:`apply_logit_cap` when configured.
-
-        Args:
-            hidden_states: Hidden states with shape
-                ``(batch_size, sequence_length, hidden_size)``.
-
-        Returns:
-            Array: Logits with shape
-            ``(batch_size, sequence_length, vocab_size)``.
-        """
-
-        return super().compute_lm_logits(hidden_states)
 
     def get_task_head(self):
         """Returns the language modeling head module.

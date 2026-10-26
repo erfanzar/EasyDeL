@@ -77,6 +77,7 @@ import collections.abc
 import contextlib
 import dataclasses
 import datetime as dt
+import inspect
 import json
 import os
 import typing as tp
@@ -245,7 +246,7 @@ logger = get_logger(__name__)
 
 
 def _optimizer_state_shardings_from_params(
-    tx: optax.GradientTransformation,
+    tx: optax.GradientTransformation | None,
     opt_state: tp.Any,
     param_shardings: tp.Any,
     replicated: jax.sharding.NamedSharding,
@@ -253,15 +254,20 @@ def _optimizer_state_shardings_from_params(
     """Mirror parameter shardings onto optimizer slots.
 
     ``optax.tree_map_params`` is the preferred path, but it requires custom
-    pytree aux data to match between placeholder init and real init. Some local
-    optimizers keep per-parameter routing metadata (for example ``layer_ids``)
-    as aux data, so placeholder init has empty aux while real init has one id
-    per parameter. In that case, keep the optimizer metadata intact and mirror
-    any subtree shaped like the parameter tree by structure.
+    pytree aux data to match between placeholder init and real init, and the
+    companion sharding tree to zip leafwise against the state. Optimizers that
+    keep per-parameter routing metadata as aux data (for example
+    ``layer_ids``), and optax's ``masked``/``multi_transform`` wrappers (used by
+    Muon) whose branches replace foreign parameters with ``MaskedNode``, make
+    it raise. In that case, and when no ``tx`` is bound (a state fresh from a
+    checkpoint load), every slot leaf whose path ends with a parameter's full
+    path takes that parameter's sharding; a leaf the optimizer already placed
+    on this mesh keeps its own ``NamedSharding``; everything else (counters,
+    coefficients) is replicated.
 
     Args:
         tx: The optax gradient transformation whose state should receive
-            shardings.
+            shardings, or ``None`` to use only the path-suffix mirror.
         opt_state: A live ``tx.init`` pytree to be annotated.
         param_shardings: A NamedSharding pytree shaped like ``graphstate``
             (parameter shardings to mirror onto opt-state slots).
@@ -317,7 +323,7 @@ def _optimizer_state_shardings_from_params(
             logger.warning("Adjusted %d optimizer-state shardings to match slot shapes.", adjusted["count"])
         return sanitized
 
-    if hasattr(optax, "tree_map_params"):
+    if tx is not None and hasattr(optax, "tree_map_params"):
         try:
             slot_shardings = optax.tree_map_params(
                 tx,
@@ -329,41 +335,50 @@ def _optimizer_state_shardings_from_params(
             )
             return _sanitize_slot_shardings(slot_shardings)
         except ValueError as exc:
-            # jax phrases a treedef mismatch differently across versions:
-            # "Mismatch custom node data" before 0.10, "different pytree
-            # metadata" / "pytree structure error" from 0.10 on. Matching only
-            # the old wording means that on current jax the exception escapes
-            # instead of falling through to the structural path below, so any
-            # optimizer whose pytree node definition carries value-dependent
-            # static aux_data fails here rather than being handled.
+            # Treedef-mismatch wording varies across jax/optax versions.
             _mismatch_markers = (
                 "Mismatch custom node data",
                 "different pytree metadata",
                 "pytree structure error",
+                "Expected named tuple",
+                "Dict key mismatch",
             )
             if not any(m in str(exc) for m in _mismatch_markers):
                 raise
 
-    param_treedef = jax.tree_util.tree_structure(param_shardings, is_leaf=_is_sharding_leaf)
+    # Optax wrappers only prefix a slot's path, so match slots to params by path suffix.
+    param_path_shardings: dict[tuple, jax.sharding.NamedSharding] = {}
+    for path, sharding in jax.tree_util.tree_flatten_with_path(param_slot_shardings, is_leaf=_is_sharding_leaf)[0]:
+        param_path_shardings[tuple(path)] = sharding
+    suffix_lengths = sorted({len(path) for path in param_path_shardings}, reverse=True)
 
-    def _matches_param_tree(value: tp.Any) -> bool:
-        """Return whether ``value`` has the same tree structure as ``param_shardings``."""
-        try:
-            return jax.tree_util.tree_structure(value) == param_treedef
-        except Exception:
-            return False
+    def _param_sharding_for_slot_path(path: tuple) -> jax.sharding.NamedSharding | None:
+        """Return the owning parameter's sharding when ``path`` ends with a full parameter path."""
+        path = tuple(path)
+        for n in suffix_lengths:
+            if len(path) >= n:
+                hit = param_path_shardings.get(path[-n:])
+                if hit is not None:
+                    return hit
+        return None
 
-    def _state_sharding(value: tp.Any) -> tp.Any:
-        """Pick the right sharding subtree for one optimizer-state slot."""
-        if _matches_param_tree(value):
-            return param_slot_shardings
+    def _sharding_by_path(path: tuple, leaf: tp.Any) -> jax.sharding.NamedSharding:
+        """Pick a slot leaf's sharding: owning parameter's, else the leaf's own on this mesh, else replicated.
+
+        The middle case covers optimizers that lay out non-parameter-shaped
+        state themselves (for example factored preconditioner statistics placed
+        on a per-leaf ``NamedSharding``); flattening those to replicated would
+        materialize them on every device.
+        """
+        hit = _param_sharding_for_slot_path(path)
+        if hit is not None:
+            return hit
+        own = getattr(leaf, "sharding", None)
+        if isinstance(own, jax.sharding.NamedSharding) and own.mesh == replicated.mesh:
+            return own
         return replicated
 
-    slot_shardings = jax.tree_util.tree_map(
-        _state_sharding,
-        opt_state,
-        is_leaf=_matches_param_tree,
-    )
+    slot_shardings = jax.tree_util.tree_map_with_path(_sharding_by_path, opt_state)
     return _sanitize_slot_shardings(slot_shardings)
 
 
@@ -891,7 +906,8 @@ class EasyDeLState(_PyTreeNode):
 
         if self.tx is not None and hasattr(optax, "tree_map_params"):
             try:
-                param_partition_specs = self.model.resolve_sharding_for_tree(self.graphstate)
+                param_shardings = self.model.resolve_sharding_for_tree(self.graphstate, mesh=mesh)
+                param_partition_specs = jax.tree_util.tree_map(lambda sharding: sharding.spec, param_shardings)
                 partition_specs = optax.tree_map_params(
                     self.tx,
                     lambda _param, spec: spec,
@@ -1046,12 +1062,21 @@ class EasyDeLState(_PyTreeNode):
         if opt_state is None:
             opt_state = self.opt_state
         mesh = self.model._get_mesh(None)
-        partition_specs = self._optimizer_partition_specs(
-            opt_state,
-            mesh=mesh,
-        )
-        shard_fns, _ = make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)
-        opt_state = jax.tree_util.tree_map(lambda f, o: f(o), shard_fns, opt_state)
+        if self.tx is not None:
+            # Keep NamedShardings intact: reducing them to PartitionSpecs loses
+            # stage-local meshes for pipeline-parallel optimizer moments.
+            param_shardings = self.model.resolve_sharding_for_tree(self.graphstate, mesh=mesh)
+            shardings = _optimizer_state_shardings_from_params(
+                self.tx, opt_state, param_shardings, replicated_named_sharding(mesh)
+            )
+            opt_state = _materialize_replicated_setup_scalars(opt_state, shardings)
+            opt_state = spx.place_setup_tree_with_shardings(
+                opt_state, shardings, label="EasyDeLState.shard_optimizer_state"
+            )
+        else:
+            partition_specs = self._optimizer_partition_specs(opt_state, mesh=mesh)
+            shard_fns, _ = make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)
+            opt_state = jax.tree_util.tree_map(lambda f, o: f(o), shard_fns, opt_state)
         return self.replace(opt_state=opt_state)
 
     def gather_optimizer_state(self: Self) -> Self:
@@ -1264,7 +1289,7 @@ class EasyDeLState(_PyTreeNode):
         self: Self,
         load_directory: str | ePathLike,
         checkpointer: Checkpointer | None = None,
-        tx_template: None | optax.GradientTransformation = None,
+        tx_template: optax.GradientTransformation | None = None,
         checkpoint_load_chunk_size: int | None = None,
         checkpoint_load_concurrent_gb: int = 128,
         checkpoint_load_tensorstore_io_concurrency: int | None = 1024,
@@ -1410,8 +1435,8 @@ class EasyDeLState(_PyTreeNode):
 
         try:
             opt_state, metadata = _load_tensorstore(template)
-        except KeyError as exc:
-            if template is not None and "Missing array for key" in str(exc):
+        except (KeyError, ValueError) as exc:
+            if template is not None and _is_optimizer_template_incompatibility(exc):
                 logger.error(
                     "Optimizer checkpoint is incompatible with the current optimizer template.",
                     exc_info=True,
@@ -1479,9 +1504,8 @@ class EasyDeLState(_PyTreeNode):
             checkpointer (Checkpointer | None): Custom checkpointer instance to use
                 for saving. If None, a default Checkpointer is created. Defaults
                 to None.
-            step (int | None): Training step to record in checkpoint metadata. If
-                None, the value is not explicitly passed to the checkpointer.
-                Defaults to None.
+            step (int | None): Training step to record in the checkpoint's extras
+                metadata. If None, no step is recorded. Defaults to None.
 
         Returns:
             None
@@ -1538,12 +1562,17 @@ class EasyDeLState(_PyTreeNode):
                     from easydel.layers.layouts import write_fused_layout_marker
                     from easydel.layers.layouts._runtime import tensor_parallel_size as _fused_tp_size
 
+                    # Don't pass ``step=`` here - save_directory is already the checkpoint directory and
+                    # passing it would create a duplicate run-{step}/run-{step} structure. The step is
+                    # recorded through the checkpoint extras metadata instead.
+                    save_kwargs: dict[str, tp.Any] = {}
+                    if step is not None:
+                        save_kwargs["extras"] = {"step": int(step)}
                     checkpointer.save_pytree(
                         tree=self.opt_state,
                         dtype=float_dtype,
                         prefix="tx",
-                        # Don't pass step here - save_directory is already the checkpoint directory
-                        # Passing step would create duplicate run-{step}/run-{step} structure
+                        **save_kwargs,
                     )
                 if not is_remote_path(save_directory) or jax.process_index() == 0:
                     # ``tensor_parallel_size`` documents ``None`` as "no config,
@@ -1645,6 +1674,15 @@ class EasyDeLState(_PyTreeNode):
         else:
             logger.info("Skipping optimizer saving as requested.")
 
+        def save_model(model, directory):
+            # State owns the checkpoint directory. Only pass the newer layout
+            # option to savers that explicitly support it; legacy/custom savers
+            # retain the original save_directory/float_dtype/step contract.
+            save_kwargs = {}
+            if "versioned" in inspect.signature(model.save_pretrained).parameters:
+                save_kwargs["versioned"] = False
+            model.save_pretrained(save_directory=directory, float_dtype=float_dtype, step=step, **save_kwargs)
+
         if resume_model_to_save is not None:
             resume_directory = save_directory / RESUME_MODEL_SUBDIR
             logger.info(
@@ -1652,11 +1690,7 @@ class EasyDeLState(_PyTreeNode):
                 save_directory,
                 resume_directory,
             )
-            resume_model_to_save.save_pretrained(
-                save_directory=resume_directory,
-                float_dtype=float_dtype,
-                step=step,
-            )
+            save_model(resume_model_to_save, resume_directory)
 
         model_to_save = self.model
         if should_save_merged_lora:
@@ -1665,11 +1699,7 @@ class EasyDeLState(_PyTreeNode):
             model_to_save = deepcopy_model(self.model)
             model_to_save.unwrap_lora_to_layers(verbose=False)
 
-        model_to_save.save_pretrained(
-            save_directory=save_directory,
-            float_dtype=float_dtype,
-            step=step,
-        )
+        save_model(model_to_save, save_directory)
         try:
             if jax.process_index() == 0:
                 metadata = {
@@ -1714,6 +1744,7 @@ class EasyDeLState(_PyTreeNode):
         checkpoint_load_tensorstore_metadata_workers: int = 256,
         checkpoint_load_progress: bool | None = None,
         skip_optimizer_state: bool = False,
+        allow_optimizer_restore_failure: bool = True,
         **kwargs,
     ) -> Self:
         """Load an EasyDeLState from a saved checkpoint directory.
@@ -1770,6 +1801,9 @@ class EasyDeLState(_PyTreeNode):
                 inferring optimizer state structure when loading. Defaults to None.
             skip_optimizer_state (bool): If true, load the checkpoint model weights
                 without restoring saved optimizer/tx state.
+            allow_optimizer_restore_failure (bool): Allow best-effort optimizer
+                loading, logging a restore error and returning model-only state.
+                Defaults to True. Set False to require a complete optimizer restore.
             **kwargs: Additional keyword arguments passed to the underlying
                 `EasyDeLBaseModule.from_pretrained` method.
 
@@ -1828,8 +1862,10 @@ class EasyDeLState(_PyTreeNode):
               model at the checkpoint root for direct inference loading.
             - Optimizer state loading is only attempted when the checkpoint
               metadata or legacy artifacts indicate optimizer state is present.
-              Failures are logged as info (not errors), allowing weights-only
-              resume or inference-style usage.
+              Restore failures are logged by default, allowing weights-only
+              resume or inference-style usage. Set
+              ``allow_optimizer_restore_failure=False`` to propagate restore errors,
+              or ``skip_optimizer_state=True`` to skip restoration entirely.
             - When `auto_shard_model=True`, both model and optimizer state are
               sharded according to the specified rules.
 
@@ -1935,6 +1971,8 @@ class EasyDeLState(_PyTreeNode):
                         verbose=verbose,
                     )
             except Exception as exc:
+                if not allow_optimizer_restore_failure:
+                    raise
                 logger.warning(
                     "EasyDeLState couldn't restore the optimizer/tx: %s: %s",
                     type(exc).__name__,
@@ -1984,7 +2022,7 @@ class EasyDeLState(_PyTreeNode):
             - :attr:`shardings`: Get current sharding annotations.
         """
         self = jax.tree_util.tree_map(
-            device_put_or_shard_abstract,
+            lambda value, annotation: device_put_or_shard_abstract(value, getattr(annotation, "sharding", annotation)),
             self,
             shape,
         )
@@ -2053,11 +2091,13 @@ class EasyDeLState(_PyTreeNode):
         if not isinstance(step, jax.Array):
             step = jnp.asarray(step, dtype=jnp.int32)
 
-        graphstate = self.model.apply_sharding_for_tree(self.graphstate)
-        graphother = self.model.apply_sharding_for_tree(self.graphother)
+        graphstate = self.model.apply_sharding_for_tree(self.graphstate, mesh=mesh)
+        graphother = self.model.apply_sharding_for_tree(self.graphother, mesh=mesh)
 
         opt_state = self.opt_state
-        if opt_state is not None and self.tx is not None and hasattr(optax, "tree_map_params"):
+        # Also for a tx-less state (fresh from ``load_state``): the mirror falls back to the
+        # path-suffix match, so loaded slots are placed before a trainer binds its optimizer.
+        if opt_state is not None:
             param_shardings = spx.extract_sharding_structure(graphstate, mesh=mesh)
             opt_shardings = _optimizer_state_shardings_from_params(self.tx, opt_state, param_shardings, replicated)
             opt_state = _materialize_replicated_setup_scalars(opt_state, opt_shardings)
@@ -2175,14 +2215,9 @@ class EasyDeLState(_PyTreeNode):
             - :meth:`shard_state`: Shard entire state.
             - :meth:`shard_optimizer_state`: Shard optimizer state.
         """
-        mesh = mesh or self.model._get_mesh(None)
-        graphstate = self.model.apply_sharding_for_tree(self.graphstate)
-        graphother = self.model.apply_sharding_for_tree(self.graphother)
-
+        graphstate = self.model.apply_sharding_for_tree(self.graphstate, mesh=mesh)
         graphother = materialize_meta_leaves(self.graphother, seed=42)
-        graphother_specs = self._materialized_tree_partition_specs(graphother)
-        shard_fns, _ = make_shard_and_gather_fns(graphother_specs, mesh)
-        graphother = jax.tree_util.tree_map(lambda f, o: f(o), shard_fns, graphother)
+        graphother = self.model.apply_sharding_for_tree(graphother, mesh=mesh)
 
         self = self.replace(graphstate=graphstate, graphother=graphother)
         return self

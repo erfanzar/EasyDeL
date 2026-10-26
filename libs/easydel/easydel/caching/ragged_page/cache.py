@@ -76,6 +76,7 @@ from easydel.infra.sharding import (
 from easydel.utils.helpers import check_bool_flag
 
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, OperationsMetadata, unwrap_metadata
+from ..budget import compute_paged_cache_budget
 from .utils import kv_cache_update, kv_cache_update_jax
 
 if tp.TYPE_CHECKING:
@@ -119,23 +120,31 @@ def previous_power_of_2(n: int) -> int:
     return 1 << (n.bit_length() - 1)
 
 
-def get_num_slices_per_kv_cache_update_page(page_size_bytes: int) -> int:
+def get_num_slices_per_kv_cache_update_page(page_size_bytes: int, *, allow_oversized_page: bool = False) -> int:
     """Calculate the number of update slices per processing page.
 
     Determines how many cache update slices fit in a 16MB processing
     page, capped at 64 for efficiency.
 
     Args:
-        page_size_bytes: Size of one KV cache page in bytes.
+        page_size_bytes: Positive size of one KV cache page in bytes.
+        allow_oversized_page: Use one slice when a page exceeds the processing
+            window. Unified attention supports this; ragged kernels require
+            the default strict window bound.
 
     Returns:
         int: Number of slices per processing page (power of 2, max 64).
 
     Raises:
-        ValueError: If page_size_bytes is too large (slices <= 0).
+        ValueError: If page_size_bytes is non-positive, or exceeds the window
+            while allow_oversized_page is False.
     """
+    if page_size_bytes <= 0:
+        raise ValueError("page_size_bytes must be positive")
     num_slices_per_page = KV_UPDATE_WINDOW_BYTES // page_size_bytes
     if num_slices_per_page <= 0:
+        if allow_oversized_page:
+            return 1
         raise ValueError("Number of slices should be positive")
     num_slices_per_page = previous_power_of_2(num_slices_per_page)
     if num_slices_per_page > MAX_SLICES_PER_UPDATE_PAGE:
@@ -223,29 +232,29 @@ def _storage_num_combined_kv_heads_for_dtype(num_kv_heads: int, k_headdim: int, 
     return align_to_multiple(num_kv_heads * 2, packing)
 
 
-def _canonicalize_dtype(dtype: jnp.dtype) -> jnp.dtype:
-    """Normalize dtype objects/classes to the scalar type form used by eformer maps.
+def canonicalize_dtype(dtype: jnp.dtype) -> jnp.dtype:
+    """Normalize dtype objects, classes, and strings to a cache storage dtype.
 
     Args:
         dtype: A NumPy/JAX dtype, dtype class, or string accepted by ``jnp.dtype``.
 
     Returns:
-        The scalar Python ``type`` underlying ``dtype`` (e.g. ``np.float16``).
+        The canonical ``jnp.dtype`` instance for ``dtype``.
     """
     return jnp.dtype(dtype)
 
 
-def _dtype_to_string(dtype: jnp.dtype) -> str:
+def dtype_to_string(dtype: jnp.dtype) -> str:
     """Convert a dtype to the stable cache-config string representation.
 
     Args:
-        dtype: Any value acceptable to ``_canonicalize_dtype``.
+        dtype: Any value acceptable to ``canonicalize_dtype``.
 
     Returns:
         The canonical eformer dtype string, falling back to ``str(jnp.dtype(...))``
         when the dtype is not in the lookup table.
     """
-    dtype = _canonicalize_dtype(dtype)
+    dtype = canonicalize_dtype(dtype)
     return DTYPE_TO_STRING_MAP.get(dtype, str(jnp.dtype(dtype)))
 
 
@@ -274,7 +283,7 @@ def _select_compatible_v3_kv_cache_dtype(
     Returns:
         ``kvdtype`` if it already divides cleanly, otherwise an upcast dtype.
     """
-    kvdtype = _canonicalize_dtype(kvdtype)
+    kvdtype = canonicalize_dtype(kvdtype)
     if kv_head_shards <= 1:
         return kvdtype
 
@@ -321,21 +330,21 @@ def _select_compatible_v3_kv_cache_dtype(
                 "Upcasting ragged-page v3 KV cache dtype from %s to %s because "
                 "packed storage groups (%d) cannot be split into whole K/V pairs "
                 "across kv_head shards (%d).",
-                _dtype_to_string(kvdtype),
-                _dtype_to_string(candidate_dtype),
+                dtype_to_string(kvdtype),
+                dtype_to_string(candidate_dtype),
                 storage_groups,
                 kv_head_shards,
             )
-            return _canonicalize_dtype(candidate_dtype)
+            return canonicalize_dtype(candidate_dtype)
 
     raise ValueError(
         "Ragged-page v3 KV cache layout is incompatible with the current kv_head sharding. "
-        f"got kvdtype={_dtype_to_string(kvdtype)}, "
+        f"got kvdtype={dtype_to_string(kvdtype)}, "
         f"num_kv_heads={num_kv_heads}, k_headdim={k_headdim}, kv_head_shards={kv_head_shards}."
     )
 
 
-def _resolve_ragged_cache_layout(
+def resolve_ragged_cache_layout(
     kvdtype: jnp.dtype,
     *,
     version: str,
@@ -362,7 +371,7 @@ def _resolve_ragged_cache_layout(
         should actually be allocated and ``effective_shards`` is ``1`` when
         replication was chosen.
     """
-    kvdtype = _canonicalize_dtype(kvdtype)
+    kvdtype = canonicalize_dtype(kvdtype)
     kv_head_shards = max(1, int(kv_head_shards))
 
     if kv_head_shards <= 1:
@@ -380,9 +389,9 @@ def _resolve_ragged_cache_layout(
                 logger.warning(
                     "Replicating ragged-page v3 KV cache across the kv-head axis to preserve requested "
                     "dtype %s; sharding across %s KV-head shards would widen storage to %s.",
-                    _dtype_to_string(kvdtype),
+                    dtype_to_string(kvdtype),
                     kv_head_shards,
-                    _dtype_to_string(resolved_dtype),
+                    dtype_to_string(resolved_dtype),
                 )
                 return kvdtype, 1
             return resolved_dtype, kv_head_shards
@@ -396,7 +405,7 @@ def _resolve_ragged_cache_layout(
             )
             return kvdtype, 1
 
-    if version == "v2" and (int(num_kv_heads) * 2) % kv_head_shards != 0:
+    if version == "v2" and int(num_kv_heads) % kv_head_shards != 0:
         logger.warning(
             "Replicating ragged-page v2 KV cache across the kv-head axis because "
             "num_kv_heads=%s cannot be split across %s kv-head shards.",
@@ -408,7 +417,7 @@ def _resolve_ragged_cache_layout(
     return kvdtype, kv_head_shards
 
 
-def _resolve_v3_kv_head_layout(
+def resolve_v3_kv_head_layout(
     kvdtype: jnp.dtype,
     *,
     logical_num_kv_heads: int,
@@ -421,9 +430,18 @@ def _resolve_v3_kv_head_layout(
     dtype packing later forces the cache to replicate, keeping that padding
     changes the model's GQA ratio (for example Qwen's 24 query heads and two
     KV heads become 24:4). Restore the logical width on replicated storage.
+
+    Args:
+        kvdtype: Requested KV cache storage dtype.
+        logical_num_kv_heads: Model's unpadded number of KV heads.
+        k_headdim: Per-head key dimension.
+        physical_kv_head_shards: Requested mesh shard count for the KV-head axis.
+
+    Returns:
+        Storage dtype, effective shard count, and physical number of KV heads.
     """
     padded_num_kv_heads = _pad_v3_kv_heads_to_shards(logical_num_kv_heads, physical_kv_head_shards)
-    resolved_dtype, effective_shards = _resolve_ragged_cache_layout(
+    resolved_dtype, effective_shards = resolve_ragged_cache_layout(
         kvdtype,
         version="v3",
         num_kv_heads=padded_num_kv_heads,
@@ -459,6 +477,13 @@ def _pad_v3_kv_heads_to_shards(num_kv_heads: int, kv_head_shards: int) -> int:
     if kv_head_shards % num_kv_heads != 0:
         return num_kv_heads
     return kv_head_shards
+
+
+# Preserve existing imports while exposing cache geometry as a public contract.
+_canonicalize_dtype = canonicalize_dtype
+_dtype_to_string = dtype_to_string
+_resolve_ragged_cache_layout = resolve_ragged_cache_layout
+_resolve_v3_kv_head_layout = resolve_v3_kv_head_layout
 
 
 def get_page_size_bytes(
@@ -719,10 +744,10 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver, mode=MODE_PREFILL)
         )
         physical_kv_head_size = mesh_axis_size(mesh, runtime_sharding_resolver.paxis.kv_head_axis)
-        kvdtype = _canonicalize_dtype(kvdtype)
+        kvdtype = canonicalize_dtype(kvdtype)
         logical_num_kv_heads = int(num_kv_heads)
         if version == "v3":
-            kvdtype, effective_kv_head_shards, storage_num_kv_heads = _resolve_v3_kv_head_layout(
+            kvdtype, effective_kv_head_shards, storage_num_kv_heads = resolve_v3_kv_head_layout(
                 kvdtype,
                 logical_num_kv_heads=logical_num_kv_heads,
                 k_headdim=k_headdim,
@@ -737,7 +762,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
                 )
             num_kv_heads = storage_num_kv_heads
         else:
-            kvdtype, effective_kv_head_shards = _resolve_ragged_cache_layout(
+            kvdtype, effective_kv_head_shards = resolve_ragged_cache_layout(
                 kvdtype,
                 version=version,
                 num_kv_heads=num_kv_heads,
@@ -752,34 +777,27 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             hbm_utilization=hbm_utilization,
             kv_head_shards=effective_kv_head_shards,
         )
-        bytes_av = jnp.finfo(kvdtype).bits // 8
-        storage_head_dim = align_to_multiple(k_headdim, HEAD_DIM_ALIGNMENT) if version == "v3" else kv_head_dim_size
-        page_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * storage_head_dim * bytes_av
-        num_pages = int(free) // page_bytes
-        if data_parallel_size > 1:
-            num_pages = (num_pages // data_parallel_size) * data_parallel_size
-        # Optionally cap the total KV-cache token capacity (num_pages * page_size)
-        # so we don't allocate, say, a 1M-token cache from HBM when the run only
-        # needs 64k. Effective capacity = min(hbm-derived, max_cache_tokens).
-        if max_cache_tokens is not None and int(max_cache_tokens) > 0:
-            capped_pages = max(1, int(max_cache_tokens) // page_size)
-            if data_parallel_size > 1:
-                capped_pages = max(data_parallel_size, (capped_pages // data_parallel_size) * data_parallel_size)
-            if capped_pages < num_pages:
-                logger.info(
-                    "Capping KV pages %s -> %s (sequence_capacity %sK -> %sK) via max_cache_tokens=%s, page_size=%s.",
-                    num_pages,
-                    capped_pages,
-                    int(num_pages * page_size / 1000),
-                    int(capped_pages * page_size / 1000),
-                    int(max_cache_tokens),
-                    page_size,
-                )
-                num_pages = capped_pages
-        if num_pages <= 0:
-            raise ValueError(
-                "Computed `num_pages` is non-positive; increase `hbm_utilization` or reduce page footprint."
+        if version == "v3":
+            # Budget the bytes of the *allocated* v3 layout (see ``get_shape_and_axes``): the packed combined-KV
+            # head axis times the aligned head dim. ``get_page_size_bytes`` shares that layout logic, including the
+            # head_dim==64 case where K/V already share the head-dim axis and must not be doubled again.
+            page_bytes = num_hidden_layers * get_page_size_bytes(
+                page_size=page_size,
+                num_kv_heads=num_kv_heads,
+                head_size=k_headdim,
+                kv_cache_dtype=kvdtype,
             )
+        else:
+            bytes_av = jnp.finfo(kvdtype).bits // 8
+            page_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * k_headdim * bytes_av
+        budget = compute_paged_cache_budget(
+            {idx: page_bytes // num_hidden_layers for idx in range(num_hidden_layers)},
+            available_bytes=free,
+            page_size=page_size,
+            data_parallel_size=data_parallel_size,
+            max_cache_tokens=max_cache_tokens,
+        )
+        num_pages = budget.num_pages
         logger.info(
             f"Creating PagesCacheConfig with {num_pages=} {page_bytes=} "
             f"sequence_capacity={int((num_pages * page_size) / 1000)}K"
@@ -808,7 +826,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
                 )
             ),
             version=version,
-            _kvdtype_str=_dtype_to_string(kvdtype),
+            _kvdtype_str=dtype_to_string(kvdtype),
         )
 
     @property
@@ -1086,6 +1104,8 @@ class RaggedPagesCacheView(BaseCacheView):
             RaggedPagesCacheView: Updated cache view with new KV pairs.
         """
         cache_metadata = unwrap_metadata(cache_metadata, "ragged")
+        if hasattr(cache_metadata, "for_layer"):
+            cache_metadata = cache_metadata.for_layer(self.layer_index)
 
         if self.metadata.is_v2:
             num_kv_heads = key.shape[2]
@@ -1211,7 +1231,7 @@ class RaggedPagesCacheView(BaseCacheView):
                 Shape: [num_pages, page_size, num_kv_heads, head_dim]
         """
         flat = self.flattened_kv_pages()
-        if kv_pair_shares_head_dim_axis(self.metadata.k_headdim):
+        if self.metadata.is_v3 and kv_pair_shares_head_dim_axis(self.metadata.k_headdim):
             return flat[..., : self.metadata.k_headdim]
         return flat[:, :, 0::2, :]
 
@@ -1224,7 +1244,7 @@ class RaggedPagesCacheView(BaseCacheView):
                 Shape: [num_pages, page_size, num_kv_heads, head_dim]
         """
         flat = self.flattened_kv_pages()
-        if kv_pair_shares_head_dim_axis(self.metadata.k_headdim):
+        if self.metadata.is_v3 and kv_pair_shares_head_dim_axis(self.metadata.k_headdim):
             return flat[..., self.metadata.k_headdim : self.metadata.k_headdim + self.metadata.v_headdim]
         return flat[:, :, 1::2, :]
 
@@ -1308,24 +1328,28 @@ class RaggedPagesCache(BaseCache):
                 )
         return cls(views=views)
 
-    def init_empty(self, *args, **kwargs) -> None:
-        """No-op stub kept only to satisfy the ``BaseCache`` contract.
+    @classmethod
+    def init_empty(cls, num_hidden_layers: tp.Any, *args, **kwargs) -> RaggedPagesCache:
+        """Create a container with ``None`` placeholders for each layer.
 
-        ``RaggedPagesCache`` always allocates its physical KV-page buffer up
-        front through :meth:`init_cache`; the empty-skeleton workflow used
-        by :class:`TransformerCache` doesn't apply here because pages are
-        managed by ejkernel against fixed shapes. This method therefore
-        ignores its arguments and returns ``None`` so that callers using
-        the abstract API don't crash.
+        The physical KV-page buffer is still allocated up front through
+        :meth:`init_cache`; this skeleton only mirrors the
+        :meth:`TransformerCache.init_empty` contract so model code can build a
+        cache shell before the engine installs real views.
 
         Args:
+            num_hidden_layers: Number of layer slots. For backward compatibility an
+                object exposing a ``num_hidden_layers`` attribute (a model config)
+                is also accepted.
             *args: Ignored.
             **kwargs: Ignored.
 
         Returns:
-            None: Always.
+            An instance of ``cls`` holding ``num_hidden_layers`` ``None`` views.
         """
-        return None
+        if not isinstance(num_hidden_layers, int):
+            num_hidden_layers = getattr(num_hidden_layers, "num_hidden_layers", num_hidden_layers)
+        return cls(views=[None for _ in range(int(num_hidden_layers))])
 
     def __repr__(self) -> str:
         """Return a one-block summary identifying the page buffer and layer count.
@@ -1505,6 +1529,10 @@ class RaggedPagesMetadata:
         num_slices_per_kv_cache_update_page (int, optional): Slices per page.
         page_size (int): Tokens per cache page. Default: 128.
         prefill_chunk_size (int): Chunk size for prefill. Default: 512.
+        cache_groups (tuple): Optional complete per-group runtime payloads.
+            Select with for_layer before KV writes and registered attention reads.
+        layer_to_cache_group (tuple[int, ...]): Static layer-to-group mapping.
+            Empty defaults preserve the existing single-table API.
 
     Example:
         >>> meta = RaggedPagesMetadata(
@@ -1521,7 +1549,7 @@ class RaggedPagesMetadata:
     query_start_loc: Int[Array, "max_num_reqs_plus_1"]  # noqa: F821
     num_seqs: Int[Array, "max_num_reqs"]  # noqa: F821
 
-    slot_mapping: Int[Array, "num_tokens"] | None = None  # noqa: F821
+    slot_mapping: Int[Array, "..."] | None = None
     position_ids: Int[Array, "num_tokens"] | None = None  # noqa: F821
 
     request_distribution: Int[Array, "3"] | None = None
@@ -1535,6 +1563,61 @@ class RaggedPagesMetadata:
     page_size: int = field(pytree_node=False, default=128)
     prefill_chunk_size: int = field(pytree_node=False, default=512)
 
+    # Optional complete per-group payloads: tables and v2 slot mappings must be
+    # selected together, as must rebased lengths/positions for windowed groups.
+    # Empty defaults keep the single-table API and pytree structure.
+    cache_groups: tuple[tp.Self, ...] = field(pytree_node=True, default=())
+    layer_to_cache_group: tuple[int, ...] = field(pytree_node=False, default=())
+
+    def for_group(self, group_index: int) -> RaggedPagesMetadata:
+        """Return the complete runtime payload for a static cache-group index.
+
+        Group entries use the same metadata class and carry their own page
+        tables, slot mappings, page size, positions and lengths. Selecting only
+        a table while retaining another group's writes would corrupt the pool.
+        The returned payload has no group dispatch attached, so selecting it
+        again in a cache view is a no-op.
+
+        Args:
+            group_index: Zero-based static group index (not a traced array).
+
+        Returns:
+            This metadata for legacy group zero, otherwise the selected payload.
+
+        Raises:
+            ValueError: If the group index is invalid or payloads are nested.
+        """
+        if not self.cache_groups:
+            if group_index != 0:
+                raise ValueError("Single-table metadata only has cache group zero")
+            return self
+        if group_index < 0 or group_index >= len(self.cache_groups):
+            raise ValueError(f"Invalid cache group index {group_index}")
+        selected = self.cache_groups[group_index]
+        if selected.cache_groups:
+            raise ValueError("Cache-group runtime payloads must not contain nested groups")
+        return selected
+
+    def for_layer(self, layer_index: int | None) -> RaggedPagesMetadata:
+        """Select matching metadata before both KV writes and attention reads.
+
+        Args:
+            layer_index: Static model layer index. Optional for legacy metadata.
+
+        Returns:
+            This metadata unchanged for the single-table API, or the layer's
+            complete group payload. Registered attention dispatch must use this
+            same selection as cache writes.
+
+        Raises:
+            ValueError: If grouped metadata has no mapping for the layer.
+        """
+        if not self.cache_groups:
+            return self
+        if layer_index is None or layer_index < 0 or layer_index >= len(self.layer_to_cache_group):
+            raise ValueError(f"Grouped page metadata has no mapping for layer {layer_index}")
+        return self.for_group(self.layer_to_cache_group[layer_index])
+
     @classmethod
     def create_empty(
         cls,
@@ -1543,11 +1626,15 @@ class RaggedPagesMetadata:
         max_pages: int,
         page_size: int = 128,
         version: tp.Literal["v3", "v2"] = "v3",
+        num_slices_per_kv_cache_update_page: int | None = None,
     ) -> RaggedPagesMetadata:
         """Create empty metadata with proper shapes for compilation.
 
         Creates zeroed metadata arrays with the correct shapes, useful for
-        JIT compilation where shapes must be known ahead of time.
+        JIT compilation where shapes must be known ahead of time. The v2
+        ``slot_mapping`` uses the real ``[3, num_slices]`` layout (cache start,
+        new-KV start, length per slice) with the same slice padding rule as
+        :meth:`RaggedPagesCacheConfig.get_padded_num_slices`.
 
         Args:
             num_tokens: Maximum token count for batch.
@@ -1555,20 +1642,26 @@ class RaggedPagesMetadata:
             max_pages: Maximum pages per request.
             page_size: Tokens per page. Default: 128.
             version: Metadata version ("v2" or "v3"). Default: "v3".
+            num_slices_per_kv_cache_update_page: Optional v2 slices-per-update-page
+                used to align the padded slice count (and stored on the metadata).
 
         Returns:
             RaggedPagesMetadata: Empty metadata with proper shapes.
         """
+        num_slices = max(1, min(2 * max_num_reqs + num_tokens // page_size, num_tokens))
+        if num_slices_per_kv_cache_update_page:
+            num_slices = align_to_multiple(num_slices, int(num_slices_per_kv_cache_update_page))
         return cls(
-            slot_mapping=jnp.zeros([num_tokens], dtype=jnp.int32) if version == "v2" else None,
+            slot_mapping=jnp.zeros((3, num_slices), dtype=jnp.int32) if version == "v2" else None,
             pages_tables=jnp.zeros((max_num_reqs, max_pages), dtype=jnp.int32),
             context_lens=jnp.zeros([max_num_reqs], dtype=jnp.int32),
             query_start_loc=jnp.zeros([max_num_reqs + 1], dtype=jnp.int32),
-            position_ids=jnp.zeros([max_num_reqs], dtype=jnp.int32),
-            num_seqs=jnp.zeros([max_num_reqs], dtype=jnp.int32),
+            position_ids=jnp.zeros([num_tokens], dtype=jnp.int32),
+            num_seqs=jnp.zeros((1,), dtype=jnp.int32),
             request_distribution=jnp.zeros((3,), dtype=jnp.int32) if version == "v3" else None,
             num_kv_update_slices=jnp.zeros((1,), dtype=jnp.int32) if version == "v2" else None,
             spec_recurrent_commit=None,
+            num_slices_per_kv_cache_update_page=num_slices_per_kv_cache_update_page,
             page_size=page_size,
             version=version,
         )

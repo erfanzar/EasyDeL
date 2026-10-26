@@ -83,6 +83,7 @@ def state_space_v1(
     *,
     block_d: int = 64,
     block_e: int = 128,
+    use_associative_scan: bool | None = None,
 ) -> tuple[
     Float[Array, "batch seq_len intermediate_size"],
     Float[Array, "batch intermediate_size ssm_state_size"],
@@ -111,6 +112,10 @@ def state_space_v1(
         initial_state: optional fp32 initial hidden state
             ``(batch, intermediate_size, ssm_state_size)``; defaults to zeros.
         conv_state: optional convolutional state (pass-through, not modified).
+        use_associative_scan: True routes through the registered parallel XLA
+            fallback; False or None uses the native sequential GPU kernel.
+        block_d: Native scan feature tile size.
+        block_e: Native output-gating tile size.
         act_fn: activation function for the output gate; only ``jax.nn.silu``
             / ``jax.nn.swish`` are accepted (or ``None`` when ``gate`` is
             ``None``).
@@ -124,6 +129,26 @@ def state_space_v1(
     Raises:
         EjkernelRuntimeError: if ``act_fn`` is not silu/swish.
     """
+    if use_associative_scan:
+        # The native TileLang kernel implements sequential recurrence only.
+        # Resolve the parallel algorithm through the registry, never silently
+        # ignore the independently requested algorithm.
+        impl = kernel_registry.get("state_space_v1", platform=Platform.XLA, backend=Backend.ANY)
+        return impl(
+            hidden_states,
+            A,
+            B,
+            C,
+            D,
+            dt,
+            gate=gate,
+            initial_state=initial_state,
+            conv_state=conv_state,
+            act_fn=act_fn,
+            block_d=block_d,
+            block_e=block_e,
+            use_associative_scan=True,
+        )
     return _impl(
         hidden_states,
         A,

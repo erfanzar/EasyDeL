@@ -40,6 +40,66 @@ if tp.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _default_separator_values(
+    pad_values: dict[str, int],
+    separator_overrides: dict[str, int] | None,
+) -> dict[str, int]:
+    """Resolve the per-field value inserted at the synthetic EOS separator.
+
+    Every aligned field separates with its pad value unless ``separator_overrides`` names a different one.
+
+    Args:
+        pad_values: ``{field: pad_value}`` for the token-aligned extra fields.
+        separator_overrides: Optional ``{field: separator_value}`` overrides.
+
+    Returns:
+        dict[str, int]: ``{field: separator_value}`` covering every field in ``pad_values``.
+    """
+    separators = dict(pad_values)
+    if separator_overrides:
+        separators.update(separator_overrides)
+    return separators
+
+
+def _align_field_values(values: tp.Iterable[int] | None, token_count: int, pad_value: int) -> list[int]:
+    """Pad or truncate one extra field to exactly ``token_count`` entries.
+
+    Args:
+        values: The field's token-aligned values, or ``None`` when the row lacks the field.
+        token_count: Number of tokens the field must align with.
+        pad_value: Value used to right-pad short fields.
+
+    Returns:
+        list[int]: A list of length ``token_count``.
+    """
+    aligned = [] if values is None else list(values)
+    if len(aligned) < token_count:
+        aligned = aligned + [pad_value] * (token_count - len(aligned))
+    return aligned[:token_count]
+
+
+def _align_extra_fields(
+    pad_values: dict[str, int],
+    token_count: int,
+    extra_fields: dict[str, tp.Any] | None,
+) -> dict[str, list[int]]:
+    """Align every configured extra field of one example with its tokens.
+
+    Args:
+        pad_values: ``{field: pad_value}`` for the configured token-aligned fields.
+        token_count: Number of tokens in the example.
+        extra_fields: The example's provided field values (missing/``None`` fields become all-pad).
+
+    Returns:
+        dict[str, list[int]]: ``{field: values}`` with each list of length ``token_count``.
+    """
+    provided = extra_fields or {}
+    return {
+        field_name: _align_field_values(provided.get(field_name), token_count, pad_value)
+        for field_name, pad_value in pad_values.items()
+    }
+
+
 @dataclass
 class PackedSequence:
     """One fixed-length output produced by a packer, plus per-token bookkeeping.
@@ -223,11 +283,9 @@ class GreedyPacker:
         self.pad_token_id = pad_token_id
         self.include_segment_ids = include_segment_ids
         self.extra_field_pad_values = extra_field_pad_values or {}
-        self.extra_field_separator_values = {
-            key: self.extra_field_pad_values[key] for key in self.extra_field_pad_values
-        }
-        if extra_field_separator_values:
-            self.extra_field_separator_values.update(extra_field_separator_values)
+        self.extra_field_separator_values = _default_separator_values(
+            self.extra_field_pad_values, extra_field_separator_values
+        )
 
         self._buffer: list[int] = []
         self._segment_ids: list[int] = []
@@ -427,13 +485,7 @@ class GreedyPacker:
         tokens: list[int],
         extra_fields: dict[str, list[int]] | None,
     ) -> dict[str, list[int]]:
-        normalized: dict[str, list[int]] = {}
-        for field_name, pad_value in self.extra_field_pad_values.items():
-            values = list((extra_fields or {}).get(field_name, []))
-            if len(values) < len(tokens):
-                values = values + [pad_value] * (len(tokens) - len(values))
-            normalized[field_name] = values[: len(tokens)]
-        return normalized
+        return _align_extra_fields(self.extra_field_pad_values, len(tokens), extra_fields)
 
 
 class PoolPacker:
@@ -611,11 +663,9 @@ class FirstFitPacker:
         self.include_segment_ids = include_segment_ids
         self.buffer_size = buffer_size
         self.extra_field_pad_values = extra_field_pad_values or {}
-        self.extra_field_separator_values = {
-            key: self.extra_field_pad_values[key] for key in self.extra_field_pad_values
-        }
-        if extra_field_separator_values:
-            self.extra_field_separator_values.update(extra_field_separator_values)
+        self.extra_field_separator_values = _default_separator_values(
+            self.extra_field_pad_values, extra_field_separator_values
+        )
 
         self._pending: list[tuple[list[int], str | None, dict[str, list[int]]]] = []
         self._stats = PackingStats(seq_length=seq_length)
@@ -771,13 +821,7 @@ class FirstFitPacker:
         tokens: list[int],
         extra_fields: dict[str, list[int]] | None,
     ) -> dict[str, list[int]]:
-        normalized: dict[str, list[int]] = {}
-        for field_name, pad_value in self.extra_field_pad_values.items():
-            values = list((extra_fields or {}).get(field_name, []))
-            if len(values) < len(tokens):
-                values = values + [pad_value] * (len(tokens) - len(values))
-            normalized[field_name] = values[: len(tokens)]
-        return normalized
+        return _align_extra_fields(self.extra_field_pad_values, len(tokens), extra_fields)
 
 
 class PackedShardedSource(ShardedDataSource[dict]):
@@ -865,11 +909,9 @@ class PackedShardedSource(ShardedDataSource[dict]):
         self._include_segment_ids = include_segment_ids
         self._input_field = input_field
         self._extra_field_pad_values = extra_field_pad_values or {}
-        self._extra_field_separator_values = {
-            key: self._extra_field_pad_values[key] for key in self._extra_field_pad_values
-        }
-        if extra_field_separator_values:
-            self._extra_field_separator_values.update(extra_field_separator_values)
+        self._extra_field_separator_values = _default_separator_values(
+            self._extra_field_pad_values, extra_field_separator_values
+        )
         self._shuffle = shuffle
         self._shuffle_buffer_factor = shuffle_buffer_factor
         self._seed = seed
@@ -1105,17 +1147,7 @@ class PackedShardedSource(ShardedDataSource[dict]):
         )
 
     def _extract_extra_fields(self, example: dict, token_count: int) -> dict[str, list[int]]:
-        extra_fields: dict[str, list[int]] = {}
-        for field_name, pad_value in self._extra_field_pad_values.items():
-            values = example.get(field_name)
-            if values is None:
-                values_list: list[int] = [pad_value] * token_count
-            else:
-                values_list = list(values)
-                if len(values_list) < token_count:
-                    values_list = values_list + [pad_value] * (token_count - len(values_list))
-            extra_fields[field_name] = values_list[:token_count]
-        return extra_fields
+        return _align_extra_fields(self._extra_field_pad_values, token_count, example)
 
 
 class PackStage(BaseStage):

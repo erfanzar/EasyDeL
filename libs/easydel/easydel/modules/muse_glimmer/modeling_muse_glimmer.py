@@ -81,7 +81,6 @@ from easydel.infra.modeling_outputs import (
     ModelOutput,
     VLMCausalLMOutput,
 )
-from easydel.infra.sequence_packing import token_attention_mask_from_mask_info
 from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
@@ -91,9 +90,9 @@ from easydel.layers import (
     dense_gate_up_layout,
     gated_mlp_forward,
 )
-from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention, block_diagonal_bias
 from easydel.layers.layouts import FusedColumnLayout, FusedSegment
-from easydel.layers.norms import LayerNorm, lowfloats
+from easydel.layers.norms import LayerNorm, lowfloats, rms_norm
 from easydel.layers.rotary import apply_rope_split_half
 from easydel.modules._base import BaseVisionLanguageModule
 
@@ -125,27 +124,6 @@ class MuseGlimmerModelOutputWithPast(ModelOutput):
     image_hidden_states: Array | None = None
 
 
-def _scaleless_rms_norm(hidden_states: Array, eps: float) -> Array:
-    """RMS-normalize the trailing axis with no learnable scale.
-
-    Mirrors HF's ``MuseGlimmerRMSNorm(with_scale=False)``: the statistic is
-    computed in float32 and the result cast back to the input dtype. Used for
-    the token-embedding norm, the attention QK-norm and the norm applied to
-    projected vision features.
-
-    Args:
-        hidden_states: Tensor whose last axis is normalized.
-        eps: Variance epsilon, added before the reciprocal square root.
-
-    Returns:
-        Array: Normalized tensor with the input dtype and shape.
-    """
-    original_dtype = hidden_states.dtype
-    promoted = hidden_states.astype(jnp.float32)
-    mean_squared = jnp.mean(jnp.square(promoted), axis=-1, keepdims=True) + eps
-    return (promoted * jax.lax.rsqrt(mean_squared)).astype(original_dtype)
-
-
 class MuseGlimmerCenteredRMSNorm(RMSNorm):
     """Zero-centred ``(1 + w)`` RMSNorm, statistics and scale in float32, cast back to the input dtype.
 
@@ -164,27 +142,6 @@ class MuseGlimmerCenteredRMSNorm(RMSNorm):
             scale_offset=1.0,
             fp32_scale=True,
         )
-
-
-def _block_diagonal_bias(cu_seqlens: np.ndarray, seq_length: int, dtype: jnp.dtype) -> Array:
-    """Build an additive attention bias that confines attention to segments.
-
-    Args:
-        cu_seqlens: Cumulative sequence boundaries of shape ``(num_segments + 1,)``;
-            segment ``i`` spans ``[cu_seqlens[i], cu_seqlens[i + 1])``.
-        seq_length: Total packed length (equal to ``cu_seqlens[-1]``).
-        dtype: Output dtype; masked pairs get ``finfo(dtype).min``.
-
-    Returns:
-        Array: Bias of shape ``(1, 1, seq_length, seq_length)``, ``0.0`` inside a
-        segment and a large negative value across segments.
-    """
-    segment_ids = np.zeros((seq_length,), dtype=np.int32)
-    for index in range(len(cu_seqlens) - 1):
-        segment_ids[int(cu_seqlens[index]) : int(cu_seqlens[index + 1])] = index
-    same_segment = jnp.asarray(segment_ids[:, None] == segment_ids[None, :])
-    bias = jnp.where(same_segment, 0.0, jnp.finfo(dtype).min).astype(dtype)
-    return bias[None, None, :, :]
 
 
 def get_vision_cu_seqlens(grid_thw: np.ndarray) -> np.ndarray:
@@ -596,8 +553,9 @@ class MuseGlimmerTextAttention(UnifiedAttention):
         Returns:
             tuple: ``(query, key, value)`` with Q/K normalized and Q scaled.
         """
-        query_states = _scaleless_rms_norm(query_states, self.qk_norm_eps) * self.qk_scale_factor
-        key_states = _scaleless_rms_norm(key_states, self.qk_norm_eps)
+        # HF ``MuseGlimmerRMSNorm(with_scale=False)``: fp32 statistic and multiply, cast back.
+        query_states = rms_norm(query_states, eps=self.qk_norm_eps, upcast=True) * self.qk_scale_factor
+        key_states = rms_norm(key_states, eps=self.qk_norm_eps, upcast=True)
         return query_states, key_states, value_states
 
     def forward_standard(
@@ -855,7 +813,7 @@ class MuseGlimmerTextDecoderLayer(spx.Module):
         )
 
 
-@register_module(TaskType.BASE_MODULE, config=MuseGlimmerTextConfig, model_type="muse_glimmer")
+@register_module(TaskType.BASE_MODULE, config=MuseGlimmerTextConfig, model_type="muse_glimmer_text")
 class MuseGlimmerTextModel(EasyDeLBaseModule):
     """Muse-Glimmer language-model trunk (embeddings, decoder stack, final norm).
 
@@ -1000,7 +958,7 @@ class MuseGlimmerTextModel(EasyDeLBaseModule):
             Array: Normalized embeddings of shape ``(batch, seq_len, hidden_size)``.
         """
         embeddings = self.embed_tokens(input_ids.astype("i4"))
-        return checkpoint_name(_scaleless_rms_norm(embeddings, self.config.rms_norm_eps), "embeddings")
+        return checkpoint_name(rms_norm(embeddings, eps=self.config.rms_norm_eps, upcast=True), "embeddings")
 
     def forward(
         self,
@@ -1061,7 +1019,6 @@ class MuseGlimmerTextModel(EasyDeLBaseModule):
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
         )
-        attention_mask = token_attention_mask_from_mask_info(mask_info, sequence_length)
 
         if position_ids is None:
             position_ids = mask_info.q_position_ids
@@ -1133,6 +1090,7 @@ class MuseGlimmerTextModel(EasyDeLBaseModule):
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
 
         hidden_states = self.norm(hidden_states)
@@ -1685,8 +1643,8 @@ class MuseGlimmerVisionModel(EasyDeLBaseModule):
         # identical across layers, which is what lets the stack be scanned.
         bias_stack = jnp.stack(
             [
-                _block_diagonal_bias(cu_seqlens, seq_length, hidden_states.dtype),
-                _block_diagonal_bias(cu_window_seqlens, seq_length, hidden_states.dtype),
+                block_diagonal_bias(cu_seqlens, seq_length, hidden_states.dtype, add_head_axis=True),
+                block_diagonal_bias(cu_window_seqlens, seq_length, hidden_states.dtype, add_head_axis=True),
             ]
         )
         bias_selector = jnp.asarray(
@@ -1710,6 +1668,7 @@ class MuseGlimmerVisionModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, 0),
             trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs("vision"),
         )
 
         reverse_indices = jnp.asarray(np.argsort(window_index))
@@ -1795,6 +1754,7 @@ class MuseGlimmerVisionAdapter(spx.Module):
         return self.act(self.fc2(self.act(self.fc1(hidden_states))))
 
 
+@register_module(TaskType.BASE_MODULE, config=MuseGlimmerConfig, model_type="muse_glimmer")
 @register_module(TaskType.VISION_LM, config=MuseGlimmerConfig, model_type="muse_glimmer")
 class MuseGlimmerModel(EasyDeLBaseModule):
     """Muse-Glimmer trunk: vision tower + adapter/projection + language model.
@@ -1886,7 +1846,7 @@ class MuseGlimmerModel(EasyDeLBaseModule):
         vision_features = self.vision_tower(pixel_values=pixel_values, grid_thw=image_grid_thw)
         vision_features = self.vision_adapter(vision_features)
         vision_features = self.vision_projection(vision_features)
-        return _scaleless_rms_norm(vision_features, self.config.text_config.rms_norm_eps)
+        return rms_norm(vision_features, eps=self.config.text_config.rms_norm_eps, upcast=True)
 
     def get_video_features(self, pixel_values_videos: Array, video_grid_thw: Array | np.ndarray) -> Array:
         """Encode packed video patches into text-space embeddings.
@@ -2139,6 +2099,7 @@ class MuseGlimmerForConditionalGeneration(BaseVisionLanguageModule[MuseGlimmerMo
     _config_class = MuseGlimmerConfig
     _auto_register = False  # Already registered via decorator
     _supports_video = True
+    supports_flat_patch_inputs: tp.ClassVar[bool] = True
     _uses_mrope = False
 
     _vision_tower_name = "vision_tower"
@@ -2242,6 +2203,36 @@ class MuseGlimmerForConditionalGeneration(BaseVisionLanguageModule[MuseGlimmerMo
             return logits
         cap = jnp.asarray(cap_value, dtype=logits.dtype)
         return cap * jax.nn.tanh(logits / cap)
+
+    def get_lm_logit_postprocess(self) -> tp.Callable[[Array], Array] | None:
+        """Return the complete post-projection transform for split pipeline heads.
+
+        The ordering matches :meth:`compute_lm_logits`: base clipping, text
+        output scaling, then optional tanh soft-capping. Standard clipping
+        captures only scalar settings; custom ``apply_logit_cap`` overrides
+        are preserved by the base clipping factory.
+
+        Returns:
+            Pure logits-to-logits callable, or None for an identity transform.
+        """
+        text_config = self.config.get_text_config()
+        output_multiplier = text_config.output_multiplier
+        softcap = text_config.final_logit_softcapping
+        clip_fn = self.get_base_lm_logit_postprocess()
+        if output_multiplier == 1.0 and softcap is None:
+            return clip_fn
+
+        def postprocess(logits: Array) -> Array:
+            """Apply base clipping, scaling and soft-capping in model order."""
+            if clip_fn is not None:
+                logits = clip_fn(logits)
+            logits = logits * jnp.asarray(output_multiplier, dtype=logits.dtype)
+            if softcap is not None:
+                cap = jnp.asarray(softcap, dtype=logits.dtype)
+                logits = cap * jax.nn.tanh(logits / cap)
+            return logits
+
+        return postprocess
 
     def compute_lm_logits(self, hidden_states: Array) -> Array:
         """Project hidden states to vocabulary logits with Muse-Glimmer capping.

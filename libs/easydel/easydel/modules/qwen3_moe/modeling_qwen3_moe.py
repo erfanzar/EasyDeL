@@ -47,7 +47,6 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     MoeCausalLMOutput,
@@ -64,14 +63,14 @@ from easydel.layers import (
     MoeRoutingStrategy,
     RowParallelLinear,
     RowParallelMoELinear,
-    dense_gate_up_layout,
+    build_fused_gate_up_projection,
     gated_mlp_forward,
     moe_down_projection_reform_param,
     moe_fused_gate_up_reform_param,
-    split_fused_gate_up_projection,
 )
 from easydel.layers import RMSNorm as RMSNorm
 from easydel.layers.attention import UnifiedAttention
+from easydel.layers.mlp import moe_gated_expert_forward
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .qwen3_moe_configuration import Qwen3MoeConfig
@@ -158,9 +157,7 @@ class Qwen3MoeMLPStack(spx.Module):
         Returns:
             Transformed hidden states [batch, seq_len, hidden_dim] after MoE MLP processing.
         """
-        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
-        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
+        return moe_gated_expert_forward(self, hidden_states, group_sizes, sorted_experts)
 
 
 class Qwen3MoeMLP(spx.Module):
@@ -198,16 +195,13 @@ class Qwen3MoeMLP(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         intermediate_size = intermediate_size if intermediate_size is not None else config.intermediate_size
-        self.gate_up_proj = ColumnParallelLinear(
-            config.hidden_size,
-            (intermediate_size, intermediate_size),
+        self.gate_up_proj = build_fused_gate_up_projection(
+            config=config,
+            intermediate_size=intermediate_size,
             dtype=dtype,
             param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            layout=dense_gate_up_layout(intermediate_size),
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -765,8 +759,8 @@ class Qwen3MoeModel(EasyDeLBaseModule):
                 enabled=trace_layers,
                 cache=past_key_values,
             )
-            if output_router_logits:
-                all_router_logits += (layer_outputs[-1],)
+            if output_router_logits and layer_outputs.router_logits is not None:
+                all_router_logits += (layer_outputs.router_logits,)
 
             return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
 
@@ -774,8 +768,11 @@ class Qwen3MoeModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
 
         return MoeModelOutput(
             last_hidden_state=hidden_states,
@@ -909,28 +906,7 @@ class Qwen3MoeForCausalLM(BaseCausalLMModule[Qwen3MoeModel, Qwen3MoeConfig]):  #
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
-            aux_loss_fn=self._compute_aux_loss,
         )
-
-    def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute auxiliary load balancing loss from router logits.
-
-        Args:
-            outputs: Model outputs containing router logits from MoE layers.
-            attention_mask: Attention mask to exclude padding tokens from loss computation.
-
-        Returns:
-            Auxiliary loss value scaled by router_aux_loss_coef, or None if no router logits.
-        """
-        if outputs.router_logits is None or len(outputs.router_logits) == 0:
-            return None
-        aux_loss = auxiliary_load_balancing_loss_func(
-            gate_logits=outputs.router_logits,
-            num_experts=self.config.num_experts,
-            top_k=self.config.num_experts_per_tok,
-            attention_mask=attention_mask,
-        )
-        return aux_loss * self.config.router_aux_loss_coef
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Qwen3MoeConfig, model_type="qwen3_moe")
@@ -1016,8 +992,9 @@ class Qwen3MoeForSequenceClassification(BaseSequenceClassificationModule[Qwen3Mo
         Raises:
             ValueError: If config.pad_token_id is None and batch_size > 1.
         """
-        transformer_outputs = self.model(
+        forward_kwargs = dict(
             input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             mask_info=mask_info,
             position_ids=position_ids,
@@ -1026,35 +1003,35 @@ class Qwen3MoeForSequenceClassification(BaseSequenceClassificationModule[Qwen3Mo
             cache_metadata=cache_metadata,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            inputs_embeds=inputs_embeds,
         )
+        if apply_lm_head:
+            return super().forward(**forward_kwargs)
 
-        hidden_states = transformer_outputs.last_hidden_state
-        logits = self.score(hidden_states)
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]
-        else:
-            batch_size = inputs_embeds.shape[0]
-
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
-        else:
-            if input_ids is not None:
-                sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-            else:
-                sequence_lengths = -1
-
-        pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
+        # Preserve the public head-skipping option without running the score head.
+        outputs = self.base_model(**forward_kwargs)
         return SequenceClassifierOutput(
-            logits=pooled_logits,
-            past_key_values=past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
+            logits=None,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            aux_loss=self.compute_router_aux_loss(outputs, attention_mask=attention_mask),
         )
+
+    def pool_sequence(self, hidden_states, input_ids=None, attention_mask=None):
+        """Pool logits, retaining last-position pooling for unmasked embeddings.
+
+        Args:
+            hidden_states: Per-token logits with shape (batch, sequence, labels).
+            input_ids: Optional token IDs used to identify padding.
+            attention_mask: Optional mask, preferred over token IDs for pooling.
+
+        Returns:
+            Logits for the last valid token, or the final position when neither
+            token IDs nor an attention mask is available.
+        """
+        if input_ids is None and attention_mask is None:
+            return hidden_states[:, -1]
+        return super().pool_sequence(hidden_states, input_ids=input_ids, attention_mask=attention_mask)
 
     def get_encoder(self):
         """

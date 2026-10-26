@@ -73,10 +73,9 @@ class Transform(ABC):
     def __rshift__(self, other: "Transform") -> "ChainedTransform":
         """Compose two transforms into a single :class:`ChainedTransform` via ``self >> other``.
 
-        Flattens cleanly: when ``self`` is already a
-        :class:`ChainedTransform`, its component list is extended
-        rather than nested, so successive ``>>`` applications produce
-        a flat chain instead of a tree.
+        Successive ``>>`` applications stay flat because
+        :class:`ChainedTransform` overrides this method to extend its own
+        component list instead of nesting.
 
         Args:
             other: The transform to run after ``self`` on every
@@ -89,8 +88,6 @@ class Transform(ABC):
         Example:
             >>> transform = RenameFields(...) >> MapTransform(...) >> FilterTransform(...)
         """
-        if isinstance(self, ChainedTransform):
-            return ChainedTransform([*self._transforms, other])
         return ChainedTransform([self, other])
 
     @property

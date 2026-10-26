@@ -434,6 +434,7 @@ class MuseGlimmerConfig(EasyDeLBaseConfig):
     """
 
     model_type = "muse_glimmer"
+    supports_flat_patch_inputs: typing.ClassVar[bool] = True
     sub_configs: typing.ClassVar = {
         "text_config": MuseGlimmerTextConfig,
         "vision_config": MuseGlimmerVisionConfig,

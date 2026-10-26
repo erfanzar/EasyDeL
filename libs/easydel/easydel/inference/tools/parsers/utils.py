@@ -44,6 +44,11 @@ Note:
 
 from __future__ import annotations
 
+import json
+import re
+from uuid import uuid4
+
+from ...openai_api_modules import DeltaFunctionCall, DeltaToolCall
 from ..utils import (
     consume_space,
     extract_intermediate_diff,
@@ -53,6 +58,59 @@ from ..utils import (
     is_complete_json,
     partial_json_loads,
 )
+
+
+def stream_json_calls(calls: list[dict], previous: list[dict], sent: list[str], ids: list[str], complete: bool):
+    """Emit every top-level call, keeping stable identities and argument prefixes.
+
+    Only parsed call objects are inspected; nested argument keys cannot create calls.
+    Incomplete argument serialization is withheld until its prefix is stable.
+    """
+    deltas = []
+    for index, call in enumerate(calls):
+        while len(sent) <= index:
+            sent.append("")
+        while len(ids) <= index:
+            ids.append("")
+        name = call.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        first = not ids[index]
+        if first:
+            ids[index] = f"call_{uuid4().hex}"
+        args = call.get("arguments")
+        fragment = ""
+        if args is not None:
+            serialized = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+            if complete or index < len(calls) - 1:
+                stable = serialized
+            elif index < len(previous) and previous[index].get("arguments") is not None:
+                old = previous[index]["arguments"]
+                old = old if isinstance(old, str) else json.dumps(old, ensure_ascii=False)
+                # A partial parser synthesizes closing syntax. Even identical
+                # snapshots may represent a still-open empty object or string.
+                stable = find_common_prefix(old, serialized).rstrip('"} ]')
+                # Numeric tokens may still grow into exponents (1 -> 1e-2),
+                # changing their serialization rather than simply appending.
+                if not isinstance(args, str):
+                    stable = re.sub(r"(?<=[ :\[,])[-+0-9.eE]+$", "", stable)
+            else:
+                stable = ""
+            if stable.startswith(sent[index]):
+                fragment = stable[len(sent[index]) :]
+                sent[index] += fragment
+        if first or fragment:
+            deltas.append(
+                DeltaToolCall(
+                    index=index,
+                    id=ids[index] if first else None,
+                    type="function" if first else None,
+                    function=DeltaFunctionCall(name=name if first else None, arguments=fragment or None),
+                )
+            )
+    previous[:] = calls
+    return deltas
+
 
 __all__ = [
     "consume_space",

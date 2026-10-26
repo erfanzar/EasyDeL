@@ -33,37 +33,29 @@ Features:
 from __future__ import annotations
 
 import ast
-import json
 import re
 from collections.abc import Sequence
-from typing import Any
 
 from eformer.loggings import get_logger
 from transformers import PreTrainedTokenizerBase
 
 from ...openai_api_modules import (
     ChatCompletionRequest,
-    DeltaFunctionCall,
     DeltaMessage,
-    DeltaToolCall,
     ExtractedToolCallInformation,
-    FunctionCall,
-    ToolCall,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
+from ._pythonic_ast import UnexpectedAstError, compute_tool_delta, handle_single_tool, make_valid_python
+
+try:  # ``regex`` (a transformers dependency) supports match timeouts; stdlib ``re`` does not.
+    import regex as _regex_engine  # pyright: ignore[reportMissingImports]
+
+    _HAS_REGEX_TIMEOUT = True
+except ImportError:  # pragma: no cover - transformers always installs ``regex``
+    _regex_engine = re
+    _HAS_REGEX_TIMEOUT = False
 
 logger = get_logger(__name__)
-
-
-class _UnexpectedAstError(Exception):
-    """Exception raised when AST parsing encounters unexpected structure.
-
-    This exception is used internally to signal that the parsed AST does not
-    match the expected format for tool calls (e.g., not a list of function
-    calls, invalid argument types).
-    """
-
-    pass
 
 
 @ToolParserManager.register_module("pythonic")  # pyright: ignore[reportUntypedClassDecorator]
@@ -80,22 +72,26 @@ class PythonicToolParser(ToolParser):
         - Handles streaming with bracket/quote tracking
         - Validates Python syntax during extraction
         - Supports multiple tool calls in single list
+        - Bounds the tool-call pattern match with ``REGEX_TIMEOUT_S`` so adversarial output cannot
+          trigger catastrophic regex backtracking
 
     Used when --enable-auto-tool-choice --tool-call-parser pythonic are set.
 
     Attributes:
         TOOL_CALL_REGEX: Compiled regex pattern for detecting tool call syntax.
+        REGEX_TIMEOUT_S: Maximum seconds a single pattern match may take before the output is
+            treated as plain content.
 
     Note:
         Tool arguments must be valid Python literals (strings, numbers,
         lists, dicts). Complex Python expressions are not supported.
     """
 
-    # TODO(mdepinet): Possible future improvements:
+    REGEX_TIMEOUT_S: float = 1.0
 
-    TOOL_CALL_REGEX = re.compile(
+    TOOL_CALL_REGEX = _regex_engine.compile(
         r"\[([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s)?\),\s*)*([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s*)?\)\s*)+\]",
-        re.DOTALL,
+        _regex_engine.DOTALL,
     )
 
     def __init__(self, tokenizer: PreTrainedTokenizerBase):
@@ -127,6 +123,27 @@ class PythonicToolParser(ToolParser):
         """
         self.current_tool_id = value
 
+    def _matches_tool_call_pattern(self, model_output: str) -> bool:
+        """Check whether the output looks like a pythonic tool-call list.
+
+        The match is bounded by ``REGEX_TIMEOUT_S``; on timeout the output is treated as not
+        being a tool call.
+
+        Args:
+            model_output: The complete model output.
+
+        Returns:
+            True if the output matches ``TOOL_CALL_REGEX`` within the time budget.
+        """
+        try:
+            if _HAS_REGEX_TIMEOUT:
+                return self.TOOL_CALL_REGEX.match(model_output, timeout=self.REGEX_TIMEOUT_S) is not None
+            return self.TOOL_CALL_REGEX.match(model_output) is not None
+        except TimeoutError:
+            logger.warning("Regex timeout occurred when matching tool call pattern.")
+            logger.debug("Regex timeout occurred when matching user input: %s", model_output)
+            return False
+
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
         """Extract tool calls from a complete model response.
 
@@ -143,14 +160,7 @@ class PythonicToolParser(ToolParser):
                 - tool_calls: List of ToolCall objects extracted
                 - content: Original content if no tools called, None otherwise
         """
-        is_tool_call_pattern = False
-        try:
-            is_tool_call_pattern = self.TOOL_CALL_REGEX.match(model_output) is not None
-        except TimeoutError:
-            logger.warning("Regex timeout occurred when matching tool call pattern.")
-            logger.debug("Regex timeout occurred when matching user input: %s", model_output)
-
-        if not is_tool_call_pattern:
+        if not self._matches_tool_call_pattern(model_output):
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
         try:
@@ -159,11 +169,11 @@ class PythonicToolParser(ToolParser):
             if isinstance(parsed, ast.List) and all(isinstance(e, ast.Call) for e in parsed.elts):
                 return ExtractedToolCallInformation(
                     tools_called=True,
-                    tool_calls=[_handle_single_tool(e) for e in parsed.elts],
+                    tool_calls=[handle_single_tool(e) for e in parsed.elts],
                     content=None,
                 )
             else:
-                raise _UnexpectedAstError("Tool output must be a list of function calls")
+                raise UnexpectedAstError("Tool output must be a list of function calls")
         except Exception:
             logger.exception("Error in extracting tool call from response.")
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
@@ -201,7 +211,7 @@ class PythonicToolParser(ToolParser):
             return DeltaMessage(content=delta_text)
 
         try:
-            valid_and_added_text = _make_valid_python(current_text)
+            valid_and_added_text = make_valid_python(current_text)
             if valid_and_added_text is None:
                 return None
             valid_text, added_text = valid_and_added_text
@@ -209,8 +219,8 @@ class PythonicToolParser(ToolParser):
             module = ast.parse(valid_text)
             parsed = getattr(module.body[0], "value", None)
             if not isinstance(parsed, ast.List) or not all(isinstance(e, ast.Call) for e in parsed.elts):
-                raise _UnexpectedAstError("Tool output must be a list of function calls")
-            tool_calls = [_handle_single_tool(e) for e in parsed.elts]
+                raise UnexpectedAstError("Tool output must be a list of function calls")
+            tool_calls = [handle_single_tool(e) for e in parsed.elts]
 
             tool_deltas = []
             for index, new_call in enumerate(tool_calls):
@@ -229,7 +239,7 @@ class PythonicToolParser(ToolParser):
                 if not new_call_complete and added_text[-2] == ")":
                     withheld_suffix = withheld_suffix + "}"
                 withheld_suffix = withheld_suffix.replace("'", '"')
-                delta = _compute_tool_delta(self.streamed_args_for_tool[index], new_call, index, withheld_suffix)
+                delta = compute_tool_delta(self.streamed_args_for_tool[index], new_call, index, withheld_suffix)
 
                 if delta is not None:
                     tool_deltas.append(delta)
@@ -250,183 +260,3 @@ class PythonicToolParser(ToolParser):
             logger.exception("Error trying to handle streaming tool call.")
             logger.debug("Skipping chunk as a result of tool streaming extraction error")
             return None
-
-
-def _get_parameter_value(val: ast.expr) -> Any:
-    """Extract parameter value from AST expression.
-
-    Recursively processes AST nodes to extract Python literals
-    including constants, dictionaries, and lists.
-
-    Args:
-        val: AST expression node to evaluate.
-
-    Returns:
-        Python value extracted from the AST node. Can be:
-            - str, int, float, bool, None for ast.Constant
-            - dict for ast.Dict (with recursive value extraction)
-            - list for ast.List (with recursive value extraction)
-
-    Raises:
-        _UnexpectedAstError: If expression is not a supported literal type
-            or if dict keys are not constants.
-    """
-    if isinstance(val, ast.Constant):
-        return val.value
-    elif isinstance(val, ast.Dict):
-        if not all(isinstance(k, ast.Constant) for k in val.keys):
-            raise _UnexpectedAstError("Dict tool call arguments must have literal keys")
-        return {k.value: _get_parameter_value(v) for k, v in zip(val.keys, val.values, strict=False)}
-    elif isinstance(val, ast.List):
-        return [_get_parameter_value(v) for v in val.elts]
-    else:
-        raise _UnexpectedAstError("Tool call arguments must be literals")
-
-
-def _handle_single_tool(call: ast.Call) -> ToolCall:
-    """Convert AST Call node to ToolCall object.
-
-    Extracts function name and keyword arguments from Python
-    function call AST representation.
-
-    Args:
-        call: AST Call node representing a function invocation.
-
-    Returns:
-        ToolCall object with:
-            - type: "function"
-            - function: FunctionCall with name and JSON-encoded arguments
-
-    Raises:
-        _UnexpectedAstError: If the function name is not a simple identifier
-            (ast.Name) or if arguments cannot be extracted.
-    """
-    if not isinstance(call.func, ast.Name):
-        raise _UnexpectedAstError("Invalid tool call name")
-    function_name = call.func.id
-    arguments = {}
-    for keyword in call.keywords:
-        arguments[keyword.arg] = _get_parameter_value(keyword.value)
-    return ToolCall(
-        type="function",
-        function=FunctionCall(name=function_name, arguments=json.dumps(arguments, ensure_ascii=False)),
-    )
-
-
-def _make_valid_python(text: str) -> tuple[str, str] | None:
-    """Complete partial Python code by adding closing brackets.
-
-    Tracks bracket stack to determine what closing characters
-    are needed to make partial Python code syntactically valid.
-    Handles brackets, parentheses, braces, and quotes.
-
-    Args:
-        text: Partial Python code string that may be incomplete.
-
-    Returns:
-        Tuple of (completed_text, added_text) where:
-            - completed_text: The input text with closing brackets appended
-            - added_text: The characters that were added to complete the code
-        Returns None if the text ends with incomplete parameter name or value
-        (e.g., ends with '=' or ':'), indicating more tokens are needed.
-
-    Raises:
-        _UnexpectedAstError: If mismatched brackets are detected.
-    """
-    bracket_stack = []
-    for index, char in enumerate(text):
-        if char in {"[", "(", "{"}:
-            bracket_stack.append(char)
-        elif char == "]":
-            if not bracket_stack or bracket_stack.pop() != "[":
-                raise _UnexpectedAstError("Mismatched square brackets")
-        elif char == ")":
-            if not bracket_stack or bracket_stack.pop() != "(":
-                raise _UnexpectedAstError("Mismatched parentheses")
-        elif char == "}":
-            if not bracket_stack or bracket_stack.pop() != "{":
-                raise _UnexpectedAstError("Mismatched curly braces")
-        elif char in {"'", '"'}:
-            if bracket_stack and bracket_stack[-1] == char:
-                if index > 0 and text[index - 1] == "\\":
-                    pass
-                else:
-                    bracket_stack.pop()
-            elif bracket_stack and bracket_stack[-1] in {"'", '"'}:
-                pass
-            else:
-                bracket_stack.append(char)
-
-    text = text.rstrip()
-    if text.endswith("=") or text.endswith(":"):
-        return None
-    if bracket_stack and bracket_stack[-1] == "{":
-        trailing_dict_text = text[: text.rfind("{")]
-        num_keys = trailing_dict_text.count(":")
-        num_values = trailing_dict_text.count(",")
-        if num_keys <= num_values:
-            return None
-    if bracket_stack and bracket_stack[-1] == "(":
-        trailing_params_text = text[: text.rfind("(")]
-        num_full_param_names = trailing_params_text.count("=")
-        num_full_param_values = trailing_params_text.count(",")
-        if num_full_param_names <= num_full_param_values:
-            return None
-    if text.endswith(","):
-        text = text[:-1]
-    if bracket_stack and bracket_stack[-1] == "[" and not text.endswith("[") and not text.endswith(")"):
-        return None
-
-    added_text = ""
-    for char in reversed(bracket_stack):
-        if char == "[":
-            added_text += "]"
-        elif char == "(":
-            added_text += ")"
-        elif char == "{":
-            added_text += "}"
-        elif char == "'":
-            added_text += "'"
-        elif char == '"':
-            added_text += '"'
-
-    return text + added_text, added_text
-
-
-def _compute_tool_delta(
-    previously_sent_args: str, new_call: ToolCall, index: int, withheld_suffix: str
-) -> DeltaToolCall | None:
-    """Compute the delta between previously sent and current tool call arguments.
-
-    Calculates what new argument data should be sent in a streaming response
-    by comparing previously sent arguments with the current state.
-
-    Args:
-        previously_sent_args: JSON string of arguments already sent to client.
-        new_call: The current ToolCall with updated arguments.
-        index: The index of this tool call in the response.
-        withheld_suffix: Characters to withhold from the end of arguments
-            (used for incomplete streaming data).
-
-    Returns:
-        DeltaToolCall containing the incremental update, or None if no new
-        data to send. For the first delta of a tool call, includes the
-        function name; subsequent deltas only include argument differences.
-    """
-    new_call_args = new_call.function.arguments
-    if withheld_suffix:
-        assert new_call_args.endswith(withheld_suffix)
-        new_call_args = new_call_args[: -len(withheld_suffix)]
-    if not previously_sent_args:
-        return DeltaToolCall(
-            id=new_call.id,
-            type="function",
-            index=index,
-            function=DeltaFunctionCall(
-                name=new_call.function.name,
-                arguments=new_call_args,
-            ),
-        )
-
-    arg_diff = new_call_args[len(previously_sent_args) :]
-    return DeltaToolCall(id=None, index=index, function=DeltaFunctionCall(arguments=arg_diff)) if arg_diff else None

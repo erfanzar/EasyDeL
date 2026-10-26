@@ -46,6 +46,7 @@ from ..metrics import get_metrics_collector
 
 if typing.TYPE_CHECKING:
     from ..engine_types import EngineCoreOutputs
+    from ..outputs import LogprobsLists
     from .registry import RequestRegistry
 
 _STOP_SENTINEL = None
@@ -336,6 +337,7 @@ class OutputPipeline:
         *,
         accumulated_text: str,
         fallback_delta: str,
+        finished: bool = False,
     ) -> tuple[str, str, bool, str | None]:
         """Trim ``accumulated_text`` at the first stop string per sampling-params policy.
 
@@ -343,8 +345,8 @@ class OutputPipeline:
         an ``include_stop_str_in_output`` flag. This helper consults both
         and either:
 
-        * leaves ``accumulated_text`` untouched when no stop sequence
-          matches, or
+        * withholds a possible stop prefix until it is disambiguated or
+          generation ends when no complete stop sequence matches, or
         * cuts the text at the start of the first match (default), or
         * cuts after the match when ``include_stop_str_in_output=True``.
 
@@ -362,6 +364,8 @@ class OutputPipeline:
                 sample.
             fallback_delta: Delta to surface when no trimming occurred (i.e.
                 the standard streaming delta from the detokenizer).
+            finished: Flush any partial stop prefix if generation ended without
+                a complete match. While unfinished, such suffixes are withheld.
 
         Returns:
             ``(visible_text, visible_delta, stop_triggered, stop_reason)``
@@ -387,6 +391,21 @@ class OutputPipeline:
                     cutoff = stop_index + len(stop_reason) if include_stop else stop_index
                     visible_text = accumulated_text[:cutoff]
                     stop_triggered = True
+                elif not finished and not include_stop:
+                    # A streamed prefix cannot be retracted after the next
+                    # decode completes a stop marker. Hold only the longest
+                    # suffix that is a proper prefix of any configured stop.
+                    held = max(
+                        (
+                            size
+                            for stop in stop_sequences
+                            for size in range(1, min(len(stop), len(accumulated_text) + 1))
+                            if accumulated_text.endswith(stop[:size])
+                        ),
+                        default=0,
+                    )
+                    if held:
+                        visible_text = accumulated_text[:-held]
 
         # Avoid replaying buffered/retracted text via stale fallback deltas.
         delta_fallback = fallback_delta if visible_text == accumulated_text else ""
@@ -477,6 +496,7 @@ class OutputPipeline:
                 rd,
                 accumulated_text=parsed["accumulated_content"],
                 fallback_delta=parsed["delta_content"] or delta_text,
+                finished=finished,
             )
             rd.decoder_visible_text = visible_text
             parsed["accumulated_content"] = visible_text
@@ -487,6 +507,7 @@ class OutputPipeline:
             rd,
             accumulated_text=accumulated_text,
             fallback_delta=delta_text,
+            finished=finished,
         )
         rd.decoder_visible_text = visible_text
         parsed = self._run_output_parsers(
@@ -559,9 +580,9 @@ class OutputPipeline:
             # Batch extraction creates fresh ToolCall ids. Preserve the ids
             # already announced in streaming deltas for the same indices.
             for index, call in enumerate(result.tool_calls or []):
-                state = dp._streamed_tool_call_state.get(index)
-                if state is not None and state.tool_call_id:
-                    call.id = state.tool_call_id
+                tool_call_id = dp.streamed_tool_call_id(index)
+                if tool_call_id:
+                    call.id = tool_call_id
         else:
             result = dp.process_delta(accumulated_text, delta_text, token_ids, prev_text, prev_token_ids)
 
@@ -778,6 +799,57 @@ class OutputPipeline:
             finished=finished,
         )
         return parsed, raw_accumulated, raw_delta, stop_hit, stop_reason
+
+    @staticmethod
+    def _append_token_logprobs(
+        comp, new_tokens: list[int], new_logprobs: LogprobsLists | None, previous_count: int
+    ) -> None:
+        """Accumulate sampled-token maps in exact engine-token order, including EOS.
+
+        Text decoding and stop-string trimming must not filter these positions:
+        ``CompletionOutput.token_ids`` records the raw sampled sequence, and
+        rollout consumers look up each sampled id in the corresponding map.
+        A backend may omit probabilities altogether, but partially populated
+        sequences or malformed rows are rejected rather than silently shifted.
+        Fresh lists preserve previously yielded streaming snapshots.
+
+        Args:
+            comp: Completion receiving the token maps and sampled logprob sum.
+            new_tokens: Raw newly emitted token ids (before EOS filtering).
+            new_logprobs: Candidate ids and logprobs for each new position, or
+                None when the backend does not report probabilities.
+            previous_count: Number of tokens emitted before this update.
+
+        Raises:
+            ValueError: Probability positions or candidates do not align with
+                the emitted tokens, or probabilities are missing for only part
+                of the sequence.
+        """
+        if new_logprobs is None:
+            if comp.logprobs is not None:
+                raise ValueError("Engine omitted log probabilities for part of a completion.")
+            return
+        if previous_count and comp.logprobs is None:
+            raise ValueError("Engine omitted log probabilities for part of a completion.")
+        if comp.logprobs is not None and len(comp.logprobs) != previous_count:
+            raise ValueError("Completion log probabilities do not align with previously emitted tokens.")
+        if len(new_logprobs.logprob_token_ids) != len(new_tokens) or len(new_logprobs.logprobs) != len(new_tokens):
+            raise ValueError("Engine log probabilities do not align with newly emitted tokens.")
+
+        maps = []
+        sampled_sum = 0.0
+        for token, candidates, values in zip(
+            new_tokens, new_logprobs.logprob_token_ids, new_logprobs.logprobs, strict=True
+        ):
+            if len(candidates) != len(values):
+                raise ValueError("Engine log probability candidate ids and values have different lengths.")
+            probabilities = {int(candidate): float(value) for candidate, value in zip(candidates, values, strict=True)}
+            if token not in probabilities:
+                raise ValueError(f"Engine log probabilities omit sampled token {token}.")
+            maps.append(probabilities)
+            sampled_sum += probabilities[token]
+        comp.logprobs = [*(comp.logprobs or []), *maps]
+        comp.cumulative_logprob = (comp.cumulative_logprob or 0.0) + sampled_sum
 
     def _append_decodable_tokens(self, rd, new_tokens: list[int]) -> list[int]:
         """Append newly generated tokens to the per-request decode stream.
@@ -997,7 +1069,9 @@ class OutputPipeline:
         if force_finished and not engine_output.finished:
             comp.finish_reason = "stop"
         else:
-            comp.finish_reason = str(engine_output.finish_reason) if engine_output.finish_reason else "finished"
+            comp.finish_reason = (
+                str(engine_output.finish_reason) if engine_output.finish_reason is not None else "finished"
+            )
 
         n_samples = len(ro.outputs)
         if n_samples == 1:
@@ -1110,7 +1184,14 @@ class OutputPipeline:
                     new_tokens = engine_output.new_token_ids
 
                     if new_tokens:
+                        comp = ro.outputs[sample_index]
+                        self._append_token_logprobs(
+                            comp, new_tokens, engine_output.new_logprobs, len(rd.generated_tokens)
+                        )
                         rd.generated_tokens.extend(new_tokens)
+                        # Token/probability alignment is independent of decoding
+                        # intervals, EOS-only updates and text stop trimming.
+                        comp.token_ids = list(rd.generated_tokens)
                         num_generated = len(rd.generated_tokens)
 
                         if rd.first_token_time is None and num_generated > 0:
@@ -1139,8 +1220,6 @@ class OutputPipeline:
                                 stop_string_finishes[request_id] = stop_reason
 
                         if parsed is not None:
-                            comp = ro.outputs[sample_index]
-                            comp.token_ids = list(rd.generated_tokens)
                             text_changed, structured_changed = self._update_outputs(
                                 comp,
                                 ro,

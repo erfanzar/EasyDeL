@@ -29,7 +29,6 @@ Exports:
 
 from __future__ import annotations
 
-import math
 import typing as tp
 
 import jax
@@ -38,11 +37,13 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import sanitize_partition_spec_for_mesh_and_shape
 
-from easydel.layers.indexer._primitives import topk_selection_mask
+from easydel.layers.rotary import apply_rope_interleaved, apply_rope_split_half
 
 from .._operation_impl import OperationImpl, OperationOutput, OperationRegistry
 from ..requirements import CacheType, ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
+from ._mask_info import topk_selection_mask
 
 
 @auto_pytree
@@ -52,8 +53,11 @@ class GlmMoeDsaIndexerOutput(OperationOutput):
     Attributes:
         topk_indices: Selected per-query token indices of shape
             ``(batch, seq, topk)``, or ``None`` before the operation runs.
-        topk_mask: The same selection as a boolean mask over the scored keys,
-            ``(batch, seq, total_seq)``; equal to scattering ``topk_indices``.
+            With explicit indexed/visibility metadata, unfilled slots are -1;
+            legacy calls preserve raw top_k indices (including masked filler slots).
+        topk_mask: Authoritative selection over the scored keys,
+            ``(batch, seq, total_seq)``; excludes hidden/masked filler lanes even
+            when legacy raw ``topk_indices`` retain them.
         cached_keys: Optional cached key tensor of shape
             ``(batch, total_seq, head_dim)``. Populated only when
             ``use_cache=True`` was passed to the operator; ``None`` otherwise.
@@ -112,52 +116,6 @@ class GlmMoeDsaIndexerOp(OperationImpl):
             .build()
         )
 
-    @staticmethod
-    def _apply_rope_interleaved(
-        x: Float[Array, "batch seq ... rope_dim"],
-        cos: Float[Array, "batch seq rope_dim_half"],
-        sin: Float[Array, "batch seq rope_dim_half"],
-    ) -> Float[Array, "batch seq ... rope_dim"]:
-        """Apply RoPE in interleaved layout (even/odd lane pairs).
-
-        Args:
-            x: Tensor whose last dimension is RoPE-rotated, of shape
-                ``(batch, seq, ..., rope_dim)``.
-            cos: Cosine table of shape ``(batch, seq, rope_dim // 2)``.
-            sin: Sine table with the same shape as ``cos``.
-
-        Returns:
-            Float[Array]: ``x`` after RoPE rotation, with the same shape.
-        """
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-        o1 = x1 * cos[..., None, :] - x2 * sin[..., None, :]
-        o2 = x2 * cos[..., None, :] + x1 * sin[..., None, :]
-        return jnp.stack((o1, o2), axis=-1).reshape(x.shape)
-
-    @staticmethod
-    def _apply_rope_split(
-        x: Float[Array, "batch seq ... rope_dim"],
-        cos: Float[Array, "batch seq rope_dim_half"],
-        sin: Float[Array, "batch seq rope_dim_half"],
-    ) -> Float[Array, "batch seq ... rope_dim"]:
-        """Apply RoPE in split (first-half / second-half) layout.
-
-        Args:
-            x: Tensor whose last dimension is RoPE-rotated, of shape
-                ``(batch, seq, ..., rope_dim)``.
-            cos: Cosine table of shape ``(batch, seq, rope_dim // 2)``.
-            sin: Sine table with the same shape as ``cos``.
-
-        Returns:
-            Float[Array]: ``x`` after RoPE rotation, with the same shape.
-        """
-        x1, x2 = jnp.split(x, 2, axis=-1)
-        return jnp.concatenate(
-            [x1 * cos[..., None, :] - x2 * sin[..., None, :], x2 * cos[..., None, :] + x1 * sin[..., None, :]],
-            axis=-1,
-        )
-
     @jax.named_scope("easydel-glm-moe-dsa-indexer-native")
     def forward_native(
         self,
@@ -176,6 +134,12 @@ class GlmMoeDsaIndexerOp(OperationImpl):
         indexer_rope_interleave: bool = False,
         *,
         precision: jax.lax.PrecisionLike = None,
+        cache_positions: Array | None = None,
+        key_valid_mask: Array | None = None,
+        query_positions: Array | None = None,
+        key_positions: Array | None = None,
+        segment_ids: Array | None = None,
+        key_segment_ids: Array | None = None,
         select_topk: tp.Callable[[Array, int, Array], tuple[Array, Array]] | None = None,
         **ignore,
     ) -> GlmMoeDsaIndexerOutput:
@@ -203,6 +167,17 @@ class GlmMoeDsaIndexerOp(OperationImpl):
             precision: Matmul precision for query-key scoring and head weighting.
                 None inherits JAX's ambient policy; fp32 operands alone do not
                 imply full-fp32 multiplication on TPU.
+            cache_positions: Optional physical write slots [batch, seq] in fixed-capacity
+                cached_keys. Negative/out-of-range slots are ignored; requires use_cache
+                and post-update key_valid_mask. Reset zeroes storage without changing shape.
+            key_valid_mask: Optional post-update historical validity [batch, kv].
+            query_positions: Logical causal positions [batch, seq], defaulting to
+                cache_positions in indexed mode or the appended query offsets otherwise.
+            key_positions: Logical key positions [batch, kv], defaulting to storage slots.
+                Supply these with query_positions for sliding/reordered physical storage.
+            segment_ids: Optional query document identities [batch, seq], negative for padding.
+            key_segment_ids: Post-update historical document identities [batch, kv];
+                required with segment_ids when caching. The owning cache retains metadata.
             select_topk: Backend row selector ``(scores, k, query) -> (values, indices)``
                 with ``jax.lax.top_k`` semantics; ``None`` uses ``jax.lax.top_k``.
             **ignore: Additional ignored keyword arguments.
@@ -212,6 +187,10 @@ class GlmMoeDsaIndexerOp(OperationImpl):
             updated ``cached_keys``.
         """
         del ignore
+        explicit_visibility = any(
+            value is not None
+            for value in (cache_positions, key_valid_mask, query_positions, key_positions, segment_ids, key_segment_ids)
+        )
 
         query_states_f32 = query_states.astype(jnp.float32)
         key_states_f32 = key_states.astype(jnp.float32)
@@ -238,18 +217,41 @@ class GlmMoeDsaIndexerOp(OperationImpl):
                 k_nope = key_states_f32[..., rope_dim:]
 
                 if indexer_rope_interleave:
-                    q_pe = self._apply_rope_interleaved(q_pe, cos, sin)
-                    k_pe = self._apply_rope_interleaved(k_pe[:, :, None, :], cos, sin).squeeze(2)
+                    q_pe = apply_rope_interleaved(q_pe, cos[..., None, :], sin[..., None, :])
+                    k_pe = apply_rope_interleaved(k_pe, cos, sin)
                 else:
-                    q_pe = self._apply_rope_split(q_pe, cos, sin)
-                    k_pe = self._apply_rope_split(k_pe[:, :, None, :], cos, sin).squeeze(2)
+                    cos_full = jnp.concatenate((cos, cos), axis=-1)
+                    sin_full = jnp.concatenate((sin, sin), axis=-1)
+                    q_pe = apply_rope_split_half(q_pe, cos_full, sin_full, unsqueeze_dim=-2)
+                    k_pe = apply_rope_split_half(k_pe, cos_full, sin_full, unsqueeze_dim=None)
 
                 query_states_f32 = jnp.concatenate([q_pe, q_nope], axis=-1)
                 key_states_f32 = jnp.concatenate([k_pe, k_nope], axis=-1)
 
         cached_keys_local = None if reset_cache else cached_keys
 
-        if use_cache:
+        if cache_positions is not None:
+            if not use_cache or cached_keys is None or key_valid_mask is None:
+                raise ValueError("cache_positions requires use_cache, preallocated cached_keys and key_valid_mask")
+            batch, q_len, dim = key_states_f32.shape
+            if cached_keys.shape[0] != batch or cached_keys.shape[-1] != dim:
+                raise ValueError("cached_keys batch/head dimensions must match key_states")
+            if cache_positions.shape != (batch, q_len):
+                raise ValueError("cache_positions must have shape [batch, seq]")
+            if key_valid_mask.shape != cached_keys.shape[:2]:
+                raise ValueError("key_valid_mask must describe the full post-update cache capacity")
+            capacity = cached_keys.shape[1]
+            slots = jnp.asarray(cache_positions, dtype=jnp.int32)
+            # Negative slots are padding, not Python-style indexes from the end.
+            slots = jnp.where((slots >= 0) & (slots < capacity), slots, capacity)
+            storage = jnp.zeros_like(cached_keys) if reset_cache else cached_keys
+            all_keys = jax.vmap(lambda old, pos, new: old.at[pos].set(new, mode="drop"))(
+                storage.astype(jnp.float32), slots, key_states_f32
+            )
+            new_cached_keys = all_keys
+            if query_positions is None:
+                query_positions = cache_positions
+        elif use_cache:
             if cached_keys_local is not None:
                 all_keys = jnp.concatenate([cached_keys_local.astype(jnp.float32), key_states_f32], axis=1)
             else:
@@ -265,13 +267,18 @@ class GlmMoeDsaIndexerOp(OperationImpl):
         index_scores = jnp.einsum("bsht,bsh->bst", scores, head_weights.astype(jnp.float32), precision=precision)
 
         total_len = int(index_scores.shape[-1])
+        caller_visible = None
 
         if attention_mask is not None:
             if attention_mask.ndim == 2:
                 attention_mask = attention_mask[:, None, :]
 
             q_len = int(index_scores.shape[-2])
-            if attention_mask.shape[-2] > q_len:
+            if attention_mask.shape[-2] == 1:
+                attention_mask = jnp.broadcast_to(
+                    attention_mask, (attention_mask.shape[0], q_len, attention_mask.shape[-1])
+                )
+            elif attention_mask.shape[-2] > q_len:
                 attention_mask = attention_mask[:, :q_len, :]
             elif attention_mask.shape[-2] < q_len:
                 q_pad_len = q_len - int(attention_mask.shape[-2])
@@ -290,30 +297,70 @@ class GlmMoeDsaIndexerOp(OperationImpl):
                     attention_mask = jnp.pad(attention_mask, ((0, 0), (0, 0), (0, pad_len)), constant_values=0.0)
 
             if attention_mask.dtype == jnp.bool_:
+                caller_visible = attention_mask
                 index_scores = jnp.where(attention_mask, index_scores, -jnp.inf)
             else:
+                # A finite-min additive sentinel is just as ineligible as -inf.
+                # Inspect the original mask dtype before converting to fp32 (a
+                # bf16/fp16 sentinel is not fp32's minimum after conversion).
+                caller_visible = jnp.isfinite(attention_mask) & (attention_mask > jnp.finfo(attention_mask.dtype).min)
                 index_scores = index_scores + attention_mask.astype(index_scores.dtype)
 
         # Causality (HF masks future keys before top-k): the current queries are the last
         # ``q_len`` keys (no-cache prefill or cache append), so query ``i`` sees keys
         # ``<= total_len - q_len + i``. A non-causal caller mask must not let future keys
         # take top-k slots that the attention kernel would then hide.
-        q_len = int(index_scores.shape[-2])
-        query_index = total_len - q_len + jnp.arange(q_len, dtype=jnp.int32)
-        future = jnp.arange(total_len, dtype=jnp.int32)[None, :] > query_index[:, None]
-        index_scores = jnp.where(future, -jnp.inf, index_scores)
+        batch, q_len = index_scores.shape[:2]
+        if query_positions is None:
+            query_positions = jnp.broadcast_to(total_len - q_len + jnp.arange(q_len), (batch, q_len))
+        if key_positions is None:
+            key_positions = jnp.broadcast_to(jnp.arange(total_len), (batch, total_len))
+        if query_positions.shape != (batch, q_len) or key_positions.shape != (batch, total_len):
+            raise ValueError("query_positions/key_positions must match [batch, seq]/[batch, kv]")
+        visible = (key_positions[:, None, :] <= query_positions[:, :, None]) & (query_positions[:, :, None] >= 0)
+        if key_valid_mask is not None:
+            if key_valid_mask.shape != (batch, total_len):
+                raise ValueError("key_valid_mask must match [batch, kv]")
+            visible = visible & key_valid_mask[:, None, :].astype(jnp.bool_)
+        if segment_ids is not None:
+            if key_segment_ids is None and not use_cache:
+                key_segment_ids = segment_ids
+            if key_segment_ids is None:
+                raise ValueError("cached segment masking requires post-update key_segment_ids")
+            if segment_ids.shape != (batch, q_len) or key_segment_ids.shape != (batch, total_len):
+                raise ValueError("segment_ids/key_segment_ids must match [batch, seq]/[batch, kv]")
+            visible = visible & (segment_ids[:, :, None] >= 0)
+            visible = visible & (segment_ids[:, :, None] == key_segment_ids[:, None, :])
+        elif key_segment_ids is not None:
+            raise ValueError("key_segment_ids requires query segment_ids")
+        eligible = visible & (index_scores != -jnp.inf)
+        if caller_visible is not None:
+            eligible = eligible & caller_visible
+        index_scores = jnp.where(eligible, index_scores, -jnp.inf)
 
         topk = min(max(int(index_topk), 1), total_len)
         if select_topk is None:
             topk_values, topk_indices = jax.lax.top_k(index_scores, k=topk)
         else:
             topk_values, topk_indices = select_topk(index_scores, topk, query_states)
-        topk_mask = topk_selection_mask(index_scores, topk_values, topk_indices)
+        # Even legacy calls need an authoritative mask: top_k fills all k slots
+        # when fewer than k candidates are eligible, including fully masked rows.
+        topk_mask = topk_selection_mask(index_scores, topk_values, topk_indices) & eligible
+        if explicit_visibility:
+            # The indexed/segment contract marks unfilled top-k slots explicitly, so
+            # callers consuming indices as well as masks cannot resurrect hidden keys.
+            # Keep the historical raw top_k behavior for legacy calls without metadata.
+            selected_valid = jnp.take_along_axis(eligible, topk_indices, axis=-1)
+            topk_indices = jnp.where(selected_valid, topk_indices, -1)
 
         return GlmMoeDsaIndexerOutput(
             topk_indices=checkpoint_name(topk_indices, "indexer_topk"),
             topk_mask=checkpoint_name(topk_mask, "indexer_topk"),
-            cached_keys=None if new_cached_keys is None else new_cached_keys.astype(key_states.dtype),
+            cached_keys=(
+                None
+                if new_cached_keys is None
+                else new_cached_keys.astype(cached_keys.dtype if cache_positions is not None else key_states.dtype)
+            ),
         )
 
     def _select_topk_tpu(self, index_scores: Array, topk: int, query_states: Array) -> tuple[Array, Array]:
@@ -336,13 +383,12 @@ class GlmMoeDsaIndexerOp(OperationImpl):
         with mesh:
             query_spec = self.metadata.get_shardings(self.get_mode(query=query_states, BTHD=True), layout="bthd").query
         jax_mesh = getattr(mesh, "jax_mesh", mesh)
-        sizes = dict(jax_mesh.shape)
-        rows = []
-        for dim, entry in zip(index_scores.shape[:2], query_spec[:2], strict=True):
-            axes = entry if isinstance(entry, tuple) else (() if entry is None else (entry,))
-            # Keep only a placement that divides the row dimension (e.g. batch 1).
-            rows.append(entry if dim % math.prod(sizes[axis] for axis in axes) == 0 else None)
-        row_spec = PartitionSpec(*rows, None)
+        # Policy specs may name axes absent from a reduced/stage-local mesh.
+        # Filter each compound placement before checking row divisibility, keeping
+        # surviving members (e.g. dp in (fsdp, dp)) and the candidate axis whole.
+        row_spec = sanitize_partition_spec_for_mesh_and_shape(
+            PartitionSpec(*query_spec[:2], None), mesh=mesh, shape=index_scores.shape
+        )
         return jax.shard_map(
             select,
             mesh=jax_mesh,
@@ -388,6 +434,12 @@ class GlmMoeDsaIndexerOp(OperationImpl):
         indexer_rope_interleave: bool = False,
         *,
         precision: jax.lax.PrecisionLike = None,
+        cache_positions: Array | None = None,
+        key_valid_mask: Array | None = None,
+        query_positions: Array | None = None,
+        key_positions: Array | None = None,
+        segment_ids: Array | None = None,
+        key_segment_ids: Array | None = None,
         **kwargs,
     ) -> GlmMoeDsaIndexerOutput:
         """Execute the DSA indexer by dispatching to the appropriate backend.
@@ -409,6 +461,15 @@ class GlmMoeDsaIndexerOp(OperationImpl):
             precision: Matmul precision for both score contractions. None
                 preserves the ambient JAX policy. Capture this argument in a
                 JIT closure or mark it static when compiling the operation.
+            cache_positions: Optional physical write slots [batch, seq] in preallocated
+                cached_keys; negative/out-of-range slots are ignored. Requires use_cache
+                and key_valid_mask. Omitted preserves legacy append/reset semantics.
+            key_valid_mask: Post-update historical key validity [batch, kv].
+            query_positions: Logical query positions [batch, seq] for causal selection.
+            key_positions: Logical key positions [batch, kv], independent of physical slots.
+            segment_ids: Query document identities [batch, seq], negative for padding.
+            key_segment_ids: Post-update key identities [batch, kv]; required for
+                cached segment masking. Metadata remains owned by the cache.
             **kwargs: Additional keyword arguments passed to the backend.
 
         Returns:
@@ -429,6 +490,12 @@ class GlmMoeDsaIndexerOp(OperationImpl):
             reset_cache=reset_cache,
             indexer_rope_interleave=indexer_rope_interleave,
             precision=precision,
+            cache_positions=cache_positions,
+            key_valid_mask=key_valid_mask,
+            query_positions=query_positions,
+            key_positions=key_positions,
+            segment_ids=segment_ids,
+            key_segment_ids=key_segment_ids,
             **kwargs,
         )
 

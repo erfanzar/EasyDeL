@@ -156,10 +156,7 @@ class PRMPreprocessTransform:
 
         if max_length is not None:
             prompt_budget = max(max_length - len(completion_ids), 0)
-            if prompt_budget == 0 and len(completion_ids) > max_length:
-                completion_ids, labels = build_completion_labels(max_length)
-                prompt_ids = []
-            elif len(prompt_ids) > prompt_budget:
+            if len(prompt_ids) > prompt_budget:
                 prompt_ids = prompt_ids[-prompt_budget:] if prompt_budget > 0 else []
 
         input_ids = prompt_ids + completion_ids

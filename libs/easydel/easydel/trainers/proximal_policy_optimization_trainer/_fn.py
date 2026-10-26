@@ -89,7 +89,7 @@ def compute_per_token_logps(logits: jax.Array, input_ids: jax.Array, prompt_leng
         containing ``log p(token_t | logits_t)`` for each completion
         position.
     """
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    log_probs = jax.nn.log_softmax(logits[:, prompt_length:, :], axis=-1)
     target_ids = input_ids[:, prompt_length:]
     token_log_probs = jnp.take_along_axis(
         log_probs,

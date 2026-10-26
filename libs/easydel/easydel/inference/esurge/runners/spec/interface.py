@@ -60,7 +60,8 @@ class SpeculativeStrategy(typing.Protocol):
         reject_backoff_steps: Drafter-call backoff after a full rejection
             (``0`` disables the stop-loss).
         debug_traces: Collected host-side verify traces (diagnostics).
-        debug_max_traces: Trace budget (``EASYDEL_SPEC_DECODE_DEBUG_STEPS``).
+        debug_max_traces: Trace budget, configured with the runner's
+            ``spec_debug_max_traces`` constructor argument.
         draft_full_log_probs_by_req: Per-request stacked draft
             log-probability tensors awaiting verification.
     """
@@ -94,6 +95,33 @@ class SpeculativeStrategy(typing.Protocol):
 
     def is_greedy_request(self, req_state: CachedRequestState | None) -> bool:
         """Whether speculative decoding should use the greedy path."""
+        ...
+
+    def uses_history_penalties(self, req_state: CachedRequestState | None) -> bool:
+        """Whether the request carries a presence, frequency or repetition penalty."""
+        ...
+
+    def penalized_verify_argmaxes(
+        self,
+        logits: jax.Array,
+        entries: typing.Sequence[tuple[_SpecVerifyMetadata, int, int]],
+    ) -> typing.Any:
+        """Greedy verify argmaxes with history penalties applied, or ``None`` when nothing is penalised."""
+        ...
+
+    def penalized_replay_token(
+        self,
+        *,
+        meta: _SpecVerifyMetadata,
+        req_state: CachedRequestState | None,
+        hidden_row: jax.Array,
+        draft_prefix: int,
+    ) -> int | None:
+        """Penalised greedy token from a replay hidden row, or ``None`` when the request is unpenalised."""
+        ...
+
+    def sync_penalty_counts(self, scheduler_output: SchedulerOutput) -> None:
+        """Rewrite drifted sampler token counts of penalised speculative requests."""
         ...
 
     def cache_replay_required(self) -> bool:
@@ -292,6 +320,25 @@ class NullSpeculation:
         """Always ``False``: mirrors the drafter-gated greedy check."""
         del req_state
         return False
+
+    def uses_history_penalties(self, req_state: CachedRequestState | None) -> bool:
+        """Always ``False``: no verify path exists to penalise."""
+        del req_state
+        return False
+
+    def sync_penalty_counts(self, scheduler_output: SchedulerOutput) -> None:
+        """No-op: without speculation the sampler's own counts stay exact."""
+        del scheduler_output
+
+    def penalized_verify_argmaxes(self, *args: typing.Any, **kwargs: typing.Any) -> typing.NoReturn:
+        """Unreachable without a drafter; fails loudly."""
+        del args, kwargs
+        self._unsupported("penalized_verify_argmaxes")
+
+    def penalized_replay_token(self, *args: typing.Any, **kwargs: typing.Any) -> typing.NoReturn:
+        """Unreachable without a drafter; fails loudly."""
+        del args, kwargs
+        self._unsupported("penalized_replay_token")
 
     def cache_replay_required(self) -> bool:
         """Always ``False``: no speculative KV to replay."""

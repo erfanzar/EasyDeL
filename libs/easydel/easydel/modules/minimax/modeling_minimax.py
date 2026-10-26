@@ -60,6 +60,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeCausalLMOutput, MoeModelOutput
+from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info, token_attention_mask_from_mask_info
 from easydel.infra.utils import ACT2FN, auto_remat
 from easydel.layers import (
     BaseMoeModule,
@@ -72,11 +73,11 @@ from easydel.layers import (
     RowParallelLinear,
     RowParallelMoELinear,
     dense_qkv_layout,
-    moe_fused_gate_up_reform_param,
     split_fused_gate_up_projection,
     split_fused_qkv_projection,
 )
 from easydel.layers.attention import UnifiedAttention
+from easydel.layers.layouts import mixtral_moe_reform_param
 from easydel.modules._base import BaseCausalLMModule
 
 from .minimax_configuration import MiniMaxConfig
@@ -293,6 +294,7 @@ class MiniMaxLightningAttention(spx.Module):
         attention_mask: Bool[Array, "batch seq_len"] | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: RecurrentCacheView | None = None,
+        mask_info: MaskInfo | None = None,
     ) -> tuple[Float[Array, "batch seq_len hidden_dim"], RecurrentCacheView | None]:
         """Run Lightning Attention with the appropriate prefill/decode path.
 
@@ -320,6 +322,9 @@ class MiniMaxLightningAttention(spx.Module):
             cache_view: Per-layer recurrent state carrying ``S`` of shape
                 ``(batch, num_heads, head_dim, head_dim)``. ``None`` skips
                 state threading entirely.
+            mask_info: Token validity and packed-document segments. Segment
+                transitions reset the rolling memory and isolate intra-block
+                products, including transitions across block boundaries.
 
         Returns:
             tuple: ``(attn_output, cache_view)`` where ``attn_output`` has
@@ -328,6 +333,22 @@ class MiniMaxLightningAttention(spx.Module):
         """
         batch_size, seq_len, _ = hidden_states.shape
         num_blocks = (seq_len + self.block_size - 1) // self.block_size
+        segment_ids = packed_segment_ids_from_mask_info(mask_info, seq_len)
+        token_mask = token_attention_mask_from_mask_info(mask_info, seq_len)
+        if attention_mask is not None:
+            explicit_mask = attention_mask[:, -seq_len:].astype(jnp.bool_)
+            token_mask = explicit_mask if token_mask is None else token_mask & explicit_mask
+        # Run IDs, rather than document labels alone, also isolate repeated
+        # segment labels separated by another document or padding.
+        segment_runs = None
+        if segment_ids is not None:
+            segment_runs = jnp.cumsum(
+                jnp.concatenate(
+                    (jnp.zeros_like(segment_ids[:, :1]), (segment_ids[:, 1:] != segment_ids[:, :-1]).astype(jnp.int32)),
+                    axis=1,
+                ),
+                axis=1,
+            )
 
         slope_rate = self._get_slope_rate()
         query_decay, key_decay, diagonal_decay = self._decay_factors(slope_rate)
@@ -371,11 +392,10 @@ class MiniMaxLightningAttention(spx.Module):
                 (batch_size, self.num_attention_heads, self.head_dim, self.head_dim), dtype=value_states.dtype
             )
 
-        if mode != common_types.MODE_DECODE:
-            if attention_mask is not None:
-                attention_mask = attention_mask.astype(jnp.bool_)
-                value_states = jnp.where(attention_mask[:, None, :, None], value_states, jnp.zeros_like(value_states))
+        if token_mask is not None:
+            value_states = jnp.where(token_mask[:, None, :, None], value_states, jnp.zeros_like(value_states))
 
+        if mode != common_types.MODE_DECODE:
             attn_outputs = []
             for i in range(num_blocks):
                 start_idx = i * self.block_size
@@ -390,6 +410,17 @@ class MiniMaxLightningAttention(spx.Module):
                 current_key_decay = key_decay[:, -current_block_size:]
                 current_diagonal_decay = diagonal_decay[:, :, :current_block_size, :current_block_size]
                 block_decay = jnp.exp(-slope_rate * float(current_block_size))
+
+                if segment_runs is not None:
+                    runs = segment_runs[:, start_idx:end_idx]
+                    incoming_run = segment_runs[:, max(start_idx - 1, 0)]
+                    same_run = runs[:, :, None] == runs[:, None, :]
+                    current_diagonal_decay = current_diagonal_decay * same_run[:, None]
+                    # Only the run continuing the incoming memory can read it;
+                    # the final run alone contributes to the outgoing memory.
+                    current_query_decay = current_query_decay * (runs == incoming_run[:, None])[:, None, :, None]
+                    current_key_decay = current_key_decay * (runs == runs[:, -1:])[:, None, :, None]
+                    block_decay = block_decay * (runs[:, -1] == incoming_run)[:, None, None, None]
 
                 attn_weights_intra = jnp.matmul(current_query_states, jnp.swapaxes(current_key_states, -1, -2))
                 attn_output_intra = jnp.matmul(attn_weights_intra * current_diagonal_decay, current_value_states)
@@ -417,6 +448,9 @@ class MiniMaxLightningAttention(spx.Module):
                     jnp.swapaxes(current_key_states, -1, -2),
                     current_value_states,
                 )
+                if segment_runs is not None and i > 0:
+                    reset = segment_runs[:, i] != segment_runs[:, i - 1]
+                    attn_weights_inter = jnp.where(reset[:, None, None, None], 0, attn_weights_inter)
                 attn_weights_inter = ratio * attn_weights_inter + current_attn_weights_inter
                 current_attn_output = jnp.matmul(current_query_states, attn_weights_inter)
                 attn_outputs.append(current_attn_output)
@@ -438,6 +472,8 @@ class MiniMaxLightningAttention(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
+        if token_mask is not None:
+            attn_output = jnp.where(token_mask[:, :, None], attn_output, 0)
         if cache_view is not None:
             cache_view = cache_view.update_recurrent_state(attn_weights_inter)
 
@@ -817,21 +853,7 @@ class MiniMaxDecoderLayer(spx.Module):
 
     @property
     def reform_param(self):
-        return {
-            "mlp.gate.weight$": {
-                "splits": [{"name": "block_sparse_moe.gate.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
-                "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-            },
-            "mlp.experts.down_proj$": {
-                "splits": [{"name": "block_sparse_moe.experts.w2.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
-                "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-            },
-            **moe_fused_gate_up_reform_param(
-                config=self.config,
-                target_prefix="block_sparse_moe.experts.gate_up_proj",
-                source_prefix="mlp.experts.gate_up_proj",
-            ),
-        }
+        return mixtral_moe_reform_param(config=self.config)
 
     def forward(
         self,
@@ -886,6 +908,7 @@ class MiniMaxDecoderLayer(spx.Module):
                 attention_mask=attention_mask,
                 mode=mode,
                 cache_view=linear_cache,
+                mask_info=mask_info,
             )
             cache_view = linear_cache
         else:
@@ -1181,8 +1204,11 @@ class MiniMaxModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
 
         router_losses = None
         if output_router_logits and all_router_logits is not None:
@@ -1353,20 +1379,7 @@ class MiniMaxForCausalLM(BaseCausalLMModule[MiniMaxModel, MiniMaxConfig]):  # ty
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
-            aux_loss_fn=self._compute_aux_loss,
         )
-
-    def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute auxiliary load balancing loss from router logits."""
-        if outputs.router_logits is None or len(outputs.router_logits) == 0:
-            return None
-        aux_loss = auxiliary_load_balancing_loss_func(
-            gate_logits=outputs.router_logits,
-            num_experts=self.config.num_local_experts,
-            top_k=self.config.num_experts_per_tok,
-            attention_mask=attention_mask,
-        )
-        return aux_loss * self.config.router_aux_loss_coef
 
     def get_inference_cache_type(self) -> str:
         """Get the cache type used for inference.

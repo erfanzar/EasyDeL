@@ -84,7 +84,7 @@ class SDFTTrainer(SDPOTrainer):
         if not isinstance(arguments, SDFTConfig):
             raise TypeError(f"arguments must be SDFTConfig, got {type(arguments)}")
         self._sdft_user_feedback_func = feedback_func
-        self._sdft_privileged_context: list[str] | None = None
+        self._sdft_privileged_context: object | None = None
         super().__init__(
             arguments=arguments,
             model=model,
@@ -123,10 +123,15 @@ class SDFTTrainer(SDPOTrainer):
                 values = [str(value)]
         if not values:
             values = [""]
-        if len(values) >= target_len:
-            return values[:target_len]
-        repeats = (target_len + len(values) - 1) // len(values)
-        return (values * repeats)[:target_len]
+        if target_len == 0:
+            return []
+        if len(values) > target_len or target_len % len(values) != 0:
+            raise ValueError(
+                f"SDFT template values have {len(values)} entries, which cannot align "
+                f"prompt-major with {target_len} rows."
+            )
+        repeats = target_len // len(values)
+        return [value for value in values for _ in range(repeats)]
 
     def _sdft_template_feedback(
         self,
@@ -140,13 +145,12 @@ class SDFTTrainer(SDPOTrainer):
         inherited SDPO batch builder. When a user feedback callable is provided,
         its output is also available to the template as ``{feedback}``.
         """
-        del rewards
         template = self.arguments.teacher_prompt_template
         if template is None:
             return ["" for _ in completions]
         user_feedbacks = [""] * len(completions)
         if self._sdft_user_feedback_func is not None:
-            raw = self._sdft_user_feedback_func(prompts=prompts, completions=completions, rewards=[0.0] * len(prompts))
+            raw = self._sdft_user_feedback_func(prompts=prompts, completions=completions, rewards=rewards)
             user_feedbacks = self._coerce_template_values(raw, len(completions))
         privileged_context = self._coerce_template_values(self._sdft_privileged_context, len(completions))
         prompt_values = self._coerce_template_values(prompts, len(completions))
@@ -176,8 +180,8 @@ class SDFTTrainer(SDPOTrainer):
 
         The SDPO base path consumes tensorized prompt/completion fields. SDFT
         additionally needs raw privileged context strings while formatting
-        teacher feedback, so this method stores a prompt-aligned context list
-        for the duration of preprocessing and clears it in ``finally`` to avoid
+        teacher feedback, so this method stores the context payload (prompt- or
+        completion-aligned) during preprocessing and clears it in ``finally`` to avoid
         leaking context between batches. When ``generate_from_teacher=True``,
         rollout generation is delegated to the frozen reference state while the
         returned batch is still optimized by the normal training step.
@@ -186,7 +190,7 @@ class SDFTTrainer(SDPOTrainer):
         context = batch.get("privileged_context")
         if context is None:
             context = batch.get("context")
-        self._sdft_privileged_context = self._coerce_template_values(context, int(batch["input_ids"].shape[0]))
+        self._sdft_privileged_context = context
         try:
             generation_state = (
                 self.ref_state if self.arguments.generate_from_teacher and self.ref_state is not None else state

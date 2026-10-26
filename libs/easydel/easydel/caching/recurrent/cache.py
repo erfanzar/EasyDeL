@@ -29,6 +29,7 @@ By parameterizing the shapes flexibly, we can support all variants with one impl
 
 from __future__ import annotations
 
+import jax
 from eformer.jaximus import ImplicitArray
 from eformer.pytree import auto_pytree, field
 from jax import numpy as jnp
@@ -333,7 +334,10 @@ class RecurrentCacheView(BaseCacheView):
                 cache_position = jnp.clip(cache_position, 0, self.metadata.conv_kernel_size - 1)
             rolled = jnp.roll(self.conv_state, shift=-1, axis=-1)
             if cache_position is not None:
-                new_conv_state = rolled.at[:, :, cache_position].set(conv_state)
+                positions = jnp.broadcast_to(jnp.asarray(cache_position), (rolled.shape[0],))
+                new_conv_state = jax.vmap(lambda row, state, pos: row.at[:, pos].set(state))(
+                    rolled, conv_state, positions
+                )
             else:
                 # Default: insert at last position
                 new_conv_state = rolled.at[:, :, -1].set(conv_state)
@@ -482,7 +486,6 @@ class RecurrentCache(BaseCache):
                     view.positions = view.positions + num
                 view.seqlen_offset = view.seqlen_offset + num
 
-
     def __repr__(self) -> str:
         """Return a multi-line ``repr`` listing each layer view.
 
@@ -494,6 +497,7 @@ class RecurrentCache(BaseCache):
     __str__ = __repr__
 
 
+@auto_pytree
 class RecurrentMetadata(BaseRunTimeMetadata):
     """Runtime-side companion to ``RecurrentCacheView`` for SSM/linear models.
 

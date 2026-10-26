@@ -85,6 +85,7 @@ def _check_custom_jvp_masked_rows(use_sink, dtype, band):
             softmax_scale=0.3,
             window=3 if band else 0,
             token_kv_len=token_len,
+            backward="reference",
         )
 
     def reference(a, b, c, d):

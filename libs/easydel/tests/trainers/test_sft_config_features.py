@@ -73,8 +73,11 @@ def test_sft_truncation_mode_defaults_to_keep_start_and_validates_values():
         SFTConfig(truncation_mode="middle")
 
 
+@pytest.mark.cpu_ok
 def test_sft_activation_offloading_guard():
-    assert SFTConfig(activation_offloading=True).activation_offloading is True
+    assert SFTConfig().activation_offloading is False
+    with pytest.raises(ValueError, match="activation_offloading"):
+        SFTConfig(activation_offloading=True)
 
 
 def test_sft_stale_compatibility_knobs_fail_loudly_when_non_default():

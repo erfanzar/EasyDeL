@@ -394,8 +394,6 @@ class Cohere2Block(spx.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.is_sliding = (layer_idx + 1) % self.config.sliding_window_pattern != 0
-        self.sliding_window = config.sliding_window
 
     def forward(
         self,
@@ -604,6 +602,8 @@ class Cohere2Model(EasyDeLBaseModule):
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
         sequence_length = inputs_embeds.shape[1]
 
+        output_attentions = self.config.output_attentions if output_attentions is None else output_attentions
+        output_hidden_states = self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
         assert sequence_length <= self.config.max_position_embeddings, (
@@ -693,6 +693,7 @@ class Cohere2Model(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
 
@@ -874,22 +875,41 @@ class Cohere2ForCausalLM(BaseCausalLMModule[Cohere2Model, Cohere2Config]):
         Returns:
             Array: The logits after applying the language model head.
         """
-        lm_logits = self.lm_head(hidden_states)
+        lm_logits = super().apply_lm_head(hidden_states)
         if self.logit_scale is not None:
-            lm_logits *= self.logit_scale
+            lm_logits = lm_logits * self.logit_scale
         return lm_logits
 
-    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
-        """Trace-safe projection with Cohere2 logit scaling."""
-        base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
+    def get_lm_logit_postprocess(self):
+        """Capture Cohere2's optional scale followed by base clipping.
+
+        Unlike Cohere, Cohere2 scales in ``apply_lm_head``, before the base
+        ``compute_lm_logits`` clips. Capture scalars only for split execution.
+        """
+        clip_fn = self.get_base_lm_logit_postprocess()
         scale = self.logit_scale
+        if scale is None:
+            return clip_fn
+
+        def _postprocess(logits: Array) -> Array:
+            """Scale raw projected logits before applying the base cap."""
+            logits = logits * scale
+            return clip_fn(logits) if clip_fn is not None else logits
+
+        return _postprocess
+
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
+        """Trace-safe projection with scaling before base clipping."""
+        # Start from the raw trace-safe projection: BaseTaskModule's wrapper
+        # already clips, which would put clipping before Cohere2's scale.
+        base_fn = EasyDeLBaseModule.make_lm_head_fn(self, vocab_shard_stage=vocab_shard_stage)
+        postprocess = self.get_lm_logit_postprocess()
+        if postprocess is None:
+            return base_fn
 
         def _project(hidden_states):
-            """Apply the LM head and Cohere2's optional ``logit_scale``."""
-            logits = base_fn(hidden_states)
-            if scale is not None:
-                logits = logits * scale
-            return logits
+            """Apply exactly one ordered logit post-processing stage."""
+            return postprocess(base_fn(hidden_states))
 
         return _project
 
@@ -1036,18 +1056,12 @@ class Cohere2ForSequenceClassification(BaseSequenceClassificationModule[Cohere2M
         else:
             batch_size = inputs_embeds.shape[0]
 
-        if self.config.pad_token_id is None and batch_size != 1:
+        if self.config.pad_token_id is None and attention_mask is None and batch_size != 1:
             raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
+        if input_ids is None and attention_mask is None:
+            pooled_logits = logits[:, -1]
         else:
-            if input_ids is not None:
-                sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-            else:
-                sequence_lengths = -1
-
-        pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
+            pooled_logits = self.pool_sequence(logits, input_ids=input_ids, attention_mask=attention_mask)
 
         return SequenceClassifierOutput(
             logits=pooled_logits,

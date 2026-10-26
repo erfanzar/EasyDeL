@@ -41,7 +41,7 @@ Example:
 from abc import ABC, abstractmethod
 
 from ..request import EngineRequest
-from .interface import CacheGroupSpec, FullAttentionSpec
+from .interface import CacheGroupSpec, ChunkedLocalAttentionSpec, FullAttentionSpec
 from .page_pool import PagePool
 from .single_type_cache_manager import FullAttentionManager, get_manager_for_kv_cache_spec
 from .utils import CachePage, PageHash
@@ -447,6 +447,75 @@ class UnitaryCacheCoordinator(CacheCoordinator):
         return hit_pages, len(hit_pages[0]) * self.page_size
 
 
+class _GroupedCacheCoordinator(CacheCoordinator):
+    """Coordinate any combination of groups sharing a token-page size.
+
+    Configuration-derived groups share the page-hash granularity, but may
+    contain several chunk/window sizes, no FULL group, or interleaved types.
+    The two-type hybrid fast path cannot represent those layouts.
+    """
+
+    def __init__(
+        self,
+        num_pages: int,
+        kv_cache_groups: list[CacheGroupSpec],
+        max_model_len: int,
+        use_eagle: bool,
+        enable_caching: bool,
+    ):
+        """Initialize registered per-group managers and verify hash granularity."""
+        super().__init__(num_pages, kv_cache_groups, max_model_len, use_eagle, enable_caching)
+        page_sizes = {group.kv_cache_spec.page_size for group in kv_cache_groups}
+        if len(page_sizes) != 1:
+            raise ValueError("Grouped prefix caching requires a common token-page size for page hashes.")
+        self.page_size = page_sizes.pop()
+
+    def find_longest_cache_hit(
+        self,
+        page_hashes: list[PageHash],
+        max_cache_hit_length: int,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
+    ) -> tuple[tuple[list[CachePage], ...], int]:
+        """Find a common prefix, rechecking local windows when its endpoint moves.
+
+        A CHUNK lookup at a chunk boundary can return only null placeholders.
+        If another group shortens the hit, those placeholders may now fall
+        inside the active chunk. Truncating that result would claim missing
+        KV as computed. Re-run every lookup at the shorter endpoint until
+        every group agrees; each unsuccessful pass drops at least one page.
+        DP locality constraints apply on every pass.
+        """
+        hit_length = min(max_cache_hit_length // self.page_size, len(page_hashes)) * self.page_size
+        reserve_eagle_page = self.use_eagle
+        while True:
+            hit_pages = tuple(
+                manager.find_longest_cache_hit(
+                    page_hashes=page_hashes,
+                    max_length=hit_length,
+                    kv_cache_group_ids=[group_id],
+                    page_pool=self.page_pool,
+                    kv_cache_spec=group.kv_cache_spec,
+                    use_eagle=False,
+                    dp_shard_hint=dp_shard_hint,
+                    data_parallel_size=data_parallel_size,
+                )[0]
+                for group_id, (group, manager) in enumerate(
+                    zip(self.kv_cache_groups, self.single_type_managers, strict=True)
+                )
+            )
+            common_length = min(len(pages) for pages in hit_pages) * self.page_size
+            if common_length == hit_length:
+                if reserve_eagle_page and hit_length:
+                    # Reserve hidden-state recomputation once, after finding
+                    # the hit. Recheck local windows at the shorter endpoint.
+                    reserve_eagle_page = False
+                    hit_length -= self.page_size
+                    continue
+                return hit_pages, hit_length
+            hit_length = common_length
+
+
 class HybridCacheCoordinator(CacheCoordinator):
     """Cache coordinator for hybrid models with multiple attention types.
 
@@ -614,7 +683,9 @@ class HybridCacheCoordinator(CacheCoordinator):
             kv_cache_group_ids=self.other_group_ids,
             page_pool=self.page_pool,
             kv_cache_spec=self.other_spec,
-            use_eagle=self.use_eagle,
+            # Full attention already reserved the EAGLE recomputation page.
+            # Sliding windows still need their extra contiguous-page check.
+            use_eagle=self.use_eagle and not isinstance(self.other_spec, ChunkedLocalAttentionSpec),
             dp_shard_hint=dp_shard_hint,
             data_parallel_size=data_parallel_size,
         )
@@ -658,7 +729,8 @@ def get_kv_cache_coordinator(
         An appropriate CacheCoordinator instance:
         - CacheCoordinatorNoPrefixCache: When caching is disabled
         - UnitaryCacheCoordinator: When there's exactly one cache group
-        - HybridCacheCoordinator: When there are multiple cache groups
+        - HybridCacheCoordinator: For the ordered FULL plus one-other-type layout
+        - A grouped coordinator: For other multi-group layouts sharing a token-page size
 
     Example:
         >>> coordinator = get_kv_cache_coordinator(
@@ -684,7 +756,15 @@ def get_kv_cache_coordinator(
             use_eagle,
             enable_caching,
         )
-    return HybridCacheCoordinator(
+    full_group_ids = [i for i, group in enumerate(kv_cache_groups) if isinstance(group.kv_cache_spec, FullAttentionSpec)]
+    other_group_ids = [i for i in range(len(kv_cache_groups)) if i not in full_group_ids]
+    full_type_ids = {kv_cache_groups[i].kv_cache_spec.type_id for i in full_group_ids}
+    other_type_ids = {kv_cache_groups[i].kv_cache_spec.type_id for i in other_group_ids}
+    two_type_layout = len(full_type_ids) == len(other_type_ids) == 1 and (
+        max(full_group_ids) < min(other_group_ids) or max(other_group_ids) < min(full_group_ids)
+    )
+    coordinator_cls = HybridCacheCoordinator if two_type_layout else _GroupedCacheCoordinator
+    return coordinator_cls(
         num_pages,
         kv_cache_groups,
         max_model_len,

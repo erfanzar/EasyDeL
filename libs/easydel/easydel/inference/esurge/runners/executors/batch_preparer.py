@@ -75,15 +75,15 @@ import jax
 import numpy as np
 from jax import numpy as jnp
 
-from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
+from easydel.caching import RaggedPagesCacheConfig, RaggedPagesMetadata, UnifiedAttentionCacheConfig
 from easydel.caching._metadatabuilder import AttentionMetadataBuilder
 from easydel.inference.esurge.runners.host_sync import host_payload_broadcast_needed
-from easydel.utils.helpers import check_bool_flag
+from easydel.utils import flags
 
 from ...core.dp_sharding import dp_shard_page_bounds, pages_per_dp_shard
 from ...page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
 from ..async_types import DeviceInputTokenHandoff
-from ..execution_types import BatchMetadata
+from ..execution_types import BatchMetadata, CacheGroupInputs
 
 #: Host-payload slots at or below this size are content-hashed and their
 #: device copies reused when unchanged (steady decode keeps most slots
@@ -210,6 +210,9 @@ class BatchMetadataPreparer:
         enable_spec_recurrent_commit: bool = False,
         input_sharding: jax.sharding.Sharding | None = None,
         slot_indexed_state: bool = False,
+        cache_group_configs: tuple[RaggedPagesCacheConfig | UnifiedAttentionCacheConfig, ...] = (),
+        layer_to_cache_group: tuple[int, ...] = (),
+        host_payloads_replicated: bool = False,
     ) -> None:
         """Initialize the BatchMetadataPreparer.
 
@@ -236,6 +239,11 @@ class BatchMetadataPreparer:
                 ``dp_recurrent_state_indices`` (shape ``[1, rows]``) even
                 without SPMD DP, so the model can address per-request slot
                 state that survives SequenceBuffer row moves.
+            cache_group_configs: Independent pool configurations in runtime order.
+                Empty preserves the single-table preparation API.
+            layer_to_cache_group: Static model-layer to pool-index ownership mapping.
+            host_payloads_replicated: This runner's host payloads are replicated
+                by its coordinator, so redundant broadcasts can be omitted.
 
         Note:
             This constructor preallocates all CPU buffers to avoid per-step
@@ -243,6 +251,22 @@ class BatchMetadataPreparer:
             and max_num_reqs.
         """
         self.metadata = metadata
+        self.host_payloads_replicated = bool(host_payloads_replicated)
+        self.cache_group_configs = tuple(cache_group_configs)
+        self.layer_to_cache_group = tuple(layer_to_cache_group)
+        if bool(self.cache_group_configs) != bool(self.layer_to_cache_group) or any(
+            index < 0 or index >= len(self.cache_group_configs) for index in self.layer_to_cache_group
+        ):
+            raise ValueError("Grouped cache configs require a valid layer_to_cache_group mapping")
+        for config in self.cache_group_configs:
+            if int(getattr(config, "data_parallel_size", 1)) != int(getattr(metadata, "data_parallel_size", 1)):
+                raise ValueError("Every cache group must use the model batch's data-parallel layout")
+            if min(int(config.get_max_num_seqs()), int(max_num_reqs)) != min(
+                int(metadata.get_max_num_seqs()), int(max_num_reqs)
+            ):
+                raise ValueError("Every cache group must use the same request-row capacity")
+        self._cache_group_preparers: dict[int, tuple[tuple[int, ...], BatchMetadataPreparer]] = {}
+        self._pending_group_result = None
         self._empty_sharding = empty_sharding
         self._input_sharding = input_sharding if input_sharding is not None else empty_sharding
 
@@ -256,7 +280,7 @@ class BatchMetadataPreparer:
         self._metadata_version = metadata.version
         self._use_slot_mapping = self._metadata_version == "v2"
         self._use_request_distribution = not self._use_slot_mapping
-        self._enable_dp_local_page_path = check_bool_flag("EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
+        self._enable_dp_local_page_path = flags.get_bool(flags.EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH)
         self._data_parallel_size = max(1, int(getattr(metadata, "data_parallel_size", 1) or 1))
 
         # Ragged paging shapes (compile-stable).
@@ -300,7 +324,6 @@ class BatchMetadataPreparer:
         self._dp_model_row_for_request_cpu = np.full((self.max_num_reqs,), -1, dtype=np.int32)
         self._slot_mapping_placeholder = np.zeros((3, 1), dtype=np.int32)
         self._num_kv_update_placeholder = np.zeros((1,), dtype=np.int32)
-        self._async_slot_mapping_placeholder = np.zeros((3, 1), dtype=np.int32)
         self._scheduled_full_placeholder_dev = jax.device_put(
             np.zeros((self.max_num_reqs,), dtype=np.int32),
             self._empty_sharding,
@@ -310,44 +333,10 @@ class BatchMetadataPreparer:
             self._empty_sharding,
         )
 
-        # Async staging buffers (avoid per-call allocations in overlap mode).
-        self._async_input_ids_cpu = np.zeros((self.max_num_tokens,), dtype=np.int32)
-        self._async_positions_cpu = np.zeros((self.max_num_tokens,), dtype=np.int32)
-        self._async_query_start_loc_cpu = np.zeros((self.max_num_reqs + 1,), dtype=np.int32)
-        self._async_seq_lens_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
-        self._async_logits_indices_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
-        self._async_scheduled_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
-        self._async_packed_qsl_seqlens_cpu = np.zeros((2, self.max_num_reqs + 1), dtype=np.int32)
-        self._async_packed_i32_padded_cpu = np.zeros((3, self.max_num_reqs), dtype=np.int32)
-        self._async_packed_f32_padded_cpu = np.zeros((6, self.max_num_reqs), dtype=np.float32)
-        self._async_packed_misc_i32_cpu = np.zeros((5,), dtype=np.int32)
-        self._async_spec_recurrent_commit_cpu = np.zeros((2, self.max_num_reqs), dtype=np.int32)
-        self._async_pages_tables_cpu = np.full(
-            (self._num_reqs_max_model_len, self._max_pages_per_req),
-            PAGE_TABLE_PADDING_VAL,
-            dtype=np.int32,
-        )
-        self._async_request_distribution_cpu = np.zeros((3,), dtype=np.int32)
-        self._async_dp_query_start_loc_cpu = np.zeros_like(self._dp_query_start_loc_cpu)
-        self._async_dp_request_distribution_cpu = np.zeros_like(self._dp_request_distribution_cpu)
-        self._async_dp_context_lens_cpu = np.zeros_like(self._dp_context_lens_cpu)
-        self._async_dp_recurrent_state_indices_cpu = np.zeros_like(self._dp_recurrent_state_indices_cpu)
-        self._async_dp_model_row_for_request_cpu = np.full_like(self._dp_model_row_for_request_cpu, -1)
-        self._async_num_kv_update_cpu = np.zeros((1,), dtype=np.int32)
-
-        self._async_num_computed_tokens_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
-        self._async_scheduled_full_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
-        self._async_active_mask_full_cpu = np.zeros((self.max_num_reqs,), dtype=bool)
-        self._async_window_row_indices_cpu = np.arange(self.max_num_reqs, dtype=np.int32)
-        self._async_recurrent_slot_indices_cpu = np.arange(self.max_num_reqs, dtype=np.int32)
-        self._async_temperature_cpu = np.zeros((self.max_num_reqs,), dtype=np.float32)
-        self._async_top_p_cpu = np.zeros((self.max_num_reqs,), dtype=np.float32)
-        self._async_top_k_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
-        self._async_min_p_cpu = np.zeros((self.max_num_reqs,), dtype=np.float32)
-        self._async_frequency_penalties_cpu = np.zeros((self.max_num_reqs,), dtype=np.float32)
-        self._async_presence_penalties_cpu = np.zeros((self.max_num_reqs,), dtype=np.float32)
-        self._async_repetition_penalties_cpu = np.ones((self.max_num_reqs,), dtype=np.float32)
-        self._async_page_table_cpu = np.zeros((self.max_num_reqs, self._max_pages_per_req), dtype=np.int32)
+        # Async staging buffers are allocated lazily by ``_ensure_async_buffers`` on the first
+        # ``start_async_prep`` call, so synchronous-only preparers do not pay for a second
+        # full set of CPU buffers.
+        self._async_buffers_ready = False
 
         # Device cache for `pages_tables`. This table is derived from the CPU page
         # table and is only required to change when pages are allocated/replaced
@@ -364,18 +353,12 @@ class BatchMetadataPreparer:
                 SLOT_MAPPING_PADDING_VAL,
                 dtype=np.int32,
             )
-            self._async_slot_mapping_cpu = np.full(
-                (3, self._max_padded_slices),
-                SLOT_MAPPING_PADDING_VAL,
-                dtype=np.int32,
-            )
             self._slot_mapping_indices = np.arange(self._max_padded_slices, dtype=np.int32)
         else:
             self._max_padded_slices = None
             self._slot_mapping_cpu = None
             self._slices_per_page = None
             self._slot_mapping_indices = None
-            self._async_slot_mapping_cpu = None
 
         # Double buffering: store pending async device transfer
         self._pending_transfer: tuple | None = None
@@ -407,6 +390,28 @@ class BatchMetadataPreparer:
         # never donated by the compiled step (only kv_pages is), so cached
         # arrays stay valid across calls.
         self._payload_put_cache: dict[int, tuple[bytes, tuple[int, ...], str, jax.Array]] = {}
+
+    @property
+    def host_payloads_replicated(self) -> bool:
+        """Return this preparer's owning runner's host-replication guarantee."""
+        return self._host_payloads_replicated
+
+    @host_payloads_replicated.setter
+    def host_payloads_replicated(self, enabled: bool) -> None:
+        """Update the policy, including already-created grouped/async preparers.
+
+        Engine coordination may be initialized after preparation has warmed up.
+        Assigning the engine-owned policy must also update retained children;
+        copying it only in child constructors leaves their broadcasts enabled.
+        Call between steps, on the same scheduler thread as preparation.
+        """
+        self._host_payloads_replicated = bool(enabled)
+        self._incr_cache = None
+        for _, child in getattr(self, "_cache_group_preparers", {}).values():
+            child.host_payloads_replicated = enabled
+        async_preparer = getattr(self, "_async_group_preparer", None)
+        if async_preparer is not None:
+            async_preparer.host_payloads_replicated = enabled
 
     def _enforce_dp_local_page_tables(
         self,
@@ -594,6 +599,7 @@ class BatchMetadataPreparer:
         page_table_cpu: np.ndarray,
         slot_mapping_out: np.ndarray | None = None,
         copy_out: bool = True,
+        request_token_offsets: np.ndarray | None = None,
     ) -> tuple[np.ndarray, int]:
         """Compute slot mapping tensor for ragged-page attention v2.
 
@@ -616,6 +622,9 @@ class BatchMetadataPreparer:
                 buffer.
             copy_out: If True, returns a copy of the result. If False, returns
                 the buffer directly (caller must not modify).
+            request_token_offsets: Start of each request in the new KV buffer.
+                Defaults to contiguous request-order packing. Supply rank-major
+                offsets when DP inserts padding between rank-local token blocks.
 
         Returns:
             Tuple of (slot_mapping, total_pages) where slot_mapping has shape
@@ -694,10 +703,17 @@ class BatchMetadataPreparer:
         slice_lens = np.maximum(kv_local_en - kv_local_st, 0).astype(np.int32)
         kv_cache_start = kv_local_st + page_numbers * page_size
 
-        new_kv_start = np.cumsum(slice_lens, dtype=np.int32)
-        if new_kv_start.size:
-            new_kv_start = np.roll(new_kv_start, 1)
-            new_kv_start[0] = 0
+        if request_token_offsets is None:
+            request_token_offsets = np.cumsum(scheduled_active, dtype=np.int32) - scheduled_active
+        # Destination slices remain in request/page order, but their sources
+        # follow the actual token packing (including DP rank padding). Each
+        # page starts at its displacement from that request's first new token.
+        new_kv_start = (
+            request_token_offsets[req_for_slice]
+            + (lps[req_for_slice] + local_off) * page_size
+            + kv_local_st
+            - start_tokens[req_for_slice]
+        )
 
         slot_mapping[0, active_positions] = kv_cache_start
         slot_mapping[1, active_positions] = new_kv_start
@@ -943,15 +959,9 @@ class BatchMetadataPreparer:
                 qsl_rank = dp_query_start_loc[rank]
                 row_lens = qsl_rank[1 : live_rows + 1] - qsl_rank[:live_rows]
                 row_ctx = dp_context_lens[rank, :live_rows]
-                row_is_decode = (row_lens == 1) & ((row_ctx - row_lens) > 0)
-                row_is_prefill = (row_lens > 0) & ~row_is_decode
-                non_decode = np.flatnonzero(~row_is_decode)
-                decode_end = int(non_decode[0]) if non_decode.size else live_rows
-                non_prefill = np.flatnonzero(~row_is_prefill[decode_end:])
-                prefill_end = decode_end + (int(non_prefill[0]) if non_prefill.size else live_rows - decode_end)
-                dp_request_distribution[rank, 0] = decode_end
-                dp_request_distribution[rank, 1] = prefill_end
-                dp_request_distribution[rank, 2] = live_rows
+                dp_request_distribution[rank] = compute_request_distribution_prefix(
+                    row_lens, row_ctx - row_lens, live_rows
+                )
         else:
             off = 0
             for req_idx in range(num_requests):
@@ -1090,6 +1100,9 @@ class BatchMetadataPreparer:
                 page_table_cpu=page_table_cpu,
                 slot_mapping_out=slot_mapping_buf,
                 copy_out=copy_slot_mapping,
+                request_token_offsets=(logits_indices[:num_requests] - scheduled[:num_requests] + 1)
+                if use_spmd_dp
+                else None,
             )
             num_kv_update_cpu[0] = int(total_pages)
 
@@ -1218,7 +1231,7 @@ class BatchMetadataPreparer:
             or spec_recurrent_commit_cpu is not None
             or page_table_version is None
             or get_batch_metadata_dump_dir()
-            or host_payload_broadcast_needed()
+            or host_payload_broadcast_needed(self.host_payloads_replicated)
         ):
             self.incremental_prep_misses += 1
             return None
@@ -1383,6 +1396,84 @@ class BatchMetadataPreparer:
             "metadata": metadata,
         }
 
+    def _prepare_cache_groups(
+        self,
+        result: tuple,
+        cache_group_inputs: tuple[CacheGroupInputs, ...],
+        **kwargs: tp.Any,
+    ) -> tuple:
+        """Attach independently prepared read/write payloads in static group order.
+
+        Each pool owns its transfer/version cache. Window identity is part of
+        that cache's identity, so equal allocator versions from different row
+        packings cannot alias. Child preparers perform the same inactive-row
+        padding, rank-major DP packing and v2 slot construction as a single pool.
+        """
+        if len(cache_group_inputs) != len(self.cache_group_configs):
+            raise ValueError("cache_group_inputs must contain one payload per configured cache group")
+        metadata, *rest = result
+        stats = dict(self.last_prep_stats)
+        groups = []
+        row_count = int(kwargs["token_ids_cpu"].shape[0])
+        for index, (config, group) in enumerate(zip(self.cache_group_configs, cache_group_inputs, strict=True)):
+            if group.page_table_cpu.ndim != 2 or group.page_table_cpu.shape[0] != row_count:
+                raise ValueError("Every group page table must align with the compact token window rows")
+            identity = group.window_identity
+            if identity is None:
+                rows = kwargs.get("window_row_indices_cpu")
+                identity = tuple(range(row_count)) if rows is None else tuple(int(row) for row in rows[:row_count])
+            if len(identity) != row_count:
+                raise ValueError("Cache group window identity must identify every compact token window row")
+            if group.num_computed_tokens_cpu is not None and group.num_computed_tokens_cpu.shape != (row_count,):
+                raise ValueError("Cache group computed progress must align with the compact token window rows")
+            cached = self._cache_group_preparers.get(index)
+            if cached is None or cached[0] != identity:
+                child = BatchMetadataPreparer(
+                    metadata=config,
+                    empty_sharding=self._empty_sharding,
+                    max_num_tokens=self.max_num_tokens,
+                    max_num_reqs=self.max_num_reqs,
+                    max_model_len=self.max_model_len,
+                    min_input_pad=self.min_input_pad,
+                    enable_spec_recurrent_commit=self._enable_spec_recurrent_commit,
+                    input_sharding=self._input_sharding,
+                    slot_indexed_state=self._slot_indexed_state,
+                    host_payloads_replicated=self.host_payloads_replicated,
+                )
+                self._cache_group_preparers[index] = (identity, child)
+            else:
+                child = cached[1]
+            group_kwargs = dict(kwargs, page_table_cpu=group.page_table_cpu, page_table_version=group.page_table_version)
+            if group.num_computed_tokens_cpu is not None:
+                group_kwargs["num_computed_tokens_cpu"] = group.num_computed_tokens_cpu
+            prepared, *_ = child.prepare_batch_metadata(**group_kwargs)
+            for key, value in child.last_prep_stats.items():
+                stats[key] = stats.get(key, 0.0) + value
+            use_dp = child._uses_spmd_dp()
+            cap = min(int(config.get_max_num_seqs()), self.max_num_reqs)
+            groups.append(
+                RaggedPagesMetadata(
+                    pages_tables=prepared.pages_tables,
+                    context_lens=prepared.rank_context_lens[:cap] if use_dp else prepared.seq_lens[:cap],
+                    query_start_loc=prepared.rank_query_start_loc if use_dp else prepared.query_start_loc[: cap + 1],
+                    num_seqs=prepared.packed_misc_i32[:1],
+                    position_ids=prepared.position_ids_buf,
+                    request_distribution=prepared.rank_request_distribution,
+                    slot_mapping=prepared.slot_mapping,
+                    num_kv_update_slices=prepared.num_kv_update_slices,
+                    spec_recurrent_commit=prepared.spec_recurrent_commit,
+                    recurrent_state_indices=(
+                        prepared.rank_recurrent_state_indices if (use_dp or self._slot_indexed_state) else None
+                    ),
+                    version=config.version,
+                    page_size=config.page_size,
+                    num_slices_per_kv_cache_update_page=config.num_slices_per_kv_cache_update_page,
+                )
+            )
+        metadata = metadata.replace(cache_groups=tuple(groups), layer_to_cache_group=self.layer_to_cache_group)
+        self.last_prep_stats = stats
+        return (metadata, *rest)
+
     def prepare_batch_metadata(
         self,
         *,
@@ -1419,6 +1510,7 @@ class BatchMetadataPreparer:
         pixel_values_videos: np.ndarray | None = None,
         video_grid_thw: np.ndarray | None = None,
         model_side_inputs_cpu: dict[str, np.ndarray] | None = None,
+        cache_group_inputs: tuple[CacheGroupInputs, ...] = (),
     ) -> tuple[BatchMetadata, jax.Array, jax.Array, jax.Array, jax.Array]:
         """Prepare batch metadata using CPU-first computation strategy.
 
@@ -1447,6 +1539,8 @@ class BatchMetadataPreparer:
                 metadata [2, max_num_reqs]. Row 0 is the active mask, row 1 is
                 the real prefix length before drafts.
             page_table_version: Optional version for page table caching.
+            cache_group_inputs: Complete per-pool inputs in configured group order,
+                with independent versions, row identities and optional rebased progress.
             mrope_position_ids_cpu: Optional mRoPE positions [3, num_tokens].
             prefill_embeds_cpu: Optional prefill embeddings [num_tokens, hidden].
             prefill_embeds_mask_cpu: Optional mask for prefill [num_tokens].
@@ -1470,6 +1564,33 @@ class BatchMetadataPreparer:
             - prep_put_time: Main device_put time
             - prep_extra_put_time: VLM data transfer time
         """
+        if len(cache_group_inputs) != len(self.cache_group_configs):
+            raise ValueError("cache_group_inputs must contain one payload per configured cache group")
+        # Capture only public inputs, before local staging variables exist.
+        group_kwargs = None
+        if cache_group_inputs:
+            group_kwargs = {
+                "num_tokens_static": num_tokens_static,
+                "scheduled_full_cpu": scheduled_full_cpu,
+                "active_mask_full_cpu": active_mask_full_cpu,
+                "input_ids_buf": input_ids_buf,
+                "position_ids_buf": position_ids_buf,
+                "token_ids_cpu": token_ids_cpu,
+                "num_computed_tokens_cpu": num_computed_tokens_cpu,
+                "temperature_cpu": temperature_cpu,
+                "top_p_cpu": top_p_cpu,
+                "top_k_cpu": top_k_cpu,
+                "min_p_cpu": min_p_cpu,
+                "frequency_penalties_cpu": frequency_penalties_cpu,
+                "presence_penalties_cpu": presence_penalties_cpu,
+                "repetition_penalties_cpu": repetition_penalties_cpu,
+                "page_table_cpu": page_table_cpu,
+                "page_table_version": page_table_version,
+                "padded_num_reqs_in": padded_num_reqs_in,
+                "window_row_indices_cpu": window_row_indices_cpu,
+                "recurrent_slot_indices_cpu": recurrent_slot_indices_cpu,
+                "spec_recurrent_commit_cpu": spec_recurrent_commit_cpu,
+            }
         incremental = self._try_incremental_decode_prepare(
             num_tokens_static=int(num_tokens_static),
             scheduled_full_cpu=scheduled_full_cpu,
@@ -1487,7 +1608,8 @@ class BatchMetadataPreparer:
             padded_num_reqs_in=int(padded_num_reqs_in),
             window_row_indices_cpu=window_row_indices_cpu,
             spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
-            has_vlm_inputs=any(
+            has_vlm_inputs=bool(cache_group_inputs)
+            or any(
                 arg is not None
                 for arg in (
                     mrope_position_ids_cpu,
@@ -1536,7 +1658,7 @@ class BatchMetadataPreparer:
         # process 0 so all hosts pass identical data to `device_put` with
         # replicated sharding. Skipped under the ZMQ step-replication plane,
         # where payloads are identical by construction (see host_sync).
-        if host_payload_broadcast_needed():
+        if host_payload_broadcast_needed(self.host_payloads_replicated):
             from jax.experimental import multihost_utils
 
             host_payload = multihost_utils.broadcast_one_to_all(host_payload)
@@ -1729,7 +1851,7 @@ class BatchMetadataPreparer:
             and video_grid_thw is None
             and not model_side_inputs_cpu
             and not get_batch_metadata_dump_dir()
-            and not host_payload_broadcast_needed()
+            and not host_payload_broadcast_needed(self.host_payloads_replicated)
         ):
             self._prime_incremental_decode_cache(
                 num_tokens_static=int(num_tokens_static),
@@ -1752,13 +1874,68 @@ class BatchMetadataPreparer:
         else:
             self._incr_cache = None
 
-        return (
-            metadata,
-            input_ids_buf,
-            position_ids_buf,
-            scheduled_full_dev,
-            active_mask_full_dev,
+        result = (metadata, input_ids_buf, position_ids_buf, scheduled_full_dev, active_mask_full_dev)
+        if group_kwargs is not None:
+            return self._prepare_cache_groups(result, cache_group_inputs, **group_kwargs)
+        return result
+
+    def _ensure_async_buffers(self) -> None:
+        """Allocate the async (double-buffer) CPU staging buffers on first use.
+
+        Synchronous-only preparers never call :meth:`start_async_prep`, so the
+        second full set of CPU buffers is only materialized when the async path
+        is actually exercised. Idempotent.
+        """
+        if self._async_buffers_ready:
+            return
+        max_reqs = self.max_num_reqs
+        self._async_slot_mapping_placeholder = np.zeros((3, 1), dtype=np.int32)
+        self._async_input_ids_cpu = np.zeros((self.max_num_tokens,), dtype=np.int32)
+        self._async_positions_cpu = np.zeros((self.max_num_tokens,), dtype=np.int32)
+        self._async_query_start_loc_cpu = np.zeros((max_reqs + 1,), dtype=np.int32)
+        self._async_seq_lens_cpu = np.zeros((max_reqs,), dtype=np.int32)
+        self._async_logits_indices_cpu = np.zeros((max_reqs,), dtype=np.int32)
+        self._async_scheduled_cpu = np.zeros((max_reqs,), dtype=np.int32)
+        self._async_packed_qsl_seqlens_cpu = np.zeros((2, max_reqs + 1), dtype=np.int32)
+        self._async_packed_i32_padded_cpu = np.zeros((3, max_reqs), dtype=np.int32)
+        self._async_packed_f32_padded_cpu = np.zeros((6, max_reqs), dtype=np.float32)
+        self._async_packed_misc_i32_cpu = np.zeros((5,), dtype=np.int32)
+        self._async_spec_recurrent_commit_cpu = np.zeros((2, max_reqs), dtype=np.int32)
+        self._async_pages_tables_cpu = np.full(
+            (self._num_reqs_max_model_len, self._max_pages_per_req),
+            PAGE_TABLE_PADDING_VAL,
+            dtype=np.int32,
         )
+        self._async_request_distribution_cpu = np.zeros((3,), dtype=np.int32)
+        self._async_dp_query_start_loc_cpu = np.zeros_like(self._dp_query_start_loc_cpu)
+        self._async_dp_request_distribution_cpu = np.zeros_like(self._dp_request_distribution_cpu)
+        self._async_dp_context_lens_cpu = np.zeros_like(self._dp_context_lens_cpu)
+        self._async_dp_recurrent_state_indices_cpu = np.zeros_like(self._dp_recurrent_state_indices_cpu)
+        self._async_dp_model_row_for_request_cpu = np.full_like(self._dp_model_row_for_request_cpu, -1)
+        self._async_num_kv_update_cpu = np.zeros((1,), dtype=np.int32)
+
+        self._async_num_computed_tokens_cpu = np.zeros((max_reqs,), dtype=np.int32)
+        self._async_scheduled_full_cpu = np.zeros((max_reqs,), dtype=np.int32)
+        self._async_active_mask_full_cpu = np.zeros((max_reqs,), dtype=bool)
+        self._async_window_row_indices_cpu = np.arange(max_reqs, dtype=np.int32)
+        self._async_recurrent_slot_indices_cpu = np.arange(max_reqs, dtype=np.int32)
+        self._async_temperature_cpu = np.zeros((max_reqs,), dtype=np.float32)
+        self._async_top_p_cpu = np.zeros((max_reqs,), dtype=np.float32)
+        self._async_top_k_cpu = np.zeros((max_reqs,), dtype=np.int32)
+        self._async_min_p_cpu = np.zeros((max_reqs,), dtype=np.float32)
+        self._async_frequency_penalties_cpu = np.zeros((max_reqs,), dtype=np.float32)
+        self._async_presence_penalties_cpu = np.zeros((max_reqs,), dtype=np.float32)
+        self._async_repetition_penalties_cpu = np.ones((max_reqs,), dtype=np.float32)
+        self._async_page_table_cpu = np.zeros((max_reqs, self._max_pages_per_req), dtype=np.int32)
+        if self._slot_mapping_cpu is not None:
+            self._async_slot_mapping_cpu = np.full(
+                (3, self._max_padded_slices),
+                SLOT_MAPPING_PADDING_VAL,
+                dtype=np.int32,
+            )
+        else:
+            self._async_slot_mapping_cpu = None
+        self._async_buffers_ready = True
 
     def start_async_prep(
         self,
@@ -1783,6 +1960,7 @@ class BatchMetadataPreparer:
         recurrent_slot_indices_cpu: np.ndarray | None = None,
         spec_recurrent_commit_cpu: np.ndarray | None = None,
         page_table_version: int | None = None,
+        cache_group_inputs: tuple[CacheGroupInputs, ...] = (),
     ) -> None:
         """Start async device transfer for double-buffered batch preparation.
 
@@ -1815,6 +1993,8 @@ class BatchMetadataPreparer:
             spec_recurrent_commit_cpu: Optional speculative recurrent commit
                 metadata [2, max_num_reqs].
             page_table_version: Optional version for page table caching.
+            cache_group_inputs: Complete per-pool inputs in configured group order,
+                with independent versions, row identities and optional rebased progress.
 
         Raises:
             RuntimeError: If a previous async prep is still pending. Must call
@@ -1826,6 +2006,79 @@ class BatchMetadataPreparer:
         """
         if self._pending_transfer is not None:
             raise RuntimeError("Async prep already in-flight; call get_async_prep_result() before starting another.")
+
+        if len(cache_group_inputs) != len(self.cache_group_configs):
+            raise ValueError("cache_group_inputs must contain one payload per configured cache group")
+        if cache_group_inputs:
+            # Dispatch every pool now, before the caller can mutate its host
+            # inputs. Device puts are asynchronous; completed metadata is kept
+            # separate from the single-pool double-buffer unpacking ABI.
+            snapshot = tuple(
+                CacheGroupInputs(
+                    page_table_cpu=group.page_table_cpu.copy(),
+                    page_table_version=group.page_table_version,
+                    window_identity=group.window_identity,
+                    num_computed_tokens_cpu=(
+                        None if group.num_computed_tokens_cpu is None else group.num_computed_tokens_cpu.copy()
+                    ),
+                )
+                for group in cache_group_inputs
+            )
+            # Preserve true double buffering: synchronous preparation while
+            # this result is pending must never overwrite its staging arrays.
+            async_preparer = getattr(self, "_async_group_preparer", None)
+            if async_preparer is None:
+                async_preparer = BatchMetadataPreparer(
+                    metadata=self.metadata,
+                    empty_sharding=self._empty_sharding,
+                    max_num_tokens=self.max_num_tokens,
+                    max_num_reqs=self.max_num_reqs,
+                    max_model_len=self.max_model_len,
+                    min_input_pad=self.min_input_pad,
+                    enable_spec_recurrent_commit=self._enable_spec_recurrent_commit,
+                    input_sharding=self._input_sharding,
+                    slot_indexed_state=self._slot_indexed_state,
+                    host_payloads_replicated=self.host_payloads_replicated,
+                    cache_group_configs=self.cache_group_configs,
+                    layer_to_cache_group=self.layer_to_cache_group,
+                )
+                self._async_group_preparer = async_preparer
+            self._pending_group_result = async_preparer.prepare_batch_metadata(
+                num_tokens_static=num_tokens_static,
+                scheduled_full_cpu=scheduled_full_cpu,
+                active_mask_full_cpu=active_mask_full_cpu,
+                input_ids_buf=input_ids_buf,
+                position_ids_buf=position_ids_buf,
+                token_ids_cpu=token_ids_cpu,
+                num_computed_tokens_cpu=num_computed_tokens_cpu,
+                temperature_cpu=temperature_cpu,
+                top_p_cpu=top_p_cpu,
+                top_k_cpu=top_k_cpu,
+                min_p_cpu=min_p_cpu,
+                frequency_penalties_cpu=frequency_penalties_cpu,
+                presence_penalties_cpu=presence_penalties_cpu,
+                repetition_penalties_cpu=repetition_penalties_cpu,
+                page_table_cpu=page_table_cpu,
+                padded_num_reqs_in=padded_num_reqs_in,
+                window_row_indices_cpu=window_row_indices_cpu,
+                recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
+                spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
+                page_table_version=page_table_version,
+                cache_group_inputs=snapshot,
+            )
+            self._pending_transfer = ()
+            self._pending_transfer_metadata = dict(
+                async_preparer.last_prep_stats,
+                num_tokens_static=num_tokens_static,
+                padded_num_reqs=padded_num_reqs_in,
+                page_table_version=page_table_version,
+                rows_to_copy=async_preparer._cached_rows_to_copy,
+                host_build_time=async_preparer.last_prep_stats.get("prep_host_time", 0.0),
+                device_put_time=async_preparer.last_prep_stats.get("prep_put_time", 0.0),
+            )
+            return
+
+        self._ensure_async_buffers()
 
         # Snapshot mutable CPU state into staging buffers (avoid per-call allocations).
         np.copyto(self._async_num_computed_tokens_cpu, num_computed_tokens_cpu)
@@ -1874,7 +2127,7 @@ class BatchMetadataPreparer:
         host_build_took = time.time() - host_build_start
 
         device_put_start = time.time()
-        if host_payload_broadcast_needed():
+        if host_payload_broadcast_needed(self.host_payloads_replicated):
             from jax.experimental import multihost_utils
 
             host_payload = multihost_utils.broadcast_one_to_all(host_payload)
@@ -1920,6 +2173,13 @@ class BatchMetadataPreparer:
 
         if self._pending_transfer is None:
             return None
+        if self._pending_group_result is not None:
+            result = self._pending_group_result
+            timings = self._pending_transfer_metadata or {}
+            self._pending_group_result = None
+            self._pending_transfer = None
+            self._pending_transfer_metadata = None
+            return result, timings
 
         device_put_took = 0.0
         host_build_took = 0.0
@@ -2067,36 +2327,11 @@ class BatchMetadataPreparer:
         correctness while removing host token materialization from the
         stage-launch critical path.
         """
-        return BatchMetadata(
-            packed_qsl_seqlens=batch_metadata.packed_qsl_seqlens,
-            packed_i32_padded=batch_metadata.packed_i32_padded,
-            packed_f32_padded=batch_metadata.packed_f32_padded,
-            packed_misc_i32=batch_metadata.packed_misc_i32,
-            pages_tables=batch_metadata.pages_tables,
-            input_ids_buf=batch_metadata.input_ids_buf,
-            position_ids_buf=batch_metadata.position_ids_buf,
-            dp_query_start_loc=batch_metadata.dp_query_start_loc,
-            dp_request_distribution=batch_metadata.dp_request_distribution,
-            dp_context_lens=batch_metadata.dp_context_lens,
-            dp_recurrent_state_indices=batch_metadata.dp_recurrent_state_indices,
+        return batch_metadata.replace(
             input_token_handoff_positions=handoff.input_positions,
             input_token_handoff_ids=handoff.token_ids,
             input_token_handoff_count=handoff.count,
             input_token_handoff_offset=(
                 handoff.offset if handoff.offset is not None else jnp.zeros((), dtype=jnp.int32)
             ),
-            num_tokens=batch_metadata.num_tokens,
-            slot_mapping=batch_metadata.slot_mapping,
-            num_kv_update_slices=batch_metadata.num_kv_update_slices,
-            pixel_values=batch_metadata.pixel_values,
-            image_grid_thw=batch_metadata.image_grid_thw,
-            pixel_values_videos=batch_metadata.pixel_values_videos,
-            video_grid_thw=batch_metadata.video_grid_thw,
-            mrope_position_ids=batch_metadata.mrope_position_ids,
-            prefill_embeds=batch_metadata.prefill_embeds,
-            prefill_embeds_mask=batch_metadata.prefill_embeds_mask,
-            visual_pos_masks=batch_metadata.visual_pos_masks,
-            deepstack_visual_embeds=batch_metadata.deepstack_visual_embeds,
-            model_side_inputs=batch_metadata.model_side_inputs,
-            spec_recurrent_commit=batch_metadata.spec_recurrent_commit,
         )

@@ -31,6 +31,7 @@ from jaxtyping import Array, Bool, Float, Int
 __all__ = (
     "indices_to_bool_mask",
     "is_vacuous_selection",
+    "mask_to_indices",
     "ste_score_proxy",
     "topk_select",
     "topk_selection_mask",
@@ -102,35 +103,57 @@ def topk_selection_mask(
     values: Float[Array, "... k"],
     indices: Int[Array, "... k"],
 ) -> Bool[Array, "... n"]:
-    """Boolean form of a ``jax.lax.top_k(scores, k)`` selection, without scattering.
+    """Convert a ``lax.top_k`` selection to a boolean mask without scatter.
 
-    ``top_k`` keeps every score above its ``k``-th value plus the
-    lowest-index scores tied with it, so the kept ties are exactly those at or
-    below the largest selected tie index. Scores are compared by IEEE
-    totalOrder (signed zeros, infinities and NaN payloads ordered), as
-    ``top_k`` orders them, so the mask equals the one-hot of ``indices``. It
-    costs elementwise passes instead of a ``[..., k, n]`` one-hot reduction or
-    a scatter, both of which are slow on TPU.
+    Resolve the shared operation helper only when called: cache construction
+    imports indexer layers before the caching package has finished exporting
+    the cache-view types consumed by operations.
 
     Args:
-        scores: The exact array ``top_k`` ranked.
-        values: ``top_k`` values ``[..., k]`` (descending), ``k >= 1``.
-        indices: ``top_k`` indices ``[..., k]``.
+        scores: The exact scores ranked by ``top_k``, shaped ``[..., n]``.
+        values: Descending selected scores ``[..., k]``, with ``k >= 1``.
+        indices: Selected indices of the same shape as ``values``.
 
     Returns:
-        Boolean ``[..., n]``; ``True`` where ``indices`` selected the position.
+        Boolean mask ``[..., n]`` matching the selected indices, including
+        IEEE total-order ties.
     """
+    from easydel.operations.kernels._mask_info import topk_selection_mask as selection_mask
 
-    def order_key(x):
-        bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.int32)
-        return jnp.where(bits < 0, bits ^ jnp.int32(0x7FFFFFFF), bits)
+    return selection_mask(scores=scores, values=values, indices=indices)
 
-    keys = order_key(scores)
-    value_keys = order_key(values)
-    kth = value_keys[..., -1:]
-    tie_cut = jnp.max(jnp.where(value_keys == kth, indices, -1), axis=-1, keepdims=True)
-    position = jax.lax.broadcasted_iota(jnp.int32, scores.shape, scores.ndim - 1)
-    return (keys > kth) | ((keys == kth) & (position <= tie_cut))
+
+def mask_to_indices(mask: Bool[Array, "... n"], k: int) -> Int[Array, "... k"]:
+    """Compact a boolean selection into ``-1``-padded indices without a sort.
+
+    The inverse of :func:`indices_to_bool_mask` for a selection of at most
+    ``k`` items per row: selected positions are written in ascending index
+    order (not score order) and the remaining slots hold ``-1``. Selected
+    positions beyond the ``k``-th are dropped. Under jit the scatter is dead
+    code when the caller only consumes the mask.
+
+    Args:
+        mask: Boolean selection ``[..., n]``.
+        k: Static output width, non-negative.
+
+    Returns:
+        Int32 indices ``[..., k]``.
+
+    Raises:
+        ValueError: If ``k`` is negative.
+    """
+    if k < 0:
+        raise ValueError("Selection width must be non-negative.")
+    shape = mask.shape[:-1]
+    width = mask.shape[-1]
+    rows = math.prod(shape)
+    flat = mask.reshape(rows, width).astype(jnp.bool_)
+    # Slot of each selected position; unselected positions target slot k, which is out of range and dropped.
+    slot = jnp.where(flat, jnp.cumsum(flat, axis=-1, dtype=jnp.int32) - 1, k)
+    index = jnp.broadcast_to(jnp.arange(width, dtype=jnp.int32), flat.shape)
+    out = jnp.full((rows, k), -1, dtype=jnp.int32)
+    out = out.at[jnp.arange(rows)[:, None], slot].set(index, mode="drop")
+    return out.reshape(*shape, k)
 
 
 def indices_to_bool_mask(

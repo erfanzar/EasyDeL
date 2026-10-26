@@ -139,7 +139,6 @@ __all__ = (
     "Granite20bFCToolParser",
     "GraniteToolParser",
     "HermesToolParser",
-    "HermesToolParser",
     "HunyuanA13BToolParser",
     "Internlm2ToolParser",
     "JambaToolParser",

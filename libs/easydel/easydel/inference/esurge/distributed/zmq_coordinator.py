@@ -91,6 +91,8 @@ class _StepLedger:
     def record_ack(self, ack: wire.StepAck) -> None:
         with self.cond:
             self.deadlines.pop((ack.step_id, ack.rank), None)
+            # Completion is also proof of liveness after blocking runner work.
+            self.last_heartbeat[ack.rank] = time.monotonic()
             if not ack.ok:
                 self.failure = f"worker rank={ack.rank} failed step {ack.step_id}: {ack.error}\n{ack.traceback or ''}"
                 self.cond.notify_all()
@@ -159,8 +161,11 @@ class _StepLedger:
                     )
                     self.cond.notify_all()
                     return
+            busy_ranks = {rank for _, rank in self.deadlines}
             for rank, beat in self.last_heartbeat.items():
-                if now - beat > self.heartbeat_timeout_s:
+                # The replay thread cannot heartbeat during synchronous device
+                # work or drains. Outstanding work has its own step deadline.
+                if rank not in busy_ranks and now - beat > self.heartbeat_timeout_s:
                     self.failure = (
                         f"worker rank={rank} stopped heartbeating ({self.heartbeat_timeout_s}s); "
                         "assuming the process died"
@@ -702,7 +707,7 @@ class ZmqWorkerCoordinator:
                 if now - last_beat_sent >= self._heartbeat_interval_s:
                     sock.send_multipart([wire.encode_message(wire.Heartbeat(rank=self.rank, ts=time.time()))])
                     last_beat_sent = now
-                if now - last_leader_beat > self._heartbeat_timeout_s:
+                if now - last_leader_beat > self._heartbeat_timeout_s and not sock.poll(0):
                     raise StepCoordinationError(
                         f"worker rank={self.rank}: leader silent for more than "
                         f"{self._heartbeat_timeout_s}s; assuming it died"
@@ -733,6 +738,10 @@ class ZmqWorkerCoordinator:
                     except Exception as exc:
                         self._nack(sock, message.step_id, wire.ACK_PHASE_SYNC_DONE, exc)
                         raise
+                    # Runner work may legitimately exceed the heartbeat budget.
+                    # Resume the silence clock now; queued beacons are consumed
+                    # before deciding the leader is dead on the next iteration.
+                    last_leader_beat = time.monotonic()
                     continue
                 if isinstance(message, wire.Drain):
                     last_leader_beat = time.monotonic()
@@ -747,6 +756,7 @@ class ZmqWorkerCoordinator:
                     except Exception as exc:
                         self._nack(sock, message.step_id, wire.ACK_PHASE_DRAINED, exc)
                         raise
+                    last_leader_beat = time.monotonic()
                     continue
                 if self._plane_handler is not None:
                     last_leader_beat = time.monotonic()

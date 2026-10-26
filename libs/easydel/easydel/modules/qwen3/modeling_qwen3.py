@@ -468,6 +468,8 @@ class Qwen3Model(EasyDeLBaseModule):
                 self.embed_tokens(input_ids.astype("i4")), "embeddings"
             )
         sequence_length = inputs_embeds.shape[1]
+        output_attentions = self.config.output_attentions if output_attentions is None else output_attentions
+        output_hidden_states = self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
 
         all_attentions: tuple[Float[Array, ...], ...] | None = () if output_attentions else None
         all_hidden_states: tuple[Float[Array, "batch seq_len hidden_dim"], ...] | None = (
@@ -554,6 +556,7 @@ class Qwen3Model(EasyDeLBaseModule):
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states: Float[Array, "batch seq_len hidden_dim"] = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")

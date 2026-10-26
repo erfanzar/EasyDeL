@@ -73,6 +73,25 @@ def _log1mexp(x: Array) -> Array:
     return jnp.where(x < cutoff, jnp.log1p(-jnp.exp(x)), jnp.log(-jnp.expm1(x)))
 
 
+def _require_scoreable_labels(labels: Array, label_pad_token_id: int) -> None:
+    """Reject undefined per-sequence odds, including in compiled/pretokenized calls."""
+    invalid = jnp.any(jnp.sum(labels != label_pad_token_id, axis=-1) == 0)
+    message = "ORPO requires at least one causally scoreable completion label in every chosen/rejected sequence."
+
+    def reject():
+        raise ValueError(message)
+
+    if isinstance(invalid, jax.core.Tracer):
+
+        def fail(_):
+            jax.debug.callback(reject, ordered=False)
+            return ()
+
+        jax.lax.cond(invalid, fail, lambda _: (), operand=None)
+    elif bool(invalid):
+        reject()
+
+
 def concatenated_forward(
     state: EasyDeLState,
     batch: collections.abc.Mapping[str, list | Array],
@@ -241,9 +260,11 @@ def concatenated_forward(
     if is_encoder_decoder:
         labels = effective_labels
     else:
-        labels = concatenated_batch["concatenated_input_ids"]
+        labels = concatenated_batch["concatenated_labels"]
         attention_mask = concatenated_batch["concatenated_attention_mask"]
         labels = jnp.where(attention_mask == 1, labels, label_pad_token_id)
+
+    _require_scoreable_labels(labels if is_encoder_decoder else labels[:, 1:], label_pad_token_id)
 
     if not is_encoder_decoder and all_logits is None and lmhead_chunksize is not None:
         shifted_labels = labels[:, 1:]
@@ -291,7 +312,7 @@ def concatenated_forward(
 
         all_log_probs = get_batch_logps(
             all_logits,
-            effective_labels,
+            labels,
             average_log_prob=True,
             is_encoder_decoder=is_encoder_decoder,
             label_pad_token_id=label_pad_token_id,
@@ -302,7 +323,7 @@ def concatenated_forward(
         rejected_log_probs = all_log_probs[len_chosen:]
         all_logit_summaries = get_batch_mean_logit_summaries(
             all_logits,
-            effective_labels,
+            labels,
             label_pad_token_id=label_pad_token_id,
             is_encoder_decoder=is_encoder_decoder,
         )
@@ -364,6 +385,8 @@ def get_batch_logps(
         logits = logits[:, :-1, :]
 
     loss_mask = labels != label_pad_token_id
+    if average_log_prob:
+        _require_scoreable_labels(labels, label_pad_token_id)
     # Replace pad token indices in labels with 0 (since they are masked out later).
     labels = jnp.expand_dims(jnp.where(labels == label_pad_token_id, 0, labels), -1)
     per_token_logps, _ = compute_token_logps_and_entropies_chunked(

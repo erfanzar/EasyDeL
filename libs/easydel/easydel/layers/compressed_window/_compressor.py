@@ -26,6 +26,14 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.layers.linears import ColumnParallelLinear
 from easydel.layers.norms import RMSNorm
+from easydel.operations.kernels.gated_pool_compress import (
+    BlockGroupLayout,
+    block_group_layout,
+    gather_group_members,
+    last_closed_overlap,
+    overlap_group_slots,
+    refresh_group_state,
+)
 
 __all__ = (
     "BlockGroupLayout",
@@ -41,158 +49,6 @@ __all__ = (
     "refresh_group_state",
     "trace_compressor_stream",
 )
-
-
-class BlockGroupLayout(tp.NamedTuple):
-    """How a block of new tokens per row maps onto ``ratio``-token compression groups (see :func:`block_group_layout`).
-
-    Attributes:
-        from_state: ``[B, G * ratio]`` bool; ``True`` where a group member was written by an earlier step (it is read
-            from the open-group state) rather than by this block.
-        state_index: ``[B, G * ratio]`` open-group state slot of each member (used where ``from_state``).
-        block_index: ``[B, G * ratio]`` block column of each member (used elsewhere).
-        closed: ``[B, G]`` bool; the groups that complete inside the block (a prefix per row).
-        entry: ``[B, G]`` entry index each group occupies.
-        refresh: ``[B, ratio]`` bool; open-group state slots this block overwrites.
-        refresh_source: ``[B, ratio]`` block column whose value lands in each refreshed slot.
-    """
-
-    from_state: Array
-    state_index: Array
-    block_index: Array
-    closed: Array
-    entry: Array
-    refresh: Array
-    refresh_source: Array
-
-
-def block_group_layout(
-    positions: Int[Array, "batch block"],
-    valid: Bool[Array, "batch block"],
-    ratio: int,
-) -> BlockGroupLayout:
-    """Group layout of a block of tokens per row for an incremental ``ratio``-token compressor.
-
-    Each row's valid cells are a prefix of the block at consecutive stream positions starting at ``positions[:, 0]``;
-    position ``p`` lives in open-group state slot ``p % ratio``. The layout reproduces a per-token step run once per
-    valid column: groups whose first members arrived earlier take them from the state, and afterwards each state slot
-    holds the latest projection at a position congruent to it. Shared by every compressor stream that keeps an
-    open-group buffer (DeepSeek-V4 single/two-series streams, :class:`GatedPoolCompressor`).
-
-    Args:
-        positions: Stream positions ``[B, blk]`` (garbage at invalid cells).
-        valid: ``[B, blk]`` bool, a prefix per row.
-        ratio: Tokens per group (static, ``>= 1``).
-
-    Returns:
-        The :class:`BlockGroupLayout` with ``G = ceil((ratio - 1 + blk) / ratio)`` groups.
-    """
-    rows, block = positions.shape
-    positions = positions.astype(jnp.int32)
-    n_valid = jnp.sum(valid, axis=1).astype(jnp.int32)
-    pos0 = positions[:, 0]
-    offset = pos0 % ratio  # members of the open group already in the state
-    groups = -(-(ratio - 1 + block) // ratio)
-    virtual = jnp.arange(groups * ratio, dtype=jnp.int32)[None, :]
-    from_state = jnp.broadcast_to(virtual < offset[:, None], (rows, groups * ratio))
-    state_index = jnp.broadcast_to(jnp.clip(virtual, 0, ratio - 1), (rows, groups * ratio))
-    block_index = jnp.clip(virtual - offset[:, None], 0, block - 1)
-    group = jnp.arange(groups, dtype=jnp.int32)[None, :]
-    closed = ((group * ratio + ratio - 1) < (offset + n_valid)[:, None]) & (n_valid > 0)[:, None]
-    entry = pos0[:, None] // ratio + group
-    last = pos0 + n_valid - 1
-    member = last[:, None] - ((last[:, None] - jnp.arange(ratio, dtype=jnp.int32)[None, :]) % ratio)
-    refresh = (member >= pos0[:, None]) & (n_valid > 0)[:, None]
-    refresh_source = jnp.clip(member - pos0[:, None], 0, block - 1)
-    return BlockGroupLayout(from_state, state_index, block_index, closed, entry, refresh, refresh_source)
-
-
-def gather_group_members(
-    layout: BlockGroupLayout,
-    state: Float[Array, "batch ratio dim"],
-    fresh: Float[Array, "batch block dim"],
-) -> Float[Array, "batch groups ratio dim"]:
-    """Members of every group touched by the block: earlier members from ``state``, new ones from ``fresh``."""
-    rows = fresh.shape[0]
-    ratio = state.shape[1]
-    old = jnp.take_along_axis(state, layout.state_index[..., None], axis=1)
-    new = jnp.take_along_axis(fresh, layout.block_index[..., None], axis=1)
-    return jnp.where(layout.from_state[..., None], old, new).reshape(rows, -1, ratio, fresh.shape[-1])
-
-
-def overlap_group_slots(
-    kv_members: Float[Array, "batch groups ratio feat"],
-    gate_members: Float[Array, "batch groups ratio feat"],
-    overlap_kv: Float[Array, "batch ratio dim"],
-    overlap_gate: Float[Array, "batch ratio dim"],
-    head_dim: int,
-) -> tuple[Array, Array]:
-    """Pooling slots of a two-series (Ca/Cb) stream for every group of a block.
-
-    Each member carries two series in ``feat = 2 * head_dim`` features: Ca (``[..., :head_dim]``) feeds the *next*
-    group's entry, Cb (``[..., head_dim:]``) the group's own. Group ``g`` pools ``[Ca of group g - 1 | Cb of group
-    g]`` along the slot axis; group 0 takes its Ca half from the carried overlap state (the last group closed before
-    the block). Same slot order as the per-token two-series step.
-
-    Args:
-        kv_members: Group members ``[B, G, ratio, 2 * head_dim]`` (see :func:`gather_group_members`).
-        gate_members: Their gates, position bias already added, fp32, same shape.
-        overlap_kv: Carried Ca kv ``[B, ratio, head_dim]``.
-        overlap_gate: Carried biased fp32 Ca gate ``[B, ratio, head_dim]`` (``-inf`` before the first close).
-        head_dim: Per-series width.
-
-    Returns:
-        ``(slot_kv, slot_gate)`` of shape ``[B, G, 2 * ratio, head_dim]``.
-    """
-    prev_kv = jnp.concatenate([overlap_kv.astype(kv_members.dtype)[:, None], kv_members[:, :-1, :, :head_dim]], axis=1)
-    prev_gate = jnp.concatenate(
-        [overlap_gate.astype(gate_members.dtype)[:, None], gate_members[:, :-1, :, :head_dim]], axis=1
-    )
-    slot_kv = jnp.concatenate([prev_kv, kv_members[..., head_dim:]], axis=2)
-    slot_gate = jnp.concatenate([prev_gate, gate_members[..., head_dim:]], axis=2)
-    return slot_kv, slot_gate
-
-
-def last_closed_overlap(
-    layout: BlockGroupLayout,
-    kv_members: Float[Array, "batch groups ratio feat"],
-    gate_members: Float[Array, "batch groups ratio feat"],
-    overlap_kv: Float[Array, "batch ratio dim"],
-    overlap_gate: Float[Array, "batch ratio dim"],
-    head_dim: int,
-) -> tuple[Array, Array]:
-    """Two-series overlap state after a block: the Ca half of the last group that closed in it (unchanged if none).
-
-    Args:
-        layout: The block's :class:`BlockGroupLayout` (closed groups form a prefix per row).
-        kv_members: Group members ``[B, G, ratio, 2 * head_dim]``.
-        gate_members: Their biased fp32 gates, same shape.
-        overlap_kv: Current carried Ca kv ``[B, ratio, head_dim]``.
-        overlap_gate: Current carried biased fp32 Ca gate ``[B, ratio, head_dim]``.
-        head_dim: Per-series width.
-
-    Returns:
-        ``(overlap_kv, overlap_gate)`` in the input dtypes.
-    """
-    n_closed = jnp.sum(layout.closed, axis=1).astype(jnp.int32)  # [B]
-    last = jnp.clip(n_closed - 1, 0, kv_members.shape[1] - 1)[:, None, None, None]
-    ca_kv = jnp.take_along_axis(kv_members, last, axis=1)[:, 0, :, :head_dim]
-    ca_gate = jnp.take_along_axis(gate_members, last, axis=1)[:, 0, :, :head_dim]
-    any_closed = (n_closed > 0)[:, None, None]
-    return (
-        jnp.where(any_closed, ca_kv.astype(overlap_kv.dtype), overlap_kv),
-        jnp.where(any_closed, ca_gate.astype(overlap_gate.dtype), overlap_gate),
-    )
-
-
-def refresh_group_state(
-    layout: BlockGroupLayout,
-    state: Float[Array, "batch ratio dim"],
-    fresh: Float[Array, "batch block dim"],
-) -> Float[Array, "batch ratio dim"]:
-    """Open-group state after the block, as the per-token writes would leave it."""
-    src = jnp.take_along_axis(fresh, layout.refresh_source[..., None], axis=1)
-    return jnp.where(layout.refresh[..., None], src, state)
 
 
 def record_stream_trace(

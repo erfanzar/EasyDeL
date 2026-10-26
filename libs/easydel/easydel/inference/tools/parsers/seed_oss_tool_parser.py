@@ -32,12 +32,10 @@ Example format:
 
 from __future__ import annotations
 
-import ast
 import json
 import re
 import uuid
 from collections.abc import Sequence
-from typing import Any
 
 from eformer.loggings import get_logger
 from transformers import AutoTokenizer as AnyTokenizer
@@ -53,6 +51,7 @@ from ...openai_api_modules import (
     ToolDefinition,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
+from ._schema_params import convert_param_value, get_arguments_config
 
 logger = get_logger(__name__)
 
@@ -126,7 +125,6 @@ class SeedOssToolParser(ToolParser):
         """
         super().__init__(tokenizer)
 
-        self._reset_streaming_state()
         self.prev_tool_call_arr: list[dict] = []
 
         self.tool_call_start_token: str = self.TOOL_CALL_START
@@ -181,13 +179,16 @@ class SeedOssToolParser(ToolParser):
         self.current_tool_id = -1
         self.current_function_name = None
         self.current_param_name = None
-        self.current_param_value = ""
         self.param_count = 0
-        self.in_param = False
         self.in_function = False
         self.accumulated_text = ""
         self.json_started = False
         self.json_closed = False
+        self.prev_tool_call_arr.clear()
+        self.streamed_args_for_tool = []
+        self._stream_calls = []
+        self._stream_content_sent = 0
+        self.is_thinking_end = False
 
     def _parse_xml_function_call(
         self,
@@ -220,135 +221,9 @@ class SeedOssToolParser(ToolParser):
             - object/dict: parsed as JSON, falls back to ast.literal_eval
         """
 
-        def get_arguments_config(func_name: str) -> dict:
-            """Get parameter configuration for a function from tool definitions.
-
-            Args:
-                func_name: The name of the function to look up.
-
-            Returns:
-                dict: Parameter properties from the tool definition, or empty dict.
-            """
-            if tools is None:
-                return {}
-            for config in tools:
-                if not hasattr(config, "type") or not (hasattr(config, "function") and hasattr(config.function, "name")):
-                    continue
-                if config.type == "function" and config.function.name == func_name:
-                    if not hasattr(config.function, "parameters"):
-                        return {}
-                    params = config.function.parameters
-                    if isinstance(params, dict) and "properties" in params:
-                        return params["properties"]
-                    elif isinstance(params, dict):
-                        return params
-                    else:
-                        return {}
-            logger.warning("Tool '%s' is not defined in the tools list.", func_name)
-            return {}
-
-        def convert_param_value(param_value: str, param_name: str, param_config: dict, func_name: str) -> Any:
-            """Convert a parameter value to its declared type.
-
-            Args:
-                param_value: The raw string value of the parameter.
-                param_name: The name of the parameter.
-                param_config: The parameter configuration from tool definitions.
-                func_name: The function name (for logging).
-
-            Returns:
-                The converted parameter value in the appropriate type.
-            """
-            if param_value.lower() == "null":
-                return None
-
-            if param_name not in param_config:
-                if param_config != {}:
-                    logger.warning(
-                        "Parsed parameter '%s' is not defined in "
-                        "the tool parameters for tool '%s', "
-                        "directly returning the string value.",
-                        param_name,
-                        func_name,
-                    )
-                return param_value
-
-            if isinstance(param_config[param_name], dict) and "type" in param_config[param_name]:
-                param_type = str(param_config[param_name]["type"]).strip().lower()
-            else:
-                param_type = "string"
-            if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
-                return param_value
-            elif (
-                param_type.startswith("int")
-                or param_type.startswith("uint")
-                or param_type.startswith("long")
-                or param_type.startswith("short")
-                or param_type.startswith("unsigned")
-            ):
-                try:
-                    param_value = int(param_value)
-                except (ValueError, TypeError):
-                    logger.warning(
-                        "Parsed value '%s' of parameter '%s' is not an integer in tool '%s', degenerating to string.",
-                        param_value,
-                        param_name,
-                        func_name,
-                    )
-                return param_value
-            elif param_type.startswith("num") or param_type.startswith("float"):
-                try:
-                    float_param_value = float(param_value)
-                    param_value = (
-                        float_param_value if float_param_value - int(float_param_value) != 0 else int(float_param_value)
-                    )
-                except (ValueError, TypeError):
-                    logger.warning(
-                        "Parsed value '%s' of parameter '%s' is not a float in tool '%s', degenerating to string.",
-                        param_value,
-                        param_name,
-                        func_name,
-                    )
-                return param_value
-            elif param_type in ["boolean", "bool", "binary"]:
-                param_value = param_value.lower()
-                if param_value not in ["true", "false"]:
-                    logger.warning(
-                        "Parsed value '%s' of parameter '%s' is not a boolean "
-                        "(`true` of `false`) in tool '%s', degenerating to false.",
-                        param_value,
-                        param_name,
-                        func_name,
-                    )
-                return param_value == "true"
-            else:
-                if param_type == "object" or param_type.startswith("dict"):
-                    try:
-                        param_value = json.loads(param_value)
-                        return param_value
-                    except (ValueError, TypeError, json.JSONDecodeError):
-                        logger.warning(
-                            "Parsed value '%s' of parameter '%s' is not a valid JSON "
-                            "object in tool '%s', will try other methods to parse it.",
-                            param_value,
-                            param_name,
-                            func_name,
-                        )
-                try:
-                    param_value = ast.literal_eval(param_value)
-                except (ValueError, SyntaxError):
-                    logger.warning(
-                        "Parsed value '%s' of parameter '%s' cannot be converted via "
-                        "Python `ast.literal_eval()` in tool '%s', degenerating to string.",
-                        param_value,
-                        param_name,
-                        func_name,
-                    )
-                return param_value
-
         end_index = function_call_str.index(">")
         function_name = function_call_str[:end_index]
-        param_config = get_arguments_config(function_name)
+        param_config = get_arguments_config(function_name, tools)
         parameters = function_call_str[end_index + 1 :]
         param_dict = {}
         for match in self.tool_call_parameter_regex.findall(parameters):
@@ -460,6 +335,14 @@ class SeedOssToolParser(ToolParser):
             logger.exception("Error in extracting tool call from response.")
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
+    def flush_streaming_content(self) -> str:
+        """Release a withheld, unfinished opening marker when no tool call followed."""
+        if self.is_tool_call_started:
+            return ""
+        pending = self.accumulated_text[self._stream_content_sent :]
+        self._stream_content_sent = len(self.accumulated_text)
+        return pending
+
     def extract_tool_calls_streaming(
         self,
         previous_text: str,
@@ -498,271 +381,78 @@ class SeedOssToolParser(ToolParser):
             2. Emits '"param_name": "value"' for each parameter
             3. Emits "}" when function ends
         """
-        if not delta_text:
-            if delta_token_ids and self.tool_call_end_token_id not in delta_token_ids:
-                complete_calls = len(self.tool_call_complete_regex.findall(current_text))
-
-                if complete_calls > 0 and len(self.prev_tool_call_arr) > 0:
-                    open_calls = current_text.count(self.tool_call_start_token) - current_text.count(
-                        self.tool_call_end_token
-                    )
-                    if open_calls == 0:
-                        return DeltaMessage(content="")
-                elif not self.is_tool_call_started and current_text:
-                    return DeltaMessage(content="")
-            return None
-
         if not previous_text:
             self._reset_streaming_state()
-
         self.accumulated_text = current_text
+        # Thinking is optional. Ignore tool-shaped text inside an actual thinking
+        # section, but never require an end marker in a tool-only response.
+        think_end = current_text.rfind(self.think_end_token)
+        think_start = current_text.rfind(self.think_start_token)
+        self.is_thinking_end = think_end >= 0
+        result_start = think_end + len(self.think_end_token) if think_end >= 0 else 0
+        active_thinking = think_start > think_end
+        result_text = current_text[result_start:]
+        tool_start = -1 if active_thinking else result_text.find(self.tool_call_start_token)
+        visible = current_text if tool_start < 0 else current_text[: result_start + tool_start]
+        if tool_start < 0 and not active_thinking:
+            # Hold an incomplete opening marker instead of leaking XML to content.
+            for size in range(min(len(visible), len(self.tool_call_start_token) - 1), 0, -1):
+                if visible.endswith(self.tool_call_start_token[:size]):
+                    visible = visible[:-size]
+                    break
+        content = visible[self._stream_content_sent :]
+        self._stream_content_sent = len(visible)
+        if tool_start < 0:
+            return DeltaMessage(content=content) if content else None
 
-        if self.json_closed and not self.in_function:
-            tool_ends = current_text.count(self.tool_call_end_token)
-            if tool_ends > self.current_tool_index:
-                self.current_tool_index += 1
-                self.header_sent = False
-                self.param_count = 0
-                self.json_started = False
-                self.json_closed = False
-
-                if self.current_tool_index >= current_text.count(self.tool_call_start_token):
-                    self.is_tool_call_started = False
-                return None
-
-        if not self.is_thinking_end and (
-            self.think_end_token_id in delta_token_ids or self.think_end_token in delta_text
-        ):
-            self.is_thinking_end = True
-
-        if not self.is_thinking_end:
-            return DeltaMessage(content=delta_text)
-
-        if not self.is_tool_call_started:
-            if self.tool_call_start_token_id in delta_token_ids or self.tool_call_start_token in delta_text:
-                self.is_tool_call_started = True
-                if self.tool_call_start_token in delta_text:
-                    content_before = delta_text[: delta_text.index(self.tool_call_start_token)]
-                    if content_before:
-                        return DeltaMessage(content=content_before)
-                return None
-            else:
-                if current_text.rstrip().endswith(self.tool_call_end_token) and delta_text.strip() == "":
-                    return None
-                return DeltaMessage(content=delta_text)
-
-        tool_starts_count = current_text.count(self.tool_call_start_token)
-        if self.current_tool_index >= tool_starts_count:
-            return None
-
-        think_end_index = (
-            current_text.find(self.think_end_token) + len(self.think_end_token)
-            if self.think_end_token in current_text
-            else 0
-        )
-        tool_starts: list[int] = []
-        idx = think_end_index
-        while True:
-            idx = current_text.find(self.tool_call_start_token, idx)
-            if idx == -1:
-                break
-            tool_starts.append(idx)
-            idx += len(self.tool_call_start_token)
-
-        if self.current_tool_index >= len(tool_starts):
-            return None
-
-        tool_start_idx = tool_starts[self.current_tool_index]
-        tool_end_idx = current_text.find(self.tool_call_end_token, tool_start_idx)
-        if tool_end_idx == -1:
-            tool_text = current_text[tool_start_idx:]
-        else:
-            tool_text = current_text[tool_start_idx : tool_end_idx + len(self.tool_call_end_token)]
-
-        if not self.header_sent:
-            if self.tool_call_prefix in tool_text:
-                func_start = tool_text.find(self.tool_call_prefix) + len(self.tool_call_prefix)
-                func_end = tool_text.find(">", func_start)
-
-                if func_end != -1:
-                    self.current_function_name = tool_text[func_start:func_end]
-                    self.current_tool_id = self._generate_tool_call_id()
-                    self.header_sent = True
-                    self.in_function = True
-
-                    already_added = any(
-                        tool.get("name") == self.current_function_name for tool in self.prev_tool_call_arr
+        self.is_tool_call_started = True
+        deltas = []
+        functions = []
+        for envelope in self.tool_call_regex.findall(result_text):
+            body = envelope[0] or envelope[1]
+            functions.extend(re.finditer(r"<function=([^>]+)>(.*?)(</function>|$)", body, re.DOTALL))
+        for index, match in enumerate(functions):
+            name, body, end = match.groups()
+            first = index >= len(self._stream_calls)
+            if first:
+                self._stream_calls.append({"id": self._generate_tool_call_id(), "count": 0, "closed": False})
+                self.streamed_args_for_tool.append("")
+                self.prev_tool_call_arr.append({"name": name, "arguments": "{}"})
+            state = self._stream_calls[index]
+            fragment = "{" if first else ""
+            parameters = list(re.finditer(r"<parameter=([^>]+)>(.*?)</parameter>", body, re.DOTALL))
+            config = get_arguments_config(name, request.tools if request else None)
+            for parameter in parameters[state["count"] :]:
+                key, value = parameter.groups()
+                if value.startswith("\n"):
+                    value = value[1:]
+                if value.endswith("\n"):
+                    value = value[:-1]
+                converted = convert_param_value(value, key, config, name)
+                fragment += (", " if state["count"] else "") + json.dumps(key, ensure_ascii=False)
+                fragment += ": " + json.dumps(converted, ensure_ascii=False)
+                state["count"] += 1
+            if end and not state["closed"]:
+                fragment += "}"
+                state["closed"] = True
+            if first or fragment:
+                self.streamed_args_for_tool[index] += fragment
+                deltas.append(
+                    DeltaToolCall(
+                        index=index,
+                        id=state["id"] if first else None,
+                        type="function" if first else None,
+                        function=DeltaFunctionCall(name=name if first else None, arguments=fragment or None),
                     )
-                    if not already_added:
-                        self.prev_tool_call_arr.append(
-                            {
-                                "name": self.current_function_name,
-                                "arguments": "{}",
-                            }
-                        )
-
-                    return DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_index,
-                                id=self.current_tool_id,
-                                function=DeltaFunctionCall(name=self.current_function_name, arguments=""),
-                                type="function",
-                            )
-                        ]
-                    )
-            return None
-
-        if self.in_function:
-            if not self.json_started and self.parameter_prefix not in delta_text:
-                self.json_started = True
-                return DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=self.current_tool_index,
-                            function=DeltaFunctionCall(arguments="{"),
-                        )
-                    ]
                 )
-
-            if not self.json_started:
-                self.json_started = True
-
-            if not self.json_closed and self.function_end_token in tool_text:
-                self.json_closed = True
-
-                func_start = tool_text.find(self.tool_call_prefix) + len(self.tool_call_prefix)
-                func_content_end = tool_text.find(self.function_end_token, func_start)
-                if func_content_end != -1:
-                    func_content = tool_text[func_start:func_content_end]
-                    try:
-                        parsed_tool = self._parse_xml_function_call(func_content, request.tools if request else None)
-                        if parsed_tool:
-                            for i, tool in enumerate(self.prev_tool_call_arr):
-                                if tool.get("name") == parsed_tool.function.name:
-                                    self.prev_tool_call_arr[i]["arguments"] = parsed_tool.function.arguments
-                                    break
-                    except Exception:
-                        logger.warning("Failed to parse tool arguments during streaming.", exc_info=True)
-
-                result = DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=self.current_tool_index,
-                            function=DeltaFunctionCall(arguments="}"),
-                        )
-                    ]
-                )
-
-                self.in_function = False
-                self.json_closed = True
-
-                return result
-
-            complete_params = tool_text.count(self.parameter_end_token)
-
-            if not self.in_param and self.param_count < complete_params:
-                param_starts = []
-                idx = 0
-                while True:
-                    idx = tool_text.find(self.parameter_prefix, idx)
-                    if idx == -1:
-                        break
-                    param_starts.append(idx)
-                    idx += len(self.parameter_prefix)
-
-                if len(param_starts) > self.param_count:
-                    param_idx = param_starts[self.param_count]
-                    param_start = param_idx + len(self.parameter_prefix)
-                    remaining = tool_text[param_start:]
-
-                    if ">" in remaining:
-                        name_end = remaining.find(">")
-                        self.current_param_name = remaining[:name_end]
-
-                        value_start = param_start + name_end + 1
-                        value_text = tool_text[value_start:]
-                        if value_text.startswith("\n"):
-                            value_text = value_text[1:]
-
-                        param_end_idx = value_text.find(self.parameter_end_token)
-                        if param_end_idx != -1:
-                            param_value = value_text[:param_end_idx]
-                            if param_value.endswith("\n"):
-                                param_value = param_value[:-1]
-
-                            if self.param_count == 0:
-                                json_fragment = (
-                                    '"' + self.current_param_name + '": "' + json.dumps(param_value)[1:-1] + '"'
-                                )
-                            else:
-                                json_fragment = (
-                                    ', "' + self.current_param_name + '": "' + json.dumps(param_value)[1:-1] + '"'
-                                )
-
-                            self.param_count += 1
-
-                            return DeltaMessage(
-                                tool_calls=[
-                                    DeltaToolCall(
-                                        index=self.current_tool_index,
-                                        function=DeltaFunctionCall(arguments=json_fragment),
-                                    )
-                                ]
-                            )
-
-            if self.in_param:
-                if self.parameter_end_token in delta_text:
-                    end_idx = delta_text.find(self.parameter_end_token)
-                    value_chunk = delta_text[:end_idx]
-
-                    if not self.current_param_value and ">" in value_chunk:
-                        gt_idx = value_chunk.find(">")
-                        value_chunk = value_chunk[gt_idx + 1 :]
-
-                    if not self.current_param_value and value_chunk.startswith("\n"):
-                        value_chunk = value_chunk[1:]
-
-                    full_value = self.current_param_value + value_chunk
-                    prev_escaped = json.dumps(self.current_param_value)[1:-1] if self.current_param_value else ""
-                    full_escaped = json.dumps(full_value)[1:-1]
-                    delta_escaped = full_escaped[len(prev_escaped) :]
-
-                    self.in_param = False
-                    self.current_param_value = ""
-
-                    return DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_index,
-                                function=DeltaFunctionCall(arguments=delta_escaped + '"'),
-                            )
-                        ]
-                    )
-                else:
-                    value_chunk = delta_text
-
-                    if not self.current_param_value and ">" in value_chunk:
-                        gt_idx = value_chunk.find(">")
-                        value_chunk = value_chunk[gt_idx + 1 :]
-
-                    if not self.current_param_value and value_chunk.startswith("\n"):
-                        value_chunk = value_chunk[1:]
-
-                    if value_chunk:
-                        prev_escaped = json.dumps(self.current_param_value)[1:-1] if self.current_param_value else ""
-                        self.current_param_value += value_chunk
-                        full_escaped = json.dumps(self.current_param_value)[1:-1]
-                        delta_escaped = full_escaped[len(prev_escaped) :]
-
-                        if delta_escaped:
-                            return DeltaMessage(
-                                tool_calls=[
-                                    DeltaToolCall(
-                                        index=self.current_tool_index,
-                                        function=DeltaFunctionCall(arguments=delta_escaped),
-                                    )
-                                ]
-                            )
-
-        return None
+            if end:
+                self.prev_tool_call_arr[index]["arguments"] = self.streamed_args_for_tool[index]
+            self.current_tool_index = index
+            self.current_function_name = name
+            self.current_tool_id = state["id"]
+            self.header_sent = True
+            self.json_started = True
+            self.json_closed = state["closed"]
+            self.in_function = not state["closed"]
+            self.param_count = state["count"]
+        return DeltaMessage(content=content or None, tool_calls=deltas or None) if content or deltas else None

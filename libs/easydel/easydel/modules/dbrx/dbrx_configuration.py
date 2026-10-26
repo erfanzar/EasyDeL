@@ -37,8 +37,6 @@ from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
 
-DBRX_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
-
 
 class DbrxAttentionConfig(EasyDeLBaseConfig):
     """
@@ -75,12 +73,8 @@ class DbrxAttentionConfig(EasyDeLBaseConfig):
                 Defaults to ``1``.
             rope_theta (float, optional): Base frequency for rotary position
                 embeddings. Defaults to ``10000.0``.
-            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`. ``model_type``
-                is silently dropped; any other unknown key raises.
-
-        Raises:
-            ValueError: If ``kwargs`` contains unknown keys other than
-                ``model_type``.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`; extra keys (for example the base attributes carried
+                by serialized sub-configs) are absorbed as attributes so saved checkpoints reload.
         """
         # Extra kwargs are absorbed as attributes by EasyDeLBaseConfig, like
         # every other EasyDeL config; a strict reject here breaks reloading
@@ -180,14 +174,10 @@ class DbrxFFNConfig(EasyDeLBaseConfig):
                 exponent for normalizing expert outputs. Defaults to ``1``.
             uniform_expert_assignment (bool, optional): Force uniform
                 expert assignment (debug). Defaults to ``False``.
-            **kwargs: Unknown keys (other than ``model_type``) raise
-                ``ValueError``.
-
-        Raises:
-            ValueError: If ``kwargs`` contains unknown keys other than
-                ``model_type``.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`; extra keys (for example the base attributes carried
+                by serialized sub-configs) are absorbed as attributes so saved checkpoints reload.
         """
-        super().__init__()
+        super().__init__(**kwargs)
         if ffn_act_fn is None:
             ffn_act_fn = {"name": "silu"}
         self.ffn_act_fn = ffn_act_fn

@@ -31,6 +31,21 @@ thresholds against it, so ties at the threshold are all kept and a row may hold
 more than ``k``. That matches the "ties may return more than k" contract the
 sampler's existing threshold search already has, and it is deliberate -- an
 exact-``k`` cut would have to impose an arbitrary order on equal logits.
+
+Two sort-free modes serve consumers that need ``top_k``'s selection but not its
+order:
+
+* ``"exact_mask"`` -- the pick set of ``jax.lax.top_k`` as a boolean mask:
+  exactly ``min(k, n)`` entries per row, every item above the ``k``-th key plus
+  the lowest-index items equal to it (``top_k``'s tie-break). Rows with fewer
+  than ``k`` finite scores fill with their lowest-index ``-inf`` items, as
+  ``top_k`` does. A sparse-attention indexer that turns its selection into a
+  mask or an additive bias wants this.
+* ``"kth"`` -- ``jax.lax.top_k(x, k)[0][..., -1]``, the selection threshold,
+  with the reduced axis removed.
+
+Both bisect the same order-preserving integer key as ``"mask"``; ``k`` may be
+static or per-row.
 """
 
 from __future__ import annotations
@@ -40,6 +55,8 @@ import jax.numpy as jnp
 from jaxtyping import Array
 
 from ..._registry import Backend, Platform, kernel_registry
+
+_MODES = ("values", "mask", "exact_mask", "kth", "filter")
 
 
 def _sortable_key(x: Array) -> Array:
@@ -73,6 +90,36 @@ def _sortable_key(x: Array) -> Array:
     return jnp.where(sign, ~bits, bits | jnp.uint32(0x80000000))
 
 
+def _key_to_value(key: Array, dtype: jnp.dtype) -> Array:
+    """Invert :func:`_sortable_key` bit for bit (NaN payloads and signed zeros included).
+
+    Args:
+        key: Unsigned keys produced by :func:`_sortable_key` for ``dtype``.
+        dtype: The original operand dtype.
+
+    Returns:
+        Values of ``dtype`` whose keys are ``key``.
+    """
+    dtype = jnp.dtype(dtype)
+    if jnp.issubdtype(dtype, jnp.bool_):
+        return key.astype(jnp.bool_)
+    if jnp.issubdtype(dtype, jnp.integer):
+        wide = dtype.itemsize > 4
+        if jnp.issubdtype(dtype, jnp.signedinteger):
+            signed = jnp.int64 if wide else jnp.int32
+            sign_bit = jnp.uint64(1 << 63) if wide else jnp.uint32(1 << 31)
+            return jax.lax.bitcast_convert_type(key ^ sign_bit, signed).astype(dtype)
+        return key.astype(dtype)
+    if dtype.itemsize > 4:
+        top = jnp.uint64(1 << 63)
+        bits = jnp.where((key & top) != 0, key ^ top, ~key)
+        return jax.lax.bitcast_convert_type(bits, jnp.float64).astype(dtype)
+    top = jnp.uint32(0x80000000)
+    bits = jnp.where((key & top) != 0, key ^ top, ~key)
+    # Narrower floats were widened exactly, so narrowing the k-th value back is exact.
+    return jax.lax.bitcast_convert_type(bits, jnp.float32).astype(dtype)
+
+
 def _moveaxis_to_last(x: Array, axis: int) -> tuple[Array, int]:
     """Bring ``axis`` to the end so the reduction is always over the last dim."""
     axis = axis if axis >= 0 else x.ndim + axis
@@ -95,9 +142,12 @@ def topk(
         operand: Input array; the reduction runs over ``axis``.
         k: Number kept. Must be a Python ``int`` for ``mode="values"``; may be a
             traced per-row array (broadcastable to ``operand`` minus ``axis``)
-            for ``mode="mask"``.
+            for the other modes.
         axis: Reduction axis. Defaults to the last.
-        mode: ``"values"`` for (values, indices); ``"mask"`` for a keep-mask;
+        mode: ``"values"`` for (values, indices); ``"mask"`` for a keep-mask
+            that keeps every tie at the threshold; ``"exact_mask"`` for the
+            pick set of ``jax.lax.top_k`` (exactly ``min(k, n)`` per row, lower
+            index wins ties); ``"kth"`` for the ``k``-th largest value;
             ``"filter"`` for ``operand`` with non-kept entries set to
             ``mask_fill``.
         mask_fill: Replacement for filtered-out entries in ``mode="filter"``.
@@ -105,12 +155,14 @@ def topk(
 
     Returns:
         ``(values, indices)`` for ``"values"``; a boolean array shaped like
-        ``operand`` for ``"mask"``; an array shaped like ``operand`` for
+        ``operand`` for ``"mask"`` and ``"exact_mask"``; ``operand``'s shape
+        without ``axis`` for ``"kth"``; an array shaped like ``operand`` for
         ``"filter"``.
 
     Raises:
-        ValueError: If ``mode`` is unknown, or ``k`` is traced under
-            ``mode="values"`` (a sorted top-k needs a static output width).
+        ValueError: If ``mode`` is unknown, ``k`` is traced under
+            ``mode="values"`` (a sorted top-k needs a static output width), or
+            a static ``k`` is outside ``[1, n]`` under ``mode="kth"``.
 
     Note:
         ``"mask"`` and ``"filter"`` bisect for the k-th largest value instead of
@@ -126,8 +178,8 @@ def topk(
         Ties at the threshold are all kept ("may return more than k"), matching
         the contract the sampler's existing search already has.
     """
-    if mode not in ("values", "mask", "filter"):
-        raise ValueError(f"unknown topk mode {mode!r}; expected 'values', 'mask' or 'filter'.")
+    if mode not in _MODES:
+        raise ValueError(f"unknown topk mode {mode!r}; expected one of {', '.join(map(repr, _MODES))}.")
 
     moved, _ = _moveaxis_to_last(operand, axis)
 
@@ -153,7 +205,13 @@ def topk(
         ks = jnp.broadcast_to(ks, (*moved.shape[:-1], 1))
     else:
         ks = jnp.broadcast_to(ks, moved.shape[:-1])[..., None]
-    ks = jnp.clip(ks, 0, width)
+    if mode == "kth":
+        if isinstance(k, int) and not 1 <= k <= width:
+            raise ValueError(f"mode='kth' needs 1 <= k <= {width}, got {k}.")
+        # A traced per-row k is clamped: k = 0 has no k-th value.
+        ks = jnp.clip(ks, 1, width)
+    else:
+        ks = jnp.clip(ks, 0, width)
 
     keys = _sortable_key(moved)
     # Largest key t with count(keys >= t) >= k. c(.) is non-increasing in t, so
@@ -170,6 +228,20 @@ def topk(
         return jnp.where(feasible, mid, lo_i), jnp.where(feasible, hi_i, mid - 1)
 
     lo, hi = jax.lax.fori_loop(0, keys.dtype.itemsize * 8, _step, (lo, hi))
+
+    if mode == "kth":
+        # ``lo`` is the k-th largest key; ``moved.shape[:-1]`` is ``operand``'s shape without ``axis``.
+        return _key_to_value(lo[..., 0], operand.dtype)
+
+    if mode == "exact_mask":
+        # Every key above the k-th, then the lowest-index keys equal to it until k are taken.
+        above = keys > lo
+        ties = keys == lo
+        need = ks - above.sum(-1, keepdims=True)
+        tie_rank = jnp.cumsum(ties.astype(jnp.int32), axis=-1)  # 1-based rank of each tie in index order
+        picked = (above | (ties & (tie_rank <= need))) & (ks > 0)
+        return jnp.moveaxis(picked, -1, axis) if axis not in (-1, operand.ndim - 1) else picked
+
     keep = (keys >= lo) & (ks > 0)
 
     if mode == "mask":

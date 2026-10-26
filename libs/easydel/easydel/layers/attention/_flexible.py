@@ -47,7 +47,6 @@ Example:
     ... )
 """
 
-import collections.abc
 import typing as tp
 from enum import StrEnum
 from functools import cached_property, partial
@@ -74,15 +73,27 @@ from easydel.caching import (
     TransformerCacheView,
     TransformerMetadata,
     UnifiedAttentionCacheView,
+    unwrap_metadata,
 )
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.sharding import StageMesh, inference_mode_forces_decode, resolve_stage_mesh
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 from easydel.operations import AttentionOutput, OperationMetadata, OperationRegistry, ScaledDotProductAttn
+from easydel.operations.requirements import ExecutionMode
 
 from ..quantization import EasyQuantizer, TurboQuantConfig
 
 logger = get_logger(__name__)
+
+
+def _layer_cache_metadata(cache_metadata: tp.Any, cache_view: tp.Any) -> tp.Any:
+    """Select the complete paged runtime payload for this layer before writes or reads."""
+    attention_view = cache_view.transformer if isinstance(cache_view, ParallelHybridCacheView) else cache_view
+    if isinstance(attention_view, (RaggedPagesCacheView, UnifiedAttentionCacheView)):
+        metadata = unwrap_metadata(cache_metadata, "ragged")
+        if metadata is not None and hasattr(metadata, "for_layer"):
+            return metadata.for_layer(attention_view.layer_index)
+    return cache_metadata
 
 
 def _attention_mesh_context(config: EasyDeLBaseConfig):
@@ -122,6 +133,8 @@ def _get_jax_dtype_from_string(dtype_string: str) -> jnp.dtype | str:
         True
     """
     dtype_mapping: dict[str, jnp.dtype] = {
+        "<class 'jax.numpy.bfloat16'>": jnp.bfloat16,
+        "<class 'jax.numpy.float16'>": jnp.float16,
         "<class 'jax.numpy.float32'>": jnp.float32,
         "<class 'jax.numpy.float64'>": jnp.float64,
         "<class 'jax.numpy.int32'>": jnp.int32,
@@ -131,6 +144,13 @@ def _get_jax_dtype_from_string(dtype_string: str) -> jnp.dtype | str:
         "<class 'jax.numpy.complex128'>": jnp.complex128,
     }
     result: jnp.dtype | str = dtype_mapping.get(dtype_string, dtype_string)
+    if isinstance(result, str):
+        # Also accept bare dtype names ("bfloat16", "float16", ...) and any other ``<class 'jax.numpy.X'>`` spelling.
+        bare_name = result.removeprefix("<class 'jax.numpy.").removesuffix("'>")
+        try:
+            return jnp.dtype(bare_name)
+        except TypeError:
+            return result
     return result
 
 
@@ -303,16 +323,18 @@ class FlexibleAttentionModule(spx.Module):
         softmax_scale (float): Scale applied to the QK^T product before
             softmax. Conventionally ``1 / sqrt(head_dim)`` but may differ
             for muP / DeepSeek MLA (``softmax_scale * mscale``).
-        dropout_prob (float): Attention-weight dropout probability. The
-            forward pass currently always disables dropout (sets it to
-            ``0.0`` and ``deterministic=True``) — present for parity with
-            the kernel signature.
+        dropout_prob (float): Attention-weight dropout probability. Applied
+            in non-deterministic passes using an explicit key or constructor
+            RNGs. TRAIN mode follows the module's training state by default;
+            prefill and decode remain deterministic.
         impl (Operation): Prefill / training attention backend instance,
             chosen from :class:`AttentionMechanisms`.
         impl_decode (Operation | None): Optional separate backend for the
             decode-only path (e.g. ``REGRESSIVE_DECODE``); ``None`` when
             the same kernel handles both phases.
-        deterministic (bool): Hardcoded ``True`` — dropout is disabled.
+        deterministic (bool | None): Override for ``forward(deterministic=None)``.
+            ``None`` follows training state in TRAIN mode and disables dropout
+            in prefill/decode; an explicit boolean overrides this policy.
         _requires_cache (bool | None): Override for the operation's
             class-level cache requirement; consulted by the
             :class:`OperationExecutor` and :attr:`requires_cache`.
@@ -344,11 +366,11 @@ class FlexibleAttentionModule(spx.Module):
                 (mechanism, dtype, mesh, sharding, optional decode backend).
             softmax_scale: Pre-softmax scale applied to QK^T (conventionally
                 ``1 / sqrt(head_dim)``; muP / DeepSeek MLA override).
-            dropout_prob: Attention dropout probability. Stored but ignored
-                by the forward pass which currently forces deterministic
-                attention.
-            rngs: SpecTrax RNG container; unused by the dispatcher itself
-                but accepted for signature parity with other modules.
+            dropout_prob: Attention dropout probability. Active during TRAIN
+                mode when the module is training, or when explicitly requested
+                with ``deterministic=False``.
+            rngs: Optional SpecTrax RNG container supplying fresh dropout keys
+                when a per-call ``dropout_rng`` is not provided.
             attn_mechanism: Optional per-instance override of the backend
                 chosen from :class:`AttentionMechanisms`. ``None`` defers to
                 ``base_config.attn_mechanism``.
@@ -358,6 +380,9 @@ class FlexibleAttentionModule(spx.Module):
                 - ``False``: disable cache (encoder-only paths such as
                   vision encoders).
                 - ``True``: force cache requirement on.
+
+        Raises:
+            TypeError: If a string attention or softmax dtype is not recognized.
         """
 
         if attn_mechanism is None:
@@ -366,10 +391,13 @@ class FlexibleAttentionModule(spx.Module):
         attn_dtype_is_string: bool = isinstance(base_config.attn_dtype, str)
         if attn_dtype_is_string:
             base_config.attn_dtype = _get_jax_dtype_from_string(base_config.attn_dtype)
+            # Fail at the public configuration boundary, not inside a compiled kernel.
+            jnp.dtype(base_config.attn_dtype)
 
         attn_softmax_dtype_is_string: bool = isinstance(base_config.attn_softmax_dtype, str)
         if attn_softmax_dtype_is_string:
             base_config.attn_softmax_dtype = _get_jax_dtype_from_string(base_config.attn_softmax_dtype)
+            jnp.dtype(base_config.attn_softmax_dtype)
 
         is_auto_mechanism: bool = attn_mechanism == AttentionMechanisms.AUTO
         if is_auto_mechanism:
@@ -392,7 +420,10 @@ class FlexibleAttentionModule(spx.Module):
             metadata=metadata,
             requires_cache=requires_cache,
         )
-        self.deterministic: bool = True
+        self.deterministic: bool | None = None
+        # Keep the RNG on the module graph so SpectraX transforms carry its advancing counter.
+        if rngs is not None:
+            self.rngs = rngs
         self.impl_decode: tp.Any | None = None
         has_decode_mechanism: bool = base_config.decode_attn_mechanism is not None
         if has_decode_mechanism:
@@ -472,11 +503,18 @@ class FlexibleAttentionModule(spx.Module):
                 ``self.softmax_scale`` when ``None``.
             logits_soft_cap: Optional soft-cap value
                 (``tanh(logits / cap) * cap``).
-            dropout_prob: Override for attention dropout probability;
-                ignored in the current build (forced to ``0.0``).
-            dropout_rng: PRNG key for dropout (unused — see ``dropout_prob``).
-            deterministic: If ``True`` disables dropout. Defaults to
-                ``self.deterministic`` when ``None``.
+            dropout_prob: Override for attention dropout probability. Defaults
+                to ``self.dropout_prob`` when ``None``. Only takes effect when
+                the pass is non-deterministic.
+            dropout_rng: PRNG key for dropout. When absent, uses a fresh key
+                from the constructor's ``rngs``; an active dropout pass requires
+                one of these sources.
+            deterministic: If ``True`` disables dropout. When ``None``, uses
+                ``self.deterministic`` if set, otherwise follows ``self.training``
+                in TRAIN mode and disables dropout in other modes. Active dropout
+                uses the registered vanilla operation (or its paged-cache adapter),
+                preserving the JAX key contract and complete cached context rather
+                than passing it to seed-only or no-dropout kernels.
             output_attentions: When ``True`` instructs the backend to
                 materialise softmax weights. Falls back to
                 ``config.output_attentions`` when ``None``.
@@ -516,65 +554,6 @@ class FlexibleAttentionModule(spx.Module):
                 or when ``mode == MODE_DECODE`` is requested without a
                 ``cache_view``.
         """
-        if isinstance(cache_view, RaggedPagesCacheView):
-            # Check the actual impl name rather than the global config.attn_mechanism
-            # to support per-layer mechanism routing (e.g., mixed MLA / non-MLA models).
-            _impl_name = getattr(self.impl, "get_impl_name", lambda: None)()
-            if isinstance(_impl_name, tuple):
-                _impl_names = set(_impl_name)
-            elif _impl_name is not None:
-                _impl_names = {_impl_name}
-            else:
-                _impl_names = set()
-            _ragged_impls = {
-                "ragged_page_attention_v2",
-                "ragged_page_attention_v3",
-                "multi_latent_ragged_page_attention_v1",
-                "multi_latent_ragged_page_attention_v2",
-            }
-            if _impl_names and not (_impl_names & _ragged_impls):
-                raise ValueError(f"RaggedPagesCacheView requires a ragged-page impl but got {_impl_names}")
-        elif isinstance(cache_view, UnifiedAttentionCacheView):
-            _impl_name = getattr(self.impl, "get_impl_name", lambda: None)()
-            if isinstance(_impl_name, tuple):
-                _impl_names = set(_impl_name)
-            elif _impl_name is not None:
-                _impl_names = {_impl_name}
-            else:
-                _impl_names = set()
-            _unified_impls = {"unified_attention", "paged_flash_attention"}
-            if _impl_names and not (_impl_names & _unified_impls):
-                raise ValueError(f"UnifiedAttentionCacheView requires a unified impl but got {_impl_names}")
-
-        if deterministic is None:
-            deterministic_computed = self.deterministic
-        else:
-            deterministic_computed = deterministic
-
-        if output_attentions is None:
-            output_attentions_computed = bool(getattr(self.config, "output_attentions", False))
-        else:
-            output_attentions_computed = output_attentions
-
-        if softmax_scale is None:
-            softmax_scale_computed = self.softmax_scale
-        else:
-            softmax_scale_computed = softmax_scale
-
-        dropout_prob_final: float = 0.0
-        dropout_rng_final: tp.Any | None = None
-
-        # Use provided precision or default
-        if precision is None:
-            precision_computed = lax.Precision.DEFAULT
-        else:
-            precision_computed = precision
-
-        # Use provided policy or default
-        if policy is None:
-            policy_computed = jax.checkpoint_policies.nothing_saveable
-        else:
-            policy_computed = policy
 
         def _get_impl_names(impl: tp.Any) -> set[str]:
             """Return the registry name(s) of an attention-implementation object.
@@ -594,6 +573,117 @@ class FlexibleAttentionModule(spx.Module):
             if impl_name is None:
                 return set()
             return {str(impl_name)}
+
+        is_decode_mode = mode == common_types.MODE_DECODE
+        active_impl = self.impl_decode if is_decode_mode and self.impl_decode is not None else self.impl
+        cache_metadata = _layer_cache_metadata(cache_metadata, cache_view)
+        masking_details = getattr(cache_view, "masking_details", None)
+        attention_view = cache_view.transformer if isinstance(cache_view, ParallelHybridCacheView) else cache_view
+        is_paged = isinstance(attention_view, (RaggedPagesCacheView, UnifiedAttentionCacheView))
+        if not is_paged and mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+            # Concatenation may bake absolute-position visibility after callers
+            # have chosen their kernel options. Dense backends must not apply a
+            # second, chunk-local window to those aligned (possibly rolled) keys.
+            # Paged kernels consume cache metadata instead of this dense mask.
+            sliding_window = None
+        if is_paged and masking_details is None:
+            # Paged cache schemas do not store masks. Resolve the production config
+            # using the attention component's layer index, not a synthetic cache field.
+            get_mask_details = getattr(self.config, "get_mask_details", None)
+            layer_masks = get_mask_details() if get_mask_details is not None else None
+            if layer_masks is not None:
+                masking_details = layer_masks.get(attention_view.layer_index)
+        # Dense cache concatenation already bakes its layer mask into MaskInfo. Paged
+        # kernels do not consume that mask, so they require explicit window/chunk options.
+        if masking_details is not None and isinstance(attention_view, (RaggedPagesCacheView, UnifiedAttentionCacheView)):
+            if masking_details.mask_type == AttnMaskType.SLIDING and sliding_window is None:
+                sliding_window = masking_details.size
+            elif masking_details.mask_type == AttnMaskType.CHUNK:
+                configured_chunk_size = (
+                    masking_details.chunks if masking_details.chunks is not None else masking_details.size
+                )
+                if configured_chunk_size is None or configured_chunk_size <= 0:
+                    raise ValueError("Chunked local attention requires a positive configured chunk size.")
+                chunk_size = extra_op_kwargs.get("chunk_size")
+                if chunk_size is None:
+                    chunk_size = configured_chunk_size
+                if chunk_size != configured_chunk_size:
+                    raise ValueError("chunk_size must match the layer's cache masking details.")
+                extra_op_kwargs["chunk_size"] = chunk_size
+        deterministic_computed = self.deterministic if deterministic is None else deterministic
+        if deterministic_computed is None:
+            # UnifiedAttention and custom model callers already forward the runtime mode.
+            # Inference must remain deterministic even when a newly loaded module is still in train mode.
+            deterministic_computed = mode != common_types.MODE_TRAIN or not self.training
+
+        if output_attentions is None:
+            output_attentions_computed = bool(getattr(self.config, "output_attentions", False))
+        else:
+            output_attentions_computed = output_attentions
+
+        if softmax_scale is None:
+            softmax_scale_computed = self.softmax_scale
+        else:
+            softmax_scale_computed = softmax_scale
+
+        dropout_prob_final: float = 0.0
+        dropout_rng_final: tp.Any | None = None
+        if not deterministic_computed:
+            dropout_prob_final = float(self.dropout_prob if dropout_prob is None else dropout_prob)
+            if not 0.0 <= dropout_prob_final < 1.0:
+                raise ValueError("dropout_prob must be in [0, 1).")
+            if dropout_prob_final > 0.0:
+                dropout_rng_final = dropout_rng
+                if dropout_rng_final is None:
+                    rngs = getattr(self, "rngs", None)
+                    if rngs is not None:
+                        dropout_rng_final = rngs.key("dropout")
+                if dropout_rng_final is None:
+                    raise ValueError(
+                        "dropout_rng must be provided when deterministic=False and dropout_prob > 0, "
+                        "or supply rngs at construction."
+                    )
+
+        if dropout_prob_final > 0.0:
+            active_impl = OperationRegistry.create(
+                impl_name="paged_attention_reference" if is_paged else AttentionMechanisms.VANILLA.value,
+                metadata=self.metadata,
+                requires_cache=self._requires_cache,
+            )
+        if extra_op_kwargs.get("chunk_size") is not None:
+            if extra_op_kwargs["chunk_size"] <= 0:
+                raise ValueError("chunk_size must be positive.")
+            if not _get_impl_names(active_impl) & {
+                AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3.value,
+                "paged_attention_reference",
+            }:
+                raise NotImplementedError("Chunked local attention requires ragged_page_attention_v3.")
+        if is_paged:
+            # Validate the actual operation against the component passed to it,
+            # including decode overrides and the key-aware dropout adapter.
+            get_requirements = getattr(active_impl, "get_instance_requirements", None)
+            if get_requirements is None:
+                get_requirements = getattr(active_impl, "get_requirements", None)
+            if get_requirements is not None:
+                execution_mode = ExecutionMode.DECODE if is_decode_mode else ExecutionMode.PREFILL
+                expected_view = get_requirements(execution_mode).cache.cache_view_class
+                if expected_view is not None and not isinstance(attention_view, expected_view):
+                    raise ValueError(
+                        f"{type(attention_view).__name__} is incompatible with {_get_impl_names(active_impl)}; "
+                        f"the operation requires {expected_view.__name__}."
+                    )
+
+        # Use provided precision or default
+        if precision is None:
+            precision_computed = lax.Precision.DEFAULT
+        else:
+            precision_computed = precision
+
+        # Use provided policy or default
+        if policy is None:
+            policy_computed = jax.checkpoint_policies.nothing_saveable
+        else:
+            policy_computed = policy
 
         def _maybe_route_varlen_multihost_tpu_attention(callable_attn: tp.Any) -> tp.Any:
             """Reroute variable-length attention to SDPA on multi-host TPU.
@@ -620,6 +710,10 @@ class FlexibleAttentionModule(spx.Module):
                     (e.g. mismatched head dimensions or unsupported
                     softmax features).
             """
+            # Dropout is routed to vanilla below with explicit length masks, never to SDPA
+            # (which ignores dropout). This also preserves varlen semantics on multi-host meshes.
+            if dropout_prob_final > 0.0:
+                return callable_attn
             if jax.default_backend() != "tpu" or jax.process_count() <= 1:
                 return callable_attn
             if cum_seqlens_q is None and cum_seqlens_k is None:
@@ -635,6 +729,8 @@ class FlexibleAttentionModule(spx.Module):
             unsupported_sdpa_features = ScaledDotProductAttn.get_unsupported_fallback_features(
                 softmax_aux=softmax_aux,
                 logits_soft_cap=logits_soft_cap,
+                dropout_prob=dropout_prob_final,
+                normalize_output=normalize_output,
             )
             if unsupported_sdpa_features:
                 raise ValueError(
@@ -662,21 +758,114 @@ class FlexibleAttentionModule(spx.Module):
             Returns:
                 :class:`AttentionOutput` returned by ``callable_attn``.
             """
-            call_kwargs = input_kwargs
+            call_kwargs = dict(input_kwargs)
             impl_names = _get_impl_names(callable_attn)
+            valid_queries = None
+            if dropout_prob_final > 0.0:
+                # SDPA silently ignores dropout; Flash uses an integer seed and several of its
+                # fallback/device paths do not implement dropout. Use the registry's key-aware
+                # reference operation for the entire stochastic pass, on every device.
+                callable_attn = active_impl
+                impl_names = _get_impl_names(callable_attn)
+                if is_paged and mask_info is None and call_kwargs["bias"] is None and init_bias is not None:
+                    # The paged adapter builds request masks itself, so initialize
+                    # the original lazy bias before that synthesis as on dense paths.
+                    call_kwargs["bias"] = init_bias()
+                    call_kwargs["init_bias"] = None
+                if not is_paged and (cum_seqlens_q is not None or cum_seqlens_k is not None):
+                    # Vanilla initializes a lazy bias only when both bias and MaskInfo are
+                    # absent. Preserve that original decision before adding our varlen mask.
+                    if mask_info is None and call_kwargs["bias"] is None and init_bias is not None:
+                        call_kwargs["bias"] = init_bias()
+                        call_kwargs["init_bias"] = None
+                    # Vanilla consumes MaskInfo rather than cum_seqlens_*. Materialize the
+                    # equivalent visibility mask before dispatch, retaining any supplied mask,
+                    # positions and baked-in causal/window flags.
+                    batch, q_len = query_states.shape[:2]
+                    kv_len = key_states.shape[1]
+
+                    def _sequence_layout(lengths: tp.Any, seq_len: int) -> tuple[tp.Any, tp.Any, tp.Any]:
+                        positions = jnp.broadcast_to(jnp.arange(seq_len), (batch, seq_len))
+                        if lengths is None:
+                            return jnp.ones_like(positions, dtype=jnp.bool_), jnp.zeros_like(positions), positions
+                        lengths = jnp.asarray(lengths)
+                        if lengths.ndim != 1:
+                            raise ValueError("cum_seqlens must be one-dimensional.")
+                        if lengths.shape[0] == batch:
+                            valid = positions < lengths[:, None]
+                            return valid, jnp.zeros_like(positions), positions
+                        if lengths.shape[0] == batch + 1:
+                            valid = positions < jnp.diff(lengths)[:, None]
+                            return valid, jnp.zeros_like(positions), positions
+                        if batch == 1 and lengths.shape[0] > 1:
+                            segments = jnp.searchsorted(lengths[1:], positions, side="right")
+                            starts = lengths[jnp.minimum(segments, lengths.shape[0] - 1)]
+                            valid = (positions >= lengths[0]) & (positions < lengths[-1])
+                            return valid, segments, positions - starts
+                        raise ValueError("cum_seqlens must contain per-example lengths or cumulative boundaries.")
+
+                    q_valid, q_segments, q_positions = _sequence_layout(cum_seqlens_q, q_len)
+                    k_valid, k_segments, k_positions = _sequence_layout(cum_seqlens_k, kv_len)
+                    visibility = q_valid[:, None, :, None] & k_valid[:, None, None, :]
+                    visibility &= q_segments[:, None, :, None] == k_segments[:, None, None, :]
+                    if mask_info is None:
+                        dropout_mask = MaskInfo(
+                            _attention_mask=visibility, q_positions=q_positions, kv_positions=k_positions
+                        )
+                    else:
+                        existing_mask = mask_info.attention_mask
+                        if existing_mask is not None:
+                            if existing_mask.ndim == 2:
+                                existing_mask = existing_mask[:, None, None, :]
+                            elif existing_mask.ndim == 3:
+                                existing_mask = existing_mask[:, None, :, :]
+                            visibility = visibility & existing_mask.astype(jnp.bool_)
+                        dropout_mask = mask_info.replace(attention_mask=visibility)
+                    # Bake relative-position causal/window masks for packed windows; the reference
+                    # kernel's dense top-left triangle would otherwise mix per-sequence offsets.
+                    if causal and not dropout_mask.causal_mask_baked_in:
+                        qp = dropout_mask.q_positions if dropout_mask.q_positions is not None else q_positions
+                        kp = dropout_mask.kv_positions if dropout_mask.kv_positions is not None else k_positions
+                        visibility &= kp[:, None, None, :] <= qp[:, None, :, None]
+                        dropout_mask = dropout_mask.replace(attention_mask=visibility, causal_mask_baked_in=True)
+                    if sliding_window is not None and not dropout_mask.sliding_window_baked_in:
+                        left, right = (
+                            sliding_window if isinstance(sliding_window, tuple) else (max(sliding_window - 1, 0),) * 2
+                        )
+                        qp = dropout_mask.q_positions if dropout_mask.q_positions is not None else q_positions
+                        kp = dropout_mask.kv_positions if dropout_mask.kv_positions is not None else k_positions
+                        visibility &= (kp[:, None, None, :] >= qp[:, None, :, None] - left) & (
+                            kp[:, None, None, :] <= qp[:, None, :, None] + right
+                        )
+                        dropout_mask = dropout_mask.replace(attention_mask=visibility, sliding_window_baked_in=True)
+                        call_kwargs["sliding_window"] = None
+                    call_kwargs["mask_info"] = dropout_mask
+                    call_kwargs["cum_seqlens_q"] = call_kwargs["cum_seqlens_k"] = None
+                    valid_queries = q_valid & jnp.any(visibility, axis=(1, 3))
             weight_aware_impls = {
                 AttentionMechanisms.VANILLA.value,
                 AttentionMechanisms.BLOCKSPARSE.value,
                 AttentionMechanisms.SPLASH.value,
             }
             if impl_names & weight_aware_impls:
-                call_kwargs = dict(input_kwargs)
                 call_kwargs["return_attention_weights"] = output_attentions_computed
-            if AttentionMechanisms.VANILLA.value in impl_names:
+            if impl_names & {AttentionMechanisms.VANILLA.value, "paged_attention_reference"}:
                 # None inherits ambient JAX precision; explicit values (including
                 # DEFAULT) are forwarded.
                 call_kwargs["precision"] = precision
-            return callable_attn(**call_kwargs)
+            result = callable_attn(**call_kwargs)
+            if valid_queries is not None:
+                # Softmax over a fully masked padded row is not guaranteed to yield zero.
+                result = AttentionOutput(
+                    attention_outputs=jnp.where(valid_queries[:, :, None, None], result.attention_outputs, 0),
+                    attention_weights=(
+                        jnp.where(valid_queries[:, None, :, None], result.attention_weights, 0)
+                        if result.attention_weights is not None
+                        else None
+                    ),
+                    cache_view=result.cache_view,
+                )
+            return result
 
         with _attention_mesh_context(self.config):  # pyright: ignore[reportOptionalContextManager]
             input_dict: dict[str, tp.Any] = dict(
@@ -687,7 +876,7 @@ class FlexibleAttentionModule(spx.Module):
                 bias=bias,
                 sliding_window=sliding_window,
                 cache_metadata=cache_metadata,
-                cache_view=cache_view,
+                cache_view=attention_view,
                 init_bias=init_bias,
                 causal=causal,
                 deterministic=deterministic_computed,
@@ -750,7 +939,11 @@ class FlexibleAttentionModule(spx.Module):
                 if output_attentions_computed and output.attention_weights is not None
                 else None
             ),
-            cache_view=output.cache_view,
+            cache_view=(
+                cache_view.replace(transformer=attention_view if output.cache_view is None else output.cache_view)
+                if isinstance(cache_view, ParallelHybridCacheView)
+                else output.cache_view
+            ),
         )
         return result
 
@@ -835,6 +1028,43 @@ class FlexibleAttentionModule(spx.Module):
         return self.operation_executor.has_separate_decode
 
 
+class SoftCappedAttentionModule(FlexibleAttentionModule):
+    """Attention performer with a configurable default attention-logit soft cap.
+
+    The registered attention operation applies ``cap * tanh(logits / cap)``
+    before softmax. A per-call cap overrides the constructor default; ``None``
+    selects that default, matching the historical Gemma performer contract.
+    """
+
+    def __init__(self, *args, logits_soft_cap: float | None = None, **kwargs):
+        """Build the performer and retain its default soft cap.
+
+        Args:
+            *args: Forwarded to :class:`FlexibleAttentionModule`.
+            logits_soft_cap: Default cap; ``None`` disables soft capping.
+            **kwargs: Forwarded to :class:`FlexibleAttentionModule`.
+        """
+        super().__init__(*args, **kwargs)
+        self.logits_soft_cap = None if logits_soft_cap is None else float(logits_soft_cap)
+
+    def forward(self, *args, logits_soft_cap: float | None = None, **kwargs):
+        """Run registered attention with the configured cap or a call-time override.
+
+        Args:
+            *args: Forwarded to :meth:`FlexibleAttentionModule.forward`.
+            logits_soft_cap: Per-call cap; ``None`` uses the constructor default.
+            **kwargs: Forwarded to :meth:`FlexibleAttentionModule.forward`.
+
+        Returns:
+            The base performer's :class:`AttentionOutput`.
+        """
+        if logits_soft_cap is None:
+            logits_soft_cap = self.logits_soft_cap
+        return super().forward(*args, logits_soft_cap=logits_soft_cap, **kwargs)
+
+    __call__ = forward
+
+
 Cfg = tp.TypeVar("Cfg", bound=EasyDeLBaseConfig)
 
 
@@ -887,19 +1117,6 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads, self.head_dim))
 
-    def _merge_heads(self, hidden_states):
-        """Collapse ``[batch, seq, heads, head_dim]`` back to ``[batch, seq, embed_dim]``.
-
-        Requires ``self.embed_dim``.
-
-        Args:
-            hidden_states: Tensor shaped ``[batch, seq, num_heads, head_dim]``.
-
-        Returns:
-            Tensor shaped ``[batch, seq, embed_dim]``.
-        """
-        return hidden_states.reshape((*hidden_states.shape[:2], self.embed_dim))
-
     def _softmax_aux(self) -> JArray | None:
         """Return this layer's attention-sink logits, or ``None``.
 
@@ -915,6 +1132,19 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
         """
         aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
         return getattr(aux, "value", aux)
+
+    def get_softmax_aux(self) -> JArray | None:
+        """Return unwrapped attention-sink logits through the layer's accessor.
+
+        Delegates to the existing ``_softmax_aux`` hook so subclasses overriding
+        that hook retain their behavior. Shared attention eligibility policies
+        can use this public API without inspecting parameter wrappers or family
+        attributes.
+
+        Returns:
+            The layer's sink logits, or ``None`` when no sinks are configured.
+        """
+        return self._softmax_aux()
 
     @staticmethod
     def apply_complex_rotary(
@@ -1024,16 +1254,7 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
             This allows for grouped query attention (GQA) where KV heads may
             be fewer than query heads.
         """
-        q_sharded: Float[JArray, "batch seq heads dim"] = apply_logical_sharding(
-            q,
-            dynamic_axes=common_types.AttnQSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        k_sharded: Float[JArray, "batch seq heads dim"] = apply_logical_sharding(
-            k,
-            dynamic_axes=common_types.AttnKVSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
+        q_sharded, k_sharded = self.apply_qk_shardings(q, k)
         v_sharded: Float[JArray, "batch seq heads dim"] = apply_logical_sharding(
             v,
             dynamic_axes=common_types.AttnKVSharding,
@@ -1146,39 +1367,10 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
             :class:`PartitionSpec` of ``tensor`` or, when absent, the
             spec of :attr:`default_key_value_sharding`.
         """
-        return getattr(tensor, "sharding", self.default_key_value_sharding).spec
-
-    @staticmethod
-    def _transpose_sequence_head(
-        *args: Float[JArray, "batch seq heads dim"],
-    ) -> collections.abc.Iterator[Float[JArray, "batch heads seq dim"]]:
-        """Swap the sequence and head axes of every input tensor.
-
-        Converts BTHD layout (``[batch, seq, heads, dim]``) to BHTD layout
-        (``[batch, heads, seq, dim]``) — the layout some kernels expect.
-
-        Args:
-            *args: Variable number of 4-D attention tensors.
-
-        Returns:
-            Lazy iterator yielding each input tensor transposed to BHTD.
-        """
-
-        def transpose_array(x: Float[JArray, "batch seq heads dim"]) -> Float[JArray, "batch heads seq dim"]:
-            """Swap the sequence and head axes of an attention tensor.
-
-            Args:
-                x: Tensor in BTHD layout, shape ``(batch, seq, heads, dim)``.
-
-            Returns:
-                jax.Array: Same tensor reshaped to BHTD layout,
-                ``(batch, heads, seq, dim)``.
-            """
-            transposed: Float[JArray, "batch heads seq dim"] = jnp.transpose(x, (0, 2, 1, 3))
-            return transposed
-
-        result_iterator: collections.abc.Iterator[Float[JArray, "batch heads seq dim"]] = map(transpose_array, args)
-        return result_iterator
+        sharding = getattr(tensor, "sharding", None)
+        if sharding is None:
+            sharding = self.default_key_value_sharding
+        return sharding.spec
 
     def _handle_cache_concat(
         self,
@@ -1186,13 +1378,14 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
         key: Float[JArray, "batch seq_k heads dim"],
         value: Float[JArray, "batch seq_v heads dim"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        mask_info: MaskInfo,
+        mask_info: MaskInfo | None,
         cache_view: TransformerCacheView | None,
         cache_metadata: TransformerMetadata | None,
+        causal: bool = True,
     ) -> tuple[
         Float[JArray, "batch seq_k heads dim"],
         Float[JArray, "batch seq_v heads dim"],
-        MaskInfo,
+        MaskInfo | None,
         TransformerCacheView | None,
         AttnMaskDetail | None,
     ]:
@@ -1209,6 +1402,8 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
             mask_info: Container for attention masks and segment information.
             cache_view: Current view into the KV cache, or None if caching disabled.
             cache_metadata: Metadata about cache state (indices, starts).
+            causal: Whether cache mask alignment should constrain queries to
+                past/current keys. Defaults to the existing causal behavior.
 
         Returns:
             Tuple containing:
@@ -1225,6 +1420,9 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
         if cache_is_none:
             return key, value, mask_info, None, None
 
+        # Keep default calls compatible with cache views implementing the older
+        # signature; only noncausal callers need the additional cache contract.
+        causal_kwargs = {} if causal else {"causal": False}
         key, value, mask_info, cache_view, masking_details = cache_view.concatenate_to_cache(
             query=query,
             key=key,
@@ -1234,6 +1432,7 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
             mask_info=mask_info,
             cache_metadata=cache_metadata,
             runtime_sharding_resolver=self.config.runtime_sharding_resolver,
+            **causal_kwargs,
         )
 
         return key, value, mask_info, cache_view, masking_details  # pyright: ignore[reportReturnType]
@@ -1278,8 +1477,10 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
             ValueError: If sliding_window contains negative values.
 
         Note:
-            In decode mode, KV tensors are dynamically sliced to the window.
-            In prefill mode, a trailing window is used for efficient processing.
+            Explicit query/key positions preserve the cache-owned KV layout and
+            intersect the mask in that coordinate system without slicing. Without
+            explicit positions, decode slices retain the union of every active
+            query's window and prefill keeps the full key range.
         """
         if isinstance(sliding_window, int):
             if sliding_window < 0:
@@ -1298,6 +1499,17 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
                 )
 
         attn = mask_info.attention_mask.astype(jnp.bool_)  # (B, H, Q, K)
+        # Cache-owned layouts can contain a rolled tail or a transient union of
+        # that tail and the current block. Their columns are not absolute token
+        # indexes. Intersect in the supplied coordinate system and retain the
+        # layout so positions, segments, auxiliary states and metadata stay aligned.
+        q_positions = getattr(mask_info, "q_positions", None)
+        kv_positions = getattr(mask_info, "kv_positions", None)
+        if q_positions is not None and kv_positions is not None:
+            relative = kv_positions[:, None, None, :] - q_positions[:, None, :, None]
+            attn = attn & (relative >= -left_window) & (relative <= right_window)
+            return key, value, mask_info.replace(attention_mask=attn, sliding_window_baked_in=True), cache_metadata
+
         B, _H, Q, K = attn.shape
         if query_length != Q:
             query_length = Q
@@ -1310,7 +1522,9 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
             indexes = jnp.zeros((B,), dtype=jnp.int32)
 
         offsets = jnp.zeros((B,), dtype=jnp.int32)
-        width = min(left_window + right_window + 1, K)
+        # A decode call can verify several tokens at once. Keep the union of
+        # their local windows, not just the final query's window.
+        width = min(left_window + right_window + (Q if mode == common_types.MODE_DECODE else 1), K)
 
         @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, None), out_axes=(0, 0, 0))
         def _select_slices(ikey, ival, imsk, offset, index, mode_):
@@ -1352,23 +1566,17 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
             if mode_ == common_types.MODE_DECODE:
                 # The active query rows are already local to the current decode step
                 # (typically Q=1), so only the KV axis needs window slicing.
-                current_row = index - 1
-                start_k = jnp.clip(current_row - left_window, 0, jnp.maximum(K - width, 0))
+                first_row = index - Q
+                start_k = jnp.clip(first_row - left_window, 0, jnp.maximum(K - width, 0))
                 imsk = jax.lax.dynamic_slice_in_dim(imsk, start_k, width, axis=2)  # (H,1,width)
                 ikey = jax.lax.dynamic_slice_in_dim(ikey, start_k, width, axis=0)  # (width, ...)
                 ival = jax.lax.dynamic_slice_in_dim(ival, start_k, width, axis=0)  # (width, ...)
                 return ikey, ival, imsk
 
-            elif mode_ == common_types.MODE_PREFILL:
-                # Trailing window on K, keep full Q
-                start_k = jnp.maximum(K - width, 0)
-                imsk = jax.lax.dynamic_slice_in_dim(imsk, start_k, width, axis=2)  # (H,Q,width)
-                ikey = jax.lax.dynamic_slice_in_dim(ikey, start_k, width, axis=0)  # (width, ...)
-                ival = jax.lax.dynamic_slice_in_dim(ival, start_k, width, axis=0)  # (width, ...)
-                return ikey, ival, imsk
-
-            else:
-                return ikey, ival, imsk
+            # Multi-query prefill needs each row's own local keys, including
+            # early rows. A trailing-cache slice would discard them (and can
+            # consist entirely of unwritten cells in an oversized cache).
+            return ikey, ival, imsk
 
         key, value, attn = _select_slices(key, value, attn, offsets, indexes, mode)
 
@@ -1390,15 +1598,16 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
         query: Array,
         key: Array,
         value: Array,
-        mask_info: MaskInfo,
+        mask_info: MaskInfo | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | common_types.EMPTY_VAL = common_types.NOT_GIVEN,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
-        sliding_window: int | None = None,
+        sliding_window: int | tuple[int, int] | None = None,
+        causal: bool = True,
     ) -> tuple[
         Array,
         Array,
-        Array,
+        MaskInfo | None,
         tp.Callable[[], Array],
         TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None,
         TransformerMetadata | RaggedPagesMetadata | None,
@@ -1434,8 +1643,9 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
             query: Current query states ``[batch, q_len, heads, dim]``.
             key: Current key states ``[batch, kv_len, heads, dim]``.
             value: Current value states ``[batch, kv_len, heads, dim]``.
-            mask_info: ejkernel :class:`MaskInfo` carrying the attention
-                mask plus segment/position metadata.
+            mask_info: Optional ejkernel :class:`MaskInfo` carrying the attention
+                mask plus segment/position metadata. ``None`` means all keys
+                are valid before applying causal, cache-bound and local masks.
             mode: Runtime mode. Pass :data:`common_types.NOT_GIVEN` to let
                 this method infer it from ``cache_view`` and ``query``
                 shape.
@@ -1443,9 +1653,15 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
                 (training path).
             cache_metadata: Optional companion metadata; auto-derived from
                 ``cache_view.starts`` / ``cache_view.indexes`` when ``None``.
-            sliding_window: Optional sliding-window size. When provided
-                (or when the cache marks the layer sliding) keys, values
-                and mask are sliced to a trailing window.
+            sliding_window: Optional window size or inclusive (left, right)
+                bounds. Cache-configured windows already baked into the mask
+                are preserved; a distinct explicit window intersects their
+                absolute-position visibility without changing the KV layout.
+                Without explicit positions, decode may slice KV to the union
+                of the active queries' windows.
+            causal: Whether transformer cache mask alignment is causal. Set
+                ``False`` for bidirectional attention over the appended block.
+                Defaults to ``True`` for backward compatibility.
 
         Returns:
             Six-tuple ``(key_states, value_states, mask_info,
@@ -1479,6 +1695,7 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
         if not is_ragged_cache and isinstance(cache_view, ParallelHybridCacheView):
             is_ragged_cache = cache_view.is_ragged
         if is_ragged_cache:
+            cache_metadata = _layer_cache_metadata(cache_metadata, cache_view)
             cache_view = cache_view.concatenate_to_cache(key=key, value=value, cache_metadata=cache_metadata)
 
             batch_size: int = query.shape[0]
@@ -1517,6 +1734,14 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
             batches_match: bool = query_batch == cache_batch
             assert batches_match, "Batch size mismatch between query and cache."
 
+        # Dense kernels can consume an absent mask directly. Cache alignment
+        # and explicit local-window slicing need a concrete visibility mask,
+        # however, even when the caller did not supply padding/segment data.
+        if mask_info is None and (cache_view is not None or sliding_window is not None):
+            mask_info = MaskInfo(
+                _attention_mask=jnp.ones((query.shape[0], 1, query_length, initial_key_length), dtype=jnp.bool_)
+            )
+
         key, value, mask_info, cache_view, _masking_details = self._handle_cache_concat(
             query=query,
             key=key,
@@ -1525,6 +1750,7 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
             mask_info=mask_info,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
+            causal=causal,
         )
 
         metadata_is_none: bool = cache_metadata is None
@@ -1553,21 +1779,31 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
             is_sliding_type: bool = has_masking_details and masking_details_final.mask_type == AttnMaskType.SLIDING
             sliding_window_computed: int | tuple[int, int]
             if is_sliding_type:
-                sliding_window_computed = sliding_window or masking_details_final.size
+                sliding_window_computed = masking_details_final.size if sliding_window is None else sliding_window
             else:
                 sliding_window_computed = sliding_window
 
-            key, value, mask_info, cache_metadata = self._apply_sliding_window(
-                key=key,
-                value=value,
-                mask_info=mask_info,
-                mode=mode_computed,
-                cache_view=cache_view,
-                sliding_window=sliding_window_computed,
-                query_length=query_length,
-                masking_details=masking_details_final,
-                cache_metadata=cache_metadata,
+            # Transformer sliding caches have already baked their configured
+            # window using absolute coordinates. Reapplying it against local KV
+            # columns loses valid history after overflow. Only that known-equal
+            # window can be omitted: a caller-baked mask without a configured
+            # sliding cache does not identify which window it contains.
+            distinct_window = sliding_window_provided and (
+                not is_sliding_type or sliding_window != masking_details_final.size
             )
+            window_baked_in = mask_info is not None and mask_info.sliding_window_baked_in
+            if not window_baked_in or distinct_window:
+                key, value, mask_info, cache_metadata = self._apply_sliding_window(
+                    key=key,
+                    value=value,
+                    mask_info=mask_info,
+                    mode=mode_computed,
+                    cache_view=cache_view,
+                    sliding_window=sliding_window_computed,
+                    query_length=query_length,
+                    masking_details=masking_details_final,
+                    cache_metadata=cache_metadata,
+                )
 
         dtype_self: jnp.dtype = self.dtype
 
@@ -1583,6 +1819,8 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
                 jax.Array: Bias broadcastable over ``(batch, heads,
                 query, key)``, in ``self.dtype``.
             """
+            if mask_info is None:
+                return jnp.zeros((query.shape[0], 1, query_length, key.shape[1]), dtype=dtype_self)
             bias: Array = mask_info.create_bias(dtype_self)
             return bias
 
@@ -1674,7 +1912,7 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
         return key, value
 
 
-def block_diagonal_bias(cu_seqlens, seq_length: int, dtype):
+def block_diagonal_bias(cu_seqlens, seq_length: int, dtype, *, add_head_axis: bool = False):
     """Additive block-diagonal attention bias from cumulative sequence lengths.
 
     Vision towers pack several images into one flat token sequence and rely on
@@ -1691,9 +1929,11 @@ def block_diagonal_bias(cu_seqlens, seq_length: int, dtype):
         cu_seqlens: Cumulative sequence lengths, shape ``(num_segments + 1,)``.
         seq_length: Total packed sequence length.
         dtype: Output dtype; also selects the mask-out sentinel.
+        add_head_axis: Return a four-dimensional, head-broadcast bias when True.
 
     Returns:
-        Additive bias of shape ``(1, seq_length, seq_length)``.
+        Additive bias of shape ``(1, seq_length, seq_length)``, or
+        ``(1, 1, seq_length, seq_length)`` when ``add_head_axis=True``.
     """
     positions = jnp.arange(seq_length)
     starts = cu_seqlens[:-1]
@@ -1703,4 +1943,4 @@ def block_diagonal_bias(cu_seqlens, seq_length: int, dtype):
     segment_ids = jnp.argmax(in_segment.astype(jnp.int32), axis=-1)
     same_segment = (segment_ids[:, None] == segment_ids[None, :]) & valid_position[:, None] & valid_position[None, :]
     attention_mask = jnp.where(same_segment, 0.0, jnp.finfo(dtype).min).astype(dtype)
-    return attention_mask[None, :, :]
+    return attention_mask[None, None, :, :] if add_head_axis else attention_mask[None, :, :]

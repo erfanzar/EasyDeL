@@ -90,6 +90,9 @@ class eSurgeCfg(TypedDict, total=False):
             ``model.drafter(...)`` by eSurge.
     """
 
+    model: NotRequired[dict[str, Any]]
+    kv_cache_dtype: NotRequired[Any | None]
+    decoding_engine: NotRequired[str | None]
     runtime: NotRequired[eSurgeRuntimeConfig]
     cache: NotRequired[eSurgeCacheRuntimeConfig]
     context: NotRequired[eSurgeContextConfig]

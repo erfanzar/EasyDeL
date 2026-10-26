@@ -50,6 +50,7 @@ from spectrax._internal.logging import LazyLogger, get_logger
 
 from . import _fs
 from ._compat import PyTree, flatten_dict
+from ._ocdbt import OcdbtSaveOptions
 from .async_manager import AsyncCheckpointManager
 
 logger: LazyLogger = get_logger("Checkpointer")
@@ -126,6 +127,8 @@ class Checkpointer:
         delete_old_temp_checkpoints: bool = True,
         max_to_keep: int | None = None,
         cleanup_uncommitted: bool = True,
+        ocdbt: bool = False,
+        ocdbt_options: OcdbtSaveOptions | None = None,
     ) -> None:
         """Create a :class:`Checkpointer`.
 
@@ -146,6 +149,10 @@ class Checkpointer:
                 Legacy checkpoints are never deleted by retention.
             cleanup_uncommitted: After each commit, delete uncommitted
                 protocol directories with a lower step (crashed saves).
+            ocdbt: Default layout for saves: ``True`` writes one coalesced OCDBT
+                store per prefix instead of one zarr store per array.
+            ocdbt_options: Default OCDBT write tuning (data-file size, TensorStore
+                concurrency).
 
         Raises:
             ValueError: If *step_policies* is not sorted by ``until`` or if a
@@ -174,6 +181,8 @@ class Checkpointer:
                 raise ValueError("Step policies must be sorted by 'until' value")
 
         self._manager = manager or AsyncCheckpointManager()
+        self.ocdbt = bool(ocdbt)
+        self.ocdbt_options = ocdbt_options
 
         if jax.process_index() == 0:
             self._checkpoint_cleanup_worker_queue: queue.Queue[str] = queue.Queue(maxsize=-1)
@@ -306,6 +315,8 @@ class Checkpointer:
         temporary: bool = False,
         write_index: bool = True,
         commit: bool = True,
+        ocdbt: bool | None = None,
+        ocdbt_options: OcdbtSaveOptions | None = None,
     ) -> str:
         """Save a PyTree under a specific prefix with treedef preserved.
 
@@ -324,6 +335,8 @@ class Checkpointer:
             commit: When ``step`` is given, commit the checkpoint after the
                 write (default). Pass ``False`` to write several prefixes and
                 call :func:`commit_checkpoint` yourself, or use :meth:`save`.
+            ocdbt: Write the OCDBT layout; ``None`` uses the checkpointer default.
+            ocdbt_options: OCDBT write tuning; ``None`` uses the checkpointer default.
 
         Returns:
             Full checkpoint directory path.
@@ -356,6 +369,8 @@ class Checkpointer:
             dtype=dtype,
             extras=merged_extras,
             write_index=write_index,
+            ocdbt=self.ocdbt if ocdbt is None else bool(ocdbt),
+            ocdbt_options=ocdbt_options if ocdbt_options is not None else self.ocdbt_options,
         )
 
         if step is not None and commit:
@@ -372,7 +387,7 @@ class Checkpointer:
         discover_latest: bool = True,
         discover_raise: bool = True,
         sharding_rules: tp.Sequence[tuple[str, NamedSharding]] | None = None,
-        dtype: jnp.dtype | None = None,
+        dtype: jnp.dtype | tp.Callable[[str], tp.Any] | None = None,
         load_treedef: bool = True,
         callback: tp.Callable[[jax.Array, str], jax.Array] | None = None,
         template: PyTree | None = None,
@@ -401,7 +416,8 @@ class Checkpointer:
             discover_raise: If ``True``, raise when no checkpoint is found.
             sharding_rules: Optional sequence of ``(regex, NamedSharding)``
                 pairs for sharding inference.
-            dtype: Optional dtype to cast loaded arrays to.
+            dtype: Optional dtype to cast loaded floating arrays to, or a callable
+                ``key -> dtype | None`` giving a per-array target (``None`` keeps the stored dtype).
             load_treedef: If ``False``, flatten the loaded tree to a
                 dotted-string dict.
             callback: Optional per-array callback ``fn(array, key) -> array``.
@@ -597,6 +613,8 @@ class Checkpointer:
                 dtype=dtype,
                 extras={**extras, "step": int(step)},
                 write_index=True,
+                ocdbt=self.ocdbt,
+                ocdbt_options=self.ocdbt_options,
             )
 
     def _finalize(
@@ -884,9 +902,10 @@ def _checkpoint_info(path: str) -> CheckpointInfo | None:
         logger.debug(f"Could not read metadata for {path}: {e}")
         return None
     try:
-        ts = dt.datetime.fromisoformat(str(meta.get("timestamp", "1970-01-01T00:00:00")))
-    except ValueError:
-        ts = dt.datetime.min
+        # Legacy metadata uses local, naive datetimes; EasyDeL state metadata includes a UTC offset.
+        ts = dt.datetime.fromisoformat(str(meta.get("timestamp", "1970-01-01T00:00:00"))).astimezone(dt.UTC)
+    except (ValueError, OverflowError):
+        ts = dt.datetime.min.replace(tzinfo=dt.UTC)
     legacy = "commit_protocol" not in meta
     committed = legacy or _fs.exists(_fs.joinpath(path, COMMIT_MARKER))
     try:

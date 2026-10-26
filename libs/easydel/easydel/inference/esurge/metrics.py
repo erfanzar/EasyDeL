@@ -59,11 +59,11 @@ import logging
 import time
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from statistics import fmean
 from threading import Lock
 from typing import Any
 
-from jax import numpy as jnp
+from eformer.paths import ePath
 
 
 @dataclass
@@ -313,7 +313,8 @@ class MetricsCollector:
         self.cache_metrics: deque[CacheMetrics] = deque(maxlen=history_size)
 
         self.counters = defaultdict(int)
-        self.timers = defaultdict(list)
+        # Bounded history of cache lifecycle events: ``(timestamp, event, details)``.
+        self.cache_events: deque[tuple[float, str, dict[str, Any] | None]] = deque(maxlen=history_size)
 
         self.last_log_time = time.time()
 
@@ -528,10 +529,13 @@ class MetricsCollector:
             details: Optional dictionary with event-specific details.
 
         Note:
-            Thread-safe. Increments a counter for the event type.
+            Thread-safe. Increments a counter for the event type and appends
+            ``(timestamp, event, details)`` to the bounded ``cache_events``
+            history, which is included in :meth:`export_metrics`.
         """
         with self._lock:
             self.counters[f"cache_event_{event}"] += 1
+            self.cache_events.append((time.time(), event, dict(details) if details is not None else None))
 
     def get_system_metrics(self, window_seconds: float = 60.0) -> SystemMetrics:
         """Get aggregated system metrics for the specified time window.
@@ -545,41 +549,52 @@ class MetricsCollector:
             metrics if no requests completed in the window.
 
         Note:
-            Thread-safe. Uses JAX numpy for mean calculations when data
-            is available.
+            Thread-safe. Averages are computed with plain host-side Python
+            statistics (no device dispatch) while holding the collector lock.
+        """
+        with self._lock:
+            return self._compute_system_metrics_locked(window_seconds)
+
+    def _compute_system_metrics_locked(self, window_seconds: float = 60.0) -> SystemMetrics:
+        """Aggregate system metrics; the caller must already hold ``self._lock``.
+
+        Args:
+            window_seconds: Time window in seconds to aggregate over.
+
+        Returns:
+            SystemMetrics aggregated over the window.
         """
         current_time = time.time()
         cutoff_time = current_time - window_seconds
 
-        with self._lock:
-            recent_requests = [req for req in self.completed_requests if req.end_time and req.end_time >= cutoff_time]
+        recent_requests = [req for req in self.completed_requests if req.end_time and req.end_time >= cutoff_time]
 
-            if not recent_requests:
-                return SystemMetrics(timestamp=current_time)
+        if not recent_requests:
+            return SystemMetrics(timestamp=current_time)
 
-            total_completed = len(recent_requests)
-            total_failed = len([req for req in recent_requests if req.error])
-            total_tokens = sum(req.generated_tokens for req in recent_requests)
+        total_completed = len(recent_requests)
+        total_failed = len([req for req in recent_requests if req.error])
+        total_tokens = sum(req.generated_tokens for req in recent_requests)
 
-            latencies = [req.total_latency for req in recent_requests if req.total_latency]
-            ttfts = [req.time_to_first_token for req in recent_requests if req.time_to_first_token]
-            throughputs = [req.tokens_per_second for req in recent_requests if req.tokens_per_second > 0]
+        latencies = [req.total_latency for req in recent_requests if req.total_latency]
+        ttfts = [req.time_to_first_token for req in recent_requests if req.time_to_first_token]
+        throughputs = [req.tokens_per_second for req in recent_requests if req.tokens_per_second > 0]
 
-            avg_latency = float(jnp.mean(jnp.array(latencies))) if latencies else 0.0
-            avg_ttft = float(jnp.mean(jnp.array(ttfts))) if ttfts else 0.0
-            avg_throughput = float(jnp.mean(jnp.array(throughputs))) if throughputs else 0.0
-            requests_per_second = total_completed / window_seconds
+        avg_latency = fmean(latencies) if latencies else 0.0
+        avg_ttft = fmean(ttfts) if ttfts else 0.0
+        avg_throughput = fmean(throughputs) if throughputs else 0.0
+        requests_per_second = total_completed / window_seconds
 
-            return SystemMetrics(
-                timestamp=current_time,
-                total_requests_completed=total_completed,
-                total_requests_failed=total_failed,
-                total_tokens_generated=total_tokens,
-                average_latency=avg_latency,
-                average_ttft=avg_ttft,
-                average_throughput=avg_throughput,
-                requests_per_second=requests_per_second,
-            )
+        return SystemMetrics(
+            timestamp=current_time,
+            total_requests_completed=total_completed,
+            total_requests_failed=total_failed,
+            total_tokens_generated=total_tokens,
+            average_latency=avg_latency,
+            average_ttft=avg_ttft,
+            average_throughput=avg_throughput,
+            requests_per_second=requests_per_second,
+        )
 
     def log_summary(self, force: bool = False) -> None:
         """Log a summary of current metrics.
@@ -598,7 +613,7 @@ class MetricsCollector:
             return
 
         with self._lock:
-            system_metrics = self.get_system_metrics()
+            system_metrics = self._compute_system_metrics_locked()
 
             latest_scheduler = self.scheduler_metrics[-1] if self.scheduler_metrics else None
             latest_runner = self.runner_metrics[-1] if self.runner_metrics else None
@@ -635,18 +650,20 @@ class MetricsCollector:
         with self._lock:
             data = {
                 "timestamp": time.time(),
-                "system_metrics": asdict(self.get_system_metrics()),
+                "system_metrics": asdict(self._compute_system_metrics_locked()),
                 "completed_requests": [asdict(req) for req in self.completed_requests],
                 "scheduler_metrics": [asdict(m) for m in self.scheduler_metrics],
                 "runner_metrics": [asdict(m) for m in self.runner_metrics],
                 "cache_metrics": [asdict(m) for m in self.cache_metrics],
+                "cache_events": [
+                    {"timestamp": ts, "event": name, "details": details} for ts, name, details in self.cache_events
+                ],
                 "counters": dict(self.counters),
             }
 
-        path = Path(file_path)
+        path = ePath(file_path)
         if format.lower() == "json":
-            with open(path, "w") as f:
-                json.dump(data, f, indent=2)
+            path.write_text(json.dumps(data, indent=2))
         else:
             raise ValueError(f"Unsupported format: {format}")
 
@@ -666,7 +683,7 @@ class MetricsCollector:
             self.runner_metrics.clear()
             self.cache_metrics.clear()
             self.counters.clear()
-            self.timers.clear()
+            self.cache_events.clear()
 
 
 _global_metrics_collector: MetricsCollector | None = None

@@ -24,7 +24,6 @@ SimPO, etc.).
 from __future__ import annotations
 
 import typing as tp
-from collections import defaultdict
 from functools import partial
 
 import numpy as np
@@ -191,8 +190,6 @@ class DPOTrainer(Trainer):
             if data_collator is None
             else data_collator
         )
-
-        self._stored_metrics = defaultdict(lambda: defaultdict(list))
 
         if isinstance(model, str):
             reject_string_model_id(model, role="policy model")
@@ -477,9 +474,9 @@ class DPOTrainer(Trainer):
         sharded_evaluation_step_function = compile_trainer_step(
             evaluation_step,
             in_shardings=(
-                self.state_shardings,
+                self.eval_state_shardings,
                 empty_sharding,
-                self.reference_state.shardings,
+                self._eval_shared_fn_extra_args[0].shardings,
             ),
             out_shardings=empty_sharding,
             static_argnums=sharded_evaluation_static_argnums,
@@ -702,6 +699,7 @@ class DPOTrainer(Trainer):
                 loss_type=self.arguments.loss_type,
                 logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
                 use_weighting=self.arguments.use_weighting,
+                ld_alpha=self.arguments.ld_alpha,
             )
         else:
             outs = forward_fn(reference_model, batch=padded_batch)
@@ -714,8 +712,40 @@ class DPOTrainer(Trainer):
 
     @property
     def _eval_shared_fn_extra_args(self) -> tuple[tp.Any]:
-        """Forward the reference state alongside the shared evaluation step."""
-        return (self.reference_state,)
+        """Use the live reference buffers with evaluation-only static metadata."""
+        graphdef = getattr(self, "_eval_reference_graphdef", None)
+        reference = self.reference_state
+        if graphdef is not None:
+            reference = reference.replace(graphdef=graphdef)
+        return (reference,)
+
+    def _configure_eval_config_override(self):
+        """Apply evaluation config overrides to the reference forward as well."""
+        super()._configure_eval_config_override()
+        self._eval_reference_graphdef = None
+        if self._eval_graphdef is not None and self.reference_state is not None:
+            self._eval_reference_graphdef = self._build_config_override_graphdef(
+                model=self.reference_state.model,
+                overrides=self.arguments.eval_config_overrides,
+                reference_graphstate=self.reference_state.graphstate,
+                trainable_selector=None,
+                label="eval_config_overrides (reference)",
+                eval_mode=True,
+            )
+
+    def _preprocess_batch_input(self, state, batch, is_train):
+        """Do not use immutable cached scores for a moving reference model."""
+        batch, infos = super()._preprocess_batch_input(state, batch, is_train)
+        if self.arguments.sync_ref_model:
+            batch = dict(batch)
+            for name in (
+                "ref_chosen_logps",
+                "ref_rejected_logps",
+                "reference_chosen_log_probs",
+                "reference_rejected_log_probs",
+            ):
+                batch.pop(name, None)
+        return batch, infos
 
     def on_step_end(
         self,

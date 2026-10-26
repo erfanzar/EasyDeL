@@ -609,15 +609,25 @@ def define_flags_with_default(
 
     default_values = {}
 
+    def parse_bool(value):
+        normalized = value.lower()
+        if normalized in ("true", "1", "yes", "on"):
+            return True
+        if normalized in ("false", "0", "no", "off"):
+            return False
+        raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}")
+
     for name, value in kwargs.items():
         default_values[name] = value
 
-        if isinstance(value, tuple):
+        if isinstance(value, bool):
+            parser.add_argument(f"--{name}", type=parse_bool, default=value, help=f"Value for {name} (True/False)")
+        elif isinstance(value, tuple):
             # For tuples, use a custom action to convert the string to a tuple of ints
             parser.add_argument(
                 f"--{name}",
                 type=str,  # Read as string
-                default=str(value),  # Store default as string
+                default=value,  # argparse leaves non-string defaults untouched, so omitting the flag keeps the tuple
                 help=f"Value for {name} (comma-separated integers)",
                 action=StoreTupleAction,
             )

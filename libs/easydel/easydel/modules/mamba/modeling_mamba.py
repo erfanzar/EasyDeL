@@ -49,6 +49,8 @@ from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info, se
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import ColumnParallelLinear, Embed
 from easydel.layers import RMSNorm as MambaRMSNorm
+from easydel.layers.linear_attention import ChannelMajorConv1D
+from easydel.layers.linears import rescaled_residual_init
 from easydel.modules._base import BaseCausalLMModule
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import SSM1Op
@@ -88,141 +90,8 @@ class MambaCausalLMOutput(BaseModelOutput):
     last_hidden_state: Array | None = None
 
 
-class Lambda(spx.Module):
-    """Convenience wrapper to insert callables into module pipelines.
-
-    Wraps a Python callable as an ``spx.Module`` so it can participate in the
-    Spectrax module tree (e.g. inside ``nn.ModuleList``).
-
-    Attributes:
-        fn (Callable): The callable invoked by ``forward``.
-    """
-
-    fn: tp.Callable
-
-    def forward(self, x, **kwargs):
-        """Invoke the wrapped callable.
-
-        Args:
-            x: Primary positional argument forwarded to ``fn``.
-            **kwargs: Additional keyword arguments forwarded to ``fn``.
-
-        Returns:
-            The return value of ``fn(x, **kwargs)``.
-        """
-        return self.fn(x, **kwargs)
-
-
-class MambaConv1D(spx.Module):
-    """Causal depthwise 1-D convolution feeding the Mamba selective scan.
-
-    Mamba prepends a small ``conv_kernel``-wide depthwise convolution
-    (``feature_group_count = features``) on the channel-major layout
-    ``(batch, features, seq_len)`` so that each token mixes a short local
-    window before being fed into the otherwise *pointwise* recurrence. The
-    convolution is left-padded with ``(conv_kernel - 1)`` zeros so it stays
-    causal during prefill, and during decode the same effect is reproduced
-    incrementally via the cached ``conv_state`` rolling buffer.
-
-    Attributes:
-        weight (ArrayParam): Kernel of shape ``(kernel_size, 1, features)``;
-            transposed and broadcast over the depthwise group at apply-time.
-        bias (ArrayParam): Optional per-channel bias of shape ``(features,)``.
-        features (int): Number of channels (== ``intermediate_size`` in the mixer).
-        kernel_size (int): Convolution kernel width / size of the rolling cache.
-    """
-
-    def __init__(
-        self,
-        features: int,
-        kernel_size: int = 1,
-        stride: int = 1,
-        padding: int = 0,
-        dilation: int = 1,
-        groups: int = 1,
-        use_bias: bool = True,
-        num_spatial_dims: int = 1,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: str | lax.Precision | None = None,
-        *,
-        rngs: spx.Rngs,
-    ):
-        """Initialize Mamba 1D convolution layer.
-
-        Args:
-            features (int): Number of output features (channels).
-            kernel_size (int, optional): Size of the convolutional kernel. Defaults to 1.
-            stride (int, optional): Stride of the convolution. Defaults to 1.
-            padding (int, optional): Padding applied to input. Defaults to 0.
-            dilation (int, optional): Dilation rate for the kernel. Defaults to 1.
-            groups (int, optional): Number of groups for grouped convolution. Defaults to 1.
-            use_bias (bool, optional): Whether to include a bias term. Defaults to True.
-            num_spatial_dims (int, optional): Number of spatial dimensions. Defaults to 1.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-        """
-        kernel_shape = (kernel_size, 1, features)
-        self.weight = ArrayParam.bound(
-            shape=kernel_shape,
-            dtype=param_dtype,
-            init_method="lecun_normal",
-            key=rngs.parameters,
-        )
-
-        if use_bias:
-            self.bias = ArrayParam.bound(
-                shape=(features,),
-                dtype=param_dtype,
-                init_method="zeros",
-                key=rngs.parameters,
-            )
-
-        self.features = features
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
-        self.groups = groups
-        self.use_bias = use_bias
-        self.num_spatial_dims = num_spatial_dims
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-
-    def forward(self, x: Array) -> Array:
-        """Apply 1D convolution to input tensor.
-
-        Args:
-            x (Array): Input tensor of shape (batch, features, sequence_length).
-
-        Returns:
-            Array: Convolved output tensor of shape (batch, features, output_length).
-
-        Raises:
-            ValueError: If input tensor rank does not match expected rank.
-        """
-        unbatched_rank = self.num_spatial_dims + 2
-        if x.ndim != unbatched_rank:
-            raise ValueError(
-                f"Input to `Conv` needs to have rank {unbatched_rank}, but input has shape {x.shape}.",
-            )
-        org_x_dtype = x.dtype
-        x = lax.conv_general_dilated(
-            lhs=x.astype(self.dtype),
-            rhs=jnp.asarray(jnp.swapaxes(self.weight.value, 0, 2), dtype=self.dtype),
-            window_strides=(self.stride,),
-            padding=((self.padding, self.padding),),
-            rhs_dilation=(self.dilation,),
-            feature_group_count=self.groups,
-        )
-
-        if self.use_bias:
-            x = x + jnp.asarray(self.bias.value.reshape(1, -1, 1), dtype=self.dtype)
-
-        return x.astype(org_x_dtype)
+# Mamba mixer front-end convolution: the shared channel-major layer (same parameter names/layout).
+MambaConv1D = ChannelMajorConv1D
 
 
 class MambaMixer(spx.Module):
@@ -304,6 +173,9 @@ class MambaMixer(spx.Module):
             kernel_size=config.conv_kernel,
             groups=intermediate_size,
             padding=config.conv_kernel - 1,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
             rngs=rngs,
         )
 
@@ -341,7 +213,7 @@ class MambaMixer(spx.Module):
             dt = jax.lax.clamp(
                 config.time_step_floor,
                 jnp.exp(
-                    jax.random.normal(
+                    jax.random.uniform(
                         key=key,
                         shape=shape,
                         dtype=jnp.float32,
@@ -380,11 +252,15 @@ class MambaMixer(spx.Module):
             bias_init=init_bias_dt,
             rngs=rngs,
         )
+        out_proj_kwargs = {}
+        if config.rescale_prenorm_residual:
+            out_proj_kwargs["kernel_init"] = rescaled_residual_init(config.num_hidden_layers)
         self.out_proj = linear_class(
             intermediate_size,
             hidden_size,
             use_bias=config.use_bias,
             rngs=rngs,
+            **out_proj_kwargs,
         )
         A = repeat(jnp.arange(1, ssm_state_size + 1, dtype=jnp.float32), "n -> d n", d=intermediate_size)
 
@@ -430,8 +306,9 @@ class MambaMixer(spx.Module):
         * **Prefill / training** (``seq_len > 1`` or no cache): the full
           ``conv1d`` is applied with left-padding of ``conv_kernel - 1`` and
           the trailing ``conv_kernel`` columns are saved into the cache for
-          later decode steps. ``SSM1Op`` runs as a parallel associative scan
-          across the whole sequence.
+          later decode steps. ``SSM1Op`` runs the configured associative or
+          sequential scan across the whole sequence, using the registered
+          kernel backend unless ``use_mambapy`` selects the Python reference.
         * **Decode** (``seq_len == 1`` with cache): the cached ``conv_state``
           rolling buffer is updated with the new token, the convolution
           collapses to a single dot product, and ``SSM1Op`` performs one
@@ -475,7 +352,7 @@ class MambaMixer(spx.Module):
 
         is_inference = seq_len == 1 and cache is not None
 
-        if is_inference and cache is not None and cache.conv_state is not None:
+        if is_inference and segment_ids is None and cache is not None and cache.conv_state is not None:
             new_hidden = hidden_states[:, :, 0]
             conv_state, _, cache_view = cache.concatenate_to_cache(conv_state=new_hidden)
 
@@ -488,7 +365,11 @@ class MambaMixer(spx.Module):
         else:
             conv_input = hidden_states
             if segment_ids is None:
-                conv_out = self.conv1d(conv_input)[..., :seq_len]
+                history_length = 0
+                if cache is not None and cache.conv_state is not None:
+                    history_length = cache.conv_state.shape[-1]
+                    conv_input = jnp.concatenate((cache.conv_state.astype(dtype), conv_input), axis=-1)
+                conv_out = self.conv1d(conv_input)[..., history_length : history_length + seq_len]
                 hidden_states = self.act(conv_out).astype(dtype)
             else:
                 kernel = jnp.asarray(self.conv1d.weight).squeeze(1).T
@@ -498,6 +379,7 @@ class MambaMixer(spx.Module):
                     kernel,
                     segment_ids,
                     bias=bias,
+                    initial_state=cache.conv_state if cache is not None else None,
                     activation=self.act,
                     output_dtype=dtype,
                 )
@@ -505,10 +387,10 @@ class MambaMixer(spx.Module):
 
             if cache is not None:
                 if segment_ids is None:
-                    if seq_len >= self.conv_kernel_size:
+                    if conv_input.shape[-1] >= self.conv_kernel_size:
                         new_conv_state = conv_input[:, :, -self.conv_kernel_size :]
                     else:
-                        pad_width = self.conv_kernel_size - seq_len
+                        pad_width = self.conv_kernel_size - conv_input.shape[-1]
                         new_conv_state = jnp.pad(conv_input, ((0, 0), (0, 0), (pad_width, 0)))
 
                 cache_view = cache.replace(conv_state=new_conv_state) if cache_view is not None else cache_view
@@ -549,6 +431,10 @@ class MambaMixer(spx.Module):
             ssm_state=ssm_state,
             segment_ids=segment_ids,
             activation=self.activation,
+            # Backend selection and scan algorithm are independent settings.
+            # The registered SSM1 operation consumes both, including for packed inputs.
+            use_associative_scan=bool(self.config.use_associative_scan),
+            use_mambapy=bool(self.config.use_mambapy),
         )
 
         scan_output = jnp.swapaxes(ssm_output.attention_outputs, 1, 2)
@@ -872,6 +758,7 @@ class MambaModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, all_hidden_states, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm_f(hidden_states)
 
@@ -972,6 +859,7 @@ class MambaForCausalLM(BaseCausalLMModule[MambaModel, MambaConfig]):  # type: ig
         apply_lm_head: bool = True,
         attention_mask: Array | None = None,
         output_hidden_states: bool | None = None,
+        mask_info: MaskInfo | None = None,
         **kwargs,
     ) -> tuple | MambaCausalLMOutput:
         """Run the SSM trunk and (optionally) project to vocab logits.
@@ -989,6 +877,7 @@ class MambaForCausalLM(BaseCausalLMModule[MambaModel, MambaConfig]):  # type: ig
             attention_mask: ``(batch, seq_len)`` padding mask forwarded to the
                 trunk.
             output_hidden_states: Optional per-layer hidden state trace.
+            mask_info: Packed document boundaries forwarded unchanged to the trunk.
             **kwargs: Ignored (consumed for cross-model call-site parity).
 
         Returns:
@@ -1000,6 +889,7 @@ class MambaForCausalLM(BaseCausalLMModule[MambaModel, MambaConfig]):  # type: ig
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             cache=cache,
             output_hidden_states=output_hidden_states,

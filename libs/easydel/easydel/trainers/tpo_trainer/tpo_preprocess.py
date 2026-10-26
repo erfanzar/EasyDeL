@@ -98,8 +98,22 @@ class TPOPreprocessTransform:
                         "`chosen`/`rejected`; provide an explicit `prompt` column."
                     )
                 result["reference"] = reference[len(prompt) :]
+            elif isinstance(prompt, list) and isinstance(reference, list):
+                if reference[: len(prompt)] != prompt:
+                    raise ValueError(
+                        "The `reference` conversation does not start with the implicit prompt extracted from "
+                        "`chosen`/`rejected`; provide an explicit `prompt` column."
+                    )
+                result["reference"] = reference[len(prompt) :]
 
-        result = maybe_apply_chat_template(result, self._tokenizer, resolve_example_tools(result, self._tools))
+        tools = resolve_example_tools(result, self._tools)
+        # Reuse the same prompt-plus-suffix renderer for the gold branch, not a
+        # standalone chat template (which would duplicate the prompt/role prefix).
+        rendered_reference = maybe_apply_chat_template(
+            {"prompt": result["prompt"], "completion": result["reference"]}, self._tokenizer, tools
+        )["completion"]
+        result = maybe_apply_chat_template(result, self._tokenizer, tools)
+        result["reference"] = rendered_reference
         return self._tokenize(result)
 
     def _tokenize(self, example: dict[str, tp.Any]) -> dict[str, tp.Any]:

@@ -45,7 +45,6 @@ from functools import partial
 from typing import Self
 
 import jax
-import numpy
 import spectrax as spx
 from eformer.loggings import get_logger
 from jax.sharding import NamedSharding, PartitionSpec
@@ -432,12 +431,6 @@ class EasyShardingMixin:
                             spec=PartitionSpec(*tuple(out.spec)[: leaf.ndim]),
                         )
                     return out
-            if (
-                (hasattr(leaf, "shape") and int(numpy.prod(leaf.shape)) < 128)
-                or (len(getattr(leaf, "shape", ())) == 0)
-                or (not hasattr(leaf, "shape"))
-            ):
-                return empty_sharding
             return empty_sharding
 
         return jax.tree_util.tree_map_with_path(lambda path, leaf: _spec_for(jax_path_to_string(path), leaf), tree)
@@ -617,8 +610,22 @@ class EasyShardingMixin:
         """
         mesh = self._get_mesh(mesh)
         gdef, graphstate, graphother = self.split_module()
-        graphstate = jax.tree_util.tree_map(lambda o: jax.device_get(o), graphstate)
-        graphother = jax.tree_util.tree_map(lambda o: jax.device_get(o), graphother)
+
+        def _gather_leaf(value):
+            """Transfer addressable shards directly; gather remote leaves one at a time."""
+            if not isinstance(value, jax.Array) or value.is_fully_addressable:
+                return jax.device_get(value)
+
+            # Only the current leaf may need an accelerator all-gather. Never
+            # replicate the full model: it may fit HBM only while sharded.
+            @partial(spx.jit, mesh=mesh, out_shardings=replicated_named_sharding(mesh))
+            def _replicate_leaf(leaf):
+                return leaf
+
+            return jax.device_get(_replicate_leaf(value))
+
+        with mesh:
+            graphstate, graphother = jax.tree_util.tree_map(_gather_leaf, (graphstate, graphother))
         self = self.merge_module(gdef, graphstate, graphother)
         if overlay_fns is not None:
             self = self._apply_sharding_fns(overlay_fns)
@@ -670,7 +677,7 @@ class EasyShardingMixin:
             ... )
             >>> model = model.apply_out_shardings(shardings)
         """
-        splits = self.split_module()
+        graphdef, graphstate, graphother = self.split_module()
 
         # # @erfanzar NOTE: spx.jit (not jax.jit) so MPMD meshes route to
         # sxjit and per-stage out_shardings land on the right submesh.
@@ -688,8 +695,8 @@ class EasyShardingMixin:
             """
             return graphstate, graphother
 
-        splits[1:] = _call(*splits[1:])
-        return self.merge_module(*splits)
+        graphstate, graphother = _call(graphstate, graphother)
+        return self.merge_module(graphdef, graphstate, graphother)
 
     def fully_gather(self: Self) -> Self:
         """Apply JAX sharding constraints to gather all parameters.

@@ -57,8 +57,6 @@ Example:
     >>> output = decode_attn(query, cached_keys, cached_values, cache_metadata)
 """
 
-import math
-
 import jax
 from ejkernel.modules import ragged_decode_attention  # pyright: ignore[reportMissingTypeStubs]
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
@@ -71,7 +69,7 @@ from easydel.caching import TransformerCacheView
 from easydel.caching.transformer import TransformerMetadata
 
 from .._attention_outputs import AttentionOutput
-from .._operation_impl import OperationImpl, OperationRegistry, axis_entry_shard_factor
+from .._operation_impl import OperationImpl, OperationRegistry
 from .._operation_meta import normalize_head_sinks
 from ..requirements import (
     CacheType,
@@ -99,15 +97,17 @@ def _slice_decode_window_for_vanilla_fallback(
     absolute cache coordinates. The vanilla fallback does not, so for non-GPU
     decode we explicitly slice the cached KV axis and the materialized mask
     to the live per-request window before calling the generic attention
-    implementation.
+    implementation. Explicit-position or already-baked inputs retain their
+    aligned columns, with window validity materialized by the caller instead.
 
     Args:
         key: Cached key tensor of shape ``(batch, kv_seq_len, num_kv_heads,
             head_dim)``.
         value: Cached value tensor of shape ``(batch, kv_seq_len,
             num_kv_heads, head_dim)``.
-        mask_info: Optional :class:`MaskInfo` whose attention mask, segment
-            ids and positions are sliced in lockstep with the KV tensors.
+        mask_info: Optional :class:`MaskInfo` whose attention mask and segment
+            ids are sliced in lockstep with zero-origin KV tensors. Explicit
+            positions or baked visibility disable the physical slice.
         cache_metadata: Per-batch cache metadata; only ``indexes`` (current
             lengths) is consulted to compute the slice start.
         sliding_window: Either an ``int`` window size (HF convention, i.e.
@@ -118,10 +118,18 @@ def _slice_decode_window_for_vanilla_fallback(
         tuple: ``(key, value, mask_info)`` where each tensor is reduced along
         the ``kv_seq_len`` axis to ``min(left + right + 1, kv_seq_len)`` and
         ``mask_info`` is ``replace``-d so that ``sliding_window_baked_in``
-        is ``True``. When ``sliding_window`` is ``None`` the inputs are
-        returned unchanged.
+        is ``True``. When ``sliding_window`` is ``None``, or ``mask_info``
+        carries explicit positions or baked visibility, the inputs are unchanged.
     """
     if sliding_window is None:
+        return key, value, mask_info
+    if mask_info is not None and (
+        mask_info.kv_positions is not None or mask_info.q_positions is not None or mask_info.sliding_window_baked_in
+    ):
+        # Explicit positions may describe rolled or reordered storage, not the
+        # zero-origin cache assumed by the contiguous slice below. The caller
+        # has already materialized absolute-coordinate window validity, so keep
+        # the aligned KV/mask columns (and any segment/position metadata).
         return key, value, mask_info
 
     if isinstance(sliding_window, int):
@@ -185,31 +193,33 @@ def _slice_decode_window_for_vanilla_fallback(
             )(kv_segment_ids, start_k)
             replace_kwargs["kv_segment_ids"] = kv_segment_ids
 
-    kv_positions = mask_info.kv_positions
-    if kv_positions is not None and kv_positions.shape[-1] == kv_len:
-        kv_positions = jax.vmap(
-            lambda row, sk: jax.lax.dynamic_slice_in_dim(row, sk, width, axis=0),
-            in_axes=(0, 0),
-            out_axes=0,
-        )(kv_positions, start_k)
-        replace_kwargs["kv_positions"] = kv_positions
-
     return key, value, mask_info.replace(**replace_kwargs)
 
 
-def _decode_validity_mask(kv_len: int, cache_metadata, sliding_window) -> jax.Array | None:
+def _decode_validity_mask(
+    kv_len: int, cache_metadata, sliding_window, mask_info: MaskInfo | None = None
+) -> jax.Array | None:
     """Absolute-coordinate decode validity ``(B, 1, 1, kv_len)`` for the vanilla fallback.
 
-    A slot ``k`` is valid when ``starts <= k < indexes`` and, with a sliding window, when it lies in
-    ``[q - left, q + right]`` for the decoded query position ``q = indexes - 1``. Returns ``None``
-    when the cache metadata carries no ``indexes``.
+    A slot at absolute position ``k`` is valid when ``starts <= k < indexes`` and, with a sliding
+    window, when it lies in ``[q - left, q + right]``. Explicit ``MaskInfo`` positions describe the
+    actual KV columns of rolled/reordered caches; without them, positions default to zero-origin
+    storage and ``q = indexes - 1``. A baked mask without positions remains authoritative because
+    its columns cannot safely be mapped back to the original cache. Returns ``None`` in that case
+    or when the cache metadata carries no ``indexes``.
     """
     indexes = getattr(cache_metadata, "indexes", None)
     if indexes is None:
         return None
+    kv_positions = None if mask_info is None else mask_info.kv_positions
+    if kv_positions is None and mask_info is not None and mask_info.sliding_window_baked_in:
+        return None
     indexes = jnp.asarray(indexes, jnp.int32).reshape(-1, 1)
-    kv_idx = jnp.arange(kv_len, dtype=jnp.int32)[None, :]
-    valid = kv_idx < indexes
+    if kv_positions is None:
+        kv_idx = jnp.arange(kv_len, dtype=jnp.int32)[None, :]
+    else:
+        kv_idx = jnp.asarray(kv_positions, jnp.int32).reshape(-1, kv_len)
+    valid = (kv_idx >= 0) & (kv_idx < indexes)
     starts = getattr(cache_metadata, "starts", None)
     if starts is not None:
         valid = valid & (kv_idx >= jnp.asarray(starts, jnp.int32).reshape(-1, 1))
@@ -218,7 +228,10 @@ def _decode_validity_mask(kv_len: int, cache_metadata, sliding_window) -> jax.Ar
             left = right = max(int(sliding_window) - 1, 0)
         else:
             left, right = map(int, sliding_window)
-        q_pos = jnp.maximum(indexes - 1, 0)
+        q_positions = None if mask_info is None else mask_info.q_positions
+        q_pos = (
+            jnp.maximum(indexes - 1, 0) if q_positions is None else jnp.asarray(q_positions, jnp.int32).reshape(-1, 1)
+        )
         valid = valid & (kv_idx >= q_pos - left) & (kv_idx <= q_pos + right)
     return valid[:, None, None, :]
 
@@ -315,18 +328,26 @@ class AutoRegressiveDecodeAttn(OperationImpl):
             fb_ignores = dict(ignores)
             mask_info = fb_ignores.pop("mask_info", None)
             fb_ignores.pop("causal", None)
+            if mask_info is None and fb_ignores.get("bias") is None and fb_ignores.get("init_bias") is not None:
+                # Materializing cache validity below must not suppress Vanilla's
+                # lazy-bias initialization, which otherwise requires no mask.
+                fb_ignores["bias"] = fb_ignores.pop("init_bias")()
             # Vanilla attention ignores ``cache_metadata`` and gets ``sliding_window=None``: bake the
             # valid cache range ``[starts, indexes)`` AND the absolute sliding window around the
             # query position into a materialized full-width mask before slicing (r11 S07-1,
             # r12 S07-1/S07-2). Lazy segment masks are materialized so the bounds are never dropped,
             # and a slice clipped at the cache end only exposes slots this mask already excludes.
-            validity = _decode_validity_mask(key.shape[1], cache_metadata, sliding_window)
+            validity = _decode_validity_mask(key.shape[1], cache_metadata, sliding_window, mask_info=mask_info)
             if validity is not None:
                 if mask_info is None:
                     mask_info = MaskInfo(_attention_mask=validity)
                 else:
                     existing = jnp.asarray(mask_info.get_or_compute_attention_mask(dtype=jnp.bool_), bool)
                     kv_len = key.shape[1]
+                    if existing.ndim == 2:
+                        existing = existing[:, None, None, :]
+                    elif existing.ndim == 3:
+                        existing = existing[:, None, :, :]
                     if existing.ndim == 4 and existing.shape[-1] < kv_len:
                         # Same convention as the cache view's ``_expand_mask_kv_dim``: unseen slots pad True.
                         pad = ((0, 0), (0, 0), (0, 0), (0, kv_len - existing.shape[-1]))
@@ -342,7 +363,10 @@ class AutoRegressiveDecodeAttn(OperationImpl):
                 value=value,
                 mask_info=mask_info,
                 cache_metadata=cache_metadata,
-                sliding_window=sliding_window,
+                # Keep the full-width tensors when an additive bias is present:
+                # validity already encodes the window, and slicing only KV/mask
+                # would misalign the caller's absolute-coordinate bias.
+                sliding_window=None if fb_ignores.get("bias") is not None else sliding_window,
             )
             vanilla_attn: VanillaAttn = VanillaAttn(self.metadata)
             return vanilla_attn(
@@ -359,7 +383,16 @@ class AutoRegressiveDecodeAttn(OperationImpl):
                 **fb_ignores,
             )
 
-        if jax.default_backend() != "gpu":
+        if (
+            jax.default_backend() != "gpu"
+            or ignores.get("mask_info") is not None
+            or ignores.get("bias") is not None
+            or ignores.get("init_bias") is not None
+            or not ignores.get("normalize_output", True)
+            or ignores.get("dropout_prob", 0.0) > 0.0
+        ):
+            # Contiguous cache bounds cannot represent arbitrary visibility,
+            # additive bias, unnormalized attention or weight dropout.
             return _vanilla_fallback()
         head_dim: int = query.shape[-1]
         softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
@@ -409,16 +442,9 @@ class AutoRegressiveDecodeAttn(OperationImpl):
         # LOCAL KV heads. When the KV-head count does not divide the query-head shard factor the
         # KV axis is replicated while queries stay sharded, so shards pair queries with the wrong
         # KV group. Block-repeat KV heads by the minimal factor; blocked repeat keeps h -> h // G.
-        num_q_heads: int = query.shape[2]
-        num_kv_heads: int = key.shape[2]
-        head_shard_factor = 1
-        if query_sharding is not None and len(query_sharding) > 1:
-            head_shard_factor = axis_entry_shard_factor(self.metadata.mesh, query_sharding[1])
-        if head_shard_factor > 1 and num_kv_heads > 1 and num_kv_heads % head_shard_factor != 0:
-            kv_head_reps = head_shard_factor // math.gcd(num_kv_heads, head_shard_factor)
-            if num_q_heads % (num_kv_heads * kv_head_reps) == 0:
-                key = jnp.repeat(key, kv_head_reps, axis=2)
-                value = jnp.repeat(value, kv_head_reps, axis=2)
+        key, value = self.expand_kv_heads_for_shard(
+            key, value, head_axis=2, query_sharding=query_sharding, query_head_axis=1, num_q_heads=query.shape[2]
+        )
         key_sharding: Ps | None = self.create_stable_sharding(
             shardings.key,
             dep=key,

@@ -18,10 +18,8 @@ mixers (SSMs). Each layer is a single SSM mixer + residual; there is no
 attention, no RoPE, and no KV cache. Decoding uses EasyDeL's
 :class:`RecurrentCache` to thread the SSM hidden state across steps.
 
-Helpers:
-
-- :func:`rms_forward` — stateless RMS normalization helper used inside the
-  mixer.
+The mixer's scale-free RMS norms on dt/B/C use the shared
+:func:`easydel.layers.norms.rms_norm` (``upcast=True``).
 
 Building blocks:
 
@@ -46,6 +44,7 @@ HuggingFace reference:
 """
 
 import functools
+from collections.abc import Callable
 from typing import cast
 
 import jax
@@ -67,33 +66,13 @@ from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers import RMSNorm as FalconMambaRMSNorm
 from easydel.layers.attention import MaskInfo
+from easydel.layers.linear_attention import ChannelMajorConv1D
+from easydel.layers.norms import rms_norm
 from easydel.modules._base import BaseCausalLMModule
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import SSM1Op
 
 from .falcon_mamba_configuration import FalconMambaConfig
-
-
-def rms_forward(hidden_states: Array, *, variance_epsilon: float = 1e-6) -> Array:
-    """Apply RMS normalization without learnable weights.
-
-    This is a helper function for HuggingFace parity, applying root mean square
-    normalization to the input hidden states without any learnable scale parameters.
-
-    Args:
-        hidden_states: Input tensor to normalize with shape (..., features).
-        variance_epsilon: Small constant added to variance for numerical stability.
-            Defaults to 1e-6.
-
-    Returns:
-        Normalized tensor with the same shape as the input, cast back to the
-        original input dtype.
-    """
-    input_dtype = hidden_states.dtype
-    hidden_states = hidden_states.astype(jnp.float32)
-    variance = jnp.mean(jnp.square(hidden_states), axis=-1, keepdims=True)
-    hidden_states = hidden_states * lax.rsqrt(variance + variance_epsilon)
-    return hidden_states.astype(input_dtype)
 
 
 @auto_pytree
@@ -145,127 +124,8 @@ class FalconMambaCausalLMOutput(BaseModelOutput):
     hidden_states: tuple[Array] | None = None
 
 
-class Conv1D(spx.Module):
-    """Depthwise causal 1D convolution used by the FalconMamba mixer.
-
-    This module implements a 1D convolution layer with depthwise separable
-    convolution support. The parameter layout matches HuggingFace after
-    conversion for model compatibility.
-
-    Parameter layout:
-        - kernel: Shape [kernel_size, 1, channels] for depthwise convolution.
-
-    Attributes:
-        features: Number of output channels.
-        kernel_size: Size of the convolutional kernel.
-        stride: Stride of the convolution.
-        padding: Padding applied to both sides of the input.
-        dilation: Spacing between kernel elements.
-        groups: Number of blocked connections from input to output channels.
-        use_bias: Whether to add a learnable bias.
-        num_spatial_dims: Number of spatial dimensions (always 1 for 1D conv).
-        dtype: Data type for computation.
-        param_dtype: Data type for parameters.
-        precision: Numerical precision for convolution operations.
-    """
-
-    def __init__(
-        self,
-        features: int,
-        kernel_size: int = 1,
-        stride: int = 1,
-        padding: int = 0,
-        dilation: int = 1,
-        groups: int = 1,
-        use_bias: bool = True,
-        num_spatial_dims: int = 1,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: str | lax.Precision | None = None,
-        *,
-        rngs: spx.Rngs,
-    ):
-        """Initialize the 1D convolution layer.
-
-        Args:
-            features: Number of output channels (features).
-            kernel_size: Size of the convolutional kernel. Defaults to 1.
-            stride: Stride of the convolution. Defaults to 1.
-            padding: Padding applied to both sides of the input. Defaults to 0.
-            dilation: Spacing between kernel elements. Defaults to 1.
-            groups: Number of blocked connections from input channels to output
-                channels. For depthwise convolution, set groups=features. Defaults to 1.
-            use_bias: Whether to add a learnable bias to the output. Defaults to True.
-            num_spatial_dims: Number of spatial dimensions. Defaults to 1.
-            dtype: Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
-            precision: Numerical precision for convolution operations. Defaults to None.
-            rngs: Random number generator state for parameter initialization.
-        """
-        kernel_shape = (kernel_size, 1, features)
-        self.weight = ArrayParam.bound(
-            shape=kernel_shape,
-            dtype=param_dtype,
-            init_method="lecun_normal",
-            key=rngs.parameters,
-        )
-
-        if use_bias:
-            self.bias = ArrayParam.bound(
-                shape=(features,),
-                dtype=param_dtype,
-                init_method="zeros",
-                key=rngs.parameters,
-            )
-
-        self.features = features
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
-        self.groups = groups
-        self.use_bias = use_bias
-        self.num_spatial_dims = num_spatial_dims
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-
-    def forward(self, x: Array) -> Array:
-        """Apply 1D convolution to the input tensor.
-
-        Args:
-            x: Input tensor of shape (batch_size, channels, sequence_length).
-                Must have rank equal to num_spatial_dims + 2.
-
-        Returns:
-            Convolved output tensor of shape (batch_size, features, output_length),
-            where output_length depends on the kernel size, stride, padding, and dilation.
-
-        Raises:
-            ValueError: If input tensor does not have the expected rank.
-        """
-        unbatched_rank = self.num_spatial_dims + 2
-        if x.ndim != unbatched_rank:
-            raise ValueError(
-                f"Input to `Conv` needs to have rank {unbatched_rank}, but input has shape {x.shape}.",
-            )
-
-        org_x_dtype = x.dtype
-        rhs = jnp.asarray(jnp.swapaxes(self.weight.value, 0, 2), dtype=self.dtype)
-        x = lax.conv_general_dilated(
-            lhs=x.astype(self.dtype),
-            rhs=rhs,
-            window_strides=(self.stride,),
-            padding=((self.padding, self.padding),),
-            rhs_dilation=(self.dilation,),
-            feature_group_count=self.groups,
-            precision=self.precision,
-        )
-
-        if self.use_bias:
-            x = x + jnp.asarray(self.bias.value.reshape(1, -1, 1), dtype=self.dtype)
-
-        return x.astype(org_x_dtype)
+# FalconMamba mixer front-end convolution: the shared channel-major layer (same parameter names/layout).
+Conv1D = ChannelMajorConv1D
 
 
 class FalconMambaMixer(spx.Module):
@@ -460,6 +320,19 @@ class FalconMambaMixer(spx.Module):
         )
         self.ssm_op = SSM1Op(metadata)
 
+    def resure(self, key: Array, shard_fn: Callable[[Array], Array] | None = None) -> None:
+        """Restore the deterministic SSM spectrum after sequential initialization.
+
+        Args:
+            key: Initialization key (unused for the deterministic spectrum).
+            shard_fn: Optional placement function supplied by sequential_init.
+        """
+        spectrum = jnp.broadcast_to(
+            jnp.log(jnp.arange(1, self.ssm_state_size + 1, dtype=jnp.float32)),
+            (self.intermediate_size, self.ssm_state_size),
+        ).astype(self.param_dtype)
+        self.A_log.value = spectrum if shard_fn is None else shard_fn(spectrum)
+
     def forward(
         self,
         input_states: Array,
@@ -511,9 +384,10 @@ class FalconMambaMixer(spx.Module):
 
         if use_packed_state_updates:
             from easydel.layers.compressed_window import grid_to_tokens, packed_row_of_token, tokens_to_grid
-            from easydel.operations.kernels.ssm1 import _packed_ssm1_fwd
+            from easydel.operations.kernels.ssm1 import packed_ssm1_fwd
 
-            num_slots = conv_states.shape[0]
+            conv_state = cache_params.conv_state
+            num_slots = conv_state.shape[0]
             token_index = jnp.arange(seq_len, dtype=jnp.int32)
             token_slots = packed_row_of_token(packed_query_start_loc, token_index, max_row=num_slots - 1)
             token_cols = token_index - packed_query_start_loc[token_slots]
@@ -526,7 +400,6 @@ class FalconMambaMixer(spx.Module):
             valid_grid = _grid(token_valid.astype(jnp.bool_))
             input_grid = _grid(hidden_states[0].swapaxes(0, 1))  # [slots, width, I]
             gate_grid = _grid(gate[0].swapaxes(0, 1))
-            conv_state = conv_states
             conv_window = jnp.concatenate((conv_state.transpose(0, 2, 1), input_grid), axis=1)
             conv_kernel = self.conv1d.weight[:, 0, :].T  # [I, K]
             conv_out = jnp.einsum(
@@ -542,13 +415,14 @@ class FalconMambaMixer(spx.Module):
             conv_out = self.act(conv_out + conv_bias).astype(jnp.float32)
 
             x_proj_out = self.x_proj(conv_out)
-            time_step_grid = rms_forward(x_proj_out[..., : self.time_step_rank], variance_epsilon=self.rms_eps)
-            b_grid = rms_forward(
+            time_step_grid = rms_norm(x_proj_out[..., : self.time_step_rank], eps=self.rms_eps, upcast=True)
+            b_grid = rms_norm(
                 x_proj_out[..., self.time_step_rank : self.time_step_rank + self.ssm_state_size],
-                variance_epsilon=self.rms_eps,
+                eps=self.rms_eps,
+                upcast=True,
             )
-            c_grid = rms_forward(
-                x_proj_out[..., self.time_step_rank + self.ssm_state_size :], variance_epsilon=self.rms_eps
+            c_grid = rms_norm(
+                x_proj_out[..., self.time_step_rank + self.ssm_state_size :], eps=self.rms_eps, upcast=True
             )
             dt_grid = jax.nn.softplus(self.dt_proj(time_step_grid).astype(jnp.float32))
             dt_grid = jnp.where(valid_grid[..., None], dt_grid, 0.0)
@@ -556,7 +430,7 @@ class FalconMambaMixer(spx.Module):
             b_grid = jnp.where(valid_grid[..., None], b_grid, 0.0)
             c_grid = jnp.where(valid_grid[..., None], c_grid, 0.0)
 
-            y_grid, ssm_states = _packed_ssm1_fwd(
+            y_grid, ssm_states = packed_ssm1_fwd(
                 conv_out,
                 -jnp.exp(self.A_log.value.astype(jnp.float32)),
                 b_grid,
@@ -565,9 +439,10 @@ class FalconMambaMixer(spx.Module):
                 dt_grid,
                 valid_grid,
                 cache_params.recurrent_state.astype(jnp.float32),
+                use_associative_scan=bool(getattr(self.config, "use_associative_scan", True)),
             )
             y_grid = y_grid * jax.nn.silu(gate_grid.astype(jnp.float32))
-            token_outputs = grid_to_tokens(y_grid, token_slots, token_cols, num_slots)
+            token_outputs = grid_to_tokens(y_grid.swapaxes(0, 1), token_slots, token_cols, num_slots)
 
             # Preserve slots with no tokens; for populated rows retain the final K inputs.
             lengths = jnp.sum(valid_grid, axis=1, dtype=jnp.int32)
@@ -597,41 +472,35 @@ class FalconMambaMixer(spx.Module):
         else:
             ssm_state0 = jnp.zeros((batch_size, self.intermediate_size, self.ssm_state_size), dtype=jnp.float32)
 
-        is_inference = seq_len == 1 and cache_params is not None
-
-        if is_inference and cache_params is not None and cache_params.conv_state is not None:
-            new_hidden = hidden_states[:, :, 0]
-            conv_state, _, cache_view = cache_params.concatenate_to_cache(conv_state=new_hidden)
-
-            conv_out_full = self.conv1d(conv_state)[..., : self.conv_kernel_size]
-            conv_out = conv_out_full[:, :, self.conv_kernel_size - 1]
-            hidden_states = jnp.expand_dims(self.act(conv_out).astype(dtype), -1)
+        conv_input = hidden_states
+        initial_conv_state = cache_params.conv_state if cache_params is not None else None
+        if segment_ids is None:
+            # Consume the rolling history for every cached chunk, not just
+            # single-token decode. Causal padding is already supplied by Conv1D.
+            conv_window = (
+                conv_input if initial_conv_state is None else jnp.concatenate((initial_conv_state, conv_input), axis=-1)
+            )
+            offset = 0 if initial_conv_state is None else initial_conv_state.shape[-1]
+            conv_out = self.conv1d(conv_window)[..., offset : offset + seq_len]
+            hidden_states = self.act(conv_out).astype(dtype)
+            new_conv_state = jnp.pad(
+                conv_window, ((0, 0), (0, 0), (max(0, self.conv_kernel_size - conv_window.shape[-1]), 0))
+            )[:, :, -self.conv_kernel_size :]
         else:
-            conv_input = hidden_states
-            if segment_ids is None:
-                conv_out = self.conv1d(conv_input)[..., :seq_len]
-                hidden_states = self.act(conv_out).astype(dtype)
-            else:
-                kernel = jnp.asarray(self.conv1d.weight).squeeze(1).T
-                bias = self.conv1d.bias if self.config.use_conv_bias else None
-                conv_out, new_conv_state = segmented_depthwise_causal_conv1d(
-                    conv_input.swapaxes(1, 2),
-                    kernel,
-                    segment_ids,
-                    bias=bias,
-                    activation=self.act,
-                    output_dtype=dtype,
-                )
-                hidden_states = conv_out.swapaxes(1, 2)
-
-            if cache_params is not None:
-                if segment_ids is None:
-                    if seq_len >= self.conv_kernel_size:
-                        new_conv_state = conv_input[:, :, -self.conv_kernel_size :]
-                    else:
-                        pad_width = self.conv_kernel_size - seq_len
-                        new_conv_state = jnp.pad(conv_input, ((0, 0), (0, 0), (pad_width, 0)))
-                cache_view = cache_params.replace(conv_state=new_conv_state) if cache_view is not None else cache_view
+            kernel = jnp.asarray(self.conv1d.weight).squeeze(1).T
+            bias = self.conv1d.bias if self.config.use_conv_bias else None
+            conv_out, new_conv_state = segmented_depthwise_causal_conv1d(
+                conv_input.swapaxes(1, 2),
+                kernel,
+                segment_ids,
+                bias=bias,
+                initial_state=initial_conv_state,
+                activation=self.act,
+                output_dtype=dtype,
+            )
+            hidden_states = conv_out.swapaxes(1, 2)
+        if cache_view is not None:
+            cache_view = cache_view.replace(conv_state=new_conv_state)
 
         if attention_mask is not None:
             hidden_states = hidden_states * jnp.expand_dims(attention_mask, 1)
@@ -643,9 +512,9 @@ class FalconMambaMixer(spx.Module):
             axis=-1,
         )
 
-        ssm_b = rms_forward(ssm_b, variance_epsilon=self.rms_eps)
-        ssm_c = rms_forward(ssm_c, variance_epsilon=self.rms_eps)
-        time_step = rms_forward(time_step, variance_epsilon=self.rms_eps)
+        ssm_b = rms_norm(ssm_b, eps=self.rms_eps, upcast=True)
+        ssm_c = rms_norm(ssm_c, eps=self.rms_eps, upcast=True)
+        time_step = rms_norm(time_step, eps=self.rms_eps, upcast=True)
 
         discrete_time_step = checkpoint_name(self.dt_proj(time_step), name="ssm_dt_proj")
         discrete_time_step = jax.nn.softplus(discrete_time_step)
@@ -670,6 +539,7 @@ class FalconMambaMixer(spx.Module):
             ssm_state=ssm_state0,
             segment_ids=segment_ids,
             activation=self.activation,
+            use_associative_scan=bool(getattr(self.config, "use_associative_scan", True)),
         )
 
         y = jnp.swapaxes(ssm_output.attention_outputs, 1, 2)
@@ -1001,6 +871,9 @@ class FalconMambaModel(EasyDeLBaseModule):
             ``cache_params`` on the trace path.
             """
             hidden_states, all_hidden_states, idx = carry
+            if output_hidden_states:
+                assert all_hidden_states is not None
+                all_hidden_states = (*all_hidden_states, hidden_states)
             with self._layer_stage_context(idx, layers=self.layers):
                 hidden_states, cache_view = block(
                     hidden_states=hidden_states,
@@ -1013,9 +886,6 @@ class FalconMambaModel(EasyDeLBaseModule):
             hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.layers)
             if trace_layers:
                 cache_params[idx] = cache_view
-            if output_hidden_states:
-                assert all_hidden_states is not None
-                all_hidden_states = (*all_hidden_states, hidden_states)
 
             return hidden_states, all_hidden_states, idx + 1
 
@@ -1023,6 +893,7 @@ class FalconMambaModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, all_hidden_states, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm_f(hidden_states)
         if output_hidden_states:
@@ -1147,6 +1018,7 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
         cache_position: Array | None = None,
         attention_mask: Array | None = None,
         cache_metadata: "OperationsMetadata | None" = None,
+        mask_info: MaskInfo | None = None,
         **kwargs,
     ) -> tuple | FalconMambaCausalLMOutput:
         """Process input and compute language modeling logits.
@@ -1168,6 +1040,8 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
                 Defaults to True.
             cache_position: Optional position indices for cache update (unused).
             attention_mask: Optional attention mask of shape (batch_size, sequence_length).
+            mask_info: Optional mask information; packed segment ids derived from it
+                keep the conv and SSM state from leaking across packed documents.
             cache_metadata: eSurge packed metadata (query_start_loc, num_seqs).
 
         Returns:
@@ -1185,6 +1059,7 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
             output_hidden_states=output_hidden_states,
             cache_position=cache_position,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             cache_metadata=cache_metadata,
         )
 

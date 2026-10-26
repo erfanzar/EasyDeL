@@ -262,14 +262,55 @@ class KTOTrainer(Trainer):
         if isinstance(dataset, dict):
             return {k: KTOTrainer._preprocess_kto_dataset(v, processing_class, arguments) for k, v in dataset.items()}
 
-        map_kwargs = {"writer_batch_size": 10}
-        try:
-            from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
+        from datasets import Dataset, IterableDataset
 
-            if isinstance(dataset, Dataset):
-                map_kwargs["num_proc"] = getattr(arguments, "dataset_num_proc", None)
-        except ImportError:
-            pass
+        from easydel.data.core.protocols import ShardedDataSource
+
+        if not isinstance(dataset, Dataset):
+
+            def preprocess_rows(rows):
+                for row in rows:
+                    if "prompt_input_ids" in row:
+                        yield row
+                        continue
+                    row = {**row, **maybe_extract_prompt(row)}
+                    if "chosen" in row and "rejected" in row:
+                        base = {k: v for k, v in row.items() if k not in {"chosen", "rejected"}}
+                        examples = [
+                            {**base, "completion": row["chosen"], "label": True},
+                            {**base, "completion": row["rejected"], "label": False},
+                        ]
+                    else:
+                        examples = [row]
+                    for example in examples:
+                        if not getattr(arguments, "skip_apply_chat_template", False):
+                            example = {
+                                **example,
+                                **maybe_apply_chat_template(
+                                    example, tokenizer=processing_class, tools=getattr(arguments, "tools", None)
+                                ),
+                            }
+                        yield example
+
+            if isinstance(dataset, ShardedDataSource):
+
+                class PreprocessedKTOSource(ShardedDataSource):
+                    @property
+                    def shard_names(self):
+                        return dataset.shard_names
+
+                    def num_shards(self):
+                        return dataset.num_shards()
+
+                    def open_shard(self, shard_name):
+                        yield from preprocess_rows(dataset.open_shard(shard_name))
+
+                return PreprocessedKTOSource()
+            if isinstance(dataset, IterableDataset):
+                return IterableDataset.from_generator(lambda: preprocess_rows(iter(dataset)))
+            raise TypeError(f"Unsupported KTO dataset type: {type(dataset)}")
+
+        map_kwargs = {"writer_batch_size": 10, "num_proc": getattr(arguments, "dataset_num_proc", None)}
 
         dataset = dataset.map(maybe_extract_prompt, **map_kwargs)
 

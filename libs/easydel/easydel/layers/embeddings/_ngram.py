@@ -53,6 +53,7 @@ import spectrax as spx
 from jax import numpy as jnp
 from jaxtyping import Array, Int
 
+from ._primes import next_prime_after
 from ._u64 import mul_by_scalar, u64_mod_small, u64_xor
 
 # Constants are taken verbatim from the reference implementation; ``_PRIME_1``
@@ -76,24 +77,11 @@ def _splitmix64(value: int) -> int:
     return (value ^ (value >> 31)) & _MASK64
 
 
-def _is_prime(value: int) -> bool:
-    if value < 2:
-        return False
-    if value % 2 == 0:
-        return value == 2
-    for divisor in range(3, math.isqrt(value) + 1, 2):
-        if value % divisor == 0:
-            return False
-    return True
-
-
 def find_nth_prime_after(start: int, count: int) -> int:
     """Return the ``count``-th prime strictly greater than ``start``."""
     prime = start
     for _ in range(count):
-        prime += 1
-        while not _is_prime(prime):
-            prime += 1
+        prime = next_prime_after(prime)
     return prime
 
 

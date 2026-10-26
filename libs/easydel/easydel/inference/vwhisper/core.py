@@ -294,8 +294,10 @@ class vWhisperInference:
                 language=language,
                 task=task,
                 return_timestamps=return_timestamps,
+                is_multilingual=self.inference_config.is_multilingual,
             )
         )
+        input_features = jnp.asarray(input_features, dtype=self.dtype)
         output_sequences = self.generate_function(
             graphdef=self.graphdef,
             graphstate=self.graphstate,
@@ -373,7 +375,7 @@ class vWhisperInference:
             stride_left = round(stride_length_s[0] * self.feature_extractor.sampling_rate)
             stride_right = round(stride_length_s[1] * self.feature_extractor.sampling_rate)
 
-            if chunk_length < stride_left + stride_right:
+            if chunk_length <= stride_left + stride_right:
                 raise ValueError("Chunk length must be superior to stride length")
 
             yield from chunk_iter_with_batch(

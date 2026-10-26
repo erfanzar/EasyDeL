@@ -34,6 +34,7 @@ from easydel.infra.etils import EasyDeLOptimizers, EasyDeLSchedulers
 from easydel.infra.loss_utils import LossConfig
 from easydel.trainers.metrics import LogWatcher
 from easydel.trainers.pose import PoSEConfig
+from easydel.trainers.randomized_yarn import RandomizedYaRNConfig
 from easydel.trainers.training_configurations import TrainingArguments
 from jax.sharding import PartitionSpec
 
@@ -63,6 +64,7 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "total_batch_size": 64,
         "eval_batch_size": 16,
         "gradient_accumulation_steps": 4,
+        "gradient_accumulation_mode": "execution",
         "warmup_steps": 250,
         "weight_decay": 0.05,
         "clip_grad": 1.5,
@@ -81,6 +83,29 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "use_grain": False,
         "grain_shard_index": 1,
         "grain_shard_count": 4,
+        # Grain random-access data lanes (only the parquet lane is selected; the lanes are exclusive)
+        "arrayrecord_num_threads": 4,
+        "arrayrecord_prefetch_buffer": 8,
+        "arrayrecord_read_rate_limit_mb_per_sec": 25.0,
+        "arrayrecord_read_rate_burst_seconds": 0.5,
+        "parquetra_train_datasets": {"chat": "/tmp/roundtrip/chat/*.parquet", "code": ["/tmp/roundtrip/c.parquet"]},
+        "parquetra_mixture_weights": {"chat": 0.75, "code": 0.25},
+        "parquetra_assistant_only": {"chat": True},
+        "parquetra_tokenizer_id": "roundtrip/tokenizer",
+        "parquetra_fast_tokenizer": "roundtrip_pkg.fast:make_encoder",
+        "parquetra_fast_tokenizer_verify_rows": 8,
+        "parquetra_pack_seq_len": 2048,
+        "parquetra_pack_embed_cap": 16,
+        "parquetra_pack_misfit_patience": 6,
+        "parquetra_mp_workers": 2,
+        "parquetra_mp_worker_cpu_only": False,
+        "parquet_metadata_cache_dir": "/tmp/roundtrip/meta",
+        # Per-dataset assistant-only supervision
+        "assistant_header_text": "<|assistant|>\n",
+        "assistant_end_text": "<|end|>",
+        "zero_supervision_report_fraction": 0.1,
+        "zero_supervision_abort_fraction": 0.6,
+        "zero_supervision_dump_limit": 5,
         "offload_dataset": True,
         "offload_device_type": "cpu",
         "offload_device_index": 0,
@@ -93,7 +118,23 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "init_tx": False,
         "train_on_inputs": False,
         "aux_loss_enabled": True,
-        "pose": PoSEConfig(enabled=True, p_pose=0.1, max_p_pose=0.5, warmup_steps=100, target_max_pos=16384),
+        "pose": PoSEConfig(
+            enabled=True,
+            p_pose=0.1,
+            max_p_pose=0.5,
+            warmup_steps=100,
+            target_max_pos=16384,
+            gap_mode="log_uniform",
+            gap_min=64,
+        ),
+        # Exclusive with pose: disabled here, every other field non-default.
+        "randomized_yarn": RandomizedYaRNConfig(
+            l_max_schedule=[1024, 2048],
+            curriculum_total_steps=100,
+            run_length=8,
+            p_apply=0.5,
+            target_max_pos=4096,
+        ),
         "training_time_limit": "2h30m",
         "step_start_point": 100,
         "force_step_start_point": True,
@@ -372,6 +413,46 @@ def test_save_load_handles_subset_of_fields(tmp_path):
     assert loaded.total_batch_size == 8
     assert loaded.save_directory == "/tmp/subset-checkpoints"
     assert loaded.to_dict() == args.to_dict()
+
+
+def test_arrayrecord_lane_fields_roundtrip(tmp_path):
+    """The ArrayRecord lane fields (exclusive with the parquet lane) survive save/load."""
+    args = TrainingArguments(
+        arrayrecord_train_datasets={"chat": "/tmp/ar/chat/*.array_record", "code": ["/tmp/ar/c.array_record"]},
+        arrayrecord_mixture_weights={"chat": 2.0, "code": 1.0},
+        arrayrecord_assistant_only={"code": False},
+        arrayrecord_train_files=["/tmp/ar/x.array_record"],
+    )
+    json_path = tmp_path / "arrayrecord.json"
+    args.save_arguments(json_path)
+    loaded = TrainingArguments.load_arguments(json_path)
+
+    assert loaded.arrayrecord_train_datasets == args.arrayrecord_train_datasets
+    assert loaded.arrayrecord_mixture_weights == {"chat": 2.0, "code": 1.0}
+    assert loaded.arrayrecord_assistant_only == {"code": False}
+    assert loaded.to_dict() == args.to_dict()
+
+
+def test_save_load_preserves_randomized_yarn_and_ga_mode(tmp_path, full_args):
+    """``randomized_yarn`` reloads as a config object; an enabled one survives without pose."""
+    json_path = tmp_path / "ryarn.json"
+    full_args.save_arguments(json_path)
+    loaded = TrainingArguments.load_arguments(json_path)
+    assert isinstance(loaded.randomized_yarn, RandomizedYaRNConfig)
+    assert loaded.randomized_yarn == full_args.randomized_yarn
+    assert loaded.gradient_accumulation_mode == "execution"
+    assert loaded.pose.gap_mode == "log_uniform" and loaded.pose.gap_min == 64
+
+    enabled = TrainingArguments(
+        randomized_yarn=RandomizedYaRNConfig(
+            enabled=True, l_max_schedule=[512, 1024], curriculum_total_steps=10, target_max_pos=2048, only_buckets=[0]
+        )
+    )
+    path = tmp_path / "ryarn_enabled.json"
+    enabled.save_arguments(path)
+    reloaded = TrainingArguments.load_arguments(path)
+    assert reloaded.randomized_yarn == enabled.randomized_yarn
+    assert reloaded.to_dict() == enabled.to_dict()
 
 
 def test_unused_logwatcher_import_is_available():

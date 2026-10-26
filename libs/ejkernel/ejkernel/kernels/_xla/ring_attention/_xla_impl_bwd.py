@@ -213,7 +213,7 @@ def _blockwise_attention_bwd(
             max_score_chunk,
             q_chunk_idx,
         ) = scan
-        dl_part = jnp.einsum("bqhd,bqhd->bhq", g_chunk, output_chunk)[..., None]
+        dl_part = jnp.einsum("bqhd,bqhd->bhq", g_chunk, output_chunk, precision=precision)[..., None]
 
         @partial(jax.checkpoint, prevent_cse=prevent_cse, policy=policy)
         def scan_kv_block(carry, scan):
@@ -237,7 +237,20 @@ def _blockwise_attention_bwd(
                 attn_weights_uncapped = attn_weights
                 attn_weights = jnp.tanh(attn_weights / logits_soft_cap) * logits_soft_cap
 
-            bias_chunk = _chunk_bias_fn(q_chunk_idx_start + q_chunk_idx, k_chunk_idx_start + k_chunk_idx)
+            # Reconstruct exactly the forward's bias layout independently of
+            # local metadata and absolute mask positions.
+            bias_chunk = _chunk_bias_fn(
+                q_chunk_idx_start + q_chunk_idx,
+                k_chunk_idx_start + k_chunk_idx,
+                query_local_chunk_idx=q_chunk_idx,
+                key_local_chunk_idx=k_chunk_idx,
+                bias_query_chunk_idx=(
+                    q_chunk_idx if bias is None or bias.shape[-2] <= q_len else q_chunk_idx_start + q_chunk_idx
+                ),
+                bias_key_chunk_idx=(
+                    k_chunk_idx if bias is None or bias.shape[-1] <= kv_len else k_chunk_idx_start + k_chunk_idx
+                ),
+            )
             attn_weights = attn_weights + bias_chunk
             valid = jnp.isfinite(attn_weights)
 
@@ -246,15 +259,15 @@ def _blockwise_attention_bwd(
             denom = denominator_chunk[..., None]
             exp_weights = jnp.where(denom > 0, exp_logits / denom, 0.0)
 
-            ds = jnp.einsum("bqhd,bkhd->bhqk", g_chunk, value_chunk)
+            ds = jnp.einsum("bqhd,bkhd->bhqk", g_chunk, value_chunk, precision=precision)
             dl = (ds - dl_part) * exp_weights
 
             if logits_soft_cap is not None:
                 sech2 = 1 - jnp.tanh(attn_weights_uncapped / logits_soft_cap) ** 2
                 dl = dl * sech2
-            dq_chunk = dq_chunk + jnp.einsum("bhqk,bkhd->bqhd", dl, k_chunk) / softmax_scale
-            dk_chunk = jnp.einsum("bqhd,bhqk->bkhd", q_chunk, dl) / softmax_scale
-            dv_chunk = jnp.einsum("bhqk,bqhd->bkhd", exp_weights, g_chunk)
+            dq_chunk = dq_chunk + jnp.einsum("bhqk,bkhd->bqhd", dl, k_chunk, precision=precision) / softmax_scale
+            dk_chunk = jnp.einsum("bqhd,bhqk->bkhd", q_chunk, dl, precision=precision) / softmax_scale
+            dv_chunk = jnp.einsum("bhqk,bqhd->bkhd", exp_weights, g_chunk, precision=precision)
 
             return dq_chunk, (
                 dk_chunk,
@@ -424,7 +437,6 @@ def _ring_attention_bwd(
         q_len,
         kv_len,
     )
-    use_positions = q_position_ids is not None and kv_position_ids is not None
 
     def scan_kv_block(carry, idx):
         """Process one ring step backward: compute local gradients and rotate.
@@ -445,9 +457,9 @@ def _ring_attention_bwd(
         dq, dk, dv, key, value, kv_segment_ids, kv_position_ids = carry
         axis_idx = lax.axis_index(axis_name) if axis_name is not None else 0
         q_block_idx = axis_idx
-        q_chunk_idx_start = 0 if use_positions else q_block_idx * (q_block_size // query_chunk_size)
+        q_chunk_idx_start = q_block_idx * (q_block_size // query_chunk_size)
         k_block_idx = (axis_idx - idx) % axis_size
-        k_chunk_idx_start = 0 if use_positions else k_block_idx * (kv_blocksize // key_chunk_size)
+        k_chunk_idx_start = k_block_idx * (kv_blocksize // key_chunk_size)
         dq, dk, dv = _blockwise_attention_bwd(
             query,
             key,

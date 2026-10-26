@@ -10469,8 +10469,10 @@ def sxjit(
                                     src_logical, src_pos = int(source[1]), int(source[2])
                                     src_physical_rank = int(source[4]) if len(source) > 4 else src_logical
                                     value = all_outputs[src_logical][src_pos]
-                                    target = _edge_transfer_sharding(
+                                    target = _stage_input_transfer_sharding(
                                         value,
+                                        input_pos=input_pos,
+                                        expected_shardings=expected_shardings,
                                         edge_sharding=source[3] if len(source) > 3 else None,
                                         fallback_sharding=my_sh,
                                         dst_rank=ri,
@@ -10480,7 +10482,7 @@ def sxjit(
                                     value = _abstract_with_sharding(value, target)
                                     del src_physical_rank
                                 else:
-                                    value = _abstract_with_sharding(prev_abs_outputs[idx], my_sh)
+                                    value = _abstract_with_sharding(prev_abs_outputs[idx], expected)
                                 invars.append(_abstract_like_value(value))
 
                             out_info = submit_compile(
@@ -10601,6 +10603,7 @@ def sxjit(
                     rank_submeshes,
                     mpmd_mesh,
                     dynamic_flat_to_orig_flat=_state.get("dynamic_flat_to_orig_flat"),
+                    expected_shardings=plan_entry[6] if len(plan_entry) > 6 else None,
                 )
                 expected_shardings = plan_entry[6] if len(plan_entry) > 6 else None
                 expected_avals = plan_entry[7] if len(plan_entry) > 7 else None
@@ -11660,6 +11663,7 @@ def _assemble_invars(
     runtime_static_flat_indices: set[int] | None = None,
     runtime_static_cache: dict[tuple[int, int], object] | None = None,
     transport_context: tuple[int, int] | None = None,
+    expected_shardings: tuple[object, ...] | None = None,
 ) -> list:
     """Assemble positional inputs for one compiled MPMD stage dispatch.
 
@@ -11699,6 +11703,9 @@ def _assemble_invars(
             stage-local placement cache.
         runtime_static_cache: Mutable cache keyed by ``(rank, orig_flat_idx)``
             containing already-placed runtime-static leaves.
+        expected_shardings: Consumer input shardings in positional ABI order.
+            Inter-stage and previous-stage slots use these exact layouts rather
+            than inheriting the producer layout; older plans may omit them.
 
     Returns:
         Positional argument list ready to pass to the compiled stage executable.
@@ -11761,8 +11768,10 @@ def _assemble_invars(
             value = all_cluster_outputs[src_rank][src_pos]
             src_physical_rank = source[4] if len(source) > 4 else src_rank
             edge_sharding = source[3] if len(source) > 3 else None
-            target = _edge_transfer_sharding(
+            target = _stage_input_transfer_sharding(
                 value,
+                input_pos=input_pos,
+                expected_shardings=expected_shardings,
                 edge_sharding=edge_sharding,
                 fallback_sharding=my_sh,
                 dst_rank=ri,
@@ -11780,7 +11789,7 @@ def _assemble_invars(
                 ),
                 src_rank=src_physical_rank,
                 dst_rank=ri,
-                preserve_current_layout=edge_sharding is None,
+                preserve_current_layout=False,
             )
             invars.append(
                 _ensure_stage_transport_result(
@@ -11793,21 +11802,32 @@ def _assemble_invars(
                 )
             )
         else:
+            target = _stage_input_transfer_sharding(
+                prev_outputs[idx],
+                input_pos=input_pos,
+                expected_shardings=expected_shardings,
+                edge_sharding=None,
+                fallback_sharding=my_sh,
+                dst_rank=ri,
+                rank_submeshes=rank_submeshes,
+                mpmd_mesh=mpmd_mesh,
+            )
             moved = _transport(
                 "device_put",
                 prev_outputs[idx],
-                my_sh,
+                target,
                 task_name=_pipeline_transport_task_name(
                     transport_context,
                     src_logical_stage=transport_context[1] - 1 if transport_context is not None else None,
                     input_pos=input_pos,
                 ),
                 dst_rank=ri,
+                preserve_current_layout=False,
             )
             invars.append(
                 _ensure_stage_transport_result(
                     moved,
-                    my_sh,
+                    target,
                     source=source,
                     src_physical_rank=None,
                     dst_rank=ri,
@@ -11943,6 +11963,7 @@ def _assemble_invars_from_plan(
     runtime_static_flat_indices: set[int] | None = None,
     runtime_static_cache: dict[tuple[int, int], object] | None = None,
     transport_context: tuple[int, int] | None = None,
+    expected_shardings: tuple[object, ...] | None = None,
 ) -> list:
     """Assemble stage inputs from a pre-classified routing template.
 
@@ -11969,6 +11990,9 @@ def _assemble_invars_from_plan(
             stage-local placement cache.
         runtime_static_cache: Mutable cache keyed by ``(rank, orig_flat_idx)``
             containing already-placed runtime-static leaves.
+        expected_shardings: Consumer input shardings in positional ABI order.
+            Inter-stage and previous-stage slots use these exact layouts rather
+            than inheriting the producer layout; older plans may omit them.
 
     Returns:
         Positional argument list ready to pass to the compiled stage executable.
@@ -12019,8 +12043,10 @@ def _assemble_invars_from_plan(
 
     for out_pos, src_rank, src_pos, edge_sharding, src_physical_rank in plan.stage_slots:
         value = all_cluster_outputs[src_rank][src_pos]
-        target = _edge_transfer_sharding(
+        target = _stage_input_transfer_sharding(
             value,
+            input_pos=out_pos,
+            expected_shardings=expected_shardings,
             edge_sharding=edge_sharding,
             fallback_sharding=my_sh,
             dst_rank=ri,
@@ -12039,7 +12065,7 @@ def _assemble_invars_from_plan(
             ),
             src_rank=src_physical_rank,
             dst_rank=ri,
-            preserve_current_layout=edge_sharding is None,
+            preserve_current_layout=False,
         )
         invars[out_pos] = _ensure_stage_transport_result(
             moved,
@@ -12052,20 +12078,31 @@ def _assemble_invars_from_plan(
 
     for out_pos, prev_idx in plan.prev_slots:
         source = ("prev", prev_idx)
+        target = _stage_input_transfer_sharding(
+            prev_outputs[prev_idx],
+            input_pos=out_pos,
+            expected_shardings=expected_shardings,
+            edge_sharding=None,
+            fallback_sharding=my_sh,
+            dst_rank=ri,
+            rank_submeshes=rank_submeshes,
+            mpmd_mesh=mpmd_mesh,
+        )
         moved = _transport(
             "device_put",
             prev_outputs[prev_idx],
-            my_sh,
+            target,
             task_name=_pipeline_transport_task_name(
                 transport_context,
                 src_logical_stage=transport_context[1] - 1 if transport_context is not None else None,
                 input_pos=out_pos,
             ),
             dst_rank=ri,
+            preserve_current_layout=False,
         )
         invars[out_pos] = _ensure_stage_transport_result(
             moved,
-            my_sh,
+            target,
             source=source,
             src_physical_rank=None,
             dst_rank=ri,
@@ -12674,6 +12711,38 @@ def _transport(
         raise
     _instr.end(span)
     return out
+
+
+def _stage_input_transfer_sharding(
+    value: object,
+    *,
+    input_pos: int,
+    expected_shardings: tuple[object, ...] | None,
+    edge_sharding: object,
+    fallback_sharding: object,
+    dst_rank: int,
+    rank_submeshes: list[object],
+    mpmd_mesh: MpMdMesh,
+) -> object:
+    """Resolve transport against the consumer's compiled positional ABI.
+
+    An unannotated marker is not permission to preserve the producer's
+    layout: the consumer may have compiled that slot as replicated. Prefer
+    its recorded input sharding, falling back to marker resolution for old
+    plans that do not record an ABI.
+    """
+    if expected_shardings is not None and input_pos < len(expected_shardings):
+        expected = expected_shardings[input_pos]
+        if expected is not None:
+            return expected
+    return _edge_transfer_sharding(
+        value,
+        edge_sharding=edge_sharding,
+        fallback_sharding=fallback_sharding,
+        dst_rank=dst_rank,
+        rank_submeshes=rank_submeshes,
+        mpmd_mesh=mpmd_mesh,
+    )
 
 
 def _edge_transfer_sharding(

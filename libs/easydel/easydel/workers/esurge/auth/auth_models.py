@@ -94,6 +94,12 @@ class RateLimitConfig:
     tokens_per_hour: int | None = None
     tokens_per_day: int | None = None
 
+    def __post_init__(self) -> None:
+        """Reject negative budgets; zero is a valid deny-all budget."""
+        for name, value in vars(self).items():
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be nonnegative or None")
+
     def as_dict(self) -> dict[str, tp.Any]:
         """Serialize the rate limit config to a plain dictionary.
 
@@ -129,6 +135,12 @@ class QuotaConfig:
     max_total_requests: int | None = None  # Lifetime request limit
     monthly_token_limit: int | None = None
     monthly_request_limit: int | None = None
+
+    def __post_init__(self) -> None:
+        """Reject negative quotas; zero is a valid deny-all budget."""
+        for name, value in vars(self).items():
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be nonnegative or None")
 
     def as_dict(self) -> dict[str, tp.Any]:
         """Serialize the quota config to a plain dictionary.
@@ -168,6 +180,11 @@ class ApiKeyPermissions:
     enable_streaming: bool = True
     enable_function_calling: bool = True
     max_tokens_per_request: int | None = None
+
+    def __post_init__(self) -> None:
+        """Validate the optional per-request token ceiling."""
+        if self.max_tokens_per_request is not None and self.max_tokens_per_request < 0:
+            raise ValueError("max_tokens_per_request must be nonnegative or None")
 
     def as_dict(self) -> dict[str, tp.Any]:
         """Serialize the permissions to a plain dictionary.

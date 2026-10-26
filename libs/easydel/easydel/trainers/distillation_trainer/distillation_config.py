@@ -340,6 +340,86 @@ class DistillationConfig(TrainingArguments):
             )
         },
     )
+    teacher_from_cache: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Offline teacher: the step runs NO teacher forward. Each batch is joined (by row content) with "
+                "records of an offline teacher cache (`easydel.data.teacher_cache`), adding `teacher_topk_idx` "
+                "[B,S,k] / `teacher_topk_logp` [B,S,k] / `teacher_tail_logp` [B,S], and the chunked KL becomes the "
+                "cached top-k + tail KL. Requires `teacher_cache_path`, `logits_chunk_size > 0`, `temperature == "
+                "1.0` (the cache stores T=1 log-probs), and no objective that needs the teacher's full "
+                "distribution or hidden states (beta / cakld_gamma / loss_top_k / MTP / hidden / attention). "
+                "`teacher_model=None` is accepted only in this mode. A batch without a cache record raises."
+            )
+        },
+    )
+    teacher_cache_topk: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "With `teacher_from_cache`: use only the first k cached ids (the tail is re-derived from the kept "
+                "log-probs). 0 = the cache's own k and stored tail."
+            )
+        },
+    )
+    teacher_cache_add_tail: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "With `teacher_from_cache`: True trains the tail-bucket form (top-k ids get the full-KL gradient, "
+                "the remaining mass is one bucket); False renormalises both distributions over the k support."
+            )
+        },
+    )
+    teacher_cache_path: str | None = field(
+        default=None,
+        metadata={"help": "With `teacher_from_cache`: the cache root (local or gs://) holding MANIFEST.json."},
+    )
+    teacher_cache_teacher_uri: str | None = field(
+        default=None,
+        metadata={"help": "With `teacher_from_cache`: required manifest `teacher_uri` (None = not checked)."},
+    )
+    teacher_cache_tokenizer: str | None = field(
+        default=None,
+        metadata={"help": "With `teacher_from_cache`: required manifest `tokenizer` (None = not checked)."},
+    )
+    teacher_cache_segment_align: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "With `teacher_from_cache`: the document-start alignment the cache was dumped with (the manifest's "
+                "`segment_align` must equal it); also the alignment used when the trainer derives the layout "
+                "sidecar of a packed batch from its `segment_ids`."
+            )
+        },
+    )
+    loss_group_weights: list[float] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Per-group loss weights: optimise sum_g w_g * mean_g (each group's supervised-token mean KL) instead "
+                "of the pooled token mean. Each supervised token of group g is scaled by w_g * N / N_g on the step "
+                "batch; groups absent from a step drop out and the rest renormalise. Groups come from the per-token "
+                "`dataset_ids` (else per-row `_dataset_id`) through `loss_group_dataset_map`. Normalised to sum 1."
+            )
+        },
+    )
+    loss_group_dataset_map: list[int] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "With `loss_group_weights`: entry i is the loss group of dataset id i (-1 = no group); None maps "
+                "dataset i to group i. A supervised token without a group is refused."
+            )
+        },
+    )
+    loss_group_max_multiplier: float | None = field(
+        default=None,
+        metadata={
+            "help": "With `loss_group_weights`: cap on a group's per-token multiplier w_g * N / N_g (None = no cap)."
+        },
+    )
 
     def __post_init__(
         self,
@@ -434,6 +514,8 @@ class DistillationConfig(TrainingArguments):
             raise ValueError("`alpha` must be within [0, 1].")
         if float(self.temperature) <= 0.0:
             raise ValueError("`temperature` must be strictly positive.")
+        self._validate_teacher_cache_fields()
+        self._validate_loss_group_fields()
         if hasattr(super(), "__post_init__"):
             super().__post_init__(
                 max_sequence_length=max_sequence_length,
@@ -441,6 +523,77 @@ class DistillationConfig(TrainingArguments):
             )
 
     __hash__ = hash_fn
+
+    def _validate_teacher_cache_fields(self) -> None:
+        """Validate the offline-teacher-cache fields.
+
+        Every refusal names the field: the cache holds the teacher's T=1 top-k + tail and nothing else, so any
+        objective reading the full teacher distribution or hidden states is refused here.
+
+        Raises:
+            ValueError: On invalid values or an objective the cache cannot serve.
+        """
+        self.teacher_from_cache = bool(self.teacher_from_cache)
+        self.teacher_cache_topk = int(self.teacher_cache_topk)
+        self.teacher_cache_add_tail = bool(self.teacher_cache_add_tail)
+        self.teacher_cache_segment_align = int(self.teacher_cache_segment_align)
+        if self.teacher_cache_topk < 0:
+            raise ValueError("`teacher_cache_topk` must be non-negative.")
+        if self.teacher_cache_segment_align < 1:
+            raise ValueError("`teacher_cache_segment_align` must be >= 1.")
+        if not self.teacher_from_cache:
+            return
+        problems = []
+        if not self.teacher_cache_path:
+            problems.append("teacher_cache_path must name the cache root")
+        # Checked on the raw value: a non-positive chunk size means "no chunking", which the cached KL cannot use
+        # (an earlier version only rejected None and let 0 / negatives through to a dense path with no teacher).
+        if self.logits_chunk_size is None or int(self.logits_chunk_size) <= 0:
+            problems.append("logits_chunk_size must be > 0 (the cached KL lives in the chunked scan)")
+        if float(self.temperature) != 1.0:
+            problems.append(f"temperature must be 1.0 (the cache stores T=1 log-probs), got {self.temperature}")
+        if self.beta is not None:
+            problems.append("beta (GJSD) needs the teacher's full distribution")
+        if self.cakld_gamma is not None:
+            problems.append("cakld_gamma needs the teacher's full distribution")
+        if self.loss_top_k > 0 or self.loss_add_tail:
+            problems.append("loss_top_k / loss_add_tail select the dense path; use teacher_cache_topk / _add_tail")
+        if self.mtp_distillation:
+            problems.append("mtp_distillation needs the teacher's full logits")
+        if self.hidden_state_loss_weight is not None or self.attention_loss_weight is not None:
+            problems.append("hidden_state_loss_weight / attention_loss_weight need a live teacher")
+        if getattr(self, "mpmd_scheduler", None) is not None:
+            problems.append("mpmd_scheduler is not wired for the cached teacher")
+        if problems:
+            raise ValueError("`teacher_from_cache=True` refused: " + "; ".join(problems) + ".")
+
+    def _validate_loss_group_fields(self) -> None:
+        """Validate and normalise the loss-group weighting fields.
+
+        Raises:
+            ValueError: On invalid weights / map / cap, or a combination the weighting cannot serve.
+        """
+        if self.loss_group_weights is None:
+            if self.loss_group_dataset_map is not None or self.loss_group_max_multiplier is not None:
+                raise ValueError("`loss_group_dataset_map` / `loss_group_max_multiplier` need `loss_group_weights`.")
+            return
+        weights = [float(w) for w in self.loss_group_weights]
+        if not weights or any(not w >= 0.0 for w in weights) or sum(weights) <= 0.0:
+            raise ValueError(f"`loss_group_weights` must be non-negative with a positive sum, got {weights}.")
+        self.loss_group_weights = [w / sum(weights) for w in weights]
+        if self.loss_group_dataset_map is not None:
+            self.loss_group_dataset_map = [int(g) for g in self.loss_group_dataset_map]
+            bad = [g for g in self.loss_group_dataset_map if not -1 <= g < len(weights)]
+            if bad:
+                raise ValueError(
+                    f"`loss_group_dataset_map` entries must be -1 or a group index < {len(weights)}, got {bad}."
+                )
+        if self.loss_group_max_multiplier is not None:
+            self.loss_group_max_multiplier = float(self.loss_group_max_multiplier)
+            if self.loss_group_max_multiplier <= 0.0:
+                raise ValueError("`loss_group_max_multiplier` must be positive when set.")
+        if getattr(self, "mpmd_scheduler", None) is not None:
+            raise ValueError("`loss_group_weights` is not wired for the mpmd_scheduler (scheduled loss) path.")
 
     def _validate_logging_fields(self) -> None:
         """Reject TRL logging-only fields that EasyDeL distillation does not use."""

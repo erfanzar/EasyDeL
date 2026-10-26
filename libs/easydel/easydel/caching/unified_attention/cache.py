@@ -63,7 +63,11 @@ from jaxtyping import Array, Float
 from spectrax import PartitionAxis, common_types
 
 from easydel.axis import ATTN_DP, resolve_attention_data_parallel_axis
-from easydel.caching.ragged_page.cache import KV_UPDATE_WINDOW_BYTES, MAX_SLICES_PER_UPDATE_PAGE
+from easydel.caching.ragged_page.cache import (
+    get_num_slices_per_kv_cache_update_page,
+    per_device_hbm_budget_bytes,
+    previous_power_of_2,
+)
 from easydel.caching.ragged_page.utils import kv_cache_update_jax
 from easydel.infra.sharding import (
     MeshLike,
@@ -75,6 +79,7 @@ from easydel.infra.sharding import (
 )
 
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, unwrap_metadata
+from ..budget import compute_paged_cache_budget
 
 if tp.TYPE_CHECKING:
     from easydel.layers.quantization._quants import EasyQuantizer
@@ -88,50 +93,11 @@ KV_HEAD = common_types.KV_HEAD
 MODE_PREFILL = common_types.MODE_PREFILL
 
 
-def per_device_hbm_budget_bytes(util: float = 0.9, mode: str = "free", safety_margin: int = 256 << 20) -> int:
-    """Calculate available HBM budget per device for cache allocation.
-
-    Queries device memory statistics and computes usable memory based
-    on utilization target and safety margin.
-
-    Args:
-        util: Target utilization fraction (0.0 to 1.0). Default: 0.9.
-        mode: Calculation mode:
-            - "free": Use fraction of currently free memory
-            - "total": Use fraction of total memory minus current usage
-        safety_margin: Reserved bytes to keep free. Default: 256MB.
-
-    Returns:
-        int: Available bytes for cache allocation per device.
-            Returns 4GB as fallback if device stats unavailable.
-    """
-    budgets: list[int] = []
-    for device in jax.local_devices():
-        try:
-            stats = device.memory_stats()
-        except Exception:
-            continue
-        if not isinstance(stats, dict):
-            continue
-        limit = stats.get("bytes_limit") or stats.get("bytes_reservable_limit") or stats.get("bytes_total")
-        used_in_use = stats.get("bytes_in_use", 0)
-        used_reserved = stats.get("bytes_reserved", 0)
-        used = max(used_in_use, used_reserved)
-        if limit is None:
-            continue
-
-        free = max(0, int(limit) - int(used))
-        if mode == "free":
-            usable = max(0, int(free * float(util)) - safety_margin)
-        else:
-            usable = max(0, int(int(limit) * float(util)) - int(used) - safety_margin)
-        budgets.append(usable)
-
-    return min(budgets) if budgets else 4 * (1024**3)
-
-
 def _previous_power_of_2(n: int) -> int:
-    """Find the largest power of 2 less than or equal to n.
+    """Find the largest power of 2 less than or equal to n, clamped to at least 1.
+
+    Thin wrapper over :func:`easydel.caching.ragged_page.cache.previous_power_of_2`
+    (which returns 0 for ``n <= 0``); a slice count of 0 is never valid here.
 
     Args:
         n: Input integer.
@@ -139,9 +105,7 @@ def _previous_power_of_2(n: int) -> int:
     Returns:
         int: Largest power of 2 <= n, or 1 if n <= 0.
     """
-    if n <= 0:
-        return 1
-    return 1 << (n.bit_length() - 1)
+    return max(1, previous_power_of_2(n))
 
 
 @auto_pytree
@@ -300,32 +264,14 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
         bytes_av = jnp.finfo(kvdtype).bits // 8
         # Two tensors (K+V) per layer.
         page_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * head_dim * bytes_av
-        num_pages = int(free) // int(page_bytes)
-        if data_parallel_size > 1:
-            num_pages = (num_pages // data_parallel_size) * data_parallel_size
-        # Optionally cap total KV-cache token capacity (num_pages * page_size) so a
-        # generous hbm_utilization can't allocate a 1M-token cache when the run only
-        # needs (e.g.) 64k. Effective capacity = min(hbm-derived, max_cache_tokens).
-        if max_cache_tokens is not None and int(max_cache_tokens) > 0:
-            capped_pages = max(1, int(max_cache_tokens) // int(page_size))
-            if data_parallel_size > 1:
-                capped_pages = max(data_parallel_size, (capped_pages // data_parallel_size) * data_parallel_size)
-            if capped_pages < num_pages:
-                logger.info(
-                    "Capping unified-attention KV pages %s -> %s (sequence_capacity %sK -> %sK) via "
-                    "max_cache_tokens=%s, page_size=%s.",
-                    num_pages,
-                    capped_pages,
-                    int(num_pages * page_size / 1000),
-                    int(capped_pages * page_size / 1000),
-                    int(max_cache_tokens),
-                    page_size,
-                )
-                num_pages = capped_pages
-        if num_pages <= 0:
-            raise ValueError(
-                "Computed `num_pages` is non-positive; increase `hbm_utilization` or reduce page footprint."
-            )
+        budget = compute_paged_cache_budget(
+            {idx: page_bytes // num_hidden_layers for idx in range(num_hidden_layers)},
+            available_bytes=free,
+            page_size=page_size,
+            data_parallel_size=data_parallel_size,
+            max_cache_tokens=max_cache_tokens,
+        )
+        num_pages = budget.num_pages
         logger.info(
             f"Creating UnifiedAttentionCacheConfig with {num_pages=} {page_bytes=} "
             f"sequence_capacity={int((num_pages * page_size) / 1000)}K"
@@ -333,8 +279,7 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
 
         # A lightweight heuristic for slot-mapping padding; matches eSurge expectations.
         page_size_bytes = 2 * page_size * num_kv_heads * head_dim * bytes_av
-        slices_raw = KV_UPDATE_WINDOW_BYTES // max(1, int(page_size_bytes))
-        num_slices_per_page = min(MAX_SLICES_PER_UPDATE_PAGE, _previous_power_of_2(int(slices_raw)))
+        num_slices_per_page = get_num_slices_per_kv_cache_update_page(int(page_size_bytes), allow_oversized_page=True)
 
         return cls(
             num_hidden_layers=num_hidden_layers,
@@ -518,6 +463,8 @@ class UnifiedAttentionCacheView(BaseCacheView):
             ValueError: If cache_metadata lacks required v2 fields.
         """
         cache_metadata = unwrap_metadata(cache_metadata, "ragged")
+        if hasattr(cache_metadata, "for_layer"):
+            cache_metadata = cache_metadata.for_layer(self.layer_index)
 
         if cache_metadata.slot_mapping is None or cache_metadata.num_kv_update_slices is None:
             raise ValueError("UnifiedAttentionCacheView requires v2-style `slot_mapping` and `num_kv_update_slices`.")

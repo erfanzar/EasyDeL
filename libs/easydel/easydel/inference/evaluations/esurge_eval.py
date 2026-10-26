@@ -1050,43 +1050,6 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
 
         return outputs
 
-    def _extract_choice_from_generation(self, generation: str) -> str:
-        """Extract a multiple-choice answer (A, B, C, D) from generated text.
-
-        Uses pattern matching to identify answer choices in various formats
-        commonly used by language models.
-
-        Args:
-            generation: The generated text string to extract from.
-
-        Returns:
-            The extracted choice as an uppercase letter (e.g., "A", "B", "C", "D")
-            or an empty string if no clear choice is found.
-
-        Example:
-            >>> adapter._extract_choice_from_generation("The answer is B.")
-            'B'
-        """
-        patterns = [
-            r"^([A-Da-d])[^A-Za-z0-9]",
-            r"^([A-Da-d])$",
-            r"[Aa]nswer[^A-Za-z0-9]*([A-Da-d])",
-            r"[Tt]he answer is[^A-Za-z0-9]*([A-Da-d])",
-            r"[Oo]ption[^A-Za-z0-9]*([A-Da-d])",
-            r"[Cc]hoice[^A-Za-z0-9]*([A-Da-d])",
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, generation.strip())
-            if match:
-                return match.group(1).upper()
-
-        first_char = generation.strip()[0:1].upper()
-        if first_char in "ABCD":
-            return first_char
-
-        return ""
-
     @staticmethod
     def _parse_instances(instances) -> tuple[list[str], list[dict[str, Any]]]:
         """Extract prompts and generation kwargs from lm-eval Instance objects.
@@ -1363,30 +1326,6 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         except TypeError:
             return self.tokenizer.decode(tokens)
 
-    def _encode_text(self, text: str) -> list[int]:
-        """Encode text to token IDs using the tokenizer.
-
-        Handles both dict-returning tokenizers and direct encode methods.
-
-        Args:
-            text: Text string to encode.
-
-        Returns:
-            list[int]: Token IDs as a list of integers.
-        """
-        try:
-            encoded = self.tokenizer(
-                text,
-                add_special_tokens=False,
-                return_attention_mask=False,
-            )
-            ids = encoded.get("input_ids", [])
-            if ids and isinstance(ids[0], list):
-                ids = ids[0]
-            return [int(t) for t in ids]
-        except Exception:
-            return [int(t) for t in self.tok_encode(text)]
-
     @property
     def prefix_token_id(self) -> int:
         """Return the prefix token used for empty-context scoring.
@@ -1570,6 +1509,8 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         if logits is None:
             raise RuntimeError("Model forward did not return logits; cannot compute loglikelihood.")
 
+        # Normalize and accumulate in fp32 even when the model's LM head emits bf16/fp16.
+        logits = logits.astype(jnp.float32)
         log_denom = logsumexp(logits, axis=-1)
         selected = jnp.take_along_axis(logits, target_ids_jax[..., None], axis=-1).squeeze(-1)
         token_logprobs = selected - log_denom

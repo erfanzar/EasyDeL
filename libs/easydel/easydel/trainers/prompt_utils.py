@@ -26,7 +26,6 @@ Key functionality:
 - Handle multi-turn conversations and function calling
 """
 
-import copy
 import json
 import typing as tp
 from collections.abc import Mapping, Sequence
@@ -38,19 +37,42 @@ from datasets import Dataset, DatasetDict  # pyright: ignore[reportMissingTypeSt
 from jax import numpy as jnp
 
 from easydel.infra.utils import ProcessingClassType
+from easydel.utils.prompt_utils import (
+    InputDict as InputDict,
+)
+from easydel.utils.prompt_utils import (
+    InputListDict as InputListDict,
+)
+from easydel.utils.prompt_utils import (
+    InputListListDict as InputListListDict,
+)
+from easydel.utils.prompt_utils import (
+    InputType as InputType,
+)
+from easydel.utils.prompt_utils import (
+    OpenAIMessage as OpenAIMessage,
+)
+from easydel.utils.prompt_utils import (
+    OpenAIMessageContentPart as OpenAIMessageContentPart,
+)
+from easydel.utils.prompt_utils import (
+    OpenAIMessageList as OpenAIMessageList,
+)
+from easydel.utils.prompt_utils import (
+    _convert_single_dict as _convert_single_dict,
+)
+from easydel.utils.prompt_utils import (
+    _is_valid_openai_message_list as _is_valid_openai_message_list,
+)
+from easydel.utils.prompt_utils import (
+    convert_to_openai_format as convert_to_openai_format,
+)
 
 DatasetType = tp.TypeVar("DatasetType", Dataset, DatasetDict)
 
-InputDict = dict[str, str]
-InputListDict = list[InputDict]
-InputListListDict = list[list[InputDict]]
-InputType = InputListListDict | InputListDict | InputDict
-OpenAIMessageContentPart = dict[str, str]
-OpenAIMessage = dict[str, str | list[OpenAIMessageContentPart]]
 OutputDict = dict[str, str]
 OutputListDict = list[OutputDict]
 OutputType = OutputDict | OutputListDict | None
-OpenAIMessageList = list[OpenAIMessage]
 TListOrMapping = tp.TypeVar("TListOrMapping", list, Mapping)
 DatasetLike = Dataset | DatasetDict
 
@@ -243,112 +265,6 @@ def resolve_example_tools(
     return example_tools if example_tools is not None else fallback_tools
 
 
-def _is_valid_openai_message_list(data: tp.Any) -> bool:
-    """Check if data conforms to OpenAI message list format.
-
-    Validates that the input data strictly follows the OpenAI Chat Completions
-    message format where content is a list of content parts.
-
-    Args:
-        data: Data to validate.
-
-    Returns:
-        bool: True if data is valid OpenAI message list, False otherwise.
-
-    Note:
-        Expected format:
-        [{"role": "user", "content": [{"type": "text", "text": "..."}]}]
-    """
-    if not isinstance(data, list):
-        return False
-
-    if not data:
-        return True
-    for item in data:
-        if not isinstance(item, dict):
-            return False
-        if "role" not in item or "content" not in item:
-            return False
-        if not isinstance(item.get("role"), str):
-            return False
-        content = item.get("content")
-        if not isinstance(content, list):
-            return False
-        for part in content:
-            if not isinstance(part, dict):
-                return False
-            if "type" not in part:
-                return False
-    return True
-
-
-def _convert_single_dict(source_dict: InputDict) -> OpenAIMessage | None:
-    """Convert a single dictionary to OpenAI message format.
-
-    Handles various input formats with flexible key names, converting them
-    to the standardized OpenAI message structure.
-
-    Args:
-        source_dict: Dictionary with message data. Searches for keys like
-                    'role', 'content', 'text', 'message' (case-insensitive).
-
-    Returns:
-        OpenAIMessage | None: Converted message in OpenAI format, or None if
-                             conversion fails.
-
-    Note:
-        - Defaults to 'user' role if not specified
-        - Handles non-standard roles with warnings
-        - Prioritizes 'content' > 'text' > 'message' for content extraction
-    """
-    if not isinstance(source_dict, dict):
-        print(f"Warning: Expected a dictionary, but got {type(source_dict)}. Skipping.")
-        return None
-
-    working_dict = copy.deepcopy(source_dict)
-
-    role = "user"
-    content_text = ""
-    role_key_found = None
-    for key in working_dict:
-        if key.lower() == "role":
-            role_value = working_dict[key]
-            if isinstance(role_value, str):
-                role = role_value.lower()
-                if role not in ["user", "assistant", "system", "tool"]:
-                    print(f"Warning: Non-standard role '{role}' found. Using it.")
-                role_key_found = key
-                break
-            else:
-                print(f"Warning: 'role' value is not a string ({role_value}). Using default 'user'.")
-                role_key_found = key
-                break
-    if role_key_found:
-        del working_dict[role_key_found]
-    content_keys_priority = ["content", "text", "message"]
-    content_key_found = None
-    for priority_key in content_keys_priority:
-        for key in working_dict:
-            if key.lower() == priority_key:
-                content_value = working_dict[key]
-                if isinstance(content_value, str):
-                    content_text = content_value
-                    content_key_found = key
-                    break
-                else:
-                    print(
-                        f"Warning: Found content key '{key}' but value is not a string ({content_value}). "
-                        "Trying other keys or defaulting to empty."
-                    )
-        if content_key_found:
-            break
-    target_message: OpenAIMessage = {
-        "role": role,
-        "content": [{"type": "text", "text": content_text}],
-    }
-    return target_message
-
-
 def reverse_openai_format(
     openai_messages: OpenAIMessageList,
     content_key_name: str = "content",
@@ -433,70 +349,6 @@ def reverse_openai_format(
         return simple_messages[0]
     else:
         return simple_messages
-
-
-def convert_to_openai_format(input_data: InputType) -> OpenAIMessageList:
-    """
-    Converts various input formats (list[list[dict]], list[dict], dict)
-    into the OpenAI Chat Completions message list format.
-
-    If the input_data already conforms to the target OpenAIMessageList format
-    (specifically with content as list of parts), it is returned directly.
-
-    Target Format Example for one message:
-    {
-        "role": "user",
-        "content": [{"type": "text", "text": "message content here"}]
-    }
-
-    Args:
-        input_data: Data in one of the supported formats or already in the
-                    target OpenAIMessageList format. Keys like 'role',
-                    'content', 'text', 'message' are searched case-insensitively
-                    within dictionaries during conversion.
-
-    Returns:
-        A list of messages in the target OpenAI format. Returns an empty list
-        if the input is invalid, cannot be parsed, results in no valid messages,
-        or is an unsupported type. Returns the input directly if it already
-        matches the target format.
-    """
-    if _is_valid_openai_message_list(input_data):
-        return tp.cast(OpenAIMessageList, input_data)
-
-    output_messages: OpenAIMessageList = []
-    items_to_process: list[InputDict] = []
-    if isinstance(input_data, list):
-        is_list_of_lists = False
-        if input_data and all(isinstance(sub_item, list) for sub_item in input_data):
-            is_list_of_lists = True
-
-        if is_list_of_lists:
-            for sublist in input_data:
-                if isinstance(sublist, list):
-                    for item in sublist:
-                        if isinstance(item, dict):
-                            items_to_process.append(item)
-        else:
-            for item in input_data:
-                if isinstance(item, dict):
-                    items_to_process.append(item)
-                elif isinstance(item, list):
-                    for sub_item in item:
-                        if isinstance(sub_item, dict):
-                            items_to_process.append(sub_item)
-
-    elif isinstance(input_data, dict):
-        items_to_process.append(input_data)
-
-    else:
-        return []
-    for source_dict in items_to_process:
-        converted_message = _convert_single_dict(source_dict)
-        if converted_message:
-            output_messages.append(converted_message)
-
-    return output_messages
 
 
 def is_conversational(example: dict[str, tp.Any]) -> bool:
@@ -882,10 +734,14 @@ def remove_none_values(example: TListOrMapping) -> TListOrMapping:
     ```
     """
     if isinstance(example, list):
-        return [remove_none_values(value) if isinstance(value, dict | list) else value for value in example]
+        return [
+            remove_none_values(value) if isinstance(value, Mapping | list) else value
+            for value in example
+            if value is not None
+        ]
     elif isinstance(example, Mapping):
         return {
-            key: remove_none_values(value) if isinstance(value, dict | list) else value
+            key: remove_none_values(value) if isinstance(value, Mapping | list) else value
             for key, value in example.items()
             if value is not None
         }
@@ -980,10 +836,10 @@ def keep_arrays_map(
     if drop_fields is None:
         drop_fields = []
     for k, v in example.items():
-        if k in array_fields:
-            results[k] = np.asarray(v)
         if k in drop_fields:
             continue
+        if k in array_fields:
+            results[k] = np.asarray(v)
         elif isinstance(v, list | np.ndarray | jax.Array):
             if isinstance(v, list):
                 try:
@@ -1154,11 +1010,20 @@ def extract_prompt(example: dict[str, Sequence]) -> dict[str, Sequence]:
     For more details, see [`maybe_extract_prompt`].
     """
     idx = 0
-    for idx in range(min(len(example["chosen"]), len(example["rejected"]))):
-        if example["chosen"][idx] != example["rejected"][idx]:
-            if example["chosen"][idx - 1] == " ":
-                idx -= 1
-            break
+    limit = min(len(example["chosen"]), len(example["rejected"]))
+    while idx < limit and example["chosen"][idx] == example["rejected"][idx]:
+        idx += 1
+    # At a text mismatch keep the shared boundary space with the responses.
+    # Exhaustion is a complete prefix, not an examined-but-unmatched element.
+    if idx < limit and idx > 0 and example["chosen"][idx - 1] == " ":
+        idx -= 1
+    # Identical message lists: an empty assistant completion cannot be rendered, so keep the final turn.
+    if (
+        idx > 0
+        and idx == len(example["chosen"]) == len(example["rejected"])
+        and isinstance(example["chosen"][idx - 1], Mapping)
+    ):
+        idx -= 1
     return {
         "prompt": example["chosen"][:idx],
         "chosen": example["chosen"][idx:],
@@ -1285,13 +1150,8 @@ def is_conversational_from_value(example: dict[str, tp.Any]) -> bool:
     if maybe_messages is None:
         maybe_messages = example.get("conversation")
 
-    if isinstance(maybe_messages, list):
+    if isinstance(maybe_messages, list) and maybe_messages:
         maybe_message = maybe_messages[0]
-
-        if isinstance(maybe_message, dict) and "from" in maybe_message and "value" in maybe_message:
-            return True
-
-        if isinstance(maybe_message, dict) and "role" in maybe_message and "content" in maybe_message:
-            return True
+        return isinstance(maybe_message, dict) and "from" in maybe_message and "value" in maybe_message
 
     return False

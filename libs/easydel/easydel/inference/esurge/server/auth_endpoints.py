@@ -31,11 +31,13 @@ metadata updates, rate-limit policies) are enforced at the boundary.
 from __future__ import annotations
 
 import typing as tp
+import uuid
 
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from easydel.workers.esurge.auth import PermissionDenied, QuotaExceeded, RateLimitExceeded
 from easydel.workers.esurge.auth.auth_models import (
     ApiKeyPermissions,
     ApiKeyRole,
@@ -179,11 +181,33 @@ class AuthEndpointsMixin:
         if not metadata:
             raise HTTPException(status_code=401, detail="Invalid or inactive API key")
 
+        authorize = getattr(self.auth_manager, "authorize_request", None)
+        reservation_id = None
+        if authorize is not None:
+            reservation_id = uuid.uuid4().hex
+            try:
+                metadata = authorize(
+                    raw_key=api_key,
+                    ip_address=raw_request.client.host if raw_request.client else None,
+                    endpoint=raw_request.url.path,
+                    reservation_id=reservation_id,
+                )
+            except (RateLimitExceeded, QuotaExceeded) as exc:
+                raise HTTPException(status_code=429, detail=str(exc)) from exc
+            except PermissionDenied as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+
         if metadata.role != ApiKeyRole.ADMIN:
+            if reservation_id is not None:
+                self.auth_manager.release_reservation(api_key, reservation_id=reservation_id)
             raise HTTPException(status_code=403, detail="Admin role required for this endpoint")
 
         raw_request.state.api_key = api_key
         raw_request.state.api_key_metadata = metadata
+        if reservation_id is not None:
+            raw_request.state.auth_reservation_id = reservation_id
+            self.auth_manager.record_usage(api_key, 0, 0, reservation_id=reservation_id)
+            raw_request.state.auth_reservation_completed = True
 
     async def create_api_key_endpoint(self, request: CreateApiKeyRequest, raw_request: Request) -> JSONResponse:
         """Admin endpoint to create a new API key.
@@ -491,6 +515,7 @@ class AuthEndpointsMixin:
             description=request.description,
             role=request.role,
             expires_in_days=request.expires_in_days,
+            clear_expiry=("expires_in_days" in provided_fields and request.expires_in_days is None),
             rate_limits=rate_limits,
             quota=quota,
             permissions=permissions,

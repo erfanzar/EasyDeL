@@ -49,13 +49,14 @@ Example:
 
 from __future__ import annotations
 
+import typing as tp
+
 from ejkernel.callib import (  # pyright: ignore[reportMissingTypeStubs]
     COMPILED_CACHE,
     COMPILED_FILE_NAME,
     ECACHE_COMPILES,
     RECOMPILE_FORCE,
     ejit,
-    get_effective_compile_dir,
     get_hash_of_lowering,
     get_safe_hash_int,
     hash_fn,
@@ -64,13 +65,46 @@ from ejkernel.callib import (  # pyright: ignore[reportMissingTypeStubs]
     save_compiled_fn,
 )
 
-from .helpers import get_cache_dir
+if tp.TYPE_CHECKING:
+    from pathlib import Path
 
-ejit = ejit
+    CACHE_DIR: Path
+    COMPILE_FUNC_DIR: Path
+
+
+def __getattr__(name: str) -> Path:
+    """Resolve documented cache paths without evaluating them on import.
+
+    Args:
+        name: Compatibility attribute requested from this module.
+
+    Returns:
+        The EasyDeL cache path or environment-namespaced executable cache path.
+
+    Raises:
+        AttributeError: If the attribute is not a supported compatibility name.
+    """
+    if name == "CACHE_DIR":
+        from .helpers import get_cache_dir
+
+        return get_cache_dir()
+    if name == "COMPILE_FUNC_DIR":
+        from ejkernel.callib import get_effective_compile_dir
+
+        return get_effective_compile_dir()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """Include lazily resolved compatibility attributes in module discovery."""
+    return sorted(set(globals()) | set(__all__))
+
 
 __all__ = [
+    "CACHE_DIR",
     "COMPILED_CACHE",
     "COMPILED_FILE_NAME",
+    "COMPILE_FUNC_DIR",
     "ECACHE_COMPILES",
     "RECOMPILE_FORCE",
     "ejit",
@@ -81,11 +115,3 @@ __all__ = [
     "load_compiled_fn",
     "save_compiled_fn",
 ]
-
-CACHE_DIR = get_cache_dir()
-
-# The single source of truth for compiled-function persistence is
-# ejkernel.callib._ejit: an environment-fingerprinted cache directory
-# (jax/jaxlib/libtpu versions + host CPU identity) with entry-size guards and
-# atomic writes, so stale or oversized entries can never crash a reader.
-COMPILE_FUNC_DIR = get_effective_compile_dir()

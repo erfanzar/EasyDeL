@@ -19,7 +19,7 @@ methods:
 
 * table management: :meth:`~EngramModelMixin.engram_modules`, :meth:`~EngramModelMixin.place_engram_tables_on_host`,
   :meth:`~EngramModelMixin.load_engram_tables`, :meth:`~EngramModelMixin.engram_hasher`;
-* the eSurge side-input hooks (contract in :mod:`easydel.inference.esurge.multimodal.side_inputs`):
+* the eSurge side-input hooks (contract in :mod:`easydel.infra.side_inputs`):
   :meth:`~EngramModelMixin.esurge_prepare_tokenizer`, :meth:`~EngramModelMixin.esurge_side_input_specs`,
   :meth:`~EngramModelMixin.esurge_side_input_provider`;
 * the trainer hook :meth:`~EngramModelMixin.host_batch_transform`.
@@ -44,12 +44,11 @@ from collections.abc import Iterable
 import numpy as np
 import spectrax as spx
 
+from easydel.infra.side_inputs import SideInputSpec, SideInputWindow
+
 from . import _hashing
 from ._hashing import EngramHasher, EngramWindowHasher
 from ._layer import FP8_SCALE_BLOCK, GatedEngram
-
-if tp.TYPE_CHECKING:
-    from easydel.inference.esurge.multimodal.side_inputs import SideInputSpec, SideInputWindow
 
 __all__ = ["EngramModelMixin", "EngramSideInputProvider", "find_engram_modules"]
 
@@ -226,8 +225,6 @@ class EngramModelMixin:
 
     def esurge_side_input_specs(self) -> dict[str, SideInputSpec]:
         """eSurge hook: ``engram_rows`` / ``engram_scales`` with host tables, ``engram_hash_ids`` otherwise."""
-        from easydel.inference.esurge.multimodal.side_inputs import SideInputSpec
-
         config = self.config
         n_layers = _engram_layer_count(config)
         if not n_layers:

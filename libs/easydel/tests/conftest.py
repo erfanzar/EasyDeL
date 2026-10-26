@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
+from functools import wraps
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,43 @@ def _patch_removed_jax_config_flags() -> None:
 
 
 _patch_removed_jax_config_flags()
+
+
+@pytest.fixture(autouse=True)
+def skip_gated_hf_model_configs(request, monkeypatch):
+    """Skip inaccessible gated configs only in the model-integration suites.
+
+    Other tests, including import/API regressions, observe the normal
+    ``AutoConfig.from_pretrained`` exception behavior. Monkeypatch restores the
+    classmethod after each integration test.
+    """
+    relative_path = request.path.relative_to(Path(__file__).parent)
+    if relative_path.parts[:2] not in (("modules", "spmd"), ("modules", "mpmd")):
+        return
+    from transformers import AutoConfig
+
+    original_from_pretrained = AutoConfig.from_pretrained.__func__
+
+    @wraps(original_from_pretrained)
+    def from_pretrained(cls, *args, **kwargs):
+        try:
+            return original_from_pretrained(cls, *args, **kwargs)
+        except OSError as exc:
+            message = str(exc).lower()
+            if not any(
+                text in message
+                for text in (
+                    "gated repo",
+                    "gated model",
+                    "access to this model is restricted",
+                    "access to this repository is restricted",
+                )
+            ):
+                raise
+            model_id = args[0] if args else kwargs.get("pretrained_model_name_or_path", "<unknown>")
+            pytest.skip(f"Gated Hugging Face config is inaccessible: {model_id}")
+
+    monkeypatch.setattr(AutoConfig, "from_pretrained", classmethod(from_pretrained))
 
 
 # --- Computation tests run on an accelerator (XERXES.md golden rule 5) ---------------------------

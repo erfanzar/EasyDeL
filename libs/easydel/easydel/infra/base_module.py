@@ -71,6 +71,7 @@ import re
 import typing as tp
 import warnings
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import cached_property, partial, wraps
@@ -79,6 +80,7 @@ from typing import Self, Unpack
 
 import jax
 import jax.tree_util
+import numpy as np
 import spectrax as spx
 from eformer.loggings import get_logger
 from jax import lax
@@ -91,7 +93,7 @@ from easydel.infra.sharding import is_mpmd_mesh, moe_expert_param_layout_scope, 
 from easydel.infra.utils import ArrayParam, materialize_meta_leaves
 from easydel.layers.norms import LayerNorm
 from easydel.utils import traversals
-from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
+from easydel.utils.traversals import flatten_dict, is_flatten
 
 from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
 from .etils import EasyDeLGradientCheckPointers
@@ -124,6 +126,23 @@ logger = get_logger(__name__)
 
 # Alias for EasyDeLBaseConfig for backward compatibility.
 BaseConf = EasyDeLBaseConfig
+
+
+def _is_jnp_scalar_dtype(value: tp.Any) -> bool:
+    """Return whether *value* is a JAX scalar-type dtype such as ``jnp.float32``.
+
+    JAX scalar types (``jnp.float32``, ``jnp.bfloat16``...) are instances of a private metaclass whose module
+    path has moved between JAX releases, so they are recognised structurally: they are classes exposing a
+    ``dtype`` attribute holding a real :class:`numpy.dtype`. Plain NumPy scalar types (``np.float32``) and
+    ``np.dtype`` instances are not matched.
+
+    Args:
+        value: Object to inspect.
+
+    Returns:
+        bool: ``True`` for JAX scalar-type dtypes.
+    """
+    return isinstance(value, type) and isinstance(getattr(value, "dtype", None), jnp.dtype)
 
 
 def _looks_like_config(value: tp.Any) -> bool:
@@ -193,14 +212,58 @@ def _is_reusable_context(value: tp.Any) -> bool:
     return hasattr(value, "__enter__") and hasattr(value, "__exit__")
 
 
+def _pin_fp32_parameters(module: tp.Any) -> None:
+    """Cast floating leaves matching ``type(module).fp32_param_patterns`` to float32 in place.
+
+    Runs after construction (eager, ``lazy_init`` and ``sequential_init`` alike), so every load path
+    starts from a float32 template for pinned leaves. Shardings of concrete arrays are preserved.
+
+    Args:
+        module: A freshly constructed :class:`EasyDeLBaseModule`.
+    """
+    from easydel.utils.parameters_transformation import fp32_param_pattern_matches
+
+    patterns = tuple(type(module).fp32_param_patterns)
+    for path, var in spx.iter_variables(module):
+        if not fp32_param_pattern_matches(path, patterns):
+            continue
+        value = var.value
+        dtype = getattr(value, "dtype", None)
+        if dtype is None or not jnp.issubdtype(dtype, jnp.floating) or dtype == jnp.float32:
+            continue
+        if isinstance(value, jax.ShapeDtypeStruct):
+            var.value = jax.ShapeDtypeStruct(value.shape, jnp.float32, sharding=value.sharding)
+        else:
+            var.value = value.astype(jnp.float32)
+
+
+_parameter_init_device: ContextVar[jax.Device | None] = ContextVar("parameter_init_device", default=None)
+
+
+@contextlib.contextmanager
+def _parameter_init_device_scope(device: jax.Device | None):
+    """Temporarily override allocation and nested constructor placement, not model metadata."""
+    if device is None:
+        yield
+        return
+    token = _parameter_init_device.set(device)
+    try:
+        with jax.default_device(device):
+            yield
+    finally:
+        _parameter_init_device.reset(token)
+
+
 @contextlib.contextmanager
 def _parameter_init_sharding_context(config: tp.Any):
     """Install mesh, axis rules, and variable placement during parameter init.
 
     Yields a context in which fresh ``jax.Array`` parameters created by an
     EasyDeL module's ``__init__`` are placed on the proper mesh according to
-    the config's :class:`RuntimeShardingResolver`. If *config* doesn't look
-    like an EasyDeL config, this is a pass-through.
+    the config's :class:`RuntimeShardingResolver`. An active sequential-init
+    device scope overrides physical placement without changing logical layout
+    or pipeline-stage metadata. If *config* doesn't look like an EasyDeL
+    config, this is a pass-through.
 
     Args:
         config: An EasyDeL config (or duck-typed equivalent) supplying the
@@ -216,6 +279,7 @@ def _parameter_init_sharding_context(config: tp.Any):
 
     mesh = config.mesh
     resolver = config.runtime_sharding_resolver
+    init_device = _parameter_init_device.get()
 
     if hasattr(resolver, "with_mesh"):
         resolver = resolver.with_mesh(mesh)
@@ -235,7 +299,11 @@ def _parameter_init_sharding_context(config: tp.Any):
             the input value unchanged when already correctly sharded, or
             ``None`` to signal that no placement should be performed.
         """
-        if not metadata or not isinstance(value, jax.Array):
+        if not isinstance(value, jax.Array):
+            return None
+        if init_device is not None:
+            return jax.device_put(value, init_device)
+        if not metadata:
             return None
 
         has_layout_metadata = any(key in metadata for key in ("sharding", "tensor_layout"))
@@ -255,7 +323,13 @@ def _parameter_init_sharding_context(config: tp.Any):
         return jax.device_put(value, named)
 
     with contextlib.ExitStack() as stack:
-        if _is_reusable_context(mesh):
+        if init_device is not None:
+            # Keep logical axes usable during construction, without activating the
+            # training devices (or mutating its mesh / pipeline-stage metadata).
+            axis_names = tuple(mesh.axis_names)
+            devices = np.asarray([init_device], dtype=object).reshape((1,) * len(axis_names))
+            stack.enter_context(spx.use_mesh(jax.sharding.Mesh(devices, axis_names)))
+        elif _is_reusable_context(mesh):
             stack.enter_context(mesh)
         if hasattr(resolver, "logical_axis_rules"):
             stack.enter_context(resolver.logical_axis_rules())
@@ -659,6 +733,30 @@ class EasyDeLLayerStackMixin:
             or self._pipeline_stage_count() > 1
         )
 
+    def _layer_scan_kwargs(self: Self, scope: str | None = None) -> dict[str, tp.Any]:
+        """Return the ``ModuleList.scan`` lowering options configured for one scan scope.
+
+        Args:
+            scope: ``"text"``, ``"vision"`` or ``"audio"``. ``None`` infers it from this module's
+                config class name, so towers built from a vision/audio sub-config pick up that scope.
+
+        Returns:
+            Keyword arguments to spread into ``layers.scan(...)``. With ``layer_scan_options=None`` the
+            training text scans of an fsdp-sharded model get ``prefetch_axes=("fsdp",)``; an explicit
+            mapping (``{}`` included) replaces that default.
+        """
+        from easydel.utils.inference_mode import is_inference_mode
+
+        from .layer_scan import auto_layer_scan_kwargs, infer_layer_scan_scope, resolve_layer_scan_kwargs
+
+        config = self.config
+        if scope is None:
+            scope = infer_layer_scan_scope(config)
+        options = getattr(config, "layer_scan_options", None)
+        if options is None:
+            return auto_layer_scan_kwargs(getattr(config, "mesh", None), scope, inference=is_inference_mode())
+        return resolve_layer_scan_kwargs(options, scope)
+
     def _mark_layer_stage_boundary(
         self: Self,
         hidden_states: tp.Any,
@@ -697,6 +795,52 @@ class EasyDeLLayerStackMixin:
             edge_sharding = self._layer_stage_boundary_sharding(hidden_states)
             return spx.sxstage_iter(hidden_states, stage=current, sharding=edge_sharding)
         return hidden_states
+
+    def _decoder_scan_step(
+        self: Self,
+        block: tp.Callable[..., tp.Any],
+        carry: tuple[tp.Any, tp.Any, tp.Any, tp.Any, tp.Any],
+        *,
+        output_hidden_states: bool,
+        output_attentions: bool,
+        trace_layers: bool,
+        cache: tp.Any = None,
+        **block_kwargs: tp.Any,
+    ) -> tuple[tp.Any, tp.Any, tp.Any, tp.Any, tp.Any]:
+        """One step of the standard decoder-stack scan body.
+
+        Carry layout: ``(hidden_states, cache_views, all_hidden_states, all_attentions, layer_index)``. Appends the
+        pre-block hidden state, runs ``block`` inside the layer's PP stage context with its cache view, marks the
+        stage boundary, writes back the cache view and appends the attention weights, in that order.
+
+        Args:
+            block: Decoder layer; called with ``hidden_states``, ``cache_view``, ``output_attentions`` and
+                ``block_kwargs`` (mask info, positions, mode, cache metadata, frequencies, ...).
+            carry: Scan carry described above.
+            output_hidden_states: Collect pre-block hidden states.
+            output_attentions: Collect attention weights (also forwarded to ``block``).
+            trace_layers: Whether cache-view plumbing is active (the Python trace path).
+            cache: Flat cache preferred over the carried views.
+            **block_kwargs: Remaining keyword arguments for ``block``.
+
+        Returns:
+            The updated carry.
+        """
+        hs, cv, ah, aa, idx = carry
+        if output_hidden_states:
+            ah = (*ah, hs)
+        with self._layer_stage_context(idx, layers=self.layers):  # type: ignore[attr-defined]
+            layer_outputs = block(
+                hidden_states=hs,
+                cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=cache),
+                output_attentions=output_attentions,
+                **block_kwargs,
+            )
+        hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)  # type: ignore[attr-defined]
+        cv = self._layer_cache_view_update(cv, idx, layer_outputs.cache_view, enabled=trace_layers, cache=cache)
+        if output_attentions:
+            aa = (*aa, layer_outputs.attention_weight)
+        return hs, cv, ah, aa, idx + 1
 
     def _layer_stage_boundary_sharding(self: Self, hidden_states: tp.Any) -> PartitionSpec | None:
         """Resolve the activation sharding contract for PP stage edges.
@@ -798,6 +942,7 @@ class EasyDeLBaseModule(
     _model_type: str | None
     _parameter_transform_rules: tp.ClassVar[list[ParameterTransformRule]] = []
     _hf_flattened_wrapper: tp.ClassVar[str | None] = None
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ()
 
     def __init_subclass__(cls, **kwargs: tp.Any) -> None:
         """Wrap subclass ``__init__`` to install parameter-init sharding context.
@@ -833,6 +978,9 @@ class EasyDeLBaseModule(
             config = _resolve_init_config(original_init, self, args, kwargs)
             with _parameter_init_sharding_context(config):
                 original_init(self, *args, **kwargs)
+            owner = next(klass for klass in type(self).__mro__ if "__init__" in klass.__dict__)
+            if owner is cls and type(self).fp32_param_patterns:
+                _pin_fp32_parameters(self)
 
         init_with_parameter_sharding._easydel_init_sharding_wrapped = True
         with contextlib.suppress(Exception):
@@ -1811,7 +1959,7 @@ class EasyDeLBaseModule(
 
         for _path, module in iter_module_search(self):
             if hasattr(module, "dtype"):
-                if str(type(module.dtype)).endswith("lax_numpy._ScalarMeta'>"):  # dont change numpy based dtypes
+                if _is_jnp_scalar_dtype(module.dtype):  # dont change numpy based dtypes
                     module.dtype = dtype
         self.dtype = dtype
         return self
@@ -1846,13 +1994,7 @@ class EasyDeLBaseModule(
                 The array cast to ``dtype`` if it has a floating-point dtype,
                 otherwise the input unchanged.
             """
-            if array.dtype in [
-                jnp.bfloat16,
-                jnp.float16,
-                jnp.float32,
-                jnp.float64,
-                jnp.float_,
-            ]:
+            if jnp.issubdtype(array.dtype, jnp.floating):
                 array = array.astype(dtype)
             return array
 
@@ -1862,7 +2004,7 @@ class EasyDeLBaseModule(
 
         for _path, module in iter_module_search(self):
             if hasattr(module, "param_dtype"):
-                if isinstance(module.param_dtype, jnp.dtype):
+                if isinstance(module.param_dtype, jnp.dtype) or _is_jnp_scalar_dtype(module.param_dtype):
                     module.param_dtype = dtype
 
         self.param_dtype = dtype
@@ -2211,7 +2353,7 @@ class EasyDeLBaseModule(
         return self.compute_embedding(input_ids, *args, **kwargs), None
 
     @classmethod
-    def sequential_init(cls: type[Self], **kwargs) -> Self:
+    def sequential_init(cls: type[Self], *, init_device: jax.Device | None = None, **kwargs) -> Self:
         """Initialize model parameters sequentially with proper sharding.
 
         Performs lazy initialization followed by sequential parameter
@@ -2226,6 +2368,11 @@ class EasyDeLBaseModule(
         3. Applies proper sharding based on partition rules to each parameter
 
         Args:
+            init_device: Optional allocation device for offloaded initialization.
+                Initializer RNGs and all parameter placement use this device while
+                the config's training mesh and variable stage/layout metadata stay
+                unchanged for subsequent sharding. Not passed to the constructor.
+                Defaults to normal training-mesh initialization.
             **kwargs: Arguments passed to lazy_init, including:
                 - config: Model configuration
                 - dtype: Computation dtype
@@ -2251,9 +2398,21 @@ class EasyDeLBaseModule(
             This method is slower than regular initialization but allows
             initializing models that would otherwise not fit in memory.
         """
+        with _parameter_init_device_scope(init_device), _parameter_init_sharding_context(kwargs.get("config")):
+            return cls._sequential_init(**kwargs)
+
+    @classmethod
+    def _sequential_init(cls: type[Self], **kwargs) -> Self:
+        """Materialize parameters within the caller's initialization placement scope."""
         from easydel.utils.traversals import iter_module_search
 
-        rng = kwargs.get("rngs", spx.Rngs(44))
+        init_device = _parameter_init_device.get()
+        rng = kwargs.get("rngs")
+        if rng is None:
+            rng = spx.Rngs(44)
+        elif init_device is not None:
+            rng = jax.tree.map(lambda value: jax.device_put(value, init_device), rng)
+        kwargs["rngs"] = rng
         lazy_model = cls.lazy_init(**kwargs)
         # # @erfanzar NOTE: variable-aware sharding via the runtime resolver.
         # The resolver's ``named_sharding_for_variable`` reads each Variable's
@@ -2267,7 +2426,7 @@ class EasyDeLBaseModule(
         fallback_spec = PartitionSpec()
 
         def _sharding_for(var, shape):
-            """Resolve a NamedSharding for a variable using metadata fallbacks.
+            """Resolve physical placement, retaining metadata for later training sharding.
 
             Args:
                 var: A SpectraX variable carrying sharding metadata, or
@@ -2275,10 +2434,12 @@ class EasyDeLBaseModule(
                 shape: Concrete tensor shape, or ``None`` for replicated.
 
             Returns:
-                jax.sharding.NamedSharding: Resolved named sharding (variable
-                metadata if available, otherwise a replicated or
-                shape-corrected fallback).
+                jax.Device | jax.sharding.NamedSharding: Explicit offload device,
+                or resolved named sharding (variable metadata if available,
+                otherwise a replicated or shape-corrected fallback).
             """
+            if init_device is not None:
+                return init_device
             if var is not None and hasattr(var, "metadata"):
                 ns = resolver.named_sharding_for_variable(var, shape=shape, mesh=full_mesh)
                 if ns is not None:
@@ -2405,8 +2566,7 @@ class EasyDeLBaseModule(
                     continue
                 if isinstance(attr, ArrayParam) and isinstance(attr.value, jax.ShapeDtypeStruct):
                     arr = _init_array_param(attr, rng.param)
-                    # No per-attribute sharding info available here; just assign.
-                    attr.value = arr
+                    attr.value = jax.device_put(arr, _sharding_for(attr, tuple(attr.value.shape)))
 
             if hasattr(module, "rngs"):
                 module.rngs = rng.fork(1)[0]
@@ -2430,7 +2590,7 @@ class EasyDeLBaseModule(
                             jax.nn.initializers.normal,
                         )(**(module.init_kwargs or {}))
                     arr = init_fn(rng.param, module.value.shape, module.value.dtype)
-                    module.value = arr
+                    module.value = jax.device_put(arr, _sharding_for(module, tuple(module.value.shape)))
                 else:
                     logger.warning(
                         f"({type(module).__name__}) found empty array at " + ("/".join([str(s) for s in path]))
@@ -2865,6 +3025,7 @@ class EasyDeLBaseModule(
             hf_flattened_wrappers=self._get_hf_flattened_wrappers(),
             checkpoint_key_normalizer=self._get_checkpoint_key_normalizer(),
             hf_model_type=getattr(self.config, "model_type", None),
+            fp32_param_patterns=tuple(self.fp32_param_patterns),
         )
         if shard_fns is not None:
             kwargs["shard_fns"] = shard_fns
@@ -2989,7 +3150,9 @@ class EasyDeLBaseModule(
 
         Args:
             parameter_values: Mapping of parameter paths (flat tuples or
-                nested dicts) to replacement values.
+                nested dicts) to replacement values. Collection-qualified paths
+                are accepted, as are unambiguous collection-free paths and the
+                dotted names returned by :meth:`parameter_values`.
             selector: Optional override for the trainable selector.
 
         Returns:
@@ -3000,16 +3163,27 @@ class EasyDeLBaseModule(
             KeyError: If ``parameter_values`` contains a key not present in
                 the current selected state.
         """
-        current_state = self.split_parameters(selector).flat_state()
+        # Exported State leaves are raw values, not boxed Variables. Detach the
+        # structure so replacements (or a later invalid key) cannot mutate self.
+        current_state = self.split_parameters(selector).copy()
+        current_values = flatten_dict(current_state.raw())
+        path_aliases: dict[tuple, list[tuple]] = {}
+        for key in current_values:
+            # Also accept legacy collection-free paths and the dotted names
+            # returned by parameter_values(). Never guess across collections.
+            for alias in {key[1:], (".".join(str(part) for part in key[1:]),)}:
+                path_aliases.setdefault(alias, []).append(key)
         if not is_flatten(parameter_values):
             parameter_values = flatten_dict(parameter_values)
         for key, value in parameter_values.items():
-            if key in current_state:
-                current_state[key].value = value
-            else:
-                raise KeyError(f"Parameter key {key} not found in the current model state.")
-        self = self.merge_parameters(unflatten_dict(current_state), selector=selector)
-        return self
+            if key not in current_values:
+                matches = path_aliases.get(key, ())
+                if len(matches) != 1:
+                    reason = "ambiguous across collections" if matches else "not found"
+                    raise KeyError(f"Parameter key {key} {reason} in the current model state.")
+                key = matches[0]
+            current_state.set(key[0], key[1:], value)
+        return self.merge_parameters(current_state, selector=selector)
 
     def flops_per_token(
         self,
@@ -3439,10 +3613,34 @@ class EasyDeLBaseModule(
                 mtp_loss = getattr(outputs, "mtp_loss", None)
                 if mtp_loss is not None:
                     other_metrics.setdefault("mtp_loss", mtp_loss)
+                indexer_aux_loss = getattr(outputs, "indexer_aux_loss", None)
+                if indexer_aux_loss is not None:
+                    other_metrics.setdefault("indexer_aux_loss", indexer_aux_loss)
                 loss_output = loss_output.replace(other_metrics=other_metrics)
                 loss_output.loss = loss_output.loss + outputs.aux_loss
         outputs = outputs.replace(loss=loss_output.loss)
         return outputs, loss_output
+
+    def _tie_embeddings_enabled(self) -> bool:
+        """Resolve constructor and config requests to share input/output weights.
+
+        The first present config key among ``tie_word_embeddings``,
+        ``use_lm_head`` and ``share_input_output_layers`` retains precedence.
+        A task wrapper's optional constructor feature can also enable tying.
+
+        Returns:
+            Whether the LM head should use the transposed embedding matrix.
+        """
+        config_tie = next(
+            (
+                getattr(self.config, key)
+                for key in ("tie_word_embeddings", "use_lm_head", "share_input_output_layers")
+                if hasattr(self.config, key)
+            ),
+            False,
+        )
+        feature = getattr(self, "_tie_embeddings_feature", None)
+        return bool(config_tie) or bool(getattr(feature, "tie", False))
 
     def apply_lm_head(self, hidden_states: Array) -> Array:
         """Apply the language model head to transform hidden states to logits.
@@ -3466,16 +3664,97 @@ class EasyDeLBaseModule(
             >>> print(logits.shape)
             (2, 128, 32000)  # (batch, seq, vocab)
         """
-        tie_embeddings = next(
-            (
-                getattr(self.config, key)
-                for key in ["tie_word_embeddings", "use_lm_head", "share_input_output_layers"]
-                if hasattr(self.config, key)
+        head = self.get_lm_head()
+        w = self._tied_lm_head_weight(head)
+        return tp.cast(Array, head(hidden_states, w=w))
+
+    def _lm_head_kernel_spec(self: Self, head: tp.Any, shape: tuple[int, ...]) -> PartitionSpec | None:
+        """Resolve the LM head's intended kernel :class:`PartitionSpec`.
+
+        Resolution order: the head's ``weight`` variable sharding metadata (present even
+        when the tied kernel is unused), then an explicit ``sharding_layout``, then the
+        layout implied by its ``_direction`` marker. Every path goes through the config's
+        ``RuntimeShardingResolver``, so axes that do not divide ``shape`` are dropped.
+
+        Args:
+            head: The LM head module whose kernel layout the tied weight must match.
+            shape: Kernel-oriented shape ``(in_features, out_features)``.
+
+        Returns:
+            PartitionSpec | None: The head kernel's partition spec, or ``None`` when no
+            layout can be resolved (the failure reason is logged once).
+        """
+        head_name = type(head).__name__
+        try:
+            resolver = self.config.runtime_sharding_resolver.with_mesh(self.config.mesh)
+        except Exception as exc:
+            logger.warn_once(f"tied LM-head: no sharding resolver/mesh available for {head_name}: {exc!r}")
+            return None
+        metadata = getattr(getattr(head, "weight", None), "metadata", None)
+        if metadata:
+            try:
+                spec = resolver.resolve_metadata(metadata, shape=shape)
+            except Exception as exc:
+                logger.warn_once(f"tied LM-head: resolving {head_name}.weight metadata failed: {exc!r}")
+                spec = None
+            if spec is not None:
+                return spec
+        layout = getattr(head, "sharding_layout", None)
+        if layout is None:
+            direction = getattr(head, "_direction", None)
+            if direction == "column":
+                layout = spx.common_types.ColumnWise
+            elif direction == "row":
+                layout = spx.common_types.RowWise
+        if layout is None:
+            return None
+        try:
+            return resolver.resolve_layout(layout, shape=shape)
+        except Exception as exc:
+            logger.warn_once(f"tied LM-head: resolving {head_name} layout {layout!r} failed: {exc!r}")
+            return None
+
+    def _tied_lm_head_weight(self: Self, head: tp.Any) -> Array | None:
+        """Return the tied-embedding LM-head weight resharded to the head kernel's layout.
+
+        The embedding is stored over ``(vocab, hidden)`` with the hidden dimension on the
+        tensor axis, so its transpose arrives over ``(hidden, vocab)`` with the
+        *contracting* dimension tensor-sharded. Left unconstrained, GSPMD can lower the
+        projection as partial full-vocab matmuls plus a tensor-axis all-reduce and
+        materialize replicated ``[batch, seq, vocab]`` logits on every device.
+        Constraining the transposed weight to the head kernel's own (column-parallel)
+        layout makes the tied path produce the same vocab-sharded logits as an untied
+        kernel.
+
+        Args:
+            head: The LM head module whose kernel layout the tied weight must match.
+
+        Returns:
+            Array | None: The transposed (and, when a layout resolves, sharding-constrained)
+            embedding matrix, or ``None`` when weight tying is disabled.
+        """
+        if not self._tie_embeddings_enabled():
+            return None
+        w = tp.cast(Array, self.get_embedding().weight.value.T)
+        if getattr(w, "shape", None) is None:
+            return w
+        spec = self._lm_head_kernel_spec(head, tuple(w.shape))
+        if spec is None:
+            logger.warn_once(
+                f"tied LM-head weight could not be resharded: no partition spec resolved for "
+                f"{type(head).__name__} at shape {tuple(w.shape)}; the transposed embedding keeps its "
+                "row-parallel layout and GSPMD may materialize replicated full-vocab logits."
+            )
+            return w
+        return tp.cast(
+            Array,
+            spx.with_sharding_constraint(
+                w,
+                spec,
+                mesh=self.config.mesh,
+                metadata=getattr(getattr(head, "weight", None), "metadata", None),
             ),
-            False,
         )
-        w = self.get_embedding().weight.value.T if tie_embeddings else None
-        return tp.cast(Array, self.get_lm_head()(hidden_states, w=w))
 
     def make_lm_head_fn(self, vocab_shard_stage: int | None = None) -> "Callable[[Array], Array]":
         """Return a trace-safe callable that projects hidden states to logits.
@@ -3507,18 +3786,11 @@ class EasyDeLBaseModule(
             A callable ``fn(hidden_states) -> logits`` that preserves
             all model-specific projection semantics.
         """
-        del vocab_shard_stage  # Kept for compatibility; 0.3.0 did not constrain the LM-head weight here.
+        # Kept for signature compatibility; the tied-weight reshard is stage-aware through the
+        # head weight's own metadata.
+        del vocab_shard_stage
         head = self.get_lm_head()
-
-        tie_embeddings = next(
-            (
-                getattr(self.config, key)
-                for key in ["tie_word_embeddings", "use_lm_head", "share_input_output_layers"]
-                if hasattr(self.config, key)
-            ),
-            False,
-        )
-        w = self.get_embedding().weight.value.T if tie_embeddings else None
+        w = self._tied_lm_head_weight(head)
 
         _native_forward = getattr(head, "native_forward", None)
 
@@ -3607,7 +3879,13 @@ class EasyDeLBaseModule(
                 updates.
             updates: Mapping of attribute names to replacement values.
         """
-        for sub_cfg in EasyDeLBaseModule._recursive_config_children(config):
+        visited = {id(config)}
+        pending = list(EasyDeLBaseModule._recursive_config_children(config))
+        while pending:
+            sub_cfg = pending.pop()
+            if id(sub_cfg) in visited:
+                continue
+            visited.add(id(sub_cfg))
             sub_cfg_dict = getattr(sub_cfg, "__dict__", None)
             for key, value in updates.items():
                 if (isinstance(sub_cfg_dict, dict) and key in sub_cfg_dict) or hasattr(type(sub_cfg), key):
@@ -3616,6 +3894,7 @@ class EasyDeLBaseModule(
                     except AttributeError:
                         # Skip read-only attributes/properties while applying broad overrides.
                         continue
+            pending.extend(EasyDeLBaseModule._recursive_config_children(sub_cfg))
 
     @staticmethod
     def _normalize_rebuild_quantization_config(config: EasyDeLBaseConfig):

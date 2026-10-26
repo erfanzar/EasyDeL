@@ -27,14 +27,13 @@ guarantees:
 - **The ZMQ step-replication plane** (``coordination="zmq"``): every host
   executes the leader's literal ``SchedulerOutput`` stream in order, so host
   payloads are identical by construction and the broadcasts are redundant
-  work. The engine marks the process via
-  :func:`mark_host_payloads_replicated` and the runner skips them.
+  work. Preparers and sampler runtimes accept a runner-owned
+  ``host_payloads_replicated`` guarantee to skip them.
 
-The flag is process-global and sticky: coordination mode is a property of
-how this process's engine steps are driven, established at engine
-construction. It only ever turns broadcasts *off* in a mode whose replay
-protocol already guarantees payload equality (cross-checked off the hot
-path by the coordinator's sampled-token digests).
+Explicit runner policies are isolated across sequential and concurrent engines.
+The process-global :func:`mark_host_payloads_replicated` API remains available
+for legacy external callers that omit an explicit policy; new engine wiring
+must pass its own guarantee instead of relying on that compatibility flag.
 
 NOTE: skipping the broadcasts under ``coordination="zmq"`` is validated on
 CPU (2-process integration test); the throughput benefit on a real TPU pod
@@ -60,12 +59,18 @@ def mark_host_payloads_replicated(enabled: bool = True) -> None:
     _HOST_PAYLOADS_REPLICATED = bool(enabled)
 
 
-def host_payload_broadcast_needed() -> bool:
+def host_payload_broadcast_needed(host_payloads_replicated: bool | None = None) -> bool:
     """Whether host payloads must be force-broadcast from process 0.
 
+    Args:
+        host_payloads_replicated: The owning runner's replication guarantee.
+            Explicit ``False`` is isolated from the legacy process flag.
+            ``None`` falls back to the process-global flag set by
+            :func:`mark_host_payloads_replicated`; engine-owned preparers and
+            samplers always pass their own policy.
+
     Returns:
-        ``True`` on multi-process runtimes running the replicated-driver
-        pattern; ``False`` on single hosts and under the ZMQ
-        step-replication plane.
+        ``True`` on multi-process replicated drivers, otherwise ``False``.
     """
-    return jax.process_count() > 1 and not _HOST_PAYLOADS_REPLICATED
+    replicated = _HOST_PAYLOADS_REPLICATED if host_payloads_replicated is None else host_payloads_replicated
+    return jax.process_count() > 1 and not replicated

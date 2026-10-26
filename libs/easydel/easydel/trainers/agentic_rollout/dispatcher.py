@@ -102,8 +102,18 @@ class ToolDispatcher:
         self,
         calls: tp.Iterable[tp.Any],
         context: GuardContext,
+        *,
+        execute: tp.Callable[[NormalizedToolCall], tp.Any] | None = None,
     ) -> tuple[DispatchResult, ...]:
-        """Guard all calls as a batch, then execute only allowed calls."""
+        """Guard all calls as a batch, then execute only allowed calls.
+
+        Args:
+            calls: Calls to normalize and evaluate as a batch.
+            context: Per-episode guard state.
+            execute: Optional execution boundary for serialized-argument tool
+                protocols. Receives only calls allowed by the guard; its result
+                is normalized just like a registered executor's result.
+        """
         normalized = normalize_tool_calls(calls)
         if not normalized:
             return ()
@@ -137,7 +147,7 @@ class ToolDispatcher:
             results.append(
                 DispatchResult(
                     call=call,
-                    execution=self._execute(call),
+                    execution=self._execute(call) if execute is None else self._normalize_execution(execute(call)),
                     blocked=False,
                     guard_decision=decision,
                 )

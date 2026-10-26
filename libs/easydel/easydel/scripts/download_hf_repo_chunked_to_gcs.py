@@ -47,7 +47,6 @@ Tips:
 
 from __future__ import annotations
 
-import fnmatch
 import os
 import shlex
 import shutil
@@ -61,6 +60,11 @@ from pathlib import Path
 from eformer.aparser import DataClassArgumentParser
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.hf_api import RepoFile
+
+try:  # package import (``python -m easydel.scripts...``)
+    from ._hf_common import enable_hf_fast_transfer, matches_any_glob, read_id_list, repo_out_dir
+except ImportError:  # run directly as a script: the script directory is on ``sys.path``
+    from _hf_common import enable_hf_fast_transfer, matches_any_glob, read_id_list, repo_out_dir  # type: ignore
 
 GiB = 1024**3
 
@@ -141,8 +145,9 @@ class ChunkedDownloadArgs:
             sync (useful for debugging).
         gsutil_parallel (bool): Use ``gsutil -m`` for parallel
             uploads to ``gs://`` destinations.
-        enable_hf_transfer (bool): Toggle the
-            ``HF_HUB_ENABLE_HF_TRANSFER`` accelerator.
+        enable_hf_transfer (bool): Enable accelerated HF downloads
+            (``hf_transfer`` on legacy ``huggingface_hub``, the Xet
+            backend on current releases).
     """
 
     out_root: str = field(
@@ -192,7 +197,7 @@ class ChunkedDownloadArgs:
     gsutil_parallel: bool = field(default=True, metadata={"help": "Use `gsutil -m` when syncing to gs:// destinations."})
     enable_hf_transfer: bool = field(
         default=False,
-        metadata={"help": "Enable hf_transfer accelerated HF downloads (requires `pip install hf_transfer`)."},
+        metadata={"help": "Enable accelerated HF downloads (hf_transfer on legacy hub, hf_xet on current hub)."},
     )
 
 
@@ -205,14 +210,7 @@ def _read_repos_file(path: str | os.PathLike) -> list[str]:
     Returns:
         List of repository ID strings.
     """
-    text = Path(path).read_text(encoding="utf-8")
-    repo_ids: list[str] = []
-    for raw_line in text.splitlines():
-        line = raw_line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        repo_ids.append(line)
-    return repo_ids
+    return read_id_list(path)
 
 
 def _sanitize_repo_id(repo_id: str) -> str:
@@ -238,10 +236,7 @@ def _repo_out_dir_local(out_root: Path, repo_id: str) -> Path:
         ``out_root/owner/name`` when ``repo_id`` is qualified, otherwise
         ``out_root/repo_id``.
     """
-    if "/" in repo_id:
-        owner, name = repo_id.split("/", 1)
-        return out_root / owner / name
-    return out_root / repo_id
+    return repo_out_dir(out_root, repo_id)
 
 
 def _repo_out_dir_gs(out_root: str, repo_id: str) -> str:
@@ -271,7 +266,7 @@ def _matches_any_glob(name: str, globs: tuple[str, ...]) -> bool:
     Returns:
         True if any pattern matches ``name``.
     """
-    return any(fnmatch.fnmatch(name, pattern) for pattern in globs)
+    return matches_any_glob(name, globs)
 
 
 def _should_keep_path(
@@ -536,11 +531,9 @@ def main(argv: list[str] | None = None) -> int:
     (args,) = parser.parse_args_into_dataclasses(args=argv, look_for_args_file=False)
 
     if args.enable_hf_transfer:
-        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-        try:
-            import hf_transfer  # noqa: F401 #type:ignore
-        except Exception:
-            print("warning: `hf_transfer` is not installed. Run: pip install -U hf_transfer", file=sys.stderr)
+        transfer_warning = enable_hf_fast_transfer()
+        if transfer_warning:
+            print(f"warning: {transfer_warning}", file=sys.stderr)
 
     repo_ids: list[str] = []
     repo_ids.extend([rid for rid in args.repo_id if rid])
@@ -696,6 +689,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{repo_tag} [fatal]: {e}", file=sys.stderr)
             if not args.continue_on_error:
                 return 2
+            # A repo that aborted (listing/auth/sync failure) must still fail the run's exit code.
+            total_failed += 1
+            repo_failed += 1
 
         print(f"  done: downloaded_ok={downloaded_ok} failed={repo_failed}")
 

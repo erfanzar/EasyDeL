@@ -112,6 +112,48 @@ def _fmt_bytes(num_bytes: int | float) -> str:
     return f"{value:.1f} TB"
 
 
+def ep_carries_batch_inactive_reason(
+    *,
+    ep: int,
+    sp: int,
+    fsdp_is_ep_bound: bool,
+    sp_is_ep_bound: bool,
+    use_ring_of_experts: bool,
+    use_expert_tensor_mode: bool = False,
+) -> str | None:
+    """Why the ep-carries-batch dispatch cannot run on a layout (``None`` means it can).
+
+    Single source of truth shared by ``BaseMoeModule._ep_carries_batch_active`` and
+    :func:`estimate_moe_layout`, so the runtime gate and the planner never disagree. Only the static
+    layout conditions live here; mesh-axis presence and expert divisibility stay with the module.
+
+    ``sp_is_ep_bound`` folds the sequence axis into the expert axis, which only matters when that axis
+    is non-trivial: at ``sp == 1`` the fold is a no-op and does not disqualify the dispatch.
+
+    Args:
+        ep: Expert-parallel axis size.
+        sp: Sequence-parallel axis size (``1`` when the mesh has no sp axis).
+        fsdp_is_ep_bound: Whether fsdp folds into the expert axis.
+        sp_is_ep_bound: Whether sp folds into the expert axis.
+        use_ring_of_experts: Whether the ring dispatch is selected.
+        use_expert_tensor_mode: Whether experts are swapped onto the tensor axis.
+
+    Returns:
+        A human-readable refusal reason, or ``None`` when the dispatch applies.
+    """
+    if use_ring_of_experts:
+        return "use_ring_of_experts=True (ring all-gathers the batch over ep, the opposite placement)"
+    if use_expert_tensor_mode:
+        return "use_expert_tensor_mode=True (ep swapped onto tp; no expert axis to dispatch over)"
+    if sp_is_ep_bound and int(sp) > 1:
+        return f"sp_is_ep_bound=True with sp={int(sp)} (the folded sp axis has no batch-carrying counterpart)"
+    if fsdp_is_ep_bound:
+        return "fsdp_is_ep_bound=True (the folded expert mesh has no distinct fsdp axis to co-shard the batch with)"
+    if int(ep) <= 1:
+        return f"expert axis has size {int(ep)}"
+    return None
+
+
 @dataclasses.dataclass(frozen=True)
 class MoeLayoutEstimate:
     """Static-shape estimate of the fused-MoE memory/communication footprint.
@@ -191,6 +233,7 @@ def estimate_moe_layout(
     chunk_size: int | None,
     fsdp_shard_expert_weights: bool = False,
     ep_carries_batch: bool = False,
+    sp_is_ep_bound: bool = False,
 ) -> MoeLayoutEstimate:
     """Estimate the fused-MoE per-core memory and communication footprint.
 
@@ -237,6 +280,8 @@ def estimate_moe_layout(
             ``ep * local_tokens * min(k, E/ep) * H`` elements. Only
             meaningful with ``ep > 1``, ``use_ring_of_experts=False`` and
             ``fsdp_is_ep_bound=False``.
+        sp_is_ep_bound: Whether sp folds into the expert axis. Disqualifies the ep-carries-batch
+            dispatch only when ``sp > 1`` (see :func:`ep_carries_batch_inactive_reason`).
 
     Returns:
         A :class:`MoeLayoutEstimate` with per-core, per-layer byte counts
@@ -251,9 +296,19 @@ def estimate_moe_layout(
     total_devices = dp * fsdp * ep * tp * sp
     global_tokens = int(tokens_per_device) * total_devices
 
-    # ep-carries-batch only exists on the non-ring, ep-unbound stage-mesh
-    # path with ep > 1 (mirrors BaseMoeModule._ep_carries_batch_active).
-    ep_carries_batch_active = bool(ep_carries_batch) and ep > 1 and not use_ring_of_experts and not fsdp_is_ep_bound
+    # ep-carries-batch only exists on the non-ring, ep-unbound stage-mesh path with ep > 1; the shared
+    # predicate is the same one BaseMoeModule._ep_carries_batch_active consults.
+    ep_carries_batch_applicable = (
+        ep_carries_batch_inactive_reason(
+            ep=ep,
+            sp=sp,
+            fsdp_is_ep_bound=fsdp_is_ep_bound,
+            sp_is_ep_bound=sp_is_ep_bound,
+            use_ring_of_experts=use_ring_of_experts,
+        )
+        is None
+    )
+    ep_carries_batch_active = bool(ep_carries_batch) and ep_carries_batch_applicable
 
     batch_ways = dp * (1 if fsdp_is_ep_bound else fsdp) * (ep if ep_carries_batch_active else 1)
     local_tokens = math.ceil(global_tokens / batch_ways)
@@ -318,9 +373,7 @@ def estimate_moe_layout(
     recommend_fsdp_weights = (
         not fsdp_shards_weights and fsdp > 1 and expert_weights_bytes_per_device > MOE_WEIGHT_RESIDENCY_RECOMMEND_BYTES
     )
-    recommend_ep_carries_batch = (
-        not ep_carries_batch_active and ep > 1 and not use_ring_of_experts and not fsdp_is_ep_bound
-    )
+    recommend_ep_carries_batch = not ep_carries_batch_active and ep_carries_batch_applicable
 
     parts = [
         (
@@ -396,6 +449,7 @@ def _validate_moe_layout_cached(
     chunk_size: int | None,
     fsdp_shard_expert_weights: bool,
     ep_carries_batch: bool,
+    sp_is_ep_bound: bool,
 ) -> MoeLayoutEstimate:
     """Cached estimate + logging + hard failure for one hashable layout.
 
@@ -419,6 +473,7 @@ def _validate_moe_layout_cached(
         chunk_size: See :func:`estimate_moe_layout`.
         fsdp_shard_expert_weights: See :func:`estimate_moe_layout`.
         ep_carries_batch: See :func:`estimate_moe_layout`.
+        sp_is_ep_bound: See :func:`estimate_moe_layout`.
 
     Returns:
         The computed :class:`MoeLayoutEstimate`.
@@ -441,6 +496,7 @@ def _validate_moe_layout_cached(
         chunk_size=chunk_size,
         fsdp_shard_expert_weights=fsdp_shard_expert_weights,
         ep_carries_batch=ep_carries_batch,
+        sp_is_ep_bound=sp_is_ep_bound,
     )
     logger.info(estimate.summary)
     if estimate.exceeds_int32_allocation_bound:
@@ -483,6 +539,7 @@ def validate_moe_layout(
     chunk_size: int | None,
     fsdp_shard_expert_weights: bool = False,
     ep_carries_batch: bool = False,
+    sp_is_ep_bound: bool = False,
 ) -> MoeLayoutEstimate:
     """Estimate an MoE layout, log it at INFO, and hard-fail impossible ones.
 
@@ -511,4 +568,5 @@ def validate_moe_layout(
         None if chunk_size is None else int(chunk_size),
         bool(fsdp_shard_expert_weights),
         bool(ep_carries_batch),
+        bool(sp_is_ep_bound),
     )

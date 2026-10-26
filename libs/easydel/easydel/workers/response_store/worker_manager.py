@@ -35,13 +35,14 @@ import sys
 import tempfile
 import time
 import uuid
-from pathlib import Path
 
 from easydel.workers.loggers import get_logger
 
 from .zmq_client import ResponseStoreWorkerClient
 
 logger = get_logger(__name__)
+
+_WORKER_MAIN_MODULE = "easydel.workers.response_store.worker_main"
 
 
 class ResponseStoreWorkerManager:
@@ -130,7 +131,6 @@ class ResponseStoreWorkerManager:
         if needs_spawn:
             endpoint = self._make_ipc_endpoint("responses")
             self._process = self._spawn_worker(endpoint)
-            self._owned = True
             try:
                 self._wait_for_endpoint(endpoint, self._process)
             except Exception:
@@ -138,6 +138,7 @@ class ResponseStoreWorkerManager:
                 self._cleanup_ipc_file(endpoint)
                 raise
 
+        self._owned = needs_spawn
         self._endpoint = endpoint
         self._client = ResponseStoreWorkerClient(endpoint)
         return self._client
@@ -177,10 +178,12 @@ class ResponseStoreWorkerManager:
             subprocess.Popen: Handle to the spawned process. The caller is
             responsible for waiting on bind via :meth:`_wait_for_endpoint`.
         """
-        worker_main_path = Path(__file__).with_name("worker_main.py")
+        # Run as a module (not as a script path) so the package-relative imports inside
+        # ``worker_main`` resolve; a script launch has no parent package.
         cmd = [
             sys.executable,
-            str(worker_main_path),
+            "-m",
+            _WORKER_MAIN_MODULE,
             "--endpoint",
             endpoint,
             "--max-stored-responses",
@@ -194,9 +197,12 @@ class ResponseStoreWorkerManager:
             cmd.extend(["--storage-dir", self._storage_dir])
 
         env = os.environ.copy()
-        env.setdefault("JAX_PLATFORMS", "cpu")
-        env.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
-        env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+        # Module startup imports EasyDeL before worker_main can isolate JAX.
+        # Override model-process settings before any child imports run.
+        env["JAX_PLATFORMS"] = "cpu"
+        env["JAX_PLATFORM_NAME"] = "cpu"
+        env["ENABLE_DISTRIBUTED_INIT"] = "0"
+        env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
         env.setdefault("PYTHONUNBUFFERED", "1")
 
         logger.info(f"Spawning response store worker: {' '.join(cmd)}")

@@ -80,7 +80,7 @@ class CompilationContext(tp.NamedTuple):
 ContextPayload = tp.TypeVar("ContextPayload", bound=tuple)
 
 _context_var: contextvars.ContextVar[ContextPayload | None] = contextvars.ContextVar("easydeL_jit_context", default=None)
-_context_generation = 0
+_context_generation: contextvars.ContextVar[int] = contextvars.ContextVar("easydeL_jit_context_generation", default=0)
 
 _JAX_USER_CONTEXT: tp.Any = None
 try:
@@ -122,14 +122,13 @@ def jit_context(context: ContextPayload | None) -> Iterator[ContextPayload | Non
     if context is not None and not isinstance(context, tuple):
         raise TypeError("jit_context expects a NamedTuple (or tuple) payload.")
 
-    global _context_generation
     token = _context_var.set(context)
-    prev_generation = _context_generation
+    prev_generation = _context_generation.get()
     prev_state = _JIT_CONTEXT_STATE.swap_local(context) if _JIT_CONTEXT_STATE else None
     try:
         yield context
     finally:
-        if prev_generation == _context_generation:
+        if prev_generation == _context_generation.get():
             _context_var.reset(token)
             if _JIT_CONTEXT_STATE:
                 _JIT_CONTEXT_STATE.set_local(prev_state)
@@ -184,14 +183,14 @@ def peek_jit_context(default: ContextPayload | None = None) -> ContextPayload | 
 def clear_jit_context() -> None:
     """Clear any active context without leaving a ``with`` block.
 
-    Bumps ``_context_generation`` so an enclosing :func:`jit_context` block
-    detects the explicit clear and skips its own restore on exit. Mostly
-    intended for testing helpers.
+    Bumps the context-local generation so an enclosing :func:`jit_context`
+    block detects the explicit clear and skips its own restore on exit, without
+    affecting scopes in other threads or execution contexts. Mostly intended
+    for testing helpers.
     """
 
-    global _context_generation
     _context_var.set(None)
-    _context_generation += 1
+    _context_generation.set(_context_generation.get() + 1)
     if _JIT_CONTEXT_STATE:
         _JIT_CONTEXT_STATE.set_local(config_ext.unset)
 

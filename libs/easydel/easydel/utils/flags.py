@@ -20,9 +20,10 @@ default, owning subsystem, and one-line doc. The typed getters
 ``os.environ`` **at call time**, so a flag set after import (e.g. by a test) is
 honored and stays togglable per run.
 
-All EasyDeL-owned flags use the ``EASYDEL_`` prefix (the eSurge subsystem was
-unified onto it — the old ``EASURGE_`` names were removed with no alias). Flags
-owned by the foundation libraries keep their own prefixes (``EJKERNEL_``,
+EasyDeL-owned flags use the ``EASYDEL_`` prefix, except for the
+``ESURGE_`` tokenizer-worker settings, which keep their names (the old
+``EASURGE_`` names were removed with no alias). Flags owned by the foundation
+libraries keep their own prefixes (``EJKERNEL_``,
 ``EFORMER_``) and are not registered here; ``EASYDEL_CACHE_COMPILES`` /
 ``EASYDEL_RECOMPILE_FORCE`` are read by ejkernel's ``callib`` by intentional
 cross-package agreement.
@@ -55,11 +56,15 @@ class FlagSpec:
     """Definition of a single EasyDeL environment flag.
 
     Attributes:
-        name: Environment variable name (``EASYDEL_...``).
+        name: Existing environment variable name (usually ``EASYDEL_...``).
         kind: One of ``"bool"``, ``"int"``, ``"float"``, ``"str"``.
         default: Value used when the variable is unset (or invalid).
         subsystem: Human-readable owner group used for documentation.
         doc: One-line description of what the flag does.
+        aliases: Existing legacy environment names, checked only when the
+            canonical name is unset.
+        true_values: Optional case-sensitive true values for flags with legacy
+            parsing semantics; ``None`` uses ``check_bool_flag``.
     """
 
     name: str
@@ -67,16 +72,29 @@ class FlagSpec:
     default: tp.Any
     subsystem: str
     doc: str
+    aliases: tuple[str, ...] = ()
+    true_values: tuple[str, ...] | None = None
 
 
 _REGISTRY: dict[str, FlagSpec] = {}
 
 
-def _register(name: str, kind: str, default: tp.Any, subsystem: str, doc: str) -> str:
+def _register(
+    name: str,
+    kind: str,
+    default: tp.Any,
+    subsystem: str,
+    doc: str,
+    *,
+    aliases: tuple[str, ...] = (),
+    true_values: tuple[str, ...] | None = None,
+) -> str:
     """Register a flag spec and return its name (for use as a module constant)."""
     if name in _REGISTRY:
         raise ValueError(f"flag {name!r} is already registered")
-    _REGISTRY[name] = FlagSpec(name=name, kind=kind, default=default, subsystem=subsystem, doc=doc)
+    _REGISTRY[name] = FlagSpec(
+        name=name, kind=kind, default=default, subsystem=subsystem, doc=doc, aliases=aliases, true_values=true_values
+    )
     return name
 
 
@@ -92,20 +110,34 @@ def _spec(name: str) -> FlagSpec:
         raise KeyError(f"{name!r} is not a registered EasyDeL flag (see easydel.utils.flags).") from exc
 
 
+def _environment_name(name: str) -> str:
+    """Select the canonical environment key, falling back to existing aliases."""
+    for candidate in (name, *_spec(name).aliases):
+        if candidate in os.environ:
+            return candidate
+    return name
+
+
 def get_bool(name: str) -> bool:
     """Read a registered boolean flag from the environment at call time.
 
     Uses :func:`easydel.utils.helpers.check_bool_flag` truthiness
-    (``true``/``yes``/``ok``/``1``/``easy``), falling back to the registered
-    default when unset.
+    (``true``/``yes``/``ok``/``1``/``easy``), unless the spec declares
+    case-sensitive legacy ``true_values``. Falls back to the registered default
+    when unset.
     """
-    return check_bool_flag(name, bool(_spec(name).default))
+    spec = _spec(name)
+    environment_name = _environment_name(name)
+    if spec.true_values is not None:
+        raw = os.environ.get(environment_name)
+        return bool(spec.default) if raw is None else raw in spec.true_values
+    return check_bool_flag(environment_name, bool(spec.default))
 
 
 def get_int(name: str) -> int:
     """Read a registered integer flag from the environment at call time."""
     default = int(_spec(name).default)
-    raw = os.environ.get(name)
+    raw = os.environ.get(_environment_name(name))
     if raw is None or raw == "":
         return default
     try:
@@ -117,7 +149,7 @@ def get_int(name: str) -> int:
 def get_float(name: str) -> float:
     """Read a registered float flag from the environment at call time."""
     default = float(_spec(name).default)
-    raw = os.environ.get(name)
+    raw = os.environ.get(_environment_name(name))
     if raw is None or raw == "":
         return default
     try:
@@ -131,7 +163,7 @@ def get_str(name: str) -> str | None:
 
     Returns the registered default (commonly ``None``) when unset or empty.
     """
-    raw = os.environ.get(name)
+    raw = os.environ.get(_environment_name(name))
     if raw is None or raw == "":
         return _spec(name).default
     return raw
@@ -144,7 +176,7 @@ def render_markdown() -> str:
         "# EasyDeL-owned environment flags",
         "",
         "Typed, call-time flags registered in `easydel/utils/flags.py`. Booleans use "
-        "`check_bool_flag` truthiness (`true`/`yes`/`ok`/`1`/`easy`).",
+        "`check_bool_flag` truthiness (`true`/`yes`/`ok`/`1`/`easy`) unless a flag documents legacy true values.",
         "",
     ]
     subsystem = None
@@ -153,7 +185,8 @@ def render_markdown() -> str:
             subsystem = spec.subsystem
             lines += ["", f"## {subsystem}", "", "| Flag | Type | Default | Description |", "| --- | --- | --- | --- |"]
         default = "none" if spec.default is None else f"`{spec.default}`"
-        lines.append(f"| `{spec.name}` | {spec.kind} | {default} | {spec.doc} |")
+        aliases = f" Legacy aliases: {', '.join(f'`{alias}`' for alias in spec.aliases)}." if spec.aliases else ""
+        lines.append(f"| `{spec.name}` | {spec.kind} | {default} | {spec.doc}{aliases} |")
     return "\n".join(lines) + "\n"
 
 
@@ -163,6 +196,23 @@ def render_markdown() -> str:
 # The names below double as importable constants so call sites read
 # ``flags.EASYDEL_SPEC_RECURRENT_REPLAY`` instead of a bare string literal.
 # --------------------------------------------------------------------------- #
+
+EASYDEL_PREFERRED_HOST_COPY_INDEX = _register(
+    "EASYDEL_PREFERRED_HOST_COPY_INDEX",
+    "int",
+    0,
+    "Checkpoint conversion",
+    "Device index used for host-mediated tensor transfers.",
+    aliases=("EASYDEL_PERFRED_HOST_COPY_INDEX",),
+)
+EASYDEL_PREFERRED_HOST_COPY = _register(
+    "EASYDEL_PREFERRED_HOST_COPY",
+    "str",
+    "cpu",
+    "Checkpoint conversion",
+    "Backend for host-mediated tensor transfers; 'none' selects JAX's default backend.",
+    aliases=("EASYDEL_PERFRED_HOST_COPY",),
+)
 
 EASYDEL_MAX_SCHEDULER_ERRORS = _register(
     "EASYDEL_MAX_SCHEDULER_ERRORS",
@@ -205,6 +255,21 @@ EASYDEL_WORKER_STARTUP_TIMEOUT = _register(
     120.0,
     "eSurge engine",
     "Seconds to wait for a tokenizer/detokenizer worker to bind before timing out.",
+)
+ESURGE_WORKER_TRUST_REMOTE_CODE = _register(
+    "ESURGE_WORKER_TRUST_REMOTE_CODE",
+    "bool",
+    True,
+    "eSurge engine",
+    "Default tokenizer trust_remote_code; legacy true values are exactly '1', 'on', 'yes' (case-sensitive).",
+    true_values=("1", "on", "yes"),
+)
+ESURGE_DETOKENIZER_CONTEXT_WINDOW = _register(
+    "ESURGE_DETOKENIZER_CONTEXT_WINDOW",
+    "int",
+    4,
+    "eSurge engine",
+    "Token context window used by the worker's incremental detokenizer.",
 )
 
 EASYDEL_SYNC_INPUTS_FOR_TIMING = _register(

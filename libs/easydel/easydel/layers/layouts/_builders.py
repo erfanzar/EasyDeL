@@ -52,8 +52,6 @@ if TYPE_CHECKING:
     from easydel.infra.sharding import TensorLayout
 
 Initializer: TypeAlias = Callable[[jax.Array, tuple[int, ...], DTypeLike], jax.Array]
-ReformRule: TypeAlias = dict[str, object]
-ReformParam: TypeAlias = dict[str, ReformRule]
 
 
 def _default_kernel_init(config: EasyDeLBaseConfig) -> Initializer:
@@ -107,7 +105,8 @@ def build_fused_gate_up_projection(
         precision: JAX matmul precision flag.
         rngs: SpecTrax RNGs supplying the parameter initializer key.
         use_bias: When ``True`` adds learnable biases (rare for SwiGLU).
-        target_prefix: Reform-rule prefix for the fused tensor name.
+        target_prefix: Reform-rule prefix for the fused tensor name; stored on
+            the layout and used by ``layout.reform_param()`` when no prefix is passed.
         gate_prefix: Source-tensor prefix for the gate half (HF naming).
         up_prefix: Source-tensor prefix for the up half (HF naming).
         kernel_init: Optional initializer override; defaults to
@@ -123,6 +122,7 @@ def build_fused_gate_up_projection(
         intermediate_size,
         gate_prefix=gate_prefix,
         up_prefix=up_prefix,
+        target_prefix=target_prefix,
     )
     return ColumnParallelLinear(
         config.hidden_size,
@@ -195,7 +195,8 @@ def build_fused_qkv_projection(
         precision: JAX matmul precision flag.
         rngs: SpecTrax RNGs supplying the parameter initializer key.
         use_bias: When ``True`` adds learnable biases (rare for attention).
-        target_prefix: Reform-rule prefix for the fused tensor name.
+        target_prefix: Reform-rule prefix for the fused tensor name; stored on
+            the layout and used by ``layout.reform_param()`` when no prefix is passed.
         query_prefix: Source-tensor prefix for the Q half (HF naming).
         key_prefix: Source-tensor prefix for the K half (HF naming).
         value_prefix: Source-tensor prefix for the V half (HF naming).
@@ -212,6 +213,7 @@ def build_fused_qkv_projection(
         query_prefix=query_prefix,
         key_prefix=key_prefix,
         value_prefix=value_prefix,
+        target_prefix=target_prefix,
     )
     return ColumnParallelLinear(
         config.hidden_size,

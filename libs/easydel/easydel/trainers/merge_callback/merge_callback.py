@@ -15,8 +15,8 @@
 
 The callback provides a TRL-compatible place to trigger a merge while keeping
 EasyDeL semantics: callers pass initialized states or pytrees, and the callback
-stores the merged graphstate in memory. It does not load model IDs, write merged
-checkpoints by itself, or push artifacts to the Hub.
+stores the merged graphstate in memory. Optional publishing uses the merged
+policy state or a caller-supplied publisher; model IDs are never loaded.
 """
 
 from __future__ import annotations
@@ -41,9 +41,12 @@ class MergeModelCallback:
         merge_at_every_checkpoint: When true, ``on_save`` attempts a merge
             whenever both policy and target states are supplied in callback
             kwargs. When false, ``on_train_end`` performs the merge instead.
-        push_to_hub: Compatibility flag retained for TRL-style constructor
-            parity. This callback does not upload by itself; callers can use
-            ``last_merged_state`` in their own publishing path.
+        push_to_hub: Publish after merging, using ``publish_fn`` or the merged
+            policy state's model Hub API.
+        hub_model_id: Destination repository for the model Hub API.
+        publish_fn: Optional publisher receiving the merged graphstate. Useful
+            for raw pytrees or custom checkpoint publishing.
+        target_state: Default initialized merge target for trainer events.
     """
 
     def __init__(
@@ -51,6 +54,9 @@ class MergeModelCallback:
         merge_config: MergeConfig | None = None,
         merge_at_every_checkpoint: bool = False,
         push_to_hub: bool = False,
+        hub_model_id: str | None = None,
+        publish_fn: tp.Callable[[object], object] | None = None,
+        target_state: object | None = None,
     ) -> None:
         """Store callback policy and merge configuration.
 
@@ -59,13 +65,17 @@ class MergeModelCallback:
                 equal-weight linear merge config.
             merge_at_every_checkpoint: Controls whether ``on_save`` performs
                 merges. When false, merging is deferred to ``on_train_end``.
-            push_to_hub: Compatibility flag retained for callers that construct
-                TRL-style merge callbacks. It is stored but not acted on by this
-                in-memory callback.
+            push_to_hub: Whether to publish each completed merge.
+            hub_model_id: Explicit Hub destination for model publishing.
+            publish_fn: Optional custom merged-graphstate publisher.
+            target_state: Default merge target, overridable by each event.
         """
         self.merge_config = merge_config or MergeConfig()
         self.merge_at_every_checkpoint = bool(merge_at_every_checkpoint)
         self.push_to_hub = bool(push_to_hub)
+        self.hub_model_id = hub_model_id
+        self.publish_fn = publish_fn
+        self.target_state = target_state
         # Holds the most recent merge result; None until on_save/on_train_end runs a merge, so callers
         # (and the docstring's promised attribute) never hit AttributeError when reading it early.
         self.last_merged_state = None
@@ -88,6 +98,23 @@ class MergeModelCallback:
         """
         return merge_pytrees(_as_graphstate(policy_state), _as_graphstate(target_state), self.merge_config)
 
+    def _merge_and_publish(self, policy_state, target_state, **kwargs) -> None:
+        """Store the merge and optionally publish it to the explicit destination."""
+        self.last_merged_state = self.merge_states(policy_state, target_state)
+        if not self.push_to_hub:
+            return
+        if self.publish_fn is not None:
+            self.publish_fn(self.last_merged_state)
+            return
+        repo_id = kwargs.get("hub_model_id") or self.hub_model_id
+        if repo_id is None:
+            raise ValueError("Merge publishing requires `hub_model_id` or `publish_fn`.")
+        merge = getattr(policy_state, "merge", None)
+        if not callable(merge):
+            raise TypeError("Publishing raw pytrees requires `publish_fn`; otherwise pass an EasyDeLState.")
+        model = merge(tree=self.last_merged_state)
+        model.push_to_hub(repo_id=repo_id, **kwargs.get("hub_kwargs", {}))
+
     def on_save(self, *args: tp.Any, **kwargs: tp.Any) -> None:
         """Handle a checkpoint-save callback event.
 
@@ -105,10 +132,17 @@ class MergeModelCallback:
             events that do not provide a target state.
         """
         if self.merge_at_every_checkpoint:
-            policy_state = kwargs.get("policy_state") or kwargs.get("state")
-            target_state = kwargs.get("target_state")
+            policy_state = kwargs.get("policy_state")
+            if policy_state is None:
+                policy_state = kwargs.get("state")
+            target_state = kwargs.get("target_state", self.target_state)
             if policy_state is not None and target_state is not None:
-                self.last_merged_state = self.merge_states(policy_state, target_state)
+                self._merge_and_publish(
+                    policy_state,
+                    target_state,
+                    hub_model_id=kwargs.get("hub_model_id"),
+                    hub_kwargs=kwargs.get("hub_kwargs", {}),
+                )
         del args
 
     def on_train_end(self, *args: tp.Any, **kwargs: tp.Any) -> None:
@@ -122,8 +156,15 @@ class MergeModelCallback:
         performing the same merge twice.
         """
         if not self.merge_at_every_checkpoint:
-            policy_state = kwargs.get("policy_state") or kwargs.get("state")
-            target_state = kwargs.get("target_state")
+            policy_state = kwargs.get("policy_state")
+            if policy_state is None:
+                policy_state = kwargs.get("state")
+            target_state = kwargs.get("target_state", self.target_state)
             if policy_state is not None and target_state is not None:
-                self.last_merged_state = self.merge_states(policy_state, target_state)
+                self._merge_and_publish(
+                    policy_state,
+                    target_state,
+                    hub_model_id=kwargs.get("hub_model_id"),
+                    hub_kwargs=kwargs.get("hub_kwargs", {}),
+                )
         del args

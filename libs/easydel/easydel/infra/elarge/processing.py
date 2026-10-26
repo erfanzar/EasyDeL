@@ -59,17 +59,20 @@ import sys
 import tempfile
 import typing as tp
 from collections.abc import Mapping
-from dataclasses import asdict, is_dataclass
+from copy import copy
+from dataclasses import asdict, fields, is_dataclass
 from enum import Enum
 from typing import Any, cast
 
 import jax
 from eformer.loggings import get_logger
-from eformer.paths import ePath, ePathLike
+from eformer.paths import ePath, ePathLike, is_remote_path
 from jax import numpy as jnp
 
 from easydel.infra.base_config import _REMOVED_BASE_CONFIG_KEYS, EasyDeLBaseConfigDict
+from easydel.infra.factory import TASK_ALIASES as TASK_ALIASES
 from easydel.infra.factory import TaskType
+from easydel.infra.factory import normalize_task as normalize_task
 from easydel.layers.quantization._quants import QuantizationConfig  # pyright: ignore[reportPrivateLocalImportUsage]
 
 from .defaults import DEFAULTS
@@ -199,7 +202,9 @@ def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
         - Lists and other non-dict iterables are NOT merged; they are
           replaced entirely by the overlay value.
         - The function creates a shallow copy at each level, so nested
-          mutable objects may still be shared with the input dicts.
+          mutable objects may still be shared with the input dicts. Use
+          :func:`clone_config` on the inputs first when the result will be
+          mutated in place.
     """
     out = dict(base)
     for k, v in overlay.items():
@@ -208,6 +213,34 @@ def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
         else:
             out[k] = v
     return out
+
+
+def clone_config(obj: Any) -> Any:
+    """Recursively copy configuration containers and dataclass value objects.
+
+    Dataclass fields (including typed quantization settings) are recursively
+    copied without running constructors. Runtime leaves such as callables,
+    device arrays, locks and model handles retain their identity; unlike a
+    general deepcopy this does not attempt to duplicate runtime resources.
+
+    Args:
+        obj: A configuration value to copy.
+
+    Returns:
+        An independent configuration tree with runtime resources shared.
+    """
+    if isinstance(obj, dict):
+        return {k: clone_config(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [clone_config(v) for v in obj]
+    if type(obj) is tuple:
+        return tuple(clone_config(v) for v in obj)
+    if is_dataclass(obj) and not isinstance(obj, type):
+        cloned = copy(obj)
+        for field in fields(obj):
+            object.__setattr__(cloned, field.name, clone_config(getattr(obj, field.name)))
+        return cloned
+    return obj
 
 
 def coerce_dtype(x: DTypeLike | None) -> jnp.dtype:
@@ -228,8 +261,8 @@ def coerce_dtype(x: DTypeLike | None) -> jnp.dtype:
               - FP8 formats: "fp8", "fp8_e4m3", "nvfp8", "mxfp8", etc.
 
     Returns:
-        The corresponding JAX numpy dtype. If the input cannot be
-        recognized, returns jnp.float32 as a fallback.
+        The corresponding JAX numpy dtype. Unrecognized specifications
+        return jnp.float32 as a fallback.
 
     Example:
         >>> coerce_dtype("bf16")
@@ -246,8 +279,7 @@ def coerce_dtype(x: DTypeLike | None) -> jnp.dtype:
 
     Note:
         The function is case-insensitive for string inputs. Unrecognized
-        strings will silently fall back to float32 rather than raising
-        an error.
+        specifications fall back to float32.
 
     See Also:
         - `coerce_precision`: For converting precision specifications.
@@ -305,14 +337,16 @@ def coerce_precision(p: PrecisionLike) -> jax.lax.Precision | None:
         p: The precision specification to convert. Can be:
             - None: Returns None (no precision constraint).
             - A jax.lax.Precision: Returned as-is.
-            - A string: Parsed case-insensitively. Valid values are:
-              - "DEFAULT": Standard precision (fastest).
-              - "HIGH": Higher precision accumulation.
-              - "HIGHEST": Maximum precision (slowest).
+            - A string: Parsed case-insensitively using JAX's own precision
+              aliases. Valid values are:
+              - "DEFAULT" / "fastest" / "bfloat16": Standard precision (fastest).
+              - "HIGH" / "bfloat16_3x" / "tensorfloat32": Higher precision accumulation.
+              - "HIGHEST" / "float32": Maximum precision (slowest).
+            - An int: ``0``/``1``/``2`` for DEFAULT/HIGH/HIGHEST.
 
     Returns:
         The corresponding JAX Precision enum value, or None if the
-        input is None. Unrecognized strings default to Precision.DEFAULT.
+        input is None. Unrecognized values default to Precision.DEFAULT.
 
     Example:
         >>> coerce_precision("HIGH")
@@ -328,9 +362,8 @@ def coerce_precision(p: PrecisionLike) -> jax.lax.Precision | None:
         <Precision.DEFAULT: 0>
 
     Note:
-        The string comparison is case-insensitive. Invalid string values
-        will silently fall back to Precision.DEFAULT rather than raising
-        an error.
+        The string comparison is case-insensitive. Unrecognized values
+        fall back to Precision.DEFAULT.
 
     See Also:
         - `coerce_dtype`: For converting dtype specifications.
@@ -339,11 +372,12 @@ def coerce_precision(p: PrecisionLike) -> jax.lax.Precision | None:
         return None
     if isinstance(p, jax.lax.Precision):
         return p
-    return {
-        "DEFAULT": jax.lax.Precision.DEFAULT,
-        "HIGH": jax.lax.Precision.HIGH,
-        "HIGHEST": jax.lax.Precision.HIGHEST,
-    }.get(str(p).upper(), jax.lax.Precision.DEFAULT)
+    try:
+        if isinstance(p, int) and not isinstance(p, bool):
+            return jax.lax.Precision(p)
+        return jax.lax.Precision(str(p).strip().lower())
+    except ValueError:
+        return jax.lax.Precision.DEFAULT
 
 
 def coerce_partition_axis(value: tp.Any) -> tp.Any:
@@ -370,85 +404,6 @@ def coerce_partition_axis(value: tp.Any) -> tp.Any:
     if isinstance(value, tp.Mapping):
         return PartitionAxis(**{k: tuple(v) if isinstance(v, list) else v for k, v in value.items()})
     return value
-
-
-# Mapping of task type string aliases to TaskType enum values.
-#
-# This dictionary provides case-insensitive lookup for common task type
-# names and their abbreviations, enabling flexible task specification
-# in configuration files and APIs.
-#
-# Keys use underscores and lowercase for normalized lookup. Supported
-# aliases include:
-#     - "causal_lm", "lm": Causal language modeling
-#     - "seq2seq", "sequence_to_sequence": Sequence-to-sequence tasks
-#     - "speech_seq2seq": Speech-to-text sequence tasks
-#     - "image_text_to_text": Vision-language tasks
-#     - "zero_shot_image_classification": Zero-shot image classification
-#     - "diffusion_lm": Diffusion-based language models
-#     - "sequence_classification": Text classification tasks
-#     - "base": Base module without task-specific heads
-TASK_ALIASES: dict[str, TaskType] = {
-    "causal_lm": TaskType.CAUSAL_LM,
-    "lm": TaskType.CAUSAL_LM,
-    "seq2seq": TaskType.SEQUENCE_TO_SEQUENCE,
-    "sequence_to_sequence": TaskType.SEQUENCE_TO_SEQUENCE,
-    "speech_seq2seq": TaskType.SPEECH_SEQUENCE_TO_SEQUENCE,
-    "image_text_to_text": TaskType.IMAGE_TEXT_TO_TEXT,
-    "zero_shot_image_classification": TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION,
-    "diffusion_lm": TaskType.DIFFUSION_LM,
-    "sequence_classification": TaskType.SEQUENCE_CLASSIFICATION,
-    "base": TaskType.BASE_MODULE,
-}
-
-
-def normalize_task(t: TaskType | str | None) -> TaskType | None:
-    """Normalize a task type specification to a TaskType enum value.
-
-    This function converts various task type representations to the
-    canonical TaskType enum, handling string aliases, case variations,
-    and hyphen/underscore differences for flexible configuration.
-
-    Args:
-        t: The task type specification to normalize. Can be:
-            - None: Returns None.
-            - A TaskType enum: Returned as-is.
-            - A string: Normalized and looked up in TASK_ALIASES.
-              Strings are lowercased, stripped, and hyphens are
-              converted to underscores before lookup.
-
-    Returns:
-        The corresponding TaskType enum value, or None if the input
-        is None or the string is not recognized in TASK_ALIASES.
-
-    Example:
-        >>> normalize_task("causal-lm")
-        <TaskType.CAUSAL_LM: 'causal_lm'>
-
-        >>> normalize_task("LM")
-        <TaskType.CAUSAL_LM: 'causal_lm'>
-
-        >>> normalize_task(TaskType.SEQUENCE_TO_SEQUENCE)
-        <TaskType.SEQUENCE_TO_SEQUENCE: 'sequence_to_sequence'>
-
-        >>> normalize_task(None)
-        None
-
-        >>> normalize_task("unknown_task")
-        None
-
-    Note:
-        Unrecognized task strings return None rather than raising an
-        error, allowing callers to provide default handling.
-
-    See Also:
-        - `TASK_ALIASES`: The mapping used for string lookups.
-    """
-    if t is None:
-        return None
-    if isinstance(t, TaskType):
-        return t
-    return TASK_ALIASES.get(str(t).strip().lower().replace("-", "_"))
 
 
 class _CodeEvalMetricProxy:
@@ -657,8 +612,6 @@ def _patch_loaded_code_eval_metric(
     *,
     num_workers: int | None,
     timeout: float | None,
-    patched: list[tuple[Any, str, Any]],
-    patched_code_eval_modules: set[tuple[str, str]],
 ) -> Any:
     """Wrap a loaded Hugging Face ``code_eval`` metric with isolated execution.
 
@@ -671,18 +624,10 @@ def _patch_loaded_code_eval_metric(
             wrap.
         num_workers: Optional override forwarded to the proxy.
         timeout: Optional per-sample timeout override forwarded to the proxy.
-        patched: Mutable list of ``(target, attr_name, original_value)``
-            tuples used by :func:`override_lm_eval_code_exec` to reverse the
-            patch on context exit. Currently unused by this helper but kept in
-            the signature for symmetry with other patch sites.
-        patched_code_eval_modules: Mutable set tracking which lm-eval modules
-            have already been patched. Unused here but retained for symmetry.
 
     Returns:
         A :class:`_CodeEvalMetricProxy` wrapping *metric*.
     """
-    del patched
-    del patched_code_eval_modules
     return _CodeEvalMetricProxy(metric, num_workers=num_workers, timeout=timeout)
 
 
@@ -716,7 +661,6 @@ def override_lm_eval_code_exec(
         return
 
     patched: list[tuple[Any, str, Any]] = []
-    patched_code_eval_modules: set[tuple[str, str]] = set()
     try:
         # Optional lm-eval dependency; EasyDeL can run without it installed.
         import evaluate as hf_evaluate  # pyright: ignore[reportMissingImports]
@@ -745,8 +689,6 @@ def override_lm_eval_code_exec(
                         metric,
                         num_workers=num_workers,
                         timeout=timeout,
-                        patched=patched,
-                        patched_code_eval_modules=patched_code_eval_modules,
                     )
                 return metric
 
@@ -770,8 +712,6 @@ def override_lm_eval_code_exec(
                 original,
                 num_workers=num_workers,
                 timeout=timeout,
-                patched=patched,
-                patched_code_eval_modules=patched_code_eval_modules,
             ),
         )
         patched.append((module, attr_name, original))
@@ -857,10 +797,12 @@ def make_serializable(obj: Any) -> Any:
 def write_text_atomic(path: str | os.PathLike | ePathLike, data: str, *, encoding: str = "utf-8") -> None:
     """Atomically write text to a file via temp-file-then-rename.
 
-    Creates parent directories as needed, writes *data* to a hidden temporary
-    file in the destination directory, and finally replaces the target path
-    with ``os.replace`` so readers never observe a partial write. On error the
-    temporary file is removed and the original exception is re-raised.
+    For local destinations, creates parent directories as needed, writes *data*
+    to a hidden temporary file, and publishes it with ``os.replace``. On error
+    the temporary file is removed and the original exception is re-raised.
+    Remote destinations use a complete-object ePath upload: GCS publishes the
+    replacement object only when that upload completes, with no local rename
+    or directory placeholder and no multi-object rename transaction.
 
     Args:
         path: Destination file path. Accepts ``str``, ``os.PathLike``, or
@@ -874,6 +816,11 @@ def write_text_atomic(path: str | os.PathLike | ePathLike, data: str, *, encodin
             write, replace). The temporary file is unlinked on failure.
     """
     target = ePath(path)
+    if is_remote_path(target):
+        # Encode explicitly: remote write_text implementations need not honor
+        # encoding, whereas write_bytes preserves the requested representation.
+        target.write_bytes(data.encode(encoding))
+        return
     target.parent.mkdir(parents=True, exist_ok=True)
     target_dir = str(target.parent)
     target_path = str(target)
@@ -981,7 +928,32 @@ def normalize(cfg: eLMConfig | Mapping[str, Any]) -> eLMConfig:
     raw = as_map(cfg)
     if "model" not in raw or "name_or_path" not in raw["model"]:
         raise ValueError("Config must include model.name_or_path")
-    merged = deep_merge(DEFAULTS, raw)
+    # Clone the module-level DEFAULTS (and the caller's raw mapping) so the in-place writes below and in the
+    # eLargeModel setters never leak into DEFAULTS or into other eLargeModel instances.
+    merged = deep_merge(clone_config(DEFAULTS), clone_config(raw))
+
+    quant = merged.get("quantization", {})
+    raw_quant = raw.get("quantization", {})
+    method = quant.get("method")
+    # The enable switch alone must leave the loader free to inherit the
+    # checkpoint/base-config quantizer rather than manufacture a new default.
+    if method is not None or quant.get("model") is not None:
+        quant_model = quant.get("model")
+        if isinstance(quant_model, QuantizationConfig):
+            quant_values = quant_model.to_dict()
+        else:
+            quant_values = dict(quant_model or {})
+        if method is not None:
+            quant_values.setdefault("dtype", "int8" if method == "a8bit" else method)
+            if "apply_quantization" not in raw_quant:
+                quant["apply_quantization"] = True
+        if quant.get("linear_pattern") is not None:
+            quant_values["pattern"] = quant["linear_pattern"]
+        if quant.get("linear_group_size") is not None:
+            quant_values["group_size"] = quant["linear_group_size"]
+        elif "group_size" not in quant_values and (method is not None or "group_size" in raw_quant):
+            quant_values["group_size"] = quant["group_size"]
+        quant["model"] = QuantizationConfig(**quant_values)
 
     vals = dict(merged.get("base_config", {}).get("values", {}) or {})
     esurge_cfg = merged.setdefault("esurge", {})
@@ -1079,7 +1051,9 @@ def materialize_base_config(cfg: eLMConfig, prefer: tp.Literal["base", "sections
             base.setdefault(k, v)
 
     set_maybe("attn_dtype", coerce_dtype(loader.get("dtype")))
-    set_maybe("kvdtype", coerce_dtype(loader.get("dtype")))
+    esurge_model = esurge.get("model", {})
+    kv_cache_dtype = esurge_model.get("kv_cache_dtype", esurge.get("kv_cache_dtype"))
+    set_maybe("kvdtype", coerce_dtype(kv_cache_dtype if kv_cache_dtype is not None else loader.get("dtype")))
     # attn_softmax_dtype is deliberately NOT derived from the loader dtype:
     # softmax accumulation stays at the model default (float32) unless the
     # config sets base_config.values.attn_softmax_dtype explicitly. Deriving
@@ -1095,7 +1069,7 @@ def materialize_base_config(cfg: eLMConfig, prefer: tp.Literal["base", "sections
     set_maybe("sp_is_ep_bound", sharding.get("sp_is_ep_bound"))
 
     kv_quant = quant.get("kv_cache")
-    if kv_quant is not None:
+    if kv_quant is not None and not isinstance(kv_quant, QuantizationConfig):
         kv_quant = QuantizationConfig(**kv_quant)
 
     set_maybe("kv_cache_quantization_config", kv_quant)

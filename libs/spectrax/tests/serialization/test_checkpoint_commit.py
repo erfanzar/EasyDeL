@@ -48,7 +48,7 @@ class _FakeManager:
         self.fail_on_prefix = fail_on_prefix
         self.saved_steps: list[int] = []
 
-    def save_pytree(self, *, pytree, path, prefix, mesh, dtype, extras, write_index):
+    def save_pytree(self, *, pytree, path, prefix, mesh, dtype, extras, write_index, ocdbt=False, ocdbt_options=None):
         if prefix == self.fail_on_prefix:
             raise RuntimeError(f"simulated crash while writing {prefix}")
         self.saved_steps.append(int(extras["step"]))

@@ -18,6 +18,9 @@ from __future__ import annotations
 import jax
 from jax import numpy as jnp
 
+from .._online_rl.math import cross_segment_discount_factors
+from .._shared.policy_losses import clipped_ppo_policy_loss
+
 
 def cross_segment_advantage_factors(
     trajectory_ids: jax.Array,
@@ -52,7 +55,7 @@ def cross_segment_advantage_factors(
         same_trajectory.astype(jnp.float32) * is_later_segment.astype(jnp.float32) * token_counts[None, :],
         axis=1,
     )
-    return jnp.power(float(gamma) * lambdas, tokens_after)
+    return cross_segment_discount_factors(tokens_after, gamma=gamma, lam=lambdas)
 
 
 def apply_cross_segment_gae_correction(
@@ -85,16 +88,14 @@ def compaction_ppo_policy_loss(
     normalizer: jax.Array | float | None = None,
 ) -> jax.Array:
     """Compute the token-global clipped PPO actor loss used by CompactionRL."""
-    action_mask = action_mask.astype(jnp.float32)
-    advantages = jax.lax.stop_gradient(advantages)
-    ratio = jnp.exp(current_logps - behavior_logps)
-    unclipped = -advantages * ratio
-    clipped = -advantages * jnp.clip(ratio, 1.0 - cliprange, 1.0 + cliprange)
-    if normalizer is None:
-        normalizer = jnp.maximum(jnp.sum(action_mask), 1.0)
-    else:
-        normalizer = jnp.maximum(jnp.asarray(normalizer, dtype=jnp.float32), 1.0)
-    return jnp.sum(jnp.maximum(unclipped, clipped) * action_mask) / normalizer
+    return clipped_ppo_policy_loss(
+        current_logps,
+        behavior_logps,
+        advantages,
+        action_mask,
+        cliprange=cliprange,
+        normalizer=normalizer,
+    )
 
 
 __all__ = (

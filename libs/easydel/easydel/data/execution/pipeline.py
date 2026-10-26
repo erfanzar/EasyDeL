@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import math
 import multiprocessing as mp
 import os
 import typing as tp
@@ -39,13 +40,15 @@ from ..core.config import (
     PipelineConfig,
     SaveStageConfig,
     TokenizeStageConfig,
+    get_dataset_name,
 )
-from ..core.protocols import PipelineContext, ShardedDataSource
+from ..core.protocols import PipelineContext, PipelineStage, ShardedDataSource
 from ..core.types import DatasetMixture, TextDatasetInform
 from ..sources import create_source, load_for_inform
 from ..transforms.base import ExpandTransform
-from ..transforms.mixture import MixStage, block_mixture_interleave
+from ..transforms.mixture import ASSISTANT_ONLY_FIELD, DATASET_ID_FIELD, MixStage, block_mixture_interleave
 from ..transforms.pack import PackStage, pack_constant_length, pack_pre_tokenized
+from ..transforms.source import TransformedShardedSource
 from ..transforms.tokenize import TokenizeStage
 from ..utils import align_columns_intersection, is_streaming, wrap_format_callback
 from .loader import AsyncDataLoader, LoadStage
@@ -62,6 +65,38 @@ if tp.TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 PipelineDataValue = ShardedDataSource | AsyncDataLoader
+
+
+class _ObservedShardedSource(ShardedDataSource[dict]):
+    """Terminal source adapter that reports consumption without changing source-stage caching."""
+
+    def __init__(self, source: ShardedDataSource, context: PipelineContext, name: str):
+        self._source = source
+        self._context = context
+        self._name = name
+
+    @property
+    def shard_names(self):
+        return self._source.shard_names
+
+    def num_shards(self):
+        return self._source.num_shards()
+
+    def get_shard_info(self, shard_name):
+        return self._source.get_shard_info(shard_name)
+
+    @property
+    def delivers_all_metadata_rows(self):
+        return self._source.delivers_all_metadata_rows
+
+    def open_shard(self, shard_name):
+        return self._context.observe_rows(self._source.open_shard(shard_name), "consume", self._name)
+
+    def open_shard_at_row(self, shard_name, row):
+        return self._context.observe_rows(self._source.open_shard_at_row(shard_name, row), "consume", self._name)
+
+    def __len__(self):
+        return len(self._source)
 
 
 class Pipeline:
@@ -108,6 +143,9 @@ class Pipeline:
                 datasets and stage settings. The constructor also
                 seeds the context's RNG from :attr:`PipelineConfig.seed`.
         """
+        errors = config.validate()
+        if errors:
+            raise ValueError("Invalid pipeline configuration: " + "; ".join(errors))
         self._config = config
         self._context = PipelineContext(config=config, seed=config.seed)
         self._data: dict[str, PipelineDataValue] | None = None
@@ -137,20 +175,7 @@ class Pipeline:
             chained.
         """
         if isinstance(config, dict):
-            datasets = [DatasetConfig(**ds) if isinstance(ds, dict) else ds for ds in config.get("datasets", [])]
-            config = PipelineConfig(
-                datasets=datasets,
-                default_tokenizer=config.get("default_tokenizer"),
-                streaming=config.get("streaming", True),
-                seed=config.get("seed"),
-                source=config.get("source"),
-                tokenize=TokenizeStageConfig(**config.get("tokenize", {})) if config.get("tokenize") else None,
-                cache=config.get("cache"),
-                mix=MixStageConfig(**config.get("mix", {})) if config.get("mix") else None,
-                pack=PackStageConfig(**config.get("pack", {})) if config.get("pack") else None,
-                load=LoadStageConfig(**config.get("load", {})) if config.get("load") else None,
-                save=SaveStageConfig(**config.get("save", {})) if config.get("save") else None,
-            )
+            config = PipelineConfig(**config)
         return cls(config)
 
     def source(self) -> "Pipeline":
@@ -174,13 +199,13 @@ class Pipeline:
 
         self._data = {}
         for i, ds_config in enumerate(self._config.datasets):
-            name = ds_config.name or f"dataset_{i}"
+            name = get_dataset_name(ds_config, i)
             if name in self._data:
                 raise ValueError(
                     f"Duplicate dataset name {name!r}: a second dataset with the same name would "
                     "silently replace the first in the pipeline. Give each DatasetConfig a unique name."
                 )
-            source = create_source(ds_config)
+            source = create_source(ds_config, self._config.source, streaming=self._config.streaming)
             if ds_config.num_rows is not None:
                 from ..transforms.source import LimitedShardedSource
 
@@ -214,8 +239,16 @@ class Pipeline:
         data = tp.cast(dict[str, ShardedDataSource], self._data)
 
         stage_config = config or self._config.tokenize
-        stage = TokenizeStage(stage_config)
-        self._data = stage.process(data, self._context)
+        if self._config.ray.enabled:
+            from ..distributed.ray_utils import RayTokenizedShardedSource
+
+            self._data = {
+                name: RayTokenizedShardedSource(source, self._config, stage_config, name)
+                for name, source in data.items()
+            }
+        else:
+            stage = TokenizeStage(stage_config)
+            self._data = self._run_stage(stage, data, stage_config)
         self._stages.append("tokenize")
         return self
 
@@ -247,7 +280,7 @@ class Pipeline:
 
         stage_config = config or self._config.mix
         stage = MixStage(stage_config)
-        self._data = stage.process(data, self._context)
+        self._data = self._run_stage(stage, data, stage_config)
         self._stages.append("mix")
         return self
 
@@ -278,7 +311,7 @@ class Pipeline:
                 "no-op. Pass PackStageConfig(enabled=True, ...) if you meant to pack."
             )
         stage = PackStage(stage_config)
-        self._data = stage.process(data, self._context)
+        self._data = self._run_stage(stage, data, stage_config)
         self._stages.append("pack")
         return self
 
@@ -311,7 +344,7 @@ class Pipeline:
                 "meant to save."
             )
         stage = SaveStage(stage_config)
-        self._data = stage.process(data, self._context)
+        self._data = self._run_stage(stage, data, stage_config)
         self._stages.append("save")
         return self
 
@@ -384,7 +417,7 @@ class Pipeline:
 
         stage_config = config or self._config.load
         stage = LoadStage(stage_config)
-        self._data = stage.process(data, self._context)
+        self._data = self._run_stage(stage, data, stage_config)
         self._stages.append("load")
         return self
 
@@ -405,11 +438,15 @@ class Pipeline:
         """
         self._ensure_data()
 
-        # If we have a single loader, return it directly
-        if len(self._data) == 1:
-            return next(iter(self._data.values()))
-
-        return next(iter(self._data.values()))
+        if len(self._data) > 1:
+            logger.warning(
+                "build() returns only the first dataset of a multi-source pipeline; "
+                "call mix() to combine datasets or get_data() to consume each one."
+            )
+        name, result = next(iter(self._data.items()))
+        if isinstance(result, ShardedDataSource):
+            return _ObservedShardedSource(result, self._context, name)
+        return result
 
     def get_data(self) -> dict[str, tp.Any]:
         """Inspect the rolling ``{name: data}`` dict at its current pipeline position.
@@ -447,6 +484,19 @@ class Pipeline:
             no effect on the pipeline.
         """
         return self._stages.copy()
+
+    def _run_stage(self, stage: PipelineStage, data: tp.Any, config: tp.Any) -> tp.Any:
+        """Validate a stage, run it, and publish its metrics when enabled."""
+        import time
+
+        if not stage.validate_config(vars(config)):
+            raise ValueError(f"Invalid configuration for pipeline stage {stage.name!r}")
+        start = time.monotonic()
+        result = stage.process(data, self._context)
+        self._context.record_metric(stage.name, "setup_seconds", time.monotonic() - start)
+        for key, value in getattr(stage, "get_metrics", dict)().items():
+            self._context.record_metric(stage.name, key, value)
+        return result
 
     def _ensure_data(self):
         """Guard helper: assert :meth:`source` has been called before any other stage.
@@ -549,7 +599,7 @@ def pretokenize(
     output_path: str,
     output_format: str = "parquet",
     max_shard_size: str | int = "500MB",
-    compression: str | None = "snappy",
+    compression: str | None = None,
     num_proc: int | None = None,
     show_progress: bool = True,
     num_shards: int | None = None,
@@ -630,7 +680,6 @@ def pretokenize(
         >>> transform = DPOPreprocessTransform(tokenizer=tokenizer, max_length=2048)
         >>> stats = pretokenize(mixed, transform, "./pretokenized_dpo")
     """
-    from ..transforms.source import TransformedShardedSource
     from .save import save_dataset
 
     if show_progress:
@@ -653,7 +702,7 @@ def pretokenize(
     else:
         transformed_source = TransformedShardedSource(source, transform)
     if drop_fields:
-        transformed_source = _DropFieldsShardedSource(transformed_source, frozenset(drop_fields))
+        transformed_source = transformed_source.drop_fields(list(drop_fields))
     if arrays_only:
         transformed_source = _ArrayFieldsOnlyShardedSource(transformed_source)
     progress_update_interval = _resolve_log_process_update_interval(log_process)
@@ -988,86 +1037,6 @@ class _ProcessParallelTransformedShardedSource(_ParallelTransformedShardedSource
                     yield transformed
 
 
-class _DropFieldsShardedSource(ShardedDataSource[dict]):
-    """Sharded source wrapper that strips a fixed set of keys from every row.
-
-    Used by :func:`pretokenize` when the caller passes ``drop_fields``
-    so unwanted columns are removed before persistence. Preserves
-    every other key untouched.
-    """
-
-    def __init__(self, source: ShardedDataSource[dict], fields: frozenset[str]):
-        """Capture the wrapped source and the keys to drop.
-
-        Args:
-            source: Upstream sharded source.
-            fields: Keys removed from each row dict during iteration;
-                stored as a :class:`frozenset` for O(1) membership
-                checks.
-        """
-        self._source = source
-        self._fields = fields
-
-    @property
-    def shard_names(self) -> tp.Sequence[str]:
-        """Pass-through to the wrapped source's shard names."""
-        return self._source.shard_names
-
-    def num_shards(self) -> int:
-        """Pass-through to the wrapped source's shard count."""
-        return self._source.num_shards()
-
-    def get_shard_info(self, shard_name: str) -> tp.Any:
-        """Forward the shard metadata query to the wrapped source."""
-        return self._source.get_shard_info(shard_name)
-
-    @property
-    def delivers_all_metadata_rows(self) -> bool:
-        """Forward the wrapped source's flag (dropping fields never drops rows)."""
-        return self._source.delivers_all_metadata_rows
-
-    def open_shard(self, shard_name: str) -> tp.Iterator[dict]:
-        """Open a shard and yield rows with the configured fields stripped.
-
-        Args:
-            shard_name: Identifier of one shard from
-                :attr:`shard_names`.
-
-        Yields:
-            dict: Rows from the upstream source with each member of
-            :attr:`_fields` removed (no-op if the key was absent).
-        """
-        yield from self._drop_fields(self._source.open_shard(shard_name))
-
-    def open_shard_at_row(self, shard_name: str, row: int) -> tp.Iterator[dict]:
-        """Resume-aware variant of :meth:`open_shard` skipping leading rows.
-
-        Args:
-            shard_name: Shard identifier.
-            row: Number of rows to discard before yielding.
-
-        Yields:
-            dict: Rows starting at offset ``row`` with the configured
-            fields stripped.
-        """
-        yield from self._drop_fields(self._source.open_shard_at_row(shard_name, row))
-
-    def _drop_fields(self, rows: tp.Iterator[dict]) -> tp.Iterator[dict]:
-        """Iterate ``rows`` removing every key in :attr:`_fields` in place.
-
-        Args:
-            rows: Source iterator over row dicts.
-
-        Yields:
-            dict: The same row dict (mutated) with the configured keys
-            removed; missing keys are silently ignored.
-        """
-        for row in rows:
-            for field in self._fields:
-                row.pop(field, None)
-            yield row
-
-
 def _is_numeric_scalar(value: tp.Any) -> bool:
     """Return whether ``value`` is a scalar tensor-compatible payload.
 
@@ -1213,6 +1182,29 @@ class _ArrayFieldsOnlyShardedSource(ShardedDataSource[dict]):
             yield {key: value for key, value in row.items() if _is_array_field_value(value)}
 
 
+class _DropFieldsShardedSource(TransformedShardedSource):
+    """Field-dropping source wrapper kept for backward compatibility with existing callers.
+
+    The field-dropping behaviour itself lives in the shared
+    :meth:`~easydel.data.core.protocols.ShardedDataSource.drop_fields` /
+    :class:`~easydel.data.transforms.field_ops.DropFields` implementation;
+    this subclass only adapts the historical ``(source, fields)`` constructor
+    onto :class:`~easydel.data.transforms.source.TransformedShardedSource` so
+    no shard/metadata/resume plumbing is duplicated here.
+    """
+
+    def __init__(self, source: ShardedDataSource[dict], fields: tp.Iterable[str]):
+        """Wrap ``source`` with a :class:`DropFields` transform.
+
+        Args:
+            source: Upstream sharded source whose rows are projected.
+            fields: Names of the row keys to remove from every row.
+        """
+        from ..transforms.field_ops import DropFields
+
+        super().__init__(source, DropFields(list(fields)))
+
+
 class _ProgressBarShardedSource(ShardedDataSource[dict]):
     """Sharded source wrapper that drives a tqdm progress bar as rows stream through.
 
@@ -1354,6 +1346,21 @@ class _ProgressBarShardedSource(ShardedDataSource[dict]):
         return self._source.get_shard_info(shard_name)
 
 
+def _stamp_sideband(example: dict, values: dict[str, int]) -> dict:
+    """Return ``example`` extended with constant per-dataset sideband columns.
+
+    Module-level (not a closure) so ``datasets`` can fingerprint and pickle it.
+
+    Args:
+        example: One source row.
+        values: ``{column: value}`` to stamp, e.g. ``{DATASET_ID_FIELD: 2}``.
+
+    Returns:
+        dict: A new row carrying the original keys plus ``values``.
+    """
+    return {**example, **values}
+
+
 def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
     """Build a unified dataset from a DatasetMixture configuration.
 
@@ -1402,9 +1409,21 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
     per_ds = []
     per_ds_by_name = {}
     content_target = mixture.text_target_field
+    # Sideband attribution columns. Either column is stamped on EVERY inform (uniform batch schema:
+    # ragged keys are silently dropped by list collation) and whitelisted through ``to_target``.
+    stamp_dataset_ids = bool(getattr(mixture, "attach_dataset_ids", False))
+    stamp_assistant_only = any(getattr(inform, "assistant_only", None) is not None for inform in mixture.informs)
 
     for index, inform in enumerate(mixture.informs):
         ds = load_for_inform(inform, mixture)
+
+        if inform.filter_fn is not None:
+            ds = ds.filter(inform.filter_fn)
+        if inform.max_samples is not None:
+            limit = int(inform.max_samples)
+            if limit < 0:
+                raise ValueError("max_samples must be >= 0")
+            ds = ds.take(limit) if is_streaming(ds) else ds.select(range(min(limit, len(ds))))
 
         if getattr(inform, "format_fields", None):
             mapping_local = dict(inform.format_fields)
@@ -1445,17 +1464,27 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
 
             try:
                 ex0 = next(iter(ds.take(1))) if is_streaming(ds) else ds[0]
-            except (StopIteration, IndexError) as e:
-                raise ValueError(
-                    f"Cannot apply format_callback to empty dataset: {getattr(inform, 'data_files', 'unknown')}"
-                ) from e
-            after = fmt(dict(ex0))
-            cols_to_remove = list(set(ex0.keys()) - set(after.keys()))
-            ds = ds.map(fmt, batched=False, remove_columns=cols_to_remove or None)
+            except (StopIteration, IndexError):
+                # Filtering or max_samples=0 may legitimately retain no rows.
+                ex0 = None
+            if ex0 is not None:
+                after = fmt(dict(ex0))
+                cols_to_remove = list(set(ex0.keys()) - set(after.keys()))
+                ds = ds.map(fmt, batched=False, remove_columns=cols_to_remove or None)
+
+        sideband: dict[str, int] = {}
+        if stamp_dataset_ids:
+            sideband[DATASET_ID_FIELD] = int(index)
+        if stamp_assistant_only:
+            choice = getattr(inform, "assistant_only", None)
+            sideband[ASSISTANT_ONLY_FIELD] = -1 if choice is None else int(bool(choice))
+        if sideband:
+            ds = ds.map(_stamp_sideband, batched=False, fn_kwargs={"values": sideband})
 
         if isinstance(inform, TextDatasetInform):
             keep = {content_target}
-            addl = getattr(inform, "additional_fields", None) or []
+            addl = list(getattr(inform, "additional_fields", None) or [])
+            addl.extend(name for name in sideband if name not in addl)
             keep.update(addl)
 
             content_field = inform.content_field
@@ -1531,17 +1560,36 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
             )
         per_ds_by_name[key] = ds
 
-    if mixture.streaming:
-        if mixture.mixture_weights and set(mixture.mixture_weights) != set(per_ds_by_name):
+    probabilities = None
+    active_weights = None
+    if mixture.mixture_weights is not None:
+        if set(mixture.mixture_weights) != set(per_ds_by_name):
             raise ValueError(
                 "mixture_weights keys do not match the mixture datasets: "
                 f"weights={sorted(mixture.mixture_weights)} vs datasets={sorted(per_ds_by_name)}. "
                 "A partial/typo'd weight map used to silently fall back to uniform mixing."
             )
+        ordered = {name: float(mixture.mixture_weights[name]) for name in per_ds_by_name}
+        if not ordered or any(not math.isfinite(weight) or weight < 0 for weight in ordered.values()):
+            raise ValueError("mixture_weights must be finite, non-negative numbers with a positive total")
+        scale = max(ordered.values())
+        if scale == 0:
+            raise ValueError("mixture_weights must have a positive total")
+        # Exclude disabled sources from both schema alignment and exhaustion
+        # tracking. In particular, HF all_exhausted cannot terminate while a
+        # zero-probability source remains in its list of active datasets.
+        active_weights = {name: weight / scale for name, weight in ordered.items() if weight > 0}
+        total = math.fsum(active_weights.values())
+        active_weights = {name: weight / total for name, weight in active_weights.items()}
+        per_ds_by_name = {name: per_ds_by_name[name] for name in active_weights}
+        per_ds = list(per_ds_by_name.values())
+        probabilities = list(active_weights.values())
+
+    if mixture.streaming:
         if getattr(mixture, "block_mixture", False):
             mixed = block_mixture_interleave(
                 per_ds_by_name,
-                weights=mixture.mixture_weights or None,
+                weights=active_weights,
                 block_size=getattr(mixture, "mixture_block_size", 2048),
                 seed=mixture.seed or 0,
                 stop=getattr(mixture, "stop_strategy", "restart"),
@@ -1555,12 +1603,12 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
         else:
             from datasets import interleave_datasets  # pyright: ignore[reportMissingTypeStubs]
 
-            probabilities = None
-            if mixture.mixture_weights:
-                ordered = [float(mixture.mixture_weights[name]) for name in per_ds_by_name]
-                total = sum(ordered)
-                probabilities = [w / total for w in ordered]
             stop_strategy = getattr(mixture, "stop_strategy", "first_exhausted")
+            if stop_strategy == "error":
+                raise ValueError(
+                    "stop_strategy='error' is not supported on the HF interleave path; "
+                    "use block_mixture=True (the block mixer implements it)."
+                )
             if stop_strategy == "restart":
                 logger.warning(
                     "stop_strategy='restart' is not supported by datasets.interleave_datasets; "
@@ -1577,18 +1625,49 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
             if mixture.shuffle_buffer_size:
                 mixed = mixed.shuffle(buffer_size=mixture.shuffle_buffer_size, seed=mixture.seed)
     else:
-        per_ds = align_columns_intersection(per_ds)
-        from datasets import concatenate_datasets  # pyright: ignore[reportMissingTypeStubs]
+        from datasets import concatenate_datasets, interleave_datasets  # pyright: ignore[reportMissingTypeStubs]
 
-        mixed = concatenate_datasets(per_ds)
+        nonempty_indices = [index for index, dataset in enumerate(per_ds) if len(dataset)]
+        had_empty = len(nonempty_indices) != len(per_ds)
+        if nonempty_indices:
+            # HF skips row maps on empty inputs, leaving their original column
+            # names. Exclude them before alignment so an unmapped content column
+            # cannot erase the surviving sources' canonical text column.
+            per_ds = [per_ds[index] for index in nonempty_indices]
+            if probabilities is not None:
+                probabilities = [probabilities[index] for index in nonempty_indices]
+        per_ds = align_columns_intersection(per_ds)
+
+        if probabilities is None:
+            # Preserve legacy concatenation when no sampling weights were set.
+            mixed = concatenate_datasets(per_ds)
+        else:
+            stop_strategy = getattr(mixture, "stop_strategy", "restart")
+            if stop_strategy == "error":
+                raise ValueError(
+                    "stop_strategy='error' is not supported for materialized weighted mixtures; "
+                    "use streaming=True with block_mixture=True (the block mixer implements it)."
+                )
+            if stop_strategy not in {"first_exhausted", "all_exhausted", "restart"}:
+                raise ValueError(f"Unknown mixture stop_strategy: {stop_strategy!r}")
+            # A materialized dataset represents one finite epoch. Restart
+            # cycles shorter constituents until every active source has been
+            # consumed once; first_exhausted stops without cycling sources.
+            hf_stop = "first_exhausted" if stop_strategy == "first_exhausted" else "all_exhausted"
+            if not nonempty_indices or (stop_strategy == "first_exhausted" and had_empty):
+                mixed = concatenate_datasets(per_ds).select([])
+            else:
+                # HF's weighted map interleaver assumes nonempty inputs: an
+                # empty input's offset otherwise selects rows from its neighbor.
+                total = math.fsum(probabilities)
+                mixed = interleave_datasets(
+                    per_ds,
+                    probabilities=[probability / total for probability in probabilities],
+                    seed=mixture.seed,
+                    stopping_strategy=hf_stop,
+                )
         if mixture.shuffle_buffer_size:
             mixed = mixed.shuffle(seed=mixture.seed)
-        if mixture.mixture_weights:
-            logger.warning(
-                "mixture_weights are ignored in non-streaming mode: datasets are concatenated "
-                "(and only shuffled when shuffle_buffer_size is set). Use streaming=True for "
-                "weighted mixing."
-            )
 
     if getattr(mixture, "pack_tokens", False):
         from datasets import IterableDataset  # pyright: ignore[reportMissingTypeStubs]

@@ -442,7 +442,6 @@ def get_per_token_logps_and_selected_logps(
     selected log-probs are current-policy log-probs gathered at exactly those
     indices, so top-k trust-region losses compare like-for-like supports.
     """
-    del logprob_vocab_chunk_size
     model_kwargs = compact_generation_model_kwargs(
         normalize_generation_model_kwargs(model_kwargs, model_callable=getattr(model, "forward", model)),
     )
@@ -469,10 +468,15 @@ def get_per_token_logps_and_selected_logps(
         raise TypeError(f"{type(model).__name__} did not return logits; top-k scoring requires full logits.")
     logits = logits[:, prompt_length - 1 : -1, :]
     targets = input_ids[:, prompt_length:]
-    log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
-    token_log_probs = jnp.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1)
-    selected_logps = jnp.take_along_axis(log_probs, selected_indices, axis=-1)
-    return token_log_probs.astype(logits.dtype), selected_logps.astype(logits.dtype)
+    # Gather targets and selected support against the same directly computed
+    # normalizer. The singleton support axis broadcasts only the gathers, not
+    # the vocabulary tensor. Recovering log_z from target_logit - target_logp
+    # loses precision for very negative targets and is NaN for masked targets.
+    scoring_indices = jnp.concatenate((targets[..., None], selected_indices), axis=-1)
+    support_logps, _ = compute_token_logps_and_entropies_chunked(
+        logits[..., None, :], scoring_indices, return_entropy=False, chunk_size=logprob_vocab_chunk_size
+    )
+    return support_logps[..., 0].astype(logits.dtype), support_logps[..., 1:].astype(logits.dtype)
 
 
 def get_per_token_logps_and_topk(
@@ -911,6 +915,11 @@ def grpo_step(
             old_per_token_logps = old_per_token_logps[:, : completion_ids.shape[1]]
         completion_token_count = jnp.sum(completion_mask)
         completion_lengths = jnp.sum(completion_mask, axis=1)
+        importance_sampling_ratio = minibatch.get("importance_sampling_ratio")
+        if importance_sampling_ratio is not None:
+            if importance_sampling_ratio.ndim == 1:
+                importance_sampling_ratio = importance_sampling_ratio[:, None]
+            importance_sampling_ratio = importance_sampling_ratio[:, : completion_ids.shape[1]]
 
         use_chunked_completion_loss = (
             completion_chunk_size is not None
@@ -1012,9 +1021,7 @@ def grpo_step(
                 chunk_advantages = advantages[start:end]
                 chunk_difficulty_weights = difficulty_weights[start:end]
                 chunk_importance_sampling_ratio = (
-                    minibatch["importance_sampling_ratio"][start:end]
-                    if "importance_sampling_ratio" in minibatch
-                    else None
+                    importance_sampling_ratio[start:end] if importance_sampling_ratio is not None else None
                 )
 
                 if dppo_divergence_type is not None:
@@ -1060,6 +1067,9 @@ def grpo_step(
                         vespo_lambda_neg=vespo_lambda_neg,
                         importance_sampling_ratio=chunk_importance_sampling_ratio,
                     )
+
+                if loss_type != "vespo" and chunk_importance_sampling_ratio is not None:
+                    chunk_per_token_loss = chunk_per_token_loss * jax.lax.stop_gradient(chunk_importance_sampling_ratio)
 
                 if off_policy_mask_threshold is not None:
                     chunk_sampling_per_token_logps = minibatch.get("sampling_per_token_logps")
@@ -1230,20 +1240,6 @@ def grpo_step(
             else:
                 per_token_kl = jnp.zeros_like(per_token_logps)
 
-        advantages = minibatch["advantages"]
-        if advantages.ndim == 1:
-            advantages = advantages[:, None]
-        has_difficulty_weights = "difficulty_weights" in minibatch
-        difficulty_weights = minibatch.get("difficulty_weights")
-        if not has_difficulty_weights:
-            difficulty_weights = jnp.ones((completion_ids.shape[0], 1), dtype=jnp.float32)
-        elif difficulty_weights.ndim == 1:
-            difficulty_weights = difficulty_weights[:, None]
-        difficulty_weights = difficulty_weights.astype(jnp.float32)
-
-        old_per_token_logps = minibatch.get("old_per_token_logps")
-        if old_per_token_logps is not None and old_per_token_logps.shape[1] != completion_ids.shape[1]:
-            old_per_token_logps = old_per_token_logps[:, : completion_ids.shape[1]]
         if old_per_token_logps is None:
             old_per_token_logps = jax.lax.stop_gradient(per_token_logps)
         importance_weights = _compute_importance_weights(
@@ -1294,8 +1290,11 @@ def grpo_step(
                     vespo_lambda_pos=vespo_lambda_pos,
                     vespo_k_neg=vespo_k_neg,
                     vespo_lambda_neg=vespo_lambda_neg,
-                    importance_sampling_ratio=minibatch.get("importance_sampling_ratio"),
+                    importance_sampling_ratio=importance_sampling_ratio,
                 )
+
+        if loss_type != "vespo" and importance_sampling_ratio is not None:
+            per_token_loss = per_token_loss * jax.lax.stop_gradient(importance_sampling_ratio)
 
         off_policy_mask = None
         if off_policy_mask_threshold is not None:
@@ -1322,9 +1321,6 @@ def grpo_step(
         if beta != 0.0:
             per_token_loss = per_token_loss + beta * per_token_kl
         per_token_loss = per_token_loss * difficulty_weights
-
-        completion_token_count = jnp.sum(completion_mask)
-        completion_lengths = jnp.sum(completion_mask, axis=1)
 
         with jax.named_scope(scope_root + "/loss_fn/reduce_loss"):
             if loss_type in {"grpo", "sapo"}:
@@ -1480,6 +1476,8 @@ def _grpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
             "vespo_lambda_neg",
             "off_policy_mask_threshold",
             "use_bias_correction_kl",
+            "dppo_divergence_type",
+            "dppo_clip_ratio_c",
         ),
         object_fields=("loss_config", "learning_rate_fn", "straight_through_emulator"),
     )
@@ -1529,6 +1527,8 @@ def _make_grpo_scheduled_loss(call):
     off_policy_mask_threshold = call.get("off_policy_mask_threshold")
     use_bias_correction_kl = call.get("use_bias_correction_kl")
     straight_through_emulator = call.get("straight_through_emulator")
+    dppo_divergence_type = call.get("dppo_divergence_type")
+    dppo_clip_ratio_c = call.get("dppo_clip_ratio_c", 20.0)
 
     def scheduled_loss(tree, batch):
         """Compute the scalar GRPO loss inside the SpectraX scheduled VJP.
@@ -1579,6 +1579,8 @@ def _make_grpo_scheduled_loss(call):
                 off_policy_mask_threshold=off_policy_mask_threshold,
                 use_bias_correction_kl=use_bias_correction_kl,
                 straight_through_emulator=None,
+                dppo_divergence_type=dppo_divergence_type,
+                dppo_clip_ratio_c=dppo_clip_ratio_c,
             )
             return metrics.loss
 

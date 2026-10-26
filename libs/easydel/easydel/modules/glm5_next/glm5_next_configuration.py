@@ -134,6 +134,9 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
             Pool size of the compressed key groups selected by the DSA indexer.
         index_kpool_always_select_tail (`bool`, *optional*, defaults to ``True``):
             Whether the incomplete trailing pool is always included.
+        indexer_aux_loss_coef (`float`, *optional*, defaults to 0.0):
+            Non-negative weight of the DSA indexer KL warm-up loss. Only full
+            indexers on stateless forwards contribute; zero disables the loss.
         layer_types (`list[str]`, *optional*):
             Per-layer attention schedule; ``"linear_attention"`` (KDA) or
             ``"deepseek_sparse_attention"`` (MLA+DSA). Defaults to KDA except
@@ -231,6 +234,7 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
         index_n_heads: int = 32,
         index_kpool: int = 16,
         index_kpool_always_select_tail: bool = True,
+        indexer_aux_loss_coef: float = 0.0,
         layer_types: list[str] | None = None,
         indexer_types: list[str] | None = None,
         index_topk_pattern: str | list[str] | None = None,
@@ -367,6 +371,7 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
         self.index_n_heads = index_n_heads
         self.index_kpool = index_kpool
         self.index_kpool_always_select_tail = index_kpool_always_select_tail
+        self.indexer_aux_loss_coef = indexer_aux_loss_coef
         self.swiglu_limit = swiglu_limit
         self.linear_head_dim = linear_head_dim
         self.linear_num_heads = linear_num_heads
@@ -548,6 +553,8 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
             )
         if self.index_kpool < 1:
             raise ValueError(f"index_kpool must be positive, got {self.index_kpool}.")
+        if not self.indexer_aux_loss_coef >= 0.0:
+            raise ValueError("indexer_aux_loss_coef must be non-negative.")
         if self.index_topk % self.index_kpool != 0:
             raise ValueError(f"index_topk ({self.index_topk}) must be divisible by index_kpool ({self.index_kpool}).")
         if self.q_lora_rank is None:
@@ -592,7 +599,7 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
             DSA/MLA layers (KV pages).
         """
         return tuple(
-            KDA_LINEAR_ATTENTION if self.is_kda_layer(idx) else FULL_ATTENTION for idx in range(self.num_hidden_layers)
+            FULL_ATTENTION if self.is_dsa_layer(idx) else KDA_LINEAR_ATTENTION for idx in range(self.num_hidden_layers)
         )
 
     def get_mask_details(self) -> dict[int, typing.Any]:

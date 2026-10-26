@@ -33,6 +33,7 @@ from spectrax import nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
+from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info
 from easydel.infra.spec_decode import SpecDecodeBase
 from easydel.layers import ColumnParallelLinear, Embed, RMSNorm
 from easydel.modules._drafting import (
@@ -189,6 +190,120 @@ class DSparkDecoderLayer(spx.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         return residual + self.mlp(hidden_states)
+
+
+def _copy_array_value(dst: tp.Any, src_value: tp.Any, *, name: str) -> None:
+    """Copy an array into a SpectraX parameter with an early shape check.
+
+    Args:
+        dst: Destination parameter exposing ``.value``.
+        src_value: Source array.
+        name: Parameter name used in error messages.
+
+    Raises:
+        TypeError: If ``dst`` has no ``.value``.
+        ValueError: If the shapes differ.
+    """
+    if not hasattr(dst, "value"):
+        raise TypeError(f"{name} must be a SpectraX-style parameter with a `.value` attribute.")
+    dst_shape = tuple(dst.value.shape)
+    src_shape = tuple(src_value.shape)
+    if dst_shape != src_shape:
+        raise ValueError(f"{name} shape mismatch: DSpark has {dst_shape}, target has {src_shape}.")
+    new_value = src_value.astype(dst.value.dtype)
+    if new_value is src_value:
+        # A same-dtype astype aliases the target buffer, which the train step would then both donate and read.
+        new_value = jax.jit(lambda a: a)(src_value)
+    dst.value = new_value
+
+
+def _target_vocab_io(target_model: tp.Any) -> tuple[tp.Any, tp.Any]:
+    """Return the target's embedding module and LM head module (``None`` when headless).
+
+    Args:
+        target_model: Frozen target module.
+
+    Returns:
+        ``(embeddings, lm_head)``.
+
+    Raises:
+        TypeError: If the target lacks the conventional accessors.
+    """
+    get_embeddings = getattr(target_model, "get_input_embeddings", None)
+    if not callable(get_embeddings):
+        get_embeddings = getattr(target_model, "get_embedding", None)
+    get_lm_head = getattr(target_model, "get_lm_head", None)
+    if not callable(get_embeddings) or not callable(get_lm_head):
+        raise TypeError("Target model must expose `get_input_embeddings`/`get_embedding` and `get_lm_head`.")
+    try:
+        target_lm_head = get_lm_head()
+    except NotImplementedError:
+        target_lm_head = None
+    return get_embeddings(), target_lm_head
+
+
+def _config_tie_flag(config: tp.Any) -> bool | None:
+    """Return the first present tying flag of ``config`` (the key order ``apply_lm_head`` uses), else ``None``."""
+    if config is None:
+        return None
+    for key in ("tie_word_embeddings", "use_lm_head", "share_input_output_layers"):
+        if hasattr(config, key):
+            return bool(getattr(config, key))
+    return None
+
+
+def _target_ties_word_embeddings(target_model: tp.Any, target_embeddings: tp.Any, target_lm_head: tp.Any) -> bool:
+    """Whether the target projects logits with ``embed_tokens.T`` rather than its ``lm_head`` array.
+
+    Args:
+        target_model: Frozen target module.
+        target_embeddings: The target's embedding module.
+        target_lm_head: The target's LM head module or ``None``.
+
+    Returns:
+        ``True`` for a headless head, a head sharing the embedding parameter, or a
+        target whose tying resolution (module method or config flag) is enabled.
+    """
+    head_weight = getattr(target_lm_head, "weight", None) if target_lm_head is not None else None
+    if head_weight is None or head_weight is target_embeddings.weight:
+        return True
+    resolver = getattr(target_model, "_tie_embeddings_enabled", None)
+    if callable(resolver):
+        return bool(resolver())
+    config = getattr(target_model, "config", None)
+    flag = _config_tie_flag(config)
+    if flag is None:
+        flag = _config_tie_flag(getattr(config, "text_config", None))
+    return bool(flag)
+
+
+def _assert_exact_cast(got: tp.Any, want: tp.Any, *, what: str) -> None:
+    """Raise ``RuntimeError`` unless ``got`` is bit-equal to ``want`` cast to ``got``'s dtype."""
+    want = want.astype(got.dtype)
+    if tuple(got.shape) != tuple(want.shape) or not bool(jnp.array_equal(got, want)):
+        raise RuntimeError(f"DSpark vocab IO mismatch: {what} is not an exact cast of the target's.")
+
+
+def _check_vocab_io_against_target(drafter: tp.Any, target_model: tp.Any) -> None:
+    """Check the drafter's embedding and (untied) LM head against the target's vocab IO.
+
+    Args:
+        drafter: DSpark drafter (or any object with ``config``, ``embed_tokens``, ``lm_head``).
+        target_model: Frozen target module.
+
+    Raises:
+        RuntimeError: On any mismatch, or when an untied target exposes no ``lm_head`` array.
+    """
+    target_embeddings, target_lm_head = _target_vocab_io(target_model)
+    embed_value = target_embeddings.weight.value
+    _assert_exact_cast(drafter.embed_tokens.weight.value, embed_value, what="embed_tokens")
+    if bool(drafter.config.tie_word_embeddings):
+        return
+    head = drafter.lm_head.weight.value
+    if _target_ties_word_embeddings(target_model, target_embeddings, target_lm_head):
+        _assert_exact_cast(head, embed_value.T, what="lm_head (vs target embed_tokens.T)")
+        return
+    _assert_exact_cast(head, target_lm_head.weight.value, what="lm_head")
 
 
 @register_module(TaskType.BASE_MODULE, config=DSparkConfig, model_type="dspark")
@@ -381,33 +496,51 @@ class DSparkModel(EasyDeLBaseModule, SpecDecodeBase):
         """Copy a SpectraX parameter value with an early shape check."""
         if not hasattr(dst, "value") or not hasattr(src, "value"):
             raise TypeError(f"{name} must be a SpectraX-style parameter with a `.value` attribute.")
-        dst_shape = tuple(dst.value.shape)
-        src_shape = tuple(src.value.shape)
-        if dst_shape != src_shape:
-            raise ValueError(f"{name} shape mismatch: DSpark has {dst_shape}, target has {src_shape}.")
-        dst.value = src.value.astype(dst.value.dtype)
+        _copy_array_value(dst, src.value, name=name)
 
     def initialize_embeddings_and_head_from_target(self, target_model: tp.Any) -> None:
-        """Initialize DSpark token embeddings and LM head from a target model.
+        """Initialize DSpark token embeddings and LM head from a target model, then verify the copies.
 
         DeepSpec initializes these two modules from the frozen target and then
         leaves them out of the optimized drafter state.  This helper performs the
         same copy for EasyDeL target modules that expose the conventional
-        ``get_input_embeddings`` and ``get_lm_head`` accessors.
-        """
-        get_embeddings = getattr(target_model, "get_input_embeddings", None)
-        if not callable(get_embeddings):
-            get_embeddings = getattr(target_model, "get_embedding", None)
-        get_lm_head = getattr(target_model, "get_lm_head", None)
-        if not callable(get_embeddings) or not callable(get_lm_head):
-            raise TypeError("Target model must expose `get_input_embeddings`/`get_embedding` and `get_lm_head`.")
+        ``get_input_embeddings`` and ``get_lm_head`` accessors.  An untied drafter
+        head is seeded from ``target.embed_tokens.T`` when the target ties its
+        embeddings (its own ``lm_head`` array is then unused and may be stale) and
+        from the target ``lm_head`` array otherwise.
 
-        target_embeddings = get_embeddings()
-        target_lm_head = get_lm_head()
-        self._copy_parameter_value(self.embed_tokens.weight, target_embeddings.weight, name="embed_tokens.weight")
-        if bool(self.config.tie_word_embeddings):
-            return
-        self._copy_parameter_value(self.lm_head.weight, target_lm_head.weight, name="lm_head.weight")
+        Args:
+            target_model: Frozen target module.
+
+        Raises:
+            TypeError: If the target lacks the embedding / LM-head accessors.
+            ValueError: On a vocab or hidden shape mismatch.
+            RuntimeError: If a copy is not an exact cast of its source.
+        """
+        target_embeddings, target_lm_head = _target_vocab_io(target_model)
+        _copy_array_value(self.embed_tokens.weight, target_embeddings.weight.value, name="embed_tokens.weight")
+        if not bool(self.config.tie_word_embeddings):
+            if _target_ties_word_embeddings(target_model, target_embeddings, target_lm_head):
+                # [vocab, hidden] -> [hidden, vocab], the layout ColumnParallelLinear stores.
+                _copy_array_value(self.lm_head.weight, target_embeddings.weight.value.T, name="lm_head.weight")
+            else:
+                _copy_array_value(self.lm_head.weight, target_lm_head.weight.value, name="lm_head.weight")
+        _check_vocab_io_against_target(self, target_model)
+
+    def check_embeddings_and_head_against_target(self, target_model: tp.Any) -> None:
+        """Verify the drafter's vocab IO is an exact cast of the target's.
+
+        ``embed_tokens`` must equal the target embedding cast to the drafter
+        dtype; an untied ``lm_head`` must equal the cast transposed embedding for
+        a tied target, or the cast target ``lm_head`` array otherwise.
+
+        Args:
+            target_model: Frozen target module.
+
+        Raises:
+            RuntimeError: On any mismatch.
+        """
+        _check_vocab_io_against_target(self, target_model)
 
     def project_target_hidden_states(self, target_hidden_states: tp.Any) -> jax.Array:
         """Extract configured target layers and project them into DSpark hidden space.
@@ -550,7 +683,15 @@ class DSparkModel(EasyDeLBaseModule, SpecDecodeBase):
         context_position_ids = make_position_ids(inputs_embeds=target_hidden_states)
         draft_position_ids = make_position_ids(input_ids=input_ids)
         kv_position_ids = jnp.concatenate((context_position_ids, draft_position_ids), axis=1)
-        mask = causal_attention_mask(batch_size, seq_len, target_hidden_states.shape[1] + seq_len)
+        # Context and draft keys share zero-based positions, not a single
+        # concatenated timeline. Apply causality to each stream independently.
+        mask = jnp.concatenate(
+            (
+                causal_attention_mask(batch_size, seq_len, target_hidden_states.shape[1]),
+                causal_attention_mask(batch_size, seq_len, seq_len),
+            ),
+            axis=-1,
+        )
         if attention_mask is not None:
             context_mask = expand_attention_mask(attention_mask, q_len=seq_len, kv_len=target_hidden_states.shape[1])
             draft_mask = expand_attention_mask(attention_mask, q_len=seq_len, kv_len=seq_len)
@@ -582,6 +723,7 @@ class DSparkModel(EasyDeLBaseModule, SpecDecodeBase):
         target_logits: jax.Array | None,
         anchor_positions: jax.Array | None,
         block_keep_mask: jax.Array | None,
+        segment_ids: jax.Array | None = None,
     ) -> DSparkForwardOutput:
         """Run the DeepSpec block-drafter training forward.
 
@@ -603,6 +745,8 @@ class DSparkModel(EasyDeLBaseModule, SpecDecodeBase):
                 ``[batch, anchors]``. ``None`` triggers sampling.
             block_keep_mask: Optional boolean mask of shape ``[batch, anchors]``
                 selecting which blocks to retain. ``None`` triggers creation.
+            segment_ids: Optional ``[batch, seq]`` packing segment ids restricting
+                each block's context to its anchor's document.
 
         Returns:
             DSparkForwardOutput: Block supervision tensors including block logits,
@@ -632,6 +776,7 @@ class DSparkModel(EasyDeLBaseModule, SpecDecodeBase):
             block_keep_mask=block_keep_mask,
             seq_len=seq_len,
             block_size=self.config.block_size,
+            segment_ids=segment_ids,
         )
         output_hidden = self._forward_backbone(
             noise_embedding=noise_embedding,
@@ -700,6 +845,8 @@ class DSparkModel(EasyDeLBaseModule, SpecDecodeBase):
         anchor_positions: Int[Array, "batch anchors"] | None = None,
         block_keep_mask: Bool[Array, "batch anchors"] | None = None,
         return_block_outputs: bool = False,
+        segment_ids: Int[Array, "batch seq"] | None = None,
+        mask_info: tp.Any = None,
         **kwargs,
     ) -> DSparkForwardOutput:
         """Run DSpark in sequence mode or DeepSpec block mode.
@@ -725,6 +872,10 @@ class DSparkModel(EasyDeLBaseModule, SpecDecodeBase):
                 sample.
             block_keep_mask: Block selection mask for block mode. ``None`` to infer.
             return_block_outputs: Force block-mode output even without ``loss_mask``.
+            segment_ids: Optional packing segment ids of shape ``[batch, seq]``; in
+                block mode each block only attends to its anchor's document.
+            mask_info: Optional ``MaskInfo``; packed segment ids are recovered from
+                it when ``segment_ids`` is not given (the trainer folds them there).
             **kwargs: Absorbed and discarded (reserved for API compatibility).
 
         Returns:
@@ -734,11 +885,20 @@ class DSparkModel(EasyDeLBaseModule, SpecDecodeBase):
         del kwargs
         target_context = self.project_target_hidden_states(target_hidden_states)
         target_last = target_last_hidden_states if target_last_hidden_states is not None else target_last_hidden_state
+        if segment_ids is None and mask_info is not None:
+            segment_ids = packed_segment_ids_from_mask_info(mask_info, int(input_ids.shape[1]))
         if return_block_outputs or loss_mask is not None or anchor_positions is not None:
             if loss_mask is None:
                 loss_mask = jnp.ones_like(input_ids, dtype=jnp.float32)
             return self._block_forward(
-                input_ids, target_context, loss_mask, target_last, target_logits, anchor_positions, block_keep_mask
+                input_ids,
+                target_context,
+                loss_mask,
+                target_last,
+                target_logits,
+                anchor_positions,
+                block_keep_mask,
+                segment_ids=segment_ids,
             )
         output = self._full_sequence_forward(input_ids, target_context, attention_mask)
         return DSparkForwardOutput(

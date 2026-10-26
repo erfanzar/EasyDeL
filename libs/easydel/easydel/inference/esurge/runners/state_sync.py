@@ -222,8 +222,6 @@ class SequenceStateSync:
         for new_req_data in scheduler_output.scheduled_new_reqs:
             if new_req_data.sampling_params is None:
                 raise ValueError("Pooling not supported in TPU")
-            if self.slot_pool.uses_spmd_dp() and new_req_data.has_vision:
-                raise ValueError("Rank-major SPMD DP currently supports text-only requests.")
             req_id = new_req_data.req_id
             if new_req_data.dp_rank is not None:
                 self.slot_pool.dp_rank_by_req[str(req_id)] = int(new_req_data.dp_rank)

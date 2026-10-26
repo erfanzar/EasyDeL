@@ -532,6 +532,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     eval_batch_size: NotRequired[int | None]
     eval_config_overrides: NotRequired[dict[str, Any] | None]
     gradient_accumulation_steps: NotRequired[int]
+    gradient_accumulation_mode: NotRequired[str]
 
     optimizer: NotRequired[str]
     trainable_selector: NotRequired[Any]
@@ -569,6 +570,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     train_on_inputs: NotRequired[bool]
     aux_loss_enabled: NotRequired[bool]
     pose: NotRequired[dict[str, Any] | None]
+    randomized_yarn: NotRequired[dict[str, Any] | None]
     process_encoder: NotRequired[dict[str, Any] | None]
     buckets: NotRequired[Any]
     xla_compiler_options: NotRequired[dict[str, Any] | None]
@@ -576,6 +578,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     profiler_enable_hlo_proto: NotRequired[bool | None]
     profiler_stop_step: NotRequired[int | None]
     training_time_limit: NotRequired[str | None]
+    host_phase_log_path: NotRequired[str | None]
     step_start_point: NotRequired[int | None]
     force_step_start_point: NotRequired[bool]
     resume_if_possible: NotRequired[bool]
@@ -688,6 +691,36 @@ class BaseTrainerCfg(TypedDict, total=False):
     bucket_configs: NotRequired[list[dict[str, Any]] | None]
     bucket_rule: NotRequired[dict[str, Any] | None]
     bucket_datasets: NotRequired[list[DatasetMixtureCfg] | None]
+
+    # Grain random-access data lanes (see easydel.trainers.data_lanes): ArrayRecord (msgpack rows) and raw
+    # parquet ("parquetra", tokenized in the loader; `parquetra_pack_seq_len > 0` selects the packed lane).
+    arrayrecord_train_files: NotRequired[str | list[str] | None]
+    arrayrecord_train_datasets: NotRequired[dict[str, str | list[str]] | None]
+    arrayrecord_mixture_weights: NotRequired[dict[str, float] | None]
+    arrayrecord_assistant_only: NotRequired[dict[str, bool] | None]
+    arrayrecord_num_threads: NotRequired[int]
+    arrayrecord_prefetch_buffer: NotRequired[int]
+    arrayrecord_read_rate_limit_mb_per_sec: NotRequired[float | None]
+    arrayrecord_read_rate_burst_seconds: NotRequired[float]
+    parquetra_train_datasets: NotRequired[dict[str, str | list[str]] | None]
+    parquetra_mixture_weights: NotRequired[dict[str, float] | None]
+    parquetra_assistant_only: NotRequired[dict[str, bool] | None]
+    parquetra_tokenizer_id: NotRequired[str | None]
+    parquetra_fast_tokenizer: NotRequired[str | None]
+    parquetra_fast_tokenizer_verify_rows: NotRequired[int]
+    parquetra_pack_seq_len: NotRequired[int]
+    parquetra_pack_embed_cap: NotRequired[int]
+    parquetra_pack_misfit_patience: NotRequired[int]
+    parquetra_mp_workers: NotRequired[int]
+    parquetra_mp_worker_cpu_only: NotRequired[bool]
+    parquet_metadata_cache_dir: NotRequired[str | None]
+    # Per-dataset assistant-only supervision: span markers (None = derived from the chat template) and the
+    # zero-supervision census thresholds.
+    assistant_header_text: NotRequired[str | None]
+    assistant_end_text: NotRequired[str | None]
+    zero_supervision_report_fraction: NotRequired[float | None]
+    zero_supervision_abort_fraction: NotRequired[float | None]
+    zero_supervision_dump_limit: NotRequired[int]
 
 
 class DPOTrainerCfg(BaseTrainerCfg):
@@ -1562,6 +1595,17 @@ class DistillationTrainerCfg(BaseTrainerCfg):
     num_generations: NotRequired[int]
     reverse_kl_top_1_mode: NotRequired[Literal["sampled", "argmax"]]
     teacher_model_revision: NotRequired[str | None]
+    # Offline teacher cache (easydel.data.teacher_cache): no teacher forward, cached top-k + tail KL.
+    teacher_from_cache: NotRequired[bool]
+    teacher_cache_topk: NotRequired[int]
+    teacher_cache_add_tail: NotRequired[bool]
+    teacher_cache_path: NotRequired[str | None]
+    teacher_cache_teacher_uri: NotRequired[str | None]
+    teacher_cache_tokenizer: NotRequired[str | None]
+    teacher_cache_segment_align: NotRequired[int]
+    loss_group_weights: NotRequired[list[float] | None]
+    loss_group_dataset_map: NotRequired[list[int] | None]
+    loss_group_max_multiplier: NotRequired[float | None]
     top_k: NotRequired[int]
     top_p: NotRequired[float]
     wandb_project: NotRequired[str | None]
@@ -3049,11 +3093,13 @@ def get_trainer_defaults(trainer_type: str) -> TrainerConfig:
         >>> defaults["optimizer"]  # From base defaults
         'adamw'
     """
+    from ..processing import clone_config
+
     trainer_type = _normalize_trainer_type(trainer_type)
     defaults = dict(BASE_TRAINER_DEFAULTS)
     if trainer_type in TRAINER_SPECIFIC_DEFAULTS:
         defaults.update(TRAINER_SPECIFIC_DEFAULTS[trainer_type])
-    return defaults  # type: ignore[return-value]
+    return clone_config(defaults)  # type: ignore[return-value]
 
 
 def normalize_trainer_config(config: dict[str, Any]) -> TrainerConfig:

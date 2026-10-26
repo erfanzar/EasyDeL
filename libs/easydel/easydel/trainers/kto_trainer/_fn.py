@@ -316,11 +316,11 @@ def training_step(
             # This mirrors the MPMD scheduled path (_prepare_kto_scheduled_batch).
             kl_batch = None
             if "_reference_kl_logps" not in batch:
-                reference_kl_logps = batch.get("reference_KL_logps")
-                if reference_kl_logps is None:
-                    kl_batch = _build_kl_batch(batch)
-                    ref_kl_out = forward_fn(reference_state.model, kl_batch)
-                    reference_kl_logps = ref_kl_out["completion_logps"]
+                # Dataset-level KL caches were paired before training shuffle;
+                # only runtime anchors share the current policy's rolled pairs.
+                kl_batch = _build_kl_batch(batch)
+                ref_kl_out = forward_fn(reference_state.model, kl_batch)
+                reference_kl_logps = ref_kl_out["completion_logps"]
                 batch["_reference_kl_logps"] = jax.lax.stop_gradient(reference_kl_logps)
             if "_policy_kl_logps" not in batch:
                 policy_kl_logps = batch.get("policy_KL_logps")
@@ -451,9 +451,10 @@ def _prepare_kto_scheduled_batch(call) -> dict[str, tp.Any]:
     if not bool(call.get("calculate_kl", False)):
         return batch
 
-    if "_reference_kl_logps" not in batch and "reference_KL_logps" in batch:
+    # Explicit runtime policy anchors may be accompanied by the legacy reference
+    # key. Dataset-only caches must still be recomputed on the current rolled pairs.
+    if "_policy_kl_logps" in batch and "_reference_kl_logps" not in batch and "reference_KL_logps" in batch:
         batch["_reference_kl_logps"] = batch["reference_KL_logps"]
-
     if "_reference_kl_logps" in batch and "_policy_kl_logps" in batch:
         return batch
 
@@ -660,10 +661,7 @@ def evaluation_step(
         with jax.named_scope(eval_scope + "/kl_forward"):
             kl_batch = _build_kl_batch(batch)
             policy_kl_logps = forward_fn(state.model, kl_batch)["completion_logps"]
-            if "reference_KL_logps" in batch:
-                reference_kl_logps = batch["reference_KL_logps"]
-            else:
-                reference_kl_logps = forward_fn(reference_state.model, kl_batch)["completion_logps"]
+            reference_kl_logps = forward_fn(reference_state.model, kl_batch)["completion_logps"]
     else:
         policy_kl_logps = reference_kl_logps = None
 

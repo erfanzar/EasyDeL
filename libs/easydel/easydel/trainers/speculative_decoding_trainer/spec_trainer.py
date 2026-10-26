@@ -26,7 +26,7 @@ from __future__ import annotations
 import dataclasses
 import typing as tp
 
-import numpy as np
+import jax
 import spectrax as spx
 from eformer.loggings import get_logger
 
@@ -37,11 +37,16 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 
 from .._shared import drop_optimizer_state
+from ..assistant_only_mask import AssistantOnlyMaskMixin
 from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import SFTPreprocessTransform
 from ..trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
-from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
+from ..training_utils import (
+    compile_trainer_step,
+    resolve_mask_prompt,
+    resolve_straight_through_emulator,
+)
 from ..utils import DataCollatorForCompletionOnlyLM
 from ._fn import speculative_decoding_step
 from .spec_config import SpeculativeDecodingConfig
@@ -53,7 +58,7 @@ logger = get_logger(__name__)
 
 
 @Registry.register("trainer", ["speculative_decoding", "spec_decoding", "spec"])
-class SpeculativeDecodingTrainer(Trainer):
+class SpeculativeDecodingTrainer(AssistantOnlyMaskMixin, Trainer):
     """Train a speculative-decoding drafter against a frozen verifier model.
 
     ``SpeculativeDecodingTrainer`` fits a smaller or cheaper drafter so its
@@ -76,6 +81,8 @@ class SpeculativeDecodingTrainer(Trainer):
 
     target_state: EasyDeLState
     arguments: SpeculativeDecodingConfig
+    # Speculative decoding keeps an explicit all-zero completion mask (no assistant_masks fallback).
+    _assistant_mask_fallback_on_empty: tp.ClassVar[bool] = False
 
     def __init__(
         self,
@@ -151,7 +158,12 @@ class SpeculativeDecodingTrainer(Trainer):
         if arguments.trainable_selector is None and hasattr(drafter_model, "trainable_selector"):
             arguments = dataclasses.replace(arguments, trainable_selector=drafter_model.trainable_selector)
 
-        if not isinstance(drafter_model, EasyDeLState):
+        if isinstance(drafter_model, EasyDeLState):
+            self._validate_pre_split_drafter_state(
+                drafter_state=drafter_model,
+                trainable_selector=self._expected_drafter_selector(arguments, drafter_model.model),
+            )
+        else:
             drafter_model = drafter_model.to_state(trainable_selector=arguments.trainable_selector)
         if not isinstance(target_model, EasyDeLState):
             target_model.eval()
@@ -169,6 +181,89 @@ class SpeculativeDecodingTrainer(Trainer):
             model_state=drafter_model,
             data_collator=data_collator,
             processing_class=processing_class,
+        )
+        if self._resumed_from_checkpoint:
+            self._check_resumed_drafter_vocab_io_against_target()
+
+    def _check_resumed_drafter_vocab_io_against_target(self) -> None:
+        """Re-run the drafter's vocab-IO gate on a resumed state against the live target.
+
+        A resumed drafter carries the embedding / LM-head copies of whatever target
+        the original run was built against, so a continuation pointed at a
+        different target would otherwise train against mismatched vocab IO.
+        Drafters without ``check_embeddings_and_head_against_target`` are skipped.
+
+        Raises:
+            RuntimeError: Propagated from the drafter gate when the restored vocab
+                IO is not an exact cast of the live target's.
+        """
+        drafter = self.model_state.model
+        gate = getattr(drafter, "check_embeddings_and_head_against_target", None)
+        if not callable(gate):
+            return
+        logger.info(
+            "Resumed drafter state: re-checking the vocab IO of %s against the live target %s.",
+            type(drafter).__name__,
+            type(self.target_state.model).__name__,
+        )
+        gate(self.target_state.model)
+
+    @staticmethod
+    def _expected_drafter_selector(arguments: SpeculativeDecodingConfig, drafter_module: tp.Any) -> tp.Any:
+        """Selector a pre-split drafter state is expected to have been split with.
+
+        An explicit non-default ``trainable_selector`` wins; ``None`` or the default
+        ``"parameters"`` defer to the module's own selector (e.g. DSpark's frozen vocab IO).
+
+        Args:
+            arguments: Trainer configuration.
+            drafter_module: Merged drafter module of the supplied state.
+
+        Returns:
+            The selector to compare the supplied state against.
+        """
+        selector = arguments.trainable_selector
+        if selector is None or (isinstance(selector, str) and selector == "parameters"):
+            return getattr(drafter_module, "trainable_selector", selector)
+        return selector
+
+    @staticmethod
+    def _validate_pre_split_drafter_state(*, drafter_state: EasyDeLState, trainable_selector: tp.Any) -> None:
+        """Fail closed when a supplied drafter state was split with a different selector.
+
+        A pre-split state cannot be safely repartitioned once its optimizer exists,
+        so its trainable leaves must be exactly those ``trainable_selector`` selects
+        on the merged module.
+
+        Args:
+            drafter_state: Caller-supplied drafter state.
+            trainable_selector: Selector the trainer expects.
+
+        Raises:
+            ValueError: If the trainable paths or pytree structure differ.
+        """
+        _, expected_graphstate, _ = drafter_state.model.split_module(trainable_selector=trainable_selector)
+        actual_paths = set(drafter_state.graphstate.paths())
+        expected_paths = set(expected_graphstate.paths())
+        same_treedef = jax.tree_util.tree_structure(drafter_state.graphstate) == jax.tree_util.tree_structure(
+            expected_graphstate
+        )
+        if actual_paths == expected_paths and same_treedef:
+            return
+
+        def _preview(paths: set[tuple[str, str]]) -> str:
+            ordered = sorted(paths)
+            preview = ", ".join(f"{collection}/{path}" for collection, path in ordered[:5])
+            if len(ordered) > 5:
+                preview = f"{preview}, ... +{len(ordered) - 5} more"
+            return preview or "none"
+
+        raise ValueError(
+            "Pre-split drafter EasyDeLState does not match `trainable_selector`; "
+            f"expected {len(expected_paths)} trainable leaves but found {len(actual_paths)}. "
+            f"Missing from state: {_preview(expected_paths - actual_paths)}. "
+            f"Unexpected in state: {_preview(actual_paths - expected_paths)}. "
+            f"Pytree structures match: {same_treedef}."
         )
 
     @staticmethod
@@ -388,10 +483,7 @@ class SpeculativeDecodingTrainer(Trainer):
         if self._is_pretokenized():
             return None
         text_field = getattr(self.arguments, "dataset_text_field", None) or "text"
-        mask_prompt = bool(getattr(self.arguments, "assistant_only_loss", False))
-        completion_only_loss = getattr(self.arguments, "completion_only_loss", None)
-        if completion_only_loss is not None:
-            mask_prompt = bool(completion_only_loss)
+        mask_prompt = resolve_mask_prompt(self.arguments)
         return SFTPreprocessTransform(
             tokenizer=self.processing_class,
             max_length=self.arguments.max_length,
@@ -477,40 +569,7 @@ class SpeculativeDecodingTrainer(Trainer):
             metadata dictionary from the base class.
         """
         batch, infos = super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
-
-        if "assistant_masks" in batch:
-            if "completion_mask" not in batch:
-                batch["completion_mask"] = batch["assistant_masks"]
-            batch.pop("assistant_masks", None)
-
-        attention_mask = batch.get("attention_mask")
-        completion_mask = batch.get("completion_mask")
-
-        if completion_mask is not None:
-            completion_mask_np = np.asarray(completion_mask)
-            if attention_mask is not None:
-                completion_mask_np = completion_mask_np * np.asarray(attention_mask)
-            completion_dtype = (
-                np.asarray(attention_mask).dtype if attention_mask is not None else completion_mask_np.dtype
-            )
-            batch["completion_mask"] = completion_mask_np.astype(completion_dtype, copy=False)
-
-            if "labels" not in batch and "input_ids" in batch:
-                labels = np.asarray(batch["input_ids"]).astype(np.int32, copy=True)
-                labels[completion_mask_np == 0] = -100
-                if attention_mask is not None:
-                    labels[np.asarray(attention_mask) == 0] = -100
-                batch["labels"] = labels
-
-        if "labels" in batch and "completion_mask" not in batch:
-            labels_np = np.asarray(batch["labels"])
-            if (labels_np == -100).any():
-                completion_mask_np = (labels_np != -100).astype(np.int32)
-                if attention_mask is not None:
-                    completion_mask_np = completion_mask_np * np.asarray(attention_mask)
-                batch["completion_mask"] = completion_mask_np
-
-        return batch, infos
+        return self._apply_assistant_supervision(batch, infos), infos
 
     @property
     def _train_shared_fn_extra_args(self) -> tuple[EasyDeLState]:

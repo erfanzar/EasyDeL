@@ -27,7 +27,7 @@ from dataclasses import dataclass
 import jax
 import spectrax as spx
 from eformer import common_types
-from ejkernel.modules import mhc_coefficients, sinkhorn_knopp
+from ejkernel.modules import MHCFusedConfig, mhc_coefficients, mhc_collapse, mhc_expand, sinkhorn_knopp
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import NamedSharding
@@ -155,6 +155,9 @@ class ManifoldHyperConnection(spx.Module):
         *,
         rngs: spx.Rngs,
         mesh_source: object | None = None,
+        fused_kernel: tp.Literal["none", "pallas"] = "none",
+        fused_tile_rows: int = 256,
+        fused_fn_pieces: int = 3,
     ):
         """Initialize the connection without depending on a model config type.
 
@@ -168,10 +171,31 @@ class ManifoldHyperConnection(spx.Module):
                 The property is read on every forward, not captured at init, so
                 model-config stage-local mesh resolution remains intact. Both
                 JAX meshes and wrappers exposing ``jax_mesh`` are supported.
+            fused_kernel: ``"none"`` (default) keeps the XLA path below unchanged.
+                ``"pallas"`` routes :meth:`forward` through ejkernel ``mhc_collapse``
+                and :meth:`residual_write` through ``mhc_expand`` on their Pallas
+                TPU implementations (one sweep over the streams per pass, analytic
+                backward, the projection at fp32 accuracy regardless of
+                ``precision``). :meth:`coefficients` is never fused. Opt-in only:
+                on TPU v5 at ``[1, S, 4, 1024]`` bf16 the fused site measured
+                1.6-1.7x slower forward+backward than XLA, faster only for
+                forward-only use at long sequences. Requires a per-device hidden
+                width that is a multiple of 128.
+            fused_tile_rows: Pallas rows per grid step (positive multiple of 128).
+            fused_fn_pieces: bf16 pieces an fp32 ``fn`` (and the fp32 logit
+                cotangent) is split into for the MXU dots; 3 = fp32 accuracy.
+
+        Raises:
+            ValueError: Unknown ``fused_kernel``.
         """
         # infra.utils itself imports layers, so this dependency must stay lazy.
         from easydel.infra.utils import ArrayParam
 
+        if fused_kernel not in ("none", "pallas"):
+            raise ValueError(f"fused_kernel must be 'none' or 'pallas', got {fused_kernel!r}")
+        self.fused_kernel = fused_kernel
+        self.fused_tile_rows = int(fused_tile_rows)
+        self.fused_fn_pieces = int(fused_fn_pieces)
         self.config = config
         self.mesh_source = mesh_source
         self.dtype = dtype
@@ -204,8 +228,92 @@ class ManifoldHyperConnection(spx.Module):
             and the read-weighted sum ``[B, S, D]`` in the input dtype.
             The write helper applies the mixer transposed.
         """
+        if self.fused_kernel == "pallas":
+            return self._fused_forward(hidden_streams)
         pre, post, comb = self.coefficients(hidden_streams)
         return post, comb, manifold_collapse(pre, hidden_streams)
+
+    def _fused_cfg(self) -> MHCFusedConfig:
+        """Pallas dispatch configuration of the opt-in fused path."""
+        return MHCFusedConfig(
+            platform="pallas",
+            backend="tpu",
+            tile_rows=self.fused_tile_rows,
+            fn_pieces=self.fused_fn_pieces,
+            grad_pieces=self.fused_fn_pieces,
+        )
+
+    def _fused_specs(self, hidden_streams: Array):
+        """``(jax_mesh, stream_spec)`` when the streams must run under ``shard_map``, else ``(None, None)``."""
+        jax_mesh, stream_spec = _stream_layout(self.mesh_source, hidden_streams.shape)
+        if jax_mesh is None or getattr(jax_mesh, "size", 1) <= 1:
+            return None, None
+        if stream_spec is None:
+            stream_spec = Ps()
+        stream_spec = Ps(*(tuple(stream_spec) + (None,) * (4 - len(stream_spec))))
+        return jax_mesh, stream_spec
+
+    def _fused_forward(self, hidden_streams: Array) -> tuple[Array, Array, Array]:
+        """``(post, comb, collapsed)`` through ejkernel ``mhc_collapse`` (Pallas), sharded like the streams.
+
+        The RMS denominator is taken from the streams (local width times the hidden-axis size), matching the
+        unfused flattened-stream RMSNorm.
+        """
+        hc = self.hc_mult
+        fn3 = self.fn.value.reshape(-1, hc, hidden_streams.shape[-1])
+        kwargs = dict(sinkhorn_iters=self.hc_sinkhorn_iters, eps=self.hc_eps, rms_eps=self.rms_norm_eps)
+        jax_mesh, spec = self._fused_specs(hidden_streams)
+        if jax_mesh is None:
+            return mhc_collapse(hidden_streams, fn3, self.base.value, self.scale.value, cfg=self._fused_cfg(), **kwargs)
+        return mhc_collapse(
+            hidden_streams,
+            fn3,
+            self.base.value,
+            self.scale.value,
+            cfg=self._fused_cfg(),
+            mesh=jax_mesh,
+            in_specs=(spec, Ps(None, None, spec[3]), Ps(), Ps()),
+            out_specs=(Ps(spec[0], spec[1], None), Ps(spec[0], spec[1], None, None), Ps(spec[0], spec[1], spec[3])),
+            **kwargs,
+        )
+
+    def residual_write(
+        self,
+        hidden_streams: Float[Array, "batch seq hc hidden"],
+        sublayer_output: Float[Array, "batch seq hidden"],
+        post: Float[Array, "batch seq hc"],
+        comb: Float[Array, "batch seq hc hc"],
+    ) -> Float[Array, "batch seq hc hidden"]:
+        """Write a sub-layer output onto the streams with this connection's kernel choice.
+
+        With ``fused_kernel="none"`` this is exactly :func:`manifold_residual_write` at this module's
+        ``precision``; with ``"pallas"`` it runs ejkernel ``mhc_expand`` (Pallas TPU), sharded like the streams.
+
+        Args:
+            hidden_streams: Original residual streams ``[B, S, hc, D]``.
+            sublayer_output: Sub-layer result ``[B, S, D]``.
+            post: Write gates ``[B, S, hc]``.
+            comb: Stream mixer ``[B, S, hc, hc]``, indexed ``[source, target]``.
+
+        Returns:
+            Updated streams ``[B, S, hc, D]`` in the stream dtype.
+        """
+        if self.fused_kernel != "pallas":
+            return manifold_residual_write(hidden_streams, sublayer_output, post, comb, precision=self.precision)
+        jax_mesh, spec = self._fused_specs(hidden_streams)
+        if jax_mesh is None:
+            return mhc_expand(hidden_streams, sublayer_output, post, comb, cfg=self._fused_cfg())
+        token, matrix = Ps(spec[0], spec[1], None), Ps(spec[0], spec[1], None, None)
+        return mhc_expand(
+            hidden_streams,
+            sublayer_output,
+            post,
+            comb,
+            cfg=self._fused_cfg(),
+            mesh=jax_mesh,
+            in_specs=(spec, Ps(spec[0], spec[1], spec[3]), token, matrix),
+            out_specs=spec,
+        )
 
     def coefficients(self, hidden_streams: Float[Array, "batch seq hc hidden"]) -> tuple[Array, Array, Array]:
         """Return ``(pre, post, comb)`` in fp32 without collapsing the streams.

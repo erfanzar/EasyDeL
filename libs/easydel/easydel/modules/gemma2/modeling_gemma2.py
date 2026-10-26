@@ -36,6 +36,8 @@ Exports:
     - :class:`Gemma2ForSequenceClassification`: Pooled classifier over the last token.
 """
 
+from copy import copy
+
 import jax
 import jax.numpy as jnp
 import spectrax as spx
@@ -71,7 +73,7 @@ from easydel.layers import (
     dense_gate_up_layout,
     gated_mlp_forward,
 )
-from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.attention import SoftCappedAttentionModule, UnifiedAttention
 from easydel.layers.norms import RMSNorm
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
@@ -102,42 +104,8 @@ class Gemma2RMSNorm(RMSNorm):
         )
 
 
-class Gemma2SoftCappedAttentionModule(FlexibleAttentionModule):
-    """:class:`FlexibleAttentionModule` with a fixed default attention-logit soft cap.
-
-    Gemma2 (and Gemma3 when ``attn_logit_softcapping`` is set) squashes the
-    scaled attention scores with ``cap * tanh(scores / cap)`` before the
-    softmax. :class:`UnifiedAttention` does not forward a soft cap to its
-    performer, so this subclass supplies ``logits_soft_cap`` whenever the
-    caller leaves it unset.
-    """
-
-    def __init__(self, *args, logits_soft_cap: float | None = None, **kwargs):
-        """Build the performer and remember the default soft cap.
-
-        Args:
-            *args: Forwarded to :class:`FlexibleAttentionModule`.
-            logits_soft_cap: Soft-cap value applied when a call does not pass
-                one; ``None`` disables soft capping.
-            **kwargs: Forwarded to :class:`FlexibleAttentionModule`.
-        """
-        super().__init__(*args, **kwargs)
-        self.logits_soft_cap = None if logits_soft_cap is None else float(logits_soft_cap)
-
-    def forward(self, *args, logits_soft_cap: float | None = None, **kwargs):
-        """Run attention, defaulting ``logits_soft_cap`` to the configured cap.
-
-        Args:
-            *args: Forwarded to :meth:`FlexibleAttentionModule.forward`.
-            logits_soft_cap: Per-call override; ``None`` uses ``self.logits_soft_cap``.
-            **kwargs: Forwarded to :meth:`FlexibleAttentionModule.forward`.
-
-        Returns:
-            The :class:`AttentionOutput` produced by the base performer.
-        """
-        if logits_soft_cap is None:
-            logits_soft_cap = self.logits_soft_cap
-        return super().forward(*args, logits_soft_cap=logits_soft_cap, **kwargs)
+# Public performer name, shared with the common implementation.
+Gemma2SoftCappedAttentionModule = SoftCappedAttentionModule
 
 
 class Gemma2Attention(UnifiedAttention):
@@ -161,12 +129,14 @@ class Gemma2Attention(UnifiedAttention):
     2. Softmax is forced to float32 via ``attention_softmax_in_fp32`` whenever
        the activation dtype is not already float32 — Gemma2's logit
        distribution can be sharp enough that bfloat16 softmax loses precision.
+       This is wired into the attention operation's metadata without changing
+       the caller's configuration.
 
     Attributes:
         config: Source ``Gemma2Config``.
         head_dim: Per-head dimensionality.
-        attention_softmax_in_fp32: ``True`` whenever the activation dtype is
-            not float32.
+        attention_softmax_in_fp32: Whether low-precision activations require
+            float32 softmax accumulation in the attention performer.
         is_cross_attention: Reserved flag for cross-attention layers (always
             ``False`` in the public Gemma2 checkpoints).
     """
@@ -188,11 +158,11 @@ class Gemma2Attention(UnifiedAttention):
         Reads ``config.layer_types[layer_idx]``: if it equals
         ``"sliding_attention"`` the constructor passes
         ``sliding_window=config.sliding_window`` down to the unified attention
-        backend; otherwise ``sliding_window=None`` (full causal). Sets
-        ``attention_softmax_in_fp32`` based on ``dtype`` and stores
+        backend; otherwise ``sliding_window=None`` (full causal). Stores
         ``is_cross_attention`` for later cross-attention specialisation.
         """
         self.is_cross_attention = is_cross_attention
+        self.attention_softmax_in_fp32 = jnp.dtype(dtype) != jnp.dtype(jnp.float32)
 
         super().__init__(
             config,
@@ -209,8 +179,6 @@ class Gemma2Attention(UnifiedAttention):
                 else None
             ),
         )
-
-        self.attention_softmax_in_fp32 = self.dtype is not jnp.float32
 
     def _create_rotary(self, config: Gemma2Config, dtype: jnp.dtype):
         """Build Gemma2's full-head-dim rotary embedding helper.
@@ -233,9 +201,13 @@ class Gemma2Attention(UnifiedAttention):
         wired through from ``config.attention_dropout``, and the scaled scores
         are tanh-soft-capped at ``config.attn_logit_softcapping`` as in HF.
         """
+        performer_config = config
+        if self.attention_softmax_in_fp32:
+            performer_config = copy(config)
+            performer_config.attn_softmax_dtype = jnp.float32
         return Gemma2SoftCappedAttentionModule(
             rngs=rngs,
-            base_config=config,
+            base_config=performer_config,
             softmax_scale=config.query_pre_attn_scalar**-0.5,
             dropout_prob=config.attention_dropout,
             logits_soft_cap=getattr(config, "attn_logit_softcapping", None),
@@ -417,7 +389,7 @@ class Gemma2DecoderLayer(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        self.is_sliding = bool(self.layer_idx % 2)
+        self.is_sliding = config.layer_types is not None and config.layer_types[self.layer_idx] == "sliding_attention"
         self.self_attn = Gemma2Attention(
             self.config,
             layer_idx=self.layer_idx,
@@ -752,6 +724,7 @@ class Gemma2Model(EasyDeLBaseModule):
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
@@ -818,6 +791,8 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
     _task_type = TaskType.CAUSAL_LM
     _model_type = "gemma2"
     _config_class = Gemma2Config
+    # Softcapping transforms logits; this head adds no auxiliary training objective.
+    _ce_only_forward = True
 
     def __init__(
         self,
@@ -965,6 +940,26 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
             cap = jnp.array(self.config.final_logit_softcapping, dtype=lm_logits.dtype)
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)
         return lm_logits
+
+    def get_lm_logit_postprocess(self):
+        """Capture the complete projection -> base clipping -> soft-cap contract.
+
+        Returns:
+            Scalar-only logit postprocessor, or ``None`` for identity.
+        """
+        clip_fn = self.get_base_lm_logit_postprocess()
+        cap_value = self.config.final_logit_softcapping
+        if cap_value is None:
+            return clip_fn
+
+        def _postprocess(logits):
+            """Clip raw logits before applying the configured tanh soft-cap."""
+            if clip_fn is not None:
+                logits = clip_fn(logits)
+            cap = jnp.array(cap_value, dtype=logits.dtype)
+            return cap * jax.nn.tanh(logits / cap)
+
+        return _postprocess
 
     def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
         """Build a trace-safe LM-head projection with Gemma-2 soft-capping.

@@ -261,20 +261,27 @@ def build_pipeline_inference_plan(
 
 
 def cap_metadata_pages(metadata: tp.Any, plan: PipelineInferencePlan | None) -> tp.Any:
-    """Apply user/runtime cache token caps to cache metadata in-place.
+    """Apply the cache token cap and capacity margin to cache metadata in-place.
+
+    Applies to every engine, SPMD and pipeline-parallel alike: the page count
+    is first bounded by ``plan.max_cache_tokens`` and then scaled by
+    ``plan.cache_capacity_margin`` so the HBM-derived pool leaves headroom for
+    non-KV allocations. With data-parallel KV sharding the result is rounded
+    down to a multiple of the DP size so pages still split evenly per rank.
 
     Args:
         metadata (Any): Cache-metadata object exposing ``num_pages`` and
-            ``page_size`` (and optionally ``_mixed_layer_configs``).
+            ``page_size`` (and optionally ``data_parallel_size`` and
+            ``_mixed_layer_configs``).
         plan (PipelineInferencePlan | None): Plan whose
             ``max_cache_tokens`` and ``cache_capacity_margin`` drive the cap.
-            A ``None`` or disabled plan is a no-op.
+            A ``None`` plan is a no-op.
 
     Returns:
         Any: The same ``metadata`` object (mutated in place).
     """
 
-    if plan is None or not plan.is_enabled or not hasattr(metadata, "num_pages") or not hasattr(metadata, "page_size"):
+    if plan is None or not hasattr(metadata, "num_pages") or not hasattr(metadata, "page_size"):
         return metadata
 
     num_pages = int(metadata.num_pages)
@@ -282,6 +289,9 @@ def cap_metadata_pages(metadata: tp.Any, plan: PipelineInferencePlan | None) -> 
         token_pages = max(1, math.ceil(int(plan.max_cache_tokens) / max(1, int(metadata.page_size))))
         num_pages = min(num_pages, int(token_pages))
     num_pages = max(1, int(num_pages * float(plan.cache_capacity_margin)))
+    dp_size = max(1, int(getattr(metadata, "data_parallel_size", 1) or 1))
+    if dp_size > 1:
+        num_pages = max(dp_size, (num_pages // dp_size) * dp_size)
     set_metadata_num_pages(metadata, num_pages)
     return metadata
 

@@ -49,7 +49,11 @@ from ..abstract_tool import ToolParser, ToolParserManager
 
 logger = get_logger(__name__)
 
-REGEX_FUNCTION_CALL = re.compile(r"function call(?:<\|role_sep\|>\n)?(\{.*)", re.DOTALL)
+REGEX_FUNCTION_CALL = re.compile(r"function call(?:<\|role_sep\|>)?\n?(\{.*)", re.DOTALL)
+_TRIGGER_WORD = "function call"
+# Every spelling of the separator that may sit between ``function call`` and the opening ``{``
+# (the ``<|role_sep|>`` special token may be stripped by the detokenizer).
+_TRIGGER_TAILS = ("{", "\n{", "<|role_sep|>{", "<|role_sep|>\n{")
 NAME_REGEX = re.compile(r'"name"\s*:\s*"([^"]*)"', re.DOTALL)
 ARGS_REGEX = re.compile(r'"arguments"\s*:\s*(.*)', re.DOTALL)
 
@@ -95,6 +99,65 @@ class GigaChat3ToolParser(ToolParser):
         self.prev_tool_call_arr: list[dict] = []
         self.content_buffer: str = ""
         self.trigger_start = "function call{"
+
+    @staticmethod
+    def _may_become_function_call(buffer: str) -> bool:
+        """Report whether ``buffer`` can still grow into a ``function call`` header.
+
+        Accepts any prefix of ``function call`` and, once that word is complete, any
+        prefix of the allowed separator spellings (``{``, ``\\n{``, ``<|role_sep|>{``,
+        ``<|role_sep|>\\n{``) so the protocol prefix is never leaked as content.
+
+        Args:
+            buffer: Left-stripped text buffered so far, before a full header matched.
+
+        Returns:
+            True while the buffer must keep being withheld.
+        """
+        if len(buffer) <= len(_TRIGGER_WORD):
+            return _TRIGGER_WORD.startswith(buffer)
+        if not buffer.startswith(_TRIGGER_WORD):
+            return False
+        rest = buffer[len(_TRIGGER_WORD) :]
+        return any(tail.startswith(rest) for tail in _TRIGGER_TAILS)
+
+    def get_tool_machinery_hints(self) -> Sequence[str]:
+        """Engage orchestration for every supported header separator spelling.
+
+        Returns:
+            The separator-independent trigger and existing compatibility hints.
+        """
+        return (_TRIGGER_WORD, *super().get_tool_machinery_hints())
+
+    def is_buffering_protocol(self, *, current_text: str, delta_text: str) -> bool:
+        """Expose pending headers even when ordinary content precedes them.
+
+        Args:
+            current_text: Cumulative visible model output.
+            delta_text: Newly decoded text.
+
+        Returns:
+            Whether content is withheld or the stream is parsing a tool call.
+        """
+        return (
+            self.tool_started
+            or bool(self.content_buffer)
+            or super().is_buffering_protocol(current_text=current_text, delta_text=delta_text)
+        )
+
+    def flush_streaming_content(self) -> str:
+        """Release ambiguous buffered text when the stream ends without a call.
+
+        ``ToolCallingMixin`` invokes this hook on its terminal update. An active
+        function call has already consumed the buffer, and its JSON must never
+        be surfaced as ordinary content.
+
+        Returns:
+            Unemitted plain text, or an empty string for an active call or after
+            a previous flush. Repeated flushes without new input are idempotent.
+        """
+        content, self.content_buffer = self.content_buffer, ""
+        return "" if self.tool_started else content
 
     def extract_tool_calls(
         self,
@@ -192,22 +255,34 @@ class GigaChat3ToolParser(ToolParser):
         """
         func_name = None
         cur_args = None
+        content = None
 
         if not self.tool_started:
+            self.content_buffer += delta_text
             match = REGEX_FUNCTION_CALL.search(current_text)
             if match:
+                # Only the buffered suffix is still un-emitted. Preserve its
+                # ordinary prefix even when the header and JSON share a chunk.
+                prefix_length = max(0, len(self.content_buffer) - (len(current_text) - match.start()))
+                content = self.content_buffer[:prefix_length] or None
                 self.tool_started = True
                 self.content_buffer = ""
             else:
-                self.content_buffer += delta_text
                 clean_buffer = self.content_buffer.lstrip()
-                is_prefix = self.trigger_start.startswith(clean_buffer)
-                starts_with_trigger = clean_buffer.startswith(self.trigger_start)
-                if is_prefix or starts_with_trigger:
+                if self._may_become_function_call(clean_buffer):
                     return None
-                flush_text = self.content_buffer
-                self.content_buffer = ""
-                return DeltaMessage(content=flush_text)
+                # A header can start anywhere, not just at the beginning of
+                # the content buffer. Emit ordinary text but retain the longest
+                # suffix that a future chunk could complete into a header.
+                pending_length = 0
+                max_header_length = len(_TRIGGER_WORD) + max(map(len, _TRIGGER_TAILS))
+                for length in range(min(len(self.content_buffer), max_header_length - 1), 0, -1):
+                    if self._may_become_function_call(self.content_buffer[-length:]):
+                        pending_length = length
+                        break
+                split = len(self.content_buffer) - pending_length
+                flush_text, self.content_buffer = self.content_buffer[:split], self.content_buffer[split:]
+                return DeltaMessage(content=flush_text) if flush_text else None
 
         match = REGEX_FUNCTION_CALL.search(current_text)
         if not match:
@@ -235,20 +310,23 @@ class GigaChat3ToolParser(ToolParser):
 
         if not self.tool_name_sent:
             if not func_name:
-                return None
+                return DeltaMessage(content=content) if content else None
             self.tool_name_sent = True
             self.tool_id = f"chatcmpl-tool-{uuid4()}"
             self.prev_tool_call_arr[0]["name"] = func_name
+            self.prev_tool_call_arr[0]["arguments"] = cur_args or ""
             return DeltaMessage(
                 tool_calls=[
                     DeltaToolCall(
                         index=0,
                         id=self.tool_id,
                         type="function",
-                        function=DeltaFunctionCall(name=func_name).model_dump(exclude_none=True),
+                        function=DeltaFunctionCall(name=func_name, arguments=cur_args or None).model_dump(
+                            exclude_none=True
+                        ),
                     )
                 ],
-                content=None,
+                content=content,
             )
 
         if cur_args is None:

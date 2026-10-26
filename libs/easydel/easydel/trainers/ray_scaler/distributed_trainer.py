@@ -248,7 +248,7 @@ class RayDistributedTrainer:
         "partition_axis": PartitionAxis(),
         "attn_mechanism": "auto",
         "attn_dtype": jnp.bfloat16,
-        "attn_softmax_dtype": jnp.bfloat16,
+        "attn_softmax_dtype": jnp.float32,
         "sharding_axis_names": ("pp", "dp", "fsdp", "ep", "tp", "sp"),
         "sharding_axis_dims": (1, 1, -1, 1, 1, 1),
         "sharding_dcn_axis_dims": (1, 1, -1, 1, 1, 1),
@@ -593,7 +593,9 @@ class RayDistributedTrainer:
         """Instantiate the wrapped model class from a configuration object.
 
         Dispatches to ``self.model_class.lazy_init`` (when ``lazy=True``) or
-        ``sequential_init`` otherwise. ``precision`` defaults to
+        ``sequential_init`` otherwise. Materialized parameters and initializer
+        RNGs use the offload device without changing the training mesh or
+        parameter sharding metadata. ``precision`` defaults to
         :attr:`lax.Precision.DEFAULT` when ``None``.
 
         Args:
@@ -612,17 +614,18 @@ class RayDistributedTrainer:
         if precision is None:
             precision = lax.Precision.DEFAULT
 
-        init_kwargs = dict(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=spx.Rngs(seed),
-        )
-
-        if lazy:
-            return self.model_class.lazy_init(**init_kwargs)
-        return self.model_class.sequential_init(**init_kwargs)
+        init_device = self._get_offload_device()
+        with jax.default_device(init_device):
+            init_kwargs = dict(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=spx.Rngs(seed),
+            )
+            if lazy:
+                return self.model_class.lazy_init(**init_kwargs)
+            return self.model_class.sequential_init(init_device=init_device, **init_kwargs)
 
     def convert_model_to_state(self, model: EasyDeLBaseModule) -> EasyDeLState:
         """Wrap a model module in an :class:`EasyDeLState` using ``state_class``.
@@ -748,10 +751,11 @@ class RayDistributedTrainer:
 
                 state = self.state_class.load_state(
                     load_directory=self.bucket_path,
+                    device=self._get_offload_device(),
                     dtype=self.config_variables["dtype"],
                     param_dtype=self.config_variables["param_dtype"],
                     precision=self.config_variables["precision"],
-                    auto_shard_model=True,
+                    auto_shard_model=False,
                     sharding_axis_names=self.config_variables["sharding_axis_names"],
                     sharding_axis_dims=self.config_variables["sharding_axis_dims"],
                     sharding_dcn_axis_dims=self.config_variables["sharding_dcn_axis_dims"],
@@ -776,6 +780,20 @@ class RayDistributedTrainer:
         if state is None:
             raise RuntimeError("Unable to obtain a valid model state.")
 
+        # Never gather a supplied distributed array onto one host. Besides
+        # rejecting non-addressable leaves, that would destroy valid training
+        # placements (including stage-local PP shardings). Stage only unsharded,
+        # fully addressable leaves; retain caller-owned distributed layouts.
+        offload_device = self._get_offload_device()
+
+        def stage_leaf(value):
+            """Offload a local leaf without collapsing an existing distributed layout."""
+            if isinstance(value, jax.Array):
+                if not value.is_fully_addressable or not isinstance(value.sharding, jax.sharding.SingleDeviceSharding):
+                    return value
+            return jax.device_put(value, offload_device)
+
+        state = jax.tree_util.tree_map(stage_leaf, state)
         return self.create_trainer(
             arguments=arguments,
             dataset_train=dataset_train,

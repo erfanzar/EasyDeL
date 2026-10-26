@@ -37,6 +37,7 @@ Two surfaces are provided:
 from __future__ import annotations
 
 import re
+import threading
 import typing as tp
 
 import jax
@@ -79,6 +80,8 @@ class DrafterRegistry:
     _builders: tp.ClassVar[dict[str, Builder]] = {}
     _aliases: tp.ClassVar[dict[str, str]] = {}
     _builtins_loaded: tp.ClassVar[bool] = False
+    _builtins_condition: tp.ClassVar[threading.Condition] = threading.Condition(threading.RLock())
+    _builtins_loading_owner: tp.ClassVar[int | None] = None
 
     @classmethod
     def register(cls, name: str, *aliases: str) -> tp.Callable[[Builder], Builder]:
@@ -111,13 +114,30 @@ class DrafterRegistry:
     def _ensure_builtin_drafters(cls) -> None:
         """Import the module that registers the built-in drafter builders once.
 
-        The flag is set before the import so a re-entrant :meth:`resolve` during
-        that import does not recurse.
+        Same-thread queries during registration may re-enter. Other threads
+        wait for completion, and a failed import leaves initialization retryable.
         """
-        if cls._builtins_loaded:
-            return
-        cls._builtins_loaded = True
-        import easydel.inference.speculative  # noqa: F401  (registers built-in drafters as a side effect)
+        owner = threading.get_ident()
+        with cls._builtins_condition:
+            while cls._builtins_loading_owner is not None:
+                if cls._builtins_loading_owner == owner:
+                    return
+                cls._builtins_condition.wait()
+            if cls._builtins_loaded:
+                return
+            cls._builtins_loading_owner = owner
+        try:
+            import easydel.inference.speculative  # noqa: F401  (registers built-in drafters as a side effect)
+        except BaseException:
+            with cls._builtins_condition:
+                cls._builtins_loading_owner = None
+                cls._builtins_condition.notify_all()
+            raise
+        else:
+            with cls._builtins_condition:
+                cls._builtins_loaded = True
+                cls._builtins_loading_owner = None
+                cls._builtins_condition.notify_all()
 
     @classmethod
     def resolve(cls, name: str) -> Builder:
@@ -159,9 +179,6 @@ class DrafterRegistry:
         """Return the sorted list of canonical registered drafter names."""
         cls._ensure_builtin_drafters()
         return sorted(cls._builders.keys())
-
-
-_DRAFTER_REGISTRY = DrafterRegistry
 
 
 def register_drafter(name: str, *aliases: str) -> tp.Callable[[Builder], Builder]:

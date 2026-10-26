@@ -149,6 +149,45 @@ def default_assistant_layer_mapping(
     ] + heuristic[len(assistant_layer_types) :]
 
 
+def gather_paged_kv(
+    key_pages: Array,
+    value_pages: Array,
+    page_table_cpu: typing.Any,
+    *,
+    batch_index: int,
+    kv_len: int | None,
+    page_size: int,
+) -> tuple[Array, Array]:
+    """Gather one request's contiguous K/V out of paged storage.
+
+    Shared by :func:`build_target_kv_pairs` and the runner-native speculative
+    strategy so both read the page table identically.
+
+    Args:
+        key_pages: Paged keys shaped ``[num_pages, page_size, ...]``.
+        value_pages: Paged values shaped like ``key_pages``.
+        page_table_cpu: Host page table shaped ``[num_rows, max_pages_per_req]``.
+        batch_index: Page-table row (request) to gather.
+        kv_len: Number of tokens to gather. ``None`` gathers every page the
+            row can address. Clamped to the pages the table covers.
+        page_size: Tokens per page.
+
+    Returns:
+        ``(keys, values)`` with a leading batch axis of 1 and ``kv_len``
+        (clamped) positions.
+    """
+    page_size = max(1, int(page_size))
+    num_cols = int(page_table_cpu.shape[1])
+    gather_len = num_cols * page_size if kv_len is None else int(kv_len)
+    pages_needed = min(num_cols, max(1, (gather_len + page_size - 1) // page_size))
+    gather_len = min(gather_len, pages_needed * page_size)
+    page_ids = jnp.asarray(page_table_cpu[int(batch_index), :pages_needed], dtype=jnp.int32)
+    token_offsets = jnp.arange(gather_len, dtype=jnp.int32)
+    page_indices = page_ids[token_offsets // page_size]
+    offsets = token_offsets % page_size
+    return key_pages[page_indices, offsets][None, ...], value_pages[page_indices, offsets][None, ...]
+
+
 def build_target_kv_pairs(
     target_cache: typing.Any,
     layer_mapping: list[int],
@@ -157,6 +196,7 @@ def build_target_kv_pairs(
     layer_to_group: dict[int, int] | None = None,
     batch_index: int = 0,
     kv_len: int | None = None,
+    page_size: int = 1,
 ) -> list[tuple[Array, Array] | None]:
     """Extract per-assistant-layer ``(K, V)`` from a target KV cache.
 
@@ -183,6 +223,7 @@ def build_target_kv_pairs(
             caches.
         kv_len: Number of tokens to gather. Defaults to the full
             dense-cache length or one page table row's page coverage.
+        page_size: Fallback tokens per page when a paged view has no metadata.
 
     Returns:
         A list of ``(K, V)`` tuples (or ``None`` for any target layer
@@ -226,19 +267,20 @@ def build_target_kv_pairs(
 
             page_table = page_tables[group_idx]
             page_table_cpu = page_table.get_cpu_tensor() if hasattr(page_table, "get_cpu_tensor") else page_table
-            page_size = int(getattr(getattr(view, "metadata", None), "page_size", 1) or 1)
-            page_size = max(1, page_size)
-            if kv_len is None:
-                gather_len = int(page_table_cpu.shape[1]) * page_size
-            else:
-                gather_len = int(kv_len)
-            pages_needed = min(int(page_table_cpu.shape[1]), max(1, (gather_len + page_size - 1) // page_size))
-            gather_len = min(gather_len, pages_needed * page_size)
-            page_ids = jnp.asarray(page_table_cpu[int(batch_index), :pages_needed], dtype=jnp.int32)
-            token_offsets = jnp.arange(gather_len, dtype=jnp.int32)
-            page_indices = page_ids[token_offsets // page_size]
-            offsets = token_offsets % page_size
-            pairs.append((key_pages[page_indices, offsets][None, ...], value_pages[page_indices, offsets][None, ...]))
+            if int(page_table_cpu.shape[1]) == 0:
+                pairs.append(None)
+                continue
+            view_page_size = int(getattr(getattr(view, "metadata", None), "page_size", page_size) or page_size)
+            pairs.append(
+                gather_paged_kv(
+                    key_pages,
+                    value_pages,
+                    page_table_cpu,
+                    batch_index=int(batch_index),
+                    kv_len=kv_len,
+                    page_size=view_page_size,
+                )
+            )
         else:
             if kv_len is None:
                 pairs.append((k[int(batch_index) : int(batch_index) + 1], v[int(batch_index) : int(batch_index) + 1]))
@@ -256,4 +298,5 @@ __all__ = (
     "SpecDecodeStats",
     "build_target_kv_pairs",
     "default_assistant_layer_mapping",
+    "gather_paged_kv",
 )

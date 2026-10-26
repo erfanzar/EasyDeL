@@ -39,13 +39,14 @@ import sys
 import tempfile
 import time
 import uuid
-from pathlib import Path
 
 from easydel.workers.loggers import get_logger
 
 from .zmq_client import AuthWorkerClient
 
 logger = get_logger(__name__)
+
+_WORKER_MAIN_MODULE = "easydel.workers.esurge.auth.worker_main"
 
 
 class AuthWorkerManager:
@@ -176,7 +177,6 @@ class AuthWorkerManager:
         if needs_auth_spawn:
             auth_endpoint = self._make_ipc_endpoint("auth")
             self._auth_process = self._spawn_auth_worker(auth_endpoint)
-            self._auth_owned = True
             try:
                 self._wait_for_endpoint(auth_endpoint, self._auth_process)
             except Exception:
@@ -184,6 +184,8 @@ class AuthWorkerManager:
                 self._cleanup_ipc_file(auth_endpoint)
                 raise
 
+        # Ownership must reflect *this* start(): a previous owned run must not leak into an attach-mode run.
+        self._auth_owned = needs_auth_spawn
         self._auth_endpoint = auth_endpoint
         self._auth_client = AuthWorkerClient(self._auth_endpoint)
         return self._auth_client
@@ -214,6 +216,7 @@ class AuthWorkerManager:
         if self._auth_owned:
             self._cleanup_ipc_file(self._auth_endpoint)
         self._auth_endpoint = None
+        self._auth_owned = False
 
     # Internal helpers -----------------------------------------------------
 
@@ -235,18 +238,20 @@ class AuthWorkerManager:
             keeps a reference so :meth:`_terminate_process` can clean
             it up on shutdown.
         """
-        worker_main_path = Path(__file__).with_name("worker_main.py")
+        # Run as a module (not as a script path) so the package-relative imports inside
+        # ``worker_main`` resolve; a script launch has no parent package.
         cmd = [
             sys.executable,
-            str(worker_main_path),
+            "-m",
+            _WORKER_MAIN_MODULE,
             "--endpoint",
             endpoint,
         ]
 
         if self._require_api_key:
             cmd.append("--require-api-key")
-        if self._admin_key:
-            cmd.extend(["--admin-key", self._admin_key])
+        if self._admin_key is not None:
+            cmd.append("--admin-key-stdin")
         if self._enable_audit_logging:
             cmd.append("--enable-audit-logging")
         else:
@@ -263,13 +268,28 @@ class AuthWorkerManager:
             cmd.extend(["--auto-save-interval", str(self._auto_save_interval)])
 
         env = os.environ.copy()
-        env.setdefault("JAX_PLATFORMS", "cpu")
-        env.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
-        env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+        # Module startup imports EasyDeL before worker_main can isolate JAX.
+        # Override model-process settings before any child imports run.
+        env["JAX_PLATFORMS"] = "cpu"
+        env["JAX_PLATFORM_NAME"] = "cpu"
+        env["ENABLE_DISTRIBUTED_INIT"] = "0"
+        env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
         env.setdefault("PYTHONUNBUFFERED", "1")
 
-        logger.info(f"Spawning auth worker: {' '.join(cmd)}")
-        return subprocess.Popen(cmd, env=env)
+        # Never log argv: it can carry the bootstrap administrator credential.
+        logger.info(f"Spawning auth worker at {endpoint}")
+        if self._admin_key is None:
+            return subprocess.Popen(cmd, env=env)
+        # Private pipe, not argv or the environment (both visible through process inspection).
+        process = subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE, text=True)
+        try:
+            process.stdin.write(self._admin_key)
+            process.stdin.close()
+        except Exception:
+            process.terminate()
+            process.wait(timeout=5)
+            raise
+        return process
 
     def _wait_for_endpoint(self, endpoint: str, process: subprocess.Popen | None) -> None:
         """Block until the worker binds to ``endpoint`` or fails fast.

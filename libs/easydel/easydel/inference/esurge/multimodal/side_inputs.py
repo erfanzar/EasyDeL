@@ -39,47 +39,7 @@ import typing as tp
 
 import numpy as np
 
-
-class SideInputSpec(tp.NamedTuple):
-    """Static description of one per-token side input.
-
-    Attributes:
-        per_token_shape: Trailing shape of one token's row (the full host array is ``[T, *per_token_shape]``).
-        dtype: NumPy dtype of the array.
-        fill: Value of padded rows.
-    """
-
-    per_token_shape: tuple[int, ...]
-    dtype: tp.Any
-    fill: int | float = 0
-
-
-class SideInputWindow(tp.NamedTuple):
-    """The scheduled token window of one request in a step.
-
-    Attributes:
-        token_ids: The request's token history row (prompt then generated tokens; positions ``< end`` are real).
-        token_types: The request's prompt token types (``None`` for text-only requests).
-        start: First scheduled position.
-        end: One past the last scheduled position.
-        num_tokens: The request's known length (prompt plus accepted outputs, speculative drafts excluded); ``-1``
-            when unknown. Feeds the ``tokens_to_end`` side input.
-    """
-
-    token_ids: np.ndarray
-    token_types: np.ndarray | None
-    start: int
-    end: int
-    num_tokens: int = -1
-
-
-class SideInputProvider(tp.Protocol):
-    """Host builder of a model's per-token side inputs."""
-
-    def build(self, windows: tp.Sequence[SideInputWindow], num_tokens: int) -> dict[str, np.ndarray]:
-        """Arrays ``[num_tokens, *per_token_shape]`` per spec name; window rows are packed back to back in order."""
-        ...
-
+from easydel.infra.side_inputs import SideInputProvider, SideInputSpec, SideInputWindow
 
 #: Side input eSurge adds for token-type VLMs: per-token image token type (``-1`` text, ``>= 0`` image span).
 TOKEN_TYPES = "token_types"

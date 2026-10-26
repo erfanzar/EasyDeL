@@ -191,30 +191,6 @@ class MinimaxToolParser(ToolParser):
 
         return args_text
 
-    def _clean_delta_braces(self, delta_text: str) -> str:
-        """Clean delta text by removing excessive closing braces.
-
-        Normalizes delta text that consists only of closing braces
-        and whitespace to prevent duplicate braces in streaming.
-
-        Args:
-            delta_text: Delta text to clean.
-
-        Returns:
-            Cleaned delta text with at most one closing brace.
-        """
-        if not delta_text:
-            return delta_text
-
-        delta_stripped = delta_text.strip()
-
-        if delta_stripped and all(c in "}\n\r\t " for c in delta_stripped):
-            brace_count = delta_stripped.count("}")
-            if brace_count > 1:
-                return "}\n" if delta_text.endswith("\n") else "}"
-
-        return delta_text
-
     def extract_tool_calls(
         self,
         model_output: str,
@@ -246,16 +222,25 @@ class MinimaxToolParser(ToolParser):
             raw_function_calls = []
             for match in function_call_tuples:
                 tool_call_content = match[0] if match[0] else match[1]
-                if tool_call_content.strip():
-                    lines = tool_call_content.strip().split("\n")
-                    for line in lines:
-                        line = line.strip()
-                        if line and line.startswith("{") and line.endswith("}"):
-                            try:
-                                parsed_call = json.loads(line)
-                                raw_function_calls.append(parsed_call)
-                            except json.JSONDecodeError:
-                                continue
+                decoder = json.JSONDecoder()
+                position = 0
+                while position < len(tool_call_content):
+                    if tool_call_content[position].isspace() or tool_call_content[position] in ",;":
+                        position += 1
+                        continue
+                    try:
+                        parsed_call, position = decoder.raw_decode(tool_call_content, position)
+                    except json.JSONDecodeError:
+                        # A malformed line must not hide later complete values.
+                        newline = tool_call_content.find("\n", position)
+                        if newline < 0:
+                            break
+                        position = newline + 1
+                        continue
+                    if isinstance(parsed_call, dict):
+                        raw_function_calls.append(parsed_call)
+                    elif isinstance(parsed_call, list):
+                        raw_function_calls.extend(call for call in parsed_call if isinstance(call, dict))
 
             tool_calls = []
             for function_call in raw_function_calls:
@@ -269,6 +254,9 @@ class MinimaxToolParser(ToolParser):
                             ),
                         )
                     )
+
+            if not tool_calls:
+                return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
             processed_pos = processed_output.find(self.tool_call_start_token)
             if processed_pos != -1:

@@ -21,8 +21,9 @@ are useful as metadata when mirroring TRL/mergekit-style config surfaces.
 
 from __future__ import annotations
 
-import typing as tp
 from dataclasses import dataclass
+
+from .merge_methods import get_merge_method
 
 
 @dataclass
@@ -64,7 +65,7 @@ class MergeConfig:
             ``dare_ties``.
     """
 
-    method: tp.Literal["linear", "ties", "dare_ties", "slerp"] = "linear"
+    method: str = "linear"
     policy_model_path: str | None = None
     target_model_path: str | None = None
     policy_model_weight: float = 0.5
@@ -80,12 +81,11 @@ class MergeConfig:
         """Validate method names, weights, and density schedules.
 
         Raises:
-            ValueError: If the method is not registered as a built-in method
-                name, any merge weight is negative, or any configured density is
+            ValueError: If the method is not registered, any merge weight
+                is negative, or any configured density is
                 outside ``[0, 1]``.
         """
-        if self.method not in {"linear", "ties", "dare_ties", "slerp"}:
-            raise ValueError("`method` must be one of 'linear', 'ties', 'dare_ties', or 'slerp'.")
+        get_merge_method(self.method)
         if self.policy_model_weight < 0.0 or self.target_model_weight < 0.0:
             raise ValueError("Merge weights must be non-negative.")
         if any(density < 0.0 for density in (*self.policy_model_density, *self.target_model_density)):

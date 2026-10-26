@@ -113,11 +113,13 @@ class DeepSeekV3ToolParser(ToolParser):
         self.tool_call_end_token: str = "<｜tool▁call▁end｜>"
 
         self.tool_call_regex = re.compile(
-            r"<｜tool▁call▁begin｜>(?P<type>.*)<｜tool▁sep｜>(?P<function_name>.*)\n```json\n(?P<function_arguments>.*)\n```<｜tool▁call▁end｜>"
+            r"<｜tool▁call▁begin｜>(?P<type>[^<\n]*)<｜tool▁sep｜>(?P<function_name>[^\n]*)\n```json\n(?P<function_arguments>.*?)\n```<｜tool▁call▁end｜>",
+            re.DOTALL,
         )
 
         self.stream_tool_call_portion_regex = re.compile(
-            r"(?P<type>.*)<｜tool▁sep｜>(?P<function_name>.*)\n```json\n(?P<function_arguments>.*[^\n`])"
+            r"(?P<type>[^<\n]*)<｜tool▁sep｜>(?P<function_name>[^\n]*)\n```json\n(?P<function_arguments>.*[^\n`])",
+            re.DOTALL,
         )
 
         self.stream_tool_call_name_regex = re.compile(r"(?P<type>.*)<｜tool▁sep｜>(?P<function_name>.*)\n")
@@ -183,6 +185,8 @@ class DeepSeekV3ToolParser(ToolParser):
                         )
                     )
 
+                if not tool_calls:
+                    return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
                 content = model_output[: model_output.find(self.tool_calls_start_token)]
                 return ExtractedToolCallInformation(
                     tools_called=True,

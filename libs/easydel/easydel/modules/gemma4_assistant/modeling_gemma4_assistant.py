@@ -92,6 +92,7 @@ from easydel.layers import (
     gated_mlp_forward,
     get_frequencies,
 )
+from easydel.layers.attention import AttentionMechanisms, FlexibleAttentionModule
 from easydel.layers.rotary import apply_basic_rope, partial_rope_frequencies
 from easydel.modules.gemma4.modeling_gemma4 import Gemma4RMSNorm
 
@@ -391,6 +392,7 @@ class Gemma4AssistantQOnlyAttention(spx.Module):
         """
         self.config = config
         self.layer_idx = layer_idx
+        self.precision = precision
         layer_type = config.layer_types[layer_idx]
         head_dim = config.global_head_dim if layer_type == "full_attention" else config.head_dim
         num_heads = config.num_attention_heads
@@ -420,6 +422,15 @@ class Gemma4AssistantQOnlyAttention(spx.Module):
             kernel_init=jax.nn.initializers.normal(0.02),
         )
         self.q_norm = Gemma4RMSNorm(dim=head_dim, epsilon=config.rms_norm_eps, param_dtype=param_dtype)
+        # Score/softmax/PV run through the OperationRegistry (vanilla op: the caller supplies a dense additive
+        # mask over target K/V); softmax_scale=1.0 because the Q/K norms already bound the logits.
+        self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
+            base_config=config,
+            softmax_scale=1.0,
+            attn_mechanism=AttentionMechanisms.VANILLA,
+            requires_cache=False,
+        )
 
     @cached_property
     def rope_frequencies(self) -> Array:
@@ -522,24 +533,30 @@ class Gemma4AssistantQOnlyAttention(spx.Module):
             key_states = q
             value_states = q
 
-        num_kv = key_states.shape[-2]
-        if num_kv != self.num_heads:
-            repeats = self.num_heads // num_kv
-            key_states = jnp.repeat(key_states, repeats, axis=-2)
-            value_states = jnp.repeat(value_states, repeats, axis=-2)
-
-        # Gemma4 attention uses ``scaling=1.0`` (HF ``Gemma4TextAttention`` and
-        # EasyDeL's own Gemma4 attention): the Q/K RMS norms already bound the
-        # logit scale, so no ``1/sqrt(head_dim)`` factor is applied here either.
-        q_bhsd = jnp.transpose(q, (0, 2, 1, 3)).astype(jnp.float32)
-        k_bhsd = jnp.transpose(key_states, (0, 2, 1, 3)).astype(jnp.float32)
-        v_bhsd = jnp.transpose(value_states, (0, 2, 1, 3)).astype(jnp.float32)
-        scores = jnp.einsum("bhsd,bhtd->bhst", q_bhsd, k_bhsd)
+        bias = None
         if attention_mask is not None:
-            scores = scores + attention_mask.astype(jnp.float32)
-        attn = jax.nn.softmax(scores, axis=-1)
-        out = jnp.einsum("bhst,bhtd->bhsd", attn, v_bhsd).astype(hidden_states.dtype)
-        out = jnp.transpose(out, (0, 2, 1, 3)).reshape(b, s, self.num_heads * self.head_dim)
+            # The float-additive mask is shared across heads; materialise the head axis so the
+            # attention operation's bias sharding (heads axis) always lines up.
+            bias = jnp.broadcast_to(
+                attention_mask.astype(jnp.float32),
+                (b, self.num_heads, s, key_states.shape[1]),
+            )
+
+        # Gemma4 attention uses ``scaling=1.0`` (HF ``Gemma4TextAttention`` and EasyDeL's own Gemma4
+        # attention): the Q/K RMS norms already bound the logit scale. The score/softmax/PV step goes through
+        # the registered attention operation (GQA handled there) in float32.
+        attentions = self.attention_performer.forward(
+            query_states=q,
+            key_states=key_states,
+            value_states=value_states,
+            mode=common_types.MODE_TRAIN,
+            bias=bias,
+            causal=False,
+            compute_dtype=jnp.float32,
+            precision=self.precision,
+        )
+        out = attentions.attention_outputs.astype(hidden_states.dtype)
+        out = out.reshape(b, s, self.num_heads * self.head_dim)
         return self.o_proj(out)
 
 

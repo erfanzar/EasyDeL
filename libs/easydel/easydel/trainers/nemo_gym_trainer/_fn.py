@@ -19,6 +19,8 @@ import json
 import typing as tp
 from pathlib import Path
 
+from eformer.paths import UniversalPath, ePath
+
 
 def _environment_reward_func(
     completions: tp.Sequence[object],
@@ -121,7 +123,7 @@ def _normalize_step_result(step_result: object) -> tuple[object, float, bool, bo
     return observation, float(reward), bool(terminated), bool(truncated), _as_mapping(info)
 
 
-def load_nemo_gym_jsonl(path: str | Path) -> object:
+def load_nemo_gym_jsonl(path: str | Path | UniversalPath) -> object:
     """Load a NeMo Gym JSONL task file into a Dataset when available.
 
     Each row keeps the original task as JSON in ``metadata`` and exposes a
@@ -130,17 +132,17 @@ def load_nemo_gym_jsonl(path: str | Path) -> object:
     """
 
     rows: list[dict[str, object]] = []
-    with Path(path).open() as handle:
-        for idx, line in enumerate(handle):
-            if not line.strip():
-                continue
-            item = json.loads(line)
-            prompt = item.get("prompt")
-            if prompt is None:
-                params = item.get("responses_create_params", {})
-                input_payload = params.get("input") if isinstance(params, dict) else None
-                prompt = input_payload if input_payload is not None else str(idx)
-            rows.append({"prompt": prompt, "metadata": json.dumps(item), "agent_ref": item.get("agent_ref")})
+    task_path = path if isinstance(path, UniversalPath) else ePath(path)
+    for idx, line in enumerate(task_path.read_text().splitlines()):
+        if not line.strip():
+            continue
+        item = json.loads(line)
+        prompt = item.get("prompt")
+        if prompt is None:
+            params = item.get("responses_create_params", {})
+            input_payload = params.get("input") if isinstance(params, dict) else None
+            prompt = input_payload if input_payload is not None else str(idx)
+        rows.append({"prompt": prompt, "metadata": json.dumps(item), "agent_ref": item.get("agent_ref")})
 
     try:
         from datasets import Dataset

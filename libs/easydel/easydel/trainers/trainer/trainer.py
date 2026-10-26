@@ -33,11 +33,12 @@ and multimodal architectures.
 
 import collections.abc
 import json as _json
-import os
 import time as _time
 import typing as tp
+import uuid
 
 import jax
+from eformer.paths import LocalPath, ePath
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLPreemptionSignal, EasyDeLTimerError
@@ -754,6 +755,7 @@ class Trainer(BaseTrainer):
                         # PoSE (text-only): host-side position_ids skip, once per microbatch
                         # before the forward (no-op unless arguments.pose.enabled).
                         batch = self._apply_pose_to_batch(batch, current_step)
+                        batch = self._apply_randomized_yarn_to_batch(batch, current_step)
                         # Vision encoder: run the tower out of band on the vision-bearing
                         # rows and swap in precomputed features, once per microbatch before
                         # the forward (no-op unless arguments.process_encoder.enabled).
@@ -1121,31 +1123,50 @@ class Trainer(BaseTrainer):
         return metrics
 
     def _append_host_phase_log(self) -> None:
-        """Append this host's step-phase timings to a local jsonl (fleet debug).
+        """Append this host's step-phase timings to the configured JSONL path.
 
-        Enabled via EASYDEL_HOST_PHASE_LOG=<path>. Each process writes its own
-        local file; collecting them across hosts lets the per-step fleet max be
-        attributed to a specific host (rank-0 metrics cannot see stragglers).
+        Set ``TrainingArguments.host_phase_log_path`` to enable fleet debugging.
+        Each host should use a distinct path so timings can be attributed to a
+        specific host (rank-zero metrics cannot see stragglers). Local paths are
+        appended without reading or rewriting earlier records. For cloud paths,
+        each step writes a unique JSONL chunk under ``path/*.jsonl``; existing
+        objects, including any legacy log at ``path``, are never overwritten.
+        This keeps per-step I/O bounded and preserves previous records if a
+        write fails, without buffering timings until training ends.
         """
-        path = os.environ.get("EASYDEL_HOST_PHASE_LOG")
+        path = self.arguments.host_phase_log_path
         if not path:
             return
+        record = (
+            _json.dumps(
+                {
+                    "t": round(_time.time(), 3),
+                    "proc": int(jax.process_index()),
+                    "put": round(getattr(self, "_last_step_put_dispatch_seconds", -1.0), 3),
+                    "dev": round(getattr(self, "_last_step_device_sync_seconds", -1.0), 3),
+                    "pre": round(getattr(self, "_last_step_preprocess_seconds", -1.0), 3),
+                }
+            )
+            + "\n"
+        )
         try:
-            with open(path, "a") as fh:
-                fh.write(
-                    _json.dumps(
-                        {
-                            "t": round(_time.time(), 3),
-                            "proc": int(jax.process_index()),
-                            "put": round(getattr(self, "_last_step_put_dispatch_seconds", -1.0), 3),
-                            "dev": round(getattr(self, "_last_step_device_sync_seconds", -1.0), 3),
-                            "pre": round(getattr(self, "_last_step_preprocess_seconds", -1.0), 3),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception as _e:
-            pass
+            log_path = ePath(path)
+            if isinstance(log_path, LocalPath):
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                # ePath resolves the backend; its local implementation exposes
+                # pathlib for append, which UniversalPath does not yet provide.
+                with log_path.path.open("a", encoding="utf-8") as stream:
+                    stream.write(record)
+            else:
+                # Object stores cannot append in place. Immutable, constant-size
+                # chunks avoid both cumulative rewrites and destructive failures.
+                chunk = log_path / f"{_time.time_ns():020d}-{uuid.uuid4().hex}.jsonl"
+                chunk.write_text(record)
+        except Exception:
+            # Optional diagnostics must not abort training: cloud backends can
+            # raise SDK/auth/retry errors that do not derive from OSError.
+            # Keep cancellation signals (BaseException) propagating normally.
+            logger.warning("Could not append host phase timings to %s", path, exc_info=True)
 
     def _execute_train_step(
         self,
@@ -1238,12 +1259,7 @@ class Trainer(BaseTrainer):
                 state = state.replace(graphdef=base_graphdef)
             else:
                 with capture_time() as _put_dispatch_time:
-                    _result = self.sharded_training_step_function(
-                        state,
-                        batch,
-                        *self._train_shared_fn_extra_args,
-                        *self._train_shared_fn_static_args,
-                    )
+                    _result = self._dispatch_train_step(state, batch)
                 self._last_step_put_dispatch_seconds = float(_put_dispatch_time())
                 with capture_time() as _device_sync_time:
                     state, metrics = jax.block_until_ready(_result)
@@ -1292,6 +1308,25 @@ class Trainer(BaseTrainer):
                 return state, metrics, annotated_exception
             raise
 
+    def _dispatch_train_step(self, state, batch):
+        """Dispatch one optimizer step and return its ``(state, metrics)`` outputs without blocking.
+
+        One execution of ``sharded_training_step_function`` by default; under
+        ``gradient_accumulation_mode="execution"`` the trainer's ``_execution_accumulation`` driver runs the
+        per-microbatch grad executions and the apply execution instead.
+        """
+        execution_accumulation = getattr(self, "_execution_accumulation", None)
+        if execution_accumulation is not None:
+            return execution_accumulation.run(
+                state, batch, tuple(self._train_shared_fn_extra_args), tuple(self._train_shared_fn_static_args)
+            )
+        return self.sharded_training_step_function(
+            state,
+            batch,
+            *self._train_shared_fn_extra_args,
+            *self._train_shared_fn_static_args,
+        )
+
     def _finalize_training(self, output, run_exception):
         """
         Finalizes the training process and prepares the output.
@@ -1310,9 +1345,8 @@ class Trainer(BaseTrainer):
             if self.arguments.do_eval:
                 for _ in self.eval(output.state):
                     ...
-        except RuntimeError:
-            logger.info("Caught RuntimeError from eval function (mostly due to `StopIteration` being called manually)")
-        self.finish()
+        finally:
+            self.finish()
         return output
 
     def train(self) -> TrainerOutput:
@@ -1415,18 +1449,14 @@ class Trainer(BaseTrainer):
 
         Note:
             - Evaluation is performed without gradient computation
-            - Catches RuntimeError from multi-host synchronization issues
+            - Normal iterator exhaustion ends evaluation; execution errors propagate
             - Progress bar shows evaluation progress in real-time
         """
         self.start_evaluation_hook()
-        try:
-            metrics_tracker = MetricsTracker()
-            step_metrics = StepMetrics(self.arguments)
-            yield from self._run_evaluation(
-                state=model_state,
-                metrics_tracker=metrics_tracker,
-                step_metrics=step_metrics,
-            )
-        except RuntimeError:
-            # In multi-host evaluation, RuntimeError might be raised; catch and continue.
-            ...
+        metrics_tracker = MetricsTracker()
+        step_metrics = StepMetrics(self.arguments)
+        yield from self._run_evaluation(
+            state=model_state,
+            metrics_tracker=metrics_tracker,
+            step_metrics=step_metrics,
+        )

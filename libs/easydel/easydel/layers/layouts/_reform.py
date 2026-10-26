@@ -53,6 +53,7 @@ def interleaved_fusion_reform_param(
     source_transforms: tp.Sequence[tp.Callable[[tp.Any], tp.Any] | None] | None = None,
     inverse_source_transforms: tp.Sequence[tp.Callable[[tp.Any], tp.Any] | None] | None = None,
     log_label: str | None = None,
+    interleave_for_tp: bool = True,
 ) -> dict[str, dict[str, tp.Any]]:
     """Build a multi-source reform rule for TP-interleaved packing.
 
@@ -86,6 +87,8 @@ def interleaved_fusion_reform_param(
             callables for export.
         log_label: Optional human-friendly label used in checkpoint
             reform logs.
+        interleave_for_tp: When ``False``, keep logical segments contiguous
+            in forward, inverse, and native fusion regardless of physical TP.
 
     Returns:
         :type:`ReformParam`-style mapping ``{f"{target_name}$": {...}}``
@@ -117,7 +120,7 @@ def interleaved_fusion_reform_param(
         Returns:
             Active tensor-parallel size; ``1`` when no TP axis applies.
         """
-        return tensor_parallel_size(config, arr=arr)
+        return tensor_parallel_size(config, arr=arr) if interleave_for_tp else 1
 
     def _fuser(torch: tp.Any, *tensors: tp.Any) -> tp.Any:
         """Apply pre-fusion transforms then TP-interleave the source tensors.
@@ -359,6 +362,44 @@ def moe_down_projection_reform_param(
             "splits": [{"name": f"{source_prefix}.weight", "spliter": _load_transform}],
             "inverse_spliter": _export_transform,
         }
+    }
+
+
+def mixtral_moe_reform_param(
+    *,
+    config: EasyDeLBaseConfig | None = None,
+) -> dict[str, dict[str, tp.Any]]:
+    """Build the router and expert reform rules shared by Mixtral-layout MoEs.
+
+    Preserves the checkpoint names and conversion directions used by the
+    Mixtral and MiniMax decoder layers, including their pre-fused gate/up
+    source. The fused expert rule keeps its TP-aware load/export transforms.
+
+    Args:
+        config: Owning model config used to resolve the active TP size.
+
+    Returns:
+        Reform rules for the router, stacked down projection and fused
+        gate/up projection, with their existing checkpoint key paths.
+    """
+
+    def transpose_router(tensor: tp.Any) -> tp.Any:
+        return tensor.swapaxes(-1, -2)
+
+    return {
+        "mlp.gate.weight$": {
+            "splits": [{"name": "block_sparse_moe.gate.weight", "spliter": transpose_router}],
+            "inverse_spliter": transpose_router,
+        },
+        **moe_down_projection_reform_param(
+            target_prefix="mlp.experts.down_proj",
+            source_prefix="block_sparse_moe.experts.w2",
+        ),
+        **moe_fused_gate_up_reform_param(
+            config=config,
+            target_prefix="block_sparse_moe.experts.gate_up_proj",
+            source_prefix="mlp.experts.gate_up_proj",
+        ),
     }
 
 

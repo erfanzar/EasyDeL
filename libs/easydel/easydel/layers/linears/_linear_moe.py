@@ -75,28 +75,7 @@ from easydel.infra.sharding import (
     sharding_for_layout,
 )
 
-
-def promote_dtype(values, *, dtype=None):
-    """Cast a tuple of arrays to a shared dtype.
-
-    Lightweight replacement for ``flax.linen.dtypes.promote_dtype`` used by
-    the MoE linear layers prior to the grouped matmul.
-
-    Args:
-        values: Iterable of arrays (or array-like values) to promote.
-        dtype: Target dtype. If ``None``, the values are returned unchanged.
-
-    Returns:
-        Tuple of arrays cast to ``dtype`` if it was provided, otherwise the
-        original ``values`` argument unchanged.
-    """
-    if dtype is None:
-        return values
-    return tuple(jnp.asarray(v, dtype=dtype) for v in values)
-
-
-if typing.TYPE_CHECKING:
-    pass
+from ._linear import promote_dtype
 
 BATCH = common_types.BATCH
 EMPTY = common_types.EMPTY
@@ -383,7 +362,8 @@ class ParallelMoELinear(spx.Module):
         if self.direction is None:
             return None
         if self.use_expert_tensor_mode:
-            return get_moe_partition_spec(self.runtime_sharding_resolver, "column", self.use_expert_tensor_mode, True)
+            # ``is_bias=False``: this is the (3-D) weight layout; the bias layout is built separately in ``__init__``.
+            return get_moe_partition_spec(self.runtime_sharding_resolver, "column", self.use_expert_tensor_mode, False)
         elif self.direction == "row":
             return get_moe_partition_spec(self.runtime_sharding_resolver, "row", self.use_expert_tensor_mode, False)
         elif self.direction == "column":
@@ -401,9 +381,11 @@ class ParallelMoELinear(spx.Module):
             configured ALT sharding pattern, or ``None`` if no ALT sharding
             is configured.
         """
-        if self.alt_sharding is None:
+        spec = self.alt_sharding
+        if spec is None:
             return None
-        return self.alt_sharding.axes
+        # ``PartitionSpec`` is a tuple subclass with no ``.axes`` attribute; its entries are the per-dim axis names.
+        return list(spec)
 
     @property
     def expert_axis(self) -> str:
@@ -415,63 +397,6 @@ class ParallelMoELinear(spx.Module):
             mesh axis.
         """
         return TP if self.use_expert_tensor_mode else EP
-
-    def _group_axes(self) -> list[str | None]:
-        """Return sharding axes for the expert ``group_sizes`` array.
-
-        Group sizes specify how many tokens are assigned to each expert and are
-        typically replicated across all devices.
-
-        Returns:
-            List containing ``[EMPTY]``, indicating ``group_sizes`` are replicated.
-        """
-        return [EMPTY]
-
-    def _input_axes(self) -> list[str | None]:
-        """Return sharding axes for input activations based on parallelism direction.
-
-        The input sharding depends on whether this is a row-parallel or column-parallel layer:
-        - Row-parallel: Inputs are sharded on the feature dimension ``[DP, TP]``
-            because different devices hold different input features
-        - Column-parallel: Inputs are replicated on the feature dimension ``[DP, EMPTY]``
-            because all devices need the full input to compute their output slice
-
-        Returns:
-            List of axis names defining the input sharding pattern:
-            - Row direction: ``[DP, TP]`` — data parallel and tensor parallel sharded
-            - Column direction: ``[DP, EMPTY]`` — only data parallel sharded
-            - No direction: ``[DP, EMPTY]`` — default to replicated features
-        """
-        if self.direction == "row":
-            return [DP, TP]
-        if self.direction == "column":
-            return [DP, EMPTY]
-        return [DP, EMPTY]
-
-    def _output_axes(self) -> list[str | list[str] | None]:
-        """Return sharding axes for output activations based on parallelism direction.
-
-        The output sharding depends on the parallelism strategy:
-        - Row-parallel: Outputs are fully reduced and replicated ``[DP, EMPTY]``
-            because all devices contribute partial results that are summed
-        - Column-parallel: Outputs are sharded on the feature dimension
-            because each device produces a different slice of the output
-            - In expert tensor mode: ``[DP, TP]``
-            - In standard mode: ``[DP, [EP, TP]]`` (combined expert+tensor parallel)
-
-        Returns:
-            List of axis names defining the output sharding pattern:
-            - Row direction: ``[DP, EMPTY]`` — replicated after all-reduce
-            - Column direction: ``[DP, TP]`` or ``[DP, [EP, TP]]`` — sharded features
-            - No direction: ``[DP, EMPTY]`` — default to replicated
-        """
-        if self.direction == "row":
-            return [DP, EMPTY]
-        if self.direction == "column":
-            if self.use_expert_tensor_mode:
-                return [DP, TP]
-            return [DP, [EP, TP]]
-        return [DP, EMPTY]
 
     def forward(
         self,
@@ -526,7 +451,11 @@ class ParallelMoELinear(spx.Module):
                 group_sizes,
                 rule=quant_rule,
                 preferred_element_type=jnp.bfloat16,
-            ) + (self._expand_bias_ragged(group_sizes, sorted_experts=sorted_experts) if self.bias is not None else 0)
+            ) + (
+                self._expand_bias_ragged(group_sizes, sorted_experts=sorted_experts, total_rows=inputs.shape[0])
+                if self.bias is not None
+                else 0
+            )
 
         if quant_rule is not None:
             # Stacked expert kernels are ``[experts, contracted, out]``: axis 1
@@ -556,7 +485,7 @@ class ParallelMoELinear(spx.Module):
         )
 
         if self.bias is not None:
-            output += self._expand_bias_ragged(group_sizes, sorted_experts=sorted_experts)
+            output += self._expand_bias_ragged(group_sizes, sorted_experts=sorted_experts, total_rows=inputs.shape[0])
 
         return output
 
@@ -564,6 +493,7 @@ class ParallelMoELinear(spx.Module):
         self,
         group_sizes: Int[Array, "num_groups"],  # noqa
         sorted_experts: Int[Array, "tokens_ragged"] | None = None,  # noqa
+        total_rows: int | None = None,
     ) -> Float[Array, "tokens_ragged out_dim"]:
         """Expand the per-expert bias to match the ragged token batch structure.
 
@@ -586,6 +516,8 @@ class ParallelMoELinear(spx.Module):
             sorted_experts: Optional pre-computed expert IDs for each token. Shape:
                 (total_tokens,). Required in expert tensor mode where expert distribution
                 may be sparse. If None, expert indices are generated from group_sizes.
+            total_rows: Static input row count used when generating indices under jit.
+                The public forward supplies this from the input shape.
 
         Returns:
             Expanded bias array aligned with sorted tokens. Shape: (total_tokens, out_features).
@@ -609,7 +541,7 @@ class ParallelMoELinear(spx.Module):
             indices = sorted_experts
         else:
             bias_rows = self.bias.value.shape[0]
-            indices = jnp.repeat(jnp.arange(bias_rows), group_sizes)
+            indices = jnp.repeat(jnp.arange(bias_rows), group_sizes, total_repeat_length=total_rows)
         return self.bias.value[indices]
 
     def kernel_view(self) -> Array | tuple[Array, Array]:

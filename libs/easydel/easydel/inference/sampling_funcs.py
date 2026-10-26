@@ -15,8 +15,7 @@
 """Sampling functions for token generation in language models.
 
 This module provides efficient JAX-based sampling functions for selecting
-the next token during text generation. It includes implementations of
-top-p (nucleus) sampling and dynamic sampling with various penalty mechanisms.
+next tokens, including nucleus sampling and dynamic sampling with penalties.
 
 Functions:
     sample_top_p_efficient: Efficient top-p sampling with temperature scaling.
@@ -69,8 +68,9 @@ def sample_top_p_efficient(
         logits: Logits tensor of shape (batch_size, vocab_size) containing
             unnormalized log probabilities for each token.
         top_p: Top-p threshold tensor of shape (batch_size,) or scalar.
-            Tokens with cumulative probability exceeding this threshold
-            are filtered out.
+            The smallest set of top tokens whose cumulative probability
+            reaches this threshold is kept (the token that crosses the
+            threshold is included); the rest are filtered out.
         temperature: Temperature tensor of shape (batch_size,) or scalar.
             Higher values increase randomness, lower values make sampling
             more deterministic.
@@ -94,96 +94,136 @@ def sample_top_p_efficient(
     top_k_logits, top_k_indices = jax.lax.top_k(scaled_logits, k=effective_k)
     top_k_probs = jax.nn.softmax(top_k_logits, axis=-1)
     cumulative_probs_k = jnp.cumsum(top_k_probs, axis=-1)
-    keep_mask_k = cumulative_probs_k <= jnp.expand_dims(top_p, axis=-1)
+    # Keep every token whose *preceding* cumulative mass is still below ``top_p`` so the token that crosses the
+    # threshold is retained (standard nucleus sampling, identical to ``TopPLogitsWarper``). Comparing the inclusive
+    # cumulative sum instead would drop that token and shrink the nucleus below the requested mass.
+    preceding_mass_k = cumulative_probs_k - top_k_probs
+    keep_mask_k = preceding_mass_k < jnp.expand_dims(top_p, axis=-1)
     keep_mask_k = keep_mask_k.at[..., 0].set(True)
     filtered_top_k_logits = jnp.where(keep_mask_k, top_k_logits, -jnp.inf)
     sampled_k_index = jax.random.categorical(rng, filtered_top_k_logits)
     return jnp.take_along_axis(top_k_indices, jnp.expand_dims(sampled_k_index, axis=-1), axis=-1).squeeze(-1)
 
 
-# vmaped_sample_top_p_efficient: Vectorized version of sample_top_p_efficient
-# for batch processing. Maps the sampling function over batches with
-# independent top_p and temperature values per sample while sharing the random
-# key. Inputs:
-#   logits: Batched logits of shape (batch_size, vocab_size).
-#   top_p: Per-sample top_p values of shape (batch_size,).
-#   temperature: Per-sample temperatures of shape (batch_size,).
-#   rng: Shared random key.
-#   top_k_for_computation: Number of top tokens to consider.
-# Returns sampled tokens of shape (batch_size,).
-vmaped_sample_top_p_efficient = jax.vmap(sample_top_p_efficient, in_axes=(0, 0, 0, None, None), out_axes=0)
-
-
-@partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, None), out_axes=(0))
-def dynamic_sample_tokens(
-    tokens: jax.Array,  # [vocab / 1] i4
-    length: jax.Array,  # [vocab / 1] i4
-    logits: jax.Array,  # [vocab] f4/f2
-    top_p: jax.Array,  # [1] f4/f2
-    temperature: jax.Array,  # [1] f4/f2
-    random_sampling: jax.Array,  # [1] b1
-    presence_penalty: jax.Array,  # [1] f4/f2
-    frequency_penalty: jax.Array,  # [1] f4/f2
-    repetition_penalty: jax.Array,  # [1] f4/f2
-    rngs: jax.Array,  # [*] rng
+def vmaped_sample_top_p_efficient(
+    logits: jax.Array,
+    top_p: jax.Array,
+    temperature: jax.Array,
+    rng: jax.random.PRNGKey,
+    top_k_for_computation: int = TOPK_FOR_COMPUTE,
 ) -> jax.Array:
-    """Dynamically sample tokens with configurable penalties and sampling modes.
-
-    This function provides flexible token sampling that can switch between
-    greedy and random (top-p) sampling modes, while applying various penalty
-    mechanisms to prevent repetition.
+    """Vectorize nucleus sampling with per-row controls and a shared random key.
 
     Args:
-        tokens: Previously generated tokens of shape (sequence_length,) used
-            for computing penalties.
-        length: Current sequence length (integer array).
-        logits: Logits tensor of shape (vocab_size,) for the current position.
-        top_p: Top-p threshold for nucleus sampling.
-        temperature: Temperature for scaling logits.
-        random_sampling: Boolean flag - True for random sampling, False for greedy.
-        presence_penalty: Penalty applied to tokens that appear in the sequence.
-        frequency_penalty: Penalty proportional to token frequency in the sequence.
-        repetition_penalty: Multiplicative penalty for repeated tokens.
-        rngs: Random key for sampling.
+        logits: Batched logits of shape ``(batch_size, vocab_size)``.
+        top_p: Per-row nucleus thresholds of shape ``(batch_size,)``.
+        temperature: Per-row temperatures of shape ``(batch_size,)``.
+        rng: Shared JAX random key.
+        top_k_for_computation: Maximum number of candidates per row.
 
     Returns:
-        Sampled token index of shape (1,).
-
-    Note:
-        This function is vectorized with jax.vmap and expects batched inputs
-        along axis 0 for all arguments except rngs.
+        Sampled token indices of shape ``(batch_size,)``.
     """
+    # Supply the optional argument positionally to vmap as well: its in_axes
+    # describes five inputs even when callers rely on the public default.
+    return jax.vmap(sample_top_p_efficient, in_axes=(0, 0, 0, None, None), out_axes=0)(
+        logits, top_p, temperature, rng, top_k_for_computation
+    )
 
-    def _random_sampling_fn(
+
+def dynamic_sample_tokens(
+    tokens: jax.Array,
+    length: jax.Array,
+    logits: jax.Array,
+    top_p: jax.Array,
+    temperature: jax.Array,
+    random_sampling: jax.Array,
+    presence_penalty: jax.Array,
+    frequency_penalty: jax.Array,
+    repetition_penalty: jax.Array,
+    rngs: jax.Array,
+) -> jax.Array:
+    """Dynamically sample a batch with penalties and greedy or random decoding.
+
+    Args:
+        tokens: Batched previous tokens, shape ``(batch_size, sequence_length)``.
+        length: Current sequence length per entry.
+        logits: Batched next-token logits, shape ``(batch_size, vocab_size)``.
+        top_p: Per-entry nucleus thresholds.
+        temperature: Per-entry sampling temperatures.
+        random_sampling: Per-entry boolean selecting random or greedy decoding.
+        presence_penalty: Per-entry fixed penalty for previously seen tokens.
+        frequency_penalty: Per-entry count-proportional penalty.
+        repetition_penalty: Per-entry multiplicative repetition penalty.
+        rngs: Shared JAX random key, not batched.
+
+    Returns:
+        Token indices of shape ``(batch_size, 1, 1)``, retaining the original
+        vectorized API's singleton dimensions.
+    """
+    # Keep the key unmapped for positional and keyword callers alike. JAX maps
+    # keyword arguments on axis zero regardless of the explicit in_axes tuple.
+    return _dynamic_sample_tokens(
         tokens,
         length,
         logits,
         top_p,
         temperature,
+        random_sampling,
         presence_penalty,
         frequency_penalty,
         repetition_penalty,
-    ):
-        """Apply random sampling with penalties."""
+        rngs,
+    )
+
+
+@partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, None), out_axes=0)
+def _dynamic_sample_tokens(
+    tokens: jax.Array,
+    length: jax.Array,
+    logits: jax.Array,
+    top_p: jax.Array,
+    temperature: jax.Array,
+    random_sampling: jax.Array,
+    presence_penalty: jax.Array,
+    frequency_penalty: jax.Array,
+    repetition_penalty: jax.Array,
+    rngs: jax.Array,
+) -> jax.Array:
+    """Sample tokens with configurable penalties and greedy or random decoding.
+
+    Args:
+        tokens: Previous tokens, batched as ``(batch_size, sequence_length)``.
+        length: Current valid sequence length for each batch entry.
+        logits: Current logits, batched as ``(batch_size, vocab_size)``.
+        top_p: Per-entry nucleus thresholds.
+        temperature: Per-entry temperature scaling.
+        random_sampling: Per-entry boolean; false selects greedy argmax.
+        presence_penalty: Per-entry fixed penalty for previously seen tokens.
+        frequency_penalty: Per-entry count-proportional penalty.
+        repetition_penalty: Per-entry multiplicative repetition penalty.
+        rngs: Shared JAX random key, not mapped over the batch.
+
+    Returns:
+        Token indices of shape ``(batch_size, 1, 1)``, preserving the original
+        vectorized API's singleton dimensions.
+    """
+
+    def _random_sampling_fn(tokens, length, logits, top_p, temperature, presence, frequency, repetition):
+        """Apply the shared logits processors before nucleus sampling."""
         logits = logits.reshape(1, -1)
-        processors = LogitsProcessorList()
-        processors.append(PresencePenaltyLogitsProcessor(presence_penalty))
-        processors.append(FrequencyPenaltyLogitsProcessor(frequency_penalty))
-        processors.append(RepetitionPenaltyLogitsProcessor(repetition_penalty))
+        processors = LogitsProcessorList(
+            [
+                PresencePenaltyLogitsProcessor(presence),
+                FrequencyPenaltyLogitsProcessor(frequency),
+                RepetitionPenaltyLogitsProcessor(repetition),
+            ]
+        )
         logits = processors(tokens.reshape(1, -1), logits, length)
         return sample_top_p_efficient(logits, top_p, temperature, rngs)[:, None]
 
-    def _greedy_sampling_fn(
-        tokens,
-        length,
-        logits,
-        top_p,
-        temperature,
-        presence_penalty,
-        frequency_penalty,
-        repetition_penalty,
-    ):
-        """Apply greedy sampling (argmax)."""
+    def _greedy_sampling_fn(tokens, length, logits, top_p, temperature, presence, frequency, repetition):
+        """Keep the original greedy argmax contract."""
         return jnp.argmax(logits.reshape(1, -1), axis=-1)[:, None]
 
     return jax.lax.cond(

@@ -36,9 +36,6 @@ Public model classes (registered with the factory):
 - :class:`DbrxModel` — base decoder.
 - :class:`DbrxForCausalLM` — causal LM head + auxiliary load-balancing loss.
 - :class:`DbrxForSequenceClassification` — pooled classifier head.
-
-Also defines :func:`_patch_hf_dbrx_aux_loss_return_type`, applied at import
-time, to repair an HF helper that occasionally returns a Python ``0``.
 """
 
 from functools import cached_property
@@ -90,47 +87,6 @@ from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassification
 from .dbrx_configuration import DbrxConfig
 
 
-def _patch_hf_dbrx_aux_loss_return_type() -> None:
-    """Patch HF DBRX aux-loss helper to always return a tensor.
-
-    Some transformers builds return Python `0` when router logits are unavailable.
-    Their `DbrxForCausalLM.forward` then calls `.to(...)` on that value and crashes.
-    """
-    try:
-        import torch
-        from transformers.models.dbrx import modeling_dbrx as hf_dbrx
-    except Exception:
-        return
-
-    base_fn = getattr(hf_dbrx, "load_balancing_loss_func", None)
-    if base_fn is None or getattr(base_fn, "_ed_tensor_return_patch", False):
-        return
-
-    def _patched_load_balancing_loss_func(*args, **kwargs):
-        """Wrap HF's DBRX MoE load-balancing loss to always return a tensor.
-
-        Older HF builds occasionally return a Python scalar from
-        ``load_balancing_loss_func`` instead of a ``torch.Tensor``, which
-        breaks downstream code that calls ``.to(...)``. This patch normalizes
-        the return value to a ``torch.Tensor`` placed on the gate logits'
-        device.
-        """
-        out = base_fn(*args, **kwargs)
-        if hasattr(out, "to"):
-            return out
-        device = None
-        gate_logits = kwargs.get("gate_logits", args[0] if len(args) > 0 else None)
-        if isinstance(gate_logits, tuple) and len(gate_logits) > 0:
-            device = getattr(gate_logits[0], "device", None)
-        return torch.tensor(float(out), device=device)
-
-    _patched_load_balancing_loss_func._ed_tensor_return_patch = True  # type: ignore
-    hf_dbrx.load_balancing_loss_func = _patched_load_balancing_loss_func
-
-
-_patch_hf_dbrx_aux_loss_return_type()
-
-
 def _config_uses_mpmd(config) -> bool:
     """Return ``True`` when the resolved mesh is MPMD (pipeline-parallel).
 
@@ -171,7 +127,11 @@ class DbrxAttention(UnifiedAttention):
         out_proj (RowParallelLinear): Linear layer for the output projection.
         attention_performer (FlexibleAttentionModule): Module to perform the core attention computation.
         rotary (RoPE): Rotary position embedding module.
-        resid_dropout (nn.Dropout): Residual dropout layer.
+        resid_dropout (nn.Dropout): Residual dropout, shared with ``DbrxNormAttentionNorm.dropout``.
+
+    Note:
+        The residual dropout (``config.resid_pdrop``) is applied once per layer in
+        :class:`DbrxNormAttentionNorm`, matching the reference DBRX implementation, not inside the attention.
     """
 
     projection_mapping: ClassVar[dict[str, str]] = {
@@ -208,6 +168,7 @@ class DbrxAttention(UnifiedAttention):
             attention_type="standard",
             causal=True,
         )
+        self.rngs = rngs
 
     def define_network(
         self,
@@ -283,7 +244,7 @@ class DbrxAttention(UnifiedAttention):
             rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
-            dropout_prob=0.0,
+            dropout_prob=config.attn_config.attn_pdrop,
         )
 
     def forward(
@@ -368,6 +329,8 @@ class DbrxAttention(UnifiedAttention):
             mask_info=mask_info,
             causal=self.causal,
             sliding_window=getattr(self, "sliding_window", None),
+            deterministic=not self.training,
+            dropout_rng=(self.rngs.dropout if self.training and self.config.attn_config.attn_pdrop > 0 else None),
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
@@ -438,6 +401,7 @@ class DbrxNormAttentionNorm(spx.Module):
         self.rngs = rngs
         self.norm_1 = LayerNorm(
             self.config.hidden_size,
+            epsilon=1e-5,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -453,16 +417,15 @@ class DbrxNormAttentionNorm(spx.Module):
         )
         self.norm_2 = LayerNorm(
             self.config.hidden_size,
+            epsilon=1e-5,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             rngs=rngs,
         )
 
-        self.dropout = nn.Dropout(
-            self.config.resid_pdrop,
-            rngs=rngs,
-        )
+        # Preserve both public dropout attributes while applying one shared layer once.
+        self.dropout = self.attn.resid_dropout
 
     def forward(
         self,
@@ -783,8 +746,8 @@ class DbrxRouter(spx.Module):
             raise RuntimeError("The router does not have moe_jitter_eps set.")
         low = 1.0 - self.moe_jitter_eps
         high = 1.0 + self.moe_jitter_eps
-        noise = jax.random.normal(self.make_rng("parameters"), x.shape, dtype=x.dtype)
-        return low + noise * (high - low)
+        # Reference DBRX draws the multiplicative jitter from U(1 - eps, 1 + eps).
+        return jax.random.uniform(self.rngs.parameters, x.shape, dtype=x.dtype, minval=low, maxval=high)
 
     def forward(self, x: Array, deterministic: bool = True) -> tuple[Array, Array, Array]:
         """Route tokens to experts using top-k selection.
@@ -949,6 +912,13 @@ class DbrxFFN(BaseMoeModule):
             select_hook=select_hook,
             refine_weights_hook=None,
         )
+
+        def gate_layer(gate_input: Array) -> Array:
+            """Perturb only the router input, including on the standard MoE path."""
+            if self.training and self.config.ffn_config.moe_jitter_eps is not None:
+                gate_input = gate_input * self.router.jitter(gate_input)
+            return self.router.layer(gate_input)
+
         experts = self.experts.mlp
         expert_count = self.config.ffn_config.moe_num_experts
         intermediate = self.config.ffn_config.ffn_hidden_size
@@ -957,7 +927,7 @@ class DbrxFFN(BaseMoeModule):
         wd = experts.w2.value.reshape(expert_count, intermediate, self.config.d_model)
         out, router_logits = self.moe_call(
             hidden_state=x,
-            gate_layer=self.router.layer,
+            gate_layer=gate_layer,
             expert_layer=self.experts,
             wi_kernel=wi,
             wu_kernel=wu,
@@ -1022,6 +992,7 @@ class DbrxBlock(spx.Module):
         self.rngs = rngs
         self.hidden_size = self.config.d_model
         self.resid_pdrop = self.config.resid_pdrop
+        self.resid_dropout = nn.Dropout(rate=self.resid_pdrop, rngs=rngs)
         attn_block = DbrxNormAttentionNorm
         ffn_block = DbrxFFN
         self.norm_attn_norm = attn_block(
@@ -1086,6 +1057,7 @@ class DbrxBlock(spx.Module):
         )
         hidden_states = decoder_output.hidden_states
         hidden_states, router_logits = self.ffn(hidden_states)
+        hidden_states = self.resid_dropout(hidden_states, deterministic=not self.training)
         hidden_states = decoder_output.residual_states + hidden_states
 
         return decoder_output.replace(
@@ -1156,6 +1128,7 @@ class DbrxModel(EasyDeLBaseModule):
         self.padding_idx = self.config.pad_token_id
         self.vocab_size = self.config.vocab_size
         self.emb_pdrop = self.config.emb_pdrop
+        self.emb_dropout = nn.Dropout(rate=self.emb_pdrop, rngs=rngs)
 
         with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
             self.wte = Embed(
@@ -1187,6 +1160,7 @@ class DbrxModel(EasyDeLBaseModule):
         with self.assign_layer_stage(self.config.num_hidden_layers - 1, total_layers=self.config.num_hidden_layers):
             self.norm_f = LayerNorm(
                 self.config.hidden_size,
+                epsilon=1e-5,
                 use_bias=False,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1265,6 +1239,7 @@ class DbrxModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids.astype("i4"))
+        inputs_embeds = self.emb_dropout(inputs_embeds)
 
         sequence_length = inputs_embeds.shape[1]
         mask_info = MaskInfo.dynamic_init(
@@ -1364,6 +1339,7 @@ class DbrxModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm_f(hidden_states)
 
@@ -1375,6 +1351,7 @@ class DbrxModel(EasyDeLBaseModule):
             hidden_states=all_hidden_states,
             attentions=all_attentions,
             router_logits=all_router_logits,
+            past_key_values=past_key_values,
         )
 
     def get_encoder(self) -> spx.Module:
@@ -1454,12 +1431,15 @@ class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):  # type: ignor
             precision=precision,
             rngs=rngs,
             lm_head_bias=False,
-            router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
+            # The causal-LM router loss is weighted by 1.0 when the coefficient is explicitly ``None``.
+            router_aux_loss_coef=(
+                1.0 if getattr(config, "router_aux_loss_coef", None) is None else config.router_aux_loss_coef
+            ),
         )
 
     def forward(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
@@ -1517,29 +1497,11 @@ class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):  # type: ignor
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
-            aux_loss_fn=self._compute_aux_loss,
         )
 
-    def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute auxiliary load balancing loss from router logits.
-
-        Args:
-            outputs: Model outputs containing router_logits from MoE layers.
-            attention_mask: Attention mask to exclude padding tokens from loss computation.
-
-        Returns:
-            Optional auxiliary loss value for load balancing, or None if router_logits unavailable.
-        """
-        if outputs.router_logits is None or len(outputs.router_logits) == 0:
-            return None
-        aux_loss = auxiliary_load_balancing_loss_func(
-            gate_logits=outputs.router_logits,
-            num_experts=self.config.ffn_config.moe_num_experts,
-            top_k=self.config.ffn_config.moe_top_k,
-            attention_mask=attention_mask,
-        )
-        coef = self.config.router_aux_loss_coef if self.config.router_aux_loss_coef is not None else 1.0
-        return aux_loss * coef
+    def _router_top_k(self) -> int:
+        """DBRX keeps the routing width under ``ffn_config.moe_top_k``."""
+        return self.config.ffn_config.moe_top_k
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=DbrxConfig, model_type="dbrx")
@@ -1663,18 +1625,12 @@ class DbrxForSequenceClassification(BaseSequenceClassificationModule[DbrxModel, 
         else:
             batch_size = inputs_embeds.shape[0]
 
-        if self.config.pad_token_id is None and batch_size != 1:
+        if self.config.pad_token_id is None and attention_mask is None and batch_size != 1:
             raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
+        if input_ids is None and attention_mask is None:
+            pooled_logits = logits[:, -1]
         else:
-            if input_ids is not None:
-                sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-            else:
-                sequence_lengths = -1
-
-        pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
+            pooled_logits = self.pool_sequence(logits, input_ids=input_ids, attention_mask=attention_mask)
 
         aux_loss = None
         if output_router_logits and transformer_outputs.router_logits is not None:

@@ -618,6 +618,8 @@ class CohereModel(EasyDeLBaseModule):
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
         sequence_length = inputs_embeds.shape[1]
 
+        output_attentions = self.config.output_attentions if output_attentions is None else output_attentions
+        output_hidden_states = self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
         assert sequence_length <= self.config.max_position_embeddings, (
@@ -701,6 +703,7 @@ class CohereModel(EasyDeLBaseModule):
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
 
@@ -763,6 +766,8 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
     _task_type = TaskType.CAUSAL_LM
     _model_type = "cohere"
     _config_class = CohereConfig
+    # This concrete head adds only logit scaling, never an auxiliary objective.
+    _ce_only_forward = True
 
     def __init__(
         self,
@@ -888,6 +893,23 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
         """
         logits = super().compute_lm_logits(hidden_states)
         return logits * self.logit_scale
+
+    def get_lm_logit_postprocess(self):
+        """Capture Cohere's base clipping followed by scaling for split LM heads.
+
+        The returned callable captures only the scalar scale and the base
+        scalar-only clipping function, never the model or its parameters.
+        """
+        clip_fn = self.get_base_lm_logit_postprocess()
+        scale = self.logit_scale
+
+        def _postprocess(logits: Array) -> Array:
+            """Apply clipping before Cohere's output scale."""
+            if clip_fn is not None:
+                logits = clip_fn(logits)
+            return logits * scale
+
+        return _postprocess
 
     def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
         """Trace-safe projection with Cohere logit scaling."""
@@ -1038,18 +1060,12 @@ class CohereForSequenceClassification(BaseSequenceClassificationModule[CohereMod
         else:
             batch_size = inputs_embeds.shape[0]
 
-        if self.config.pad_token_id is None and batch_size != 1:
+        if self.config.pad_token_id is None and attention_mask is None and batch_size != 1:
             raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
+        if input_ids is None and attention_mask is None:
+            pooled_logits = logits[:, -1]
         else:
-            if input_ids is not None:
-                sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-            else:
-                sequence_lengths = -1
-
-        pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
+            pooled_logits = self.pool_sequence(logits, input_ids=input_ids, attention_mask=attention_mask)
 
         return SequenceClassifierOutput(
             logits=pooled_logits,

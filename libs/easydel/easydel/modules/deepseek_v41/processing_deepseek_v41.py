@@ -364,6 +364,19 @@ class DeepseekV41ImageExpander:
         return ExpandedImagePrompt(token_ids=ids, token_types=types, spans=spans, features=features)
 
 
+def _feature_grid_thw(feature: tp.Any) -> np.ndarray:
+    """Read the image layout retained alongside pixel-cleared encoder results."""
+    grid = feature.grid_thw
+    if grid is None:
+        grid = getattr(feature, "_esurge_vision_grid_thw", None)
+    if grid is None:
+        raise ValueError("Image feature needs its patch grid or retained encoder-cache grid metadata.")
+    grid = np.asarray(grid).reshape(-1)
+    if grid.shape != (3,) or int(grid[0]) != 1 or np.any(grid[1:] <= 0):
+        raise ValueError(f"Image feature must have one positive [1, height, width] patch grid; got {grid}.")
+    return grid
+
+
 def token_types_from_features(features: tp.Sequence[tp.Any], num_tokens: int, downsample_ratio: int) -> np.ndarray:
     """Rebuild the prompt token types from image features (placeholder offset + patch grid).
 
@@ -372,7 +385,7 @@ def token_types_from_features(features: tp.Sequence[tp.Any], num_tokens: int, do
     """
     types = np.full((int(num_tokens),), TOKEN_TYPE_TEXT, dtype=np.int64)
     for feature in features:
-        grid = np.asarray(feature.grid_thw).reshape(-1)
+        grid = _feature_grid_thw(feature)
         n_llm_h, n_llm_w = -(-int(grid[1]) // downsample_ratio), -(-int(grid[2]) // downsample_ratio)
         span = image_token_types(n_llm_h, n_llm_w)
         placeholder = feature.placeholder_range
@@ -383,17 +396,30 @@ def token_types_from_features(features: tp.Sequence[tp.Any], num_tokens: int, do
 
 
 def compute_prefill_embeddings(
-    model: tp.Any, prompt_token_ids: tp.Sequence[int], features: tp.Sequence[tp.Any]
+    model: tp.Any,
+    prompt_token_ids: tp.Sequence[int],
+    features: tp.Sequence[tp.Any],
+    encoder_cache_provider: tp.Callable[[tp.Any, tp.Callable[[], tp.Any]], tp.Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Eagerly encode the images and merge them into the prompt embeddings.
+    """Encode or reuse image rows, then merge them into this prompt's fresh embeddings.
 
     Args:
         model: ``DeepseekV41ForConditionalGeneration``.
         prompt_token_ids: Expanded prompt ids.
-        features: Image features (pixel values still present), any order.
+        features: Image features in any order, carrying pixels or cached aligner rows.
+        encoder_cache_provider: Optional ``provider(feature, encode)`` returning the
+            feature's aligner rows, not prompt-dependent merged embeddings. ``encode``
+            is a zero-argument lazy fallback requiring raw pixels. The provider owns
+            cache identity/weight-version validation and may reuse cached-only features.
+            Without a provider, ``feature.cached_embeddings`` is used when present;
+            otherwise the image is encoded and its rows retained on the feature.
 
     Returns:
         ``(embeds, token_types)``: ``float32 [S, hidden]`` merged embeddings and ``int64 [S]`` token types.
+
+    Raises:
+        ValueError: If neither encoder rows nor raw pixels are available, or an
+            encoder result's row count disagrees with its image grid.
     """
     import jax
     from jax import numpy as jnp
@@ -410,11 +436,39 @@ def compute_prefill_embeddings(
         embeds = model.compute_embedding(jnp.asarray(np.asarray(prompt_token_ids, dtype=np.int32))[None, :])
         rows = []
         for feature in ordered:
-            grid = np.asarray(feature.grid_thw).reshape(-1)
-            patches = jnp.asarray(feature.pixel_values, dtype=dtype)[None]
-            out = base.get_image_features(patches, image_grid=(int(grid[1]), int(grid[2])))
-            rows.append(out.reshape(-1, out.shape[-1]))
-        merged = base.merge_image_embeddings(embeds, jnp.asarray(types)[None, :], jnp.concatenate(rows, axis=0)[None])
+            grid = _feature_grid_thw(feature)
+            image_grid = (int(grid[1]), int(grid[2]))
+
+            def encode(feature=feature, image_grid=image_grid):
+                if feature.pixel_values is None:
+                    raise ValueError("Image feature has neither cached encoder rows nor raw pixels.")
+                patches = jnp.asarray(feature.pixel_values, dtype=dtype)[None]
+                return base.get_image_features(patches, image_grid=image_grid)
+
+            cache_rows = False
+            if encoder_cache_provider is not None:
+                out = encoder_cache_provider(feature, encode)
+            else:
+                out = getattr(feature, "cached_embeddings", None)
+                if out is None:
+                    out = encode()
+                    cache_rows = True
+            out = jnp.asarray(out, dtype=dtype)
+            expected_rows = math.ceil(image_grid[0] / ratio) * math.ceil(image_grid[1] / ratio)
+            if out.ndim < 2 or math.prod(out.shape[:-1]) != expected_rows:
+                raise ValueError(f"Image encoder result must provide {expected_rows} rows; got shape {out.shape}.")
+            out = out.reshape(-1, out.shape[-1])
+            # MultiModalFeature.clear_pixel_values also clears grid_thw. Keep the
+            # small layout metadata needed to rebuild token types on later turns.
+            feature._esurge_vision_grid_thw = np.array(grid, copy=True)
+            if cache_rows and callable(getattr(feature, "set_cached_embeddings", None)):
+                feature.set_cached_embeddings(out)
+            rows.append(out)
+        merged = (
+            base.merge_image_embeddings(embeds, jnp.asarray(types)[None, :], jnp.concatenate(rows, axis=0)[None])
+            if rows
+            else embeds
+        )
         host = np.asarray(jax.device_get(merged.astype(jnp.float32)))
     return host[0], types
 

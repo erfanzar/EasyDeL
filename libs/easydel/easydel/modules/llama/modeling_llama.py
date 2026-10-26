@@ -49,7 +49,7 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
+from easydel.infra.utils import ACT2FN, auto_remat
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -58,7 +58,7 @@ from easydel.layers import (
     dense_gate_up_layout,
     gated_mlp_forward,
 )
-from easydel.layers.attention import UnifiedAttention
+from easydel.layers.attention import BaseDecoderLayer, UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .llama_configuration import LlamaConfig
@@ -272,8 +272,11 @@ class LlamaDecoderLayer(spx.Module):
         Returns:
             DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
         """
-        attn_outputs = self.self_attn(
-            self.input_layernorm(hidden_states),
+        # Llama never tagged the normalised activations, so the shared helpers skip that checkpoint name.
+        hidden_states, attn_outputs = BaseDecoderLayer.pre_norm_residual_attn(
+            hidden_states,
+            self.self_attn,
+            self.input_layernorm,
             mask_info,
             position_ids,
             mode,
@@ -281,21 +284,16 @@ class LlamaDecoderLayer(spx.Module):
             cache_metadata,
             output_attentions,
             frequencies,
+            checkpoint_norm=False,
         )
-        hidden_states = checkpoint_name(hidden_states + attn_outputs.attention_output, "residual")
-
-        feed_forward_input = self.post_attention_layernorm(hidden_states)
-
-        if self.config.use_scan_mlp:
-            feed_forward_hidden_states = blockwise_ffn(
-                self.mlp,
-                feed_forward_input,
-                self.config.scan_mlp_chunk_size,
-            )
-        else:
-            feed_forward_hidden_states = self.mlp(feed_forward_input)
-
-        hidden_states = checkpoint_name(hidden_states + feed_forward_hidden_states, "residual")
+        hidden_states = BaseDecoderLayer.pre_norm_residual_mlp(
+            hidden_states,
+            self.mlp,
+            self.post_attention_layernorm,
+            use_scan=self.config.use_scan_mlp,
+            scan_chunk_size=self.config.scan_mlp_chunk_size,
+            checkpoint_norm=False,
+        )
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -501,37 +499,26 @@ class LlamaModel(EasyDeLBaseModule):
             the auxiliary tuples and threads cache views through
             :meth:`_layer_cache_view_at` / :meth:`_layer_cache_view_update`.
             """
-            hs, cv, ah, aa, idx = carry
-            if output_hidden_states:
-                ah = (*ah, hs)
-            with self._layer_stage_context(idx, layers=self.layers):
-                layer_outputs = block(
-                    hidden_states=hs,
-                    mask_info=mask_info,
-                    position_ids=position_ids,
-                    mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
-                    cache_metadata=cache_metadata,
-                    output_attentions=output_attentions,
-                    frequencies=frequencies,
-                )
-            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
+            return self._decoder_scan_step(
+                block,
+                carry,
+                output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
+                trace_layers=trace_layers,
                 cache=past_key_values,
+                mask_info=mask_info,
+                position_ids=position_ids,
+                mode=mode,
+                cache_metadata=cache_metadata,
+                frequencies=frequencies,
             )
-            if output_attentions:
-                aa = (*aa, layer_outputs.attention_weight)
-            return hs, cv, ah, aa, idx + 1
 
         init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
         hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
             _run_layer,
             init_carry,
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")

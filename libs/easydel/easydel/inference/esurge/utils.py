@@ -49,6 +49,8 @@ from ejkernel.callib import cdiv as cdiv
 from jax import numpy as jnp
 from typing_extensions import TypeIs
 
+from easydel.utils._parser_utils import is_list_of as _is_list_of
+
 T = TypeVar("T")
 
 
@@ -271,14 +273,7 @@ def is_list_of(
         >>> is_list_of([], str)
         True
     """
-    if not isinstance(value, list):
-        return False
-
-    if check == "first":
-        return len(value) == 0 or isinstance(value[0], typ)
-    elif check == "all":
-        return all(isinstance(v, typ) for v in value)
-    return False
+    return _is_list_of(value, typ, check=check, raise_on_invalid_check=False)
 
 
 def chunk_list(lst: list[T], chunk_size: int):

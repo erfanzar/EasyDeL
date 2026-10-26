@@ -54,6 +54,7 @@ See Also:
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import re
 import typing
@@ -200,7 +201,7 @@ def quantize(
     dtype: QuantizationType | str | None = None,
     group_size: int | None = None,
     simulate: bool = False,
-) -> jax.Array | tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
+) -> jax.Array | tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array | None]:
     """Quantize ``array`` using the requested format and return packed weights or a simulation.
 
     The primary array-level quantization entry point. Dispatches to the
@@ -237,6 +238,8 @@ def quantize(
               parameters. The return shape depends on the mode:
                 - affine/int8: (w_q, scales, biases)
                 - nf4/mxfp4/mxfp8/nvfp8: (w_q, scales)
+                - channelwise / W*A* presets: (integer_codes, float32_scales, None),
+                  in the input layout, with scales reduced over axis -2
             - For binary/ternary: Returns int8 codes when simulate=False.
             - If config.jax_native is True and dtype is supported by JAX:
               Returns `array.astype(jax_dtype)` (materialized array).
@@ -297,6 +300,13 @@ def quantize(
         config if config is not None else QuantizationConfig(dtype=dtype, group_size=group_size, simulate=simulate)
     )
     mode, group_size, bits, needs_biases = resolve_ejkernel_quant_params(config_for_ejkernel)
+    if mode == "channelwise":
+        from easydel.layers.linears._linear_quantized import channelwise_quantize_array
+
+        codes, scales, _ = channelwise_quantize_array(array, bits)
+        if simulate:
+            return (codes.astype(jnp.float32) * scales).astype(array.dtype)
+        return codes, scales, None
     packed = ej_quantize(array, group_size=group_size, bits=bits, mode=mode)
     if not simulate:
         return packed
@@ -314,7 +324,9 @@ def quantize(
         bits=bits,
         mode=mode,
     )
-    return dequantized.astype(array.dtype)
+    # ``ej_quantize`` (default ``axis="row"``) maps the weight into ejkernel's quantization layout by swapping the
+    # last two axes and ``ej_dequantize`` returns that same layout, so undo the swap to hand back the input layout.
+    return jnp.swapaxes(dequantized, -2, -1).astype(array.dtype)
 
 
 class EasyQuantizer:
@@ -402,7 +414,7 @@ class EasyQuantizer:
         self,
         array: jax.Array,
         path: str | tuple[str] | None = None,
-    ) -> jax.Array | tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
+    ) -> jax.Array | tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array | None]:
         """Quantize ``array`` with optional path-based filtering.
 
         When ``path`` is supplied it is normalized into a dotted string and
@@ -458,8 +470,8 @@ class EasyQuantizer:
     def quantize_array(
         self,
         array: jax.Array,
-        simulate: bool = False,
-    ) -> jax.Array | tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
+        simulate: bool | None = None,
+    ) -> jax.Array | tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array | None]:
         """Quantize a single array using the bound config (no path filtering).
 
         Convenience method that forwards to :func:`quantize` without the
@@ -470,8 +482,10 @@ class EasyQuantizer:
                 or bfloat16 format.
             simulate: If True, uses simulation mode where the array is discretized
                 but remains in its original dtype. The returned array shows
-                quantization effects but doesn't provide memory savings.
-                Defaults to False.
+                quantization effects but doesn't provide memory savings. If False,
+                returns packed weights. Overrides the bound config's ``simulate``
+                for this call only. Defaults to None, which keeps the bound
+                config's ``simulate`` setting.
 
         Returns:
             Quantized array or packed weights. If simulate=False, returns
@@ -491,7 +505,11 @@ class EasyQuantizer:
         if self._config is None:
             return array
 
-        return quantize(array, config=self._config, simulate=simulate)
+        config = self._config
+        if simulate is not None and bool(simulate) != config.simulate:
+            # ``quantize`` takes ``simulate`` from the config whenever one is given, so apply the override there.
+            config = dataclasses.replace(config, simulate=bool(simulate))
+        return quantize(array, config=config)
 
     def apply_quantization(
         self,

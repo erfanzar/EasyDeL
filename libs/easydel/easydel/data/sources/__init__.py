@@ -41,6 +41,13 @@ from .hf_wrapper import (
     HFDatasetShardedSource,
     wrap_hf_dataset,
 )
+from .parquet_random_access import (
+    ParquetRandomAccessSource,
+)
+from .rowgroup_shuffle import (
+    RowGroupShuffledParquetSource,
+    enumerate_parquet_row_groups,
+)
 
 __all__ = [
     "ArrowShardedSource",
@@ -49,10 +56,13 @@ __all__ = [
     "HFDatasetShardedSource",
     "HuggingFaceShardedSource",
     "JsonShardedSource",
+    "ParquetRandomAccessSource",
     "ParquetShardInfo",
     "ParquetShardedSource",
+    "RowGroupShuffledParquetSource",
     "TextShardedSource",
     "create_source",
+    "enumerate_parquet_row_groups",
     "expand_data_files",
     "load_for_inform",
     "wrap_hf_dataset",

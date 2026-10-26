@@ -182,6 +182,11 @@ class OnPolicyDistillationConfig(DistillationConfig):
             "top_p": self.top_p,
             "top_k": self.top_k,
         }
+        # Inherit sampling defaults before offline validation neutralizes them.
+        if self.generation_top_p is None:
+            self.generation_top_p = self.top_p
+        if self.generation_top_k is None:
+            self.generation_top_k = self.top_k
         self.max_prompt_length = None  # type: ignore[assignment]
         self.max_completion_length = None  # type: ignore[assignment]
         self.top_p = 1.0

@@ -95,26 +95,29 @@ class TestGLM4MoeLite:
         assert result.success, f"GLM4-MoE-Lite generation failed: {result.error_message}"
 
     def test_ragged_cache_uses_mla_q_head_dim(self, glm4_moe_lite_config, monkeypatch):
-        """Paged-cache config must use MLA q_head_dim, not rope-only head_dim."""
-        captured = {}
+        """Paged-cache config must use decompressed MLA key/value geometry."""
         from easydel.caching import RaggedPagesCacheConfig
 
-        original_create = RaggedPagesCacheConfig.create
-
-        def _capture_create(**kwargs):
-            captured.update(kwargs)
-            return types.SimpleNamespace(**kwargs)
-
-        monkeypatch.setattr(RaggedPagesCacheConfig, "create", staticmethod(_capture_create))
-        try:
-            dummy = types.SimpleNamespace(config=glm4_moe_lite_config, mesh=glm4_moe_lite_config.mesh)
-            ed.Glm4MoeLiteForCausalLM.create_ragged_page_cache_config(dummy, max_length=1024)
-        finally:
-            monkeypatch.setattr(RaggedPagesCacheConfig, "create", original_create)
+        monkeypatch.setattr(
+            RaggedPagesCacheConfig, "create", staticmethod(lambda **kwargs: types.SimpleNamespace(**kwargs))
+        )
+        dummy = types.SimpleNamespace(
+            config=glm4_moe_lite_config,
+            mesh=glm4_moe_lite_config.mesh,
+            _standard_ragged_layer_indices_for_cache_budget=lambda: list(range(glm4_moe_lite_config.num_hidden_layers)),
+            _pp_stage_cache_layer_count=lambda indices, total_layers: len(indices),
+        )
+        dummy._create_standard_ragged_page_cache_config = types.MethodType(
+            ed.Glm4MoeLiteForCausalLM._create_standard_ragged_page_cache_config, dummy
+        )
+        cache_config = ed.Glm4MoeLiteForCausalLM.create_ragged_page_cache_config(dummy, max_length=1024)
 
         expected_q_head_dim = glm4_moe_lite_config.qk_nope_head_dim + glm4_moe_lite_config.qk_rope_head_dim
-        assert captured["kv_head_dim_size"] == expected_q_head_dim
-        assert captured["k_headdim"] == expected_q_head_dim
+        assert cache_config.kv_head_dim_size == expected_q_head_dim
+        assert cache_config.k_headdim == expected_q_head_dim
+        assert cache_config.v_headdim == glm4_moe_lite_config.v_head_dim
+        assert cache_config.num_kv_heads == glm4_moe_lite_config.num_attention_heads
+        assert cache_config.num_hidden_layers == glm4_moe_lite_config.num_hidden_layers
 
 
 if __name__ == "__main__":

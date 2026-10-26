@@ -188,14 +188,18 @@ class Exaone4Config(EasyDeLBaseConfig):
             sliding_window_pattern = 0
 
         if layer_types is None:
-            self.layer_types = [
-                (
-                    "sliding_attention"
-                    if ((i + 1) % sliding_window_pattern != 0 and i < num_hidden_layers)
-                    else "full_attention"
-                )
-                for i in range(num_hidden_layers)
-            ]
+            if sliding_window_pattern == 0:
+                # No sliding window (or pattern 0): every layer is full attention.
+                self.layer_types = ["full_attention"] * num_hidden_layers
+            else:
+                self.layer_types = [
+                    (
+                        "sliding_attention"
+                        if ((i + 1) % sliding_window_pattern != 0 and i < num_hidden_layers)
+                        else "full_attention"
+                    )
+                    for i in range(num_hidden_layers)
+                ]
         else:
             self.layer_types = layer_types
 

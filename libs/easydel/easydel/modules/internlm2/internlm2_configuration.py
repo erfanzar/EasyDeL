@@ -130,6 +130,7 @@ class InternLM2Config(EasyDeLBaseConfig):
         bits: int | None = None,
         scan_layers: bool = False,
         layer_types: list[str] | None = None,
+        attention_dropout: float = 0.0,
         **kwargs,
     ):
         """Initializes an InternLM2Config object.
@@ -153,6 +154,7 @@ class InternLM2Config(EasyDeLBaseConfig):
             pretraining_tp (int, optional): Tensor parallelism degree during pretraining. Defaults to 1.
             tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
             bias (bool, optional): Whether to use bias in linear layers. Defaults to True.
+            attention_dropout (float, optional): Training attention-probability dropout. Defaults to 0.0.
             rope_theta (float, optional): Base value for RoPE. Defaults to 10000.
             rope_scaling (dict, optional): RoPE scaling configuration. Defaults to None.
             gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
@@ -175,6 +177,7 @@ class InternLM2Config(EasyDeLBaseConfig):
         self.num_hidden_layers = num_hidden_layers
         self.rope_theta = rope_theta
         self.bias = bias
+        self.attention_dropout = attention_dropout
         self.num_attention_heads = num_attention_heads
         self.max_position_embeddings = max_position_embeddings
         self.rms_norm_eps = rms_norm_eps
@@ -214,35 +217,3 @@ class InternLM2Config(EasyDeLBaseConfig):
             if "rope_type" in legacy_rope_scaling and "type" not in legacy_rope_scaling:
                 legacy_rope_scaling["type"] = legacy_rope_scaling["rope_type"]
             object.__setattr__(self, "rope_parameters", legacy_rope_scaling)
-
-    @property
-    def granted_freq_max_position_embedding(self) -> int:
-        """Returns the maximum position embedding size specifically for frequency-based position embeddings.
-
-        If `freq_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
-        `max_position_embeddings`.
-
-        Returns:
-            int: The granted maximum position embedding size for frequency encoding.
-        """
-        return getattr(
-            self,
-            "freq_max_position_embeddings",
-            self.max_position_embeddings,
-        )
-
-    @property
-    def granted_mask_max_position_embedding(self) -> int:
-        """Returns the maximum position embedding size specifically for mask-based position embeddings.
-
-        If `mask_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
-        `max_position_embeddings`.
-
-        Returns:
-            int: The granted maximum position embedding size for mask encoding.
-        """
-        return getattr(
-            self,
-            "mask_max_position_embeddings",
-            self.max_position_embeddings,
-        )

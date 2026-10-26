@@ -63,12 +63,20 @@ from eformer.optimizers import (
 )
 
 _tree_map = jax.tree_util.tree_map
-_is_tuple = lambda x: isinstance(x, tuple)  # noqa: E731
 
 
-def _split(out, n):
-    """Split a tree of ``n``-tuples into ``n`` parallel trees (one fused pass produced them)."""
-    return tuple(_tree_map(lambda x, i=i: x[i], out, is_leaf=_is_tuple) for i in range(n))
+def _split(out, n, template=None):
+    """Split per-leaf results using the input tree's container structure.
+
+    ``template`` distinguishes tuple/namedtuple parameter containers from the
+    result tuples emitted at parameter leaves. The two-argument form is kept
+    for compatibility with callers whose original trees contain no tuples.
+    """
+    if template is None:
+        return tuple(_tree_map(lambda x, i=i: x[i], out, is_leaf=lambda x: isinstance(x, tuple)) for i in range(n))
+    treedef = jax.tree_util.tree_structure(template)
+    results = treedef.flatten_up_to(out)
+    return tuple(treedef.unflatten([result[i] for result in results]) for i in range(n))
 
 
 def fused_adamw(
@@ -119,7 +127,7 @@ def fused_adamw(
             out = _tree_map(lambda g, m, v: upd(g, m, v, g), *leaves)
         else:
             out = _tree_map(upd, *leaves)
-        updates, mu, nu = _split(out, 3)
+        updates, mu, nu = _split(out, 3, grads)
         return updates, {"mu": mu, "nu": nu, "count": count}
 
     return optax.GradientTransformation(init, update)
@@ -170,7 +178,7 @@ def fused_lion(
             out = _tree_map(lambda g, m: upd(g, m, g), grads, state["mu"])
         else:
             out = _tree_map(upd, grads, state["mu"], params)
-        updates, mu = _split(out, 2)
+        updates, mu = _split(out, 2, grads)
         return updates, {"mu": mu, "count": count}
 
     return optax.GradientTransformation(init, update)
@@ -221,7 +229,7 @@ def fused_rmsprop(
             return ((-lr_t * direction).astype(g.dtype), v32.astype(v.dtype))
 
         out = _tree_map(upd, grads, state["nu"])
-        updates, nu = _split(out, 2)
+        updates, nu = _split(out, 2, grads)
         return updates, {"nu": nu, "count": count}
 
     return optax.GradientTransformation(init, update)

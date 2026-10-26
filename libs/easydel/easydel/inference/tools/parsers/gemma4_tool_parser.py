@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
+from functools import cached_property
 from uuid import uuid4
 
 from eformer.loggings import get_logger
@@ -257,6 +258,11 @@ def _parse_gemma4_array(arr_str: str, *, partial: bool = False) -> list:
             sub_start = i + 1
             i += 1
             while i < n and depth > 0:
+                if arr_str[i:].startswith(STRING_DELIM):
+                    i += len(STRING_DELIM)
+                    next_delim = arr_str.find(STRING_DELIM, i)
+                    i = n if next_delim == -1 else next_delim + len(STRING_DELIM)
+                    continue
                 if arr_str[i] == "[":
                     depth += 1
                 elif arr_str[i] == "]":
@@ -315,14 +321,17 @@ class Gemma4ToolParser(ToolParser):
             re.DOTALL,
         )
 
-        if self.model_tokenizer:
-            self.tool_call_start_token_ids = self.model_tokenizer.encode(TOOL_CALL_START, add_special_tokens=False)
-            self.tool_call_end_token_ids = self.model_tokenizer.encode(TOOL_CALL_END, add_special_tokens=False)
-        else:
-            self.tool_call_start_token_ids = []
-            self.tool_call_end_token_ids = []
-
         self.buffered_delta_text = ""
+
+    @cached_property
+    def tool_call_start_token_ids(self) -> list[int]:
+        """Encoded opening marker, resolved only when a consumer requests token IDs."""
+        return self.model_tokenizer.encode(TOOL_CALL_START, add_special_tokens=False) if self.model_tokenizer else []
+
+    @cached_property
+    def tool_call_end_token_ids(self) -> list[int]:
+        """Encoded closing marker, resolved only when a consumer requests token IDs."""
+        return self.model_tokenizer.encode(TOOL_CALL_END, add_special_tokens=False) if self.model_tokenizer else []
 
     def _buffer_delta_text(self, delta_text: str) -> str:
         """Withhold partial tool-call markers that may span multiple deltas.
@@ -487,7 +496,7 @@ class Gemma4ToolParser(ToolParser):
                 return DeltaMessage(content=delta_text)
             return None
 
-        if start_count > prev_start_count and start_count > end_count:
+        if start_count > prev_start_count:
             self.current_tool_id += 1
             self.current_tool_name_sent = False
             self.streamed_args_for_tool.append("")
@@ -593,9 +602,23 @@ class Gemma4ToolParser(ToolParser):
 
         all_matches = self.tool_call_regex.findall(current_text)
         if self.current_tool_id < len(all_matches):
-            _, args_str = all_matches[self.current_tool_id]
+            func_name, args_str = all_matches[self.current_tool_id]
             final_args = _parse_gemma4_args(args_str)
             final_args_json = json.dumps(final_args, ensure_ascii=False)
+            if not self.current_tool_name_sent:
+                self.current_tool_name_sent = True
+                self.prev_tool_call_arr[self.current_tool_id] = {"name": func_name, "arguments": final_args}
+                self.streamed_args_for_tool[self.current_tool_id] = final_args_json
+                return DeltaMessage(
+                    tool_calls=[
+                        DeltaToolCall(
+                            index=self.current_tool_id,
+                            type="function",
+                            id=f"chatcmpl-tool-{uuid4()}",
+                            function=DeltaFunctionCall(name=func_name, arguments=final_args_json),
+                        )
+                    ]
+                )
 
             prev_streamed = self.streamed_args_for_tool[self.current_tool_id]
             if len(final_args_json) > len(prev_streamed):

@@ -60,8 +60,7 @@ from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
 from jax import numpy as jnp
 from jax._src.stages import Compiled
-from jax.sharding import PartitionSpec
-from spectrax import common_types, with_sharding_constraint
+from spectrax import common_types
 from tqdm.autonotebook import tqdm
 from transformers import GenerationConfig, ProcessorMixin
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -70,7 +69,7 @@ from easydel import __version__
 
 # Import ShardedDataSource for trainer integration
 from easydel.data.core.protocols import ShardedDataSource
-from easydel.data.sources.hf_wrapper import wrap_hf_dataset
+from easydel.data.sources.hf_wrapper import HFDatasetShardedSource, wrap_hf_dataset
 from easydel.inference import SamplingParams
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
@@ -86,11 +85,13 @@ from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import CompilationTracker
 from easydel.trainers.pose import apply_pose_to_batch, validate_pose_target_max_pos
 from easydel.trainers.process_encoder import EncoderProcessor, validate_process_encoder
+from easydel.trainers.randomized_yarn import apply_randomized_yarn_to_batch, validate_randomized_yarn_target
 from easydel.utils import Timers, is_remote_path, readme_generator
 from easydel.utils.lazy_import import is_package_available
 from easydel.utils.traversals import specs_to_name_sharding
 
 from . import fused_optimizers as _fused_optimizers  # noqa: F401  registers fused_adamw/fused_lion/fused_rmsprop
+from ._reward_sideband import is_reward_sideband
 from .buckets import (
     BucketRule,
     CycleBucketRule,
@@ -137,6 +138,10 @@ logger = get_logger(__name__)
 log_debug_maybe = logger.debug
 
 DEFAULT_ARGS_JSON_NAME = "easydel-training-arguments.json"
+
+
+_SOURCE_SHUFFLE_BUFFER_ROWS = 1000
+"""Minimum reservoir size (rows) used when shuffling a ``ShardedDataSource`` for training."""
 
 
 def _iter_sharded_source_from_start(source: ShardedDataSource) -> collections.abc.Iterator:
@@ -292,6 +297,8 @@ class GenerationResults(NamedTuple):
         completion_prompts: Optional prompt objects (text or chat dicts) aligned one-to-one with completions.
         finish_reason: Per-completion generation stop reason ("stop"/"length"/"eos_token"/"abort"),
             aligned one-to-one with completions; ``None`` when the backend does not report it.
+        sampling_per_token_logps: Optional float32 sampled-token log probabilities
+            aligned with ``completion_ids``; padding positions are zero.
     """
 
     generation_results: str | list[str]
@@ -307,6 +314,7 @@ class GenerationResults(NamedTuple):
     tool_calls: list[list | None] | None = None
     raw_text: str | list[str] | None = None
     finish_reason: list[str | None] | None = None
+    sampling_per_token_logps: jax.Array | None = None
 
 
 class _EsurgeGenerationArrays(NamedTuple):
@@ -338,6 +346,7 @@ class _EsurgeGenerationArrays(NamedTuple):
     raw_output_records: list[str]
     finish_reason_records: list[str | None]
     completion_prompts: list[str | list[dict[str, str]]]
+    sampling_per_token_logps: jax.Array | None = None
 
 
 class BaseTrainer(BaseTrainerProtocol):
@@ -388,6 +397,10 @@ class BaseTrainer(BaseTrainerProtocol):
     _has_buckets = False
     _user_data_collator = False
     _encoder_processor = None
+    _data_lane_resume_cursor = None
+    # Trainers mixing in ``AssistantOnlyMaskMixin`` consume the per-dataset sideband carriers; every other
+    # trainer has them dropped in ``_preprocess_batch_input`` before the model call.
+    consumes_assistant_only_carriers: tp.ClassVar[bool] = False
     _RUNTIME_MODEL_OVERRIDE_STATE_ATTRS: tp.ClassVar[frozenset[str]] = frozenset(
         {
             "model_state",
@@ -487,6 +500,9 @@ class BaseTrainer(BaseTrainerProtocol):
         buckets: list[TrainingBucket] | None = None,
         bucket_rule: BucketRule | None = None,
         bucket_datasets: list | None = None,
+        callbacks: collections.abc.Sequence[tp.Any] | None = None,
+        hub_model_id: str | None = None,
+        hub_kwargs: dict[str, tp.Any] | None = None,
         **deprecated_kwargs,
     ):
         """
@@ -511,6 +527,10 @@ class BaseTrainer(BaseTrainerProtocol):
             bucket_datasets: Optional list of datasets/Sources, one per bucket, used to
                 build each bucket's dataloader. Falls back to
                 ``arguments.bucket_datasets`` (and then to ``dataset_train``).
+            callbacks: Optional lifecycle callbacks; callback classes are instantiated without arguments.
+                Callbacks may also be attached later with ``add_callback``.
+            hub_model_id: Optional explicit Hub destination passed to lifecycle callbacks.
+            hub_kwargs: Optional Hub publishing keyword arguments passed to callbacks.
             **deprecated_kwargs: Deprecated keyword arguments for backward compatibility
 
         Raises:
@@ -521,6 +541,11 @@ class BaseTrainer(BaseTrainerProtocol):
             faulthandler.enable(file=sys.stderr, all_threads=True)
         except Exception:
             pass
+        if deprecated_kwargs:
+            logger.warning(
+                f"{type(self).__name__} ignored unsupported keyword arguments: {sorted(deprecated_kwargs)}. "
+                "They have no effect; check for misspelled or removed trainer arguments."
+            )
         self._runtime_trace("__init__.begin")
         if arguments is None:
             raise ValueError("training argument must be passed to Trainers.")
@@ -533,6 +558,12 @@ class BaseTrainer(BaseTrainerProtocol):
         if arguments.model_name is None:
             arguments.model_name = getattr(model_state.model, "_model_type", "module")
         self.arguments = arguments
+        self.callbacks: list[tp.Any] = []
+        self.hub_model_id = hub_model_id
+        self.hub_kwargs = dict(hub_kwargs or {})
+        self._train_end_callbacks_dispatched = False
+        for callback in callbacks or ():
+            self.add_callback(callback)
         # Warn-and-ignore sequence packing on trainers whose data path can't support it
         # (RL/online rollout, paired-preference). Never crash — just disable the flag.
         if getattr(self.arguments, "sequence_packing", False) and not self.supports_sequence_packing:
@@ -584,6 +615,10 @@ class BaseTrainer(BaseTrainerProtocol):
                     actual_step = int(jax.device_get(resumed_state.step))
                     logger.info(f"Successfully resumed from checkpoint at step {actual_step}")
                     self._load_auxiliary_states(checkpoint_path)
+                    # Read before an optional `remove_ckpt_after_load` deletes the directory.
+                    from .data_lanes import read_lane_cursor
+
+                    self._data_lane_resume_cursor = read_lane_cursor(checkpoint_path, jax.process_index())
                 except Exception as e:
                     raise RuntimeError(
                         f"Failed to resume from checkpoint {checkpoint_path} ({type(e).__name__}: {e}). "
@@ -597,8 +632,14 @@ class BaseTrainer(BaseTrainerProtocol):
                     # The state is already restored; failing to delete the old copy is not fatal.
                     logger.warning(f"Could not remove loaded checkpoint {checkpoint_path}: {e}")
 
-        # Train with dropout etc. live: `from_pretrained` hands back eval-mode models.
-        self.model_state = self._in_training_mode(model_state)
+        # Restore training mode unless the trainer explicitly requests deterministic
+        # preference scores. This also applies to policies restored from checkpoints.
+        if getattr(self.arguments, "disable_dropout", False):
+            from .model_loading import disable_state_dropout
+
+            self.model_state = disable_state_dropout(model_state)
+        else:
+            self.model_state = self._in_training_mode(model_state)
         self._apply_runtime_model_config_overrides()
         self._apply_step_start_point()
         self._model = jax.eval_shape(lambda: self.model_state.model)
@@ -609,6 +650,7 @@ class BaseTrainer(BaseTrainerProtocol):
         self.finetune = finetune
         self.processing_class = processing_class
         self._pose_image_token_id, self._pose_pad_id = self._setup_pose()
+        self._setup_randomized_yarn()
 
         if self.data_collator is None and getattr(self.arguments, "use_data_collator", True):
             base_collator = self.create_collect_function(
@@ -636,7 +678,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     values = [item.get(key) for item in per_example]
                     if any(v is None for v in values):
                         continue
-                    if key == "tools":
+                    if key == "tools" or any(is_reward_sideband(v) for v in values):
                         stacked[key] = values
                         continue
                     try:
@@ -744,6 +786,12 @@ class BaseTrainer(BaseTrainerProtocol):
                 raise ValueError(
                     f"pose.only_buckets {out_of_range} out of range for {len(self._buckets)} configured bucket(s)."
                 )
+        ryarn = getattr(self.arguments, "randomized_yarn", None)
+        if ryarn is not None and ryarn.enabled and ryarn.only_buckets is not None:
+            if not self._has_buckets or any(b >= len(self._buckets) for b in ryarn.only_buckets):
+                raise ValueError(
+                    f"randomized_yarn.only_buckets {ryarn.only_buckets} does not match the configured training buckets."
+                )
 
         # Resolve constructor/argument buckets first: their accumulation overrides
         # must not bypass the full-batch encoder-feature slicing guard.
@@ -753,6 +801,42 @@ class BaseTrainer(BaseTrainerProtocol):
         self._initialize_attributes()
         self.initialize_trainer_utils()
         self._runtime_trace("__init__.end")
+
+    def add_callback(self, callback: tp.Any) -> tp.Any:
+        """Register a lifecycle callback instance (or no-argument class) once by identity.
+
+        Returns:
+            The registered callback instance, useful for inspecting callback results.
+        """
+        if isinstance(callback, type):
+            callback = callback()
+        if not any(callable(getattr(callback, event, None)) for event in ("on_save", "on_train_end")):
+            raise TypeError("A trainer callback must define on_save or on_train_end.")
+        if not hasattr(self, "callbacks"):
+            self.callbacks = []
+        if not any(existing is callback for existing in self.callbacks):
+            self.callbacks.append(callback)
+        return callback
+
+    def remove_callback(self, callback: tp.Any) -> None:
+        """Unregister a callback instance without affecting other registered callbacks."""
+        self.callbacks = [existing for existing in getattr(self, "callbacks", ()) if existing is not callback]
+
+    def _dispatch_callbacks(self, event: str, state: EasyDeLState, **kwargs: tp.Any) -> None:
+        """Deliver an event to compatible hooks, propagating callback failures unchanged."""
+        payload = {
+            "trainer": self,
+            "arguments": self.arguments,
+            "state": state,
+            "policy_state": state,
+            "hub_model_id": getattr(self, "hub_model_id", None) or getattr(self.arguments, "hub_model_id", None),
+            "hub_kwargs": dict(getattr(self, "hub_kwargs", None) or getattr(self.arguments, "hub_kwargs", None) or {}),
+            **kwargs,
+        }
+        for callback in tuple(getattr(self, "callbacks", ())):
+            hook = getattr(callback, event, None)
+            if callable(hook):
+                hook(**filter_kwargs_for_callable(hook, payload))
 
     @staticmethod
     def _in_training_mode(state: EasyDeLState) -> EasyDeLState:
@@ -985,11 +1069,7 @@ class BaseTrainer(BaseTrainerProtocol):
             "cuda out of memory",
             "cudnn_status_alloc_failed",
         )
-        has_oom_marker = any(marker in message for marker in markers)
-        jax_runtime_error = getattr(jax.errors, "JaxRuntimeError", None)
-        if jax_runtime_error is not None and isinstance(exc, jax_runtime_error):
-            return has_oom_marker
-        return has_oom_marker
+        return any(marker in message for marker in markers)
 
     def _memory_optimization_trainer_name(self) -> str:
         """Return a human-readable trainer name for memory optimization messages.
@@ -1723,54 +1803,94 @@ class BaseTrainer(BaseTrainerProtocol):
 
     @staticmethod
     def _extract_reward_batch_sidechannels(batch: tp.Any) -> dict[str, tp.Any]:
-        """Preserve non-numeric batch metadata needed by callable reward functions.
+        """Preserve non-numeric batch columns needed by callable reward functions.
 
-        Currently extracts the ``tools`` field if present, converting JAX
-        / NumPy arrays back to Python lists so they survive transport into
-        a Python reward callback.
+        ``_purify_batch`` keeps only numeric arrays, so string or structured
+        columns (gold ``answer``, ``verification_info``, ``tools``, ...) would
+        never reach a reward function. They are returned here as one Python
+        value per example.
 
         Args:
             batch: The current batch (dict, list of dicts, or other shape).
 
         Returns:
-            A dict with extracted side-channel metadata (e.g.
-            ``{"tools": [...]}``); empty when nothing relevant is found.
+            A dict mapping each non-numeric column to a per-example list;
+            empty when there is none.
         """
+
+        def _is_numeric(values) -> bool:
+            def _numeric_dtype(arr) -> bool:
+                return bool(np.issubdtype(arr.dtype, np.number) or arr.dtype == np.bool_)
+
+            try:
+                arr = np.asarray(values)
+            except (ValueError, TypeError):
+                arr = None
+            if arr is not None and arr.dtype != object:
+                return _numeric_dtype(arr)
+            # Ragged numeric rows (unpadded token ids) are still numeric columns.
+            try:
+                return bool(values) and all(v is not None and _numeric_dtype(np.asarray(v)) for v in values)
+            except (ValueError, TypeError):
+                return False
+
         if isinstance(batch, dict):
-            if "tools" not in batch:
-                return {}
-            tools = batch["tools"]
-            if isinstance(tools, tuple):
-                tools = list(tools)
-            elif isinstance(tools, (np.ndarray, jax.Array)):
-                tools = np.asarray(jax.device_get(tools), dtype=object).tolist()
-            return {"tools": tools}
+            out = {}
+            for key, value in batch.items():
+                if isinstance(value, tuple):
+                    value = list(value)
+                elif isinstance(value, (np.ndarray, jax.Array)):
+                    if _is_numeric(value) and key != "tools":
+                        continue
+                    value = np.asarray(jax.device_get(value), dtype=object).tolist()
+                if isinstance(value, list) and (key == "tools" or not _is_numeric(value)):
+                    out[key] = value
+            return out
 
         if isinstance(batch, (list, tuple)) and batch and isinstance(batch[0], dict):
-            tools = [example.get("tools") for example in batch]
-            if any(tool is not None for tool in tools):
-                return {"tools": tools}
+            out = {}
+            for key in batch[0]:
+                values = [example.get(key) for example in batch]
+                if all(v is None for v in values):
+                    continue
+                if key == "tools" or not _is_numeric(values):
+                    out[key] = values
+            return out
         return {}
 
     @staticmethod
-    def _sanitize_text_prompt(prompt: str, processor: PreTrainedTokenizerBase | None) -> str:
-        """Remove pad token occurrences from a decoded text prompt.
+    def _completion_aligned_reward_batch(
+        reward_batch: dict[str, tp.Any],
+        sidechannels: dict[str, tp.Any],
+        *,
+        prompt_count: int,
+        completion_count: int,
+    ) -> dict[str, tp.Any]:
+        """Repeat prompt-level side-channel columns so they line up with the generated completions.
 
         Args:
-            prompt: The decoded text string to sanitize.
-            processor: Tokenizer or processor to look up the pad token from.
+            reward_batch: Purified batch merged with the side channels.
+            sidechannels: Columns returned by ``_extract_reward_batch_sidechannels``.
+            prompt_count: Number of prompts in the batch.
+            completion_count: Number of completions scored (``prompt_count * G``).
 
         Returns:
-            The prompt string with all pad token substrings removed.
+            ``reward_batch`` with each side-channel column expanded to one row per completion.
         """
-        pad_token = None
-        if processor is not None:
-            pad_token = getattr(processor, "pad_token", None) or getattr(
-                getattr(processor, "tokenizer", None), "pad_token", None
+        if not sidechannels:
+            return reward_batch
+        from .reward_protocol import align_reward_sidechannels
+
+        try:
+            aligned = align_reward_sidechannels(
+                {key: reward_batch[key] for key in sidechannels if key in reward_batch},
+                prompt_count=int(prompt_count),
+                completion_count=int(completion_count),
             )
-        if pad_token:
-            prompt = prompt.replace(pad_token, "")
-        return prompt
+        except ValueError as exc:
+            logger.warn_once(f"reward side-channel columns left prompt-aligned: {exc}")
+            return reward_batch
+        return {**reward_batch, **aligned}
 
     @staticmethod
     def _peek_first_example(dataset: tp.Any) -> tp.Any | None:
@@ -2231,8 +2351,10 @@ class BaseTrainer(BaseTrainerProtocol):
             pad_token_id = self.processing_class.pad_token_id
         if pad_token_id is not None:
             return pad_token_id
-        else:
-            return self.eos_token_id[0]
+        eos_ids = self._eos_token_id
+        if not eos_ids:
+            raise ValueError("Generation requires a pad_token_id or an eos_token_id.")
+        return eos_ids[0]
 
     @cached_property
     def _eos_token_id(self) -> list[int]:
@@ -2251,13 +2373,14 @@ class BaseTrainer(BaseTrainerProtocol):
             proc_eos_token_id = self.processing_class.eos_token_id
         if isinstance(proc_eos_token_id, int):
             proc_eos_token_id = [proc_eos_token_id]
-        eos_ids = eos_ids + proc_eos_token_id
-        if hasattr(self.model, "generation_config"):
-            conf_eos = self.model.generation_config.eos_token_id
+        eos_ids.extend(proc_eos_token_id or [])
+        generation_config = getattr(self.model, "generation_config", None)
+        if generation_config is not None:
+            conf_eos = generation_config.eos_token_id
             if isinstance(conf_eos, int):
                 conf_eos = [conf_eos]
-            eos_ids = eos_ids + conf_eos
-        return list(set(eos_ids))
+            eos_ids.extend(conf_eos or [])
+        return list(dict.fromkeys(eos_ids))
 
     def _make_attn_mask(self, arr):
         """Build a causal attention mask that masks positions after the first EOS token.
@@ -2307,19 +2430,105 @@ class BaseTrainer(BaseTrainerProtocol):
         # Use wrap_hf_dataset for HF datasets
         return wrap_hf_dataset(dataset)
 
-    def _apply_preprocess_transforms(self) -> None:
-        """Apply preprocessing transforms to data sources.
+    def _dataset_preprocess_workers(self) -> int | None:
+        """Validate and return the optional process-backed preprocessing worker count."""
+        workers = getattr(self.arguments, "dataset_num_proc", None)
+        if workers is None:
+            return None
+        if isinstance(workers, bool):
+            raise ValueError("`dataset_num_proc` must be a positive integer or None.")
+        try:
+            workers = operator.index(workers)
+        except TypeError as exc:
+            raise ValueError("`dataset_num_proc` must be a positive integer or None.") from exc
+        if workers < 1:
+            raise ValueError("`dataset_num_proc` must be a positive integer or None.")
+        return workers
 
-        Gets the trainer-specific transform via _get_preprocess_transform()
-        and applies it to both train and eval sources if available. When
-        ``sequence_packing`` is enabled for a trainer that supports it, wraps
-        the transformed token stream in a packed fixed-length source.
+    def _preprocess_source(self, source: ShardedDataSource, transform: "Transform") -> ShardedDataSource:
+        """Map materialized HF data with configured processes, otherwise retain lazy iteration.
+
+        The map adapter uses the same source-transform implementation as the lazy
+        path, including batched tokenization, row filtering and row expansion.
+        Mapping replaces (rather than merges) each row, preserving dropped columns.
+        Streaming and arbitrary sharded sources keep their original lazy behavior.
         """
-        transform = self._get_preprocess_transform()
-        if transform is not None and self._train_source is not None:
-            self._train_source = self._train_source.transform(transform)
-        if transform is not None and self._eval_source is not None:
-            self._eval_source = self._eval_source.transform(transform)
+        workers = self._dataset_preprocess_workers()
+        if workers is not None and isinstance(source, HFDatasetShardedSource) and not source.is_streaming:
+            from datasets import Dataset, Features, Value
+
+            from easydel.data.transforms.source import transform_preserves_row_count
+
+            dataset = source._dataset
+            if isinstance(dataset, Dataset):
+                variable_rows = not transform_preserves_row_count(transform)
+
+                def map_batch(batch):
+                    """Apply the ordinary source transform to one host-only HF batch."""
+                    keys = list(batch)
+                    rows = [
+                        dict(zip(keys, values, strict=True)) for values in zip(*(batch[k] for k in keys), strict=True)
+                    ]
+                    mapped = list(HFDatasetShardedSource(rows).transform(transform).iter_shards())
+                    if variable_rows:
+                        # A stable intermediate schema lets workers emit empty
+                        # batches before seeing their first non-filtered row.
+                        import pickle
+
+                        return {"_preprocessed_row": [pickle.dumps(row) for row in mapped]}
+                    output_keys = dict.fromkeys(key for row in mapped for key in row)
+                    return {key: [row.get(key) for row in mapped] for key in output_keys}
+
+                mapped = dataset.map(
+                    map_batch,
+                    batched=True,
+                    batch_size=32,
+                    remove_columns=dataset.column_names,
+                    num_proc=workers,
+                    features=Features({"_preprocessed_row": Value("binary")}) if variable_rows else None,
+                )
+                if variable_rows and len(mapped):
+
+                    def decode_batch(batch):
+                        """Unpack our locally produced rows without rerunning preprocessing."""
+                        import pickle
+
+                        rows = [pickle.loads(row) for row in batch["_preprocessed_row"]]
+                        keys = dict.fromkeys(key for row in rows for key in row)
+                        return {key: [row.get(key) for row in rows] for key in keys}
+
+                    mapped = mapped.map(decode_batch, batched=True, remove_columns=["_preprocessed_row"])
+                name = source.shard_names[0].removesuffix(":0")
+                return HFDatasetShardedSource(mapped, name=name)
+        return source.transform(transform)
+
+    def _preprocess_transform_for_source(self, source: ShardedDataSource) -> "Transform | None":
+        """Resolve existing no-argument trainer hooks against this source's schema.
+
+        Legacy hooks inspect ``_train_source`` to detect pretokenized rows. Bind
+        it only while constructing the transform so evaluation is independently
+        classified, including eval-only trainers and heterogeneous train/eval data.
+        """
+        train_source = self._train_source
+        try:
+            self._train_source = source
+            return self._get_preprocess_transform()
+        finally:
+            self._train_source = train_source
+
+    def _apply_preprocess_transforms(self) -> None:
+        """Preprocess train/eval independently, then apply optional sequence packing.
+
+        Materialized Hugging Face datasets honor ``dataset_num_proc`` through
+        ``Dataset.map``. Other sources remain lazy and resume in source order.
+        """
+        self._dataset_preprocess_workers()
+        for attr in ("_train_source", "_eval_source"):
+            source = getattr(self, attr)
+            if source is not None:
+                transform = self._preprocess_transform_for_source(source)
+                if transform is not None:
+                    setattr(self, attr, self._preprocess_source(source, transform))
 
         if getattr(self.arguments, "sequence_packing", False):
             self._apply_sequence_packing_to_sources()
@@ -2690,6 +2899,13 @@ class BaseTrainer(BaseTrainerProtocol):
         batch = self._apply_user_data_collator(batch)
         # Purify batch to keep only JAX-compatible array fields
         batch = self._purify_batch(batch)
+        if not self.consumes_assistant_only_carriers and isinstance(batch, dict):
+            # Per-dataset sideband carriers (assistant-only choice, dataset attribution) are host-side metadata;
+            # trainers that do not assemble masks from them drop them so the model never receives them.
+            from .assistant_only_mask import SIDEBAND_CARRIER_FIELDS
+
+            for key in SIDEBAND_CARRIER_FIELDS:
+                batch.pop(key, None)
         batch = self._apply_model_host_batch_transform(batch)
         return batch, {}
 
@@ -2763,6 +2979,41 @@ class BaseTrainer(BaseTrainerProtocol):
         return apply_pose_to_batch(
             batch,
             config=pose,
+            step=step,
+            seed=self.arguments.shuffle_seed_train,
+            image_token_id=self._pose_image_token_id,
+            pad_id=self._pose_pad_id,
+        )
+
+    def _setup_randomized_yarn(self) -> None:
+        """Validate ``randomized_yarn`` against the RoPE table and resolve the image/pad ids it shares with PoSE."""
+        ryarn = getattr(self.arguments, "randomized_yarn", None)
+        if ryarn is None or not ryarn.enabled:
+            return
+        who = type(self._model).__name__
+        config = self._model.config
+        validate_randomized_yarn_target(ryarn, model_max_freq_pos=config.granted_freq_max_position_embedding, who=who)
+        if hasattr(config, "image_token_id"):
+            self._pose_image_token_id = config.image_token_id
+        elif hasattr(config, "vision_config"):
+            raise ValueError(
+                f"randomized_yarn.enabled on multimodal {who} but its config exposes no image_token_id to "
+                "exclude image documents (would corrupt mRoPE)."
+            )
+        processor = self.processing_class
+        tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        self._pose_pad_id = getattr(tokenizer, "pad_token_id", None)
+
+    def _apply_randomized_yarn_to_batch(self, batch: tp.Any, step: int) -> tp.Any:
+        """Host-side, pre-forward Randomized YaRN on ``position_ids`` (no-op unless enabled)."""
+        ryarn = getattr(self.arguments, "randomized_yarn", None)
+        if ryarn is None or not ryarn.enabled or not isinstance(batch, dict):
+            return batch
+        if not ryarn.applies_to_bucket(self._bucket_for_step if self._has_buckets else None):
+            return batch
+        return apply_randomized_yarn_to_batch(
+            batch,
+            config=ryarn,
             step=step,
             seed=self.arguments.shuffle_seed_train,
             image_token_id=self._pose_image_token_id,
@@ -2845,6 +3096,9 @@ class BaseTrainer(BaseTrainerProtocol):
             """
             if key == "labels" or key.endswith("_labels"):
                 return -100
+            if key in ("assistant_only_mask", "dataset_ids"):
+                # -1 is the inert "inherit / unattributed" value; 0 would mean "opted out" / dataset 0.
+                return -1
             if np.issubdtype(array.dtype, np.bool_):
                 return False
             return 0
@@ -3574,9 +3828,9 @@ class BaseTrainer(BaseTrainerProtocol):
             max_tokens = 1024
         sampling_params = SamplingParams(
             max_tokens=int(max_tokens),
-            temperature=args.generation_temperature or 0.7,
-            top_p=args.generation_top_p or 0.95,
-            top_k=args.generation_top_k or 64,
+            temperature=0.7 if args.generation_temperature is None else args.generation_temperature,
+            top_p=0.95 if args.generation_top_p is None else args.generation_top_p,
+            top_k=64 if args.generation_top_k is None else args.generation_top_k,
             presence_penalty=float(getattr(args, "generation_presence_penalty", 0.0) or 0.0),
             frequency_penalty=float(getattr(args, "generation_frequency_penalty", 0.0) or 0.0),
             repetition_penalty=float(getattr(args, "generation_repetition_penalty", 1.0) or 1.0),
@@ -3597,6 +3851,11 @@ class BaseTrainer(BaseTrainerProtocol):
                 value = config_overrides.get(key)
                 if value is not None:
                     setattr(sampling_params, attr, cast(value))
+        do_sample = (config_overrides or {}).get("do_sample")
+        if do_sample is None:
+            do_sample = getattr(args, "generation_do_sample", None)
+        if do_sample is False:
+            sampling_params.temperature = 0.0
         return sampling_params
 
     def _esurge_outputs_to_arrays(
@@ -3636,6 +3895,7 @@ class BaseTrainer(BaseTrainerProtocol):
         sequence_rows: list[list[int]] = []
         completion_id_rows: list[list[int]] = []
         completion_mask_rows: list[list[int]] = []
+        sampling_logps_rows: list[list[float] | None] = []
         output_records: list[str] = []
         reasoning_records: list[str | None] = []
         tool_call_records: list[list | None] = []
@@ -3745,6 +4005,19 @@ class BaseTrainer(BaseTrainerProtocol):
 
                 completion_id_rows.append(padded_completion_ids)
                 completion_mask_rows.append(padded_completion_mask)
+                token_logprobs = getattr(completion, "logprobs", None)
+                if token_logprobs is None:
+                    sampling_logps_rows.append(None)
+                else:
+                    if len(token_logprobs) < completion_len:
+                        raise ValueError("eSurge returned fewer sampled-token log probabilities than completion tokens.")
+                    sampled_logps = []
+                    for token, candidates in zip(completion_tokens, token_logprobs[:completion_len], strict=True):
+                        if token not in candidates:
+                            raise ValueError(f"eSurge log probabilities omit sampled token {token}.")
+                        value = candidates[token]
+                        sampled_logps.append(float(getattr(value, "logprob", value)))
+                    sampling_logps_rows.append(sampled_logps + [0.0] * completion_padding)
 
                 sequence_tokens = [pad_token_id] * prompt_padding + base_prompt_tokens + completion_tokens
                 remaining_padding = max_total_len - len(sequence_tokens)
@@ -3767,6 +4040,7 @@ class BaseTrainer(BaseTrainerProtocol):
             new_order = [idx for group in per_prompt for idx in group] + unmatched
             completion_id_rows = [completion_id_rows[i] for i in new_order]
             completion_mask_rows = [completion_mask_rows[i] for i in new_order]
+            sampling_logps_rows = [sampling_logps_rows[i] for i in new_order]
             completion_prompts = [completion_prompts[i] for i in new_order]
             output_records = [output_records[i] for i in new_order]
             reasoning_records = [reasoning_records[i] for i in new_order]
@@ -3785,6 +4059,11 @@ class BaseTrainer(BaseTrainerProtocol):
         completion_mask = jnp.array(np.asarray(completion_mask_rows, dtype=np.int32))
         total_seq_len = prompt_ids.shape[-1] + completion_ids.shape[-1]
         sequences = sequences[:, :total_seq_len]
+        sampling_per_token_logps = None
+        if any(row is not None for row in sampling_logps_rows):
+            if any(row is None for row in sampling_logps_rows):
+                raise ValueError("eSurge returned sampled-token log probabilities for only some completions.")
+            sampling_per_token_logps = jnp.array(np.asarray(sampling_logps_rows, dtype=np.float32))
         return _EsurgeGenerationArrays(
             prompt_ids=prompt_ids,
             prompt_mask=prompt_mask,
@@ -3797,6 +4076,7 @@ class BaseTrainer(BaseTrainerProtocol):
             raw_output_records=raw_output_records,
             finish_reason_records=finish_reason_records,
             completion_prompts=completion_prompts,
+            sampling_per_token_logps=sampling_per_token_logps,
         )
 
     def _generate_via_esurge(
@@ -3851,6 +4131,11 @@ class BaseTrainer(BaseTrainerProtocol):
         if not prompts:
             raise ValueError("No prompts available for eSurge generation")
 
+        # Request the sampled token only (no vocabulary top-k payload). Keep
+        # caller-owned params unchanged, including for follow-up tool rollouts.
+        sampling_params = copy.copy(sampling_params)
+        if sampling_params.logprobs is None:
+            sampling_params.logprobs = 0
         esurge_kwargs = self._esurge_init_kwargs()
         effective_prompt_len = prompt_seq_len if prompt_seq_len is not None else (args.max_length or 2048)
         # eSurge reserves a few tokens from the context budget (defaults to
@@ -3940,6 +4225,7 @@ class BaseTrainer(BaseTrainerProtocol):
             raw_output_records = arrays.raw_output_records
             finish_reason_records = arrays.finish_reason_records
             completion_prompts = arrays.completion_prompts
+            sampling_per_token_logps = arrays.sampling_per_token_logps
 
             if all_gather:
                 sequences = self._all_gather(sequences)
@@ -3947,6 +4233,8 @@ class BaseTrainer(BaseTrainerProtocol):
                 prompt_mask = self._all_gather(prompt_mask)
                 completion_ids = self._all_gather(completion_ids)
                 completion_mask = self._all_gather(completion_mask)
+                if sampling_per_token_logps is not None:
+                    sampling_per_token_logps = self._all_gather(sampling_per_token_logps)
             results = self.maybe_release_generation_runtime(
                 GenerationResults(
                     generation_results=output_records,
@@ -3962,6 +4250,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     tool_calls=tool_call_records,
                     raw_text=raw_output_records,
                     finish_reason=finish_reason_records,
+                    sampling_per_token_logps=sampling_per_token_logps,
                 ),
                 state=state,
                 release_runtime_after_generation=release_runtime_after_generation,
@@ -5143,19 +5432,6 @@ class BaseTrainer(BaseTrainerProtocol):
             )
         wandb.log({"training_generations": self.training_generation_log_table}, step=cur_step)
 
-    def _one_to_all(self, arr: jax.Array) -> jax.Array:
-        """Distribute array from one device to all devices.
-
-        Args:
-            arr: Array to distribute.
-
-        Returns:
-            Array distributed across devices.
-        """
-        with self.mesh:
-            arr = with_sharding_constraint(arr, PartitionSpec(None), mesh=self.mesh, ignore_mpmd=True)
-        return arr
-
     def _all_gather(self, arr: jax.Array) -> jax.Array:
         """Gather array from all devices to a single replicated array.
 
@@ -5530,7 +5806,7 @@ class BaseTrainer(BaseTrainerProtocol):
             return None
         transform = self._get_bucket_preprocess_transform(sharded, bucket)
         if transform is not None:
-            sharded = sharded.transform(transform)
+            sharded = self._preprocess_source(sharded, transform)
         return sharded
 
     def _get_bucket_preprocess_transform(
@@ -5767,6 +6043,14 @@ class BaseTrainer(BaseTrainerProtocol):
             # Compile per-bucket step fns now that the flavor's configure_functions
             # has set up its compiled-fn signature / static-arg shape.
             self._compile_bucket_step_functions()
+            if (
+                getattr(self.arguments, "gradient_accumulation_mode", "scan") == "execution"
+                and int(getattr(self.arguments, "gradient_accumulation_steps", 1) or 1) > 1
+                and getattr(self, "_execution_accumulation", None) is None
+            ):
+                raise ValueError(
+                    f"{type(self).__name__} does not support gradient_accumulation_mode='execution'; use 'scan'."
+                )
         self.timer.log("configure functions and sharding them")
         self._runtime_trace("_configure_functions.compiled")
         self._runtime_trace("_configure_generation_function.begin")
@@ -5911,27 +6195,56 @@ class BaseTrainer(BaseTrainerProtocol):
             source: ShardedDataSource to iterate over.
             batch_size: Batch size for batching examples.
             is_train: Whether this is for training (affects logging).
-            shuffle: Whether to shuffle (currently not implemented for sources).
+            shuffle: Whether to shuffle. When ``True`` the source is wrapped in a streaming
+                reservoir shuffle (:meth:`ShardedDataSource.shuffle`) seeded with
+                ``arguments.shuffle_seed_train`` (``0`` for non-training loaders) plus the
+                epoch index, so every epoch sees a different but reproducible order and
+                checkpoint resume (``skip_batches``) replays the same stream.
             num_epochs: Number of epochs to iterate.
             drop_remainder: Whether to drop the last incomplete batch.
-            skip_batches: Number of complete batches to skip before yielding.
+            skip_batches: Number of yielded batches to skip across epochs,
+                including partial tails when ``drop_remainder`` is ``False``.
                 When supported by the source stack, this seeks instead of
                 materializing skipped rows during checkpoint resume.
 
         Yields:
             Lists of examples (pre-tokenized dicts) to be collated.
         """
-        skip_examples = max(int(skip_batches), 0) * int(batch_size)
-        for _ in range(num_epochs):
+        remaining_batches = max(int(skip_batches), 0)
+        # Only exact delivered-row metadata can position a batch offset across
+        # epoch boundaries. Expanding/filtering/streaming sources instead replay
+        # skipped batches, counting a partial tail only when it would be yielded.
+        epoch_rows = None
+        if remaining_batches and source.delivers_all_metadata_rows and self._length_is_exact(source):
+            epoch_rows = self._sum_known_shard_rows(source)
+        epoch_batches = None
+        if epoch_rows is not None:
+            epoch_batches = epoch_rows // batch_size if drop_remainder else (epoch_rows + batch_size - 1) // batch_size
+        base_seed = int(self.arguments.shuffle_seed_train or 0) if is_train and shuffle else 0
+        shuffle_buffer = max(_SOURCE_SHUFFLE_BUFFER_ROWS, int(batch_size))
+        for epoch in range(num_epochs):
+            if epoch_batches is not None and remaining_batches >= epoch_batches:
+                remaining_batches -= epoch_batches
+                continue
+            skip_examples = 0
+            if epoch_batches is not None:
+                skip_examples = remaining_batches * batch_size
+                remaining_batches = 0
             batch = []
-            for example in _iter_sharded_source_from_example_offset(source, skip_examples):
+            epoch_source = source.shuffle(buffer_size=shuffle_buffer, seed=base_seed + epoch) if shuffle else source
+            for example in _iter_sharded_source_from_example_offset(epoch_source, skip_examples):
                 batch.append(example)
                 if len(batch) >= batch_size:
-                    yield batch
+                    if remaining_batches:
+                        remaining_batches -= 1
+                    else:
+                        yield batch
                     batch = []
             if batch and not drop_remainder:
-                yield batch
-            skip_examples = 0
+                if remaining_batches:
+                    remaining_batches -= 1
+                else:
+                    yield batch
 
     def _configure_grain_dataloader(self):
         """Configure Grain dataloaders for training and evaluation.
@@ -6277,10 +6590,70 @@ class BaseTrainer(BaseTrainerProtocol):
             TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
                                             maximum number of training and evaluation steps.
         """
+        if (
+            self.arguments.parquetra_train_datasets
+            or self.arguments.arrayrecord_train_datasets
+            or (self.arguments.arrayrecord_train_files)
+        ):
+            return self._configure_grain_lane_dataloader()
+        if self.arguments.parquetra_assistant_only or self.arguments.arrayrecord_assistant_only:
+            raise ValueError(
+                "`parquetra_assistant_only` / `arrayrecord_assistant_only` are set but no grain lane is selected "
+                "(`parquetra_train_datasets` / `arrayrecord_train_*`); the flags would be silently ignored."
+            )
         if self.arguments.use_grain:
             return self._configure_grain_dataloader()
         else:
             return self._configure_tfds_dataloader()
+
+    def _configure_grain_lane_dataloader(self) -> TrainerConfigureDataloaderOutput:
+        """Build the random-access parquet or ArrayRecord training lane (see :mod:`.data_lanes`).
+
+        Evaluation datasets are not served by these lanes; ``dataset_eval`` keeps its usual loader.
+        """
+        from .data_lanes import configure_arrayrecord_lane, configure_parquetra_lane
+
+        if self.arguments.parquetra_train_datasets:
+            loader, steps = configure_parquetra_lane(self)
+            label = "parquetra"
+        else:
+            loader, steps = configure_arrayrecord_lane(self)
+            label = "arrayrecord"
+        self._set_dataset_size_metadata(
+            is_train=True,
+            resolution=_ResolvedStepCount(int(steps), None, False, label, False, False),
+        )
+        dataloader_eval, max_evaluation_steps = None, 0
+        if self.dataset_eval is not None and self.arguments.do_eval:
+            fallback = self._configure_grain_dataloader() if self.arguments.use_grain else None
+            if fallback is not None:
+                dataloader_eval, max_evaluation_steps = fallback.dataloader_eval, fallback.max_evaluation_steps
+        return TrainerConfigureDataloaderOutput(
+            dataloader_train=loader,
+            max_training_steps=int(steps),
+            dataloader_eval=dataloader_eval,
+            max_evaluation_steps=max_evaluation_steps,
+        )
+
+    def _save_data_lane_state(self, checkpoint_dir: str, step: int) -> None:
+        """Persist the packed-lane cursor for ``step`` next to a checkpoint (one file per host)."""
+        from .data_lanes import PackedParquetLoader, write_lane_cursor
+
+        loader = getattr(self, "dataloader_train", None)
+        if not isinstance(loader, PackedParquetLoader):
+            return
+        cursor = loader.cursor_at(int(step))
+        if cursor is None:
+            logger.warning(
+                "packed lane: no cursor recorded for step %d; a resume from this checkpoint will use the "
+                "seed-shifted stream.",
+                step,
+            )
+            return
+        try:
+            write_lane_cursor(checkpoint_dir, jax.process_index(), cursor)
+        except Exception as exc:
+            logger.warning(f"packed lane: failed to write the data cursor into {checkpoint_dir}: {exc}")
 
     def configure_model(self) -> TrainerConfigureModelOutput:
         """
@@ -6466,6 +6839,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 save_directory=full_path,
                 merge_lora_before_save=merge_lora_before_save,
             )
+            self._save_data_lane_state(full_path, step)
             if jax.process_index() == 0:
                 metadata_path = ePath(full_path) / "metadata.json"
                 if metadata_path.exists():
@@ -6487,6 +6861,7 @@ class BaseTrainer(BaseTrainerProtocol):
             _restore_checkpoint_metadata(saved_directory[0])
             self._cleanup_old_checkpoints()
             self._sync_checkpointer_after_callback_save(step=step)
+            self._dispatch_callbacks("on_save", state, checkpoint_path=saved_directory[0], step=step)
         return saved_directory[0]
 
     def _maybe_remove_loaded_checkpoint(self, checkpoint_path: str) -> None:
@@ -6794,11 +7169,13 @@ class BaseTrainer(BaseTrainerProtocol):
                 torch_save_pretrained_kwargs=torch_save_pretrained_kwargs,
             )
         else:
-            return self._save_state(
+            checkpoint_path = self._save_state(
                 state=state,
                 save_directory=save_directory,
                 merge_lora_before_save=self.arguments.merge_lora_before_save,
             )
+            self._dispatch_callbacks("on_save", state, checkpoint_path=checkpoint_path)
+            return checkpoint_path
 
     def _save_to_torch(
         self,
@@ -6944,6 +7321,7 @@ class BaseTrainer(BaseTrainerProtocol):
         Notes:
             Sets up static metrics and records training start time.
         """
+        self._train_end_callbacks_dispatched = False
         self._setup_static_metrics()
         self._training_time_start = time.time()
 
@@ -6982,7 +7360,7 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         compiled = False
 
-        def compile_function(function, dataloader, state, tag):
+        def compile_function(function, dataloader, state, tag, *, is_train):
             """Lower and AOT-compile a step function if not already compiled.
 
             Args:
@@ -6990,21 +7368,38 @@ class BaseTrainer(BaseTrainerProtocol):
                 dataloader: Dataloader providing a sample batch for shape inference.
                 state: Current model state passed as the first compilation arg.
                 tag: Human-readable label used in log messages.
+                is_train: Select training or evaluation preprocessing and arguments.
 
             Returns:
-                The compiled function, or the original if already compiled.
+                The original callable with its executable cache warmed, retaining
+                the runtime step's static positional-argument contract.
             """
             if not isinstance(function, Compiled):
                 logger.info("Compiling function: %s", tag)
-                return function.lower(state, next(iter(dataloader))).compile()
+                batch, _ = self._get_next_batch(iter(dataloader), dataloader)
+                if self.data_collator is not None:
+                    batch = self.data_collator(batch)
+                batch, _ = self._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
+                if is_train:
+                    extra_args = self._train_shared_fn_extra_args
+                    static_args = self._train_shared_fn_static_args
+                else:
+                    state = self._eval_state_for_compiled_step(state)
+                    extra_args = self._eval_shared_fn_extra_args
+                    static_args = self._eval_shared_fn_static_args
+                function.lower(state, batch, *extra_args, *static_args).compile()
+                # Keep the JIT wrapper: a bare Compiled callable does not accept
+                # the static positional arguments supplied by normal trainer steps.
             return function
 
-        if self.dataloader_train is not None:
+        # Execution-mode GA never calls the scan step; compiling it would allocate the stacked program it avoids.
+        if self.dataloader_train is not None and getattr(self, "_execution_accumulation", None) is None:
             self.sharded_training_step_function = compile_function(
                 self.sharded_training_step_function,
                 self.dataloader_train,
                 self.model_state,
                 "trainer.sharded_training_step_function",
+                is_train=True,
             )
             compiled = True
 
@@ -7012,10 +7407,9 @@ class BaseTrainer(BaseTrainerProtocol):
             self.sharded_evaluation_step_function = compile_function(
                 self.sharded_evaluation_step_function,
                 self.dataloader_eval,
-                # The eval step is compiled against the eval-override graphdef
-                # (when configured); lowering must see the same static graphdef.
-                self._eval_state_for_compiled_step(self.model_state),
+                self.model_state,
                 "trainer.sharded_evaluation_step_function",
+                is_train=False,
             )
             compiled = True
 
@@ -7237,6 +7631,10 @@ class BaseTrainer(BaseTrainerProtocol):
                 if self.arguments.save_directory is not None and os.path.dirname(checkpoint_path) == "":
                     checkpoint_path = str(ePath(self.arguments.save_directory) / checkpoint_path)
 
+        if run_exception is None and not getattr(self, "_train_end_callbacks_dispatched", False):
+            self._train_end_callbacks_dispatched = True
+            self._dispatch_callbacks("on_train_end", state, checkpoint_path=checkpoint_path)
+
         return TrainerOutput(
             state=state,
             mesh=self.mesh,
@@ -7258,7 +7656,7 @@ class BaseTrainer(BaseTrainerProtocol):
             raise RuntimeError("EasyDeL Runtime dumped") from exception
         return self._prepare_training_output(
             state=state,
-            run_exception=None,
+            run_exception=exception,
         )
 
     def _setup_initial_metrics(self, state):
@@ -7321,8 +7719,21 @@ class BaseTrainer(BaseTrainerProtocol):
             except StopIteration as exc:
                 raise RuntimeError("Dataloader is empty and cannot provide batches.") from exc
 
-        for id_to_pop in self.arguments.ids_to_pop_from_dataset or []:
-            _ = batch.pop(id_to_pop, None)
+        ids_to_pop = tuple(self.arguments.ids_to_pop_from_dataset or ())
+        if ids_to_pop:
+            if isinstance(batch, collections.abc.MutableMapping):
+                for id_to_pop in ids_to_pop:
+                    _ = batch.pop(id_to_pop, None)
+            elif isinstance(batch, list | tuple):
+                # Sharded-source dataloaders yield lists of example dicts that the collator
+                # consumes afterwards; drop the columns from each example (without mutating
+                # rows owned by the source).
+                batch = [
+                    {key: value for key, value in example.items() if key not in ids_to_pop}
+                    if isinstance(example, collections.abc.Mapping)
+                    else example
+                    for example in batch
+                ]
 
         return batch, data_iter
 

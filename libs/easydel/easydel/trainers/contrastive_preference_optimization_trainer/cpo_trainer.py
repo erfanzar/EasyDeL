@@ -23,7 +23,7 @@ variants (sigmoid, hinge, IPO, SimPO, AlphaPO) selected through
 from __future__ import annotations
 
 import typing as tp
-from functools import partial
+from functools import cached_property, partial
 
 from eformer.loggings import get_logger
 
@@ -125,7 +125,6 @@ class CPOTrainer(Trainer):
         self.arguments = arguments
         self.processing_class = processing_class
         self.truncation_mode = arguments.truncation_mode
-        self._stored_metrics = {}
 
         model = self._resolve_policy_model(model)
         if isinstance(model, EasyDeLState):
@@ -245,6 +244,23 @@ class CPOTrainer(Trainer):
         except (StopIteration, IndexError):
             return False
 
+    @cached_property
+    def concatenated_forward(self) -> tp.Callable:
+        """Lazily compile stand-alone paired scoring when a caller requests it."""
+        return compile_trainer_auxiliary(
+            self._concatenated_forward_fn,
+            mesh=self.model.mesh,
+            static_argnames=(
+                "is_encoder_decoder",
+                "label_pad_token_id",
+                "padding_value",
+                "max_length",
+                "truncation_mode",
+                "aux_loss_enabled",
+                "loss_type",
+            ),
+        )
+
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Build the JIT-compiled CPO training/evaluation step functions.
 
@@ -283,19 +299,9 @@ class CPOTrainer(Trainer):
             loss_type=self.arguments.loss_type,
             logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
         )
-        self.concatenated_forward = compile_trainer_auxiliary(
-            partial_concatenated_forward,
-            mesh=mesh,
-            static_argnames=(
-                "is_encoder_decoder",
-                "label_pad_token_id",
-                "padding_value",
-                "max_length",
-                "truncation_mode",
-                "aux_loss_enabled",
-                "loss_type",
-            ),
-        )
+        self._concatenated_forward_fn = partial_concatenated_forward
+        # Reconfiguration invalidates any previously requested stand-alone scorer.
+        self.__dict__.pop("concatenated_forward", None)
 
         self._train_shared_fn_static_args = (
             self.scheduler,
@@ -342,7 +348,7 @@ class CPOTrainer(Trainer):
         self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             evaluation_step,
-            in_shardings=(self.state_shardings, empty_sharding),
+            in_shardings=(self.eval_state_shardings, empty_sharding),
             out_shardings=empty_sharding,
             static_argnums=evaluation_static_argnums,
             mesh=self.model.mesh,

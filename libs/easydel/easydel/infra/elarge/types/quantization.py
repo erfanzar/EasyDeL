@@ -150,6 +150,10 @@ class QuantizationCfg(QuantizedTrainingCfg, total=False):
     precision and act on the matmul instead.
     """
 
+    method: NotRequired[str | None]
+    group_size: NotRequired[int]
+    linear_pattern: NotRequired[str | None]
+    linear_group_size: NotRequired[int | None]
     platform: NotRequired[EasyDeLPlatforms | None]
     kv_cache: NotRequired[QuantizationConfig | EasyDeLQuantizationCfg | None]
     model: NotRequired[QuantizationConfig | EasyDeLQuantizationCfg | None]

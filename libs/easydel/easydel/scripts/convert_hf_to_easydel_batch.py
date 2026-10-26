@@ -50,6 +50,47 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from eformer.aparser import DataClassArgumentParser
+from eformer.paths import ePath
+
+try:  # package import (``python -m easydel.scripts...``)
+    from ._hf_common import strip_comment
+except ImportError:  # run directly as a script: the script directory is on ``sys.path``
+    from _hf_common import strip_comment  # type: ignore
+
+OutDir = Path | str
+
+
+def _is_remote(location: str | os.PathLike) -> bool:
+    """Return True when ``location`` is an object-store URI such as ``gs://bucket/x``."""
+    return "://" in str(location)
+
+
+def _job_out_dir(out_root: OutDir, name: str) -> OutDir:
+    """Join ``name`` under ``out_root``, keeping object-store URIs as strings.
+
+    ``pathlib.Path`` mangles ``gs://bucket/x`` into the relative path ``gs:/bucket/x``, so remote roots are joined
+    textually and later handed to ``ePath``.
+
+    Args:
+        out_root: Local output root, or a ``scheme://`` URI string.
+        name: Per-model directory name.
+
+    Returns:
+        ``Path`` for a local root, ``str`` URI for a remote root.
+    """
+    if _is_remote(out_root):
+        return f"{str(out_root).rstrip('/')}/{name}"
+    return Path(out_root) / name
+
+
+def _out_dir_nonempty(out_dir: OutDir) -> bool:
+    """Return True when ``out_dir`` contains at least one entry (local or remote)."""
+    if _is_remote(out_dir):
+        # Object-store directories are prefixes, so there need not be an exact
+        # object for exists() to find even when checkpoint files are present.
+        return any(True for _ in ePath(str(out_dir)).iterdir())
+    path = Path(out_dir)
+    return path.is_dir() and any(True for _ in path.iterdir())
 
 
 @dataclass(frozen=True)
@@ -70,14 +111,15 @@ class ModelJob:
             ``--repo-id``. Auto-derived from ``source`` when the
             models file omits it (using
             :attr:`BatchArgs.repo_owner`).
-        out_dir (Path): Filesystem directory under ``out_root``
-            where the converted checkpoint is written; passed as
-            ``--out`` to the per-model script.
+        out_dir (Path | str): Directory under ``out_root`` where the
+            converted checkpoint is written; passed as ``--out`` to the
+            per-model script. A ``str`` URI (e.g. ``gs://...``) when the
+            output root is remote.
     """
 
     source: str
     repo_id: str
-    out_dir: Path
+    out_dir: OutDir
 
 
 def _strip_comment(line: str) -> str:
@@ -96,10 +138,10 @@ def _strip_comment(line: str) -> str:
         str: Comment-free, whitespace-stripped line. Empty when
         the input is fully blank or comment-only.
     """
-    return line.split("#", 1)[0].strip()
+    return strip_comment(line)
 
 
-def _parse_models_file(path: str | os.PathLike, *, default_owner: str, out_root: Path) -> list[ModelJob]:
+def _parse_models_file(path: str | os.PathLike, *, default_owner: str, out_root: OutDir) -> list[ModelJob]:
     """Read a models file and turn each non-empty line into a :class:`ModelJob`.
 
     Strips comments via :func:`_strip_comment`, skips blank
@@ -133,7 +175,7 @@ def _parse_models_file(path: str | os.PathLike, *, default_owner: str, out_root:
 
         source, repo_id = _parse_model_line(line, default_owner=default_owner)
         name = repo_id.split("/", 1)[-1]
-        jobs.append(ModelJob(source=source, repo_id=repo_id, out_dir=out_root / name))
+        jobs.append(ModelJob(source=source, repo_id=repo_id, out_dir=_job_out_dir(out_root, name)))
 
     return jobs
 
@@ -344,7 +386,11 @@ def main(argv: list[str] | None = None) -> int:
         look_for_args_file=False,
     )
 
-    out_root = Path(args.out_root).expanduser().resolve()
+    out_root: OutDir
+    if _is_remote(args.out_root):
+        out_root = str(args.out_root).rstrip("/")
+    else:
+        out_root = Path(args.out_root).expanduser().resolve()
     convert_script = (
         Path(args.convert_script).expanduser().resolve() if args.convert_script else _default_convert_script()
     )
@@ -361,10 +407,10 @@ def main(argv: list[str] | None = None) -> int:
             continue
         name = source.split("/", 1)[-1]
         repo_id = f"{args.repo_owner}/{name}"
-        jobs.append(ModelJob(source=source, repo_id=repo_id, out_dir=out_root / name))
+        jobs.append(ModelJob(source=source, repo_id=repo_id, out_dir=_job_out_dir(out_root, name)))
 
     # De-dup while keeping order
-    seen: set[tuple[str, str, Path]] = set()
+    seen: set[tuple[str, str, OutDir]] = set()
     unique: list[ModelJob] = []
     for job in jobs:
         key = (job.source, job.repo_id, job.out_dir)
@@ -377,19 +423,22 @@ def main(argv: list[str] | None = None) -> int:
     if not jobs:
         raise SystemExit("No models selected. Use --source and/or --models-file.")
 
-    out_root.mkdir(parents=True, exist_ok=True)
+    if isinstance(out_root, Path):
+        out_root.mkdir(parents=True, exist_ok=True)
 
     ok = 0
     skipped = 0
     failed = 0
 
     for idx, job in enumerate(jobs, start=1):
-        if args.skip_existing and job.out_dir.exists() and any(job.out_dir.iterdir()):
+        if args.skip_existing and _out_dir_nonempty(job.out_dir):
             print(f"[{idx}/{len(jobs)}] [skip] {job.source} -> {job.out_dir} (exists)")
             skipped += 1
             continue
 
-        job.out_dir.mkdir(parents=True, exist_ok=True)
+        # Remote (object-store) outputs are created by the per-model script itself.
+        if isinstance(job.out_dir, Path):
+            job.out_dir.mkdir(parents=True, exist_ok=True)
 
         cmd = [
             python_exe,

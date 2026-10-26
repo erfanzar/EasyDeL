@@ -25,11 +25,8 @@ sequences into fixed-length blocks.  Public entry point is
 from __future__ import annotations
 
 import typing as tp
-from pathlib import Path
 
-import numpy as np
 from eformer.loggings import get_logger
-from transformers import AutoTokenizer
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
@@ -37,12 +34,17 @@ from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 
-from ..model_loading import reject_string_model_id
+from ..assistant_only_mask import AssistantOnlyMaskMixin
+from ..model_loading import apply_chat_template_path, apply_tokenizer_overrides, reject_string_model_id
 from ..prompt_transforms import SFTPreprocessTransform
 from ..trainer import Trainer
 from ..trainer._fn import evaluation_step, training_step
 from ..trainer_protocol import TrainerConfigureFunctionOutput
-from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
+from ..training_utils import (
+    compile_trainer_step,
+    resolve_mask_prompt,
+    resolve_straight_through_emulator,
+)
 from ..utils import DataCollatorForCompletionOnlyLM, get_formatting_func_from_dataset
 from .sft_config import SFTConfig
 
@@ -55,7 +57,7 @@ logger = get_logger(__name__)
 
 
 @Registry.register("trainer", "sft")
-class SFTTrainer(Trainer):
+class SFTTrainer(AssistantOnlyMaskMixin, Trainer):
     """Supervised Fine-Tuning trainer for language models.
 
     Implements standard supervised fine-tuning for both base and instruction-tuned
@@ -143,9 +145,9 @@ class SFTTrainer(Trainer):
         tokenizer = processing_class
         if hasattr(processing_class, "tokenizer"):
             tokenizer = processing_class.tokenizer
-        self._apply_tokenizer_overrides(tokenizer, eos_token=arguments.eos_token, pad_token=arguments.pad_token)
+        apply_tokenizer_overrides(tokenizer, eos_token=arguments.eos_token, pad_token=arguments.pad_token)
         if arguments.chat_template_path is not None:
-            self._apply_chat_template_path(tokenizer, arguments.chat_template_path)
+            apply_chat_template_path(tokenizer, arguments.chat_template_path)
         if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -174,11 +176,8 @@ class SFTTrainer(Trainer):
 
     @staticmethod
     def _apply_tokenizer_overrides(tokenizer: object, *, eos_token: str | None, pad_token: str | None) -> None:
-        """Apply configured tokenizer token overrides in-place."""
-        if eos_token is not None:
-            tokenizer.eos_token = eos_token
-        if pad_token is not None:
-            tokenizer.pad_token = pad_token
+        """Apply token overrides through the shared helper (compatibility API)."""
+        apply_tokenizer_overrides(tokenizer, eos_token=eos_token, pad_token=pad_token)
 
     def _get_preprocess_transform(self) -> SFTPreprocessTransform | None:
         """Build the lazy SFT preprocessing transform for the data source.
@@ -209,10 +208,7 @@ class SFTTrainer(Trainer):
         if self._is_pretokenized():
             return None
 
-        mask_prompt = bool(getattr(self.arguments, "assistant_only_loss", False))
-        completion_only_loss = getattr(self.arguments, "completion_only_loss", None)
-        if completion_only_loss is not None:
-            mask_prompt = bool(completion_only_loss)
+        mask_prompt = resolve_mask_prompt(self.arguments)
 
         return SFTPreprocessTransform(
             tokenizer=self.processing_class,
@@ -231,40 +227,8 @@ class SFTTrainer(Trainer):
 
     @staticmethod
     def _apply_chat_template_path(tokenizer: object, chat_template_path: str) -> None:
-        """Assign a chat template from a local file or tokenizer source."""
-        path = Path(chat_template_path)
-        if path.is_file():
-            tokenizer.chat_template = path.read_text(encoding="utf-8")
-            return
-
-        template_tokenizer = AutoTokenizer.from_pretrained(chat_template_path)
-        chat_template = template_tokenizer.chat_template
-        if chat_template is None:
-            raise ValueError(f"No chat_template found at {chat_template_path!r}.")
-        tokenizer.chat_template = chat_template
-
-    def _is_pretokenized(self) -> bool:
-        """Detect whether the bound training source already exposes tokenised text.
-
-        Peeks at the first row of the first shard and reports whether
-        the column ``"input_ids"`` is present. The presence of that
-        field is the signal the trainer uses to skip
-        :class:`SFTPreprocessTransform` (chat-template rendering and
-        tokenisation) and feed rows directly to the data collator. The
-        method is defensive against unset sources, empty shard lists,
-        and shards yielding no rows.
-
-        Returns:
-            ``True`` when the first sample of the first shard contains
-            ``"input_ids"``; ``False`` otherwise.
-        """
-        if self._train_source is None:
-            return False
-        try:
-            sample = next(iter(self._train_source.open_shard(self._train_source.shard_names[0])))
-            return "input_ids" in sample
-        except (StopIteration, IndexError):
-            return False
+        """Assign a chat template through the shared helper (compatibility API)."""
+        apply_chat_template_path(tokenizer, chat_template_path)
 
     def _apply_preprocess_transforms(self) -> None:
         """Run the base preprocessor and optionally wrap the source in a packer.
@@ -373,37 +337,4 @@ class SFTTrainer(Trainer):
             ``(processed_batch, auxiliary_metrics)``.
         """
         batch, infos = super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
-
-        if "assistant_masks" in batch:
-            if "completion_mask" not in batch or not np.asarray(batch["completion_mask"]).any():
-                batch["completion_mask"] = batch["assistant_masks"]
-            batch.pop("assistant_masks", None)
-
-        attention_mask = batch.get("attention_mask")
-        completion_mask = batch.get("completion_mask")
-
-        if completion_mask is not None:
-            completion_mask_np = np.asarray(completion_mask)
-            if attention_mask is not None:
-                completion_mask_np = completion_mask_np * np.asarray(attention_mask)
-            completion_dtype = (
-                np.asarray(attention_mask).dtype if attention_mask is not None else completion_mask_np.dtype
-            )
-            batch["completion_mask"] = completion_mask_np.astype(completion_dtype, copy=False)
-
-            if "labels" not in batch and "input_ids" in batch:
-                labels = np.asarray(batch["input_ids"]).astype(np.int32, copy=True)
-                labels[completion_mask_np == 0] = -100
-                if attention_mask is not None:
-                    labels[np.asarray(attention_mask) == 0] = -100
-                batch["labels"] = labels
-
-        if "labels" in batch and "completion_mask" not in batch:
-            labels_np = np.asarray(batch["labels"])
-            if (labels_np == -100).any():
-                completion_mask_np = (labels_np != -100).astype(np.int32)
-                if attention_mask is not None:
-                    completion_mask_np = completion_mask_np * np.asarray(attention_mask)
-                batch["completion_mask"] = completion_mask_np
-
-        return batch, infos
+        return self._apply_assistant_supervision(batch, infos), infos

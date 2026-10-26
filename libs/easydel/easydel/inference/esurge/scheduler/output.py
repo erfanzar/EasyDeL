@@ -367,3 +367,6 @@ class SchedulerOutput:
 
     req_ids_per_rank: dict[int, list[str]] = field(default_factory=dict)
     """Scheduled request IDs grouped by their owning DP rank."""
+
+    pending_structured_output_tokens: bool = False
+    """True when a structured-output request still has unresolved async placeholders (set by ``AsyncScheduler``)."""

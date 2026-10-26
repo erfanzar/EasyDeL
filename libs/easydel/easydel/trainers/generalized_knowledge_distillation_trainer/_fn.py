@@ -35,6 +35,7 @@ from spectrax import with_sharding_constraint
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
+from ..distillation_trainer.loss_utils import fused_kl_vocab_parallel, resolve_kl_direction
 from ..training_utils import (
     ScheduledLossAdapter,
     bind_scheduled_module,
@@ -50,33 +51,6 @@ from ..training_utils import (
     update_metrics,
     update_state_respectfully,
 )
-
-
-def _stop_gradient_tree(tree):
-    """Detach a pytree by applying stop_gradient to every array leaf.
-
-    Args:
-        tree: PyTree to detach.
-
-    Returns:
-        PyTree with gradients stopped for all array leaves.
-    """
-
-    def _maybe_stop(x):
-        """Apply ``jax.lax.stop_gradient`` to JAX-array leaves only.
-
-        Args:
-            x: Pytree leaf (JAX array or Python value).
-
-        Returns:
-            ``x`` with ``stop_gradient`` applied if it is a JAX array,
-            otherwise unchanged.
-        """
-        if isinstance(x, jax.Array):
-            return jax.lax.stop_gradient(x)
-        return x
-
-    return jax.tree_util.tree_map(_maybe_stop, tree)
 
 
 def _ejkernel_gjsd_loss(
@@ -105,8 +79,6 @@ def _ejkernel_gjsd_loss(
     ejkernel applies the Hinton ``T**2`` factor; ``generalized_jsd_loss`` does not, so the
     result is divided by ``temperature ** 2`` (which also rescales the gradient correctly).
     """
-    from ejkernel.modules.operations import fused_kl_divergence as _fused_kl
-
     if mask is not None:
         weights = mask.astype(student_logits.dtype)
     elif labels is not None:
@@ -114,18 +86,12 @@ def _ejkernel_gjsd_loss(
     else:
         weights = None
 
-    if beta <= 0.0:
-        direction = "forward"
-    elif beta >= 1.0:
-        direction = "reverse"
-    else:
-        direction = "jsd"
+    direction = resolve_kl_direction(beta)
 
-    out = _fused_kl(
+    out = fused_kl_vocab_parallel(
         student_logits,
         teacher_logits,
         weights,
-        reduction="mean",
         direction=direction,
         temperature=temperature,
         beta=float(beta),
@@ -455,10 +421,7 @@ def _prepare_gkd_scheduled_batch(call) -> dict[str, tp.Any]:
         batch_argnums=1,
     )
     teacher_logits = np.asarray(jax.device_get(stop_gradient_tree(teacher_forward(teacher_model, constrained_batch))))
-    if isinstance(call.bound_arguments, dict):
-        call.bound_arguments["_gkd_teacher_logits"] = teacher_logits
-    else:  # pragma: no cover - ScheduledStepCall currently stores a dict.
-        batch["teacher_logits"] = teacher_logits
+    batch["teacher_logits"] = teacher_logits
     return batch
 
 
@@ -474,7 +437,7 @@ def _gkd_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
     """
     return scheduled_loss_cache_key(
         call,
-        value_fields=("beta", "temperature", "partition_spec"),
+        value_fields=("beta", "temperature", "partition_spec", "loss_config"),
         object_fields=("straight_through_emulator",),
     )
 
@@ -501,10 +464,9 @@ def _make_gkd_scheduled_loss(call):
 
         Args:
             tree: Student graphstate to differentiate against.
-            batch: Minibatch dict. Teacher logits are captured from
-                the auxiliary frozen-teacher forward as a host array so
-                the scheduled graph does not close over a full-mesh
-                sharded device constant.
+            batch: Minibatch dict including teacher logits as a dynamic
+                input, refreshed by the auxiliary frozen-teacher forward
+                for every step.
 
         Returns:
             The generalized JSD loss scalar.
@@ -513,9 +475,7 @@ def _make_gkd_scheduled_loss(call):
             with jax.named_scope("easydel/trainer/gkd/scheduled_loss/bind_module"):
                 module = bind_scheduled_module(call, tree)
                 model_batch = dict(batch)
-                teacher_logits = call.get("_gkd_teacher_logits")
-                if teacher_logits is None:
-                    teacher_logits = model_batch.get("teacher_logits")
+                teacher_logits = model_batch.get("teacher_logits")
                 if teacher_logits is None:
                     raise RuntimeError("GKD scheduled MPMD loss requires precomputed teacher_logits.")
                 model_batch.pop("teacher_logits", None)

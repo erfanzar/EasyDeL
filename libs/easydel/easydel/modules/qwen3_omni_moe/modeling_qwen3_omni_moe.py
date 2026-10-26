@@ -49,6 +49,7 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
     BaseModelOutput,
     DecoderLayerOutput,
+    EmbeddingInfo,
     ModelOutput,
     MoeCausalLMOutput,
     VLMCausalLMOutput,
@@ -65,16 +66,18 @@ from easydel.layers import (
     RMSNorm,
     RowParallelLinear,
     RowParallelMoELinear,
-    dense_gate_up_layout,
     dense_qkv_layout,
-    gated_mlp_forward,
     moe_down_projection_reform_param,
     moe_fused_gate_up_reform_param,
-    split_fused_gate_up_projection,
 )
-from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention, block_diagonal_bias
+from easydel.layers.mlp import GatedMLP, moe_gated_expert_forward
 from easydel.layers.norms import LayerNorm
-from easydel.layers.rotary import apply_rope_split_half
+from easydel.layers.rotary import (
+    apply_rope_split_half,
+    vision_grid_pos_embed_interpolate,
+    vision_grid_rotary_embeddings,
+)
 from easydel.modules._base import BaseConditionalGenerationModule, BaseVisionLanguageModule
 
 from .qwen3_omni_moe_configuration import (
@@ -90,25 +93,23 @@ from .qwen3_omni_moe_configuration import (
     Qwen3OmniMoeVisionConfig,
     Qwen3OmniMoeVisionEncoderConfig,
 )
+from .rope_utils import build_omni_rope_positions, build_omni_rope_positions_traced
 
 
 @auto_pytree
 class Qwen3OmniMoeCausalLMOutputWithPast(ModelOutput):
-    """Output class for Qwen3OmniMoe causal language model.
-
-    Contains model outputs including logits, hidden states, attention weights,
-    and multimodal embeddings from audio and image encoders.
+    """Multimodal causal-LM outputs with optional audio, vision, and router features.
 
     Attributes:
-        loss (Array | None): Language modeling loss if labels provided.
-        logits (Array): Prediction scores from language model head.
-        past_key_values (list[Array] | None): Cached key-value states for generation.
-        hidden_states (tuple[Array] | None): Hidden states from all layers if requested.
-        attentions (tuple[Array] | None): Attention weights from all layers if requested.
-        rope_deltas (Array | None): RoPE position deltas for multimodal inputs.
-        image_hidden_states (Array | None): Encoded image features [batch, seq_len, hidden_dim].
-        audio_hidden_states (Array | None): Encoded audio features [batch, seq_len, hidden_dim].
-        router_logits (tuple[Array] | None): Router logits from MoE layers if requested.
+        loss: Language-model loss when labels are supplied.
+        logits: Vocabulary prediction scores.
+        past_key_values: Cached key/value states for generation.
+        hidden_states: Optional hidden states from the decoder layers.
+        attentions: Optional per-layer attention weights.
+        rope_deltas: Multimodal RoPE position offsets.
+        image_hidden_states: Encoded image features.
+        audio_hidden_states: Encoded audio features.
+        router_logits: Optional per-layer expert-routing logits.
     """
 
     loss: Array | None = None
@@ -123,11 +124,7 @@ class Qwen3OmniMoeCausalLMOutputWithPast(ModelOutput):
 
 
 class Qwen3OmniMoeAudioMLP(spx.Module):
-    """Feed-forward network for audio encoder.
-
-    Implements a two-layer feedforward network with configurable activation
-    function for processing audio features in the audio encoder.
-    """
+    """Two-layer audio feed-forward network, also shared by the encoder layers."""
 
     def __init__(
         self,
@@ -138,15 +135,14 @@ class Qwen3OmniMoeAudioMLP(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
-        """Initialize audio encoder MLP.
+        """Initialize the audio feed-forward projections.
 
         Args:
-            config (Qwen3OmniMoeAudioConfig): Audio encoder configuration with
-                d_model and encoder_ffn_dim parameters.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
+            config: Audio dimensions and activation configuration.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: Matmul precision.
+            rngs: Parameter initialization streams.
         """
         self.fc1 = ColumnParallelLinear(
             config.d_model,
@@ -169,13 +165,13 @@ class Qwen3OmniMoeAudioMLP(spx.Module):
         self.act = ACT2FN[config.activation_function]
 
     def forward(self, hidden_states: Array) -> Array:
-        """Apply feedforward transformation to audio features.
+        """Apply the feed-forward transform, preserving the input hidden dimension.
 
         Args:
-            hidden_states: Input tensor [batch, seq_len, d_model].
+            hidden_states: Input audio states of shape [batch, seq_len, d_model].
 
         Returns:
-            Transformed hidden states [batch, seq_len, d_model].
+            Transformed states with the same shape.
         """
         return self.fc2(self.act(self.fc1(hidden_states)))
 
@@ -226,7 +222,7 @@ class Qwen3OmniMoeAudioAttention(spx.Module):
         self.k_proj = ColumnParallelLinear(
             self.d_model,
             self.d_model,
-            use_bias=False,
+            use_bias=True,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -302,7 +298,7 @@ class Qwen3OmniMoeAudioAttention(spx.Module):
             key_states=k,
             value_states=v,
             mode=common_types.MODE_TRAIN,
-            attention_mask=attention_mask,
+            mask_info=MaskInfo.from_attention_mask(attention_mask) if attention_mask is not None else None,
             causal=False,
         ).attention_outputs
 
@@ -321,7 +317,7 @@ class Qwen3OmniMoeAudioAttention(spx.Module):
         return typing.cast(Array, attn_output)
 
 
-class Qwen3OmniMoeAudioEncoderLayer(spx.Module):
+class Qwen3OmniMoeAudioEncoderLayer(Qwen3OmniMoeAudioMLP):
     """Transformer layer for audio encoder.
 
     Implements a single transformer layer with pre-normalization architecture,
@@ -412,7 +408,7 @@ class Qwen3OmniMoeAudioEncoderLayer(spx.Module):
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.fc2(self.act(self.fc1(hidden_states)))
+        hidden_states = super().forward(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
@@ -589,22 +585,63 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
             BaseModelOutput with encoded audio features.
         """
 
-        hidden_states = input_features.transpose(0, 2, 1)[..., None]
+        batch_size, mel_bins, time = input_features.shape
+        chunk_size = 2 * self.n_window
+        if chunk_size <= 0 or self.conv_chunksize <= 0 or self.n_window_infer < chunk_size:
+            raise ValueError("Audio windows and conv_chunksize must be positive; n_window_infer must cover a chunk.")
+        if feature_lens is None:
+            feature_lens = (
+                jnp.sum(attention_mask, axis=-1, dtype=jnp.int32)
+                if attention_mask is not None
+                else jnp.full((batch_size,), time, dtype=jnp.int32)
+            )
+        feature_lens = jnp.clip(jnp.asarray(feature_lens, dtype=jnp.int32), 0, time)
+        valid_frames = jnp.arange(time)[None, :] < feature_lens[:, None]
+        if attention_mask is not None:
+            valid_frames = valid_frames & attention_mask.astype(jnp.bool_)
+        input_features = jnp.where(valid_frames[:, None, :], input_features, 0)
 
-        hidden_states = jax.nn.gelu(self.conv2d1(hidden_states))
-        hidden_states = jax.nn.gelu(self.conv2d2(hidden_states))
-        hidden_states = jax.nn.gelu(self.conv2d3(hidden_states))
-
+        # Static padded chunks keep the encoder JIT-compatible even when lengths are traced.
+        num_chunks = (time + chunk_size - 1) // chunk_size
+        conv_chunk_size = min(time, chunk_size)
+        padded = jnp.pad(input_features, ((0, 0), (0, 0), (0, num_chunks * conv_chunk_size - time)))
+        chunks = padded.reshape(batch_size, mel_bins, num_chunks, conv_chunk_size)
+        chunks = chunks.transpose(0, 2, 3, 1).reshape(batch_size * num_chunks, conv_chunk_size, mel_bins, 1)
+        # HF pads every chunk to the longest *actual* chunk in the batch, not
+        # the padded input width. Keep static shapes, but reproduce that common
+        # convolution boundary after every stage so out-of-bound activations
+        # (including bias and the last valid frame's receptive field) cannot feed
+        # back into retained positions at the next stage. Do not mask to each
+        # chunk's own length: HF retains padding activations up to the batch max.
+        conv_extent = jnp.minimum(jnp.max(feature_lens), conv_chunk_size)
+        conv_outputs = []
+        for start in range(0, chunks.shape[0], self.conv_chunksize):
+            chunk = chunks[start : start + self.conv_chunksize].astype(self.dtype)
+            extent = conv_extent
+            for conv in (self.conv2d1, self.conv2d2, self.conv2d3):
+                # The checkpoint's CNN uses exact GELU, independently of the
+                # configurable transformer/projection activation.
+                chunk = jax.nn.gelu(conv(chunk), approximate=False)
+                extent = (extent + 1) // 2
+                inside_extent = jnp.arange(chunk.shape[1]) < extent
+                chunk = jnp.where(inside_extent[None, :, None, None], chunk, 0)
+            conv_outputs.append(chunk)
+        hidden_states = jnp.concatenate(conv_outputs, axis=0)
         b, t, f, c = hidden_states.shape
-        hidden_states = hidden_states.reshape(b, t, f * c)
-
+        # HF flattens [channels, frequency], not [frequency, channels].
+        hidden_states = hidden_states.transpose(0, 1, 3, 2).reshape(b, t, c * f)
         hidden_states = self.conv_out(hidden_states)
-
-        seq_len = hidden_states.shape[1]
-        pos_emb = create_sinusoidal_positions(seq_len, self.d_model).astype(hidden_states.dtype)
+        pos_emb = create_sinusoidal_positions(t, self.d_model).astype(hidden_states.dtype)
         hidden_states = hidden_states + pos_emb[None, :, :]
+        hidden_states = hidden_states.reshape(batch_size, num_chunks * t, self.d_model)
 
-        # Note: For simplicity, we process without cu_seqlens chunking
+        chunk_lengths = jnp.clip(feature_lens[:, None] - jnp.arange(num_chunks)[None, :] * chunk_size, 0, chunk_size)
+        encoded_lengths = (chunk_lengths + 7) // 8
+        valid_tokens = (jnp.arange(t)[None, None, :] < encoded_lengths[..., None]).reshape(batch_size, -1)
+        window_size = t * (self.n_window_infer // chunk_size)
+        window_ids = jnp.arange(num_chunks * t) // window_size
+        attention_mask = (window_ids[:, None] == window_ids[None, :])[None, None, :, :] & valid_tokens[:, None, None, :]
+
         def _layer_loop(layer, carry):
             """Apply a single audio-encoder layer inside the layer-stack scan.
 
@@ -623,12 +660,14 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, 0),
             trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs("audio"),
         )
         hidden_states = self.ln_post(hidden_states)
 
         hidden_states = self.proj1(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.proj2(hidden_states)
+        hidden_states = jnp.where(valid_tokens[..., None], hidden_states, 0)
 
         return BaseModelOutput(last_hidden_state=hidden_states)
 
@@ -678,6 +717,30 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
         return self.conv2d1
 
 
+def _encode_audio_for_merging(audio_tower, input_features, feature_lens=None, feature_attention_mask=None):
+    """Encode audio and compact valid tokens before text-placeholder merging.
+
+    The static-sized tail is unused by placeholder merging; valid tokens from every
+    sample must precede it rather than leaving padding between different samples.
+    """
+    if feature_lens is None:
+        feature_lens = (
+            jnp.sum(feature_attention_mask, axis=-1, dtype=jnp.int32)
+            if feature_attention_mask is not None
+            else jnp.full((input_features.shape[0],), input_features.shape[-1], dtype=jnp.int32)
+        )
+    features = audio_tower(
+        input_features, feature_lens=feature_lens, attention_mask=feature_attention_mask
+    ).last_hidden_state
+    chunk_size = 2 * audio_tower.n_window
+    lengths = jnp.clip(jnp.asarray(feature_lens), 0, input_features.shape[-1])
+    output_lengths = (lengths // chunk_size) * ((chunk_size + 7) // 8) + (lengths % chunk_size + 7) // 8
+    valid = jnp.arange(features.shape[1])[None, :] < output_lengths[:, None]
+    flat_features = features.reshape(-1, features.shape[-1])
+    indices = jnp.nonzero(valid.reshape(-1), size=flat_features.shape[0], fill_value=0)[0]
+    return flat_features[indices], jnp.sum(output_lengths, dtype=jnp.int32)
+
+
 def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
     """Build a block-diagonal additive attention mask from a cu_seqlens vector.
 
@@ -701,15 +764,8 @@ def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) 
         Additive mask of shape ``(1, seq_length, seq_length)`` ready to
         be broadcast across attention heads.
     """
-    # Segment-id comparison instead of slicing by ``cu_seqlens`` values: the values are traced when
-    # the vision blocks run under ``lax.scan``, and dynamic slice bounds cannot be traced.
-    cu_seqlens = jnp.asarray(cu_seqlens, dtype=jnp.int32)
-    positions = jnp.arange(seq_length, dtype=jnp.int32)
-    segment_ids = jnp.searchsorted(cu_seqlens[1:], positions, side="right")
-    segment_ids = jnp.where(positions < cu_seqlens[-1], segment_ids, -1)
-    same_block = (segment_ids[:, None] == segment_ids[None, :]) & (segment_ids[:, None] >= 0)
-    attention_mask = jnp.where(same_block, jnp.zeros((), dtype), jnp.finfo(dtype).min).astype(dtype)
-    return attention_mask[None]
+    # Shared segment-membership mask (no slicing by traced ``cu_seqlens`` values, so it runs under ``lax.scan``).
+    return block_diagonal_bias(jnp.asarray(cu_seqlens, dtype=jnp.int32), seq_length, dtype)
 
 
 class Qwen3OmniMoeVisionPatchEmbed(spx.Module):
@@ -1181,8 +1237,6 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
         head_dim = config.hidden_size // config.num_heads
         self._head_dim_ro = head_dim // 2
 
-        self._rotary_dim = head_dim // 2
-
         self.blocks = nn.ModuleList([])
         for idx in range(config.depth):
             with self.assign_layer_stage(idx, total_layers=config.depth):
@@ -1210,31 +1264,9 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
 
     def fast_pos_embed_interpolate(self, grid_thw: Array) -> Array:
         """Interpolate learned positions and reorder patches into spatial-merge blocks."""
-        merge_size = self.spatial_merge_size
-        side = self.num_grid_per_side
-        positions = []
-        for t, h, w in grid_thw:
-            t, h, w = int(t), int(h), int(w)
-            h_grid = jnp.linspace(0, side - 1, h)
-            w_grid = jnp.linspace(0, side - 1, w)
-            h_floor = jnp.floor(h_grid).astype(jnp.int32)
-            w_floor = jnp.floor(w_grid).astype(jnp.int32)
-            h_ceil = jnp.minimum(h_floor + 1, side - 1)
-            w_ceil = jnp.minimum(w_floor + 1, side - 1)
-            dh = h_grid - h_floor
-            dw = w_grid - w_floor
-
-            corners = (
-                (h_floor[:, None] * side + w_floor[None, :], (1 - dh)[:, None] * (1 - dw)[None, :]),
-                (h_floor[:, None] * side + w_ceil[None, :], (1 - dh)[:, None] * dw[None, :]),
-                (h_ceil[:, None] * side + w_floor[None, :], dh[:, None] * (1 - dw)[None, :]),
-                (h_ceil[:, None] * side + w_ceil[None, :], dh[:, None] * dw[None, :]),
-            )
-            pos_embed = sum(self.pos_embed(idx.reshape(-1)) * weight.reshape(-1, 1) for idx, weight in corners)
-            pos_embed = pos_embed.reshape(h // merge_size, merge_size, w // merge_size, merge_size, -1)
-            pos_embed = jnp.transpose(pos_embed, (0, 2, 1, 3, 4)).reshape(h * w, -1)
-            positions.append(jnp.tile(pos_embed, (t, 1)))
-        return jnp.concatenate(positions, axis=0)
+        return vision_grid_pos_embed_interpolate(
+            self.pos_embed, grid_thw, self.num_grid_per_side, self.spatial_merge_size
+        )
 
     def rot_pos_emb(self, grid_thw: Array, max_grid_size: int) -> Array:
         """Compute 2-D RoPE frequencies for the packed vision tokens.
@@ -1258,38 +1290,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
             ``(total_tokens, head_dim_ro)`` where ``total_tokens`` is
             the sum of ``T * H * W`` over the batch.
         """
-        pos_ids = []
-        for t, h, w in grid_thw:
-            hpos_ids = jnp.arange(h)[:, None]
-            hpos_ids = jnp.broadcast_to(hpos_ids, (h, w))
-            hpos_ids = hpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            hpos_ids = jnp.transpose(hpos_ids, (0, 2, 1, 3)).flatten()
-
-            wpos_ids = jnp.arange(w)[None, :]
-            wpos_ids = jnp.broadcast_to(wpos_ids, (h, w))
-            wpos_ids = wpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            wpos_ids = jnp.transpose(wpos_ids, (0, 2, 1, 3)).flatten()
-
-            stacked = jnp.stack([hpos_ids, wpos_ids], axis=-1)
-            pos_ids.append(jnp.tile(stacked, (int(t), 1)))
-
-        pos_ids = jnp.concatenate(pos_ids, axis=0)
-        rotary_pos_emb_full = jnp.outer(
-            jnp.arange(0, max_grid_size, dtype="f4"),
-            1.0 / (10000 ** (jnp.arange(0, self._head_dim_ro, 2, dtype="f4") / self._head_dim_ro)),
-        )
-        rotary_pos_emb = jnp.take(rotary_pos_emb_full, pos_ids, axis=0)
-        return rotary_pos_emb.reshape(pos_ids.shape[0], -1)
+        return vision_grid_rotary_embeddings(grid_thw, max_grid_size, self._head_dim_ro, self.spatial_merge_size)
 
     def forward(
         self,
@@ -1337,6 +1338,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, 0),
             trace=not self.config.scan_layers or self._pipeline_stage_count() > 1 or bool(self.deepstack_visual_indexes),
+            **self._layer_scan_kwargs("vision"),
         )
         return typing.cast(Array, self.merger(hidden_states)), deepstack_features
 
@@ -1380,7 +1382,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
         return self.patch_embed
 
 
-class Qwen3OmniMoeTextMLP(spx.Module):
+class Qwen3OmniMoeTextMLP(GatedMLP):
     """Dense MLP for non-MoE layers in Qwen3OmniMoe text decoder.
 
     Implements the feedforward network with SwiGLU activation function
@@ -1395,58 +1397,29 @@ class Qwen3OmniMoeTextMLP(spx.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: spx.Rngs,
+        intermediate_size: int | None = None,
+        kernel_init=None,
     ):
-        """Initialize text decoder MLP.
+        """Initialize the shared gated MLP with the submodel's width and initializer.
 
         Args:
-            config (Qwen3OmniMoeTextConfig): Text decoder configuration.
+            config (Qwen3OmniMoeTextConfig): Submodel dimensions and activation.
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             rngs (spx.Rngs): Random number generator state.
+            intermediate_size: Optional shared-expert width override.
+            kernel_init: Projection initializer. Defaults to normal(config.initializer_range).
         """
-        self.config = config
-        self.gate_up_proj = ColumnParallelLinear(
-            config.hidden_size,
-            (config.intermediate_size, config.intermediate_size),
+        super().__init__(
+            config,
             dtype=dtype,
             param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            layout=dense_gate_up_layout(config.intermediate_size),
+            intermediate_size=intermediate_size,
+            kernel_init=kernel_init,
         )
-        self.down_proj = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    @property
-    def reform_param(self):
-        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
-
-    def forward(self, hidden_states: Array) -> Array:
-        """Apply SwiGLU feedforward transformation.
-
-        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
-        supported layouts through the ejkernel fused MLP kernels and runs
-        the legacy composition otherwise.
-
-        Args:
-            hidden_states: Input tensor [batch, seq_len, hidden_dim].
-
-        Returns:
-            Transformed hidden states [batch, seq_len, hidden_dim].
-        """
-        return gated_mlp_forward(self, hidden_states)
 
 
 class Qwen3OmniMoeMLPStack(spx.Module):
@@ -1524,9 +1497,7 @@ class Qwen3OmniMoeMLPStack(spx.Module):
         Returns:
             Transformed hidden states after MoE MLP processing.
         """
-        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
-        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
+        return moe_gated_expert_forward(self, hidden_states, group_sizes, sorted_experts)
 
 
 class Qwen3OmniMoeTextSparseBlock(BaseMoeModule):
@@ -1651,6 +1622,13 @@ class Qwen3OmniMoeTextAttention(UnifiedAttention):
             sliding_window=sliding_window,
             use_qk_norm=True,
         )
+
+    def _apply_rotary(self, query_states, key_states, position_ids, frequencies=None):
+        """Keep fractional video timestamps on the direct mRoPE frequency path."""
+        if jnp.issubdtype(position_ids.dtype, jnp.floating):
+            # Integer lookup tables cannot represent timed video coordinates.
+            frequencies = None
+        return super()._apply_rotary(query_states, key_states, position_ids, frequencies)
 
     def _postprocess_qkv(self, query_states, key_states, value_states):
         """Apply Q/K normalization after computing query, key, and value projections.
@@ -1865,7 +1843,7 @@ class Qwen3OmniMoeTalkerResizeMLP(spx.Module):
         return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_states)))
 
 
-class Qwen3OmniMoeTalkerTextMLP(spx.Module):
+class Qwen3OmniMoeTalkerTextMLP(Qwen3OmniMoeTextMLP):
     """Dense MLP for Talker text model.
 
     Implements the feedforward network with SwiGLU activation function
@@ -1893,129 +1871,18 @@ class Qwen3OmniMoeTalkerTextMLP(spx.Module):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             rngs (spx.Rngs): Random number generator state.
         """
-        self.config = config
-        imz = intermediate_size or config.intermediate_size
-        self.gate_up_proj = ColumnParallelLinear(
-            config.hidden_size,
-            (imz, imz),
+        super().__init__(
+            config,
             dtype=dtype,
             param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            layout=dense_gate_up_layout(imz),
+            intermediate_size=intermediate_size,
         )
-        self.down_proj = RowParallelLinear(
-            imz,
-            config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    @property
-    def reform_param(self):
-        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
-
-    def forward(self, hidden_states: Array) -> Array:
-        """Apply SwiGLU feedforward transformation.
-
-        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
-        supported layouts through the ejkernel fused MLP kernels and runs
-        the legacy composition otherwise.
-
-        Args:
-            hidden_states: Input tensor [batch, seq_len, hidden_dim].
-
-        Returns:
-            Transformed hidden states [batch, seq_len, hidden_dim].
-        """
-        return gated_mlp_forward(self, hidden_states)
 
 
-class Qwen3OmniMoeTalkerMLPStack(spx.Module):
-    """Stacked MoE MLP module for Talker using ParallelMoELinear layers.
-
-    Implements the expert MLP stack with SwiGLU activation function for
-    the Talker's MoE layers.
-    """
-
-    def __init__(
-        self,
-        config: Qwen3OmniMoeTalkerTextConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: spx.Rngs,
-    ):
-        """Initialize Talker MoE MLP stack.
-
-        Args:
-            config (Qwen3OmniMoeTalkerTextConfig): Talker text configuration with MoE parameters.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-        """
-        self.config = config
-        self.gate_up_proj = ColumnParallelMoELinear(
-            num_experts=config.num_experts,
-            in_features=config.hidden_size,
-            out_features=2 * config.moe_intermediate_size,
-            rngs=rngs,
-            kernel_init=jax.nn.initializers.normal(),
-            use_bias=False,
-            partition_manager=config.runtime_sharding_resolver,
-            use_expert_tensor_mode=config.use_expert_tensor_mode,
-            dtype=dtype,
-            param_dtype=param_dtype,
-        )
-        self.down_proj = RowParallelMoELinear(
-            num_experts=config.num_experts,
-            in_features=config.moe_intermediate_size,
-            out_features=config.hidden_size,
-            rngs=rngs,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(),
-            partition_manager=config.runtime_sharding_resolver,
-            use_expert_tensor_mode=config.use_expert_tensor_mode,
-            dtype=dtype,
-            param_dtype=param_dtype,
-        )
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    @property
-    def reform_param(self):
-        return {
-            **moe_fused_gate_up_reform_param(config=self.config),
-            **moe_down_projection_reform_param(),
-        }
-
-    def forward(
-        self,
-        hidden_states: Array,
-        group_sizes: Array,
-        sorted_experts: Array | None = None,
-    ) -> Array:
-        """Apply SwiGLU feedforward transformation through MoE experts.
-
-        Args:
-            hidden_states: Input tensor after expert routing.
-            group_sizes: Array specifying the number of tokens routed to each expert.
-            sorted_experts: Optional array of sorted expert indices.
-
-        Returns:
-            Transformed hidden states after MoE MLP processing.
-        """
-        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
-        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
+class Qwen3OmniMoeTalkerMLPStack(Qwen3OmniMoeMLPStack):
+    """Talker experts sharing the Thinker expert implementation and checkpoint layout."""
 
 
 class Qwen3OmniMoeTalkerTextSparseMoeBlock(BaseMoeModule):
@@ -2324,73 +2191,8 @@ class Qwen3OmniMoeTalkerTextDecoderLayer(spx.Module):
         )
 
 
-class Qwen3OmniMoeTalkerCodePredictorMLP(spx.Module):
-    """Dense MLP for Talker code predictor.
-
-    Implements the feedforward network with SwiGLU activation function
-    for the code predictor (non-MoE) layers.
-    """
-
-    def __init__(
-        self,
-        config: Qwen3OmniMoeTalkerCodePredictorConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: spx.Rngs,
-    ):
-        """Initialize code predictor MLP.
-
-        Args:
-            config (Qwen3OmniMoeTalkerCodePredictorConfig): Code predictor configuration.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-        """
-        self.config = config
-        self.gate_up_proj = ColumnParallelLinear(
-            config.hidden_size,
-            (config.intermediate_size, config.intermediate_size),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-            layout=dense_gate_up_layout(config.intermediate_size),
-        )
-        self.down_proj = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    @property
-    def reform_param(self):
-        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
-
-    def forward(self, hidden_states: Array) -> Array:
-        """Apply SwiGLU feedforward transformation.
-
-        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
-        supported layouts through the ejkernel fused MLP kernels and runs
-        the legacy composition otherwise.
-
-        Args:
-            hidden_states: Input tensor [batch, seq_len, hidden_dim].
-
-        Returns:
-            Transformed hidden states [batch, seq_len, hidden_dim].
-        """
-        return gated_mlp_forward(self, hidden_states)
+class Qwen3OmniMoeTalkerCodePredictorMLP(Qwen3OmniMoeTextMLP):
+    """Code-predictor SwiGLU block sharing the text MLP implementation and checkpoint layout."""
 
 
 class Qwen3OmniMoeTalkerCodePredictorAttention(UnifiedAttention):
@@ -2765,6 +2567,7 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
 
@@ -2772,6 +2575,7 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
+            past_key_values=past_key_values,
         )
 
     def get_encoder(self):
@@ -2932,6 +2736,7 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(
             logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            past_key_values=outputs.past_key_values,
             last_hidden_state=outputs.last_hidden_state,
         )
 
@@ -3185,6 +2990,7 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
 
@@ -3331,6 +3137,8 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         output_hidden_states: bool = False,
         output_router_logits: bool = False,
         apply_codec_head: bool = True,
+        thinker_inputs_embeds: Float[Array, "batch seq_len thinker_hidden_dim"] | None = None,
+        thinker_multimodal_mask: Bool[Array, "batch seq_len"] | None = None,
     ) -> MoeCausalLMOutput:
         """Forward pass through the full Talker model.
 
@@ -3351,12 +3159,24 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             output_hidden_states: Whether to return all hidden states.
             output_router_logits: Whether to return MoE router logits.
             apply_codec_head: Whether to apply the codec head for logits.
+            thinker_inputs_embeds: Thinker token embeddings, projected with text_projection.
+            thinker_multimodal_mask: Select hidden_projection for multimodal tokens and
+                text_projection for text tokens when both thinker inputs are provided.
 
         Returns:
             MoeCausalLMOutput with codec logits and optional intermediate outputs.
         """
-        if thinker_hidden_states is not None and inputs_embeds is None:
-            inputs_embeds = self.text_projection(thinker_hidden_states)
+        if inputs_embeds is None:
+            if thinker_hidden_states is not None:
+                inputs_embeds = self.hidden_projection(thinker_hidden_states)
+            if thinker_inputs_embeds is not None:
+                text_embeds = self.text_projection(thinker_inputs_embeds)
+                if inputs_embeds is not None:
+                    if thinker_multimodal_mask is None:
+                        raise ValueError("thinker_multimodal_mask is required when both Thinker inputs are supplied.")
+                    inputs_embeds = jnp.where(thinker_multimodal_mask[..., None], inputs_embeds, text_embeds)
+                else:
+                    inputs_embeds = text_embeds
 
         outputs = self.model(
             input_ids=input_ids,
@@ -3472,7 +3292,7 @@ class Qwen3OmniMoeCode2WavLayerScale(spx.Module):
         return x * self.weight.value.astype(self.dtype)
 
 
-class Qwen3OmniMoeCode2WavMLP(spx.Module):
+class Qwen3OmniMoeCode2WavMLP(Qwen3OmniMoeTextMLP):
     """SwiGLU feed-forward block used inside the Code2Wav transformer.
 
     Implements the standard ``down_proj(act(gate_proj(x)) * up_proj(x))``
@@ -3501,46 +3321,25 @@ class Qwen3OmniMoeCode2WavMLP(spx.Module):
             precision: JAX numerical precision.
             rngs: Random number generator state.
         """
-        self.config = config
-        self.gate_up_proj = ColumnParallelLinear(
-            config.hidden_size,
-            (config.intermediate_size, config.intermediate_size),
+        super().__init__(
+            config,
             dtype=dtype,
             param_dtype=param_dtype,
-            use_bias=False,
             precision=precision,
             rngs=rngs,
-            layout=dense_gate_up_layout(config.intermediate_size),
+            # Preserve Code2Wav's default ParallelLinear initializer, not the text normal initializer.
+            kernel_init=jax.nn.initializers.lecun_normal(),
         )
-        self.down_proj = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.act_fn = ACT2FN[config.hidden_act]
 
-    @property
-    def reform_param(self):
-        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
-    def forward(self, hidden_states: Array) -> Array:
-        """Apply gated MLP: down_proj(act(gate_proj(x)) * up_proj(x)).
-
-        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
-        supported layouts through the ejkernel fused MLP kernels and runs
-        the legacy composition otherwise.
-
-        Args:
-            hidden_states: Input hidden states.
-
-        Returns:
-            Transformed hidden states with same hidden dimension.
-        """
-        return gated_mlp_forward(self, hidden_states)
+def _code2wav_position_embeddings(config, hidden_states, position_ids=None):
+    """Build full-width split-half RoPE tables for the Code2Wav sequence."""
+    if position_ids is None:
+        position_ids = jnp.broadcast_to(jnp.arange(hidden_states.shape[1]), hidden_states.shape[:2])
+    inv_freq = config.rope_theta ** (-jnp.arange(0, config.head_dim, 2, dtype=jnp.float32) / config.head_dim)
+    phases = position_ids.astype(jnp.float32)[..., None] * inv_freq
+    phases = jnp.concatenate((phases, phases), axis=-1)
+    return jnp.cos(phases), jnp.sin(phases)
 
 
 class Qwen3OmniMoeCode2WavAttention(spx.Module):
@@ -3617,18 +3416,25 @@ class Qwen3OmniMoeCode2WavAttention(spx.Module):
             requires_cache=False,  # Code2Wav encoder doesn't need KV cache
         )
 
+    @property
+    def reform_param(self):
+        """Expose HF split-QKV checkpoint conversion on the projection owner."""
+        return self.qkv_proj.build_reform_param("qkv_proj", config=self.config)
+
     def forward(
         self,
         hidden_states: Array,
         attention_mask: Array | None = None,
         position_ids: Array | None = None,
+        position_embeddings: tuple[Array, Array] | None = None,
     ) -> Array:
         """Apply sliding window causal attention.
 
         Args:
             hidden_states: Input hidden states [batch, seq_len, hidden_dim].
             attention_mask: Optional attention mask.
-            position_ids: Optional position IDs (unused, included for interface compatibility).
+            position_ids: Optional per-token rotary position IDs.
+            position_embeddings: Optional shared cosine/sine tables from the transformer trunk.
 
         Returns:
             Attention output with same shape as input hidden states.
@@ -3657,20 +3463,30 @@ class Qwen3OmniMoeCode2WavAttention(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
+        cos, sin = (
+            _code2wav_position_embeddings(self.config, hidden_states, position_ids)
+            if position_embeddings is None
+            else position_embeddings
+        )
+        q = apply_rope_split_half(q, cos, sin)
+        k = apply_rope_split_half(k, cos, sin)
+
         if self.sliding_window is not None:
             causal_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
             window_mask = jnp.triu(jnp.ones((seq_len, seq_len), dtype=jnp.bool_), k=-self.sliding_window + 1)
-            mask = causal_mask & window_mask
+            mask = (causal_mask & window_mask)[None, None, :, :]
             if attention_mask is not None:
-                mask = mask & attention_mask
-            attention_mask = mask
+                if attention_mask.ndim == 2:
+                    attention_mask = attention_mask[:, None, None, :]
+                mask = mask & attention_mask.astype(jnp.bool_)
+            attention_mask = jnp.broadcast_to(mask, (batch_size, mask.shape[1], seq_len, seq_len))
 
         attn_output = self.attention.forward(
             query_states=q,
             key_states=k,
             value_states=v,
             mode=common_types.MODE_TRAIN,
-            attention_mask=attention_mask,
+            mask_info=MaskInfo.from_attention_mask(attention_mask) if attention_mask is not None else None,
             causal=True,
         ).attention_outputs
 
@@ -3768,15 +3584,12 @@ class Qwen3OmniMoeCode2WavTransformerLayer(spx.Module):
             rngs=rngs,
         )
 
-    @property
-    def reform_param(self):
-        return self.qkv_proj.build_reform_param("qkv_proj", config=self.config)
-
     def forward(
         self,
         hidden_states: Array,
         attention_mask: Array | None = None,
         position_ids: Array | None = None,
+        position_embeddings: tuple[Array, Array] | None = None,
     ) -> Array:
         """Run pre-norm transformer layer with LayerScale on both residual branches.
 
@@ -3790,7 +3603,7 @@ class Qwen3OmniMoeCode2WavTransformerLayer(spx.Module):
         """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        attn_output = self.self_attn(hidden_states, attention_mask, position_ids)
+        attn_output = self.self_attn(hidden_states, attention_mask, position_ids, position_embeddings)
         hidden_states = residual + self.self_attn_layer_scale(attn_output)
 
         residual = hidden_states
@@ -3880,6 +3693,7 @@ class Qwen3OmniMoeCode2WavTransformerModel(EasyDeLLayerStackMixin, spx.Module):
             BaseModelOutput with normalized last hidden state.
         """
         hidden_states = inputs_embeds
+        position_embeddings = _code2wav_position_embeddings(self.config, hidden_states, position_ids)
 
         def _layer_loop(layer, carry):
             """Apply a single code-predictor decoder layer inside the layer-stack scan.
@@ -3891,7 +3705,7 @@ class Qwen3OmniMoeCode2WavTransformerModel(EasyDeLLayerStackMixin, spx.Module):
             """
             hidden_states, idx = carry
             with self._layer_stage_context(idx, layers=self.layers):
-                hidden_states = layer(hidden_states, attention_mask, position_ids)
+                hidden_states = layer(hidden_states, attention_mask, position_ids, position_embeddings)
             hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.layers)
 
             return hidden_states, idx + 1
@@ -3900,6 +3714,7 @@ class Qwen3OmniMoeCode2WavTransformerModel(EasyDeLLayerStackMixin, spx.Module):
             _layer_loop,
             (hidden_states, 0),
             trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
 
@@ -4039,11 +3854,14 @@ def _visual_deepstack_embeddings(
     video_max_grid_size: int | None,
     image_token_id: int,
     video_token_id: int,
+    image_embeds: Array | None = None,
+    video_embeds: Array | None = None,
+    image_deepstack: list[Array] | None = None,
+    video_deepstack: list[Array] | None = None,
 ) -> tuple[Array | None, Array | None, Array | None, list[Array] | None]:
-    """Collect visual features and align intermediate features to visual token positions."""
-    image_embeds = video_embeds = None
-    image_deepstack = video_deepstack = None
-    image_mask = video_mask = None
+    """Collect raw/cached visual features and align every intermediate residual."""
+    image_mask = input_ids == image_token_id if image_embeds is not None else None
+    video_mask = input_ids == video_token_id if video_embeds is not None else None
     if pixel_values is not None:
         if image_grid_thw is None:
             raise ValueError("`image_grid_thw` must be provided when `pixel_values` is not None.")
@@ -4059,6 +3877,11 @@ def _visual_deepstack_embeddings(
         video_embeds, video_deepstack = visual(pixel_values_videos, video_grid_thw, video_max_grid_size)
         video_mask = input_ids == video_token_id
 
+    image_deepstack = [] if image_deepstack is None else image_deepstack
+    video_deepstack = [] if video_deepstack is None else video_deepstack
+    for features, residuals in ((image_embeds, image_deepstack), (video_embeds, video_deepstack)):
+        if residuals and (features is None or any(layer.shape != features.shape for layer in residuals)):
+            raise ValueError("Cached DeepStack residuals require matching visual embedding shapes.")
     if image_mask is not None and video_mask is not None:
         visual_mask = image_mask | video_mask
         # Use a fixed output width (from the vision towers) so this also
@@ -4083,11 +3906,16 @@ def _visual_deepstack_embeddings(
 
 
 def _inject_visual_deepstack(hidden_states: Array, visual_mask: Array, visual_embeds: Array) -> Array:
-    """Add compact DeepStack embeddings to visual positions of text states."""
+    """Add compact or token-aligned serving residuals at visual positions."""
     flattened = hidden_states.reshape(-1, hidden_states.shape[-1])
     mask = visual_mask.reshape(-1)
-    index = jnp.where(mask, jnp.cumsum(mask) - 1, 0)
-    updated = jnp.where(mask[:, None], flattened + visual_embeds[index].astype(flattened.dtype), flattened)
+    residuals = visual_embeds.reshape(-1, visual_embeds.shape[-1])
+    if residuals.shape[0] == flattened.shape[0]:
+        aligned = residuals
+    else:
+        index = jnp.where(mask, jnp.cumsum(mask) - 1, 0)
+        aligned = residuals[index]
+    updated = jnp.where(mask[:, None], flattened + aligned.astype(flattened.dtype), flattened)
     return updated.reshape(hidden_states.shape)
 
 
@@ -4240,17 +4068,21 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
             cache_views=views,
             extra=needs_trace_cache or bool(output_router_logits) or bool(deepstack_visual_embeds),
         )
+        cache_views = views if trace_layers else None
+        # Hoisted out of the loop body: the caching property must not be
+        # first materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
 
         def _layer_loop(layer, carry):
-            """Apply a single Talker code-predictor MoE layer inside the layer-stack scan.
+            """Apply a single Thinker text MoE decoder layer inside the layer-stack scan.
 
-            Body of ``self.layers.scan`` for the Talker code-predictor
-            MoE decoder; runs ``layer`` on the current hidden states,
-            optionally accumulates per-layer hidden states, self-attention
-            weights, and MoE router logits, and returns the updated
-            carry tuple.
+            Body of ``self.layers.scan`` for the Thinker text decoder;
+            runs ``layer`` on the current hidden states, writes the
+            returned KV cache view back, optionally accumulates per-layer
+            hidden states, self-attention weights, and MoE router logits,
+            and returns the updated carry tuple.
             """
-            hidden_states, all_hidden_states, all_self_attentions, all_router_logits, layer_idx = carry
+            hidden_states, cv, all_hidden_states, all_self_attentions, all_router_logits, layer_idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -4260,11 +4092,11 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
                     mask_info=mask_info,
                     position_ids=position_ids,
                     output_attentions=output_attentions,
+                    output_router_logits=output_router_logits,
                     mode=mode,
-                    cache_view=(
-                        past_key_values.views[layer_idx] if trace_layers and past_key_values is not None else None
-                    ),
+                    cache_view=self._layer_cache_view_at(cv, layer_idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
+                    frequencies=frequencies,
                 )
             hidden_states = layer_outputs.hidden_states
             # Truthiness (not ``is not None``) so an empty list never reaches the traced index
@@ -4276,16 +4108,24 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
             hidden_states = self._mark_layer_stage_boundary(hidden_states, layer_idx, layers=self.layers)
 
             if output_attentions:
-                all_self_attentions += (layer_outputs.attentions,)
-            if output_router_logits:
+                all_self_attentions += (layer_outputs.attention_weight,)
+            cv = self._layer_cache_view_update(
+                cv,
+                layer_idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
+            if output_router_logits and layer_outputs.router_logits is not None:
                 all_router_logits += (layer_outputs.router_logits,)
 
-            return hidden_states, all_hidden_states, all_self_attentions, all_router_logits, layer_idx + 1
+            return hidden_states, cv, all_hidden_states, all_self_attentions, all_router_logits, layer_idx + 1
 
-        hidden_states, all_hidden_states, all_self_attentions, all_router_logits, _ = self.layers.scan(
+        hidden_states, _, all_hidden_states, all_self_attentions, all_router_logits, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_self_attentions, all_router_logits, 0),
+            (hidden_states, cache_views, all_hidden_states, all_self_attentions, all_router_logits, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
 
@@ -4435,6 +4275,8 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
         *,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         input_features: Float[Array, "batch mel_bins time"] | None = None,
+        feature_lens: Int[Array, "batch"] | None = None,
+        feature_attention_mask: Bool[Array, "batch time"] | None = None,
         audio_embeds: Array | None = None,
         pixel_values: Float[Array, "num_patches channels h w"] | None = None,
         image_grid_thw: Int[Array, "num_images 3"] | None = None,
@@ -4455,6 +4297,8 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
             input_ids: Input token IDs of shape (batch_size, sequence_length).
             inputs_embeds: Pre-computed text embeddings. If None, computed from input_ids.
             input_features: Raw audio features (mel-spectrogram) to encode.
+            feature_lens: Valid mel-frame count for each audio sample.
+            feature_attention_mask: Padding mask over mel frames.
             audio_embeds: Pre-computed audio embeddings to merge.
             pixel_values: Raw image pixel values to encode via vision encoder.
             image_grid_thw: Grid dimensions (temporal, height, width) for each image.
@@ -4485,9 +4329,11 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
         ):
             raise ValueError("`input_ids` must be provided to merge multimodal embeddings.")
 
+        audio_valid_length = None
         if audio_embeds is None and input_features is not None:
-            audio_outputs = self.audio(input_features)
-            audio_embeds = audio_outputs.last_hidden_state
+            audio_embeds, audio_valid_length = _encode_audio_for_merging(
+                self.audio, input_features, feature_lens, feature_attention_mask
+            )
 
         if audio_embeds is not None:
             if audio_embeds.ndim == 3:
@@ -4497,6 +4343,7 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
                 inputs_embeds,
                 audio_embeds.astype(inputs_embeds.dtype),
                 self.config.audio_token_id,
+                multimodal_embeddings_valid_length=audio_valid_length,
             )
 
         if image_embeds is None and pixel_values is not None:
@@ -4555,6 +4402,8 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        feature_lens: Int[Array, "batch"] | None = None,
+        feature_attention_mask: Bool[Array, "batch time"] | None = None,
     ) -> VLMCausalLMOutput:
         """Forward pass through the base Qwen3OmniMoe model with multimodal embedding fusion.
 
@@ -4568,6 +4417,8 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
             mask_info: Mask information for efficient attention.
             position_ids: Position IDs for RoPE.
             input_features: Audio mel-spectrogram features.
+            feature_lens: Valid mel-frame count for each audio sample.
+            feature_attention_mask: Padding mask over mel frames.
             pixel_values: Image pixel values.
             image_grid_thw: Grid dimensions for image patches.
             image_max_grid_size: Maximum grid size for images.
@@ -4625,6 +4476,8 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,
                 input_features=input_features,
+                feature_lens=feature_lens,
+                feature_attention_mask=feature_attention_mask,
                 image_embeds=image_embeds,
                 video_embeds=video_embeds,
                 pixel_values=pixel_values,
@@ -4728,6 +4581,7 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
@@ -4877,6 +4731,174 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.video_token_id = config.video_token_id
         self.audio_token_id = config.audio_token_id
 
+    def get_rope_index(
+        self,
+        input_ids=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        attention_mask=None,
+        use_audio_in_video=False,
+        audio_seqlens=None,
+        second_per_grids=None,
+    ):
+        """Build prompt positions, including timed video and interleaved audio.
+
+        Generation preparation validates concrete metadata; raw-media compiled
+        training uses a token scan without host transfers or dynamic shapes.
+        """
+        traced = any(
+            isinstance(value, jax.core.Tracer)
+            for value in jax.tree.leaves((input_ids, image_grid_thw, video_grid_thw, attention_mask, second_per_grids))
+        )
+        build_positions = build_omni_rope_positions_traced if traced else build_omni_rope_positions
+        positions, deltas = build_positions(
+            self.config,
+            input_ids,
+            image_grid_thw,
+            video_grid_thw,
+            attention_mask,
+            use_audio_in_video,
+            audio_seqlens,
+            second_per_grids,
+        )
+        return jnp.asarray(positions), jnp.asarray(deltas)
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        max_length,
+        pad_token_id,
+        starts=None,
+        pixel_values=None,
+        attention_mask=None,
+        **kwargs,
+    ):
+        """Prepare the text cache and Omni's multimodal positional metadata."""
+        model_inputs = self.base_model.prepare_inputs_for_generation(
+            input_ids=input_ids,
+            max_length=max_length,
+            pad_token_id=pad_token_id,
+            starts=starts,
+            attention_mask=attention_mask,
+        )
+        model_inputs.update({key: value for key, value in kwargs.items() if value is not None})
+        model_inputs["pixel_values"] = pixel_values
+        if kwargs.get("position_ids") is None:
+            audio_seqlens = kwargs.get("audio_seqlens", kwargs.get("feature_lens"))
+            if audio_seqlens is None and kwargs.get("feature_attention_mask") is not None:
+                audio_seqlens = jnp.sum(kwargs["feature_attention_mask"], axis=-1)
+            model_inputs["position_ids"], model_inputs["rope_deltas"] = self.get_rope_index(
+                input_ids=input_ids,
+                image_grid_thw=kwargs.get("image_grid_thw"),
+                video_grid_thw=kwargs.get("video_grid_thw"),
+                attention_mask=attention_mask,
+                use_audio_in_video=kwargs.get("use_audio_in_video", False),
+                audio_seqlens=audio_seqlens,
+                second_per_grids=kwargs.get("second_per_grids"),
+            )
+        return model_inputs
+
+    def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        """Drop already-encoded audio along with vision tensors after prefill."""
+        model_kwargs = super().update_inputs_for_generation(model_outputs, model_kwargs)
+        for name in ("input_features", "feature_lens", "feature_attention_mask", "audio_seqlens", "second_per_grids"):
+            model_kwargs.pop(name, None)
+        return model_kwargs
+
+    def compute_embedding_with_info(
+        self,
+        input_ids,
+        *,
+        inputs_embeds=None,
+        pixel_values=None,
+        image_grid_thw=None,
+        image_max_grid_size=None,
+        pixel_values_videos=None,
+        video_grid_thw=None,
+        video_max_grid_size=None,
+        image_embeds=None,
+        video_embeds=None,
+        deepstack_image_embeds=None,
+        deepstack_video_embeds=None,
+        attention_mask=None,
+        position_ids=None,
+        rope_deltas=None,
+        visual_pos_masks=None,
+        deepstack_visual_embeds=None,
+        use_audio_in_video=False,
+        audio_seqlens=None,
+        second_per_grids=None,
+        **kwargs,
+    ):
+        """Return merged embeddings plus every residual and position needed for replay.
+
+        Raw vision towers run once. Callers can pass the returned position IDs,
+        visual mask and DeepStack residuals to a forward with only inputs_embeds.
+        The legacy compute_embedding/feature-getter array APIs are unchanged.
+        """
+        if input_ids is None and any(
+            value is not None
+            for value in (
+                pixel_values,
+                pixel_values_videos,
+                image_embeds,
+                video_embeds,
+            )
+        ):
+            raise ValueError("`input_ids` must be provided to merge multimodal embeddings.")
+        images, videos, raw_mask, raw_deepstack = _visual_deepstack_embeddings(
+            self.visual,
+            input_ids,
+            pixel_values,
+            image_grid_thw,
+            image_max_grid_size,
+            pixel_values_videos,
+            video_grid_thw,
+            video_max_grid_size,
+            self.config.image_token_id,
+            self.config.video_token_id,
+            image_embeds=image_embeds,
+            video_embeds=video_embeds,
+            image_deepstack=deepstack_image_embeds,
+            video_deepstack=deepstack_video_embeds,
+        )
+        if images is not None:
+            kwargs["image_embeds"] = images
+        if videos is not None:
+            kwargs["video_embeds"] = videos
+        embeddings = self.compute_embedding(input_ids, inputs_embeds=inputs_embeds, **kwargs)
+        if raw_mask is not None:
+            visual_pos_masks, deepstack_visual_embeds = raw_mask, raw_deepstack
+        if position_ids is None and input_ids is not None:
+            audio_seqlens = kwargs.get("feature_lens") if audio_seqlens is None else audio_seqlens
+            if audio_seqlens is None and kwargs.get("feature_attention_mask") is not None:
+                audio_seqlens = jnp.sum(kwargs["feature_attention_mask"], axis=-1)
+            position_ids, rope_deltas = self.get_rope_index(
+                input_ids,
+                image_grid_thw,
+                video_grid_thw,
+                attention_mask,
+                use_audio_in_video,
+                audio_seqlens,
+                second_per_grids,
+            )
+        if raw_mask is not None and raw_deepstack:
+            compact_index = jnp.cumsum(raw_mask.reshape(-1)) - 1
+            if images is not None:
+                slots = jnp.nonzero((input_ids == self.image_token_id).reshape(-1), size=images.shape[0])[0]
+                deepstack_image_embeds = [layer[compact_index[slots]] for layer in raw_deepstack]
+            if videos is not None:
+                slots = jnp.nonzero((input_ids == self.video_token_id).reshape(-1), size=videos.shape[0])[0]
+                deepstack_video_embeds = [layer[compact_index[slots]] for layer in raw_deepstack]
+        return embeddings, EmbeddingInfo(
+            position_ids=position_ids,
+            rope_deltas=rope_deltas,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+            deepstack_image_embeds=deepstack_image_embeds,
+            deepstack_video_embeds=deepstack_video_embeds,
+        )
+
     @property
     def audio(self):
         """HuggingFace-compatible alias for the audio encoder.
@@ -4897,6 +4919,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         *,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         input_features: Float[Array, "batch mel_bins time"] | None = None,
+        feature_lens: Int[Array, "batch"] | None = None,
+        feature_attention_mask: Bool[Array, "batch time"] | None = None,
         audio_embeds: Array | None = None,
         pixel_values: Float[Array, "num_patches channels h w"] | None = None,
         image_grid_thw: Int[Array, "num_images 3"] | None = None,
@@ -4918,6 +4942,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             input_ids: Input token IDs of shape (batch_size, sequence_length).
             inputs_embeds: Pre-computed text embeddings. If None, computed from input_ids.
             input_features: Raw audio features (mel-spectrogram) to encode.
+            feature_lens: Valid mel-frame count for each audio sample.
+            feature_attention_mask: Padding mask over mel frames.
             audio_embeds: Pre-computed audio embeddings to merge.
             pixel_values: Raw image pixel values to encode via vision encoder.
             image_grid_thw: Grid dimensions (temporal, height, width) for each image.
@@ -4948,9 +4974,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         ):
             raise ValueError("`input_ids` must be provided to merge multimodal embeddings.")
 
+        audio_valid_length = None
         if audio_embeds is None and input_features is not None:
-            audio_outputs = self.audio_tower(input_features)
-            audio_embeds = audio_outputs.last_hidden_state
+            audio_embeds, audio_valid_length = _encode_audio_for_merging(
+                self.audio_tower, input_features, feature_lens, feature_attention_mask
+            )
 
         if audio_embeds is not None:
             if audio_embeds.ndim == 3:
@@ -4960,6 +4988,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 inputs_embeds,
                 audio_embeds.astype(inputs_embeds.dtype),
                 self.audio_token_id,
+                multimodal_embeddings_valid_length=audio_valid_length,
             )
 
         if image_embeds is None and pixel_values is not None:
@@ -5019,6 +5048,14 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
+        feature_lens: Int[Array, "batch"] | None = None,
+        feature_attention_mask: Bool[Array, "batch time"] | None = None,
+        visual_pos_masks: Array | None = None,
+        deepstack_visual_embeds: list[Array] | None = None,
+        rope_deltas: Array | None = None,
+        use_audio_in_video: bool = False,
+        audio_seqlens: Array | None = None,
+        second_per_grids: Array | None = None,
     ) -> MoeCausalLMOutput:
         """Forward pass through the Thinker for multimodal conditional generation.
 
@@ -5032,6 +5069,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             mask_info: Mask information for efficient attention.
             position_ids: Position IDs for RoPE.
             input_features: Audio mel-spectrogram features.
+            feature_lens: Valid mel-frame count for each audio sample.
+            feature_attention_mask: Padding mask over mel frames.
             pixel_values: Image pixel values.
             image_grid_thw: Grid dimensions for image patches.
             image_max_grid_size: Maximum grid size for images.
@@ -5053,19 +5092,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             raise ValueError("You must provide either `input_ids` or `inputs_embeds`.")
         if input_ids is None and (pixel_values is not None or pixel_values_videos is not None):
             raise ValueError("`input_ids` must be provided to merge multimodal embeddings.")
-        image_embeds, video_embeds, visual_pos_masks, deepstack_visual_embeds = _visual_deepstack_embeddings(
-            self.visual,
-            input_ids,
-            pixel_values,
-            image_grid_thw,
-            image_max_grid_size,
-            pixel_values_videos,
-            video_grid_thw,
-            video_max_grid_size,
-            self.config.image_token_id,
-            self.config.video_token_id,
-        )
-
         if (
             inputs_embeds is None
             or input_features is not None
@@ -5074,19 +5100,33 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         ):
             if input_ids is None:
                 raise ValueError("`input_ids` must be provided to compute or merge multimodal embeddings.")
-            inputs_embeds = self.compute_embedding(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                input_features=input_features,
-                image_embeds=image_embeds,
-                video_embeds=video_embeds,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                image_max_grid_size=image_max_grid_size,
-                pixel_values_videos=pixel_values_videos,
-                video_grid_thw=video_grid_thw,
-                video_max_grid_size=video_max_grid_size,
-            )
+            # Text-only compiled training does not need host multimodal parsing.
+            if pixel_values is None and pixel_values_videos is None and input_features is None:
+                inputs_embeds = self.compute_embedding(input_ids, inputs_embeds=inputs_embeds)
+            else:
+                inputs_embeds, info = self.compute_embedding_with_info(
+                    input_ids=input_ids,
+                    inputs_embeds=inputs_embeds,
+                    input_features=input_features,
+                    feature_lens=feature_lens,
+                    feature_attention_mask=feature_attention_mask,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    image_max_grid_size=image_max_grid_size,
+                    pixel_values_videos=pixel_values_videos,
+                    video_grid_thw=video_grid_thw,
+                    video_max_grid_size=video_max_grid_size,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    rope_deltas=rope_deltas,
+                    visual_pos_masks=visual_pos_masks,
+                    deepstack_visual_embeds=deepstack_visual_embeds,
+                    use_audio_in_video=use_audio_in_video,
+                    audio_seqlens=audio_seqlens,
+                    second_per_grids=second_per_grids,
+                )
+                position_ids, rope_deltas = info.position_ids, info.rope_deltas
+                visual_pos_masks, deepstack_visual_embeds = info.visual_pos_masks, info.deepstack_visual_embeds
 
         outputs = self.model(
             input_ids=input_ids,
@@ -5197,45 +5237,49 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self,
         pixel_values: Float[Array, "num_patches channels height width"],
         image_grid_thw: Int[Array, "num_images 3"] | None = None,
+        return_deepstack: bool = False,
         **kwargs,
-    ) -> Float[Array, "num_patches hidden"]:
+    ) -> Float[Array, "num_patches hidden"] | tuple[tuple[Array, ...], list[Array]]:
         """Extract image features from the vision encoder.
 
         Args:
             pixel_values: Input pixel values for the images.
             image_grid_thw: Grid dimensions (temporal, height, width) for each image.
+            return_deepstack: Return ((merged_features,), residuals) instead of only features.
             **kwargs: Additional arguments passed to the vision encoder.
 
         Returns:
-            Image features ready for merging with text embeddings.
+            Image features, or the features and all intermediate residuals when requested.
         """
         max_grid_size = kwargs.get("image_max_grid_size")
         if max_grid_size is None:
             max_grid_size = int(jnp.max(image_grid_thw[:, 1:]).item())
-        merged, _ = self.visual(pixel_values, image_grid_thw, max_grid_size)
-        return merged
+        merged, deepstack = self.visual(pixel_values, image_grid_thw, max_grid_size)
+        return ((merged,), deepstack) if return_deepstack else merged
 
     def get_video_features(
         self,
         pixel_values_videos: Float[Array, "num_patches channels height width"],
         video_grid_thw: Int[Array, "num_videos 3"] | None = None,
+        return_deepstack: bool = False,
         **kwargs,
-    ) -> Float[Array, "num_patches hidden"]:
+    ) -> Float[Array, "num_patches hidden"] | tuple[tuple[Array, ...], list[Array]]:
         """Extract video features from the vision encoder.
 
         Args:
             pixel_values_videos: Input pixel values for the videos.
             video_grid_thw: Grid dimensions (temporal, height, width) for each video.
+            return_deepstack: Return ((merged_features,), residuals) instead of only features.
             **kwargs: Additional arguments passed to the vision encoder.
 
         Returns:
-            Video features ready for merging with text embeddings.
+            Video features, or the features and all intermediate residuals when requested.
         """
         max_grid_size = kwargs.get("video_max_grid_size")
         if max_grid_size is None:
             max_grid_size = int(jnp.max(video_grid_thw[:, 1:]).item())
-        merged, _ = self.visual(pixel_values_videos, video_grid_thw, max_grid_size)
-        return merged
+        merged, deepstack = self.visual(pixel_values_videos, video_grid_thw, max_grid_size)
+        return ((merged,), deepstack) if return_deepstack else merged
 
     def get_audio_features(
         self,
@@ -5251,7 +5295,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         Returns:
             Audio features ready for merging with text embeddings.
         """
-        audio_outputs = self.audio_tower(input_features)
+        audio_outputs = self.audio_tower(input_features, **kwargs)
         return audio_outputs.last_hidden_state
 
 
@@ -5372,6 +5416,22 @@ class Qwen3OmniMoeForConditionalGeneration(
         """
         return self.thinker.compute_embedding(input_ids, *args, **kwargs)
 
+    def compute_embedding_with_info(self, input_ids, *args, **kwargs):
+        """Preserve Thinker position metadata and DeepStack residuals for prefill."""
+        return self.thinker.compute_embedding_with_info(input_ids, *args, **kwargs)
+
+    def get_rope_index(self, *args, **kwargs):
+        """Delegate Omni prompt positional indexing to the Thinker."""
+        return self.thinker.get_rope_index(*args, **kwargs)
+
+    def prepare_inputs_for_generation(self, *args, **kwargs):
+        """Prepare the Thinker's multimodal prompt and continuation cache."""
+        return self.thinker.prepare_inputs_for_generation(*args, **kwargs)
+
+    def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        """Delegate continuation updates and encoded-media cleanup to the Thinker."""
+        return self.thinker.update_inputs_for_generation(model_outputs, model_kwargs)
+
     def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
@@ -5391,6 +5451,14 @@ class Qwen3OmniMoeForConditionalGeneration(
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
+        feature_lens: Int[Array, "batch"] | None = None,
+        feature_attention_mask: Bool[Array, "batch time"] | None = None,
+        visual_pos_masks: Array | None = None,
+        deepstack_visual_embeds: list[Array] | None = None,
+        rope_deltas: Array | None = None,
+        use_audio_in_video: bool = False,
+        audio_seqlens: Array | None = None,
+        second_per_grids: Array | None = None,
     ) -> MoeCausalLMOutput:
         """Forward pass through the Thinker component.
 
@@ -5411,6 +5479,8 @@ class Qwen3OmniMoeForConditionalGeneration(
                 the layout based on whether mRoPE is enabled.
             input_features: Mel-spectrogram features
                 ``(batch, mel_bins, time)`` for the audio encoder.
+            feature_lens: Valid mel-frame count for each audio sample.
+            feature_attention_mask: Padding mask over mel frames.
             pixel_values: Packed image pixel values for the vision tower.
             image_grid_thw: Per-image ``(T, H, W)`` grids.
             pixel_values_videos: Packed video pixel values for the vision
@@ -5442,6 +5512,8 @@ class Qwen3OmniMoeForConditionalGeneration(
             mask_info=mask_info,
             position_ids=position_ids,
             input_features=input_features,
+            feature_lens=feature_lens,
+            feature_attention_mask=feature_attention_mask,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             pixel_values_videos=pixel_values_videos,
@@ -5453,6 +5525,12 @@ class Qwen3OmniMoeForConditionalGeneration(
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
             apply_lm_head=apply_lm_head,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+            rope_deltas=rope_deltas,
+            use_audio_in_video=use_audio_in_video,
+            audio_seqlens=audio_seqlens,
+            second_per_grids=second_per_grids,
         )
 
     def get_encoder(self):
@@ -5491,8 +5569,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         self,
         pixel_values: Float[Array, "num_patches channels height width"],
         image_grid_thw: Int[Array, "num_images 3"] | None = None,
+        return_deepstack: bool = False,
         **kwargs,
-    ) -> Float[Array, "num_patches hidden"]:
+    ) -> Float[Array, "num_patches hidden"] | tuple[tuple[Array, ...], list[Array]]:
         """Extract image features via the Thinker's vision encoder.
 
         Convenience wrapper that proxies to
@@ -5515,6 +5594,16 @@ class Qwen3OmniMoeForConditionalGeneration(
         return self.thinker.get_image_features(
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            return_deepstack=return_deepstack,
+            **kwargs,
+        )
+
+    def get_video_features(self, pixel_values_videos, video_grid_thw=None, return_deepstack=False, **kwargs):
+        """Extract video features, optionally retaining intermediate residuals."""
+        return self.thinker.get_video_features(
+            pixel_values_videos,
+            video_grid_thw,
+            return_deepstack=return_deepstack,
             **kwargs,
         )
 

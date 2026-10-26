@@ -62,7 +62,6 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
     BaseModelOutput,
     DecoderLayerOutput,
@@ -85,11 +84,35 @@ from easydel.layers import (
     moe_gate_up_fusion_reform_param,
     split_fused_gate_up_projection,
 )
-from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
-from easydel.layers.rotary import yarn_get_mscale
+from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule
 
 from .deepseek_configuration import DeepseekV3Config
+
+
+@jax.custom_jvp
+def _normalize_topk_weights(weights: Array) -> Array:
+    """Normalize selected sigmoid mass without squaring tiny denominators in AD."""
+    mass = jnp.sum(weights, axis=-1, keepdims=True)
+    denominator = jnp.where(mass == 0, 1.0, mass + 1e-20)
+    return weights / denominator
+
+
+@_normalize_topk_weights.defjvp
+def _normalize_topk_weights_jvp(primals, tangents):
+    """Use the quotient's normalized output rather than a reciprocal squared.
+
+    The ordinary division VJP forms ``denominator**-2``, overflowing float32
+    even for valid positive sigmoid mass near 1e-20. This equivalent linear
+    rule keeps both forward- and reverse-mode derivatives finite there while
+    retaining the exact forward formula and the constant-denominator zero case.
+    """
+    (weights,), (weights_dot,) = primals, tangents
+    mass = jnp.sum(weights, axis=-1, keepdims=True)
+    denominator = jnp.where(mass == 0, 1.0, mass + 1e-20)
+    normalized = _normalize_topk_weights(weights)
+    mass_dot = jnp.where(mass == 0, 0.0, jnp.sum(weights_dot, axis=-1, keepdims=True))
+    return normalized, (weights_dot - normalized * mass_dot) / denominator
 
 
 class DeepseekV3MLP(spx.Module):
@@ -551,20 +574,30 @@ class DeepseekV3MoE(BaseMoeModule):
         token_count = scores_for_choice.shape[0]
         group_scores = scores_for_choice.reshape(token_count, n_group, n_routed_experts // n_group)
         group_scores = jnp.sum(jax.lax.top_k(group_scores, k=2)[0], axis=-1)
-        group_idx = jax.lax.top_k(group_scores, k=topk_group)[1]
-        group_mask = jnp.zeros_like(group_scores)
-        row_idx = jnp.arange(token_count)[:, None]
-        group_mask = group_mask.at[row_idx, group_idx].set(1.0)
-        score_mask = jnp.repeat(group_mask[:, :, None], n_routed_experts // n_group, axis=2).reshape(token_count, -1)
-        masked_scores = jnp.where(score_mask > 0, scores_for_choice, 0.0)
-        topk_weight, topk_idx = jax.lax.top_k(masked_scores, k=k)
+        # Keep group scores and indices paired, including in eager execution
+        # on token-sharded TPU inputs, where narrow top_k index lowering can
+        # choose group zero for every token. Stable sorting preserves top_k's
+        # lower-index tie break without changing noaux_tc's top-two group mass.
+        group_indices = jnp.broadcast_to(jnp.arange(n_group, dtype=jnp.int32), group_scores.shape)
+        _, ranked_groups = jax.lax.sort_key_val(-group_scores, group_indices, dimension=-1, is_stable=True)
+        selected_groups = ranked_groups[:, :topk_group]
+        # Build local membership directly, without a scatter addressed by global
+        # token indices; each token shard owns its complete expert dimension.
+        expert_groups = jnp.arange(n_routed_experts) // (n_routed_experts // n_group)
+        score_mask = jnp.any(selected_groups[:, :, None] == expert_groups[None, None, :], axis=1)
+        masked_scores = jnp.where(score_mask, scores_for_choice, -jnp.inf)
+        _, topk_idx = jax.lax.top_k(masked_scores, k=k)
+        # Exclusion sentinels are selection-only. If k exceeds the eligible
+        # capacity, preserve finite zero-weight padding instead of combining
+        # -inf values or the excluded experts' nonzero sigmoid probabilities.
+        combine_scores = scores_for_choice
         if e_score_correction_bias is not None:
             # The bias steers selection only; combine weights are the raw sigmoid scores.
-            topk_weight = jnp.take_along_axis(
-                scores_for_choice - e_score_correction_bias.astype(jnp.float32), topk_idx, axis=-1
-            )
+            combine_scores = combine_scores - e_score_correction_bias.astype(jnp.float32)
+        combine_scores = jnp.where(score_mask, combine_scores, 0.0)
+        topk_weight = jnp.take_along_axis(combine_scores, topk_idx, axis=-1)
         if k > 1 and norm_topk_prob:
-            topk_weight = topk_weight / (jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20)
+            topk_weight = _normalize_topk_weights(topk_weight)
         topk_weight = topk_weight * routed_scaling_factor
         return topk_weight, topk_idx
 
@@ -700,33 +733,6 @@ class DeepseekV3Attention(UnifiedAttention):
         class's ``projection_mapping`` so the HF attribute names are unchanged.
         """
         self._build_mla_projections(config, dtype, param_dtype, precision, rngs)
-
-    def _create_attention_performer(self, config, rngs):
-        """Create attention performer module with custom softmax scale.
-
-        Configures the attention performer with MLA-specific softmax scaling,
-        including optional YARN-based scaling for extended context lengths.
-
-        Args:
-            config: Model configuration with attention settings.
-            rngs: Random number generator state for dropout.
-
-        Returns:
-            FlexibleAttentionModule: Configured attention performer.
-        """
-        softmax_scale = self.q_head_dim**-0.5
-        if self.config.rope_scaling is not None:
-            mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
-            scaling_factor = self.config.rope_scaling["factor"]
-            if mscale_all_dim:
-                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-                softmax_scale = softmax_scale * mscale * mscale
-        return FlexibleAttentionModule(
-            rngs=rngs,
-            base_config=config,
-            softmax_scale=float(softmax_scale),
-            dropout_prob=getattr(config, "attention_dropout", 0.0),
-        )
 
 
 class DeepseekV3DecoderLayer(spx.Module):
@@ -1173,6 +1179,7 @@ class DeepseekV3Model(EasyDeLBaseModule):
             _layer_loop,
             (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
             trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
@@ -1221,11 +1228,13 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
 
     Wraps :class:`DeepseekV3Model` with an unbiased linear ``lm_head``. Goes
     through ``forward_moe`` so per-MoE-layer router logits are surfaced;
-    however DeepSeek-V3's ``noaux_tc`` routing means the auxiliary
-    load-balancing loss is *not* added to the objective (load balance is
-    maintained purely through the learnable
-    ``e_score_correction_bias``). Routing weights still flow into the
-    output for diagnostics and downstream MoE-aware tooling.
+    ``noaux_tc`` routing balances expert selection through
+    ``e_score_correction_bias`` independently of the auxiliary objective.
+    The optional sequence-level balancing loss uses the unbiased sigmoid
+    probabilities and the actual grouped expert selections, weighted by
+    ``config.aux_loss_alpha`` (or an explicit ``router_aux_loss_coef`` override).
+    Setting the coefficient to zero disables this loss without disabling
+    router diagnostics.
 
     Attributes:
         config (DeepseekV3Config): Configuration for the model.
@@ -1347,15 +1356,50 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         if outputs.router_logits is None or len(outputs.router_logits) == 0:
             return None
 
-        all_router_logits = jnp.stack(outputs.router_logits, axis=0)
+        coef = getattr(self.config, "router_aux_loss_coef", None)
+        if coef is None:
+            coef = self.config.aux_loss_alpha
+        if not coef:
+            return None
 
-        aux_loss = auxiliary_load_balancing_loss_func(
-            gate_logits=all_router_logits,
-            num_experts=self.config.n_routed_experts,
-            top_k=self.config.num_experts_per_tok,
-            attention_mask=attention_mask,
+        num_experts = self.config.n_routed_experts
+        top_k = self.config.num_experts_per_tok
+        batch_size, sequence_length = outputs.last_hidden_state.shape[:2]
+        mask = (
+            jnp.ones((batch_size, sequence_length), dtype=jnp.float32)
+            if attention_mask is None
+            else jnp.asarray(attention_mask, dtype=jnp.float32)
         )
-        return aux_loss * self.config.router_aux_loss_coef
+        if mask.shape != (batch_size, sequence_length):
+            raise ValueError(f"attention_mask must have shape {(batch_size, sequence_length)}, got {mask.shape}.")
+        if not self.config.seq_aux:
+            mask = mask.reshape(1, -1)
+        token_count = jnp.maximum(mask.sum(axis=-1, keepdims=True), 1.0)
+        losses = []
+        moe_layers = [layer.mlp for layer in self.model.layers if isinstance(layer.mlp, DeepseekV3MoE)]
+        for choice_scores, moe in zip(outputs.router_logits, moe_layers, strict=True):
+            choice_scores = choice_scores.reshape(-1, num_experts).astype(jnp.float32)
+            # The gate returns sigmoid scores PLUS selection-only bias, not logits.
+            # Applying softmax would change both the objective and its gradients.
+            scores = choice_scores - moe.gate.e_score_correction_bias.value.astype(jnp.float32)
+            probabilities = scores / jnp.maximum(scores.sum(axis=-1, keepdims=True), 1e-20)
+            _, selected = moe._select_experts_static(
+                choice_scores,
+                None,
+                top_k,
+                n_group=self.config.n_group,
+                topk_group=self.config.topk_group,
+                n_routed_experts=num_experts,
+                norm_topk_prob=False,
+                routed_scaling_factor=1.0,
+            )
+            counts = jax.nn.one_hot(selected, num_experts, dtype=jnp.float32).sum(axis=-2)
+            counts = counts.reshape(*mask.shape, num_experts)
+            probabilities = probabilities.reshape(*mask.shape, num_experts)
+            frequency = (counts * mask[..., None]).sum(axis=1) / (token_count * top_k)
+            mean_probability = (probabilities * mask[..., None]).sum(axis=1) / token_count
+            losses.append(num_experts * jnp.mean(jnp.sum(frequency * mean_probability, axis=-1)))
+        return coef * jnp.mean(jnp.stack(losses))
 
     def create_transformer_cache_config(self, batch_size: int, max_length: int, **kwargs):
         """Create cache configuration for MLA attention.
@@ -1371,22 +1415,12 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         Returns:
             TransformerCacheConfig: Configuration object for MLA-compatible transformer cache.
         """
-        from easydel.caching import TransformerCacheConfig
-
-        config = self.config
-
-        q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
-        v_head_dim = config.v_head_dim
-
-        return TransformerCacheConfig.create(
-            num_hidden_layers=config.num_hidden_layers,
+        # Padding sentinel and permissive, ignored kwargs are kept for API compatibility;
+        # expanded MLA geometry is resolved by the shared generation builder.
+        return super().create_transformer_cache_config(
             batch_size=batch_size,
-            sequence_length=max_length,
-            num_heads=config.num_attention_heads,
-            key_heads=config.num_attention_heads,
-            value_heads=config.num_attention_heads,
-            key_dim=q_head_dim,
-            value_dim=v_head_dim,
+            max_length=max_length,
+            pad_token_id=-100,
         )
 
     def create_ragged_page_cache_config(
@@ -1417,60 +1451,41 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         Returns:
             RaggedPagesCacheConfig: Configuration object for MLA-compatible paged cache.
         """
-        from easydel.caching import MLARaggedPagesCacheConfig, RaggedPagesCacheConfig
-        from easydel.layers.attention import AttentionMechanisms
+        from easydel.infra.mixins.generation import EasyGenerationMixin
 
-        config = self.config
-        text_config = config.get_text_config()
-
-        if dtype is None:
-            dtype = text_config.kvdtype
-
-        q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
-        v_head_dim = config.v_head_dim
-
-        match text_config.attn_mechanism:
-            case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3:
-                version = "v3"
-            case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2:
-                version = "v2"
-            case _:
-                version = "v3"
-
-        attn_mechanism = getattr(text_config, "attn_mechanism", None)
-        if hasattr(attn_mechanism, "value"):
-            attn_mechanism = attn_mechanism.value
-        is_mla_ragged = str(attn_mechanism) in (
+        text_config = self.config.get_text_config()
+        mechanism = getattr(text_config.attn_mechanism, "value", text_config.attn_mechanism)
+        if mechanism not in (
             "multi_latent_ragged_page_attention_v1",
             "multi_latent_ragged_page_attention_v2",
-        )
-        if is_mla_ragged:
-            return MLARaggedPagesCacheConfig.create(
+        ) and not hasattr(self, "_create_standard_ragged_page_cache_config"):
+            from easydel.caching import RaggedPagesCacheConfig
+
+            # Config/mesh-only callers have no bound standard-cache helper or
+            # pipeline-budget methods; keep their original geometry.
+            q_head_dim = self.config.qk_nope_head_dim + self.config.qk_rope_head_dim
+            return RaggedPagesCacheConfig.create(
                 mesh=self.mesh,
                 runtime_sharding_resolver=text_config.runtime_sharding_resolver,
-                kvdtype=dtype,
+                kvdtype=text_config.kvdtype if dtype is None else dtype,
                 max_model_length=max_length,
-                num_hidden_layers=config.num_hidden_layers,
-                num_kv_heads=config.num_attention_heads,
-                kv_lora_rank=config.kv_lora_rank,
-                qk_rope_head_dim=config.qk_rope_head_dim,
+                num_hidden_layers=self.config.num_hidden_layers,
+                num_kv_heads=self.config.num_attention_heads,
+                kv_head_dim_size=q_head_dim,
+                k_headdim=q_head_dim,
+                v_headdim=self.config.v_head_dim,
                 hbm_utilization=hbm_utilization,
                 page_size=page_size,
                 max_cache_tokens=max_cache_tokens,
+                version="v2" if mechanism == "ragged_page_attention_v2" else "v3",
             )
 
-        return RaggedPagesCacheConfig.create(
-            mesh=self.mesh,
-            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
-            kvdtype=dtype,
-            max_model_length=max_length,
-            num_hidden_layers=config.num_hidden_layers,
-            num_kv_heads=config.num_attention_heads,
-            kv_head_dim_size=q_head_dim,
-            k_headdim=q_head_dim,
-            v_headdim=v_head_dim,
-            hbm_utilization=hbm_utilization,
+        # Real instances retain shared stage budgeting and MLA cache extensions.
+        return EasyGenerationMixin.create_ragged_page_cache_config(
+            self,
+            max_length=max_length,
             page_size=page_size,
+            hbm_utilization=hbm_utilization,
+            dtype=dtype,
             max_cache_tokens=max_cache_tokens,
-            version=version,
         )

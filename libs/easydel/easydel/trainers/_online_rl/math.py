@@ -355,6 +355,27 @@ def following_segment_token_counts(
     return jnp.moveaxis(reverse_counts, 0, -1)[..., ::-1]
 
 
+def cross_segment_discount_factors(
+    tokens_after: jax.Array,
+    *,
+    gamma: float,
+    lam: jax.Array | float,
+) -> jax.Array:
+    """Compute shared cross-segment discount factors for already aligned counts.
+
+    Args:
+        tokens_after: Number of later optimized tokens.
+        gamma: Non-negative temporal discount.
+        lam: Scalar or count-aligned GAE lambda.
+
+    Returns:
+        Float32 factors with the broadcast shape of counts and lambda.
+    """
+    if gamma < 0:
+        raise ValueError(f"gamma must be non-negative, got {gamma}")
+    return jnp.power(float(gamma) * jnp.asarray(lam, dtype=jnp.float32), jnp.asarray(tokens_after))
+
+
 def cross_segment_advantage_correction(
     advantages: jax.Array,
     segment_ids: jax.Array,
@@ -403,12 +424,13 @@ def cross_segment_advantage_correction(
 
     counts = following_segment_token_counts(segment_ids, action_mask)
     lambda_array = _broadcast_per_trajectory(lam, advantages.shape[:-1], "lam")
-    factor = jnp.power(float(gamma) * lambda_array[..., None], counts)
+    factor = cross_segment_discount_factors(counts, gamma=gamma, lam=lambda_array[..., None])
     return jnp.where(action_mask, advantages * factor, 0.0)
 
 
 __all__ = (
     "cross_segment_advantage_correction",
+    "cross_segment_discount_factors",
     "following_segment_token_counts",
     "global_token_denominator",
     "global_token_mean",

@@ -34,19 +34,20 @@ from collections.abc import Sequence
 from typing import Any
 from uuid import uuid4
 
+import partial_json_parser
 from eformer.loggings import get_logger
+from partial_json_parser.core.options import Allow
 from transformers import AutoTokenizer as AnyTokenizer
 
 from ...openai_api_modules import (
     ChatCompletionRequest,
-    DeltaFunctionCall,
     DeltaMessage,
-    DeltaToolCall,
     ExtractedToolCallInformation,
     FunctionCall,
     ToolCall,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
+from .utils import is_complete_json, partial_json_loads, stream_json_calls
 
 logger = get_logger(__name__)
 
@@ -58,16 +59,6 @@ def _random_uuid() -> str:
         A 32-character hexadecimal string from a UUID4.
     """
     return uuid4().hex
-
-
-def _make_tool_call_id() -> str:
-    """Generate a unique tool call ID.
-
-    Returns:
-        A string in the format "chatcmpl-tool-<uuid>" where uuid is a
-        full UUID4 string.
-    """
-    return f"chatcmpl-tool-{uuid4()}"
 
 
 @ToolParserManager.register_module("xlam")  # pyright: ignore[reportUntypedClassDecorator]
@@ -307,199 +298,51 @@ class xLAMToolParser(ToolParser):
         if not is_tool_call_block:
             return DeltaMessage(content=delta_text)
 
+        if not previous_text:
+            self.prev_tool_call_arr.clear()
+            self.streamed_args.clear()
+            self.streaming_state = {"current_tool_index": -1, "tool_ids": [], "sent_tools": []}
+        search_text = preprocessed_tool_calls or current_text
+        if not preprocessed_tool_calls:
+            # Strip protocol wrappers, not JSON structure. The partial JSON parser
+            # identifies top-level objects, including arbitrarily nested arguments.
+            if "</think>" in search_text:
+                search_text = search_text.split("</think>", 1)[1]
+            for marker in ("[TOOL_CALLS]", "<tool_call>"):
+                if marker in search_text:
+                    search_text = search_text.split(marker, 1)[1]
+            match = re.search(r"```(?:json)?\s*([\s\S]*?)(?:```|$)", search_text)
+            if match:
+                search_text = match.group(1)
         try:
-            if not hasattr(self, "streaming_state"):
-                self.streaming_state = {"current_tool_index": -1, "tool_ids": [], "sent_tools": []}
-
-            try:
-                tool_calls_text = preprocessed_tool_calls if preprocessed_tool_calls else current_text
-                parsed_tools = json.loads(tool_calls_text)
-                if isinstance(parsed_tools, list):
-                    self.prev_tool_call_arr = parsed_tools
-            except json.JSONDecodeError:
-                pass
-
-            if hasattr(self, "current_tools_sent") and len(self.current_tools_sent) > 0:
-                if len(self.current_tools_sent) == 1 and self.current_tools_sent[0] is False:
-                    name_pattern = r'"name"\s*:\s*"([^"]+)"'
-                    name_match = re.search(name_pattern, current_text)
-                    if name_match:
-                        function_name = name_match.group(1)
-                        tool_id = _make_tool_call_id()
-                        delta = DeltaMessage(
-                            tool_calls=[
-                                DeltaToolCall(
-                                    index=0,
-                                    type="function",
-                                    id=tool_id,
-                                    function=DeltaFunctionCall(name=function_name).model_dump(exclude_none=True),
-                                )
-                            ]
-                        )
-                        self.current_tools_sent = [True]
-                        self.current_tool_id = 0
-                        self.streaming_state["current_tool_index"] = 0
-                        if len(self.streaming_state["sent_tools"]) == 0:
-                            self.streaming_state["sent_tools"].append(
-                                {"sent_name": True, "sent_arguments_prefix": False, "sent_arguments": ""}
-                            )
-                        else:
-                            self.streaming_state["sent_tools"][0]["sent_name"] = True
-                        self.current_tool_name_sent = True
-                        return delta
-
-            search_text = preprocessed_tool_calls if preprocessed_tool_calls else current_text
-            if not preprocessed_tool_calls and has_potential_json_block:
-                json_match = re.search(r"```(?:json)?\s*([\s\S]*?)(?:```|$)", current_text)
-                if json_match:
-                    potential_json = json_match.group(1).strip()
-                    if potential_json.startswith("[") and (
-                        '"name"' in potential_json and '"arguments"' in potential_json
-                    ):
-                        search_text = potential_json
-
-            name_pattern = r'"name"\s*:\s*"([^"]+)"'
-            name_matches = list(re.finditer(name_pattern, search_text))
-            tool_count = len(name_matches)
-
-            if tool_count == 0:
-                partial_name_pattern = r'"name"\s*:\s*"([^"]*)'
-                partial_matches = list(re.finditer(partial_name_pattern, search_text))
-                if partial_matches:
-                    return None
-                return DeltaMessage(content=delta_text)
-
-            while len(self.streaming_state["tool_ids"]) < tool_count:
-                self.streaming_state["tool_ids"].append(None)
-            while len(self.streaming_state["sent_tools"]) < tool_count:
-                self.streaming_state["sent_tools"].append(
-                    {"sent_name": False, "sent_arguments_prefix": False, "sent_arguments": ""}
-                )
-
-            if self.streaming_state["current_tool_index"] == -1:
-                self.streaming_state["current_tool_index"] = 0
-                self.current_tool_id = 0
-
-            current_idx = self.streaming_state["current_tool_index"]
-            if current_idx >= tool_count:
-                return None
-
-            if not self.streaming_state["sent_tools"][current_idx]["sent_name"]:
-                function_name = name_matches[current_idx].group(1)
-                tool_id = f"call_{current_idx}_{_random_uuid()}"
-                self.streaming_state["tool_ids"][current_idx] = tool_id
-                self.streaming_state["sent_tools"][current_idx]["sent_name"] = True
-                self.streaming_state["sent_tools"][current_idx]["sent_arguments_prefix"] = False
-                self.streaming_state["sent_tools"][current_idx]["sent_arguments"] = ""
-
-                while len(self.streamed_args) <= current_idx:
-                    self.streamed_args.append("")
-
-                return DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=current_idx,
-                            type="function",
-                            id=tool_id,
-                            function=DeltaFunctionCall(name=function_name).model_dump(exclude_none=True),
-                        )
-                    ]
-                )
-
-            empty_args_pattern = r'"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{\s*\}'
-            empty_args_matches = list(re.finditer(empty_args_pattern, search_text))
-            if current_idx < len(empty_args_matches):
-                if not self.streaming_state["sent_tools"][current_idx]["sent_arguments_prefix"]:
-                    self.streaming_state["sent_tools"][current_idx]["sent_arguments_prefix"] = True
-                    self.streaming_state["sent_tools"][current_idx]["sent_arguments"] = "{"
-                    while len(self.streamed_args) <= current_idx:
-                        self.streamed_args.append("")
-                    self.streamed_args[current_idx] += "{"
-                    return DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=current_idx,
-                                function=DeltaFunctionCall(arguments="{").model_dump(exclude_none=True),
-                            )
-                        ]
-                    )
-
-                if self.streaming_state["sent_tools"][current_idx]["sent_arguments"] == "{":
-                    self.streaming_state["sent_tools"][current_idx]["sent_arguments"] = "{}"
-                    self.streamed_args[current_idx] += "}"
-                    self.streaming_state["sent_tools"][current_idx]["sent_arguments_prefix"] = True
-                    delta = DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=current_idx,
-                                function=DeltaFunctionCall(arguments="}").model_dump(exclude_none=True),
-                            )
-                        ]
-                    )
-                    if current_idx < tool_count - 1:
-                        self.streaming_state["current_tool_index"] += 1
-                        self.current_tool_id = self.streaming_state["current_tool_index"]
-                    return delta
-
-            args_pattern = r'"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*(\{(?:[^{}]|(?:\{[^{}]*\}))*\})'
-            args_matches = list(re.finditer(args_pattern, search_text))
-            if current_idx >= len(args_matches):
-                return None
-
-            args_text = args_matches[current_idx].group(1)
-            if tool_count > 1:
-                try:
-                    parsed_tools = json.loads(search_text)
-                    if isinstance(parsed_tools, list) and current_idx < len(parsed_tools):
-                        current_tool = parsed_tools[current_idx]
-                        if isinstance(current_tool.get("arguments"), dict):
-                            args_text = json.dumps(current_tool["arguments"])
-                        else:
-                            args_text = str(current_tool.get("arguments", "{}"))
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    pass
-
-            sent_args = self.streaming_state["sent_tools"][current_idx]["sent_arguments"]
-            if not self.streaming_state["sent_tools"][current_idx]["sent_arguments_prefix"] and args_text.startswith(
-                "{"
-            ):
-                self.streaming_state["sent_tools"][current_idx]["sent_arguments_prefix"] = True
-                self.streaming_state["sent_tools"][current_idx]["sent_arguments"] = "{"
-                while len(self.streamed_args) <= current_idx:
-                    self.streamed_args.append("")
-                self.streamed_args[current_idx] += "{"
-                return DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=current_idx,
-                            function=DeltaFunctionCall(arguments="{").model_dump(exclude_none=True),
-                        )
-                    ]
-                )
-
-            if args_text.startswith(sent_args):
-                args_diff = args_text[len(sent_args) :]
-                if args_diff:
-                    self.streaming_state["sent_tools"][current_idx]["sent_arguments"] = args_text
-                    while len(self.streamed_args) <= current_idx:
-                        self.streamed_args.append("")
-                    self.streamed_args[current_idx] += args_diff
-                    return DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=current_idx,
-                                function=DeltaFunctionCall(arguments=args_diff).model_dump(exclude_none=True),
-                            )
-                        ]
-                    )
-
-            if current_idx < tool_count - 1 and args_text.endswith("}"):
-                self.streaming_state["current_tool_index"] += 1
-                self.current_tool_id = self.streaming_state["current_tool_index"]
-                return None
-
+            parsed, _ = partial_json_loads(search_text.strip(), Allow.ALL & ~Allow.STR)
+        except (ValueError, partial_json_parser.core.exceptions.MalformedJSON):
             return None
-
-        except Exception:
-            logger.exception("Error trying to handle streaming tool call.")
+        calls = parsed if isinstance(parsed, list) else [parsed]
+        if not all(isinstance(call, dict) for call in calls):
             return None
+        try:
+            partial, _ = partial_json_loads(search_text.strip(), Allow.ALL)
+            partial_calls = partial if isinstance(partial, list) else [partial]
+            for index, call in enumerate(calls):
+                if index < len(partial_calls) and isinstance(partial_calls[index], dict) and "name" in call:
+                    call["arguments"] = partial_calls[index].get("arguments")
+        except (ValueError, partial_json_parser.core.exceptions.MalformedJSON):
+            pass
+        deltas = stream_json_calls(
+            calls,
+            self.prev_tool_call_arr,
+            self.streamed_args,
+            self.streaming_state["tool_ids"],
+            is_complete_json(search_text.strip()),
+        )
+        self.prev_tool_calls = self.prev_tool_call_arr
+        self.current_tools_sent = [bool(tool_id) for tool_id in self.streaming_state["tool_ids"]]
+        self.current_tool_id = len(calls) - 1
+        self.current_tool_name_sent = bool(self.current_tools_sent and self.current_tools_sent[-1])
+        self.streaming_state["current_tool_index"] = self.current_tool_id
+        self.streaming_state["sent_tools"] = [
+            {"sent_name": sent, "sent_arguments_prefix": bool(args), "sent_arguments": args}
+            for sent, args in zip(self.current_tools_sent, self.streamed_args, strict=True)
+        ]
+        return DeltaMessage(tool_calls=deltas) if deltas else None

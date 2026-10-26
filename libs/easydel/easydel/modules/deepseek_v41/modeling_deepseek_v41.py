@@ -83,7 +83,6 @@ from easydel.layers import Embed, RMSNorm, clamped_swiglu
 from easydel.layers.attention import CompressedWindowAttention
 from easydel.layers.compressed_window import (
     DECODE_ATTEND_PLATFORM,
-    MASK_MIN,
     TRAIN_ATTEND_PLATFORM,
     GatedPoolCompressor,
     GatedPoolCompressorConfig,
@@ -103,12 +102,13 @@ from easydel.layers.compressed_window import (
     ring_visibility_bias,
     run_column_blocks,
     tokens_to_grid,
+    window_token_bias,
 )
 from easydel.layers.engram import ENGRAM_TABLE_KEY_RE, EngramModelMixin, GatedEngram
 from easydel.layers.indexer import (
-    IndexerScoreInputs,
     SharedKeyIndexer,
     SharedKeyIndexerConfig,
+    indexer_distillation_loss,
     select_candidate_blocks,
     selection_bias,
 )
@@ -250,18 +250,6 @@ def _ced_shift_grid(grid: Array, col_offset: Array) -> Array:
     return jax.vmap(lambda g, c: jnp.take(g, c, axis=0))(grid, cols)
 
 
-def _linear_kwargs(config: DeepseekV41Config, dtype, param_dtype, precision, rngs) -> dict[str, tp.Any]:
-    """Common bias-free ColumnParallel/RowParallel constructor arguments."""
-    return dict(
-        use_bias=False,
-        dtype=dtype,
-        param_dtype=param_dtype,
-        precision=precision,
-        kernel_init=jax.nn.initializers.normal(config.initializer_range),
-        rngs=rngs,
-    )
-
-
 class DeepseekV41Compressor(GatedPoolCompressor):
     """V4.1 binding of :class:`~easydel.layers.compressed_window.GatedPoolCompressor` (reference ``Compressor``)."""
 
@@ -296,7 +284,7 @@ class DeepseekV41Indexer(SharedKeyIndexer):
     ``score[t] = sum_h relu(q_h . k_t) * w_h`` with ``w = weights_proj(x) * index_head_dim^-0.5 * n_heads^-0.5``;
     entries beyond the query's reach ``(position + 1) // ratio`` are excluded. Selection is a hard top-k (the selection
     carries no gradient, as in the reference's inference-mode module); with ``indexer_aux_loss_coef > 0`` the model
-    trains the scores through :func:`indexer_distillation_loss`.
+    trains the scores through :func:`easydel.layers.indexer.indexer_distillation_loss`.
     """
 
     def __init__(
@@ -372,129 +360,6 @@ class DeepseekV41Indexer(SharedKeyIndexer):
         )
 
 
-def _window_token_bias(token_valid: Bool[Array, "batch seq"], window: int) -> Float[Array, "batch 1 seq seq"]:
-    """Dense additive bias of the token region: key ``k`` visible to query ``q`` iff ``q - window < k <= q`` and valid.
-
-    Only the dense fallback paths need this; the registered compressed-window op builds the same mask in-kernel from
-    ``token_valid``.
-    """
-    seq = token_valid.shape[1]
-    q_idx = jnp.arange(seq)[:, None]
-    k_idx = jnp.arange(seq)[None, :]
-    allowed = ((k_idx <= q_idx) & (k_idx > q_idx - window))[None, None] & token_valid.astype(bool)[:, None, None, :]
-    return jnp.where(allowed, 0.0, MASK_MIN).astype(jnp.float32)
-
-
-def indexer_distillation_loss(
-    q: Float[Array, "batch heads seq dim"],
-    window_kv: Float[Array, "batch seq dim"],
-    entries: Float[Array, "batch entries dim"],
-    sinks: Float[Array, "heads"],
-    token_valid: Bool[Array, "batch seq"],
-    scores: Float[Array, "batch seq entries"] | IndexerScoreInputs,
-    *,
-    window: int,
-    scaling: float,
-    precision: jax.lax.PrecisionLike = None,
-    block_q: int = 64,
-) -> Array:
-    """Dense indexer warm-up objective ``KL(stop_grad(p) || softmax(scores))`` (DeepSeek DSA indexer training).
-
-    ``p`` is the layer's dense attention distribution over the compressed entries: the sink-augmented softmax over
-    ``[window tokens | compressed entries | sink]`` (all entries a query can reach, not only the top-k), summed over
-    attention heads and L1-normalized over the entries. The indexer side is ``softmax`` of its scores over the same
-    reachable entries. Everything on the attention side is under ``stop_gradient``, so only the indexer scores
-    receive gradient. Queries that reach no entry contribute nothing; the loss is the mean KL over the queries that do.
-
-    Args:
-        q: Roped queries ``[B, H, S, D]``.
-        window_kv: Roped token K/V (K == V) ``[B, S, D]``.
-        entries: Roped compressed entries ``[B, T, D]``.
-        sinks: Per-head attention sinks ``[H]``.
-        token_valid: Per-key validity of the token region ``[B, S]``; key ``k`` is visible to query ``s`` iff
-            ``s - window < k <= s`` and ``token_valid[k]``.
-        scores: Indexer scores ``[B, S, T]`` with ``-inf`` at unreachable entries, or lazy
-            :class:`~easydel.layers.indexer.IndexerScoreInputs` evaluated per query tile (no ``[B, S, T]`` score
-            tensor in either AD direction).
-        window: Sliding-window size.
-        scaling: Attention logit scale.
-        precision: Matmul precision.
-        block_q: Queries per tile. Each tile only touches its ``block_q + window - 1`` token keys plus the entries,
-            so the token part costs ``O(S * window)`` and no ``[B, H, S, S]`` tensor exists.
-
-    Returns:
-        Scalar fp32 loss.
-    """
-    q = jax.lax.stop_gradient(q)
-    window_kv = jax.lax.stop_gradient(window_kv)
-    entries = jax.lax.stop_gradient(entries).astype(window_kv.dtype)
-    sinks = jax.lax.stop_gradient(sinks).astype(jnp.float32)
-    batch, heads, seq, _ = q.shape
-    num_entries = entries.shape[1]
-    tile = max(1, min(block_q, seq))
-    span = min(tile + window - 1, seq)
-    tiles = -(-seq // tile)
-    pad = tiles * tile - seq
-    q_padded = jnp.pad(q, ((0, 0), (0, 0), (0, pad), (0, 0)))
-    valid = token_valid.astype(bool)
-    sink = sinks.reshape(1, heads, 1, 1)
-
-    if isinstance(scores, IndexerScoreInputs):
-        # Scores are evaluated per tile from the indexer's queries; padded rows get position -1 (reach nothing).
-        iq = jnp.pad(scores.q, ((0, 0), (0, pad), (0, 0), (0, 0)))
-        iw = jnp.pad(scores.weights, ((0, 0), (0, pad), (0, 0)))
-        ipos = jnp.pad(scores.positions.astype(jnp.int32), ((0, 0), (0, pad)), constant_values=-1)
-
-        def _tile_scores(index):
-            start = index * tile
-            return scores.rows(
-                jax.lax.dynamic_slice_in_dim(iq, start, tile, axis=1),
-                jax.lax.dynamic_slice_in_dim(iw, start, tile, axis=1),
-                jax.lax.dynamic_slice_in_dim(ipos, start, tile, axis=1),
-            )
-
-    else:
-        dense_padded = jnp.pad(scores, ((0, 0), (0, pad), (0, 0)), constant_values=-jnp.inf)
-
-        def _tile_scores(index):
-            return jax.lax.dynamic_slice_in_dim(dense_padded, index * tile, tile, axis=1)
-
-    @jax.checkpoint
-    def _tile_kl(index):
-        """``(sum of per-query KL, number of queries reaching an entry)`` for queries in tile ``index``.
-
-        The target is normalized per query row, so the KL is complete inside the tile: no ``[B, S, T]`` target or
-        score tensor exists in either AD direction (the tile is rematerialized in the backward pass).
-        """
-        start = index * tile
-        lo = jnp.clip(start - window + 1, 0, seq - span)
-        q_t = jax.lax.dynamic_slice_in_dim(q_padded, start, tile, axis=2)
-        k_t = jax.lax.dynamic_slice_in_dim(window_kv, lo, span, axis=1)
-        key_ok = jax.lax.dynamic_slice_in_dim(valid, lo, span, axis=1)
-        scores_t = _tile_scores(index)  # [B, tile, T], carries the indexer gradient
-        reach_t = jax.lax.stop_gradient(scores_t) > -jnp.inf
-        q_pos = start + jnp.arange(tile, dtype=jnp.int32)[:, None]
-        k_pos = lo + jnp.arange(span, dtype=jnp.int32)[None, :]
-        allowed = ((k_pos <= q_pos) & (k_pos > q_pos - window))[None] & key_ok[:, None, :]  # [B, tile, span]
-        window_logits = jnp.einsum("bhsd,btd->bhst", q_t, k_t, precision=precision).astype(jnp.float32) * scaling
-        window_logits = jnp.where(allowed[:, None], window_logits, MASK_MIN)
-        entry_logits = jnp.einsum("bhsd,btd->bhst", q_t, entries, precision=precision).astype(jnp.float32)
-        entry_logits = jnp.where(reach_t[:, None], entry_logits * scaling, MASK_MIN)
-        sinks_t = jnp.broadcast_to(sink, (batch, heads, tile, 1))
-        combined = jnp.concatenate([window_logits, entry_logits, sinks_t], axis=-1)
-        probs = jax.nn.softmax(combined - jnp.max(combined, axis=-1, keepdims=True), axis=-1)
-        target = jnp.sum(probs[..., span : span + num_entries], axis=1)  # [B, tile, T], summed over heads
-        target = jax.lax.stop_gradient(target / jnp.maximum(jnp.sum(target, axis=-1, keepdims=True), 1e-30))
-        log_pred = jax.nn.log_softmax(jnp.where(reach_t, scores_t, MASK_MIN).astype(jnp.float32), axis=-1)
-        positive = target > 0
-        kl = jnp.sum(jnp.where(positive, target * (jnp.log(jnp.where(positive, target, 1.0)) - log_pred), 0.0), axis=-1)
-        row_valid = jnp.any(reach_t, axis=-1).astype(jnp.float32)
-        return jnp.sum(kl * row_valid), jnp.sum(row_valid)
-
-    kl_sums, counts = jax.lax.map(_tile_kl, jnp.arange(tiles, dtype=jnp.int32))
-    return jnp.sum(kl_sums) / jnp.maximum(jnp.sum(counts), 1.0)
-
-
 class DeepseekV41Attention(CompressedWindowAttention):
     """Shared-KV MQA with sinks over a sliding window plus indexer-selected compressed entries.
 
@@ -553,7 +418,7 @@ class DeepseekV41Attention(CompressedWindowAttention):
             )
         batch, _, seq, _ = q.shape
         num_entries = kv.shape[1] - seq
-        token_bias = _window_token_bias(token_valid, self.sliding_window)
+        token_bias = window_token_bias(token_valid, self.sliding_window)
         if entry_topk is None:
             entry_bias = jnp.zeros((batch, 1, seq, num_entries), jnp.float32)
         else:
@@ -764,13 +629,13 @@ class DeepseekV41Attention(CompressedWindowAttention):
                 if index_scores is not None:
                     aux = indexer_distillation_loss(
                         q,
-                        kv,
                         compress_kv,
-                        self.sinks.value,
-                        token_valid,
                         index_scores,
-                        window=self.sliding_window,
                         scaling=self.scaling,
+                        window_kv=kv,
+                        sinks=self.sinks.value,
+                        token_valid=token_valid,
+                        window=self.sliding_window,
                         precision=self.precision,
                     )
                     previous = shared.get("indexer_aux")
@@ -1399,41 +1264,31 @@ class DeepseekV41DecoderLayer(spx.Module):
 
 @auto_pytree
 class DeepseekV41ModelOutput(MoeModelOutput):
-    """:class:`MoeModelOutput` plus the DSpark main hidden states and the indexer auxiliary loss.
+    """:class:`MoeModelOutput` plus the DSpark main hidden states.
+
+    The unscaled indexer warm-up loss travels in the inherited ``indexer_aux_loss`` field (set only when
+    ``indexer_aux_loss_coef > 0`` on a stateless forward).
 
     Attributes:
         main_hidden: ``[B, S, len(dspark_target_layer_ids) * D]`` concatenated target-layer hidden states, only when
             requested with ``output_dspark_hidden=True``.
-        indexer_aux_loss: Unscaled sum over index-source layers of :func:`indexer_distillation_loss`, only when
-            ``indexer_aux_loss_coef > 0`` on a stateless forward.
     """
 
     main_hidden: Array | None = None
-    indexer_aux_loss: Array | None = None
 
 
 @auto_pytree
 class DeepseekV41CausalLMOutput(MoeCausalLMOutput):
-    """:class:`MoeCausalLMOutput` plus ``main_hidden`` and the unscaled ``indexer_aux_loss`` (see the model output)."""
+    """:class:`MoeCausalLMOutput` plus ``main_hidden`` (see the model output)."""
 
     main_hidden: Array | None = None
-    indexer_aux_loss: Array | None = None
 
 
 @auto_pytree
 class DeepseekV41VLMOutput(VLMCausalLMOutput):
-    """:class:`VLMCausalLMOutput` plus ``main_hidden`` and the unscaled ``indexer_aux_loss`` (see the model output)."""
+    """:class:`VLMCausalLMOutput` plus ``main_hidden`` (see the model output)."""
 
     main_hidden: Array | None = None
-    indexer_aux_loss: Array | None = None
-
-
-def _total_aux_loss(config: DeepseekV41Config, base_aux: Array | None, indexer_aux: Array | None) -> Array | None:
-    """Fold ``indexer_aux_loss_coef * indexer_aux`` into the router auxiliary loss (``None`` when both are absent)."""
-    if indexer_aux is None:
-        return base_aux
-    scaled = float(config.indexer_aux_loss_coef) * indexer_aux
-    return scaled if base_aux is None else base_aux + scaled
 
 
 @register_module(TaskType.BASE_MODULE, config=DeepseekV41Config, model_type="deepseek_v41")
@@ -1815,6 +1670,7 @@ class DeepseekV41Model(EngramModelMixin, EasyDeLBaseModule):
                 0,
             ),
             trace=True,
+            **self._layer_scan_kwargs("text"),
         )
         hidden_states = self.norm(manifold_collapse(pre_mix, hidden_streams))
         main_hidden = None
@@ -2038,7 +1894,7 @@ class DeepseekV41ForCausalLM(EngramModelMixin, BaseCausalLMModule[DeepseekV41Mod
         if apply_lm_head:
             logits = self.compute_lm_logits(self.prepare_lm_head_inputs(outputs.last_hidden_state))
         return DeepseekV41CausalLMOutput(
-            aux_loss=_total_aux_loss(self.config, self.compute_router_aux_loss(outputs), outputs.indexer_aux_loss),
+            aux_loss=self.compute_aux_loss(outputs),
             logits=logits,
             hidden_states=outputs.hidden_states,
             last_hidden_state=outputs.last_hidden_state,
@@ -2323,11 +2179,20 @@ class DeepseekV41ForConditionalGeneration(  # type: ignore
 
         return DeepseekV41ImageExpander(self.config)
 
-    def esurge_compute_prefill_embeddings(self, prompt_token_ids, features):
-        """eSurge hook: encode a request's images and merge them into its prompt embeddings."""
+    def esurge_compute_prefill_embeddings(self, prompt_token_ids, features, encoder_cache_provider=None):
+        """Merge this prompt with image rows from an optional ``provider(feature, encode)`` cache.
+
+        Args:
+            prompt_token_ids: Expanded prompt token ids.
+            features: Image features carrying raw pixels or cached aligner rows.
+            encoder_cache_provider: Optional cache provider accepting a feature and
+                a lazy zero-argument encoder fallback. Defaults to feature-local reuse.
+        """
         from .processing_deepseek_v41 import compute_prefill_embeddings
 
-        return compute_prefill_embeddings(self, prompt_token_ids, features)
+        return compute_prefill_embeddings(
+            self, prompt_token_ids, features, encoder_cache_provider=encoder_cache_provider
+        )
 
     def __init__(
         self,
@@ -2425,7 +2290,7 @@ class DeepseekV41ForConditionalGeneration(  # type: ignore
             last_hidden_state=hidden_states,
             attentions=None,
             router_logits=outputs.router_logits,
-            aux_loss=_total_aux_loss(self.config, self.compute_router_aux_loss(outputs), outputs.indexer_aux_loss),
+            aux_loss=self.compute_aux_loss(outputs),
             main_hidden=outputs.main_hidden,
             indexer_aux_loss=outputs.indexer_aux_loss,
         )
@@ -2470,6 +2335,5 @@ __all__ = [
     "DeepseekV41SparseMoeBlock",
     "DeepseekV41VLMOutput",
     "DeepseekV41VLModel",
-    "indexer_distillation_loss",
     "select_candidate_blocks",
 ]

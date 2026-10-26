@@ -66,21 +66,14 @@ from .openai_api_modules import (
 )
 from .sampling_params import SamplingParams
 from .stream_protocol import (
-    build_responses_function_call_items,
-    build_responses_message_item,
     build_responses_object,
     build_responses_output_items,
-    build_responses_reasoning_item,
     coerce_stream_delta_message,
     compute_stream_delta_text,
     jsonify_tool_calls,
     responses_assistant_message_from_output_items,
-    should_emit_responses_message_item,
 )
 from .typed_models import (
-    ResponseFunctionCallItem,
-    ResponseMessageItem,
-    ResponseReasoningItem,
     ResponsesOutputItem,
     ResponsesResponse,
 )
@@ -1327,90 +1320,57 @@ class BaseInferenceApiServer(ABC):
             if isinstance(input_value, str):
                 messages.append(ChatMessage(role="user", content=input_value))
             elif isinstance(input_value, list):
-                if all(
-                    (isinstance(item, ChatMessage)) or (isinstance(item, dict) and "role" in item)
-                    for item in input_value
-                ):
-                    for item in input_value:
-                        if isinstance(item, ChatMessage):
-                            messages.append(cls._normalize_chat_message(item))
+                for item in input_value:
+                    if isinstance(item, ChatMessage):
+                        messages.append(cls._normalize_chat_message(item))
+                        continue
+                    if not isinstance(item, dict):
+                        messages.append(ChatMessage(role="user", content=str(item)))
+                        continue
+                    item_type = str(item.get("type", "")).strip().lower()
+                    if item_type == "function_call":
+                        arguments = item.get("arguments", "")
+                        if not isinstance(arguments, str):
+                            arguments = json.dumps(arguments, ensure_ascii=False)
+                        call = {
+                            "id": str(item.get("call_id") or item.get("id") or ""),
+                            "type": "function",
+                            "function": {"name": item.get("name", ""), "arguments": arguments},
+                        }
+                        # Adjacent function items are one assistant turn (parallel calls).
+                        if messages and messages[-1].role == "assistant" and messages[-1].tool_calls:
+                            messages[-1].tool_calls.append(call)
                         else:
-                            messages.append(cls._normalize_chat_message(ChatMessage.model_validate(item)))
-                elif all(isinstance(item, dict) and "type" in item for item in input_value):
-                    for item in tp.cast(list[dict[str, tp.Any]], input_value):
-                        item_type = str(item.get("type", "")).strip().lower()
-                        if item_type == "message":
-                            role = item.get("role")
-                            role_value = str(role).strip() if isinstance(role, str) and role.strip() else "user"
-                            messages.append(
-                                cls._normalize_chat_message(
-                                    ChatMessage(role=role_value, content=item.get("content", ""))
-                                )
+                            messages.append(ChatMessage(role="assistant", content=None, tool_calls=[call]))
+                    elif item_type == "function_call_output":
+                        output = item.get("output", item.get("content", ""))
+                        output_text = (
+                            json.dumps(output, ensure_ascii=False)
+                            if isinstance(output, (dict, list))
+                            else ("" if output is None else str(output))
+                        )
+                        messages.append(
+                            ChatMessage(
+                                role="tool",
+                                content=output_text,
+                                tool_call_id=str(
+                                    item.get("call_id") or item.get("tool_call_id") or item.get("id") or ""
+                                ),
                             )
-                            continue
-
-                        if item_type == "function_call_output":
-                            call_id = item.get("call_id") or item.get("tool_call_id") or item.get("id")
-                            output_value = item.get("output")
-                            if output_value is None:
-                                output_value = item.get("content")
-
-                            if isinstance(output_value, (dict, list)):
-                                output_text = json.dumps(output_value, ensure_ascii=False)
-                            elif output_value is None:
-                                output_text = ""
-                            else:
-                                output_text = str(output_value)
-
-                            tool_msg = ChatMessage(role="tool", content=output_text)
-                            if call_id is not None:
-                                tool_msg.tool_call_id = str(call_id)
-                            messages.append(tool_msg)
-                            continue
-
-                        if item_type in {"input_text", "output_text", "text"}:
-                            text_value = item.get("text")
-                            if text_value is None:
-                                text_value = item.get("content", "")
-                            messages.append(ChatMessage(role="user", content=str(text_value)))
-                            continue
-
+                        )
+                    elif item_type == "message" or "role" in item:
+                        payload = dict(item)
+                        payload.setdefault("role", "user")
+                        payload.setdefault("content", "")
+                        messages.append(cls._normalize_chat_message(ChatMessage.model_validate(payload)))
+                    elif item_type in {"input_text", "output_text", "text"}:
+                        messages.append(ChatMessage(role="user", content=str(item.get("text", item.get("content", "")))))
+                    else:
                         messages.append(ChatMessage(role="user", content=json.dumps(item, ensure_ascii=False)))
-                else:
-                    messages.append(ChatMessage(role="user", content=json.dumps(input_value, ensure_ascii=False)))
             elif input_value is not None:
                 messages.append(ChatMessage(role="user", content=str(input_value)))
 
         return messages
-
-    @staticmethod
-    def _flatten_messages_to_text(messages: list[ChatMessage]) -> list[ChatMessage]:
-        """Collapse content arrays into plain text for tool parsing and templating.
-
-        Args:
-            messages: Chat messages whose content may be a list of typed parts.
-
-        Returns:
-            New list of :class:`ChatMessage` instances with plain string
-            content suitable for templating engines that expect strings.
-        """
-
-        flattened: list[ChatMessage] = []
-        for msg in messages:
-            content = msg.content
-            if isinstance(content, list):
-                text_parts: list[str] = []
-                for part in content:
-                    if isinstance(part, dict):
-                        part_type = part.get("type")
-                        if part_type in ("text", "input_text"):
-                            text_parts.append(str(part.get("text", "")))
-                flattened.append(
-                    msg.model_copy(update={"content": " ".join(part_text for part_text in text_parts if part_text)})
-                )
-            else:
-                flattened.append(msg.model_copy(deep=True))
-        return flattened
 
     @staticmethod
     def _extract_responses_tools(
@@ -1437,7 +1397,9 @@ class BaseInferenceApiServer(ABC):
             if isinstance(tool, ToolDefinition):
                 tools_for_template.append(tool.model_dump(exclude_none=True))
             elif isinstance(tool, FunctionDefinition):
-                tools_for_template.append({"type": "function", "function": tool.model_dump(exclude_none=True)})
+                function_payload = tool.model_dump(exclude_none=True)
+                function_payload.pop("type", None)
+                tools_for_template.append({"type": "function", "function": function_payload})
             else:
                 payload = tool.model_dump(exclude_none=True)
                 if isinstance(payload, dict) and isinstance(payload.get("function"), dict):
@@ -1559,60 +1521,6 @@ class BaseInferenceApiServer(ABC):
             n=int(n or 1),
             stop=stop,
         )
-
-    @staticmethod
-    def _build_responses_reasoning_item(reasoning_text: str) -> ResponseReasoningItem:
-        """Build a Responses ``reasoning`` output item from raw text.
-
-        Args:
-            reasoning_text: The reasoning summary text to embed.
-
-        Returns:
-            A :class:`ResponseReasoningItem` payload object.
-        """
-        return build_responses_reasoning_item(reasoning_text)
-
-    @staticmethod
-    def _build_responses_function_call_items(tool_calls: list[tp.Any] | None) -> list[ResponseFunctionCallItem]:
-        """Build Responses ``function_call`` output items from tool calls.
-
-        Args:
-            tool_calls: Tool call records produced by the engine, or ``None``.
-
-        Returns:
-            List of :class:`ResponseFunctionCallItem` objects (empty when
-            ``tool_calls`` is falsy).
-        """
-        return build_responses_function_call_items(tool_calls)
-
-    @staticmethod
-    def _build_responses_message_item(output_text: str) -> ResponseMessageItem:
-        """Build a Responses ``message`` output item from generated text.
-
-        Args:
-            output_text: Assistant-visible text to wrap.
-
-        Returns:
-            A :class:`ResponseMessageItem` payload object.
-        """
-        return build_responses_message_item(output_text)
-
-    @staticmethod
-    def _should_emit_responses_message_item(
-        output_text: str,
-        tool_calls: list[tp.Any] | None = None,
-    ) -> bool:
-        """Return whether a Responses output should include a message item.
-
-        Args:
-            output_text: Generated text to consider for inclusion.
-            tool_calls: Optional tool calls accompanying the output.
-
-        Returns:
-            ``True`` when the message item should be emitted alongside any
-            tool/reasoning items.
-        """
-        return should_emit_responses_message_item(output_text, tool_calls)
 
     @classmethod
     def _build_responses_output_items(
@@ -2075,7 +1983,7 @@ class BaseInferenceApiServer(ABC):
         Returns:
             Token count produced by :meth:`_count_tokens`.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self.thread_pool, self._count_tokens, content, model_name)
 
     @abstractmethod

@@ -18,9 +18,9 @@ Provides efficient storage and management of token sequences, page tables,
 and generation metadata for batch processing.
 
 Classes:
-    SequenceBuffer: Main buffer for managing sequences
-    DecodeRowInfo: Information about sequences in decode phase
-    ModelRunBatch: Batch data for model execution
+    SequenceBuffer: Main buffer for managing sequences.
+    DecodeRowInfo: Information about sequences in decode phase.
+    ModelRunBatch: Host-side token and position batch for model execution.
 
 Example:
     >>> buffer = SequenceBuffer(
@@ -36,6 +36,7 @@ Example:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import jax
@@ -49,88 +50,127 @@ from easydel.utils.compiling_utils import ejit
 from ...sampling_params import SamplingParams, SamplingType
 from ..outputs import LogprobsTensors, swap_dict_values
 from ..page_table import MultiGroupPageTable
+from .states import CachedRequestState
 
 logger = get_logger(__name__)
 
 
-@ejit(static_argnames=("padded_num_reqs", "padded_prompt_len"))  # pyright: ignore[reportUntypedFunctionDecorator]
+@ejit(static_argnames=("padded_num_reqs", "padded_prompt_len"))
 def pack_prompts(token_ids, num_prompt_tokens, padded_num_reqs, padded_prompt_len, pad_id):
-    """Pack prompt tokens into a padded tensor.
-
-    Creates a padded tensor of prompt tokens with consistent shape for
-    batch processing. Tokens beyond the prompt length are replaced with
-    the padding ID.
+    """Pack prompt tokens to ``[padded_num_reqs, padded_prompt_len]``.
 
     Args:
-        token_ids: Token IDs array of shape [max_num_reqs, max_model_len].
-        num_prompt_tokens: Number of prompt tokens per request [max_num_reqs].
-        padded_num_reqs: Target number of requests after padding.
-        padded_prompt_len: Target prompt length after padding.
-        pad_id: Token ID to use for padding.
+        token_ids: Token rows shaped [max_num_reqs, max_model_len].
+        num_prompt_tokens: Valid prompt length per row.
+        padded_num_reqs: Output row count.
+        padded_prompt_len: Output token count per row.
+        pad_id: Token ID for padding positions.
 
     Returns:
-        Packed prompts array of shape [padded_num_reqs, padded_prompt_len]
-        with valid tokens and padding.
-
-    Note:
-        This function is JIT-compiled with static arguments for padded dimensions
-        to enable efficient compilation caching.
+        Prompt rows with non-prompt and padded positions filled with pad_id.
     """
-    with jax.named_scope("easydel/esurge/sequence_buffer/pack_prompts"):
-        slice_tokens = token_ids[:padded_num_reqs, :padded_prompt_len]
-        lengths = num_prompt_tokens[:padded_num_reqs, None]  # [B,1]
-        arange = jnp.arange(padded_prompt_len, dtype=lengths.dtype)[None, :]  # [1,T]
-        mask = arange < lengths  # [B,T]
-        pad_mat = jnp.full_like(slice_tokens, pad_id)
-        return jnp.where(mask, slice_tokens, pad_mat)
+    tokens = jnp.pad(
+        token_ids,
+        ((0, max(0, padded_num_reqs - token_ids.shape[0])), (0, max(0, padded_prompt_len - token_ids.shape[1]))),
+        constant_values=pad_id,
+    )[:padded_num_reqs, :padded_prompt_len]
+    lengths = jnp.pad(num_prompt_tokens, (0, max(0, padded_num_reqs - num_prompt_tokens.shape[0])))[:padded_num_reqs]
+    return jnp.where(jnp.arange(padded_prompt_len)[None, :] < lengths[:, None], tokens, pad_id)
 
 
-@ejit(static_argnames=("padded_num_reqs",))  # pyright: ignore[reportUntypedFunctionDecorator]
+@ejit(static_argnames=("padded_num_reqs",))
 def build_sampling_arrays(temperature, min_p, top_p, top_k, num_reqs, padded_num_reqs):
-    """Build padded sampling parameter arrays.
-
-    Pads sampling parameters to a consistent size for batch processing,
-    filling unused slots with default values.
+    """Build sampling arrays, padding inactive rows with neutral defaults.
 
     Args:
-        temperature: Temperature values for sampling.
-        min_p: Minimum probability threshold values.
-        top_p: Top-p (nucleus) sampling values.
-        top_k: Top-k sampling values.
-        num_reqs: Actual number of requests.
-        padded_num_reqs: Target padded number of requests.
+        temperature: Temperature values per row.
+        min_p: Minimum probability thresholds per row.
+        top_p: Nucleus thresholds per row.
+        top_k: Top-k counts per row.
+        num_reqs: Number of active rows (may be dynamic under JIT).
+        padded_num_reqs: Output row count.
 
     Returns:
-        A tuple of padded arrays:
-            - temperature: Padded with -1.0 (float32)
-            - min_p: Padded with 0.0 (float32)
-            - top_p: Padded with 1.0 (float32)
-            - top_k: Padded with 0 (int32)
-
-    Note:
-        Default padding values are chosen to be neutral for sampling operations.
+        Temperature, min-p, top-p and top-k arrays padded with -1, 0, 1 and 0.
     """
 
-    def fill(arr, fill_val):
-        """Create a padded array filled with a default value and active entries copied in.
+    def fill(arr, default, dtype):
+        values = jnp.pad(arr, (0, max(0, padded_num_reqs - arr.shape[0])), constant_values=default)[:padded_num_reqs]
+        return jnp.where(jnp.arange(padded_num_reqs) < num_reqs, values, default).astype(dtype)
 
-        Args:
-            arr: Source array containing active sampling parameter values.
-            fill_val: Default value used for padding slots beyond num_reqs.
+    return (
+        fill(temperature, -1.0, jnp.float32),
+        fill(min_p, 0.0, jnp.float32),
+        fill(top_p, 1.0, jnp.float32),
+        fill(top_k, 0, jnp.int32),
+    )
 
-        Returns:
-            Padded array of shape (padded_num_reqs,) with active values at the front.
-        """
-        out = jnp.full((padded_num_reqs,), fill_val, dtype=arr.dtype)
-        return out.at[:num_reqs].set(arr[:num_reqs])
 
-    with jax.named_scope("easydel/esurge/sequence_buffer/build_sampling_arrays"):
-        return (
-            fill(temperature, -1.0).astype(jnp.float32),
-            fill(min_p, 0.0).astype(jnp.float32),
-            fill(top_p, 1.0).astype(jnp.float32),
-            fill(top_k, 0).astype(jnp.int32),
-        )
+@ejit(static_argnames=("vocab_size", "max_allowed"))
+def build_allowed_mask(allowed_ids_padded, allowed_lens, vocab_size, max_allowed):
+    """Build a JIT-compatible mask with True for disallowed token IDs.
+
+    Args:
+        allowed_ids_padded: Allowed IDs shaped [rows, max_allowed].
+        allowed_lens: Number of valid allowed IDs per row.
+        vocab_size: Vocabulary size.
+        max_allowed: Padded allowed-ID count.
+
+    Returns:
+        Boolean [rows, vocab_size] mask. Padded and invalid IDs are ignored.
+    """
+    rows = jnp.arange(allowed_ids_padded.shape[0])[:, None]
+    valid = (jnp.arange(max_allowed)[None, :] < allowed_lens[:, None]) & (
+        (allowed_ids_padded >= 0) & (allowed_ids_padded < vocab_size)
+    )
+    indices = jnp.where(valid, allowed_ids_padded, vocab_size)
+    return jnp.ones((allowed_ids_padded.shape[0], vocab_size), dtype=bool).at[rows, indices].set(False, mode="drop")
+
+
+@ejit(static_argnums=(2, 3))
+def fill_slice(arr, fill_val, num_reqs, padded_num_reqs):
+    """Fill inactive rows and return the padded prefix.
+
+    Args:
+        arr: Array whose first dimension contains request rows.
+        fill_val: Value to store in inactive rows.
+        num_reqs: Active request count.
+        padded_num_reqs: Output row count.
+
+    Returns:
+        Array of padded_num_reqs rows with inactive rows filled with fill_val.
+    """
+    padding = ((0, max(0, padded_num_reqs - arr.shape[0])),) + ((0, 0),) * (arr.ndim - 1)
+    values = jnp.pad(arr, padding, constant_values=fill_val)[:padded_num_reqs]
+    active = (jnp.arange(padded_num_reqs) < num_reqs).reshape((padded_num_reqs,) + (1,) * (arr.ndim - 1))
+    return jnp.where(active, values, fill_val)
+
+
+@dataclass(frozen=True)
+class DecodeRowInfo:
+    """Host description of an active decode request and its batch token offset."""
+
+    req_id: str
+    req_index: int
+    token_offset: int
+    num_computed_tokens: int
+
+
+@dataclass(frozen=True)
+class ModelRunBatch:
+    """Independent host snapshot of a flattened execution batch.
+
+    Arrays contain scheduled tokens only, in request-row order; request_indices
+    maps each token to its SequenceBuffer row. Preparing a batch does not advance
+    compute progress or allocate KV pages.
+    """
+
+    req_ids: tuple[str, ...]
+    input_ids: np.ndarray
+    position_ids: np.ndarray
+    request_indices: np.ndarray
+    scheduled_token_counts: tuple[int, ...]
+    decode_rows: tuple[DecodeRowInfo, ...]
 
 
 def swap_rows(arr, i1, i2):
@@ -194,46 +234,6 @@ def move_row(arr, from_idx, to_idx):
     out = np.asarray(arr).copy()
     out[to_idx] = out[from_idx]
     return out
-
-
-@ejit(static_argnames=("vocab_size", "max_allowed"))  # pyright: ignore[reportUntypedFunctionDecorator]
-def build_allowed_mask(allowed_ids_padded, allowed_lens, vocab_size, max_allowed):
-    """Build a mask for allowed token IDs.
-
-    Creates a boolean mask indicating which tokens are allowed for each request.
-    The mask uses inverted logic where True means disallowed and False means allowed.
-
-    Args:
-        allowed_ids_padded: Padded array of allowed token IDs [B, max_allowed].
-        allowed_lens: Number of valid allowed IDs per request [B].
-        vocab_size: Total vocabulary size.
-        max_allowed: Maximum number of allowed tokens per request.
-
-    Returns:
-        Boolean mask of shape [B, vocab_size] where True indicates
-        the token is disallowed and False indicates it's allowed.
-
-    Note:
-        The inverted logic (True=disallowed) is used for compatibility
-        with masking operations that zero out disallowed values.
-    """
-    with jax.named_scope("easydel/esurge/sequence_buffer/build_allowed_mask"):
-        B = allowed_ids_padded.shape[0]
-        mask = jnp.ones((B, vocab_size), dtype=bool)
-
-        batch_idx = jnp.repeat(jnp.arange(B)[:, None], max_allowed, axis=1)  # [B, max_allowed]
-        flat_batch = batch_idx.reshape(-1)
-        flat_token = allowed_ids_padded.reshape(-1)
-
-        ar = jnp.arange(max_allowed)[None, :]
-        valid = ar < allowed_lens[:, None]
-        flat_valid = valid.reshape(-1)
-
-        flat_batch = flat_batch[flat_valid]
-        flat_token = flat_token[flat_valid]
-
-        mask = mask.at[flat_batch, flat_token].set(False)
-        return mask
 
 
 class SequenceBuffer:
@@ -406,7 +406,88 @@ class SequenceBuffer:
         if len(self.logit_bias) <= upto_idx:
             self.logit_bias.extend([None] * (upto_idx + 1 - len(self.logit_bias)))
 
-    def add_request(self, request: EngineRequest, req_index: int | None = None) -> None:
+    def begin_sequence(
+        self,
+        req_id: str,
+        prompt_token_ids: list[int],
+        sampling_params: SamplingParams | None = None,
+        page_ids: tuple[list[int], ...] | None = None,
+    ) -> int:
+        """Admit a text sequence using the same bookkeeping as add_request.
+
+        Args:
+            req_id: Unique request identifier.
+            prompt_token_ids: Prompt token IDs.
+            sampling_params: Generation parameters; defaults to greedy sampling.
+            page_ids: Preallocated KV pages per group. Empty groups are used
+                when omitted; the caller remains responsible for allocating pages
+                before executing the resulting model batch.
+
+        Returns:
+            The admitted sequence-buffer row index.
+        """
+        request = CachedRequestState(
+            req_id=req_id,
+            prompt_token_ids=list(prompt_token_ids),
+            sampling_params=sampling_params if sampling_params is not None else SamplingParams(temperature=0.0),
+            generator=None,
+            page_ids=page_ids if page_ids is not None else tuple([] for _ in self.page_table.page_tables),
+            num_computed_tokens=0,
+            output_token_ids=[],
+        )
+        self.add_request(request)
+        return self.req_id_to_index[req_id]
+
+    def prepare_batch(self, max_num_tokens: int | None = None) -> ModelRunBatch:
+        """Snapshot pending tokens into a host execution batch without advancing state.
+
+        Args:
+            max_num_tokens: Optional tighter token budget; defaults to
+                max_num_batched_tokens. Requests are selected in row order,
+                skipping empty slots and fully computed sequences.
+
+        Returns:
+            Independent flat token/position arrays, source rows, per-request
+            scheduled counts, and decode-row descriptions.
+
+        Raises:
+            ValueError: If max_num_tokens is negative.
+        """
+        budget = self.max_num_batched_tokens if max_num_tokens is None else int(max_num_tokens)
+        if budget < 0:
+            raise ValueError("max_num_tokens must be nonnegative")
+        budget = min(budget, self.max_num_batched_tokens)
+        req_ids: list[str] = []
+        counts: list[int] = []
+        tokens: list[int] = []
+        positions: list[int] = []
+        rows: list[int] = []
+        decode_rows: list[DecodeRowInfo] = []
+        for row, req_id in enumerate(self._req_ids):
+            if req_id is None or budget == 0:
+                continue
+            start = int(self.num_computed_tokens[row])
+            count = min(budget, max(0, int(self.num_tokens[row]) - start))
+            if count == 0:
+                continue
+            if start >= int(self.num_prompt_tokens[row]):
+                decode_rows.append(DecodeRowInfo(req_id, row, len(tokens), start))
+            req_ids.append(req_id)
+            counts.append(count)
+            tokens.extend(self.token_ids[row, start : start + count].tolist())
+            positions.extend(range(start, start + count))
+            rows.extend([row] * count)
+            budget -= count
+        return ModelRunBatch(
+            tuple(req_ids),
+            np.asarray(tokens, dtype=np.int32),
+            np.asarray(positions, dtype=np.int32),
+            np.asarray(rows, dtype=np.int32),
+            tuple(counts),
+            tuple(decode_rows),
+        )
+
+    def add_request(self, request: EngineRequest | CachedRequestState, req_index: int | None = None) -> None:
         """Add a new request to the buffer.
 
         Adds a request with its tokens, sampling parameters, and metadata.
@@ -841,8 +922,13 @@ class SequenceBuffer:
         if sampling_params.min_tokens:
             self.min_tokens[req_index] = (sampling_params.min_tokens, sampling_params.all_stop_token_ids)
 
-        if hasattr(request, "generator_seed") and request.generator_seed is not None:
-            self.generator_seeds[req_index] = request.generator_seed
+        seed = sampling_params.seed
+        if seed is None:
+            seed = getattr(request, "generator_seed", None)
+        if seed is not None:
+            self.generator_seeds[req_index] = seed
+        else:
+            self.generator_seeds.pop(req_index, None)
 
         if sampling_params.logprobs is not None:
             self.num_logprobs[req_id] = sampling_params.logprobs
@@ -963,6 +1049,8 @@ class SequenceBuffer:
         Note:
             Returns empty dict if the index doesn't contain a valid request.
         """
+        if req_index < 0 or req_index >= len(self._req_ids):
+            return {}
         req_id = self._req_ids[req_index]
         if req_id is None:
             return {}
@@ -1040,20 +1128,3 @@ class SequenceBuffer:
 
         self._update_request_distribution()
         self._layout_version += 1
-
-
-@ejit(static_argnums=(2, 3))  # pyright: ignore[reportUntypedFunctionDecorator]
-def fill_slice(arr, fill_val, num_reqs, padded_num_reqs):
-    """Fill array slice with padding value.
-
-    Args:
-        arr: Input array to pad.
-        fill_val: Value to use for padding.
-        num_reqs: Number of valid requests.
-        padded_num_reqs: Target padded size.
-
-    Returns:
-        Array with padding applied from num_reqs to padded_num_reqs.
-    """
-    with jax.named_scope("easydel/esurge/sequence_buffer/fill_slice"):
-        return arr.at[num_reqs:padded_num_reqs].set(fill_val)[:padded_num_reqs]

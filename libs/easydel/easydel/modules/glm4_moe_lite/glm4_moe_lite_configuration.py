@@ -25,58 +25,7 @@ import typing as tp
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
-
-
-def _rope_scaling_from_rope_parameters(
-    rope_parameters: dict[str, typing.Any] | None,
-    rope_scaling: dict[str, typing.Any] | None,
-) -> dict[str, typing.Any] | None:
-    """Normalise the HF ``rope_parameters`` block into EasyDeL ``rope_scaling``.
-
-    Hugging Face checkpoints carry a flat ``rope_parameters`` dict while
-    EasyDeL expects an EasyDeL-flavoured ``rope_scaling`` dict that always
-    has a ``rope_type`` key. When both are supplied ``rope_scaling`` wins
-    (only ``type`` is renamed to ``rope_type`` if needed); otherwise the
-    relevant keys are copied out of ``rope_parameters`` into a fresh
-    ``rope_scaling`` mapping.
-
-    Args:
-        rope_parameters: HF-style RoPE parameters mapping or ``None``.
-        rope_scaling: EasyDeL RoPE scaling mapping or ``None``.
-
-    Returns:
-        A normalised ``rope_scaling`` mapping or ``None`` when neither
-        input was supplied.
-    """
-    if rope_scaling is not None:
-        if "type" in rope_scaling and "rope_type" not in rope_scaling:
-            rope_scaling = dict(rope_scaling)
-            rope_scaling["rope_type"] = rope_scaling["type"]
-        return rope_scaling
-
-    if rope_parameters is None:
-        return None
-
-    rope_scaling_out: dict[str, typing.Any] = {
-        "rope_type": rope_parameters.get("rope_type", "default"),
-    }
-    for key in (
-        "factor",
-        "original_max_position_embeddings",
-        "low_freq_factor",
-        "high_freq_factor",
-        "short_factor",
-        "long_factor",
-        "beta_fast",
-        "beta_slow",
-        "extrapolation_factor",
-        "attn_factor",
-        "mscale",
-        "mscale_all_dim",
-    ):
-        if key in rope_parameters:
-            rope_scaling_out[key] = rope_parameters[key]
-    return rope_scaling_out
+from easydel.layers.rotary._scaling import rope_scaling_from_rope_parameters
 
 
 @register_config("glm4_moe_lite")
@@ -244,7 +193,7 @@ class Glm4MoeLiteConfig(EasyDeLBaseConfig):
             rope_theta: RoPE base frequency. Falls back to
                 ``rope_parameters["rope_theta"]`` and finally ``10000.0``.
             rope_parameters: HF-style RoPE parameters mapping; merged into
-                ``rope_scaling`` via :func:`_rope_scaling_from_rope_parameters`.
+                ``rope_scaling`` via :func:`~easydel.layers.rotary._scaling.rope_scaling_from_rope_parameters`.
             rope_scaling: EasyDeL-flavoured RoPE scaling dict.
             rope_interleave: Whether RoPE uses interleaved (vs. half-split)
                 channel layout.
@@ -289,7 +238,7 @@ class Glm4MoeLiteConfig(EasyDeLBaseConfig):
         self.use_cache = use_cache
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-        self.rope_scaling = _rope_scaling_from_rope_parameters(rope_parameters, rope_scaling)
+        self.rope_scaling = rope_scaling_from_rope_parameters(rope_parameters, rope_scaling)
 
         if rope_theta is None and rope_parameters is not None:
             rope_theta = rope_parameters.get("rope_theta", 10000.0)

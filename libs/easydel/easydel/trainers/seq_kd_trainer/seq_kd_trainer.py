@@ -216,28 +216,6 @@ class SeqKDTrainer(Trainer):
             tools=getattr(self.arguments, "tools", None),
         )
 
-    def _is_pretokenized(self) -> bool:
-        """Detect whether the bound training source already exposes tokenised prompts.
-
-        Peeks at the first row of the first shard of
-        ``self._train_source`` and reports whether it carries an
-        ``"input_ids"`` field. Defensive against unset sources, empty
-        shard lists, and shards that yield no rows -- in all those
-        cases the method returns ``False`` so the trainer attaches the
-        preprocessing transform as a safe default.
-
-        Returns:
-            ``True`` only when the first row of the first shard
-            contains ``"input_ids"``.
-        """
-        if self._train_source is None:
-            return False
-        try:
-            sample = next(iter(self._train_source.open_shard(self._train_source.shard_names[0])))
-            return "input_ids" in sample
-        except (StopIteration, IndexError):
-            return False
-
     def create_grain_collect_function(
         self,
         max_sequence_length: int,

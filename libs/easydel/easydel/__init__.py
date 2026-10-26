@@ -50,8 +50,7 @@ except ModuleNotFoundError:  # pragma: no cover
         return _getlogger(name or __name__)
 
 
-from packaging.version import Version as _version
-
+from ._linkup import _validate_dependency_versions
 from ._linkup import apply_linkup as _apply_linkup
 from ._linkup import initialize_distributed as _initialize_distributed
 from .utils import LazyModule as _LazyModule
@@ -184,9 +183,9 @@ _import_structure = {
         "AutoEasyDeLModelForCausalLM",
         "AutoEasyDeLModelForDiffusionLM",
         "AutoEasyDeLModelForEmbedding",
+        "AutoEasyDeLModelForImageClassification",
         "AutoEasyDeLModelForImageTextToText",
         "AutoEasyDeLModelForSeq2SeqLM",
-        "AutoEasyDeLModelForEmbedding",
         "AutoEasyDeLModelForSequenceClassification",
         "AutoEasyDeLModelForSpeechSeq2Seq",
         "AutoEasyDeLModelForZeroShotImageClassification",
@@ -197,6 +196,7 @@ _import_structure = {
         "AutoStateForCausalLM",
         "AutoStateForDiffusionLM",
         "AutoStateForEmbedding",
+        "AutoStateForImageClassification",
         "AutoStateForImageSequenceClassification",
         "AutoStateForImageTextToText",
         "AutoStateForSeq2SeqLM",
@@ -937,6 +937,7 @@ if _tp.TYPE_CHECKING:
         AutoEasyDeLModelForCausalLM,
         AutoEasyDeLModelForDiffusionLM,
         AutoEasyDeLModelForEmbedding,
+        AutoEasyDeLModelForImageClassification,
         AutoEasyDeLModelForImageTextToText,
         AutoEasyDeLModelForSeq2SeqLM,
         AutoEasyDeLModelForSequenceClassification,
@@ -949,6 +950,7 @@ if _tp.TYPE_CHECKING:
         AutoStateForCausalLM,
         AutoStateForDiffusionLM,
         AutoStateForEmbedding,
+        AutoStateForImageClassification,
         AutoStateForImageSequenceClassification,
         AutoStateForImageTextToText,
         AutoStateForSeq2SeqLM,
@@ -1397,32 +1399,13 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_eformer_versions = ["0.1.0"]
-    _targeted_ejkernel_versions = ["0.0.82"]
-
-    from eformer import __version__ as _eform_version
-    from ejkernel import __version__ as _ejker_version
-
-    assert _version(_eform_version) in [
-        _version(_targeted_version) for _targeted_version in _targeted_eformer_versions
-    ], (
-        f"this version of EasyDeL is only compatible with eformer {', '.join(_targeted_eformer_versions)},"
-        f" but found eformer {_eform_version}"
-    )
-    assert _version(_ejker_version) in [
-        _version(_targeted_version) for _targeted_version in _targeted_ejkernel_versions
-    ], (
-        f"this version of EasyDeL is only compatible with ejkernel {', '.join(_targeted_ejkernel_versions)},"
-        f" but found ejkernel {_ejker_version}"
-    )
+    _validate_dependency_versions()
 
     if not _is_package_available("torch"):
         _logger.warning("please install `torch` (cpu) if you want to use `AutoEasyDeLModel*.from_torch_pretrained`")
 
-    del _version
-    del _eform_version
 
-
+del _validate_dependency_versions
 del _logger
 del _LazyModule
 del _is_package_available

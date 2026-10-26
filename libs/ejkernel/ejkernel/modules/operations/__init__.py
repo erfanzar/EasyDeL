@@ -115,6 +115,13 @@ Available Operations:
             ``KL(softmax(teacher) || softmax(student))`` fused with the analytic student
             gradient (teacher detached); same HBM-free + vocab-parallel behaviour.
             Returns a ``KLDivergenceOutput``.
+        - FusedCakldTv / fused_cakld_tv: Per-row confidence-gated forward/reverse KL blend
+            (gate = teacher max-probability) with optional TV mix and gated Renyi
+            student-entropy penalty; XLA-only, vocab-parallel capable.
+            Returns a ``CakldTvOutput``.
+        - FusedRenyiEntropy / fused_renyi_entropy: Per-row Renyi entropy of
+            ``softmax(logits / T)`` from two logsumexps; XLA-only, vocab-parallel capable.
+            Returns a ``RenyiEntropyOutput``.
 
     Miscellaneous:
         - MeanPooling / mean_pooling: Sequence mean pooling.
@@ -185,17 +192,22 @@ from .configs import (
     CompressedWindowDecodeConfig,
     DecodeAttentionConfig,
     DeepSeekAttentionConfig,
+    DsaSparseAttentionConfig,
     FlashAttentionConfig,
     FlashMLAConfig,
+    FusedCakldTvConfig,
     FusedConvDecodeConfig,
     FusedCrossEntropyConfig,
     FusedKLDivergenceConfig,
+    FusedRenyiEntropyConfig,
     GatedDeltaRuleConfig,
     GatedDeltaRuleGroupedDecodeConfig,
     GDNComputeScheduleV2Config,
     GdnSpecWindowStatesConfig,
     GLAttentionConfig,
     GroupedMatmulConfig,
+    IndexerScoresConfig,
+    KdaChunkConfig,
     KernelDeltaAttentionConfig,
     LightningAttentionConfig,
     MeanPoolingConfig,
@@ -219,6 +231,7 @@ from .configs import (
     ReduceScatterConfig,
     ReduceScatterMatmulConfig,
     RingAttentionConfig,
+    RowPermuteConfig,
     RWKV4Config,
     RWKV6Config,
     RWKV7Config,
@@ -231,7 +244,9 @@ from .configs import (
 )
 from .decode_attention import DecodeAttention, decode_attention
 from .deepseek_attn import DeepSeekAttention, deepseek_attn
+from .dsa_sparse_attention import DsaSparseAttention, dsa_sparse_attention
 from .flash_attention import FlashAttention, flash_attention
+from .fused_cakld_tv import CakldTvOutput, FusedCakldTv, fused_cakld_tv
 from .fused_conv_decode import FusedConvDecode, fused_conv_decode, fused_conv_decode_op
 from .fused_cross_entropy import CrossEntropyOutput, FusedCrossEntropy, fused_cross_entropy
 from .fused_kl_divergence import FusedKLDivergence, KLDivergenceOutput, fused_kl_divergence
@@ -243,6 +258,7 @@ from .fused_mlp import (
     resolve_mlp_combine,
     split_gate_up,
 )
+from .fused_renyi_entropy import FusedRenyiEntropy, RenyiEntropyOutput, fused_renyi_entropy
 from .gated_delta_rule import GatedDeltaRule, gated_delta_rule
 from .gated_delta_rule_grouped_decode import (
     GatedDeltaRuleGroupedDecode,
@@ -263,8 +279,11 @@ from .grouped_matmul import (
     grouped_matmul_channelwise,
     grouped_matmul_w8a8,
 )
+from .indexer_scores import IndexerScores, indexer_scores
+from .kda_chunk import KdaChunk, kda_chunk
 from .kernel_delta_attention import KernelDeltaAttention, kda_attention, kernel_delta_attention
 from .lightning_attention import LightningAttention, lightning_attention
+from .mhc import MHCCollapse, MHCExpand, MHCFusedConfig, mhc_collapse, mhc_expand
 from .mhc_coefficients import MHCCoefficients, MHCCoefficientsConfig, mhc_coefficients
 from .multi_head_latent_attention import FlashMLA, flash_mla
 from .multi_latent_ragged_page_attention import (
@@ -285,6 +304,7 @@ from .ragged_causal_conv1d import (
     ragged_causal_conv1d,
     ragged_causal_conv1d_head_sharded,
     ragged_causal_conv1d_op,
+    reorder_conv_features_for_sharding,
 )
 from .ragged_decode_attention import RaggedDecodeAttention, ragged_decode_attention
 from .ragged_gated_delta_rule import RaggedGatedDeltaRule, ragged_gated_delta_rule
@@ -316,6 +336,7 @@ from .recurrent import RecurrentAttention, recurrent_attention
 from .reduce_scatter import ReduceScatter, reduce_scatter
 from .reduce_scatter_matmul import ReduceScatterMatmul, reduce_scatter_matmul
 from .ring_attention import RingAttention, ring_attention
+from .row_permute import RowPermute, row_permute
 from .rwkv4 import RWKV4, rwkv4
 from .rwkv6 import RWKV6, rwkv6
 from .rwkv7 import RWKV7, RWKV7Mul, rwkv7, rwkv7_mul
@@ -349,6 +370,7 @@ __all__ = (
     "AttentionConfig",
     "BlockSparseAttention",
     "BlockSparseAttentionConfig",
+    "CakldTvOutput",
     "ChunkedPrefillPagedDecode",
     "ChunkedPrefillPagedDecodeConfig",
     "CompressedWindowAttention",
@@ -360,10 +382,14 @@ __all__ = (
     "DecodeAttentionConfig",
     "DeepSeekAttention",
     "DeepSeekAttentionConfig",
+    "DsaSparseAttention",
+    "DsaSparseAttentionConfig",
     "FlashAttention",
     "FlashAttentionConfig",
     "FlashMLA",
     "FlashMLAConfig",
+    "FusedCakldTv",
+    "FusedCakldTvConfig",
     "FusedConvDecode",
     "FusedConvDecodeConfig",
     "FusedCrossEntropy",
@@ -371,6 +397,8 @@ __all__ = (
     "FusedKLDivergence",
     "FusedKLDivergenceConfig",
     "FusedMlp",
+    "FusedRenyiEntropy",
+    "FusedRenyiEntropyConfig",
     "GDNComputeScheduleV2",
     "GDNComputeScheduleV2Config",
     "GLAttention",
@@ -384,7 +412,11 @@ __all__ = (
     "GroupedMatmul",
     "GroupedMatmulChannelwise",
     "GroupedMatmulConfig",
+    "IndexerScores",
+    "IndexerScoresConfig",
     "KLDivergenceOutput",
+    "KdaChunk",
+    "KdaChunkConfig",
     "KernelDeltaAttention",
     "KernelDeltaAttentionConfig",
     "KernelTilePolicy",
@@ -392,6 +424,9 @@ __all__ = (
     "LightningAttentionConfig",
     "MHCCoefficients",
     "MHCCoefficientsConfig",
+    "MHCCollapse",
+    "MHCExpand",
+    "MHCFusedConfig",
     "MeanPooling",
     "MeanPoolingConfig",
     "MultiLatentRaggedPageAttention",
@@ -437,8 +472,11 @@ __all__ = (
     "ReduceScatterConfig",
     "ReduceScatterMatmul",
     "ReduceScatterMatmulConfig",
+    "RenyiEntropyOutput",
     "RingAttention",
     "RingAttentionConfig",
+    "RowPermute",
+    "RowPermuteConfig",
     "ScaledDotProductAttention",
     "ScaledDotProductAttentionConfig",
     "SinkhornKnopp",
@@ -464,13 +502,16 @@ __all__ = (
     "compute_schedule_table_v2",
     "decode_attention",
     "deepseek_attn",
+    "dsa_sparse_attention",
     "flash_attention",
     "flash_mla",
+    "fused_cakld_tv",
     "fused_conv_decode",
     "fused_conv_decode_op",
     "fused_cross_entropy",
     "fused_kl_divergence",
     "fused_mlp",
+    "fused_renyi_entropy",
     "gated_delta_rule",
     "gated_delta_rule_grouped_decode",
     "gated_delta_rule_grouped_decode_op",
@@ -482,11 +523,15 @@ __all__ = (
     "grouped_matmul",
     "grouped_matmul_channelwise",
     "grouped_matmul_w8a8",
+    "indexer_scores",
     "kda_attention",
+    "kda_chunk",
     "kernel_delta_attention",
     "lightning_attention",
     "mean_pooling",
     "mhc_coefficients",
+    "mhc_collapse",
+    "mhc_expand",
     "multi_latent_ragged_page_attention",
     "multi_latent_ragged_page_attention_v2",
     "native_sparse_attention",
@@ -514,8 +559,10 @@ __all__ = (
     "recurrent_attention",
     "reduce_scatter",
     "reduce_scatter_matmul",
+    "reorder_conv_features_for_sharding",
     "resolve_mlp_combine",
     "ring_attention",
+    "row_permute",
     "rwkv4",
     "rwkv6",
     "rwkv7",

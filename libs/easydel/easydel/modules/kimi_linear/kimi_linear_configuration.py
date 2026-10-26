@@ -30,8 +30,6 @@ from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
 from easydel.layers import RopeConfig
 
-KIMI_LINEAR_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
-
 
 @register_config("kimi_linear")
 class KimiLinearConfig(EasyDeLBaseConfig):
@@ -133,6 +131,21 @@ class KimiLinearConfig(EasyDeLBaseConfig):
             - `kda_layers`: List of layer indices using KDA (1-indexed)
             - `full_attn_layers`: List of layer indices using MLA (1-indexed)
             - Other KDA-specific parameters
+
+        Kimi K3 Parameters:
+        attn_res_block_size (`int`, *optional*):
+            Enables Attention Residuals. Every `attn_res_block_size` layers a new block starts: the running prefix
+            sum is stored as a block residual, and each sublayer input becomes a softmax-weighted mix of the stored
+            block residuals and the current prefix sum (scored over RMS-normed candidates). `None` keeps the plain
+            residual stream.
+        activation_situ_beta (`float`, *optional*):
+            Gate-branch saturation scale of the `"situ"` activation.
+        activation_situ_linear_beta (`float`, *optional*):
+            Linear-branch saturation scale of the `"situ"` activation (`None`/`0.0` disables the squash).
+        routed_expert_hidden_size (`int`, *optional*):
+            Latent width the routed experts operate in (LatentMoE).
+        latent_moe_use_norm (`bool`, *optional*, defaults to `False`):
+            Apply an RMSNorm to the down-projected LatentMoE latent.
     """
 
     model_type = "kimi_linear"
@@ -183,6 +196,9 @@ class KimiLinearConfig(EasyDeLBaseConfig):
         activation_situ_linear_beta: float | None = None,
         routed_expert_hidden_size: int | None = None,
         latent_moe_use_norm: bool = False,
+        attention_bias: bool = False,
+        attention_dropout: float = 0.0,
+        output_router_logits: bool = False,
         **kwargs,
     ):
         """Initialise a :class:`KimiLinearConfig`.
@@ -196,6 +212,7 @@ class KimiLinearConfig(EasyDeLBaseConfig):
         (MLA) and linear-attention (KDA) layers correctly.
 
         Args:
+            output_router_logits: Whether to return per-layer MoE router logits by default. Defaults to False.
             **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
         """
         self.vocab_size = vocab_size
@@ -241,7 +258,15 @@ class KimiLinearConfig(EasyDeLBaseConfig):
         # Attention Residuals: every `attn_res_block_size` layers the model mixes
         # the running prefix sum with that block's residual through a softmax over
         # RMS-normed candidates. ``None`` keeps the plain residual stream.
+        if attn_res_block_size is not None and (
+            isinstance(attn_res_block_size, bool) or not isinstance(attn_res_block_size, int) or attn_res_block_size <= 0
+        ):
+            raise ValueError(f"`attn_res_block_size` must be a positive integer or None; got {attn_res_block_size!r}.")
         self.attn_res_block_size = attn_res_block_size
+        # MLA projection bias / attention-probability dropout (read by the shared MLA builder and attention performer).
+        self.attention_bias = attention_bias
+        self.attention_dropout = attention_dropout
+        self.output_router_logits = output_router_logits
         # SITU gated activation parameters (``hidden_act="situ"``).
         self.activation_situ_beta = activation_situ_beta
         self.activation_situ_linear_beta = activation_situ_linear_beta
@@ -265,8 +290,22 @@ class KimiLinearConfig(EasyDeLBaseConfig):
         # these entries and reject the KDA type the hybrid cache needs. Assign
         # and validate after, the same way DeepSeek-V4 handles its own types.
         layer_types = kwargs.pop("layer_types", None)
+        derived_types = [
+            KDA_LINEAR_ATTENTION if i + 1 in (linear_attn_config or {}).get("kda_layers", []) else FULL_ATTENTION
+            for i in range(num_hidden_layers)
+        ]
         if layer_types is None:
-            layer_types = list(self.get_layer_types())
+            layer_types = derived_types
+        elif linear_attn_config is not None and list(layer_types) != derived_types:
+            raise ValueError("`layer_types` and `linear_attn_config` describe different attention schedules.")
+        # Retain the legacy one-indexed lists as a synchronized view of the same schedule,
+        # including explicit layer_types-only configurations used by AutoModel/cache callers.
+        if linear_attn_config is not None or KDA_LINEAR_ATTENTION in layer_types:
+            self.linear_attn_config = {
+                **(linear_attn_config or {}),
+                "kda_layers": [i + 1 for i, kind in enumerate(layer_types) if kind == KDA_LINEAR_ATTENTION],
+                "full_attn_layers": [i + 1 for i, kind in enumerate(layer_types) if kind == FULL_ATTENTION],
+            }
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -276,7 +315,7 @@ class KimiLinearConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-        self.layer_types = layer_types
+        self.layer_types = list(layer_types)
         self.validate_layer_type()
 
     @property
@@ -299,14 +338,7 @@ class KimiLinearConfig(EasyDeLBaseConfig):
     @property
     def is_linear_attn(self) -> bool:
         """Check if model uses linear attention (KDA)."""
-        return not (
-            self.linear_attn_config is None
-            or (
-                isinstance(self.linear_attn_config, dict)
-                and self.linear_attn_config.get("kda_layers") is not None
-                and len(self.linear_attn_config.get("kda_layers", [])) == 0
-            )
-        )
+        return KDA_LINEAR_ATTENTION in self.layer_types
 
     def is_kda_layer(self, layer_idx: int) -> bool:
         """Check if a layer uses KDA linear attention (1-indexed in config).
@@ -317,7 +349,7 @@ class KimiLinearConfig(EasyDeLBaseConfig):
         Returns:
             True if layer uses KDA, False otherwise.
         """
-        return self.linear_attn_config is not None and (layer_idx + 1) in self.linear_attn_config.get("kda_layers", [])
+        return 0 <= layer_idx < self.num_hidden_layers and self.layer_types[layer_idx] == KDA_LINEAR_ATTENTION
 
     def is_mla_layer(self, layer_idx: int) -> bool:
         """Check if a layer uses MLA full attention (1-indexed in config).
@@ -328,9 +360,7 @@ class KimiLinearConfig(EasyDeLBaseConfig):
         Returns:
             True if layer uses MLA, False otherwise.
         """
-        return self.linear_attn_config is not None and (layer_idx + 1) in self.linear_attn_config.get(
-            "full_attn_layers", []
-        )
+        return 0 <= layer_idx < self.num_hidden_layers and self.layer_types[layer_idx] == FULL_ATTENTION
 
     def is_moe_layer(self, layer_idx: int) -> bool:
         """Check if a layer uses MoE.
@@ -381,13 +411,7 @@ class KimiLinearConfig(EasyDeLBaseConfig):
         Returns:
             Tuple of layer type strings ("full_attention" or "kda_linear_attention").
         """
-        layer_types = []
-        for i in range(self.num_hidden_layers):
-            if self.is_kda_layer(i):
-                layer_types.append(KDA_LINEAR_ATTENTION)
-            else:
-                layer_types.append(FULL_ATTENTION)
-        return tuple(layer_types)
+        return tuple(self.layer_types)
 
     @property
     def q_head_dim(self) -> int:
@@ -397,13 +421,13 @@ class KimiLinearConfig(EasyDeLBaseConfig):
         return self.head_dim
 
     def get_rope_config(self) -> RopeConfig:
-        """Get RoPE configuration.
+        """Return the RoPE scaling configuration used by the rotary builders.
 
         Returns:
-            RopeConfig instance.
+            RopeConfig: Configuration honoring ``rope_scaling`` and inherited overrides.
         """
-        return RopeConfig(
-            rope_type="default",
-            max_position_embeddings=self.max_position_embeddings,
-            rope_theta=self.rope_theta,
-        )
+        return super()._get_rope_config()
+
+    def _get_rope_config(self) -> RopeConfig:
+        """Delegate the rotary-builder hook to the public configuration API."""
+        return self.get_rope_config()

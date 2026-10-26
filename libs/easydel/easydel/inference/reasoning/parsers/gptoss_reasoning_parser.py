@@ -30,11 +30,12 @@ from collections.abc import Sequence
 from transformers import AutoTokenizer as AnyTokenizer
 
 from ...openai_api_modules import DeltaMessage
-from ..abstract_reasoning import ReasoningParser, ReasoningParserManager
+from ..abstract_reasoning import ReasoningParserManager
+from ..basic_parsers import BaseThinkingReasoningParser
 
 
 @ReasoningParserManager.register_module(["openai_gptoss", "gptoss"])  # pyright: ignore[reportUntypedClassDecorator]
-class GptOssReasoningParser(ReasoningParser):
+class GptOssReasoningParser(BaseThinkingReasoningParser):
     """Reasoning parser for GptOss models using channel/message marker tags.
 
     Splits cumulative model output into a hidden reasoning section and a
@@ -57,6 +58,8 @@ class GptOssReasoningParser(ReasoningParser):
 
     CHANNEL_TAG = "<|channel|>"
     MESSAGE_TAG = "<|message|>"
+    start_token = CHANNEL_TAG
+    end_token = MESSAGE_TAG
 
     def __init__(self, tokenizer: AnyTokenizer):
         """Initialize the parser and resolve marker token IDs.
@@ -162,28 +165,6 @@ class GptOssReasoningParser(ReasoningParser):
             meaningful to emit (e.g. an empty delta or a delta that only
             contained a partial marker).
         """
-        if not delta_text:
-            return None
-
-        if self._reasoning_done:
-            return DeltaMessage(content=delta_text)
-
-        if self.MESSAGE_TAG in delta_text:
-            self._reasoning_done = True
-            parts = delta_text.split(self.MESSAGE_TAG, 1)
-            reasoning_part = parts[0] if self._in_reasoning else None
-            content_part = parts[1] if len(parts) > 1 else None
-            return DeltaMessage(
-                reasoning_content=reasoning_part if reasoning_part else None,
-                content=content_part if content_part else None,
-            )
-
-        if self.CHANNEL_TAG in delta_text:
-            self._in_reasoning = True
-            after = delta_text.split(self.CHANNEL_TAG, 1)[1]
-            return DeltaMessage(reasoning_content=after) if after else None
-
-        if self._in_reasoning:
-            return DeltaMessage(reasoning_content=delta_text)
-
-        return DeltaMessage(content=delta_text)
+        return super().extract_reasoning_streaming(
+            previous_text, current_text, delta_text, previous_token_ids, current_token_ids, delta_token_ids, request
+        )
