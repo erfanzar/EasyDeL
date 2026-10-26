@@ -139,6 +139,7 @@ _ESURGE_INT_FIELDS = frozenset(
         "distributed_max_inflight_steps",
         "num_draft_tokens",
         "spec_debug_max_traces",
+        "recurrent_prefix_snapshots",
     }
 )
 _ESURGE_FLOAT_FIELDS = frozenset(

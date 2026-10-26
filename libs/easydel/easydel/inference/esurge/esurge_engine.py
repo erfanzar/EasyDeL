@@ -436,6 +436,8 @@ class eSurge:
                 - ``cache_capacity_margin`` (float): Safety margin in ``(0, 1]``.
                 - ``data_parallelism_axis`` (str): Mesh axis used for KV-page DP.
                 - ``destroy_pages_on_pause`` (bool): Free pages on engine pause.
+                - ``recurrent_prefix_snapshots`` (int): Recurrent-state snapshot
+                  slots that let linear-attention/SSM models use prefix caching.
 
                 Consumed via ``Unpack[eSurgeCacheRuntimeConfig]``.
             context (eSurgeContextConfig | Mapping[str, Any] | None):
@@ -799,6 +801,7 @@ class eSurge:
             drafter=drafter,
             spec_debug_max_traces=self.spec_debug_max_traces,
             spec_adaptive_conf_threshold=self.spec_adaptive_conf_threshold,
+            recurrent_prefix_snapshots=self.cache_config.recurrent_prefix_snapshots,
         )
         self._install_side_input_tokenizer_state()
 
