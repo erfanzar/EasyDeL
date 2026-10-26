@@ -424,6 +424,7 @@ class eSurgeRunner:
         spec_adaptive_conf_threshold: float = 0.0,
         vision_cache: VisionEncoderCache | None = None,
         host_payloads_replicated: bool = False,
+        recurrent_prefix_snapshots: int = 16,
     ):
         """Initialize the model runner.
 
@@ -476,6 +477,8 @@ class eSurgeRunner:
                 host payloads on all processes. Defaults to False independently of
                 legacy process-global policy; update between steps if coordination
                 starts after runner construction.
+            recurrent_prefix_snapshots: Recurrent-state snapshot slots that let linear-attention/SSM models reuse
+                prefix-cache hits. ``0`` turns prefix caching off for such models.
         """
         self.host_payloads_replicated = host_payloads_replicated
         self.model = model.esurge_compatible_model
@@ -745,6 +748,16 @@ class eSurgeRunner:
             self.executor_manager.set_main_hidden_enabled(True)
         self.log_it = logger.info if verbose else logger.debug
         self._setup_variables()
+        # Snapshots address the plain row-indexed recurrent pool; pooled-slot (DP / compressed-window), pipeline
+        # and speculative-candidate layouts keep prefix caching off instead.
+        snapshots_supported = (
+            self._has_recurrent_layers
+            and not self.slot_pool.is_enabled()
+            and not self.pipeline_plan.is_enabled
+            and drafter is None
+        )
+        self.recurrent_prefix_snapshot_slots = int(recurrent_prefix_snapshots) if snapshots_supported else 0
+        self.executor_manager.recurrent_snapshot_slots = self.recurrent_prefix_snapshot_slots
         self.enable_overlap_execution = enable_overlap_execution
         self.enable_sampler_metrics = enable_sampler_metrics
 
@@ -877,6 +890,35 @@ class eSurgeRunner:
         if not moved:
             return
         self.executor_manager.permute_recurrent_slots(perm)
+
+    def _snapshot_rows(self, by_req: dict[str, int]) -> tuple[list[int], list[int]]:
+        """Map ``request id -> snapshot slot`` to aligned (state row, slot) lists for live requests."""
+        rows: list[int] = []
+        slots: list[int] = []
+        for req_id, slot in by_req.items():
+            row = self.sequence_buffer.req_id_to_index.get(req_id)
+            if row is not None:
+                rows.append(int(row))
+                slots.append(int(slot))
+        return rows, slots
+
+    def _apply_recurrent_snapshot_restores(self, scheduler_output: SchedulerOutput) -> None:
+        """Load the recurrent state of prefix-cache hits before their first forward."""
+        restores = getattr(scheduler_output, "recurrent_snapshot_restores", None)
+        if not restores:
+            return
+        if not self.recurrent_prefix_snapshot_slots:
+            raise RuntimeError("Scheduler issued recurrent snapshot restores but this runner has no snapshot store.")
+        rows, slots = self._snapshot_rows(restores)
+        self.executor_manager.restore_recurrent_snapshots(rows, slots)
+
+    def _apply_recurrent_snapshot_saves(self, scheduler_output: SchedulerOutput) -> None:
+        """Store the recurrent state of rows whose prefill chunk ended on their snapshot boundary."""
+        saves = getattr(scheduler_output, "recurrent_snapshot_saves", None)
+        if not saves or not self.recurrent_prefix_snapshot_slots:
+            return
+        rows, slots = self._snapshot_rows(saves)
+        self.executor_manager.save_recurrent_snapshots(rows, slots)
 
     def _recurrent_rows_per_dp_rank(self) -> int:
         """Return the number of recurrent-state rows owned by each DP rank.
@@ -1950,6 +1992,7 @@ class eSurgeRunner:
         """
         logger.info("Destroying eSurgeRunner ragged KV cache pages")
         self.executor_manager.kv_pages = None
+        self.executor_manager.drop_recurrent_snapshots()
 
     def initialize_kv_cache(self) -> None:
         """Allocate the operations cache when the executor manager has none.
@@ -2784,6 +2827,7 @@ class eSurgeRunner:
             # Rows are final for this step: rewrite the sampler's device token counts of penalised speculative
             # requests that now take the plain sampler path (their counts drift during verify steps).
             self.spec.sync_penalty_counts(scheduler_output)
+        self._apply_recurrent_snapshot_restores(scheduler_output)
 
         if not scheduler_output.total_num_scheduled_tokens:
             if pending_pre_async_results is not None and pre_async_repair_pending:
@@ -4398,6 +4442,8 @@ class eSurgeRunner:
             total_post_proc_time += time.time() - up_wtime
 
             start_index = next_start_index
+
+        self._apply_recurrent_snapshot_saves(scheduler_output)
 
         # Draft every collected greedy inline-MTP request in ONE batched pass over
         # the pooled MTP cache (``k`` batched forwards for the whole running batch,

@@ -195,6 +195,76 @@ def _jit_slot_sidecar_rows(output_shardings, fill_values):
     return jax.jit(transform, out_shardings=list(output_shardings))
 
 
+_SNAPSHOT_DROP_INDEX = 2**30
+
+
+def _snapshot_sharding(array: jax.Array) -> jax.sharding.Sharding:
+    """Sharding for a snapshot store: the live leaf's layout with the slot axis replicated."""
+    sharding = array.sharding
+    if isinstance(sharding, NamedSharding):
+        spec = tuple(sharding.spec)[: array.ndim]
+        spec = spec + (None,) * (array.ndim - len(spec))
+        return NamedSharding(sharding.mesh, PartitionSpec(None, *spec[1:]))
+    return sharding
+
+
+@lru_cache(maxsize=32)
+def _jit_snapshot_save(output_shardings: tuple[jax.sharding.Sharding, ...]):
+    """``snapshots[slots] = pools[rows]`` for every leaf; padded slots are out of range and dropped."""
+
+    def body(pools, snapshots, rows, slots):
+        return [
+            snapshot.at[slots].set(pool[rows].astype(snapshot.dtype), mode="drop")
+            for pool, snapshot in zip(pools, snapshots, strict=True)
+        ]
+
+    return jax.jit(body, out_shardings=list(output_shardings), donate_argnums=(1,))
+
+
+@lru_cache(maxsize=32)
+def _jit_snapshot_restore(output_shardings: tuple[jax.sharding.Sharding, ...]):
+    """``pools[rows] = snapshots[slots]`` for every leaf; padded rows are out of range and dropped."""
+
+    def body(pools, snapshots, rows, slots):
+        return [
+            pool.at[rows].set(snapshot[slots].astype(pool.dtype), mode="drop")
+            for pool, snapshot in zip(pools, snapshots, strict=True)
+        ]
+
+    return jax.jit(body, out_shardings=list(output_shardings))
+
+
+def _per_slot_state_leaves(views) -> list[tuple[int, str, typing.Any]]:
+    """Every per-request recurrent leaf (state and sidecars) as ``(view_index, field_name, array)``."""
+    leaves: list[tuple[int, str, typing.Any]] = []
+    for idx, _rec, entry_leaves, _n_slots in _recurrent_leaf_entries(views):
+        leaves.extend((idx, name, array) for name, array in entry_leaves if array is not None)
+    for idx, view in enumerate(views):
+        rec = view.recurrent if isinstance(view, ParallelHybridCacheView) else view
+        if isinstance(rec, KDACacheView):
+            names: tuple[str, ...] = ("positions",)
+        elif isinstance(rec, RecurrentCacheView):
+            names = ("positions", "ple_conv_state", "ple_token_context", "ple_segment_context")
+        else:
+            continue
+        for name in names:
+            array = getattr(rec, name, None)
+            if array is not None:
+                leaves.append((idx, name, array))
+    return leaves
+
+
+def _replace_per_slot_leaves(views: list, updates: dict[int, dict[str, typing.Any]]) -> None:
+    """Write per-slot leaf replacements back into ``views``, keeping hybrid-wrapper mirrors in sync."""
+    for idx, values in updates.items():
+        view = views[idx]
+        if isinstance(view, ParallelHybridCacheView):
+            mirrors = {name: values[name] for name in ("conv_state", "recurrent_state", "positions") if name in values}
+            views[idx] = view.replace(recurrent=view.recurrent.replace(**values), **mirrors)
+        else:
+            views[idx] = view.replace(**values)
+
+
 def _recurrent_leaf_entries(views):
     """Collect the per-slot state leaves row maintenance must move or zero.
 
@@ -2029,6 +2099,89 @@ class ExecutionManager:
         changed = _transform_recurrent_sidecars(new_views, sidecar_clear_indices) or changed
         if changed:
             self.kv_pages = HybridCache(views=new_views)
+
+    def _recurrent_snapshot_store(self, leaves: list[tuple[int, str, typing.Any]]) -> list[jax.Array]:
+        """Return (allocating on first use) the snapshot arrays matching ``leaves``."""
+        signature = tuple((idx, name, tuple(array.shape[1:]), str(array.dtype)) for idx, name, array in leaves)
+        store = getattr(self, "_recurrent_snapshot_arrays", None)
+        if store is not None and getattr(self, "_recurrent_snapshot_signature", None) == signature:
+            return store
+        unsupported = [f"view {idx}.{name}" for idx, name, array in leaves if not isinstance(array, jax.Array)]
+        if unsupported:
+            raise RuntimeError(
+                "Recurrent prefix snapshots need plain device arrays for per-slot state; got "
+                f"{', '.join(unsupported)}. Set cache.recurrent_prefix_snapshots=0 to disable prefix caching instead."
+            )
+        num_slots = int(getattr(self, "recurrent_snapshot_slots", 0) or 0)
+        if num_slots <= 0:
+            raise RuntimeError("Recurrent prefix snapshots were requested but no snapshot slots are configured.")
+        shapes = [((num_slots, *array.shape[1:]), array.dtype) for _idx, _name, array in leaves]
+        shardings = [_snapshot_sharding(array) for _idx, _name, array in leaves]
+        make = jax.jit(lambda: [jnp.zeros(shape, dtype) for shape, dtype in shapes], out_shardings=shardings)
+        store = list(make())
+        self._recurrent_snapshot_arrays = store
+        self._recurrent_snapshot_signature = signature
+        return store
+
+    def _recurrent_snapshot_index_arrays(
+        self, rows: list[int], slots: list[int], *, pad_rows: bool
+    ) -> tuple[jax.Array, jax.Array]:
+        """Fixed-width row/slot index vectors; the padded side points out of range so its writes are dropped."""
+        width = int(self.max_num_reqs)
+        rows_np = numpy.full((width,), _SNAPSHOT_DROP_INDEX if pad_rows else 0, dtype=numpy.int32)
+        slots_np = numpy.full((width,), 0 if pad_rows else _SNAPSHOT_DROP_INDEX, dtype=numpy.int32)
+        rows_np[: len(rows)] = numpy.asarray(rows, dtype=numpy.int32)
+        slots_np[: len(slots)] = numpy.asarray(slots, dtype=numpy.int32)
+        return jnp.asarray(rows_np), jnp.asarray(slots_np)
+
+    def save_recurrent_snapshots(self, rows: list[int], slots: list[int]) -> None:
+        """Copy the recurrent state of physical rows ``rows`` into snapshot slots ``slots``.
+
+        Args:
+            rows: Recurrent-state rows (sequence-buffer rows on the plain recurrent path).
+            slots: Snapshot slots to write, aligned with ``rows``.
+        """
+        cache = self.kv_pages
+        if not rows or not isinstance(cache, HybridCache):
+            return
+        leaves = _per_slot_state_leaves(list(cache.views))
+        if not leaves:
+            return
+        store = self._recurrent_snapshot_store(leaves)
+        rows_dev, slots_dev = self._recurrent_snapshot_index_arrays(rows, slots, pad_rows=False)
+        transform = _jit_snapshot_save(tuple(array.sharding for array in store))
+        pools = [array for _idx, _name, array in leaves]
+        self._recurrent_snapshot_arrays = list(transform(pools, store, rows_dev, slots_dev))
+
+    def restore_recurrent_snapshots(self, rows: list[int], slots: list[int]) -> None:
+        """Overwrite the recurrent state of physical rows ``rows`` with snapshot slots ``slots``.
+
+        Args:
+            rows: Recurrent-state rows to overwrite.
+            slots: Snapshot slots to read, aligned with ``rows``.
+        """
+        cache = self.kv_pages
+        if not rows or not isinstance(cache, HybridCache):
+            return
+        views = list(cache.views)
+        leaves = _per_slot_state_leaves(views)
+        if not leaves:
+            return
+        store = self._recurrent_snapshot_store(leaves)
+        rows_dev, slots_dev = self._recurrent_snapshot_index_arrays(rows, slots, pad_rows=True)
+        pools = [array for _idx, _name, array in leaves]
+        transform = _jit_snapshot_restore(tuple(array.sharding for array in pools))
+        restored = transform(pools, store, rows_dev, slots_dev)
+        updates: dict[int, dict[str, jax.Array]] = {}
+        for (idx, name, _array), value in zip(leaves, restored, strict=True):
+            updates.setdefault(idx, {})[name] = value
+        _replace_per_slot_leaves(views, updates)
+        self.kv_pages = HybridCache(views=views)
+
+    def drop_recurrent_snapshots(self) -> None:
+        """Release the snapshot store; contents are only meaningful to the scheduler that issued them."""
+        self._recurrent_snapshot_arrays = None
+        self._recurrent_snapshot_signature = None
 
     def permute_recurrent_slots(self, perm: numpy.ndarray) -> None:
         """Gather recurrent/SSM state rows into a new physical row layout.

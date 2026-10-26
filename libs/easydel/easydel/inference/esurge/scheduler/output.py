@@ -370,3 +370,9 @@ class SchedulerOutput:
 
     pending_structured_output_tokens: bool = False
     """True when a structured-output request still has unresolved async placeholders (set by ``AsyncScheduler``)."""
+
+    recurrent_snapshot_restores: dict[str, int] = field(default_factory=dict)
+    """Request id -> recurrent snapshot slot to copy into the request's state row before this step's forward."""
+
+    recurrent_snapshot_saves: dict[str, int] = field(default_factory=dict)
+    """Request id -> recurrent snapshot slot to fill from the request's state row after this step's forward."""

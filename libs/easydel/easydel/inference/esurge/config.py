@@ -414,6 +414,8 @@ def _validate_esurge_cache_runtime_config(self):
         raise ValueError(f"max_cache_tokens must be positive when specified, got {self.max_cache_tokens}")
     if not (0.0 < float(self.cache_capacity_margin) <= 1.0):
         raise ValueError(f"cache_capacity_margin must be in (0, 1], got {self.cache_capacity_margin}")
+    if int(self.recurrent_prefix_snapshots) < 0:
+        raise ValueError(f"recurrent_prefix_snapshots must be >= 0, got {self.recurrent_prefix_snapshots}")
 
 
 @typed_config(
@@ -425,6 +427,7 @@ def _validate_esurge_cache_runtime_config(self):
         "cache_capacity_margin": 0.92,
         "data_parallelism_axis": "dp",
         "destroy_pages_on_pause": True,
+        "recurrent_prefix_snapshots": 16,
     },
     post_init=_validate_esurge_cache_runtime_config,
 )
@@ -470,6 +473,11 @@ class eSurgeCacheRuntimeConfig(TypedDict, total=False):
             frees the entire page pool to reclaim HBM. Useful when the engine
             shares HBM with other workloads. The pages are reallocated by
             :meth:`eSurge.resume`.
+        recurrent_prefix_snapshots: Number of recurrent-state snapshots kept so
+            linear-attention/SSM hybrids (Qwen3.5/3-Next GDN, KDA, Mamba) can
+            reuse prefix-cache hits. Each snapshot stores one request's conv and
+            recurrent state at a page boundary. ``0`` disables prefix caching
+            for such models; attention-only models ignore it.
     """
 
     hbm_utilization: NotRequired[float]
@@ -479,6 +487,7 @@ class eSurgeCacheRuntimeConfig(TypedDict, total=False):
     cache_capacity_margin: NotRequired[float]
     data_parallelism_axis: NotRequired[str]
     destroy_pages_on_pause: NotRequired[bool]
+    recurrent_prefix_snapshots: NotRequired[int]
 
     @classmethod
     def from_dict(
