@@ -43,8 +43,13 @@ class plus the fusion helpers, so users typically only need
 from __future__ import annotations
 
 from .mpmd import (
+    DispatchWatchdog,
     MpmdPipelineDispatchStats,
     MpmdPipelineExecutor,
+    ScheduleTracer,
+    StallReport,
+    dispatch_watchdog,
+    format_schedule_grid,
     sxcall,
     sxenter_loop,
     sxexit_loop,
@@ -55,6 +60,7 @@ from .mpmd import (
     sxstage_region,
     sxvalue_and_grad,
     sxvalue_and_grad_and_apply,
+    trace_schedule,
 )
 from .schedules import (
     Action,
@@ -77,6 +83,7 @@ from .schedules import (
 
 __all__ = (
     "Action",
+    "DispatchWatchdog",
     "DualPipeV",
     "Eager1F1B",
     "FusedTask",
@@ -89,9 +96,13 @@ __all__ = (
     "MpmdPipelineExecutor",
     "Phase",
     "Schedule",
+    "ScheduleTracer",
+    "StallReport",
     "Std1F1B",
     "ZeroBubbleH1",
+    "dispatch_watchdog",
     "dualpipev_tasks",
+    "format_schedule_grid",
     "fuse_1f1b_steady_state",
     "fuse_zerobubble_bwd_pair",
     "sxcall",
@@ -104,4 +115,5 @@ __all__ = (
     "sxstage_region",
     "sxvalue_and_grad",
     "sxvalue_and_grad_and_apply",
+    "trace_schedule",
 )
