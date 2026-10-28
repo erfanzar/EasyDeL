@@ -411,6 +411,10 @@ class LossConfig:
             and up to ~3x faster; full fwd+bwd is ~1.4-1.9x at >50% padding but
             ~1.7x slower on dense, since differentiating the gate costs even when
             nothing is skipped). Default False -- enable only for padded inputs.
+        skip_nonfinite_updates: If True, ``update_state_respectfully`` skips the optimizer update
+            whenever the loss or any floating-point gradient leaf is non-finite (NaN or Inf). The
+            guard runs even when the ``FAST_COMPILE`` flag short-circuits the default update path.
+            Default False.
 
     Example:
         >>> # Standard configuration with label smoothing
@@ -448,6 +452,7 @@ class LossConfig:
     cross_entropy_platform: tp.Literal["auto", "xla", "pallas", "tilelang", "triton", "cuda", "cute"] | None = None
     mtp_only: bool = False
     sparse_loss: bool = False
+    skip_nonfinite_updates: bool = False
 
     def __repr__(self):
         """Return a detailed string representation of the configuration.

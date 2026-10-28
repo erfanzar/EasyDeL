@@ -493,7 +493,7 @@ class KimiMoEGate(spx.Module):
 
         self.e_score_correction_bias = ArrayParam.bound(
             shape=(self.n_routed_experts,),
-            dtype=param_dtype,
+            dtype=jnp.float32,
             init_method="constant",
             init_kwargs={"value": 0.0},
             key=rngs.parameters,
@@ -1700,6 +1700,8 @@ class KimiLinearModel(EasyDeLBaseModule):
     _upgrade_legacy_native_state = _upgrade_legacy_kda_gate_state
     checkpoint_key_rules: ClassVar[KeyRuleSet] = KIMI_LINEAR_KEY_RULES
 
+    fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -2051,6 +2053,8 @@ class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig
     _config_class = KimiLinearConfig
 
     checkpoint_key_rules: ClassVar[KeyRuleSet] = KIMI_LINEAR_KEY_RULES
+
+    fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 
     def __init__(
         self,

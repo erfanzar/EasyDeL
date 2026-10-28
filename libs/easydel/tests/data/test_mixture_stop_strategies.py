@@ -93,11 +93,22 @@ def test_all_exhausted_sees_every_row_once_then_terminates():
     assert sorted(r["i"] for r in rows if r["src"] == "big") == list(range(30))
 
 
-def test_restart_default_replays_identical_shard_order():
-    mix = _mix({"a": _source("a", 4, 3), "pad": _source("pad", 1, 10_000)}, block_size=8)
+def test_restart_without_reshuffle_replays_identical_shard_order():
+    mix = _mix({"a": _source("a", 4, 3), "pad": _source("pad", 1, 10_000)}, block_size=8, reshuffle_on_restart=False)
     epochs = _epochs_of(list(islice(mix.open_shard("mixed_shard_0"), 200)), "a", 12)
     assert len(epochs) >= 3
     assert epochs[1] == epochs[0] == epochs[2] == [0] * 3 + [1] * 3 + [2] * 3 + [3] * 3
+
+
+def test_restart_default_reshuffles_and_other_strategies_do_not():
+    sources = {"a": _source("a", 12, 3), "pad": _source("pad", 1, 10_000)}
+    default = list(islice(_mix(sources, block_size=8, seed=7).open_shard("mixed_shard_0"), 400))
+    explicit = list(islice(_reshuffled(seed=7).open_shard("mixed_shard_0"), 400))
+    assert default == explicit
+    epochs = _epochs_of(default, "a", 36)
+    assert epochs[1] != epochs[0]
+    assert MixStageConfig().reshuffle_on_restart is None
+    assert not _mix(sources, stop_strategy="all_exhausted")._reshuffle_on_restart
 
 
 def _reshuffled(seed=7, **kw):

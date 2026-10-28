@@ -269,7 +269,7 @@ class MixedShardedSource(ShardedDataSource[dict]):
     :class:`WeightScheduler` integration replaces the static weights with
     curriculum-driven weights at each block.
 
-    With ``reshuffle_on_restart=True`` every restart of a constituent visits
+    With ``reshuffle_on_restart`` on (the default for ``"restart"``) every restart of a constituent visits
     its shards in a fresh deterministic permutation seeded by
     ``(seed, crc32(name), epoch)`` instead of replaying the identical
     order; row order inside a shard is unchanged, so pair it with a
@@ -290,7 +290,7 @@ class MixedShardedSource(ShardedDataSource[dict]):
         seed: int | None = None,
         stop_strategy: str = "restart",
         weight_scheduler: WeightScheduler | None = None,
-        reshuffle_on_restart: bool = False,
+        reshuffle_on_restart: bool | None = None,
         attach_dataset_ids: bool = False,
         draw_log_interval: int = DEFAULT_DRAW_LOG_INTERVAL,
     ):
@@ -318,7 +318,11 @@ class MixedShardedSource(ShardedDataSource[dict]):
                 names must equal the source names exactly.
             reshuffle_on_restart: Visit a restarted constituent's shards in
                 a fresh deterministic per-epoch permutation. Only meaningful
-                with ``stop_strategy="restart"``. An unseeded mixer draws its
+                with ``stop_strategy="restart"``. ``None`` (default) enables it
+                for ``"restart"``; pass ``False`` to replay the identical shard
+                order every pass (the previous default, also needed to resume a
+                checkpoint written with that order past a wrap exactly). An
+                unseeded mixer draws its
                 seed once at construction and records it in
                 :class:`MixedShardState`, so resume stays exact.
             attach_dataset_ids: Stamp :data:`DATASET_ID_FIELD` (the
@@ -356,6 +360,8 @@ class MixedShardedSource(ShardedDataSource[dict]):
         self._seed = seed if seed is not None else int(np.random.SeedSequence().entropy)
         self._stop_strategy = stop_strategy
         self._weight_scheduler = weight_scheduler
+        if reshuffle_on_restart is None:
+            reshuffle_on_restart = stop_strategy == "restart"
         self._reshuffle_on_restart = bool(reshuffle_on_restart)
         self._attach_dataset_ids = bool(attach_dataset_ids)
         self._dataset_ids = {name: index for index, name in enumerate(self._names)}
@@ -857,7 +863,7 @@ class MixedShardedSource(ShardedDataSource[dict]):
         Canonical-order epochs go through :meth:`_chain_shards` so subclasses overriding it keep
         working; permuted epochs open the shards in :meth:`_epoch_shard_order`.
         """
-        if not self._reshuffle_on_restart or epoch <= 0:
+        if not self._reshuffle_on_restart or epoch <= 0 or len(source.shard_names) < 2:
             return self._chain_shards(source)
         return self._chain_ordered(source, self._epoch_shard_order(source, name=name, epoch=epoch))
 

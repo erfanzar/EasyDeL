@@ -165,10 +165,10 @@ def test_llama_empty_cache_prefill_uses_real_scan_when_enabled(monkeypatch):
     original_module_scan = ModuleList.scan
     original_stacked_scan = StackedModuleList.scan
 
-    def wrapped_scan(self, fn, init_carry, *, trace=False, unroll=None):
+    def wrapped_scan(self, fn, init_carry, *, trace=False, unroll=None, **scan_kwargs):
         calls.append(trace)
         original = original_stacked_scan if isinstance(self, StackedModuleList) else original_module_scan
-        return original(self, fn, init_carry, trace=trace, unroll=unroll)
+        return original(self, fn, init_carry, trace=trace, unroll=unroll, **scan_kwargs)
 
     monkeypatch.setattr(ModuleList, "scan", wrapped_scan)
     monkeypatch.setattr(StackedModuleList, "scan", wrapped_scan)

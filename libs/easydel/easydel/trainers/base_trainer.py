@@ -120,7 +120,7 @@ from .training_utils import (
     normalize_generation_model_kwargs,
     prepare_generation_model_kwargs_for_call,
 )
-from .utils import CollateMapTransform, HFDataSource, ToNumpy
+from .utils import CollateMapTransform, HFDataSource, ToNumpy, is_numeric_dtype
 
 try:
     import wandb
@@ -574,6 +574,7 @@ class BaseTrainer(BaseTrainerProtocol):
             logger.warning(_msg)
             self.arguments.sequence_packing = False
         self._preemption_checkpoint_path = None
+        self._last_saved_checkpoint: tuple[int, str] | None = None
         self._tpu_preemption_sync_available = None
 
         self._resumed_from_checkpoint = False
@@ -1820,7 +1821,7 @@ class BaseTrainer(BaseTrainerProtocol):
 
         def _is_numeric(values) -> bool:
             def _numeric_dtype(arr) -> bool:
-                return bool(np.issubdtype(arr.dtype, np.number) or arr.dtype == np.bool_)
+                return is_numeric_dtype(arr.dtype)
 
             try:
                 arr = np.asarray(values)
@@ -3149,16 +3150,16 @@ class BaseTrainer(BaseTrainerProtocol):
         for key, value in batch.items():
             # Keep only numeric arrays (numpy or JAX)
             if isinstance(value, (np.ndarray, jax.Array)):
-                # Check if it's a numeric dtype (not object/string)
-                if hasattr(value, "dtype") and np.issubdtype(value.dtype, np.number):
-                    purified[key] = _normalize_batch_array(value)
-                elif hasattr(value, "dtype") and value.dtype == np.bool_:
-                    purified[key] = value
+                dtype = getattr(value, "dtype", None)
+                if dtype is not None and is_numeric_dtype(dtype):
+                    purified[key] = value if np.dtype(dtype) == np.bool_ else _normalize_batch_array(value)
+                else:
+                    logger.warn_once(f"_purify_batch dropped batch key {key!r} with non-numeric dtype {dtype}.")
             elif isinstance(value, (list, tuple)):
                 # Try to convert to array - will fail for strings
                 try:
                     arr = np.asarray(value)
-                    if np.issubdtype(arr.dtype, np.number) or arr.dtype == np.bool_:
+                    if is_numeric_dtype(arr.dtype):
                         purified[key] = _normalize_batch_array(arr)
                 except (ValueError, TypeError):
                     pass  # Skip non-convertible values
@@ -6858,6 +6859,9 @@ class BaseTrainer(BaseTrainerProtocol):
             true_callbacks=[save_callback],
         )
         if saved_directory[0] is not None:
+            meta = checkpointer_metadata[0] if isinstance(checkpointer_metadata[0], dict) else {}
+            # A temporary (time-policy) checkpoint is pruned later, so it must not stand in for the final save.
+            self._last_saved_checkpoint = None if meta.get("is_temporary", False) else (int(step), saved_directory[0])
             _restore_checkpoint_metadata(saved_directory[0])
             self._cleanup_old_checkpoints()
             self._sync_checkpointer_after_callback_save(step=step)
@@ -7620,12 +7624,16 @@ class BaseTrainer(BaseTrainerProtocol):
             filename = str(self._preemption_checkpoint_path)
         elif self.arguments.do_last_save:
             current_step = int(jax.device_get(state.step))
-            filename = self._save_checkpoint_for_step(
-                state=state,
-                step=current_step,
-                force=True,
-                merge_lora_before_save=self.arguments.merge_lora_before_save,
-            )
+            last_saved = getattr(self, "_last_saved_checkpoint", None)
+            if last_saved is not None and last_saved[0] == current_step:
+                filename = last_saved[1]
+            else:
+                filename = self._save_checkpoint_for_step(
+                    state=state,
+                    step=current_step,
+                    force=True,
+                    merge_lora_before_save=self.arguments.merge_lora_before_save,
+                )
             if filename is not None:
                 checkpoint_path = str(filename)
                 if self.arguments.save_directory is not None and os.path.dirname(checkpoint_path) == "":

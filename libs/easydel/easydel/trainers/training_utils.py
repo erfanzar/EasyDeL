@@ -214,6 +214,110 @@ SHARED_GENERATION_MODEL_INPUT_KEYS = frozenset(
     }
 )
 
+PACKED_EMBED_PER_IMAGE_KEYS = frozenset({"image_grid_thw"})
+
+# Leaves indexed by embed row / image rather than batch row; they must not vote on the batch size.
+_NON_BATCH_LEADING_KEYS = frozenset(
+    {"image_embeds", "image_embed_positions", "image_embed_mask", *PACKED_EMBED_PER_IMAGE_KEYS}
+    | SHARED_GENERATION_MODEL_INPUT_KEYS
+)
+
+
+def slice_packed_embed_leaves(
+    batch: tp.Any,
+    batch_size: int,
+    start_index: tp.Any,
+    minibatch_size: int,
+) -> dict[str, tp.Any]:
+    """Build the packed image-embed leaves of one microbatch of a packed multimodal batch.
+
+    Packed batches carry ``image_embeds`` as a flat ``(E, D)`` buffer ordered by owning batch row and
+    zero-padded to a static ``E``. Row ownership comes from ``image_embed_positions[:, 0]`` gated by
+    ``image_embed_mask`` or, when those are absent, from per-row counts in ``embed_n_tok``. The
+    microbatch keeps the embed rows owned by batch rows ``[start_index, start_index + minibatch_size)``,
+    compacted to the front in order and zero-padded back to ``E`` so shapes stay static under jit.
+    ``image_embed_positions[:, 0]`` is rebased to the microbatch and ``image_embed_mask`` /
+    ``n_real_embeds`` are recomputed. Flat layout only: a window-blocked buffer is compacted to flat.
+
+    Args:
+        batch: Batch mapping; anything else yields no packed leaves.
+        batch_size: Full batch size.
+        start_index: First batch row of the microbatch (may be a traced scalar).
+        minibatch_size: Rows per microbatch.
+
+    Returns:
+        Replacement leaves keyed by name; empty when the batch carries no packed embeds.
+
+    Raises:
+        ValueError: If row ownership markers are present but unusable, or ``embed_n_tok`` counts exceed
+            the buffer.
+    """
+    if not isinstance(batch, collections.abc.Mapping) or "image_embeds" not in batch:
+        return {}
+    embeds = batch["image_embeds"]
+    positions = batch.get("image_embed_positions")
+    mask = batch.get("image_embed_mask")
+    n_tok = batch.get("embed_n_tok")
+    use_positions = positions is not None and mask is not None
+    if not use_positions and n_tok is None:
+        if positions is not None or mask is not None:
+            raise ValueError("`image_embed_positions` and `image_embed_mask` must be provided together.")
+        return {}
+    if getattr(embeds, "ndim", 0) < 1:
+        raise ValueError("packed `image_embeds` must have a leading embed-row axis.")
+    if not use_positions and (getattr(n_tok, "ndim", 0) < 1 or int(n_tok.shape[0]) != int(batch_size)):
+        raise ValueError(
+            f"`embed_n_tok` must have one entry per batch row ({batch_size}) to slice packed image_embeds, "
+            f"got shape {getattr(n_tok, 'shape', None)}."
+        )
+
+    owner_leaves = (positions, mask) if use_positions else (n_tok,)
+    host = not isinstance(start_index, jax.core.Tracer) and all(
+        isinstance(leaf, np.ndarray) for leaf in (embeds, *owner_leaves)
+    )
+    xp = np if host else jnp
+    num_embeds = int(embeds.shape[0])
+    size = int(minibatch_size)
+    rows = xp.arange(num_embeds, dtype=xp.int32)
+    if use_positions:
+        owner = xp.asarray(positions)[:, 0]
+        valid = xp.asarray(mask) != 0
+    else:
+        counts = xp.asarray(n_tok).reshape(int(batch_size), -1).sum(axis=1)
+        ends = xp.cumsum(counts, dtype=xp.int32)
+        if host and int(ends[-1]) > num_embeds:
+            raise ValueError(f"`embed_n_tok` sums to {int(ends[-1])} embed rows but `image_embeds` has {num_embeds}.")
+        owner = xp.searchsorted(ends, rows, side="right")
+        valid = rows < ends[-1]
+    keep = valid & (owner >= start_index) & (owner < start_index + size)
+
+    if host:
+        index = np.flatnonzero(keep)
+        count = index.size
+
+        def take(leaf):
+            out = np.zeros_like(leaf)
+            out[:count] = leaf[index]
+            return out
+
+    else:
+        index = jnp.nonzero(keep, size=num_embeds, fill_value=num_embeds)[0]
+        count = keep.sum(dtype=jnp.int32)
+
+        def take(leaf):
+            return jnp.take(jnp.asarray(leaf), index, axis=0, mode="fill", fill_value=0)
+
+    out = {"image_embeds": take(embeds)}
+    if use_positions:
+        taken = take(positions)
+        shift = xp.where(rows < count, start_index, 0).astype(taken.dtype)
+        out["image_embed_positions"] = xp.stack([taken[:, 0] - shift, taken[:, 1]], axis=1)
+        out["image_embed_mask"] = (rows < count).astype(xp.asarray(mask).dtype)
+    if "n_real_embeds" in batch:
+        out["n_real_embeds"] = xp.asarray(count, dtype=xp.asarray(batch["n_real_embeds"]).dtype)
+    return out
+
+
 GROUPED_MULTIMODAL_MODEL_INPUT_KEYS = frozenset(
     {
         "pixel_values",
@@ -1982,6 +2086,11 @@ def compile_trainer_step(
     # callables on the regular marker-based MPMD path so custom trainers keep
     # their full metrics and is_training behavior.
 
+    from .batch_placement import release_batch_slot, replicated_batch_slot_spec, wrap_batch_placed
+
+    batch_spec = replicated_batch_slot_spec(arguments, mesh, in_shardings)
+    in_shardings = release_batch_slot(in_shardings, batch_spec)
+
     static_nums = _normalize_static_argnums(static_argnums)
     kwargs = {
         "mutable": mutable,
@@ -2004,7 +2113,7 @@ def compile_trainer_step(
         kwargs["out_shardings"] = out_shardings
     compiled = spx.jit(fn, **kwargs)
     compiled.static_argnums_ = static_nums
-    return compiled
+    return wrap_batch_placed(compiled, batch_spec, mesh)
 
 
 def _slice_batch_for_scheduled_step(
@@ -2020,13 +2129,25 @@ def _slice_batch_for_scheduled_step(
     The same layout contract is used by ordinary accumulation, scheduled
     accumulation and auxiliary forwards. Dynamic slices support scan indices;
     auxiliary forwards use static slices to keep their existing sharding path.
+
+    Packed image-embed leaves are re-selected per microbatch by :func:`slice_packed_embed_leaves`
+    (static shapes, so the scan body compiles once).
+
+    Raises:
+        ValueError: If packed embed leaves carry unusable row-ownership markers.
     """
+    packed = {}
+    if int(minibatch_size) < int(batch_size):
+        packed = slice_packed_embed_leaves(
+            batch, batch_size, start_index if dynamic else int(start_index), minibatch_size
+        )
+    passthrough = (*packed, *PACKED_EMBED_PER_IMAGE_KEYS) if packed else ()
 
     def _slice_leaf(path, arr):
         if not hasattr(arr, "shape") or len(arr.shape) == 0:
             return arr
         key = next((entry.key for entry in reversed(path) if isinstance(entry, tu.DictKey)), None)
-        if key in SHARED_GENERATION_MODEL_INPUT_KEYS:
+        if key in SHARED_GENERATION_MODEL_INPUT_KEYS or key in passthrough:
             return arr
         axis = infer_prompt_batch_axis(arr, batch_size, key=key)
         if axis is None:
@@ -2035,7 +2156,10 @@ def _slice_batch_for_scheduled_step(
             return lax.dynamic_slice_in_dim(arr, start_index, minibatch_size, axis=axis)
         return lax.slice_in_dim(arr, start_index, start_index + minibatch_size, axis=axis)
 
-    return jax.tree_util.tree_map_with_path(_slice_leaf, batch)
+    out = jax.tree_util.tree_map_with_path(_slice_leaf, batch)
+    if packed:
+        out = {**out, **packed}
+    return out
 
 
 def _scheduled_step_key(fn: tp.Callable[..., tp.Any]) -> tuple[str, str]:
@@ -2489,9 +2613,22 @@ def _infer_batch_size(batch: tp.Any) -> int:
     """
 
     leaves = tu.tree_leaves(batch)
-    leading_dims = [
-        int(leaf.shape[0]) for leaf in leaves if hasattr(leaf, "shape") and len(getattr(leaf, "shape", ())) >= 1
-    ]
+    leading_dims: list[int] = []
+    fallback_dims: list[int] = []
+    for path, leaf in tu.tree_leaves_with_path(batch):
+        shape = tuple(getattr(leaf, "shape", ()) or ())
+        if not shape:
+            continue
+        fallback_dims.append(int(shape[0]))
+        key = next((entry.key for entry in reversed(path) if isinstance(entry, tu.DictKey)), None)
+        if key in _NON_BATCH_LEADING_KEYS:
+            continue
+        if key == "position_ids" and len(shape) >= 3 and int(shape[0]) == 3:
+            leading_dims.append(int(shape[1]))
+            continue
+        leading_dims.append(int(shape[0]))
+    if not leading_dims:
+        leading_dims = fallback_dims
     if not leading_dims:
         keys = list(batch.keys())[:8] if isinstance(batch, dict) else "n/a"
         leaf_types = sorted({type(leaf).__name__ for leaf in leaves[:64]})
@@ -2552,7 +2689,8 @@ def update_state_respectfully(
     Returns:
             EasyDeLState: The updated state of the model.
     """
-    if FAST_COMPILE:
+    guard_nonfinite = loss_config is not None and bool(getattr(loss_config, "skip_nonfinite_updates", False))
+    if FAST_COMPILE and not guard_nonfinite:
         return state.apply_gradients(grads=gradients)
     else:
 
@@ -2580,21 +2718,35 @@ def update_state_respectfully(
             state, _ = args
             return state
 
-        should_update = True
+        should_update = jnp.asarray(True)
         if loss_config is not None:
-            should_update = lax.cond(
-                loss_config.break_on_nan,
-                lambda x: lax.cond(
-                    jnp.isnan(metrics.loss),
-                    lambda _: False,
-                    lambda _: True,
-                    None,
-                ),
-                lambda x: True,
-                None,
-            )
+            if guard_nonfinite:
+                should_update = jnp.all(jnp.isfinite(metrics.loss))
+            elif loss_config.break_on_nan:
+                should_update = jnp.logical_not(jnp.any(jnp.isnan(metrics.loss)))
+            if guard_nonfinite:
+                should_update = jnp.logical_and(should_update, _tree_all_finite(gradients))
         state = lax.cond(should_update, update_fn, skip_fn, (state, gradients))
         return state
+
+
+def _tree_all_finite(tree: tp.Any) -> jax.Array:
+    """Return a scalar bool that is True when every inexact leaf of ``tree`` is finite.
+
+    Args:
+        tree: Pytree of arrays (typically gradients). Non-floating leaves are ignored.
+
+    Returns:
+        A scalar boolean array.
+    """
+    flags = [
+        jnp.all(jnp.isfinite(leaf))
+        for leaf in tu.tree_leaves(tree)
+        if hasattr(leaf, "dtype") and jnp.issubdtype(leaf.dtype, jnp.inexact)
+    ]
+    if not flags:
+        return jnp.asarray(True)
+    return functools.reduce(jnp.logical_and, flags)
 
 
 def slice_host_minibatch(batch: tp.Any, batch_size: int, start_index: int, minibatch_size: int) -> tp.Any:
@@ -2609,17 +2761,31 @@ def slice_host_minibatch(batch: tp.Any, batch_size: int, start_index: int, minib
         start_index: First row of the microbatch.
         minibatch_size: Rows per microbatch.
 
+    Packed image-embed leaves (``image_embeds`` indexed by embed row) are re-selected for the microbatch's
+    batch rows by :func:`slice_packed_embed_leaves`; they keep their full static row count.
+
     Returns:
         The microbatch, same structure as ``batch``.
+
+    Raises:
+        ValueError: If packed embed leaves carry unusable row-ownership markers.
     """
     start = int(start_index)
     stop = start + int(minibatch_size)
+    packed = {}
+    if int(minibatch_size) < int(batch_size):
+        packed = slice_packed_embed_leaves(batch, batch_size, start, minibatch_size)
+        for key, value in packed.items():
+            sharding = getattr(batch[key], "sharding", None)
+            if isinstance(batch[key], jax.Array) and sharding is not None:
+                packed[key] = jax.device_put(value, sharding)
+    passthrough = (*packed, *PACKED_EMBED_PER_IMAGE_KEYS) if packed else ()
 
     def _slice_leaf(path, arr):
         if not hasattr(arr, "shape") or len(arr.shape) == 0:
             return arr
         key = next((entry.key for entry in reversed(path) if isinstance(entry, tu.DictKey)), None)
-        if key in SHARED_GENERATION_MODEL_INPUT_KEYS:
+        if key in SHARED_GENERATION_MODEL_INPUT_KEYS or key in passthrough:
             return arr
         axis = infer_prompt_batch_axis(arr, batch_size, key=key)
         if axis is None:
@@ -2632,7 +2798,10 @@ def slice_host_minibatch(batch: tp.Any, batch_size: int, start_index: int, minib
         index[axis] = slice(start, stop)
         return arr[tuple(index)]
 
-    return jax.tree_util.tree_map_with_path(_slice_leaf, batch)
+    out = jax.tree_util.tree_map_with_path(_slice_leaf, batch)
+    if packed:
+        out = {**out, **packed}
+    return out
 
 
 def zero_gradient_accumulator(graphstate: tp.Any) -> dict[str, tp.Any]:

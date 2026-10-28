@@ -315,14 +315,21 @@ def test_shuffled_filtered_source_resumes_by_delivered_rows():
     assert [row["id"] for row in shuffled.open_shard_at_row(shuffled.shard_names[0], 2)] == full[2:]
 
 
-def test_restart_mixture_filtered_source_resumes_by_delivered_rows():
+@pytest.mark.parametrize("reshuffle", [False, None], ids=["fixed-order", "default-reshuffle"])
+@pytest.mark.parametrize("split", [2, 4, 5])
+def test_restart_mixture_filtered_source_resumes_by_delivered_rows(reshuffle, split):
     source = _MetadataRowsSource({"s0": list(range(4)), "s1": list(range(4, 8))})
     filtered = source.filter(lambda row: row["id"] % 2 == 1)
-    mixed = MixedShardedSource({"only": filtered}, block_size=1, seed=2, stop_strategy="restart")
+    mixed = MixedShardedSource(
+        {"only": filtered}, block_size=1, seed=2, stop_strategy="restart", reshuffle_on_restart=reshuffle
+    )
     full = [row["id"] for row in itertools.islice(mixed.open_shard(mixed.shard_names[0]), 12)]
-    assert full == [1, 3, 5, 7] * 3
-    resumed = [row["id"] for row in itertools.islice(mixed.open_shard_at_row(mixed.shard_names[0], 2), 8)]
-    assert resumed == full[2:10]
+    if reshuffle is False:
+        assert full == [1, 3, 5, 7] * 3
+    assert full[:4] == [1, 3, 5, 7]
+    assert all(sorted(full[k : k + 4]) == [1, 3, 5, 7] for k in (4, 8))
+    resumed = [row["id"] for row in itertools.islice(mixed.open_shard_at_row(mixed.shard_names[0], split), 7)]
+    assert resumed == full[split : split + 7]
 
 
 def test_restart_mixture_resumes_past_actual_row_cycle_not_metadata_row_cycle():

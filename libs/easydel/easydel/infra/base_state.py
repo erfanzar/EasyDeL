@@ -542,6 +542,55 @@ def _is_optimizer_template_incompatibility(exc: Exception) -> bool:
     )
 
 
+def _reconcile_optimizer_dtypes(opt_state: tp.Any, template: tp.Any) -> tuple[tp.Any, dict[str, int]]:
+    """Cast restored floating optimizer leaves to the dtypes of the live template.
+
+    Checkpoints may be written in a narrower float dtype than the live optimizer state (e.g. bf16 moments
+    saved with ``float_dtype=param_dtype`` while the live Adam moments are fp32). Returning them unchanged
+    gives a state whose avals differ from the compiled train step's.
+
+    Args:
+        opt_state: Restored optimizer-state pytree.
+        template: Pytree of arrays or ``jax.ShapeDtypeStruct`` describing the live optimizer state.
+
+    Returns:
+        ``(reconciled_state, casts)`` where ``casts`` counts leaves cast per ``"from->to"`` dtype pair.
+
+    Raises:
+        ValueError: If the tree structures or leaf shapes differ, or a leaf differs in a non floating->floating
+            dtype pair.
+    """
+    state_items, state_def = jax.tree_util.tree_flatten_with_path(opt_state)
+    template_items, template_def = jax.tree_util.tree_flatten_with_path(template)
+    if state_def != template_def:
+        raise ValueError(
+            "Restored optimizer state structure does not match the live optimizer template: "
+            f"{state_def} vs {template_def}."
+        )
+    casts: dict[str, int] = {}
+    leaves = []
+    for (path, leaf), (_, want) in zip(state_items, template_items, strict=True):
+        have_dtype = getattr(leaf, "dtype", None)
+        want_dtype = getattr(want, "dtype", None)
+        if have_dtype is None or want_dtype is None:
+            leaves.append(leaf)
+            continue
+        name = jax.tree_util.keystr(path)
+        if tuple(leaf.shape) != tuple(want.shape):
+            raise ValueError(f"Optimizer leaf {name} has shape {tuple(leaf.shape)}, expected {tuple(want.shape)}.")
+        if have_dtype != want_dtype:
+            if not (jnp.issubdtype(have_dtype, jnp.floating) and jnp.issubdtype(want_dtype, jnp.floating)):
+                raise ValueError(
+                    f"Optimizer leaf {name} has dtype {have_dtype}, expected {want_dtype}; only floating -> floating "
+                    "casts are reconciled."
+                )
+            leaf = leaf.astype(want_dtype)
+            key = f"{have_dtype}->{want_dtype}"
+            casts[key] = casts.get(key, 0) + 1
+        leaves.append(leaf)
+    return jax.tree_util.tree_unflatten(state_def, leaves), casts
+
+
 class EasyDeLState(_PyTreeNode):
     """Complete state container for EasyDeL models during training or inference.
 
@@ -1465,6 +1514,13 @@ class EasyDeLState(_PyTreeNode):
                 "Adam/optimizer moments for Q/K/V and gate/up weights will be silently scrambled; "
                 "re-save it with the current code to make trainer resumes mesh-portable."
             )
+        if template is not None:
+            opt_state, casts = _reconcile_optimizer_dtypes(opt_state, template)
+            if casts:
+                logger.info(
+                    "Cast restored optimizer leaves to the live optimizer dtypes: "
+                    + ", ".join(f"{count} x {pair}" for pair, count in sorted(casts.items()))
+                )
         checkpoint_meta = _read_checkpoint_metadata(load_directory)
         step = checkpoint_meta.get("step", None)
         if step is None:
