@@ -3061,7 +3061,8 @@ class EasyBridgeMixin(PushToHubMixin):
         # remaining meta leaves now so the model is fully materialized and safe to serialize.
         model = model.materialize_meta_state()
         if stacked_layer_paths:
-            model = _restack_layer_containers(model, stacked_layer_paths)
+            # Eager stacking drops the per-layer mesh placement; re-place the stacked leaves on the mesh.
+            model = _restack_layer_containers(model, stacked_layer_paths).shard_model()
         logger.debug("model and parameters pytree merged.")
 
         model = model.quantize(
