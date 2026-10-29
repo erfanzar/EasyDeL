@@ -1,0 +1,5652 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""HuggingFace bridge mixin layered onto :class:`EasyDeLBaseModule`.
+
+This module owns :class:`EasyBridgeMixin`, the single point of truth for moving
+weights into and out of EasyDeL. It handles five intertwined concerns that
+every model in the repo needs but no single model wants to re-implement:
+
+* **EasyDeL-native save / load** (:meth:`EasyBridgeMixin.save_pretrained`,
+  :meth:`EasyBridgeMixin.from_pretrained`) — writes/reads a SpectraX
+  graphstate alongside a transformers-compatible ``config.json``, lazy
+  initialises the module under the configured mesh, then shards the
+  weights using the resolver from :class:`EasyDeLBaseConfig`.
+* **PyTorch checkpoint ingestion** — both eager (load everything, convert
+  once) and streaming (one safetensors shard at a time) via
+  :class:`TorchLoadOptions` and :class:`StreamingCheckpointInfo`. The
+  streaming path keeps host memory bounded so larger-than-RAM HF
+  checkpoints can be converted in place.
+* **MoE expert grouping** — collects per-expert weight shards into the
+  consolidated EasyDeL ``ParallelMoELinear`` layouts and validates that
+  every group is complete before declaring success.
+* **LoRA-aware re-instantiation** — when a checkpoint contains LoRA
+  adapter leaves but the live model is plain, the loader rebuilds the
+  matching :class:`eLoRA` wrappers on the fly so the parameter merge
+  lands on the correct paths.
+* **HuggingFace Hub publishing** — inherits ``transformers.PushToHubMixin``
+  and adds concurrency controls, async uploads, ``ePath`` remote-write
+  support, and an auto-generated model card via
+  :class:`easydel.utils.readme_generator.ReadmeGenerator`.
+
+Module exports:
+    - :class:`EasyBridgeMixin`: The mixin itself.
+    - :class:`TorchLoadOptions`: Parsed ``torch_load_mode`` settings.
+    - :class:`StreamingCheckpointInfo`: Streaming-conversion handle.
+
+Constants:
+    ``SAFE_WEIGHTS_NAME``, ``SAFE_WEIGHTS_INDEX_NAME``,
+    ``ED_SAFE_WEIGHTS_INDEX_NAME``, ``TENSORSTORE_INDEX_NAME``,
+    ``CONFIG_NAME``, ``GENERATION_CONFIG_NAME`` and the older
+    ``WEIGHTS_NAME`` / ``TF2_WEIGHTS_NAME`` legacy filenames.
+    ``CANDIDATE_FILENAMES`` enumerates the weight-index/payload filenames
+    EasyDeL probes when discovering a checkpoint.
+"""
+
+from __future__ import annotations
+
+import collections.abc
+import contextlib
+import gc
+import inspect
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+import typing as tp
+import warnings
+from contextlib import contextmanager
+from copy import deepcopy
+from dataclasses import dataclass
+
+import huggingface_hub
+import huggingface_hub.errors
+import jax
+import numpy as np
+import spectrax as spx
+from eformer.loggings import get_logger
+from eformer.paths import ePath, ePathLike
+from huggingface_hub import CommitOperationAdd, create_branch, create_commit, create_repo
+from huggingface_hub.utils import HfHubHTTPError
+from jax import numpy as jnp
+from spectrax import PartitionAxis, nn
+from spectrax.serialization import Checkpointer, find_latest_checkpoint
+from transformers.utils.hub import PushToHubMixin
+
+from easydel.layers import QuantizationConfig, eLoRA
+from easydel.utils.checkpoint_compat import (
+    adapt_legacy_checkpoint_collections as _adapt_legacy_checkpoint_collections,
+)
+from easydel.utils.checkpoint_compat import (
+    apply_legacy_native_config_defaults as _apply_legacy_native_config_defaults,
+)
+from easydel.utils.checkpoint_compat import (
+    materialize_tied_lm_head_from_embeddings as _materialize_tied_lm_head_from_embeddings,
+)
+from easydel.utils.checkpoint_compat import (
+    rename_legacy_checkpoint_leaves as _rename_legacy_checkpoint_leaves,
+)
+from easydel.utils.helpers import is_remote_path
+from easydel.utils.instrumentation import phase_timer as _phase_timer
+from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
+from easydel.utils.traversals import (
+    flatten_dict,
+    get_module_from_path,
+    is_flatten,
+    iter_module_search,
+    merge_model_and_tree,
+    set_module_from_path,
+    string_key_to_int,
+    tree_path_to_string,
+    unflatten_dict,
+)
+
+# Legacy filename constants live in ``base_config``; re-exported here (see the module docstring) so there is a
+# single definition.
+from ..base_config import (  # noqa: F401
+    CHAT_TEMPLATE_NAME,
+    FEATURE_EXTRACTOR_NAME,
+    GENERATION_CONFIG_NAME,
+    IMAGE_PROCESSOR_NAME,
+    MODEL_CARD_NAME,
+    PROCESSOR_NAME,
+    SAFE_WEIGHTS_INDEX_NAME,
+    SAFE_WEIGHTS_NAME,
+    TF2_WEIGHTS_INDEX_NAME,
+    TF2_WEIGHTS_NAME,
+    TF_WEIGHTS_NAME,
+    WEIGHTS_INDEX_NAME,
+    WEIGHTS_NAME,
+    EasyDeLBaseConfig,
+    EasyDeLBaseConfigDict,
+    is_remote_url,
+)
+from ..base_config import download_url as _download_url
+from ..etils import EasyDeLBackends, EasyDeLPlatforms
+from ..sharding import MeshLike
+
+if tp.TYPE_CHECKING:
+    from ..base_module import EasyDeLBaseModule
+logger = get_logger(__name__)
+
+ED_SAFE_WEIGHTS_INDEX_NAME = "easydel-model.parameters.safetensors.index.json"
+TENSORSTORE_INDEX_NAME = "tensorstore_index.json"
+CONFIG_NAME = "config.json"
+
+
+_QUANT_CONSUMED = object()
+
+_QUANTIZED_LOAD_CHUNK_SIZE = 16
+
+
+def _build_quant_decoder(hf_config: tp.Any, ckpt_keys: tp.Iterable[str]):
+    """Build a decoder for a pre-quantized checkpoint, or ``None``.
+
+    Pre-quantized checkpoints store packed codes plus a sibling scale tensor.
+    Nothing in the streaming converter knew about them, so the codes were cast
+    as if they were ordinary numbers -- valid-looking output, wrong values, no
+    error. This resolves the registered adapter for the checkpoint's
+    ``quant_method`` and returns a callable that turns a (weight, scale) pair
+    into the dense tensor the rest of the pipeline expects.
+
+    Args:
+        hf_config: The checkpoint's HF config; read for ``quantization_config``.
+        ckpt_keys: Every key in the checkpoint, used to find scale siblings.
+
+    Returns:
+        ``decode(key, tensor, fetch) -> tensor | None | _QUANT_CONSUMED``, or
+        ``None`` when the checkpoint is not quantized or declares a scheme no
+        adapter claims (which stays a pass-through rather than an error, so
+        unquantized checkpoints are entirely unaffected).
+    """
+    raw = getattr(hf_config, "quantization_config", None)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raw = getattr(raw, "to_dict", lambda: None)() or getattr(raw, "__dict__", None)
+    if not isinstance(raw, dict):
+        return None
+    method = str(raw.get("quant_method", "") or "").lower()
+    if not method:
+        return None
+    # Some checkpoints keep part of the quantization description OUTSIDE
+    # `quantization_config`: DeepSeek-V4 puts `expert_dtype: "fp4"` at the top
+    # level, while `quantization_config` describes only the dense fp8 weights.
+    # An adapter only ever sees the config block, so fold those hints in here
+    # or the experts -- 97% of the model -- silently decode as the dense
+    # format and come out at half their true input width.
+    raw = dict(raw)
+    for hint in ("expert_dtype",):
+        value = getattr(hf_config, hint, None)
+        if value is not None:
+            raw.setdefault(hint, value)
+    try:
+        from easydel.layers.quantization.checkpoint import get_adapter
+        from easydel.utils.parameters_transformation import TensorConverter
+
+        adapter = get_adapter(method)
+        parsed = adapter.parse_config(raw)
+    except Exception as exc:  # unknown scheme: leave the checkpoint alone
+        logger.warning(f"No checkpoint-quantization adapter for {method!r} ({exc}); loading tensors verbatim.")
+        return None
+
+    key_set = set(ckpt_keys)
+
+    def _source_for(key: str):
+        """Pick the per-layer source format, honouring `overrides`."""
+        for pattern, fmt in parsed.overrides:
+            if re.search(pattern, key):
+                return fmt
+        return parsed.default
+
+    # Only scales paired with quantized weights are metadata. Prefer the
+    # adapter-declared spelling, retaining historical sibling suffix aliases.
+    # A learned parameter named `scale` is not metadata merely by suffix.
+    weight_scales = {}
+    for key in key_set:
+        if not key.endswith(".weight"):
+            continue
+        stem = key[: -len(".weight")]
+        if parsed.ignored.matches(stem):
+            continue
+        suffixes = (*adapter.source_suffixes(_source_for(key)), "scale", "weight_scale", "weight_scale_inv")
+        scale_key = next(
+            (
+                f"{stem}.{suffix}"
+                for suffix in suffixes
+                if suffix in ("scale", "weight_scale", "weight_scale_inv") and f"{stem}.{suffix}" in key_set
+            ),
+            None,
+        )
+        if scale_key is not None:
+            weight_scales[key] = scale_key
+    scale_keys = set(weight_scales.values())
+
+    def decode(key: str, tensor, fetch):
+        if key in scale_keys:
+            return _QUANT_CONSUMED
+        scale_key = weight_scales.get(key)
+        if scale_key is None:
+            return None
+        source = _source_for(key)
+        scale = fetch(scale_key)
+        if scale is None:
+            return None
+        # The adapter's canonical form is deliberately still quantized
+        # (`quant_kernel` + `quant_scales`) -- that is the runtime
+        # representation. Conversion needs a DENSE tensor for the streaming
+        # writer, so call the format's codec directly; load-time quantization
+        # is what puts the weights back to 4 bits in HBM.
+        from easydel.layers.quantization.checkpoint._codecs import decode_mxfp4, decode_scaled_elements
+
+        weight = TensorConverter.to_jax_preserving_dtype(tensor)
+        scale_arr = TensorConverter.to_jax_preserving_dtype(scale)
+
+        def _as_torch(arr):
+            """Hand back a torch tensor: the rest of the pipeline still calls
+            torch methods (`.permute`) on whatever this returns."""
+            import numpy as _np
+            import torch as _torch
+
+            return _torch.from_numpy(_np.asarray(arr, dtype=_np.float32))
+
+        if source.quant_method == "mxfp4":
+            if jnp.dtype(weight.dtype) == jnp.int8:
+                # Packed nibble pairs stored signed; identical bits.
+                weight = jax.lax.bitcast_convert_type(weight, jnp.uint8)
+            if jnp.dtype(scale_arr.dtype) != jnp.uint8:
+                scale_arr = jax.lax.bitcast_convert_type(scale_arr, jnp.uint8)
+            return _as_torch(decode_mxfp4(weight, scale_arr, transpose=False, dtype=jnp.float32))
+        return _as_torch(
+            decode_scaled_elements(
+                weight.astype(jnp.float32),
+                scale_arr.astype(jnp.float32),
+                transpose=False,
+                dtype=jnp.float32,
+                block_shape=source.block_shape,
+            )
+        )
+
+    decode.consumed_keys = frozenset(scale_keys)
+    return decode
+
+
+def stage_remote_metadata(
+    pretrained_model_name_or_path: str | os.PathLike,
+    *,
+    subfolder: str = "",
+    filenames: collections.abc.Sequence[str] = (CONFIG_NAME, GENERATION_CONFIG_NAME),
+) -> tuple[str | os.PathLike, tempfile.TemporaryDirectory | None]:
+    """Materialize a remote checkpoint's small metadata files locally.
+
+    ``AutoConfig.from_pretrained`` goes through the HF hub resolver, which
+    understands repo ids and local directories but not object-store URIs -- a
+    ``gs://`` path fails with "Repo id must be in the form 'repo_name'". The
+    weight side of the loader is already ``ePath``-aware and streams shards
+    straight from the bucket, so only these few KB need to land on disk.
+
+    Args:
+        pretrained_model_name_or_path: Checkpoint location. Non-``gs://``
+            values are returned untouched, so callers can apply this
+            unconditionally.
+        subfolder: Optional subfolder within the checkpoint.
+        filenames: Metadata files to stage. Missing ones are skipped -- only
+            the first is required, since a checkpoint without a config is not
+            loadable anyway.
+
+    Returns:
+        ``(config_source, tmpdir)``. ``tmpdir`` is ``None`` for non-remote
+        inputs, and otherwise must be kept alive by the caller until the
+        config has been read.
+
+    Raises:
+        FileNotFoundError: If the first entry of ``filenames`` is absent.
+    """
+    if not str(pretrained_model_name_or_path).startswith("gs://"):
+        return pretrained_model_name_or_path, None
+
+    tmp = tempfile.TemporaryDirectory()
+    base = str(pretrained_model_name_or_path).rstrip("/")
+    normalized = str(subfolder or "").strip("/").replace("\\", "/")
+    if normalized:
+        base = f"{base}/{normalized}"
+    for index, filename in enumerate(filenames):
+        source = ePath(f"{base}/{filename}")
+        try:
+            payload = source.read_bytes()
+        except Exception as exc:
+            if index == 0:
+                raise FileNotFoundError(f"{filename} not found under {base!r}") from exc
+            continue
+        ePath(os.path.join(tmp.name, os.path.basename(filename))).write_bytes(payload)
+    return tmp.name, tmp
+
+
+CANDIDATE_FILENAMES = [
+    SAFE_WEIGHTS_INDEX_NAME,
+    SAFE_WEIGHTS_NAME,
+    ED_SAFE_WEIGHTS_INDEX_NAME,
+    TENSORSTORE_INDEX_NAME,
+    "model_structure.json",
+]
+
+
+@contextmanager
+def working_or_temp_dir(working_dir: str | os.PathLike | None = None, use_temp_dir: bool = False):
+    """Yield either *working_dir* or a fresh temp dir, cleaning up the temp.
+
+    Args:
+        working_dir: Persistent directory to use. Created if it does not
+            exist.
+        use_temp_dir: When ``True`` (or when *working_dir* is ``None``), a
+            ``tempfile.mkdtemp()`` directory is yielded and removed on exit.
+
+    Yields:
+        str | os.PathLike: The working directory path for use inside the
+        ``with`` block.
+    """
+    if use_temp_dir or working_dir is None:
+        temp_dir = tempfile.mkdtemp()
+        try:
+            yield temp_dir
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    else:
+        os.makedirs(working_dir, exist_ok=True)
+        yield working_dir
+
+
+_HUB_KWARG_NAMES = ("cache_dir", "revision", "token", "local_files_only", "force_download", "subfolder", "proxies")
+_TRANSFORMER_OPTION_NAMES = (
+    "embedding_layer_names",
+    "layernorm_names",
+    "moe_block_names",
+    "moe_names",
+    "moe_block_path",
+    "moe_path",
+    "reform_param",
+    "hf_flattened_wrappers",
+    "checkpoint_key_normalizer",
+)
+
+
+def _stacked_layer_paths(model: tp.Any) -> tuple[tuple, ...]:
+    """Return the module paths of every ``StackedModuleList`` in ``model``.
+
+    Args:
+        model: Module tree, typically freshly built by ``lazy_init``.
+
+    Returns:
+        Tuple paths (attribute names) of the stacked layer containers.
+    """
+    from spectrax.core.paths import str_to_path
+
+    if not isinstance(model, spx.Module):
+        return ()
+    return tuple(str_to_path(path) for path, _ in spx.iter_modules(model, select=nn.StackedModuleList) if path)
+
+
+def _torch_pretrained_model_class() -> type:
+    from transformers import PreTrainedModel
+
+    return PreTrainedModel
+
+
+@contextlib.contextmanager
+def _torch_fp32_pinned_load(patterns: tuple[str, ...]):
+    """Keep checkpoint keys matching ``patterns`` in float32 during a half-precision torch load.
+
+    Extends transformers' per-key ``dtype_plan`` (the ``_keep_in_fp32_modules_strict`` mechanism) for the
+    duration of one ``from_pretrained`` call, so only the pinned leaves are materialized in float32.
+    Patterns match whole dotted segments, like ``fp32_param_pattern_matches``.
+    """
+    if not patterns:
+        yield
+        return
+    import torch
+
+    model_class = _torch_pretrained_model_class()
+    original = model_class._get_dtype_plan
+    extra = {rf"(?:^|\.){re.escape(pattern)}(?:\.|$)": torch.float32 for pattern in patterns}
+
+    def _get_dtype_plan(self, dtype):
+        plan = original(self, dtype)
+        if dtype in (torch.float16, torch.bfloat16):
+            plan = {**plan, **extra}
+        return plan
+
+    model_class._get_dtype_plan = _get_dtype_plan
+    try:
+        yield
+    finally:
+        model_class._get_dtype_plan = original
+
+
+def _restack_layer_containers(model: tp.Any, paths: tuple[tuple, ...]) -> tp.Any:
+    """Replace the ``ModuleList`` at each path with its stacked equivalent.
+
+    Args:
+        model: Fully materialized model built with ``scan_layers=False``.
+        paths: Container paths that the ``scan_layers=True`` build stacks.
+
+    Returns:
+        The same model with those containers stacked.
+
+    Raises:
+        TypeError: If a path does not resolve to a ``ModuleList`` reachable by attribute names.
+    """
+    for path in sorted(paths, key=len, reverse=True):
+        parent = model
+        for key in path[:-1]:
+            parent = parent[key] if isinstance(key, int) else getattr(parent, key)
+        name = path[-1]
+        child = getattr(parent, name, None) if isinstance(name, str) else None
+        if not isinstance(child, nn.ModuleList):
+            raise TypeError(f"cannot re-stack layer container at {'.'.join(map(str, path))}: got {type(child)}")
+        setattr(parent, name, child.stack())
+    return model
+
+
+def _checkpoint_transformer_options(transformer: tp.Any) -> tuple[tp.Any, ...]:
+    """Extract the conversion options shared by both streaming loaders.
+
+    Args:
+        transformer: Model's partial ``pure_transform_fn``.
+
+    Returns:
+        Options in ``_TRANSFORMER_OPTION_NAMES`` order; absent options are ``None``.
+    """
+    return tuple(transformer.keywords.get(name) for name in _TRANSFORMER_OPTION_NAMES)
+
+
+def _extract_hub_kwargs(kwargs: collections.abc.Mapping[str, tp.Any]) -> dict[str, tp.Any]:
+    """Pick the HuggingFace Hub download kwargs out of a ``from_pretrained``-style kwargs mapping.
+
+    Args:
+        kwargs: Caller-supplied keyword arguments. Not mutated.
+
+    Returns:
+        dict[str, Any]: The subset of ``cache_dir``, ``revision``, ``token``, ``local_files_only``,
+        ``force_download``, ``subfolder`` and ``proxies`` present in ``kwargs``.
+    """
+    return {k: kwargs[k] for k in _HUB_KWARG_NAMES if k in kwargs}
+
+
+def _split_subfolder(filename: str, subfolder: str) -> tuple[str, str]:
+    """Decide whether *filename* already includes the configured subfolder.
+
+    Args:
+        filename: Candidate filename, possibly already prefixed with the subfolder.
+        subfolder: Configured repo subfolder (may be empty).
+
+    Returns:
+        tuple[str, str]: ``(filename, effective_subfolder)`` to forward to ``hf_hub_download``.
+    """
+    if not subfolder:
+        return filename, ""
+    normalized = subfolder.strip("/").replace("\\", "/")
+    if filename.startswith(normalized + "/"):
+        return filename, ""
+    return filename, normalized
+
+
+def _hf_download_file(
+    repo_id: str,
+    filename: str,
+    *,
+    subfolder: str,
+    revision: str | None,
+    cache_dir: str | None,
+    force_download: bool,
+    proxies: tp.Any,
+    token: str | bool | None,
+    local_files_only: bool,
+) -> str:
+    """Download one file from the HF Hub, honoring the configured subfolder.
+
+    Args:
+        repo_id: Hub repository id.
+        filename: Repo-relative filename.
+        subfolder: Configured repo subfolder (may be empty).
+        revision: Optional branch/tag/commit.
+        cache_dir: Hub cache directory.
+        force_download: Whether to re-download cached files.
+        proxies: Optional proxy mapping.
+        token: Hub token.
+        local_files_only: Whether to refuse network access.
+
+    Returns:
+        str: Local path to the downloaded file.
+    """
+    filename, effective_subfolder = _split_subfolder(filename, subfolder)
+    return huggingface_hub.hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        subfolder=effective_subfolder,
+        revision=revision,
+        cache_dir=cache_dir,
+        force_download=force_download,
+        proxies=proxies,
+        token=token,
+        local_files_only=local_files_only,
+    )
+
+
+def _find_local_file(root: str, filename: str, subfolder: str, *, disabled: bool = False) -> str | None:
+    """Locate *filename* under a local pretrained-model directory.
+
+    Args:
+        root: Candidate local model directory.
+        filename: Repo-relative filename.
+        subfolder: Configured repo subfolder (may be empty).
+        disabled: When ``True`` (e.g. a remote ``gs://`` source) never resolve locally.
+
+    Returns:
+        str | None: Absolute local path when the file exists, else ``None``.
+    """
+    if disabled or not os.path.isdir(root):
+        return None
+    filename, effective_subfolder = _split_subfolder(filename, subfolder)
+    if effective_subfolder:
+        root = os.path.join(root, effective_subfolder)
+    candidate = os.path.join(root, filename)
+    return candidate if os.path.isfile(candidate) else None
+
+
+def _load_json_index(path: str) -> dict[str, tp.Any]:
+    """Read a JSON checkpoint index file from *path*.
+
+    Args:
+        path: Filesystem path to the JSON file.
+
+    Returns:
+        dict: Parsed JSON contents.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _expert_merge_for_key(k: str, nk: str, *, hf_key_mapper, hf_model_type, key_normalizer):
+    """Place a per-expert key in transformers' merged expert layout (see ``resolve_expert_merge``).
+
+    Args:
+        k: Raw checkpoint key.
+        nk: The same key after normalization.
+        hf_key_mapper: ``HFCheckpointKeyMapper`` for the model, or ``None`` when the model normalizes keys itself.
+        hf_model_type: HF ``model_type`` used for the conversion-mapping lookup.
+        key_normalizer: The model's own ``checkpoint_key_normalizer`` or ``None``.
+
+    Returns:
+        The expert-merge description, or ``None`` when the key is not a mergeable expert tensor.
+    """
+    from easydel.utils.parameters_transformation import resolve_expert_merge
+
+    if hf_key_mapper is not None:
+        return hf_key_mapper.expert_merge(k)
+    return resolve_expert_merge(nk, hf_model_type, apply_renamings=key_normalizer is not None)
+
+
+def _match_moe_checkpoint_key(
+    key: str,
+    *,
+    normalize_key: tp.Callable[[str], str | None],
+    resolve_merge: tp.Callable,
+    moe_block_path: tp.Sequence[str] | None,
+    moe_names: tp.Collection[str],
+    moe_path: tp.Sequence[str] | None,
+    expert_fusion_sources: tp.Collection[str] = (),
+    hf_merge_targets: tp.Collection[str] = (),
+) -> tuple[str, int, tp.Any] | None:
+    """Resolve an expert checkpoint key to a stacked runtime or synthetic merge group.
+
+    Both streaming loaders share canonical expert-name mapping. The in-memory
+    converter may additionally request synthetic groups used by reform fusions;
+    the direct-to-disk writer requests only groups it can write incrementally.
+
+    Args:
+        key: Original checkpoint key, preserved by callers for shard fetches.
+        normalize_key: Model/HF key normalizer; ``None`` means the key is unowned.
+        resolve_merge: Resolver for HF expert-merge metadata.
+        moe_block_path: Model expert-block prefixes.
+        moe_names: Runtime expert leaf names.
+        moe_path: Declared runtime expert paths.
+        expert_fusion_sources: Additional stacked source paths consumed by reform fusions.
+        hf_merge_targets: HF merged tensor keys consumed by reform rules.
+
+    Returns:
+        ``(group_path, expert_index, synthetic_merge_spec)`` or ``None`` when unclaimed.
+    """
+    from easydel.utils.parameters_transformation import canonical_expert_leaf
+
+    if not (moe_block_path and moe_names and moe_path):
+        return None
+    normalized = normalize_key(key)
+    expert_name = moe_path[0].split(".")[-2]
+    expert_prefix = f".{expert_name}."
+    if normalized is None or expert_prefix not in normalized:
+        return None
+    merge = resolve_merge(key, normalized)
+    for block_path in moe_block_path:
+        prefix = block_path + expert_prefix
+        if not normalized.startswith(prefix):
+            continue
+        expert_part, separator, leaf = normalized[len(prefix) :].partition(".")
+        if not separator or not expert_part.isdigit():
+            continue
+        name = leaf.removesuffix(".weight")
+        if merge is not None and name not in moe_names:
+            _, _, spec, part = merge
+            canonical = canonical_expert_leaf(spec, part)
+            if canonical in moe_names:
+                name = canonical
+            elif len(spec.parts) == 1 and spec.target in moe_names:
+                name = spec.target
+        target = f"{block_path}.{expert_name}.{name}"
+        if name in moe_names or target in expert_fusion_sources:
+            return target, int(expert_part), None
+    if merge is not None and merge[0] in hf_merge_targets:
+        merged_key, expert_index, spec, part = merge
+        return f"{merged_key}#part{part}", expert_index, spec
+    return None
+
+
+def _normalize_checkpoint_key(
+    k: str, *, key_normalizer, hf_key_mapper, hf_model_type, hf_flattened_wrappers
+) -> str | None:
+    """Map a checkpoint key to EasyDeL naming (re-insert flattened wrappers).
+
+    A model's own normalizer encodes its on-disk layout; otherwise transformers' load-time renames are used, so
+    keys match what the full loader sees (e.g. VLMs saved under legacy ``language_model.model.*``).
+
+    Args:
+        k: Raw checkpoint state-dict key (old or new HF layout).
+        key_normalizer: The model's own ``checkpoint_key_normalizer`` or ``None``.
+        hf_key_mapper: ``HFCheckpointKeyMapper`` for the model, or ``None``.
+        hf_model_type: HF ``model_type`` used for the rename lookup.
+        hf_flattened_wrappers: Flattened wrapper prefixes to re-insert.
+
+    Returns:
+        str | None: The normalized key; ``None`` marks a tensor the runtime does not own.
+    """
+    from easydel.utils.parameters_transformation import StateDictConverter, hf_rename_key
+
+    if key_normalizer is not None:
+        k = key_normalizer(k)
+    else:
+        k = hf_rename_key(k, hf_model_type, mapper=hf_key_mapper)
+    if k is None:
+        return None
+    return StateDictConverter.normalize_flattened_wrapper_key(k, hf_flattened_wrappers)
+
+
+def _checkpoint_cpu_device() -> jax.Device | None:  # pyright: ignore[reportInvalidTypeForm] #type: ignore
+    """Resolve a host CPU device for checkpoint-time array normalization.
+
+    Used by checkpoint loaders to materialize tensors on CPU first so
+    accelerator HBM is not consumed by stray temporaries while a checkpoint
+    is being assembled.
+
+    Returns:
+        jax.Device | None: The first available CPU device, or ``None`` when
+        none can be enumerated.
+    """
+    try:
+        cpu_devices = jax.devices("cpu")
+    except Exception:
+        return None
+    return cpu_devices[0] if cpu_devices else None
+
+
+def _normalize_checkpoint_leaf_to_jax(
+    value: tp.Any,
+    *,
+    cpu_device: jax.Device | None,  # pyright: ignore[reportInvalidTypeForm]
+) -> tp.Any:
+    """Convert NumPy leaves into JAX arrays without consuming accelerator HBM.
+
+    Args:
+        value: Pytree leaf. Only ``numpy.ndarray`` and ``numpy.generic``
+            scalars are transformed; everything else passes through.
+        cpu_device: Optional target CPU device. When supplied the leaf is
+            placed there via :func:`jax.device_put`; otherwise it is wrapped
+            with :func:`jnp.asarray` (default placement).
+
+    Returns:
+        Any: The original value, or a JAX array on the requested CPU device
+        when the input was NumPy-backed.
+    """
+    if not isinstance(value, np.ndarray | np.generic):
+        return value
+    if cpu_device is not None:
+        return jax.device_put(value, cpu_device)
+    return jnp.asarray(value)
+
+
+def _collect_lora_checkpoint_paths(
+    flat_state: dict[tuple[tp.Any, ...], tp.Any],
+) -> dict[tuple[tp.Any, ...], dict[str, tp.Any]]:
+    """Extract LoRA adapter locations from a flattened checkpoint state.
+
+    Checkpoints are loaded as a flat mapping from tree paths to leaves. LoRA
+    adapters appear as sibling leaves such as ``(..., "lora_a")`` and
+    ``(..., "lora_b")``. This helper groups those leaves by their parent module
+    path and only returns entries where both adapter matrices are present.
+
+    Args:
+        flat_state: Flattened checkpoint mapping produced during load.
+
+    Returns:
+        A mapping from module path to a small dictionary containing the matched
+        ``lora_a`` and ``lora_b`` leaves for that module.
+    """
+    lora_paths: dict[tuple[tp.Any, ...], dict[str, tp.Any]] = {}
+    for key, value in flat_state.items():
+        if not isinstance(key, tuple) or len(key) < 2:
+            continue
+        leaf_name = str(key[-1])
+        if leaf_name not in {"lora_a", "lora_b"}:
+            continue
+        # Strip the leading collection name (e.g. "lora") so the path
+        # points to the actual module location inside the model.
+        module_path = key[1:-1]
+        entry = lora_paths.setdefault(module_path, {})
+        entry[leaf_name] = value
+    return {path: values for path, values in lora_paths.items() if {"lora_a", "lora_b"} <= set(values)}
+
+
+def _rebuild_lora_modules_from_checkpoint(
+    model: "EasyDeLBaseModule",
+    flat_state: dict[tuple[tp.Any, ...], tp.Any],
+) -> "EasyDeLBaseModule":
+    """Recreate LoRA wrappers before merging a LoRA checkpoint into a model.
+
+    ``from_pretrained`` first instantiates the plain base model and only then
+    merges checkpoint leaves into it. That is fine for standard checkpoints, but
+    LoRA checkpoints contain parameter paths like ``lm_head.lora_a`` that do not
+    exist on the plain model yet. This helper scans the checkpoint, identifies
+    which modules were LoRA-wrapped at save time, and rebuilds matching
+    :class:`eLoRA` wrappers on the live model so the subsequent parameter merge
+    lands on the correct paths.
+
+    Args:
+        model: Freshly initialized model instance that will receive checkpoint
+            weights.
+        flat_state: Flattened checkpoint mapping. Only the structure is
+            inspected here; values are merged later by the normal loader path.
+
+    Returns:
+        The same model instance, potentially mutated in-place with rebuilt LoRA
+        wrappers.
+    """
+    lora_paths = _collect_lora_checkpoint_paths(flat_state)
+    if not lora_paths:
+        return model
+
+    rebuilt = 0
+    for path in sorted(lora_paths, key=len):
+        module = get_module_from_path(model=model, path=path)
+        if module is None or isinstance(module, nn.LoRA):
+            continue
+
+        lora_a = lora_paths[path]["lora_a"]
+        shape = getattr(lora_a, "shape", None)
+        if shape is None or len(shape) < 2:
+            logger.warning(
+                "Skipping LoRA checkpoint path %s because lora_a has an unexpected shape %s.",
+                ".".join(str(part) for part in path),
+                shape,
+            )
+            continue
+        rank = shape[-1]
+        in_features = getattr(module, "in_features", None)
+        out_features = getattr(module, "out_features", None)
+        if rank is None or in_features is None or out_features is None:
+            logger.warning(
+                "Skipping LoRA checkpoint path %s because the target module does not expose linear dimensions.",
+                ".".join(str(part) for part in path),
+            )
+            continue
+
+        set_module_from_path(
+            model=model,
+            path=path,
+            new_value=eLoRA(
+                int(in_features),
+                int(rank),
+                int(out_features),
+                base_module=module,
+                rngs=spx.Rngs(0),
+                dtype=getattr(module, "dtype", None),
+            ),
+        )
+        rebuilt += 1
+
+    if rebuilt:
+        logger.info("Detected LoRA checkpoint; rebuilt %d LoRA wrapper(s) before parameter merge.", rebuilt)
+    return model
+
+
+@dataclass
+class TorchLoadOptions:
+    """Parsed ``torch_load_mode`` options consumed by :meth:`EasyBridgeMixin._from_torch_pretrained`.
+
+    Produced by :func:`_parse_torch_load_options` from the user-facing
+    ``torch_load_mode``/``streaming_*`` kwargs of ``from_pretrained``. Carries
+    every decision that the streaming/eager PyTorch loader needs without
+    forcing the loader to keep re-parsing the kwargs dict.
+
+    Attributes:
+        mode: Loading strategy. ``"streaming"`` materializes one HuggingFace
+            shard at a time and converts it on the fly to keep host memory
+            bounded; ``"eager"`` downloads/loads the full state dict before
+            conversion.
+        streaming_cache: Disk-cache policy for streaming mode. ``"auto"``
+            keeps shards under the standard HF cache, ``"copy"`` forces a
+            local copy, and ``"none"`` reads through fsspec without caching.
+        streaming_tmp_dir: Optional explicit directory used to stage
+            intermediate shard copies in streaming mode. ``None`` defers to
+            ``streaming_cache`` to choose a location.
+        hub_kwargs: Extra keyword arguments forwarded to the underlying
+            HuggingFace Hub download helper (``revision``, ``token``,
+            ``proxies``, etc.).
+    """
+
+    mode: str
+    streaming_cache: str
+    streaming_tmp_dir: str | None
+    hub_kwargs: dict[str, tp.Any]
+
+
+@dataclass
+class StreamingCheckpointInfo:
+    """Streaming-conversion handle bundling everything needed to load PyTorch shards lazily.
+
+    Built once at the start of :meth:`EasyBridgeMixin._from_torch_pretrained`
+    when ``torch_load_mode="streaming"`` so the per-shard worker has a single
+    object to consult instead of juggling several parallel mappings.
+
+    Attributes:
+        ckpt_weight_format: Serialization format of the source shards —
+            ``"safetensors"`` or PyTorch's ``"bin"`` (pickle).
+        ckpt_key_to_filename: Mapping from each parameter key in the source
+            checkpoint to the shard filename that holds its tensor data.
+            Drives shard-prefetch ordering.
+        ckpt_filename_to_path: Mapping from shard filename to a fully
+            resolved local path (already-downloaded or fsspec-cached). Used
+            by the per-shard loader to find the bytes.
+        ed_config: The EasyDeL configuration produced from the HF config so
+            converters can derive shapes, dtypes, and partition rules
+            without re-parsing the upstream config.
+        generation_config: Optional ``transformers.GenerationConfig``-like
+            object discovered alongside the model. ``None`` when the
+            checkpoint doesn't ship one.
+        pretrained_model_name_or_path: Original Hub repo id or local path
+            the user passed in. Used for logging and for any follow-up
+            shard fetches that need to re-resolve the source.
+        resolve_shard: Callable accepting ``(filename, optional_subfolder)``
+            that returns a usable local path to that shard, transparently
+            downloading if the shard hasn't been seen yet.
+    """
+
+    ckpt_weight_format: tp.Literal["safetensors", "bin"]
+    ckpt_key_to_filename: dict[str, str]
+    ckpt_filename_to_path: dict[str, str]
+    ed_config: tp.Any
+    generation_config: tp.Any
+    pretrained_model_name_or_path: str
+    resolve_shard: tp.Callable[[str, str | None], str]
+
+
+def _save_generation_config(generation_config: tp.Any, save_directory: ePathLike) -> None:
+    """Persist a generation config to ``save_directory`` using EasyDeL path I/O.
+
+    Handles dict, ``transformers.GenerationConfig``, and legacy
+    ``save_pretrained``-style values transparently and works against both
+    local filesystems and remote ePath targets (GCS, S3, ...).
+
+    Args:
+        generation_config: The generation config to persist. ``None``
+            short-circuits to a no-op.
+        save_directory: Destination directory (local or remote).
+    """
+    if generation_config is None:
+        return
+
+    output_path = ePath(save_directory) / GENERATION_CONFIG_NAME
+    try:
+        if isinstance(generation_config, dict):
+            output_path.write_text(json.dumps(generation_config, indent=2, sort_keys=True))
+            return
+        if hasattr(generation_config, "to_json_string"):
+            output_path.write_text(generation_config.to_json_string(use_diff=False))
+            return
+        if hasattr(generation_config, "to_dict"):
+            output_path.write_text(json.dumps(generation_config.to_dict(), indent=2, sort_keys=True))
+            return
+        generation_config.save_pretrained(str(save_directory))
+    except Exception:
+        logger.warning(
+            "Failed to save generation config at %s via EasyDeL writer; trying transformers save_pretrained.",
+            output_path,
+            exc_info=True,
+        )
+        generation_config.save_pretrained(str(save_directory))
+
+
+def _load_generation_config(
+    pretrained_model_name_or_path: str | os.PathLike,
+    *,
+    subfolder: str = "",
+    trust_remote_code: bool | None = None,
+    log_missing: bool = False,
+    **hf_kwargs,
+):
+    """Load a ``GenerationConfig`` with ePath-first lookup (supports GCS paths).
+
+    Tries ePath candidates inside *pretrained_model_name_or_path* first so
+    remote checkpoints (GCS/S3) don't require an HF Hub roundtrip, then
+    falls back to ``GenerationConfig.from_pretrained``.
+
+    Args:
+        pretrained_model_name_or_path: Local path, ePath URI, or HF repo id.
+        subfolder: Optional sub-directory inside the model location to
+            search before the root.
+        trust_remote_code: Forwarded to ``GenerationConfig.from_pretrained``
+            when the ePath path fails.
+        log_missing: When ``True``, emit a warning if no generation config
+            is found anywhere.
+        **hf_kwargs: Additional kwargs forwarded to the HF loader fallback
+            (``revision``, ``token``, ``proxies``, ...).
+
+    Returns:
+        GenerationConfig | None: A loaded config, or ``None`` when no
+        generation config exists for this model.
+    """
+    from transformers import GenerationConfig
+
+    model_path = ePath(str(pretrained_model_name_or_path))
+    normalized_subfolder = str(subfolder or "").strip("/")
+    candidates: list[ePath] = []  # type:ignore
+    if normalized_subfolder:
+        candidates.append(model_path / normalized_subfolder / GENERATION_CONFIG_NAME)
+    candidates.append(model_path / GENERATION_CONFIG_NAME)
+
+    for candidate in candidates:
+        try:
+            if not candidate.exists():
+                continue
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return GenerationConfig.from_dict(payload)
+            logger.warning("Invalid generation config payload at %s (expected JSON object).", candidate)
+        except Exception:
+            logger.warning(
+                "Failed to load generation config from %s; falling back to transformers loader.",
+                candidate,
+                exc_info=True,
+            )
+
+    loader_kwargs = dict(hf_kwargs)
+    if normalized_subfolder:
+        loader_kwargs["subfolder"] = normalized_subfolder
+    elif "subfolder" in loader_kwargs:
+        loader_kwargs.pop("subfolder")
+    if trust_remote_code is not None:
+        loader_kwargs["trust_remote_code"] = trust_remote_code
+
+    try:
+        return GenerationConfig.from_pretrained(str(pretrained_model_name_or_path), **loader_kwargs)
+    except OSError:
+        if log_missing:
+            logger.warning(
+                "generation_config.json not found for '%s'; falling back to model-config defaults.",
+                pretrained_model_name_or_path,
+            )
+        return None
+
+
+def _parse_torch_load_options(kwargs: dict[str, tp.Any]) -> TorchLoadOptions:
+    """Parse ``torch_load_mode`` related kwargs into a :class:`TorchLoadOptions`.
+
+    Removes (via ``pop``) the relevant entries from ``kwargs`` and consolidates
+    them into a typed options struct so the streaming/eager PyTorch loader
+    paths don't have to re-parse them.
+
+    Args:
+        kwargs: Caller-supplied ``from_pretrained`` kwargs. The function
+            mutates this dict to extract ``torch_load_mode``,
+            ``torch_streaming_cache``, ``torch_streaming_tmp_dir`` and any
+            Hub-related kwargs.
+
+    Returns:
+        TorchLoadOptions: Normalized options including the resolved mode,
+        streaming-cache policy, optional temp dir, and a filtered HF Hub
+        kwargs dict.
+    """
+    torch_load_mode = str(kwargs.pop("torch_load_mode", "full")).lower()
+    if torch_load_mode not in {"full", "streaming"}:
+        warnings.warn(
+            f"Unknown torch_load_mode={torch_load_mode!r}; falling back to 'streaming'. Expected: 'full'|'streaming'.",
+            stacklevel=2,
+        )
+        torch_load_mode = "streaming"
+
+    torch_streaming_cache = str(kwargs.pop("torch_streaming_cache", "hf_cache")).lower()
+    torch_streaming_tmp_dir = kwargs.pop("torch_streaming_tmp_dir", None)
+    if torch_load_mode == "streaming" and torch_streaming_cache not in {"hf_cache", "temp"}:
+        warnings.warn(
+            f"Unknown torch_streaming_cache={torch_streaming_cache!r}; falling back to 'hf_cache'. "
+            "Expected: 'hf_cache'|'temp'.",
+            stacklevel=2,
+        )
+        torch_streaming_cache = "hf_cache"
+
+    hub_kwargs = _extract_hub_kwargs(kwargs)
+
+    return TorchLoadOptions(
+        mode=torch_load_mode,
+        streaming_cache=torch_streaming_cache,
+        streaming_tmp_dir=torch_streaming_tmp_dir,
+        hub_kwargs=hub_kwargs,
+    )
+
+
+def _normalize_quantization_config(
+    quantization_config: QuantizationConfig | dict[str, tp.Any] | None,
+    *,
+    strict: bool = True,
+) -> QuantizationConfig | None:
+    """Coerce a quantization-config dict into a :class:`QuantizationConfig`.
+
+    Args:
+        quantization_config: ``None``, an existing config, or a dict of
+            field overrides.
+        strict: Forwarded to :meth:`QuantizationConfig.coerce`. Strict mode
+            (explicitly user-supplied overrides) raises on unknown keys;
+            lenient mode (dicts inherited from a checkpoint's
+            ``config.json``) drops Hugging Face checkpoint-format
+            descriptors such as ``{"quant_method": "fp8", ...}`` instead of
+            raising.
+
+    Returns:
+        QuantizationConfig | None: A typed config or ``None``.
+    """
+    if quantization_config is None:
+        return None
+    if isinstance(quantization_config, QuantizationConfig):
+        return quantization_config
+    if isinstance(quantization_config, dict):
+        return QuantizationConfig.coerce(quantization_config, strict=strict)
+    return quantization_config
+
+
+def _strip_trailing_separators(path: str) -> str:
+    """Drop any trailing forward- or back-slashes from a path string.
+
+    Args:
+        path: Filesystem path or URL fragment.
+
+    Returns:
+        str: ``path`` with trailing ``/`` and ``\\`` removed.
+    """
+    while path.endswith("/") or path.endswith("\\"):
+        path = path[:-1]
+    return path
+
+
+class EasyBridgeMixin(PushToHubMixin):
+    """Cross-framework persistence and Hub-publishing layer mixed into every :class:`EasyDeLBaseModule`.
+
+    ``EasyBridgeMixin`` is the bridge between EasyDeL's SpecTrax-based runtime
+    representation and the wider model ecosystem. It owns three responsibilities
+    that the rest of the codebase consistently delegates to it instead of
+    reimplementing per-architecture:
+
+    1. **Saving and loading EasyDeL-native weights.**
+       :meth:`save_pretrained` writes the SpecTrax graphstate alongside an HF
+       ``config.json`` (with EasyDeL-specific extensions stripped), an
+       optional ``generation_config.json``, and a generated README/model
+       card. :meth:`from_pretrained` restores that artifact, creating a lazy
+       module under the configured mesh, sharding the weights according to
+       the partition rules, and (optionally) quantizing them on the fly.
+    2. **Importing PyTorch checkpoints.**
+       The ``_from_torch_pretrained`` family supports both ``"eager"`` and
+       ``"streaming"`` loading via :class:`TorchLoadOptions` /
+       :class:`StreamingCheckpointInfo`. Streaming mode converts one shard
+       at a time using ``ParameterTransformRule`` rules registered on the
+       model class, which lets EasyDeL load larger-than-RAM checkpoints
+       without materializing the whole HF state dict.
+    3. **HuggingFace Hub publishing.**
+       Inherits :class:`transformers.utils.PushToHubMixin` so subclasses
+       expose ``push_to_hub(...)``. EasyDeL augments this with concurrency
+       resolution, async upload helpers, and ``ePath``-based remote-write
+       support so checkpoints can be saved directly to GCS/S3 without a
+       local round-trip.
+
+    The mixin only reads attributes (``config``, ``base_model_prefix``,
+    ``_model_task``, ``_model_type``, ``config_class``) from its host class —
+    those are populated by :class:`EasyDeLBaseModule` and the registry
+    decorators in :mod:`easydel.infra.factory` — so nothing in this mixin
+    depends on a particular architecture.
+
+    Attributes:
+        config (EasyDeLBaseConfig): Active model configuration. Read for
+            partition rules, attention mechanism, and quantization knobs
+            during save/load.
+        hf_torch_auto_loader (Any | None): Optional HuggingFace AutoModel
+            class used as a fallback path when a direct EasyDeL converter is
+            not registered for the source checkpoint.
+        config_class (type[EasyDeLBaseConfig] | None): Configuration class
+            used to instantiate ``config`` when loading; populated by
+            ``register_module``.
+        base_model_prefix (str | None): Module prefix used when adapting
+            HuggingFace checkpoint keys to the EasyDeL parameter tree.
+        _model_task (str | None): Task identifier ("CausalLM",
+            "SequenceClassification", ...) embedded into model cards and
+            checkpoint metadata.
+        _model_type (str | None): Architecture identifier ("llama",
+            "qwen3", ...) embedded into model cards and used to look up
+            the converter registry.
+    """
+
+    config: EasyDeLBaseConfig
+    hf_torch_auto_loader: tp.Any | None = None
+    config_class: type[EasyDeLBaseConfig] | None = None
+    base_model_prefix: str | None = None
+    _model_task: str | None = None
+    _model_type: str | None = None
+
+    def _model_card(self, name: str, repo_id: str) -> str:
+        """Generates a model card (README.md) for the given model.
+
+        Args:
+            name (str): The name of the model.
+            repo_id (str): The repository ID on Hugging Face Hub.
+
+        Returns:
+            str: The generated README.md content.
+        """
+        from easydel import __version__
+
+        # Retrieve attention mechanism from config, default to "vanilla" if not found
+        attn_mechanism = getattr(self.config, "attn_mechanism", "vanilla")
+        if not isinstance(attn_mechanism, str):  # Handle cases where it might be an Enum
+            try:
+                attn_mechanism = attn_mechanism.value
+            except AttributeError:
+                attn_mechanism = str(attn_mechanism).split(".")[-1].lower()  # Fallback
+
+        model_info = ModelInfo(
+            name=name,
+            type=self.__class__.__name__,
+            repo_id=repo_id,
+            model_type=self._model_type,
+            model_task=self._model_task or "CausalLM",  # Default to CausalLM if not set
+            attn_mechanism=attn_mechanism,
+            version=__version__,
+        )
+        return ReadmeGenerator().generate_readme(model_info)
+
+    def _save_model_files(
+        self,
+        save_directory: ePathLike,
+        float_dtype=None,
+        *,
+        step: int | None = None,
+    ):
+        """Saves the model's configuration, weights, and potentially the generation config to the specified directory.
+
+        Args:
+            save_directory (ePathLike): The directory where the model files will be saved.
+            float_dtype (dtype, optional): Data type for saving weights. Defaults to None.
+            step (int, optional): The training step number for versioned checkpoints.
+                Defaults to None.
+        """
+        if not is_remote_path(save_directory) or jax.process_index() == 0:
+            save_directory.mkdir(parents=True, exist_ok=True)
+
+            config_to_save = deepcopy(self.config)
+            config_to_save.__dict__.pop("attn_dtype", None)
+            config_to_save.__dict__.pop("attn_softmax_dtype", None)
+            config_to_save.architectures = [self.__class__.__name__]
+            # Weights are serialized verbatim in the live mesh's interleave;
+            # record that tp in config.json (recursively — sub-configs too) so
+            # any later mesh can re-interleave. config.json is required for any
+            # load, so this field survives partial copies that drop the marker.
+            from easydel.layers.layouts import stamp_fused_tp_config
+            from easydel.layers.layouts._runtime import tensor_parallel_size as _fused_tp_size
+
+            stamp_fused_tp_config(config_to_save, _fused_tp_size(self.config))
+            config_to_save.save_pretrained(str(save_directory))
+
+            if self.can_generate() and hasattr(self, "generation_config"):
+                if self.generation_config is not None:
+                    _save_generation_config(self.generation_config, save_directory)
+
+        state = spx.export(self)[1]
+        state_dict = state.raw()
+        # Fused projections are serialized verbatim (the live mesh's
+        # interleave); the tp recorded in config.json + the sidecar marker
+        # lets any later mesh re-interleave them on load.
+        from easydel.layers.layouts import write_fused_layout_marker
+        from easydel.layers.layouts._runtime import tensor_parallel_size as _fused_tp_size
+
+        if not is_remote_path(save_directory) or jax.process_index() == 0:
+            write_fused_layout_marker(save_directory, _fused_tp_size(self.config))
+        cpu_device = _checkpoint_cpu_device()
+        numpy_leaf_paths: list[str] = []
+        state_dict = jax.tree_util.tree_map_with_path(
+            lambda path, x: (
+                (
+                    numpy_leaf_paths.append(tree_path_to_string(path, sep=".")),
+                    _normalize_checkpoint_leaf_to_jax(x, cpu_device=cpu_device),
+                )[-1]
+                if isinstance(x, np.ndarray | np.generic)
+                else x
+            ),
+            state_dict,
+        )
+        if numpy_leaf_paths:
+            preview_limit = 32
+            preview = ", ".join(numpy_leaf_paths[:preview_limit])
+            remainder = len(numpy_leaf_paths) - preview_limit
+            suffix = f" ... (+{remainder} more)" if remainder > 0 else ""
+            logger.info(
+                f"Normalizing {len(numpy_leaf_paths)} NumPy checkpoint leaves to CPU-backed JAX arrays before save: {preview}{suffix}"
+            )
+        # save_pretrained has already selected the complete checkpoint directory,
+        # including its config/card. Keep all prefixes there while recording the step
+        # in Checkpointer's standard discovery metadata.
+        checkpoint_options = {"step": int(step), "destination": "."} if step is not None else {}
+        fp32_patterns = tuple(getattr(self, "fp32_param_patterns", ()) or ())
+        if float_dtype is not None and fp32_patterns:
+            from easydel.utils.parameters_transformation import fp32_pinned_dtype
+
+            def _cast_unpinned(path, x):
+                if not hasattr(x, "dtype") or not jnp.issubdtype(x.dtype, jnp.floating):
+                    return x
+                return x.astype(fp32_pinned_dtype(tree_path_to_string(path, sep="."), float_dtype, fp32_patterns))
+
+            state_dict = jax.tree_util.tree_map_with_path(_cast_unpinned, state_dict)
+            float_dtype = None
+        output_model_file = Checkpointer(
+            base_path=str(save_directory),
+            save_interval=None,
+            step_policies=[],
+        ).save_pytree(
+            tree=state_dict,
+            prefix="model",
+            mesh=self.mesh,
+            dtype=float_dtype,
+            **checkpoint_options,
+        )
+
+        logger.info(f"Model weights saved in {output_model_file}")
+
+    def save_pretrained(
+        self,
+        save_directory: str | os.PathLike,
+        push_to_hub: bool = False,
+        token: str | bool | None = None,
+        float_dtype: jnp.dtype | None = None,
+        step: int | None = None,
+        upload_num_threads: int | None = None,
+        versioned: bool = True,
+        mismatch_allowed: bool = True,
+        **kwargs,
+    ):
+        """Saves the model, its configuration, and optionally pushes it to the Hugging Face Hub.
+
+        Args:
+            save_directory (str or PathLike): The directory where to save the model.
+            push_to_hub (bool, optional): If True, pushes the model to the Hugging Face Hub.
+                Defaults to False.
+            token (str or bool, optional): The Hugging Face Hub token for authentication.
+                Defaults to None.
+            float_dtype (jnp.dtype, optional): Data type for saving weights. Defaults to None.
+            step (int, optional): The training step number for versioned checkpoints.
+                Defaults to None.
+            upload_num_threads (int | None, optional): Number of concurrent upload threads
+                to use for Hub commits. If None, EasyDeL auto-selects a capped default.
+            versioned: If True and ``step`` is given, save a complete checkpoint
+                under ``save_directory/run-{step}``. An already matching per-step
+                directory is reused. Set False when a caller owns checkpoint layout.
+            mismatch_allowed: If False, require all model parameters to be
+                materialized before saving or uploading. Defaults to True.
+            **kwargs: Additional keyword arguments for Hugging Face Hub (e.g., repo_id,
+                commit_message).
+
+        Note:
+            This method saves the model state exactly as it exists. Call
+            ``gather_model()`` first if you need gathered weights before export.
+        """
+
+        easy_directory = ePath(save_directory)
+        if easy_directory.is_file():
+            logger.error(f"Provided path ({easy_directory}) should be a directory, not a file")
+            return
+        repo_id = kwargs.pop("repo_id", easy_directory.name)
+        if step is not None and versioned and easy_directory.name != f"run-{int(step)}":
+            easy_directory = easy_directory / f"run-{int(step)}"
+        if not mismatch_allowed:
+            self.assert_parameters_materialized(context="saving checkpoint (mismatch_allowed=False)")
+
+        commit_message: str | None = None
+        files_timestamps: dict[str, float] = {}
+        if push_to_hub:
+            commit_message = kwargs.pop("commit_message", None)
+            repo_id = self._create_repo(repo_id, **kwargs)
+            files_timestamps = self._get_files_timestamps(easy_directory)
+
+        self._save_model_files(
+            save_directory=easy_directory,
+            float_dtype=float_dtype,
+            step=step,
+        )
+        if not is_remote_path(easy_directory) or jax.process_index() == 0:
+            readme_path = easy_directory / "README.md"
+            if not readme_path.exists():
+                readme_path.write_text(self._model_card(repo_id, repo_id))
+
+        if push_to_hub and jax.process_index() == 0:
+            self._upload_modified_files(
+                str(easy_directory),
+                repo_id,
+                files_timestamps,
+                commit_message=commit_message,
+                token=token,
+                upload_num_threads=upload_num_threads,
+            )
+
+    def push_to_hub(
+        self,
+        repo_id: str,
+        use_temp_dir: bool | None = None,
+        commit_message: str | None = None,
+        private: bool | None = None,
+        token: bool | str | None = None,
+        create_pr: bool = False,
+        float_dtype: jnp.dtype | None = None,
+        verbose: bool = True,
+        mismatch_allowed: bool = True,
+        revision: str | None = None,
+        commit_description: str | None = None,
+        upload_num_threads: int | None = None,
+    ) -> tp.Any:
+        """Pushes the model to the Hugging Face Hub.
+
+        Args:
+            repo_id (str): The repository ID on Hugging Face Hub.
+            use_temp_dir (bool, optional): If True, uses a temporary directory. Defaults to None
+            commit_message (str, optional): The commit message for the push.
+            private (bool, optional): If True, creates a private repository.
+            token (str or bool, optional): The Hugging Face Hub token.
+            create_pr (bool, optional): If True, creates a pull request.
+            float_dtype (dtype, optional): Data type for saving weights.
+            verbose (bool, optional): Whether to print verbose messages. Defaults to True.
+            mismatch_allowed (bool, optional): If True, allows mismatch in parameters while loading. Defaults to True.
+            revision (str, optional): The revision to push to.
+            commit_description (str, optional): The commit description for the push.
+            upload_num_threads (int | None, optional): Number of concurrent upload threads
+                to use for Hub commits. If None, EasyDeL auto-selects a capped default.
+
+        Returns:
+            str: The URL of the created repository.
+
+        Note:
+            Call ``gather_model()`` before pushing if you need gathered weights in
+            the exported checkpoint.
+        """
+        if not mismatch_allowed:
+            self.assert_parameters_materialized(context="pushing checkpoint (mismatch_allowed=False)")
+        working_dir = ePath(repo_id.split("/")[-1])
+        if verbose:
+            logger.info("Uploading model checkpoint to %s", repo_id)
+
+        repo_id = create_repo(
+            repo_id,
+            private=private,
+            token=token,
+            exist_ok=True,
+        ).repo_id
+
+        if use_temp_dir is None:
+            use_temp_dir = not working_dir.is_dir()
+
+        with working_or_temp_dir(working_dir=str(working_dir), use_temp_dir=use_temp_dir) as work_dir:
+            files_timestamps = self._get_files_timestamps(work_dir)
+            self.save_pretrained(
+                save_directory=work_dir,
+                push_to_hub=False,
+                token=token,
+                float_dtype=float_dtype,
+                verbose=verbose,
+                mismatch_allowed=mismatch_allowed,
+                repo_id=repo_id,
+            )
+
+            return self._upload_modified_files(
+                str(work_dir),
+                repo_id,
+                files_timestamps,
+                commit_message=commit_message,
+                token=token,
+                create_pr=create_pr,
+                revision=revision,
+                commit_description=commit_description,
+                upload_num_threads=upload_num_threads,
+            )
+
+    @classmethod
+    def can_generate(cls) -> bool:
+        """Checks if the model can generate sequences with `.generate()`.
+
+        Returns:
+            bool: True if the model can generate, False otherwise.
+        """
+        return True
+
+    def _upload_modified_files(
+        self,
+        working_dir: str | os.PathLike,
+        repo_id: str,
+        files_timestamps: dict[str, float],
+        commit_message: str | None = None,
+        token: bool | str | None = None,
+        create_pr: bool = False,
+        revision: str | None = None,
+        commit_description: str | None = None,
+        upload_num_threads: int | None = None,
+    ):
+        """Upload modified files under ``working_dir`` to ``repo_id`` on the Hub.
+
+        Walks the directory recursively, batches new/modified files into a
+        single :func:`huggingface_hub.create_commit` call, and applies the
+        EasyDeL-resolved concurrency limit so large checkpoints don't
+        oversubscribe HF's upload endpoint.
+
+        Args:
+            working_dir: Directory containing the files to upload.
+            repo_id: Target Hugging Face Hub repository id.
+            files_timestamps: Mapping of relative POSIX paths under
+                ``working_dir`` to their last-known mtime. Backward-compatible
+                with legacy callers that supplied only the top-level path
+                segment.
+            commit_message: Optional explicit commit message. Inferred from
+                the class name when ``None``.
+            token: Hugging Face auth token override.
+            create_pr: When ``True``, create a pull request instead of
+                committing directly to the branch.
+            revision: Optional target branch / revision.
+            commit_description: Optional long-form commit description.
+            upload_num_threads: Optional explicit concurrency cap. ``None``
+                lets :meth:`_resolve_upload_num_threads` pick a default.
+
+        Returns:
+            Any: Whatever :func:`huggingface_hub.create_commit` returns
+            (typically the commit info object) when something was actually
+            uploaded; ``None`` when there were no modified files.
+        """
+        if commit_message is None:
+            if "Model" in self.__class__.__name__:
+                commit_message = "Upload model"
+            elif "Config" in self.__class__.__name__:
+                commit_message = "Upload config"
+            elif "Tokenizer" in self.__class__.__name__:
+                commit_message = "Upload tokenizer"
+            elif "FeatureExtractor" in self.__class__.__name__:
+                commit_message = "Upload feature extractor"
+            elif "Processor" in self.__class__.__name__:
+                commit_message = "Upload processor"
+            else:
+                commit_message = f"Upload {self.__class__.__name__}"
+
+        operations = []
+        modified_paths = []
+
+        for root, dirs, files in os.walk(working_dir):
+            if ".git" in dirs:
+                dirs.remove(".git")
+
+            for name in files:
+                src = os.path.join(root, name)
+                rel = os.path.relpath(src, working_dir)
+                rel_posix = rel.replace(os.sep, "/")
+
+                mtime = os.path.getmtime(src)
+                last = files_timestamps.get(rel_posix)
+
+                if last is None:
+                    top_level = rel_posix.split("/", 1)[0]
+                    top_last = files_timestamps.get(top_level)
+                    if top_last is not None and mtime <= top_last:
+                        continue
+                else:
+                    if mtime <= last:
+                        continue
+
+                operations.append(CommitOperationAdd(path_or_fileobj=src, path_in_repo=rel_posix))
+                modified_paths.append(rel_posix)
+
+        if not operations:
+            logger.info("No modified files found in %s; nothing to upload.", working_dir)
+            return None
+
+        upload_num_threads = self._resolve_upload_num_threads(
+            upload_num_threads=upload_num_threads,
+            operation_count=len(operations),
+        )
+
+        if revision is not None and not revision.startswith("refs/pr"):
+            try:
+                create_branch(repo_id=repo_id, branch=revision, token=token, exist_ok=True)
+            except HfHubHTTPError as e:
+                if e.response.status_code == 403 and create_pr:
+                    pass
+                else:
+                    raise
+
+        logger.info(f"Uploading the files to {repo_id}")
+        create_commit_kwargs = dict(
+            repo_id=repo_id,
+            operations=operations,
+            commit_message=commit_message,
+            commit_description=commit_description,
+            token=token,
+            create_pr=create_pr,
+            revision=revision,
+        )
+        if upload_num_threads is not None:
+            create_commit_kwargs["num_threads"] = upload_num_threads
+        return create_commit(**create_commit_kwargs)
+
+    @staticmethod
+    def _resolve_upload_num_threads(upload_num_threads: int | None, operation_count: int) -> int:
+        """Resolve Hub upload concurrency with a conservative automatic default.
+
+        Capped at 16 (or the actual CPU count, whichever is smaller) so we
+        don't overwhelm the HF Hub endpoint when committing very large
+        checkpoints.
+
+        Args:
+            upload_num_threads: Optional caller-specified thread count.
+            operation_count: Number of files about to be uploaded; used to
+                shrink the cap below the system maximum when the commit is
+                small.
+
+        Returns:
+            int: A safe positive thread count to forward to
+            :func:`huggingface_hub.create_commit`.
+        """
+        if upload_num_threads is not None:
+            return max(int(upload_num_threads), 1)
+
+        cpu_count = int(os.cpu_count() or 1)
+        auto_threads = max(1, min(cpu_count, 16, max(int(operation_count), 1)))
+        logger.info(
+            "Auto-selected upload_num_threads=%s (operations=%s, os.cpu_count()=%s).",
+            auto_threads,
+            int(operation_count),
+            cpu_count,
+        )
+        return auto_threads
+
+    @classmethod
+    def _load_model_weights(
+        cls,
+        resolved_archive_file: str | None,
+        model: EasyDeLBaseModule,
+        param_dtype: jnp.dtype,
+        mesh: MeshLike,
+        shard_fns: dict[str, tp.Callable] | None,
+        quantization_config: QuantizationConfig | None,
+        apply_quantization: bool,
+        verbose: bool,
+        checkpoint_load_chunk_size: int | None = None,
+        checkpoint_load_concurrent_gb: int = 128,
+        checkpoint_load_tensorstore_io_concurrency: int | None = 1024,
+        checkpoint_load_tensorstore_copy_concurrency: int | None = 1024,
+        checkpoint_load_tensorstore_cache_gb: int | None = 128,
+        checkpoint_load_tensorstore_assume_metadata: bool = True,
+        checkpoint_load_tensorstore_metadata_workers: int = 256,
+        checkpoint_load_progress: bool | None = None,
+        mismatch_allowed: bool = True,
+    ) -> EasyDeLBaseModule:
+        """Loads model weights from a checkpoint file.
+
+        Args:
+            resolved_archive_file (str | None): The path to the checkpoint file.
+                Can be None if no weights file is provided.
+            model (EasyDeLBaseModule): The EasyDeL model instance to load weights into.
+            param_dtype (jnp.dtype): The data type for model parameters.
+            mesh (jax.sharding.Mesh): The JAX mesh for distributed sharding.
+            shard_fns (dict[Callable] | None): Custom shard functions for loading checkpoint.
+                Defaults to None.
+            quantization_config (QuantizationConfig | None): Quantization configuration
+                for loading. Pass None to disable quantization.
+            apply_quantization (bool): Whether to apply module-level quantization
+                during loading.
+            verbose (bool): Whether to print verbose messages during loading.
+            checkpoint_load_chunk_size: Optional TensorStore load batch size.
+                Larger values allow more of JAX's async deserializer to overlap
+                remote reads. ``None`` loads all arrays in one call.
+            checkpoint_load_concurrent_gb: In-flight TensorStore read budget per
+                deserialize call, in decimal gigabytes.
+            checkpoint_load_tensorstore_io_concurrency: TensorStore file I/O
+                concurrency override for TensorStore checkpoints.
+            checkpoint_load_tensorstore_copy_concurrency: TensorStore data-copy
+                concurrency override for TensorStore checkpoints.
+            checkpoint_load_tensorstore_cache_gb: TensorStore cache-pool size in
+                decimal gigabytes for TensorStore checkpoints.
+            checkpoint_load_tensorstore_assume_metadata: If ``True``, prefetch
+                zarr metadata and pass it to TensorStore with
+                ``assume_metadata=True``.
+            checkpoint_load_tensorstore_metadata_workers: Worker count for
+                TensorStore metadata prefetch.
+            checkpoint_load_progress: Whether to show a tqdm-style progress
+                line while TensorStore checkpoint tensors are deserialized.
+                ``None`` follows *verbose*.
+            mismatch_allowed: If ``True`` (default), checkpoint leaves that the
+                model does not declare are dropped. If ``False``, unexpected,
+                missing parameter arrays, and shape-mismatched leaves raise
+                ``ValueError`` before the state is merged.
+
+        Returns:
+            EasyDeLBaseModule: The model with loaded parameters.
+
+        Note:
+            When *apply_quantization* is set, kernels are converted as the
+            checkpoint streams in (see ``callback``) and the results are cached
+            per dense-kernel path, so the post-load pass reuses them instead of
+            re-quantizing. In-stream conversion only happens on the loader's
+            CHUNKED read path, because that is the only path that runs the
+            per-array callback: reading the whole checkpoint at once leaves
+            every dense tensor resident before the first one is converted, which
+            defeats the point of quantizing at load. A chunk size is therefore
+            forced when none is given (``checkpoint_load_chunk_size``
+            overrides it) -- chunking is not a tuning preference here, it is
+            what bounds dense residency to a few tensors.
+
+        Note:
+            A layer may decline quantization (``quantization_supported``) and
+            keep dense weights rather than failing the load, so declines are
+            logged by layer type. A silent decline on the expert stack leaves
+            ~97% of a MoE model at full precision, and the only symptom is an
+            out-of-memory error from the allocator with nothing tying it back to
+            the quantization request.
+
+        Note:
+            Fused projections are excluded from in-stream quantization while a
+            tensor-parallel re-interleave is pending. ``retp_fused_state`` runs
+            between the streaming callback and the post-load pass, so for a
+            fused projection the re-interleave would land on a ``.weight`` that
+            is subsequently thrown away: the stored codes would keep the
+            checkpoint's canonical order while ``fused_param_tp`` is stamped to
+            the live tp, telling the runtime splitter they are interleaved. That
+            is the identity at tp=1 and scrambles gate/up at tp>1 -- observed on
+            DeepSeek-V4-Flash A16W4, where every shared expert diverged by rel
+            ~1.3 at tp=2 while attention, which has no fused projections, stayed
+            clean. Deferring only those leaves keeps streaming's bounded dense
+            residency for everything else, and only when an interleave is
+            actually pending.
+
+        Note:
+            The legacy ``.scale`` -> ``.weight`` rewrite is given the model's
+            declared leaf names so it cannot clobber a parameter the current
+            model genuinely calls ``scale``.
+        """
+        quantized_checkpoint = False
+        modules_quantized_on_load = False
+        kernel_map: dict[tuple, tuple[tuple, tuple, tuple]] = {}
+        streamed_quant: dict[tuple, dict[str, tp.Any]] = {}
+        quantization_config = _normalize_quantization_config(quantization_config)
+
+        extraargs = {}
+        itwas_tensorstore = False
+        if resolved_archive_file:
+            native_marker = next(
+                (
+                    name
+                    for name in (TENSORSTORE_INDEX_NAME, "model_structure.json")
+                    if str(resolved_archive_file).endswith(name)
+                ),
+                None,
+            )
+            if native_marker is not None:
+                resolved_archive_file = _strip_trailing_separators(str(resolved_archive_file)[: -len(native_marker)])
+                itwas_tensorstore = True
+                extraargs["chunk_size"] = checkpoint_load_chunk_size
+                extraargs["concurrent_gb"] = checkpoint_load_concurrent_gb
+                extraargs["tensorstore_io_concurrency"] = checkpoint_load_tensorstore_io_concurrency
+                extraargs["tensorstore_copy_concurrency"] = checkpoint_load_tensorstore_copy_concurrency
+                extraargs["tensorstore_cache_gb"] = checkpoint_load_tensorstore_cache_gb
+                extraargs["tensorstore_assume_metadata"] = checkpoint_load_tensorstore_assume_metadata
+                extraargs["tensorstore_metadata_workers"] = checkpoint_load_tensorstore_metadata_workers
+                extraargs["show_progress"] = verbose if checkpoint_load_progress is None else checkpoint_load_progress
+                logger.debug(
+                    "[from_pretrained] TensorStore checkpoint load "
+                    "chunk_size=%s concurrent_gb=%s io_concurrency=%s copy_concurrency=%s "
+                    "cache_gb=%s assume_metadata=%s metadata_workers=%s progress=%s",
+                    checkpoint_load_chunk_size,
+                    checkpoint_load_concurrent_gb,
+                    checkpoint_load_tensorstore_io_concurrency,
+                    checkpoint_load_tensorstore_copy_concurrency,
+                    checkpoint_load_tensorstore_cache_gb,
+                    checkpoint_load_tensorstore_assume_metadata,
+                    checkpoint_load_tensorstore_metadata_workers,
+                    extraargs["show_progress"],
+                )
+
+        quantizer_for_modules = None
+        if itwas_tensorstore and apply_quantization:
+            if quantization_config is None:
+                quantization_config = _normalize_quantization_config(
+                    getattr(model.config, "quantization_config", None), strict=False
+                )
+            if quantization_config is None:
+                from easydel.layers import QuantizationConfig as _QConfig
+                from easydel.layers import QuantizationType as _QType
+
+                quantization_config = _QConfig(dtype=_QType.INT8)
+                logger.warning(
+                    "apply_quantization was requested but no quantization_config was provided; "
+                    "defaulting to INT8. Pass quantization_config to control quantization type."
+                )
+
+            from easydel.layers.quantization._quants import EasyQuantizer
+            from easydel.utils.traversals import iter_module_search
+
+            quantizer_for_modules = EasyQuantizer(quantization_config=quantization_config)
+            pattern_str: str | None = quantizer_for_modules.pattern
+            pattern = re.compile(pattern_str) if pattern_str is not None else None
+            unsupported: dict[str, int] = {}
+            for path, module in iter_module_search(model, spx.Module):
+                if not hasattr(module, "to_quantized") or not callable(module.to_quantized):
+                    continue
+                path_str = ".".join([str(p) for p in path])
+                if pattern is not None and not pattern.search(path_str):
+                    continue
+                _supported = getattr(module, "quantization_supported", None)
+                if callable(_supported) and not _supported(quantization_config):
+                    unsupported[type(module).__name__] = unsupported.get(type(module).__name__, 0) + 1
+                    continue
+                # iter_module_search yields string path segments; checkpoint
+                # state keys promote digit segments to int (string_key_to_int).
+                # Canonicalize so kernel_map keys match state keys exactly.
+                path = tuple(int(p) if isinstance(p, str) and p.isdigit() else p for p in path)
+                kernel_key = (*path, "weight")
+                kernel_map[kernel_key] = ((*path, "quant_kernel"), (*path, "quant_scales"), (*path, "quant_biases"))
+            logger.info(
+                f"apply_quantization: {len(kernel_map)} layer(s) selected for "
+                f"{quantization_config.dtype} (bits={quantization_config.bits})."
+            )
+            if kernel_map and extraargs.get("chunk_size") is None:
+                extraargs["chunk_size"] = _QUANTIZED_LOAD_CHUNK_SIZE
+                logger.info(
+                    f"Loading in chunks of {_QUANTIZED_LOAD_CHUNK_SIZE} arrays so weights are quantized as they "
+                    "stream in (pass checkpoint_load_chunk_size to override)."
+                )
+            if unsupported:
+                detail = ", ".join(f"{n}x{c}" for c, n in sorted(unsupported.items()))
+                logger.warning(
+                    f"{sum(unsupported.values())} layer(s) do not support "
+                    f"{quantization_config.dtype} (bits={quantization_config.bits}) and keep DENSE weights: {detail}. "
+                    f"{len(kernel_map)} layer(s) will be quantized."
+                )
+
+        _fused_defer_paths: set[tuple] = set()
+        if kernel_map:
+            try:
+                from easydel.layers.layouts import fused_layout_param_specs, read_fused_checkpoint_tp
+                from easydel.layers.layouts._runtime import tensor_parallel_size as _fq_tp_size
+
+                _fq_cfg = getattr(model, "config", None)
+                _fq_live_tp = int(_fq_tp_size(_fq_cfg))
+                _fq_saved_tp = read_fused_checkpoint_tp(resolved_archive_file, _fq_cfg)
+                _fq_saved_tp = 1 if _fq_saved_tp is None else int(_fq_saved_tp)
+                if _fq_saved_tp != _fq_live_tp:
+                    _fq_registry = getattr(model, "fused_params", None) or dict(fused_layout_param_specs(model))
+                    for _fq_path in _fq_registry:
+                        _fq_parts = tuple(int(seg) if seg.isdigit() else seg for seg in str(_fq_path).split(".") if seg)
+                        _fused_defer_paths.add(_fq_parts)
+                    if _fused_defer_paths:
+                        logger.info(
+                            f"Deferring in-stream quantization for {len(_fused_defer_paths)} fused projection(s): "
+                            f"they must be re-interleaved from tp={_fq_saved_tp} to tp={_fq_live_tp} first."
+                        )
+            except Exception as exc:  # pragma: no cover - never block a load on this
+                logger.warning(f"Could not determine fused-projection re-interleave state ({exc}).")
+
+        def _apply_shard_fn(x, p):
+            """Apply a per-path shard function from ``shard_fns``, if any.
+
+            Args:
+                x: The tensor leaf being loaded.
+                p: Path tuple or dotted string identifying the leaf.
+
+            Returns:
+                Any: The transformed tensor, or *x* unchanged when no
+                matching shard function exists.
+            """
+            if shard_fns is not None:
+                key_get = p
+                if isinstance(p, str):
+                    key_get = tuple(p.split("."))
+                callable_fn = shard_fns.get(key_get)
+                if callable_fn is not None:
+                    x = callable_fn(x)
+            return x
+
+        def _canonical_kernel_path(p) -> tuple | None:
+            """Map a checkpoint leaf path to its ``kernel_map`` key, if any.
+
+            Leaf paths arrive either dotted or as tuples, with or without the
+            leading collection segment (``"parameters"``); digits are matched
+            as ints to line up with the module paths ``kernel_map`` is built
+            from.
+            """
+            if not kernel_map:
+                return None
+            key = tuple(p.split(".")) if isinstance(p, str) else tuple(p)
+            key = tuple(int(k) if isinstance(k, str) and k.isdigit() else k for k in key)
+            if key in kernel_map:
+                return key
+            if len(key) > 1 and key[1:] in kernel_map:
+                return key[1:]
+            # Structure-backed SpectraX callbacks include the save prefix as
+            # well as the collection: model.parameters.<module>.weight.
+            if len(key) > 2 and key[:2] in (("model", "parameters"), ("model", "params")):
+                if key[2:] in kernel_map:
+                    return key[2:]
+            return None
+
+        def _quantize_kernel(kernel_value) -> dict[str, tp.Any]:
+            """Quantize one dense kernel into its ``quant_*`` leaves.
+
+            Shared by the streaming callback and the post-load fallback so both
+            produce byte-identical leaves.
+            """
+            from easydel.layers.linears._linear_quantized import _effective_ejkernel_group_size
+            from easydel.layers.quantization._configs import resolve_ejkernel_quant_params
+
+            mode, group_size, bits, needs_biases = resolve_ejkernel_quant_params(quantization_config)
+            if mode == "channelwise":
+                from easydel.layers.linears._linear_quantized import (
+                    channelwise_quantize_array,
+                    should_pack_int4_companion,
+                )
+
+                quant_kernel, quant_scales, quant_biases = channelwise_quantize_array(
+                    jnp.asarray(kernel_value),
+                    bits,
+                    expert_chunk=getattr(getattr(model, "config", None), "quantize_expert_chunk", None),
+                )
+                out = {"kernel": quant_kernel, "scales": quant_scales, "biases": quant_biases}
+                if bits == 4 and quant_kernel.ndim == 2 and should_pack_int4_companion(*quant_kernel.shape):
+                    from ejkernel.modules import pack_int4_adjacent
+
+                    out["packed"] = pack_int4_adjacent(quant_kernel)
+                return out
+
+            from ejkernel.callib import ejit  # pyright: ignore[reportMissingTypeStubs]
+            from ejkernel.quantization import prepack_quantized_weights  # pyright: ignore[reportMissingTypeStubs]
+
+            _prepack = ejit(prepack_quantized_weights, static_argnames=["group_size", "bits", "mode", "transpose"])
+            group_size = _effective_ejkernel_group_size(mode, group_size, tuple(kernel_value.shape))
+            if needs_biases:
+                quant_kernel, quant_scales, quant_biases = _prepack(
+                    kernel_value, group_size=group_size, bits=bits, mode=mode, transpose=False
+                )
+            else:
+                quant_kernel, quant_scales = _prepack(
+                    kernel_value, group_size=group_size, bits=bits, mode=mode, transpose=False
+                )
+                quant_biases = None
+            return {"kernel": quant_kernel, "scales": quant_scales, "biases": quant_biases}
+
+        def callback(x, p):
+            """Checkpointer per-tensor callback: shard, then quantize in-stream.
+
+            Quantizing here rather than after the load is what makes
+            ``apply_quantization`` usable on a model that only fits once
+            quantized. The post-load pass popped dense kernels out of a fully
+            materialized ``state``, so the whole checkpoint had to fit at its
+            stored precision first -- DeepSeek-V4-Flash is 529.6 GiB of bf16
+            against 383 GiB of HBM, so it died before reaching the code meant
+            to shrink it. Converting each kernel as it arrives caps the dense
+            residency at one tensor.
+
+            Args:
+                x: Tensor leaf being loaded from the checkpoint.
+                p: Path tuple/string identifying the leaf.
+
+            Returns:
+                Any: the sharded leaf, or its packed quantized kernel.
+
+            Note:
+                A fused projection with a pending tensor-parallel re-interleave
+                is left dense here so ``retp_fused_state`` can rewrite it; the
+                post-load pass then quantizes the re-interleaved weight.
+            """
+            x = _apply_shard_fn(x, p)
+            lookup = _canonical_kernel_path(p)
+            if lookup is None or lookup in streamed_quant:
+                return x
+            if _fused_defer_paths and tuple(lookup[:-1]) in _fused_defer_paths:
+                return x
+            try:
+                pieces = _quantize_kernel(x)
+            except Exception as exc:  # fall back to the post-load pass
+                logger.warning(f"in-stream quantization failed for {lookup} ({exc}); deferring to post-load pass.")
+                return x
+            streamed_quant[lookup] = pieces
+            return pieces["kernel"]
+
+        if resolved_archive_file:
+            extraargs["callback"] = callback
+            resolve_shardings = getattr(model, "resolve_shardings_regex", None)
+            sharding_rules = resolve_shardings() if callable(resolve_shardings) else None
+            load_pytree_params = inspect.signature(Checkpointer.load_pytree).parameters
+            load_pytree_extraargs = {key: value for key, value in extraargs.items() if key in load_pytree_params}
+            from easydel.utils.parameters_transformation import fp32_pinned_dtype
+
+            fp32_patterns = tuple(getattr(model, "fp32_param_patterns", ()) or ())
+
+            def _pinned_load_dtype(key: str):
+                return fp32_pinned_dtype(key, param_dtype, fp32_patterns)
+
+            load_dtype = _pinned_load_dtype if fp32_patterns else param_dtype
+            with _phase_timer("  load: Checkpointer.load_pytree"):
+                state, _ = Checkpointer(
+                    base_path=str(resolved_archive_file),
+                    save_interval=None,
+                    step_policies=[],
+                ).load_pytree(
+                    mesh=mesh,
+                    dtype=load_dtype,  # legacy
+                    sharding_rules=sharding_rules,
+                    prefix="model",
+                    discover_latest=False,
+                    load_treedef=False,
+                    can_skip_structure=True,
+                    **load_pytree_extraargs,
+                )
+            with _phase_timer("  load: flatten + legacy rename + lora rebuild"):
+                if isinstance(state, spx.State):
+                    state = state.raw()
+                # When load_treedef=False, Spectrax returns a flat dict with
+                # dot-separated string keys (e.g. "layer0.weight"). Convert
+                # these to tuple keys so downstream flatten/unflatten works.
+                if (
+                    isinstance(state, dict)
+                    and state
+                    and isinstance(next(iter(state.keys())), str)
+                    and not any(isinstance(v, dict) for v in state.values())
+                ):
+                    state = {tuple(k.split(".")): v for k, v in state.items()}
+                # Keep all collections (params, lora, buffers, rng, ...) —
+                # downstream flatten/unflatten handles the nested structure.
+                if any(isinstance(v, dict) for v in state.values()):
+                    state = flatten_dict(state)
+                state = string_key_to_int(state)
+                _declared_leaf_keys: set[tuple[tp.Any, ...]] = set()
+                _declared_leaf_shapes: dict[tuple[tp.Any, ...], tuple] = {}
+                try:
+                    for _c, _d in spx.export(model)[1].raw().items():
+                        for _path, _value in flatten_dict(_d).items():
+                            _declared_leaf_keys.add(tuple(_path))
+                            _declared_leaf_keys.add((_c, *_path))
+                            if hasattr(_value, "shape"):
+                                _declared_leaf_shapes[tuple(_path)] = _value.shape
+                                _declared_leaf_shapes[(_c, *_path)] = _value.shape
+                except Exception as exc:  # keep the legacy behaviour on any surprise
+                    logger.debug(f"Could not enumerate model leaves for legacy-rename guard ({exc}).")
+                state = _rename_legacy_checkpoint_leaves(state, known_keys=_declared_leaf_keys)
+                # Drop any saved RNG-state leaves (``...rng.rngs.*``). PRNG keys are
+                # per-run, not weights, and a checkpoint serialized under a
+                # low-precision ``param_dtype`` can store them downcast (e.g. as
+                # bfloat16), which is an invalid PRNG key on reload (JAX requires
+                # uint32 key_data). Skipping them lets the model keep the fresh
+                # uint32 rngs from ``lazy_init`` + ``materialize_meta_state``.
+                rng_state_keys = [
+                    key for key in state if isinstance(key, tuple) and any(str(part) in ("rng", "rngs") for part in key)
+                ]
+                if rng_state_keys:
+                    for key in rng_state_keys:
+                        del state[key]
+                    logger.info(
+                        "Skipping %d saved RNG-state leaf(s) during load; using freshly-seeded uint32 rngs instead.",
+                        len(rng_state_keys),
+                    )
+                # Mesh-portability: fused params are stored in the save mesh's
+                # interleave with that tp recorded in config.json / the sidecar
+                # marker. Re-interleave from the recorded tp to the live tp,
+                # then overwrite the live config so it always describes the
+                # layout the weights actually carry. Legacy checkpoints (no
+                # recorded tp) are loaded verbatim — only correct when the
+                # load tp matches the save tp.
+                from easydel.layers.layouts import (
+                    fused_layout_param_specs,
+                    read_fused_checkpoint_tp,
+                    retp_fused_state,
+                    stamp_fused_tp_config,
+                )
+                from easydel.layers.layouts._runtime import tensor_parallel_size as _cf_tp_size
+
+                _cf_saved_tp = read_fused_checkpoint_tp(resolved_archive_file, getattr(model, "config", None))
+                _cf_live_tp = _cf_tp_size(getattr(model, "config", None))
+                if _cf_saved_tp is None and fused_layout_param_specs(model):
+                    # No recorded fused-param tp: assume the canonical (tp=1)
+                    # layout. Conversions write canonical order and trainer
+                    # saves stamp their tp, so canonical is the common case
+                    # for unstamped checkpoints — assuming the live tp instead
+                    # silently scrambles Q/K/V and gate/up (observed: a tp=1
+                    # conversion loaded verbatim under tp=4 read KL ~ ln(vocab)).
+                    _cf_saved_tp = 1
+                    if _cf_live_tp > 1:
+                        logger.warning(
+                            "Native checkpoint has no recorded fused-param tp; assuming canonical tp=1 "
+                            f"and re-interleaving fused projections for tp={_cf_live_tp}. If this "
+                            "checkpoint was actually saved under a different tensor-parallel size, "
+                            "stamp its real `fused_param_tp` into the checkpoint's config.json "
+                            "(metadata only, no weight rewrite)."
+                        )
+                if _cf_saved_tp is not None:
+                    state = retp_fused_state(model, state, saved_tp=_cf_saved_tp, target_tp=_cf_live_tp)
+                if hasattr(model, "config") and _cf_saved_tp is not None:
+                    stamp_fused_tp_config(model.config, _cf_live_tp)
+                model = _rebuild_lora_modules_from_checkpoint(model=model, flat_state=state)
+
+                from easydel.utils.parameters_transformation import StateDictConverter
+
+                # ``getattr`` on the model too, matching the ``config`` accesses
+                # above: this path also runs for model-likes that never bind a
+                # transform fn, and a missing one means the same as one without
+                # reform rules.
+                _pure_transform_fn = getattr(model, "pure_transform_fn", None)
+                native_fused_counts = StateDictConverter.apply_native_reform_param_fusions(
+                    state,
+                    getattr(_pure_transform_fn, "keywords", {}).get("reform_param"),
+                )
+                for label, count in native_fused_counts.items():
+                    logger.info("Fused %d native checkpoint %s into runtime merged weights.", count, label)
+
+                if native_fused_counts or _cf_saved_tp is not None:
+                    # Leaves synthesized after the rule-based tensorstore read
+                    # (native fusions, tp re-interleaves) bypassed the loader's
+                    # placement: their sources matched no live-variable rule and
+                    # loaded replicated. Left that way, XLA re-slices the
+                    # replicated copy inside every shard_map call (measured:
+                    # 8ms/step and 4x expert HBM on a tp=4 qwen3-30B decode).
+                    # Re-place any leaf whose live sharding mismatches its rule.
+                    _rules = tuple(sharding_rules or ())
+                    # Fast path: resolve_shardings_regex pins each variable's
+                    # LITERAL path wrapped as `^(?:.*/)?<escaped>(?:/.*)?$`.
+                    # Un-wrap and un-escape those cores so the dict is keyed
+                    # by the resolved plain path (the raw regex pattern never
+                    # equals a path, so keying by pattern made this dead) and
+                    # the common exact-path case is one dict hit instead of a
+                    # full regex scan. First-wins to mirror the scan order.
+                    _literal = {}
+                    _prefix, _suffix = r"^(?:.*/)?", r"(?:/.*)?$"
+                    for _pat, _shard in _rules:
+                        _core = _pat
+                        if _core.startswith(_prefix):
+                            _core = _core[len(_prefix) :]
+                        if _core.endswith(_suffix):
+                            _core = _core[: -len(_suffix)]
+                        _plain = re.sub(r"\\(.)", r"\1", _core)
+                        if re.escape(_plain) == _core:
+                            _literal.setdefault(_plain, _shard)
+
+                    def _rule_sharding_for(key_tuple):
+                        parts = [str(p) for p in key_tuple]
+                        if parts and parts[0] in ("parameters", "params", "buffers"):
+                            parts = parts[1:]
+                        path = "/".join(parts)
+                        hit = _literal.get(path)
+                        if hit is not None:
+                            return hit
+                        for pat, shard in _rules:
+                            if re.fullmatch(pat, path):
+                                return shard
+                        return None
+
+                    _replaced = 0
+                    for _key, _leaf in list(state.items()):
+                        if not hasattr(_leaf, "sharding"):
+                            continue
+                        if getattr(_leaf.sharding, "memory_kind", None) == "pinned_host":
+                            continue  # host-offloaded leaves (engram tables) keep their host placement
+                        _target = _rule_sharding_for(_key)
+                        if _target is None or _leaf.sharding == _target:
+                            continue
+                        if (
+                            not mismatch_allowed
+                            and _key in _declared_leaf_shapes
+                            and _canonical_kernel_path(_key) not in streamed_quant
+                        ):
+                            expected_shape = _declared_leaf_shapes[_key]
+                            if _leaf.shape != expected_shape:
+                                raise ValueError(
+                                    f"Checkpoint is incompatible (mismatch_allowed=False): "
+                                    f"{'.'.join(map(str, _key))} has shape {_leaf.shape}, expected {expected_shape}"
+                                )
+                        state[_key] = jax.device_put(_leaf, _target)
+                        _replaced += 1
+                    if _replaced:
+                        logger.info(
+                            "Re-placed %d post-load synthesized leaves onto their live variable shardings.",
+                            _replaced,
+                        )
+
+            has_quantized_keys = any(
+                isinstance(k, tuple) and k and str(k[-1]).startswith("quant_") for k in state.keys()
+            )
+            if has_quantized_keys:
+                quantized_checkpoint = True
+                if quantization_config is None:
+                    quantization_config = _normalize_quantization_config(
+                        getattr(model.config, "quantization_config", None), strict=False
+                    )
+                if quantization_config is None:
+                    from easydel.layers import QuantizationConfig as _QConfig
+                    from easydel.layers import QuantizationType as _QType
+
+                    quantization_config = _QConfig(dtype=_QType.INT8)
+                    logger.warning(
+                        "Quantized checkpoint detected but no quantization_config was provided; "
+                        "defaulting to INT8. Pass quantization_config to ensure correct behavior."
+                    )
+                model = model.quantize(
+                    quantization_config=quantization_config,
+                    apply_quantization=True,
+                    verbose=verbose,
+                    raise_error=False,
+                )
+            elif itwas_tensorstore and not apply_quantization and quantization_config is not None:
+                logger.warning(
+                    "quantization_config was provided but apply_quantization=False; weights stay "
+                    "unquantized on this native-checkpoint load. Pass apply_quantization=True to "
+                    "quantize at load."
+                )
+            elif itwas_tensorstore and apply_quantization:
+                if quantization_config is None:
+                    quantization_config = _normalize_quantization_config(
+                        getattr(model.config, "quantization_config", None), strict=False
+                    )
+                if quantization_config is None:
+                    from easydel.layers import QuantizationConfig as _QConfig
+                    from easydel.layers import QuantizationType as _QType
+
+                    quantization_config = _QConfig(dtype=_QType.INT8)
+                    logger.warning(
+                        "apply_quantization was requested but no quantization_config was provided; "
+                        "defaulting to INT8. Pass quantization_config to control quantization type."
+                    )
+                if kernel_map:
+                    if quantizer_for_modules is None:
+                        from easydel.layers.quantization._quants import EasyQuantizer
+
+                        quantizer_for_modules = EasyQuantizer(quantization_config=quantization_config)
+                    model = quantizer_for_modules.apply_quantization(model, verbose=verbose)
+                    modules_quantized_on_load = True
+
+                    # Module paths carry no collection segment, but modern spx
+                    # checkpoints key their leaves as ``(collection, *path)``
+                    # (e.g. ``("parameters", "model", ..., "weight")``). Resolve
+                    # each kernel path against both forms and reuse the resolved
+                    # prefix for the packed quant_* keys so they land in the
+                    # same collection as the dense weight they replace.
+                    prefix_by_suffix: dict[tuple, tuple] = {}
+                    for state_key in state:
+                        if isinstance(state_key, tuple) and len(state_key) > 1:
+                            prefix_by_suffix.setdefault(state_key[1:], state_key[:1])
+                    quantized_on_load_count = 0
+                    for kernel_key, (quant_kernel_key, quant_scales_key, quant_biases_key) in kernel_map.items():
+                        prefix: tuple = ()
+                        source_key = kernel_key
+                        if source_key not in state:
+                            found = prefix_by_suffix.get(kernel_key)
+                            if found is None:
+                                continue
+                            prefix = tuple(found)
+                            source_key = (*prefix, *kernel_key)
+                        kernel_value = state.pop(source_key)
+                        pieces = streamed_quant.pop(kernel_key, None)
+                        if pieces is None:
+                            pieces = _quantize_kernel(kernel_value)
+                        quant_kernel = pieces["kernel"]
+                        state[(*prefix, *quant_kernel_key)] = quant_kernel
+                        state[(*prefix, *quant_scales_key)] = pieces["scales"]
+                        state[(*prefix, *quant_biases_key)] = pieces["biases"]
+                        if "packed" in pieces:
+                            # Same gate the module constructor applies: only
+                            # layers large enough for the fused W4A4 pair route
+                            # declare (and can receive) a packed companion leaf.
+                            packed_key = (*quant_kernel_key[:-1], "quant_kernel_packed")
+                            state[(*prefix, *packed_key)] = pieces["packed"]
+                        quantized_on_load_count += 1
+                        if hasattr(quant_kernel, "block_until_ready"):
+                            quant_kernel.block_until_ready()
+                        del kernel_value
+                    if quantized_on_load_count == 0:
+                        logger.warning(
+                            "apply_quantization was requested and %d modules were converted, but no "
+                            "matching checkpoint kernels were found to prepack; the load will fail "
+                            "with abstract quantized leaves.",
+                            len(kernel_map),
+                        )
+                    else:
+                        logger.info(
+                            "Quantized %d/%d checkpoint kernels on load (%s).",
+                            quantized_on_load_count,
+                            len(kernel_map),
+                            quantization_config.dtype,
+                        )
+
+            with _phase_timer("  load: build required_params (spx.export)"):
+                # Use the full spx.Parameter tree here instead of model.graphtree_parameters_shape:
+                # the default trainable selector may exclude other live weight
+                # collections, but checkpoints still contain the untouched base weights.
+                model_state_raw = spx.export(model)[1].raw()
+                # Strip the leading collection segment from checkpoint keys so
+                # they can be compared against the model's parameter paths.
+                required_params: set[tuple[tp.Any, ...]] = set()
+                required_param_leaves: dict[tuple[tp.Any, ...], tp.Any] = {}
+                for c, d in model_state_raw.items():
+                    for path_tuple, leaf in flatten_dict(d).items():
+                        key = (c, *path_tuple)
+                        required_params.add(key)
+                        required_param_leaves[key] = leaf
+            with _phase_timer("  load: adapt legacy collections + drop unexpected"):
+                # Old EasyDeL saves either omitted the collection wrapper or used
+                # the legacy `params` collection name; align them to the live model.
+                state = _adapt_legacy_checkpoint_collections(state, required_params)
+                # Model-specific reshaping of leaves from older native saves
+                # (e.g. Kimi-Linear's per-head KDA gates).
+                _upgrade_legacy = getattr(model, "_upgrade_legacy_native_state", None)
+                if callable(_upgrade_legacy):
+                    state = _upgrade_legacy(state, required_param_leaves)
+                model_config = getattr(model, "config", None)
+                tie_word_embeddings = bool(getattr(model_config, "tie_word_embeddings", False))
+                text_config = getattr(model_config, "text_config", None)
+                if not tie_word_embeddings and text_config is not None:
+                    tie_word_embeddings = bool(getattr(text_config, "tie_word_embeddings", False))
+                lm_head_names = tuple(dict.fromkeys(("lm_head", str(getattr(model, "_lm_head_name", "lm_head")))))
+                state = _materialize_tied_lm_head_from_embeddings(
+                    state,
+                    required_param_leaves,
+                    tie_word_embeddings=tie_word_embeddings,
+                    lm_head_names=lm_head_names,
+                )
+                unexpected_keys = set(state.keys()) - required_params
+                if unexpected_keys and not mismatch_allowed:
+                    preview = ", ".join(sorted(".".join(map(str, key)) for key in list(unexpected_keys)[:8]))
+                    more = f", ... +{len(unexpected_keys) - 8} more" if len(unexpected_keys) > 8 else ""
+                    raise ValueError(
+                        f"Checkpoint {resolved_archive_file} has {len(unexpected_keys)} leaf/leaves the model does "
+                        f"not declare (mismatch_allowed=False): {preview}{more}"
+                    )
+                if not mismatch_allowed:
+                    missing = {
+                        key
+                        for key in required_params - state.keys()
+                        if key and key[0] == "parameters" and hasattr(required_param_leaves[key], "shape")
+                    }
+                    mismatched = {
+                        key
+                        for key in required_params & state.keys()
+                        if hasattr(required_param_leaves[key], "shape")
+                        and getattr(state[key], "shape", None) != required_param_leaves[key].shape
+                    }
+                    if missing or mismatched:
+                        details = ", ".join(sorted(".".join(map(str, key)) for key in missing | mismatched)[:8])
+                        raise ValueError(
+                            f"Checkpoint {resolved_archive_file} is incompatible (mismatch_allowed=False): "
+                            f"{len(missing)} missing and {len(mismatched)} shape-mismatched leaves: {details}"
+                        )
+                for unexpected_key in unexpected_keys:
+                    del state[unexpected_key]
+
+            cpu_device = _checkpoint_cpu_device()
+
+            def _convert(x, target_dtype=param_dtype):
+                """Normalize a single checkpoint leaf to JAX with target dtype.
+
+                Args:
+                    x: A checkpoint leaf (NumPy or JAX array, possibly other).
+                    target_dtype: Floating dtype for this leaf (``float32`` for
+                        ``fp32_param_patterns`` leaves, ``param_dtype`` otherwise).
+
+                Returns:
+                    Any: A JAX array cast to ``target_dtype`` if it is
+                    floating-point and differs from the target; non-array
+                    leaves pass through.
+                """
+                x = _normalize_checkpoint_leaf_to_jax(x, cpu_device=cpu_device)
+                if not hasattr(x, "astype"):
+                    return x
+                dtype = getattr(x, "dtype", None)
+                if dtype is None:
+                    return x
+                if jnp.issubdtype(dtype, jnp.inexact) and dtype != target_dtype:
+                    return x.astype(target_dtype)
+                return x
+
+            with _phase_timer("  load: dtype-cast leaves"):
+                # Convert in-place to avoid holding both the original and converted
+                # parameter trees in memory at the same time (important for large
+                # dtype downcasts like bf16 -> fp8).
+                if isinstance(state, dict):
+                    for k in list(state.keys()):
+                        v = state[k]
+                        if isinstance(k, tuple) and k and str(k[-1]) == "quant_kernel":
+                            new_v = v
+                        else:
+                            new_v = _convert(v, fp32_pinned_dtype(k, param_dtype, fp32_patterns))
+                        state[k] = new_v
+                        # JAX is async; force completion so the old buffer can be freed
+                        # before converting the next leaf to reduce peak memory.
+                        if new_v is not v and hasattr(new_v, "block_until_ready"):
+                            new_v.block_until_ready()
+                        del v
+                else:
+                    state = jax.tree_util.tree_map(_convert, state)
+
+            silence_merge = quantized_checkpoint or modules_quantized_on_load
+            with _phase_timer("  load: merge_model_and_tree"):
+                model = merge_model_and_tree(model=model, tree=unflatten_dict(state), silence=silence_merge)
+            with _phase_timer("  load: assert_parameters_materialized"):
+                model.assert_parameters_materialized(context=f"loading weights from {resolved_archive_file}")
+            # Concretize any abstract non-parameter leaves (e.g. lazy_init's eval_shape-abstract
+            # spx.Rngs keys) that merge_model_and_tree left unfilled, so the returned model can
+            # be serialized by save_pretrained without hitting ShapeDtypeStruct leaves.
+            return model.materialize_meta_state()
+
+        else:
+            return model
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | os.PathLike | None,
+        sharding_axis_dims: collections.abc.Sequence[int] = (1, 1, -1, 1, 1, 1),
+        sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = None,
+        sharding_axis_names: collections.abc.Sequence[str] = ("pp", "dp", "fsdp", "ep", "tp", "sp"),
+        partition_axis: PartitionAxis | None = None,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike | None = None,
+        config_kwargs: dict[str, tp.Any] | None = None,
+        backend: EasyDeLBackends | None = None,
+        platform: EasyDeLPlatforms | None = "jax",
+        shard_fns: dict[str, tp.Callable] | None = None,
+        auto_shard_model: bool = True,
+        verbose: bool = True,
+        mismatch_allowed: bool = True,
+        checkpoint_load_chunk_size: int | None = None,
+        checkpoint_load_concurrent_gb: int = 128,
+        checkpoint_load_tensorstore_io_concurrency: int | None = 1024,
+        checkpoint_load_tensorstore_copy_concurrency: int | None = 1024,
+        checkpoint_load_tensorstore_cache_gb: int | None = 128,
+        checkpoint_load_tensorstore_assume_metadata: bool = True,
+        checkpoint_load_tensorstore_metadata_workers: int = 256,
+        checkpoint_load_progress: bool | None = None,
+        *model_args,
+        config: EasyDeLBaseConfig | str | os.PathLike | None = None,
+        cache_dir: str | os.PathLike | None = None,
+        force_download: bool = False,
+        local_files_only: bool = False,
+        token: str | bool | None = None,
+        revision: str = "main",
+        quantization_config: QuantizationConfig | None = None,
+        apply_quantization: bool = False,
+        **kwargs,
+    ):
+        """Loads an EasyDeL model from a pretrained model or path.
+
+        Args:
+            pretrained_model_name_or_path (str | PathLike | None): The name or path of the
+                pretrained model. Can be a HuggingFace Hub model ID or a local directory path.
+            sharding_axis_dims (Sequence[int]): The dimensions for sharding axes.
+                Defaults to (1, 1, -1, 1, 1, 1).
+            sharding_dcn_axis_dims (Sequence[int] | None): The dimensions for DCN (Data Center
+                Network) sharding axes for multi-host setups. Defaults to None.
+            sharding_axis_names (Sequence[str]): The names of sharding axes.
+                Defaults to ("pp", "dp", "fsdp", "ep", "tp", "sp").
+            partition_axis (PartitionAxis): The partition axis configuration for model sharding.
+                Defaults to PartitionAxis().
+            dtype (jnp.dtype): The data type for model computations. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): The data type for model parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike): The computation precision.
+                Defaults to jax.lax.Precision("fastest").
+            config_kwargs (dict[str, Any] | None): Additional configuration parameters to override.
+                Defaults to None.
+            backend (EasyDeLBackends | None): The backend to use. Defaults to None.
+            platform (EasyDeLPlatforms | None): The platform to use. Defaults to "jax".
+            shard_fns (dict[Callable] | None): Custom shard functions for loading checkpoint.
+                Defaults to None.
+            auto_shard_model (bool): Whether to automatically shard the model. Defaults to True.
+            verbose (bool): Whether to print verbose messages. Defaults to True.
+            mismatch_allowed (bool): If True, allows mismatch in parameters while loading.
+                Defaults to True.
+            checkpoint_load_chunk_size: Optional TensorStore checkpoint load batch
+                size. Defaults to ``None`` so TensorStore can schedule the
+                whole checkpoint in one async call.
+            checkpoint_load_concurrent_gb: In-flight TensorStore read budget per
+                deserialize call, in decimal gigabytes. Defaults to ``128``.
+            checkpoint_load_tensorstore_io_concurrency: TensorStore file I/O
+                concurrency override for TensorStore checkpoints. Defaults to
+                ``1024``.
+            checkpoint_load_tensorstore_copy_concurrency: TensorStore data-copy
+                concurrency override for TensorStore checkpoints. Defaults to
+                ``1024``.
+            checkpoint_load_tensorstore_cache_gb: TensorStore cache-pool size in
+                decimal gigabytes for TensorStore checkpoints. Defaults to
+                ``128``.
+            checkpoint_load_tensorstore_assume_metadata: If ``True``, prefetch
+                zarr metadata and pass it to TensorStore with
+                ``assume_metadata=True``. Defaults to ``True``.
+            checkpoint_load_tensorstore_metadata_workers: Worker count for
+                TensorStore metadata prefetch. Defaults to ``256``.
+            checkpoint_load_progress: Whether to show a tqdm-style checkpoint
+                tensor load progress line. ``None`` follows ``verbose``.
+            *model_args: Additional positional arguments passed to the model.
+            config (EasyDeLBaseConfig | str | PathLike | None): Model configuration or path
+                to configuration file. Defaults to None.
+            cache_dir (str | PathLike | None): Directory to cache downloaded models.
+                Defaults to None.
+            force_download (bool): Whether to force re-download of model files. Defaults to False.
+            local_files_only (bool): Whether to only use local files without downloading.
+                Defaults to False.
+            token (str | bool | None): HuggingFace Hub authentication token. Defaults to None.
+            revision (str): The specific model version to use (branch, tag, or commit).
+                Defaults to "main".
+            verbose (bool): Legacy parameter for verbose output. Defaults to True.
+            quantization_config (QuantizationConfig | None): Quantization configuration
+                for loading. Pass None to disable. Defaults to None.
+            apply_quantization (bool): Whether to apply module-level quantization. Defaults to False.
+            **kwargs: Additional keyword arguments (e.g., proxies, trust_remote_code, subfolder,
+                max_workers for remote snapshot downloads).
+
+        Returns:
+            EasyDeLBaseModule: The loaded EasyDeL model with weights.
+        """
+
+        from huggingface_hub import HfApi
+        from transformers import GenerationConfig
+
+        try:
+            from transformers.utils import is_offline_mode as _is_offline_mode
+        except ImportError:  # transformers>=5 moved to utils.hub
+            from transformers.utils.hub import is_offline_mode as _is_offline_mode
+
+        from easydel.modules.auto.auto_configuration import (
+            AutoEasyDeLConfig,
+            AutoShardAndGatherFunctions,
+            get_modules_by_type,
+        )
+
+        if partition_axis is None:
+            partition_axis = PartitionAxis()
+        if precision is None:
+            precision = jax.lax.Precision("fastest")
+
+        api = HfApi(token=token)
+
+        proxies = kwargs.pop("proxies", None)
+        trust_remote_code = kwargs.pop("trust_remote_code", None)
+        from_pipeline = kwargs.pop("_from_pipeline", None)
+        from_auto_class = kwargs.pop("_from_auto", False)
+        subfolder = kwargs.pop("subfolder", "")
+        commit_hash = kwargs.pop("_commit_hash", None)
+        snapshot_max_workers = kwargs.pop("max_workers", None)
+        if snapshot_max_workers is None:
+            snapshot_max_workers = max(1, min(int(os.cpu_count() or 1), 16))
+        else:
+            snapshot_max_workers = max(int(snapshot_max_workers), 1)
+
+        _ = kwargs.pop("adapter_kwargs", None)
+
+        if trust_remote_code is True:
+            logger.warning(
+                "The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored."
+            )
+
+        if _is_offline_mode() and not local_files_only:
+            logger.info("Offline mode: forcing local_files_only=True")
+            local_files_only = True
+
+        # Select a versioned checkpoint before resolving any metadata. Otherwise
+        # a root config (or its absence) can disagree with the latest weights.
+        if pretrained_model_name_or_path is not None:
+            checkpoint_root = ePath(pretrained_model_name_or_path) / subfolder
+            if checkpoint_root.is_dir() and not any((checkpoint_root / name).is_file() for name in CANDIDATE_FILENAMES):
+                latest = find_latest_checkpoint(str(checkpoint_root))
+                if latest is not None:
+                    pretrained_model_name_or_path = str(latest)
+                    subfolder = ""
+        config_path = config if config is not None else pretrained_model_name_or_path
+        config_loading_kwargs = dict(
+            subfolder=subfolder,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            local_files_only=local_files_only,
+            token=token,
+            revision=revision,
+            proxies=proxies,
+        )
+
+        timings: dict[str, float] = {}
+        total_start = time.perf_counter()
+
+        with _phase_timer("AutoEasyDeLConfig.from_pretrained", accumulator=timings):
+            config = AutoEasyDeLConfig.from_pretrained(
+                config_path,
+                sharding_axis_dims=sharding_axis_dims,
+                sharding_dcn_axis_dims=sharding_dcn_axis_dims,
+                sharding_axis_names=sharding_axis_names,
+                partition_axis=partition_axis,
+                from_torch=False,
+                backend=backend,
+                platform=platform,
+                model_task=cls._model_task,
+                **config_loading_kwargs,
+            )
+            # Auto config implementations may retain otherwise-consumed Hub
+            # kwargs as attributes. Credentials are transport-only and must
+            # never survive on the model's serializable config.
+            for credential_name in ("token", "use_auth_token", "proxies"):
+                config.__dict__.pop(credential_name, None)
+            # The compatibility adapter re-reads raw config.json to distinguish
+            # absent legacy fields from explicitly saved values. Point it at the
+            # same metadata selected above, never a conflicting checkpoint root
+            # or the Hub's default branch without the supplied access options.
+            try:
+                metadata_root = ePath(config_path)
+                metadata_path = config_path
+                if metadata_root.is_dir():
+                    metadata_path = metadata_root / subfolder / CONFIG_NAME
+                elif not metadata_root.is_file() and not is_remote_url(str(config_path)):
+                    metadata_path = api.hf_hub_download(
+                        repo_id=str(config_path),
+                        filename=CONFIG_NAME,
+                        **{
+                            **config_loading_kwargs,
+                            "revision": commit_hash or getattr(config, "_commit_hash", None) or revision,
+                        },
+                    )
+                _apply_legacy_native_config_defaults(config, str(metadata_path))
+            except Exception as exc:
+                # As in the shared adapter, inability to re-read metadata must
+                # not prevent loading an otherwise resolved configuration.
+                logger.debug("Could not read selected config for legacy defaults (%s).", exc)
+        config_kwargs = {} if config_kwargs is None else config_kwargs
+        config.add_basic_configurations(
+            sharding_axis_dims=sharding_axis_dims,
+            sharding_dcn_axis_dims=sharding_dcn_axis_dims,
+            sharding_axis_names=sharding_axis_names,
+            partition_axis=partition_axis,
+            backend=backend,
+            platform=platform,
+            **config_kwargs,
+        )
+        if quantization_config is None:
+            quantization_config = _normalize_quantization_config(
+                getattr(config, "quantization_config", None), strict=False
+            )
+        else:
+            quantization_config = _normalize_quantization_config(quantization_config)
+
+        if commit_hash is None:
+            commit_hash = getattr(config, "_commit_hash", None)
+
+        resolved_archive_file = None
+        archive_file: ePath | None = None  # pyright: ignore[reportInvalidTypeForm]
+        filename: str | None = None
+        _resolve_phase = _phase_timer("resolve+download checkpoint files", accumulator=timings)
+        _resolve_phase.__enter__()
+        if pretrained_model_name_or_path:
+            pretrained_model_name_or_path = str(pretrained_model_name_or_path)
+
+            is_local = ePath(pretrained_model_name_or_path).is_dir()
+
+            def _pick_first_existing(dir_path: ePath) -> tuple[ePath | None, str | None]:  # type:ignore
+                """Return the first ``CANDIDATE_FILENAMES`` entry present in *dir_path*.
+
+                Args:
+                    dir_path: Directory to probe.
+
+                Returns:
+                    tuple: ``(path, filename)`` for the first existing
+                    candidate, or ``(None, None)`` when none of the
+                    candidates exist.
+                """
+                for cand in CANDIDATE_FILENAMES:
+                    p = dir_path / cand
+                    if p.is_file():
+                        return p, cand
+                return None, None
+
+            if is_local:
+                raise_errors_on_him = True
+                root = ePath(pretrained_model_name_or_path) / subfolder
+                archive_file, _ = _pick_first_existing(root)
+                if not archive_file:
+                    latest = find_latest_checkpoint(str(root))
+                    if latest is not None:
+                        archive_file, _ = _pick_first_existing(ePath(latest))
+                        if archive_file:
+                            raise_errors_on_him = False
+                    if raise_errors_on_him:
+                        raise FileNotFoundError(
+                            f"No model weights found in '{root}'. Tried: {', '.join(CANDIDATE_FILENAMES)} "
+                            "we also tried to find latest checkpoint but there was nothing ;/"
+                        )
+                is_local = True
+            else:
+                # Sometimes the path is nested under subfolder
+                alt_root = ePath(subfolder) / pretrained_model_name_or_path
+                if alt_root.is_dir():
+                    archive_file, _ = _pick_first_existing(alt_root)
+                    if archive_file:
+                        is_local = True
+
+                if not is_local:
+                    if is_remote_url(pretrained_model_name_or_path):
+                        filename = pretrained_model_name_or_path
+                        resolved_archive_file = _download_url(pretrained_model_name_or_path)
+                    else:
+                        filename = None
+                        for cand in CANDIDATE_FILENAMES:
+                            try:
+                                resolved_archive_file = api.hf_hub_download(
+                                    repo_id=pretrained_model_name_or_path,
+                                    filename=cand,
+                                    subfolder=subfolder,
+                                    revision=revision,
+                                    cache_dir=cache_dir,
+                                    force_download=force_download,
+                                    proxies=proxies,
+                                    token=token,
+                                    local_files_only=local_files_only,
+                                )
+                                filename = cand
+                                break
+                            except (FileNotFoundError, huggingface_hub.errors.EntryNotFoundError):
+                                continue
+
+                        if resolved_archive_file is None:
+                            raise OSError(
+                                f"Can't load the model for '{pretrained_model_name_or_path}'. "
+                                f"Tried to download one of: {', '.join(CANDIDATE_FILENAMES)}. "
+                                f"If you're loading from https://huggingface.co/models, make sure the repo exists and "
+                                f"contains one of the expected files, or provide a local directory."
+                            )
+
+                        if filename == SAFE_WEIGHTS_INDEX_NAME:
+                            try:
+                                with open(resolved_archive_file, "r", encoding="utf-8") as f:
+                                    index_data = json.load(f)
+                                shard_names = sorted(set(index_data.get("weight_map", {}).values()))
+                                for shard_name in shard_names:
+                                    api.hf_hub_download(
+                                        repo_id=pretrained_model_name_or_path,
+                                        filename=shard_name,
+                                        subfolder=subfolder,
+                                        revision=revision,
+                                        cache_dir=cache_dir,
+                                        force_download=force_download,
+                                        proxies=proxies,
+                                        token=token,
+                                        local_files_only=local_files_only,
+                                    )
+                            except Exception as e:
+                                raise RuntimeError(f"Downloaded sharded index but failed to fetch shards: {e}") from e
+
+            if not local_files_only and not is_local:
+                api.snapshot_download(
+                    repo_id=pretrained_model_name_or_path,
+                    revision=revision,
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    proxies=proxies,
+                    token=token,
+                    local_files_only=local_files_only,
+                    max_workers=snapshot_max_workers,
+                )
+
+            if is_local:
+                logger.debug(f"loading weights file {archive_file}")
+                resolved_archive_file = str(archive_file)
+                filename = os.path.basename(str(archive_file))
+            else:
+                logger.debug(f"loading weights file {filename} from cache at {resolved_archive_file}")
+        _resolve_phase.__exit__(None, None, None)
+
+        archive_name = filename or os.path.basename(str(resolved_archive_file or ""))
+        resolved_archive_str = str(resolved_archive_file or "")
+        is_tensorstore_checkpoint = any(
+            archive_name == name or resolved_archive_str.rstrip("/").endswith(name)
+            for name in (TENSORSTORE_INDEX_NAME, "model_structure.json")
+        )
+        if auto_shard_model and shard_fns is None:
+            if is_tensorstore_checkpoint:
+                logger.debug(
+                    "[from_pretrained] skipping AutoShardAndGatherFunctions.from_config for TensorStore checkpoint; "
+                    "SpectraX will resolve sharding rules during load."
+                )
+            else:
+                with _phase_timer("AutoShardAndGatherFunctions.from_config", accumulator=timings):
+                    shard_fns, _ = AutoShardAndGatherFunctions.from_config(
+                        config=config,
+                        flatten=False,
+                        model_task=cls._model_task,
+                    )
+                    fns = {"parameters": shard_fns}
+                    fns.update(shard_fns)
+                    shard_fns = fns
+
+        cls = get_modules_by_type(config.model_type, cls._model_task)[1]
+        with _phase_timer("cls.lazy_init", accumulator=timings):
+            model = cls.lazy_init(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=spx.Rngs(0),
+            )
+        with _phase_timer("cls._load_model_weights", accumulator=timings):
+            model = cls._load_model_weights(
+                resolved_archive_file,
+                model,
+                param_dtype,
+                model.mesh,
+                shard_fns,
+                quantization_config,
+                apply_quantization,
+                verbose,
+                checkpoint_load_chunk_size,
+                checkpoint_load_concurrent_gb,
+                checkpoint_load_tensorstore_io_concurrency,
+                checkpoint_load_tensorstore_copy_concurrency,
+                checkpoint_load_tensorstore_cache_gb,
+                checkpoint_load_tensorstore_assume_metadata,
+                checkpoint_load_tensorstore_metadata_workers,
+                checkpoint_load_progress,
+                mismatch_allowed=mismatch_allowed,
+            )
+        with _phase_timer("model.quantize", accumulator=timings):
+            model = model.quantize(
+                quantization_config=quantization_config,
+                apply_quantization=apply_quantization,
+                verbose=verbose,
+                raise_error=False,
+            )
+        if model.can_generate():
+            with _phase_timer("_load_generation_config", accumulator=timings):
+                model.generation_config = _load_generation_config(
+                    pretrained_model_name_or_path,
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    proxies=proxies,
+                    local_files_only=local_files_only,
+                    token=token,
+                    revision=revision,
+                    subfolder=subfolder,
+                    _from_auto=from_auto_class,
+                    _from_pipeline=from_pipeline,
+                    log_missing=True,
+                    **kwargs,
+                )
+                if model.generation_config is None:
+                    try:
+                        model.generation_config = GenerationConfig.from_model_config(model.config)
+                    except Exception:
+                        logger.debug("Failed to build fallback generation config from model.config", exc_info=True)
+        if auto_shard_model:
+            # double check to make sure weights are correct or just a simple non-op.
+            model.assert_parameters_materialized(context="before shard_model in from_pretrained")
+            with _phase_timer("model.shard_model", accumulator=timings):
+                model = model.shard_model()
+
+        model = model.wire_distributed_matmul()
+
+        total_elapsed = time.perf_counter() - total_start
+        breakdown = ", ".join(f"{k}={v:.2f}s" for k, v in sorted(timings.items(), key=lambda kv: -kv[1]))
+        logger.debug(f"[from_pretrained] TOTAL={total_elapsed:.2f}s  ({breakdown})")
+        # Loaded models are for inference unless a trainer switches them back:
+        # training mode would leave dropout live (GPT-2/OPT ship p=0.1).
+        return model.eval()
+
+    @classmethod
+    def _from_torch_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        device: jax.Device | None = None,  # type:ignore
+        dtype: jax.numpy.dtype = jax.numpy.float32,
+        param_dtype: jax.numpy.dtype = jax.numpy.float32,
+        precision: jax.lax.Precision | None = None,
+        sharding_axis_dims: collections.abc.Sequence[int] = (1, 1, -1, 1, 1, 1),
+        sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = None,
+        sharding_axis_names: collections.abc.Sequence[str] = ("pp", "dp", "fsdp", "ep", "tp", "sp"),
+        partition_axis: PartitionAxis | None = None,
+        shard_fns: collections.abc.Mapping[tuple, tp.Callable] | dict | None = None,
+        backend: EasyDeLBackends | None = None,
+        platform: EasyDeLPlatforms | None = None,
+        config_kwargs: EasyDeLBaseConfigDict | None = None,
+        auto_shard_model: bool = True,
+        quantization_config: QuantizationConfig | None = None,
+        apply_quantization: bool = False,
+        verbose: bool = True,
+        **kwargs,
+    ):
+        """Loads an EasyDeL model from a PyTorch pretrained checkpoint.
+
+        This method converts PyTorch model weights to JAX format and creates an EasyDeL model.
+        Supports both full loading (loads entire model into memory) and streaming loading
+        (processes one shard at a time to reduce memory usage).
+
+        Args:
+            pretrained_model_name_or_path (str): The HuggingFace Hub model ID or local path
+                to the PyTorch checkpoint.
+            device (jax.Device | None): The JAX device for tensor placement. Defaults to None.
+            dtype (jax.numpy.dtype): The data type for model computations.
+                Defaults to jax.numpy.float32.
+            param_dtype (jax.numpy.dtype): The data type for model parameters.
+                Defaults to jax.numpy.float32.
+            precision (jax.lax.Precision | None): The computation precision. Defaults to None.
+            sharding_axis_dims (Sequence[int]): The dimensions for sharding axes.
+                Defaults to (1, 1, -1, 1, 1, 1).
+            sharding_dcn_axis_dims (Sequence[int] | None): The dimensions for DCN sharding axes
+                for multi-host setups. Defaults to None.
+            sharding_axis_names (Sequence[str]): The names of sharding axes.
+                Defaults to ("pp", "dp", "fsdp", "ep", "tp", "sp").
+            partition_axis (PartitionAxis | None): The partition axis configuration.
+                Defaults to None.
+            shard_fns (Mapping[tuple, Callable] | dict | None): Custom shard functions for
+                sharding tensors. Defaults to None.
+            backend (EasyDeLBackends | None): The backend to use. Defaults to None.
+            platform (EasyDeLPlatforms | None): The platform to use. Defaults to None.
+            config_kwargs (EasyDeLBaseConfigDict | None): Additional configuration parameters.
+                Defaults to None.
+            auto_shard_model (bool): Whether to automatically shard the model. Defaults to True.
+            quantization_config (QuantizationConfig | None): Quantization configuration.
+                Pass None to disable. Defaults to None.
+            apply_quantization (bool): Whether to apply module-level quantization. Defaults to False.
+            verbose (bool): Whether to print verbose messages. Defaults to True.
+            **kwargs: Additional keyword arguments including:
+                - torch_load_mode (str): "full" or "streaming". Defaults to "streaming".
+                - torch_streaming_cache (str): "hf_cache" or "temp". Defaults to "hf_cache".
+                - torch_streaming_tmp_dir (str): Temporary directory for streaming.
+                - allow_missing_mtp_init (bool): If True, missing MTP-only
+                  parameters are initialized from their module initializers after
+                  checkpoint conversion. Any non-MTP missing parameter still
+                  raises. Defaults to False.
+                - trust_remote_code (bool): Whether to trust remote code. Defaults to False.
+                - cache_dir, revision, token, local_files_only, force_download, subfolder, proxies.
+
+        Returns:
+            EasyDeLBaseModule: The loaded EasyDeL model with converted weights.
+
+        Raises:
+            ModuleNotFoundError: If PyTorch is not installed.
+        """
+        from transformers import AutoConfig
+
+        from easydel.modules.auto.auto_configuration import AutoShardAndGatherFunctions, get_modules_by_type
+
+        try:
+            import torch
+
+            def _clear():
+                """Drop CUDA cached memory and run a Python GC pass.
+
+                Returns:
+                    None.
+                """
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+
+        except ModuleNotFoundError as er:
+            raise ModuleNotFoundError(
+                "in order to load model from torch you should install torch first run `pip install torch`"
+            ) from er
+
+        load_options = _parse_torch_load_options(kwargs)
+        allow_missing_mtp_init = bool(kwargs.pop("allow_missing_mtp_init", False))
+        trust_remote_code = kwargs.get("trust_remote_code", False)
+
+        logger.debug(f"Downloading model config from {pretrained_model_name_or_path}")
+        # `gs://` reaches here for HF-format checkpoints kept in a bucket; the
+        # hub resolver cannot parse an object-store URI, while the weight side
+        # below already streams shards through ePath.
+        _config_source, _staged_meta = stage_remote_metadata(
+            pretrained_model_name_or_path,
+            subfolder=str(kwargs.get("subfolder", "") or ""),
+        )
+        hf_config = AutoConfig.from_pretrained(
+            _config_source,
+            trust_remote_code=trust_remote_code,
+            **load_options.hub_kwargs,
+        )
+        model_type: str = hf_config.model_type
+        config_class, module = get_modules_by_type(model_type, task_type=cls._model_task)
+
+        generation_config = None
+        state_dict = None
+        ckpt_info: StreamingCheckpointInfo | None = None
+
+        if load_options.mode == "full":
+            ed_config, generation_config, state_dict = cls._load_full_torch_checkpoint(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                config_class=config_class,
+                hub_kwargs=load_options.hub_kwargs,
+                torch_loader=cls.get_torch_loader(),
+                clear_fn=_clear,
+                kwargs=kwargs,
+                param_dtype=param_dtype,
+                fp32_param_patterns=tuple(getattr(module, "fp32_param_patterns", ()) or ()),
+            )
+        else:
+            ckpt_info = cls._resolve_streaming_checkpoint(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                config_class=config_class,
+                hub_kwargs=load_options.hub_kwargs,
+                kwargs=kwargs,
+            )
+            ed_config = ckpt_info.ed_config
+            generation_config = ckpt_info.generation_config
+
+        logger.debug("adding hf_model basic EasyDeL configurations.")
+        if hasattr(ed_config, "attach_custom_arguments"):
+            ed_config.attach_custom_arguments()
+        config_kwargs = {} if config_kwargs is None else config_kwargs
+        ed_config.add_basic_configurations(
+            sharding_axis_dims=sharding_axis_dims,
+            sharding_dcn_axis_dims=sharding_dcn_axis_dims,
+            sharding_axis_names=sharding_axis_names,
+            partition_axis=partition_axis,
+            backend=backend,
+            platform=platform,
+            **config_kwargs,
+        )
+
+        logger.debug("creating easydel model")
+        model = module.lazy_init(
+            config=ed_config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=spx.Rngs(0),
+        )
+        # HF conversion fuses and shards by per-layer leaf names, which a stacked layer
+        # container hides; convert into the unstacked layout and re-stack afterwards.
+        stacked_layer_paths = _stacked_layer_paths(model)
+        if stacked_layer_paths:
+            ed_config.scan_layers = False
+            try:
+                model = module.lazy_init(
+                    config=ed_config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=spx.Rngs(0),
+                )
+            finally:
+                ed_config.scan_layers = True
+        model.generation_config = generation_config
+
+        _clear()
+
+        if shard_fns is not None:
+            if auto_shard_model:
+                warnings.warn(
+                    "`auto_shard_model` will be ignored since you are passing custom sharding functions",
+                    stacklevel=1,
+                )
+            logger.debug("sharding model parameters based on the given `shard_fns`.")
+            if not is_flatten(shard_fns):
+                shard_fns = flatten_dict(shard_fns)
+        elif auto_shard_model:
+            shard_fns, _ = AutoShardAndGatherFunctions.from_pretrained(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                sharding_axis_dims=sharding_axis_dims,
+                sharding_dcn_axis_dims=sharding_dcn_axis_dims,
+                sharding_axis_names=sharding_axis_names,
+                partition_axis=partition_axis,
+                backend=backend,
+                platform=platform,
+                config_kwargs=config_kwargs,
+                trust_remote_code=trust_remote_code,
+                model_task=cls._model_task,
+            )
+
+        logger.debug("converting huggingface-model to easydel-model.")
+        uses_tie_word_embedding = getattr(hf_config, "tie_word_embeddings", False)
+
+        callback = None
+        passed_shard_fns = shard_fns
+
+        if load_options.mode == "full":
+            cls._maybe_restore_mtp_tensors_to_full_state_dict(
+                state_dict=state_dict,
+                model=model,
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                config_class=config_class,
+                hub_kwargs=load_options.hub_kwargs,
+                kwargs=kwargs,
+                clear_fn=_clear,
+            )
+            params = model.pure_transform_fn(
+                state_dict,
+                config=hf_config,
+                device=device,
+                shard_fns=passed_shard_fns,
+                params_pattern_selection=None,
+                remove_state_dict=True,
+                uses_tie_word_embedding=uses_tie_word_embedding,
+                callback=callback,
+            )
+            del state_dict
+            _clear()
+        else:
+            if ckpt_info is None:
+                raise RuntimeError("torch_load_mode='streaming' was selected but no checkpoint info was resolved.")
+
+            parameters_flat = cls._convert_streaming_checkpoint_to_params(
+                model=model,
+                ckpt_info=ckpt_info,
+                hf_config=hf_config,
+                load_options=load_options,
+                shard_fns=passed_shard_fns,
+                callback=callback,
+                device=device,
+                clear_fn=_clear,
+            )
+            parameters_flat = cls._fill_tied_lm_head_from_embeddings(model, parameters_flat)
+            params = unflatten_dict(parameters_flat)
+
+        if is_flatten(params):
+            logger.info("converted parameters are flatten making them unflatten.")
+            params = unflatten_dict(params)
+
+        logger.debug("merging model and parameters pytree.")
+        model = merge_model_and_tree(model=model, tree=params)
+        if allow_missing_mtp_init:
+            model = cls._materialize_missing_mtp_parameters(model)
+        model.assert_parameters_materialized(context=f"converting torch checkpoint {pretrained_model_name_or_path}")
+        # lazy_init builds spx.Rngs under jax.eval_shape, so the rng PRNG-key leaves return
+        # abstract and merge_model_and_tree (parameters only) never fills them. Concretize the
+        # remaining meta leaves now so the model is fully materialized and safe to serialize.
+        model = model.materialize_meta_state()
+        if stacked_layer_paths:
+            # Eager stacking drops the per-layer mesh placement; re-place the stacked leaves on the mesh.
+            model = _restack_layer_containers(model, stacked_layer_paths).shard_model()
+        logger.debug("model and parameters pytree merged.")
+
+        model = model.quantize(
+            quantization_config=quantization_config,
+            apply_quantization=apply_quantization,
+            raise_error=False,
+        )
+        model = model.wire_distributed_matmul()
+
+        logger.debug("returning model.")
+        # Inference mode, as in the native loader and transformers' from_pretrained.
+        return model.eval()
+
+    @staticmethod
+    def _fill_tied_lm_head_from_embeddings(model, parameters_flat: dict[tuple, tp.Any]) -> dict[tuple, tp.Any]:
+        """Give a tied model its ``lm_head`` leaf when the checkpoint stores only the embeddings.
+
+        Hugging Face tied checkpoints (Gemma, Cohere, ...) omit ``lm_head.weight``;
+        the full loader gets it from the torch model's shared tensor, while a
+        streaming load only sees what is on disk.
+        """
+        config = getattr(model, "config", None)
+        tied = bool(getattr(config, "tie_word_embeddings", False))
+        text_config = getattr(config, "text_config", None)
+        if not tied and text_config is not None:
+            tied = bool(getattr(text_config, "tie_word_embeddings", False))
+        if not tied:
+            return parameters_flat
+        required = {
+            (collection, *path): leaf
+            for collection, tree in spx.export(model)[1].raw().items()
+            for path, leaf in flatten_dict(tree).items()
+        }
+        state = {("parameters", *key): value for key, value in parameters_flat.items()}
+        lm_head_names = tuple(dict.fromkeys(("lm_head", str(getattr(model, "_lm_head_name", "lm_head")))))
+        filled = _materialize_tied_lm_head_from_embeddings(
+            state, required, tie_word_embeddings=True, lm_head_names=lm_head_names
+        )
+        if filled is state:
+            return parameters_flat
+        return {key[1:]: value for key, value in filled.items()}
+
+    @staticmethod
+    def _parameter_path_to_string(path: str | tuple[tp.Any, ...]) -> str:
+        """Normalize SpectraX tuple paths and state dotted paths."""
+        if isinstance(path, tuple):
+            return ".".join(str(part) for part in path)
+        return str(path)
+
+    @classmethod
+    def _is_mtp_parameter_path(cls, path: str | tuple[tp.Any, ...]) -> bool:
+        """Return True when a dotted parameter path belongs to the MTP head."""
+        path = cls._parameter_path_to_string(path)
+        return path == "mtp" or path.startswith("mtp.") or ".mtp." in path
+
+    @classmethod
+    def _materialize_missing_mtp_parameters(cls, model):
+        """Initialize missing MTP parameters while keeping normal strict loading.
+
+        Some checkpoints are base-model-only but their config enables a new MTP
+        head. This helper permits exactly that case: every missing parameter must
+        live under an ``mtp`` path, and those leaves are initialized with the
+        owning module's initializer before the standard materialization assertion
+        runs.
+        """
+        missing = model.abstract_parameter_leaves()
+        if not missing:
+            return model
+
+        non_mtp = [
+            (collection, path, shape, dtype)
+            for collection, path, shape, dtype in missing
+            if not cls._is_mtp_parameter_path(path)
+        ]
+        if non_mtp:
+            return model
+
+        missing_paths = {path for _collection, path, _shape, _dtype in missing}
+        initialized: set[str] = set()
+        rng = spx.Rngs(0)
+        resolver = getattr(model, "runtime_sharding_resolver", None)
+        mesh = getattr(model, "mesh", None)
+        fallback_spec = jax.sharding.PartitionSpec()
+
+        def _leaf(var):
+            return var.value if hasattr(var, "value") else var
+
+        def _named_sharding_for(var, shape):
+            if resolver is not None and mesh is not None and var is not None and hasattr(var, "metadata"):
+                named_sharding = resolver.named_sharding_for_variable(var, shape=shape, mesh=mesh)
+                if named_sharding is not None:
+                    return named_sharding
+            if mesh is not None and shape is not None:
+                return spx.get_corrected_named_sharding(shape, fallback_spec, raise_mesh_error=False)
+            return None
+
+        def _place(arr, var):
+            sharding = _named_sharding_for(var, tuple(arr.shape))
+            return jax.device_put(arr, sharding) if sharding is not None else arr
+
+        def _init_array_param(param, key):
+            direct_initializers = {"zeros", "ones"}
+            if param.init_method in direct_initializers:
+                init_fn = getattr(jax.nn.initializers, param.init_method)
+            else:
+                init_fn = getattr(jax.nn.initializers, param.init_method, jax.nn.initializers.normal)(
+                    **(param.init_kwargs or {})
+                )
+            return init_fn(key, param.value.shape, param.value.dtype)
+
+        def _set_if_missing(path: str, var, init_fn) -> None:
+            if path not in missing_paths or var is None:
+                return
+            value = _leaf(var)
+            if not isinstance(value, jax.ShapeDtypeStruct):
+                initialized.add(path)
+                return
+            arr = init_fn(rng.parameters, value.shape, value.dtype)
+            arr = _place(arr, var)
+            if hasattr(var, "value"):
+                var.value = arr
+            else:
+                raise TypeError(f"Cannot initialize missing MTP parameter {path!r}: leaf has no value attribute.")
+            initialized.add(path)
+
+        for module_path, module in iter_module_search(model, spx.Module):
+            module_path = cls._parameter_path_to_string(module_path)
+            if not module_path or not cls._is_mtp_parameter_path(module_path):
+                continue
+
+            weight = getattr(module, "weight", None)
+            if weight is not None:
+                weight_path = f"{module_path}.weight"
+                if hasattr(module, "kernel_init"):
+                    _set_if_missing(
+                        weight_path,
+                        weight,
+                        lambda key, shape, dtype, m=module: m.kernel_init(key=key, shape=shape, dtype=dtype),
+                    )
+                elif hasattr(module, "embedding_init"):
+                    _set_if_missing(
+                        weight_path,
+                        weight,
+                        lambda key, shape, dtype, m=module: m.embedding_init(key=key, shape=shape, dtype=dtype),
+                    )
+                elif hasattr(module, "scale_init"):
+                    _set_if_missing(
+                        weight_path, weight, lambda key, shape, dtype, m=module: m.scale_init(key, shape, dtype)
+                    )
+                elif hasattr(weight, "init_method"):
+                    _set_if_missing(weight_path, weight, lambda key, _shape, _dtype, p=weight: _init_array_param(p, key))
+                else:
+                    _set_if_missing(
+                        weight_path, weight, lambda key, shape, dtype: jax.nn.initializers.ones(key, shape, dtype)
+                    )
+
+            bias = getattr(module, "bias", None)
+            if bias is not None:
+                bias_path = f"{module_path}.bias"
+                if hasattr(module, "bias_init"):
+                    _set_if_missing(
+                        bias_path,
+                        bias,
+                        lambda key, shape, dtype, m=module: m.bias_init(key=key, shape=shape, dtype=dtype),
+                    )
+                elif hasattr(bias, "init_method"):
+                    _set_if_missing(bias_path, bias, lambda key, _shape, _dtype, p=bias: _init_array_param(p, key))
+                else:
+                    _set_if_missing(
+                        bias_path, bias, lambda key, shape, dtype: jax.nn.initializers.zeros(key, shape, dtype)
+                    )
+
+        for path, var in spx.iter_variables(model, select="parameters"):
+            path = cls._parameter_path_to_string(path)
+            if path not in missing_paths or path in initialized:
+                continue
+            value = _leaf(var)
+            if not isinstance(value, jax.ShapeDtypeStruct):
+                initialized.add(path)
+                continue
+            if hasattr(var, "init_method"):
+                arr = _init_array_param(var, rng.parameters)
+            elif path.endswith(".bias"):
+                arr = jax.nn.initializers.zeros(rng.parameters, value.shape, value.dtype)
+            elif path.endswith(".weight") and len(value.shape) == 1:
+                arr = jax.nn.initializers.ones(rng.parameters, value.shape, value.dtype)
+            else:
+                arr = jax.nn.initializers.normal(0.02)(rng.parameters, value.shape, value.dtype)
+            var.value = _place(arr, var)
+            initialized.add(path)
+
+        still_missing = sorted(missing_paths - initialized)
+        if still_missing:
+            preview = ", ".join(still_missing[:8])
+            if len(still_missing) > 8:
+                preview = f"{preview}, ... +{len(still_missing) - 8} more"
+            raise ValueError(f"Unable to initialize missing MTP parameters: {preview}")
+
+        logger.warning(
+            f"Initialized {len(initialized)} missing MTP parameter leaf/leaves from module initializers; "
+            "all non-MTP checkpoint parameters remain strictly required."
+        )
+        return model
+
+    @classmethod
+    def _resolve_streaming_checkpoint(
+        cls,
+        pretrained_model_name_or_path: str,
+        config_class: type,
+        hub_kwargs: dict[str, tp.Any],
+        kwargs: dict[str, tp.Any],
+    ) -> StreamingCheckpointInfo:
+        """Resolve checkpoint files for streaming mode, returning checkpoint info.
+
+        This method discovers available checkpoint files (SafeTensors or PyTorch .bin format)
+        and builds the metadata needed for streaming conversion without loading all weights
+        into memory.
+
+        Args:
+            pretrained_model_name_or_path (str): The HuggingFace Hub model ID or local path.
+            config_class (type): The EasyDeL config class to use for loading configuration.
+            hub_kwargs (dict[str, Any]): Keyword arguments for HuggingFace Hub operations
+                (cache_dir, revision, token, etc.).
+            kwargs (dict[str, Any]): Additional keyword arguments including revision, token,
+                local_files_only, force_download, proxies, subfolder, and cache_dir.
+
+        Returns:
+            StreamingCheckpointInfo: Metadata containing checkpoint format, key-to-file mappings,
+                resolved file paths, EasyDeL config, generation config, and a resolve_shard
+                callable for on-demand shard downloading.
+
+        Raises:
+            FileNotFoundError: If no valid PyTorch checkpoint files can be found.
+            ValueError: If the shard index file is invalid (missing weight_map).
+        """
+        logger.debug(f"Resolving checkpoint files (streaming) for {pretrained_model_name_or_path}")
+
+        ckpt_weight_format: tp.Literal["safetensors", "bin"] | None = None
+        ckpt_key_to_filename: dict[str, str] = {}
+        ckpt_filename_to_path: dict[str, str] = {}
+
+        revision = kwargs.get("revision", None)
+        token = kwargs.get("token", None)
+        local_files_only = bool(kwargs.get("local_files_only", False))
+        force_download = bool(kwargs.get("force_download", False))
+        proxies = kwargs.get("proxies", None)
+        subfolder = str(kwargs.get("subfolder", "") or "")
+        cache_dir = kwargs.get("cache_dir", None)
+
+        def _hf_download(filename: str, *, cache_dir_override: str | None = None) -> str:
+            """Download a file from the HF Hub, honoring the configured subfolder.
+
+            Args:
+                filename: Repo-relative filename.
+                cache_dir_override: Optional cache override (otherwise
+                    ``cache_dir`` from the enclosing scope is used).
+
+            Returns:
+                str: Local path to the downloaded file.
+            """
+            return _hf_download_file(
+                pretrained_model_name_or_path,
+                filename,
+                subfolder=subfolder,
+                revision=revision,
+                cache_dir=cache_dir_override if cache_dir_override is not None else cache_dir,
+                force_download=force_download,
+                proxies=proxies,
+                token=token,
+                local_files_only=local_files_only,
+            )
+
+        def _find_local(filename: str) -> str | None:
+            """Locate *filename* under a local pretrained-model directory (``None`` when absent)."""
+            return _find_local_file(pretrained_model_name_or_path, filename, subfolder)
+
+        def _resolve_shard(fname: str, cache_dir_override: str | None = None) -> str:
+            """Unified shard resolution: local first, then HF download."""
+            local_path = _find_local(fname)
+            if local_path is not None:
+                return local_path
+            return _hf_download(fname, cache_dir_override=cache_dir_override)
+
+        _load_index = _load_json_index
+
+        resolved_index_file: str | None = None
+        resolved_single_file: str | None = None
+
+        if os.path.isdir(pretrained_model_name_or_path):
+            resolved_index_file = _find_local(SAFE_WEIGHTS_INDEX_NAME)
+            if resolved_index_file is not None:
+                ckpt_weight_format = "safetensors"
+            else:
+                resolved_index_file = _find_local(WEIGHTS_INDEX_NAME)
+                if resolved_index_file is not None:
+                    ckpt_weight_format = "bin"
+
+            if resolved_index_file is None:
+                resolved_single_file = _find_local(SAFE_WEIGHTS_NAME)
+                if resolved_single_file is not None:
+                    ckpt_weight_format = "safetensors"
+                else:
+                    resolved_single_file = _find_local(WEIGHTS_NAME)
+                    if resolved_single_file is not None:
+                        ckpt_weight_format = "bin"
+        else:
+            try:
+                resolved_index_file = _hf_download(SAFE_WEIGHTS_INDEX_NAME)
+                ckpt_weight_format = "safetensors"
+            except (FileNotFoundError, huggingface_hub.errors.EntryNotFoundError):
+                resolved_index_file = None
+
+            if resolved_index_file is None:
+                try:
+                    resolved_index_file = _hf_download(WEIGHTS_INDEX_NAME)
+                    ckpt_weight_format = "bin"
+                except (FileNotFoundError, huggingface_hub.errors.EntryNotFoundError):
+                    resolved_index_file = None
+
+            if resolved_index_file is None:
+                try:
+                    resolved_single_file = _hf_download(SAFE_WEIGHTS_NAME)
+                    ckpt_weight_format = "safetensors"
+                except (FileNotFoundError, huggingface_hub.errors.EntryNotFoundError):
+                    resolved_single_file = None
+
+            if resolved_index_file is None and resolved_single_file is None:
+                try:
+                    resolved_single_file = _hf_download(WEIGHTS_NAME)
+                    ckpt_weight_format = "bin"
+                except (FileNotFoundError, huggingface_hub.errors.EntryNotFoundError):
+                    resolved_single_file = None
+
+        if ckpt_weight_format is None or (resolved_index_file is None and resolved_single_file is None):
+            raise FileNotFoundError(
+                "Couldn't locate a PyTorch checkpoint to convert. Expected one of: "
+                f"{SAFE_WEIGHTS_INDEX_NAME}, {SAFE_WEIGHTS_NAME}, {WEIGHTS_INDEX_NAME}, {WEIGHTS_NAME}"
+            )
+
+        if resolved_index_file is not None:
+            index_data = _load_index(resolved_index_file)
+            weight_map = index_data.get("weight_map") or {}
+            if not weight_map:
+                raise ValueError(f"Invalid shard index file (missing weight_map): {resolved_index_file}")
+            ckpt_key_to_filename = dict(weight_map)
+            for fname in sorted(set(weight_map.values())):
+                if os.path.isdir(pretrained_model_name_or_path):
+                    resolved = _find_local(fname)
+                    if resolved is None:
+                        raise FileNotFoundError(f"Missing shard file {fname!r} under {pretrained_model_name_or_path!r}")
+                    ckpt_filename_to_path[fname] = resolved
+        else:
+            assert resolved_single_file is not None
+            if ckpt_weight_format == "safetensors":
+                ckpt_filename_to_path[SAFE_WEIGHTS_NAME] = resolved_single_file
+            else:
+                ckpt_filename_to_path[WEIGHTS_NAME] = resolved_single_file
+
+        ed_config = config_class.from_pretrained(pretrained_model_name_or_path, **hub_kwargs)
+        generation_config = _load_generation_config(pretrained_model_name_or_path, **hub_kwargs)
+
+        return StreamingCheckpointInfo(
+            ckpt_weight_format=ckpt_weight_format,
+            ckpt_key_to_filename=ckpt_key_to_filename,
+            ckpt_filename_to_path=ckpt_filename_to_path,
+            ed_config=ed_config,
+            generation_config=generation_config,
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            resolve_shard=_resolve_shard,
+        )
+
+    @classmethod
+    def _convert_streaming_checkpoint_to_params(
+        cls,
+        model,
+        ckpt_info: StreamingCheckpointInfo,
+        hf_config: tp.Any,
+        load_options: TorchLoadOptions,
+        shard_fns: dict[tuple, tp.Callable] | None,
+        callback: tp.Callable | None,
+        device: tp.Any | None,
+        clear_fn: tp.Callable[[], None],
+    ) -> dict[tuple, tp.Any]:
+        """Convert streaming PyTorch checkpoint to flattened JAX params dict.
+
+        This function handles the streaming conversion of PyTorch checkpoints to JAX format,
+        including MoE expert grouping and multi-file handling.
+
+        Args:
+            model (EasyDeLBaseModule): The EasyDeL model instance used for transformation
+                configuration and parameter shape information.
+            ckpt_info (StreamingCheckpointInfo): Checkpoint metadata with paths and
+                resolve_shard callable.
+            hf_config (Any): The HuggingFace config for the model.
+            load_options (TorchLoadOptions): Options with streaming cache settings.
+            shard_fns (dict[tuple, Callable] | None): Optional sharding functions to apply
+                to tensors.
+            callback (Callable | None): Optional callback for post-processing tensors
+                (e.g., quantization).
+            device (Any | None): Optional JAX device for tensor placement.
+            clear_fn (Callable[[], None]): Function to call for memory cleanup between shards.
+
+        Returns:
+            dict[tuple, Any]: Flattened dict of (tuple_key -> jax_array) ready for unflattening.
+        """
+        import torch
+        from safetensors.torch import safe_open
+
+        from easydel.utils.parameters_transformation import (
+            HFCheckpointKeyMapper,
+            StateDictConverter,
+        )
+
+        ckpt_weight_format = ckpt_info.ckpt_weight_format
+        ckpt_key_to_filename = ckpt_info.ckpt_key_to_filename
+        ckpt_filename_to_path = ckpt_info.ckpt_filename_to_path
+        pretrained_model_name_or_path = ckpt_info.pretrained_model_name_or_path
+        resolve_shard = ckpt_info.resolve_shard
+        torch_streaming_cache = load_options.streaming_cache
+        torch_streaming_tmp_dir = load_options.streaming_tmp_dir
+
+        transformer = model.pure_transform_fn
+        (
+            embedding_layer_names,
+            layernorm_names,
+            moe_block_names,
+            moe_names,
+            moe_block_path,
+            moe_path,
+            reform_param,
+            hf_flattened_wrappers,
+            _ckpt_key_normalizer,
+        ) = _checkpoint_transformer_options(transformer)
+
+        def _resolve_merge(k: str, nk: str):
+            """Place a per-expert key in transformers' merged expert layout (see ``resolve_expert_merge``)."""
+            return _expert_merge_for_key(
+                k,
+                nk,
+                hf_key_mapper=hf_key_mapper,
+                hf_model_type=hf_model_type,
+                key_normalizer=_ckpt_key_normalizer,
+            )
+
+        def _normalize_key(k: str) -> str | None:
+            """Map a checkpoint key to EasyDeL naming (re-insert flattened wrappers).
+
+            Args:
+                k: Raw checkpoint state-dict key (old or new HF layout).
+
+            Returns:
+                str: The key with any transformers >= 5.13 flattened wrapper
+                prefix re-inserted; unchanged when already in EasyDeL layout.
+            """
+            return _normalize_checkpoint_key(
+                k,
+                key_normalizer=_ckpt_key_normalizer,
+                hf_key_mapper=hf_key_mapper,
+                hf_model_type=hf_model_type,
+                hf_flattened_wrappers=hf_flattened_wrappers,
+            )
+
+        moe_names_set = set(moe_names or [])
+        expected_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
+        expert_prefix = f".{expected_expert_name}."
+        # Like the full loader's `apply_moe_transformations`, per-expert tensors
+        # that feed a reform fusion (DeepSeek's `experts.<i>.gate_proj`) stack
+        # too, even though the runtime leaf is the fused `gate_up_proj`.
+        expert_fusion_sources = {
+            (source[:-7] if source.endswith(".weight") else source)
+            for rule in (reform_param or {}).values()
+            if "sources" in rule
+            for source in rule["sources"]
+            if expert_prefix in source
+        }
+        # Rules sourcing a tensor transformers>=5 builds in memory by merging
+        # per-expert checkpoint tensors (`mlp.experts.gate_up_proj` from
+        # `experts.<i>.{w1,w3}` / `{gate,up}_proj`); `resolve_expert_merge`
+        # reads that merge from transformers' own conversion mapping.
+        hf_model_type = transformer.keywords.get("hf_model_type") or getattr(hf_config, "model_type", None)
+        # transformers' own key mapping for this model (scoped renames + merges),
+        # unless the model normalizes its checkpoint keys itself.
+        hf_key_mapper = (
+            HFCheckpointKeyMapper.for_config(hf_config, trust_remote_code=bool(getattr(hf_config, "auto_map", None)))
+            if _ckpt_key_normalizer is None
+            else None
+        )
+        merged_expert_rules = {
+            rule["sources"][0]: (rule_key, rule)
+            for rule_key, rule in (reform_param or {}).items()
+            if "fuser" in rule and len(rule.get("sources", ())) == 1 and expert_prefix in rule["sources"][0]
+        }
+        # Tensors transformers builds in memory from per-expert checkpoint keys
+        # that a rule consumes: as a fusion source (above) or by name through a
+        # rename/split rule (Mixtral `mlp.experts.down_proj`). Each part is
+        # stacked as a synthetic group, then merged exactly like transformers.
+        hf_merge_targets = set(merged_expert_rules) | {
+            (rule_key[:-1] if rule_key.endswith("$") else rule_key)
+            for rule_key, rule in (reform_param or {}).items()
+            if "splits" in rule and expert_prefix in rule_key
+        }
+        hf_merge_specs: dict[str, tp.Any] = {}  # merged key -> ExpertMergeSpec
+
+        consolidated_moe_keys: set[str] = set()
+        moe_groups: dict[str, dict[int, str]] = {}
+        moe_expert_keys: set[str] = set()
+
+        def _register_moe_key(k: str):
+            """Record the shared expert matcher result for in-memory stacking/fusion."""
+            match = _match_moe_checkpoint_key(
+                k,
+                normalize_key=_normalize_key,
+                resolve_merge=_resolve_merge,
+                moe_block_path=moe_block_path,
+                moe_names=moe_names_set,
+                moe_path=moe_path,
+                expert_fusion_sources=expert_fusion_sources,
+                hf_merge_targets=hf_merge_targets,
+            )
+            if match is not None:
+                target_path, expert_idx, spec = match
+                if spec is not None:
+                    hf_merge_specs[target_path.rsplit("#part", 1)[0]] = spec
+                moe_groups.setdefault(target_path, {})[expert_idx] = k
+                moe_expert_keys.add(k)
+
+        if not ckpt_key_to_filename:
+            filename = next(iter(ckpt_filename_to_path.keys()))
+            resolved_path = ckpt_filename_to_path[filename]
+            if ckpt_weight_format == "safetensors":
+                with safe_open(resolved_path, framework="pt", device="cpu") as f:
+                    for k in f.keys():
+                        ckpt_key_to_filename[k] = filename
+                        _register_moe_key(k)
+            else:
+                shard = None
+                try:
+                    shard = torch.load(resolved_path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    shard = torch.load(resolved_path, map_location="cpu")
+                for k in shard.keys():
+                    ckpt_key_to_filename[k] = filename
+                    _register_moe_key(k)
+                del shard
+                clear_fn()
+        else:
+            for k in ckpt_key_to_filename:
+                _register_moe_key(k)
+
+        for target_path in moe_groups:
+            consolidated_moe_keys.add(f"{target_path}.weight")
+
+        quant_decode = _build_quant_decoder(hf_config, ckpt_key_to_filename)
+        consumed_quant_keys = getattr(quant_decode, "consumed_keys", frozenset())
+        normalized_to_original = {
+            nk: k for k in ckpt_key_to_filename if k not in consumed_quant_keys and (nk := _normalize_key(k)) is not None
+        }
+        reform_fusion_groups, reform_fusion_rules = StateDictConverter.collect_reform_param_fusion_groups(
+            normalized_to_original.keys(),
+            reform_param,
+        )
+        reform_fusion_groups = {
+            fused_key: tuple(normalized_to_original.get(source_key, source_key) for source_key in source_keys)
+            for fused_key, source_keys in reform_fusion_groups.items()
+        }
+        reform_fusion_source_keys = {
+            source_key for source_keys in reform_fusion_groups.values() for source_key in source_keys
+        }
+        # Fusions whose sources are stacked expert tensors (``experts.gate_proj``
+        # + ``experts.up_proj`` -> ``experts.gate_up_proj``) only exist once the
+        # per-expert keys are stacked, as in the full loader's stack-then-fuse.
+        stacked_moe_keys = {f"{target_path}.weight" for target_path in moe_groups}
+        stacked_fusion_groups, stacked_fusion_rules = StateDictConverter.collect_reform_param_fusion_groups(
+            set(normalized_to_original) | stacked_moe_keys,
+            reform_param,
+        )
+        stacked_fusion_groups = {
+            fused_key: source_keys
+            for fused_key, source_keys in stacked_fusion_groups.items()
+            if fused_key not in reform_fusion_groups and all(k in stacked_moe_keys for k in source_keys)
+        }
+        for merged_key, spec in hf_merge_specs.items():
+            part_keys = tuple(f"{merged_key}#part{part}.weight" for part in range(len(spec.parts)))
+            if merged_key in normalized_to_original or not all(k in stacked_moe_keys for k in part_keys):
+                continue
+            if merged_key in merged_expert_rules:
+                rule_key, rule = merged_expert_rules[merged_key]
+                target_key = rule_key[:-1] if rule_key.endswith("$") else rule_key
+
+                def _merge(torch, *parts, _rule=rule, _dim=spec.concat_dim):
+                    return StateDictConverter.fuse_reform_param_tensors(_rule, [torch.cat(parts, dim=_dim)])
+
+            else:  # consumed by name, like the full loader's in-memory tensor
+                target_key = merged_key
+
+                def _merge(torch, *parts, _dim=spec.concat_dim):
+                    return parts[0] if len(parts) == 1 else torch.cat(parts, dim=_dim)
+
+            stacked_fusion_groups[target_key] = part_keys
+            stacked_fusion_rules[target_key] = {"fuser": _merge}
+        stacked_fusion_by_source = {
+            source_key: fused_key
+            for fused_key, source_keys in stacked_fusion_groups.items()
+            for source_key in source_keys
+        }
+        pending_stacked: dict[str, tp.Any] = {}
+
+        uses_tie_word_embedding = getattr(hf_config, "tie_word_embeddings", False)
+        converter_config = {
+            "embedding_layer_names": set(embedding_layer_names or []),
+            "layernorm_names": set(layernorm_names or []),
+            "moe_block_names": set(moe_block_names or []),
+            "moe_names": set(moe_names or []),
+            "lm_head_name": None,
+            "uses_tie_word_embedding": uses_tie_word_embedding,
+            "dtype": model.param_dtype,
+            "consolidated_moe_keys": consolidated_moe_keys,
+            "reform_param": reform_param,
+            "fp32_param_patterns": tuple(getattr(model, "fp32_param_patterns", ()) or ()),
+        }
+
+        parameters_flat: dict[tuple, tp.Any] = {}
+
+        def _maybe_shard_and_callback(key_tuple, arr):
+            """Apply optional shard fn and user callback to a converted leaf.
+
+            Args:
+                key_tuple: Path tuple for the parameter.
+                arr: Converted JAX array.
+
+            Returns:
+                Any: The array after applying ``shard_fns[key_tuple]`` and
+                the user-supplied ``callback`` (if any).
+            """
+            if shard_fns and key_tuple in shard_fns:
+                arr = shard_fns[key_tuple](arr)
+            if callback is not None:
+                arr = callback(arr, key_tuple)
+            return arr
+
+        def _process_tensor(key: str, tensor, pre_normalized: bool = False):
+            """Convert one HF tensor and store the result(s) in ``parameters_flat``.
+
+            Args:
+                key: HF state-dict key.
+                tensor: The torch tensor for that key.
+                pre_normalized: ``key`` is already in normalized form (fused,
+                    stacked or merged keys built here); normalizing again could
+                    re-apply renames to a runtime name.
+
+            Returns:
+                None. Side-effect: populates the ``parameters_flat`` dict
+                in the enclosing scope.
+            """
+            normalized = key if pre_normalized else _normalize_key(key)
+            if normalized is None:
+                return
+            results = StateDictConverter.process_tensor(normalized, tensor, converter_config)
+            if results is None:
+                return
+            for key_tuple, jax_array in results:
+                parameters_flat[key_tuple] = _maybe_shard_and_callback(key_tuple, jax_array)
+
+        @contextlib.contextmanager
+        def _with_resolved_shard(fname: str):
+            """Yield a local path for shard *fname*, downloading if needed.
+
+            Honors a streaming cache strategy: reuses already-downloaded
+            paths, downloads from HF when the source is a remote repo, or
+            stages into a temporary directory when streaming.
+
+            Args:
+                fname: Shard filename to resolve.
+
+            Yields:
+                str: Local filesystem path to the shard.
+            """
+            if fname in ckpt_filename_to_path and os.path.isfile(ckpt_filename_to_path[fname]):
+                yield ckpt_filename_to_path[fname]
+                return
+
+            if os.path.isdir(pretrained_model_name_or_path):
+                resolved = resolve_shard(fname, None)
+                ckpt_filename_to_path[fname] = resolved
+                yield resolved
+                return
+
+            if torch_streaming_cache == "hf_cache":
+                resolved = resolve_shard(fname, None)
+                ckpt_filename_to_path[fname] = resolved
+                yield resolved
+                return
+
+            if torch_streaming_tmp_dir is not None:
+                if os.path.isfile(torch_streaming_tmp_dir):
+                    raise NotADirectoryError(f"torch_streaming_tmp_dir points to a file: {torch_streaming_tmp_dir!r}")
+                os.makedirs(torch_streaming_tmp_dir, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=torch_streaming_tmp_dir) as tmpdir:
+                yield resolve_shard(fname, tmpdir)
+
+        def _read_source(key: str, getter):
+            """Decode original-key sources before stacking, fusion or conversion.
+
+            Scale lookup uses the checkpoint index, including when the sibling
+            was stored in another shard. Synthetic fused keys never pass here.
+            """
+            tensor = getter(key)
+            if quant_decode is None:
+                return tensor
+
+            def fetch(scale_key):
+                filename = ckpt_key_to_filename[scale_key]
+                if filename == ckpt_key_to_filename[key]:
+                    return getter(scale_key)
+                with _with_resolved_shard(filename) as path:
+                    if ckpt_weight_format == "safetensors":
+                        with safe_open(path, framework="pt", device="cpu") as handle:
+                            return handle.get_tensor(scale_key)
+                    try:
+                        scale_shard = torch.load(path, map_location="cpu", weights_only=True)
+                    except TypeError:
+                        scale_shard = torch.load(path, map_location="cpu")
+                    return scale_shard[scale_key]
+
+            decoded = quant_decode(key, tensor, fetch)
+            return tensor if decoded is None else decoded
+
+        def _emit_stacked(stacked_key: str, stacked_tensor):
+            """Convert a stacked expert tensor, or hold it until its fusion group is complete."""
+            fused_key = stacked_fusion_by_source.get(stacked_key)
+            if fused_key is None:
+                _process_tensor(stacked_key, stacked_tensor, pre_normalized=True)
+                return
+            pending_stacked[stacked_key] = stacked_tensor
+            source_keys = stacked_fusion_groups[fused_key]
+            if all(k in pending_stacked for k in source_keys):
+                fused_tensor = StateDictConverter.fuse_reform_param_tensors(
+                    stacked_fusion_rules[fused_key],
+                    [pending_stacked.pop(k) for k in source_keys],
+                )
+                _process_tensor(fused_key, fused_tensor, pre_normalized=True)
+                del fused_tensor
+
+        def _run_streaming_conversion():
+            """Stream HF shards into JAX parameters with MoE consolidation.
+
+            Iterates each checkpoint shard, converts non-MoE tensors as they
+            arrive, and accumulates per-expert MoE weights to consolidate
+            single-file groups in place. Multi-file MoE groups are deferred
+            until all contributing shards have been seen.
+
+            Returns:
+                None. Side-effect: populates ``parameters_flat`` in the
+                enclosing scope.
+            """
+            file_to_non_moe_keys: dict[str, list[str]] = {}
+            for key, fname in ckpt_key_to_filename.items():
+                if key in consumed_quant_keys or _normalize_key(key) is None:
+                    continue
+                if key in moe_expert_keys:
+                    continue
+                if key in reform_fusion_source_keys:
+                    continue
+                file_to_non_moe_keys.setdefault(fname, []).append(key)
+
+            file_to_reform_fusion_groups: dict[str, list[tuple[str, tuple[str, ...]]]] = {}
+            multi_file_reform_fusion_groups: dict[str, tuple[str, ...]] = {}
+            for fused_key, source_keys in reform_fusion_groups.items():
+                files = {ckpt_key_to_filename[k] for k in source_keys if k in ckpt_key_to_filename}
+                if len(files) == 1:
+                    fname = next(iter(files))
+                    file_to_reform_fusion_groups.setdefault(fname, []).append((fused_key, source_keys))
+                else:
+                    multi_file_reform_fusion_groups[fused_key] = source_keys
+
+            file_to_moe_groups: dict[str, list[tuple[str, dict[int, str]]]] = {}
+            multi_file_moe_groups: dict[str, dict[int, str]] = {}
+            for target_path, expert_key_by_idx in moe_groups.items():
+                files = {ckpt_key_to_filename[k] for k in expert_key_by_idx.values() if k in ckpt_key_to_filename}
+                if len(files) == 1:
+                    fname = next(iter(files))
+                    file_to_moe_groups.setdefault(fname, []).append((target_path, expert_key_by_idx))
+                else:
+                    multi_file_moe_groups[target_path] = expert_key_by_idx
+
+            all_files = sorted(set(ckpt_key_to_filename.values()) | set(ckpt_filename_to_path.keys()))
+
+            for fname in all_files:
+                non_moe_keys = file_to_non_moe_keys.get(fname, [])
+                reform_fusion_groups_for_file = file_to_reform_fusion_groups.get(fname, [])
+                moe_groups_for_file = file_to_moe_groups.get(fname, [])
+                if not non_moe_keys and not reform_fusion_groups_for_file and not moe_groups_for_file:
+                    continue
+
+                with _with_resolved_shard(fname) as resolved_path:
+                    if ckpt_weight_format == "safetensors":
+                        with safe_open(resolved_path, framework="pt", device="cpu") as f:
+                            for k in sorted(non_moe_keys):
+                                _process_tensor(k, _read_source(k, f.get_tensor))
+
+                            for fused_key, source_keys in reform_fusion_groups_for_file:
+                                fused_tensor = StateDictConverter.fuse_reform_param_tensors(
+                                    reform_fusion_rules[fused_key],
+                                    [_read_source(source_key, f.get_tensor) for source_key in source_keys],
+                                )
+                                _process_tensor(fused_key, fused_tensor, pre_normalized=True)
+                                del fused_tensor
+                                clear_fn()
+
+                            for target_path, expert_key_by_idx in moe_groups_for_file:
+                                expert_indices = sorted(expert_key_by_idx.keys())
+                                if not expert_indices:
+                                    continue
+                                stacked_key = f"{target_path}.weight"
+                                first_key = expert_key_by_idx[expert_indices[0]]
+                                first_tensor = _read_source(first_key, f.get_tensor)
+                                stacked_shape = (len(expert_indices), *first_tensor.shape)
+                                stacked_tensor = torch.empty(
+                                    stacked_shape,
+                                    dtype=first_tensor.dtype,
+                                    device=first_tensor.device,
+                                )
+                                for pos, expert_idx in enumerate(expert_indices):
+                                    stacked_tensor[pos] = _read_source(expert_key_by_idx[expert_idx], f.get_tensor)
+                                _emit_stacked(stacked_key, stacked_tensor)
+                                del stacked_tensor
+                                clear_fn()
+                    else:
+                        shard = None
+                        try:
+                            shard = torch.load(resolved_path, map_location="cpu", weights_only=True)
+                        except TypeError:
+                            shard = torch.load(resolved_path, map_location="cpu")
+
+                        for k in sorted(non_moe_keys):
+                            _process_tensor(k, _read_source(k, shard.__getitem__))
+
+                        for fused_key, source_keys in reform_fusion_groups_for_file:
+                            fused_tensor = StateDictConverter.fuse_reform_param_tensors(
+                                reform_fusion_rules[fused_key],
+                                [_read_source(source_key, shard.__getitem__) for source_key in source_keys],
+                            )
+                            _process_tensor(fused_key, fused_tensor, pre_normalized=True)
+                            del fused_tensor
+                            clear_fn()
+
+                        for target_path, expert_key_by_idx in moe_groups_for_file:
+                            expert_indices = sorted(expert_key_by_idx.keys())
+                            if not expert_indices:
+                                continue
+                            stacked_key = f"{target_path}.weight"
+                            first_key = expert_key_by_idx[expert_indices[0]]
+                            first_tensor = _read_source(first_key, shard.__getitem__)
+                            stacked_shape = (len(expert_indices), *first_tensor.shape)
+                            stacked_tensor = torch.empty(
+                                stacked_shape,
+                                dtype=first_tensor.dtype,
+                                device=first_tensor.device,
+                            )
+                            for pos, expert_idx in enumerate(expert_indices):
+                                stacked_tensor[pos] = _read_source(expert_key_by_idx[expert_idx], shard.__getitem__)
+                            _emit_stacked(stacked_key, stacked_tensor)
+                            del stacked_tensor
+                            clear_fn()
+
+                        del shard
+                        clear_fn()
+
+            if multi_file_reform_fusion_groups:
+                for fused_key, source_keys in sorted(multi_file_reform_fusion_groups.items()):
+                    tensors = []
+                    for source_key in source_keys:
+                        fname = ckpt_key_to_filename[source_key]
+                        with _with_resolved_shard(fname) as resolved_path:
+                            if ckpt_weight_format == "safetensors":
+                                with safe_open(resolved_path, framework="pt", device="cpu") as f:
+                                    tensors.append(_read_source(source_key, f.get_tensor))
+                            else:
+                                shard = None
+                                try:
+                                    shard = torch.load(resolved_path, map_location="cpu", weights_only=True)
+                                except TypeError:
+                                    shard = torch.load(resolved_path, map_location="cpu")
+                                tensors.append(_read_source(source_key, shard.__getitem__))
+                                del shard
+                                clear_fn()
+
+                    fused_tensor = StateDictConverter.fuse_reform_param_tensors(
+                        reform_fusion_rules[fused_key],
+                        tensors,
+                    )
+                    _process_tensor(fused_key, fused_tensor, pre_normalized=True)
+                    del tensors
+                    del fused_tensor
+                    clear_fn()
+
+            if multi_file_moe_groups:
+                if torch_streaming_cache == "temp":
+                    raise RuntimeError(
+                        "Encountered MoE expert groups spanning multiple shard files while "
+                        "torch_streaming_cache='temp'. Use torch_streaming_cache='hf_cache' "
+                        "(and a local cache_dir) to avoid re-downloading shards."
+                    )
+
+                for target_path, expert_key_by_idx in sorted(multi_file_moe_groups.items()):
+                    expert_indices = sorted(expert_key_by_idx.keys())
+                    if not expert_indices:
+                        continue
+
+                    stacked_key = f"{target_path}.weight"
+                    first_key = expert_key_by_idx[expert_indices[0]]
+                    first_fname = ckpt_key_to_filename[first_key]
+                    with _with_resolved_shard(first_fname) as first_path:
+                        if ckpt_weight_format == "safetensors":
+                            with safe_open(first_path, framework="pt", device="cpu") as f:
+                                first_tensor = _read_source(first_key, f.get_tensor)
+                        else:
+                            shard = None
+                            try:
+                                shard = torch.load(first_path, map_location="cpu", weights_only=True)
+                            except TypeError:
+                                shard = torch.load(first_path, map_location="cpu")
+                            first_tensor = _read_source(first_key, shard.__getitem__)
+                            del shard
+                            clear_fn()
+
+                    stacked_shape = (len(expert_indices), *first_tensor.shape)
+                    stacked_tensor = torch.empty(
+                        stacked_shape,
+                        dtype=first_tensor.dtype,
+                        device=first_tensor.device,
+                    )
+
+                    pos_by_expert = {expert_idx: pos for pos, expert_idx in enumerate(expert_indices)}
+                    per_file: dict[str, list[tuple[int, str]]] = {}
+                    for expert_idx, key in expert_key_by_idx.items():
+                        fname = ckpt_key_to_filename[key]
+                        per_file.setdefault(fname, []).append((pos_by_expert[expert_idx], key))
+
+                    for fname, items in per_file.items():
+                        with _with_resolved_shard(fname) as resolved_path:
+                            if ckpt_weight_format == "safetensors":
+                                with safe_open(resolved_path, framework="pt", device="cpu") as f:
+                                    for pos, key in items:
+                                        stacked_tensor[pos] = _read_source(key, f.get_tensor)
+                            else:
+                                shard = None
+                                try:
+                                    shard = torch.load(resolved_path, map_location="cpu", weights_only=True)
+                                except TypeError:
+                                    shard = torch.load(resolved_path, map_location="cpu")
+                                for pos, key in items:
+                                    stacked_tensor[pos] = _read_source(key, shard.__getitem__)
+                                del shard
+                                clear_fn()
+
+                    _emit_stacked(stacked_key, stacked_tensor)
+                    del stacked_tensor
+                    clear_fn()
+
+        if device is not None:
+            with jax.default_device(device):
+                _run_streaming_conversion()
+        else:
+            _run_streaming_conversion()
+        if pending_stacked:
+            raise ValueError(f"Stacked expert tensors never completed their fusion group: {sorted(pending_stacked)}")
+
+        return parameters_flat
+
+    @classmethod
+    def _maybe_restore_mtp_tensors_to_full_state_dict(
+        cls,
+        *,
+        state_dict: dict[str, tp.Any] | None,
+        model: tp.Any,
+        pretrained_model_name_or_path: str,
+        config_class: type,
+        hub_kwargs: dict[str, tp.Any],
+        kwargs: dict[str, tp.Any],
+        clear_fn: tp.Callable[[], None],
+    ) -> None:
+        """Restore top-level ``mtp.*`` tensors lost by HF full-model loading.
+
+        Some Qwen3.5 checkpoints store MTP-head weights as top-level
+        ``mtp.*`` tensors while the corresponding Transformers model may mark
+        those keys as unexpected and omit them from ``hf_model.state_dict()``.
+        EasyDeL still materializes ``self.mtp`` for configs with an MTP head,
+        so re-read only those raw checkpoint tensors before conversion.
+        """
+        if state_dict is None:
+            return
+        if any(key.startswith("mtp.") for key in state_dict):
+            return
+
+        has_mtp = False
+        try:
+            model_has_mtp = getattr(model, "has_mtp", None)
+            has_mtp = bool(model_has_mtp()) if callable(model_has_mtp) else getattr(model, "mtp", None) is not None
+        except Exception:
+            has_mtp = getattr(model, "mtp", None) is not None
+        if not has_mtp:
+            return
+
+        try:
+            ckpt_info = cls._resolve_streaming_checkpoint(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                config_class=config_class,
+                hub_kwargs=hub_kwargs,
+                kwargs=kwargs,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Model has an MTP head, but raw checkpoint shards could not be resolved to restore mtp.* tensors: %s",
+                exc,
+            )
+            return
+
+        try:
+            import torch
+            from safetensors.torch import safe_open
+        except ModuleNotFoundError:
+            return
+
+        ckpt_key_to_filename = ckpt_info.ckpt_key_to_filename
+        ckpt_filename_to_path = ckpt_info.ckpt_filename_to_path
+
+        if not ckpt_key_to_filename:
+            filename = next(iter(ckpt_filename_to_path.keys()))
+            resolved_path = ckpt_filename_to_path[filename]
+            if ckpt_info.ckpt_weight_format == "safetensors":
+                with safe_open(resolved_path, framework="pt", device="cpu") as f:
+                    for key in f.keys():
+                        ckpt_key_to_filename[key] = filename
+            else:
+                try:
+                    shard = torch.load(resolved_path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    shard = torch.load(resolved_path, map_location="cpu")
+                for key in shard.keys():
+                    ckpt_key_to_filename[key] = filename
+                del shard
+                clear_fn()
+
+        mtp_keys = sorted(key for key in ckpt_key_to_filename if key.startswith("mtp."))
+        if not mtp_keys:
+            return
+
+        restored = 0
+        keys_by_file: dict[str, list[str]] = {}
+        for key in mtp_keys:
+            keys_by_file.setdefault(ckpt_key_to_filename[key], []).append(key)
+
+        for filename, keys in keys_by_file.items():
+            resolved_path = ckpt_filename_to_path.get(filename)
+            if resolved_path is None or not os.path.isfile(resolved_path):
+                resolved_path = ckpt_info.resolve_shard(filename, None)
+                ckpt_filename_to_path[filename] = resolved_path
+
+            if ckpt_info.ckpt_weight_format == "safetensors":
+                with safe_open(resolved_path, framework="pt", device="cpu") as f:
+                    for key in keys:
+                        state_dict[key] = f.get_tensor(key)
+                        restored += 1
+            else:
+                try:
+                    shard = torch.load(resolved_path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    shard = torch.load(resolved_path, map_location="cpu")
+                for key in keys:
+                    state_dict[key] = shard[key]
+                    restored += 1
+                del shard
+                clear_fn()
+
+        if restored:
+            logger.info("Restored %d top-level MTP tensor(s) from raw checkpoint shards.", restored)
+
+    @classmethod
+    def _load_full_torch_checkpoint(
+        cls,
+        pretrained_model_name_or_path: str,
+        config_class: type,
+        hub_kwargs: dict[str, tp.Any],
+        torch_loader: tp.Any,
+        clear_fn: tp.Callable[[], None],
+        kwargs: dict[str, tp.Any],
+        param_dtype: jnp.dtype | None = None,
+        fp32_param_patterns: tuple[str, ...] = (),
+    ) -> tuple[tp.Any, tp.Any, dict[str, tp.Any]]:
+        """Load full PyTorch checkpoint into memory (for torch_load_mode='full').
+
+        Args:
+            pretrained_model_name_or_path (str): The HuggingFace Hub model ID or local path.
+            config_class (type): The EasyDeL config class to use for loading configuration.
+            hub_kwargs (dict[str, Any]): Keyword arguments for HuggingFace Hub operations
+                (cache_dir, revision, token, etc.).
+            torch_loader (Any): The HuggingFace AutoModel class for loading the PyTorch model.
+            clear_fn (Callable[[], None]): Function to call for memory cleanup after loading.
+            kwargs (dict[str, Any]): Additional keyword arguments for model loading
+                (e.g., torch_dtype).
+            param_dtype (jnp.dtype | None): Target parameter dtype. Without an explicit
+                ``torch_dtype`` the torch model loads in this dtype (or the checkpoint's own
+                dtype when torch has no match), so weights are rounded once, to the target.
+            fp32_param_patterns: The model's fp32-pinned segment patterns. Matching keys load
+                in float32 while the rest load in ``param_dtype``.
+
+        Returns:
+            tuple[Any, Any, dict[str, Any]]: A tuple of (ed_config, generation_config, state_dict)
+                where ed_config is the EasyDeL configuration, generation_config is the
+                generation configuration (if available), and state_dict contains the model weights.
+        """
+        import torch
+
+        logger.debug(f"Downloading hf_model weights from {pretrained_model_name_or_path}")
+        pin_supported = hasattr(_torch_pretrained_model_class(), "_get_dtype_plan")
+        if fp32_param_patterns and not pin_supported:
+            # No per-key dtype hook: load everything in fp32 so pinned leaves reach the converter un-rounded.
+            param_dtype = jnp.float32
+        if "torch_dtype" not in kwargs:
+            target = jnp.dtype(param_dtype).name if param_dtype is not None else None
+            kwargs["torch_dtype"] = getattr(torch, target, "auto") if target else "auto"
+        torch_dtype = kwargs.pop("torch_dtype")
+        pinned = fp32_param_patterns if pin_supported else ()
+        try:
+            with _torch_fp32_pinned_load(pinned):
+                hf_model = torch_loader.from_pretrained(
+                    pretrained_model_name_or_path,
+                    dtype=torch_dtype,
+                    **kwargs,
+                )
+        except ValueError as err:
+            # Remote-code repos register only the Auto classes in their
+            # ``auto_map`` (Kimi-VL maps AutoModelForCausalLM, not
+            # AutoModelForImageTextToText); load through one of those instead.
+            if "Unrecognized configuration class" not in str(err):
+                raise
+            fallback = cls._auto_map_torch_loader(pretrained_model_name_or_path, hub_kwargs, kwargs)
+            if fallback is None:
+                raise
+            with _torch_fp32_pinned_load(pinned):
+                hf_model = fallback.from_pretrained(
+                    pretrained_model_name_or_path,
+                    dtype=torch_dtype,
+                    **kwargs,
+                )
+        generation_config = getattr(hf_model, "generation_config", None)
+        ed_config = config_class.from_pretrained(pretrained_model_name_or_path, **hub_kwargs)
+        state_dict = hf_model.state_dict()
+
+        del hf_model
+        clear_fn()
+        return ed_config, generation_config, state_dict
+
+    @staticmethod
+    def _auto_map_torch_loader(
+        pretrained_model_name_or_path: str,
+        hub_kwargs: dict[str, tp.Any],
+        kwargs: dict[str, tp.Any],
+    ) -> tp.Any | None:
+        """Pick a transformers Auto class able to build this checkpoint's config.
+
+        Remote-code repos register only the classes in their ``auto_map``
+        (Kimi-VL: ``AutoModelForCausalLM``), and transformers itself files some
+        built-in models under another Auto mapping (5.13 lists
+        ``Mistral4ForCausalLM`` only for image-text-to-text).
+        """
+        import transformers
+        from transformers import AutoConfig
+
+        hf_config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path,
+            trust_remote_code=kwargs.get("trust_remote_code", False),
+            **hub_kwargs,
+        )
+        auto_map = getattr(hf_config, "auto_map", None) or {}
+        for name in (
+            "AutoModelForImageTextToText",
+            "AutoModelForVision2Seq",
+            "AutoModelForCausalLM",
+            "AutoModelForSeq2SeqLM",
+        ):
+            auto_class = getattr(transformers, name, None)
+            if auto_class is None:
+                continue
+            if name in auto_map:
+                return auto_class
+            try:
+                if type(hf_config) in auto_class._model_mapping:
+                    return auto_class
+            except Exception:  # lazy mapping could not resolve this config type
+                continue
+        return None
+
+    @classmethod
+    def huggingface_to_easydel_sequential(
+        cls,
+        pretrained_model_name_or_path: str,
+        save_directory: str | os.PathLike,
+        *,
+        output_repo_id: str | None = None,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.Precision | None = None,
+        sharding_axis_dims: collections.abc.Sequence[int] = (1, 1, -1, 1, 1, 1),
+        sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = None,
+        sharding_axis_names: collections.abc.Sequence[str] = ("pp", "dp", "fsdp", "ep", "tp", "sp"),
+        partition_axis: PartitionAxis | None = None,
+        backend: EasyDeLBackends | None = None,
+        platform: EasyDeLPlatforms | None = None,
+        config_kwargs: EasyDeLBaseConfigDict | None = None,
+        trust_remote_code: bool = False,
+        torch_streaming_cache: str = "temp",
+        torch_streaming_tmp_dir: str | None = None,
+        tensorstore_chunk_bytes: int = 2_147_483_648,
+        resume: bool = False,
+        verbose: bool = True,
+        **kwargs,
+    ) -> str:
+        """Convert a HuggingFace PyTorch checkpoint to an EasyDeL checkpoint sequentially.
+
+        This avoids materializing the full `state_dict`/params tree in memory by:
+        - downloading one shard at a time (optionally to a temp dir),
+        - converting each tensor to the EasyDeL naming/layout,
+        - writing each tensor immediately into a TensorStore (zarr) checkpoint.
+
+        MoE expert weights are written slice-by-slice to avoid allocating stacked expert tensors.
+
+        Args:
+            pretrained_model_name_or_path (str): The HuggingFace Hub model ID or local path
+                to the PyTorch checkpoint.
+            save_directory (str | PathLike): The directory where the converted checkpoint
+                will be saved.
+            output_repo_id (str | None): If provided, it is used in the generated README.md
+                so the model card points to the final Hub repo. Defaults to None.
+            dtype (jnp.dtype): The data type for model computations. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): The data type for model parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.Precision | None): The computation precision. Defaults to None.
+            sharding_axis_dims (Sequence[int]): The dimensions for sharding axes.
+                Defaults to (1, 1, -1, 1, 1, 1).
+            sharding_dcn_axis_dims (Sequence[int] | None): The dimensions for DCN sharding axes
+                for multi-host setups. Defaults to None.
+            sharding_axis_names (Sequence[str]): The names of sharding axes.
+                Defaults to ("pp", "dp", "fsdp", "ep", "tp", "sp").
+            partition_axis (PartitionAxis | None): The partition axis configuration.
+                Defaults to None.
+            backend (EasyDeLBackends | None): The backend to use. Defaults to None.
+            platform (EasyDeLPlatforms | None): The platform to use. Defaults to None.
+            config_kwargs (EasyDeLBaseConfigDict | None): Additional configuration parameters
+                to override. Defaults to None.
+            trust_remote_code (bool): Whether to trust remote code from HuggingFace Hub.
+                Defaults to False.
+            torch_streaming_cache (str): Where to cache downloaded shards. Options are
+                "hf_cache" (uses HuggingFace cache) or "temp" (uses temporary directory).
+                Defaults to "temp".
+            torch_streaming_tmp_dir (str | None): Custom temporary directory for streaming.
+                Only used when torch_streaming_cache="temp". Defaults to None.
+            tensorstore_chunk_bytes (int): The chunk size in bytes for TensorStore arrays.
+                Defaults to 2_147_483_648 (2GB).
+            resume (bool): Reuse a partially converted checkpoint in ``save_directory``.
+                Every parameter already listed in its ``tensorstore_index.json`` is
+                left untouched and its source tensors are never read, so only the
+                missing ones are fetched and written. Large conversions take hours
+                and a stall used to mean starting over; this also repairs a
+                checkpoint that a fixed converter bug left incomplete.
+                Defaults to False.
+            verbose (bool): Whether to print verbose messages. Defaults to True.
+            **kwargs: Additional keyword arguments (e.g., cache_dir, revision, token,
+                local_files_only, force_download, subfolder, proxies).
+
+        Returns:
+            str: The path to the saved checkpoint directory.
+
+        Note:
+            A resumed run adopts whatever the previous one already wrote: its
+            index entries are carried into the new index verbatim, so the
+            rewritten index still describes the whole checkpoint, and their
+            relative paths gate every read. In particular a group already
+            stacked is never re-read expert by expert -- per-expert tensors are
+            ~97% of a MoE checkpoint's tensors and the whole cost of the
+            conversion.
+
+        Note:
+            On a pre-quantized checkpoint, ``reform_param`` fusion sources are
+            decoded BEFORE they are fused. A fusion source is claimed by the
+            fusion path and never reaches the single-tensor writer, so the
+            fusion would otherwise concatenate packed codes -- and since the
+            fused key has no scale sibling of its own, the result was dropped on
+            the floor instead of erroring, silently costing DeepSeek-V4 every
+            shared-expert ``gate_up_proj``.
+        """
+        from datetime import datetime
+
+        import tensorstore as ts
+        from huggingface_hub.errors import EntryNotFoundError
+        from jax.experimental.array_serialization import serialization as jax_ser
+        from jax.experimental.array_serialization import tensorstore_impl as ts_impl
+        from transformers import AutoConfig
+
+        from easydel.modules.auto.auto_configuration import get_modules_by_type
+        from easydel.utils.parameters_transformation import (
+            HFCheckpointKeyMapper,
+            StateDictConverter,
+            TensorConverter,
+        )
+
+        if jax.process_count() > 1 and jax.process_index() != 0:
+            logger.info("Skipping sequential conversion on non-zero process index.")
+            return str(save_directory)
+
+        torch_streaming_cache = str(torch_streaming_cache).lower().strip()
+        if torch_streaming_cache not in {"hf_cache", "temp"}:
+            warnings.warn(
+                f"Unknown torch_streaming_cache={torch_streaming_cache!r}; falling back to 'temp'. "
+                "Expected: 'hf_cache'|'temp'.",
+                stacklevel=1,
+            )
+            torch_streaming_cache = "temp"
+
+        cpu_device = None
+        try:
+            cpu_device = jax.devices("cpu")[0]
+        except Exception:
+            cpu_device = None
+        import contextlib
+
+        convert_ctx = jax.default_device(cpu_device) if cpu_device is not None else contextlib.nullcontext()
+
+        save_root = ePath(save_directory)
+        save_root.mkdir(parents=True, exist_ok=True)
+
+        hub_kwargs = _extract_hub_kwargs(kwargs)
+
+        gcs_source = str(pretrained_model_name_or_path).startswith("gs://")
+        gcs_meta_tmp: tempfile.TemporaryDirectory[str] | None = None
+        config_source = pretrained_model_name_or_path
+
+        def _gcs_object_uri(filename: str) -> str:
+            effective_subfolder = str(kwargs.get("subfolder", "") or "").strip("/").replace("\\", "/")
+            if effective_subfolder and filename.startswith(effective_subfolder + "/"):
+                filename = filename[len(effective_subfolder) + 1 :]
+            base = str(pretrained_model_name_or_path).rstrip("/")
+            if effective_subfolder:
+                base = f"{base}/{effective_subfolder}"
+            return f"{base}/{filename}"
+
+        def _copy_gcs_file(filename: str, dest_dir: str) -> str:
+            """Stage one remote object locally, streaming in chunks.
+
+            Uses ``ePath`` rather than shelling out to ``gsutil``: the repo's
+            GCS I/O goes through ``ePath`` everywhere else, and ``gsutil``
+            aborts on multi-GB objects when its compiled ``crcmod`` is missing
+            ("check_hashes" warning) -- which is every safetensors shard here,
+            so shard streaming failed on the first file.
+
+            ``ePath`` exposes whole-object reads only, so the shard lands in
+            memory once before being written; the streaming loader keeps just
+            one shard resident at a time, which is the point of staging it.
+            """
+            os.makedirs(dest_dir, exist_ok=True)
+            local_path = os.path.join(dest_dir, os.path.basename(filename))
+            uri = _gcs_object_uri(filename)
+            # Fast path: `gcloud storage cp` does a parallel/chunked transfer
+            # and measured 877 MB/s against ePath's single-stream 115 MB/s on
+            # a 3.5 GB shard (7.6x) -- ~22 minutes over a 48-shard model. It is
+            # the modern replacement for `gsutil`, which is what used to be
+            # here and which aborts on multi-GB objects when its compiled
+            # crcmod is missing. ePath stays the fallback so nothing depends on
+            # a CLI being installed.
+            if shutil.which("gcloud") is not None:
+                result = subprocess.run(
+                    ["gcloud", "storage", "cp", uri, local_path],
+                    capture_output=True,
+                    check=False,
+                )
+                if result.returncode == 0 and os.path.exists(local_path):
+                    return local_path
+            try:
+                payload = ePath(uri).read_bytes()
+            except Exception as exc:
+                # Callers probe a list of candidate filenames and expect a
+                # miss to be catchable; surface one portable error rather than
+                # the storage backend's own (gsutil raised CalledProcessError,
+                # ePath raises google.api_core NotFound).
+                raise FileNotFoundError(uri) from exc
+            with open(local_path, "wb") as dst:
+                dst.write(payload)
+            del payload
+            return local_path
+
+        if gcs_source:
+            gcs_meta_tmp = tempfile.TemporaryDirectory()
+            _copy_gcs_file(CONFIG_NAME, gcs_meta_tmp.name)
+            try:
+                _copy_gcs_file(GENERATION_CONFIG_NAME, gcs_meta_tmp.name)
+            except FileNotFoundError:
+                pass
+            config_source = gcs_meta_tmp.name
+
+        hf_config = AutoConfig.from_pretrained(
+            config_source,
+            trust_remote_code=trust_remote_code,
+            **hub_kwargs,
+        )
+        model_type: str = hf_config.model_type
+        ed_config_cls, module = get_modules_by_type(model_type, task_type=cls._model_task)
+
+        generation_config = _load_generation_config(
+            config_source,
+            trust_remote_code=trust_remote_code,
+            **hub_kwargs,
+        )
+
+        ed_config: EasyDeLBaseConfig = ed_config_cls.from_pretrained(
+            config_source,
+            trust_remote_code=trust_remote_code,
+            **hub_kwargs,
+        )
+        if hasattr(ed_config, "attach_custom_arguments"):
+            ed_config.attach_custom_arguments()
+        config_kwargs = {} if config_kwargs is None else config_kwargs
+        if partition_axis is None:
+            partition_axis = PartitionAxis()
+        add_config_overrides: dict[str, tp.Any] = {}
+        if isinstance(getattr(ed_config, "gradient_checkpointing", None), bool):
+            from easydel.infra.etils import EasyDeLGradientCheckPointers
+
+            add_config_overrides["gradient_checkpointing"] = (
+                EasyDeLGradientCheckPointers.CHECKPOINT_DOTS
+                if bool(ed_config.gradient_checkpointing)
+                else EasyDeLGradientCheckPointers.NONE
+            )
+        ed_config.add_basic_configurations(
+            sharding_axis_dims=sharding_axis_dims,
+            sharding_dcn_axis_dims=sharding_dcn_axis_dims,
+            sharding_axis_names=sharding_axis_names,
+            partition_axis=partition_axis,
+            backend=backend,
+            platform=platform,
+            **add_config_overrides,
+            **config_kwargs,
+        )
+
+        model = module.lazy_init(
+            config=ed_config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=spx.Rngs(0),
+        )
+
+        parameters_shape = getattr(model, "graphtree_parameters_shape", None)
+        if parameters_shape is None:
+            parameters_shape = model.parameters_shape
+        if not isinstance(parameters_shape, dict) and hasattr(parameters_shape, "flatten"):
+            parameters_shape = parameters_shape.flatten()
+        required_params = set(flatten_dict(parameters_shape))
+        normalized_required_params: set[tuple] = set()
+        for key_tuple in required_params:
+            if len(key_tuple) == 1 and isinstance(key_tuple[0], str):
+                key = key_tuple[0]
+                if key.startswith("parameters/"):
+                    key = key[len("parameters/") :]
+                normalized_required_params.add(tuple(int(n) if n.isdigit() else n for n in key.split(".")))
+            else:
+                normalized_required_params.add(key_tuple)
+        required_params = normalized_required_params
+        # spec_map: dict[tuple, PartitionSpec] = {}
+        # if partition_rules is not None:
+        #     try:
+        #         specs_tree = match_partition_rules(partition_rules, model.graphtree_parameters_shape)
+        #         spec_map = flatten_dict(specs_tree)
+        #     except Exception:
+        #         spec_map = {}
+
+        transformer = model.pure_transform_fn
+        (
+            embedding_layer_names,
+            layernorm_names,
+            moe_block_names,
+            moe_names,
+            moe_block_path,
+            moe_path,
+            reform_param,
+            hf_flattened_wrappers,
+            _ckpt_key_normalizer,
+        ) = _checkpoint_transformer_options(transformer)
+
+        def _resolve_merge(k: str, nk: str):
+            """Place a per-expert key in transformers' merged expert layout (see ``resolve_expert_merge``)."""
+            return _expert_merge_for_key(
+                k,
+                nk,
+                hf_key_mapper=hf_key_mapper,
+                hf_model_type=hf_model_type,
+                key_normalizer=_ckpt_key_normalizer,
+            )
+
+        def _normalize_key(k: str) -> str | None:
+            """Map a checkpoint key to EasyDeL naming (re-insert flattened wrappers).
+
+            Args:
+                k: Raw checkpoint state-dict key (old or new HF layout).
+
+            Returns:
+                str: The key with any transformers >= 5.13 flattened wrapper
+                prefix re-inserted; unchanged when already in EasyDeL layout.
+            """
+            return _normalize_checkpoint_key(
+                k,
+                key_normalizer=_ckpt_key_normalizer,
+                hf_key_mapper=hf_key_mapper,
+                hf_model_type=hf_model_type,
+                hf_flattened_wrappers=hf_flattened_wrappers,
+            )
+
+        uses_tie_word_embedding = getattr(hf_config, "tie_word_embeddings", False)
+
+        moe_names_set = set(moe_names or [])
+        expected_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
+        expert_prefix = f".{expected_expert_name}."
+        hf_model_type = transformer.keywords.get("hf_model_type") or getattr(hf_config, "model_type", None)
+        # transformers' own key mapping for this model (scoped renames + merges),
+        # unless the model normalizes its checkpoint keys itself.
+        hf_key_mapper = (
+            HFCheckpointKeyMapper.for_config(hf_config, trust_remote_code=bool(getattr(hf_config, "auto_map", None)))
+            if _ckpt_key_normalizer is None
+            else None
+        )
+
+        consolidated_moe_keys: set[str] = set()
+        moe_groups: dict[str, dict[int, str]] = {}
+        expert_key_to_group: dict[str, tuple[str, int]] = {}
+
+        def _register_moe_key(k: str):
+            """Record the shared expert matcher result for incremental disk writes."""
+            match = _match_moe_checkpoint_key(
+                k,
+                normalize_key=_normalize_key,
+                resolve_merge=_resolve_merge,
+                moe_block_path=moe_block_path,
+                moe_names=moe_names_set,
+                moe_path=moe_path,
+            )
+            if match is not None:
+                target_path, expert_idx, _ = match
+                moe_groups.setdefault(target_path, {})[expert_idx] = k
+                expert_key_to_group[k] = (target_path, expert_idx)
+
+        ckpt_weight_format: tp.Literal["safetensors", "bin"] | None = None
+        ckpt_key_to_filename: dict[str, str] = {}
+
+        revision = kwargs.get("revision", None)
+        token = kwargs.get("token", None)
+        local_files_only = bool(kwargs.get("local_files_only", False))
+        force_download = bool(kwargs.get("force_download", False))
+        proxies = kwargs.get("proxies", None)
+        subfolder = str(kwargs.get("subfolder", "") or "")
+        cache_dir = kwargs.get("cache_dir", None)
+
+        def _hf_download(filename: str, *, cache_dir_override: str | None = None) -> str:
+            """Download a file from the HF Hub, honoring the configured subfolder.
+
+            Args:
+                filename: Repo-relative filename.
+                cache_dir_override: Optional cache override (otherwise
+                    ``cache_dir`` from the enclosing scope is used).
+
+            Returns:
+                str: Local path to the downloaded file.
+            """
+            return _hf_download_file(
+                pretrained_model_name_or_path,
+                filename,
+                subfolder=subfolder,
+                revision=revision,
+                cache_dir=cache_dir_override if cache_dir_override is not None else cache_dir,
+                force_download=force_download,
+                proxies=proxies,
+                token=token,
+                local_files_only=local_files_only,
+            )
+
+        def _find_local(filename: str) -> str | None:
+            """Locate *filename* under a local pretrained-model directory (``None`` when absent or remote)."""
+            return _find_local_file(pretrained_model_name_or_path, filename, subfolder, disabled=gcs_source)
+
+        _load_index = _load_json_index
+
+        resolved_index_file: str | None = None
+        resolved_single_file: str | None = None
+
+        if gcs_source:
+            if gcs_meta_tmp is None:
+                raise RuntimeError("GCS metadata temporary directory was not initialized.")
+            try:
+                resolved_index_file = _copy_gcs_file(SAFE_WEIGHTS_INDEX_NAME, gcs_meta_tmp.name)
+                ckpt_weight_format = "safetensors"
+            except FileNotFoundError:
+                resolved_index_file = None
+
+            if resolved_index_file is None:
+                try:
+                    resolved_index_file = _copy_gcs_file(WEIGHTS_INDEX_NAME, gcs_meta_tmp.name)
+                    ckpt_weight_format = "bin"
+                except FileNotFoundError:
+                    resolved_index_file = None
+
+            if resolved_index_file is None:
+                try:
+                    resolved_single_file = _copy_gcs_file(SAFE_WEIGHTS_NAME, gcs_meta_tmp.name)
+                    ckpt_weight_format = "safetensors"
+                except FileNotFoundError:
+                    resolved_single_file = None
+
+            if resolved_index_file is None and resolved_single_file is None:
+                try:
+                    resolved_single_file = _copy_gcs_file(WEIGHTS_NAME, gcs_meta_tmp.name)
+                    ckpt_weight_format = "bin"
+                except FileNotFoundError:
+                    resolved_single_file = None
+        elif os.path.isdir(pretrained_model_name_or_path):
+            resolved_index_file = _find_local(SAFE_WEIGHTS_INDEX_NAME)
+            if resolved_index_file is not None:
+                ckpt_weight_format = "safetensors"
+            else:
+                resolved_index_file = _find_local(WEIGHTS_INDEX_NAME)
+                if resolved_index_file is not None:
+                    ckpt_weight_format = "bin"
+
+            if resolved_index_file is None:
+                resolved_single_file = _find_local(SAFE_WEIGHTS_NAME)
+                if resolved_single_file is not None:
+                    ckpt_weight_format = "safetensors"
+                else:
+                    resolved_single_file = _find_local(WEIGHTS_NAME)
+                    if resolved_single_file is not None:
+                        ckpt_weight_format = "bin"
+        else:
+            try:
+                resolved_index_file = _hf_download(SAFE_WEIGHTS_INDEX_NAME)
+                ckpt_weight_format = "safetensors"
+            except (FileNotFoundError, EntryNotFoundError):
+                resolved_index_file = None
+
+            if resolved_index_file is None:
+                try:
+                    resolved_index_file = _hf_download(WEIGHTS_INDEX_NAME)
+                    ckpt_weight_format = "bin"
+                except (FileNotFoundError, EntryNotFoundError):
+                    resolved_index_file = None
+
+            if resolved_index_file is None:
+                try:
+                    resolved_single_file = _hf_download(SAFE_WEIGHTS_NAME)
+                    ckpt_weight_format = "safetensors"
+                except (FileNotFoundError, EntryNotFoundError):
+                    resolved_single_file = None
+
+            if resolved_index_file is None and resolved_single_file is None:
+                try:
+                    resolved_single_file = _hf_download(WEIGHTS_NAME)
+                    ckpt_weight_format = "bin"
+                except (FileNotFoundError, EntryNotFoundError):
+                    resolved_single_file = None
+
+        if ckpt_weight_format is None or (resolved_index_file is None and resolved_single_file is None):
+            raise FileNotFoundError(
+                "Couldn't locate a PyTorch checkpoint to convert. Expected one of: "
+                f"{SAFE_WEIGHTS_INDEX_NAME}, {SAFE_WEIGHTS_NAME}, {WEIGHTS_INDEX_NAME}, {WEIGHTS_NAME}"
+            )
+
+        ckpt_filename_to_path: dict[str, str] = {}
+        if resolved_index_file is not None:
+            index_data = _load_index(resolved_index_file)
+            weight_map = index_data.get("weight_map") or {}
+            if not weight_map:
+                raise ValueError(f"Invalid shard index file (missing weight_map): {resolved_index_file}")
+            ckpt_key_to_filename = dict(weight_map)
+            for k in ckpt_key_to_filename:
+                _register_moe_key(k)
+            for target_path in moe_groups:
+                consolidated_moe_keys.add(f"{target_path}.weight")
+        else:
+            assert resolved_single_file is not None
+            filename = SAFE_WEIGHTS_NAME if ckpt_weight_format == "safetensors" else WEIGHTS_NAME
+            ckpt_filename_to_path[filename] = resolved_single_file
+
+        converter_config = {
+            "embedding_layer_names": set(embedding_layer_names or []),
+            "layernorm_names": set(layernorm_names or []),
+            "moe_block_names": set(moe_block_names or []),
+            "moe_names": set(moe_names or []),
+            "lm_head_name": None,
+            "uses_tie_word_embedding": uses_tie_word_embedding,
+            "dtype": model.param_dtype,
+            "consolidated_moe_keys": consolidated_moe_keys,
+            "reform_param": reform_param,
+            "fp32_param_patterns": tuple(getattr(model, "fp32_param_patterns", ()) or ()),
+        }
+
+        def _chunk_shape_for(
+            key_tuple: tuple,
+            global_shape: tuple[int, ...],
+            dtype_: jnp.dtype,
+            *,
+            moe: bool,
+        ) -> list[int]:
+            """Compute the TensorStore chunk shape for a parameter.
+
+            Args:
+                key_tuple: Path tuple identifying the parameter.
+                global_shape: Full (unsharded) tensor shape.
+                dtype_: The element dtype.
+                moe: Whether this parameter belongs to a consolidated MoE
+                    weight (in which case the leading expert axis is split
+                    one-per-chunk).
+
+            Returns:
+                list[int]: A chunk shape suitable for the zarr backend.
+            """
+            # Chunk shapes are derived from the full global shape; per-shard
+            # chunking is intentionally not applied here (TensorStore stores the
+            # global array and shards on read).
+            local_shape = global_shape
+            chunk = ts_impl._compute_chunk_shape(
+                tuple(int(max(1, d)) for d in local_shape), dtype_, tensorstore_chunk_bytes
+            )
+            if moe and chunk:
+                chunk = [1, *list(chunk[1:])]
+            return [int(max(1, d)) for d in chunk]
+
+        def _tensorstore_path_for_params(key_tuple: tuple) -> tuple[str, str]:
+            """Build absolute and relative TensorStore paths for a parameter.
+
+            Args:
+                key_tuple: Path tuple identifying the parameter.
+
+            Returns:
+                tuple: ``(absolute_path, relative_path)`` rooted at
+                ``save_root/model``.
+            """
+            rel = os.path.join("model", *[str(p) for p in key_tuple])
+            abs_path = os.path.join(str(save_root), rel)
+            return abs_path, rel
+
+        array_index: list[dict[str, tp.Any]] = []
+        pending_expert_entries: dict[str, dict[str, tp.Any]] = {}
+        resume_paths: set[str] = set()
+        if resume:
+            existing_index = save_root / TENSORSTORE_INDEX_NAME
+            if existing_index.exists():
+                try:
+                    existing_entries = json.loads(existing_index.read_text()).get("prefixes", {}).get("model", [])
+                except Exception as exc:
+                    raise ValueError(
+                        f"resume=True but {existing_index} is unreadable ({exc}); "
+                        "delete the directory to convert from scratch."
+                    ) from exc
+                for entry in existing_entries:
+                    path = entry.get("path")
+                    if path is None or path in resume_paths:
+                        continue
+                    resume_paths.add(path)
+                    array_index.append(entry)
+                if verbose:
+                    logger.info(f"Resuming: {len(resume_paths)} parameters already present, skipping their sources.")
+            elif verbose:
+                logger.info(f"resume=True but no {TENSORSTORE_INDEX_NAME} in {save_root}; converting from scratch.")
+
+        def _already_written(key_tuple: tuple) -> bool:
+            """Whether a resumed run already holds this parameter."""
+            return bool(resume_paths) and _tensorstore_path_for_params(key_tuple)[1] in resume_paths
+
+        def _write_tensor(key_tuple: tuple, value) -> None:
+            """Write a single converted parameter to a TensorStore zarr store.
+
+            Args:
+                key_tuple: Path tuple for the parameter.
+                value: The JAX array to persist.
+
+            Returns:
+                None. Side-effect: appends an entry to ``array_index``.
+            """
+            if key_tuple not in required_params:
+                return
+            abs_path, rel_path = _tensorstore_path_for_params(key_tuple)
+            if rel_path in resume_paths:
+                return
+            spec = jax_ser.get_tensorstore_spec(abs_path)
+            chunks = _chunk_shape_for(key_tuple, tuple(int(i) for i in value.shape), value.dtype, moe=False)
+            spec["metadata"] = ts_impl._get_tensorstore_metadata_cached(
+                tuple(int(i) for i in value.shape),
+                value.dtype,
+                tuple(chunks),
+                driver="zarr",
+            )
+            spec["dtype"] = jnp.dtype(value.dtype).name
+            t = ts.open(ts.Spec(spec), create=True, open=True).result()
+            t.write(value).result()
+            array_index.append(
+                {
+                    "path": rel_path,
+                    "shape": [int(i) for i in value.shape],
+                    "dtype": str(value.dtype),
+                }
+            )
+            _write_checkpoint_index()
+
+        def _write_checkpoint_index() -> None:
+            """Persist the TensorStore index and metadata files to ``save_root``.
+
+            Returns:
+                None.
+            """
+            index_path = save_root / TENSORSTORE_INDEX_NAME
+            index_data = {
+                "format": "tensorstore",
+                "version": "easydel",
+                "prefixes": {"model": array_index},
+            }
+            payload = json.dumps(index_data, indent=2)
+            if str(index_path).startswith("gs://"):
+                # Object replacement is atomic; never expose a partial JSON object.
+                index_path.write_text(payload)
+            else:
+                staged_index = save_root / f".{TENSORSTORE_INDEX_NAME}.{time.time_ns()}.tmp"
+                staged_index.write_text(payload)
+                staged_index.rename(index_path)
+            meta_path = save_root / "checkpoint_metadata.json"
+            meta_path.write_text(
+                json.dumps(
+                    {"timestamp": datetime.now().isoformat(), "custom_metadata": {"step": 0}},
+                    indent=2,
+                )
+            )
+
+        def _save_configs() -> None:
+            """Save the EasyDeL config and generation config alongside weights.
+
+            Strips runtime-only attention dtype hints and records the model
+            architecture before delegating to ``save_pretrained``.
+
+            Returns:
+                None.
+            """
+            config_to_save = deepcopy(ed_config)
+            config_to_save.__dict__.pop("attn_dtype", None)
+            config_to_save.__dict__.pop("attn_softmax_dtype", None)
+            config_to_save.architectures = [module.__name__]
+            # Fused projections are written in the conversion mesh's interleave
+            # (tp=1 on a single-device conversion = canonical order). Record it
+            # so loading under any tp re-interleaves instead of assuming the
+            # live layout — an unstamped checkpoint scrambles Q/K/V and
+            # gate/up when the load tp differs.
+            from easydel.layers.layouts import stamp_fused_tp_config, write_fused_layout_marker
+            from easydel.layers.layouts._runtime import tensor_parallel_size as _fused_tp_size
+
+            stamp_fused_tp_config(config_to_save, _fused_tp_size(ed_config))
+            write_fused_layout_marker(save_root, _fused_tp_size(ed_config))
+            if str(save_root).startswith("gs://"):
+                (save_root / CONFIG_NAME).write_text(config_to_save.to_json_string(use_diff=True))
+            else:
+                config_to_save.save_pretrained(str(save_root))
+            if generation_config is not None:
+                _save_generation_config(generation_config, save_root)
+
+        _save_configs()
+
+        @contextlib.contextmanager
+        def _with_resolved_shard(fname: str):
+            """Yield a local path for shard *fname*, downloading if needed.
+
+            Args:
+                fname: Shard filename to resolve.
+
+            Yields:
+                str: Local filesystem path to the shard.
+
+            Raises:
+                FileNotFoundError: If a local source is configured but
+                    *fname* is missing.
+                NotADirectoryError: If ``torch_streaming_tmp_dir`` resolves
+                    to a regular file.
+            """
+            if fname in ckpt_filename_to_path and os.path.isfile(ckpt_filename_to_path[fname]):
+                yield ckpt_filename_to_path[fname]
+                return
+
+            if os.path.isdir(pretrained_model_name_or_path):
+                resolved = _find_local(fname)
+                if resolved is None:
+                    raise FileNotFoundError(f"Missing shard file {fname!r} under {pretrained_model_name_or_path!r}")
+                ckpt_filename_to_path[fname] = resolved
+                yield resolved
+                return
+
+            if gcs_source:
+                if torch_streaming_tmp_dir is not None:
+                    if os.path.isfile(torch_streaming_tmp_dir):
+                        raise NotADirectoryError(
+                            f"torch_streaming_tmp_dir points to a file: {torch_streaming_tmp_dir!r}"
+                        )
+                    os.makedirs(torch_streaming_tmp_dir, exist_ok=True)
+                with tempfile.TemporaryDirectory(dir=torch_streaming_tmp_dir) as tmpdir:
+                    yield _copy_gcs_file(fname, tmpdir)
+                return
+
+            if torch_streaming_cache == "hf_cache":
+                resolved = _hf_download(fname)
+                ckpt_filename_to_path[fname] = resolved
+                yield resolved
+                return
+
+            if torch_streaming_tmp_dir is not None:
+                if os.path.isfile(torch_streaming_tmp_dir):
+                    raise NotADirectoryError(f"torch_streaming_tmp_dir points to a file: {torch_streaming_tmp_dir!r}")
+                os.makedirs(torch_streaming_tmp_dir, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=torch_streaming_tmp_dir) as tmpdir:
+                yield _hf_download(fname, cache_dir_override=tmpdir)
+
+        def _iter_keys_single_file(filename: str, path: str):
+            """Yield every state-dict key from a single shard file.
+
+            Args:
+                filename: Logical shard filename (used by the surrounding
+                    bookkeeping; the on-disk path is *path*).
+                path: Local filesystem path to the shard.
+
+            Yields:
+                str: Each state-dict key contained in the shard.
+            """
+            import torch
+            from safetensors.torch import safe_open
+
+            if ckpt_weight_format == "safetensors":
+                with safe_open(path, framework="pt", device="cpu") as f:
+                    for k in f.keys():
+                        yield k
+            else:
+                shard = None
+                try:
+                    shard = torch.load(path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    shard = torch.load(path, map_location="cpu")
+                for k in shard.keys():
+                    yield k
+                del shard
+
+        if not ckpt_key_to_filename:
+            filename = next(iter(ckpt_filename_to_path.keys()))
+            resolved_path = ckpt_filename_to_path[filename]
+            for k in _iter_keys_single_file(filename, resolved_path):
+                ckpt_key_to_filename[k] = filename
+                _register_moe_key(k)
+            for target_path in moe_groups:
+                consolidated_moe_keys.add(f"{target_path}.weight")
+            converter_config["consolidated_moe_keys"] = consolidated_moe_keys
+
+        file_to_keys: dict[str, list[str]] = {}
+        for k, fname in ckpt_key_to_filename.items():
+            file_to_keys.setdefault(fname, []).append(k)
+
+        # Pre-quantized checkpoints ship a scale tensor beside every quantized
+        # weight. Without this the streaming loop casts the packed codes as if
+        # they were ordinary numbers -- DeepSeek-V4's fp4 experts came out as
+        # bf16 with half their true input width, silently. Resolve the adapter
+        # once here; `_decode_quantized` below pairs each weight with its scale
+        # and hands both to the adapter's codec.
+        quant_decode = _build_quant_decoder(hf_config, ckpt_key_to_filename)
+        # Set per shard below; the decoder needs the sibling scale tensor,
+        # which always lives in the same shard as its weight.
+        _shard_getter: dict[str, tp.Any] = {"fn": None}
+
+        normalized_to_original = {nk: k for k in ckpt_key_to_filename if (nk := _normalize_key(k)) is not None}
+        fusion_groups, fusion_rules_by_target = StateDictConverter.collect_reform_param_fusion_groups(
+            normalized_to_original.keys(),
+            reform_param,
+        )
+        fusion_source_to_targets: dict[str, list[str]] = {}
+        for fused_key, source_keys in fusion_groups.items():
+            key_tuple = tuple(int(n) if n.isdigit() else n for n in fused_key.split("."))
+            if key_tuple not in required_params:
+                continue
+            for source_key in source_keys:
+                fusion_source_to_targets.setdefault(normalized_to_original.get(source_key, source_key), []).append(
+                    fused_key
+                )
+        fusion_pending: dict[str, dict[str, tp.Any]] = {fused_key: {} for fused_key in fusion_groups}
+        fusion_counts: dict[str, int] = {}
+
+        moe_expected: dict[str, int] = {tp: len(expert_key_by_idx) for tp, expert_key_by_idx in moe_groups.items()}
+        moe_remaining: dict[str, int] = dict(moe_expected)
+
+        def _moe_target_key_tuple(target_path: str) -> tuple:
+            """The stacked parameter a MoE group consolidates into."""
+            return tuple(int(n) if n.isdigit() else n for n in f"{target_path}.weight".split("."))
+
+        resumed_moe_targets = {t for t in moe_remaining if _already_written(_moe_target_key_tuple(t))}
+        for target in resumed_moe_targets:
+            moe_remaining.pop(target, None)
+        moe_handles: dict[str, dict[str, tp.Any]] = {}
+
+        def _open_stacked_expert_store(key_tuple: tuple, global_shape: tuple[int, ...]):
+            """Create the zarr store for one ``[experts, ...]`` parameter and index it.
+
+            Returns:
+                tuple: ``(abs_path, rel_path, tensorstore_array)``.
+            """
+            abs_path, rel_path = _tensorstore_path_for_params(key_tuple)
+            chunks = _chunk_shape_for(key_tuple, global_shape, model.param_dtype, moe=True)
+            ts_spec = jax_ser.get_tensorstore_spec(abs_path)
+            ts_spec["metadata"] = ts_impl._get_tensorstore_metadata_cached(
+                global_shape,
+                model.param_dtype,
+                tuple(chunks),
+                driver="zarr",
+            )
+            ts_spec["dtype"] = jnp.dtype(model.param_dtype).name
+            ts_arr = ts.open(ts.Spec(ts_spec), create=True, open=True).result()
+            # Allocation is not completion: an interrupted expert group must
+            # never be advertised as resumable by another completed dense write.
+            pending_expert_entries[rel_path] = {
+                "path": rel_path,
+                "shape": [int(d) for d in global_shape],
+                "dtype": str(jnp.dtype(model.param_dtype)),
+            }
+            return abs_path, rel_path, ts_arr
+
+        def _ensure_moe_group_ready(target_path: str, *, sample_expert_tensor) -> dict[str, tp.Any] | None:
+            """Lazily allocate a TensorStore handle for a consolidated MoE weight.
+
+            Uses *sample_expert_tensor* to infer ``(in_features, out_features)``
+            and stacks the experts along a new leading axis on disk.
+
+            Args:
+                target_path: Consolidated MoE target path.
+                sample_expert_tensor: One expert's weight tensor (used solely
+                    for shape/dtype inference).
+
+            Returns:
+                dict[str, Any] | None: The TensorStore handle dict, or
+                ``None`` if the target path is not part of the model's
+                required params.
+            """
+            if target_path in moe_handles:
+                return moe_handles[target_path]
+
+            stacked_key = f"{target_path}.weight"
+            out_key = stacked_key[:-7] + ".weight" if stacked_key.endswith(".weight") else stacked_key + ".weight"
+            key_tuple = tuple(int(n) if n.isdigit() else n for n in out_key.split("."))
+            if key_tuple not in required_params:
+                return None
+
+            out_features, in_features = tuple(int(i) for i in sample_expert_tensor.shape)
+            num_experts = int(moe_expected[target_path])
+            abs_path, rel_path, ts_arr = _open_stacked_expert_store(key_tuple, (num_experts, in_features, out_features))
+
+            handle = {
+                "key_tuple": key_tuple,
+                "abs_path": abs_path,
+                "rel_path": rel_path,
+                "num_experts": num_experts,
+                "in_features": in_features,
+                "out_features": out_features,
+                "pos_by_expert": {ei: pos for pos, ei in enumerate(sorted(moe_groups[target_path].keys()))},
+                "ts": ts_arr,
+            }
+            moe_handles[target_path] = handle
+            return handle
+
+        def _finalize_moe_group(target_path: str) -> None:
+            """Drop a completed MoE group's TensorStore handle to free resources.
+
+            Args:
+                target_path: Consolidated MoE target path that is fully
+                    written.
+
+            Returns:
+                None.
+            """
+            if target_path in moe_handles:
+                handle = moe_handles.pop(target_path)
+                array_index.append(pending_expert_entries.pop(handle["rel_path"]))
+                _write_checkpoint_index()
+
+        def _process_and_write(key: str, tensor, decode_quant: bool = True, pre_normalized: bool = False) -> None:
+            """Convert a non-MoE HF tensor and persist it to TensorStore.
+
+            Args:
+                key: HF state-dict key.
+                tensor: The torch tensor for that key.
+                decode_quant: Whether to run the pre-quantized decoder. Callers
+                    that already decoded (the reform_param fusion path, which
+                    must decode each source before concatenating them) pass
+                    ``False``; the fused key is synthetic and has no scale
+                    sibling of its own.
+                pre_normalized: Whether ``key`` is already in EasyDeL naming.
+                    Fusion targets are built from normalized source names, so
+                    running a vendor-layout normalizer over one asks it to
+                    translate a key no checkpoint contains. DeepSeek-V4's
+                    answers ``None`` -- "the runtime does not own this" -- and
+                    every fused shared-expert ``gate_up_proj`` was discarded on
+                    that line, silently, because ``None`` is a normal answer.
+
+            Returns:
+                None.
+            """
+            normalized = key if pre_normalized else _normalize_key(key)
+            # Unowned tensor (e.g. an optional head the runtime does not build).
+            if normalized is None:
+                return
+            if decode_quant and quant_decode is not None:
+                decoded = quant_decode(key, tensor, _fetch_quant_scale)
+                if decoded is _QUANT_CONSUMED:
+                    return
+                if decoded is not None:
+                    tensor = decoded
+            with convert_ctx:
+                results = StateDictConverter.process_tensor(normalized, tensor, converter_config)
+            if results is None:
+                return
+            for key_tuple, jax_array in results:
+                _write_tensor(key_tuple, jax_array)
+
+        # Per-expert checkpoint tensors feeding a fused expert leaf through a
+        # rule that consumes either stacked parts named by its ``sources``
+        # (DeepSeek: ``experts.gate_proj.weight`` + ``experts.up_proj.weight``)
+        # or the tensor transformers>=5 merges in memory (``experts.gate_up_proj``,
+        # resolved from transformers' conversion mapping). Each expert is fused
+        # on its own through that rule and written into its slot, so memory
+        # stays one expert deep.
+        # fused_key -> (rule, number of parts, concat dim or ``None`` for separate sources)
+        expert_part_rules: dict[str, tuple[dict[str, tp.Any], int, int | None]] = {}
+        separate_expert_parts: dict[str, tuple[str, int]] = {}  # "<base><leaf>" -> (fused_key, part)
+        merged_expert_sources: dict[str, tuple[str, dict[str, tp.Any]]] = {}  # source -> (fused_key, rule)
+        source_leaf_re = re.compile(rf"^(.*\.{re.escape(expected_expert_name)}\.)([^.]+)\.weight$")
+        for rule_key, rule in (reform_param or {}).items():
+            sources = tuple(rule.get("sources", ()))
+            if "fuser" not in rule:
+                continue
+            fused_key = rule_key[:-1] if rule_key.endswith("$") else rule_key
+            if tuple(int(n) if n.isdigit() else n for n in fused_key.split(".")) not in required_params:
+                continue
+            leaves = [source_leaf_re.match(source) for source in sources]
+            if len(sources) >= 2 and all(leaves) and len({m.group(1) for m in leaves}) == 1:
+                expert_part_rules[fused_key] = (rule, len(sources), None)
+                for part, match in enumerate(leaves):
+                    separate_expert_parts[match.group(1) + match.group(2)] = (fused_key, part)
+            elif len(sources) == 1 and expert_prefix in sources[0] and sources[0] not in normalized_to_original:
+                merged_expert_sources[sources[0]] = (fused_key, rule)
+        per_expert_re = re.compile(rf"^(.*\.{re.escape(expected_expert_name)}\.)(\d+)\.([^.]+)\.weight$")
+        expert_part_key_to_group: dict[str, tuple[str, int, int]] = {}  # key -> (fused_key, expert, part)
+        expert_part_indices: dict[str, set[int]] = {}
+        # Merged tensors a rename/split rule consumes by name (Mixtral's
+        # ``experts.<i>.w2`` -> ``mlp.experts.down_proj``): stacked per layer and
+        # written through the normal rule path, as the full loader would.
+        by_name_targets = {
+            (rule_key[:-1] if rule_key.endswith("$") else rule_key)
+            for rule_key, rule in (reform_param or {}).items()
+            if "splits" in rule and expert_prefix in rule_key
+        } - set(normalized_to_original)
+        stack_key_to_group: dict[str, tuple[str, int, int]] = {}  # key -> (merged key, expert, part)
+        stack_groups: dict[str, tuple[tp.Any, list[set[int]]]] = {}  # merged key -> (spec, experts per part)
+        if expert_part_rules or merged_expert_sources or by_name_targets:
+            for k in ckpt_key_to_filename:
+                if k in fusion_source_to_targets or k in expert_key_to_group:
+                    continue
+                nk = _normalize_key(k)
+                match = per_expert_re.match(nk) if nk is not None else None
+                if match is None:
+                    continue
+                hit = separate_expert_parts.get(match.group(1) + match.group(3))
+                if hit is None and by_name_targets:
+                    merge = _resolve_merge(k, nk)
+                    if merge is not None and merge[0] in by_name_targets:
+                        spec = merge[2]
+                        stack_groups.setdefault(merge[0], (spec, [set() for _ in spec.parts]))[1][merge[3]].add(merge[1])
+                        stack_key_to_group[k] = (merge[0], merge[1], merge[3])
+                        continue
+                if hit is None:
+                    merge = _resolve_merge(k, nk)
+                    if merge is None or merge[0] not in merged_expert_sources or len(merge[2].parts) < 2:
+                        continue
+                    fused_key, rule = merged_expert_sources[merge[0]]
+                    expert_part_rules.setdefault(fused_key, (rule, len(merge[2].parts), merge[2].concat_dim))
+                    hit = (fused_key, merge[3])
+                expert_part_key_to_group[k] = (hit[0], int(match.group(2)), hit[1])
+                expert_part_indices.setdefault(hit[0], set()).add(int(match.group(2)))
+        expert_part_remaining = {
+            fused_key: len(indices)
+            for fused_key, indices in expert_part_indices.items()
+            if not _already_written(tuple(int(n) if n.isdigit() else n for n in fused_key.split(".")))
+        }
+        expert_part_pending: dict[str, dict[int, dict[int, tp.Any]]] = {}
+        expert_part_handles: dict[str, tp.Any] = {}
+
+        stack_pending: dict[str, list[dict[int, tp.Any]]] = {}
+
+        def _process_stack_part(key: str, tensor) -> None:
+            """Collect one per-expert tensor; write the merged tensor once its layer is complete."""
+            merged_key, idx, part = stack_key_to_group[key]
+            if quant_decode is not None:
+                decoded = quant_decode(key, tensor, _fetch_quant_scale)
+                if decoded is _QUANT_CONSUMED:
+                    return
+                if decoded is not None:
+                    tensor = decoded
+            spec, expected = stack_groups[merged_key]
+            parts = stack_pending.setdefault(merged_key, [{} for _ in spec.parts])
+            parts[part][idx] = tensor
+            if any(set(got) != want for got, want in zip(parts, expected, strict=True)):
+                return
+            with convert_ctx:
+                stacked = [torch.stack([got[e] for e in sorted(got)]) for got in stack_pending.pop(merged_key)]
+                merged = stacked[0] if len(stacked) == 1 else torch.cat(stacked, dim=spec.concat_dim)
+            _process_and_write(merged_key, merged, decode_quant=False, pre_normalized=True)
+
+        def _process_expert_part(key: str, tensor) -> None:
+            """Hold one expert part until the expert is complete, then fuse and write that expert."""
+            fused_key, idx, part = expert_part_key_to_group[key]
+            if fused_key not in expert_part_remaining:
+                return
+            if quant_decode is not None:
+                decoded = quant_decode(key, tensor, _fetch_quant_scale)
+                if decoded is _QUANT_CONSUMED:
+                    return
+                if decoded is not None:
+                    tensor = decoded
+            rule, num_parts, concat_dim = expert_part_rules[fused_key]
+            slot = expert_part_pending.setdefault(fused_key, {}).setdefault(idx, {})
+            slot[part] = tensor
+            if len(slot) < num_parts:
+                return
+            parts = [slot.pop(p)[None] for p in range(num_parts)]
+            del expert_part_pending[fused_key][idx]
+            with convert_ctx:
+                inputs = parts if concat_dim is None else [torch.cat(parts, dim=concat_dim)]
+                fused = StateDictConverter.fuse_reform_param_tensors(rule, inputs)
+                expert_slice = TensorConverter.convert_pytorch_to_jnp(fused[0].contiguous(), model.param_dtype)
+            if fused_key not in expert_part_handles:
+                indices = sorted(expert_part_indices[fused_key])
+                key_tuple = tuple(int(n) if n.isdigit() else n for n in fused_key.split("."))
+                _, _, ts_arr = _open_stacked_expert_store(key_tuple, (len(indices), *expert_slice.shape))
+                expert_part_handles[fused_key] = (ts_arr, {ei: pos for pos, ei in enumerate(indices)})
+            ts_arr, pos_by_expert = expert_part_handles[fused_key]
+            ts_arr[pos_by_expert[idx]].write(expert_slice).result()
+            expert_part_remaining[fused_key] -= 1
+            if expert_part_remaining[fused_key] <= 0:
+                expert_part_handles.pop(fused_key, None)
+                key_tuple = tuple(int(n) if n.isdigit() else n for n in fused_key.split("."))
+                rel_path = _tensorstore_path_for_params(key_tuple)[1]
+                array_index.append(pending_expert_entries.pop(rel_path))
+                _write_checkpoint_index()
+                label = str(rule.get("log_label", fused_key))
+                fusion_counts[label] = fusion_counts.get(label, 0) + 1
+
+        def _process_fusion_source(key: str, tensor) -> bool:
+            """Accumulate reform_param source tensors and write fused targets.
+
+            Note:
+                Sources are decoded before they are fused. A fusion source is
+                claimed here and never reaches ``_process_and_write``, so on a
+                pre-quantized checkpoint the fusion would otherwise concatenate
+                packed codes, and the synthetic fused key has no scale sibling
+                to decode them with.
+            """
+            fused_targets = fusion_source_to_targets.get(key)
+            if not fused_targets:
+                return False
+
+            if quant_decode is not None:
+                decoded = quant_decode(key, tensor, _fetch_quant_scale)
+                if decoded is _QUANT_CONSUMED:
+                    return True
+                if decoded is not None:
+                    tensor = decoded
+
+            for fused_key in fused_targets:
+                rule = fusion_rules_by_target[fused_key]
+                pending = fusion_pending.setdefault(fused_key, {})
+                normalized_source = _normalize_key(key)
+                if normalized_source is None:
+                    continue
+                pending[normalized_source] = tensor
+                source_keys = tuple(rule["sources"])
+                if not all(source_key in pending for source_key in source_keys):
+                    continue
+
+                source_tensors = [pending.pop(source_key) for source_key in source_keys]
+                with convert_ctx:
+                    fused_tensor = StateDictConverter.fuse_reform_param_tensors(rule, source_tensors)
+                _process_and_write(fused_key, fused_tensor, decode_quant=False, pre_normalized=True)
+                label = str(rule.get("log_label", fused_key))
+                fusion_counts[label] = fusion_counts.get(label, 0) + 1
+
+                del source_tensors
+                del fused_tensor
+
+            return True
+
+        import torch
+        from safetensors.torch import safe_open
+
+        if verbose:
+            logger.info(f"Sequential conversion started: {pretrained_model_name_or_path} -> {save_root}")
+
+        def _source_is_complete(key: str) -> bool:
+            """Skip completed outputs before resolving or reading their sources."""
+            if key in fusion_source_to_targets:
+                targets = fusion_source_to_targets[key]
+            elif key in expert_part_key_to_group:
+                targets = [expert_part_key_to_group[key][0]]
+            elif key in expert_key_to_group:
+                return expert_key_to_group[key][0] in resumed_moe_targets
+            else:
+                normalized = _normalize_key(key)
+                if normalized is None:
+                    return True
+                targets = [normalized]
+            return all(
+                _already_written(tuple(int(n) if n.isdigit() else n for n in target.split("."))) for target in targets
+            )
+
+        def _fetch_quant_scale(key: str):
+            filename = ckpt_key_to_filename[key]
+            if filename == _shard_getter.get("filename"):
+                return _shard_getter["fn"](key)
+            with _with_resolved_shard(filename) as path:
+                if ckpt_weight_format == "safetensors":
+                    with safe_open(path, framework="pt", device="cpu") as handle:
+                        return handle.get_tensor(key)
+                try:
+                    scale_shard = torch.load(path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    scale_shard = torch.load(path, map_location="cpu")
+                return scale_shard[key]
+
+        for fname in sorted(file_to_keys.keys()):
+            keys = sorted(
+                k
+                for k in file_to_keys[fname]
+                if not _source_is_complete(k) and k not in getattr(quant_decode, "consumed_keys", ())
+            )
+            _shard_getter["filename"] = fname
+            if not keys:
+                continue
+
+            if verbose:
+                logger.info(f"Converting shard: {fname} ({len(keys)} tensors)")
+
+            with _with_resolved_shard(fname) as resolved_path:
+                if ckpt_weight_format == "safetensors":
+                    with safe_open(resolved_path, framework="pt", device="cpu") as f:
+                        _shard_getter["fn"] = f.get_tensor
+                        for k in keys:
+                            if k in fusion_source_to_targets:
+                                _process_fusion_source(k, f.get_tensor(k))
+                                continue
+                            if k in expert_part_key_to_group:
+                                _process_expert_part(k, f.get_tensor(k))
+                                continue
+                            if k in stack_key_to_group:
+                                _process_stack_part(k, f.get_tensor(k))
+                                continue
+
+                            if k in expert_key_to_group:
+                                target_path, expert_idx = expert_key_to_group[k]
+                                if target_path in resumed_moe_targets:
+                                    continue
+                                expert_tensor = f.get_tensor(k)
+                                # Experts bypass `_process_and_write`, so the quantized-source
+                                # decode has to happen here too -- this is where 97% of a
+                                # DeepSeek-V4 checkpoint's tensors actually flow.
+                                if quant_decode is not None:
+                                    _decoded = quant_decode(k, expert_tensor, _fetch_quant_scale)
+                                    if _decoded is _QUANT_CONSUMED:
+                                        continue
+                                    if _decoded is not None:
+                                        expert_tensor = _decoded
+                                handle = _ensure_moe_group_ready(target_path, sample_expert_tensor=expert_tensor)
+                                if handle is not None:
+                                    pos = handle["pos_by_expert"][expert_idx]
+                                    with convert_ctx:
+                                        expert_slice = TensorConverter.convert_pytorch_to_jnp(
+                                            expert_tensor.permute(1, 0),
+                                            model.param_dtype,
+                                        )
+                                    handle["ts"][pos].write(expert_slice).result()
+                                moe_remaining[target_path] -= 1
+                                if moe_remaining[target_path] <= 0:
+                                    _finalize_moe_group(target_path)
+                                del expert_tensor
+                                continue
+
+                            _shard_getter["fn"] = f.get_tensor
+                            if _normalize_key(k) is None:
+                                continue  # unowned: skip the read (engram tables are ~100 GB each)
+                            _process_and_write(k, f.get_tensor(k))
+                else:
+                    shard = None
+                    try:
+                        shard = torch.load(resolved_path, map_location="cpu", weights_only=True)
+                    except TypeError:
+                        shard = torch.load(resolved_path, map_location="cpu")
+
+                    _shard_getter["fn"] = shard.get
+                    for k in keys:
+                        if k in fusion_source_to_targets:
+                            _process_fusion_source(k, shard[k])
+                            continue
+                        if k in expert_part_key_to_group:
+                            _process_expert_part(k, shard[k])
+                            continue
+                        if k in stack_key_to_group:
+                            _process_stack_part(k, shard[k])
+                            continue
+
+                        if k in expert_key_to_group:
+                            target_path, expert_idx = expert_key_to_group[k]
+                            if target_path in resumed_moe_targets:
+                                continue
+                            expert_tensor = shard[k]
+                            # Experts bypass `_process_and_write`, so the quantized-source
+                            # decode has to happen here too -- this is where 97% of a
+                            # DeepSeek-V4 checkpoint's tensors actually flow.
+                            if quant_decode is not None:
+                                _decoded = quant_decode(k, expert_tensor, _fetch_quant_scale)
+                                if _decoded is _QUANT_CONSUMED:
+                                    continue
+                                if _decoded is not None:
+                                    expert_tensor = _decoded
+                            handle = _ensure_moe_group_ready(target_path, sample_expert_tensor=expert_tensor)
+                            if handle is not None:
+                                pos = handle["pos_by_expert"][expert_idx]
+                                with convert_ctx:
+                                    expert_slice = TensorConverter.convert_pytorch_to_jnp(
+                                        expert_tensor.permute(1, 0),
+                                        model.param_dtype,
+                                    )
+                                handle["ts"][pos].write(expert_slice).result()
+                            moe_remaining[target_path] -= 1
+                            if moe_remaining[target_path] <= 0:
+                                _finalize_moe_group(target_path)
+                            del expert_tensor
+                            continue
+                        _process_and_write(k, shard[k])
+                    del shard
+
+            gc.collect()
+
+        # At this point any remaining pending source means a declared group was split
+        # incompletely across the checkpoint index and could not be materialized.
+        incomplete_fusions = {
+            fused_key: sorted(set(rule["sources"]) - set(fusion_pending.get(fused_key, {})))
+            for fused_key, rule in fusion_rules_by_target.items()
+            if fusion_pending.get(fused_key)
+        }
+        if incomplete_fusions:
+            raise RuntimeError(
+                "Some reform_param fusion groups were incomplete after processing all shards: "
+                + ", ".join([f"{k} missing={missing}" for k, missing in sorted(incomplete_fusions.items())[:10]])
+            )
+
+        incomplete = {k: v for k, v in moe_remaining.items() if v > 0}
+        incomplete.update({fused_key: v for fused_key, v in expert_part_remaining.items() if v > 0})
+        incomplete.update({merged_key: "partial" for merged_key in stack_pending})
+        if incomplete:
+            raise RuntimeError(
+                "Some MoE expert groups were incomplete after processing all shards: "
+                + ", ".join([f"{k} missing={v}" for k, v in sorted(incomplete.items())][:10])
+            )
+        if verbose and fusion_counts:
+            for label, count in sorted(fusion_counts.items()):
+                logger.info("Fused %d reform_param %s during sequential conversion.", count, label)
+
+        _write_checkpoint_index()
+        try:
+            attn_mechanism = getattr(ed_config, "attn_mechanism", "auto")
+            if hasattr(attn_mechanism, "value"):
+                attn_mechanism = attn_mechanism.value
+
+            model_display_name = getattr(hf_config, "_name_or_path", None) or pretrained_model_name_or_path
+            readme_repo_id = output_repo_id or str(save_root)
+            model_info = ModelInfo(
+                name=str(model_display_name),
+                type=module.__name__,
+                repo_id=readme_repo_id,
+                description=f"EasyDeL checkpoint converted from {pretrained_model_name_or_path}.",
+                model_type=model_type,
+                model_task=cls._model_task or "CausalLM",
+                attn_mechanism=str(attn_mechanism),
+            )
+            ReadmeGenerator().generate_readme(model_info, output_path=str(save_root / "README.md"))
+        except Exception:
+            logger.exception("Failed to generate README for converted checkpoint at %s", save_root)
+        if verbose:
+            logger.info(f"Sequential conversion finished. Wrote {len(array_index)} tensors to {save_root}")
+
+        return str(save_root)
+
+    @classmethod
+    def get_torch_loader(cls):
+        """Gets the appropriate HuggingFace AutoModel class for loading PyTorch weights.
+
+        This method returns the correct transformers AutoModel class based on the model's
+        task type (e.g., CausalLM, Seq2Seq, AudioClassification). If the class has a
+        custom `hf_torch_auto_loader` attribute set, that will be used instead.
+
+        Returns:
+            type: The HuggingFace AutoModel class appropriate for this model's task type.
+
+        Raises:
+            ValueError: If no matching AutoModel class can be found for the model's task type.
+                In this case, set `hf_torch_auto_loader` on your class manually.
+        """
+        from ..factory import TaskType
+
+        auto_loader = getattr(cls, "hf_torch_auto_loader", None)
+        if auto_loader is not None:
+            return auto_loader
+        if cls._model_task == TaskType.CAUSAL_LM:
+            from transformers import AutoModelForCausalLM as module
+        elif cls._model_task == TaskType.AUDIO_CLASSIFICATION:
+            from transformers import AutoModelForAudioClassification as module
+        elif cls._model_task == TaskType.SEQUENCE_TO_SEQUENCE:
+            from transformers import AutoModelForSeq2SeqLM as module
+        elif cls._model_task == TaskType.SPEECH_SEQUENCE_TO_SEQUENCE:
+            from transformers import AutoModelForSpeechSeq2Seq as module
+        elif cls._model_task == TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION:
+            from transformers import AutoModelForZeroShotImageClassification as module
+        elif cls._model_task == TaskType.IMAGE_TEXT_TO_TEXT:
+            from transformers import AutoModelForImageTextToText as module
+        elif cls._model_task == TaskType.SEQUENCE_CLASSIFICATION:
+            from transformers import AutoModelForSequenceClassification as module
+        elif cls._model_task == TaskType.TOKEN_CLASSIFICATION:
+            from transformers import AutoModelForTokenClassification as module
+        elif cls._model_task == TaskType.QUESTION_ANSWERING:
+            from transformers import AutoModelForQuestionAnswering as module
+        elif cls._model_task == TaskType.EMBEDDING:
+            from transformers import AutoModelForCausalLM as module
+        elif cls._model_task == TaskType.BASE_MODULE:
+            from transformers import AutoModel as module
+        elif cls._model_task == TaskType.BASE_VISION:
+            # hf dont see anything diff between base and vision modules
+            from transformers import AutoModel as module
+        elif cls._model_task == TaskType.ANY_TO_ANY:
+            from transformers import AutoModelForTextToWaveform as module
+        else:
+            raise ValueError("couldn't find requested hf autoloader, you can set `hf_torch_auto_loader` to your class")
+        return module

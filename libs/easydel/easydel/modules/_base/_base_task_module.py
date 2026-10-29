@@ -1,0 +1,1011 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Abstract base class for all task-specific modules.
+
+This module provides the foundation for all task-specific model wrappers,
+including auto-registration, feature management, and common interfaces.
+
+The BaseTaskModule class serves as the abstract base for creating specialized
+model wrappers for different NLP and ML tasks such as:
+    - Causal Language Modeling (BaseCausalLMModule)
+    - Sequence Classification (BaseSequenceClassificationModule)
+    - Token Classification (BaseTokenClassificationModule)
+    - Question Answering (BaseQuestionAnsweringModule)
+    - Conditional Generation (BaseConditionalGenerationModule)
+    - Image Classification (BaseImageClassificationModule)
+    - Vision-Language Modeling (BaseVisionLanguageModule)
+
+Key Features:
+    - Generic typing support with ModelT and ConfigT type parameters
+    - Automatic registration with EasyDeL's factory system
+    - Modular feature system for logit capping, embedding tying, etc.
+    - Configurable task heads with gradient checkpointing support
+    - Consistent interface across all task-specific modules
+
+Example:
+    Creating a custom task module:
+
+    ```python
+    class MyModelForCausalLM(BaseTaskModule[MyModel, MyConfig]):
+        _task_type = TaskType.CAUSAL_LM
+        _model_type = "my_model"
+        _config_class = MyConfig
+
+        def __init__(self, config, dtype=jnp.bfloat16, *, rngs):
+            super().__init__(
+                config=config,
+                base_model_class=MyModel,
+                dtype=dtype,
+                rngs=rngs,
+            )
+
+        def forward(self, input_ids, **kwargs):
+            # Implementation
+            pass
+
+        def get_task_head(self):
+            return self.lm_head
+    ```
+
+See Also:
+    - easydel.infra.base_module.EasyDeLBaseModule: Parent class
+    - easydel.infra.factory: Registration and TaskType definitions
+"""
+
+from abc import ABC, abstractmethod
+from collections.abc import Callable
+from copy import deepcopy
+from numbers import Number
+from types import CodeType, FunctionType, MethodType
+from typing import Any, Generic, TypeVar, cast
+
+import jax
+import spectrax as spx
+from jax import lax
+from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array
+from spectrax import apply_logical_sharding, common_types
+
+from easydel.infra.base_config import EasyDeLBaseConfig
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
+
+from ._features import (
+    GradientCheckpointingFeature,
+    LogitCapFeature,
+    RouterAuxLossFeature,
+    SequenceLengthPoolingFeature,
+    TieEmbeddingsFeature,
+)
+from ._protocols import BaseModelProtocol
+
+# Type variables for generic base models and configs
+ModelT = TypeVar("ModelT", bound=BaseModelProtocol)
+"""Type variable for base model types that implement BaseModelProtocol."""
+
+ConfigT = TypeVar("ConfigT", bound=EasyDeLBaseConfig)
+"""Type variable for configuration types that extend EasyDeLBaseConfig."""
+
+
+class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
+    """Abstract base class for all task-specific modules.
+
+    This class provides the foundation for creating task-specific model wrappers
+    (e.g., ForCausalLM, ForSequenceClassification) with automatic registration,
+    feature management, and consistent interfaces.
+
+    The class uses Python's Generic typing system to provide type safety when
+    working with different base model and configuration types. Subclasses should
+    specify their concrete types:
+
+    ```python
+    class MyForCausalLM(BaseTaskModule[MyModel, MyConfig]):
+        ...
+    ```
+
+    Type Parameters:
+        ModelT: The base model type (must implement BaseModelProtocol).
+            This is the underlying transformer model that will be wrapped.
+        ConfigT: The configuration type (must extend EasyDeLBaseConfig).
+            This contains all hyperparameters and settings for the model.
+
+    Attributes:
+        config (ConfigT): Model configuration containing hyperparameters.
+        dtype (jnp.dtype): Data type for computations (e.g., jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for model parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+
+    Class Attributes:
+        _task_type (TaskType | None): The TaskType this module implements.
+            Set in subclasses to enable auto-registration (e.g., TaskType.CAUSAL_LM).
+        _auto_register (bool): Whether to auto-register this module with the
+            EasyDeL factory system. Defaults to True.
+        _model_type (str | None): Model type string for registration
+            (e.g., "mistral", "arctic", "llama"). Must be set for registration.
+        _config_class (type | None): The configuration class for this model.
+            Must be set for registration.
+
+    Note:
+        Subclasses must implement:
+            - forward: Forward pass through the model
+            - get_task_head: Return the task-specific head (e.g., lm_head)
+    """
+
+    # Class variables for registration (to be set by subclasses)
+    _task_type: TaskType | None = None
+    _auto_register: bool = True
+    _model_type: str | None = None
+    _config_class: type | None = None
+
+    def __init_subclass__(cls, **kwargs):
+        """Handle automatic registration when subclassed.
+
+        This method is called automatically by Python when a class inherits
+        from BaseTaskModule. It registers the module with the EasyDeL factory
+        system if auto-registration is enabled and all required class attributes
+        are set.
+
+        The registration allows models to be loaded via AutoModel classes:
+        ```python
+        model = AutoModelForCausalLM.from_pretrained("model_name")
+        ```
+
+        Args:
+            **kwargs: Additional keyword arguments passed to parent __init_subclass__.
+
+        Note:
+            Registration only occurs when all of:
+                - _auto_register is True
+                - _task_type is set
+                - _model_type is set
+                - _config_class is set
+        """
+        super().__init_subclass__(**kwargs)
+
+        if cls._auto_register and cls._task_type is not None:
+            # Only register if this is a concrete subclass with a model type
+            if cls._model_type is not None and cls._config_class is not None:
+                register_module(
+                    task_type=cls._task_type,
+                    config=cls._config_class,
+                    model_type=cls._model_type,
+                )(cls)
+
+    def __init__(
+        self,
+        config: ConfigT,
+        base_model: ModelT | None = None,
+        base_model_class: type[ModelT] | None = None,
+        base_model_name: str = "model",
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        tie_word_embeddings: bool = False,
+        logit_cap: float | None = None,
+        router_aux_loss_coef: float | None = None,
+        pooling_strategy: str = "last",
+        head_bias: bool = False,
+        head_kernel_init: Callable | None = None,
+    ):
+        """Initialize the base task module.
+
+        This constructor sets up the base model, configures features like logit
+        capping and embedding tying, and prepares the module for task-specific
+        head creation in subclasses.
+
+        Args:
+            config: Model configuration containing hyperparameters such as
+                hidden_size, vocab_size, num_layers, etc.
+            base_model: Pre-instantiated base model instance. If provided,
+                base_model_class is ignored. Useful when sharing a base model
+                across multiple task heads.
+            base_model_class: Base model class to instantiate. Required if
+                base_model is not provided. The class will be instantiated
+                with the same dtype, param_dtype, precision, and rngs.
+            base_model_name: Attribute name under which to store the base model.
+                Common values include "model", "transformer", "bert", etc.
+                Defaults to "model".
+            dtype: Data type for computations. Affects activations and
+                intermediate values. Defaults to jnp.bfloat16.
+            param_dtype: Data type for model parameters (weights). Can differ
+                from dtype for mixed-precision training. Defaults to jnp.bfloat16.
+            precision: Precision setting for JAX matrix operations. Can be
+                None (default), jax.lax.Precision.DEFAULT, HIGH, or HIGHEST.
+            rngs: spectrax random number generators for initialization and
+                dropout. Must include at least 'parameters' key.
+            tie_word_embeddings: Whether to share weights between the input
+                embedding layer and the output projection (LM head). Reduces
+                parameters and can improve performance. Defaults to False.
+            logit_cap: Maximum absolute value for output logits. If set,
+                logits are clipped to [-logit_cap, logit_cap]. Useful for
+                stabilizing training. Defaults to None (no capping).
+            router_aux_loss_coef: Coefficient for Mixture-of-Experts router
+                auxiliary loss. Encourages balanced expert utilization.
+                Defaults to None (no aux loss). Common values: 0.001-0.1.
+            pooling_strategy: Strategy for reducing sequence to single vector.
+                Options: "last" (last non-pad token), "first" (first token/CLS),
+                "mean" (average all tokens), "max" (max pooling).
+                Defaults to "last".
+            head_bias: Whether to include bias in the task-specific head
+                (e.g., lm_head, classifier). Defaults to False.
+            head_kernel_init: Custom kernel initializer for the task head.
+                If None, uses normal distribution with stddev from
+                config.initializer_range (default 0.02).
+
+        Raises:
+            ValueError: If neither base_model nor base_model_class is provided.
+
+        Example:
+            ```python
+            class MyForCausalLM(BaseTaskModule[MyModel, MyConfig]):
+                def __init__(self, config, dtype=jnp.bfloat16, *, rngs):
+                    super().__init__(
+                        config=config,
+                        base_model_class=MyModel,
+                        base_model_name="model",
+                        dtype=dtype,
+                        rngs=rngs,
+                        tie_word_embeddings=config.tie_word_embeddings,
+                        logit_cap=30.0,  # Cap logits at +/- 30
+                    )
+                    # Create task head...
+            ```
+        """
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        if base_model is None:
+            if base_model_class is None:
+                raise ValueError("Either base_model or base_model_class must be provided")
+            base_model = base_model_class(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
+
+        setattr(self, base_model_name, base_model)
+        self._base_model_name = base_model_name
+
+        self._head_bias = head_bias
+        self._head_kernel_init = head_kernel_init or jax.nn.initializers.normal(
+            stddev=getattr(config, "initializer_range", 0.02)
+        )
+
+        self._logit_cap_feature = LogitCapFeature(logit_cap) if logit_cap is not None else None
+        self._tie_embeddings_feature = TieEmbeddingsFeature(tie_word_embeddings)
+        self._router_aux_loss_feature = (
+            RouterAuxLossFeature(router_aux_loss_coef) if router_aux_loss_coef is not None else None
+        )
+        pad_token_id = getattr(config, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = -1
+        self._pooling_feature = SequenceLengthPoolingFeature(strategy=pooling_strategy, pad_token_id=pad_token_id)
+        self._gradient_checkpointing_feature = GradientCheckpointingFeature(
+            policy=getattr(config, "gradient_checkpointing", None),
+            save_names=getattr(config, "gradient_checkpointing_targets", None),
+            exclude_names=getattr(config, "gradient_checkpointing_targets", None),
+        )
+
+    def _base_model_layer_count_for_head(self) -> int:
+        """Return the decoder/text stack length used for task-head placement.
+
+        Task heads such as ``lm_head`` consume the final hidden states produced
+        by the decoder/text stack. In pipeline-parallel (PP) mode their
+        parameters should therefore be created under the final layer's stage
+        assignment. Different model families expose that stack under different
+        attribute names, so this helper probes the common containers
+        (``language_model``/``text_model``/``decoder``/``model``/
+        ``transformer``/``gpt``) and the common layer-list names
+        (``layers``/``h``/``blocks``/``block``/``layer``) without forcing
+        every wrapper to add a model-specific branch.
+
+        Returns:
+            int: The number of decoder layers found, or ``0`` when no
+            recognised stack is present (in which case callers should fall
+            back to creating the task head outside any stage context).
+        """
+        candidates = [self.base_model]
+        for owner in list(candidates):
+            for attr_name in ("language_model", "text_model", "decoder", "model", "transformer", "gpt"):
+                nested = getattr(owner, attr_name, None)
+                if nested is not None and nested not in candidates:
+                    candidates.append(nested)
+
+        for owner in candidates:
+            for layers_name in ("layers", "h", "blocks", "block", "layer"):
+                layers = getattr(owner, layers_name, None)
+                if layers is None:
+                    continue
+                try:
+                    count = len(layers)
+                except TypeError:
+                    continue
+                if count:
+                    return int(count)
+        return 0
+
+    def _create_task_head_on_last_stage(self, factory: Callable[[], Any]) -> Any:
+        """Create a task head on the decoder's final pipeline-parallel stage.
+
+        When pipeline parallelism is active, task heads (``lm_head``,
+        ``classifier``, etc.) should live on the same PP stage as the final
+        decoder layer so that the head's parameters and the hidden states it
+        consumes are already co-located. This helper probes the decoder stack
+        for its layer count, opens an :meth:`assign_layer_stage` context for
+        the last stage, and invokes ``factory`` inside it. When no decoder
+        stack is found (rare or non-PP setups), ``factory`` is invoked
+        directly without a stage context.
+
+        Args:
+            factory: Zero-arg callable that constructs and returns the task
+                head module. Typically a closure over the head class and its
+                hyperparameters.
+
+        Returns:
+            The task head module returned by ``factory``, built under the
+            final stage's mesh context when applicable.
+        """
+        stage_total = self._base_model_layer_count_for_head()
+        if stage_total:
+            with self.assign_layer_stage(stage_total - 1, total_layers=stage_total):
+                return factory()
+        return factory()
+
+    @property
+    def base_model(self) -> ModelT:
+        """Access the base model via the configured attribute name.
+
+        This property provides a consistent way to access the underlying
+        transformer model regardless of what attribute name was used
+        during initialization (e.g., "model", "transformer", "bert").
+
+        Returns:
+            ModelT: The base model instance that was either passed to
+                __init__ or instantiated from base_model_class.
+
+        Example:
+            ```python
+            # Access base model for direct operations
+            hidden_states = module.base_model(input_ids)
+
+            # Get embedding layer
+            embeddings = module.base_model.get_embedding()
+            ```
+        """
+        return getattr(self, self._base_model_name)
+
+    def apply_logit_cap(self, logits):
+        """Apply logit capping if configured.
+
+        Logit capping clips output logits to a specified range to prevent
+        extreme values that can cause numerical instability during training
+        or lead to overconfident predictions.
+
+        Args:
+            logits: Input logits tensor of any shape, typically
+                (batch_size, sequence_length, vocab_size) for language models.
+
+        Returns:
+            Logits tensor with values clipped to [-cap, cap] if logit capping
+            is enabled, otherwise returns the input unchanged.
+
+        Example:
+            ```python
+            # In forward pass
+            raw_logits = self.lm_head(hidden_states)
+            capped_logits = self.apply_logit_cap(raw_logits)
+            # capped_logits are now in range [-logit_cap, logit_cap]
+            ```
+
+        Note:
+            This method is a no-op if logit_cap was not set during initialization.
+        """
+        if self._logit_cap_feature is not None:
+            return self._logit_cap_feature.apply(logits)
+        return logits
+
+    def _snapshot_logit_cap(self, apply_cap: Callable) -> Callable:
+        """Rebind a custom cap to a parameter-free snapshot of its settings.
+
+        Scalar instance settings and attributes referenced by the callback (or
+        its helper methods) are copied. This never deep-copies the backbone to
+        detach a bound method. Keeping the original class allows inherited helpers and
+        zero-argument ``super()`` in existing overrides to keep working.
+
+        Args:
+            apply_cap: Existing custom clipping function or bound method.
+
+        Returns:
+            An independent clipping callback with no live model capture.
+
+        Raises:
+            TypeError: A custom cap depends on parameterized state rather than
+                scalar settings or parameter-free components.
+        """
+        snapshot = object.__new__(type(self))
+        memo = {id(self): snapshot}
+        captured_names = set()
+
+        def check_parameter_free(value, seen):
+            """Reject parameters before copying, without allocating arrays."""
+            if id(value) in seen:
+                return
+            seen.add(id(value))
+            if isinstance(value, (spx.Variable, jax.Array)) or (
+                hasattr(value, "shape") and hasattr(value, "dtype") and not isinstance(value, (Number, type))
+            ):
+                raise TypeError("Custom logit caps must capture only scalar settings or parameter-free components")
+            if isinstance(value, (str, bytes, Number, type)) or value is None:
+                return
+            if isinstance(value, MethodType):
+                check_parameter_free(value.__self__, seen)
+                check_parameter_free(value.__func__, seen)
+            elif isinstance(value, FunctionType):
+                for cell in value.__closure__ or ():
+                    check_parameter_free(cell.cell_contents, seen)
+                check_parameter_free(value.__defaults__, seen)
+                check_parameter_free(value.__kwdefaults__, seen)
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    check_parameter_free(key, seen)
+                    check_parameter_free(item, seen)
+            elif isinstance(value, (tuple, list, set, frozenset)):
+                for item in value:
+                    check_parameter_free(item, seen)
+            elif hasattr(value, "__dict__") and not isinstance(value, type):
+                for item in vars(value).values():
+                    check_parameter_free(item, seen)
+
+        def attribute_names(code):
+            """Include settings used inside comprehensions and nested functions."""
+            yield from code.co_names
+            for constant in code.co_consts:
+                if isinstance(constant, CodeType):
+                    yield from attribute_names(constant)
+                elif isinstance(constant, str):
+                    # getattr(self, "setting", default) does not list setting
+                    # in co_names, but it still depends on its current value.
+                    yield constant
+
+        def capture(value):
+            """Copy settings and rebind methods/closures referring to this owner."""
+            if id(value) in memo:
+                return memo[id(value)]
+            if isinstance(value, MethodType) and value.__self__ is self:
+                result = MethodType(capture(value.__func__), snapshot)
+            elif isinstance(value, FunctionType):
+                # Helpers and super() can introduce additional scalar settings.
+                for name in attribute_names(value.__code__):
+                    if name not in captured_names and hasattr(self, name):
+                        captured_names.add(name)
+                        descriptor = next((vars(base)[name] for base in type(self).__mro__ if name in vars(base)), None)
+                        if isinstance(descriptor, property):
+                            # A read-only property cannot be assigned, and its
+                            # resolved value is not its storage. Copy the getter's
+                            # dependencies and let the original descriptor run.
+                            if descriptor.fget is not None:
+                                capture(descriptor.fget)
+                        else:
+                            object.__setattr__(snapshot, name, capture(getattr(self, name)))
+                if "super" in value.__code__.co_names:
+                    for base in type(self).__mro__[1:]:
+                        inherited = vars(base).get(value.__name__)
+                        if isinstance(inherited, FunctionType) and inherited is not value:
+                            capture(inherited)
+                closure = None
+                if value.__closure__ is not None:
+                    closure = tuple(make_cell(capture(cell.cell_contents)) for cell in value.__closure__)
+                result = FunctionType(
+                    value.__code__, value.__globals__, value.__name__, capture(value.__defaults__), closure
+                )
+                result.__kwdefaults__ = capture(value.__kwdefaults__)
+            else:
+                check_parameter_free(value, set())
+                result = deepcopy(value, memo)
+            memo[id(value)] = result
+            return result
+
+        def make_cell(value):
+            """Create a replacement closure cell without retaining its old owner."""
+            return (lambda: value).__closure__[0]
+
+        # Runtime-computed getattr names cannot be discovered from bytecode.
+        # Preserve scalar instance settings as well, without traversing/copying
+        # the model's backbone, parameters, or unrelated feature objects.
+        for name, value in vars(self).items():
+            if isinstance(value, (str, bytes, Number)) or value is None:
+                captured_names.add(name)
+                object.__setattr__(snapshot, name, value)
+        return capture(apply_cap)
+
+    def get_base_lm_logit_postprocess(self) -> Callable[[Array], Array] | None:
+        """Capture the clipping stage, including existing custom overrides.
+
+        Family-owned :meth:`get_lm_logit_postprocess` hooks can compose this
+        stage before or after their scaling/soft-capping, matching their
+        full-logit path. The standard implementation captures only its scalar
+        cap. Existing ``apply_logit_cap`` overrides remain authoritative, but
+        are rebound to snapshots of their scalar settings/parameter-free
+        components rather than retaining the live model and its parameters.
+
+        Returns:
+            A clipping callable, or ``None`` for identity.
+        """
+        apply_cap = getattr(self, "apply_logit_cap", None)
+        if callable(apply_cap) and getattr(apply_cap, "__func__", None) is not BaseTaskModule.apply_logit_cap:
+            return BaseTaskModule._snapshot_logit_cap(self, apply_cap)
+        if self._logit_cap_feature is None:
+            return None
+        cap = self._logit_cap_feature.cap_value
+
+        def _clip(logits: Array) -> Array:
+            """Apply the captured symmetric logit cap."""
+            return jnp.clip(logits, -cap, cap)
+
+        return _clip
+
+    def get_lm_logit_postprocess(self) -> Callable[[Array], Array] | None:
+        """Capture the complete post-projection transform for split LM heads.
+
+        The ordinary task head projects first and then applies
+        :meth:`apply_logit_cap` in :meth:`compute_lm_logits`. This hook
+        reproduces that stage, including existing custom overrides. The
+        standard clipping implementation captures only the scalar cap.
+        ``None`` explicitly declares an identity transform, not permission
+        for a caller to infer transformations from configuration attributes.
+
+        Subclasses adding transformations in ``apply_lm_head`` or
+        ``compute_lm_logits`` must override this hook with their complete
+        ordered transform, composing :meth:`get_base_lm_logit_postprocess`
+        where their full-logit path applies base clipping. Such callables
+        must capture only scalar settings or parameter-free components.
+
+        Returns:
+            A pure logits-to-logits callable, or ``None`` for identity.
+        """
+        return self.get_base_lm_logit_postprocess()
+
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None) -> Callable[[Array], Array]:
+        """Trace-safe LM-head projection with logit capping.
+
+        Extends ``EasyDeLBaseModule.make_lm_head_fn`` by wrapping the
+        base projection with :meth:`apply_logit_cap`.  Model subclasses
+        that add further post-processing in ``compute_lm_logits`` (e.g.
+        logit soft-capping or scaling) should override this method.
+
+        ``vocab_shard_stage`` is forwarded to the base ``make_lm_head_fn`` so
+        the column-parallel reshard of the tied-embedding LM-head weight (see
+        :meth:`easydel.infra.base_module.EasyDeLBaseModule.make_lm_head_fn`)
+        takes effect through this subclass too.
+        """
+        base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
+        # Share the same clipping authority as split heads, including custom
+        # overrides; the ordinary stage captures only its scalar cap.
+        cap_fn = self.get_base_lm_logit_postprocess()
+        if cap_fn is None:
+            return base_fn
+
+        def _project(hidden_states: Array) -> Array:
+            """Trace-safe LM-head projection composed with logit capping."""
+            return cap_fn(base_fn(hidden_states))
+
+        return _project
+
+    def _resolve_lmhead_chunksize(self, seq_len: int | None = None) -> int | None:
+        """Resolve the configured LM-head token chunk size for the current input.
+
+        Reads ``config.lmhead_chunksize`` and applies validation and clamping
+        logic to produce a usable chunk size value. The chunk size controls how
+        many tokens are projected through the LM head at once, which is useful
+        for reducing peak memory when the vocabulary is large.
+
+        The resolution rules are:
+        1. If ``config.lmhead_chunksize`` is ``None``, chunking is disabled
+           and ``None`` is returned.
+        2. If the configured value is ``<= 0``, chunking is disabled and
+           ``None`` is returned.
+        3. If ``seq_len`` is provided, the chunk size is clamped to
+           ``[1, seq_len]`` so it never exceeds the actual sequence length.
+        4. Otherwise, the raw (positive) chunk size is returned as-is.
+
+        Args:
+            seq_len: The sequence length of the current input. When provided,
+                the returned chunk size will be clamped to at most this value.
+                Pass ``None`` when the sequence length is unknown or not
+                applicable (e.g., for non-3D inputs).
+
+        Returns:
+            The resolved chunk size as a positive integer, or ``None`` if
+            chunking is not configured or has been disabled (value <= 0).
+        """
+
+        chunk_size = self.config.lmhead_chunksize
+        if chunk_size is None:
+            return None
+        chunk_size = int(chunk_size)
+        if chunk_size <= 0:
+            return None
+        if seq_len is None:
+            return chunk_size
+        return max(1, min(chunk_size, int(seq_len)))
+
+    def _constrain_lm_logits(self, logits: Array) -> Array:
+        """Apply logical-axis sharding constraints to full-rank LM logits.
+
+        Routes the logits tensor through ``apply_logical_sharding`` with
+        ``(BATCH, LENGTH, VOCAB)`` axes so that the produced logits respect
+        the configured partition rules (e.g., vocab-parallel sharding) before
+        being returned to the caller. Non-3-D inputs are passed through
+        unchanged because the chunked LM-head path may produce auxiliary
+        shapes (e.g., per-chunk accumulators) where the standard axis mapping
+        does not apply.
+
+        Args:
+            logits: Logits tensor. Expected shape is
+                ``(batch_size, sequence_length, vocab_size)``; any other rank
+                is returned unchanged.
+
+        Returns:
+            Array: The same logits with logical-axis sharding applied when
+            ``logits.ndim == 3``, otherwise the input unchanged.
+        """
+        if logits.ndim != 3:
+            return logits
+        return cast(
+            Array,
+            apply_logical_sharding(
+                logits,
+                axes=(common_types.BATCH, common_types.LENGTH, common_types.VOCAB),
+                mode=common_types.MODE_TRAIN,
+                partition_manager=self.config.runtime_sharding_resolver,
+            ),
+        )
+
+    def compute_lm_logits(self, hidden_states: Array) -> Array:
+        """Project hidden states to vocabulary logits, optionally chunking across tokens.
+
+        When ``lmhead_chunksize`` is configured on the model config, the
+        sequence/token dimension is split into fixed-size chunks and each
+        chunk is projected through the LM head independently. This avoids
+        materializing the full ``[batch, seq_len, vocab_size]`` logit tensor
+        at once, significantly reducing peak memory for long sequences or
+        large vocabularies.
+
+        Chunked projection is implemented with ``jax.checkpoint`` per chunk
+        (so activations are recomputed during the backward pass rather than
+        stored) and ``jax.lax.fori_loop`` to iterate over chunks without
+        unrolling the loop in the XLA computation graph.
+
+        If the hidden states are not 3-D, if chunking is not configured, or
+        if the sequence length is already within a single chunk, the
+        projection falls back to a single unchunked call.
+
+        Padding is applied when the sequence length is not evenly divisible
+        by the chunk size; the extra positions are sliced off before
+        returning.
+
+        Args:
+            hidden_states: Model hidden states to project. Expected shape is
+                ``(batch_size, seq_len, hidden_dim)`` for the chunked path.
+                Non-3-D inputs bypass chunking and are projected directly.
+
+        Returns:
+            Logit tensor of shape ``(batch_size, seq_len, vocab_size)`` (or
+            matching the input rank when chunking is bypassed), with logit
+            capping applied if configured.
+        """
+
+        chunk_size = self._resolve_lmhead_chunksize(hidden_states.shape[1] if hidden_states.ndim == 3 else None)
+        if chunk_size is None or hidden_states.ndim != 3 or hidden_states.shape[1] <= chunk_size:
+            logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
+            return self._constrain_lm_logits(self.apply_logit_cap(logits))
+
+        batch_size, seq_len, _hidden_dim = hidden_states.shape
+        pad_len = (-seq_len) % chunk_size
+        if pad_len:
+            hidden_states = jnp.pad(hidden_states, ((0, 0), (0, pad_len), (0, 0)))
+
+        padded_seq_len = hidden_states.shape[1]
+        num_chunks = padded_seq_len // chunk_size
+
+        def _project_chunk(chunk_hidden_states: Array) -> Array:
+            """Project a single chunk of hidden states through the LM head with logit capping."""
+            logits = checkpoint_name(self.apply_lm_head(chunk_hidden_states), "lm_head_output")
+            return self._constrain_lm_logits(self.apply_logit_cap(logits))
+
+        _project_chunk = jax.checkpoint(_project_chunk, prevent_cse=False)
+        first_chunk_hidden_states = lax.dynamic_slice_in_dim(hidden_states, 0, chunk_size, axis=1)
+        first_chunk_logits = _project_chunk(first_chunk_hidden_states)
+        # Seed the accumulator from the first projected chunk so tensor-parallel
+        # vocab sharding can propagate onto the full logits buffer.
+        logits = jnp.broadcast_to(
+            jnp.zeros_like(first_chunk_logits[:, :1, :]),
+            (batch_size, padded_seq_len, first_chunk_logits.shape[-1]),
+        )
+        logits = lax.dynamic_update_slice(logits, first_chunk_logits, (0, 0, 0))
+
+        def _write_chunk(i: int, logits_buffer: Array) -> Array:
+            """fori_loop body: project chunk ``i`` and scatter it into ``logits_buffer``."""
+            start = i * chunk_size
+            chunk_hidden_states = lax.dynamic_slice_in_dim(hidden_states, start, chunk_size, axis=1)
+            chunk_logits = _project_chunk(chunk_hidden_states)
+            return lax.dynamic_update_slice(logits_buffer, chunk_logits, (0, start, 0))
+
+        if num_chunks > 1:
+            logits = lax.fori_loop(1, num_chunks, _write_chunk, logits)
+        if pad_len:
+            logits = logits[:, :seq_len, :]
+        return self._constrain_lm_logits(logits)
+
+    def compute_router_aux_loss(self, outputs, attention_mask=None) -> Any:
+        """Compute router auxiliary loss for MoE models if configured.
+
+        For Mixture-of-Experts (MoE) models, this method computes an auxiliary
+        loss that encourages balanced utilization across experts. This prevents
+        the router from collapsing to always select the same few experts.
+
+        Args:
+            outputs: Model outputs containing per-layer ``all_router_losses``
+                or raw ``router_logits`` from which to compute load balancing.
+            attention_mask: Optional mask excluding padding from router-logit loss.
+
+        Returns:
+            The weighted sum of router losses multiplied by router_aux_loss_coef,
+            or None if MoE auxiliary loss is not configured or no router losses
+            are available in the outputs.
+
+        Example:
+            ```python
+            outputs = self.base_model(input_ids)
+            aux_loss = self.compute_router_aux_loss(outputs)
+            if aux_loss is not None:
+                total_loss = lm_loss + aux_loss
+            ```
+
+        Note:
+            This method is a no-op if router_aux_loss_coef was not set
+            during initialization or if the model is not an MoE model.
+        """
+        if self._router_aux_loss_feature is None:
+            return None
+
+        router_losses = getattr(outputs, "all_router_losses", None)
+        if router_losses is not None:
+            return self._router_aux_loss_feature.compute_loss(router_losses)
+
+        # Most MoE backbones expose logits, not precomputed per-layer losses.
+        router_logits = getattr(outputs, "router_logits", None)
+        if router_logits is None:
+            return None
+        if not isinstance(router_logits, (tuple, list)):
+            router_logits = (router_logits,)
+        router_logits = tuple(logits for logits in router_logits if logits is not None)
+        if not router_logits:
+            return None
+
+        loss = auxiliary_load_balancing_loss_func(
+            gate_logits=router_logits,
+            num_experts=router_logits[0].shape[-1],
+            top_k=self._router_top_k(),
+            attention_mask=attention_mask,
+        )
+        return loss * self._router_aux_loss_feature.coef
+
+    def _router_top_k(self) -> int:
+        """Experts routed per token, used by the router load-balancing loss.
+
+        Plain text MoE configs carry ``num_experts_per_tok`` directly; only the multimodal wrappers nest it under
+        ``get_text_config()``. Families whose config names the value differently (or whose router ignores it)
+        override this.
+        """
+        get_text_config = getattr(self.config, "get_text_config", None)
+        text_config = get_text_config() if callable(get_text_config) else self.config
+        return getattr(text_config, "num_experts_per_tok", 1)
+
+    def compute_indexer_aux_loss(self, outputs) -> Any:
+        """Scale the backbone's sparse-attention indexer warm-up loss by ``indexer_aux_loss_coef``.
+
+        Backbones with a trainable indexer report the unscaled per-layer sum of
+        :func:`easydel.layers.indexer.indexer_distillation_loss` as ``outputs.indexer_aux_loss``. The coefficient is
+        read from the model config (or its text config for multimodal wrappers).
+
+        Args:
+            outputs: Backbone outputs, possibly carrying ``indexer_aux_loss``.
+
+        Returns:
+            ``indexer_aux_loss_coef * outputs.indexer_aux_loss``, or ``None`` when the backbone reports no indexer
+            loss or the coefficient is zero.
+        """
+        indexer_aux = getattr(outputs, "indexer_aux_loss", None)
+        if indexer_aux is None:
+            return None
+        coef = getattr(self.config, "indexer_aux_loss_coef", None)
+        if coef is None:
+            get_text_config = getattr(self.config, "get_text_config", None)
+            text_config = get_text_config() if callable(get_text_config) else None
+            coef = getattr(text_config, "indexer_aux_loss_coef", None)
+        coef = float(coef or 0.0)
+        if coef == 0.0:
+            return None
+        return coef * indexer_aux
+
+    def compute_aux_loss(self, outputs, attention_mask=None) -> Any:
+        """Total auxiliary loss: router load balancing (:meth:`compute_router_aux_loss`) plus the indexer warm-up
+        (:meth:`compute_indexer_aux_loss`).
+
+        Args:
+            outputs: Backbone outputs.
+            attention_mask: Optional mask excluding padding from the router-logit loss.
+
+        Returns:
+            The summed auxiliary loss, or ``None`` when neither term is present.
+        """
+        router = self.compute_router_aux_loss(outputs, attention_mask=attention_mask)
+        indexer = self.compute_indexer_aux_loss(outputs)
+        if indexer is None:
+            return router
+        return indexer if router is None else router + indexer
+
+    def pool_sequence(self, hidden_states, input_ids=None, attention_mask=None):
+        """Pool sequence of hidden states to a single vector.
+
+        Reduces a sequence of hidden state vectors to a single vector
+        representation, which is required for sequence-level tasks like
+        classification.
+
+        Args:
+            hidden_states: Tensor of shape (batch_size, sequence_length, hidden_dim)
+                containing the hidden states for each token position.
+            input_ids: Optional tensor of shape (batch_size, sequence_length)
+                containing input token IDs. Required for "last" pooling strategy
+                when attention_mask is not provided, to find non-padding positions.
+            attention_mask: Optional tensor of shape (batch_size, sequence_length)
+                indicating valid (1) vs padding (0) positions. Preferred over
+                input_ids for finding sequence lengths.
+
+        Returns:
+            Tensor of shape (batch_size, hidden_dim) containing the pooled
+            representation for each sequence in the batch.
+
+        Raises:
+            ValueError: If using "last" pooling strategy without input_ids
+                or attention_mask.
+
+        Example:
+            ```python
+            # Pool for classification
+            hidden_states = outputs.last_hidden_state
+            pooled = self.pool_sequence(hidden_states, input_ids=input_ids)
+            logits = self.classifier(pooled)
+            ```
+
+        Note:
+            The pooling strategy is configured during initialization via
+            the pooling_strategy parameter.
+        """
+        return self._pooling_feature.pool(hidden_states, input_ids, attention_mask=attention_mask)
+
+    @abstractmethod
+    def forward(self, *args, **kwargs):
+        """Forward pass through the module.
+
+        This method must be implemented by subclasses to define the specific
+        task logic (e.g., language modeling, classification, etc.).
+
+        The signature varies by task type but typically includes:
+            - input_ids: Input token IDs
+            - attention_mask: Attention mask
+            - position_ids: Position IDs
+            - past_key_values: KV cache for generation
+            - output_attentions: Whether to return attention weights
+            - output_hidden_states: Whether to return all hidden states
+
+        Returns:
+            A task-specific output dataclass (e.g., CausalLMOutput,
+            SequenceClassifierOutput, etc.).
+
+        Raises:
+            NotImplementedError: Always raised in base class. Subclasses
+                must provide implementation.
+        """
+        raise NotImplementedError
+
+    def get_encoder(self):
+        """Return the encoder part of the model's architecture.
+
+        For encoder-decoder models (like T5, BART), this returns the encoder
+        component. For decoder-only models (like GPT, LLaMA), this raises
+        NotImplementedError.
+
+        Returns:
+            The encoder module for encoder-decoder architectures.
+
+        Raises:
+            NotImplementedError: For decoder-only models that don't have
+                a separate encoder component.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """Return the decoder part of the model's architecture.
+
+        For both encoder-decoder and decoder-only models, this returns the
+        decoder component that generates output sequences.
+
+        Returns:
+            The decoder module from the base model.
+        """
+        return self.base_model.get_decoder()
+
+    @abstractmethod
+    def get_task_head(self):
+        """Return the task-specific output head.
+
+        Each task type has a specific head that transforms hidden states
+        into task-appropriate outputs:
+            - CausalLM: lm_head (projects to vocabulary)
+            - Classification: classifier/score (projects to num_labels)
+            - QA: qa_outputs (projects to start/end logits)
+
+        Returns:
+            The task-specific head module (typically a Linear layer).
+
+        Raises:
+            NotImplementedError: Always raised in base class. Subclasses
+                must provide implementation.
+
+        Example:
+            ```python
+            # In CausalLM
+            def get_task_head(self):
+                return self.lm_head
+
+            # In SequenceClassification
+            def get_task_head(self):
+                return self.score
+            ```
+        """
+        raise NotImplementedError
+
+    def get_embedding(self):
+        """Return the input embedding layer of the model.
+
+        The embedding layer converts token IDs to dense vectors. This is
+        needed for operations like weight tying (sharing embeddings with
+        the output projection).
+
+        Returns:
+            The embedding module from the base model, typically containing
+            an embedding matrix of shape (vocab_size, hidden_size).
+
+        Example:
+            ```python
+            embedding = module.get_embedding()
+            if tie_embeddings:
+                lm_head.weight = embedding.weight.T
+            ```
+        """
+        return self.base_model.get_embedding()

@@ -1,0 +1,63 @@
+// Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include <cuda_runtime.h>
+
+#include <cstdint>
+
+namespace rpa_v3 {
+
+constexpr int kMaxHeadDim = 256;
+
+struct RpaV3Params {
+  const void *queries;
+  const void *keys;
+  const void *values;
+  const void *kv_cache;
+  const int32_t *kv_lens;
+  const int32_t *block_tables;
+  const int32_t *query_start_loc;
+  const int32_t *distribution;
+  const float *softmax_aux;
+  void *out;
+  void *kv_cache_out;
+  int32_t total_tokens;
+  int32_t num_q_heads;
+  int32_t num_kv_heads;
+  int32_t head_dim_padded;
+  int32_t page_size;
+  int32_t pages_per_seq;
+  int32_t num_kv_heads_x2_per_pack;
+  int32_t kv_packing;
+  float softmax_scale;
+  float softcap;
+  int32_t sliding_window;
+  int32_t use_sinks;
+  int32_t use_q_scale;
+  int32_t use_k_scale;
+  int32_t use_v_scale;
+  float q_scale;
+  float k_scale;
+  float v_scale;
+};
+
+template <typename T, int HEAD_DIM>
+void run_rpa_v3_update_kv_(RpaV3Params &params, cudaStream_t stream);
+
+template <typename T, int HEAD_DIM>
+void run_rpa_v3_attention_(RpaV3Params &params, cudaStream_t stream);
+
+}  // namespace rpa_v3

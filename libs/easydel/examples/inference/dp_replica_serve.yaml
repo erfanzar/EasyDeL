@@ -1,0 +1,51 @@
+# One-command data-parallel eSurge serving.
+#
+#   python -m easydel.scripts.elarge --config dp_replica_serve.yaml
+#
+# eLarge carves this host's TPU chips into one replica per mesh `dp` unit
+# (each its own JAX world on a contiguous chip subset), then starts a
+# routed OpenAI API server in front of them. The replica count comes from
+# `sharding.axis_dims` dp — here dp=2, so two replicas — and each replica's
+# own mesh collapses dp to 1 (tp fills its chip subset). Validated on a
+# v5p-8: two replicas x two chips, coherent chat + concurrent load spread
+# across both replicas.
+#
+# The parent router process runs CPU-pinned (it re-execs itself so the
+# replicas own the accelerator), connects to each replica over the request
+# plane, and load-balances with prefix-affinity + join-shortest-queue.
+#
+# Overrides (all optional):
+#   - serve.replicas.count           pin the replica count explicitly
+#                                    (otherwise it follows the dp axis)
+#   - serve.replicas.base_control_port  request-plane port base (default 19700)
+#   - serve.replicas.endpoints       route to replicas on OTHER hosts instead
+#                                    of splitting this host, e.g.
+#                                    ["host1:19700", "host2:19700"]
+
+config:
+  model:
+    name_or_path: Qwen/Qwen3.5-4B
+    dtype: bf16
+  sharding:
+    # Canonical 6-axis mesh. `dp` = replica count (peeled into independent
+    # processes); the remaining axes shard WITHIN each replica's carved chip
+    # subset — `tp=-1` fills it, and `pp>1` would pipeline-shard a large
+    # model across the subset. Here: 2 replicas, tp filling each.
+    axis_dims: [1, 2, 1, 1, -1, 1]
+    axis_names: ["pp", "dp", "fsdp", "ep", "tp", "sp"]
+  esurge:
+    runtime:
+      max_model_len: 4096
+      max_num_seqs: 16
+    cache:
+      hbm_utilization: 0.6
+      page_size: 32
+    parsing:
+      tool_parser: ""
+      reasoning_parser: ""
+
+actions:
+  - serve:
+      host: "0.0.0.0"
+      port: 11556
+      replicas: {}   # count follows sharding dp (=2); empty block is enough

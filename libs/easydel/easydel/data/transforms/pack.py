@@ -1,0 +1,1453 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Token packing utilities for efficient training.
+
+This module provides:
+- Greedy packing: Simple concatenation-based packing
+- Pool-based packing: Multiple packers for efficient bin-packing
+- First-fit packing: Bin-packing with first-fit decreasing
+- Segment IDs for attention masking
+"""
+
+from __future__ import annotations
+
+import logging
+import random
+import typing as tp
+from dataclasses import dataclass
+
+import jax.numpy as jnp
+import numpy as np
+
+from ..core.config import PackStageConfig
+from ..core.protocols import BaseStage, PipelineContext, ShardedDataSource
+
+if tp.TYPE_CHECKING:
+    from collections.abc import Iterator, Sequence
+
+logger = logging.getLogger(__name__)
+
+
+def _default_separator_values(
+    pad_values: dict[str, int],
+    separator_overrides: dict[str, int] | None,
+) -> dict[str, int]:
+    """Resolve the per-field value inserted at the synthetic EOS separator.
+
+    Every aligned field separates with its pad value unless ``separator_overrides`` names a different one.
+
+    Args:
+        pad_values: ``{field: pad_value}`` for the token-aligned extra fields.
+        separator_overrides: Optional ``{field: separator_value}`` overrides.
+
+    Returns:
+        dict[str, int]: ``{field: separator_value}`` covering every field in ``pad_values``.
+    """
+    separators = dict(pad_values)
+    if separator_overrides:
+        separators.update(separator_overrides)
+    return separators
+
+
+def _align_field_values(values: tp.Iterable[int] | None, token_count: int, pad_value: int) -> list[int]:
+    """Pad or truncate one extra field to exactly ``token_count`` entries.
+
+    Args:
+        values: The field's token-aligned values, or ``None`` when the row lacks the field.
+        token_count: Number of tokens the field must align with.
+        pad_value: Value used to right-pad short fields.
+
+    Returns:
+        list[int]: A list of length ``token_count``.
+    """
+    aligned = [] if values is None else list(values)
+    if len(aligned) < token_count:
+        aligned = aligned + [pad_value] * (token_count - len(aligned))
+    return aligned[:token_count]
+
+
+def _align_extra_fields(
+    pad_values: dict[str, int],
+    token_count: int,
+    extra_fields: dict[str, tp.Any] | None,
+) -> dict[str, list[int]]:
+    """Align every configured extra field of one example with its tokens.
+
+    Args:
+        pad_values: ``{field: pad_value}`` for the configured token-aligned fields.
+        token_count: Number of tokens in the example.
+        extra_fields: The example's provided field values (missing/``None`` fields become all-pad).
+
+    Returns:
+        dict[str, list[int]]: ``{field: values}`` with each list of length ``token_count``.
+    """
+    provided = extra_fields or {}
+    return {
+        field_name: _align_field_values(provided.get(field_name), token_count, pad_value)
+        for field_name, pad_value in pad_values.items()
+    }
+
+
+@dataclass
+class PackedSequence:
+    """One fixed-length output produced by a packer, plus per-token bookkeeping.
+
+    Carries the packed token sequence together with the metadata
+    downstream consumers need to undo the packing for attention and
+    loss computation: the attention mask (which positions are valid
+    after padding), the segment ids (which packed example each
+    position belongs to, so attention can be masked across segment
+    boundaries), and the source ids (which constituent dataset each
+    segment came from, for per-source metrics). Constructed by
+    :class:`GreedyPacker`, :class:`PoolPacker`, and
+    :class:`FirstFitPacker` and consumed by
+    :class:`PackedShardedSource`.
+
+    Attributes:
+        input_ids (np.ndarray): Token id sequence of shape
+            ``(seq_length,)`` and dtype ``int32``.
+        attention_mask (np.ndarray | None): Same-shape mask with
+            ``1`` for valid tokens and ``0`` for padding; ``None``
+            for fully-filled sequences that did not require padding.
+        segment_ids (np.ndarray | None): Same-shape array assigning
+            each token to a packed segment; segment boundaries are
+            consumed by attention masks so model layers do not
+            cross-attend between concatenated examples. ``None``
+            when the parent packer had ``include_segment_ids=False``.
+        source_ids (list[str] | None): Per-segment list of source
+            identifiers (typically dataset names from
+            :class:`MixedShardedSource`'s ``"__source__"`` metadata).
+            ``None`` when no sources were attached.
+        num_segments (int): Count of original examples concatenated
+            into this packed window.
+    """
+
+    input_ids: np.ndarray
+    attention_mask: np.ndarray | None = None
+    segment_ids: np.ndarray | None = None
+    extra_fields: dict[str, np.ndarray] | None = None
+    source_ids: list[str] | None = None
+    num_segments: int = 0
+
+    def to_dict(self) -> dict[str, np.ndarray]:
+        """Render the packed sequence as a dict suitable for batch collation.
+
+        Always includes ``"input_ids"``; ``"attention_mask"`` and
+        ``"segment_ids"`` are only added when the corresponding
+        attributes are non-``None`` so consumers can distinguish "not
+        present" from "present but all-ones".
+
+        Returns:
+            dict[str, np.ndarray]: Dict with the packer's
+            stack-friendly arrays. Used as the row payload yielded by
+            :class:`PackedShardedSource`.
+        """
+        result = {"input_ids": self.input_ids}
+        if self.attention_mask is not None:
+            result["attention_mask"] = self.attention_mask
+        if self.segment_ids is not None:
+            result["segment_ids"] = self.segment_ids
+        if self.extra_fields is not None:
+            result.update(self.extra_fields)
+        return result
+
+
+@dataclass
+class PackingStats:
+    """Aggregated packing statistics for one packer run.
+
+    Tracks how efficiently a packer fills fixed-length windows so
+    users can compare strategies and diagnose padding waste. All
+    counters are accumulated as rows are added and windows are
+    emitted; the :attr:`efficiency` property computes the fraction
+    of emitted token positions that are real (non-padding) data.
+
+    Attributes:
+        seq_length (int): Target window length; stored for the
+            efficiency denominator.
+        total_input_tokens (int): Sum of token lengths of every
+            upstream example handed to the packer.
+        total_packed_tokens (int): Number of non-padding token
+            positions emitted across all windows.
+        total_emitted_windows (int): Number of packed windows
+            produced, including the final padded partial window.
+        total_eos_separators (int): Number of EOS separators
+            inserted between packed examples.
+        perfect_fills (int): Number of emitted windows that contain
+            no padding at all.
+    """
+
+    seq_length: int
+    total_input_tokens: int = 0
+    total_packed_tokens: int = 0
+    total_emitted_windows: int = 0
+    total_eos_separators: int = 0
+    perfect_fills: int = 0
+    total_segments: int = 0
+
+    @property
+    def efficiency(self) -> float:
+        """Fraction of emitted token positions that are non-padding.
+
+        Returns:
+            float: Ratio in ``[0.0, 1.0]``. Returns ``0.0`` when no
+            windows have been emitted.
+        """
+        denom = self.total_emitted_windows * self.seq_length
+        return self.total_packed_tokens / denom if denom > 0 else 0.0
+
+    @property
+    def avg_segments_per_window(self) -> float:
+        """Average number of original examples packed into each window.
+
+        This is a rough indicator of packing density independent of
+        sequence length.
+
+        Returns:
+            float: Segments per window, or ``0.0`` when no windows
+            have been emitted.
+        """
+        return self.total_segments / self.total_emitted_windows if self.total_emitted_windows > 0 else 0.0
+
+    def to_dict(self) -> dict[str, tp.Any]:
+        """Render stats as a JSON-friendly dict."""
+        return {
+            "seq_length": self.seq_length,
+            "total_input_tokens": self.total_input_tokens,
+            "total_packed_tokens": self.total_packed_tokens,
+            "total_emitted_windows": self.total_emitted_windows,
+            "total_eos_separators": self.total_eos_separators,
+            "perfect_fills": self.perfect_fills,
+            "total_segments": self.total_segments,
+            "efficiency": self.efficiency,
+            "avg_segments_per_window": self.avg_segments_per_window,
+        }
+
+
+class GreedyPacker:
+    """Streaming first-come-first-served packer that fills one window at a time.
+
+    Maintains a single rolling buffer; each call to :meth:`add`
+    appends the new tokens (plus an EOS separator) and emits a
+    completed :class:`PackedSequence` whenever the buffer reaches
+    ``seq_length``. Leftover tokens past the boundary roll into the
+    next window. Final non-empty leftovers are surfaced via
+    :meth:`flush_final` (with padding and an attention mask).
+
+    This is the cheapest strategy — a single buffer means no fitting
+    overhead — but produces sub-optimal packing density relative to
+    :class:`PoolPacker` and :class:`FirstFitPacker` on highly skewed
+    length distributions.
+    """
+
+    def __init__(
+        self,
+        seq_length: int,
+        eos_token_id: int,
+        pad_token_id: int = 0,
+        include_segment_ids: bool = True,
+        extra_field_pad_values: dict[str, int] | None = None,
+        extra_field_separator_values: dict[str, int] | None = None,
+    ):
+        """Capture packing settings and initialise empty rolling buffers.
+
+        Args:
+            seq_length: Number of tokens per emitted window.
+            eos_token_id: Token id appended between concatenated
+                examples; consumed by attention masking on the model
+                side.
+            pad_token_id: Token id used to pad incomplete windows
+                produced by :meth:`flush_final`.
+            include_segment_ids: When ``True``, track segment ids
+                alongside ``input_ids`` so attention can be masked
+                across segment boundaries.
+            extra_field_pad_values: Optional token-aligned fields to pack
+                alongside ``input_ids`` and their pad values.
+            extra_field_separator_values: Values appended to aligned fields
+                for the synthetic EOS separator between examples.
+        """
+        self.seq_length = seq_length
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
+        self.include_segment_ids = include_segment_ids
+        self.extra_field_pad_values = extra_field_pad_values or {}
+        self.extra_field_separator_values = _default_separator_values(
+            self.extra_field_pad_values, extra_field_separator_values
+        )
+
+        self._buffer: list[int] = []
+        self._segment_ids: list[int] = []
+        self._extra_buffers: dict[str, list[int]] = {key: [] for key in self.extra_field_pad_values}
+        self._current_segment = 0
+        self._source_ids: list[str] = []
+        self._stats = PackingStats(seq_length=seq_length)
+
+    @property
+    def stats(self) -> PackingStats:
+        """Return the accumulated packing statistics for this packer."""
+        return self._stats
+
+    def add(
+        self,
+        tokens: list[int],
+        source_id: str | None = None,
+        extra_fields: dict[str, list[int]] | None = None,
+    ) -> PackedSequence | None:
+        """Append a tokenized example, emitting a packed window if one is ready.
+
+        After adding, an EOS separator and segment-id bump are
+        recorded so the boundary between this and the next example
+        is preserved. A full window is flushed via :meth:`_flush`
+        whenever the rolling buffer reaches ``seq_length``.
+
+        Args:
+            tokens: Token id list for one upstream example.
+            source_id: Optional source label used to populate
+                :attr:`PackedSequence.source_ids`. Pass the dataset
+                name from :class:`MixedShardedSource`'s
+                ``"__source__"`` field for per-source visibility.
+            extra_fields: Optional token-aligned values matching
+                ``tokens`` for configured extra fields.
+
+        Returns:
+            list[PackedSequence]: Every window this call completed —
+            an example longer than ``seq_length`` can complete several
+            in one call, and returning only the last one silently
+            dropped the others (a confirmed data-loss bug). Empty when
+            the tokens were absorbed into the buffer for a later call.
+        """
+        results: list[PackedSequence] = []
+        self._stats.total_input_tokens += len(tokens)
+
+        if not tokens:
+            # A zero-length example contributes no tokens; appending the
+            # EOS separator + segment bump below would fabricate an empty
+            # segment (a doubled EOS boundary) in the packed stream.
+            return results
+
+        aligned_extra_fields = self._normalize_extra_fields(tokens, extra_fields)
+
+        for index, tok in enumerate(tokens):
+            self._buffer.append(tok)
+            if self.include_segment_ids:
+                self._segment_ids.append(self._current_segment)
+            for field_name, values in aligned_extra_fields.items():
+                self._extra_buffers[field_name].append(values[index])
+
+            if len(self._buffer) >= self.seq_length:
+                results.append(self._flush(mid_example=True))
+
+        if len(self._buffer) > 0:
+            self._buffer.append(self.eos_token_id)
+            self._stats.total_eos_separators += 1
+            if self.include_segment_ids:
+                self._segment_ids.append(self._current_segment)
+            for field_name, separator_value in self.extra_field_separator_values.items():
+                self._extra_buffers[field_name].append(separator_value)
+            self._current_segment += 1
+            if source_id:
+                self._source_ids.append(source_id)
+
+        if len(self._buffer) >= self.seq_length:
+            results.append(self._flush())
+
+        return results
+
+    def _flush(self, mid_example: bool = False) -> PackedSequence:
+        """Emit a packed sequence and retain any leftover tokens.
+
+        Args:
+            mid_example: ``True`` when the window was cut while tokens of
+                the current example were still being appended (before its
+                EOS separator and segment bump). Those tokens carry segment
+                id ``_current_segment``, so that example counts as one more
+                segment of this window; otherwise every segment in the
+                window was already closed by an EOS.
+
+        Returns:
+            ``PackedSequence`` populated from the first ``seq_length``
+            tokens of the buffer; remaining tokens are kept for the next
+            packing round.
+        """
+        num_segments = self._current_segment + int(mid_example)
+        # Take exactly seq_length tokens
+        input_ids = np.array(self._buffer[: self.seq_length], dtype=np.int32)
+
+        segment_ids = None
+        if self.include_segment_ids:
+            segment_ids = np.array(self._segment_ids[: self.seq_length], dtype=np.int32)
+        extra_fields = {
+            field_name: np.array(values[: self.seq_length], dtype=np.int32)
+            for field_name, values in self._extra_buffers.items()
+        } or None
+
+        self._stats.total_packed_tokens += self.seq_length
+        self._stats.total_emitted_windows += 1
+        self._stats.perfect_fills += 1
+        self._stats.total_segments += num_segments
+
+        result = PackedSequence(
+            input_ids=input_ids,
+            segment_ids=segment_ids,
+            extra_fields=extra_fields,
+            source_ids=self._source_ids.copy() if self._source_ids else None,
+            num_segments=num_segments,
+        )
+
+        self._buffer = self._buffer[self.seq_length :]
+        if self.include_segment_ids:
+            self._segment_ids = self._segment_ids[self.seq_length :]
+        for field_name in self._extra_buffers:
+            self._extra_buffers[field_name] = self._extra_buffers[field_name][self.seq_length :]
+        self._source_ids = []
+        self._current_segment = 0
+
+        return result
+
+    def flush_final(self) -> PackedSequence | None:
+        """Emit the trailing partial window (padded) when iteration ends.
+
+        Pads the remaining tokens to ``seq_length`` with
+        :attr:`pad_token_id`, builds an attention mask that is ``1``
+        for the original tokens and ``0`` for padding, and resets the
+        internal buffers so the packer can be reused. No-op when the
+        buffer is empty.
+
+        Returns:
+            PackedSequence | None: The padded trailing window with
+            ``attention_mask`` set; ``None`` when there's nothing
+            left to flush.
+        """
+        if not self._buffer:
+            return None
+
+        pad_len = self.seq_length - len(self._buffer)
+        input_ids = np.array(self._buffer + [self.pad_token_id] * pad_len, dtype=np.int32)
+
+        attention_mask = np.ones(self.seq_length, dtype=np.int32)
+        attention_mask[len(self._buffer) :] = 0
+
+        segment_ids = None
+        if self.include_segment_ids:
+            padded_segments = self._segment_ids + [self._current_segment] * pad_len
+            segment_ids = np.array(padded_segments, dtype=np.int32)
+        extra_fields = {
+            field_name: np.array(
+                values + [self.extra_field_pad_values[field_name]] * pad_len,
+                dtype=np.int32,
+            )
+            for field_name, values in self._extra_buffers.items()
+        } or None
+
+        self._stats.total_packed_tokens += len(self._buffer)
+        self._stats.total_emitted_windows += 1
+        if len(self._buffer) == self.seq_length:
+            self._stats.perfect_fills += 1
+        # Segments 0.._current_segment-1 are the real examples in the buffer
+        # (each add() terminated its example with an EOS before bumping the
+        # counter); the padded tail reuses _current_segment as a distinct id
+        # but is attention-masked padding, not a segment. Counting it made
+        # total_segments/num_segments over-report by one on every padded
+        # final window, unlike FirstFitPacker which excludes its padding id.
+        self._stats.total_segments += self._current_segment
+
+        result = PackedSequence(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            extra_fields=extra_fields,
+            source_ids=self._source_ids.copy() if self._source_ids else None,
+            num_segments=self._current_segment,
+        )
+
+        self._buffer = []
+        self._segment_ids = []
+        self._extra_buffers = {key: [] for key in self.extra_field_pad_values}
+        self._source_ids = []
+        self._current_segment = 0
+
+        return result
+
+    def _normalize_extra_fields(
+        self,
+        tokens: list[int],
+        extra_fields: dict[str, list[int]] | None,
+    ) -> dict[str, list[int]]:
+        return _align_extra_fields(self.extra_field_pad_values, len(tokens), extra_fields)
+
+
+class PoolPacker:
+    """Pool of independent :class:`GreedyPacker` instances using best-fit dispatch.
+
+    Maintains ``num_packers`` separate greedy packers; each incoming
+    example is routed to the packer that would have the least free
+    space *after* accepting it (best-fit decreasing). This trims
+    padding compared with a single greedy packer at the cost of
+    extra book-keeping. Output windows from any packer are surfaced
+    in completion order.
+    """
+
+    def __init__(
+        self,
+        seq_length: int,
+        eos_token_id: int,
+        pad_token_id: int = 0,
+        num_packers: int = 4,
+        include_segment_ids: bool = True,
+        extra_field_pad_values: dict[str, int] | None = None,
+        extra_field_separator_values: dict[str, int] | None = None,
+    ):
+        """Allocate ``num_packers`` underlying :class:`GreedyPacker` instances.
+
+        Args:
+            seq_length: Target window length, propagated to every
+                inner packer.
+            eos_token_id: EOS separator id, propagated to every
+                inner packer.
+            pad_token_id: Padding id used during final flushes.
+            num_packers: Pool size — larger values trade memory for
+                better packing density. ``1`` collapses to greedy
+                packing.
+            include_segment_ids: Whether the inner packers track
+                segment ids.
+            extra_field_pad_values: Optional token-aligned fields to pack
+                alongside ``input_ids`` and their pad values.
+            extra_field_separator_values: Values appended to aligned fields
+                for the synthetic EOS separator between examples.
+        """
+        self.seq_length = seq_length
+        self.num_packers = num_packers
+        self._packers = [
+            GreedyPacker(
+                seq_length,
+                eos_token_id,
+                pad_token_id,
+                include_segment_ids,
+                extra_field_pad_values,
+                extra_field_separator_values,
+            )
+            for _ in range(num_packers)
+        ]
+
+    def add(
+        self,
+        tokens: list[int],
+        source_id: str | None = None,
+        extra_fields: dict[str, list[int]] | None = None,
+    ) -> list[PackedSequence]:
+        """Route the tokens to the best-fit inner packer and surface any completed windows.
+
+        Best fit is computed as the smallest non-negative
+        ``seq_length - (current_buffer_len + token_len + 1_for_EOS)``;
+        ties pick the lowest-index packer. The chosen packer's
+        return is forwarded as a list (length 0 or 1) for API
+        symmetry with :class:`FirstFitPacker`.
+
+        Args:
+            tokens: Token id list for one upstream example.
+            source_id: Optional source label propagated through to
+                the inner packer.
+            extra_fields: Optional token-aligned values matching
+                ``tokens`` for configured extra fields.
+
+        Returns:
+            list[PackedSequence]: Completed packed windows produced
+            by this call. Empty when no packer rolled over.
+        """
+        token_len = len(tokens)
+
+        # Find the packer with the best fit (least remaining space after adding)
+        best_idx = 0
+        best_fit = float("inf")
+
+        for i, packer in enumerate(self._packers):
+            current_len = len(packer._buffer)
+            remaining_after = self.seq_length - (current_len + token_len + 1)  # +1 for EOS
+
+            if 0 <= remaining_after < best_fit:
+                best_fit = remaining_after
+                best_idx = i
+
+        return self._packers[best_idx].add(tokens, source_id, extra_fields)
+
+    def flush_all(self) -> list[PackedSequence]:
+        """Drain trailing partial windows from every inner packer.
+
+        Calls :meth:`GreedyPacker.flush_final` on each packer in the
+        pool and aggregates the non-``None`` results. Suitable for
+        end-of-iteration cleanup.
+
+        Returns:
+            list[PackedSequence]: One trailing window per inner
+            packer that still had data. Empty when every packer was
+            already drained.
+        """
+        results = []
+        for packer in self._packers:
+            result = packer.flush_final()
+            if result is not None:
+                results.append(result)
+        return results
+
+    @property
+    def stats(self) -> PackingStats:
+        """Aggregate packing stats across all inner packers."""
+        aggregated = PackingStats(seq_length=self.seq_length)
+        for packer in self._packers:
+            s = packer.stats
+            aggregated.total_input_tokens += s.total_input_tokens
+            aggregated.total_packed_tokens += s.total_packed_tokens
+            aggregated.total_emitted_windows += s.total_emitted_windows
+            aggregated.total_eos_separators += s.total_eos_separators
+            aggregated.perfect_fills += s.perfect_fills
+            aggregated.total_segments += s.total_segments
+        return aggregated
+
+
+class FirstFitPacker:
+    """Buffered first-fit-decreasing bin packer for higher packing density.
+
+    Buffers ``buffer_size`` examples before producing windows, then
+    sorts them in decreasing length and applies the classic
+    first-fit-decreasing bin-packing heuristic to arrange them into
+    ``seq_length``-sized bins. Each bin becomes one
+    :class:`PackedSequence` with attention mask and segment ids
+    populated. Higher density than :class:`PoolPacker` at the cost
+    of buffering latency (output is delayed until each
+    ``buffer_size`` window of upstream rows arrives).
+    """
+
+    def __init__(
+        self,
+        seq_length: int,
+        eos_token_id: int,
+        pad_token_id: int = 0,
+        include_segment_ids: bool = True,
+        buffer_size: int = 1000,
+        extra_field_pad_values: dict[str, int] | None = None,
+        extra_field_separator_values: dict[str, int] | None = None,
+    ):
+        """Capture packing settings and initialise the pending buffer.
+
+        Args:
+            seq_length: Target bin/window length in tokens.
+            eos_token_id: Token id appended after each example
+                inside a bin.
+            pad_token_id: Token id used to pad bins that did not
+                completely fill.
+            include_segment_ids: Whether to record segment ids per
+                token.
+            buffer_size: Number of upstream examples accumulated
+                before a packing pass runs. Larger buffers give
+                better density but more latency and memory use.
+            extra_field_pad_values: Optional token-aligned fields to pack
+                alongside ``input_ids`` and their pad values.
+            extra_field_separator_values: Values appended to aligned fields
+                for the synthetic EOS separator between examples.
+        """
+        self.seq_length = seq_length
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
+        self.include_segment_ids = include_segment_ids
+        self.buffer_size = buffer_size
+        self.extra_field_pad_values = extra_field_pad_values or {}
+        self.extra_field_separator_values = _default_separator_values(
+            self.extra_field_pad_values, extra_field_separator_values
+        )
+
+        self._pending: list[tuple[list[int], str | None, dict[str, list[int]]]] = []
+        self._stats = PackingStats(seq_length=seq_length)
+
+    @property
+    def stats(self) -> PackingStats:
+        """Return the accumulated packing statistics for this packer."""
+        return self._stats
+
+    def add(
+        self,
+        tokens: list[int],
+        source_id: str | None = None,
+        extra_fields: dict[str, list[int]] | None = None,
+    ) -> list[PackedSequence]:
+        """Buffer one example, triggering a packing pass when the buffer fills.
+
+        Args:
+            tokens: Token id list for one upstream example.
+            source_id: Optional source label associated with this
+                example; aggregated into
+                :attr:`PackedSequence.source_ids` when the bin is
+                emitted.
+            extra_fields: Optional token-aligned values matching
+                ``tokens`` for configured extra fields.
+
+        Returns:
+            list[PackedSequence]: Newly packed bins when this call
+            tipped the buffer over ``buffer_size`` and triggered
+            :meth:`_pack_buffer`; an empty list otherwise.
+        """
+        self._stats.total_input_tokens += len(tokens)
+        aligned = self._normalize_extra_fields(tokens, extra_fields)
+        # Split oversized examples into window-sized chunks instead of
+        # truncating them: the old `tokens[:seq_length]` in _pack_buffer
+        # silently discarded every token past the first window.
+        for start in range(0, len(tokens), self.seq_length):
+            chunk = tokens[start : start + self.seq_length]
+            chunk_fields = {name: values[start : start + self.seq_length] for name, values in aligned.items()}
+            self._pending.append((chunk, source_id, chunk_fields))
+
+        if len(self._pending) >= self.buffer_size:
+            return self._pack_buffer()
+
+        return []
+
+    def _pack_buffer(self) -> list[PackedSequence]:
+        """Pack the pending buffer using first-fit decreasing.
+
+        Returns:
+            List of ``PackedSequence`` objects, padded to ``seq_length``,
+            consuming all currently buffered sequences.
+        """
+        if not self._pending:
+            return []
+
+        # Sort by length (decreasing)
+        sorted_pending = sorted(self._pending, key=lambda x: len(x[0]), reverse=True)
+
+        # Bins: list of (tokens, segment_ids, source_ids, extra_fields)
+        bins: list[tuple[list[int], list[int], list[str], dict[str, list[int]]]] = []
+
+        for tokens, source_id, extra_fields in sorted_pending:
+            append_eos = len(tokens) < self.seq_length
+            token_len = len(tokens) + int(append_eos)
+            placed = False
+
+            for _i, (bin_tokens, bin_segments, bin_sources, bin_extra_fields) in enumerate(bins):
+                if len(bin_tokens) + token_len <= self.seq_length:
+                    segment_id = max(bin_segments) + 1 if bin_segments else 0
+                    bin_tokens.extend(tokens)
+                    if append_eos:
+                        bin_tokens.append(self.eos_token_id)
+                        self._stats.total_eos_separators += 1
+                    bin_segments.extend([segment_id] * token_len)
+                    for field_name, values in extra_fields.items():
+                        bin_extra_fields[field_name].extend(values)
+                        if append_eos:
+                            bin_extra_fields[field_name].append(self.extra_field_separator_values[field_name])
+                    if source_id:
+                        bin_sources.append(source_id)
+                    placed = True
+                    break
+
+            if not placed:
+                new_tokens = [*tokens]
+                if append_eos:
+                    new_tokens.append(self.eos_token_id)
+                    self._stats.total_eos_separators += 1
+                new_segments = [0] * len(new_tokens)
+                new_sources = [source_id] if source_id else []
+                new_extra_fields = {}
+                for field_name, values in extra_fields.items():
+                    field_values = [*values]
+                    if append_eos:
+                        field_values.append(self.extra_field_separator_values[field_name])
+                    new_extra_fields[field_name] = field_values
+                bins.append((new_tokens, new_segments, new_sources, new_extra_fields))
+
+        results = []
+        for bin_tokens, bin_segments, bin_sources, bin_extra_fields in bins:
+            pad_len = self.seq_length - len(bin_tokens)
+            input_ids = np.array(bin_tokens + [self.pad_token_id] * pad_len, dtype=np.int32)
+
+            attention_mask = np.ones(self.seq_length, dtype=np.int32)
+            attention_mask[len(bin_tokens) :] = 0
+
+            segment_ids = None
+            if self.include_segment_ids:
+                max_seg = max(bin_segments) if bin_segments else 0
+                padded_segments = bin_segments + [max_seg + 1] * pad_len
+                segment_ids = np.array(padded_segments, dtype=np.int32)
+            extra_fields = {
+                field_name: np.array(
+                    values + [self.extra_field_pad_values[field_name]] * pad_len,
+                    dtype=np.int32,
+                )
+                for field_name, values in bin_extra_fields.items()
+            } or None
+
+            num_segments = max(bin_segments) + 1 if bin_segments else 0
+            self._stats.total_packed_tokens += len(bin_tokens)
+            self._stats.total_emitted_windows += 1
+            self._stats.total_segments += num_segments
+            if len(bin_tokens) == self.seq_length:
+                self._stats.perfect_fills += 1
+
+            results.append(
+                PackedSequence(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    segment_ids=segment_ids,
+                    extra_fields=extra_fields,
+                    source_ids=bin_sources if bin_sources else None,
+                    num_segments=num_segments,
+                )
+            )
+
+        self._pending = []
+        return results
+
+    def flush_all(self) -> list[PackedSequence]:
+        """Run a final packing pass over whatever is still buffered.
+
+        Returns:
+            list[PackedSequence]: Bins produced from the residual
+            buffer; may be empty when the buffer was already drained.
+        """
+        return self._pack_buffer()
+
+    def _normalize_extra_fields(
+        self,
+        tokens: list[int],
+        extra_fields: dict[str, list[int]] | None,
+    ) -> dict[str, list[int]]:
+        return _align_extra_fields(self.extra_field_pad_values, len(tokens), extra_fields)
+
+
+class PackedShardedSource(ShardedDataSource[dict]):
+    """:class:`ShardedDataSource` adapter that packs an upstream tokenized source.
+
+    Reads tokenized rows from an underlying
+    :class:`ShardedDataSource`, drives a configurable packer
+    (:class:`GreedyPacker`, :class:`PoolPacker`, or
+    :class:`FirstFitPacker`), and yields packed dict rows ready for
+    training. The ``"__source__"`` metadata produced by
+    :class:`MixedShardedSource` is forwarded to the packer as
+    ``source_id`` so per-source segment provenance is preserved.
+
+    An optional reservoir-sampling shuffle (sized as
+    ``shuffle_buffer_factor * 100``) acts on the packed rows so
+    consecutive output windows do not all come from the same packer
+    in pool/first-fit modes.
+    """
+
+    def __init__(
+        self,
+        source: ShardedDataSource[dict],
+        seq_length: int,
+        eos_token_id: int,
+        pad_token_id: int = 0,
+        strategy: str = "greedy",
+        num_packers: int = 4,
+        include_segment_ids: bool = True,
+        input_field: str = "input_ids",
+        extra_field_pad_values: dict[str, int] | None = None,
+        extra_field_separator_values: dict[str, int] | None = None,
+        shuffle: bool = True,
+        shuffle_buffer_factor: int = 10,
+        seed: int | None = None,
+        return_stats: bool = True,
+        warn_on_padded_input: bool = True,
+        on_iteration_end: tp.Callable[[PackingStats], None] | None = None,
+    ):
+        """Capture packer selection and shuffle settings without iterating.
+
+        Args:
+            source: Upstream tokenized :class:`ShardedDataSource`
+                whose rows carry token ids in ``input_field``.
+            seq_length: Window size produced by the packer.
+            eos_token_id: EOS separator token id used between
+                packed examples.
+            pad_token_id: Padding token id for trailing partial
+                windows.
+            strategy: ``"greedy"`` (single rolling buffer),
+                ``"pool"`` (best-fit dispatch across multiple
+                buffers), or ``"first_fit"`` (buffered FFD bin
+                packing).
+            num_packers: Pool size when ``strategy == "pool"``;
+                ignored otherwise.
+            include_segment_ids: Whether the packer tracks segment
+                ids.
+            input_field: Row key from which token ids are read.
+            extra_field_pad_values: Optional token-aligned row fields to
+                preserve through packing, mapped to their pad value.
+            extra_field_separator_values: Values inserted for each
+                extra field at the synthetic EOS separator.
+            shuffle: Run reservoir-sampling shuffle on packed rows
+                before yielding.
+            shuffle_buffer_factor: Multiplier on a reference batch
+                size (currently 100) controlling the shuffle
+                reservoir capacity.
+            seed: Optional RNG seed for the shuffle reservoir.
+            return_stats: When ``True``, statistics from the most
+                recent pack run are exposed via
+                :attr:`packing_stats`.
+            warn_on_padded_input: When ``True``, emit a warning if the
+                first few upstream rows all have length exactly
+                ``seq_length``, suggesting they were pre-padded.
+            on_iteration_end: Optional callback invoked once after a
+                complete iteration through this source finishes. Receives
+                the final :class:`PackingStats` so callers (e.g. pipeline
+                stages) can record metrics without breaking laziness.
+        """
+        self._source = source
+        self._seq_length = seq_length
+        self._eos_token_id = eos_token_id
+        self._pad_token_id = pad_token_id
+        self._strategy = strategy
+        self._num_packers = num_packers
+        self._include_segment_ids = include_segment_ids
+        self._input_field = input_field
+        self._extra_field_pad_values = extra_field_pad_values or {}
+        self._extra_field_separator_values = _default_separator_values(
+            self._extra_field_pad_values, extra_field_separator_values
+        )
+        self._shuffle = shuffle
+        self._shuffle_buffer_factor = shuffle_buffer_factor
+        self._seed = seed
+        self._return_stats = return_stats
+        self._warn_on_padded_input = warn_on_padded_input
+        self._on_iteration_end = on_iteration_end
+        self._last_packing_stats: PackingStats | None = None
+        self._epoch_counter = 0
+
+    @property
+    def packing_stats(self) -> PackingStats | None:
+        """Statistics from the most recent complete pack run.
+
+        Returns:
+            PackingStats | None: Aggregated stats after the source has
+            been iterated, or ``None`` if the source has not been
+            consumed yet (or if ``return_stats=False``).
+        """
+        return self._last_packing_stats if self._return_stats else None
+
+    @property
+    def shard_names(self) -> "Sequence[str]":
+        """Return a single synthetic shard for the packed source.
+
+        Returns:
+            One-element list ``["packed_shard_0"]``.
+        """
+        return ["packed_shard_0"]
+
+    def num_shards(self) -> int:
+        """Return the constant shard count of one.
+
+        Returns:
+            Always ``1``.
+        """
+        return 1
+
+    def _create_packer(self):
+        """Instantiate a packer matching ``self._strategy``.
+
+        Returns:
+            A ``GreedyPacker``, ``PoolPacker``, or ``FirstFitPacker``
+            configured from this source's settings.
+        """
+        if self._strategy == "pool":
+            return PoolPacker(
+                self._seq_length,
+                self._eos_token_id,
+                self._pad_token_id,
+                self._num_packers,
+                self._include_segment_ids,
+                self._extra_field_pad_values,
+                self._extra_field_separator_values,
+            )
+        elif self._strategy == "first_fit":
+            return FirstFitPacker(
+                self._seq_length,
+                self._eos_token_id,
+                self._pad_token_id,
+                self._include_segment_ids,
+                extra_field_pad_values=self._extra_field_pad_values,
+                extra_field_separator_values=self._extra_field_separator_values,
+            )
+        else:  # greedy
+            return GreedyPacker(
+                self._seq_length,
+                self._eos_token_id,
+                self._pad_token_id,
+                self._include_segment_ids,
+                self._extra_field_pad_values,
+                self._extra_field_separator_values,
+            )
+
+    def open_shard(self, shard_name: str) -> "Iterator[dict]":
+        """Drive the upstream source through the packer and yield packed dict rows.
+
+        Walks every shard of :attr:`_source`, hands each row's
+        tokens to the configured packer, and re-emits any packed
+        windows the packer produces. Empty token lists are skipped.
+        After the upstream is exhausted, drains the packer's
+        residual buffer (via :meth:`flush_all` for batch-style
+        packers or :meth:`flush_final` for the greedy packer). When
+        shuffling is enabled, the residual reservoir is fully
+        shuffled and drained at the end.
+
+        Args:
+            shard_name: Ignored — :class:`PackedShardedSource`
+                exposes a single synthetic shard.
+
+        Yields:
+            dict: Each packed row as produced by
+            :meth:`PackedSequence.to_dict` — at minimum
+            ``{"input_ids": ndarray}`` and possibly
+            ``"attention_mask"`` / ``"segment_ids"`` depending on
+            packer state.
+        """
+        # Per-iteration RNG instance: seeding the global `random` module here
+        # polluted every other consumer of `random` in the process and made
+        # each epoch replay the identical shuffle order. Deriving the seed
+        # from an epoch counter keeps runs reproducible while giving each
+        # pass over the source a fresh order.
+        epoch = self._epoch_counter
+        self._epoch_counter += 1
+        rng = random.Random(self._seed + epoch) if self._seed is not None else random.Random()
+
+        packer = self._create_packer()
+        shuffle_buffer = []
+        max_buffer = self._shuffle_buffer_factor * 100  # Approximate batch size
+
+        def emit(packed: PackedSequence):
+            """Inline closure: feed a packed window through the optional shuffle reservoir.
+
+            Captures ``self._shuffle``, ``shuffle_buffer``, and
+            ``max_buffer`` from the enclosing :meth:`open_shard`
+            scope. With shuffling disabled, simply renders the
+            packed sequence as a dict. With shuffling on, fills the
+            reservoir up to ``max_buffer`` (returning ``None`` while
+            warming up); once full, swaps the new entry for a
+            randomly selected existing one and yields the evicted
+            entry.
+
+            Args:
+                packed: The newly produced packed window.
+
+            Returns:
+                dict | None: Dict ready to yield, or ``None`` while
+                the shuffle reservoir is still being filled (the
+                caller skips ``None`` returns).
+            """
+            result = packed.to_dict()
+            if self._shuffle:
+                if len(shuffle_buffer) < max_buffer:
+                    shuffle_buffer.append(result)
+                    return None
+                else:
+                    idx = rng.randrange(0, max_buffer)
+                    out = shuffle_buffer[idx]
+                    shuffle_buffer[idx] = result
+                    return out
+            return result
+
+        def _run() -> "Iterator[dict]":
+            """Inner generator that drives the packer over the source."""
+            padded_check_budget = 5
+            padded_check_seen = 0
+            padded_check_full = 0
+
+            for source_shard in self._source.shard_names:
+                for example in self._source.open_shard(source_shard):
+                    tokens = example.get(self._input_field, [])
+                    if len(tokens) == 0:
+                        continue
+
+                    if self._warn_on_padded_input and padded_check_seen < padded_check_budget:
+                        padded_check_seen += 1
+                        if len(tokens) == self._seq_length:
+                            padded_check_full += 1
+                        else:
+                            # Saw a non-max-length row; no need to keep checking.
+                            padded_check_seen = padded_check_budget
+
+                    source_id = example.get("__source__")
+                    extra_fields = self._extract_extra_fields(example, len(tokens))
+
+                    for packed in packer.add(list(tokens), source_id, extra_fields):
+                        out = emit(packed)
+                        if out is not None:
+                            yield out
+
+            if self._warn_on_padded_input and padded_check_seen > 0 and padded_check_full == padded_check_seen:
+                logger.warning(
+                    "PackedShardedSource: first %d non-empty upstream rows all have length == seq_length (%d). "
+                    "Inputs appear pre-padded, which makes packing inefficient. "
+                    "Use SFTPreprocessTransform(packing_mode=True) or pass padding=False.",
+                    padded_check_seen,
+                    self._seq_length,
+                )
+
+            if isinstance(packer, (PoolPacker, FirstFitPacker)):
+                for packed in packer.flush_all():
+                    out = emit(packed)
+                    if out is not None:
+                        yield out
+            else:
+                final = packer.flush_final()
+                if final is not None:
+                    out = emit(final)
+                    if out is not None:
+                        yield out
+
+            if self._shuffle:
+                rng.shuffle(shuffle_buffer)
+                yield from shuffle_buffer
+
+        try:
+            yield from _run()
+        finally:
+            if self._return_stats:
+                self._last_packing_stats = packer.stats
+                if self._on_iteration_end is not None:
+                    self._on_iteration_end(packer.stats)
+
+    def __len__(self) -> int:
+        """Coarse estimate of the packed-row count, derived from upstream length.
+
+        Assumes ~70% packing efficiency / ~1.4 source examples per
+        packed window — accurate enough for progress bars but not
+        for exact counts. Real counts depend on the token-length
+        distribution and the chosen strategy.
+
+        Returns:
+            int: Estimate of ``len(source) / 1.4`` floored to at
+            least ``1``.
+
+        Raises:
+            TypeError: If the wrapped source does not support
+                ``len()`` (i.e. is streaming).
+        """
+        # Estimate based on average sequence length ratio
+        # Assume ~70% packing efficiency as a rough heuristic
+        source_len = len(self._source)
+        # Rough estimate: each packed sequence contains ~1.4 original sequences on average
+        return max(1, int(source_len / 1.4))
+
+    def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"PackedShardedSource(seq_length=N, strategy='...', source=...)"``.
+        """
+        return (
+            f"PackedShardedSource(seq_length={self._seq_length}, strategy={self._strategy!r}, source={self._source!r})"
+        )
+
+    def _extract_extra_fields(self, example: dict, token_count: int) -> dict[str, list[int]]:
+        return _align_extra_fields(self._extra_field_pad_values, token_count, example)
+
+
+class PackStage(BaseStage):
+    """Pipeline stage that wraps each dataset in a :class:`PackedShardedSource`.
+
+    Activated by :attr:`PackStageConfig.enabled`; when off, the
+    stage is a pass-through. When on, every entry of the rolling
+    source dict is replaced by a :class:`PackedShardedSource`
+    configured from :class:`PackStageConfig`. The trainer then sees
+    fixed-length packed windows instead of variable-length
+    tokenized rows, dramatically improving GPU/TPU utilisation for
+    short-sequence datasets.
+    """
+
+    def __init__(self, config: PackStageConfig | None = None):
+        """Capture the pack configuration and forward to the base stage.
+
+        Args:
+            config: :class:`PackStageConfig` controlling enable
+                flag, sequence length, EOS/pad ids, packing
+                strategy, and shuffle behaviour. ``None`` produces
+                a default disabled config so the stage is
+                constructible without arguments.
+        """
+        super().__init__(config.__dict__ if config else {})
+        self._stage_config = config or PackStageConfig()
+
+    @property
+    def name(self) -> str:
+        """Stage identifier used in metric and log namespaces.
+
+        Returns:
+            str: Constant string ``"pack"``.
+        """
+        return "pack"
+
+    def process(
+        self,
+        data: dict[str, ShardedDataSource],
+        context: PipelineContext,
+    ) -> dict[str, ShardedDataSource]:
+        """Replace each source in ``data`` with a packed version.
+
+        No-ops when packing is disabled in the stage config, so
+        callers can chain ``pack()`` unconditionally. The
+        per-source RNG seed is taken from ``context.seed`` so the
+        whole pipeline run is reproducible.
+
+        Args:
+            data: Rolling ``{dataset_name: ShardedDataSource}`` dict
+                from the previous stage.
+            context: Shared :class:`PipelineContext`; only
+                ``context.seed`` is consulted.
+
+        Returns:
+            dict[str, ShardedDataSource]: ``data`` itself when the
+            stage is disabled; otherwise a same-keyed dict whose
+            values are :class:`PackedShardedSource` instances.
+        """
+        if not self._stage_config.enabled:
+            return data
+
+        result = {}
+        for ds_name, source in data.items():
+            on_iteration_end = None
+            if self._stage_config.return_stats and self._stage_config.record_context_stats:
+
+                def _record(stats: PackingStats, ds: str = ds_name) -> None:
+                    context.record_metric(self.name, f"{ds}_packing_stats", stats.to_dict())
+
+                on_iteration_end = _record
+
+            packed = PackedShardedSource(
+                source=source,
+                seq_length=self._stage_config.seq_length,
+                eos_token_id=self._stage_config.eos_token_id,
+                pad_token_id=self._stage_config.pad_token_id,
+                strategy=self._stage_config.strategy,
+                num_packers=self._stage_config.num_packers,
+                include_segment_ids=self._stage_config.include_segment_ids,
+                shuffle=self._stage_config.shuffle_packed,
+                shuffle_buffer_factor=self._stage_config.shuffle_buffer_factor,
+                seed=context.seed,
+                return_stats=self._stage_config.return_stats,
+                warn_on_padded_input=self._stage_config.warn_on_padded_input,
+                extra_field_pad_values=self._stage_config.extra_field_pad_values,
+                extra_field_separator_values=self._stage_config.extra_field_separator_values,
+                on_iteration_end=on_iteration_end,
+            )
+            result[ds_name] = packed
+            logger.info(f"Packed dataset '{ds_name}' with strategy={self._stage_config.strategy}")
+
+        return result
+
+
+def report_packing_stats(
+    source: ShardedDataSource[dict],
+    seq_length: int,
+    eos_token_id: int = 2,
+    pad_token_id: int = 0,
+    strategy: str = "greedy",
+    num_packers: int = 4,
+    input_field: str = "input_ids",
+    max_rows: int = 10000,
+) -> PackingStats:
+    """Pack a sample of ``source`` and return efficiency statistics.
+
+    This helper is useful for diagnosing padding waste before a long
+    training run. It creates a fresh temporary packer, consumes at most
+    ``max_rows`` upstream rows, flushes the residual buffer, and returns
+    the aggregated :class:`PackingStats`. The original ``source`` is not
+    mutated.
+
+    Args:
+        source: Upstream tokenized :class:`ShardedDataSource` whose rows
+            carry token ids in ``input_field``.
+        seq_length: Target packed window length.
+        eos_token_id: EOS separator token id.
+        pad_token_id: Padding token id.
+        strategy: Packing strategy — ``"greedy"``, ``"pool"``, or
+            ``"first_fit"``.
+        num_packers: Pool size when ``strategy == "pool"``.
+        input_field: Row key containing token ids.
+        max_rows: Maximum upstream rows to sample.
+
+    Returns:
+        PackingStats: Aggregated statistics after packing the sample.
+    """
+    from .source import LimitedShardedSource
+
+    limited = LimitedShardedSource(source, max_rows=max_rows)
+    packed = PackedShardedSource(
+        source=limited,
+        seq_length=seq_length,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        strategy=strategy,
+        num_packers=num_packers,
+        input_field=input_field,
+        shuffle=False,
+        return_stats=True,
+    )
+
+    for _ in packed.open_shard(packed.shard_names[0]):
+        pass
+
+    return packed.packing_stats or PackingStats(seq_length=seq_length)
+
+
+def pack_pre_tokenized(
+    stream,
+    seq_length: int,
+    eos_token_id: int,
+    batch_size: int,
+    shuffle: bool,
+    buffer_factor: int,
+    tokens_field: str = "tokens",
+    seed: int | None = None,
+):
+    """Pack pre-tokenized sequences into constant-length chunks.
+
+    Takes a stream of pre-tokenized examples and packs them into fixed-length
+    sequences for efficient training. Sequences are concatenated and split
+    at the specified sequence length, with EOS tokens inserted as needed.
+
+    Args:
+        stream: Iterator of dictionaries containing 'tokens' field.
+        seq_length: Target length for packed sequences.
+        eos_token_id: Token ID to use for padding/separation.
+        batch_size: Batch size (used for shuffle buffer calculation).
+        shuffle: Whether to shuffle the packed sequences.
+        buffer_factor: Multiplier for shuffle buffer size (batch_size * buffer_factor).
+
+    Returns:
+        Generator yielding dictionaries with 'input_ids' as JAX arrays.
+    """
+
+    def gen():
+        """Inline closure that runs the pre-tokenized constant-length packer.
+
+        Captures ``stream``, ``seq_length``, ``eos_token_id``,
+        ``batch_size``, ``shuffle``, and ``buffer_factor`` from
+        :func:`pack_pre_tokenized`. Maintains a numpy buffer plus
+        an optional reservoir-shuffle list of size
+        ``batch_size * buffer_factor``; slices ``seq_length``
+        windows out of the buffer and either yields them directly
+        or pushes them through the reservoir.
+
+        Yields:
+            dict: ``{"input_ids": jax.Array}`` per packed window.
+            The trailing reservoir contents are shuffled and drained
+            after the upstream stream is exhausted.
+        """
+        buf = np.array([], dtype=np.int32)
+        eos = np.array([eos_token_id], dtype=np.int32)
+        shuffle_buf = []
+        # Instance RNG: the module-global `random` polluted other consumers
+        # and made the packed order irreproducible despite mixture.seed.
+        rng = random.Random(seed) if seed is not None else random.Random()
+        # batch_size may be None (unbatched row stream); it only scales the
+        # reservoir used when shuffle is enabled, so fall back to 1.
+        max_buf = (batch_size or 1) * buffer_factor
+        dropped_tail = 0
+
+        for sample in stream:
+            toks = sample[tokens_field]
+            # Use asarray to avoid unnecessary copy if already int32 ndarray
+            toks = np.asarray(toks, dtype=np.int32)
+            buf = np.concatenate([buf, toks], axis=0)
+            if len(buf) % seq_length != 0:
+                buf = np.concatenate([buf, eos], axis=0)
+            while len(buf) >= seq_length:
+                ex = {"input_ids": jnp.array(buf[:seq_length])}
+                buf = buf[seq_length:]
+                if shuffle:
+                    if len(shuffle_buf) < max_buf:
+                        shuffle_buf.append(ex)
+                    else:
+                        i = rng.randrange(0, max_buf)
+                        yield shuffle_buf[i]
+                        shuffle_buf[i] = ex
+                else:
+                    yield ex
+        dropped_tail = len(buf)
+        if dropped_tail:
+            logger.info(
+                f"pack_pre_tokenized: dropping trailing partial window of {dropped_tail} tokens "
+                f"(< seq_length={seq_length}); constant-length packing has no padded tail."
+            )
+        rng.shuffle(shuffle_buf)
+        for ex in shuffle_buf:
+            yield ex
+
+    return gen
+
+
+def pack_constant_length(
+    stream,
+    tokenize_fn,
+    seq_length: int,
+    eos_token_id: int,
+    batch_size: int,
+    shuffle: bool,
+    buffer_factor: int,
+    tokenize_batch_size: int | None = None,
+    seed: int | None = None,
+):
+    """Pack sequences with on-the-fly tokenization into constant-length chunks.
+
+    Combines tokenization and packing in a single pipeline. Takes raw examples,
+    tokenizes them using the provided function, and packs the results into
+    fixed-length sequences.
+
+    Args:
+        stream: Iterator of raw examples to tokenize.
+        tokenize_fn: Function that takes an example and returns token IDs.
+            When ``tokenize_batch_size`` is set, it instead receives a LIST of
+            examples and must return a list of token-id sequences (one per
+            example, same order) — this is what lets HF fast tokenizers use
+            their internal (rayon) parallelism, which only engages on batch
+            encodes; per-string calls stay single-threaded regardless of
+            ``TOKENIZERS_PARALLELISM``.
+        seq_length: Target length for packed sequences.
+        eos_token_id: Token ID to use for padding/separation.
+        batch_size: Batch size (used for shuffle buffer calculation).
+        shuffle: Whether to shuffle the packed sequences.
+        buffer_factor: Multiplier for shuffle buffer size (batch_size * buffer_factor).
+        tokenize_batch_size: When set (> 1), buffer this many raw examples and
+            call ``tokenize_fn`` once per buffer with the list. ``None`` keeps
+            the per-example calling convention.
+
+    Returns:
+        Generator yielding dictionaries with 'input_ids' as JAX arrays.
+    """
+
+    def token_iter():
+        """Inline closure: lazily tokenise the upstream stream into a ``tokens`` shape.
+
+        Captures ``stream``, ``tokenize_fn`` and ``tokenize_batch_size`` from
+        :func:`pack_constant_length`. Examples pass through ``tokenize_fn``
+        one-by-one (default) or in lists of ``tokenize_batch_size`` and are
+        re-emitted as ``{"tokens": <ids>}`` so :func:`pack_pre_tokenized`
+        can consume them.
+
+        Yields:
+            dict: One ``{"tokens": list[int]}`` per upstream example.
+        """
+        if tokenize_batch_size and tokenize_batch_size > 1:
+            buf = []
+            for ex in stream:
+                buf.append(ex)
+                if len(buf) >= tokenize_batch_size:
+                    for toks in tokenize_fn(buf):
+                        yield {"tokens": toks}
+                    buf = []
+            if buf:
+                for toks in tokenize_fn(buf):
+                    yield {"tokens": toks}
+        else:
+            for ex in stream:
+                yield {"tokens": tokenize_fn(ex)}
+
+    return pack_pre_tokenized(token_iter(), seq_length, eos_token_id, batch_size, shuffle, buffer_factor, seed=seed)

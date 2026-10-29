@@ -1,0 +1,694 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Kahneman-Tversky Optimization (KTO) trainer.
+
+KTO learns from unpaired desirable/undesirable feedback by minimising
+a prospect-theory-inspired loss against a reference model.  Compared
+to DPO, it does not require explicit ``(chosen, rejected)`` pairs and
+instead consumes ``(prompt, completion, label)`` triples where
+``label`` is a boolean.
+"""
+
+from __future__ import annotations
+
+import typing as tp
+
+import numpy as np
+from eformer.loggings import get_logger
+from tqdm.auto import tqdm
+
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
+from easydel.infra.utils import ProcessingClassType
+from easydel.utils import Registry
+
+from .._shared import copy_frozen_policy, drop_optimizer_state
+from ..binary_classifier_optimization_trainer._fn import concatenated_forward
+from ..model_loading import disable_state_dropout, reject_string_model_id
+from ..prompt_transforms import KTOPreprocessTransform
+from ..prompt_utils import (
+    maybe_apply_chat_template,
+    maybe_extract_prompt,
+    maybe_unpair_preference_dataset,
+)
+from ..trainer.trainer import Trainer
+from ..trainer_protocol import TrainerConfigureFunctionOutput
+from ..training_utils import compile_trainer_auxiliary, compile_trainer_step, resolve_straight_through_emulator
+from ..utils import BCODataCollatorGrain, BCODataCollatorTFDS
+from ._fn import _build_kl_batch, evaluation_step, training_step
+from .kto_config import KTOConfig
+
+if tp.TYPE_CHECKING:
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
+
+    from easydel.data.core.protocols import ShardedDataSource
+
+logger = get_logger(__name__)
+
+
+@Registry.register("trainer", "kto")
+class KTOTrainer(Trainer):
+    """Trainer for Kahneman-Tversky Optimization (KTO).
+
+    Implements the unpaired prospect-theoretic alignment objective
+    from Ethayarajh et al. 2024: each example carries a single
+    boolean ``label`` (desirable vs. undesirable) and the loss
+    shapes the implicit reward
+    ``r = beta * (logp - logp_ref)`` against the running KL anchor
+    ``z`` (estimated from a *mismatched-completion* batch built by
+    :func:`_build_kl_batch`). With ``loss_type = "apo_zero_unpaired"``
+    the trainer instead runs the APO-zero unpaired surrogate.
+
+    See :func:`kto_objective` for the loss form and
+    :func:`training_step` for the per-step pipeline.
+
+    Attributes:
+        arguments: :class:`KTOConfig` controlling losses, lengths,
+            UDM-style weighting, and the inherited
+            ``TrainingArguments`` surface.
+        processing_class: Tokenizer/processor used for prompt and
+            completion encoding.
+        reference_state: Frozen reference :class:`EasyDeLState`;
+            falls back to a deep copy of the policy when none is
+            provided.
+        calculate_kl: Cached flag controlling whether the running KL
+            anchor is computed (``True`` for ``loss_type == "kto"``).
+    """
+
+    supports_sequence_packing: tp.ClassVar[bool] = False  # RL/online or paired-preference: warn-and-ignore packing
+
+    arguments: KTOConfig
+
+    def __init__(
+        self,
+        arguments: KTOConfig,
+        model: EasyDeLBaseModule | EasyDeLState | None,
+        reference_model: EasyDeLBaseModule | EasyDeLState | None = None,
+        processing_class: ProcessingClassType | None = None,
+        train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
+        eval_dataset: Dataset | IterableDataset | ShardedDataSource | dict[str, Dataset] | None = None,
+        data_collator: BCODataCollatorTFDS | BCODataCollatorGrain | None = None,
+    ):
+        """Initialize the KTO trainer.
+
+        Resolves the policy and reference states (deep-copying when no
+        reference is provided), validates required inputs, configures
+        padding, and forwards construction to :class:`Trainer`.
+
+        Args:
+            arguments: KTO-specific training configuration.
+            model: Policy module or state.
+            reference_model: Optional reference module/state; deep-
+                copied from ``model`` when omitted.
+            processing_class: Tokenizer/processor used for prompt and
+                completion encoding.
+            train_dataset: Dataset of ``(prompt, completion, label)``
+                triples.
+            eval_dataset: Optional evaluation dataset.
+            data_collator: Optional custom collator (defaults to the
+                BCO-compatible KTO collator).
+
+        Raises:
+            TypeError: If ``arguments`` is not a :class:`KTOConfig`.
+            ValueError: If required inputs are missing or no padding
+                token can be determined.
+        """
+        if not isinstance(arguments, KTOConfig):
+            raise TypeError(f"`arguments` must be a `KTOConfig`, received {type(arguments)}")
+        if processing_class is None:
+            raise ValueError("`processing_class` must be provided for KTO training.")
+        if model is None:
+            raise ValueError("`model` must be supplied to the KTO trainer.")
+        if train_dataset is None:
+            raise ValueError("`train_dataset` must be provided for KTOTrainer.")
+
+        if getattr(processing_class, "pad_token_id", None) is None and hasattr(processing_class, "eos_token"):
+            processing_class.pad_token = processing_class.eos_token
+
+        model = self._resolve_policy_model(model)
+        reference_model = self._resolve_reference_model(reference_model)
+
+        if isinstance(model, EasyDeLState):
+            model_state = model
+        else:
+            model_state = model.to_state(trainable_selector=arguments.trainable_selector)
+
+        if reference_model is None:
+            reference_state = copy_frozen_policy(model_state)
+        elif isinstance(reference_model, EasyDeLState):
+            reference_state = reference_model
+        elif isinstance(reference_model, EasyDeLBaseModule):
+            reference_state = reference_model.to_state(trainable_selector=arguments.trainable_selector)
+        else:
+            reference_state = copy_frozen_policy(model_state)
+
+        if arguments.disable_dropout:
+            model_state = disable_state_dropout(model_state)
+            reference_state = disable_state_dropout(reference_state)
+
+        self.arguments = arguments
+        if self.arguments.is_encoder_decoder is not None:
+            self.is_encoder_decoder = self.arguments.is_encoder_decoder
+        else:
+            self.is_encoder_decoder = getattr(model_state.model.config, "is_encoder_decoder", False)
+            self.arguments.is_encoder_decoder = self.is_encoder_decoder
+
+        if arguments.padding_value is not None:
+            self.padding_value = arguments.padding_value
+        else:
+            pad_token_id = getattr(processing_class, "pad_token_id", None)
+            if pad_token_id is None and hasattr(processing_class, "tokenizer"):
+                pad_token_id = getattr(processing_class.tokenizer, "pad_token_id", None)
+            if pad_token_id is None:
+                raise ValueError("Tokenizer must expose a pad token or `padding_value` must be specified.")
+            self.padding_value = pad_token_id
+            self.arguments.padding_value = pad_token_id
+
+        if arguments.max_completion_length is None and arguments.max_length is not None:
+            arguments.max_completion_length = max(arguments.max_length - arguments.max_prompt_length, 1)
+
+        if data_collator is None:
+            input_data_collator_tfds = BCODataCollatorTFDS(
+                max_prompt_length=arguments.max_prompt_length,
+                max_completion_length=arguments.max_completion_length,
+                pad_token_id=self.padding_value,
+                label_pad_token_id=arguments.label_pad_token_id,
+                is_encoder_decoder=self.is_encoder_decoder,
+            )
+            input_data_collator_grain = BCODataCollatorGrain(
+                max_prompt_length=arguments.max_prompt_length,
+                max_completion_length=arguments.max_completion_length,
+                pad_token_id=self.padding_value,
+                label_pad_token_id=arguments.label_pad_token_id,
+                is_encoder_decoder=self.is_encoder_decoder,
+            )
+        else:
+            input_data_collator_tfds = data_collator
+            input_data_collator_grain = data_collator
+
+        self.input_data_collator_tfds = input_data_collator_tfds
+        self.input_data_collator_grain = input_data_collator_grain
+
+        self.processing_class = processing_class
+        self.reference_state = drop_optimizer_state(reference_state)
+        self.calculate_kl = arguments.loss_type == "kto"
+        self.aux_loss_enabled = getattr(model_state.model, "output_router_logits", False)
+        self.aux_loss_coef = getattr(model_state.model, "router_aux_loss_coef", 0.0)
+
+        # Preprocess datasets: extract prompts, unpair preference data, apply chat template
+        train_dataset = self._preprocess_kto_dataset(train_dataset, processing_class, arguments)
+        if eval_dataset is not None:
+            eval_dataset = self._preprocess_kto_dataset(eval_dataset, processing_class, arguments)
+
+        super().__init__(
+            arguments=arguments,
+            model_state=model_state,
+            dataset_train=train_dataset,
+            dataset_eval=eval_dataset,
+            data_collator=None,
+            processing_class=processing_class,
+        )
+
+    @staticmethod
+    def _resolve_policy_model(
+        model: EasyDeLBaseModule | EasyDeLState,
+    ) -> EasyDeLBaseModule | EasyDeLState:
+        """Reject accidental string policy identifiers."""
+        if isinstance(model, str):
+            reject_string_model_id(model, role="policy model")
+        return model
+
+    @staticmethod
+    def _resolve_reference_model(
+        reference_model: EasyDeLBaseModule | EasyDeLState | None,
+    ) -> EasyDeLBaseModule | EasyDeLState | None:
+        """Reject accidental string references."""
+        if isinstance(reference_model, str):
+            reject_string_model_id(reference_model, role="reference model")
+        return reference_model
+
+    @staticmethod
+    def _preprocess_kto_dataset(dataset, processing_class, arguments):
+        """Preprocess dataset for KTO training.
+
+        Handles raw preference datasets (chosen/rejected format) by:
+        1. Extracting shared prompts from chosen/rejected conversations
+        2. Unpairing preference data (1 pair → 2 examples with labels)
+        3. Applying chat template to convert conversations to text
+
+        Args:
+            dataset: Raw dataset with chosen/rejected or prompt/completion/label fields.
+            processing_class: Tokenizer for chat template application.
+            arguments: KTO training arguments.
+
+        Returns:
+            Preprocessed dataset with prompt, completion, label fields.
+        """
+        if dataset is None:
+            return None
+
+        if isinstance(dataset, dict):
+            return {k: KTOTrainer._preprocess_kto_dataset(v, processing_class, arguments) for k, v in dataset.items()}
+
+        from datasets import Dataset, IterableDataset
+
+        from easydel.data.core.protocols import ShardedDataSource
+
+        if not isinstance(dataset, Dataset):
+
+            def preprocess_rows(rows):
+                for row in rows:
+                    if "prompt_input_ids" in row:
+                        yield row
+                        continue
+                    row = {**row, **maybe_extract_prompt(row)}
+                    if "chosen" in row and "rejected" in row:
+                        base = {k: v for k, v in row.items() if k not in {"chosen", "rejected"}}
+                        examples = [
+                            {**base, "completion": row["chosen"], "label": True},
+                            {**base, "completion": row["rejected"], "label": False},
+                        ]
+                    else:
+                        examples = [row]
+                    for example in examples:
+                        if not getattr(arguments, "skip_apply_chat_template", False):
+                            example = {
+                                **example,
+                                **maybe_apply_chat_template(
+                                    example, tokenizer=processing_class, tools=getattr(arguments, "tools", None)
+                                ),
+                            }
+                        yield example
+
+            if isinstance(dataset, ShardedDataSource):
+
+                class PreprocessedKTOSource(ShardedDataSource):
+                    @property
+                    def shard_names(self):
+                        return dataset.shard_names
+
+                    def num_shards(self):
+                        return dataset.num_shards()
+
+                    def open_shard(self, shard_name):
+                        yield from preprocess_rows(dataset.open_shard(shard_name))
+
+                return PreprocessedKTOSource()
+            if isinstance(dataset, IterableDataset):
+                return IterableDataset.from_generator(lambda: preprocess_rows(iter(dataset)))
+            raise TypeError(f"Unsupported KTO dataset type: {type(dataset)}")
+
+        map_kwargs = {"writer_batch_size": 10, "num_proc": getattr(arguments, "dataset_num_proc", None)}
+
+        dataset = dataset.map(maybe_extract_prompt, **map_kwargs)
+
+        # Step 2: Unpair preference data (chosen/rejected → prompt/completion/label)
+        dataset = maybe_unpair_preference_dataset(dataset, num_proc=map_kwargs.get("num_proc"))
+
+        if not getattr(arguments, "skip_apply_chat_template", False):
+            dataset = dataset.map(
+                maybe_apply_chat_template,
+                fn_kwargs={"tokenizer": processing_class, "tools": getattr(arguments, "tools", None)},
+                **map_kwargs,
+            )
+
+        return dataset
+
+    def _get_preprocess_transform(self) -> KTOPreprocessTransform | None:
+        """Build the KTO preprocessing transform for a :class:`ShardedDataSource`.
+
+        Skips transform construction when the underlying data source
+        is already pretokenized (carries ``prompt_input_ids``), in
+        which case the trainer consumes the batch as-is.
+
+        Returns:
+            A :class:`KTOPreprocessTransform` configured with the
+            tokenizer, prompt/completion budgets, label pad id, and
+            optional tools spec; ``None`` when the dataset is
+            pretokenized.
+        """
+
+        if self._is_pretokenized():
+            return None
+        return KTOPreprocessTransform(
+            tokenizer=self.processing_class,
+            max_prompt_length=self.arguments.max_prompt_length,
+            max_completion_length=self.arguments.max_completion_length,
+            label_pad_token_id=self.arguments.label_pad_token_id,
+            tools=getattr(self.arguments, "tools", None),
+        )
+
+    @staticmethod
+    def _source_is_pretokenized(source: "ShardedDataSource | None") -> bool:
+        """Return whether a source already contains tokenized KTO prompt fields."""
+        if source is None:
+            return False
+        try:
+            sample = next(iter(source.open_shard(source.shard_names[0])))
+            return "prompt_input_ids" in sample
+        except (StopIteration, IndexError):
+            return False
+
+    def _is_pretokenized(self) -> bool:
+        """Detect whether the training :class:`ShardedDataSource` is pre-tokenized.
+
+        Opens the first shard, peeks at one sample, and checks for the
+        ``prompt_input_ids`` key. Used to short-circuit transform
+        construction when the dataset already carries tokenized
+        prompts and completions.
+
+        Returns:
+            ``True`` when the first sample exposes
+            ``prompt_input_ids``; ``False`` when no train source is
+            attached, the shard is empty, or the key is missing.
+        """
+        return self._source_is_pretokenized(self._train_source)
+
+    @staticmethod
+    def _source_has_reference_logps(source: "ShardedDataSource | None", *, require_kl: bool = False) -> bool:
+        """Return whether a source carries precomputed KTO reference log-probs."""
+        if source is None:
+            return False
+        try:
+            sample = next(iter(source.open_shard(source.shard_names[0])))
+        except (StopIteration, IndexError):
+            return False
+        if "reference_logps" not in sample:
+            return False
+        return not require_kl or "reference_KL_logps" in sample
+
+    def _build_source_from_dataset(
+        self,
+        dataset: "Dataset | IterableDataset | ShardedDataSource | None",
+    ) -> "ShardedDataSource | None":
+        """Convert a dataset to a sharded source and attach preprocessing if needed."""
+        source = self._to_sharded_source(dataset)
+        if source is None or self._source_is_pretokenized(source):
+            return source
+        return source.transform(self._get_preprocess_transform())
+
+    def configure_functions(self) -> TrainerConfigureFunctionOutput:
+        """Build the JIT-compiled KTO training/evaluation step functions.
+
+        Resolves the optional QAT straight-through emulator, defines
+        the BCO-style concatenated forward used to score
+        ``(prompt, completion)`` pairs, and compiles
+        :func:`training_step` and :func:`evaluation_step` with the
+        right input/output shardings (including the reference state's
+        sharding spec) and the active MPMD pipeline schedule.
+
+        Returns:
+            ``TrainerConfigureFunctionOutput`` with the sharded
+            training / evaluation step callables, the model mesh,
+            and the streaming checkpoint manager.
+        """
+        mesh = self.model.mesh
+        empty_sharding = replicated_named_sharding(mesh)
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_group_size=self.arguments.quantization_group_size,
+            quantization_bits=self.arguments.quantization_bits,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
+
+        def forward_fn(model, batch):
+            """Run the BCO-style concatenated forward shared with KTO.
+
+            Args:
+                model: The current policy or reference model module.
+                batch: The collated KTO batch.
+
+            Returns:
+                The dict of completion log-probs / mean logits used by
+                the KTO loss.
+            """
+            return concatenated_forward(
+                model,
+                batch,
+                is_encoder_decoder=self.arguments.is_encoder_decoder,
+                label_pad_token_id=self.arguments.label_pad_token_id,
+                padding_value=self.padding_value,
+                max_length=self.arguments.max_length,
+                truncation_mode=self.arguments.truncation_mode,
+                aux_loss_enabled=self.aux_loss_enabled,
+                logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+            )
+
+        self.concatenated_forward = compile_trainer_auxiliary(forward_fn, mesh=mesh, static_argnames=())
+
+        self._train_shared_fn_static_args = (
+            self.scheduler,
+            forward_fn,
+            self.arguments.beta,
+            self.arguments.desirable_weight,
+            self.arguments.undesirable_weight,
+            self.arguments.loss_type,
+            self.calculate_kl,
+            self.aux_loss_coef,
+            self.arguments.loss_config,
+            self.arguments.step_partition_spec,
+            self.arguments.gradient_accumulation_steps,
+            straight_through_emulator,
+        )
+
+        ref_sharding = self.reference_state.shardings if self.reference_state is not None else empty_sharding
+
+        train_static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
+        self._runtime_trace("train.compile_wrapper.begin")
+        sharded_training_step_function = compile_trainer_step(
+            training_step,
+            in_shardings=(self.state_shardings, empty_sharding, ref_sharding),
+            out_shardings=(self.state_shardings, empty_sharding),
+            donate_argnums=(0,),
+            static_argnums=train_static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
+        )
+        self._runtime_trace("train.compile_wrapper.end")
+
+        self._eval_shared_fn_static_args = (
+            forward_fn,
+            self.arguments.beta,
+            self.arguments.desirable_weight,
+            self.arguments.undesirable_weight,
+            self.arguments.loss_type,
+            self.calculate_kl,
+            self.aux_loss_coef,
+            self.arguments.step_partition_spec,
+        )
+
+        eval_static_argnums = (3, 4, 5, 6, 7, 8, 9, 10)
+        self._runtime_trace("eval.compile_wrapper.begin")
+        sharded_evaluation_step_function = compile_trainer_step(
+            evaluation_step,
+            in_shardings=(self.state_shardings, empty_sharding, ref_sharding),
+            out_shardings=empty_sharding,
+            static_argnums=eval_static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
+        )
+        self._runtime_trace("eval.compile_wrapper.end")
+
+        self.sharded_training_step_function = sharded_training_step_function
+        self.sharded_evaluation_step_function = sharded_evaluation_step_function
+        self._train_shared_fn_extra_args = (self.reference_state,)
+        self._eval_shared_fn_extra_args = (self.reference_state,)
+
+        checkpoint_manager = self.arguments.get_streaming_checkpointer()
+
+        return TrainerConfigureFunctionOutput(
+            sharded_training_step_function=sharded_training_step_function,
+            sharded_evaluation_step_function=sharded_evaluation_step_function,
+            mesh=mesh,
+            checkpoint_manager=checkpoint_manager,
+        )
+
+    def configure_dataloaders(self):
+        """Precompute optional KTO reference log-probs before base dataloaders."""
+        if self.dataset_train is not None and not self._source_has_reference_logps(
+            self._train_source, require_kl=self.calculate_kl
+        ):
+            if self.arguments.precompute_ref_log_probs:
+                self._precompute_reference_log_probs_for_split(
+                    dataset_attr="dataset_train",
+                    source_attr="_train_source",
+                    batch_size=self.arguments.precompute_ref_batch_size or self.training_batch_size,
+                    is_train=True,
+                    desc="Train dataset reference log probs",
+                )
+        if self.dataset_eval is not None and not self._source_has_reference_logps(
+            self._eval_source, require_kl=self.calculate_kl
+        ):
+            if self.arguments.precompute_ref_log_probs:
+                self._precompute_reference_log_probs_for_split(
+                    dataset_attr="dataset_eval",
+                    source_attr="_eval_source",
+                    batch_size=self.arguments.precompute_ref_batch_size or self.evaluation_batch_size,
+                    is_train=False,
+                    desc="Eval dataset reference log probs",
+                )
+        return super().configure_dataloaders()
+
+    def _precompute_reference_log_probs_for_split(
+        self,
+        *,
+        dataset_attr: str,
+        source_attr: str,
+        batch_size: int,
+        is_train: bool,
+        desc: str,
+    ) -> bool:
+        """Materialize reference log-prob columns for one KTO dataset split.
+
+        The method only mutates dataset/source attributes when the dataset
+        supports ``add_column`` and at least one batch is produced. Otherwise it
+        returns ``False`` and leaves runtime scoring to the normal KTO path.
+        """
+        dataset = getattr(self, dataset_attr)
+        source = getattr(self, source_attr)
+        if dataset is None or source is None:
+            return False
+        if not hasattr(dataset, "add_column"):
+            logger.warning(
+                "`precompute_ref_log_probs=True` requires a dataset that supports `add_column`; "
+                "falling back to on-the-fly KTO reference scoring for `%s`.",
+                dataset_attr,
+            )
+            return False
+
+        reference_logps: list[np.ndarray] = []
+        reference_kl_logps: list[np.ndarray] = []
+        data_collator = self.data_collator or (lambda batch: batch)
+        batch_iterator = self._create_dataloader_from_source(
+            source=source,
+            batch_size=batch_size,
+            is_train=is_train,
+            shuffle=False,
+            num_epochs=1,
+            drop_remainder=False,
+        )
+        for raw_batch in tqdm(iterable=batch_iterator, desc=desc):
+            padded_batch = self._purify_batch(data_collator(raw_batch))
+            if self.calculate_kl:
+                completion_logps, kl_logps = self.compute_reference_log_probs(padded_batch, include_kl=True)
+                reference_logps.append(np.asarray(completion_logps))
+                reference_kl_logps.append(np.asarray(kl_logps))
+            else:
+                reference_logps.append(np.asarray(self.compute_reference_log_probs(padded_batch)))
+
+        if not reference_logps:
+            return False
+
+        updated_dataset = dataset.add_column(
+            name="reference_logps",
+            column=np.concatenate(reference_logps, axis=0),
+        )
+        if self.calculate_kl:
+            updated_dataset = updated_dataset.add_column(
+                name="reference_KL_logps",
+                column=np.concatenate(reference_kl_logps, axis=0),
+            )
+        setattr(self, dataset_attr, updated_dataset)
+        setattr(self, source_attr, self._build_source_from_dataset(updated_dataset))
+        return True
+
+    def compute_reference_log_probs(self, padded_batch: dict, *, include_kl: bool = False) -> tp.Any:
+        """Compute KTO reference completion log-probs for a padded batch."""
+        reference_model = self.model_state.model if self.reference_state is None else self.reference_state.model
+        reference_model.eval()
+        forward_fn = getattr(self, "concatenated_forward", None)
+        if forward_fn is None:
+            completion_logps = concatenated_forward(
+                reference_model,
+                padded_batch,
+                is_encoder_decoder=self.arguments.is_encoder_decoder,
+                label_pad_token_id=self.arguments.label_pad_token_id,
+                padding_value=self.padding_value,
+                max_length=self.arguments.max_length,
+                truncation_mode=self.arguments.truncation_mode,
+                aux_loss_enabled=self.aux_loss_enabled,
+                logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+            )["completion_logps"]
+            if not include_kl:
+                return completion_logps
+            kl_batch = _build_kl_batch(padded_batch)
+            kl_logps = concatenated_forward(
+                reference_model,
+                kl_batch,
+                is_encoder_decoder=self.arguments.is_encoder_decoder,
+                label_pad_token_id=self.arguments.label_pad_token_id,
+                padding_value=self.padding_value,
+                max_length=self.arguments.max_length,
+                truncation_mode=self.arguments.truncation_mode,
+                aux_loss_enabled=self.aux_loss_enabled,
+                logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+            )["completion_logps"]
+            return completion_logps, kl_logps
+
+        completion_logps = forward_fn(reference_model, padded_batch)["completion_logps"]
+        if not include_kl:
+            return completion_logps
+        kl_logps = forward_fn(reference_model, _build_kl_batch(padded_batch))["completion_logps"]
+        return completion_logps, kl_logps
+
+    def create_grain_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
+    ) -> tp.Callable:
+        """Return the Grain-compatible KTO data collator.
+
+        The collator was already constructed during :meth:`__init__`
+        with the trainer's prompt/completion budgets and pad-token
+        configuration, so the ``max_sequence_length`` and
+        ``truncation_mode`` arguments are accepted only for protocol
+        parity with :class:`Trainer`.
+
+        Args:
+            max_sequence_length: Ignored. Retained for base-class
+                signature compatibility.
+            truncation_mode: Ignored. Retained for base-class
+                signature compatibility.
+
+        Returns:
+            The :class:`BCODataCollatorGrain` instance stashed on the
+            trainer.
+        """
+        return self.input_data_collator_grain
+
+    def create_tfds_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
+    ) -> tp.Callable:
+        """Return the TFDS-compatible KTO data collator.
+
+        Same contract as :meth:`create_grain_collect_function`; the
+        collator is already built in :meth:`__init__`.
+
+        Args:
+            max_sequence_length: Ignored. Retained for base-class
+                signature compatibility.
+            truncation_mode: Ignored. Retained for base-class
+                signature compatibility.
+
+        Returns:
+            The :class:`BCODataCollatorTFDS` instance stashed on the
+            trainer.
+        """
+        return self.input_data_collator_tfds

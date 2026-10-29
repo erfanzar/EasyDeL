@@ -1,0 +1,2026 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unified Attention Module for EasyDeL.
+
+This module provides a single base class (UnifiedAttention) that supports multiple
+attention mechanisms through method-based routing. It enables building attention
+layers for various model architectures without code duplication.
+
+Supported Attention Types:
+    Standard RoPE:
+        Rotary Position Embedding-based attention used by most modern models
+        including Llama, Mistral, Gemma, Qwen, and others.
+
+    Multi-head Latent Attention (MLA):
+        DeepSeek V2/V3 style attention with LoRA-compressed queries and
+        compressed key-value projections for memory efficiency.
+
+    ALiBi (Attention with Linear Biases):
+        Position-independent attention with learned linear biases,
+        used by models like Falcon and MPT.
+
+Key Features:
+    Multiple Forward Paths:
+        - forward_standard(): Standard RoPE-based attention
+        - forward_mla(): Multi-head Latent Attention
+        - forward_alibi(): ALiBi positional bias attention
+
+    Post-processing Hooks:
+        - _preprocess_qkv(): Transform Q/K/V before reshape
+        - _postprocess_qkv(): Apply Q/K normalization after reshape
+
+    Projection Customization:
+        - Fused or separate Q/K/V projections
+        - Customizable projection names via projection_mapping
+        - Support for MLA-specific projections
+
+    Memory Optimization:
+        - Sliding window attention for local context
+        - KV caching for autoregressive generation
+        - Grouped Query Attention (GQA) support
+
+Classes:
+    UnifiedAttention:
+        Base attention module supporting standard, MLA, and ALiBi attention.
+
+Functions:
+    apply_rotary_pos_emb:
+        Apply rotary position embeddings to query and key tensors.
+
+Example:
+    Creating a standard attention layer::
+
+        >>> from easydel.layers.attention import UnifiedAttention
+        >>>
+        >>> class LlamaAttention(UnifiedAttention):
+        ...     '''Llama-style attention with Q/K normalization.'''
+        ...
+        ...     def _postprocess_qkv(self, q, k, v):
+        ...         q = self.q_norm(q)
+        ...         k = self.k_norm(k)
+        ...         return q, k, v
+
+    Creating MLA attention (DeepSeek)::
+
+        >>> class DeepseekAttention(UnifiedAttention):
+        ...     def __init__(self, config, rngs, layer_idx, ...):
+        ...         super().__init__(
+        ...             config, rngs=rngs, layer_idx=layer_idx,
+        ...             attention_type='mla',
+        ...             use_mla_lora=True
+        ...         )
+
+    Creating ALiBi attention (Falcon)::
+
+        >>> class FalconAttention(UnifiedAttention):
+        ...     def __init__(self, config, rngs, layer_idx, ...):
+        ...         super().__init__(
+        ...             config, rngs=rngs, layer_idx=layer_idx,
+        ...             attention_type='alibi'
+        ...         )
+
+Note:
+    The UnifiedAttention class is designed to be subclassed for specific model
+    architectures. Override methods like _postprocess_qkv(), _create_rotary(),
+    or the projection creation methods to customize behavior.
+
+See Also:
+    - easydel.layers.attention: FlexibleAttentionModule for attention computation
+    - easydel.layers.components.rotary_embedding: RoPE implementations
+    - easydel.layers.caching: KV cache implementations
+"""
+
+from __future__ import annotations
+
+import copy
+import warnings
+from typing import TYPE_CHECKING, ClassVar, Generic, Literal, TypeVar, cast
+
+import jax
+import jax.numpy as jnp
+import spectrax as spx
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, DTypeLike, Float, Int, PRNGKeyArray
+from spectrax import common_types, nn
+
+from easydel.caching import (
+    MLARaggedPagesCacheView,
+    OperationsMetadata,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCacheView,
+    TransformerMetadata,
+    UnifiedAttentionCacheView,
+)
+from easydel.infra.modeling_outputs import AttentionLayerOutput
+
+from ..layouts import build_fused_qkv_projection
+from ..linears import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
+from ..norms._norms import RMSNorm
+from ..rotary import apply_rope_interleaved, yarn_get_mscale
+from ._flexible import AttentionModule, FlexibleAttentionModule
+
+if TYPE_CHECKING:
+    from easydel.infra.base_config import EasyDeLBaseConfig
+else:
+    EasyDeLBaseConfig = object
+
+
+Cfg = TypeVar("BaseModuleCfg", bound=EasyDeLBaseConfig)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
+    """Apply split-half rotary embeddings to query and key tensors.
+
+    Args:
+        q: Queries ``[batch, heads, seq, dim]``.
+        k: Keys ``[batch, kv_heads, seq, dim]``.
+        cos: Cosine lookup table ``[max_seq_len, dim]``.
+        sin: Sine lookup table ``[max_seq_len, dim]``.
+        position_ids: Lookup positions ``[batch, seq]``.
+
+    Returns:
+        Rotated query and key tensors, preserving their shapes.
+    """
+    cos = cos[position_ids][:, None, :, :]
+    sin = sin[position_ids][:, None, :, :]
+
+    def rotate(x):
+        half = x.shape[-1] // 2
+        return x * cos + jnp.concatenate((-x[..., half:], x[..., :half]), axis=-1) * sin
+
+    return rotate(q), rotate(k)
+
+
+class UnifiedAttention(AttentionModule, Generic[Cfg]):
+    """Unified attention module supporting multiple attention mechanisms.
+
+    A single base class that handles all common attention patterns through:
+    1. Multiple forward paths (methods) for different attention types
+    2. Post-processing hooks for Q/K normalization and other transformations
+    3. Automatic routing based on configuration
+
+    Supported Attention Types:
+        - standard: RoPE-based attention (default, most models)
+        - mla: Multi-head Latent Attention (DeepSeek V2/V3)
+        - alibi: ALiBi positional bias (Falcon, MPT)
+
+    Key Features:
+        - Q/K normalization via _postprocess_qkv() hook
+        - Fused or separate QKV projections
+        - Sliding window attention
+        - Grouped Query Attention (GQA)
+        - KV caching support
+        - Residual dropout
+
+    Model-specific customizations via override methods:
+        - define_network(): Custom projection structure (e.g., fused QKV)
+        - _postprocess_qkv(): Apply Q/K normalization or other transformations
+        - _create_rotary(): Custom RoPE configuration
+        - _create_alibi_slopes(): Custom ALiBi slopes
+        - forward(), forward_mla(), forward_alibi(): Full attention path override
+
+    Example:
+        >>> # Standard attention with Q/K norm
+        >>> class Gemma3Attention(UnifiedAttention):
+        ...     def _postprocess_qkv(self, q, k, v):
+        ...         q = self.q_norm(q)
+        ...         k = self.k_norm(k)
+        ...         return q, k, v
+        >>>
+        >>> # MLA attention (DeepSeek)
+        >>> class DeepseekV2Attention(UnifiedAttention):
+        ...     def __init__(self, config, ...):
+        ...         config.attention_type = 'mla'
+        ...         super().__init__(config, ...)
+        >>>
+        >>> # ALiBi attention (Falcon)
+        >>> class FalconAttention(UnifiedAttention):
+        ...     def __init__(self, config, ...):
+        ...         config.attention_type = 'alibi'
+        ...         super().__init__(config, ...)
+        >>>
+        >>> # Custom projection names (e.g., matching HuggingFace names)
+        >>> class CustomAttention(UnifiedAttention):
+        ...     projection_mapping: ClassVar = {
+        ...         "query_projection": "query_projection",
+        ...         "key_projection": "key_projection",
+        ...         "value_projection": "value_projection",
+        ...         "output_projection": "output_projection",
+        ...         "query_key_value_projection": "query_key_value_projection",
+        ...     }
+    """
+
+    norms_mapping: ClassVar[dict[str, str]] = {
+        "query_normalization": "q_norm",
+        "key_normalization": "k_norm",
+        "value_normalization": "v_norm",
+        "output_normalization": "o_norm",
+    }
+    _spx_scan_safe_static_fields: ClassVar[frozenset[str]] = frozenset({"layer_idx"})
+    projection_mapping: ClassVar[dict[str, str]] = {
+        "query_projection": "q_proj",
+        "key_projection": "k_proj",
+        "value_projection": "v_proj",
+        "output_projection": "o_proj",
+        "query_key_value_projection": "qkv_proj",
+        "qkv_projection": "qkv_proj",
+        # MLA-specific projections (DeepSeek V2/V3)
+        "mla_q_proj": "q_proj",
+        "mla_q_a_proj": "q_a_proj",
+        "mla_q_a_layernorm": "q_a_layernorm",
+        "mla_q_b_proj": "q_b_proj",
+        "mla_kv_a_proj_with_mqa": "kv_a_proj_with_mqa",
+        "mla_kv_a_layernorm": "kv_a_layernorm",
+        "mla_kv_b_proj": "kv_b_proj",
+    }
+    fused_qkv_layout: ClassVar[Literal["contiguous", "gqa_grouped"]] = "contiguous"
+
+    def _projection_attr(self, logical_name: str) -> str:
+        """Resolve a logical projection name to its concrete attribute name.
+
+        Consults :attr:`projection_mapping`, with one wrinkle: the fused
+        QKV projection has two historical logical names
+        (``"query_key_value_projection"`` and the older ``"qkv_projection"``).
+        Lookups for the former first try the canonical key, then the
+        legacy key, and finally fall back to the literal default
+        ``"qkv_proj"`` so subclasses that override only one of the two
+        keys still work.
+
+        Args:
+            logical_name: Logical projection name (e.g.
+                ``"query_projection"``, ``"output_projection"``,
+                ``"query_key_value_projection"``).
+
+        Returns:
+            Concrete attribute name on the module (e.g. ``"q_proj"``,
+            ``"o_proj"``, ``"qkv_proj"``).
+        """
+        if logical_name == "query_key_value_projection":
+            return self.projection_mapping.get(
+                "query_key_value_projection",
+                self.projection_mapping.get("qkv_projection", "qkv_proj"),
+            )
+        return self.projection_mapping[logical_name]
+
+    def __init__(
+        self,
+        config: Cfg,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: str | jax.lax.Precision | None = None,
+        *,
+        rngs: spx.Rngs,
+        layer_idx: int,
+        attention_type: Literal["standard", "mla", "alibi"] = "standard",
+        causal: bool = True,
+        sliding_window: int | tuple[int, int] | None = None,
+        use_qk_norm: bool = False,
+        use_fused_qkv: bool = True,
+        use_gqa: bool = False,
+        use_mla_lora: bool = False,
+    ) -> None:
+        """Build the QKV/output projections, RoPE/ALiBi, and the attention performer.
+
+        The constructor reads the standard transformer attention quantities
+        from ``config`` (``hidden_size``, ``num_attention_heads``,
+        ``num_key_value_heads``, ``head_dim``) — falling back to sensible
+        defaults when fields are missing — and then delegates the actual
+        layer creation to :meth:`define_network`, which can be overridden
+        to swap in fused QKV / model-specific norms / partial-rotary RoPE.
+
+        Args:
+            config: Owning model config (an :class:`EasyDeLBaseConfig`
+                subclass). Provides hidden size, head counts, RoPE base,
+                attention dropout, optional ``head_dim``, ``rms_norm_eps``,
+                and ``attention_bias`` flags.
+            dtype: Compute dtype for projections, normalisations, and
+                attention. Defaults to ``bfloat16``.
+            param_dtype: Storage dtype for projection / norm parameters.
+                Defaults to ``bfloat16``.
+            precision: JAX matmul precision flag forwarded to every linear
+                in the block. ``None`` defers to the JIT compiler default.
+            rngs: SpecTrax random-number generators consumed in turn by
+                each created sub-module's parameter initializer.
+            layer_idx: Zero-based index of this layer in the decoder stack.
+                Recorded as a static field (see ``_spx_scan_safe_static_fields``)
+                so that scanned-stage attention layers stay trace-stable.
+            attention_type: Selects the forward path that :meth:`forward`
+                routes to:
+
+                * ``"standard"`` — RoPE-based MHA/GQA used by Llama, Mistral,
+                  Qwen, Gemma, etc.
+                * ``"mla"`` — Multi-head Latent Attention (DeepSeek V2/V3)
+                  with optional ``use_mla_lora`` query compression.
+                * ``"alibi"`` — ALiBi linear-bias attention (Falcon, MPT);
+                  rotary is replaced with a learned per-head slope.
+            causal: When ``True`` the attention performer applies a causal
+                mask. Set ``False`` for encoder-style cross attention.
+            sliding_window: Optional Mistral-style local window. Either an
+                integer (symmetric ``[w, w]``) or a ``(left, right)`` tuple.
+                ``None`` disables local masking; the kernel still applies
+                the causal mask when ``causal=True``.
+            use_qk_norm: Enable per-head RMSNorm on the query and key
+                tensors (Gemma3, Olmoe). Norms are created via
+                :meth:`_create_q_norm` / :meth:`_create_k_norm` and applied
+                in :meth:`_postprocess_qkv`.
+            use_fused_qkv: Deprecated compatibility argument. Dense attention
+                is always structurally fused in EasyDeL.
+            use_gqa: Documentation-only flag indicating GQA is in effect
+                — the actual GQA broadcasting follows from
+                ``num_key_value_heads < num_attention_heads`` regardless.
+            use_mla_lora: For ``attention_type="mla"``, switch to the
+                LoRA-compressed query path (``q_a_proj`` ->
+                ``q_a_layernorm`` -> ``q_b_proj``) used by DeepSeek V3.
+        """
+        super().__init__(config=config)
+        if not use_fused_qkv:
+            warnings.warn(
+                "use_fused_qkv=False is no longer supported; dense attention is structurally fused. "
+                "The argument is ignored.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+
+        self.layer_idx = layer_idx
+
+        self.attention_type = attention_type
+        self.causal = causal
+        self.sliding_window = sliding_window
+        self.use_qk_norm = use_qk_norm
+        self.use_fused_qkv = True
+        self.use_tp_interleaved_qkv = False
+        self.use_gqa = use_gqa
+        self.use_mla_lora = use_mla_lora
+
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+
+        self.num_key_value_heads = getattr(config, "num_key_value_heads", self.num_heads)
+        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.define_network(config, dtype, param_dtype, precision, rngs)
+
+    def define_network(
+        self,
+        config: Cfg,
+        dtype: DTypeLike,
+        param_dtype: DTypeLike,
+        precision: jax.lax.Precision,
+        rngs: PRNGKeyArray,
+    ) -> None:
+        """Materialize the attention block's sub-modules.
+
+        Default behaviour:
+
+        * Build the fused QKV projection via :meth:`_create_fused_qkv_proj`
+          (independent ``q_proj`` / ``k_proj`` / ``v_proj`` are *not*
+          instantiated), bind it under the name from
+          :attr:`projection_mapping`, and accumulate the checkpoint reform
+          rules so HF q/k/v checkpoints can be loaded into the fused tensor.
+        * Build the output projection via :meth:`_create_o_proj`.
+        * For ALiBi attention, build the per-head slopes; otherwise build
+          the rotary embedding module.
+        * Build the :class:`FlexibleAttentionModule` performer.
+        * Optionally build Q/K RMSNorms when ``use_qk_norm`` was set.
+        * Build an :class:`spx.nn.Dropout` for residual dropout when the
+          config requests it.
+
+        Override this method to swap in custom projection structures
+        (model-specific norms, partial-rotary RoPE, MLA-only branches, etc.).
+
+        Args:
+            config: Owning model configuration.
+            dtype: Compute dtype for projections, norms and attention.
+            param_dtype: Storage dtype for projection / norm parameters.
+            precision: JAX matmul precision flag.
+            rngs: SpecTrax RNGs consumed sequentially by each sub-module
+                being created.
+
+        Raises:
+            ValueError: When the fused QKV projection does not carry a
+                :class:`FusedColumnLayout`, which is required to derive
+                checkpoint reform rules.
+        """
+        qkv_attr = self._projection_attr("query_key_value_projection")
+        setattr(self, qkv_attr, self._create_fused_qkv_proj(config, dtype, param_dtype, precision, rngs))
+        self.use_tp_interleaved_qkv = True
+        include_bias = any(bool(getattr(config, attr, False)) for attr in ("attention_bias", "qkv_bias", "bias"))
+        if getattr(self.query_key_value_projection, "layout", None) is None:
+            raise ValueError(
+                f"{type(self).__name__} uses fused QKV with source Q/K/V checkpoint keys, "
+                "but query_key_value_projection does not carry a FusedColumnLayout."
+            )
+        self.query_key_value_projection.build_reform_param(
+            qkv_attr,
+            config=config,
+            include_bias=include_bias,
+        )
+
+        setattr(
+            self,
+            self.projection_mapping["output_projection"],
+            self._create_o_proj(config, dtype, param_dtype, precision, rngs),
+        )
+
+        if self.attention_type == "alibi":
+            self._create_alibi_slopes(config)
+            self.rotary = None  # ALiBi does not use rotary embeddings
+        else:
+            self.rotary = self._create_rotary(config, dtype)
+
+        self.attention_performer: FlexibleAttentionModule | None = self._create_attention_performer(config, rngs)
+
+        if self.use_qk_norm:
+            setattr(
+                self,
+                self.norms_mapping["query_normalization"],
+                self._create_q_norm(config, dtype, param_dtype, rngs),
+            )
+
+            setattr(
+                self,
+                self.norms_mapping["key_normalization"],
+                self._create_k_norm(config, dtype, param_dtype, rngs),
+            )
+
+        if hasattr(config, "resid_pdrop") and config.resid_pdrop > 0:
+            # Training-mode dropout draws its key from the stashed Rngs; without
+            # it every forward with resid_pdrop > 0 raises outside eval().
+            self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
+
+    def _build_mla_projections(
+        self,
+        config: Cfg,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.Precision,
+        rngs: spx.Rngs,
+    ):
+        """Build the DeepSeek-style MLA projection stack.
+
+        Four families -- ``deepseek_v2``, ``deepseek_v3``, ``glm4_moe_lite`` and
+        ``mistral4`` -- carried this method with byte-identical bodies once the
+        family-name tokens are normalised; ``glm_moe_dsa`` matched at 0.967,
+        differing only by its extra indexer construction. It is parameterised
+        entirely through ``self.projection_mapping``, so the HF attribute names
+        each family expects are already an input rather than a hardcode.
+
+        When ``q_lora_rank`` is unset a single dense ``q_proj`` is built;
+        otherwise the low-rank ``q_a_proj -> q_a_layernorm -> q_b_proj`` chain
+        is materialised. Callers override ``define_network`` and delegate here.
+
+        Required on the caller (set in its ``__init__`` before delegating);
+        this base class does not define them, so calling this on a non-MLA
+        attention layer raises ``AttributeError`` rather than silently
+        misbuilding:
+
+        - ``self.use_mla_lora`` -- selects the dense vs low-rank query path
+        - ``self.q_head_dim`` -- per-head query width (nope + rope halves)
+        - ``self.v_head_dim`` -- per-head value width
+        - ``self.projection_mapping`` -- HF attribute names to bind under
+
+        Args:
+            config: Model configuration.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
+        if not self.use_mla_lora:
+            setattr(
+                self,
+                self.projection_mapping["mla_q_proj"],
+                ColumnParallelLinear(
+                    config.hidden_size,
+                    config.num_attention_heads * self.q_head_dim,
+                    rngs=rngs,
+                    use_bias=False,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                    precision=precision,
+                ),
+            )
+        else:
+            setattr(
+                self,
+                self.projection_mapping["mla_q_a_proj"],
+                ColumnParallelLinear(
+                    config.hidden_size,
+                    config.q_lora_rank,
+                    rngs=rngs,
+                    use_bias=config.attention_bias,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                    precision=precision,
+                ),
+            )
+            setattr(
+                self,
+                self.projection_mapping["mla_q_a_layernorm"],
+                RMSNorm(
+                    config.q_lora_rank,
+                    eps=config.rms_norm_eps,
+                    rngs=rngs,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                ),
+            )
+            setattr(
+                self,
+                self.projection_mapping["mla_q_b_proj"],
+                ColumnParallelLinear(
+                    config.q_lora_rank,
+                    config.num_attention_heads * self.q_head_dim,
+                    rngs=rngs,
+                    use_bias=False,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                    precision=precision,
+                ),
+            )
+
+        setattr(
+            self,
+            self.projection_mapping["mla_kv_a_proj_with_mqa"],
+            ColumnParallelLinear(
+                config.hidden_size,
+                config.kv_lora_rank + config.qk_rope_head_dim,
+                rngs=rngs,
+                use_bias=config.attention_bias,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                precision=precision,
+            ),
+        )
+        setattr(
+            self,
+            self.projection_mapping["mla_kv_a_layernorm"],
+            RMSNorm(
+                config.kv_lora_rank,
+                eps=config.rms_norm_eps,
+                rngs=rngs,
+                dtype=dtype,
+                param_dtype=param_dtype,
+            ),
+        )
+        setattr(
+            self,
+            self.projection_mapping["mla_kv_b_proj"],
+            ColumnParallelLinear(
+                config.kv_lora_rank,
+                config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
+                rngs=rngs,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                precision=precision,
+            ),
+        )
+        setattr(
+            self,
+            self.projection_mapping["output_projection"],
+            RowParallelLinear(
+                config.num_attention_heads * self.v_head_dim,
+                config.hidden_size,
+                rngs=rngs,
+                use_bias=config.attention_bias,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                precision=precision,
+            ),
+        )
+
+        self.rotary = self._create_rotary(config, dtype)
+        self.attention_performer = self._create_attention_performer(config, rngs)
+
+    @property
+    def reform_param(self) -> dict[str, dict[str, object]]:
+        """Derive fused-QKV checkpoint reform rules from the projection layout."""
+        qkv_attr = self._projection_attr("query_key_value_projection")
+        qkv_proj = getattr(self, qkv_attr, None)
+        if qkv_proj is None or getattr(qkv_proj, "layout", None) is None:
+            return {}
+        include_bias = any(bool(getattr(self.config, attr, False)) for attr in ("attention_bias", "qkv_bias", "bias"))
+        return qkv_proj.build_reform_param(qkv_attr, config=self.config, include_bias=include_bias)
+
+    def _create_o_proj(
+        self,
+        config: Cfg,
+        dtype: DTypeLike,
+        param_dtype: DTypeLike,
+        precision: jax.lax.Precision,
+        rngs: PRNGKeyArray,
+    ) -> RowParallelLinear:
+        """Create output projection layer.
+
+        Creates a row-parallel linear layer for projecting attention output
+        back to the hidden dimension.
+
+        Args:
+            config: Model configuration containing hidden_size.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            precision: JAX precision setting for matrix operations.
+            rngs: Random number generators for parameter initialization.
+
+        Returns:
+            RowParallelLinear layer mapping num_heads * head_dim to hidden_size.
+
+        Note:
+            Row-parallel is used for the output projection as it follows
+            column-parallel attention computation, enabling efficient all-reduce.
+        """
+        return RowParallelLinear(
+            self.num_heads * self.head_dim,
+            config.hidden_size,
+            rngs=rngs,
+            use_bias=getattr(config, "attention_bias", False),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
+            precision=precision,
+        )
+
+    def _create_fused_qkv_proj(
+        self,
+        config: Cfg,
+        dtype: DTypeLike,
+        param_dtype: DTypeLike,
+        precision: jax.lax.Precision,
+        rngs: PRNGKeyArray,
+    ) -> ColumnParallelLinear:
+        """Build the single fused ``[Q | K | V]`` projection (Phi-3 / DBRX / MPT).
+
+        Returns a column-parallel linear of width
+        ``(num_heads + 2 * num_kv_heads) * head_dim`` so that one matmul
+        produces all three streams concatenated along the feature axis;
+        the caller (``forward_*``) is responsible for splitting the result
+        with the correct head counts (the K and V slices have
+        ``num_key_value_heads * head_dim`` features when GQA is in play).
+        Tensor-parallelism is preserved because the fused width still
+        partitions cleanly along the head axis.
+
+        Args:
+            config: Owning model config; ``hidden_size`` and the
+                ``attention_bias`` / ``initializer_range`` flags are read.
+            dtype: Compute dtype for the fused linear.
+            param_dtype: Storage dtype for the fused weight.
+            precision: JAX matmul precision flag.
+            rngs: SpecTrax RNGs supplying the parameter initializer key.
+
+        Returns:
+            A :class:`ColumnParallelLinear` mapping
+            ``hidden_size -> (num_heads + 2*num_kv_heads) * head_dim``.
+        """
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_key_value_heads * self.head_dim
+        return build_fused_qkv_projection(
+            config=config,
+            q_size=q_size,
+            kv_size=kv_size,
+            rngs=rngs,
+            use_bias=bool(getattr(config, "attention_bias", False)),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            target_prefix=self._projection_attr("query_key_value_projection"),
+            query_prefix=self.projection_mapping["query_projection"],
+            key_prefix=self.projection_mapping["key_projection"],
+            value_prefix=self.projection_mapping["value_projection"],
+        )
+
+    def _project_qkv(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+    ) -> tuple[Array, Array, Array]:
+        """Run the fused QKV projection and split the output into Q, K, V.
+
+        Splitting is layout-aware:
+
+        * If the fused projection carries a :class:`FusedColumnLayout`
+          (the common case for dense attention) the layout's TP-aware
+          split is used so each rank sees correctly-sized slices under
+          tensor parallelism.
+        * Otherwise, when ``fused_qkv_layout == "gqa_grouped"``, the
+          fused tensor is reshaped to expose the GQA group axis and the
+          Q / K / V slices are sliced from it.
+        * As a last resort the tensor is split contiguously at
+          ``[q_size, q_size + kv_size]`` boundaries.
+
+        Args:
+            hidden_states: Residual stream of shape
+                ``[batch, seq_len, hidden_dim]``.
+
+        Returns:
+            Tuple ``(query_states, key_states, value_states)`` each of
+            shape ``[batch, seq_len, *_features]``; downstream code is
+            responsible for the head reshape.
+        """
+        qkv = checkpoint_name(self.query_key_value_projection(hidden_states), "attn_qkv")
+        qkv_layout = getattr(self.query_key_value_projection, "layout", None)
+        if qkv_layout is not None:
+            parts = qkv_layout.split(qkv, config=self.config)
+            return cast(tuple[Array, Array, Array], parts)
+        if self.fused_qkv_layout == "gqa_grouped":
+            qkv_states = jnp.reshape(
+                qkv,
+                (*qkv.shape[:-1], self.num_key_value_heads, self.num_key_value_groups + 2, self.head_dim),
+            )
+            query_states = jnp.reshape(
+                qkv_states[..., : self.num_key_value_groups, :],
+                (*qkv.shape[:-1], self.num_heads, self.head_dim),
+            )
+            key_states = qkv_states[..., -2, :]
+            value_states = qkv_states[..., -1, :]
+            return query_states, key_states, value_states
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_key_value_heads * self.head_dim
+        return tuple(jnp.split(qkv, (q_size, q_size + kv_size), axis=-1))
+
+    def _create_rotary(self, config: Cfg, dtype: DTypeLike):
+        """Build the rotary position embedding module for this layer.
+
+        Default builds a full-head-dim RoPE via
+        :meth:`EasyDeLBaseConfig.get_basic_rope` using ``config.rope_theta``
+        (default ``10000.0``). Override for partial-rotary (e.g.
+        ``rotary_dim < head_dim`` for Phi), Llama3-style scaling,
+        Linear/Dynamic-NTK, YaRN, etc.
+
+        Args:
+            config: Owning model config providing ``rope_theta`` / scaling
+                hyperparameters.
+            dtype: Compute dtype for the RoPE module.
+
+        Returns:
+            Rotary embedding module compatible with :meth:`_apply_rotary`.
+        """
+        return config.get_basic_rope(
+            dtype=dtype,
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            base=getattr(config, "rope_theta", 10000.0),
+        )
+
+    def _apply_rotary(
+        self,
+        query_states: Float[Array, "batch_size seq_len num_heads head_dim"],
+        key_states: Float[Array, "batch_size seq_len num_kv_heads head_dim"],
+        position_ids: Int[Array, "batch_size seq_len"],
+        frequencies: Float[Array, "max_seq_len head_dim"] | None = None,
+    ) -> tuple[
+        Float[Array, "batch_size seq_len num_heads head_dim"],
+        Float[Array, "batch_size seq_len num_kv_heads head_dim"],
+    ]:
+        """Apply rotary position embeddings to query and key tensors.
+
+        Uses the rotary embedding module to encode positional information
+        into the query and key representations.
+
+        Args:
+            query_states: Query tensor [batch_size, seq_len, num_heads, head_dim].
+            key_states: Key tensor [batch_size, seq_len, num_kv_heads, head_dim].
+            position_ids: Position indices [batch_size, seq_len].
+            frequencies: Optional precomputed frequencies. If None, uses
+                the rotary module's internal frequency computation.
+
+        Returns:
+            Tuple of (rotated_query, rotated_key) with positional information
+            encoded via rotation.
+
+        Note:
+            If self.rotary is None (e.g., for ALiBi attention), returns the
+            input tensors unchanged.
+        """
+        rotary = getattr(self, "rotary", None)
+        if rotary is None:
+            return query_states, key_states
+        q_rotated: Float[Array, "batch_size seq_len num_heads head_dim"]
+        k_rotated: Float[Array, "batch_size seq_len num_kv_heads head_dim"]
+        q_rotated, k_rotated = rotary(
+            query=query_states,
+            key=key_states,
+            positions=position_ids,
+            frequencies=frequencies,
+        )
+        return q_rotated, k_rotated
+
+    def _create_alibi_slopes(self, config: Cfg) -> None:
+        """Build the per-head ALiBi slopes ``m_i = 2^(-8(i+1)/n)``.
+
+        Implements the geometric slope schedule from the ALiBi paper
+        (Press et al., 2022): each head ``i`` (1-indexed in the formula)
+        receives a fixed multiplicative slope that is applied to the
+        relative-position matrix to produce a head-specific positional
+        bias. The schedule places head 1 at ``2^(-8/n)`` (slowest decay,
+        global view) and head ``n`` at ``2^(-8)`` (fastest decay, local
+        view) so that different heads attend to different distance scales
+        for free.
+
+        Subclasses can override this method (for example, Falcon-180B
+        uses a non-power-of-two head count and falls back to a slightly
+        different schedule).
+
+        Args:
+            config: Owning model config (currently unused — present for
+                signature parity with subclass overrides).
+        """
+        n: int = self.num_heads
+        slopes = jnp.array([2 ** (-8 * (i + 1) / n) for i in range(n)])
+        self.alibi_slopes = slopes
+
+    def _compute_alibi_bias(self, sequence_length: int) -> Float[Array, "num_heads seq_len seq_len"]:
+        """Materialize the ALiBi bias ``b_h[i, j] = m_h * (j - i)``.
+
+        Outer-products the per-head ALiBi slopes (from
+        :meth:`_create_alibi_slopes`) with the relative-position matrix
+        ``j - i`` (negative on the upper triangle, so the causal mask
+        kept downstream still produces sensible logits). This bias is
+        added to the attention logits *before* softmax in
+        :meth:`forward_alibi`.
+
+        Args:
+            sequence_length: Number of tokens in the current attention
+                window. The returned bias is square ``seq_len x seq_len``;
+                with KV caching, the caller is responsible for slicing
+                rows/columns to match the actual Q/K lengths.
+
+        Returns:
+            Float array of shape ``[num_heads, seq_len, seq_len]`` ready
+            to broadcast against ``[batch, num_heads, seq_q, seq_k]``
+            logits.
+        """
+        positions = jnp.arange(sequence_length)
+        # Compute relative positions (broadcasting)
+        relative_positions: Int[Array, "seq_len seq_len"] = positions[None, :] - positions[:, None]
+        alibi_bias: Float[Array, "num_heads seq_len seq_len"] = (
+            relative_positions[None, :, :] * self.alibi_slopes[:, None, None]
+        )
+        return alibi_bias
+
+    def _fit_alibi_bias(
+        self,
+        alibi_bias: Array,
+        batch_size: int,
+        q_len: int,
+        kv_len: int,
+    ) -> Float[Array, "batch num_heads q_len kv_len"]:
+        """Shape an ALiBi bias to the ``[batch, heads, q_len, kv_len]`` the attention kernels take.
+
+        Accepts ``[heads, K]`` (per-key), ``[heads, Q, K]`` (square) or
+        ``[batch|1, heads, Q|1, K]`` biases. Keys are aligned to the end of the
+        window (the newest ``kv_len`` columns; missing columns are zero-padded on
+        the right, where the mask hides them), and queries to the last ``q_len``
+        rows.
+        """
+        alibi_bias = jnp.asarray(alibi_bias, dtype=self.dtype)
+        if alibi_bias.ndim == 3:
+            alibi_bias = alibi_bias[None, ...]
+        elif alibi_bias.ndim == 2:
+            alibi_bias = alibi_bias[None, :, None, :]
+        if alibi_bias.shape[-1] > kv_len:
+            alibi_bias = alibi_bias[..., alibi_bias.shape[-1] - kv_len :]
+        elif alibi_bias.shape[-1] < kv_len:
+            pad = [(0, 0)] * (alibi_bias.ndim - 1) + [(0, kv_len - alibi_bias.shape[-1])]
+            alibi_bias = jnp.pad(alibi_bias, pad)
+        if alibi_bias.shape[-2] > q_len:
+            alibi_bias = alibi_bias[..., alibi_bias.shape[-2] - q_len :, :]
+        return jnp.broadcast_to(alibi_bias, (batch_size, alibi_bias.shape[1], q_len, kv_len))
+
+    def _create_attention_performer(self, config: Cfg, rngs: spx.Rngs) -> FlexibleAttentionModule:
+        """Build the :class:`FlexibleAttentionModule` that runs the kernel.
+
+        Resolves per-layer attention routing:
+
+        * For ``attention_type == "mla"`` and when the config defines a
+          non-``"auto"`` ``mla_attn_mechanism``, the performer is created
+          with that explicit mechanism, enabling mixed MLA / non-MLA
+          stacks (e.g. dense layers run flash attention while MLA layers
+          run a paged kernel).
+        * When ``mla_attn_dtype`` / ``mla_attn_softmax_dtype`` are set,
+          a shallow-copied config is used so the MLA performer sees
+          different dtypes without mutating the shared config.
+
+        Override to customize attention dropout or softmax scale (e.g.
+        muP / DeepSeek mscale).
+
+        Args:
+            config: Owning model config.
+            rngs: SpecTrax RNGs passed to the performer constructor.
+
+        Returns:
+            :class:`FlexibleAttentionModule` bound to the resolved
+            performer config and mechanism.
+        """
+        attn_mechanism = None
+        performer_config = config
+        if self.attention_type == "mla":
+            mla_mech = config.mla_attn_mechanism
+            if mla_mech is not None:
+                mla_mech_val = getattr(mla_mech, "value", mla_mech)
+                if str(mla_mech_val).lower() != "auto":
+                    attn_mechanism = mla_mech
+            mla_attn_dtype = getattr(config, "mla_attn_dtype", None)
+            mla_attn_softmax_dtype = getattr(config, "mla_attn_softmax_dtype", None)
+            if mla_attn_dtype is not None or mla_attn_softmax_dtype is not None:
+                performer_config = copy.copy(config)
+                if mla_attn_dtype is not None:
+                    performer_config.attn_dtype = mla_attn_dtype
+                if mla_attn_softmax_dtype is not None:
+                    performer_config.attn_softmax_dtype = mla_attn_softmax_dtype
+        softmax_scale = self.head_dim**-0.5
+        if self.attention_type == "mla":
+            softmax_scale = self._mla_softmax_scale(config)
+        return FlexibleAttentionModule(
+            rngs=rngs,
+            base_config=performer_config,
+            softmax_scale=float(softmax_scale),
+            dropout_prob=getattr(config, "attention_dropout", 0.0),
+            attn_mechanism=attn_mechanism,
+        )
+
+    def _mla_softmax_scale(self, config: Cfg) -> float:
+        """MLA score scale: the full ``qk_nope + qk_rope`` query width, with YaRN ``mscale**2``.
+
+        MLA sets ``head_dim`` to the value width for output merging, so the
+        generic ``head_dim**-0.5`` would scale scores by the wrong width.
+        """
+        q_head_dim = getattr(self, "q_head_dim", None) or (config.qk_nope_head_dim + config.qk_rope_head_dim)
+        scale = q_head_dim**-0.5
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if isinstance(rope_scaling, dict) and rope_scaling.get("mscale_all_dim"):
+            mscale = yarn_get_mscale(rope_scaling["factor"], rope_scaling["mscale_all_dim"])
+            scale = scale * mscale * mscale
+        return scale
+
+    def _create_q_norm(self, config: Cfg, dtype: DTypeLike, param_dtype: DTypeLike, rngs: spx.Rngs) -> RMSNorm:
+        """Build the per-head query RMSNorm (Gemma3, Olmoe-style QK norm).
+
+        Override to swap RMSNorm for LayerNorm, change the epsilon, or
+        change the normalised feature axis.
+
+        Args:
+            config: Owning model config; ``rms_norm_eps`` is consulted
+                (defaulting to ``1e-6``).
+            dtype: Compute dtype for the norm.
+            param_dtype: Storage dtype for the norm scale.
+            rngs: SpecTrax RNGs supplying the parameter initializer key.
+
+        Returns:
+            :class:`RMSNorm` normalising the last axis of size ``head_dim``.
+        """
+        return RMSNorm(
+            self.head_dim,
+            eps=getattr(config, "rms_norm_eps", 1e-6),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+    def _create_k_norm(self, config: Cfg, dtype: DTypeLike, param_dtype: DTypeLike, rngs: spx.Rngs) -> RMSNorm:
+        """Build the per-head key RMSNorm (QK-norm models).
+
+        Override for custom K normalization (LayerNorm vs RMSNorm, custom eps).
+
+        Args:
+            config: Owning model config; ``rms_norm_eps`` is consulted.
+            dtype: Compute dtype for the norm.
+            param_dtype: Storage dtype for the norm scale.
+            rngs: SpecTrax RNGs supplying the parameter initializer key.
+
+        Returns:
+            :class:`RMSNorm` normalising the last axis of size ``head_dim``.
+        """
+        return RMSNorm(
+            self.head_dim,
+            eps=getattr(config, "rms_norm_eps", 1e-6),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+    @property
+    def query_projection(self) -> ColumnParallelLinear:
+        """Get query projection layer.
+
+        Returns:
+            The query projection layer, accessed via projection_mapping
+            to support custom attribute names.
+        """
+        return getattr(self, self.projection_mapping["query_projection"])
+
+    @property
+    def key_projection(self) -> ColumnParallelLinear:
+        """Get key projection layer.
+
+        Returns:
+            The key projection layer, accessed via projection_mapping
+            to support custom attribute names.
+        """
+        return getattr(self, self.projection_mapping["key_projection"])
+
+    @property
+    def value_projection(self) -> ColumnParallelLinear:
+        """Get value projection layer.
+
+        Returns:
+            The value projection layer, accessed via projection_mapping
+            to support custom attribute names.
+        """
+        return getattr(self, self.projection_mapping["value_projection"])
+
+    @property
+    def output_projection(self) -> RowParallelLinear:
+        """Get output projection layer.
+
+        Returns:
+            The output projection layer that maps attention output
+            back to hidden dimension.
+        """
+        return getattr(self, self.projection_mapping["output_projection"])
+
+    @property
+    def query_key_value_projection(self) -> ColumnParallelLinear:
+        """Get fused QKV projection layer.
+
+        Returns:
+            The fused query-key-value projection layer.
+        """
+        return getattr(self, self._projection_attr("query_key_value_projection"))
+
+    @property
+    def query_normalization(self) -> RMSNorm:
+        """Get query normalization layer.
+
+        Returns:
+            The RMSNorm layer for normalizing query representations.
+
+        Raises:
+            AttributeError: If use_qk_norm was False during initialization.
+        """
+        return getattr(self, self.norms_mapping["query_normalization"])
+
+    @property
+    def key_normalization(self) -> RMSNorm:
+        """Get key normalization layer.
+
+        Returns:
+            The RMSNorm layer for normalizing key representations.
+
+        Raises:
+            AttributeError: If use_qk_norm was False during initialization.
+        """
+        return getattr(self, self.norms_mapping["key_normalization"])
+
+    @property
+    def value_normalization(self) -> RMSNorm:
+        """Get value normalization layer.
+
+        Returns:
+            The RMSNorm layer for normalizing value representations.
+
+        Raises:
+            AttributeError: If value normalization was not configured.
+        """
+        return getattr(self, self.norms_mapping["value_normalization"])
+
+    @property
+    def output_normalization(self) -> RMSNorm:
+        """Get output normalization layer.
+
+        Returns:
+            The RMSNorm layer for normalizing output representations.
+
+        Raises:
+            AttributeError: If output normalization was not configured.
+        """
+        return getattr(self, self.norms_mapping["output_normalization"])
+
+    @property
+    def mla_q_proj(self) -> ColumnParallelLinear:
+        """Get MLA query projection (non-LoRA variant).
+
+        Returns:
+            Direct query projection used when use_mla_lora=False.
+
+        Raises:
+            AttributeError: If MLA projections were not configured.
+        """
+        return getattr(self, self.projection_mapping["mla_q_proj"])
+
+    @property
+    def mla_q_a_proj(self) -> ColumnParallelLinear:
+        """Get MLA query A projection (LoRA down-projection).
+
+        Returns:
+            First projection in the LoRA-style query compression
+            (hidden_size -> lora_rank).
+
+        Raises:
+            AttributeError: If use_mla_lora was False during initialization.
+        """
+        return getattr(self, self.projection_mapping["mla_q_a_proj"])
+
+    @property
+    def mla_q_a_layernorm(self) -> RMSNorm:
+        """Get MLA query A layer normalization.
+
+        Returns:
+            Normalization layer applied after q_a_proj and before q_b_proj.
+
+        Raises:
+            AttributeError: If use_mla_lora was False during initialization.
+        """
+        return getattr(self, self.projection_mapping["mla_q_a_layernorm"])
+
+    @property
+    def mla_q_b_proj(self) -> ColumnParallelLinear:
+        """Get MLA query B projection (LoRA up-projection).
+
+        Returns:
+            Second projection in the LoRA-style query compression
+            (lora_rank -> num_heads * q_head_dim).
+
+        Raises:
+            AttributeError: If use_mla_lora was False during initialization.
+        """
+        return getattr(self, self.projection_mapping["mla_q_b_proj"])
+
+    @property
+    def mla_kv_a_proj_with_mqa(self) -> ColumnParallelLinear:
+        """Get MLA KV A projection with multi-query attention.
+
+        Returns:
+            Compressed KV projection that outputs both latent KV
+            and positional key component (kv_lora_rank + qk_rope_head_dim).
+
+        Raises:
+            AttributeError: If MLA projections were not configured.
+        """
+        return getattr(self, self.projection_mapping["mla_kv_a_proj_with_mqa"])
+
+    @property
+    def mla_kv_a_layernorm(self) -> RMSNorm:
+        """Get MLA KV A layer normalization.
+
+        Returns:
+            Normalization layer applied to compressed KV before kv_b_proj.
+
+        Raises:
+            AttributeError: If MLA projections were not configured.
+        """
+        return getattr(self, self.projection_mapping["mla_kv_a_layernorm"])
+
+    @property
+    def mla_kv_b_proj(self) -> ColumnParallelLinear:
+        """Get MLA KV B projection.
+
+        Returns:
+            Decompression projection for KV (kv_lora_rank ->
+            num_heads * (qk_nope_head_dim + v_head_dim)).
+
+        Raises:
+            AttributeError: If MLA projections were not configured.
+        """
+        return getattr(self, self.projection_mapping["mla_kv_b_proj"])
+
+    def _preprocess_qkv(
+        self,
+        query_states: Float[Array, "batch_size seq_len num_heads_times_head_dim"],
+        key_states: Float[Array, "batch_size seq_len num_kv_heads_times_head_dim"],
+        value_states: Float[Array, "batch_size seq_len num_kv_heads_times_head_dim"],
+    ) -> tuple[
+        Float[Array, "batch_size seq_len num_heads_times_head_dim"],
+        Float[Array, "batch_size seq_len num_kv_heads_times_head_dim"],
+        Float[Array, "batch_size seq_len num_kv_heads_times_head_dim"],
+    ]:
+        """Pre-process Q/K/V after projection before reshape/RoPE/sharding.
+
+        **KEY METHOD**: Override this to apply Q/K normalization or other transformations.
+        By default, applies Q/K norm if configured, otherwise returns unchanged.
+
+        Pattern for Q/K normalization:
+            >>> def _preprocess_qkv(self, q, k, v):
+            ...     if hasattr(self, 'q_norm'):
+            ...         q = self.q_norm(q)
+            ...         k = self.k_norm(k)
+            ...     return q, k, v
+
+        Args:
+            query_states: Query tensor [batch_size, seq_len, num_heads * head_dim]
+            key_states: Key tensor [batch_size, seq_len, num_kv_heads * head_dim]
+            value_states: Value tensor [batch_size, seq_len, num_kv_heads * head_dim]
+
+        Returns:
+            Tuple of (processed_query, processed_key, processed_value)
+        """
+        return query_states, key_states, value_states
+
+    def _postprocess_qkv(
+        self,
+        query_states: Float[Array, "batch_size seq_len num_heads head_dim"],
+        key_states: Float[Array, "batch_size seq_len num_kv_heads head_dim"],
+        value_states: Float[Array, "batch_size seq_len num_kv_heads head_dim"],
+    ) -> tuple[
+        Float[Array, "batch_size seq_len num_heads head_dim"],
+        Float[Array, "batch_size seq_len num_kv_heads head_dim"],
+        Float[Array, "batch_size seq_len num_kv_heads head_dim"],
+    ]:
+        """Post-process Q/K/V after projection and reshape, before RoPE/sharding.
+
+        **KEY METHOD**: Override this to apply Q/K normalization or other transformations.
+        By default, applies Q/K norm if configured, otherwise returns unchanged.
+
+        Pattern for Q/K normalization:
+            >>> def _postprocess_qkv(self, q, k, v):
+            ...     if hasattr(self, 'q_norm'):
+            ...         q = self.q_norm(q)
+            ...         k = self.k_norm(k)
+            ...     return q, k, v
+
+        Args:
+            query_states: Query tensor [batch_size, seq_len, num_heads, head_dim]
+            key_states: Key tensor [batch_size, seq_len, num_kv_heads, head_dim]
+            value_states: Value tensor [batch_size, seq_len, num_kv_heads, head_dim]
+
+        Returns:
+            Tuple of (processed_query, processed_key, processed_value)
+        """
+        return query_states, key_states, value_states
+
+    def _merge_heads(
+        self, hidden_states: Float[Array, "batch_size seq_len num_heads head_dim"]
+    ) -> Float[Array, "batch_size seq_len hidden_dim"]:
+        """Merge attention heads back to hidden dimension.
+
+        Args:
+            hidden_states: Attention output tensor [batch_size, seq_len, num_heads, head_dim]
+
+        Returns:
+            Merged tensor [batch_size, seq_len, hidden_dim] where hidden_dim = num_heads * head_dim
+        """
+        batch_size: int = hidden_states.shape[0]
+        seq_len: int = hidden_states.shape[1]
+        merged = hidden_states.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
+        return merged
+
+    def forward_standard(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
+    ) -> AttentionLayerOutput:
+        """Standard RoPE-based attention forward path (Llama / Mistral / Gemma / Qwen).
+
+        The default path for almost every modern decoder model. Honours
+        the ``_causal_baked`` and ``sliding_window_baked_in`` flags on
+        ``mask_info`` so masks that the cache has already applied are not
+        re-applied by the kernel.
+
+        Flow:
+            1. ``_project_qkv`` -> fused QKV matmul + layout-aware split.
+            2. ``_preprocess_qkv`` hook (pre-reshape transformations).
+            3. Reshape into ``[batch, seq, heads, dim]``.
+            4. ``_postprocess_qkv`` hook (Q/K norm in QK-norm models).
+            5. Apply Q/K/V sharding constraints.
+            6. Apply RoPE via the rotary module.
+            7. ``concatenate`` — KV cache write + mask preparation +
+               optional sliding-window slicing.
+            8. Run the attention performer (kernel-specific).
+            9. Merge heads, output projection, hidden-state re-sharding,
+               optional residual dropout.
+
+        Args:
+            hidden_states: Input residual stream
+                ``[batch, seq_len, hidden_dim]``.
+            mask_info: Mask container (mask, segment IDs, positions).
+            position_ids: Per-token absolute positions ``[batch, seq_len]``
+                used for RoPE.
+            mode: Runtime mode (train / prefill / decode).
+            cache_view: Optional KV cache view; mutated in place by the
+                cache concat step in inference modes.
+            cache_metadata: Optional companion cache metadata.
+            output_attentions: When ``True`` instructs the kernel to
+                materialize softmax weights.
+            frequencies: Optional precomputed RoPE cos/sin cache.
+            alibi: Accepted for signature parity with the other forward
+                paths; unused by standard RoPE attention.
+
+        Returns:
+            :class:`AttentionLayerOutput` containing the attention output,
+            optional attention weights, and the updated cache view.
+        """
+        batch_size: int = hidden_states.shape[0]
+        sequence_length: int = hidden_states.shape[1]
+
+        query_states, key_states, value_states = self._project_qkv(hidden_states)
+
+        query_states, key_states, value_states = self._preprocess_qkv(query_states, key_states, value_states)
+
+        query_states: Float[Array, "batch_size seq_len num_heads head_dim"] = query_states.reshape(
+            batch_size,
+            sequence_length,
+            self.num_heads,
+            self.head_dim,
+        )
+        key_states: Float[Array, "batch_size kvseq_len num_kv_heads head_dim"] = key_states.reshape(
+            batch_size,
+            sequence_length,
+            self.num_key_value_heads,
+            self.head_dim,
+        )
+        value_states: Float[Array, "batch_size kvseq_len num_kv_heads vhead_dim"] = value_states.reshape(
+            batch_size,
+            sequence_length,
+            self.num_key_value_heads,
+            self.head_dim,
+        )
+        query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
+        query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
+
+        causal_for_kernel = self.causal
+        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
+
+        (
+            key_states,
+            value_states,
+            mask_info,
+            init_attention_bias,
+            cache_view,
+            cache_metadata,
+        ) = self.concatenate(
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
+            mask_info=mask_info,
+            sliding_window=self.sliding_window,
+            causal=self.causal,
+        )
+
+        # A caller-baked mask may contain a different window. Concatenate must
+        # intersect it with the configured window before redundant kernel-side
+        # masking can be suppressed, using the final mask's baked-in flag.
+        sliding_window_for_kernel = self.sliding_window
+        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+            sliding_window_for_kernel = None
+
+        softmax_aux = self._softmax_aux()
+
+        attentions: AttentionLayerOutput = self.attention_performer.forward(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            mode=mode,
+            bias=None,
+            cache_metadata=cache_metadata,
+            cache_view=cache_view,
+            init_bias=init_attention_bias,
+            mask_info=mask_info,
+            causal=causal_for_kernel,
+            sliding_window=sliding_window_for_kernel,
+            softmax_aux=softmax_aux,
+            output_attentions=output_attentions,
+            precision=self.precision,
+        )
+
+        if attentions.cache_view is not None:
+            cache_view = attentions.cache_view
+
+        attention_out = self._merge_heads(attentions.attention_outputs)
+        attn_output = self.shard_attention_prod(attention_out, pre_projection=True)
+        attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
+
+        if hasattr(self, "resid_dropout"):
+            attn_output = self.resid_dropout(attn_output)
+
+        return AttentionLayerOutput(
+            attention_output=attn_output,
+            attention_weight=attentions.attention_weights if output_attentions else None,
+            cache_view=cache_view,
+        )
+
+    def _postprocess_mla_queries(
+        self,
+        q_nope: Float[Array, "batch heads seq_len nope_dim"],
+        q_pe: Float[Array, "batch heads seq_len rope_dim"],
+        position_ids: Int[Array, "batch seq_len"],
+    ) -> tuple[Array, Array]:
+        """Transform both MLA query components after RoPE and before weight absorption.
+
+        Subclasses can apply position-dependent query temperatures here without
+        duplicating either the standard or the weight-absorbed attention path.
+        The default leaves both query components unchanged.
+
+        Args:
+            q_nope: Non-positional query components in compute dtype.
+            q_pe: Rotary-transformed positional query components in compute dtype.
+            position_ids: Query positions, including any cache offset.
+
+        Returns:
+            Transformed ``(q_nope, q_pe)`` with the input shapes and dtypes.
+        """
+        return q_nope, q_pe
+
+    def forward_mla(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
+    ) -> AttentionLayerOutput:
+        """Multi-head Latent Attention forward path (DeepSeek V2/V3).
+
+        Compresses queries via either a direct projection or a LoRA
+        decomposition (``mla_q_a_proj`` -> ``mla_q_a_layernorm`` ->
+        ``mla_q_b_proj``) and decomposes keys into a "no-position" (nope)
+        and a positional (pe) component. Two cache paths are supported:
+
+        * **Standard MLA path** — decompresses KV through ``mla_kv_b_proj``
+          and runs attention with full-head Q/K/V tensors.
+        * **Weight-absorbed ragged path** (when ``cache_view`` is an
+          :class:`MLARaggedPagesCacheView`) — absorbs ``W_k`` into the
+          query (``q_absorbed = q_nope @ W_k^T``), keeps the cache as
+          compressed latents + positional keys, and applies ``W_v`` after
+          attention. This is the inference-optimised path that exploits
+          MLA's KV compression at runtime.
+
+        Args:
+            hidden_states: Residual stream ``[batch, seq_len, hidden_dim]``.
+            mask_info: Mask information for attention.
+            position_ids: Position indices used for RoPE on the positional
+                query/key components.
+            mode: Runtime mode (train / prefill / decode).
+            cache_view: Optional KV cache view; an
+                :class:`MLARaggedPagesCacheView` triggers the weight-absorbed
+                path.
+            cache_metadata: Optional cache metadata companion.
+            output_attentions: Whether to return materialized attention
+                weights (expensive for paged kernels).
+            frequencies: Optional precomputed RoPE cos/sin cache.
+            alibi: Accepted for signature parity with the other forward
+                paths; unused by MLA.
+
+        Returns:
+            :class:`AttentionLayerOutput` containing the attention output,
+            optional attention weights, and the updated cache view.
+        """
+        bsz, q_len, _ = hidden_states.shape
+
+        if not self.use_mla_lora:
+            q = checkpoint_name(self.mla_q_proj(hidden_states), name="attn_query")
+        else:
+            q = checkpoint_name(
+                self.mla_q_b_proj(
+                    self.mla_q_a_layernorm(checkpoint_name(self.mla_q_a_proj(hidden_states), name="attn_query_a"))
+                ),
+                name="attn_query",
+            )
+
+        # Reshape and transpose: [batch, heads, seq, dim]
+        q = q.reshape(bsz, q_len, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
+
+        # Split query into nope (non-positional) and pe (positional) parts
+        q_nope, q_pe = q[..., : self.qk_nope_head_dim], q[..., self.qk_nope_head_dim :]
+
+        compressed_kv = self.mla_kv_a_proj_with_mqa(hidden_states)
+        k_pe = compressed_kv[..., self.kv_lora_rank :]
+        compressed_kv = compressed_kv[..., : self.kv_lora_rank]
+
+        k_pe = k_pe.reshape(bsz, q_len, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
+
+        _use_mla_ragged = isinstance(cache_view, MLARaggedPagesCacheView)
+
+        if not _use_mla_ragged:
+            # Standard path: decompress KV through kv_b_proj
+            kv = (
+                self.mla_kv_b_proj(self.mla_kv_a_layernorm(compressed_kv))
+                .reshape(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+                .transpose(0, 2, 1, 3)
+            )
+            k_nope = kv[..., : self.qk_nope_head_dim]
+            value_states = kv[..., self.qk_nope_head_dim : self.qk_nope_head_dim + self.v_head_dim]
+        else:
+            # MLA ragged path: apply layernorm to compressed_kv but skip kv_b_proj.
+            # Weight absorption: absorb W_k into query, apply W_v after attention.
+            compressed_kv = self.mla_kv_a_layernorm(compressed_kv)
+            # Placeholders for concatenate (not used by the MLA kernel path)
+            k_nope = None
+            value_states = None
+
+        # Apply RoPE directly to MLA format [batch, heads, seq, rope_dim]
+        if frequencies is not None:
+            freq_array = frequencies.value if hasattr(frequencies, "value") else frequencies
+            # Gather frequencies for all positions: position_ids is [batch, seq], freq_array is [max_seq, rope_dim*2]
+            # Result: [batch, seq, rope_dim*2]
+            freqs = freq_array[position_ids]
+            # Split into cos/sin: each [batch, seq, rope_dim]
+            cos, sin = jnp.split(freqs, 2, -1)
+            # Expand for heads dimension: [batch, 1, seq, rope_dim]
+            cos = cos[:, None, :, :].astype(q_pe.dtype)
+            sin = sin[:, None, :, :].astype(q_pe.dtype)
+            # DeepSeek checkpoints pair channels (2i, 2i+1); configs without
+            # ``rope_interleave`` keep the split-half (NeoX) pairing.
+            if getattr(self.config, "rope_interleave", False):
+                q_pe = apply_rope_interleaved(q_pe, cos, sin)
+                k_pe = apply_rope_interleaved(k_pe, cos, sin)
+            else:
+                q1, q2 = jnp.split(q_pe, 2, axis=-1)
+                k1, k2 = jnp.split(k_pe, 2, axis=-1)
+                q_pe = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
+                k_pe = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
+
+        q_nope, q_pe = self._postprocess_mla_queries(q_nope, q_pe, position_ids)
+
+        causal_for_kernel = self.causal
+        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
+
+        sliding_window_for_kernel = self.sliding_window
+        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+            sliding_window_for_kernel = None
+
+        if _use_mla_ragged:
+            # Weight absorption: split kv_b_proj weight into W_k and W_v
+            # kv_b_weight: [kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim)]
+            kv_b_weight = self.mla_kv_b_proj.weight.value
+            kv_b_weight = kv_b_weight.reshape(self.kv_lora_rank, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+            w_k = kv_b_weight[:, :, : self.qk_nope_head_dim]  # [kv_lora_rank, N, qk_nope_dim]
+            w_v = kv_b_weight[:, :, self.qk_nope_head_dim :]  # [kv_lora_rank, N, v_head_dim]
+
+            # Absorb W_k into query: q_absorbed = q_nope @ W_k^T
+            # q_nope: [B, N, S, qk_nope_dim], w_k: [kv_lora_rank, N, qk_nope_dim]
+            # q_absorbed: [B, N, S, kv_lora_rank]
+            q_absorbed = jnp.einsum(
+                "bnsd,and->bnsa",
+                q_nope.astype(jnp.float32),
+                w_k.astype(jnp.float32),
+            ).astype(q_nope.dtype)
+
+            # Flatten for kernel: [B, S, N, kv_lora_rank] -> [total_tokens, N, kv_lora_rank]
+            mla_queries_nope = q_absorbed.transpose(0, 2, 1, 3)
+            # q_pe: [B, N, S, rope_dim] -> [B, S, N, rope_dim]
+            mla_queries_pe = q_pe.transpose(0, 2, 1, 3)
+            # compressed_kv: [B, S, kv_lora_rank] (already normed)
+            mla_keys_values = compressed_kv
+            # k_pe: [B, 1, S, rope_dim] -> [B, S, rope_dim]
+            mla_keys_pe = k_pe[:, 0, :, :]
+
+            # Use correct softmax_scale based on original qk dimensions, not latent dims
+            # Same scale as the dense path (includes any YaRN mscale**2).
+            mla_softmax_scale = self.attention_performer.softmax_scale
+
+            # Build dummy query/key/value for concatenate (cache update)
+            # The MLA cache concatenate needs compressed_kv and k_pe
+            # Build a combined key for cache: [B, S, 1, kv_lora_rank + rope_dim]
+            key_for_cache = jnp.concatenate(
+                [compressed_kv[:, :, None, :], k_pe.transpose(0, 2, 1, 3)],
+                axis=-1,
+            )  # [B, S, 1, kv_lora_rank + rope_dim]
+            # Dummy query/value for concatenate signature
+            query_for_concat = mla_queries_nope
+            value_for_cache = key_for_cache  # MLA: value pages = key pages
+
+            (
+                _,
+                _,
+                mask_info,
+                init_attention_bias,
+                cache_view,
+                cache_metadata,
+            ) = self.concatenate(
+                query=query_for_concat,
+                key=key_for_cache,
+                value=value_for_cache,
+                cache_view=cache_view,
+                cache_metadata=cache_metadata,
+                mask_info=mask_info,
+                causal=self.causal,
+            )
+
+            softmax_aux = self._softmax_aux()
+
+            attentions = self.attention_performer.forward(
+                query_states=query_for_concat,
+                key_states=key_for_cache,
+                value_states=value_for_cache,
+                mode=mode,
+                bias=None,
+                cache_metadata=cache_metadata,
+                cache_view=cache_view,
+                init_bias=init_attention_bias,
+                mask_info=mask_info,
+                causal=causal_for_kernel,
+                sliding_window=sliding_window_for_kernel,
+                softmax_aux=softmax_aux,
+                queries_nope=mla_queries_nope,
+                queries_pe=mla_queries_pe,
+                keys_values=mla_keys_values,
+                keys_pe=mla_keys_pe,
+                softmax_scale=mla_softmax_scale,
+                output_attentions=output_attentions,
+            )
+
+            # Native MLA kernels return [total_tokens, N, kv_lora_rank],
+            # while the stochastic paged adapter preserves [B, S, N, kv_lora_rank].
+            # Normalize both layouts before applying the absorbed V projection.
+            attn_out = attentions.attention_outputs.reshape(bsz * q_len, self.num_heads, self.kv_lora_rank)
+            # Project through W_v to get [total_tokens, N, v_head_dim].
+            attn_out = jnp.einsum(
+                "tna,anh->tnh",
+                attn_out.astype(jnp.float32),
+                w_v.astype(jnp.float32),
+            ).astype(attn_out.dtype)
+
+            # Reshape to [batch, seq, num_heads * v_head_dim] for output projection
+            batch_size = hidden_states.shape[0]
+            seq_len = hidden_states.shape[1]
+            attn_output = attn_out.reshape(batch_size, seq_len, -1)
+        else:
+            # Recombine nope and pe parts for query
+            query_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), q_pe.dtype)
+            query_states = query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
+            query_states = query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
+
+            # Recombine nope and pe parts for key
+            key_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), k_pe.dtype)
+            key_states = key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
+            key_states = key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
+
+            # Transpose back to [batch, seq, heads, dim]
+            query_states = query_states.transpose(0, 2, 1, 3)
+            key_states = key_states.transpose(0, 2, 1, 3)
+            value_states = value_states.transpose(0, 2, 1, 3)
+
+            (
+                key_states,
+                value_states,
+                mask_info,
+                init_attention_bias,
+                cache_view,
+                cache_metadata,
+            ) = self.concatenate(
+                query=query_states,
+                key=key_states,
+                value=value_states,
+                cache_view=cache_view,
+                cache_metadata=cache_metadata,
+                mask_info=mask_info,
+                causal=self.causal,
+            )
+
+            softmax_aux = self._softmax_aux()
+
+            attentions = self.attention_performer.forward(
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                mode=mode,
+                bias=None,
+                cache_metadata=cache_metadata,
+                cache_view=cache_view,
+                init_bias=init_attention_bias,
+                mask_info=mask_info,
+                causal=causal_for_kernel,
+                sliding_window=sliding_window_for_kernel,
+                softmax_aux=softmax_aux,
+                output_attentions=output_attentions,
+            )
+
+            attn_out = attentions.attention_outputs
+            attn_output = self._merge_heads(attn_out)
+
+        if attentions.cache_view is not None:
+            cache_view = attentions.cache_view
+
+        attn_output = self.shard_attention_prod(attn_output, pre_projection=True)
+        attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
+
+        return AttentionLayerOutput(
+            attention_output=attn_output,
+            attention_weight=attentions.attention_weights if output_attentions else None,
+            cache_view=cache_view,
+        )
+
+    def forward_alibi(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
+    ) -> AttentionLayerOutput:
+        """ALiBi positional bias attention forward path (Falcon, MPT).
+
+        Replaces RoPE with Attention with Linear Biases (Press et al., 2022):
+        an additive per-head bias proportional to the query/key distance.
+        When ``alibi`` is provided it is used verbatim; otherwise the bias
+        is rebuilt from the cached :attr:`alibi_slopes` against the post-cache
+        key length.
+
+        Flow:
+            1. Project Q/K/V via :meth:`_project_qkv`.
+            2. Reshape to multi-head ``[batch, seq, heads, dim]``.
+            3. ``_postprocess_qkv`` hook for optional Q/K normalization.
+            4. Apply Q/K/V sharding constraints.
+            5. Concatenate with KV cache and bake mask (if any).
+            6. Materialize ALiBi bias against the post-cache key length.
+            7. Run attention with the ALiBi tensor passed as ``bias=`` to
+               the kernel.
+            8. Merge heads, apply output projection, re-shard, optional
+               residual dropout.
+
+        Args:
+            hidden_states: Residual stream ``[batch, seq_len, hidden_dim]``.
+            mask_info: Mask information for attention.
+            position_ids: Position indices (unused by ALiBi but kept for
+                signature parity).
+            mode: Runtime mode (train / prefill / decode).
+            cache_view: Optional KV cache view.
+            cache_metadata: Optional cache metadata companion.
+            output_attentions: Whether to return materialized attention
+                weights.
+            alibi: Optional precomputed ALiBi bias broadcastable over
+                ``[batch_or_1, heads, qseq_or_1, kvseq_or_1]``. When ``None``,
+                computed internally via :meth:`_compute_alibi_bias` at the
+                post-cache key length.
+
+        Returns:
+            :class:`AttentionLayerOutput` containing the attention output,
+            optional attention weights, and the updated cache view.
+        """
+        batch_size, sequence_length = hidden_states.shape[:2]
+
+        query_states, key_states, value_states = self._project_qkv(hidden_states)
+
+        query_states = query_states.reshape(batch_size, sequence_length, self.num_heads, self.head_dim)
+        key_states = key_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
+
+        query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
+
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
+
+        causal_for_kernel = self.causal
+        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
+
+        sliding_window_for_kernel = self.sliding_window
+        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+            sliding_window_for_kernel = None
+        (
+            key_states,
+            value_states,
+            mask_info,
+            init_attention_bias,
+            cache_view,
+            cache_metadata,
+        ) = self.concatenate(
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
+            mask_info=mask_info,
+            causal=self.causal,
+        )
+
+        if alibi is not None:
+            alibi_bias = alibi
+        else:
+            alibi_bias = self._compute_alibi_bias(key_states.shape[1])  # Use full KV length after cache
+        alibi_bias = self._fit_alibi_bias(
+            alibi_bias,
+            batch_size=query_states.shape[0],
+            q_len=query_states.shape[1],
+            kv_len=key_states.shape[1],
+        )
+
+        softmax_aux = self._softmax_aux()
+
+        attentions = self.attention_performer.forward(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            mode=mode,
+            bias=alibi_bias,  # KEY: Use ALiBi bias instead of RoPE
+            cache_metadata=cache_metadata,
+            cache_view=cache_view,
+            init_bias=init_attention_bias,
+            mask_info=mask_info,
+            causal=causal_for_kernel,
+            sliding_window=sliding_window_for_kernel,
+            softmax_aux=softmax_aux,
+            output_attentions=output_attentions,
+        )
+
+        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs), pre_projection=True)
+        attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
+
+        if hasattr(self, "resid_dropout"):
+            attn_output = self.resid_dropout(attn_output)
+
+        return AttentionLayerOutput(
+            attention_output=attn_output,
+            attention_weight=attentions.attention_weights if output_attentions else None,
+            cache_view=cache_view,
+        )
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
+    ) -> AttentionLayerOutput:
+        """Main entry point that routes to the appropriate forward method.
+
+        Automatically selects the correct attention mechanism based on the
+        attention_type set during initialization. Routes to:
+        - forward_standard(): Standard RoPE-based attention
+        - forward_mla(): Multi-head Latent Attention
+        - forward_alibi(): ALiBi positional bias attention
+
+        Args:
+            hidden_states: Input tensor with shape [batch, seq_len, hidden_dim].
+            mask_info: Container for attention masks and segment information.
+                May include attention_mask, segment_ids, and position information.
+            position_ids: Position indices with shape [batch, seq_len].
+            mode: Runtime mode (MODE_TRAIN, MODE_PREFILL, or MODE_DECODE).
+            cache_view: Optional view into the KV cache for autoregressive
+                generation. Can be TransformerCacheView, RaggedPagesCacheView,
+                or UnifiedAttentionCacheView.
+            cache_metadata: Optional metadata about cache state including
+                start indices and current positions.
+            output_attentions: If True, include attention weights in output.
+                May increase memory usage significantly.
+            frequencies: Optional precomputed RoPE frequencies. If None, uses
+                the module's internal rotary embedding computation.
+            alibi: Optional precomputed ALiBi positional bias. If None and
+                attention_type='alibi', computed internally.
+
+        Returns:
+            AttentionLayerOutput containing:
+                - attention_output: Output tensor [batch, seq_len, hidden_dim]
+                - attention_weight: Attention weights if output_attentions=True
+                - cache_view: Updated cache view for next generation step
+
+        Note:
+            Models usually don't need to override this method unless they have
+            special routing logic. Instead, override the specific forward_*
+            methods or the helper methods like _postprocess_qkv().
+
+        Example:
+            >>> # Standard usage
+            >>> output = attention(
+            ...     hidden_states,
+            ...     mask_info=mask_info,
+            ...     position_ids=position_ids,
+            ...     mode=common_types.MODE_PREFILL
+            ... )
+            >>> next_hidden = output.attention_output
+        """
+        if self.attention_type == "mla":
+            return self.forward_mla(
+                hidden_states,
+                mask_info,
+                position_ids,
+                mode,
+                cache_view,
+                cache_metadata,
+                output_attentions,
+                frequencies,
+                alibi,
+            )
+        elif self.attention_type == "alibi":
+            return self.forward_alibi(
+                hidden_states,
+                mask_info,
+                position_ids,
+                mode,
+                cache_view,
+                cache_metadata,
+                output_attentions,
+                alibi,
+            )
+        else:
+            return self.forward_standard(
+                hidden_states,
+                mask_info,
+                position_ids,
+                mode,
+                cache_view,
+                cache_metadata,
+                output_attentions,
+                frequencies,
+                alibi,
+            )
+
+    # Operation access properties for dynamic discovery
+    @property
+    def operation_executor(self):
+        """Get the OperationExecutor from the underlying attention performer.
+
+        Provides access to the operation executor for dynamic operation
+        discovery and mode-specific execution.
+
+        Returns:
+            OperationExecutor wrapping prefill and decode operations if
+            attention_performer exists, None otherwise.
+        """
+        if hasattr(self, "attention_performer") and self.attention_performer is not None:
+            return self.attention_performer.operation_executor
+        return None
+
+    @property
+    def operation(self):
+        """Get the primary operation from the attention performer.
+
+        Returns:
+            The prefill operation instance if attention_performer exists,
+            None otherwise.
+        """
+        if hasattr(self, "attention_performer") and self.attention_performer is not None:
+            return self.attention_performer.operation
+        return None
+
+    @property
+    def operation_requirements(self):
+        """Get combined requirements from the attention performer.
+
+        Retrieves metadata and cache requirements from both prefill and
+        decode operations.
+
+        Returns:
+            OperationRequirements with combined metadata/cache requirements
+            if attention_performer exists, default requirements otherwise.
+        """
+        from easydel.operations.requirements import OperationRequirements
+
+        if hasattr(self, "attention_performer") and self.attention_performer is not None:
+            return self.attention_performer.operation_requirements
+        return OperationRequirements.default()
+
+    @property
+    def requires_cache(self) -> bool:
+        """Check whether this attention layer requires a KV cache.
+
+        Returns:
+            True if the attention mechanism requires cache for proper
+            operation, False otherwise. Defaults to True if attention_performer
+            is not available.
+        """
+        if hasattr(self, "attention_performer") and self.attention_performer is not None:
+            return self.attention_performer.requires_cache
+        return True

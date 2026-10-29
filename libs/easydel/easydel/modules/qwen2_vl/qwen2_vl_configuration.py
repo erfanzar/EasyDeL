@@ -1,0 +1,374 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Configuration classes for the Qwen2-VL multimodal model family.
+
+This module defines two configurations consumed by Qwen2-VL:
+
+- :class:`Qwen2VLVisionConfig`: hyperparameters for the vision tower
+  (patch embedding size, hidden dimensions, transformer depth, etc.).
+- :class:`Qwen2VLConfig` (registered as ``qwen2_vl_text`` / ``qwen2_vl``):
+  hyperparameters for the language backbone, including 3-D rotary
+  position embeddings (mRoPE) used to encode video temporal/spatial
+  positions and the vision-merge spatial/temporal stride parameters.
+"""
+
+import typing
+from collections.abc import Mapping
+
+from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.factory import register_config
+from easydel.infra.utils import AttnMaskDetail
+
+
+@register_config("qwen2_vl_vision")
+class Qwen2VLVisionConfig(EasyDeLBaseConfig):
+    """
+    Configuration class for the vision component of Qwen2VL model.
+    This class stores the configuration parameters for the vision encoder part of the Qwen2VL multimodal model.
+
+    Args:
+      depth (`int`, *optional*, defaults to 32):
+        Number of layers in the vision transformer.
+      embed_dim (`int`, *optional*, defaults to 1280):
+        Dimensionality of the embeddings produced by the vision encoder.
+      hidden_size (`int`, *optional*, defaults to 3584):
+        Dimensionality of the intermediate representations in the vision transformer.
+      hidden_act (`str`, *optional*, defaults to "quick_gelu"):
+        The non-linear activation function used in the vision transformer.
+      mlp_ratio (`int`, *optional*, defaults to 4):
+        Ratio of the hidden size to the intermediate size in the MLP layers.
+      num_heads (`int`, *optional*, defaults to 16):
+        Number of attention heads in the vision transformer.
+      in_channels (`int`, *optional*, defaults to 3):
+        Number of input channels for the image (typically 3 for RGB).
+      patch_size (`int`, *optional*, defaults to 14):
+        Size of the patches that the image is divided into.
+      spatial_merge_size (`int`, *optional*, defaults to 2):
+        The merge size for spatial dimensions in the vision transformer.
+      temporal_patch_size (`int`, *optional*, defaults to 2):
+        Size of the temporal patches when processing video input.
+    """
+
+    model_type = "qwen2_vl"
+    base_config_key = "vision_config"
+    # Matches HF: the 2-D vision rotary is axial (``rope_parameters`` carries rope_type/rope_theta).
+    default_rope_type = "axial"
+
+    def __init__(
+        self,
+        depth: int = 32,
+        embed_dim: int = 1280,
+        hidden_size: int = 3584,
+        hidden_act: str = "quick_gelu",
+        mlp_ratio: int = 4,
+        num_heads: int = 16,
+        in_channels: int = 3,
+        patch_size: int = 14,
+        spatial_merge_size: int = 2,
+        temporal_patch_size: int = 2,
+        initializer_range: float = 0.02,
+        **kwargs,
+    ):
+        """Initialize the Qwen2-VL vision encoder configuration.
+
+        Args:
+            depth: Number of transformer layers in the vision tower.
+            embed_dim: Patch-embedding dimension produced by the vision encoder.
+            hidden_size: Intermediate / projected hidden size of the vision tower.
+            hidden_act: Activation function used inside the vision MLP.
+            mlp_ratio: Ratio between hidden size and MLP intermediate dimension.
+            num_heads: Number of attention heads.
+            in_channels: Number of input image channels (typically 3 for RGB).
+            patch_size: Square spatial patch size in pixels.
+            spatial_merge_size: Spatial merge factor used by the patch merger.
+            temporal_patch_size: Temporal patch size for video inputs.
+            initializer_range: Standard deviation for the truncated-normal
+                weight initializer.
+            **kwargs: Additional arguments forwarded to
+                :class:`EasyDeLBaseConfig`.
+        """
+        super().__init__(**kwargs)
+
+        self.depth = depth
+        self.embed_dim = embed_dim
+        self.hidden_size = hidden_size
+        self.hidden_act = hidden_act
+        self.mlp_ratio = mlp_ratio
+        self.num_heads = num_heads
+        # HF aliases ``num_attention_heads`` -> ``num_heads`` (its axial vision rope reads the former).
+        self.num_attention_heads = num_heads
+        self.in_channels = in_channels
+        self.patch_size = patch_size
+        self.spatial_merge_size = spatial_merge_size
+        self.temporal_patch_size = temporal_patch_size
+        self.initializer_range = initializer_range
+
+
+@register_config("qwen2_vl_text")
+class Qwen2VLTextConfig(EasyDeLBaseConfig):
+    """Configuration for the Qwen2-VL text decoder backbone.
+
+    Stores parameters for the decoder-only transformer used as the language backbone
+    in Qwen2-VL. Supports multi-rope (mRoPE) position embeddings for joint
+    spatial-temporal-text positioning, grouped query attention, and optional
+    sliding window attention.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 152064):
+            Vocabulary size of the Qwen2-VL text model.
+        hidden_size (`int`, *optional*, defaults to 8192):
+            Dimensionality of the hidden layers.
+        intermediate_size (`int`, *optional*, defaults to 29568):
+            Dimensionality of the MLP intermediate layer.
+        num_hidden_layers (`int`, *optional*, defaults to 80):
+            Number of transformer decoder layers.
+        num_attention_heads (`int`, *optional*, defaults to 64):
+            Number of attention heads for each attention layer.
+        num_key_value_heads (`int`, *optional*):
+            Number of key-value heads for grouped query attention. Defaults to
+            ``num_attention_heads`` (MHA) if ``None``.
+        hidden_act (`str`, *optional*, defaults to `"silu"`):
+            Activation function used in the MLP layers.
+        max_position_embeddings (`int`, *optional*, defaults to 32768):
+            Maximum sequence length this model supports.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            Standard deviation for weight initialization.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-5):
+            Epsilon for RMS normalization layers.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether to return past key/values for caching during generation.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie input and output word embeddings.
+        rope_theta (`float`, *optional*, defaults to 1000000.0):
+            Base frequency for rotary position embeddings.
+        use_sliding_window (`bool`, *optional*, defaults to `False`):
+            Whether to enable sliding window attention.
+        sliding_window (`int`, *optional*, defaults to 4096):
+            Sliding window size (set to ``None`` internally when disabled).
+        max_window_layers (`int`, *optional*, defaults to 80):
+            Layers at or above this index use sliding window attention.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            Dropout rate for attention weights.
+        rope_scaling (`dict`, *optional*):
+            RoPE scaling configuration. Automatically detects ``mrope`` type when
+            ``mrope_section`` is present.
+        rope_parameters (`dict`, *optional*):
+            Alternative name for ``rope_scaling`` (HF compatibility).
+        layer_types (`list[str]`, *optional*):
+            Per-layer attention type. Auto-derived from sliding window settings
+            if not provided.
+        attention_bias (`bool`, *optional*, defaults to `True`):
+            Whether the Q/K/V projections use a bias (the output projection never does).
+    """
+
+    model_type = "qwen2_vl_text"
+    # Native checkpoints saved before `attention_bias` existed built q/k/v without bias.
+    _legacy_native_defaults: typing.ClassVar[dict[str, typing.Any]] = {"attention_bias": False}
+    base_config_key = "text_config"
+    keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
+
+    def __init__(
+        self,
+        vocab_size: int = 152064,
+        hidden_size: int = 8192,
+        intermediate_size: int = 29568,
+        num_hidden_layers: int = 80,
+        num_attention_heads: int = 64,
+        num_key_value_heads: int | None = None,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 32768,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-05,
+        use_cache: bool = True,
+        tie_word_embeddings: bool = False,
+        rope_theta: float = 1000000.0,
+        use_sliding_window: bool = False,
+        sliding_window: int = 4096,
+        max_window_layers: int = 80,
+        attention_dropout: float = 0.0,
+        rope_scaling: dict | None = None,
+        rope_parameters: dict | None = None,
+        layer_types: list[str] | None = None,
+        attention_bias: bool = True,
+        **kwargs,
+    ):
+        """Initialize the Qwen2-VL text decoder configuration.
+
+        Args:
+            vocab_size: Text-side vocabulary size.
+            hidden_size: Decoder hidden dimension.
+            intermediate_size: MLP intermediate dimension.
+            num_hidden_layers: Number of decoder layers.
+            num_attention_heads: Number of query attention heads.
+            num_key_value_heads: Number of grouped-query KV heads;
+                defaults to ``num_attention_heads`` (i.e. MHA) when ``None``.
+            hidden_act: Activation used inside the MLP block.
+            max_position_embeddings: Maximum sequence length supported.
+            initializer_range: Standard deviation for weight initialization.
+            rms_norm_eps: RMS normalization epsilon.
+            use_cache: Whether to return KV caches during generation.
+            tie_word_embeddings: Whether to tie embedding and LM-head weights.
+            rope_theta: Base frequency for rotary position embeddings.
+            use_sliding_window: Enable sliding-window attention.
+            sliding_window: Sliding-window length (set to ``None`` internally
+                when ``use_sliding_window=False``).
+            max_window_layers: Layers at or above this index use sliding-window
+                attention when ``use_sliding_window=True``.
+            attention_dropout: Dropout probability on attention weights.
+            rope_scaling: RoPE scaling configuration dictionary; ``mrope`` is
+                auto-detected via the presence of ``mrope_section``.
+            rope_parameters: Alias for ``rope_scaling`` (HF compatibility).
+            layer_types: Per-layer attention type. Auto-derived from
+                sliding-window settings when ``None``.
+            attention_bias: Whether the Q/K/V projections carry a bias. HF
+                Qwen2-VL hard-codes ``bias=True`` for Q/K/V (the output
+                projection is always bias-free).
+            **kwargs: Additional arguments forwarded to
+                :class:`EasyDeLBaseConfig`.
+        """
+        # HF Qwen2-VL splits the doubled cos/sin by ``mrope_section * 2`` and
+        # takes chunk ``i`` from axis ``i % 3`` (T/H/W in each rotary half).
+        self._external_rope_config_kwargs = {"repetition_style": True}
+        super().__init__(**kwargs)
+
+        self.vocab_size = vocab_size
+        self.max_position_embeddings = max_position_embeddings
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.use_sliding_window = use_sliding_window
+        self.sliding_window = sliding_window if self.use_sliding_window else None
+        self.max_window_layers = max_window_layers
+
+        if num_key_value_heads is None:
+            num_key_value_heads = num_attention_heads
+
+        self.num_key_value_heads = num_key_value_heads
+        self.hidden_act = hidden_act
+        self.initializer_range = initializer_range
+        self.rms_norm_eps = rms_norm_eps
+        self.use_cache = use_cache
+        self.rope_theta = rope_theta
+        self.attention_dropout = attention_dropout
+        self.tie_word_embeddings = tie_word_embeddings
+        self.attention_bias = attention_bias
+
+        self.rope_scaling = rope_scaling or rope_parameters
+        if self.rope_scaling is not None:
+            rtype = self.rope_scaling.get("type") or self.rope_scaling.get("rope_type", "default")
+            if "mrope_section" in self.rope_scaling or rtype == "mrope":
+                self.rope_scaling["type"] = "mrope"
+                self.rope_scaling["rope_type"] = "mrope"
+            elif "type" in self.rope_scaling:
+                self.rope_scaling["rope_type"] = self.rope_scaling["type"]
+
+        self.head_dim = hidden_size // num_attention_heads
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = [
+                (
+                    "sliding_attention"
+                    if self.sliding_window is not None and i >= self.max_window_layers
+                    else "full_attention"
+                )
+                for i in range(self.num_hidden_layers)
+            ]
+
+
+@register_config("qwen2_vl")
+class Qwen2VLConfig(EasyDeLBaseConfig):
+    r"""
+    This is the configuration class to store the configuration of a [`Qwen2VLModel`]. It is used to instantiate a
+    Qwen2-VL model according to the specified arguments, defining the model architecture. Instantiating a configuration
+    with the defaults will yield a similar configuration to that of
+    Qwen2-VL-7B-Instruct [Qwen/Qwen2-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct).
+
+    Args:
+        text_config (`Union[Qwen2VLTextConfig, dict]`, *optional*):
+            The config for the text decoder.
+        vision_config (`Union[Qwen2VLVisionConfig, dict]`, *optional*):
+            The config for the vision encoder.
+        image_token_id (`int`, *optional*, defaults to 151655):
+            The image token index to encode image prompts.
+        video_token_id (`int`, *optional*, defaults to 151656):
+            The video token index to encode video prompts.
+        vision_start_token_id (`int`, *optional*, defaults to 151652):
+            The token index to denote start of vision input.
+        vision_end_token_id (`int`, *optional*, defaults to 151653):
+            The token index to denote end of vision input.
+    """
+
+    model_type = "qwen2_vl"
+    # The vision stem consumes flattened spatio-temporal patches, not NCHW images.
+    esurge_flat_patch_inputs = True
+    sub_configs: typing.ClassVar = {"vision_config": Qwen2VLVisionConfig, "text_config": Qwen2VLTextConfig}
+    keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
+
+    def __init__(
+        self,
+        text_config: Mapping[str, typing.Any] | Qwen2VLTextConfig | None = None,
+        vision_config: Mapping[str, typing.Any] | Qwen2VLVisionConfig | None = None,
+        image_token_id: int = 151655,
+        video_token_id: int = 151656,
+        vision_start_token_id: int = 151652,
+        vision_end_token_id: int = 151653,
+        **kwargs,
+    ):
+        """Initialize the composite Qwen2-VL configuration.
+
+        Args:
+            text_config: Text decoder configuration as a dict,
+                :class:`Qwen2VLTextConfig`, or ``None`` to build from
+                ``**kwargs``.
+            vision_config: Vision encoder configuration as a dict,
+                :class:`Qwen2VLVisionConfig`, or ``None`` for defaults.
+            image_token_id: Token id used as a placeholder for image patches
+                inside ``input_ids``.
+            video_token_id: Token id used as a placeholder for video patches
+                inside ``input_ids``.
+            vision_start_token_id: Token id marking the start of a vision
+                sequence.
+            vision_end_token_id: Token id marking the end of a vision sequence.
+            **kwargs: Additional arguments forwarded to
+                :class:`EasyDeLBaseConfig` and used as fallback when
+                ``text_config`` is ``None``.
+        """
+        super().__init__(**kwargs)
+
+        if isinstance(vision_config, dict):
+            self.vision_config = self.sub_configs["vision_config"](**vision_config)
+        elif vision_config is None:
+            self.vision_config = self.sub_configs["vision_config"]()
+        else:
+            # Already-constructed ``Qwen2VLVisionConfig`` instance: keep it.
+            self.vision_config = vision_config
+
+        if isinstance(text_config, dict):
+            self.text_config = self.sub_configs["text_config"](**text_config)
+        elif text_config is None:
+            self.text_config = self.sub_configs["text_config"](**kwargs)
+        else:
+            # Already-constructed ``Qwen2VLTextConfig`` instance: keep it.
+            self.text_config = text_config
+
+        self.image_token_id = image_token_id
+        self.video_token_id = video_token_id
+        self.vision_start_token_id = vision_start_token_id
+        self.vision_end_token_id = vision_end_token_id
+
+    def get_mask_details(self) -> dict[int, AttnMaskDetail]:
+        """Return the nested text decoder's per-layer full/sliding mask schedule."""
+        return super().get_mask_details()

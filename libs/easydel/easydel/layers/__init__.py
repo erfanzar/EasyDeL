@@ -1,0 +1,350 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""EasyDeL Layers Module — pure NN building blocks.
+
+Top-level aggregator for every reusable neural-network primitive that does
+not depend on a specific model architecture. The package is structured so
+that model implementations under ``easydel/modules/`` can compose attention,
+MLP, norm, embedding, MoE, and quantization pieces directly from this
+namespace without reaching into private modules.
+
+Submodules:
+    :mod:`attention`: :class:`FlexibleAttentionModule`, :class:`UnifiedAttention`,
+        :class:`AttentionMechanisms`, and decoder layer helpers.
+    :mod:`layouts`: Fused projection layouts and TP-interleaved checkpoint
+        reform rules (:class:`FusedColumnLayout`, :class:`FusedExpertLayout`,
+        :func:`build_fused_qkv_projection`, :func:`build_fused_gate_up_projection`).
+    :mod:`linears`: :class:`ParallelLinear`, :class:`ColumnParallelLinear`,
+        :class:`RowParallelLinear`, plus quantized and MoE variants.
+    :mod:`norms`: :class:`RMSNorm`, :class:`RMSNormGated`.
+    :mod:`embeddings`: :class:`Embed`.
+    :mod:`moe`: :class:`BaseMoeModule` and routing/load-balancing strategies.
+    :mod:`quantization`: :class:`QuantizationConfig`, :class:`EasyQuantizer`,
+        straight-through estimators.
+    :mod:`rotary`: Rotary embedding variants (Llama3, YaRN, DeepSeek, Phi3,
+        dynamic-NTK, linear scaling) and frequency computation helpers.
+"""
+
+import importlib
+import typing as tp
+
+from ._sharding import all_gather_then_dot
+from .embeddings import Embed, VisionPatchEmbed
+from .layouts import (
+    FusedColumnLayout,
+    FusedExpertLayout,
+    FusedSegment,
+    build_fused_gate_up_projection,
+    build_fused_qkv_projection,
+    dense_gate_up_layout,
+    dense_qkv_layout,
+    gate_up_fusion_reform_param,
+    hf_per_expert_swiglu_reform_param,
+    interleave_segments_last_axis,
+    interleaved_fusion_reform_param,
+    keep_interleaved_segments_last_axis,
+    moe_down_projection_reform_param,
+    moe_fused_gate_up_reform_param,
+    moe_gate_up_fusion_reform_param,
+    normalize_segment_sizes,
+    qkv_fusion_reform_param,
+    split_contiguous_segments_last_axis,
+    split_fused_gate_up_projection,
+    split_fused_qkv_projection,
+    split_interleaved_pair_last_axis,
+    split_interleaved_segments_last_axis,
+    tensor_parallel_axis,
+    tensor_parallel_size,
+    torch_deinterleave_axis_segments_for_tp,
+    torch_deinterleave_segments_for_tp,
+    torch_interleave_axis_segments_for_tp,
+    torch_interleave_segments_for_tp,
+    with_tp_last_axis_sharding,
+)
+from .linears import (
+    ColumnParallelLinear,
+    ColumnParallelLinearQuantized,
+    ColumnParallelMoELinear,
+    GroupedLinear,
+    ParallelLinear,
+    ParallelLinearQuantized,
+    ParallelMoELinear,
+    RowParallelLinear,
+    RowParallelLinearQuantized,
+    RowParallelMoELinear,
+    eLoRA,
+)
+from .mlp import clamped_swiglu, gated_mlp_forward, moe_gated_expert_forward, swiglu_oai
+from .moe import (
+    BaseMoeModule,
+    MoeFusedHooks,
+    MoeLayoutEstimate,
+    MoeLoadBalancingStrategy,
+    MoEMethods,
+    MoeMetrics,
+    MoeRoutingStrategy,
+    estimate_moe_layout,
+    get_moe_partition_spec,
+    validate_moe_layout,
+)
+from .norms import RMSNorm, RMSNormGated
+from .quantization import (
+    EasyDeLQuantizationConfig,
+    EasyQuantizer,
+    QuantizationConfig,
+    QuantizationType,
+    apply_quantization_rules,
+    build_quantization_provider,
+    quantize,
+    straight_through,
+    straight_through_1bit,
+    straight_through_8bit,
+    straight_through_channelwise,
+    straight_through_mxfp4,
+    straight_through_mxfp8,
+    straight_through_nf4,
+    straight_through_nvfp8,
+)
+from .residual import (
+    GatedResidual,
+    ManifoldHyperConnection,
+    ManifoldHyperConnectionConfig,
+    ManifoldHyperHead,
+    MeanHyperHead,
+    expand_streams,
+    inject_streams,
+    manifold_residual_write,
+    mean_hyper_head,
+)
+from .rotary import (
+    DeepseekScalingRotaryEmbedding,
+    DynamicNTKScalingRotaryEmbedding,
+    LinearScalingRotaryEmbedding,
+    Llama3RotaryEmbedding,
+    MultiModalRotaryEmbedding,
+    Phi3LongRoPEScaledRotaryEmbedding,
+    RopeConfig,
+    RotaryEmbedding,
+    YaRNScalingRotaryEmbedding,
+    apply_rope_interleaved_partial,
+    compute_basic_frequencies,
+    compute_basic_inv_frequencies,
+    compute_deepseek_frequencies,
+    compute_dynamic_frequencies,
+    compute_labeled_inv_frequencies,
+    compute_linear_frequencies,
+    compute_llama3_frequencies,
+    compute_llama3_inv_frequencies,
+    compute_phi3_frequencies,
+    compute_yarn_frequencies,
+    compute_yarn_inv_frequencies,
+    cos_sin_from_inv_frequencies,
+    get_frequencies,
+    get_inv_frequencies,
+    get_rope,
+    labeled_rope_cos_sin,
+)
+
+if tp.TYPE_CHECKING:
+    from .indexer import (
+        BaseIndexer,
+        BlockMaxIndexer,
+        BlockMaxIndexerConfig,
+        BlockTopKIndexer,
+        CompressedIndexer,
+        CompressedIndexerConfig,
+        IndexerConfig,
+        IndexerKind,
+        IndexerOutput,
+        IndexerSelection,
+        SelectionSpec,
+        SparseIndexer,
+        TokenIndexer,
+        TokenIndexerConfig,
+    )
+
+# Caches import layers.quantization during initialization. Indexers depend on
+# registered operations, which in turn import the completed cache namespace.
+# Resolve these public re-exports only when requested, not when importing an
+# unrelated layer subpackage, to keep both import orders valid.
+_INDEXER_EXPORTS = frozenset(
+    {
+        "BaseIndexer",
+        "BlockMaxIndexer",
+        "BlockMaxIndexerConfig",
+        "BlockTopKIndexer",
+        "CompressedIndexer",
+        "CompressedIndexerConfig",
+        "IndexerConfig",
+        "IndexerKind",
+        "IndexerOutput",
+        "IndexerSelection",
+        "SelectionSpec",
+        "SparseIndexer",
+        "TokenIndexer",
+        "TokenIndexerConfig",
+    }
+)
+
+
+def __getattr__(name: str) -> tp.Any:
+    """Resolve shared indexer re-exports without eager operation/cache imports.
+
+    Args:
+        name: Requested module attribute.
+
+    Returns:
+        The canonical public indexer object, cached in this module's namespace.
+
+    Raises:
+        AttributeError: When ``name`` is not a public layer export.
+    """
+    if name in _INDEXER_EXPORTS:
+        value = getattr(importlib.import_module(".indexer", __name__), name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """Include lazily resolved public indexers in module introspection."""
+    return sorted(set(globals()) | _INDEXER_EXPORTS)
+
+
+__all__ = [
+    "BaseIndexer",
+    "BaseMoeModule",
+    "BlockMaxIndexer",
+    "BlockMaxIndexerConfig",
+    "BlockTopKIndexer",
+    "ColumnParallelLinear",
+    "ColumnParallelLinearQuantized",
+    "ColumnParallelMoELinear",
+    "CompressedIndexer",
+    "CompressedIndexerConfig",
+    "DeepseekScalingRotaryEmbedding",
+    "DynamicNTKScalingRotaryEmbedding",
+    "EasyDeLQuantizationConfig",
+    "EasyQuantizer",
+    "Embed",
+    "FusedColumnLayout",
+    "FusedExpertLayout",
+    "FusedSegment",
+    "GatedResidual",
+    "GroupedLinear",
+    "IndexerConfig",
+    "IndexerKind",
+    "IndexerOutput",
+    "IndexerSelection",
+    "LinearScalingRotaryEmbedding",
+    "Llama3RotaryEmbedding",
+    "ManifoldHyperConnection",
+    "ManifoldHyperConnectionConfig",
+    "ManifoldHyperHead",
+    "MeanHyperHead",
+    "MoEMethods",
+    "MoeFusedHooks",
+    "MoeLayoutEstimate",
+    "MoeLoadBalancingStrategy",
+    "MoeMetrics",
+    "MoeRoutingStrategy",
+    "MultiModalRotaryEmbedding",
+    "ParallelLinear",
+    "ParallelLinearQuantized",
+    "ParallelMoELinear",
+    "Phi3LongRoPEScaledRotaryEmbedding",
+    "QuantizationConfig",
+    "QuantizationType",
+    "RMSNorm",
+    "RMSNormGated",
+    "RopeConfig",
+    "RotaryEmbedding",
+    "RowParallelLinear",
+    "RowParallelLinearQuantized",
+    "RowParallelMoELinear",
+    "SelectionSpec",
+    "SparseIndexer",
+    "TokenIndexer",
+    "TokenIndexerConfig",
+    "VisionPatchEmbed",
+    "YaRNScalingRotaryEmbedding",
+    "all_gather_then_dot",
+    "apply_quantization_rules",
+    "apply_rope_interleaved_partial",
+    "build_fused_gate_up_projection",
+    "build_fused_qkv_projection",
+    "build_quantization_provider",
+    "clamped_swiglu",
+    "compute_basic_frequencies",
+    "compute_basic_inv_frequencies",
+    "compute_deepseek_frequencies",
+    "compute_dynamic_frequencies",
+    "compute_labeled_inv_frequencies",
+    "compute_linear_frequencies",
+    "compute_llama3_frequencies",
+    "compute_llama3_inv_frequencies",
+    "compute_phi3_frequencies",
+    "compute_yarn_frequencies",
+    "compute_yarn_inv_frequencies",
+    "cos_sin_from_inv_frequencies",
+    "dense_gate_up_layout",
+    "dense_qkv_layout",
+    "eLoRA",
+    "estimate_moe_layout",
+    "expand_streams",
+    "gate_up_fusion_reform_param",
+    "gated_mlp_forward",
+    "get_frequencies",
+    "get_inv_frequencies",
+    "get_moe_partition_spec",
+    "get_rope",
+    "hf_per_expert_swiglu_reform_param",
+    "inject_streams",
+    "interleave_segments_last_axis",
+    "interleaved_fusion_reform_param",
+    "keep_interleaved_segments_last_axis",
+    "labeled_rope_cos_sin",
+    "manifold_residual_write",
+    "mean_hyper_head",
+    "moe_down_projection_reform_param",
+    "moe_fused_gate_up_reform_param",
+    "moe_gate_up_fusion_reform_param",
+    "moe_gated_expert_forward",
+    "normalize_segment_sizes",
+    "qkv_fusion_reform_param",
+    "quantize",
+    "split_contiguous_segments_last_axis",
+    "split_fused_gate_up_projection",
+    "split_fused_qkv_projection",
+    "split_interleaved_pair_last_axis",
+    "split_interleaved_segments_last_axis",
+    "straight_through",
+    "straight_through_1bit",
+    "straight_through_8bit",
+    "straight_through_channelwise",
+    "straight_through_mxfp4",
+    "straight_through_mxfp8",
+    "straight_through_nf4",
+    "straight_through_nvfp8",
+    "swiglu_oai",
+    "tensor_parallel_axis",
+    "tensor_parallel_size",
+    "torch_deinterleave_axis_segments_for_tp",
+    "torch_deinterleave_segments_for_tp",
+    "torch_interleave_axis_segments_for_tp",
+    "torch_interleave_segments_for_tp",
+    "validate_moe_layout",
+    "with_tp_last_axis_sharding",
+]

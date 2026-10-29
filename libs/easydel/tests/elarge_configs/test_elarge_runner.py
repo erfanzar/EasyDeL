@@ -1,0 +1,351 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Test runner for eLargeModel YAML configurations.
+
+This module provides pytest-based tests that run the elarge script with
+various YAML configurations, mirroring the trainer tests in tests/trainers/.
+
+Usage:
+    pytest tests/elarge_configs/test_elarge_runner.py -v
+    pytest tests/elarge_configs/test_elarge_runner.py::test_sft -v
+    pytest tests/elarge_configs/test_elarge_runner.py -k "dpo or orpo" -v
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+CONFIGS_DIR = Path(__file__).parent
+ELARGE_MODULE = "easydel.scripts.elarge"
+TRAINING_TEST_STEPS = int(os.environ.get("EASYDEL_ELARGE_TEST_STEPS", "3"))
+
+
+def _materialize_training_test_config(config_path: Path) -> Path:
+    """Create a short-running copy of an eLarge YAML config for runtime tests."""
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError("PyYAML is required for eLarge config tests.") from exc
+
+    with config_path.open(encoding="utf-8") as handle:
+        doc: dict[str, Any] = yaml.safe_load(handle) or {}
+
+    config = doc.get("config")
+    if config is None:
+        config = doc
+    if not isinstance(config, dict):
+        raise TypeError(f"Expected mapping config in {config_path}, got {type(config).__name__}")
+
+    trainer = config.setdefault("trainer", {})
+    if not isinstance(trainer, dict):
+        raise TypeError(f"Expected trainer mapping in {config_path}, got {type(trainer).__name__}")
+
+    trainer["max_training_steps"] = TRAINING_TEST_STEPS
+    trainer["save_steps"] = None
+    trainer["do_last_save"] = False
+
+    tmp_dir = (Path.cwd() / "tmp-files" / "elarge-tests" / "runtime-configs").resolve()
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    runtime_path = tmp_dir / config_path.name
+    with runtime_path.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(doc, handle, sort_keys=False)
+    return runtime_path
+
+
+def run_elarge_config(config_name: str, dry_run: bool = False) -> subprocess.CompletedProcess:
+    """Run the elarge script with a given config file.
+
+    Args:
+        config_name: Name of the YAML config file (without directory).
+        dry_run: If True, only parse and validate without executing.
+
+    Returns:
+        CompletedProcess with stdout/stderr captured.
+    """
+    config_path = CONFIGS_DIR / config_name
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config not found: {config_path}")
+
+    runtime_config_path = config_path if dry_run else _materialize_training_test_config(config_path)
+    cmd = [sys.executable, "-m", ELARGE_MODULE, str(runtime_config_path)]
+    if dry_run:
+        cmd.append("--dry-run")
+
+    env = os.environ.copy()
+    # Keep tests non-interactive and CI-safe.
+    env.setdefault("WANDB_MODE", "offline")
+    env.setdefault("WANDB_SILENT", "true")
+
+    # Ensure caches are writable in sandboxed/CI environments (mirrors tests/inference/*).
+    # Only redirect when the default $HOME/.cache isn't writable.
+    default_cache_root = Path.home() / ".cache"
+    if not default_cache_root.exists() or not os.access(default_cache_root, os.W_OK):
+        cache_root = (Path.cwd() / "tmp-files" / "elarge-tests" / "cache").resolve()
+        cache_root.mkdir(parents=True, exist_ok=True)
+        env.setdefault("XDG_CACHE_HOME", str(cache_root / "xdg"))
+        env.setdefault("HF_HOME", str(cache_root / "huggingface"))
+        env.setdefault("HF_DATASETS_CACHE", str(cache_root / "huggingface-datasets"))
+        env.setdefault("TRANSFORMERS_CACHE", str(cache_root / "transformers"))
+        env.setdefault("COMPILE_FUNC_DIR", str(cache_root / "ejkernel" / "ejit_compiled_functions"))
+
+    if dry_run:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=1800,  # 30 minute timeout for training
+            env=env,
+        )
+
+    logs_dir = (Path.cwd() / "tmp-files" / "elarge-tests" / "logs").resolve()
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / f"{Path(config_name).stem}.log"
+
+    with log_path.open("w+", encoding="utf-8") as log_fp:
+        proc = subprocess.run(
+            cmd,
+            stdout=log_fp,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=1800,  # 30 minute timeout for training
+            env=env,
+        )
+        log_fp.seek(0)
+        output = log_fp.read()
+
+    return subprocess.CompletedProcess(
+        args=proc.args,
+        returncode=proc.returncode,
+        stdout=output,
+        stderr="",
+    )
+
+
+class TestElargeDryRun:
+    """Test that all configs can be parsed and validated (dry-run)."""
+
+    @pytest.mark.parametrize(
+        "config_name",
+        [
+            "sft.yaml",
+            "sft_qat_ste.yaml",
+            "dpo.yaml",
+            "orpo.yaml",
+            "distillation.yaml",
+            "on_policy_distillation.yaml",
+            "reward.yaml",
+            "bco.yaml",
+            "cpo.yaml",
+            "kto.yaml",
+            "gkd.yaml",
+            "grpo.yaml",
+            "sdpo.yaml",
+            "ppo.yaml",
+            "gfpo.yaml",
+            "gspo.yaml",
+            "xpo.yaml",
+            "nash_md.yaml",
+            "seq_kd.yaml",
+            "sparse_distillation.yaml",
+            "speculative_decoding.yaml",
+        ],
+    )
+    def test_dry_run(self, config_name: str):
+        """Validate config parsing without execution."""
+        result = run_elarge_config(config_name, dry_run=True)
+        assert result.returncode == 0, f"Dry-run failed for {config_name}:\n{result.stderr}"
+
+    def test_speculative_decoding_registry_resolution(self):
+        """Ensure eLarge resolves speculative decoding to the trainer config class."""
+        import easydel.trainers  # noqa: F401
+        from easydel.infra.elarge.types.training import (
+            get_training_arguments_class,
+            normalize_trainer_config,
+        )
+        from easydel.trainers import SpeculativeDecodingConfig
+
+        cfg = normalize_trainer_config({"trainer_type": "spec-decoding"})
+        assert cfg["trainer_type"] == "speculative_decoding"
+        assert cfg["metrics_to_show_in_rich_pbar"] == [
+            "loss",
+            "draft_accept_rate",
+            "tau_probabilistic",
+            "deepspec_block_ce_loss",
+            "deepspec_block_l1_loss",
+        ]
+        assert get_training_arguments_class("speculative_decoding") is SpeculativeDecodingConfig
+
+    def test_speculative_decoding_build_trainer_kwargs(self, tmp_path, monkeypatch):
+        """Ensure eLarge constructs speculative trainers with drafter/target kwargs."""
+        from easydel.infra import eLargeModel
+        from easydel.trainers import SpeculativeDecodingConfig
+
+        captured = {}
+
+        class CapturingTrainer:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        drafter_model = object()
+        target_model = object()
+        tokenizer = object()
+        elm = eLargeModel(
+            {
+                "model": {"name_or_path": "drafter"},
+                "target_model": {"name_or_path": "target"},
+                "trainer": {
+                    "trainer_type": "speculative_decoding",
+                    "save_directory": str(tmp_path / "spec"),
+                },
+            }
+        )
+        elm._model = drafter_model
+        elm._tokenizer = tokenizer
+        monkeypatch.setattr(elm, "build_target_model", lambda: target_model)
+
+        trainer = elm.build_trainer(trainer_class=CapturingTrainer)
+
+        assert isinstance(trainer, CapturingTrainer)
+        assert isinstance(captured["arguments"], SpeculativeDecodingConfig)
+        assert captured["drafter_model"] is drafter_model
+        assert captured["target_model"] is target_model
+        assert captured["processing_class"] is tokenizer
+
+
+class TestElargeTraining:
+    """End-to-end training tests using YAML configs.
+
+    These tests actually run training for a few steps to verify the full pipeline.
+    They are marked as slow and can be skipped with: pytest -m "not slow"
+    """
+
+    @pytest.mark.slow
+    def test_sft(self):
+        """Test SFT training via YAML config."""
+        result = run_elarge_config("sft.yaml")
+        assert result.returncode == 0, f"SFT training failed:\n{result.stderr or result.stdout}"
+
+    @pytest.mark.slow
+    def test_sft_qat_ste(self):
+        """Test SFT QAT+STE training via YAML config."""
+        result = run_elarge_config("sft_qat_ste.yaml")
+        assert result.returncode == 0, f"SFT QAT+STE training failed:\n{result.stderr or result.stdout}"
+
+    @pytest.mark.slow
+    def test_dpo(self):
+        """Test DPO training via YAML config."""
+        result = run_elarge_config("dpo.yaml")
+        assert result.returncode == 0, f"DPO training failed:\n{result.stderr or result.stdout}"
+
+    @pytest.mark.slow
+    def test_orpo(self):
+        """Test ORPO training via YAML config."""
+        result = run_elarge_config("orpo.yaml")
+        assert result.returncode == 0, f"ORPO training failed:\n{result.stderr or result.stdout}"
+
+    @pytest.mark.slow
+    def test_distillation(self):
+        """Test distillation training via YAML config."""
+        result = run_elarge_config("distillation.yaml")
+        assert result.returncode == 0, f"Distillation training failed:\n{result.stderr or result.stdout}"
+
+    @pytest.mark.slow
+    def test_on_policy_distillation(self):
+        """Test on-policy distillation training via YAML config."""
+        result = run_elarge_config("on_policy_distillation.yaml")
+        assert result.returncode == 0, f"On-policy distillation training failed:\n{result.stderr or result.stdout}"
+
+    @pytest.mark.slow
+    def test_sdpo(self):
+        """Test SDPO training via YAML config."""
+        result = run_elarge_config("sdpo.yaml")
+        assert result.returncode == 0, f"SDPO training failed:\n{result.stderr or result.stdout}"
+
+
+if __name__ == "__main__":
+    # Allow running directly: python test_elarge_runner.py [config_name] [--dry-run]
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run elarge YAML config tests")
+    parser.add_argument(
+        "config",
+        nargs="?",
+        default="all",
+        help="Config name (sft, dpo, orpo, distillation, sdpo, ...) or 'all'",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Only parse and validate")
+    args = parser.parse_args()
+
+    configs = {
+        "sft": "sft.yaml",
+        "sft_qat_ste": "sft_qat_ste.yaml",
+        "dpo": "dpo.yaml",
+        "orpo": "orpo.yaml",
+        "distillation": "distillation.yaml",
+        "on_policy_distillation": "on_policy_distillation.yaml",
+        "reward": "reward.yaml",
+        "bco": "bco.yaml",
+        "cpo": "cpo.yaml",
+        "kto": "kto.yaml",
+        "gkd": "gkd.yaml",
+        "grpo": "grpo.yaml",
+        "sdpo": "sdpo.yaml",
+        "ppo": "ppo.yaml",
+        "gfpo": "gfpo.yaml",
+        "gspo": "gspo.yaml",
+        "xpo": "xpo.yaml",
+        "nash_md": "nash_md.yaml",
+        "seq_kd": "seq_kd.yaml",
+        "sparse_distillation": "sparse_distillation.yaml",
+    }
+
+    if args.config == "all":
+        to_run = list(configs.values())
+    elif args.config in configs:
+        to_run = [configs[args.config]]
+    else:
+        print(f"Unknown config: {args.config}")
+        print(f"Available: {list(configs.keys())} or 'all'")
+        sys.exit(1)
+
+    for config_name in to_run:
+        print(f"\n{'=' * 60}")
+        print(f"Running: {config_name} (dry_run={args.dry_run})")
+        print("=" * 60)
+
+        try:
+            result = run_elarge_config(config_name, dry_run=args.dry_run)
+            print(result.stdout)
+            if result.stderr:
+                print("STDERR:", result.stderr)
+            if result.returncode != 0:
+                print(f"FAILED with return code {result.returncode}")
+                sys.exit(result.returncode)
+            print(f"SUCCESS: {config_name}")
+        except subprocess.TimeoutExpired:
+            print(f"TIMEOUT: {config_name}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"ERROR: {e}")
+            sys.exit(1)
+
+    print("\nAll tests passed!")

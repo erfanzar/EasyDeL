@@ -1,0 +1,1658 @@
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+"""Operation-specific configuration classes.
+
+This module defines configuration dataclasses for each attention operation,
+providing type-safe, operation-specific parameters for kernel execution
+and autotuning.
+
+Configuration Hierarchy:
+    BaseOperationConfig
+    ├── FlashAttentionConfig (block sizes via FwdParams/BwdParams)
+    ├── BlockSparseAttentionConfig (sparse patterns + block sizes)
+    ├── NativeSparseAttentionConfig (block_q, block_k, block_d, block_size)
+    ├── PageAttentionConfig (num_splits, pages_per_compute_block)
+    ├── RingAttentionConfig (distributed attention)
+    ├── FlashMLAConfig (block_q, block_k for MLA)
+    ├── GroupedMatmulConfig (block_m, block_n, block_k for MoE)
+    ├── QuantizedMatmulConfig (block_m, block_n, block_k for quantized matmul)
+    ├── MeanPoolingConfig (block_size for pooling)
+    ├── KernelDeltaAttentionConfig (linear attention)
+    ├── RWKV4Config, RWKV6Config, RWKV7Config (recurrent models)
+    └── StateSpaceV1Config, StateSpaceV2Config (Mamba-style SSMs)
+
+Common Parameters:
+    All configs inherit from BaseOperationConfig which provides:
+        - platform: Target execution platform (triton/pallas/cuda/cute/xla/auto)
+        - backend: Hardware backend (gpu/tpu/cpu/any)
+
+Block Size Guidelines:
+    - GPU (Triton): 64-256 for query/key blocks, 4-8 warps
+    - TPU (Pallas): 128-256 for larger tiles to leverage matrix units
+    - XLA: Block sizes are hints; XLA compiler optimizes automatically
+
+Example:
+    >>> from ejkernel.modules.operations import FlashAttention, FlashAttentionConfig
+    >>> from ejkernel.ops import FwdParams
+    >>>
+    >>> # Custom configuration for flash attention
+    >>> cfg = FlashAttentionConfig(
+    ...     fwd_params=FwdParams(q_blocksize=128, kv_blocksize=128),
+    ...     platform="triton",
+    ... )
+    >>> output = flash_attention(q, k, v, causal=True, cfg=cfg)
+"""
+
+import json
+from dataclasses import asdict, dataclass
+from typing import Literal
+
+from ejkernel.callib import hash_fn
+from ejkernel.ops import BwdParams, FwdParams
+
+
+@dataclass
+class BaseOperationConfig:
+    """Base configuration for all operations.
+
+    This is the parent class for all operation-specific configurations.
+    It provides common platform and backend selection parameters that
+    are inherited by all specialized configurations.
+
+    Args:
+        platform: Target execution platform for kernel dispatch.
+            - "triton": Triton GPU kernels (NVIDIA/AMD GPUs)
+            - "pallas": Pallas kernels (TPU/GPU)
+            - "cuda": CUDA-specific implementations
+            - "cute": CUTLASS CuTe DSL implementations
+            - "xla": XLA compiler-based implementations (most portable)
+            - "auto": Automatic platform selection based on hardware (default)
+        backend: Target hardware backend specification.
+            - "gpu": GPU-specific optimizations
+            - "tpu": TPU-specific optimizations
+            - "cpu": CPU-specific optimizations
+            - "any": No backend preference (default)
+
+    Note:
+        When platform is "xla", the backend is automatically set to "any"
+        since XLA handles backend selection internally.
+    """
+
+    platform: Literal["triton", "pallas", "cuda", "cute", "tilelang", "xla", "auto"] = "auto"
+    backend: str = "any"
+
+    __hash__ = hash_fn
+
+    def to_dict(self) -> dict:
+        """Serialize this config to a plain dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        """Deserialize a config from a plain dictionary."""
+        return cls(**data)
+
+    def to_json(self) -> str:
+        """Serialize this config to a JSON string."""
+        return json.dumps(self.to_dict())
+
+    @classmethod
+    def from_json(cls, s: str):
+        """Deserialize a config from a JSON string."""
+        return cls.from_dict(json.loads(s))
+
+
+@dataclass
+class FlashAttentionConfig(BaseOperationConfig):
+    """Configuration for Flash Attention operation.
+
+    Args:
+        fwd_params: Forward kernel parameters (uses `q_blocksize`/`kv_blocksize` for tiling).
+        bwd_params: Backward kernel parameters (optional).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    fwd_params: FwdParams | None = None
+    bwd_params: BwdParams | None = None
+
+    def __post_init__(self):
+        """Convert dict-typed forward/backward params to FwdParams/BwdParams."""
+        if isinstance(self.fwd_params, dict):
+            self.fwd_params = FwdParams(**self.fwd_params)
+        if isinstance(self.bwd_params, dict):
+            self.bwd_params = BwdParams(**self.bwd_params)
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class BlockSparseAttentionConfig(BaseOperationConfig):
+    """Configuration for Block Sparse Attention operation.
+
+    Args:
+        fwd_params: Forward kernel parameters (q/kv block sizes, warps, stages).
+        bwd_params: Backward kernel parameters (q/kv block sizes, warps, stages).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    fwd_params: FwdParams | None = None
+    bwd_params: BwdParams | None = None
+
+    def __post_init__(self):
+        """Convert dict-typed forward/backward params to FwdParams/BwdParams."""
+        if isinstance(self.fwd_params, dict):
+            self.fwd_params = FwdParams(**self.fwd_params)
+        if isinstance(self.bwd_params, dict):
+            self.bwd_params = BwdParams(**self.bwd_params)
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class NativeSparseAttentionConfig(BaseOperationConfig):
+    """Configuration for Native Sparse Attention operation.
+
+    Args:
+        block_q: Query block size (default: 64)
+        block_k: Key block size (default: 64)
+        block_d: Head dimension block size (default: 64)
+        block_size: Size of attention blocks for sparsity (default: 64)
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 1)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_q: int = 64
+    block_k: int = 64
+    block_d: int = 64
+    block_size: int = 64
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RecurrentAttentionConfig(BaseOperationConfig):
+    """Configuration for Recurrent Attention operation.
+
+    Args:
+        block_q: Query block size (default: 64)
+        block_k: Key block size (default: 64)
+        block_d: Head dimension block size (default: 64)
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 1)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_q: int = 64
+    block_k: int = 64
+    block_d: int = 64
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RingAttentionConfig(BaseOperationConfig):
+    """Configuration for Ring Attention operation.
+
+    Args:
+        fwd_params: Forward pass block size parameters
+        bwd_params: Backward pass block size parameters
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    fwd_params: FwdParams | None = None
+    bwd_params: BwdParams | None = None
+
+    def __post_init__(self):
+        """Convert dict-typed forward/backward params to FwdParams/BwdParams."""
+        if isinstance(self.fwd_params, dict):
+            self.fwd_params = FwdParams(**self.fwd_params)
+        if isinstance(self.bwd_params, dict):
+            self.bwd_params = BwdParams(**self.bwd_params)
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class PageAttentionConfig(BaseOperationConfig):
+    """Configuration for Page Attention operation.
+
+    Args:
+        num_splits: Number of partitions for splitting contexts (default: 0 for auto)
+        pages_per_compute_block: Pages per compute block (default: None)
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 1)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    num_splits: int = 0
+    pages_per_compute_block: int | None = None
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class UnifiedAttentionConfig(BaseOperationConfig):
+    """Configuration for vLLM-style unified (paged) attention operation.
+
+    Args:
+        seq_threshold_3d: Threshold (in #seqs) for selecting the segmented 3D
+            decode kernel on GPU (Triton only).
+        num_par_softmax_segments: Number of parallel softmax segments used by
+            the segmented 3D decode kernel (Triton only).
+        block_dim: CUDA thread-block dimension for the CUDA backend.
+        num_warps: Optional Triton kernel override.
+        num_stages: Optional Triton kernel override.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    seq_threshold_3d: int | None = None
+    num_par_softmax_segments: int | None = None
+    block_dim: int = 128
+    num_warps: int | None = None
+    num_stages: int | None = None
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class DecodeAttentionConfig(BaseOperationConfig):
+    """Configuration for vLLM-style paged decode attention operation.
+
+    Args:
+        num_kv_splits: Number of KV splits used by the Triton kernel (default: 16).
+        num_warps: Optional Triton kernel override.
+        num_stages: Optional Triton kernel override.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    num_kv_splits: int = 16
+    num_warps: int | None = None
+    num_stages: int | None = None
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class ChunkedPrefillPagedDecodeConfig(BaseOperationConfig):
+    """Configuration for chunked prefill + paged decode attention operation.
+
+    This op updates a block-tabled KV cache and then runs unified paged attention
+    on the packed queries. On GPU, the underlying unified attention kernel may
+    use a 2D or 3D grid depending on `seq_threshold_3d`.
+
+    Args:
+        seq_threshold_3d: Threshold (#seqs) for selecting 3D segmented decode kernel (Triton only).
+        num_par_softmax_segments: Parallel softmax segments for 3D kernel (Triton only).
+        num_warps: Optional Triton kernel override.
+        num_stages: Optional Triton kernel override.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    seq_threshold_3d: int | None = None
+    num_par_softmax_segments: int | None = None
+    num_warps: int | None = None
+    num_stages: int | None = None
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class AttentionConfig(BaseOperationConfig):
+    """Configuration for basic Attention operation.
+
+    Args:
+        block_q: Query block size for the FlashAttention path (default: 128).
+        block_k: Key block size for the FlashAttention path (default: 128).
+        weights_block_q: Q-tile size for the dense ``(B, H, Sq, Sk)``
+            attention-weights kernel (default: 64). The operation picks
+            this from seq_len via ``heuristic_cfg`` — the kernel does not.
+        weights_block_k: K-tile size for the dense attention-weights kernel
+            (default: 64). Same heuristic policy as ``weights_block_q``.
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 2)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_q: int = 128
+    block_k: int = 128
+    weights_block_q: int = 64
+    weights_block_k: int = 64
+    num_warps: int = 4
+    num_stages: int = 2
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class FusedMlpConfig(BaseOperationConfig):
+    """Configuration for the fused MLP operation.
+
+    Args:
+        tile_i: Intermediate-dimension tile width per grid step for the
+            Pallas kernels (default: 1024, the measured optimum on TPU v5).
+            Semantic for the W4A4 variant (hidden re-quantization block
+            boundaries); pure tiling for the bf16 variant.
+        tile_m: Row-tile width for the dense bf16 Pallas kernel.
+        prefill_threshold: Token count at which integer formats switch from
+            the fused-upcast path to the int-MXU dot (default: 256).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    tile_i: int = 1024
+    tile_m: int = 512
+    prefill_threshold: int = 256
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class GroupedMatmulConfig(BaseOperationConfig):
+    """Configuration for Grouped Matrix Multiplication operation.
+
+    Args:
+        block_m: M dimension tile size (default: 128).
+        block_n: N dimension tile size (default: 128).
+        block_k: K (contraction) dimension tile size (default: 128).
+        num_warps: Number of warps for Triton kernels (default: 4).
+            Pass ``None`` to let the backend choose.
+        num_stages: Number of pipeline stages (default: 2).
+            Pass ``None`` to let the backend choose.
+        bypass_xla_tiling: If True and the resolved platform is XLA, skip
+            the tiling computation and pass ``tiling=None`` to the XLA impl
+            (default: False).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    block_m: int = 128
+    block_n: int = 128
+    block_k: int = 128
+    num_warps: int = 4
+    num_stages: int = 2
+    bypass_xla_tiling: bool = False
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class AllGatherMatmulConfig(BaseOperationConfig):
+    """Configuration for the fused All-Gather + Matmul operation.
+
+    Block sizes are silently clamped to the largest divisor of the actual
+    matrix dimension that is still ``<=`` the requested value, so they need
+    not exactly divide the problem size.
+
+    Args:
+        block_n: N-dimension block size for RHS tiling (default: 128).
+        block_k: K-dimension (contraction) block size (default: 128).
+        num_warps: Number of warps for Triton kernels (default: 4).
+            Unused in the XLA/Pallas path.
+        num_stages: Pipeline stages for Triton kernels (default: 2).
+            Unused in the XLA/Pallas path.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    block_n: int = 128
+    block_k: int = 128
+    num_warps: int = 4
+    num_stages: int = 2
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class ReduceScatterMatmulConfig(BaseOperationConfig):
+    """Configuration for the fused Matmul + Reduce-Scatter operation.
+
+    Block sizes are silently clamped to the largest divisor of the actual
+    matrix dimension that is still ``<=`` the requested value.
+
+    Args:
+        block_m: M-dimension block size (default: 128).
+        block_n: N-dimension block size (default: 128).
+        block_k: K-dimension (contraction) block size (default: 128).
+        num_warps: Number of warps for Triton kernels (default: 4).
+            Unused in the XLA/Pallas path.
+        num_stages: Pipeline stages for Triton kernels (default: 2).
+            Unused in the XLA/Pallas path.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    block_m: int = 128
+    block_n: int = 128
+    block_k: int = 128
+    num_warps: int = 4
+    num_stages: int = 2
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class AllReduceConfig(BaseOperationConfig):
+    """Configuration for the standalone all-reduce collective.
+
+    Args:
+        mode: Collective algorithm.  ``"one_shot"`` forces the Pallas TPU
+            direct-exchange kernel, ``"ring"`` delegates to XLA's lowering,
+            and ``"auto"`` resolves to the XLA path (measured faster on
+            v5p-8 at all sizes).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    mode: Literal["auto", "one_shot", "ring"] = "auto"
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class AllGatherConfig(BaseOperationConfig):
+    """Configuration for the standalone all-gather collective.
+
+    Args:
+        mode: Collective algorithm.  ``"one_shot"`` forces the Pallas TPU
+            direct-exchange kernel, ``"ring"`` delegates to XLA's lowering,
+            ``"auto"`` resolves to the XLA path (measured faster on v5p-8).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    mode: Literal["auto", "one_shot", "ring"] = "auto"
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class ReduceScatterConfig(BaseOperationConfig):
+    """Configuration for the standalone reduce-scatter collective.
+
+    Args:
+        mode: Collective algorithm.  ``"one_shot"`` forces the Pallas TPU
+            direct slice-exchange kernel, ``"ring"`` delegates to XLA's
+            lowering, ``"auto"`` resolves to the XLA path (measured faster
+            on v5p-8).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    mode: Literal["auto", "one_shot", "ring"] = "auto"
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class AllToAllConfig(BaseOperationConfig):
+    """Configuration for the dense all-to-all collective.
+
+    Args:
+        platform: Target platform (xla/auto; no TPU-specific engine —
+            XLA's lowering is the measured-best on current hardware).
+        backend: Backend specification (default: "any").
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedGatherConfig(BaseOperationConfig):
+    """Configuration for the ragged row-gather (MoE permute/unpermute).
+
+    Args:
+        platform: Target platform (xla/auto).  A SparseCore engine was
+            measured 7-23x slower than the TC gather on v5p and is not
+            registered; this op is the landing pad for newer-gen SC engines.
+        backend: Backend specification (default: "any").
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedGatherReduceConfig(BaseOperationConfig):
+    """Configuration for the weighted grouped gather-sum (MoE top-k combine).
+
+    Args:
+        platform: Target platform (xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class QuantizedMatmulConfig(BaseOperationConfig):
+    """Configuration for Quantized Matrix Multiplication operation.
+
+    Args:
+        block_m: M dimension block size (default: 128)
+        block_n: N dimension block size (default: 128)
+        block_k: K dimension block size (default: 64)
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 3)
+        use_bf16: Use BF16 for the dot input tiles (default: True)
+        split_k: Optional split-K factor for Triton kernels (default: None)
+        tpu_path: Optional TPU Pallas path override.
+            TPU Pallas uses packed-only execution. Legacy values
+            ("hybrid", "predecode") are accepted and normalized to packed.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_m: int = 128
+    block_n: int = 128
+    block_k: int = 64
+    num_warps: int = 4
+    num_stages: int = 3
+    use_bf16: bool = True
+    split_k: int | None = None
+    tpu_path: Literal["packed"] | None = None
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class MeanPoolingConfig(BaseOperationConfig):
+    """Configuration for Mean Pooling operation.
+
+    Args:
+        block_size: Block size for pooling (default: 64)
+        block_dim: Triton hidden-dimension tile size (default: 64)
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 1)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_size: int = 64
+    block_dim: int = 64
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedDecodeAttentionConfig(BaseOperationConfig):
+    """Configuration for Ragged Decode Attention operation.
+
+    The only tunable block-size parameter is ``fwd_params``, which passes
+    ``q_blocksize`` and ``kv_blocksize`` to the underlying kernel.  Triton
+    ``num_warps``/``num_stages`` are embedded in ``FwdParams``; there are no
+    separate top-level fields for those.
+
+    Args:
+        fwd_params: Forward-pass tiling parameters (``FwdParams`` with
+            ``q_blocksize``, ``kv_blocksize``, ``num_warps``, ``num_stages``).
+            Defaults to ``None`` (kernel selects defaults).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    fwd_params: FwdParams | None = None
+
+    def __post_init__(self):
+        """Convert dict-typed forward params to FwdParams."""
+        if isinstance(self.fwd_params, dict):
+            self.fwd_params = FwdParams(**self.fwd_params)
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class CompressedWindowDecodeConfig(BaseOperationConfig):
+    """Configuration for the compressed-window decode attention operation.
+
+    Shared-KV (``K == V``) single-step (or short-query) attention with an
+    explicit per-``(slot, query, kv)`` additive bias and per-head learnable
+    attention sinks (DeepSeek-V4 compressed-window decode). The entire KV axis
+    (sliding-window ring plus compressed entries) is small and bounded, so the
+    kernel keeps it resident in VMEM and runs a single-pass sink-augmented
+    softmax rather than a flash-style online scan.
+
+    Args:
+        fwd_params: Optional ``FwdParams`` tiling hints. Currently unused by the
+            single-pass kernel (the KV axis is not blocked); accepted for
+            interface parity and future tuning.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    fwd_params: FwdParams | None = None
+
+    def __post_init__(self):
+        """Convert dict-typed forward params to FwdParams."""
+        if isinstance(self.fwd_params, dict):
+            self.fwd_params = FwdParams(**self.fwd_params)
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class CompressedWindowAttentionConfig(BaseOperationConfig):
+    """Configuration for the compressed-window full-sequence attention operation.
+
+    Shared-KV (``K == V``) full-sequence attention with an explicit additive
+    bias and per-head learnable attention sinks (DeepSeek-V4 training / prefill
+    forward). Unlike the decode config, the KV axis can be long, so the Pallas
+    kernel streams it in tiles (``pltpu.make_async_copy`` double-buffering) with
+    a flash-style online softmax; ``fwd_params`` tunes the tile sizes.
+
+    Args:
+        fwd_params: Optional ``FwdParams`` tiling hints. ``q_blocksize`` sets the
+            query tile and ``kv_blocksize`` the streamed KV tile; both default to
+            ``min(128, round_up(axis, 8))`` when unset.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+        window: Sliding-window size of the token-KV region. ``0`` (default)
+            scans the whole KV axis; ``> 0`` enables the Pallas band-skip
+            (O(S*window) forward + matching windowed backward).
+        token_kv_len: Length of the sliding-window token region at the front of
+            the KV axis (the rest are always-visible compressed entries). Only
+            used when ``window > 0``.
+        backward: Pallas differentiation rule: ``"flash"`` (default; tiled
+            Pallas backward, reverse mode only) or ``"reference"`` (custom JVP
+            through the tiled reference math; supports forward-mode AD).
+        causal: Promise that the bias closes every key past the diagonal; the
+            Pallas kernels then skip token tiles above it (exact).
+        bias_kpool: Keys per pool of a pooled bias (``bias_pool``); ``0`` = per-key bias.
+        bias_closed: Closed-pool sentinel of a pooled bias (``None`` = dtype min).
+    """
+
+    fwd_params: FwdParams | None = None
+    window: int = 0
+    token_kv_len: int = 0
+    backward: str = "flash"
+    causal: bool = False
+    bias_kpool: int = 0
+    bias_closed: float | None = None
+
+    def __post_init__(self):
+        """Convert dict-typed forward params to FwdParams."""
+        if isinstance(self.fwd_params, dict):
+            self.fwd_params = FwdParams(**self.fwd_params)
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedPageAttentionv2Config(BaseOperationConfig):
+    """Configuration for Ragged Page Attention operation.
+
+    Args:
+        num_kv_pages_per_block: Number of KV pages to process per compute block (default: None for auto)
+        num_queries_per_block: Number of queries to process per compute block (default: None for auto)
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 1)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    num_kv_pages_per_block: int | None = None
+    num_queries_per_block: int | None = None
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedPageAttentionv2TurboQuantConfig(BaseOperationConfig):
+    """Configuration for Ragged Page Attention v2 with TurboQuant compression.
+
+    Controls the tiling strategy for the read-only TurboQuant-compressed
+    paged attention kernel.  The two block-size parameters determine how
+    queries and KV pages are grouped during the attention computation:
+
+    * Larger ``num_kv_pages_per_block`` reduces loop overhead but increases
+      per-iteration memory.
+    * Larger ``num_queries_per_block`` amortises the cost of pre-rotating
+      and pre-projecting queries across more tokens.
+
+    When either is ``None``, the kernel selects a default based on the
+    total number of pages per sequence.
+
+    Attributes:
+        num_kv_pages_per_block: Number of KV pages to process per block
+            in the inner attention loop.  ``None`` for automatic selection.
+        num_queries_per_block: Number of query tokens to process per block.
+            ``None`` defaults to 8.
+        num_warps: Kept for API parity with backend kernels (unused on XLA).
+        num_stages: Kept for API parity with backend kernels (unused on XLA).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: ``"any"``).
+    """
+
+    num_kv_pages_per_block: int | None = None
+    num_queries_per_block: int | None = None
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedPageAttentionv3Config(BaseOperationConfig):
+    """Configuration for Ragged Page Attention operation.
+
+    Args:
+        num_kv_pages_per_block: Number of KV pages to process per compute block (default: None for auto)
+        num_queries_per_block: Number of queries to process per compute block (default: None for auto)
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 1)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    chunk_prefill_size: int | None = None
+    num_kv_pages_per_block: int | None = None
+    num_queries_per_block: int | None = None
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedPageAttentionv3TurboQuantConfig(BaseOperationConfig):
+    """Configuration for Ragged Page Attention v3 with TurboQuant compression.
+
+    Controls the tiling strategy for the fused compress-and-attend
+    TurboQuant paged attention kernel.  This extends the v2 config with
+    an additional ``chunk_prefill_size`` parameter for prefill workloads.
+
+    The two block-size parameters determine how queries and KV pages are
+    grouped during both the compression phase and the attention computation:
+
+    * Larger ``num_kv_pages_per_block`` reduces loop overhead but increases
+      per-iteration memory.
+    * Larger ``num_queries_per_block`` amortises pre-rotation/pre-projection
+      cost and batches more tokens in the KV-write phase.
+
+    When either is ``None``, the kernel selects a default based on the
+    total number of pages per sequence.
+
+    Attributes:
+        chunk_prefill_size: Optional chunk size for prefill workloads.
+            Accepted for API parity with the standard RPA v3 config;
+            currently unused in the XLA TurboQuant backend.
+        num_kv_pages_per_block: Number of KV pages to process per block
+            in the inner attention loop.  ``None`` for automatic selection.
+        num_queries_per_block: Number of query tokens to process per block.
+            ``None`` defaults to 8.
+        num_warps: Kept for API parity with backend kernels (unused on XLA).
+        num_stages: Kept for API parity with backend kernels (unused on XLA).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: ``"any"``).
+    """
+
+    chunk_prefill_size: int | None = None
+    num_kv_pages_per_block: int | None = None
+    num_queries_per_block: int | None = None
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class MultiLatentRaggedPageAttentionConfig(BaseOperationConfig):
+    """Configuration for Multi-Latent Ragged Page Attention.
+
+    Args:
+        chunk_prefill_size: Optional chunk size for prefill sequences.
+        num_kv_pages_per_block: KV pages per kernel block (None = auto).
+        num_queries_per_block: Queries per kernel block (None = auto).
+        vmem_limit_bytes: Optional TPU VMEM hint for Pallas backend.
+        num_warps: Kept for API consistency (unused on XLA/Pallas paths).
+        num_stages: Kept for API consistency (unused on XLA/Pallas paths).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: \"any\").
+    """
+
+    chunk_prefill_size: int | None = None
+    num_kv_pages_per_block: int | None = None
+    num_queries_per_block: int | None = None
+    vmem_limit_bytes: int | None = None
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class MultiLatentRaggedPageAttentionV2Config(BaseOperationConfig):
+    """Configuration for Multi-Latent Ragged Page Attention v2.
+
+    Args:
+        chunk_prefill_size: Optional chunk size for prefill sequences.
+        num_kv_pages_per_block: KV pages per kernel block. May be a single
+            int or a `(decode, prefill, mixed)` tuple.
+        num_queries_per_block: Queries per kernel block. May be a single int
+            or a `(decode, prefill, mixed)` tuple.
+        vmem_limit_bytes: Optional TPU VMEM hint for Pallas backend.
+        num_warps: Kept for API consistency (unused on XLA/Pallas paths).
+        num_stages: Kept for API consistency (unused on XLA/Pallas paths).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    chunk_prefill_size: int | None = None
+    num_kv_pages_per_block: tuple[int, int, int] | int | None = None
+    num_queries_per_block: tuple[int, int, int] | int | None = None
+    vmem_limit_bytes: int | None = None
+    num_warps: int = 4
+    num_stages: int = 1
+
+    def __post_init__(self):
+        """Normalize list-based JSON payloads back into tuples."""
+
+        def _normalize(
+            value: tuple[int, int, int] | list[int] | int | None,
+            field_name: str,
+        ) -> tuple[int, int, int] | int | None:
+            """Convert JSON-deserialized lists back to tuples and validate length.
+
+            Args:
+                value: Block-size value — may be a tuple, list, int, or None.
+                field_name: Config field name (for error messages).
+
+            Returns:
+                Validated value as tuple, int, or None.
+
+            Raises:
+                ValueError: If a tuple/list with length != 3 is provided.
+            """
+            if isinstance(value, list):
+                value = tuple(value)
+            if isinstance(value, tuple) and len(value) != 3:
+                raise ValueError(f"{field_name} must have exactly three entries.")
+            return value
+
+        self.num_kv_pages_per_block = _normalize(
+            self.num_kv_pages_per_block,
+            "num_kv_pages_per_block",
+        )
+        self.num_queries_per_block = _normalize(
+            self.num_queries_per_block,
+            "num_queries_per_block",
+        )
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class SparseMultiLatentRaggedPageAttentionConfig(BaseOperationConfig):
+    """Configuration for sparse (top-k selected chunks) MLA ragged paged attention.
+
+    Args:
+        num_queries_per_block: Query rows processed per kernel step.
+        num_chunks_per_block: Selected chunks gathered per KV step (Pallas backend).
+        vmem_limit_bytes: Optional TPU VMEM hint for the Pallas backend.
+        num_warps: Kept for API consistency (unused on XLA/Pallas paths).
+        num_stages: Kept for API consistency (unused on XLA/Pallas paths).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    num_queries_per_block: int | None = None
+    num_chunks_per_block: int | None = None
+    vmem_limit_bytes: int | None = None
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class GLAttentionConfig(BaseOperationConfig):
+    """Configuration for Gated Linear Attention operation.
+
+    Args:
+        block_q: Query block size (default: 64)
+        block_k: Key block size (default: 64)
+        block_d: Head dimension block size (default: 64)
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 1)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_q: int = 64
+    block_k: int = 64
+    block_d: int = 64
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class LightningAttentionConfig(BaseOperationConfig):
+    """Configuration for Lightning Attention operation.
+
+    Args:
+        block_q: Query block size (default: 64)
+        block_k: Key block size (default: 64)
+        block_d: Head dimension block size (default: 64)
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 1)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_q: int = 64
+    block_k: int = 64
+    block_d: int = 64
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class KernelDeltaAttentionConfig(BaseOperationConfig):
+    """Configuration for Kernel Delta Attention (KDA) operation.
+
+    Args:
+        chunk_size: Chunk size for the XLA chunked recurrence path. TileLang
+            uses a recurrent native scan and treats this as a compatibility hint.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    chunk_size: int = 64
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class KdaChunkConfig(BaseOperationConfig):
+    """Configuration for the fused chunked per-channel-decay KDA (``kda_chunk``).
+
+    Args:
+        block_h: Heads per Pallas grid step (``num_heads`` must be a multiple; 1 keeps the
+            ``[cs, cs, K]`` temporaries at one head).
+        backward: ``"pallas"`` (fused reverse-sweep kernel) or ``"xla"`` (reversed-scan recompute).
+        bwd_reduce: ``"vpu"`` or ``"mxu"`` evaluation of the backward's weighted reductions (both exact).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    block_h: int = 1
+    backward: str = "pallas"
+    bwd_reduce: str = "vpu"
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RowPermuteConfig(BaseOperationConfig):
+    """Configuration for the run-table row permutation (``row_permute``).
+
+    Args:
+        chunk_rows: Source rows per streamed VMEM window of the Pallas TPU kernel (a multiple of 16).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    chunk_rows: int = 128
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class GatedDeltaRuleConfig(BaseOperationConfig):
+    """Configuration for Gated Delta Rule (GDR) operation.
+
+    ``chunk_size`` controls the trade-off between intra-chunk parallelism and
+    inter-chunk state propagation overhead. ``use_chunked`` selects the
+    chunked training/prefill algorithm; setting it to ``False`` forces the
+    recurrent XLA path. ``use_input_dtype_phase1_outputs`` is a TPU/Pallas
+    optimization knob for forward-only chunked prefill: it stores the large
+    phase-1 handoff tensors in the input dtype instead of fp32. The custom-VJP
+    training residual path still stores fp32 intermediates for backward
+    stability. ``use_input_dtype_state`` is a separate forward-only TPU/Pallas
+    knob for callers that do not need an fp32 recurrent state from the prefill.
+
+    Both ``use_input_dtype_*`` knobs default to ``False`` and should stay
+    ``False`` whenever forward values are compared or mixed across grad and
+    no-grad contexts (e.g. a frozen distillation teacher vs a trained student):
+    the custom-VJP training core ignores them, so enabling them makes a no-grad
+    forward numerically diverge from the grad-path forward of the same weights
+    (~4e-3 per layer in bf16, compounding with depth). Enable them only for
+    pure-inference pipelines where that trade is understood.
+
+    ``sequence_parallel_truncate_state_gradient`` keeps sequence-parallel
+    forward state propagation exact but treats the affine cross-shard state
+    correction as forward-only. ``sequence_parallel_forward_only`` makes the
+    whole sequence-parallel GDR output forward-only.
+
+    Args:
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+        chunk_size: Chunk size for the chunked forward pass (default: 64).
+            Larger chunks increase parallelism but also increase memory for
+            intra-chunk attention matrices. Typical values: 32, 64, 128, 256.
+        use_chunked: Whether to use the chunked algorithm when the caller does
+            not explicitly disable it. ``False`` forces recurrent XLA.
+        use_input_dtype_phase1_outputs: Whether the TPU/Pallas forward-only
+            chunked path should write large phase-1 outputs in the input dtype
+            (default ``False``). Ignored by XLA and by the Pallas custom-VJP
+            training residual path — see the divergence note above before
+            enabling.
+        use_input_dtype_state: Whether the TPU/Pallas forward-only chunked path
+            should carry recurrent state in the input dtype (default ``False``).
+            Keep ``False`` for stateful prefill/decode callers that need the
+            internal carry kept in fp32 — the easydel adapter forces this
+            whenever a cache state is passed in — and see the divergence note
+            above before enabling.
+        sequence_parallel_truncate_state_gradient: Whether sequence-parallel
+            GDR should stop gradients through the affine summary/cross-shard
+            state correction path while preserving exact forward propagation.
+        sequence_parallel_forward_only: Whether sequence-parallel GDR should
+            stop gradients at its output while preserving exact forward values.
+    """
+
+    chunk_size: int = 64
+    use_chunked: bool = True
+    use_input_dtype_phase1_outputs: bool = False
+    use_input_dtype_state: bool = False
+    sequence_parallel_truncate_state_gradient: bool = False
+    sequence_parallel_forward_only: bool = False
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedGatedDeltaRuleConfig(BaseOperationConfig):
+    """Configuration for Ragged Gated Delta Rule operation.
+
+    Processes variable-length sequences packed into a flat token stream
+    with chunked parallel intra-chunk computation.
+
+    Args:
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+        chunk_size: Chunk size for the chunked prefill path (default: 64).
+    """
+
+    chunk_size: int = 64
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedCausalConv1DConfig(BaseOperationConfig):
+    """Configuration for ragged causal depthwise conv1d.
+
+    Args:
+        d_conv: Static convolution window size.
+        apply_silu: Whether to fuse SiLU into the convolution output.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    d_conv: int = 4
+    apply_silu: bool = True
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class FusedConvDecodeConfig(BaseOperationConfig):
+    """Configuration for fused conv-state shift + depthwise conv decode.
+
+    Args:
+        d_conv: Static convolution window size.
+        activation: Activation applied after convolution (default: "silu").
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    d_conv: int = 4
+    activation: Literal["silu", "swish", "none"] = "silu"
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class GatedDeltaRuleGroupedDecodeConfig(BaseOperationConfig):
+    """Configuration for grouped GDR single-step decode.
+
+    Args:
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    pass
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class GdnSpecWindowStatesConfig(BaseOperationConfig):
+    """Configuration for the GDN speculative-window state-scan op.
+
+    Args:
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    pass
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedGatedDeltaRuleV2Config(BaseOperationConfig):
+    """Configuration for the Qwen3-Next packed-inference ragged GDN op.
+
+    This is the mixed-QKV/raw-gate operation used by continuous batching. It
+    wraps decode-only, mixed-prefill, optional TPU fused decode, and optional
+    recurrent-scan prefill paths.
+
+    Attributes:
+        chunk_size: Chunk size for the chunked prefill/scan paths (default: 64).
+        kernel_tile_policy: TPU Pallas decode tile policy. ``"auto"`` uses
+            VMEM-aware tile selection; ``"b16"``, ``"b8"``, ``"b4"``,
+            ``"b2"`` and ``"b1"`` force a token tile size.
+        use_fused_gdn_decode: Whether to route supported decode-only TPU calls
+            through the fused GDN decode kernel.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    chunk_size: int = 64
+    kernel_tile_policy: Literal["auto", "b16", "b8", "b4", "b2", "b1"] = "auto"
+    use_fused_gdn_decode: bool = False
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class GDNComputeScheduleV2Config(BaseOperationConfig):
+    """Configuration for GDN v2 schedule-table construction.
+
+    The schedule builder is pure JAX/XLA helper logic used by the ragged GDN v2
+    TPU kernels before launching Pallas compute. It has no tunable kernel tile
+    parameters; the config only controls registry dispatch.
+
+    Attributes:
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RWKV4Config(BaseOperationConfig):
+    """Configuration for RWKV-4 recurrence operation.
+
+    RWKV-4 uses a linear attention mechanism with time-decay factors and
+    gating for efficient language modeling without quadratic complexity.
+
+    The core operation computes:
+        wkv_t = sum_{i<t} exp(-w*(t-i)) * k_i * v_i + u * k_t * v_t
+
+    Args:
+        block_c: Channel-axis tile size for the tile-lang backend
+            (default ``64``). Ignored by the XLA backend. The
+            operation's ``heuristic_cfg`` picks this from channel
+            count; the autotuner enumerates a small set of values.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_c: int = 64
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RWKV6Config(BaseOperationConfig):
+    """Configuration for RWKV-6 recurrence operation.
+
+    RWKV-6 extends RWKV-4 with token-dependent decay factors (w parameter),
+    allowing the model to learn how long to retain information per token.
+
+    Key improvements over RWKV-4:
+        - Token-dependent time decay (learned per-position)
+        - Improved receptance gating mechanism
+
+    Args:
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+
+    Note:
+        This operation currently uses XLA implementation without
+        tunable block sizes.
+    """
+
+    pass
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RWKV7Config(BaseOperationConfig):
+    """Configuration for RWKV-7 recurrence operation.
+
+    RWKV-7 introduces additional improvements to the RWKV architecture
+    with enhanced state update mechanisms and gating operations.
+
+    Args:
+        block_v: Value-dimension tile size for Triton kernels.
+        num_warps: Number of warps for Triton kernels.
+        num_stages: Number of pipeline stages for Triton kernels.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_v: int = 64
+    num_warps: int = 4
+    num_stages: int = 3
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RWKV7MulConfig(BaseOperationConfig):
+    """Configuration for RWKV-7 multiplicative recurrence operation.
+
+    This variant of RWKV-7 uses multiplicative state updates instead
+    of additive updates, providing different expressiveness characteristics
+    for sequence modeling tasks.
+
+    Args:
+        block_v: Value-dimension tile size for Triton kernels.
+        num_warps: Number of warps for Triton kernels.
+        num_stages: Number of pipeline stages for Triton kernels.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_v: int = 64
+    num_warps: int = 4
+    num_stages: int = 3
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class FlashMLAConfig(BaseOperationConfig):
+    """Configuration for Flash Multi-head Latent Attention operation.
+
+    Args:
+        block_q: Query block size (default: 128)
+        block_k: Key block size (default: 128)
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 2)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_q: int = 128
+    block_k: int = 128
+    num_warps: int = 4
+    num_stages: int = 2
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class DeepSeekAttentionConfig(BaseOperationConfig):
+    """Configuration for DeepSeek Sparse Attention (DSA) operation.
+
+    DSA combines MLA attention with a Lightning Indexer that dynamically
+    selects top-k KV tokens per query, reducing complexity from O(L^2) to O(L*k).
+
+    Args:
+        index_topk: Number of KV tokens to select per query (default: 2048).
+        block_q: Query block size for the inner FlashAttention call (default: 128).
+        block_k: Key block size for the inner FlashAttention call (default: 128).
+        gemm_block: GEMM/indexer/topk tile size shared by the DSA-internal
+            tile-lang sub-kernels (indexer, KV-recon GEMMs, elementwise
+            add/cast, top-k bias). The operation's ``heuristic_cfg`` picks
+            this from seq_len; the autotuner enumerates ``{64, 128}``.
+            Default ``128`` is the cold-start fallback for direct callers.
+        num_warps: Number of warps for Triton kernels (default: 4).
+        num_stages: Number of pipeline stages (default: 2).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+
+    Reference:
+        DeepSeek-V3.2: https://arxiv.org/abs/2512.02556
+    """
+
+    index_topk: int = 2048
+    block_q: int = 128
+    block_k: int = 128
+    gemm_block: int = 128
+    num_warps: int = 4
+    num_stages: int = 2
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class ScaledDotProductAttentionConfig(BaseOperationConfig):
+    """Configuration for Scaled Dot Product Attention operation.
+
+    Args:
+        block_q: Query tile size for tile-lang FlashAttention-backed SDPA.
+        block_k: Key/value tile size for tile-lang FlashAttention-backed SDPA.
+        num_warps: GPU warp-count hint when the selected backend uses it.
+        num_stages: Pipeline-stage hint when the selected backend uses it.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_q: int = 128
+    block_k: int = 128
+    num_warps: int = 4
+    num_stages: int = 2
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class PrefillPageAttentionConfig(BaseOperationConfig):
+    """Configuration for Prefill Page Attention operation.
+
+    Args:
+        block_k: KV-token tile size for TileLang prefill paged attention.
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 1)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_k: int | None = None
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class StateSpaceV1Config(BaseOperationConfig):
+    """Configuration for SSM1 (Mamba1-style) Selective State Space operation.
+
+    Args:
+        block_d: ``D``-axis tile size for the tile-lang SSM-1 scan kernel
+            (default ``64``). Ignored by XLA. The operation picks this from
+            shape via ``heuristic_cfg`` — the kernel does not.
+        block_e: Width-axis tile size for the gating helper (``silu_gate``)
+            applied after the scan (default ``128``).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_d: int = 64
+    block_e: int = 128
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class StateSpaceV2Config(BaseOperationConfig):
+    """Configuration for SSM2 (Mamba2-style) Selective State Space operation.
+
+    Args:
+        n_groups: Number of groups for B, C parameters (default: 1)
+        use_gated_rmsnorm: Whether to use gated RMSNorm for output (default: False)
+        rmsnorm_eps: Epsilon for RMSNorm stability (default: 1e-5)
+        block_e: Width-axis tile size for the silu gate helper applied after
+            the scan (default ``128``). Ignored when ``use_gated_rmsnorm``.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    n_groups: int = 1
+    use_gated_rmsnorm: bool = False
+    rmsnorm_eps: float = 1e-5
+    block_e: int = 128
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class FusedCrossEntropyConfig(BaseOperationConfig):
+    """Configuration for fused cross-entropy.
+
+    Args:
+        block_v: Tile size along the **vocab** axis for the inner
+            online-softmax scan (default ``0`` = auto: 256 / 512 /
+            1024 / 2048 depending on ``V``). Each CTA streams its
+            row(s) through ``ceildiv(V, block_v)`` chunks; larger
+            ``block_v`` amortises chunk-loop overhead but uses more
+            SMEM / registers per CTA.
+        block_m: Rows per CTA (``M`` = flattened ``batch · seq``).
+            Default ``0`` = auto: ``1`` when ``N < 1024`` else ``4``.
+            ``block_m=1`` maximises SM occupancy (smallest SMEM
+            footprint, preferred for wide ``V``); larger amortises
+            per-CTA fixed cost when ``N`` is huge but burns more
+            registers / SMEM per CTA.
+        num_warps: Number of warps (kernel-only hint).
+        num_stages: Pipeline depth (kernel-only hint).
+        platform: Target platform (tilelang/xla/auto).
+        backend: Backend specification.
+    """
+
+    block_v: int = 0
+    block_m: int = 0
+    num_warps: int = 4
+    num_stages: int = 2
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class FusedKLDivergenceConfig(BaseOperationConfig):
+    """Configuration for fused KL divergence (forward / reverse / JSD).
+
+    Args:
+        block_v: Tile size along the **vocab** axis for the inner
+            online-softmax scan (default ``0`` = auto: 256-4096 by
+            ``V``). Larger ``block_v`` amortises chunk-loop overhead;
+            smaller eases register / SMEM pressure for huge ``V``.
+        block_m: Rows per CTA (``M`` = flattened ``batch · seq``).
+            Default ``0`` = auto: ``1`` when ``N < 1024`` else ``4``.
+            ``block_m=1`` is preferred for wide vocabularies — keeps
+            occupancy high; larger ``block_m`` amortises fixed cost
+            on small-V/big-N shapes.
+        num_warps: Number of warps (kernel-only hint).
+        num_stages: Pipeline depth (kernel-only hint).
+        platform: Target platform (tilelang/xla/auto).
+        backend: Backend specification.
+    """
+
+    block_v: int = 0
+    block_m: int = 0
+    num_warps: int = 4
+    num_stages: int = 2
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class FusedCakldTvConfig(BaseOperationConfig):
+    """Configuration for the fused dynamic-CAKLD + TV distillation loss.
+
+    The only implementation is the XLA one, which does its own tiling, so there
+    are no block-size fields; the inherited ``platform`` / ``backend`` select it.
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class FusedRenyiEntropyConfig(BaseOperationConfig):
+    """Configuration for the fused per-row Renyi entropy.
+
+    The only implementation is the XLA one, which does its own tiling, so there
+    are no block-size fields; the inherited ``platform`` / ``backend`` select it.
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class MHCCoefficientsConfig(BaseOperationConfig):
+    """mHC coefficient dispatch settings (pallas/TPU or xla/any).
+
+    Inherited ``platform`` and ``backend`` select the implementation. The packed
+    TPU path has fixed 128-token tiles and supports first-order reverse AD only.
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class MHCFusedConfig(BaseOperationConfig):
+    """Configuration for the mHC site operations ``mhc_collapse`` / ``mhc_expand``.
+
+    The heuristic configuration selects ``platform="xla"`` on every backend (the
+    measured faster site end to end); the Pallas TPU path runs only on request.
+
+    Args:
+        tile_rows: Pallas rows per grid step (positive multiple of 128).
+        fn_pieces: bf16 pieces an fp32 predictor / stream is split into for the
+            Pallas MXU projection (3 = fp32 accuracy, 1 = plain bf16).
+        grad_pieces: bf16 pieces of the fp32 logit cotangent in the Pallas
+            backward dots.
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    tile_rows: int = 256
+    fn_pieces: int = 3
+    grad_pieces: int = 3
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class SinkhornKnoppConfig(BaseOperationConfig):
+    """Configuration for the Sinkhorn-Knopp doubly-stochastic projection.
+
+    Args:
+        platform: Target platform (pallas/xla/auto). The Pallas TPU kernel runs
+            every iteration inside one program; the XLA path is the unrolled
+            reference loop and the mandatory fallback.
+        backend: Backend specification (default: "any").
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class TopKConfig(BaseOperationConfig):
+    """Configuration for the fused exact top-k.
+
+    Args:
+        platform: Target platform (pallas/xla/auto). The Pallas TPU path
+            bisects for the exact ``k``-th key and compacts the survivors,
+            bit-identical to ``jax.lax.top_k``; it is selected for ``k >= 32``
+            over wide, many-row inputs. The XLA path serves tiny ``k``, narrow
+            axes, few rows, and the per-row dynamic ``k`` mask mode, where it is
+            faster.
+        backend: Backend specification (default: "any").
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class IndexerScoresConfig(BaseOperationConfig):
+    """Configuration for the fused Lightning-indexer scoring.
+
+    The tiles are requests: the Pallas TPU kernel rounds them up to the sublane / lane multiples (16 / 128) and
+    shrinks them until the heaviest program fits half the local VMEM (``pltpu.get_tpu_info()``). The XLA reference
+    ignores them.
+
+    Args:
+        block_q: Query tile. Default 128.
+        block_t: Entry (key) tile. Default 1024: measured best on one TPU chip at ``H = 64``, ``d = 128``,
+            ``S = 8192``, ``T = 2048`` bf16 (fwd+bwd 3.96 ms vs 6.44 / 4.84 / 5.60 ms at 256 / 512 / 2048).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    block_q: int = 128
+    block_t: int = 1024
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class DsaSparseAttentionConfig(BaseOperationConfig):
+    """Configuration for the pool-bitmap block-sparse DSA attention.
+
+    Every field is a per-pair cost option of the Pallas TPU kernels; the visited
+    pairs (and therefore the numerics, up to fp32 reassociation) never change.
+    The XLA reference validates and ignores them. Defaults are the measured-best
+    values on a v5p chip.
+
+    Args:
+        block_q: Query tile (multiple of 128). Default 256.
+        block_kv: Key tile (multiple of 128 and ``32 * kpool``). Default 512:
+            bitwise the 256 tiling and ~8% faster.
+        backward: ``"fused"`` (single-pass backward, default; -22..-36% vs the
+            two passes) or ``"two_pass"``.
+        fwd_nt: Forward ``K @ q^T`` as NT dots without the q^T scratch.
+        fwd_lean: Forward with the ``-1e30`` running-max seed (bitwise the base).
+        bwd_lean: Two-pass backward lean recompute (fp32 reassociation).
+        pool_sum: Pool-cotangent reduction, ``"reshape"`` or ``"matmul"``.
+        stale_tau: Speculative stale-max forward threshold (``None`` = off;
+            measured 1.7x slower at block density 1).
+        fused_groups: Fused-backward core groups (``None`` = automatic, 1 or 2).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    block_q: int = 256
+    block_kv: int = 512
+    backward: str = "fused"
+    fwd_nt: bool = False
+    fwd_lean: bool = False
+    bwd_lean: bool = False
+    pool_sum: str = "reshape"
+    stale_tau: float | None = None
+    fused_groups: int | None = None
+
+    __hash__ = hash_fn

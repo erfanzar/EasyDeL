@@ -1,0 +1,1268 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""RWKV model implementation for EasyDeL.
+
+This module implements the RWKV (Receptance-Weighted Key-Value)
+recurrent-attention architecture. RWKV combines transformer-style
+parallel training with linear-time recurrent inference by replacing
+softmax attention with a per-channel time-mix block parameterized by
+learnable exponential decay rates.
+
+Components:
+- Time-mix block (RWKV self-attention surrogate) with state carrying
+  the per-channel running-key statistics.
+- Channel-mix block (RWKV feedforward surrogate) using receptance/value
+  gating.
+- :class:`RwkvModel` is the trunk; :class:`RwkvForCausalLM` adds an LM
+  head for next-token prediction.
+
+The implementation supports both parallel-mode (training, used here)
+and recurrent-mode inference using cached layer state.
+"""
+
+import math
+import typing as tp
+from functools import partial
+
+import jax
+import jax.lax
+import spectrax as spx
+from eformer.pytree import auto_pytree
+from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
+
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import ModelOutput
+from easydel.infra.utils import ArrayParam, auto_remat
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseCausalLMModule
+
+from .rwkv_configuration import RwkvConfig as RwkvConfig
+
+# NOTE:Updated but wont work forsure, check this later.
+
+
+@auto_pytree
+class RwkvOutput(ModelOutput):
+    """Output container for the base RWKV model with recurrent state.
+
+    Attributes:
+        last_hidden_state: Final hidden states from the model of shape
+            (batch, seq_len, hidden_size).
+        state: Recurrent state tensors for continuing generation. Contains
+            channel mix and time mix states for each layer.
+        hidden_states: Optional tuple of hidden states from all layers if
+            output_hidden_states=True.
+        attentions: Optional tuple of attention weights from all layers if
+            output_attentions=True.
+    """
+
+    last_hidden_state: Array = None
+    state: tuple[Array, ...] | None = None
+    hidden_states: tuple[Array, ...] | None = None
+    attentions: tuple[Array, ...] | None = None
+
+
+@auto_pytree
+class RwkvCausalLMOutput(ModelOutput):
+    """Causal LM output including logits and state for RWKV generation.
+
+    Attributes:
+        loss: Optional language modeling loss if labels are provided.
+        logits: Prediction logits of shape (batch, seq_len, vocab_size).
+        state: Recurrent state tensors for continuing generation.
+        hidden_states: Optional tuple of hidden states from all layers.
+        attentions: Optional tuple of attention weights from all layers.
+    """
+
+    loss: Array | None = None
+    logits: Array = None
+    state: list[Array] | None = None
+    hidden_states: tuple[Array, ...] | None = None
+    attentions: tuple[Array, ...] | None = None
+
+
+def init_state(hidden_size: int, batch_size: int | None = None, attention_hidden_size: int | None = None):
+    """Create zeroed RWKV recurrent state tensors for a given hidden size.
+
+    RWKV is recurrent over the sequence dimension but can be vectorized over
+    the batch dimension. The returned tuple holds both the time-mix state
+    (four arrays: previous hidden, numerator, denominator, log-normaliser)
+    and the channel-mix state (single previous-hidden array). The
+    log-normaliser is initialised to ``-1e38`` so the log-sum-exp update is
+    numerically equivalent to starting from an empty running average.
+
+    Args:
+        hidden_size: Per-channel dimensionality of the RWKV state.
+        batch_size: Optional batch axis. When ``None`` the returned arrays
+            are 1-D; when set, they have a leading batch axis.
+        attention_hidden_size: Width of the three WKV accumulators. Defaults
+            to hidden_size. Previous-hidden states always use hidden_size.
+
+    Returns:
+        Tuple ``(time_mix_state, channel_mix_state)`` where
+        ``time_mix_state`` is itself a 4-tuple of arrays and
+        ``channel_mix_state`` is a single array.
+    """
+    attention_hidden_size = hidden_size if attention_hidden_size is None else attention_hidden_size
+    leading_shape = () if batch_size is None else (batch_size,)
+    zeros = jnp.zeros((*leading_shape, hidden_size))
+    accumulators = jnp.zeros((*leading_shape, attention_hidden_size), dtype=jnp.float32)
+    min_values = jnp.full((*leading_shape, attention_hidden_size), -1e38, dtype=jnp.float32)
+    time_mix_state = (zeros, accumulators, accumulators, min_values)
+    channel_mix_state = zeros
+    return time_mix_state, channel_mix_state
+
+
+def _init_global_state(config, batch_size, dtype=jnp.float32):
+    """Allocate per-layer previous-hidden states and fp32 WKV accumulators."""
+    state = [
+        jnp.zeros(
+            (batch_size, config.hidden_size if i < 2 else config.attention_hidden_size, config.num_hidden_layers),
+            dtype=dtype if i < 2 else jnp.float32,
+        )
+        for i in range(5)
+    ]
+    state[4] = state[4] - 1e30
+    return state
+
+
+def rwkv_linear_attention(
+    time_decay,
+    time_first,
+    key,
+    value,
+    state=None,
+    return_state=False,
+):
+    """Reference RWKV linear-attention update with optional recurrent state.
+
+    Implements the RWKV attention mechanism that achieves linear
+    complexity through a recurrent formulation: a weighted combination
+    of values using exponential decay over time steps, with a
+    log-sum-exp normaliser for stability.
+
+    This is the pedagogical Python-loop reference implementation (valid
+    JAX: functional ``.at[].set`` updates, no in-place writes). The
+    runtime-fused path used by :class:`RwkvSelfAttention` is
+    ``jax.lax.scan``-based and lives inside the layer's ``forward``;
+    this helper is retained for clarity / debugging and numerical checks.
+
+    Args:
+        time_decay: Time-decay parameter controlling how quickly past
+            information fades, shape ``(hidden_size,)``.
+        time_first: Initial time-weighting parameter for the first token,
+            shape ``(hidden_size,)``.
+        key: Key tensor of shape ``(batch, seq_len, hidden_size)``.
+        value: Value tensor of shape ``(batch, seq_len, hidden_size)``.
+        state: Optional tuple ``(numerator_state, denominator_state,
+            max_state)`` carried from previous time steps to continue
+            the recurrence.
+        return_state: Whether to return the updated recurrent state.
+
+    Returns:
+        Tuple ``(output, state)`` where ``output`` has shape
+        ``(batch, seq_len, hidden_size)`` and ``state`` is a list
+        ``[num_state, den_state, max_state]`` if ``return_state`` is true
+        or a non-``None`` ``state`` was supplied, else ``None``.
+    """
+    current_sequence_length = key.shape[1]
+    output = jnp.zeros_like(key)
+
+    if state is None:
+        num_state = jnp.zeros_like(key[:, 0], dtype=jnp.float32)
+        den_state = jnp.zeros_like(key[:, 0], dtype=jnp.float32)
+        max_state = jnp.zeros_like(key[:, 0], dtype=jnp.float32) - 1e38
+    else:
+        num_state, den_state, max_state = state
+
+    time_decay = -jnp.exp(time_decay)
+
+    for current_index in range(current_sequence_length):
+        current_key = key[:, current_index].astype(jnp.float32)
+        current_value = value[:, current_index].astype(jnp.float32)
+
+        max_for_output = jnp.maximum(max_state, current_key + time_first)
+        e1 = jnp.exp(max_state - max_for_output)
+        e2 = jnp.exp(current_key + time_first - max_for_output)
+        numerator = e1 * num_state + e2 * current_value
+        denominator = e1 * den_state + e2
+        output = output.at[:, current_index].set((numerator / denominator).astype(output.dtype))
+
+        max_for_state = jnp.maximum(max_state + time_decay, current_key)
+        e1 = jnp.exp(max_state + time_decay - max_for_state)
+        e2 = jnp.exp(current_key - max_for_state)
+        num_state = e1 * num_state + e2 * current_value
+        den_state = e1 * den_state + e2
+        max_state = max_for_state
+
+    if return_state or state is not None:
+        state = [num_state, den_state, max_state]
+
+    return output, state
+
+
+class RwkvSelfAttention(spx.Module):
+    """RWKV self-attention mechanism with linear complexity.
+
+    Implements the RWKV attention mechanism, also known as the "time mixing"
+    block. This uses a recurrent formulation with learned time decay and
+    time-first parameters to achieve linear complexity instead of quadratic
+    complexity of standard attention.
+
+    The mechanism mixes the current input with the previous hidden state
+    using learnable mixing parameters for key, value, and receptance
+    (analogous to gate in gated architectures).
+
+    Attributes:
+        config (RwkvConfig): Model configuration.
+        layer_id (int): Index of this layer in the model.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Numerical precision for operations.
+        attention_hidden_size (int): Hidden dimension for attention.
+    """
+
+    def __init__(
+        self,
+        config: RwkvConfig,
+        layer_id: int,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ) -> None:
+        """Initialize RWKV self-attention layer.
+
+        Args:
+            config (RwkvConfig): Model configuration with RWKV parameters.
+            layer_id (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        self.config = config
+        self.layer_id = layer_id
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.rngs = rngs
+        num_hidden_layers = config.num_hidden_layers
+        hidden_size = config.hidden_size
+        attention_hidden_size = config.attention_hidden_size if config.attention_hidden_size is not None else hidden_size
+        self.attention_hidden_size = attention_hidden_size
+
+        ratio_0_to_1 = layer_id / (num_hidden_layers - 1)
+        ratio_1_to_almost_0 = 1.0 - (layer_id / num_hidden_layers)
+        zigzag = 0.5 * (jnp.arange(1, attention_hidden_size + 1) % 3 - 1)
+        time_first = jnp.full((attention_hidden_size,), math.log(0.3), dtype=jnp.float32) + zigzag.astype(jnp.float32)
+        h = jnp.arange(attention_hidden_size, dtype=jnp.float32)
+        time_decay = -5 + 8 * (h / (attention_hidden_size - 1)) ** (0.7 + 1.3 * ratio_0_to_1)
+        x = jnp.arange(hidden_size) / hidden_size
+
+        time_mix_key = jnp.power(x, ratio_1_to_almost_0)
+        time_mix_value = time_mix_key + 0.3 * ratio_0_to_1
+        time_mix_receptance = jnp.power(x, 0.5 * ratio_1_to_almost_0)
+
+        self.time_decay = ArrayParam.bound(
+            shape=time_decay.shape,
+            dtype=jnp.float32,
+            init_method="zeros",
+            key=None,
+            value=time_decay.astype(jnp.float32),
+        )
+        self.time_first = ArrayParam.bound(
+            shape=time_first.shape,
+            dtype=jnp.float32,
+            init_method="zeros",
+            key=None,
+            value=time_first.astype(jnp.float32),
+        )
+        self.time_mix_key = ArrayParam.bound(
+            shape=time_mix_key.shape,
+            dtype=self.param_dtype,
+            init_method="zeros",
+            key=None,
+            value=time_mix_key.astype(self.param_dtype),
+        )
+        self.time_mix_value = ArrayParam.bound(
+            shape=time_mix_value.shape,
+            dtype=self.param_dtype,
+            init_method="zeros",
+            key=None,
+            value=time_mix_value.astype(self.param_dtype),
+        )
+        self.time_mix_receptance = ArrayParam.bound(
+            shape=time_mix_receptance.shape,
+            dtype=self.param_dtype,
+            init_method="zeros",
+            key=None,
+            value=time_mix_receptance.astype(self.param_dtype),
+        )
+
+        self.key = ColumnParallelLinear(
+            hidden_size,
+            attention_hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.value = ColumnParallelLinear(
+            hidden_size,
+            attention_hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.receptance = RowParallelLinear(
+            hidden_size,
+            attention_hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.output = RowParallelLinear(
+            attention_hidden_size,
+            hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+    def forward(
+        self,
+        hidden: Array,
+        state: tuple[Array, Array, Array, Array],
+    ):
+        """Apply RWKV self-attention to input hidden states.
+
+        Performs time mixing by blending current input with previous state
+        using learned mixing parameters, then computing recurrent attention.
+
+        Args:
+            hidden (Array): Input hidden states of shape (batch, seq_len, hidden_size).
+            state (tuple[Array, Array, Array, Array]): Recurrent state tuple containing
+                (sx, aa, bb, pp) where sx is the previous hidden state and aa, bb, pp
+                are the numerator, denominator, and max state for attention.
+
+        Returns:
+            tuple[Array, tuple]: Tuple containing:
+                - Output tensor of shape (batch, seq_len, hidden_size)
+                - Updated state tuple (hidden[:, -1, :], aa, bb, pp)
+        """
+        sx, aa, bb, pp = state
+        # `hidden` is (batch, seq, hidden) during training/testing.
+        c_x = jnp.concatenate(
+            (jnp.expand_dims(sx, 1), hidden[:, :-1, :]),
+            axis=1,
+        )
+        key_x = hidden * self.time_mix_key.value.reshape(1, 1, -1) + c_x * (
+            1 - self.time_mix_key.value.reshape(1, 1, -1)
+        )
+        value_x = hidden * self.time_mix_value.value.reshape(1, 1, -1) + c_x * (
+            1 - self.time_mix_value.value.reshape(1, 1, -1)
+        )
+        receptance_x = hidden * self.time_mix_receptance.value.reshape(1, 1, -1) + c_x * (
+            1 - self.time_mix_receptance.value.reshape(1, 1, -1)
+        )
+        receptance_state = checkpoint_name(jax.nn.sigmoid(self.receptance(receptance_x)), "attn_receptance")
+        key_states = checkpoint_name(self.key(key_x), "attn_key")
+        value_states = checkpoint_name(self.value(value_x), "attn_value")
+
+        def step(in_state, kv):
+            """Perform one recurrent WKV (Weighted Key-Value) step.
+
+            Computes the time-mixed output for a single timestep using
+            exponential gating with numerically stable log-sum-exp.
+            Designed to be scanned over the sequence dimension via
+            ``jax.lax.scan``.
+
+            Args:
+                in_state: Tuple ``(aa, bb, p)`` representing the accumulated
+                    numerator, denominator, and log-normalizer of the running
+                    WKV state.
+                kv: Tuple ``(key, value)`` for the current timestep.
+
+            Returns:
+                Tuple of ``(next_state, output)`` where *next_state* has the
+                same structure as *in_state* and *output* is the context
+                vector for this timestep.
+            """
+            (inner_aa, inner_bb, inner_p), (kk, vv) = in_state, kv
+            ww = self.time_first.value.reshape(-1) + kk
+            p = jnp.maximum(inner_p, ww)
+            e1 = jnp.exp(inner_p - p)
+            e2 = jnp.exp(ww - p)
+            next_c_x = ((e1 * inner_aa + e2 * vv) / (e1 * inner_bb + e2)).astype(dtype=receptance_state.dtype)
+
+            ww = -jnp.exp(self.time_decay.value.reshape(-1)) + inner_p
+            p = jnp.maximum(ww, kk)
+            e1 = jnp.exp(ww - p)
+            e2 = jnp.exp(kk - p)
+            inner_aa = e1 * inner_aa + e2 * vv
+            inner_bb = e1 * inner_bb + e2
+            inner_p = p
+            next_inner_state = (inner_aa, inner_bb, inner_p)
+            return next_inner_state, next_c_x
+
+        # Scan over the sequence axis (time), keeping batch dimension in the carry.
+        xs = (jnp.swapaxes(key_states, 0, 1), jnp.swapaxes(value_states, 0, 1))
+        (aa, bb, pp), c_x = jax.lax.scan(step, (aa, bb, pp), xs)
+        c_x = jnp.swapaxes(c_x, 0, 1)
+
+        attn_prod = receptance_state * c_x
+        if self.config.use_sharding_constraint:
+            attn_prod = apply_logical_sharding(
+                attn_prod,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
+        out = checkpoint_name(self.output(attn_prod), "attn_output")
+        next_state = (hidden[:, -1, :], aa, bb, pp)
+        return out, next_state
+
+
+class RwkvFeedForward(spx.Module):
+    """RWKV feedforward network with channel mixing.
+
+    Implements the "channel mixing" block of RWKV which is analogous to
+    the feedforward network in transformers. It uses a gating mechanism
+    with receptance (sigmoid gate) and squared ReLU activation for the
+    key projection.
+
+    The channel mixing blends the current input with the previous state
+    using learned time mixing parameters before applying the feedforward
+    transformations.
+
+    Attributes:
+        config (RwkvConfig): Model configuration.
+        layer_id (int): Index of this layer in the model.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Numerical precision for operations.
+    """
+
+    def __init__(
+        self,
+        config: RwkvConfig,
+        layer_id: int,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ) -> None:
+        """Initialize RWKV feedforward (channel mixing) layer.
+
+        Args:
+            config (RwkvConfig): Model configuration with RWKV parameters.
+            layer_id (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        self.config = config
+        self.layer_id = layer_id
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.rngs = rngs
+        hidden_size = config.hidden_size
+        layer_id = self.layer_id
+        num_hidden_layers = self.config.num_hidden_layers
+        intermediate_size = config.intermediate_size if config.intermediate_size is not None else 4 * config.hidden_size
+
+        x = jnp.arange(hidden_size) / hidden_size
+
+        ratio_1_to_almost_0 = 1.0 - (layer_id / num_hidden_layers)
+        time_mix_key = jnp.power(x, ratio_1_to_almost_0)
+        # HF reference uses the same exponent for key + receptance in the channel-mix block.
+        time_mix_receptance = jnp.power(x, ratio_1_to_almost_0)
+        self.time_mix_key = ArrayParam.bound(
+            shape=time_mix_key.shape,
+            dtype=self.param_dtype,
+            init_method="zeros",
+            key=None,
+            value=time_mix_key.astype(self.param_dtype),
+        )
+        self.time_mix_receptance = ArrayParam.bound(
+            shape=time_mix_receptance.shape,
+            dtype=self.param_dtype,
+            init_method="zeros",
+            key=None,
+            value=time_mix_receptance.astype(self.param_dtype),
+        )
+
+        self.key = ColumnParallelLinear(
+            hidden_size,
+            intermediate_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.receptance = RowParallelLinear(
+            hidden_size,
+            hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.value = ColumnParallelLinear(
+            intermediate_size,
+            hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+    def forward(self, hidden, state):
+        """Apply channel mixing feedforward transformation.
+
+        Blends current input with previous state, then applies gated
+        feedforward with squared ReLU activation.
+
+        Args:
+            hidden (Array): Input hidden states of shape (batch, seq_len, hidden_size).
+            state (Array): Previous channel mix state of shape (batch, hidden_size).
+
+        Returns:
+            tuple[Array, Array]: Tuple containing:
+                - Output tensor of shape (batch, seq_len, hidden_size)
+                - Updated state (last hidden position for next step)
+        """
+        sx = jnp.concatenate((jnp.expand_dims(state, 1), hidden[:, :-1, :]), axis=1)
+        xk = hidden * self.time_mix_key.value.reshape(1, 1, -1) + sx * (1 - self.time_mix_key.value.reshape(1, 1, -1))
+        xr = hidden * self.time_mix_receptance.value.reshape(1, 1, -1) + sx * (
+            1 - self.time_mix_receptance.value.reshape(1, 1, -1)
+        )
+        r = checkpoint_name(jax.nn.sigmoid(self.receptance(xr)), "mlp_gate")
+        k = checkpoint_name(jnp.square(jax.nn.relu(self.key(xk))), "mlp_up")
+        output = checkpoint_name(r * self.value(k), "mlp_output")
+        if self.config.use_sharding_constraint:
+            output = apply_logical_sharding(
+                output,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
+        return output, hidden[:, -1, :]
+
+
+class SingleStandRwkvBlock(spx.Module):
+    """Single RWKV layer combining normalization, time mixing, and channel mixing.
+
+    Implements a complete RWKV block with pre-normalization architecture.
+    Each block contains:
+    - Layer normalization followed by time mixing (attention)
+    - Layer normalization followed by channel mixing (feedforward)
+    - Residual connections around both sub-layers
+
+    The first layer also includes an additional pre-normalization step.
+
+    Attributes:
+        config (RwkvConfig): Model configuration.
+        layer_id (int): Index of this layer in the model.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Numerical precision for operations.
+    """
+
+    def __init__(
+        self,
+        config: RwkvConfig,
+        layer_id: int,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        rngs: spx.Rngs = None,
+    ) -> None:
+        """Initialize RWKV block.
+
+        Args:
+            config (RwkvConfig): Model configuration with RWKV parameters.
+            layer_id (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs, optional): Random number generator state. Defaults to None.
+        """
+        self.config = config
+        self.layer_id = layer_id
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.rngs = rngs
+
+        if layer_id == 0:
+            self.pre_ln = LayerNorm(
+                config.hidden_size,
+                epsilon=config.layer_norm_epsilon,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                rngs=rngs,
+            )
+
+        self.ln1 = LayerNorm(
+            config.hidden_size,
+            epsilon=config.layer_norm_epsilon,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+        self.ln2 = LayerNorm(
+            config.hidden_size,
+            epsilon=config.layer_norm_epsilon,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+        self.attention = RwkvSelfAttention(
+            config=config,
+            layer_id=layer_id,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.feed_forward = RwkvFeedForward(
+            config=config,
+            layer_id=layer_id,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+    def forward(self, hidden, state=None, use_cache: bool = False, output_attentions: bool = False, rescale_factor=1.0):
+        """Forward pass through the RWKV block.
+
+        Applies pre-normalization followed by time mixing (attention),
+        then channel mixing (feedforward), with residual connections.
+
+        Args:
+            hidden (Array): Input tensor of shape (batch, seq_len, hidden_size).
+            state: Recurrent state, either as a tuple of (time_mix_state, channel_mix_state)
+                or as a global state list with shape [5, batch, hidden_size, num_layers].
+            use_cache (bool, optional): Whether to use and update the cache. Defaults to False.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to False.
+            rescale_factor: Divisor for both residual branch outputs during inference.
+                Implements projection rescaling without mutating checkpoint weights.
+
+        Returns:
+            tuple: Tuple containing:
+                - Output hidden states of shape (batch, seq_len, hidden_size)
+                - Updated state (same format as input state)
+                - Attention weights if output_attentions=True, else None
+        """
+        uses_global_state = isinstance(state, list)
+        if state is None:
+            state = init_state(
+                self.config.hidden_size,
+                batch_size=hidden.shape[0],
+                attention_hidden_size=self.config.attention_hidden_size,
+            )
+
+        if uses_global_state:
+            ffd_state = state[0][:, :, self.layer_id]
+            self_state = (
+                state[1][:, :, self.layer_id],
+                state[2][:, :, self.layer_id],
+                state[3][:, :, self.layer_id],
+                state[4][:, :, self.layer_id],
+            )
+        else:
+            self_state, ffd_state = state
+        if self.layer_id == 0:
+            hidden = self.pre_ln(hidden)
+
+        attention, self_state = self.attention(
+            self.ln1(hidden),
+            state=self_state,
+        )
+        attention = attention / rescale_factor
+        hidden = checkpoint_name(hidden + attention, "residual")
+
+        feed_forward, ffd_state = self.feed_forward(self.ln2(hidden), state=ffd_state)
+        hidden = checkpoint_name(hidden + feed_forward / rescale_factor, "layer_output")
+        if self.config.use_sharding_constraint:
+            hidden = apply_logical_sharding(
+                hidden,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
+
+        if uses_global_state:
+            # Never write scan-local values into the caller's Python list.
+            # The model threads this new list through the scan carry.
+            next_state = [
+                previous.at[:, :, self.layer_id].set(current)
+                for previous, current in zip(state, (ffd_state, *self_state), strict=True)
+            ]
+            outputs = (hidden, next_state)
+        else:
+            outputs = (hidden, (self_state, ffd_state))
+        if output_attentions:
+            outputs += (attention,)
+        else:
+            outputs += (None,)
+
+        return outputs
+
+
+# Use SingleStandRwkvBlock directly since nn.vmap on class constructors has issues
+# with keyword argument resolution in recent SpecTrax versions
+RwkvBlock = SingleStandRwkvBlock
+
+
+@register_module(TaskType.BASE_MODULE, config=RwkvConfig, model_type="rwkv")
+class RwkvModel(EasyDeLBaseModule):
+    """RWKV (Receptance Weighted Key Value) base model implementation.
+
+    Implements the RWKV architecture, a novel RNN-based language model that
+    achieves transformer-level performance with linear complexity. Unlike
+    transformers, RWKV uses a recurrent formulation that enables:
+    - Linear time and memory complexity during training
+    - Constant memory during inference (no growing context window)
+    - Efficient parallel training like transformers
+
+    The model consists of stacked RWKV blocks, each containing time mixing
+    (analogous to attention) and channel mixing (analogous to FFN) layers.
+
+    Attributes:
+        config (RwkvConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
+
+    def __init__(
+        self,
+        config: RwkvConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize RWKV base model.
+
+        Args:
+            config (RwkvConfig): Model configuration with RWKV parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16
+                but is overridden to jnp.float32 for numerical stability.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16
+                but is overridden to jnp.float32 for numerical stability.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        dtype = jnp.float32
+        param_dtype = jnp.float32
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embeddings = Embed(
+                config.vocab_size,
+                config.hidden_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+        remat_layer_block = auto_remat(
+            RwkvBlock,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.blocks = nn.ModuleList([])
+        for idx in range(self.config.num_hidden_layers):
+            with self.assign_layer_stage(idx, total_layers=self.config.num_hidden_layers):
+                self.blocks.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        layer_id=idx,
+                        rngs=rngs,
+                    )
+                )
+
+        self.layers_are_rescaled = False
+        self.deterministic = True
+        with self.assign_layer_stage(config.num_hidden_layers - 1, total_layers=config.num_hidden_layers):
+            # HF builds ``ln_out`` as ``nn.LayerNorm(hidden_size)``: torch's default
+            # eps=1e-5, independent of ``config.layer_norm_epsilon``.
+            self.ln_out = LayerNorm(
+                config.hidden_size,
+                epsilon=1e-5,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        state: list[Array] | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> tuple | RwkvOutput:
+        """Forward pass through the RWKV base model.
+
+        Processes input tokens through embedding, all RWKV blocks with
+        time and channel mixing, and final layer normalization.
+
+        Args:
+            input_ids (Int[Array, "batch seq_len"] | None, optional): Input token IDs.
+                Must be provided if inputs_embeds is None. Defaults to None.
+            attention_mask (Bool[Array, "batch seq_len"] | None, optional): Mask to avoid
+                processing padding tokens. Currently not used by RWKV. Defaults to None.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"] | None, optional):
+                Pre-computed input embeddings. Defaults to None.
+            state (list[Array] | None, optional): Recurrent state from previous forward
+                pass, as a list of 5 arrays with shape (batch, hidden_size, num_layers).
+                Defaults to None.
+            use_cache (bool | None, optional): Whether to maintain and return the
+                recurrent state. Defaults to None (uses config setting).
+            output_attentions (bool | None, optional): Whether to return attention
+                weights. Defaults to None (uses config setting).
+            output_hidden_states (bool | None, optional): Whether to return hidden
+                states from all layers. Defaults to None (uses config setting).
+
+        Returns:
+            RwkvOutput: Contains last_hidden_state, optional state, hidden_states,
+                and attentions.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else (self.config.use_cache if self.deterministic else False)
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
+
+        if inputs_embeds is None:
+            inputs_embeds = checkpoint_name(self.embeddings(input_ids), "embeddings")
+
+        if use_cache and state is None:
+            state = _init_global_state(self.config, inputs_embeds.shape[0], inputs_embeds.dtype)
+
+        hidden_states = inputs_embeds
+
+        all_hidden_states = ()
+        all_self_attentions = ()
+
+        def _layer_loop(block, carry):
+            """Apply a single RWKV block inside the layer-stack scan.
+
+            Body of ``self.blocks.scan``; runs ``block`` on the current
+            hidden states, optionally accumulates per-layer hidden states
+            / time-mix attention weights, and returns the updated carry.
+            """
+            hidden_states, layer_state, all_hidden_states, all_self_attentions, idx = carry
+            rescale_factor = 1.0
+            if self.layers_are_rescaled and self.config.rescale_every > 0:
+                rescale_factor = jnp.exp2(jnp.asarray(idx // self.config.rescale_every, dtype=hidden_states.dtype))
+            with self._layer_stage_context(idx, layers=self.blocks):
+                hidden_states, next_state, attentions = block(
+                    hidden_states,
+                    state=layer_state,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    rescale_factor=rescale_factor,
+                )
+
+            if self.layers_are_rescaled and self.config.rescale_every > 0:
+                # ``idx`` is a tracer under ``lax.scan``; select instead of branching in Python.
+                hidden_states = jnp.where((idx + 1) % self.config.rescale_every == 0, hidden_states / 2, hidden_states)
+            hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.blocks)
+
+            if output_hidden_states:
+                all_hidden_states = (*all_hidden_states, hidden_states)
+
+            if output_attentions:
+                all_self_attentions = (*all_self_attentions, attentions)
+
+            return (
+                hidden_states,
+                next_state if layer_state is not None else None,
+                all_hidden_states,
+                all_self_attentions,
+                idx + 1,
+            )
+
+        hidden_states, state, all_hidden_states, all_self_attentions, _ = self.blocks.scan(
+            _layer_loop,
+            (hidden_states, state, all_hidden_states, all_self_attentions, 0),
+            trace=output_hidden_states
+            or output_attentions
+            or not self.config.scan_layers
+            or self._pipeline_stage_count() > 1,
+            **self._layer_scan_kwargs("text"),
+        )
+        hidden_states = checkpoint_name(self.ln_out(hidden_states), "model_output")
+
+        if output_hidden_states:
+            all_hidden_states = (*all_hidden_states, hidden_states)
+
+        return RwkvOutput(
+            last_hidden_state=hidden_states,
+            state=state,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attentions,
+        )
+
+    def train(self, mode: bool = True):
+        """Set training mode and enable configured activation rescaling in evaluation.
+
+        Args:
+            mode: Whether to train. Evaluation enables ``config.rescale_every``.
+
+        Returns:
+            This model for chaining.
+        """
+        self.rescale_layers(not mode)
+        return super().train(mode)
+
+    def rescale_layers(self, rescaled: bool = True) -> None:
+        """Toggle inference rescaling without modifying stored checkpoint weights.
+
+        Each block's residual branch outputs are divided by
+        ``2 ** (block_index // config.rescale_every)``, equivalent to rescaling
+        its output projections. Hidden states are halved at each configured
+        boundary. Evaluation enables this automatically, while training disables
+        it. Call outside compiled forwards to change the mode.
+
+        Args:
+            rescaled: Whether to enable rescaling. ``rescale_every <= 0`` always
+                disables the feature.
+        """
+        self.layers_are_rescaled = bool(rescaled) and self.config.rescale_every > 0
+
+    def get_embedding(self):
+        """Return the input token embedding (post token-shift).
+
+        RWKV embeds tokens through ``self.embeddings`` and then applies
+        the time-mixing token-shift inside each block; this accessor
+        returns the underlying :class:`Embed` table so checkpoint
+        loaders and weight-tying utilities can reach it directly.
+
+        Returns:
+            spx.Module: The token :class:`Embed` module.
+        """
+        return self.embeddings
+
+    def get_decoder(self):
+        """Return ``self`` — the RWKV trunk *is* the decoder.
+
+        RWKV is a recurrent linear-time model with no separate
+        encoder/decoder split; ``forward`` consumes the embedded
+        sequence and threads the time-mixing state through each block
+        directly.
+
+        Returns:
+            spx.Module: ``self``.
+        """
+        return self
+
+
+@register_module(TaskType.CAUSAL_LM, config=RwkvConfig, model_type="rwkv")
+class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):  # type: ignore
+    """RWKV model with a language modeling head for causal language modeling tasks.
+
+    This model combines the RWKV recurrent backbone with a linear language
+    modeling head to perform autoregressive text generation with linear-time
+    complexity and constant memory during inference.
+
+    Attributes:
+        config (RwkvConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (overridden to jnp.float32).
+        param_dtype (jnp.dtype): Data type for parameters (overridden to jnp.float32).
+        precision: Precision setting for JAX operations.
+    """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "rwkv"
+    _config_class = RwkvConfig
+
+    def __init__(
+        self,
+        config: RwkvConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize RWKV model for causal language modeling.
+
+        Args:
+            config (RwkvConfig): Model configuration with RWKV parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16
+                but is overridden to jnp.float32 for numerical stability.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16
+                but is overridden to jnp.float32 for numerical stability.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        dtype = jnp.float32
+        param_dtype = jnp.float32
+        super().__init__(
+            config=config,
+            base_model_class=RwkvModel,
+            base_model_name="rwkv",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            lm_head_name="head",
+            lm_head_bias=False,
+        )
+
+    @property
+    def transform_fn(self):
+        """Get the state dict transformation function for HuggingFace weight conversion.
+
+        Returns:
+            Callable: A partial function configured with StateDictConverter.huggingface_to_easydel
+                that handles embedding, layernorm, and RWKV-specific parameter conversions
+                (e.g., keeping time_decay and time_first in float32).
+        """
+        from easydel.layers import BaseMoeModule, ParallelMoELinear
+        from easydel.utils import traversals
+        from easydel.utils.parameters_transformation import StateDictConverter
+
+        embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, Embed)]
+        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, LayerNorm)]
+        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, ParallelMoELinear)]
+        moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]
+
+        def _keep_fp32(array: Array, key: tuple):
+            """State-dict callback that keeps ``time_decay``/``time_first`` arrays in fp32.
+
+            RWKV's per-channel decay rates are stored as exponents and
+            are sensitive to precision; this callback prevents them from
+            being downcast when the rest of the parameter tree is
+            promoted to a lower-precision dtype during HuggingFace ->
+            EasyDeL state-dict conversion.
+            """
+            if key and key[-1] in {"time_decay", "time_first"}:
+                return array.astype(jnp.float32)
+            return array
+
+        return partial(
+            StateDictConverter.huggingface_to_easydel,
+            embedding_layer_names=embedding_path,
+            layernorm_names=layernorm_path,
+            moe_names=list(set([names.split(".")[-1] for names in moe_path])),
+            moe_block_names=list(set([names.split(".")[-1] for names in moe_block_path])),
+            moe_block_path=moe_block_path,
+            moe_path=moe_path,
+            dtype=self.param_dtype,
+            shard_fns=self._shard_fns,
+            reform_param=self._get_reform_param(),
+            callback=_keep_fp32,
+        )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: Int[Array, "batch seq_len"],
+        max_length: int,
+        pad_token_id: int,
+        starts: int | None = None,
+        shardings: int | None = None,
+        attention_mask: Array | None = None,
+        token_type_ids: Array | None = None,
+        mask_info=None,
+        state: list[Array] | None = None,
+        inputs_embeds: Array | None = None,
+        **kwargs,
+    ) -> dict[str, tp.Any]:
+        """Prepare model inputs for text generation.
+
+        Initializes or retrieves the recurrent state and prepares all
+        necessary inputs for the RWKV generation loop.
+
+        Args:
+            input_ids (Int[Array, "batch seq_len"]): Input token IDs to start generation.
+            max_length (int): Maximum sequence length for generation (unused).
+            pad_token_id (int): Token ID used for padding (unused).
+            starts (int | None, optional): Starting position (unused). Defaults to None.
+            shardings (int | None, optional): Sharding configuration (unused). Defaults to None.
+            attention_mask (Array | None, optional): Attention mask. Defaults to None.
+            token_type_ids (Array | None, optional): Token type IDs (unused). Defaults to None.
+            mask_info: Mask information (unused). Defaults to None.
+            state (list[Array] | None, optional): Previous recurrent state. Defaults to None.
+            inputs_embeds (Array | None, optional): Input embeddings (unused). Defaults to None.
+            **kwargs: Additional keyword arguments (unused).
+
+        Returns:
+            dict[str, tp.Any]: Prepared inputs including state and optional attention_mask.
+        """
+        del max_length, pad_token_id, starts, shardings, token_type_ids, mask_info, kwargs
+        del inputs_embeds
+
+        if state is None:
+            state = _init_global_state(self.config, input_ids.shape[0], self.dtype)
+
+        model_inputs: dict[str, tp.Any] = {"state": state}
+        if attention_mask is not None:
+            model_inputs["attention_mask"] = attention_mask
+        return model_inputs
+
+    def update_inputs_for_generation(
+        self,
+        model_outputs: RwkvCausalLMOutput,
+        model_kwargs: dict[str, tp.Any],
+    ) -> dict[str, tp.Any]:
+        """Update model inputs for the next generation step.
+
+        Extracts the updated recurrent state from model outputs and adds
+        it to the model kwargs for the next forward pass during
+        autoregressive generation.
+
+        Args:
+            model_outputs (RwkvCausalLMOutput): Model outputs from the current
+                generation step containing the updated state.
+            model_kwargs (dict[str, tp.Any]): Current model keyword arguments.
+
+        Returns:
+            dict[str, tp.Any]: Updated model kwargs with the new state.
+        """
+        model_kwargs["state"] = model_outputs.state
+        return model_kwargs
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        state: list[Array] | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
+    ) -> tuple | RwkvCausalLMOutput:
+        """Forward pass for causal language modeling.
+
+        Processes input through the RWKV backbone and applies the language
+        modeling head to produce next-token logits.
+
+        Args:
+            input_ids (Int[Array, "batch seq_len"] | None, optional): Input token IDs.
+                Must be provided if inputs_embeds is None. Defaults to None.
+            attention_mask (Bool[Array, "batch seq_len"] | None, optional): Mask to avoid
+                processing padding tokens. Defaults to None.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"] | None, optional):
+                Pre-computed input embeddings. Defaults to None.
+            state (list[Array] | None, optional): Recurrent state from previous forward
+                pass. Defaults to None.
+            use_cache (bool | None, optional): Whether to maintain and return the
+                recurrent state. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention
+                weights. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden
+                states from all layers. Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return router
+                logits (unused for RWKV). Defaults to None.
+
+        Returns:
+            RwkvCausalLMOutput: Contains logits, state, and optional hidden_states
+                and attentions.
+        """
+        rwkv_outputs = self.rwkv(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            state=state,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
+        hidden_states = rwkv_outputs[0]
+
+        logits = self.compute_lm_logits(hidden_states)
+
+        return RwkvCausalLMOutput(
+            logits=logits,
+            state=rwkv_outputs.state,
+            hidden_states=rwkv_outputs.hidden_states,
+            attentions=rwkv_outputs.attentions,
+        )
+
+    def get_lm_head(self):
+        """Return the linear LM head used for next-token prediction.
+
+        RWKV stores the LM head as ``self.head`` (rather than the more
+        common ``self.lm_head``) to follow the upstream naming, and
+        does not tie weights with the input embedding by default.
+
+        Returns:
+            ColumnParallelLinear: The vocabulary projection head.
+        """
+        return self.head
+
+    def get_embedding(self):
+        """Return the wrapped RWKV embedding table.
+
+        Returns:
+            spx.Module: ``self.rwkv.get_embedding()`` — the same
+            :class:`Embed` exposed by :class:`RwkvModel`.
+        """
+        return self.rwkv.get_embedding()
+
+    def get_decoder(self):
+        """Return the wrapped recurrent RWKV decoder.
+
+        Returns:
+            spx.Module: The :class:`RwkvModel` trunk that owns the
+            time-mixing state machinery.
+        """
+        return self.rwkv

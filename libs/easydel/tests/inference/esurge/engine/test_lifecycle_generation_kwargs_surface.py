@@ -1,0 +1,1212 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import hashlib
+import pprint
+import threading
+from inspect import signature
+from types import SimpleNamespace
+
+import jax.numpy as jnp
+from easydel.inference.esurge.engine.loop import EngineLoop
+from easydel.inference.esurge.esurge_engine import eSurge
+from easydel.inference.esurge.request import EngineRequest
+from easydel.inference.esurge.runners import model_runner as model_runner_module
+from easydel.inference.esurge.runners.model_runner import eSurgeRunner
+from easydel.inference.esurge.scheduler.output import CachedRequestData, SchedulerOutput
+from easydel.inference.logits_process import (
+    FrequencyPenaltyLogitsProcessor,
+    PresencePenaltyLogitsProcessor,
+    RepetitionPenaltyLogitsProcessor,
+)
+from easydel.inference.sampling_params import SamplingParams
+from easydel.infra.mixins import generation as generation_module
+from easydel.infra.mixins.generation import EasyGenerationMixin
+from transformers.generation.configuration_utils import GenerationConfig
+
+
+def test_esurge_generation_surface_includes_required_engine_kwargs():
+    get_esurge_params = signature(EasyGenerationMixin.get_esurge).parameters
+    esurge_generate_params = signature(EasyGenerationMixin.esurge_generate).parameters
+    pause_esurge_params = signature(EasyGenerationMixin.pause_esurge).parameters
+
+    for name in (
+        "data_parallelism_axis",
+        "enable_prefix_caching",
+        "max_num_seq_buckets",
+    ):
+        assert name in get_esurge_params
+        assert name in esurge_generate_params
+    for name in ("release_model_state", "clear_compiled_cache"):
+        assert name in pause_esurge_params
+
+
+def test_get_esurge_refreshes_model_state_before_auto_resume(monkeypatch):
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self):
+            self.config = type(
+                "Cfg",
+                (),
+                {
+                    "granted_freq_max_position_embedding": 1024,
+                },
+            )()
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+    class DummyEngine:
+        def __init__(self):
+            self._paused = True
+            self.silent_mode = True
+            self.num_running_requests = 0
+            self.num_pending_requests = 0
+            self.update_calls = 0
+            self.resume_calls = 0
+
+        def update_model_weights(self, _model):
+            self.update_calls += 1
+
+        def resume(self):
+            # Regression guard: resume must never happen before state refresh.
+            assert self.update_calls > 0
+            self.resume_calls += 1
+            self._paused = False
+
+    monkeypatch.setattr(generation_module, "_ESURGE_MAP_CACHE", {})
+    model = DummyModel()
+    engine = DummyEngine()
+
+    tokenizer = SimpleNamespace(name_or_path="tok")
+    kwargs = dict(
+        tokenizer=tokenizer,
+        max_model_len=512,
+        min_input_pad=16,
+        max_num_seqs=8,
+        max_num_seq_buckets=[1, 2, 4, 8],
+        max_num_batched_tokens=64,
+        hbm_utilization=0.5,
+        page_size=32,
+        max_cache_tokens=None,
+        enable_prefix_caching=True,
+        data_parallelism_axis="dp",
+        async_scheduling=True,
+        overlap_execution=True,
+        runner_verbose=False,
+        decode_truncated_prompt=True,
+        destroy_pages_on_pause=True,
+        silent_mode=True,
+    )
+
+    model_hash = model._esurge_cache_scope()
+    extra_dict_str = pprint.pformat(model._normalize_esurge_cache_value(kwargs), sort_dicts=True)
+    bytes_in = hashlib.md5(extra_dict_str.encode("utf-8")).digest()
+    extra_dict_hash = int.from_bytes(bytes_in, byteorder="big", signed=True)
+    generation_module._ESURGE_MAP_CACHE[f"{model_hash}-{extra_dict_hash}"] = engine
+
+    resolved = model.get_esurge(**kwargs)
+
+    assert resolved is engine
+    assert engine.update_calls == 1
+    assert engine.resume_calls == 1
+
+
+def test_get_esurge_default_cache_refreshes_legacy_engine_before_auto_resume(monkeypatch):
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self):
+            self.config = type(
+                "Cfg",
+                (),
+                {
+                    "granted_freq_max_position_embedding": 1024,
+                },
+            )()
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+    class DummyEngine:
+        def __init__(self):
+            self._paused = True
+            self.silent_mode = True
+            self.num_running_requests = 0
+            self.num_pending_requests = 0
+            self.update_calls = 0
+            self.resume_calls = 0
+            self.runner = type("Runner", (), {"model": None})()
+
+        def update_model_weights(self, _model):
+            self.update_calls += 1
+            self.runner.model = object()
+
+        def resume(self):
+            assert self.update_calls > 0
+            self.resume_calls += 1
+            self._paused = False
+
+    monkeypatch.setattr(generation_module, "_ESURGE_MAP_CACHE", {})
+    model = DummyModel()
+    engine = DummyEngine()
+
+    generation_module._ESURGE_MAP_CACHE[f"{model._esurge_cache_scope()}-cached"] = engine
+
+    resolved = model.get_esurge()
+
+    assert resolved is engine
+    assert engine.update_calls == 1
+    assert engine.resume_calls == 1
+
+
+def test_refresh_esurge_engine_weights_reuses_cached_graphdef_only_for_matching_source_layout():
+    class DummyGraphDef:
+        def __init__(self, fingerprint):
+            self._fingerprint = fingerprint
+
+        def __hash__(self):
+            return self._fingerprint
+
+    class DummyConfig:
+        def __init__(self, marker):
+            self.marker = marker
+
+        def to_dict(self):
+            return {"marker": self.marker}
+
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self, graphdef):
+            self.graphdef = graphdef
+            self.config = DummyConfig("baseline-layout")
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+    class DummyEngine:
+        def __init__(self):
+            self.calls = []
+            self.runner = type(
+                "Runner",
+                (),
+                {"executor_manager": type("ExecMgr", (), {"graphdef": "cached-engine-graphdef"})()},
+            )()
+
+        def update_model_weights(self, _model, *, restart_scheduler=True, graphdef=None):
+            self.calls.append(
+                {
+                    "restart_scheduler": restart_scheduler,
+                    "graphdef": graphdef,
+                }
+            )
+
+    model = DummyModel(DummyGraphDef(11))
+    engine = DummyEngine()
+    model._remember_esurge_engine_source_graphdef(engine, model.graphdef)
+
+    model._refresh_esurge_engine_weights(engine)
+    assert engine.calls[-1]["graphdef"] == "cached-engine-graphdef"
+
+    model.graphdef = DummyGraphDef(22)
+    model.config = DummyConfig("changed-layout")
+    model._refresh_esurge_engine_weights(engine)
+    assert engine.calls[-1]["graphdef"] is None
+
+
+def test_refresh_esurge_engine_weights_reuses_cached_graphdef_when_layout_signature_matches():
+    class DummyGraphDef:
+        def __init__(self, fingerprint):
+            self._fingerprint = fingerprint
+
+        def __hash__(self):
+            return self._fingerprint
+
+    class DummyConfig:
+        def __init__(self, marker):
+            self.marker = marker
+
+        def to_dict(self):
+            return {"marker": self.marker}
+
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self, *, graphdef_fingerprint, config_marker):
+            self.graphdef = DummyGraphDef(graphdef_fingerprint)
+            self.config = DummyConfig(config_marker)
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+    class DummyEngine:
+        def __init__(self):
+            self.calls = []
+            self.runner = type(
+                "Runner",
+                (),
+                {"executor_manager": type("ExecMgr", (), {"graphdef": "cached-engine-graphdef"})()},
+            )()
+
+        def update_model_weights(self, _model, *, restart_scheduler=True, graphdef=None):
+            self.calls.append(
+                {
+                    "restart_scheduler": restart_scheduler,
+                    "graphdef": graphdef,
+                }
+            )
+
+    model = DummyModel(graphdef_fingerprint=11, config_marker="same-layout")
+    engine = DummyEngine()
+    model._remember_esurge_engine_source_graphdef(engine, model.graphdef)
+
+    model.graphdef = DummyGraphDef(22)
+    model._refresh_esurge_engine_weights(engine)
+    assert engine.calls[-1]["graphdef"] == "cached-engine-graphdef"
+
+    model.config = DummyConfig("changed-layout")
+    model.graphdef = DummyGraphDef(33)
+    model._refresh_esurge_engine_weights(engine)
+    assert engine.calls[-1]["graphdef"] is None
+
+
+def test_source_layout_signature_does_not_touch_esurge_compatible_model():
+    class DummyConfig:
+        def to_dict(self):
+            return {"marker": "baseline-layout"}
+
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self):
+            self.config = DummyConfig()
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+        @property
+        def trainable_selector(self):
+            return "parameters"
+
+        @property
+        def esurge_compatible_model(self):
+            raise AssertionError("layout signature must not construct esurge_compatible_model")
+
+    model = DummyModel()
+
+    signature = model._source_layout_signature_for_esurge_metadata()
+
+    assert isinstance(signature, str)
+    assert signature
+
+
+def test_lifecycle_update_graphdef_prefers_overridden_esurge_graphdef():
+    class WrapperLike:
+        graphdef = "wrapper-graphdef"
+
+        @property
+        def esurge_graphdef(self):
+            return "delegated-esurge-graphdef"
+
+        def _esurge_graphdef_from_graphdef(self, _graphdef):
+            raise AssertionError("wrapper helper should not be used when esurge_graphdef is overridden")
+
+    resolved = eSurge._resolve_graphdef_for_weight_update(
+        WrapperLike(),
+        split_graphdef="split-wrapper-graphdef",
+    )
+
+    assert resolved == "delegated-esurge-graphdef"
+
+
+def test_lifecycle_split_graph_components_prefers_compatible_model_for_wrapper_delegate():
+    class CompatibleModel:
+        def split_module(self):
+            return ("compatible-graphdef", "compatible-graphstate", "compatible-graphother")
+
+    class WrapperLike:
+        def __init__(self):
+            self.model = CompatibleModel()
+
+        def split_module(self):
+            return ("wrapper-graphdef", "wrapper-graphstate", "wrapper-graphother")
+
+        @property
+        def esurge_graphdef(self):
+            return "delegated-esurge-graphdef"
+
+        @property
+        def esurge_compatible_model(self):
+            return self.model
+
+    split_model, graphdef, graphstate, graphother = eSurge._split_graph_components_for_weight_update(WrapperLike())
+
+    assert split_model.__class__.__name__ == "CompatibleModel"
+    assert (graphdef, graphstate, graphother) == (
+        "compatible-graphdef",
+        "compatible-graphstate",
+        "compatible-graphother",
+    )
+
+
+def test_lifecycle_prefetch_waits_for_async_decode_batches():
+    request = EngineRequest(
+        request_id="req-decode",
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=4),
+        eos_token_id=2,
+    )
+    request.num_computed_tokens = request.num_tokens
+    request.num_output_placeholders = 1
+    scheduler = SimpleNamespace(requests={request.request_id: request})
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_pages=[],
+        finished_req_ids=set(),
+        async_scheduling=True,
+    )
+
+    assert not EngineLoop._can_prefetch_scheduler_output(scheduler, scheduler_output)
+
+
+def test_lifecycle_prefetch_allows_pure_prefill_batches():
+    request = EngineRequest(
+        request_id="req-prefill",
+        prompt_token_ids=[1, 2, 3, 4, 5],
+        sampling_params=SamplingParams(max_tokens=4),
+        eos_token_id=2,
+    )
+    request.num_computed_tokens = request.num_tokens - 1
+    scheduler = SimpleNamespace(requests={request.request_id: request})
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_pages=[],
+        finished_req_ids=set(),
+        async_scheduling=True,
+    )
+
+    assert EngineLoop._can_prefetch_scheduler_output(scheduler, scheduler_output)
+
+
+def test_lifecycle_aborts_after_prefetched_overlap_drain_failure():
+    request = EngineRequest(
+        request_id="req-prefill",
+        prompt_token_ids=[1, 2, 3, 4, 5],
+        sampling_params=SamplingParams(max_tokens=4),
+        eos_token_id=2,
+    )
+    request.num_computed_tokens = request.num_tokens - 2
+
+    current_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_pages=[],
+        finished_req_ids=set(),
+        async_scheduling=False,
+    )
+    prefetched_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_pages=[],
+        finished_req_ids=set(),
+        async_scheduling=False,
+    )
+
+    class DummyScheduler:
+        def __init__(self):
+            self.requests = {request.request_id: request}
+            self.running = []
+            self.waiting = []
+            self.schedule_calls = 0
+
+        def schedule(self):
+            self.schedule_calls += 1
+            if self.schedule_calls == 1:
+                return current_output
+            if self.schedule_calls == 2:
+                return prefetched_output
+            raise AssertionError("scheduler loop should stop after aborting the prefetched overlap path")
+
+    class DummyRunner:
+        def __init__(self):
+            self.executor_manager = SimpleNamespace(kv_pages=object())
+            self.async_dispatches = 0
+
+        def execute_model_async(self, scheduler_output):
+            del scheduler_output
+            self.async_dispatches += 1
+            return "future"
+
+        def can_dispatch_next_before_async_drain(self, scheduler_output):
+            del scheduler_output
+            return True
+
+        def wait_for_execution(self, future):
+            del future
+            raise RuntimeError("drain failed")
+
+        def shutdown(self):
+            pass
+
+    scheduler = DummyScheduler()
+    runner = DummyRunner()
+    recorded: dict = {"exc": None}
+
+    def _emit_outputs(engine_outputs):
+        if not engine_outputs:
+            return
+        raise AssertionError("engine outputs should not be processed after the drain failure")
+
+    loop = EngineLoop(
+        scheduler=scheduler,
+        runner=runner,
+        coordinator=None,
+        scheduler_lock=threading.Lock(),
+        emit_outputs=_emit_outputs,
+        drain_parser_stops=lambda: None,
+        on_fatal=lambda exc: (recorded.__setitem__("exc", exc), loop.request_stop()),
+        heartbeat=lambda: None,
+        handle_profiling_step=lambda: None,
+        is_nonrecoverable=lambda exc: False,
+        overlap_execution=True,
+        async_scheduling=False,
+        runner_verbose=False,
+        info=lambda *args, **kwargs: None,
+    )
+    loop.start()
+    thread = loop.thread
+    assert thread is not None
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert not loop.running
+    assert isinstance(recorded["exc"], RuntimeError)
+    assert "drain failed" in str(recorded["exc"])
+    assert scheduler.schedule_calls == 2
+    assert runner.async_dispatches == 2
+
+
+def test_lifecycle_pp_async_dispatches_next_step_before_draining_previous():
+    current_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={"req": 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_pages=[],
+        finished_req_ids=set(),
+        async_scheduling=True,
+    )
+    next_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={"req": 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_pages=[],
+        finished_req_ids=set(),
+        async_scheduling=True,
+    )
+    empty_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={},
+        total_num_scheduled_tokens=0,
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_pages=[],
+        finished_req_ids=set(),
+        async_scheduling=True,
+    )
+
+    events: list[str] = []
+    loop_holder: dict = {"loop": None}
+
+    class DummyScheduler:
+        def __init__(self):
+            self.running = []
+            self.waiting = []
+            self.requests = {}
+            self.schedule_calls = 0
+            self.update_calls = 0
+
+        def schedule(self):
+            self.schedule_calls += 1
+            events.append(f"schedule{self.schedule_calls}")
+            if self.schedule_calls == 1:
+                return current_output
+            if self.schedule_calls == 2:
+                return next_output
+            return empty_output
+
+        def update_from_output(self, scheduler_output, model_output):
+            del scheduler_output, model_output
+            self.update_calls += 1
+            events.append(f"update{self.update_calls}")
+            if self.update_calls >= 2:
+                loop_holder["loop"].request_stop()
+            return {}
+
+    class DummyRunner:
+        def __init__(self):
+            self.executor_manager = SimpleNamespace(
+                kv_pages=object(),
+                pipeline_plan=SimpleNamespace(is_enabled=True),
+            )
+            self.async_dispatches = 0
+
+        def execute_model_async(self, scheduler_output):
+            del scheduler_output
+            self.async_dispatches += 1
+            events.append(f"execute{self.async_dispatches}")
+            return f"future{self.async_dispatches}"
+
+        def execute_model(self, scheduler_output):
+            del scheduler_output
+            events.append("execute_zero")
+            return object()
+
+        def wait_for_execution(self, future):
+            events.append(f"wait_{future}")
+            return object()
+
+        def can_dispatch_next_before_async_drain(self, scheduler_output):
+            return bool(scheduler_output.async_scheduling and scheduler_output.total_num_scheduled_tokens)
+
+        def shutdown(self):
+            pass
+
+        def log_it(self, *_args, **_kwargs):
+            pass
+
+    scheduler = DummyScheduler()
+    runner = DummyRunner()
+    recorded: dict = {"exc": None}
+
+    loop = EngineLoop(
+        scheduler=scheduler,
+        runner=runner,
+        coordinator=None,
+        scheduler_lock=threading.Lock(),
+        emit_outputs=lambda engine_outputs: None,
+        drain_parser_stops=lambda: None,
+        on_fatal=lambda exc: (recorded.__setitem__("exc", exc), loop.request_stop()),
+        heartbeat=lambda: None,
+        handle_profiling_step=lambda: None,
+        is_nonrecoverable=lambda exc: False,
+        overlap_execution=True,
+        async_scheduling=True,
+        runner_verbose=False,
+        info=lambda *args, **kwargs: None,
+    )
+    loop_holder["loop"] = loop
+    loop.start()
+    thread = loop.thread
+    assert thread is not None
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert recorded["exc"] is None
+    assert events.index("execute2") < events.index("wait_future1")
+    assert events.index("update1") < events.index("wait_future2")
+
+
+def test_runner_async_drain_handoff_gate_allows_tp_decode():
+    runner = SimpleNamespace(
+        async_scheduling=True,
+        model=None,
+        _model_uses_vlm_inputs=lambda: False,
+        _has_default_sampling_penalties=lambda: True,
+    )
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={"req": 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_pages=[],
+        finished_req_ids=set(),
+        async_scheduling=True,
+    )
+
+    assert eSurgeRunner.can_dispatch_next_before_async_drain(runner, scheduler_output)
+
+
+def test_runner_async_drain_handoff_gate_rejects_structured_placeholders():
+    runner = SimpleNamespace(
+        async_scheduling=True,
+        model=None,
+        _model_uses_vlm_inputs=lambda: False,
+        _has_default_sampling_penalties=lambda: True,
+    )
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={"req": 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_pages=[],
+        finished_req_ids=set(),
+        async_scheduling=True,
+    )
+    scheduler_output.pending_structured_output_tokens = True
+
+    assert not eSurgeRunner.can_dispatch_next_before_async_drain(runner, scheduler_output)
+
+
+def test_model_runner_update_model_weights_replaces_explicit_graphdef_with_compatible_graphdef(monkeypatch):
+    raw_graphdef = object()
+    compatible_graphdef = object()
+
+    class CompatibleModel:
+        graphdef = compatible_graphdef
+
+    class RawModel:
+        @property
+        def esurge_compatible_model(self):
+            return CompatibleModel()
+
+    monkeypatch.setattr(model_runner_module.spx, "bind", lambda graphdef, state: RawModel())
+
+    class DummyExecutorManager:
+        def __init__(self):
+            self.calls = []
+
+        def update_graphs(self, **kwargs):
+            self.calls.append(kwargs)
+
+    class DummyRunner:
+        def __init__(self):
+            self.requests = []
+            self.executor_manager = DummyExecutorManager()
+            self.model = None
+            self.setup_calls = 0
+
+        def _setup_variables(self):
+            self.setup_calls += 1
+
+    runner = DummyRunner()
+
+    class MockState:
+        def overlay(self, other):
+            return self.merge(other, copy=False)
+
+        def merge(self, other, *, copy=False):
+            del copy
+            return f"{self._val}+{other}"
+
+    gs = MockState()
+    gs._val = "graphstate"
+    go = "graphother"
+
+    eSurgeRunner.update_model_weights(
+        runner,
+        model=None,
+        graphdef=raw_graphdef,
+        graphstate=gs,
+        graphother=go,
+        reset_state=True,
+    )
+
+    assert isinstance(runner.model, CompatibleModel)
+    assert runner.executor_manager.calls[0]["graphdef"] is compatible_graphdef
+    assert runner.executor_manager.calls[0]["graphstate"] is gs
+    assert runner.executor_manager.calls[0]["graphother"] == "graphother"
+
+
+def test_get_esurge_preserves_existing_positional_argument_order():
+    params = list(signature(EasyGenerationMixin.get_esurge).parameters)
+    assert params.index("max_num_batched_tokens") < params.index("max_num_seq_buckets")
+    assert params.index("silent_mode") < params.index("data_parallelism_axis")
+
+
+def test_resume_esurge_refreshes_model_state_before_resuming(monkeypatch):
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self):
+            self.config = type(
+                "Cfg",
+                (),
+                {
+                    "granted_freq_max_position_embedding": 1024,
+                },
+            )()
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+    class DummyEngine:
+        def __init__(self):
+            self._paused = True
+            self.silent_mode = True
+            self.num_running_requests = 0
+            self.num_pending_requests = 0
+            self.update_calls = 0
+            self.resume_calls = 0
+            self.runner = type("Runner", (), {"model": None})()
+
+        def update_model_weights(self, _model, *, restart_scheduler=True):
+            assert restart_scheduler is False
+            self.update_calls += 1
+            self.runner.model = object()
+
+        def resume(self):
+            assert self.runner.model is not None
+            self.resume_calls += 1
+            self._paused = False
+
+    monkeypatch.setattr(generation_module, "_ESURGE_MAP_CACHE", {})
+    model = DummyModel()
+    engine = DummyEngine()
+
+    generation_module._ESURGE_MAP_CACHE[f"{model._esurge_cache_scope()}-resume"] = engine
+    model.resume_esurge()
+
+    assert engine.update_calls == 1
+    assert engine.resume_calls == 1
+
+
+def test_get_esurge_does_not_inherit_buckets_when_max_num_seqs_is_explicit(monkeypatch):
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self, cached_engine):
+            self._cached_engine = cached_engine
+            self.config = type(
+                "Cfg",
+                (),
+                {
+                    "granted_freq_max_position_embedding": 1024,
+                },
+            )()
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+        def get_relevant_esurge(self, tokenizer=None, max_num_seqs=None):
+            return self._cached_engine
+
+    class CachedEngine:
+        def __init__(self):
+            self.runner = type("Runner", (), {"max_num_seq_buckets": [1, 2, 4, 8]})()
+
+    class ExpectedEngine:
+        def __init__(self):
+            self.num_running_requests = 0
+            self.num_pending_requests = 0
+            self._paused = False
+            self.update_calls = 0
+
+        def update_model_weights(self, _model):
+            self.update_calls += 1
+
+    def _unexpected_esurge_ctor(*_args, **_kwargs):
+        raise AssertionError("Unexpected eSurge construction; expected cached key lookup to succeed.")
+
+    monkeypatch.setattr(generation_module, "_ESURGE_MAP_CACHE", {})
+    monkeypatch.setattr("easydel.inference.eSurge", _unexpected_esurge_ctor)
+
+    model = DummyModel(CachedEngine())
+    expected_engine = ExpectedEngine()
+
+    kwargs = dict(
+        tokenizer="tok",
+        max_model_len=512,
+        min_input_pad=16,
+        max_num_seqs=16,
+        max_num_batched_tokens=64,
+        hbm_utilization=0.5,
+        page_size=32,
+        max_cache_tokens=None,
+        enable_prefix_caching=True,
+        data_parallelism_axis="dp",
+        async_scheduling=True,
+        overlap_execution=True,
+        runner_verbose=False,
+        decode_truncated_prompt=True,
+        destroy_pages_on_pause=True,
+        silent_mode=True,
+    )
+
+    model_hash = model._esurge_cache_scope()
+    extra_dict = dict(
+        tokenizer=kwargs["tokenizer"],
+        max_model_len=kwargs["max_model_len"],
+        min_input_pad=kwargs["min_input_pad"],
+        max_num_seqs=kwargs["max_num_seqs"],
+        max_num_seq_buckets=None,
+        max_num_batched_tokens=kwargs["max_num_batched_tokens"],
+        hbm_utilization=kwargs["hbm_utilization"],
+        page_size=kwargs["page_size"],
+        max_cache_tokens=kwargs["max_cache_tokens"],
+        enable_prefix_caching=kwargs["enable_prefix_caching"],
+        data_parallelism_axis=kwargs["data_parallelism_axis"],
+        async_scheduling=kwargs["async_scheduling"],
+        overlap_execution=kwargs["overlap_execution"],
+        runner_verbose=kwargs["runner_verbose"],
+        decode_truncated_prompt=kwargs["decode_truncated_prompt"],
+        destroy_pages_on_pause=kwargs["destroy_pages_on_pause"],
+        silent_mode=kwargs["silent_mode"],
+    )
+    extra_dict_str = pprint.pformat(model._normalize_esurge_cache_value(extra_dict), sort_dicts=True)
+    bytes_in = hashlib.md5(extra_dict_str.encode("utf-8")).digest()
+    extra_dict_hash = int.from_bytes(bytes_in, byteorder="big", signed=True)
+    generation_module._ESURGE_MAP_CACHE[f"{model_hash}-{extra_dict_hash}"] = expected_engine
+
+    resolved = model.get_esurge(**kwargs)
+
+    assert resolved is expected_engine
+    assert expected_engine.update_calls == 1
+
+
+def test_get_esurge_skips_redundant_refresh_for_fresh_engine(monkeypatch):
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self):
+            self.config = type(
+                "Cfg",
+                (),
+                {
+                    "granted_freq_max_position_embedding": 1024,
+                },
+            )()
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+    class DummyEngine:
+        def __init__(self):
+            self._paused = False
+            self.silent_mode = True
+            self.num_running_requests = 0
+            self.num_pending_requests = 0
+            self.update_calls = 0
+            self.runner = type("Runner", (), {"model": object()})()
+
+        def update_model_weights(self, _model, *, restart_scheduler=True):
+            del restart_scheduler
+            self.update_calls += 1
+
+    monkeypatch.setattr(generation_module, "_ESURGE_MAP_CACHE", {})
+
+    created_engines: list[DummyEngine] = []
+
+    def _fake_esurge_ctor(*_args, **_kwargs):
+        engine = DummyEngine()
+        created_engines.append(engine)
+        return engine
+
+    monkeypatch.setattr("easydel.inference.eSurge", _fake_esurge_ctor)
+
+    model = DummyModel()
+    engine = model.get_esurge(
+        tokenizer="tok",
+        max_model_len=512,
+        min_input_pad=16,
+        max_num_seqs=8,
+        max_num_seq_buckets=[1, 2, 4, 8],
+        max_num_batched_tokens=64,
+        hbm_utilization=0.5,
+        page_size=32,
+        enable_prefix_caching=True,
+        data_parallelism_axis="dp",
+        runner_verbose=False,
+        decode_truncated_prompt=True,
+        destroy_pages_on_pause=True,
+        silent_mode=True,
+    )
+
+    assert engine is created_engines[0]
+    assert engine.update_calls == 0
+
+
+def test_get_esurge_new_engine_does_not_require_graphdef_for_fingerprint(monkeypatch):
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self):
+            self.config = type(
+                "Cfg",
+                (),
+                {
+                    "granted_freq_max_position_embedding": 1024,
+                },
+            )()
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+        @property
+        def graphdef(self):
+            raise AttributeError("graphdef unavailable")
+
+    class DummyEngine:
+        def __init__(self):
+            self._paused = False
+            self.silent_mode = True
+            self.num_running_requests = 0
+            self.num_pending_requests = 0
+
+    monkeypatch.setattr(generation_module, "_ESURGE_MAP_CACHE", {})
+
+    created_engines: list[DummyEngine] = []
+
+    def _fake_esurge_ctor(*_args, **_kwargs):
+        engine = DummyEngine()
+        created_engines.append(engine)
+        return engine
+
+    monkeypatch.setattr("easydel.inference.eSurge", _fake_esurge_ctor)
+
+    model = DummyModel()
+    engine = model.get_esurge(
+        tokenizer="tok",
+        max_model_len=512,
+        min_input_pad=16,
+        max_num_seqs=8,
+        max_num_seq_buckets=[1, 2, 4, 8],
+        max_num_batched_tokens=64,
+        hbm_utilization=0.5,
+        page_size=32,
+        enable_prefix_caching=True,
+        data_parallelism_axis="dp",
+        runner_verbose=False,
+        decode_truncated_prompt=True,
+        destroy_pages_on_pause=True,
+        silent_mode=True,
+    )
+
+    assert engine is created_engines[0]
+    assert not hasattr(engine, "_easydel_source_graphdef_fingerprint")
+
+
+def test_get_esurge_reuses_cached_engine_for_equivalent_tokenizer_instances(monkeypatch):
+    class DummyProcessor:
+        def __init__(self, name_or_path, *, padding_side="right"):
+            self.name_or_path = name_or_path
+            self.padding_side = padding_side
+
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self):
+            self.config = type(
+                "Cfg",
+                (),
+                {
+                    "granted_freq_max_position_embedding": 1024,
+                },
+            )()
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+    class DummyEngine:
+        def __init__(self, processor):
+            self._paused = False
+            self.silent_mode = True
+            self.num_running_requests = 0
+            self.num_pending_requests = 0
+            self.update_calls = 0
+            self.processor = processor
+            self.tokenizer = processor
+            self.runner = type("Runner", (), {"model": object()})()
+
+        def update_model_weights(self, _model, *, restart_scheduler=True):
+            del restart_scheduler
+            self.update_calls += 1
+
+    monkeypatch.setattr(generation_module, "_ESURGE_MAP_CACHE", {})
+
+    created_engines: list[DummyEngine] = []
+
+    def _fake_esurge_ctor(*_args, **kwargs):
+        engine = DummyEngine(kwargs["processor"])
+        created_engines.append(engine)
+        return engine
+
+    monkeypatch.setattr("easydel.inference.eSurge", _fake_esurge_ctor)
+
+    model = DummyModel()
+    first_processor = DummyProcessor("tok")
+    second_processor = DummyProcessor("tok")
+
+    first = model.get_esurge(
+        tokenizer=first_processor,
+        max_model_len=512,
+        min_input_pad=16,
+        max_num_seqs=8,
+        max_num_seq_buckets=[1, 2, 4, 8],
+        max_num_batched_tokens=64,
+        hbm_utilization=0.5,
+        page_size=32,
+        enable_prefix_caching=True,
+        data_parallelism_axis="dp",
+        runner_verbose=False,
+        decode_truncated_prompt=True,
+        destroy_pages_on_pause=True,
+        silent_mode=True,
+    )
+    second = model.get_esurge(
+        tokenizer=second_processor,
+        max_model_len=512,
+        min_input_pad=16,
+        max_num_seqs=8,
+        max_num_seq_buckets=[1, 2, 4, 8],
+        max_num_batched_tokens=64,
+        hbm_utilization=0.5,
+        page_size=32,
+        enable_prefix_caching=True,
+        data_parallelism_axis="dp",
+        runner_verbose=False,
+        decode_truncated_prompt=True,
+        destroy_pages_on_pause=True,
+        silent_mode=True,
+    )
+
+    assert first is second
+    assert len(created_engines) == 1
+    assert second.processor is second_processor
+    assert second.tokenizer is second_processor
+
+
+def test_get_esurge_reuses_cached_engine_when_tokenizer_padding_side_changes(monkeypatch):
+    class DummyProcessor:
+        def __init__(self, name_or_path, *, padding_side):
+            self.name_or_path = name_or_path
+            self.padding_side = padding_side
+
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self):
+            self.config = type(
+                "Cfg",
+                (),
+                {
+                    "granted_freq_max_position_embedding": 1024,
+                },
+            )()
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+    class DummyEngine:
+        def __init__(self, processor):
+            self._paused = False
+            self.silent_mode = True
+            self.num_running_requests = 0
+            self.num_pending_requests = 0
+            self.processor = processor
+            self.tokenizer = processor
+            self.runner = type("Runner", (), {"model": object()})()
+
+        def update_model_weights(self, _model, *, restart_scheduler=True):
+            del restart_scheduler
+
+    monkeypatch.setattr(generation_module, "_ESURGE_MAP_CACHE", {})
+
+    created_engines: list[DummyEngine] = []
+
+    def _fake_esurge_ctor(*_args, **kwargs):
+        engine = DummyEngine(kwargs["processor"])
+        created_engines.append(engine)
+        return engine
+
+    monkeypatch.setattr("easydel.inference.eSurge", _fake_esurge_ctor)
+
+    model = DummyModel()
+    first = model.get_esurge(
+        tokenizer=DummyProcessor("tok", padding_side="right"),
+        max_model_len=512,
+        min_input_pad=16,
+        max_num_seqs=8,
+        max_num_seq_buckets=[1, 2, 4, 8],
+        max_num_batched_tokens=64,
+        hbm_utilization=0.5,
+        page_size=32,
+        enable_prefix_caching=True,
+        data_parallelism_axis="dp",
+        runner_verbose=False,
+        decode_truncated_prompt=True,
+        destroy_pages_on_pause=True,
+        silent_mode=True,
+    )
+    second_processor = DummyProcessor("tok", padding_side="left")
+    second = model.get_esurge(
+        tokenizer=second_processor,
+        max_model_len=512,
+        min_input_pad=16,
+        max_num_seqs=8,
+        max_num_seq_buckets=[1, 2, 4, 8],
+        max_num_batched_tokens=64,
+        hbm_utilization=0.5,
+        page_size=32,
+        enable_prefix_caching=True,
+        data_parallelism_axis="dp",
+        runner_verbose=False,
+        decode_truncated_prompt=True,
+        destroy_pages_on_pause=True,
+        silent_mode=True,
+    )
+
+    assert first is second
+    assert len(created_engines) == 1
+    assert second.processor is second_processor
+    assert second.tokenizer is second_processor
+
+
+def test_generate_accepts_penalty_kwargs_for_compiled_generation():
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self):
+            self.config = type(
+                "Cfg",
+                (),
+                {
+                    "is_encoder_decoder": False,
+                    "max_position_embeddings": 128,
+                },
+            )()
+            self.generation_config = GenerationConfig(
+                do_sample=True,
+                max_new_tokens=1,
+                pad_token_id=0,
+                eos_token_id=2,
+            )
+
+        def _sample(
+            self,
+            input_ids,
+            max_length,
+            pad_token_id,
+            eos_token_id,
+            prng_key,
+            *,
+            logits_warper=None,
+            logits_processor=None,
+            trace=True,
+            model_kwargs=None,
+        ):
+            del input_ids, max_length, pad_token_id, eos_token_id, prng_key, logits_warper, trace, model_kwargs
+            return logits_processor
+
+    model = DummyModel()
+    processors = model.generate(
+        jnp.asarray([[1, 2]], dtype=jnp.int32),
+        do_sample=True,
+        max_new_tokens=1,
+        presence_penalty=0.4,
+        frequency_penalty=0.2,
+        repetition_penalty=1.3,
+        trace=False,
+    )
+
+    assert any(isinstance(processor, PresencePenaltyLogitsProcessor) for processor in processors)
+    assert any(isinstance(processor, FrequencyPenaltyLogitsProcessor) for processor in processors)
+    assert any(isinstance(processor, RepetitionPenaltyLogitsProcessor) for processor in processors)

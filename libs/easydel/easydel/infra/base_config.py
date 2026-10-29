@@ -1,0 +1,3851 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Base configuration classes for EasyDeL models.
+
+This module provides the foundational configuration system for all EasyDeL models,
+extending HuggingFace's PretrainedConfig with EasyDeL-specific features like
+attention mechanisms, quantization, gradient checkpointing, and hardware optimization.
+
+Classes:
+    EasyDeLBaseConfig: Main configuration class with all EasyDeL features
+    EasyDeLBaseConfigDict: Simplified dictionary-based configuration
+
+Key Features:
+    - Multiple attention mechanism support (flash, ring, etc.)
+    - Quantization configuration
+    - Gradient checkpointing policies
+    - Scan and runtime sharding controls
+    - RoPE (Rotary Position Embedding) configuration
+    - Custom kernel support
+
+Example:
+    >>> from easydel.infra import EasyDeLBaseConfig
+    >>> config = EasyDeLBaseConfig(
+    ...     hidden_size=768,
+    ...     num_attention_heads=12,
+    ...     attention_mechanism="flash",
+    ...     gradient_checkpointing_policy="",
+    ...     scan_layers=True,
+    ... )
+"""
+
+from __future__ import annotations
+
+import collections.abc
+import copy
+import dataclasses
+import hashlib
+import inspect
+import json
+import os
+import re
+import typing as tp
+import urllib.request
+import warnings
+from typing import Any, NotRequired
+from urllib.parse import urlparse
+
+import jax
+import jax.extend
+import numpy as np
+import spectrax as spx
+import transformers
+from eformer.paths import ePath, ePathLike
+from eformer.pytree import auto_pytree
+from huggingface_hub.constants import HF_HUB_CACHE
+from huggingface_hub.file_download import REGEX_COMMIT_HASH
+from jax import numpy as jnp
+from jax.sharding import AxisType
+from jax.sharding import PartitionSpec as Ps
+from jaxtyping import Array
+from spectrax import PartitionAxis
+from spectrax.common_types import DP, EP, FSDP, MODE_TRAIN, NOT_GIVEN, SP, TP
+from spectrax.core.stage_assignment import current_stage_assignment, resolve_stage_rank
+
+# .venv/lib/python3.13/site-packages/transformers/configuration_utils.py
+from transformers.configuration_utils import PretrainedConfig, recursive_diff_dict
+from transformers.modeling_gguf_pytorch_utils import load_gguf_checkpoint
+from transformers.utils import CONFIG_NAME, cached_file
+from transformers.utils.generic import is_timm_config_dict
+
+from easydel.layers import QuantizationConfig
+from easydel.utils.compiling_utils import hash_fn
+from easydel.utils.helpers import check_bool_flag, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
+
+from .etils import (
+    AVAILABLE_ATTENTION_MECHANISMS,
+    AVAILABLE_GRADIENT_CHECKPOINT_TARGETS,
+    AVAILABLE_GRADIENT_CHECKPOINTS,
+    AVAILABLE_MOE_METHODS,
+    DEFAULT_ATTENTION_MECHANISM,
+    DEFAULT_MLA_ATTENTION_MECHANISM,
+    EasyDeLBackends,
+    EasyDeLGradientCheckPointers,
+    EasyDeLPlatforms,
+)
+from .layer_scan import normalize_layer_scan_options
+from .sharding import AxisPolicy, LogicalAxisRules, MeshLike, PipelineStageRankResolver, RuntimeShardingResolver
+
+if tp.TYPE_CHECKING:
+    from ejkernel.modules.operations.configs import BaseOperationConfig  # pyright: ignore[reportMissingTypeStubs]
+
+    from easydel.layers import RopeConfig
+
+    from .utils import AttnMaskDetail, ModuleCaches
+
+
+logger = get_logger(__name__)
+
+DEFAULT_SHARDING_AXIS_DIMS: tuple[int, ...] = (1, 1, -1, 1, 1, 1)
+DEFAULT_SHARDING_AXIS_NAMES: tuple[str, ...] = ("pp", "dp", "fsdp", "ep", "tp", "sp")
+
+# Model weight / processor file-name constants retained for direct-import compatibility.
+
+WEIGHTS_NAME = "pytorch_model.bin"
+
+# Index file for sharded PyTorch model weights.
+WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
+
+TF2_WEIGHTS_NAME = "tf_model.h5"
+
+# Index file for sharded TensorFlow 2 model weights.
+TF2_WEIGHTS_INDEX_NAME = "tf_model.h5.index.json"
+
+TF_WEIGHTS_NAME = "model.ckpt"
+
+SAFE_WEIGHTS_NAME = "model.safetensors"
+
+# Index file for sharded SafeTensors format model weights.
+SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
+
+# Configuration file for feature extractors/preprocessors.
+FEATURE_EXTRACTOR_NAME = "preprocessor_config.json"
+
+# Alias for feature extractor config (image processors use same file).
+IMAGE_PROCESSOR_NAME = FEATURE_EXTRACTOR_NAME
+
+# Configuration file for multi-modal processors.
+PROCESSOR_NAME = "processor_config.json"
+
+# Configuration file for chat templates.
+CHAT_TEMPLATE_NAME = "chat_template.json"
+
+# Configuration file for generation parameters.
+GENERATION_CONFIG_NAME = "generation_config.json"
+
+MODEL_CARD_NAME = "modelcard.json"
+
+DEFAULT_MOE_METHOD = "fused_moe"
+
+# Whether to treat experts as tensor-parallel by default.
+EXPERT_TP_MODE = False
+
+# Whether FSDP axis is folded into expert-parallel axis by default.
+FSDP_IS_EP_BOUND = True
+
+# Whether sequence-parallel axis is folded into expert-parallel axis by default.
+SP_IS_EP_BOUND = True
+
+# Whether to use ring topology for expert dispatch by default.
+RING_EXPERTS = False
+
+_REMOVED_BASE_CONFIG_KEYS = frozenset(
+    {
+        "hardware_abstraction",
+        "pallas_m_block_size",
+        "pallas_k_block_size",
+        "pallas_n_block_size",
+    }
+)
+
+# Instance flag set once ``EasyDeLBaseConfig.__init__`` finishes; afterwards late
+# ``rope_theta`` / ``partial_rotary_factor`` assignments are mirrored into the flat
+# ``rope_parameters`` dict. Runtime-only: never serialized.
+_ROPE_FIELDS_SYNCED_ATTR = "_rope_fields_synced"
+
+
+def is_remote_url(url_or_filename: str) -> bool:
+    """Return whether the given path is an HTTP(S) URL.
+
+    Args:
+        url_or_filename: Candidate string that may be a URL or a local path.
+
+    Returns:
+        bool: ``True`` if the input parses as an ``http://`` or ``https://``
+        URL, ``False`` otherwise (including when parsing fails).
+    """
+    try:
+        return urlparse(url_or_filename).scheme in {"http", "https"}
+    except Exception:
+        return False
+
+
+def download_url(url: str, cache_dir: str | None = None) -> str:
+    """Download a URL into a content-addressed cache and return the local path.
+
+    Uses an SHA-256 of the URL as the cache filename to avoid re-downloading.
+
+    Args:
+        url: Remote URL to fetch.
+        cache_dir: Optional cache directory; defaults to the Hugging Face hub
+            cache (``HF_HUB_CACHE``).
+
+    Returns:
+        str: Local filesystem path to the cached download.
+    """
+    cache_dir = cache_dir or HF_HUB_CACHE
+    os.makedirs(cache_dir, exist_ok=True)
+    parsed = urlparse(url)
+    filename = os.path.basename(parsed.path) or "download"
+    _, ext = os.path.splitext(filename)
+    hashed = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    cached_path = os.path.join(cache_dir, f"{hashed}{ext}")
+    if not os.path.exists(cached_path):
+        urllib.request.urlretrieve(url, cached_path)
+    return cached_path
+
+
+def _compute_mpmd_axis(jax_mesh: jax.sharding.Mesh) -> str | None:
+    """Return ``"pp"`` only when the resolved mesh has multiple pipeline stages."""
+    if "pp" not in getattr(jax_mesh, "axis_names", ()):
+        return None
+    try:
+        return "pp" if int(jax_mesh.shape["pp"]) > 1 else None
+    except (KeyError, TypeError):
+        return None
+
+
+def _mesh_shape_ep(mesh, pm, fsdp_is_ep_bound, sp_is_ep_bound):
+    """Derive flattened mesh shape and axis names for expert-parallel layouts.
+
+    Args:
+        mesh: JAX device mesh to extract dimensions from.
+        pm: Runtime sharding resolver instance for axis name resolution.
+        fsdp_is_ep_bound: Whether to fold FSDP axis into expert-parallel axis.
+        sp_is_ep_bound: Whether to fold sequence-parallel axis into expert-parallel axis.
+
+    Returns:
+        Tuple of ((dp_size, ep_size, tp_size), (dp_name, ep_name, tp_name)) containing
+        the flattened mesh dimensions and corresponding axis names.
+    """
+    dpname, fsdpname, epname, tpname, spname = (
+        _resolve_eformer_axis(DP, pm),
+        _resolve_eformer_axis(FSDP, pm),
+        _resolve_eformer_axis(EP, pm),
+        _resolve_eformer_axis(TP, pm),
+        _resolve_eformer_axis(SP, pm),
+    )
+
+    axis_sizes = mesh.shape
+    assigned_axes: dict[str, str] = {}
+    size_by_group = {"dp": 1, "ep": 1, "tp": 1}
+
+    def assign_axis(axis_name: str | None, group: str) -> None:
+        """Bind a physical mesh axis to a logical group, multiplying its size.
+
+        Args:
+            axis_name: Physical mesh axis name (or ``None`` to skip).
+            group: Target logical group, one of ``"dp"``, ``"ep"``, or
+                ``"tp"``.
+
+        Returns:
+            None. ``assigned_axes`` and ``size_by_group`` from the enclosing
+            scope are updated in-place.
+        """
+        if axis_name is None:
+            return
+
+        existing_group = assigned_axes.get(axis_name)
+        if existing_group is not None:
+            return
+
+        assigned_axes[axis_name] = group
+        size_by_group[group] *= axis_sizes.get(axis_name, 1)
+
+    # Give dedicated TP/EP axes priority, then place DP and any bound axes.
+    # This keeps the folded mesh shape valid when multiple semantic roles alias
+    # the same physical mesh dimension.
+    assign_axis(tpname, "tp")
+    assign_axis(epname, "ep")
+    assign_axis(dpname, "dp")
+    assign_axis(fsdpname, "ep" if fsdp_is_ep_bound else "dp")
+    assign_axis(spname, "ep" if sp_is_ep_bound else "dp")
+
+    odpsize = size_by_group["dp"]
+    epsize = size_by_group["ep"]
+    otpsize = size_by_group["tp"]
+    return (odpsize, epsize, otpsize), (dpname, epname, tpname)
+
+
+def _resolve_eformer_axis(axis: str | list[str], manager: RuntimeShardingResolver):
+    """Resolve logical axis name(s) to the concrete mesh axis names for training.
+
+    Axis labels such as ``"tp"`` or ``"ep"`` are symbolic and need to be translated
+    into the actual mesh axis names chosen by the runtime sharding resolver. This helper
+    keeps the caller agnostic to how axes are laid out on the physical device mesh.
+
+    Args:
+        axis: Single axis name or a list/tuple of axis names to resolve (for example
+            ``"tp"``, ``"ep"``, ``"dp"``, ``"fsdp"``, ``"sp"``).
+        manager: Runtime sharding resolver that owns the axis resolution rules.
+
+    Returns:
+        Resolved axis name(s). A string is returned for a single input, otherwise a
+        list preserving the provided order.
+
+    Example:
+        >>> _resolve_eformer_axis("tp", runtime_sharding_resolver)
+        >>> _resolve_eformer_axis(["tp", "ep"], runtime_sharding_resolver)
+    """
+    was_list = isinstance(axis, (list, tuple))
+    if not was_list:
+        axis = [axis]
+    out = manager.paxis.resolve_axis(axes=axis, mode=MODE_TRAIN)
+    if not was_list:
+        return out[0]
+    return out
+
+
+def extract_commit_hash(resolved_file: str | None, commit_hash: str | None) -> str | None:
+    """Extracts the git commit hash from a HuggingFace cache file path.
+
+    When models are downloaded from HuggingFace Hub, they're cached locally with paths
+    containing the commit hash in the format: `.../snapshots/<commit_hash>/...`.
+    This function extracts that hash for tracking model versions.
+
+    Args:
+        resolved_file: Path to the resolved cache file. If None or if commit_hash
+            is already provided, returns the existing commit_hash immediately.
+        commit_hash: Existing commit hash if already known. If provided, this
+            function returns it without parsing the file path.
+
+    Returns:
+        The extracted commit hash string (40-character hex), or None if:
+        - No file path is provided
+        - The path doesn't contain a snapshots directory
+        - The extracted string doesn't match git commit hash format
+
+    Example:
+        >>> path = "/cache/snapshots/abc123def456.../model.safetensors"
+        >>> commit_hash = extract_commit_hash(path, None)
+        >>> # commit_hash = "abc123def456..." if valid
+    """
+    if resolved_file is None or commit_hash is not None:
+        return commit_hash
+    resolved_file = str(ePath(resolved_file).as_posix())
+    search = re.search(r"snapshots/([^/]+)/", resolved_file)
+    if search is None:
+        return None
+    commit_hash = search.groups()[0]
+    return commit_hash if REGEX_COMMIT_HASH.match(commit_hash) else None
+
+
+def set_attrs_smartly(self, attr_name: str, default: tp.Any, new_attr: tp.Any):
+    """Sets attributes intelligently with default values and optional updates.
+
+    This helper function provides smart attribute management:
+    1. If the attribute doesn't exist, sets it to the default value
+    2. If new_attr is provided (not NOT_GIVEN sentinel), updates the attribute
+
+    This pattern allows configuration classes to have default values while
+    supporting explicit overrides through constructor parameters.
+
+    Args:
+        self: The object to set the attribute on.
+        attr_name: Name of the attribute to set/update.
+        default: Default value to use if the attribute doesn't exist yet.
+        new_attr: New value to set if provided. If equal to NOT_GIVEN sentinel,
+            the existing value (or default) is preserved.
+
+    Example:
+        >>> config = SomeConfig()
+        >>> set_attrs_smartly(config, "hidden_size", 768, 1024)
+        >>> # config.hidden_size = 1024 (updated)
+        >>>
+        >>> set_attrs_smartly(config, "num_layers", 12, NOT_GIVEN)
+        >>> # config.num_layers = 12 (default, since NOT_GIVEN)
+    """
+    if not hasattr(self, attr_name):
+        setattr(self, attr_name, default)
+    if new_attr is not NOT_GIVEN:
+        setattr(self, attr_name, new_attr)
+
+
+@auto_pytree
+class EasyMethod:
+    """Constants for EasyDeL operation modes.
+
+    Defines the different modes in which EasyDeL models can operate.
+
+    Attributes:
+        TRAIN: Training mode for model optimization.
+        SERVE: Serving mode for inference.
+        EVAL: Evaluation mode (alias for serve).
+        CONVERT: Conversion mode for model format changes.
+    """
+
+    TRAIN: str = "train"
+    SERVE: str = "serve"
+    EVAL: str = "serve"
+    CONVERT: str = "convert"
+
+
+warnings.filterwarnings(
+    "ignore",
+    message="Passing `gradient_checkpointing` to a config initialization is deprecated",  # EasyDeL will handle this
+)
+
+
+warnings.filterwarnings("ignore", message="You are using a model of type")
+warnings.filterwarnings("ignore", message="Some donated buffers were not usable:")
+
+
+class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
+    """Typed dictionary mirror of :class:`EasyDeLBaseConfig`'s constructor surface.
+
+    Every field is the keyword-style override you can pass to
+    ``EasyDeLBaseConfig.__init__`` (and equivalently to
+    :meth:`eLargeModel.update_module` via ``Unpack[EasyDeLBaseConfigDict]``)
+    to configure sharding, attention kernels, MoE kernels, RoPE caches, and
+    quantization without subclassing the config. All keys are ``NotRequired``
+    so callers may supply only the fields they wish to override; missing
+    fields keep their constructor defaults defined on
+    :class:`EasyDeLBaseConfig`.
+
+    Attributes:
+        sharding_axis_dims: Per-axis device counts for the model mesh, in the
+            canonical ``(pp, dp, fsdp, ep, tp, sp)`` order. ``-1`` consumes all
+            remaining devices on that axis.
+        sharding_dcn_axis_dims: Optional outer (DCN-slice) mesh sizes for
+            multi-host / multi-slice topologies; ``None`` keeps a single-slice
+            mesh.
+        sharding_axis_names: Logical names for each mesh axis. Must agree in
+            length with ``sharding_axis_dims``.
+        attn_mechanism: Attention implementation used during training/forward
+            passes (e.g. ``"flash_attn2"``, ``"ring"``, ``"vanilla"``).
+        decode_attn_mechanism: Attention implementation used during
+            autoregressive decoding. ``None`` re-uses ``attn_mechanism``.
+        mla_attn_mechanism: MLA-specific attention override; ``"auto"`` lets
+            EasyDeL pick the best MLA kernel for the current platform.
+        mla_attn_dtype: Activation dtype for MLA attention. ``None`` falls back
+            to ``attn_dtype``.
+        mla_attn_softmax_dtype: Softmax accumulator dtype for MLA attention.
+            ``None`` falls back to ``attn_softmax_dtype``.
+        blocksize_k: Key-axis block size used by tiled attention kernels.
+        blocksize_q: Query-axis block size used by tiled attention kernels.
+        blocksize_b: Batch/block tile size used by some attention backends.
+        moe_tiling_size_batch: Batch tile size used by MoE GEMM kernels.
+        moe_tiling_size_seqlen: Sequence-axis tile size used by MoE GEMM
+            kernels.
+        moe_tiling_size_dim: Hidden-dim tile size used by MoE GEMM kernels.
+        partition_axis: ``PartitionAxis`` instance describing how logical model
+            tensors map onto the named mesh axes.
+        axis_policy: Optional ``AxisPolicy`` (or dict that constructs one)
+            controlling EasyDeL's semantic-axis sharding scope.
+        use_sharded_kv_caching: When True, KV-cache tensors are sharded across
+            mesh axes instead of replicated.
+        use_sharding_constraint: When True, EasyDeL inserts explicit
+            ``with_sharding_constraint`` calls during forward construction.
+        backend: Explicit JAX backend (``"tpu"``, ``"gpu"``, ``"cpu"``).
+            ``None`` defers to ``jax.default_backend()``.
+        platform: Hardware/kernel platform hint (e.g. ``"triton"``, ``"pallas"``,
+            ``"jax"``). ``None`` selects the platform-default.
+        easy_method: Workflow context tag — one of ``"train"``, ``"serve"``,
+            ``"convert"``. Some kernels and code paths branch on this.
+        bits: Optional bit-width for weight quantization. ``None`` disables.
+        scan_ring_attention: Use scanned ring-attention implementation when
+            available.
+        scan_attention_layers: Apply ``jax.lax.scan`` over attention blocks to
+            trade compute for memory.
+        scan_layers: Apply ``jax.lax.scan`` over identical model layers.
+            Models that opt in expose a stack-of-layers pytree.
+        collective_matmul_impl: Engine for explicit-collective parallel
+            matmuls installed via ``wire_distributed_matmul()`` —
+            ``"auto"`` (default; best measured engine, with a decline
+            protocol falling back to the GSPMD einsum), ``"none"``,
+            ``"xla"``, or ``"pallas_ring"``.
+        pipeline_stage_regions: When True, partition the forward graph into
+            pipeline regions according to declared stage boundaries.
+        pipeline_virtual_stages: Number of virtual pipeline stages per
+            physical stage (interleaved 1F1B / loop schedules).
+        pipeline_stage_layout: Layout strategy for assigning layers to
+            pipeline stages (``"contiguous"``, ``"interleaved"``, ``"loop"``).
+        pipeline_terminal_stage_layer_reserve: Extra logical layer slots reserved
+            for the terminal stage's non-transformer work (norm, LM head, loss)
+            when assigning transformer layers to PP stages.
+        use_scan_mlp: Apply ``jax.lax.scan`` over MLP rows to save memory.
+        scan_mlp_chunk_size: Chunk size used when scanning MLPs.
+        sequence_axis_name: Logical mesh axis name treated as the sequence /
+            attention axis.
+        gradient_checkpointing: Gradient-checkpointing policy enum/string used
+            by SpectraX remat. ``"none"`` disables checkpointing.
+        gradient_checkpointing_targets: Optional list of submodule labels to
+            include or exclude from selective checkpointing.
+        kv_cache_quantization_config: Quantization config applied to KV-cache
+            tensors. ``None`` disables KV-cache quantization.
+        kv_cache_sharding_sequence_axis_name: Mesh axis (or tuple of axes)
+            used when sharding KV pages along the sequence dimension.
+        use_qmm_best_config: Whether quantized matmul kernels should request
+            ejkernel's tuned block configuration.
+        qmm_platform_override: Force a specific quantized-matmul platform
+            (``"pallas"``, ``"xla"``, ``"triton"``). ``None`` keeps the
+            platform-default.
+        qmm_tpu_path_override: Force a specific quantized-matmul TPU code
+            path (``"hybrid"``, ``"packed"``, ``"predecode"``). ``None`` keeps
+            the default.
+        flash_attention_backward_pass_impl: Backend used for the flash
+            attention backward kernel (``"triton"`` or ``"xla"``).
+        attn_dtype: Dtype used for attention activations. Defaults to
+            ``bfloat16``.
+        kvdtype: Dtype used for stored KV pages. ``None`` re-uses
+            ``attn_dtype``.
+        attn_softmax_dtype: Dtype used for the softmax accumulator inside
+            attention. Defaults to ``float32`` for numerical stability.
+        fcm_max_ratio: Upper bound on the forgetful-causal-mask sampling
+            ratio used during training augmentation.
+        fcm_min_ratio: Lower bound on the forgetful-causal-mask sampling
+            ratio used during training augmentation.
+        use_expert_tensor_mode: Treat the expert axis as an additional
+            tensor-parallel axis (Mixtral-style sharding).
+        moe_method: Mixture-of-experts dispatch implementation (e.g.
+            ``"gmm"``, ``"ragged"``).
+        moe_force_xla_gmm: Force XLA grouped-matmul kernels for MoE even when
+            fused Pallas/Triton kernels are available.
+        use_ring_of_experts: Use ring-topology dispatch for MoE expert
+            communication.
+        fsdp_is_ep_bound: Fold the FSDP axis into the expert axis when
+            building the per-stage expert mesh.
+        sp_is_ep_bound: Fold the sequence-parallel axis into the expert axis
+            when building the per-stage expert mesh.
+        moe_chunk_size: Optional token chunk size for the fused-MoE dispatch
+            pipeline. When set, the per-shard token stream inside the fused
+            MoE ``shard_map`` is processed in chunks of this many tokens
+            under a gradient-checkpointed scan, capping the peak dispatch
+            buffer at ``moe_chunk_size * num_experts_per_tok * hidden_size``
+            elements per core regardless of batch/sequence size. ``None``
+            (default) keeps the single-pass dispatch.
+        moe_fsdp_shard_expert_weights: Shard the expert (leading) dimension
+            of MoE expert weights over the FSDP axis at rest and all-gather
+            them over FSDP inside the fused-MoE ``shard_map`` right before
+            use (ZeRO-3 style). Only takes effect when the FSDP axis is not
+            expert-bound (``fsdp_is_ep_bound=False``). Default ``False``.
+        moe_ep_carries_batch: Shard the token batch over the expert axis as
+            well (MaxText-style "ep carries batch"). Activations resolve the
+            logical BATCH axis to ``(fsdp, dp, ep)`` instead of
+            ``(fsdp, dp)``, and the fused-MoE dispatch sends each token to
+            the expert shard that owns its expert via a ragged all-to-all
+            (dispatch + combine) instead of replicating the batch over ep
+            and computing at home. Cuts per-core MoE dispatch buffers and
+            non-MoE activation memory by the ep degree at the cost of two
+            ragged all-to-alls per MoE layer. Only takes effect when
+            ``ep > 1``, ``use_ring_of_experts=False``,
+            ``fsdp_is_ep_bound=False`` and either ``sp_is_ep_bound=False`` or
+            a size-1 sp axis, on the SPMD stage-mesh path, with ``n_routed_experts`` divisible by ep
+            and the batch divisible by ``dp*fsdp*ep``. Default ``False``.
+        moe_batch_axes_follow_resolver: Name the fused-MoE ``shard_map`` batch
+            axes in the runtime resolver's ``HiddenStateSharding`` order (fsdp
+            mapped to ep when ``fsdp_is_ep_bound``) so the block-boundary specs
+            match the residual stream and GSPMD emits no whole-shard
+            collective-permute at MoE entry/exit. Default ``False``.
+        layer_scan_options: Lowering options for lowered repeated-layer scans
+            (``block_scan``, ``barrier``, ``prefetch_axes``, ``prefetch_exclude``,
+            ``prefetch_defer_dw``, ``unroll``); top-level keys apply to every scan,
+            ``"text"`` / ``"vision"`` / ``"audio"`` keys hold per-tower overrides.
+            ``None`` prefetches fsdp-sharded weights in training text scans when fsdp > 1;
+            ``{}`` keeps the plain lowering (see :mod:`easydel.infra.layer_scan`).
+        quantization_config: Quantization config applied to linear layers.
+            ``None`` disables weight quantization.
+        operation_configs: Mapping from ejkernel operation name to a
+            ``BaseOperationConfig`` override. Empty mapping or ``None`` keeps
+            ejkernel's autotune behavior.
+        mask_max_position_embeddings: Maximum sequence length for which causal
+            masks are precomputed and cached on-mesh.
+        freq_max_position_embeddings: Maximum sequence length for which
+            RoPE frequencies are precomputed and cached on-mesh.
+        precompute_masks: Whether to precompute and cache causal masks at
+            module construction time.
+        lmhead_chunksize: Optional chunk size for chunked LM-head projection.
+            When set, the LM head materializes logits in sequence chunks
+            instead of a single full-sequence matmul.
+    """
+
+    sharding_axis_dims: NotRequired[collections.abc.Sequence[int]]
+    sharding_dcn_axis_dims: NotRequired[collections.abc.Sequence[int] | None]
+    sharding_axis_names: NotRequired[collections.abc.Sequence[str]]
+    attn_mechanism: NotRequired[AVAILABLE_ATTENTION_MECHANISMS]
+    decode_attn_mechanism: NotRequired[AVAILABLE_ATTENTION_MECHANISMS]
+    mla_attn_mechanism: NotRequired[AVAILABLE_ATTENTION_MECHANISMS]
+    mla_attn_dtype: NotRequired[jnp.dtype | str | None]
+    mla_attn_softmax_dtype: NotRequired[jnp.dtype | str | None]
+    blocksize_k: NotRequired[int]
+    blocksize_q: NotRequired[int]
+    blocksize_b: NotRequired[int]
+    moe_tiling_size_batch: NotRequired[int]
+    moe_tiling_size_seqlen: NotRequired[int]
+    moe_tiling_size_dim: NotRequired[int]
+    partition_axis: NotRequired[PartitionAxis]
+    axis_policy: NotRequired[AxisPolicy]
+    use_sharded_kv_caching: NotRequired[bool]
+    use_sharding_constraint: NotRequired[bool]
+    backend: NotRequired[EasyDeLBackends | str | None]
+    platform: NotRequired[EasyDeLPlatforms | str | None]
+    easy_method: NotRequired[tp.Literal["train", "serve", "convert"]]
+    bits: NotRequired[int | None]
+    scan_ring_attention: NotRequired[bool]
+    scan_attention_layers: NotRequired[bool]
+    scan_layers: NotRequired[bool]
+    use_fused_mlp: NotRequired[bool]
+    collective_matmul_impl: NotRequired[str]
+    pipeline_stage_regions: NotRequired[bool]
+    pipeline_virtual_stages: NotRequired[int]
+    pipeline_stage_layout: NotRequired[tp.Literal["contiguous", "interleaved", "loop"]]
+    pipeline_terminal_stage_layer_reserve: NotRequired[int]
+    use_scan_mlp: NotRequired[bool]
+    scan_mlp_chunk_size: NotRequired[int]
+    sequence_axis_name: NotRequired[str]
+    gradient_checkpointing: NotRequired[EasyDeLGradientCheckPointers | str | AVAILABLE_GRADIENT_CHECKPOINTS]
+    gradient_checkpointing_targets: NotRequired[list[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS] | None]
+    kv_cache_quantization_config: NotRequired[QuantizationConfig | None]
+    kv_cache_sharding_sequence_axis_name: NotRequired[str | tuple[str, ...]]
+    use_qmm_best_config: NotRequired[bool]
+    qmm_platform_override: NotRequired[str | None]
+    qmm_tpu_path_override: NotRequired[str | None]
+    flash_attention_backward_pass_impl: NotRequired[tp.Literal["triton", "xla"]]
+    attn_dtype: NotRequired[jnp.dtype]
+    kvdtype: NotRequired[jnp.dtype]
+    attn_softmax_dtype: NotRequired[jnp.dtype]
+    fcm_max_ratio: NotRequired[float]
+    fcm_min_ratio: NotRequired[float]
+    use_expert_tensor_mode: NotRequired[bool]
+    moe_method: NotRequired[AVAILABLE_MOE_METHODS]
+    moe_force_xla_gmm: NotRequired[bool]
+    use_ring_of_experts: NotRequired[bool]
+    fsdp_is_ep_bound: NotRequired[bool]
+    sp_is_ep_bound: NotRequired[bool]
+    moe_chunk_size: NotRequired[int | None]
+    moe_fsdp_shard_expert_weights: NotRequired[bool]
+    moe_ep_carries_batch: NotRequired[bool]
+    moe_batch_axes_follow_resolver: NotRequired[bool]
+    layer_scan_options: NotRequired[dict[str, tp.Any] | None]
+    quantization_config: NotRequired[QuantizationConfig | None]
+    operation_configs: NotRequired[dict[str, BaseOperationConfig] | None]
+    mask_max_position_embeddings: NotRequired[int]
+    freq_max_position_embeddings: NotRequired[int]
+    precompute_masks: NotRequired[bool]
+    lmhead_chunksize: NotRequired[int | None]
+
+
+class EasyDeLBaseConfig(PretrainedConfig):
+    """Base configuration shared across EasyDeL models.
+
+    Extends `transformers.PretrainedConfig` with distributed sharding metadata,
+    attention kernel selection, quantization knobs, RoPE helpers, and hardware
+    abstraction flags used for both training and serving.
+
+    Args:
+        sharding_axis_dims: Parallelism sizes for ``(pp, dp, fsdp, ep, tp, sp)``.
+            ``-1`` consumes all remaining devices. Defaults to ``(1, 1, -1, 1, 1, 1)``.
+        sharding_dcn_axis_dims: Optional mesh sizes for DCN slices when running
+            multi-host or multi-slice setups.
+        sharding_axis_names: Logical mesh axis names, defaults to
+            ``("pp", "dp", "fsdp", "ep", "tp", "sp")``.
+        attn_mechanism: Attention implementation to use during training/forward passes.
+        decode_attn_mechanism: Attention implementation to use during decoding
+            (falls back to ``attn_mechanism`` if left as ``None``).
+        mla_attn_mechanism: Attention mechanism override for MLA layers.
+            Use ``"auto"`` to infer MLA-specific serving kernels (defaults to
+            ``"auto"``). Non-MLA layers ignore this field.
+        mla_attn_dtype: Optional MLA-specific attention activation dtype.
+            Defaults to ``attn_dtype`` when unset.
+        mla_attn_softmax_dtype: Optional MLA-specific attention softmax dtype.
+            Defaults to ``attn_softmax_dtype`` when unset.
+        blocksize_k: Key block size for attention kernels. Defaults to ``128``.
+        blocksize_q: Query block size for attention kernels. Defaults to ``128``.
+        blocksize_b: Batch/block size used by some attention backends. Defaults to ``1``.
+        moe_tiling_size_batch: Batch tiling used by MoE kernels. Defaults to ``4``.
+        moe_tiling_size_seqlen: Sequence length tiling for MoE kernels. Defaults to ``128``.
+        moe_tiling_size_dim: Hidden dimension tiling for MoE kernels. Defaults to ``128``.
+        partition_axis: `PartitionAxis` describing how logical axes map to the mesh.
+        use_sharded_kv_caching: Whether to shard KV cache placement instead of replicating.
+        use_sharding_constraint: Insert explicit sharding constraints during model build.
+        backend: Explicit JAX backend (falls back to ``jax.default_backend()``).
+        platform: Platform hint for kernel selection (defaults to ``"triton"`` on GPU,
+            otherwise ``"jax"``).
+        easy_method: Workflow context (``"train"``, ``"serve"``, or ``"convert"``).
+        bits: Optional quantization bit width for weights.
+        scan_ring_attention: Use scanning for ring attention implementations.
+        scan_attention_layers: Apply scan to attention blocks to save memory.
+        scan_layers: Apply scan to repeated model layers when the model supports it.
+        collective_matmul_impl: Explicit-collective matmul engine selector
+            (``"auto"``/``"none"``/``"xla"``/``"pallas_ring"``); see
+            ``wire_distributed_matmul()``.
+        use_scan_mlp: Apply scan to MLP blocks.
+        scan_mlp_chunk_size: Chunk size when scanning MLPs. Defaults to ``1024``.
+        sequence_axis_name: Name of the sequence/attention axis. Defaults to ``"sp"``.
+        gradient_checkpointing: Gradient checkpointing policy enum/string.
+        gradient_checkpointing_targets: Optional list of target names to include or
+            exclude when using selective checkpointing policies.
+        precompute_masks: Whether to precompute and cache causal masks on the mesh.
+        lmhead_chunksize: Optional token chunk size for chunked LM-head projection.
+            When set, models may project hidden states to logits in sequence chunks
+            instead of a single full-sequence LM-head matmul.
+        kv_cache_quantization_config: Quantization config for KV cache tensors. Pass ``None`` to disable.
+        quantization_config: Quantization config for linear layers. Pass ``None`` to disable.
+        use_qmm_best_config: Whether quantized linear kernels should request
+            ejkernel tuned block configs by default. Defaults to ``True``.
+        qmm_platform_override: Optional explicit quantized-matmul platform
+            override (for example ``"pallas"``, ``"xla"``, ``"triton"``).
+        qmm_tpu_path_override: Optional explicit quantized-matmul TPU fused
+            path override (``"hybrid"``, ``"packed"``, ``"predecode"``).
+        kv_cache_sharding_sequence_axis_name: Axis (or axes) used when sharding the KV cache.
+        flash_attention_backward_pass_impl: Backward kernel for flash attention
+            (``"triton"`` or ``"xla"``). Defaults to ``"triton"``.
+        attn_dtype: Attention activation dtype. Defaults to ``jnp.bfloat16``.
+        kvdtype: KV cache dtype. Defaults to ``attn_dtype`` when ``None``.
+        attn_softmax_dtype: Softmax computation dtype. Defaults to ``jnp.float32``.
+        fcm_max_ratio: Maximum ratio used when sampling forgetful causal masks.
+        fcm_min_ratio: Minimum ratio used when sampling forgetful causal masks.
+        moe_method: Mixture-of-experts implementation to use.
+        moe_force_xla_gmm: Force XLA GMM kernels for MoE even when fused kernels exist.
+        use_ring_of_experts: Whether to dispatch experts with a ring topology.
+        use_expert_tensor_mode: Treat experts as an additional tensor-parallel axis.
+        fsdp_is_ep_bound: Fold the FSDP axis into the expert axis when building expert meshes.
+        sp_is_ep_bound: Fold the sequence-parallel axis into the expert axis when building expert meshes.
+        moe_chunk_size: Optional token chunk size for chunk-scanned fused-MoE dispatch (``None`` disables).
+        moe_fsdp_shard_expert_weights: Shard MoE expert weights over FSDP at rest and gather at use.
+        moe_ep_carries_batch: Shard the token batch over the expert axis and dispatch tokens to their
+            expert-owning shard (MaxText-style "ep carries batch"; default ``False``).
+        moe_batch_axes_follow_resolver: Order the fused-MoE batch axes like the runtime resolver's
+            hidden-state spec (no block-boundary relayout; default ``False``).
+        layer_scan_options: Per-scope ``ModuleList.scan`` lowering options (default ``None``).
+        **kwargs: Forwarded to `PretrainedConfig`.
+
+    Raises:
+        UserWarning: If KV-cache quantization is requested together with sharded KV caching.
+    """
+
+    # Whether to show EasyDeL-specific attributes in repr output.
+    # Set to True for debugging to see all configuration values.
+    _show_private_attrs: bool = False
+
+    # Cached SpectraX device mesh with automatic axis types.
+    # Set via set_model_mesh() or lazily created on first access to `mesh` property.
+    _hidden_mesh: spx.SpxMesh | None = None
+
+    # Cached SpectraX device mesh with explicit axis types.
+    # Set via set_explicit_mesh() or lazily created on first access to `explicit_mesh` property.
+    _hidden_explicit_mesh: spx.SpxMesh | None = None
+
+    # Cached SpectraX device mesh with manual axis types.
+    # Set via set_manual_mesh() or lazily created on first access to `manual_mesh` property.
+    _hidden_manual_mesh: spx.SpxMesh | None = None
+
+    # Backward-compat defaults that were implicitly available in older
+    # transformers.PreTrainedConfig versions.
+    _hf_compat_defaults: tp.ClassVar[dict[str, tp.Any]] = {
+        "pad_token_id": None,
+        "bos_token_id": None,
+        "eos_token_id": None,
+        "sep_token_id": None,
+        "decoder_start_token_id": None,
+        "add_cross_attention": False,
+        "tie_encoder_decoder": False,
+        "is_decoder": False,
+        "tie_word_embeddings": True,
+        "cross_attention_hidden_size": None,
+        "_output_attentions": False,
+        "_attn_implementation_internal": None,
+        "_experts_implementation_internal": None,
+    }
+
+    # Families whose HF config stores RoPE parameters per layer type (``{layer_type: {...}}``) set this to True.
+    per_layer_rope_parameters: tp.ClassVar[bool] = False
+
+    _rope_relevant_keys: tp.ClassVar[set[str]] = {
+        "rope_parameters",
+        "rope_scaling",
+        "rope_theta",
+        "partial_rotary_factor",
+        "layer_types",
+    }
+
+    _mesh_cache_names: tp.ClassVar[tuple[str, ...]] = (
+        "_hidden_mesh",
+        "_hidden_explicit_mesh",
+        "_hidden_manual_mesh",
+    )
+    _mesh_input_keys: tp.ClassVar[frozenset[str]] = frozenset(
+        {
+            "sharding_axis_dims",
+            "sharding_axis_names",
+            "sharding_dcn_axis_dims",
+            "backend",
+            "should_sort_granules_by_key",
+            "allow_split_physical_axes",
+        }
+    )
+
+    def __setattr__(self, key, value):
+        """Set an attribute, normalizing RoPE and MoE-related fields on the fly.
+
+        Args:
+            key: Attribute name being assigned.
+            value: New value for the attribute.
+
+        Returns:
+            None.
+        """
+        # HF v5 expects `rope_parameters` to include `rope_theta`.
+        # Keep late assignments (e.g. tests mutating `config.rope_scaling`) compatible.
+        if key in self._mesh_input_keys and key in self.__dict__ and self.__dict__[key] != value:
+            # Explicit user meshes are pinned; only topology-derived caches
+            # should be rebuilt after late overrides (including graph rebuilds).
+            for cache_name in self._mesh_cache_names:
+                if self.__dict__.get(f"{cache_name}_auto_created", False):
+                    object.__setattr__(self, cache_name, None)
+        raw_rope_parameters = None
+        if key in {"rope_scaling", "rope_parameters"} and isinstance(value, dict):
+            raw_rope_parameters = value
+            value = self._normalize_rope_assignment(value)
+        super().__setattr__(key, value)
+        # Keep common MoE expert-count aliases in sync for late config mutations.
+        # Several HF MoE implementations read `num_local_experts` directly.
+        if key in {"n_routed_experts", "num_experts"}:
+            super().__setattr__("num_local_experts", value)
+        if self.__dict__.get(_ROPE_FIELDS_SYNCED_ATTR, False):
+            # After construction the scalar fields and the flat HF v5 mapping must
+            # stay one source of truth: late overrides (``from_dict(..., rope_theta=...)``,
+            # ``config_kwargs``) update both, so a save/reload cannot resurrect a stale value.
+            if key in {"rope_theta", "partial_rotary_factor"} and value is not None:
+                rope_parameters = self.__dict__.get("rope_parameters")
+                if self._is_flat_rope_parameters(rope_parameters) and rope_parameters.get(key) != value:
+                    super().__setattr__("rope_parameters", {**rope_parameters, key: value})
+            elif raw_rope_parameters is not None:
+                self._sync_rope_fields_from_parameters(raw_rope_parameters)
+        if key in self._rope_relevant_keys:
+            self._backfill_rope_parameters()
+
+    def __init_subclass__(cls, **kwargs):
+        """Restore ``__hash__`` on subclasses dropped by ``PretrainedConfig``.
+
+        Args:
+            **kwargs: Forwarded to ``super().__init_subclass__``.
+
+        Returns:
+            None.
+        """
+        super().__init_subclass__(**kwargs)
+
+        # PreTrainedConfig provides value-based equality, which causes Python to
+        # set ``__hash__ = None`` on subclasses unless we restore it explicitly.
+        # EasyDeL passes configs through static JIT paths, so config subclasses
+        # must remain hashable for graph definitions to compile.
+        if cls.__dict__.get("__hash__") is None:
+            cls.__hash__ = hash_fn
+
+    @staticmethod
+    def _is_flat_rope_parameters(rope_parameters: tp.Any) -> bool:
+        """Return whether ``rope_parameters`` is one flat RoPE dict (not keyed by layer type).
+
+        Args:
+            rope_parameters: Candidate ``rope_parameters`` / ``rope_scaling`` value.
+
+        Returns:
+            bool: ``True`` for a non-empty dict whose values are all scalars/lists.
+        """
+        return (
+            isinstance(rope_parameters, dict)
+            and bool(rope_parameters)
+            and not any(isinstance(value, dict) for value in rope_parameters.values())
+        )
+
+    def _sync_rope_fields_from_parameters(self, rope_parameters: tp.Any) -> None:
+        """Mirror ``rope_theta`` / ``partial_rotary_factor`` from a flat ``rope_parameters`` dict.
+
+        transformers v5 serializes these only inside ``rope_parameters`` and gives
+        that dict priority over top-level fields, while EasyDeL's rotary builders
+        read ``self.rope_theta`` / ``self.partial_rotary_factor``. Without this a
+        v5-saved Llama-3 (theta 5e5) silently falls back to the class default.
+        ``partial_rotary_factor`` is only mirrored onto configs that declare it, so
+        families that size partial RoPE themselves (e.g. GPT-NeoX ``rotary_pct``)
+        are not rotated twice.
+
+        Args:
+            rope_parameters: Raw ``rope_parameters`` value; per-layer-type
+                (nested) mappings are ignored.
+        """
+        if not self._is_flat_rope_parameters(rope_parameters):
+            return
+        rope_theta = rope_parameters.get("rope_theta")
+        if rope_theta is not None and getattr(self, "rope_theta", None) != rope_theta:
+            super().__setattr__("rope_theta", rope_theta)
+        partial_rotary_factor = rope_parameters.get("partial_rotary_factor")
+        if (
+            partial_rotary_factor is not None
+            and hasattr(self, "partial_rotary_factor")
+            and self.partial_rotary_factor != partial_rotary_factor
+        ):
+            super().__setattr__("partial_rotary_factor", partial_rotary_factor)
+
+    @classmethod
+    def from_dict(cls, config_dict: dict[str, tp.Any], **kwargs):
+        """Instantiate a config, lifting v5-only RoPE fields to their legacy top-level keys.
+
+        transformers v5 saves ``rope_theta`` (and, for some families,
+        ``partial_rotary_factor``) only inside ``rope_parameters``. Constructors
+        that take ``rope_theta=<default>`` would otherwise never see the saved
+        value, including families that assign it after ``super().__init__``.
+        When both spellings are present, a transformers-written config follows
+        transformers (``rope_parameters`` wins), while an EasyDeL-saved config
+        keeps the top-level value it ran with (older EasyDeL saves could leave
+        a stale ``rope_parameters`` theta behind) and the dict is aligned to it.
+        ``partial_rotary_factor`` is only lifted for constructors that accept it
+        (or when it is already top-level).
+
+        Args:
+            config_dict: Serialized configuration mapping.
+            **kwargs: Forwarded to :meth:`transformers.PretrainedConfig.from_dict`.
+
+        Returns:
+            The instantiated configuration (or ``(config, unused_kwargs)``
+            when ``return_unused_kwargs=True``).
+        """
+        rope_parameters = config_dict.get("rope_parameters") if isinstance(config_dict, dict) else None
+        if cls._is_flat_rope_parameters(rope_parameters):
+            config_dict = dict(config_dict)
+            rope_parameters = dict(rope_parameters)
+            init_parameters = inspect.signature(cls.__init__).parameters
+            easydel_saved = any(key in config_dict for key in ("attn_mechanism", "sharding_axis_dims"))
+            for key in ("rope_theta", "partial_rotary_factor"):
+                if rope_parameters.get(key) is None:
+                    continue
+                if easydel_saved and config_dict.get(key) is not None:
+                    rope_parameters[key] = config_dict[key]
+                elif key == "rope_theta" or key in init_parameters or key in config_dict:
+                    config_dict[key] = rope_parameters[key]
+            config_dict["rope_parameters"] = rope_parameters
+        return super().from_dict(config_dict, **kwargs)
+
+    @staticmethod
+    def _normalize_rope_parameters_dict(
+        rope_parameters: dict[str, tp.Any],
+        *,
+        rope_theta: float | int | None = None,
+    ) -> dict[str, tp.Any]:
+        """Normalize a single RoPE parameter dictionary to HF v5-style keys.
+
+        Bridges the historical ``type``/``rope_type`` naming and backfills
+        ``rope_theta`` when supplied.
+
+        Args:
+            rope_parameters: A flat dict of RoPE parameters as read from an
+                HF config (may use legacy ``type`` instead of ``rope_type``).
+            rope_theta: Optional explicit RoPE base frequency to insert when
+                missing.
+
+        Returns:
+            dict[str, Any]: A new dict with both ``type`` and ``rope_type``
+            keys populated and ``rope_theta`` filled when provided.
+        """
+        normalized = dict(rope_parameters)
+        if "type" in normalized and "rope_type" not in normalized:
+            normalized["rope_type"] = normalized["type"]
+        normalized.setdefault("rope_type", "default")
+        normalized.setdefault("type", normalized["rope_type"])
+        if rope_theta is not None:
+            normalized.setdefault("rope_theta", rope_theta)
+        return normalized
+
+    def _normalize_rope_assignment(self, rope_parameters: dict[str, tp.Any]) -> dict[str, tp.Any]:
+        """Normalize a ``rope_parameters``/``rope_scaling`` assignment.
+
+        Detects whether the dict is a flat RoPE config or a per-layer-type
+        nested mapping (when ``layer_types`` keys match) and dispatches to
+        :meth:`_normalize_rope_parameters_dict` accordingly.
+
+        Args:
+            rope_parameters: Raw dict being assigned to ``rope_parameters`` or
+                ``rope_scaling``.
+
+        Returns:
+            dict[str, Any]: Normalized HF v5-style RoPE config (flat or
+            nested by layer-type, depending on input shape).
+        """
+        rope_theta = getattr(self, "rope_theta", None)
+        partial_rotary_factor = getattr(self, "partial_rotary_factor", None)
+        layer_types = getattr(self, "layer_types", None)
+
+        layer_types_set = set(layer_types) if isinstance(layer_types, (list, tuple, set)) else None
+        is_nested = bool(layer_types_set) and set(rope_parameters.keys()).issubset(layer_types_set)
+        if is_nested:
+            return {
+                key: self._normalize_rope_parameters_dict(
+                    value if isinstance(value, dict) else {},
+                    rope_theta=rope_theta,
+                )
+                for key, value in rope_parameters.items()
+            }
+
+        normalized = self._normalize_rope_parameters_dict(rope_parameters, rope_theta=rope_theta)
+        if partial_rotary_factor is not None:
+            normalized.setdefault("partial_rotary_factor", partial_rotary_factor)
+        return self._apply_default_rope_type(normalized)
+
+    def _apply_default_rope_type(self, rope_parameters: dict[str, tp.Any]) -> dict[str, tp.Any]:
+        """Honor the class-level ``default_rope_type`` the way transformers' ``standardize_rope_params`` does.
+
+        Configs whose HF counterpart declares a non-default rope type (e.g. ``"axial"`` for 2-D vision towers)
+        set ``default_rope_type`` on the class; a flat ``rope_type="default"`` mapping is then rewritten to it and
+        ``rope_theta`` is filled from the config (or ``default_theta``). Classes keeping ``"default"`` are untouched.
+
+        Args:
+            rope_parameters: Normalized RoPE mapping (flat or nested by layer type).
+
+        Returns:
+            dict[str, Any]: The mapping, retyped when the class declares a non-default rope type.
+        """
+        default_rope_type = getattr(type(self), "default_rope_type", "default")
+        if default_rope_type == "default" or not isinstance(rope_parameters, dict):
+            return rope_parameters
+        if rope_parameters and not self._is_flat_rope_parameters(rope_parameters):
+            return rope_parameters
+        updated = dict(rope_parameters)
+        if updated.get("rope_type", "default") == "default":
+            updated["rope_type"] = default_rope_type
+            updated["type"] = default_rope_type
+        if updated.get("rope_theta") is None:
+            updated["rope_theta"] = getattr(self, "rope_theta", None) or self.default_theta
+        return updated
+
+    def _backfill_rope_parameters(self) -> None:
+        """Ensure rope parameters remain usable after late attribute mutations.
+
+        Triggered from :meth:`__setattr__` whenever one of the rope-relevant
+        attributes (``rope_parameters``, ``rope_scaling``, ``rope_theta``,
+        ``partial_rotary_factor``, ``layer_types``) changes. Rebuilds and
+        re-stores ``self.rope_parameters`` in HF v5 layout (flat or per
+        layer-type) so downstream rope helpers stay consistent.
+        """
+        rope_theta = getattr(self, "rope_theta", None)
+        partial_rotary_factor = getattr(self, "partial_rotary_factor", None)
+        layer_types = getattr(self, "layer_types", None)
+        unique_layer_types = list(dict.fromkeys(layer_types)) if isinstance(layer_types, (list, tuple)) else None
+        # Only a small set of models encode RoPE parameters per layer-type in HF configs.
+        # Most models (e.g. Gemma2) expect a flat `rope_parameters` mapping. Families opt in by
+        # setting the ``per_layer_rope_parameters`` class attribute to True.
+        declares_per_layer_rope = bool(getattr(type(self), "per_layer_rope_parameters", False))
+        multi_layer_rope = declares_per_layer_rope and bool(unique_layer_types)
+
+        rope_parameters = getattr(self, "rope_parameters", None) if hasattr(self, "rope_parameters") else None
+        if rope_parameters is None and rope_theta is None:
+            return
+
+        if rope_parameters is None:
+            rope_parameters = {}
+
+        if not isinstance(rope_parameters, dict):
+            return
+
+        if rope_parameters:
+            normalized = self._normalize_rope_assignment(rope_parameters)
+        else:
+            normalized = {}
+
+        if not normalized and rope_theta is not None:
+            normalized = {"rope_type": "default", "rope_theta": rope_theta}
+            if partial_rotary_factor is not None:
+                normalized["partial_rotary_factor"] = partial_rotary_factor
+            normalized = self._apply_default_rope_type(normalized)
+
+        if (
+            multi_layer_rope
+            and isinstance(normalized, dict)
+            and "rope_type" in normalized
+            and unique_layer_types is not None
+        ):
+            normalized = {layer_type: dict(normalized) for layer_type in unique_layer_types}
+
+        if (
+            isinstance(normalized, dict)
+            and unique_layer_types is not None
+            and set(normalized.keys()).issubset(set(unique_layer_types))
+        ):
+            for layer_type in unique_layer_types:
+                layer_params = normalized.get(layer_type, {})
+                if not isinstance(layer_params, dict):
+                    layer_params = {}
+                layer_params = self._normalize_rope_parameters_dict(layer_params, rope_theta=rope_theta)
+                if partial_rotary_factor is not None:
+                    layer_params.setdefault("partial_rotary_factor", partial_rotary_factor)
+                normalized[layer_type] = layer_params
+
+        if isinstance(normalized, dict) and "rope_type" in normalized:
+            if rope_theta is not None:
+                normalized.setdefault("rope_theta", rope_theta)
+            if partial_rotary_factor is not None:
+                normalized.setdefault("partial_rotary_factor", partial_rotary_factor)
+
+        super().__setattr__("rope_parameters", normalized)
+
+    def _ensure_hf_compat_fields(self, kwargs: dict[str, tp.Any]) -> None:
+        """Populate fields commonly expected by HF model implementations.
+
+        Reads from :attr:`_hf_compat_defaults` to ensure attributes such as
+        ``pad_token_id`` / ``tie_word_embeddings`` exist on the instance, and
+        keeps the various MoE expert-count aliases (``num_experts``,
+        ``n_routed_experts``, ``num_local_experts``) in sync.
+
+        Args:
+            kwargs: Raw constructor kwargs; values present here override the
+                compatibility defaults.
+        """
+        for key, default_value in self._hf_compat_defaults.items():
+            if key in kwargs:
+                setattr(self, key, kwargs[key])
+            elif not hasattr(self, key):
+                setattr(self, key, default_value)
+
+        # Common alias used by several MoE model implementations.
+        if not hasattr(self, "num_local_experts"):
+            if hasattr(self, "num_experts"):
+                self.num_local_experts = self.num_experts
+            elif hasattr(self, "n_routed_experts"):
+                self.num_local_experts = self.n_routed_experts
+
+    def _ensure_rope_context_fields(self, kwargs: dict[str, tp.Any]) -> None:
+        """Ensure fields needed by HF rope standardization exist before super().__init__.
+
+        HF's ``PretrainedConfig.__init__`` runs early rope normalisation that
+        reads ``max_position_embeddings`` directly. This method populates that
+        attribute from any plausible source (kwargs, freq/mask overrides,
+        rope-scaling metadata) so the upstream init path does not crash.
+
+        Args:
+            kwargs: Raw constructor kwargs inspected for length hints.
+        """
+        if hasattr(self, "max_position_embeddings"):
+            return
+
+        max_position_embeddings = kwargs.get("max_position_embeddings")
+        if max_position_embeddings is None:
+            max_position_embeddings = kwargs.get("original_max_position_embeddings")
+        if max_position_embeddings is None:
+            max_position_embeddings = kwargs.get("freq_max_position_embeddings")
+        if max_position_embeddings is None:
+            max_position_embeddings = kwargs.get("mask_max_position_embeddings")
+
+        # HF converts rope params early inside PretrainedConfig.__init__ and expects
+        # this attribute to exist whenever rope parameters are present.
+        if max_position_embeddings is None:
+            rope_parameters = kwargs.get("rope_parameters", kwargs.get("rope_scaling"))
+            if isinstance(rope_parameters, dict):
+                max_position_embeddings = rope_parameters.get("original_max_position_embeddings")
+
+        self.max_position_embeddings = max_position_embeddings
+
+    def _ensure_rope_parameters(self, kwargs: dict[str, tp.Any]) -> None:
+        """Bridge legacy rope fields to ``rope_parameters`` expected by HF v5.
+
+        Merges any legacy ``rope_scaling`` / ``rope_theta`` /
+        ``partial_rotary_factor`` arguments into a normalized
+        ``rope_parameters`` dict that downstream EasyDeL and HF code can
+        rely on.
+
+        Args:
+            kwargs: Raw constructor kwargs, possibly containing the legacy
+                rope field names.
+        """
+        rope_theta = kwargs.get("rope_theta", getattr(self, "rope_theta", None))
+        partial_rotary_factor = kwargs.get("partial_rotary_factor", getattr(self, "partial_rotary_factor", None))
+        _layer_types = kwargs.get("layer_types", getattr(self, "layer_types", None))
+
+        rope_parameters = kwargs.get("rope_parameters", getattr(self, "rope_parameters", None))
+        if rope_parameters is None and "rope_scaling" in kwargs:
+            rope_parameters = kwargs["rope_scaling"]
+
+        # Some configs assign `self.rope_scaling` before calling super().__init__.
+        if rope_parameters is None and hasattr(self, "rope_parameters"):
+            rope_parameters = getattr(self, "rope_parameters", None)
+
+        has_rope_signal = (
+            rope_parameters is not None
+            or "rope_scaling" in kwargs
+            or "rope_theta" in kwargs
+            or hasattr(self, "rope_theta")
+            or partial_rotary_factor is not None
+        )
+        # A class declaring a non-default rope type (2-D vision towers) always carries ``rope_parameters``: its HF
+        # counterpart reads them unconditionally even when the config sets no rope field.
+        if not has_rope_signal and getattr(type(self), "default_rope_type", "default") == "default":
+            return
+
+        if rope_parameters is None:
+            rope_parameters = {}
+
+        if isinstance(rope_parameters, dict):
+            rope_parameters = self._normalize_rope_assignment(rope_parameters)
+            if rope_theta is not None and "rope_theta" not in rope_parameters and "rope_type" in rope_parameters:
+                rope_parameters["rope_theta"] = rope_theta
+            if partial_rotary_factor is not None and "rope_type" in rope_parameters:
+                rope_parameters.setdefault("partial_rotary_factor", partial_rotary_factor)
+
+        self.rope_parameters = rope_parameters
+
+    def __init__(
+        self,
+        sharding_axis_dims: collections.abc.Sequence[int] = DEFAULT_SHARDING_AXIS_DIMS,
+        sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = None,
+        sharding_axis_names: collections.abc.Sequence[str] = DEFAULT_SHARDING_AXIS_NAMES,
+        attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM,
+        decode_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = None,
+        mla_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_MLA_ATTENTION_MECHANISM,
+        mla_attn_dtype: jnp.dtype | str | None = None,
+        mla_attn_softmax_dtype: jnp.dtype | str | None = None,
+        blocksize_k: int = 512,
+        blocksize_q: int = 512,
+        blocksize_b: int = 1,
+        moe_tiling_size_batch: int = 4,
+        moe_tiling_size_seqlen: int = 128,
+        moe_tiling_size_dim: int = 128,
+        axis_policy: AxisPolicy | dict[str, tp.Any] | None = None,
+        partition_axis: PartitionAxis | None = None,
+        use_sharded_kv_caching: bool = False,
+        use_sharding_constraint: bool = False,
+        backend: EasyDeLBackends | None = None,
+        platform: EasyDeLPlatforms | None = None,
+        easy_method: tp.Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
+        bits: int | None = None,
+        scan_ring_attention: bool = True,
+        scan_attention_layers: bool = False,
+        scan_layers: bool = False,
+        use_fused_mlp: bool = True,
+        collective_matmul_impl: str = "auto",
+        pipeline_stage_regions: bool = False,
+        pipeline_virtual_stages: int = 1,
+        pipeline_stage_layout: tp.Literal["contiguous", "interleaved", "loop"] = "loop",
+        pipeline_terminal_stage_layer_reserve: int = 0,
+        use_scan_mlp: bool = False,
+        scan_mlp_chunk_size: int = 1024,
+        sequence_axis_name: str = "sp",
+        gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
+        gradient_checkpointing_targets: list[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS] | None = None,
+        precompute_masks: bool = True,
+        lmhead_chunksize: int | None = None,
+        kv_cache_quantization_config: QuantizationConfig | None = None,
+        quantization_config: QuantizationConfig | None = None,
+        use_qmm_best_config: bool = False,
+        qmm_platform_override: str | None = None,
+        qmm_tpu_path_override: str | None = None,
+        kv_cache_sharding_sequence_axis_name: str | tuple[str, ...] = "sp",
+        flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = "triton",
+        attn_dtype: jnp.dtype = jnp.bfloat16,
+        kvdtype: jnp.dtype | None = None,
+        attn_softmax_dtype: jnp.dtype = jnp.float32,
+        fcm_max_ratio: float = 0.0,
+        fcm_min_ratio: float = 0.0,
+        moe_method: AVAILABLE_MOE_METHODS = DEFAULT_MOE_METHOD,
+        moe_force_xla_gmm: bool = False,
+        use_expert_tensor_mode: bool = EXPERT_TP_MODE,
+        use_ring_of_experts: bool = RING_EXPERTS,
+        fsdp_is_ep_bound: bool = FSDP_IS_EP_BOUND,
+        sp_is_ep_bound: bool = SP_IS_EP_BOUND,
+        moe_chunk_size: int | None = None,
+        moe_fsdp_shard_expert_weights: bool = False,
+        moe_ep_carries_batch: bool = False,
+        moe_batch_axes_follow_resolver: bool = False,
+        layer_scan_options: dict[str, tp.Any] | None = None,
+        operation_configs: dict[str, BaseOperationConfig] | None = None,
+        **kwargs,
+    ):
+        """Initialize base EasyDeL config fields and honor user overrides.
+
+        This constructor initializes all EasyDeL-specific configuration attributes
+        while preserving any values already set (e.g., by subclass constructors).
+        It uses `getattr` patterns to allow subclasses to set attributes before
+        calling `super().__init__()`.
+
+        See class docstring for detailed parameter descriptions.
+        """
+        for key in _REMOVED_BASE_CONFIG_KEYS:
+            kwargs.pop(key, None)
+        kwargs.pop(_ROPE_FIELDS_SYNCED_ATTR, None)
+
+        self.sharding_axis_dims = getattr(self, "sharding_axis_dims", sharding_axis_dims)
+        self.sharding_dcn_axis_dims = getattr(self, "sharding_dcn_axis_dims", sharding_dcn_axis_dims)
+        self.sharding_axis_names = getattr(self, "sharding_axis_names", sharding_axis_names)
+
+        if backend is not None:
+            resolved_backend: str = backend
+        else:
+            try:
+                resolved_backend = jax.default_backend()
+            except Exception as err:
+                logger.warning(f"Unable to resolve JAX default backend ({err}); falling back to 'cpu' for config init.")
+                resolved_backend = "cpu"
+
+        self.backend = getattr(self, "backend", resolved_backend)
+        self.platform = getattr(
+            self,
+            "platform",
+            platform if platform is not None else ("triton" if resolved_backend == "gpu" else "jax"),
+        )
+
+        self.easy_method = getattr(self, "easy_method", easy_method)
+        self.attn_mechanism = getattr(self, "attn_mechanism", attn_mechanism)
+        self.decode_attn_mechanism = getattr(self, "decode_attn_mechanism", decode_attn_mechanism)
+        self.mla_attn_mechanism = getattr(self, "mla_attn_mechanism", mla_attn_mechanism)
+        self.blocksize_b = getattr(self, "blocksize_b", blocksize_b)
+        self.blocksize_k = getattr(self, "blocksize_k", blocksize_k)
+        self.blocksize_q = getattr(self, "blocksize_q", blocksize_q)
+        self.moe_tiling_size_batch = getattr(self, "moe_tiling_size_batch", moe_tiling_size_batch)
+        self.moe_tiling_size_seqlen = getattr(self, "moe_tiling_size_seqlen", moe_tiling_size_seqlen)
+        self.moe_tiling_size_dim = getattr(self, "moe_tiling_size_dim", moe_tiling_size_dim)
+        resolved_axis_policy = axis_policy if axis_policy is not None else getattr(self, "axis_policy", None)
+        if isinstance(resolved_axis_policy, dict):
+            resolved_axis_policy = AxisPolicy.from_dict(resolved_axis_policy)
+        if resolved_axis_policy is None:
+            resolved_axis_policy = AxisPolicy.from_partition_axis(partition_axis)
+        self.axis_policy = getattr(self, "axis_policy", resolved_axis_policy)
+        if isinstance(self.axis_policy, dict):
+            self.axis_policy = AxisPolicy.from_dict(self.axis_policy)
+        if not isinstance(self.axis_policy, AxisPolicy):
+            self.axis_policy = AxisPolicy.from_partition_axis(self.axis_policy)
+
+        if partition_axis is None:
+            partition_axis = self.axis_policy.to_partition_axis()
+        if isinstance(partition_axis, dict):
+            partition_axis = PartitionAxis(**partition_axis)
+        self.partition_axis = getattr(self, "partition_axis", partition_axis)
+        if isinstance(self.partition_axis, dict):
+            self.partition_axis = PartitionAxis(**self.partition_axis)
+        self.axis_policy = AxisPolicy.from_partition_axis(self.partition_axis)
+        self.bits = getattr(self, "bits", bits)
+        self.scan_attention_layers = getattr(self, "scan_attention_layers", scan_attention_layers)
+        self.scan_ring_attention = getattr(self, "scan_ring_attention", scan_ring_attention)
+        self.scan_layers = getattr(self, "scan_layers", scan_layers)
+        self.use_fused_mlp = getattr(self, "use_fused_mlp", use_fused_mlp)
+        self.collective_matmul_impl = getattr(self, "collective_matmul_impl", collective_matmul_impl)
+        self.pipeline_stage_regions = getattr(self, "pipeline_stage_regions", pipeline_stage_regions)
+        self.pipeline_virtual_stages = getattr(self, "pipeline_virtual_stages", pipeline_virtual_stages)
+        self.pipeline_stage_layout = getattr(self, "pipeline_stage_layout", pipeline_stage_layout)
+        self.pipeline_terminal_stage_layer_reserve = max(
+            0,
+            int(getattr(self, "pipeline_terminal_stage_layer_reserve", pipeline_terminal_stage_layer_reserve) or 0),
+        )
+        if self.pipeline_stage_layout not in {"contiguous", "interleaved", "loop"}:
+            raise ValueError(
+                "`pipeline_stage_layout` must be one of 'contiguous', 'interleaved', or 'loop'. "
+                f"Got {self.pipeline_stage_layout!r}."
+            )
+        self.use_sharded_kv_caching = getattr(self, "use_sharded_kv_caching", use_sharded_kv_caching)
+        self.use_scan_mlp = getattr(self, "use_scan_mlp", use_scan_mlp)
+        self.scan_mlp_chunk_size = getattr(self, "scan_mlp_chunk_size", scan_mlp_chunk_size)
+        self.use_sharding_constraint = getattr(self, "use_sharding_constraint", use_sharding_constraint)
+        self.sequence_axis_name = getattr(self, "sequence_axis_name", sequence_axis_name)
+        self.kv_cache_sharding_sequence_axis_name = getattr(
+            self, "kv_cache_sharding_sequence_axis_name", kv_cache_sharding_sequence_axis_name
+        )
+        self.gradient_checkpointing = getattr(self, "gradient_checkpointing", gradient_checkpointing)
+        self.gradient_checkpointing_targets = getattr(
+            self, "gradient_checkpointing_targets", gradient_checkpointing_targets
+        )
+        self.precompute_masks = getattr(self, "precompute_masks", precompute_masks)
+        self.lmhead_chunksize = getattr(self, "lmhead_chunksize", lmhead_chunksize)
+        if self.lmhead_chunksize is not None:
+            if not isinstance(self.lmhead_chunksize, (int, np.integer)):
+                raise TypeError(
+                    "`lmhead_chunksize` must be an int when provided, got "
+                    f"{type(self.lmhead_chunksize).__name__}: {self.lmhead_chunksize!r}"
+                )
+            self.lmhead_chunksize = int(self.lmhead_chunksize)
+            if self.lmhead_chunksize <= 0:
+                raise ValueError("`lmhead_chunksize` must be positive when provided.")
+
+        self.kv_cache_quantization_config = getattr(self, "kv_cache_quantization_config", kv_cache_quantization_config)
+        self.quantization_config = getattr(self, "quantization_config", quantization_config)
+        self.use_qmm_best_config = getattr(self, "use_qmm_best_config", bool(use_qmm_best_config))
+        self.qmm_platform_override = getattr(self, "qmm_platform_override", qmm_platform_override)
+        self.qmm_tpu_path_override = getattr(self, "qmm_tpu_path_override", qmm_tpu_path_override)
+        self.flash_attention_backward_pass_impl = getattr(
+            self, "flash_attention_backward_pass_impl", flash_attention_backward_pass_impl
+        )
+        self.attn_dtype = getattr(self, "attn_dtype", attn_dtype)
+        self.kvdtype = getattr(self, "kvdtype", kvdtype if kvdtype is not None else self.attn_dtype)
+        self.attn_softmax_dtype = getattr(self, "attn_softmax_dtype", attn_softmax_dtype)
+        self.mla_attn_dtype = getattr(
+            self,
+            "mla_attn_dtype",
+            mla_attn_dtype if mla_attn_dtype is not None else self.attn_dtype,
+        )
+        self.mla_attn_softmax_dtype = getattr(
+            self,
+            "mla_attn_softmax_dtype",
+            mla_attn_softmax_dtype if mla_attn_softmax_dtype is not None else self.attn_softmax_dtype,
+        )
+        self._coerce_runtime_dtype_fields()
+        self.fcm_max_ratio = getattr(self, "fcm_max_ratio", fcm_max_ratio)
+        self.fcm_min_ratio = getattr(self, "fcm_min_ratio", fcm_min_ratio)
+        self.moe_method = getattr(self, "moe_method", moe_method)
+        self.moe_force_xla_gmm = getattr(self, "moe_force_xla_gmm", moe_force_xla_gmm)
+        self.use_ring_of_experts = getattr(self, "use_ring_of_experts", use_ring_of_experts)
+        self.use_expert_tensor_mode = getattr(self, "use_expert_tensor_mode", use_expert_tensor_mode)
+        self.fsdp_is_ep_bound = getattr(self, "fsdp_is_ep_bound", fsdp_is_ep_bound)
+        self.sp_is_ep_bound = getattr(self, "sp_is_ep_bound", sp_is_ep_bound)
+        self.moe_chunk_size = getattr(self, "moe_chunk_size", moe_chunk_size)
+        if self.moe_chunk_size is not None:
+            if not isinstance(self.moe_chunk_size, (int, np.integer)):
+                raise TypeError(
+                    "`moe_chunk_size` must be an int when provided, got "
+                    f"{type(self.moe_chunk_size).__name__}: {self.moe_chunk_size!r}"
+                )
+            self.moe_chunk_size = int(self.moe_chunk_size)
+            if self.moe_chunk_size <= 0:
+                raise ValueError("`moe_chunk_size` must be positive when provided.")
+        self.moe_fsdp_shard_expert_weights = getattr(
+            self, "moe_fsdp_shard_expert_weights", moe_fsdp_shard_expert_weights
+        )
+        self.moe_ep_carries_batch = bool(getattr(self, "moe_ep_carries_batch", moe_ep_carries_batch))
+        self.moe_batch_axes_follow_resolver = bool(
+            getattr(self, "moe_batch_axes_follow_resolver", moe_batch_axes_follow_resolver)
+        )
+        self.layer_scan_options = getattr(self, "layer_scan_options", layer_scan_options)
+        normalize_layer_scan_options(self.layer_scan_options)
+        self._maybe_extend_batch_axis_for_ep()
+        self.operation_configs = (
+            operation_configs if operation_configs is not None else getattr(self, "operation_configs", None)
+        )
+        self.pretraining_tp = 1  # it's for pytorch models.
+
+        # Keep legacy HF-compatible config fields available even when subclasses
+        # don't pass them explicitly to super().__init__.
+        self._ensure_hf_compat_fields(kwargs)
+        self._ensure_rope_context_fields(kwargs)
+        self._sync_rope_fields_from_parameters(kwargs.get("rope_parameters"))
+        self._ensure_rope_parameters(kwargs)
+
+        if self.kv_cache_quantization_config is not None and self.use_sharded_kv_caching:
+            use_sharded_kv_caching = self.use_sharded_kv_caching
+            warnings.warn(
+                f"`kv_cache_quantization_config={self.kv_cache_quantization_config}` and `{use_sharded_kv_caching=}`"
+                " can't be used together at the moment.",
+                stacklevel=1,
+            )
+
+        self._external_rope_config_kwargs = getattr(self, "_external_rope_config_kwargs", {})
+        super().__init__(**kwargs)
+        object.__setattr__(self, _ROPE_FIELDS_SYNCED_ATTR, True)
+
+    @staticmethod
+    def create_mesh(
+        sharding_axis_dims: collections.abc.Sequence[int] = DEFAULT_SHARDING_AXIS_DIMS,
+        sharding_axis_names: collections.abc.Sequence[str] = DEFAULT_SHARDING_AXIS_NAMES,
+        sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = None,
+        process_is_granule: bool = False,
+        should_sort_granules_by_key: bool = True,
+        allow_split_physical_axes: bool = True,
+        backend: str | None = None,
+        eformer_craft_mesh: bool | None = None,
+        axis_types: (
+            collections.abc.Sequence[AxisType | str] | AxisType | str | tp.Literal["auto", "explicit", "manual"] | None
+        ) = None,
+    ):
+        """Creates a JAX device mesh for distributed model execution.
+
+        This function constructs a multi-dimensional mesh of devices that defines how
+        model parameters and computations are distributed across hardware. The mesh axes
+        correspond to different parallelism strategies:
+
+        - pp (pipeline parallel): Split model stages across devices
+        - dp (data parallel): Replicate model across data batches
+        - fsdp (fully sharded data parallel): Shard parameters and optimizer states
+        - ep (expert parallel): Distribute experts in MoE models
+        - tp (tensor parallel): Partition individual weight matrices
+        - sp (sequence parallel): Split sequence dimension across devices
+
+        Args:
+            sharding_axis_dims: Size of each parallelism dimension. Use -1 to automatically
+                fill remaining devices. Default: (1, 1, -1, 1, 1, 1) means all remaining
+                devices go to FSDP after reserving single pp and dp slots.
+            sharding_axis_names: Names for each mesh axis. Must match length of
+                sharding_axis_dims. Default: ("pp", "dp", "fsdp", "ep", "tp", "sp").
+            sharding_dcn_axis_dims: Dimensions for data center network (DCN) sharding.
+                Used for multi-host/multi-slice setups. Default: None.
+            process_is_granule: Deprecated parameter, not used.
+            should_sort_granules_by_key: Whether to sort device granules by key for
+                deterministic ordering. Default: True.
+            allow_split_physical_axes: Whether to allow splitting physical device axes
+                when mapping to logical mesh axes. Default: True.
+            backend: Backend platform to create mesh for ('gpu', 'tpu', etc.).
+                If None or empty string, uses default backend.
+            eformer_craft_mesh: If True, use eformer's mesh creation path
+                (mesh_utils-based, supports multi-slice/multi-process). If False, use
+                JAX's `make_mesh` path when possible. Default: reads
+                `EFORMER_CREATE_MESH` (True).
+            axis_types: Optional axis type(s) for mesh axes. Accepts `AxisType` values
+                or "auto", "explicit", "manual" strings. A single value applies to all
+                axes; a sequence must match `sharding_axis_names`. Default: "auto".
+
+        Returns:
+            A SpectraX mesh configured for distributed execution with the specified
+            parallelism dimensions. The ``pp`` axis is registered as the MPMD
+            pipeline axis when present.
+
+        Example:
+            >>> # Create mesh with DP=4, TP=2 on 8 GPUs
+            >>> mesh = EasyDeLBaseConfig.create_mesh(
+            ...     sharding_axis_dims=(1, 4, 1, 1, 2, 1),
+            ...     sharding_axis_names=("pp", "dp", "fsdp", "ep", "tp", "sp"),
+            ... )
+            >>> # mesh.shape = {'pp': 1, 'dp': 4, 'fsdp': 1, 'ep': 1, 'tp': 2, 'sp': 1}
+        """
+        if backend == "":
+            backend = None
+        if eformer_craft_mesh is None:
+            eformer_craft_mesh = check_bool_flag("EFORMER_CREATE_MESH", True)
+
+        axis_dims = tuple(int(v) for v in sharding_axis_dims)
+        try:
+            available_devices = jax.device_count(backend)
+        except Exception:
+            available_devices = None
+
+        if available_devices == 1:
+            known_product = 1
+            for dim in axis_dims:
+                if dim != -1:
+                    known_product *= dim
+            if known_product > 1:
+                normalized_axis_dims = tuple(-1 if dim == -1 else 1 for dim in axis_dims)
+                logger.warning(
+                    "Single-device runtime detected with multi-device sharding axis_dims=%s; normalizing to %s.",
+                    axis_dims,
+                    normalized_axis_dims,
+                )
+                axis_dims = normalized_axis_dims
+
+        # Create the mesh first WITHOUT an mpmd guess so spectrax resolves
+        # ``-1`` axis dims against the device count.  Then read the resolved
+        # ``pp`` size from ``mesh.shape`` and re-wrap with ``mpmd_axis`` only
+        # when there's a real pipeline (>1 stages).
+        mesh = spx.create_mesh(
+            axis_dims=axis_dims,
+            axis_names=sharding_axis_names,
+            mpmd_axis=None,
+            dcn_mesh_dims=sharding_dcn_axis_dims,
+            should_sort_granules_by_key=should_sort_granules_by_key,
+            allow_split_physical_axes=allow_split_physical_axes,
+            backend=backend,
+            use_jax=not eformer_craft_mesh,
+            axis_types=axis_types,
+        )
+        jax_mesh = getattr(mesh, "jax_mesh", None)
+        if jax_mesh is None:
+            return mesh
+        return spx.SpxMesh(jax_mesh=jax_mesh, mpmd_axis=_compute_mpmd_axis(jax_mesh))
+
+    def _build_mesh(
+        self,
+        axis_types: (
+            collections.abc.Sequence[AxisType | str] | AxisType | str | tp.Literal["auto", "explicit", "manual"] | None
+        ) = None,
+    ) -> spx.SpxMesh:
+        """Create a JAX mesh using the config sharding settings.
+
+        Internal helper that normalizes sharding axis dimensions and names from
+        various input formats (dict or sequence) and delegates to `create_mesh`.
+
+        Args:
+            axis_types: Optional axis type(s) for mesh axes. Accepts `AxisType` values
+                or "auto", "explicit", "manual" strings. A single value applies to all
+                axes; a sequence must match `sharding_axis_names`. Default: None (auto).
+
+        Returns:
+            SpectraX mesh configured with the normalized sharding parameters.
+        """
+        sharding_axis_dims = (
+            [v for _k, v in self.sharding_axis_dims.items()]
+            if isinstance(self.sharding_axis_dims, dict)
+            else self.sharding_axis_dims
+        )
+        sharding_axis_names = (
+            [v for _k, v in self.sharding_axis_names.items()]
+            if isinstance(self.sharding_axis_names, dict)
+            else self.sharding_axis_names
+        )
+        sharding_dcn_axis_dims = (
+            [v for _k, v in self.sharding_dcn_axis_dims.items()]
+            if isinstance(self.sharding_dcn_axis_dims, dict)
+            else self.sharding_dcn_axis_dims
+        )
+        return self.create_mesh(
+            sharding_axis_dims=tuple(sharding_axis_dims) if sharding_axis_dims is not None else sharding_axis_dims,
+            sharding_axis_names=tuple(sharding_axis_names) if sharding_axis_names is not None else sharding_axis_names,
+            sharding_dcn_axis_dims=(
+                tuple(sharding_dcn_axis_dims) if sharding_dcn_axis_dims is not None else sharding_dcn_axis_dims
+            ),
+            should_sort_granules_by_key=(
+                (self.should_sort_granules_by_key if self.should_sort_granules_by_key is not None else True)
+                if hasattr(self, "should_sort_granules_by_key")
+                else True
+            ),
+            allow_split_physical_axes=(
+                (self.allow_split_physical_axes if self.allow_split_physical_axes is not None else True)
+                if hasattr(self, "allow_split_physical_axes")
+                else True
+            ),
+            backend=((self.backend if self.backend is not None else "") if hasattr(self, "backend") else ""),
+            axis_types=axis_types,
+        )
+
+    @property
+    def mesh(self) -> spx.SpxMesh:
+        """Gets or creates the JAX device mesh for this configuration.
+
+        This property lazily constructs a device mesh from the configuration's sharding
+        parameters. Once created, the mesh is cached for reuse. The mesh can be explicitly
+        set using `set_model_mesh()` to override the auto-generated one.
+
+        The mesh is constructed from:
+        - sharding_axis_dims: Device counts per axis
+        - sharding_axis_names: Logical names for each axis
+        - sharding_dcn_axis_dims: Multi-host configuration (if applicable)
+        - Various granule sorting and axis splitting options
+
+        Returns:
+            JAX Mesh object defining the device topology for distributed execution.
+            The mesh axes correspond to parallelism strategies (pp, dp, fsdp, ep, tp, sp).
+
+        Note:
+            If a custom mesh was set via `set_model_mesh()`, that mesh is returned
+            instead of creating a new one.
+
+        Example:
+            >>> config = EasyDeLBaseConfig(
+            ...     sharding_axis_dims=(1, 2, 1, 1, 4, 1),
+            ...     sharding_axis_names=("pp", "dp", "fsdp", "ep", "tp", "sp"),
+            ... )
+            >>> mesh = config.mesh
+            >>> # mesh.shape = {'pp': 1, 'dp': 2, 'fsdp': 1, 'ep': 1, 'tp': 4, 'sp': 1}
+        """
+        if self._hidden_mesh is not None:
+            return self._hidden_mesh
+
+        mesh = self._as_spx_mesh(self._build_mesh())
+        self._propagate_mesh_to_sub_configs(mesh, "_hidden_mesh", "set_model_mesh", auto_created=True)
+        return mesh
+
+    @property
+    def explicit_mesh(self) -> spx.SpxMesh:
+        """Gets or creates the JAX device mesh with explicit axis types.
+
+        This property mirrors `mesh`, but requests AxisType.Explicit for all axes.
+        The mesh can be overridden with `set_explicit_mesh()`.
+        """
+        if self._hidden_explicit_mesh is not None:
+            return self._hidden_explicit_mesh
+
+        mesh = self._as_spx_mesh(self._build_mesh(axis_types="explicit"))
+        self._propagate_mesh_to_sub_configs(mesh, "_hidden_explicit_mesh", "set_explicit_mesh", auto_created=True)
+        return mesh
+
+    @property
+    def manual_mesh(self) -> spx.SpxMesh:
+        """Gets or creates the JAX device mesh with manual axis types.
+
+        This property mirrors `mesh`, but requests AxisType.Manual for all axes.
+        The mesh can be overridden with `set_manual_mesh()`.
+        """
+        if self._hidden_manual_mesh is not None:
+            return self._hidden_manual_mesh
+
+        mesh = self._as_spx_mesh(self._build_mesh(axis_types="manual"))
+        self._propagate_mesh_to_sub_configs(mesh, "_hidden_manual_mesh", "set_manual_mesh", auto_created=True)
+        return mesh
+
+    def _stage_spmd_devices(self) -> np.ndarray:
+        """Return the SPMD device array for the layer's pipeline stage.
+
+        When ``self.mesh`` carries an MPMD axis (pp > 1), the global device
+        grid spans every pipeline stage; expert parallelism lives *inside*
+        a stage, so we slice down to the owning stage and let
+        ``_mesh_shape_ep`` lay (dp, ep, tp) over its SPMD sub-mesh.
+
+        ``BaseMoeModule.__init__`` evaluates ``config.auto_expert_mesh``
+        and ``config.expert_mesh`` while the calling model is in a
+        ``spx.assign_stage(total=num_layers, current=layer_idx)`` block
+        (see e.g. ``modeling_qwen3_moe.py``). ``current_stage_assignment``
+        therefore returns this layer's ``(current, total)`` hint, which
+        ``resolve_stage_rank`` projects onto the live ``mpmd_dim``. Each
+        layer caches its own stage's expert mesh, so per-layer
+        ``shard_map`` calls see the devices their stage actually runs on.
+
+        Outside an ``assign_stage`` scope there's no per-layer hint, and
+        stage 0 is the only sensible fallback.
+        """
+        parent: spx.SpxMesh = self.mesh
+        if not parent.is_mpmd:
+            return parent.devices.flatten()
+
+        mpmd = parent.mpmd_mesh
+        assignment = current_stage_assignment()
+        stage_rank_resolver = getattr(self.runtime_sharding_resolver, "stage_rank_resolver", None)
+        owner = (
+            stage_rank_resolver(assignment, mpmd.mpmd_dim)
+            if stage_rank_resolver is not None
+            else resolve_stage_rank(assignment, mpmd.mpmd_dim)
+        )
+        if owner is None:
+            owner = 0
+        return mpmd.submesh(owner).devices.flatten()
+
+    def _build_expert_mesh(self, axis_types: tuple[jax.sharding.AxisType, ...]) -> spx.SpxMesh:
+        """Construct the ``(dp, ep, tp)`` expert mesh on the current stage's sub-mesh.
+
+        Args:
+            axis_types: 3-tuple of :class:`jax.sharding.AxisType` values
+                (one per axis: dp, ep, tp) describing the desired axis
+                semantics (Auto / Explicit / Manual).
+
+        Returns:
+            spx.SpxMesh: An SpectraX mesh sized for the current pipeline
+            stage's SPMD sub-mesh with experts folded according to
+            ``fsdp_is_ep_bound`` / ``sp_is_ep_bound``.
+        """
+        (odpsize, epsize, otpsize), (dpname, epname, tpname) = _mesh_shape_ep(
+            self.mesh,
+            self.runtime_sharding_resolver,
+            self.fsdp_is_ep_bound,
+            self.sp_is_ep_bound,
+        )
+        stage_devices = self._stage_spmd_devices()
+        return spx.SpxMesh(
+            jax_mesh=jax.sharding.Mesh(
+                stage_devices.reshape(odpsize, epsize, otpsize),
+                axis_names=(dpname, epname, tpname),
+                axis_types=axis_types,
+            ),
+            mpmd_axis=None,
+        )
+
+    @property
+    def expert_mesh(self) -> spx.SpxMesh:
+        """Get the mesh configuration for expert parallelism.
+
+        Creates a mesh with expert-parallel axes folded according to the
+        `fsdp_is_ep_bound` and `sp_is_ep_bound` configuration flags. This mesh
+        is used for MoE (Mixture of Experts) models to distribute experts
+        across devices with explicit axis types. When the parent mesh carries
+        an MPMD pipeline axis, the expert mesh is built from a single stage's
+        sub-mesh so (dp, ep, tp) lay over SPMD devices only.
+
+        Returns:
+            spx.SpxMesh: A mesh with explicit axis types configured for
+                expert parallelism with (dp, ep, tp) axis ordering.
+        """
+        return self._build_expert_mesh(
+            axis_types=(
+                jax.sharding.AxisType.Explicit,
+                jax.sharding.AxisType.Explicit,
+                jax.sharding.AxisType.Explicit,
+            ),
+        )
+
+    @property
+    def expert_abstract_mesh(self) -> jax.sharding.AbstractMesh:
+        """Get the abstract mesh descriptor for expert parallelism.
+
+        Returns an abstract mesh that matches the `expert_mesh` axis sizes
+        and names. Abstract meshes are lightweight representations used for
+        sharding specification without device assignment.
+
+        Returns:
+            jax.sharding.AbstractMesh: An abstract mesh descriptor with the same
+                axis configuration as `expert_mesh`.
+        """
+        (odpsize, epsize, otpsize), (dpname, epname, tpname) = _mesh_shape_ep(
+            self.mesh,
+            self.runtime_sharding_resolver,
+            self.fsdp_is_ep_bound,
+            self.sp_is_ep_bound,
+        )
+        return self.expert_mesh.abstract_mesh.update(
+            axis_sizes=(odpsize, epsize, otpsize),
+            axis_names=(dpname, epname, tpname),
+        )
+
+    @property
+    def auto_expert_mesh(self) -> spx.SpxMesh:
+        """Get the mesh for expert parallelism with automatic axis types.
+
+        Similar to `expert_mesh`, but uses `jax.sharding.AxisType.Auto` for
+        all axes, allowing JAX to automatically determine the optimal sharding
+        strategy based on the computation graph.
+
+        Returns:
+            spx.SpxMesh: A mesh with auto axis types configured for
+                expert parallelism with (dp, ep, tp) axis ordering.
+        """
+        return self._build_expert_mesh(
+            axis_types=(
+                jax.sharding.AxisType.Auto,
+                jax.sharding.AxisType.Auto,
+                jax.sharding.AxisType.Auto,
+            ),
+        )
+
+    @staticmethod
+    def _as_spx_mesh(mesh: MeshLike) -> spx.SpxMesh:
+        """Coerce any mesh-like value to an :class:`spx.SpxMesh`.
+
+        If *mesh* is already an :class:`spx.SpxMesh`, it is returned as-is.
+        Otherwise it is converted to a ``jax.sharding.Mesh`` via
+        :func:`spx.to_jax_mesh` and wrapped in an ``SpxMesh`` whose
+        ``mpmd_axis`` is computed by :func:`_compute_mpmd_axis`.
+
+        Args:
+            mesh: A ``jax.sharding.Mesh``, ``spx.SpxMesh``, or any value
+                accepted by :func:`spx.to_jax_mesh`.
+
+        Returns:
+            spx.SpxMesh: A SpectraX mesh with MPMD axis info populated.
+        """
+        if isinstance(mesh, spx.SpxMesh):
+            return mesh
+        jax_mesh = spx.to_jax_mesh(mesh)
+        return spx.SpxMesh(jax_mesh=jax_mesh, mpmd_axis=_compute_mpmd_axis(jax_mesh))
+
+    def _propagate_mesh_to_sub_configs(
+        self,
+        mesh: MeshLike,
+        attr_name_on_self: str,
+        setter_method_name: str,
+        *,
+        auto_created: bool = False,
+        _visited: set[int] | None = None,
+    ):
+        """Propagate a mesh to ``self`` and all declared sub-configurations.
+
+        Cascades a mesh assignment through any ``sub_configs`` (e.g. text /
+        vision sub-configs on multimodal models) so all parts of a composite
+        config agree on the active device topology.
+
+        Args:
+            mesh: JAX device mesh (or compatible value) to propagate.
+            attr_name_on_self: Hidden cache attribute to update on this
+                config and its sub-configs (e.g. ``"_hidden_mesh"``).
+            setter_method_name: Public setter to invoke on sub-configs when
+                present (e.g. ``"set_model_mesh"``).
+            auto_created: Whether topology overrides may invalidate this cache.
+                False for explicit user assignments, True for lazy construction.
+            _visited: Shared identity set to guard cyclic config graphs.
+        """
+        if _visited is None:
+            _visited = set()
+        if id(self) in _visited:
+            return
+        _visited.add(id(self))
+        spx_mesh = self._as_spx_mesh(mesh)
+        setattr(self, attr_name_on_self, spx_mesh)
+        setattr(self, f"{attr_name_on_self}_auto_created", auto_created)
+
+        sub_configs = getattr(self, "sub_configs", None)
+        if not isinstance(sub_configs, dict):
+            return
+
+        for cfg_key in sub_configs.keys():
+            sub_cfg = getattr(self, cfg_key, None)
+            if sub_cfg is None:
+                continue
+            try:
+                if isinstance(sub_cfg, EasyDeLBaseConfig):
+                    sub_cfg._propagate_mesh_to_sub_configs(
+                        spx_mesh,
+                        attr_name_on_self,
+                        setter_method_name,
+                        auto_created=auto_created,
+                        _visited=_visited,
+                    )
+                elif hasattr(sub_cfg, setter_method_name):
+                    getattr(sub_cfg, setter_method_name)(spx_mesh)
+                else:
+                    setattr(sub_cfg, attr_name_on_self, spx_mesh)
+            except (AttributeError, TypeError):
+                try:
+                    setattr(sub_cfg, attr_name_on_self, spx_mesh)
+                except (AttributeError, TypeError):
+                    pass
+
+    def set_model_mesh(self, mesh: MeshLike):
+        """Sets a custom mesh for the model, overriding the auto-generated one.
+
+        Args:
+            mesh: JAX device mesh to use for this model.
+        """
+        self._propagate_mesh_to_sub_configs(mesh, "_hidden_mesh", "set_model_mesh")
+
+    def set_explicit_mesh(self, mesh: MeshLike):
+        """Sets a custom explicit-axis mesh for the model.
+
+        Args:
+            mesh: JAX device mesh to use for this model.
+        """
+        self._propagate_mesh_to_sub_configs(mesh, "_hidden_explicit_mesh", "set_explicit_mesh")
+
+    def set_manual_mesh(self, mesh: MeshLike):
+        """Sets a custom manual-axis mesh for the model.
+
+        Args:
+            mesh: JAX device mesh to use for this model.
+        """
+        self._propagate_mesh_to_sub_configs(mesh, "_hidden_manual_mesh", "set_manual_mesh")
+
+    def get_mesh(self) -> spx.SpxMesh:
+        """Return the device mesh for this configuration.
+
+        Equivalent to the :attr:`mesh` property; kept as a method for callers that prefer an explicit getter.
+
+        Returns:
+            spx.SpxMesh: The (lazily created or explicitly set) device mesh.
+        """
+        return self.mesh
+
+    def jax_mesh(self):
+        """Deprecated method for getting the JAX mesh.
+
+        Deprecated:
+            Use `mesh` property or `get_mesh()` method instead.
+
+        Returns:
+            JAX device mesh.
+        """
+        warnings.warn("`jax_mesh` is deprecated use `get_mesh` or `mesh`", DeprecationWarning, stacklevel=2)
+        return self.get_mesh()
+
+    @classmethod
+    def _set_token_in_kwargs(cls, kwargs: dict[str, tp.Any], token: str | bool | None = None) -> None:
+        """Normalize auth token arguments for Hugging Face Hub utilities.
+
+        Args:
+            kwargs: Keyword-argument dictionary that will be forwarded to a
+                Hugging Face Hub call; mutated in place to hold a canonical
+                ``token`` key.
+            token: Optional explicit token override. When ``None``, an
+                existing legacy ``use_auth_token`` entry is promoted to
+                ``token`` for downstream HF compatibility.
+        """
+        if token is not None:
+            kwargs["token"] = token
+            return
+        if "token" not in kwargs and "use_auth_token" in kwargs:
+            kwargs["token"] = kwargs.pop("use_auth_token")
+
+    def get_axis_dims(self) -> collections.abc.Sequence[int]:
+        """Returns the device mesh axis dimensions for parallelism.
+
+        Returns:
+            Sequence of integers specifying the size of each parallelism axis.
+            Typically (dp_size, fsdp_size, ep_size, tp_size, sp_size).
+            Value of -1 means "use all remaining devices for this axis".
+
+        Example:
+            >>> config.sharding_axis_dims = (2, 4, 1, 1, 1)
+            >>> dims = config.get_axis_dims()
+            >>> # dims = (2, 4, 1, 1, 1) - 2 data parallel, 4 FSDP, rest replicated
+        """
+        return self.sharding_axis_dims
+
+    def get_axis_names(self) -> collections.abc.Sequence[str]:
+        """Returns the logical names for each device mesh axis.
+
+        Returns:
+            Sequence of strings naming each parallelism axis.
+            Typically ("pp", "dp", "fsdp", "ep", "tp", "sp") for pipeline,
+            data parallel, fully sharded data parallel, expert parallel,
+            tensor parallel, and sequence parallel respectively.
+
+        Example:
+            >>> names = config.get_axis_names()
+            >>> # names = ('pp', 'dp', 'fsdp', 'ep', 'tp', 'sp')
+        """
+        return self.sharding_axis_names
+
+    def get_backend(self) -> str:
+        """Returns the JAX backend platform being used.
+
+        Retrieves the configured backend (e.g., 'gpu', 'tpu', 'cpu'), or falls back
+        to the default JAX backend if not explicitly set.
+
+        Returns:
+            Backend platform string. Common values: 'gpu', 'tpu', 'cpu'.
+
+        Example:
+            >>> config = EasyDeLBaseConfig(backend='gpu')
+            >>> config.get_backend()
+            'gpu'
+            >>>
+            >>> # With no backend set, returns JAX default
+            >>> config = EasyDeLBaseConfig(backend='')
+            >>> config.get_backend()  # Might return 'gpu', 'tpu', etc.
+        """
+        return self.backend if self.backend else jax.extend.backend.get_backend().platform
+
+    def read_basics_from_config(self, config: EasyDeLBaseConfig):
+        """Reads and applies basic configuration attributes from another config instance.
+
+        Copies EasyDeL-specific attributes like sharding, attention mechanism,
+        quantization settings, etc. from the provided config.
+
+        Args:
+            config: Source configuration to read attributes from.
+        """
+        base_reads = [
+            "sharding_axis_dims",
+            "sharding_dcn_axis_dims",
+            "sharding_axis_names",
+            "attn_mechanism",
+            "decode_attn_mechanism",
+            "mla_attn_mechanism",
+            "mla_attn_dtype",
+            "mla_attn_softmax_dtype",
+            "blocksize_k",
+            "blocksize_q",
+            "blocksize_b",
+            "moe_tiling_size_batch",
+            "moe_tiling_size_seqlen",
+            "moe_tiling_size_dim",
+            "axis_policy",
+            "partition_axis",
+            "use_sharded_kv_caching",
+            "backend",
+            "platform",
+            "easy_method",
+            "bits",
+            "scan_ring_attention",
+            "scan_attention_layers",
+            "scan_layers",
+            "pipeline_stage_regions",
+            "pipeline_virtual_stages",
+            "pipeline_stage_layout",
+            "pipeline_terminal_stage_layer_reserve",
+            "use_sharding_constraint",
+            "use_scan_mlp",
+            "scan_mlp_chunk_size",
+            "sequence_axis_name",
+            "gradient_checkpointing",
+            "gradient_checkpointing_targets",
+            "precompute_masks",
+            "lmhead_chunksize",
+            "kv_cache_quantization_config",
+            "quantization_config",
+            "use_qmm_best_config",
+            "qmm_platform_override",
+            "qmm_tpu_path_override",
+            "kv_cache_sharding_sequence_axis_name",
+            "flash_attention_backward_pass_impl",
+            "attn_dtype",
+            "kvdtype",
+            "attn_softmax_dtype",
+            "moe_method",
+            "moe_force_xla_gmm",
+            "use_ring_of_experts",
+            "use_expert_tensor_mode",
+            "fsdp_is_ep_bound",
+            "sp_is_ep_bound",
+            "moe_chunk_size",
+            "moe_fsdp_shard_expert_weights",
+            "moe_ep_carries_batch",
+            "moe_batch_axes_follow_resolver",
+            "layer_scan_options",
+            "use_fused_mlp",
+            "collective_matmul_impl",
+            "fcm_max_ratio",
+            "fcm_min_ratio",
+            "operation_configs",
+        ]
+        for key in base_reads:
+            if hasattr(config, key):
+                setattr(self, key, getattr(config, key))
+        self._coerce_runtime_dtype_fields()
+
+    def _static_mesh_axis_size(self, axis_name: str) -> int | None:
+        """Return a mesh axis size known without building a mesh.
+
+        Prefers an already attached mesh, otherwise reads ``sharding_axis_dims`` /
+        ``sharding_axis_names``. An auto-filled (``-1``) or missing axis yields ``None``.
+
+        Args:
+            axis_name: Physical mesh axis name (for example ``"sp"``).
+
+        Returns:
+            int | None: The axis size, or ``None`` when it cannot be determined statically.
+        """
+        mesh = getattr(self, "_hidden_mesh", None)
+        if mesh is not None:
+            shape = getattr(mesh, "shape", None)
+            try:
+                sizes = dict(shape) if shape is not None else {}
+            except (TypeError, ValueError):
+                sizes = {}
+            if axis_name in sizes:
+                return int(sizes[axis_name])
+        dims = getattr(self, "sharding_axis_dims", None)
+        names = getattr(self, "sharding_axis_names", None)
+        if isinstance(dims, dict):
+            dims = list(dims.values())
+        if isinstance(names, dict):
+            names = list(names.values())
+        if dims is None or names is None:
+            return None
+        names = tuple(names)
+        dims = tuple(dims)
+        if axis_name not in names or len(names) != len(dims):
+            return None
+        size = int(dims[names.index(axis_name)])
+        return None if size < 1 else size
+
+    def _maybe_extend_batch_axis_for_ep(self) -> None:
+        """Extend the activation batch axis with the expert axis for ep-carried batch.
+
+        When ``moe_ep_carries_batch`` is enabled and the layout passes
+        :func:`easydel.layers.moe._layout_planner.ep_carries_batch_inactive_reason`
+        (fsdp not folded into the expert axis, sp folded only when sp has size
+        1, no ring/expert-tensor mode), the token batch of *every*
+        activation — not just the fused-MoE ``shard_map`` — should shard over
+        the expert axis: non-MoE layers then hold ``B/(dp*fsdp*ep)`` tokens
+        per core and the reshard at the MoE boundary disappears. Every
+        activation resolves the logical ``BATCH`` axis through
+        ``PartitionAxis.batch_axis``, so appending the expert axis here
+        extends the layout model-wide. ``decode_batch_axis`` is deliberately
+        left untouched: autoregressive decode batches are small and keep the
+        historical ep-replicated placement.
+
+        Idempotent — a batch axis that already names the expert axis is kept
+        as is, so calling this from both ``__init__`` and
+        ``add_basic_configurations`` is safe. When the batch does not divide
+        by ``dp*fsdp*ep`` at runtime, spec sanitization drops the trailing
+        axis and activations quietly fall back to ``(fsdp, dp)`` batch
+        sharding (the fused MoE then reshards at its boundary).
+        """
+        if not getattr(self, "moe_ep_carries_batch", False):
+            return
+        # Lazy import: easydel.layers.moe depends on this config.
+        from easydel.layers.moe._layout_planner import ep_carries_batch_inactive_reason
+
+        partition_axis = self.partition_axis
+        ep_name = getattr(partition_axis, "expert_parallel_axis", "ep") if partition_axis is not None else "ep"
+        sp_name = getattr(partition_axis, "sequence_parallel_axis", "sp") if partition_axis is not None else "sp"
+        ep_size = self._static_mesh_axis_size(ep_name)
+        sp_size = self._static_mesh_axis_size(sp_name)
+        reason = ep_carries_batch_inactive_reason(
+            # Unknown sizes keep the permissive ep assumption and the conservative sp assumption.
+            ep=2 if ep_size is None else ep_size,
+            sp=2 if sp_size is None else sp_size,
+            fsdp_is_ep_bound=bool(getattr(self, "fsdp_is_ep_bound", True)),
+            sp_is_ep_bound=bool(getattr(self, "sp_is_ep_bound", True)),
+            use_ring_of_experts=bool(getattr(self, "use_ring_of_experts", False)),
+            use_expert_tensor_mode=bool(getattr(self, "use_expert_tensor_mode", False)),
+        )
+        if reason is not None:
+            logger.warn_once(
+                f"moe_ep_carries_batch=True is inactive: {reason}; the activation batch axis keeps its "
+                "(fsdp, dp) layout."
+            )
+            return
+        if not isinstance(partition_axis, PartitionAxis):
+            return
+        ep_axis = getattr(partition_axis, "expert_parallel_axis", None)
+        batch_axis = getattr(partition_axis, "batch_axis", None)
+        if ep_axis is None or batch_axis is None:
+            return
+        batch_tuple = (batch_axis,) if isinstance(batch_axis, str) else tuple(batch_axis)
+        ep_tuple = (ep_axis,) if isinstance(ep_axis, str) else tuple(ep_axis)
+        if any(name in batch_tuple for name in ep_tuple):
+            return
+        self.partition_axis = dataclasses.replace(partition_axis, batch_axis=(*batch_tuple, *ep_tuple))
+        self.axis_policy = AxisPolicy.from_partition_axis(self.partition_axis)
+
+    def add_basic_configurations(
+        self,
+        sharding_axis_dims: collections.abc.Sequence[int] = NOT_GIVEN,
+        sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = NOT_GIVEN,
+        sharding_axis_names: collections.abc.Sequence[str] = NOT_GIVEN,
+        attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = NOT_GIVEN,
+        decode_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = NOT_GIVEN,
+        mla_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = NOT_GIVEN,
+        mla_attn_dtype: jnp.dtype | str | None = NOT_GIVEN,
+        mla_attn_softmax_dtype: jnp.dtype | str | None = NOT_GIVEN,
+        blocksize_k: int = NOT_GIVEN,
+        blocksize_q: int = NOT_GIVEN,
+        blocksize_b: int = NOT_GIVEN,
+        moe_tiling_size_batch: int = NOT_GIVEN,
+        moe_tiling_size_seqlen: int = NOT_GIVEN,
+        moe_tiling_size_dim: int = NOT_GIVEN,
+        axis_policy: AxisPolicy | dict[str, tp.Any] = NOT_GIVEN,
+        partition_axis: PartitionAxis = NOT_GIVEN,
+        use_sharded_kv_caching: bool = NOT_GIVEN,
+        backend: EasyDeLBackends | None = NOT_GIVEN,
+        platform: EasyDeLPlatforms | None = NOT_GIVEN,
+        easy_method: tp.Literal["train", "serve", "convert"] = NOT_GIVEN,
+        bits: int | None = NOT_GIVEN,
+        scan_ring_attention: bool = NOT_GIVEN,
+        scan_attention_layers: bool = NOT_GIVEN,
+        scan_layers: bool = NOT_GIVEN,
+        use_fused_mlp: bool = NOT_GIVEN,
+        collective_matmul_impl: str = NOT_GIVEN,
+        pipeline_stage_regions: bool = NOT_GIVEN,
+        pipeline_virtual_stages: int = NOT_GIVEN,
+        pipeline_stage_layout: tp.Literal["contiguous", "interleaved", "loop"] = NOT_GIVEN,
+        pipeline_terminal_stage_layer_reserve: int = NOT_GIVEN,
+        use_sharding_constraint: bool = NOT_GIVEN,
+        use_scan_mlp: bool = NOT_GIVEN,
+        scan_mlp_chunk_size: int = NOT_GIVEN,
+        sequence_axis_name: str = NOT_GIVEN,
+        gradient_checkpointing: EasyDeLGradientCheckPointers = NOT_GIVEN,
+        gradient_checkpointing_targets: list[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS] | None = NOT_GIVEN,
+        precompute_masks: bool = NOT_GIVEN,
+        kv_cache_quantization_config: QuantizationConfig | None = NOT_GIVEN,
+        quantization_config: QuantizationConfig | None = NOT_GIVEN,
+        use_qmm_best_config: bool = NOT_GIVEN,
+        qmm_platform_override: str | None = NOT_GIVEN,
+        qmm_tpu_path_override: str | None = NOT_GIVEN,
+        kv_cache_sharding_sequence_axis_name: str | tuple[str, ...] = NOT_GIVEN,
+        flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = NOT_GIVEN,
+        attn_dtype: jnp.dtype = NOT_GIVEN,
+        kvdtype: jnp.dtype | None = NOT_GIVEN,
+        attn_softmax_dtype: jnp.dtype = NOT_GIVEN,
+        moe_method: AVAILABLE_MOE_METHODS = NOT_GIVEN,
+        moe_force_xla_gmm: bool = NOT_GIVEN,
+        use_ring_of_experts: bool = NOT_GIVEN,
+        use_expert_tensor_mode: bool = NOT_GIVEN,
+        fsdp_is_ep_bound: bool = NOT_GIVEN,
+        sp_is_ep_bound: bool = NOT_GIVEN,
+        moe_chunk_size: int | None = NOT_GIVEN,
+        moe_fsdp_shard_expert_weights: bool = NOT_GIVEN,
+        moe_ep_carries_batch: bool = NOT_GIVEN,
+        moe_batch_axes_follow_resolver: bool = NOT_GIVEN,
+        layer_scan_options: dict[str, tp.Any] | None = NOT_GIVEN,
+        **kwargs,
+    ):
+        """
+        Populate baseline EasyDeL attributes on an existing config instance.
+
+        Each argument mirrors the constructor but is optional: passing `NOT_GIVEN`
+        leaves any existing attribute untouched, while a provided value overwrites
+        the current setting. If an attribute is missing entirely, a sensible default
+        is applied via `set_attrs_smartly`. This helper is used by derived configs
+        (and their `sub_configs`) to keep sharding/attention/quantization knobs in
+        sync without re-implementing initialization logic.
+
+        Args:
+            sharding_axis_dims: Fallback mesh sizes for ``(pp, dp, fsdp, ep, tp, sp)``,
+                defaulting to ``(1, 1, -1, 1, 1, 1)``.
+            sharding_dcn_axis_dims: Optional DCN mesh sizes (default ``None``).
+            sharding_axis_names: Mesh axis labels, default ``("pp", "dp", "fsdp", "ep", "tp", "sp")``.
+            attn_mechanism: Attention mechanism to use (default ``"vanilla"``).
+            decode_attn_mechanism: Optional decode-time attention mechanism.
+            mla_attn_mechanism: MLA-layer-specific attention mechanism override
+                (default ``"auto"``).
+            mla_attn_dtype: Optional MLA-specific attention activation dtype
+                (defaults to ``attn_dtype``).
+            mla_attn_softmax_dtype: Optional MLA-specific softmax dtype
+                (defaults to ``attn_softmax_dtype``).
+            blocksize_k: Attention key block size, default ``512`` when unset.
+            blocksize_q: Attention query block size, default ``512`` when unset.
+            blocksize_b: Batch/block size used by attention kernels (default ``1``).
+            moe_tiling_size_batch: Batch tiling for MoE kernels (default ``4``).
+            moe_tiling_size_seqlen: Sequence tiling for MoE kernels (default ``128``).
+            moe_tiling_size_dim: Hidden-dim tiling for MoE kernels (default ``128``).
+            partition_axis: PartitionAxis describing logical mesh layout (default ``PartitionAxis()``).
+            use_sharded_kv_caching: Whether to shard KV caches (default ``False``).
+            backend: Backend string, default ``None`` (falls back to JAX default).
+            platform: Platform hint, default ``"jax"``.
+            easy_method: EasyDeL execution mode, default ``EasyMethod.TRAIN``.
+            bits: Optional quantization bit width, default ``None``.
+            scan_ring_attention: Enable scan for ring attention (default ``True``).
+            scan_attention_layers: Enable scan for attention blocks (default ``True``).
+            scan_layers: Enable scan for repeated model layers when supported.
+            pipeline_stage_regions: Emit SpectraX ``sxstage_region`` markers around EasyDeL module calls.
+            pipeline_virtual_stages: Logical virtual pipeline stages per physical pipeline rank.
+            pipeline_stage_layout: Virtual-stage to physical PP-rank layout.
+            pipeline_terminal_stage_layer_reserve: Extra logical layer slots reserved for terminal-stage norm/head/loss.
+            use_sharding_constraint: Insert sharding constraints (default ``False``).
+            use_scan_mlp: Enable scan for MLPs (default ``False``).
+            scan_mlp_chunk_size: Chunk size for scanned MLPs (default ``1024``).
+            sequence_axis_name: Label for the sequence/attention axis (default ``"sp"``).
+            gradient_checkpointing: Gradient checkpointing policy (default ``EasyDeLGradientCheckPointers.NONE``).
+            gradient_checkpointing_targets: Optional list of checkpoint targets to include/exclude (default ``None``).
+            precompute_masks: Whether to precompute and cache masks (default ``True``).
+            kv_cache_quantization_config: KV cache quantization config (default ``None`` = no quantization).
+            quantization_config: Linear-layer quantization config (default ``None`` = no quantization).
+            use_qmm_best_config: Whether quantized linear kernels request
+                ejkernel tuned block configs by default (default ``False``).
+            qmm_platform_override: Optional explicit quantized-matmul platform override.
+            qmm_tpu_path_override: Optional explicit quantized-matmul TPU path override.
+            kv_cache_sharding_sequence_axis_name: Axis name(s) for KV cache sharding (default ``"sp"``).
+            flash_attention_backward_pass_impl: Backward kernel for flash attention (default ``"triton"``).
+            attn_dtype: Attention activation dtype (default ``jnp.float32``).
+            kvdtype: KV cache dtype (defaults to `attn_dtype` when unset).
+            attn_softmax_dtype: Softmax computation dtype (default ``jnp.float32``).
+            moe_method: MoE implementation to use (default ``DEFAULT_MOE_METHOD``).
+            moe_force_xla_gmm: Force XLA GMM kernels for MoE (default ``False``).
+            use_ring_of_experts: Dispatch experts with a ring topology (default ``RING_EXPERTS``).
+            use_expert_tensor_mode: Treat experts as a tensor-parallel axis (default ``EXPERT_TP_MODE``).
+            fsdp_is_ep_bound: Fold FSDP into the expert axis when building expert meshes.
+            sp_is_ep_bound: Fold sequence-parallel into the expert axis when building expert meshes.
+            moe_chunk_size: Token chunk size for chunk-scanned fused-MoE dispatch (default ``None`` = disabled).
+            moe_fsdp_shard_expert_weights: Shard MoE expert weights over FSDP at rest and gather at use
+                (default ``False``).
+            moe_ep_carries_batch: Shard the token batch over the expert axis and dispatch tokens to
+                their expert-owning shard (MaxText-style "ep carries batch"; default ``False``).
+            moe_batch_axes_follow_resolver: Order the fused-MoE batch axes like the runtime resolver's
+                hidden-state spec (default ``False``).
+            layer_scan_options: Per-scope ``ModuleList.scan`` lowering options (default ``None``).
+            **kwargs: Extra attributes to attach to this config and any defined ``sub_configs``.
+        """
+
+        set_attrs_smartly(self, "sharding_axis_dims", DEFAULT_SHARDING_AXIS_DIMS, sharding_axis_dims)
+        set_attrs_smartly(self, "sharding_dcn_axis_dims", None, sharding_dcn_axis_dims)
+        set_attrs_smartly(self, "sharding_axis_names", DEFAULT_SHARDING_AXIS_NAMES, sharding_axis_names)
+        set_attrs_smartly(self, "blocksize_q", 512, blocksize_q)
+        set_attrs_smartly(self, "blocksize_k", 512, blocksize_k)
+        set_attrs_smartly(self, "blocksize_b", 1, blocksize_b)
+        set_attrs_smartly(self, "moe_tiling_size_batch", 4, moe_tiling_size_batch)
+        set_attrs_smartly(self, "moe_tiling_size_seqlen", 128, moe_tiling_size_seqlen)
+        set_attrs_smartly(self, "moe_tiling_size_dim", 128, moe_tiling_size_dim)
+        if axis_policy is NOT_GIVEN:
+            set_attrs_smartly(self, "axis_policy", AxisPolicy(), NOT_GIVEN)
+        else:
+            normalized_axis_policy = AxisPolicy.from_partition_axis(axis_policy)
+            set_attrs_smartly(self, "axis_policy", AxisPolicy(), normalized_axis_policy)
+        if partition_axis is NOT_GIVEN:
+            partition_axis = self.axis_policy.to_partition_axis()
+        set_attrs_smartly(self, "partition_axis", self.axis_policy.to_partition_axis(), partition_axis)
+        if isinstance(self.partition_axis, dict):
+            self.partition_axis = PartitionAxis(**self.partition_axis)
+        self.axis_policy = AxisPolicy.from_partition_axis(self.partition_axis)
+        set_attrs_smartly(self, "use_sharding_constraint", False, use_sharding_constraint)
+
+        set_attrs_smartly(self, "backend", None, backend)
+        set_attrs_smartly(self, "platform", "jax", platform)
+        set_attrs_smartly(self, "use_sharded_kv_caching", False, use_sharded_kv_caching)
+        set_attrs_smartly(self, "attn_mechanism", "vanilla", attn_mechanism)
+        set_attrs_smartly(self, "mla_attn_mechanism", "auto", mla_attn_mechanism)
+        set_attrs_smartly(self, "decode_attn_mechanism", None, decode_attn_mechanism)
+
+        set_attrs_smartly(self, "easy_method", EasyMethod.TRAIN, easy_method)
+        set_attrs_smartly(self, "bits", None, bits)
+        set_attrs_smartly(self, "scan_attention_layers", False, scan_attention_layers)
+        set_attrs_smartly(self, "scan_ring_attention", True, scan_ring_attention)
+        set_attrs_smartly(self, "scan_layers", False, scan_layers)
+        set_attrs_smartly(self, "use_fused_mlp", True, use_fused_mlp)
+        set_attrs_smartly(self, "collective_matmul_impl", "auto", collective_matmul_impl)
+        set_attrs_smartly(self, "pipeline_stage_regions", False, pipeline_stage_regions)
+        set_attrs_smartly(self, "pipeline_virtual_stages", 1, pipeline_virtual_stages)
+        set_attrs_smartly(self, "pipeline_stage_layout", "loop", pipeline_stage_layout)
+        set_attrs_smartly(
+            self,
+            "pipeline_terminal_stage_layer_reserve",
+            0,
+            pipeline_terminal_stage_layer_reserve,
+        )
+        self.pipeline_terminal_stage_layer_reserve = max(0, int(self.pipeline_terminal_stage_layer_reserve or 0))
+        if self.pipeline_stage_layout not in {"contiguous", "interleaved", "loop"}:
+            raise ValueError(
+                "`pipeline_stage_layout` must be one of 'contiguous', 'interleaved', or 'loop'. "
+                f"Got {self.pipeline_stage_layout!r}."
+            )
+        set_attrs_smartly(self, "use_scan_mlp", False, use_scan_mlp)
+        set_attrs_smartly(self, "scan_mlp_chunk_size", 1024, scan_mlp_chunk_size)
+        set_attrs_smartly(self, "sequence_axis_name", "sp", sequence_axis_name)
+        set_attrs_smartly(self, "kv_cache_sharding_sequence_axis_name", "sp", kv_cache_sharding_sequence_axis_name)
+        set_attrs_smartly(self, "gradient_checkpointing", EasyDeLGradientCheckPointers.NONE, gradient_checkpointing)
+        set_attrs_smartly(self, "gradient_checkpointing_targets", None, gradient_checkpointing_targets)
+        set_attrs_smartly(self, "precompute_masks", True, precompute_masks)
+        set_attrs_smartly(self, "kv_cache_quantization_config", None, kv_cache_quantization_config)
+        set_attrs_smartly(self, "quantization_config", None, quantization_config)
+        set_attrs_smartly(self, "use_qmm_best_config", False, use_qmm_best_config)
+        set_attrs_smartly(self, "qmm_platform_override", None, qmm_platform_override)
+        set_attrs_smartly(self, "qmm_tpu_path_override", None, qmm_tpu_path_override)
+        set_attrs_smartly(self, "flash_attention_backward_pass_impl", "triton", flash_attention_backward_pass_impl)
+        set_attrs_smartly(self, "attn_dtype", jnp.bfloat16, attn_dtype)
+        set_attrs_smartly(self, "kvdtype", jnp.bfloat16, kvdtype if kvdtype is not None else self.attn_dtype)
+        set_attrs_smartly(self, "attn_softmax_dtype", jnp.float32, attn_softmax_dtype)
+        set_attrs_smartly(self, "mla_attn_dtype", self.attn_dtype, mla_attn_dtype)
+        set_attrs_smartly(self, "mla_attn_softmax_dtype", self.attn_softmax_dtype, mla_attn_softmax_dtype)
+        self._coerce_runtime_dtype_fields()
+        set_attrs_smartly(self, "moe_method", DEFAULT_MOE_METHOD, moe_method)
+        set_attrs_smartly(self, "moe_force_xla_gmm", False, moe_force_xla_gmm)
+        set_attrs_smartly(self, "use_ring_of_experts", RING_EXPERTS, use_ring_of_experts)
+        set_attrs_smartly(self, "use_expert_tensor_mode", EXPERT_TP_MODE, use_expert_tensor_mode)
+        set_attrs_smartly(self, "fsdp_is_ep_bound", FSDP_IS_EP_BOUND, fsdp_is_ep_bound)
+        set_attrs_smartly(self, "sp_is_ep_bound", SP_IS_EP_BOUND, sp_is_ep_bound)
+        set_attrs_smartly(self, "moe_chunk_size", None, moe_chunk_size)
+        set_attrs_smartly(self, "moe_fsdp_shard_expert_weights", False, moe_fsdp_shard_expert_weights)
+        set_attrs_smartly(self, "moe_ep_carries_batch", False, moe_ep_carries_batch)
+        set_attrs_smartly(self, "moe_batch_axes_follow_resolver", False, moe_batch_axes_follow_resolver)
+        set_attrs_smartly(self, "layer_scan_options", None, layer_scan_options)
+        normalize_layer_scan_options(self.layer_scan_options)
+        self._maybe_extend_batch_axis_for_ep()
+
+        for key_, value_ in kwargs.items():
+            if key_ in _REMOVED_BASE_CONFIG_KEYS:
+                continue
+            setattr(self, key_, value_)
+        if getattr(self, "sub_configs", None) is not None:
+            for name, _ in getattr(self, "sub_configs", {}).items():
+                getattr(self, name).read_basics_from_config(self)
+                for key_, value_ in kwargs.items():
+                    if key_ in _REMOVED_BASE_CONFIG_KEYS:
+                        continue
+                    setattr(getattr(self, name), key_, value_)
+
+    # Attributes to hide from __repr__ and __str__ output.
+    # These include EasyDeL-specific configuration attributes that are numerous
+    # and would clutter the representation, as well as HuggingFace PretrainedConfig
+    # defaults that are typically not modified by users.
+    _hidden_repr_attrs: tp.ClassVar[set[str]] = {
+        "sharding_axis_dims",
+        "sharding_dcn_axis_dims",
+        "sharding_axis_names",
+        "attn_mechanism",
+        "decode_attn_mechanism",
+        "mla_attn_mechanism",
+        "mla_attn_dtype",
+        "mla_attn_softmax_dtype",
+        "blocksize_k",
+        "blocksize_q",
+        "blocksize_b",
+        "moe_tiling_size_batch",
+        "moe_tiling_size_seqlen",
+        "moe_tiling_size_dim",
+        "axis_policy",
+        "partition_axis",
+        "use_sharded_kv_caching",
+        "use_sharding_constraint",
+        "backend",
+        "platform",
+        "easy_method",
+        "bits",
+        "scan_ring_attention",
+        "scan_attention_layers",
+        "scan_layers",
+        "pipeline_stage_regions",
+        "pipeline_virtual_stages",
+        "pipeline_stage_layout",
+        "pipeline_terminal_stage_layer_reserve",
+        "use_scan_mlp",
+        "scan_mlp_chunk_size",
+        "sequence_axis_name",
+        "gradient_checkpointing",
+        "gradient_checkpointing_targets",
+        "precompute_masks",
+        "kv_cache_quantization_config",
+        "quantization_config",
+        "use_qmm_best_config",
+        "qmm_platform_override",
+        "qmm_tpu_path_override",
+        "kv_cache_sharding_sequence_axis_name",
+        "flash_attention_backward_pass_impl",
+        "attn_dtype",
+        "kvdtype",
+        "attn_softmax_dtype",
+        "fcm_max_ratio",
+        "fcm_min_ratio",
+        "moe_method",
+        "moe_force_xla_gmm",
+        "use_expert_tensor_mode",
+        "use_ring_of_experts",
+        "fsdp_is_ep_bound",
+        "sp_is_ep_bound",
+        "operation_configs",
+        # HuggingFace PretrainedConfig default attributes
+        "pretraining_tp",
+        "return_dict",
+        "output_hidden_states",
+        "torchscript",
+        "dtype",
+        "task_specific_params",
+        "problem_type",
+        "tokenizer_class",
+        "prefix",
+        "bos_token_id",
+        "pad_token_id",
+        "eos_token_id",
+        "sep_token_id",
+        "decoder_start_token_id",
+        "max_length",
+        "min_length",
+        "do_sample",
+        "early_stopping",
+        "num_beams",
+        "temperature",
+        "top_k",
+        "top_p",
+        "typical_p",
+        "repetition_penalty",
+        "length_penalty",
+        "no_repeat_ngram_size",
+        "encoder_no_repeat_ngram_size",
+        "bad_words_ids",
+        "num_return_sequences",
+        "output_scores",
+        "return_dict_in_generate",
+        "forced_bos_token_id",
+        "forced_eos_token_id",
+        "remove_invalid_values",
+        "exponential_decay_length_penalty",
+        "suppress_tokens",
+        "begin_suppress_tokens",
+        "num_beam_groups",
+        "diversity_penalty",
+        "transformers_version",
+        "add_cross_attention",
+        "tie_encoder_decoder",
+        "architectures",
+        "finetuning_task",
+        "id2label",
+        "label2id",
+        "chunk_size_feed_forward",
+        "is_encoder_decoder",
+        "is_decoder",
+        "cross_attention_hidden_size",
+        "tie_word_embeddings",
+        "output_attentions",
+        "pruned_heads",
+        "tf_legacy_loss",
+        "use_bfloat16",
+    }
+
+    def __repr__(self):
+        """Return a multi-line summary of public config fields.
+
+        Generates a human-readable representation of the configuration object,
+        displaying each attribute on its own line with proper formatting.
+
+        The output:
+        - Excludes private attributes (those starting with '_')
+        - Hides EasyDeL internal attributes unless `_show_private_attrs` is True
+        - Truncates attribute values longer than 1500 characters
+        - Replaces newlines in values with indented newlines for readability
+
+        Returns:
+            str: Multi-line string representation in the format:
+                ClassName(
+                    attr1 : value1
+                    attr2 : value2
+                    ...
+                )
+
+        Example:
+            >>> config = EasyDeLBaseConfig(hidden_size=768)
+            >>> print(repr(config))
+            EasyDeLBaseConfig(
+                hidden_size : 768
+                ...
+            )
+        """
+
+        string = f"{self.__class__.__name__}(\n"
+        for k, v in self.__dict__.items():
+            if k.startswith("_"):
+                continue
+            if not self._show_private_attrs and k in self._hidden_repr_attrs:
+                continue
+            try:
+                repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
+                string += repr_src if len(repr_src) < 1500 else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
+            except TypeError:
+                pass
+        return string + ")"
+
+    def to_diff_dict(self) -> dict[str, Any]:
+        """Serialize config to a minimal dictionary with only non-default values.
+
+        Removes all attributes from the configuration that correspond to the default
+        config attributes for better readability, while always retaining the `config`
+        attribute from the class. Useful for saving compact configuration files that
+        only contain customized settings.
+
+        The method compares against both `PretrainedConfig` defaults and the
+        class-specific defaults to determine which values to include.
+
+        Returns:
+            dict[str, Any]: Dictionary containing only non-default configuration
+                attributes, plus essential metadata like `model_type` for nested configs.
+
+        Example:
+            >>> config = MyConfig(hidden_size=1024)  # non-default
+            >>> diff = config.to_diff_dict()
+            >>> # Only contains hidden_size=1024 and other non-defaults
+        """
+        config_dict = self.to_dict()
+        default_config_dict = PretrainedConfig().to_dict()
+        class_config_dict = self.__class__().to_dict() if not self.has_no_defaults_at_init else {}
+
+        serializable_config_dict = {}
+
+        for key, value in config_dict.items():
+            if (
+                isinstance(getattr(self, key, None), PretrainedConfig)
+                and key in class_config_dict
+                and isinstance(class_config_dict[key], dict)
+            ) or key in self.sub_configs:
+                diff = recursive_diff_dict(value, default_config_dict, config_obj=getattr(self, key, None))
+                if "model_type" in value:
+                    diff["model_type"] = value["model_type"]
+
+                serializable_config_dict[key] = diff
+            elif (
+                key not in default_config_dict
+                or key == "transformers_version"
+                or key == "vocab_file"
+                or value != default_config_dict[key]
+                or (key in default_config_dict and value != class_config_dict.get(key, value))
+            ):
+                serializable_config_dict[key] = value
+
+        self._remove_keys_not_serialized(serializable_config_dict)
+
+        serializable_config_dict.pop("_name_or_path", None)
+
+        self.dict_dtype_to_str(serializable_config_dict)
+
+        return serializable_config_dict
+
+    @staticmethod
+    def _is_dtype_like(value: tp.Any) -> bool:
+        """Return True for JAX/NumPy dtype objects and scalar type classes.
+
+        Args:
+            value: Arbitrary value to probe.
+
+        Returns:
+            bool: ``True`` when ``value`` looks like a dtype object or a
+            scalar-type class exposed by numpy/ml_dtypes/jax/torch.
+        """
+        if isinstance(value, np.dtype):
+            return True
+        value_module = getattr(value.__class__, "__module__", "")
+        if value_module.startswith("torch") and value.__class__.__name__ == "dtype":
+            return True
+        if isinstance(value, type):
+            module = getattr(value, "__module__", "")
+            return (
+                module.startswith("numpy")
+                or module.startswith("ml_dtypes")
+                or module.startswith("jax.")
+                or module.startswith("torch")
+            )
+        return False
+
+    @staticmethod
+    def _is_torch_dtype_instance(value: tp.Any) -> bool:
+        """Return True for concrete ``torch.dtype`` objects without importing torch eagerly.
+
+        Args:
+            value: Arbitrary value to probe.
+
+        Returns:
+            bool: ``True`` when ``value`` is a torch dtype instance.
+        """
+        value_module = getattr(value.__class__, "__module__", "")
+        return value_module.startswith("torch") and value.__class__.__name__ == "dtype"
+
+    @staticmethod
+    def _dtype_name(value: tp.Any) -> str:
+        """Convert framework-specific dtype objects into a stable string name.
+
+        Args:
+            value: Any dtype-like value (NumPy / JAX dtype, torch.dtype,
+                or string).
+
+        Returns:
+            str: Canonical name (e.g. ``"bfloat16"``, ``"float32"``) suitable
+            for round-tripping through JSON.
+        """
+        try:
+            return np.dtype(value).name
+        except TypeError:
+            pass
+        text = str(value).strip()
+        if text.startswith("torch."):
+            text = text.removeprefix("torch.")
+        return text
+
+    @classmethod
+    def _coerce_dtype_spec(cls, value: tp.Any) -> tp.Any:
+        """Convert persisted dtype strings back into runtime dtype objects.
+
+        Accepts JSON-serialised dtype names (``"bf16"``, ``"float32"``,
+        ``"fp8_e4m3"`` etc.) plus their aliases and converts them back into
+        :class:`jnp.dtype` instances. Native torch/NumPy dtype objects are
+        passed through unchanged.
+
+        Args:
+            value: Persisted dtype representation.
+
+        Returns:
+            Any: A runtime dtype object when ``value`` resolves to a known
+            spec, otherwise the original ``value``.
+        """
+        if value is None:
+            return None
+        if cls._is_torch_dtype_instance(value):
+            # HF configs expose `torch_dtype` through the `dtype` property. Preserve
+            # concrete torch dtypes so downstream HF model init keeps working.
+            return value
+        if cls._is_dtype_like(value):
+            return jnp.dtype(cls._dtype_name(value))
+        if isinstance(value, str):
+            aliases = {
+                "bf16": "bfloat16",
+                "fp16": "float16",
+                "f16": "float16",
+                "fp32": "float32",
+                "f32": "float32",
+                "fp64": "float64",
+                "f64": "float64",
+                "nvfp8": "float8_e4m3",
+                "mxfp8": "float8_e5m2",
+                "fp8": "float8_e5m2",
+                "float8": "float8_e5m2",
+                "fp8_e4m3": "float8_e4m3",
+                "fp8_e4m3fn": "float8_e4m3fn",
+                "fp8_e4m3fnuz": "float8_e4m3fnuz",
+                "fp8_e4m3b11fnuz": "float8_e4m3b11fnuz",
+                "fp8_e3m4": "float8_e3m4",
+                "fp8_e8m0fnu": "float8_e8m0fnu",
+                "mxfp4": "float4_e2m1fn",
+                "fp4": "float4_e2m1fn",
+                "float4": "float4_e2m1fn",
+            }
+            normalized = value.strip().lower()
+            if normalized.startswith("torch."):
+                normalized = normalized.removeprefix("torch.")
+            normalized = aliases.get(normalized, normalized)
+            try:
+                return jnp.dtype(normalized)
+            except TypeError:
+                return value
+        return value
+
+    def _coerce_runtime_dtype_fields(self) -> None:
+        """Rehydrate known dtype config fields after loading from serialized JSON.
+
+        Iterates over the canonical dtype attributes
+        (``dtype``, ``attn_dtype``, ``kvdtype``, ``attn_softmax_dtype``,
+        ``mla_attn_dtype``, ``mla_attn_softmax_dtype``) and replaces any
+        serialised string with the corresponding runtime dtype object.
+        """
+        for field_name in (
+            "dtype",
+            "attn_dtype",
+            "kvdtype",
+            "attn_softmax_dtype",
+            "mla_attn_dtype",
+            "mla_attn_softmax_dtype",
+        ):
+            if hasattr(self, field_name):
+                setattr(self, field_name, self._coerce_dtype_spec(getattr(self, field_name)))
+
+    @classmethod
+    def _normalize_json_value(cls, value: tp.Any) -> tp.Any:
+        """Recursively normalize dtype-like values into JSON-safe primitives.
+
+        Args:
+            value: Arbitrary nested Python object pulled from
+                :meth:`to_dict` / :meth:`to_diff_dict`.
+
+        Returns:
+            Any: A structurally identical value with dtype-like leaves
+            converted to canonical strings and numpy scalars unwrapped to
+            Python primitives.
+        """
+        if isinstance(value, dict):
+            return {k: cls._normalize_json_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [cls._normalize_json_value(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(cls._normalize_json_value(v) for v in value)
+        if isinstance(value, (set, frozenset)):
+            return [cls._normalize_json_value(v) for v in value]
+        if hasattr(value, "to_dict") and callable(value.to_dict):
+            return cls._normalize_json_value(value.to_dict())
+        if isinstance(value, np.generic):
+            return value.item()
+        if cls._is_dtype_like(value):
+            return cls._dtype_name(value)
+        return value
+
+    def dict_dtype_to_str(self, d: dict[str, Any]) -> None:
+        """Normalize dtype-like values anywhere in the config tree in-place.
+
+        Args:
+            d: Mutable dictionary representation of the config; mutated so
+                that every leaf produced by :meth:`_normalize_json_value` is
+                JSON-safe.
+        """
+        for key, value in list(d.items()):
+            d[key] = self._normalize_json_value(value)
+
+    def to_dict(self) -> dict[str, tp.Any]:
+        """Serialize config to a dictionary while temporarily hiding forbidden types.
+
+        Converts all configuration attributes to a Python dictionary suitable for
+        JSON serialization. Handles special cases like nested PretrainedConfig objects,
+        JAX mesh objects (which cannot be deep-copied), and dtype representations.
+
+        Returns:
+            dict[str, Any]: Complete dictionary representation of the configuration,
+                including model_type and transformers_version metadata.
+
+        Note:
+            EasyDeL caches the active JAX mesh on the config (``_hidden_mesh``) for
+            runtime use. That object contains non-picklable JAX devices, so we must
+            exclude it from any deep copies performed during serialization. The mesh
+            is temporarily removed and restored after serialization.
+
+        Example:
+            >>> config = MyConfig(hidden_size=1024)
+            >>> config_dict = config.to_dict()
+            >>> # config_dict can be saved to JSON or used to recreate config
+        """
+        sd = self.__dict__
+        forbidden_types = {"_ScalarMeta"}
+        extracted_values: dict[str, tp.Any] = {}
+
+        for key in list(sd.keys()):
+            value = sd.get(key)
+            if (
+                key in {"_hidden_mesh", "_hidden_explicit_mesh", "_hidden_manual_mesh"}
+                or value.__class__.__name__ in forbidden_types
+            ):
+                extracted_values[key] = sd.pop(key)
+
+        try:
+            result = copy.deepcopy(self.__dict__)
+            result.pop(_ROPE_FIELDS_SYNCED_ATTR, None)
+            for cache_name in self._mesh_cache_names:
+                result.pop(f"{cache_name}_auto_created", None)
+            if hasattr(self.__class__, "model_type"):
+                result["model_type"] = self.__class__.model_type
+
+            result["transformers_version"] = transformers.__version__
+
+            for key, value in result.items():
+                if isinstance(value, PretrainedConfig):
+                    value = value.to_dict()
+                    del value["transformers_version"]
+
+                result[key] = value
+
+            self._remove_keys_not_serialized(result)
+            self.dict_dtype_to_str(result)
+            return result
+        finally:
+            for key, value in extracted_values.items():
+                sd[key] = value
+
+    def __deepcopy__(self, memo):
+        """Deep copy the config while keeping the cached runtime mesh by reference.
+
+        Creates a deep copy of all configuration attributes except for the cached
+        JAX mesh objects (`_hidden_mesh`, `_hidden_explicit_mesh`, `_hidden_manual_mesh`),
+        which are copied by reference since they contain device handles that cannot
+        be safely deep-copied.
+
+        Args:
+            memo: Memoization dictionary used by copy.deepcopy to track already-copied
+                objects and avoid infinite recursion.
+
+        Returns:
+            New EasyDeLBaseConfig instance with deep-copied attributes and
+            shared mesh references.
+        """
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+
+        for key, value in self.__dict__.items():
+            if key in {"_hidden_mesh", "_hidden_explicit_mesh", "_hidden_manual_mesh"}:
+                object.__setattr__(result, key, value)
+            else:
+                object.__setattr__(result, key, copy.deepcopy(value, memo))
+
+        return result
+
+    def attach_custom_arguments(self, **kwargs):
+        """Attach custom arguments as attributes to the configuration.
+
+        Convenience method for adding arbitrary attributes to the configuration
+        at runtime. Useful for passing model-specific or experiment-specific
+        parameters that aren't part of the standard configuration schema.
+
+        Args:
+            **kwargs: Arbitrary key-value pairs to attach as attributes.
+                Each key becomes an attribute name and its value is set
+                using `set_attrs_smartly` for proper handling.
+
+        Example:
+            >>> config = EasyDeLBaseConfig()
+            >>> config.attach_custom_arguments(
+            ...     custom_dropout=0.1,
+            ...     experiment_name="test_run"
+            ... )
+            >>> config.custom_dropout
+            0.1
+        """
+        for k, v in kwargs.items():
+            set_attrs_smartly(self, k, v, v)
+
+    def __str__(self):
+        """Return a string representation of the configuration.
+
+        Provides the same output as `__repr__`, displaying a multi-line
+        summary of non-private configuration attributes.
+
+        Returns:
+            str: Human-readable configuration summary.
+        """
+        return self.__repr__()
+
+    @classmethod  # From HF.
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | os.PathLike,
+        cache_dir: str | os.PathLike | None = None,
+        force_download: bool = False,
+        local_files_only: bool = False,
+        token: str | bool | None = None,
+        revision: str = "main",
+        **kwargs,
+    ):
+        r"""
+        Instantiate a [`PretrainedConfig`] (or a derived class) from a pretrained model configuration.
+
+        Args:
+            pretrained_model_name_or_path (`str` or `os.PathLike`):
+                This can be either:
+
+                - a string, the *model id* of a pretrained model configuration hosted inside a model repo on
+                  huggingface.co.
+                - a path to a *directory* containing a configuration file saved using the
+                  [`~PretrainedConfig.save_pretrained`] method, e.g., `./my_model_directory/`.
+                - a path or url to a saved configuration JSON *file*, e.g., `./my_model_directory/configuration.json`.
+            cache_dir (`str` or `os.PathLike`, *optional*):
+                Path to a directory in which a downloaded pretrained model configuration should be cached if the
+                standard cache should not be used.
+            force_download (`bool`, *optional*, defaults to `False`):
+                Whether or not to force to (re-)download the configuration files and override the cached versions if
+                they exist.
+            resume_download:
+                Deprecated and ignored. All downloads are now resumed by default when possible.
+                Will be removed in v5 of Transformers.
+            proxies (`dict[str, str]`, *optional*):
+                A dictionary of proxy servers to use by protocol or endpoint, e.g., `{'http': 'foo.bar:3128',
+                'http://hostname': 'foo.bar:4012'}.` The proxies are used on each request.
+            token (`str` or `bool`, *optional*):
+                The token to use as HTTP bearer authorization for remote files. If `True`, or not specified, will use
+                the token generated when running `hf auth login` (stored in `~/.huggingface`).
+            revision (`str`, *optional*, defaults to `"main"`):
+                The specific model version to use. It can be a branch name, a tag name, or a commit id, since we use a
+                git-based system for storing models and other artifacts on huggingface.co, so `revision` can be any
+                identifier allowed by git.
+
+                <Tip>
+
+                To test a pull request you made on the Hub, you can pass `revision="refs/pr/<pr_number>"`.
+
+                </Tip>
+
+            return_unused_kwargs (`bool`, *optional*, defaults to `False`):
+                If `False`, then this function returns just the final configuration object.
+
+                If `True`, then this functions returns a `Tuple(config, unused_kwargs)` where *unused_kwargs* is a
+                dictionary consisting of the key/value pairs whose keys are not configuration attributes: i.e., the
+                part of `kwargs` which has not been used to update `config` and is otherwise ignored.
+            subfolder (`str`, *optional*, defaults to `""`):
+                In case the relevant files are located inside a subfolder of the model repo on huggingface.co, you can
+                specify the folder name here.
+            kwargs (`dict[str, Any]`, *optional*):
+                The values in kwargs of any keys which are configuration attributes will be used to override the loaded
+                values. Behavior concerning key/value pairs whose keys are *not* configuration attributes is controlled
+                by the `return_unused_kwargs` keyword parameter.
+
+        Returns:
+            [`PretrainedConfig`]: The configuration object instantiated from this pretrained model.
+
+        Examples:
+
+        ```python
+        # We can't instantiate directly the base class *PretrainedConfig* so let's show the examples on a
+        # derived class: BertConfig
+        config = BertConfig.from_pretrained(
+            "google-bert/bert-base-uncased"
+        )  # Download configuration from huggingface.co and cache.
+        config = BertConfig.from_pretrained(
+            "./test/saved_model/"
+        )  # E.g. config (or model) was saved using *save_pretrained('./test/saved_model/')*
+        config = BertConfig.from_pretrained("./test/saved_model/my_configuration.json")
+        config = BertConfig.from_pretrained("google-bert/bert-base-uncased", output_attentions=True, foo=False)
+        assert config.output_attentions == True
+        config, unused_kwargs = BertConfig.from_pretrained(
+            "google-bert/bert-base-uncased", output_attentions=True, foo=False, return_unused_kwargs=True
+        )
+        assert config.output_attentions == True
+        assert unused_kwargs == {"foo": False}
+        ```"""
+        kwargs["cache_dir"] = cache_dir
+        kwargs["force_download"] = force_download
+        kwargs["local_files_only"] = local_files_only
+        kwargs["revision"] = revision
+
+        cls._set_token_in_kwargs(kwargs, token)
+
+        config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path, **kwargs)
+        # Composite checkpoints (e.g. `zai-org/GLM-5.3-Flash`: a
+        # `Glm5NextForConditionalGeneration` wrapper around
+        # `text_config` + `vision_config`) keep the quantization recipe at the
+        # OUTER level — it quantizes the language-model weights, not the
+        # modality split. When resolution descends into a sub-config below,
+        # carry `quantization_config` along so quantized serving finds it.
+        outer_config_dict = dict(config_dict)
+        if cls.base_config_key and cls.base_config_key in config_dict:
+            config_dict = config_dict[cls.base_config_key]
+
+        if "model_type" in config_dict and hasattr(cls, "model_type") and config_dict["model_type"] != cls.model_type:
+            for v in outer_config_dict.values():
+                if isinstance(v, dict) and v.get("model_type") == cls.model_type:
+                    config_dict = v
+                    break
+
+        if (
+            config_dict is not outer_config_dict
+            and "quantization_config" in outer_config_dict
+            and "quantization_config" not in config_dict
+        ):
+            config_dict["quantization_config"] = outer_config_dict["quantization_config"]
+
+        return cls.from_dict(config_dict, **kwargs)
+
+    def save_pretrained(self, save_directory: str | os.PathLike | ePathLike, push_to_hub: bool = False, **kwargs):
+        """
+        Save a configuration object to the directory `save_directory`, so that it can be re-loaded using the
+        [`~PretrainedConfig.from_pretrained`] class method.
+
+        Args:
+            save_directory (`str` or `os.PathLike`):
+                Directory where the configuration JSON file will be saved (will be created if it does not exist).
+            push_to_hub (`bool`, *optional*, defaults to `False`):
+                Whether or not to push your model to the Hugging Face model hub after saving it. You can specify the
+                repository you want to push to with `repo_id` (will default to the name of `save_directory` in your
+                namespace).
+            kwargs (`Dict[str, Any]`, *optional*):
+                Additional key word arguments passed along to the [`~utils.PushToHubMixin.push_to_hub`] method.
+        """
+        self._set_token_in_kwargs(kwargs)
+        easy_directory = ePath(save_directory)
+        if easy_directory.is_file():
+            raise AssertionError(f"Provided path ({save_directory}) should be a directory, not a file")
+
+        non_default_generation_parameters_getter = getattr(self, "_get_non_default_generation_parameters", None)
+        if callable(non_default_generation_parameters_getter):
+            non_default_generation_parameters = non_default_generation_parameters_getter()
+        else:
+            generation_parameters_getter = getattr(self, "_get_generation_parameters", None)
+            non_default_generation_parameters = (
+                generation_parameters_getter() if callable(generation_parameters_getter) else {}
+            )
+        if len(non_default_generation_parameters) > 0:
+            warnings.warn(
+                "Some non-default generation parameters are set in the model config. These should go into either a) "
+                "`model.generation_config` (as opposed to `model.config`); OR b) a GenerationConfig file "
+                "(https://huggingface.co/docs/transformers/generation_strategies#save-a-custom-decoding-strategy-with-your-model)."
+                "This warning will become an exception in the future."
+                f"\nNon-default generation parameters: {non_default_generation_parameters!s}",
+                UserWarning,
+                stacklevel=1,
+            )
+
+        easy_directory.mkdir(parents=True, exist_ok=True)
+
+        commit_message: str | None = None
+        repo_id: str = ""
+        files_timestamps: dict[str, float] = {}
+        if push_to_hub:
+            commit_message = kwargs.pop("commit_message", None)
+            repo_id = kwargs.pop("repo_id", None) or easy_directory.name
+            create_repo = getattr(self, "_create_repo", None)
+            if callable(create_repo):
+                repo_id = create_repo(repo_id, **kwargs)
+            else:
+                # transformers v5 dropped ``PushToHubMixin._create_repo``; create the repo through the Hub API.
+                from huggingface_hub import create_repo as hub_create_repo
+
+                repo_id = hub_create_repo(
+                    repo_id,
+                    token=kwargs.get("token"),
+                    private=kwargs.get("private"),
+                    exist_ok=True,
+                ).repo_id
+            files_timestamps = self._get_files_timestamps(str(easy_directory))
+
+        output_config_file = easy_directory / CONFIG_NAME
+
+        self.to_json_file(output_config_file, use_diff=True)
+        logger.debug(f"Configuration saved in {output_config_file}")
+
+        if push_to_hub:
+            self._upload_modified_files(
+                str(easy_directory),
+                repo_id,
+                files_timestamps,
+                commit_message=commit_message,
+                token=kwargs.get("token"),
+            )
+
+    def to_json_file(self, json_file_path: str | os.PathLike | ePathLike, use_diff: bool = True):
+        """
+        Save this instance to a JSON file.
+
+        Args:
+            json_file_path (`str` or `os.PathLike`):
+                Path to the JSON file in which this configuration instance's parameters will be saved.
+            use_diff (`bool`, *optional*, defaults to `True`):
+                If set to `True`, only the difference between the config instance and the default `PretrainedConfig()`
+                is serialized to JSON file.
+        """
+        ePath(json_file_path).write_text(self.to_json_string(use_diff=use_diff))
+
+    def to_json_string(self, use_diff: bool = True) -> str:
+        """Serialize the config to a JSON string.
+
+        Applies dtype normalisation and float-encoding before delegating to
+        :func:`json.dumps` so the output round-trips through
+        :meth:`from_pretrained`.
+
+        Args:
+            use_diff: When ``True`` (default), emit only fields that differ
+                from :class:`PretrainedConfig` defaults via
+                :meth:`to_diff_dict`. Otherwise dump the full
+                :meth:`to_dict` payload.
+
+        Returns:
+            str: A JSON document (indented, sorted keys) terminated by a
+            newline.
+        """
+        config_dict = self.to_diff_dict() if use_diff else self.to_dict()
+        config_dict = self._encode_special_floats(config_dict)
+        config_dict = self._normalize_json_value(config_dict)
+        return json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
+
+    @classmethod
+    def _dict_from_json_file(cls, json_file: str | os.PathLike | ePathLike):
+        """Load a configuration dictionary from a JSON file.
+
+        Internal helper for parsing JSON configuration files. Supports various
+        path types including local paths, cloud storage paths (via ePath),
+        and standard os.PathLike objects.
+
+        Args:
+            json_file (str | os.PathLike | ePathLike): Path to the JSON
+                configuration file to load.
+
+        Returns:
+            dict[str, Any]: Dictionary containing the parsed configuration
+                with all JSON fields as Python objects.
+
+        Raises:
+            json.JSONDecodeError: If the file contains invalid JSON.
+            UnicodeDecodeError: If the file encoding is not UTF-8.
+            FileNotFoundError: If the specified file does not exist.
+        """
+        # Mirror of the special-float encoding applied in to_json_string:
+        # without the decode, inf/nan fields (e.g. mamba2/falcon_h1
+        # time_step_limit) reload as `{"__float__": "Infinity"}` dicts.
+        return cls._decode_special_floats(json.loads(ePath(json_file).read_text(encoding="utf-8")))
+
+    @classmethod
+    def _get_config_dict(
+        cls,
+        pretrained_model_name_or_path: str | os.PathLike,
+        **kwargs,
+    ) -> tuple[dict[str, tp.Any] | None, dict[str, tp.Any]]:
+        """Load a configuration dictionary from a local path or HuggingFace Hub.
+
+        Internal method that handles multiple loading scenarios:
+        - Local directory containing config.json
+        - Local JSON file path
+        - HuggingFace Hub model ID
+        - Remote URL
+        - GGUF checkpoint files
+
+        The method extracts relevant kwargs for the loading process and returns
+        remaining unused kwargs for downstream processing.
+
+        Args:
+            pretrained_model_name_or_path (str | os.PathLike): Either:
+                - A model ID string for HuggingFace Hub (e.g., "meta-llama/Llama-2-7b")
+                - A local directory path containing config.json
+                - A direct path to a JSON config file
+                - A remote URL to a config file
+            **kwargs: Additional keyword arguments including:
+                - cache_dir: Directory for caching downloaded files
+                - force_download: Force re-download even if cached
+                - proxies: Proxy configuration dictionary
+                - token: HuggingFace authentication token
+                - local_files_only: Only use local files, no downloads
+                - revision: Git revision (branch, tag, or commit)
+                - subfolder: Subfolder within the repo
+                - gguf_file: Path to GGUF file if loading from GGUF format
+
+        Returns:
+            tuple[dict[str, Any], dict[str, Any]]: A tuple of:
+                - Configuration dictionary loaded from the file
+                - Remaining unused kwargs
+
+        Raises:
+            OSError: If the configuration file cannot be found or loaded.
+            json.JSONDecodeError: If the config file is not valid JSON.
+        """
+        cache_dir = kwargs.pop("cache_dir", None)
+        force_download = kwargs.pop("force_download", False)
+        resume_download = kwargs.pop("resume_download", None)
+        proxies = kwargs.pop("proxies", None)
+        token = kwargs.pop("token", None)
+        local_files_only = kwargs.pop("local_files_only", False)
+        revision = kwargs.pop("revision", None)
+        trust_remote_code = kwargs.pop("trust_remote_code", None)
+        subfolder = kwargs.pop("subfolder", "")
+        from_pipeline = kwargs.pop("_from_pipeline", None)
+        from_auto_class = kwargs.pop("_from_auto", False)
+        commit_hash = kwargs.pop("_commit_hash", None)
+
+        gguf_file = kwargs.get("gguf_file", None)
+
+        if trust_remote_code is True:
+            logger.warning(
+                "The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored."
+            )
+
+        user_agent = {"file_type": "config", "from_auto_class": from_auto_class}
+        if from_pipeline is not None:
+            user_agent["using_pipeline"] = from_pipeline
+
+        pretrained_model_name_or_path = str(pretrained_model_name_or_path)
+
+        configuration_file = CONFIG_NAME
+        is_local = ePath(pretrained_model_name_or_path).is_dir()
+        if (ePath(subfolder) / pretrained_model_name_or_path).is_file():
+            resolved_config_file = pretrained_model_name_or_path
+            is_local = True
+        elif is_remote_url(pretrained_model_name_or_path):
+            configuration_file = pretrained_model_name_or_path if gguf_file is None else gguf_file
+            resolved_config_file = download_url(pretrained_model_name_or_path)
+        else:
+            configuration_file = kwargs.pop("_configuration_file", CONFIG_NAME) if gguf_file is None else gguf_file
+            google_cloud_file = ePath(pretrained_model_name_or_path) / subfolder / configuration_file
+            if not google_cloud_file.exists():
+                try:
+                    resolved_config_file = cached_file(
+                        pretrained_model_name_or_path,
+                        configuration_file,
+                        cache_dir=cache_dir,
+                        force_download=force_download,
+                        proxies=proxies,
+                        resume_download=resume_download,
+                        local_files_only=local_files_only,
+                        token=token,
+                        user_agent=user_agent,
+                        revision=revision,
+                        subfolder=subfolder,
+                        _commit_hash=commit_hash,
+                    )
+                    if resolved_config_file is None:
+                        return None, kwargs
+                except OSError:
+                    raise
+                except Exception as e:
+                    raise OSError(
+                        f"Can't load the configuration of '{pretrained_model_name_or_path}'. "
+                        "If you were trying to load it from 'https://huggingface.co/models', "
+                        "make sure you don't have a local directory with the same name. Otherwise, "
+                        f"make sure '{pretrained_model_name_or_path}' is the correct path to a "
+                        f"directory containing a {configuration_file} file"
+                    ) from e
+            else:
+                resolved_config_file = google_cloud_file
+
+            commit_hash = extract_commit_hash(resolved_config_file, commit_hash)
+        try:
+            if gguf_file:
+                config_dict = load_gguf_checkpoint(resolved_config_file, return_tensors=False)["config"]
+            else:
+                config_dict = cls._dict_from_json_file(resolved_config_file)
+
+            config_dict["_commit_hash"] = commit_hash
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise OSError(f"It looks like the config file at '{resolved_config_file}' is not a valid JSON file.") from e
+
+        if is_local:
+            logger.debug(f"loading configuration file {resolved_config_file}")
+        else:
+            logger.debug(f"loading configuration file {configuration_file} from cache at {resolved_config_file}")
+
+        if "model_type" not in config_dict and is_timm_config_dict(config_dict):
+            config_dict["model_type"] = "timm_wrapper"
+
+        return config_dict, kwargs
+
+    @property
+    def granted_freq_max_position_embedding(self) -> int:
+        """Return the max position embedding allowed for frequency-based caches.
+
+        This property determines the maximum sequence length for precomputing
+        rotary position embedding frequencies. It allows models to specify a
+        different (potentially larger) value for frequency caches than for
+        attention masks.
+
+        Returns:
+            int: Maximum position embedding length for frequency computations.
+                Falls back to `max_position_embeddings` if `freq_max_position_embeddings`
+                is not set.
+        """
+        result = getattr(self, "freq_max_position_embeddings", getattr(self, "max_position_embeddings", None))
+        if result is None:
+            raise ValueError("`max_position_embeddings` must be set before requesting rope cache bounds.")
+        return result
+
+    @property
+    def granted_mask_max_position_embedding(self) -> int:
+        """Return the max position embedding allowed for mask precomputation.
+
+        This property determines the maximum sequence length for precomputing
+        causal attention masks. It allows models to specify a different
+        (potentially smaller to save memory) value for mask caches.
+
+        Returns:
+            int: Maximum position embedding length for mask computations.
+                Falls back to `max_position_embeddings` if `mask_max_position_embeddings`
+                is not set.
+        """
+        result = getattr(self, "mask_max_position_embeddings", getattr(self, "max_position_embeddings", None))
+        if result is None:
+            raise ValueError("`max_position_embeddings` must be set before requesting mask cache bounds.")
+        return result
+
+    def _get_rope_config(self) -> RopeConfig:
+        """Build a RopeConfig from the configuration fields.
+
+        Constructs a rotary position embedding configuration by:
+        1. Loading from `rope_scaling` dict if present, otherwise using defaults
+        2. Filling `original_max_position_embeddings` from config if not in scaling
+        3. Applying any external rope config kwargs set via `_external_rope_config_kwargs`
+
+        This method is used internally by `get_basic_rope`, `get_basic_frequencies`,
+        and `get_basic_inv_frequencies` to ensure consistent RoPE configuration.
+
+        Returns:
+            RopeConfig: Configured RoPE settings including scaling type,
+                factor, and other rope-specific parameters.
+        """
+        from easydel.layers import RopeConfig
+
+        rope_scaling = getattr(self, "rope_scaling", None)
+        if isinstance(rope_scaling, dict) and rope_scaling and not self._is_flat_rope_parameters(rope_scaling):
+            # Per-layer-type mapping (HF v5 Gemma3/OLMo3 style): the shared rotary
+            # builders serve the global layers, so use the ``full_attention`` entry.
+            # Local layers build their own (unscaled) tables. Types the shared
+            # builders do not implement (e.g. Gemma4 ``proportional``, built by the
+            # model itself) keep the previous unscaled fallback.
+            full_attention = rope_scaling.get("full_attention")
+            rope_scaling = None
+            if isinstance(full_attention, dict):
+                full_rope_type = full_attention.get("rope_type", full_attention.get("type", "default"))
+                if full_rope_type in {"default", "linear", "dynamic", "yarn", "deepseek_yarn", "llama3", "longrope"}:
+                    rope_scaling = full_attention
+        if not isinstance(rope_scaling, dict) or not rope_scaling:
+            config = RopeConfig()
+        else:
+            config = RopeConfig.from_dict(rope_scaling)
+
+        if config.original_max_position_embeddings is None:
+            config.original_max_position_embeddings = getattr(self, "original_max_position_embeddings", None)
+
+        if self._external_rope_config_kwargs is not None and len(self._external_rope_config_kwargs.keys()) > 0:
+            config.update(**self._external_rope_config_kwargs)
+
+        return config
+
+    def get_basic_rope(
+        self,
+        dtype: Array,
+        head_size: int,
+        rotary_dim: int | None = None,
+        is_neox_style: bool = True,
+        base: float | None = None,
+    ):
+        """Return a rotary position embedding function configured for this model.
+
+        Creates a RoPE (Rotary Position Embedding) function that can be applied
+        to query and key tensors during attention computation. The function
+        incorporates all model-specific settings like rope_scaling, partial_rotary_factor,
+        and max_position_embeddings.
+
+        Args:
+            dtype (Array): Target dtype for the generated embeddings (e.g., jnp.bfloat16).
+            head_size (int): Attention head dimension size.
+            rotary_dim (int, optional): Number of dimensions to apply rotary embeddings to.
+                Defaults to `head_size` if not specified.
+            is_neox_style (bool): Whether to use GPT-NeoX style rotary embeddings
+                (interleaved real/imaginary). Defaults to True.
+            base (float, optional): Base frequency for computing position embeddings.
+                Defaults to `self.rope_theta` (typically 10000.0).
+
+        Returns:
+            Callable: A function that takes (query, key, positions) and returns
+                rotated (query, key) tensors with position information encoded.
+
+        Example:
+            >>> rope_fn = config.get_basic_rope(
+            ...     dtype=jnp.bfloat16,
+            ...     head_size=64,
+            ... )
+            >>> rotated_q, rotated_k = rope_fn(query, key, positions)
+        """
+        from easydel.layers import get_rope
+
+        partial_rotary_factor = getattr(self, "partial_rotary_factor", 1.0)
+        rotary_dim = rotary_dim or head_size
+        rope_config = self._get_rope_config()
+        return get_rope(
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position=self.granted_freq_max_position_embedding,
+            base=base or self.rope_theta,
+            dtype=dtype,
+            is_neox_style=is_neox_style,
+            rope_scaling=rope_config.to_dict(),
+            partial_rotary_factor=partial_rotary_factor,
+        )
+
+    def get_basic_inv_frequencies(
+        self,
+        head_size: int | None = None,
+        rotary_dim: int | None = None,
+        base: float | None = None,
+        partial_rotary_factor: float = 1.0,
+    ) -> ModuleCaches:
+        """Compute inverse frequencies for rotary position embeddings.
+
+        Generates the inverse frequency tensor used to compute rotary embeddings.
+        The inverse frequencies are: 1 / (base^(2i/d)) for i in [0, d/2).
+        These frequencies are then used with position indices to create the
+        sinusoidal position encodings.
+
+        Args:
+            head_size (int, optional): Attention head dimension size.
+                Defaults to `self.head_dim` if not specified.
+            rotary_dim (int, optional): Number of dimensions for rotary embeddings.
+                Defaults to `head_size` if not specified.
+            base (float, optional): Base frequency value (typically 10000.0).
+                Defaults to `self.rope_theta`.
+            partial_rotary_factor (float): Fraction of head dimensions to apply
+                rotary embeddings to. Range [0, 1]. Defaults to 1.0 (full rotation)
+                or the model's `partial_rotary_factor` attribute.
+
+        Returns:
+            ModuleCaches: Container wrapping the computed inverse frequency tensor
+                with shape dependent on rotary_dim and rope_scaling configuration.
+
+        Example:
+            >>> caches = config.get_basic_inv_frequencies(head_size=64)
+            >>> inv_freqs = caches.data  # The actual frequency tensor
+        """
+        from easydel.layers import get_inv_frequencies
+
+        from .utils import ModuleCaches
+
+        partial_rotary_factor = getattr(self, "partial_rotary_factor", partial_rotary_factor)
+        head_size = head_size or self.head_dim
+        rotary_dim = rotary_dim or head_size
+        rope_config = self._get_rope_config()
+
+        frequencies = get_inv_frequencies(
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position=self.granted_freq_max_position_embedding,
+            base=base or self.rope_theta,
+            rope_scaling=rope_config.to_dict(),
+            partial_rotary_factor=partial_rotary_factor,
+        )
+
+        return ModuleCaches(frequencies)
+
+    def get_basic_frequencies(
+        self,
+        head_size: int | None = None,
+        rotary_dim: int | None = None,
+        base: float | None = None,
+    ) -> ModuleCaches:
+        """Compute frequencies for rotary embeddings and place on the device mesh.
+
+        Similar to `get_basic_inv_frequencies` but computes the full frequency
+        tensors (cos and sin of position * inv_freq) and places them on the
+        configured device mesh with appropriate sharding.
+
+        The frequencies are kept in float32 (a bfloat16 cos/sin table costs
+        ~1e-3 relative attention error at every position past the first) and
+        sharded with a replicated PartitionSpec.
+
+        Args:
+            head_size (int, optional): Attention head dimension size.
+                Defaults to `self.head_dim` if not specified.
+            rotary_dim (int, optional): Number of dimensions for rotary embeddings.
+                Defaults to `head_size` if not specified.
+            base (float, optional): Base frequency value (typically 10000.0).
+                Defaults to `self.rope_theta`.
+
+        Returns:
+            ModuleCaches: Container wrapping the frequency tensor, already placed
+                on the device mesh with NamedSharding for efficient distributed access.
+
+        Note:
+            The returned frequencies are float32 and replicated across all
+            devices (PartitionSpec()); the rotary kernels cast their outputs back
+            to the activation dtype.
+        """
+        from easydel.layers import get_frequencies
+
+        from .utils import ModuleCaches
+
+        partial_rotary_factor = getattr(self, "partial_rotary_factor", 1.0)
+        head_size = head_size or self.head_dim
+        rotary_dim = rotary_dim or head_size
+        rope_config = self._get_rope_config()
+
+        frequencies = get_frequencies(
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position=self.granted_freq_max_position_embedding,
+            base=base or self.rope_theta,
+            rope_scaling=rope_config.to_dict(),
+            partial_rotary_factor=partial_rotary_factor,
+        ).astype(jnp.float32)
+
+        return ModuleCaches(spx.with_sharding_constraint(frequencies, Ps(), mesh=self.mesh, ignore_mpmd=True))
+
+    @staticmethod
+    def _create_causal_mask(target_length):
+        """Create a causal attention mask for autoregressive models.
+
+        Generates a lower triangular boolean mask that prevents attention
+        from future tokens to past tokens, enforcing the autoregressive property
+        required for language models.
+
+        The mask is True for positions that CAN be attended to (past and current)
+        and uses JAX's efficient boolean operations for construction.
+
+        Args:
+            target_length (int): The sequence length for the mask. For a sequence
+                of N tokens, creates an NxN mask.
+
+        Returns:
+            jnp.ndarray: 4D boolean array with shape [1, 1, target_length, target_length].
+                The leading dimensions are batch (1) and heads (1), allowing
+                broadcasting during attention computation. Element [0, 0, i, j]
+                is True if position i can attend to position j (i.e., j <= i).
+
+        Example:
+            >>> mask = EasyDeLBaseConfig._create_causal_mask(4)
+            >>> # mask[0, 0] is:
+            >>> # [[True, False, False, False],
+            >>> #  [True, True,  False, False],
+            >>> #  [True, True,  True,  False],
+            >>> #  [True, True,  True,  True ]]
+        """
+        causal_mask_bool = jnp.zeros((target_length, target_length), dtype=jnp.bool_)
+
+        if target_length != 1:
+            row_indices = jnp.arange(target_length)[:, None]
+            col_indices = jnp.arange(target_length)[None, :]
+            lower_triangular = row_indices >= col_indices
+            causal_mask_bool = jnp.logical_or(causal_mask_bool, lower_triangular)
+        else:
+            causal_mask_bool = causal_mask_bool.at[:, 0].set(True)
+
+        row_indices = jnp.arange(target_length)[:, None]
+        col_indices = jnp.arange(target_length)[None, :]
+        cache_mask = col_indices <= row_indices
+        causal_mask_bool = jnp.logical_and(causal_mask_bool, cache_mask)
+        causal_mask_bool = causal_mask_bool[None, None, :, :].astype("b1")
+        return causal_mask_bool
+
+    def get_mask_details(self) -> dict[int, AttnMaskDetail] | None:
+        """Get attention mask details for each layer.
+
+        Retrieves layer-specific attention mask configurations, which is
+        particularly useful for models with heterogeneous attention patterns
+        (e.g., models using different attention types per layer like sliding
+        window attention in some layers and full attention in others).
+
+        Returns:
+            dict[int, AttnMaskDetail] | None: A dictionary mapping layer indices
+                to their corresponding AttnMaskDetail configurations, or None
+                if the model doesn't define layer-specific mask types.
+        """
+        config = self.get_text_config()
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types is not None:
+            from easydel.infra.utils import AttnMaskDetail, AttnMaskType
+
+            mapping = {}
+            for layer_idx, layer_type in enumerate(layer_types):
+                mapping[layer_idx] = AttnMaskDetail(
+                    mask_type=AttnMaskType.from_hf(layer_type),
+                    size=getattr(config, "sliding_window", getattr(config, "sliding_windows", None)),
+                    chunks=getattr(config, "attention_chunk_size", None),
+                )
+            return mapping
+        return None
+
+    def get_basic_causal_mask(self, *args, **kwargs):
+        """Get or create the precomputed causal attention mask.
+
+        Creates a lower-triangular causal mask for autoregressive attention
+        and places it on the device mesh. The mask prevents tokens from
+        attending to future positions in the sequence.
+
+        The mask is computed for `granted_mask_max_position_embedding` length
+        and cached on the device with replicated sharding.
+
+        Args:
+            *args: Unused positional arguments (for API compatibility).
+            **kwargs: Unused keyword arguments (for API compatibility).
+
+        Returns:
+            ModuleCaches | bool: If `precompute_masks` is True, returns a
+                ModuleCaches containing the boolean causal mask with shape
+                [1, 1, max_len, max_len]. Returns False if mask precomputation
+                is disabled.
+
+        Note:
+            When `precompute_masks=False`, attention layers must generate
+            causal masks dynamically, which may impact performance.
+        """
+        from .utils import ModuleCaches
+
+        if self.precompute_masks is False:
+            return False
+
+        target_length = self.granted_mask_max_position_embedding
+
+        mask = self._create_causal_mask(target_length)
+        return ModuleCaches(spx.with_sharding_constraint(mask, Ps(), mesh=self.mesh, ignore_mpmd=True))
+
+    def get_fcm_mask(
+        self,
+        batch_size: int | None = None,
+        seq_length: int | None = None,
+        deterministic: bool = False,
+        rng: jax.Array | None = None,
+        *,
+        key: jax.Array | None = None,
+        shape: tuple[int, int, int, int] | None = None,
+        fcm_ratio: float | None = None,
+    ):
+        """Generate a Forgetful Causal Mask (FCM) for training.
+
+        FCM randomly hides context positions during training. By default the
+        dropping ratio is sampled per sequence uniformly between
+        ``fcm_min_ratio`` and ``fcm_max_ratio``. The documented ``key``, ``shape``,
+        ``fcm_ratio`` calling convention is also supported for a fixed ratio.
+
+        Args:
+            batch_size: Number of sequences. May be omitted when ``shape`` is given.
+            seq_length: Sequence length. May be omitted when ``shape`` is given.
+            deterministic: If True, return None (no FCM applied).
+            rng: PRNG key used to sample the mask. Required when FCM is active.
+                A config owns no RNG stream, so the caller supplies it explicitly.
+            key: Alias for ``rng`` used by the shape-based calling convention.
+            shape: Optional mask shape ``(batch_size, 1, seq_length, seq_length)``.
+            fcm_ratio: Optional fixed dropping probability in [0, 1]. Overrides
+                the configured ratio range and enables FCM even if that range is disabled.
+
+        Returns:
+            Boolean mask of shape ``[batch_size, 1, seq_length, seq_length]``
+            where True means visible, or None when deterministic or when FCM is
+            disabled and no fixed ratio was supplied. The first context position
+            is always visible. Combine this mask with the causal attention mask.
+
+        Raises:
+            ValueError: If active FCM lacks a PRNG key, the dimensions or ratio
+                are invalid, or conflicting calling conventions are supplied.
+        """
+        if deterministic or (fcm_ratio is None and self.fcm_max_ratio <= 0):
+            return None
+        if rng is not None and key is not None:
+            raise ValueError("Specify only one of `rng` and `key`.")
+        rng = key if rng is None else rng
+        if rng is None:
+            raise ValueError("`get_fcm_mask` requires `rng` or `key` (a JAX PRNG key) when FCM is active.")
+        if shape is not None:
+            if len(shape) != 4 or shape[1] != 1 or shape[2] != shape[3]:
+                raise ValueError("`shape` must be (batch_size, 1, seq_length, seq_length).")
+            if batch_size is not None and batch_size != shape[0]:
+                raise ValueError("`batch_size` conflicts with `shape`.")
+            if seq_length is not None and seq_length != shape[2]:
+                raise ValueError("`seq_length` conflicts with `shape`.")
+            batch_size, seq_length = shape[0], shape[2]
+        if batch_size is None or seq_length is None or batch_size <= 0 or seq_length <= 0:
+            raise ValueError("Positive `batch_size` and `seq_length` (or `shape`) are required.")
+        if fcm_ratio is None:
+            if not 0 <= self.fcm_min_ratio <= self.fcm_max_ratio <= 1:
+                raise ValueError("FCM ratios must satisfy 0 <= fcm_min_ratio <= fcm_max_ratio <= 1.")
+            ratio_key, mask_key = jax.random.split(rng)
+            ratio = jax.random.uniform(
+                ratio_key,
+                shape=(batch_size, 1, 1, 1),
+                minval=self.fcm_min_ratio,
+                maxval=self.fcm_max_ratio,
+            )
+        else:
+            if not 0 <= fcm_ratio <= 1:
+                raise ValueError("`fcm_ratio` must be in [0, 1].")
+            ratio, mask_key = fcm_ratio, rng
+        mask = jax.random.uniform(mask_key, shape=(batch_size, 1, seq_length, seq_length)) >= ratio
+        return mask.at[:, :, :, 0].set(True)
+
+    def get_kv_shared_layer_mapping(self) -> dict[int, int]:
+        """Return a mapping from KV-shared layer indices to their donor indices.
+
+        Layers beyond the ``num_kv_shared_layers`` threshold reuse K/V from
+        the last non-shared layer of the same attention type (sliding or full).
+
+        Returns:
+            Dict mapping ``shared_layer_idx -> donor_layer_idx``.  Empty when
+            ``num_kv_shared_layers`` is 0 or ``layer_types`` is not set.
+        """
+        return {}
+
+    @staticmethod
+    def _fix_parent_kws(kw1, kw2):
+        """Merge two keyword argument dictionaries, with kw1 taking precedence.
+
+        Internal utility for combining configuration keyword arguments, typically
+        used when inheriting or composing configurations where child config
+        values should override parent defaults.
+
+        Args:
+            kw1 (dict): Primary dictionary whose values take precedence.
+                This is typically the child/override configuration.
+            kw2 (dict): Secondary dictionary providing default values.
+                This is typically the parent/base configuration.
+
+        Returns:
+            dict: New dictionary containing all keys from both inputs.
+                For keys present in both, values from `kw1` are used.
+
+        Example:
+            >>> base = {"a": 1, "b": 2}
+            >>> override = {"b": 3, "c": 4}
+            >>> merged = EasyDeLBaseConfig._fix_parent_kws(override, base)
+            >>> # merged = {"b": 3, "c": 4, "a": 1}
+        """
+        result = copy.deepcopy(kw1)
+        tkey = result.keys()
+        for k, v in kw2.items():
+            if k not in tkey:
+                result[k] = v
+        return result
+
+    @property
+    def runtime_sharding_resolver(self) -> RuntimeShardingResolver:
+        """Build the canonical :class:`RuntimeShardingResolver` for this config.
+
+        Synthesises a resolver from the config's :class:`AxisPolicy` and live
+        mesh, including a :class:`PipelineStageRankResolver` when virtual
+        pipeline stages are in play.
+
+        Returns:
+            RuntimeShardingResolver: A resolver bound to the current mesh and
+            capable of mapping logical axes to mesh axes for the current
+            execution mode.
+        """
+        if not isinstance(getattr(self, "axis_policy", None), AxisPolicy):
+            self.axis_policy = AxisPolicy.from_partition_axis(getattr(self, "partition_axis", None))
+        if not isinstance(getattr(self, "partition_axis", None), PartitionAxis):
+            self.partition_axis = self.axis_policy.to_partition_axis()
+        mesh = self.mesh
+        stage_rank_resolver = None
+        physical_stages = int(getattr(mesh, "shape", {}).get("pp", 1))
+        virtual_stages = int(getattr(self, "pipeline_virtual_stages", 1) or 1)
+        if physical_stages > 1 and virtual_stages > 1:
+            stage_rank_resolver = PipelineStageRankResolver(
+                physical_stages=physical_stages,
+                virtual_stages=virtual_stages,
+                layout=str(getattr(self, "pipeline_stage_layout", "loop")),
+            )
+        return RuntimeShardingResolver(
+            axis_policy=self.axis_policy,
+            mesh=mesh,
+            stage_rank_resolver=stage_rank_resolver,
+        )
+
+    def logical_axis_rules(
+        self,
+        *,
+        mode: str | int | object = MODE_TRAIN,
+        shape: tuple[int, ...] | object = NOT_GIVEN,
+        overrides: LogicalAxisRules | None = None,
+    ):
+        """Open a SpectraX logical-axis-rules scope for this config's policy.
+
+        Convenience pass-through to
+        :meth:`RuntimeShardingResolver.logical_axis_rules` that scopes
+        SpectraX logical-axis-rule rewrites to the current mesh and
+        :class:`AxisPolicy`.
+
+        Args:
+            mode: Execution mode passed to the resolver (defaults to
+                ``MODE_TRAIN``); selects between train/inference axis maps.
+            shape: Tensor shape used to disambiguate axis-binding rules for
+                shape-dependent policies.
+            overrides: Optional ad-hoc additions or replacements to the
+                resolved logical-axis rules.
+
+        Returns:
+            ContextManager: A SpectraX context manager that activates the
+            resolved logical-axis-rule set for its scope.
+        """
+        return self.runtime_sharding_resolver.logical_axis_rules(mode=mode, shape=shape, overrides=overrides)
+
+    @property
+    def partition_manager(self) -> RuntimeShardingResolver:
+        """Compatibility view returning the runtime sharding resolver.
+
+        EasyDeL now uses ``RuntimeShardingResolver`` internally. The historical
+        ``partition_manager`` property remains available so existing model and
+        trainer code can keep calling ``resolve(...)`` / ``shard(...)`` while the
+        rest of the stack migrates to ``axis_policy``.
+        """
+        return self.runtime_sharding_resolver
+
+    __hash__ = hash_fn
+
+
+EasyDeLBaseConfig.__init__.__doc__ = EasyDeLBaseConfig.__doc__
+EasyDeLBaseConfigDict.__doc__ = EasyDeLBaseConfig.__init__.__doc__
+EasyDeLBaseConfigDict.__annotations__ = EasyDeLBaseConfig.__annotations__

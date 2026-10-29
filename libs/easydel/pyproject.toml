@@ -1,0 +1,240 @@
+[build-system]
+requires = ["uv_build>=0.7.19,<0.8.0"]
+build-backend = "uv_build"
+
+[project]
+name = "easydel"
+version = "0.4.0"
+authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
+description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "Apache-2.0" }
+keywords = [
+	"Deep Learning",
+	"Machine Learning",
+	"JAX",
+	"CUDA",
+	"XLA",
+	"Triton",
+	"Pallas",
+]
+classifiers = [
+	"Development Status :: 3 - Alpha",
+	"Intended Audience :: Developers",
+	"Topic :: Scientific/Engineering :: Artificial Intelligence",
+	"License :: OSI Approved :: Apache Software License",
+	"Programming Language :: Python :: 3.11",
+	"Programming Language :: Python :: 3.12",
+	"Programming Language :: Python :: 3.13",
+]
+dependencies = [
+	"jax>=0.10.0",
+	"jaxlib>=0.10.0",
+	"eformer==0.1.0",
+	"ejkernel==0.0.82",
+	"eray==0.1.0",
+	"spectrax-lib==0.1.5",
+	"ray[default]==2.54.0",
+	"einops~=0.8.0",
+	"transformers~=5.18.0",
+	"sentencepiece>=0.2.0",
+	"fastapi>=0.115.2",
+	"wandb>=0.22.2",
+	"uvloop==0.21.0",
+	"uvicorn[standard]>=0.32.0",
+	"jinja2>=3.1.5",
+	"grain~=0.2.11",
+	"datasets>=3.6.0",
+	"gcsfs>=2024.2,<2026",
+	"zstandard>=0.23.0",
+	"pyyaml>=6.0",
+	"msgspec~=0.19.0",
+	"partial-json-parser>=0.2.1.1.post6",
+	"google-api-python-client>=2.179.0",
+	"cryptography>=45.0.6",
+	"pyzmq>=27.1.0",
+	"grafanalib>=0.7.1",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/erfanzar/EasyDeL"
+"Repository" = "https://github.com/erfanzar/EasyDeL"
+"Documentation" = "https://easydel.readthedocs.io/en/latest/"
+
+
+[tool.uv.build-backend]
+module-name = "easydel"
+module-root = "."
+
+[tool.setuptools]
+package-dir = { "" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+"easydel" = ["py.typed"]
+
+[project.optional-dependencies]
+torch = ["torch==2.8.0"]
+cuda = [
+	"jax[cuda13]>=0.10.0 ; sys_platform == 'linux'",
+	"torch==2.8.0",
+	"ejkernel[cuda,triton]==0.0.82 ; sys_platform == 'linux'",
+]
+tpu = ["jax[tpu]>=0.10.0 ; sys_platform == 'linux'", "ejkernel[tpu]==0.0.82 ; sys_platform == 'linux'"]
+tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
+lm_eval = ["lm_eval~=0.4.11"]
+profile = [
+	"protobuf>=6.31.1",
+	"xprof>=2.20.6",
+	"tb-nightly>=2.21.0a20250820",
+	"xprof-nightly>=2.21.6a20250820",
+]
+podutils = ["eopod==0.0.36"]
+mm = ["pillow>=12.1.1"]
+
+[tool.black]
+line-length = 121
+target-version = ["py311"]
+preview = true
+
+[tool.ruff]
+line-length = 121
+target-version = "py311"
+# No first-party source roots: import grouping must not depend on the working directory. The pre-commit hook runs
+# from the repo root with --config, where the default src=["."] finds no package, while editors run from this
+# directory, where it does; the two disagreed on hundreds of files. Same-package detection still applies.
+src = []
+
+[tool.ruff.lint]
+select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
+ignore = [
+	"F722",   # Forward annotations needed for jaxtyping
+	"B008",   # Do not perform function calls in argument defaults
+	"UP015",  # Unnecessary open mode
+	"A005",   # Module-level shadowing
+	"UP037",  # Remove quotes from type annotation - needed for jaxtyping string literals
+	"E501",   # Line too long (handled by formatter)
+	"RUF001", # Ruff's own complexity check - handled by other tools
+	"RUF002", # Ruff's own complexity check - handled by other tools
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401"]
+"**/modeling_*.py" = [
+	"UP037",
+	"F821",
+] # Allow quoted type annotations and forward refs in model files
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+exclude = ["easydel/"]
+
+[tool.basedpyright]
+# Keep the linter useful: correctness diagnostics stay enabled, while the
+# dynamic JAX/SpectraX/model-registry noise is muted below.
+reportAssignmentType = "none"
+reportUnknownVariableType = "none"
+reportPrivateUsage = "none"
+reportPrivateLocalImportUsage = "none"
+reportOptionalCall = "none"
+reportUnknownMemberType = "none"
+reportGeneralTypeIssues = "none"
+reportArgumentType = "none"
+enableTypeIgnoreComments = true
+reportMissingTypeArgument = "none"
+reportUnknownParameterType = "none"
+reportAny = "none"
+reportCallIssue = "none"
+reportUnknownArgumentType = "none"
+reportRedeclaration = "none"
+reportCallInDefaultInitializer = "none"
+reportConstantRedefinition = "none"
+reportDeprecated = "none"
+reportFunctionMemberAccess = "none"
+reportImportCycles = "none"
+reportImplicitRelativeImport = "none"
+reportInconsistentConstructor = "none"
+reportInconsistentOverload = "error"
+reportInvalidCast = "none"
+reportInvalidTypeArguments = "error"
+reportInvalidTypeForm = "none"
+reportInvalidTypeVarUse = "none"
+reportMissingImports = "error"
+reportMissingSuperCall = "none"
+reportMissingTypeStubs = "none"
+reportOptionalContextManager = "error"
+reportOptionalIterable = "error"
+reportOptionalOperand = "error"
+reportOptionalSubscript = "error"
+reportPossiblyUnboundVariable = "error"
+reportPropertyTypeMismatch = "none"
+# Return-type mismatches fail CI rather than being hidden globally.
+reportReturnType = "error"
+reportTypedDictNotRequiredAccess = "none"
+reportUnsupportedDunderAll = "none"
+reportUnnecessaryCast = "none"
+reportUnhashable = "error"
+reportUnnecessaryComparison = "none"
+reportUnnecessaryContains = "none"
+reportUnnecessaryTypeIgnoreComment = "none"
+reportUntypedBaseClass = "none"
+reportUntypedFunctionDecorator = "none"
+reportUnusedClass = "none"
+reportUnusedFunction = "none"
+reportUnusedImport = "none"
+reportUnusedVariable = "none"
+reportIgnoreCommentWithoutRule = "none"
+reportUnnecessaryIsInstance = "none"
+reportUnusedCallResult = "none"
+reportUnknownLambdaType = "none"
+reportUnannotatedClassAttribute = "none"
+reportImplicitStringConcatenation = "none"
+reportMissingParameterType = "none"
+reportImplicitOverride = "none"
+reportImplicitAbstractClass = "none"
+reportExplicitAny = "none"
+reportIncompatibleMethodOverride = "none"
+reportIndexIssue = "none"
+reportAttributeAccessIssue = "none"
+reportUnreachable = "none"
+reportOptionalMemberAccess = "none"
+reportOperatorIssue = "none"
+reportUninitializedInstanceVariable = "none"
+reportIncompatibleVariableOverride = "none"
+reportPrivateImportUsage = "none"
+reportUnusedParameter = "none"
+
+[tool.pytest.ini_options]
+markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.uv]
+conflicts = [
+	[
+		{ extra = "cuda" },
+		{ extra = "tpu" },
+	],
+	[
+		{ extra = "cuda" },
+		{ extra = "torch" },
+	],
+	[
+		{ extra = "profile" },
+		{ extra = "tensorflow" },
+	],
+]
+
+# Resolver-level settings (prerelease policy, the pytorch-cpu index definition)
+# live in the workspace-root pyproject.toml. The sibling libraries resolve from
+# the workspace during development; published wheels keep the pinned versions.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu", marker = "extra == 'torch'" }
+spectrax-lib = { workspace = true }
+ejkernel = { workspace = true }
+eformer = { workspace = true }
+eray = { workspace = true }

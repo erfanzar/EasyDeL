@@ -1,0 +1,3263 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Comprehensive trainer configuration support for ELM (EasyDeL Large Model).
+
+This module provides TypedDict-based configuration classes for all trainer types
+available in EasyDeL. It serves as the central configuration registry for training
+workflows, supporting various optimization paradigms including:
+
+- Supervised Fine-Tuning (SFT)
+- Direct Preference Optimization (DPO)
+- Odds Ratio Preference Optimization (ORPO)
+- Group Relative Policy Optimization (GRPO)
+- Self-Distillation Policy Optimization (SDPO)
+- Proximal Policy Optimization (PPO)
+- Kahneman-Tversky Optimization (KTO)
+- Binary Classifier Optimization (BCO)
+- Contrastive Preference Optimization (CPO)
+- Generalized Knowledge Distillation (GKD)
+- Nash Mixture-of-Decoders (Nash-MD)
+- Exploratory Preference Optimization (XPO)
+- Reward Model Training
+- Knowledge Distillation
+
+The module uses TypedDict for type-safe configuration validation while maintaining
+flexibility through NotRequired fields. Configuration classes follow an inheritance
+hierarchy where specialized trainers extend base configurations.
+
+Example:
+    Basic usage with trainer configuration:
+
+    >>> from easydel.infra.elarge.types import (
+    ...     normalize_trainer_config,
+    ...     get_trainer_class,
+    ... )
+    >>> config = {
+    ...     "trainer_type": "dpo",
+    ...     "learning_rate": 1e-6,
+    ...     "beta": 0.1,
+    ... }
+    >>> normalized = normalize_trainer_config(config)
+    >>> trainer_cls = get_trainer_class("dpo")
+
+Note:
+    All configuration classes use total=False to make all fields optional,
+    allowing partial configuration with sensible defaults applied at runtime.
+"""
+
+from __future__ import annotations
+
+import warnings
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast
+
+from .eval import BenchmarkConfig
+
+if TYPE_CHECKING:
+    from easydel.infra.etils import MpMdSchedulers
+
+    from .data import DatasetMixtureCfg
+
+# Mapping of trainer type aliases to their canonical forms.
+#
+# This dictionary allows alternative naming conventions (e.g., underscore vs
+# hyphen) to be transparently normalized to canonical trainer type identifiers.
+_TRAINER_TYPE_ALIASES: dict[str, str] = {
+    "nash_md": "nash-md",
+    "agentic_moshpit": "agentic-moshpit",
+    "async-grpo": "async_grpo",
+    "compaction-rl": "compaction_rl",
+    "compaction_reinforcement_learning": "compaction_rl",
+    "dppo-trainer": "dppo",
+    "gspo-token": "gspo_token",
+    "grpo-replay-buffer": "grpo_with_replay_buffer",
+    "grpo-with-replay-buffer": "grpo_with_replay_buffer",
+    "grpo_replay_buffer": "grpo_with_replay_buffer",
+    "grpo_replay_buffer_trainer": "grpo_with_replay_buffer",
+    "nemo-gym": "nemo_gym",
+    "online-dpo": "online_dpo",
+    "rlvr_trainer": "rlvr",
+    "self_distillation": "sdft",
+    "single-rollout-asynchronous-optimization": "sao",
+    "single_rollout_asynchronous_optimization": "sao",
+    "spec": "speculative_decoding",
+    "spec-decoding": "speculative_decoding",
+    "spec_decoding": "speculative_decoding",
+    "speculative-decoding": "speculative_decoding",
+}
+
+
+def _normalize_trainer_type(trainer_type: str) -> str:
+    """Normalize trainer type string to canonical form.
+
+    Handles case normalization and known aliases (e.g., "nash_md" -> "nash-md").
+    This ensures consistent trainer type identification regardless of how users
+    specify the trainer type in their configuration.
+
+    Args:
+        trainer_type: Trainer type string to normalize. Can be in any case
+            and may use alternative naming conventions.
+
+    Returns:
+        Normalized trainer type string in lowercase with aliases resolved
+        to their canonical form.
+
+    Example:
+        >>> _normalize_trainer_type("DPO")
+        'dpo'
+        >>> _normalize_trainer_type("nash_md")
+        'nash-md'
+        >>> _normalize_trainer_type("GRPO")
+        'grpo'
+    """
+    normalized = trainer_type.lower()
+    return _TRAINER_TYPE_ALIASES.get(normalized, normalized)
+
+
+class LossConfig(TypedDict, total=False):
+    """Configuration for loss computation in training.
+
+    This TypedDict defines all configurable parameters for loss calculation,
+    supporting various loss types including cross-entropy, classification losses,
+    and chunked computation strategies for memory efficiency.
+
+    The loss configuration supports advanced features like label smoothing,
+    Z-loss regularization for MoE models, and flexible reduction strategies.
+
+    Attributes:
+        ignore_index: Token index to ignore in loss computation.
+            Defaults to -100, which is the standard PyTorch convention
+            for padding tokens in language modeling.
+        label_smoothing: Label smoothing factor for regularization.
+            A value of 0.0 means no smoothing (hard labels), while
+            positive values blend the target distribution with a
+            uniform distribution over all labels.
+        z_loss: Z-loss regularization coefficient for router auxiliary loss
+            in Mixture-of-Experts models. Helps prevent router collapse.
+        loss_normalizing_factor: Strategy for normalizing loss across tokens
+            and sequences. Options include:
+            - "NO_WEIGHT_NUM_REAL_TARGET_TOKENS": Normalize by real tokens without weights
+            - "NUM_REAL_TARGET_TOKENS": Normalize by count of real (non-padding) tokens
+            - "NUM_TOTAL_TARGET_TOKENS": Normalize by total token count
+            - "AVERAGE_PER_SEQUENCE": Average loss per sequence
+        num_labels: Number of labels for classification tasks.
+            Used in sequence classification heads.
+        problem_type: Type of classification problem being solved.
+            Affects loss computation and output interpretation.
+        divide_weight_sum: Whether to divide loss by the sum of sample weights
+            when using weighted loss computation.
+        shift_tokens: Whether to shift tokens for causal language model loss
+            computation. When True, targets are shifted by one position
+            to predict the next token.
+        break_on_nan: Whether to raise an error when NaN loss values are
+            detected during training. Useful for debugging numerical issues.
+        reduction: Loss reduction method applied after computing per-sample
+            losses. One of "none" (no reduction), "mean" (average), or
+            "sum" (total).
+        num_classification_labels: Number of classification labels for
+            sequence classification tasks.
+        classification_problem_type: Type of classification problem for
+            sequence classification. One of "regression",
+            "single_label_classification", or "multi_label_classification".
+        chunk_vocab_size: Chunk size for vocabulary-chunked cross entropy
+            computation. Reduces memory usage for large vocabularies.
+        chunk_token_size: Chunk size for token-chunked cross entropy
+            computation. Reduces memory usage for long sequences.
+        chunk_block_size: Block size for chunked computations.
+            Controls granularity of memory-efficient computation.
+        compute_dtype: Data type for loss computation. Use "fp32" for
+            numerical stability or "bf16" for faster computation.
+        cross_entropy_platform: Optional ejkernel sparse cross-entropy backend
+            override. ``None`` keeps the default XLA path; set ``"pallas"`` or
+            ``"auto"`` to opt into registered alternatives through config.
+        mtp_only: Train only on ``outputs.mtp_loss`` and skip the ordinary
+            task loss. Intended for MTP-head-only fine-tunes.
+
+    Example:
+        >>> loss_config: LossConfig = {
+        ...     "ignore_index": -100,
+        ...     "label_smoothing": 0.1,
+        ...     "reduction": "mean",
+        ...     "shift_tokens": True,
+        ... }
+    """
+
+    ignore_index: NotRequired[int]
+    label_smoothing: NotRequired[float]
+    z_loss: NotRequired[float]
+    loss_normalizing_factor: NotRequired[
+        Literal[
+            "NO_WEIGHT_NUM_REAL_TARGET_TOKENS",
+            "NUM_REAL_TARGET_TOKENS",
+            "NUM_TOTAL_TARGET_TOKENS",
+            "AVERAGE_PER_SEQUENCE",
+        ]
+    ]
+    num_labels: NotRequired[int | None]
+    problem_type: NotRequired[str | None]
+    divide_weight_sum: NotRequired[bool]
+    shift_tokens: NotRequired[bool]
+    break_on_nan: NotRequired[bool]
+    reduction: NotRequired[Literal["none", "mean", "sum"] | None]
+    num_classification_labels: NotRequired[int | None]
+    classification_problem_type: NotRequired[
+        Literal[
+            "regression",
+            "single_label_classification",
+            "multi_label_classification",
+        ]
+        | None
+    ]
+    chunk_vocab_size: NotRequired[int | None]
+    chunk_token_size: NotRequired[int | None]
+    chunk_block_size: NotRequired[int | None]
+    compute_dtype: NotRequired[Literal["fp32", "bf16"] | None]
+    cross_entropy_platform: NotRequired[Literal["auto", "xla", "pallas", "tilelang", "triton", "cuda", "cute"] | None]
+    mtp_only: NotRequired[bool]
+    sparse_loss: NotRequired[bool]
+
+
+class BaseTrainerCfg(TypedDict, total=False):
+    """Base configuration shared by all trainers (TrainingArguments).
+
+    This TypedDict serves as the foundation for all trainer configurations,
+    providing common parameters for learning rate scheduling, optimization,
+    data loading, checkpointing, logging, and distributed training.
+
+    All specialized trainer configurations inherit from this base class,
+    ensuring consistent parameter naming and behavior across different
+    training paradigms.
+
+    Attributes:
+        trainer_type: Type of trainer to use. Determines which trainer class
+            and configuration defaults are applied.
+        learning_rate: Initial learning rate for optimization.
+        learning_rate_end: Final learning rate for schedulers that support
+            annealing to a specific value.
+        num_train_epochs: Number of complete passes through the training dataset.
+        max_training_steps: Maximum number of training steps. If set, overrides
+            num_train_epochs.
+        per_epoch_training_steps: Number of training steps per epoch.
+            Used for custom epoch definitions.
+        per_epoch_evaluation_steps: Number of evaluation steps per epoch.
+        total_batch_size: Total batch size across all devices and accumulation steps.
+        eval_batch_size: Batch size for evaluation. Defaults to total_batch_size.
+        eval_config_overrides: Model-config overrides applied only to the evaluation
+            forward, e.g. ``{'attn_mechanism': 'vanilla'}`` to evaluate against the
+            reference attention kernel while training on a fused one.
+        gradient_accumulation_steps: Number of gradient accumulation steps before
+            performing an optimizer update.
+        optimizer: Optimizer type string (e.g., "adamw", "lion", "sgd").
+        trainable_selector: Selector used to extract trainable state from models
+            (for example "parameters", "lora", or ("parameters", "lora")).
+        scheduler: Learning rate scheduler type (e.g., "linear", "cosine", "none").
+        warmup_steps: Number of warmup steps for learning rate scheduling.
+        weight_decay: L2 regularization coefficient for optimizer.
+        clip_grad: Maximum gradient norm for gradient clipping. None disables clipping.
+        extra_optimizer_kwargs: Additional keyword arguments passed to the optimizer.
+        custom_scheduler: Custom scheduler function or configuration.
+        mpmd_scheduler: Optional MPMD pipeline schedule (``spectrax.runtime.schedules.Schedule``
+            instance, e.g. ``Std1F1B(microbatches=N)`` / ``GPipe(microbatches=N)``). Forwarded
+            to ``spx.jit(schedule=...)`` when the model mesh is MPMD. None ⇒ forward-only
+            marker-cluster MPMD program (no microbatch interleaving). Ignored on SPMD meshes.
+        dataloader_num_workers: Number of worker processes for data loading.
+        dataloader_fast_forward_on_resume: Whether a resumed run seeks the train
+            dataloader forward by the restored global step before the first step.
+            Defaults to True; set False when the source is already positioned or
+            seeking is prohibitively expensive.
+        dataloader_pin_memory: Whether to pin memory in data loaders for faster
+            GPU transfer.
+        dataloader_prefetch: Whether to overlap host-side batch fetching with
+            the compiled training step.
+        dataloader_prefetch_workers: Parallel host producer threads for the batch
+            prefetcher. Fetch stays serialized (deterministic stream order);
+            collation fans out. Raise when producing one batch takes longer than
+            the device step. Collator must be thread-safe when > 1.
+        dataloader_prefetch_buffer_size: Max collated batches queued ahead by the
+            prefetcher (per bucket when buckets are enabled). Defaults to
+            ``dataloader_prefetch_workers``; each queued batch holds one full
+            global batch in host memory.
+        remove_unused_columns: Whether to remove columns not used by the model
+            from the dataset.
+        ids_to_pop_from_dataset: List of column names to explicitly remove from dataset.
+        shuffle_train_dataset: Whether to shuffle the training dataset.
+        shuffle_seed_train: Random seed for dataset shuffling.
+        use_data_collator: Whether to use a data collator for batch preparation.
+        use_grain: Whether to use Grain for efficient data loading.
+        grain_shard_index: Shard index for Grain-based data loading.
+        grain_shard_count: Total number of shards for Grain-based data loading.
+        offload_dataset: Whether to offload dataset to specified device.
+        offload_device_type: Device type for dataset offloading (e.g., "cpu").
+        offload_device_index: Device index for dataset offloading.
+        do_train: Whether to run training.
+        do_eval: Whether to run evaluation.
+        do_last_save: Whether to save checkpoint at training completion.
+        is_fine_tuning: Whether this is a fine-tuning run (vs pre-training).
+        init_tx: Whether to initialize the optimizer (transformer) state.
+        train_on_inputs: Whether to compute loss on input tokens in addition
+            to target tokens.
+        aux_loss_enabled: Whether to enable auxiliary losses (e.g., for MoE).
+        pose: Optional PoSE position-augmentation configuration.
+        process_encoder: Optional on-the-fly vision-encoder configuration. Runs a VLM's
+            vision tower outside the train step (frozen, so no vision backward) and
+            hands precomputed patch embeddings to the step. Keys: ``enabled``,
+            ``row_bucket_multiple``, ``max_rows_per_step``, ``feature_dtype``,
+            ``presence_key``, ``only_buckets``, ``require_support``.
+        training_time_limit: Maximum training time as string (e.g., "2h30m").
+        buckets: Optional training-bucket definitions routed per step.
+        xla_compiler_options: Extra options forwarded to the XLA compiler.
+        profiler_duration_ms: Profiler capture duration in milliseconds.
+        profiler_enable_hlo_proto: Whether the profiler emits the HLO proto.
+        profiler_stop_step: Step at which profiling stops.
+        step_start_point: Step number to resume training from.
+        force_step_start_point: Whether to force ``step_start_point`` onto a
+            loaded nonzero state and reseed optimizer/scheduler counters.
+        resume_if_possible: Whether to automatically resume from latest checkpoint.
+        truncation_mode: How to truncate sequences that exceed max_length.
+            "keep_end" preserves the end, "keep_start" preserves the beginning.
+        max_length: Maximum sequence length for inputs.
+        max_sequence_length: Deprecated alias for max_length.
+        save_interval_minutes: Save checkpoint every N minutes.
+        save_steps: Save checkpoint every N steps.
+        save_total_limit: Maximum number of checkpoints to keep.
+        save_directory: Directory path for saving checkpoints.
+        save_optimizer_state: Whether to include optimizer state in checkpoints.
+        merge_lora_before_save: Whether regular and final trainer checkpoints
+            should save a merged LoRA export at the checkpoint root while
+            keeping an unmerged ``_resume_model`` copy so state-loading can
+            resume the original LoRA graph with or without optimizer state.
+        merge_lora_before_tpu_preemption_save: Whether TPU preemption
+            checkpoints should also export merged LoRA weights instead of using
+            the faster resume-focused path.
+        save_tpu_preemption_checkpoints: Whether JAX TPU preemption sync should
+            force-save a standard EasyDeL checkpoint for auto-resume.
+        remove_ckpt_after_load: Whether to remove checkpoint after loading.
+        evaluation_steps: Run evaluation every N steps.
+        max_evaluation_steps: Maximum number of evaluation steps per evaluation run.
+        log_steps: Log training metrics every N steps.
+        report_steps: Report metrics to external trackers every N steps.
+        log_all_workers: Whether all workers should log, or only the main process.
+        log_grad_norms: Whether to log gradient norms during training.
+        report_metrics: Whether to report metrics to external trackers (e.g., WandB).
+        metrics_to_show_in_rich_pbar: List of metric names to display in Rich progress bar.
+        progress_bar_type: Type of progress bar ("tqdm", "rich", or "json").
+        watchers: List of LogWatcher instances for custom per-parameter metric logging.
+        weight_distribution_pattern: Regex pattern for selecting weights to log distributions.
+        weight_distribution_log_steps: Log weight distributions every N steps.
+        verbose: Whether to enable verbose logging output.
+        process_zero_is_admin: Whether process 0 has admin privileges for logging/saving.
+        use_wandb: Whether to use Weights & Biases for experiment tracking.
+        wandb_entity: WandB entity (team or user) for logging.
+        wandb_name: Name for the WandB run.
+        trainer_prefix: Prefix for the trainer name in logging and checkpoints.
+        backend: JAX backend to use (e.g., "gpu", "tpu").
+        auto_shard_states: Whether to automatically shard model states across devices.
+        performance_mode: Whether to enable performance optimizations.
+        profiler_path: Optional output directory for the JAX profiler trace. When set,
+            the trainer calls ``jax.profiler.start_trace(profiler_path)`` immediately
+            after the first training step completes (so the trace excludes the initial
+            JIT-compile of step 1) and ``jax.profiler.stop_trace()`` when training
+            finishes. Set to None to disable.
+        profiler_log_all_workers: Whether all distributed workers should record JAX
+            profiler traces without enabling all-worker metrics/logging.
+        profiler_include_compile: Whether to start the profiler before the first
+            training step so compile/HLO data is included in the trace.
+        profiler_host_tracer_level: Optional ``ProfileOptions().host_tracer_level``
+            override (1-4) for the trace; higher values capture more host-side detail.
+        profiler_python_tracer_level: Optional ``ProfileOptions().python_tracer_level``
+            override for Python function-level profiling.
+        track_memory: Whether to track memory usage. Can be bool or float threshold.
+        low_mem_usage: Whether to enable low memory usage optimizations.
+        quantization_mode: QAT/STE quantization mode for forward-pass emulation.
+        quantization_group_size: Group size for group-wise quantizers.
+        quantization_bits: Bit-width for configurable quantizers (e.g. affine).
+        tensor_straight_through: Optional per-tensor STE transform callable.
+        straight_through_emulator: Optional graphstate-level STE transform callable.
+        model_name: Name of the model being trained.
+        model_parameters: Dictionary of model configuration parameters.
+        frozen_parameters: Regex pattern for parameters to freeze during training.
+        loss_config: Configuration for loss computation.
+        lmhead_chunksize: Optional token chunk size for LM-head projection during training/inference.
+        jax_distributed_config: Configuration for JAX distributed setup.
+        step_partition_spec: PartitionSpec for step function sharding.
+        state_apply_fn_kwarguments_to_model: Keyword arguments passed to model
+            during state application.
+        sparsify_module: Whether to enable module sparsification.
+        sparse_module_type: Type of sparse representation (e.g., "bcoo").
+        pruning_module: Pruning module or configuration.
+        tx_mu_dtype: Data type for optimizer momentum terms.
+        generation_top_p: Top-p (nucleus) sampling probability for generation preview.
+        generation_top_k: Top-k sampling parameter for generation preview.
+        generation_presence_penalty: Presence penalty for generation preview.
+        generation_frequency_penalty: Frequency penalty for generation preview.
+        generation_repetition_penalty: Repetition penalty for generation preview.
+        generation_temperature: Temperature for generation preview sampling.
+        generation_do_sample: Whether to use sampling for generation preview.
+        generation_num_return_sequences: Number of sequences to generate in preview.
+        generation_max_new_tokens: Maximum new tokens for generation preview.
+        generation_shard_inputs: Whether to shard inputs for generation.
+        generation_interval: Run generation preview every N steps.
+        generation_prompts: List of prompts for generation preview.
+        generation_use_train_prompts: Whether to use prompts from training data.
+        generation_num_prompts: Number of prompts to use from dataset.
+        generation_dataset_prompt_field: Field name containing prompts in dataset.
+        generation_extra_kwargs: Extra keyword arguments for generation.
+        generation_config_overrides: Overrides for generation configuration.
+        generation_seed: Random seed for generation preview.
+        generation_preview_print: Whether to print generation preview to console.
+        generation_log_to_wandb: Whether to log generation preview to WandB.
+        log_training_generations_to_wandb: Whether to log rollout/training generations to WandB.
+        benchmark_interval: Run benchmark suites every N training steps.
+        benchmarks: List of named benchmark configs to execute during training.
+        use_esurge_generation: Whether to use eSurge for optimized generation.
+        esurge_use_tqdm: Whether to show tqdm progress for eSurge generation.
+        esurge_hbm_utilization: HBM utilization target for eSurge.
+        esurge_max_num_seqs: Maximum concurrent sequences for eSurge.
+        esurge_min_input_pad: Minimum input padding for eSurge.
+        esurge_page_size: Page size for eSurge paged attention.
+        esurge_silent_mode: Whether to suppress eSurge output.
+        esurge_runner_verbose: Whether to enable verbose eSurge runner performance logs.
+        esurge_max_num_batched_tokens: Max num tokens to batch together for eSurge generation.
+        esurge_enable_prefix_caching: Enable/disable eSurge prefix caching.
+        esurge_data_parallelism_axis: Mesh axis name for eSurge data-parallel KV pages.
+        esurge_async_scheduling: Enable/disable asynchronous eSurge scheduling.
+        esurge_overlap_execution: Enable/disable overlapped eSurge execution.
+        esurge_max_num_seq_buckets: Optional explicit sequence-capacity buckets for eSurge runner compilation.
+        bucket_configs: Optional list of training-bucket dicts. Each entry becomes a
+            ``easydel.trainers.buckets.TrainingBucket`` (model-config variant, e.g.
+            ``{"attn_mechanism": "vanilla"}``, plus its own ``max_length``). When set
+            with ``bucket_rule``, the trainer builds one compiled step function and one
+            dataloader per bucket and selects which to use each step. All buckets share
+            one parameter/optimizer tree. None (default) disables bucketing.
+        bucket_rule: Serialized ``BucketRule`` selecting the active bucket per optimizer
+            step, e.g. ``{"kind": "mod", "mod": 5, "on_bucket": 0, "off_bucket": 1}``
+            runs the vanilla bucket every 5th step. Required when ``bucket_configs`` is set.
+        bucket_datasets: Optional list of ``DatasetMixtureCfg``, one per bucket, used to
+            build each bucket's dataloader. Length must match ``bucket_configs``.
+
+    Example:
+        >>> config: BaseTrainerCfg = {
+        ...     "learning_rate": 5e-5,
+        ...     "num_train_epochs": 3,
+        ...     "total_batch_size": 32,
+        ...     "optimizer": "adamw",
+        ...     "warmup_steps": 100,
+        ... }
+    """
+
+    trainer_type: NotRequired[
+        Literal[
+            "sft",
+            "base",
+            "dpo",
+            "grpo",
+            "sdpo",
+            "gfpo",
+            "gspo",
+            "ppo",
+            "orpo",
+            "reward",
+            "distillation",
+            "bco",
+            "cpo",
+            "gkd",
+            "kto",
+            "nash_md",
+            "nash-md",
+            "xpo",
+            "on_policy_distillation",
+            "seq_kd",
+            "sparse_distillation",
+            "spec",
+            "spec-decoding",
+            "spec_decoding",
+            "speculative-decoding",
+            "speculative_decoding",
+            "agentic-moshpit",
+            "agentic_moshpit",
+            "async-grpo",
+            "async_grpo",
+            "bema_dpo",
+            "compaction-rl",
+            "compaction_rl",
+            "compaction_reinforcement_learning",
+            "dppo",
+            "dppo-trainer",
+            "gold",
+            "grpo-replay-buffer",
+            "grpo-with-replay-buffer",
+            "grpo_replay_buffer",
+            "grpo_replay_buffer_trainer",
+            "grpo_with_replay_buffer",
+            "gspo-token",
+            "gspo_token",
+            "minillm",
+            "nemo-gym",
+            "nemo_gym",
+            "online-dpo",
+            "online_dpo",
+            "papo",
+            "prm",
+            "rlvr",
+            "rlvr_trainer",
+            "rloo",
+            "sao",
+            "sdft",
+            "self_distillation",
+            "ssd",
+            "tpo",
+            "embedding",
+            "single-rollout-asynchronous-optimization",
+            "single_rollout_asynchronous_optimization",
+        ]
+    ]
+    learning_rate: NotRequired[float]
+    learning_rate_end: NotRequired[float | None]
+    num_train_epochs: NotRequired[int]
+    max_training_steps: NotRequired[int | None]
+    per_epoch_training_steps: NotRequired[int | None]
+    per_epoch_evaluation_steps: NotRequired[int | None]
+    total_batch_size: NotRequired[int]
+    eval_batch_size: NotRequired[int | None]
+    eval_config_overrides: NotRequired[dict[str, Any] | None]
+    gradient_accumulation_steps: NotRequired[int]
+    gradient_accumulation_mode: NotRequired[str]
+
+    optimizer: NotRequired[str]
+    trainable_selector: NotRequired[Any]
+    scheduler: NotRequired[str]
+    warmup_steps: NotRequired[int]
+    weight_decay: NotRequired[float]
+    clip_grad: NotRequired[float | None]
+    extra_optimizer_kwargs: NotRequired[dict]
+    custom_scheduler: NotRequired[Any]
+    mpmd_scheduler: NotRequired[MpMdSchedulers | None]
+
+    dataloader_num_workers: NotRequired[int | None]
+    dataloader_fast_forward_on_resume: NotRequired[bool]
+    dataloader_pin_memory: NotRequired[bool | None]
+    dataloader_prefetch: NotRequired[bool]
+    dataloader_prefetch_workers: NotRequired[int]
+    dataloader_prefetch_buffer_size: NotRequired[int | None]
+    remove_unused_columns: NotRequired[bool]
+    ids_to_pop_from_dataset: NotRequired[list[str] | None]
+    shuffle_train_dataset: NotRequired[bool]
+    shuffle_seed_train: NotRequired[int]
+    use_data_collator: NotRequired[bool]
+    use_grain: NotRequired[bool]
+    grain_shard_index: NotRequired[int | None]
+    grain_shard_count: NotRequired[int | None]
+    offload_dataset: NotRequired[bool]
+    offload_device_type: NotRequired[str]
+    offload_device_index: NotRequired[int]
+
+    do_train: NotRequired[bool]
+    do_eval: NotRequired[bool]
+    do_last_save: NotRequired[bool]
+    is_fine_tuning: NotRequired[bool]
+    init_tx: NotRequired[bool]
+    train_on_inputs: NotRequired[bool]
+    aux_loss_enabled: NotRequired[bool]
+    pose: NotRequired[dict[str, Any] | None]
+    randomized_yarn: NotRequired[dict[str, Any] | None]
+    process_encoder: NotRequired[dict[str, Any] | None]
+    buckets: NotRequired[Any]
+    xla_compiler_options: NotRequired[dict[str, Any] | None]
+    profiler_duration_ms: NotRequired[int | None]
+    profiler_enable_hlo_proto: NotRequired[bool | None]
+    profiler_stop_step: NotRequired[int | None]
+    training_time_limit: NotRequired[str | None]
+    host_phase_log_path: NotRequired[str | None]
+    step_start_point: NotRequired[int | None]
+    force_step_start_point: NotRequired[bool]
+    resume_if_possible: NotRequired[bool]
+    truncation_mode: NotRequired[Literal["keep_end", "keep_start"]]
+    max_length: NotRequired[int | None]
+    # Deprecated alias (kept for backward compatibility).
+    max_sequence_length: NotRequired[int | None]
+    save_interval_minutes: NotRequired[float | None]
+    save_steps: NotRequired[int | None]
+    save_total_limit: NotRequired[int | None]
+    save_directory: NotRequired[str]
+    save_optimizer_state: NotRequired[bool]
+    merge_lora_before_save: NotRequired[bool]
+    merge_lora_before_tpu_preemption_save: NotRequired[bool]
+    save_tpu_preemption_checkpoints: NotRequired[bool]
+    remove_ckpt_after_load: NotRequired[bool]
+
+    evaluation_steps: NotRequired[int | None]
+    max_evaluation_steps: NotRequired[int | None]
+
+    log_steps: NotRequired[int]
+    report_steps: NotRequired[int]
+    log_all_workers: NotRequired[bool]
+    log_grad_norms: NotRequired[bool]
+    report_metrics: NotRequired[bool]
+    metrics_to_show_in_rich_pbar: NotRequired[list[str] | None]
+    progress_bar_type: NotRequired[Literal["tqdm", "rich", "json"]]
+    watchers: NotRequired[list[Any]]
+    weight_distribution_pattern: NotRequired[str]
+    weight_distribution_log_steps: NotRequired[int]
+    verbose: NotRequired[bool]
+    process_zero_is_admin: NotRequired[bool]
+    use_wandb: NotRequired[bool]
+    wandb_entity: NotRequired[str | None]
+    wandb_name: NotRequired[str | None]
+    trainer_prefix: NotRequired[str | None]
+
+    backend: NotRequired[str | None]
+    auto_shard_states: NotRequired[bool]
+    performance_mode: NotRequired[bool]
+    profiler_path: NotRequired[str | None]
+    profiler_log_all_workers: NotRequired[bool]
+    profiler_include_compile: NotRequired[bool]
+    profiler_host_tracer_level: NotRequired[int | None]
+    profiler_python_tracer_level: NotRequired[int | None]
+    track_memory: NotRequired[bool | float]
+    low_mem_usage: NotRequired[bool]
+    quantization_mode: NotRequired[Literal["nf4", "affine", "mxfp8", "nvfp8", "mxfp4", "nvfp4"] | None]
+    quantization_group_size: NotRequired[int | None]
+    quantization_bits: NotRequired[int | None]
+    tensor_straight_through: NotRequired[Any | None]
+    straight_through_emulator: NotRequired[Any | None]
+
+    model_name: NotRequired[str | None]
+    model_parameters: NotRequired[dict | None]
+    frozen_parameters: NotRequired[str | None]
+
+    loss_config: NotRequired[LossConfig | None]
+    lmhead_chunksize: NotRequired[int | None]
+    jax_distributed_config: NotRequired[dict | None]
+    step_partition_spec: NotRequired[Any]
+    state_apply_fn_kwarguments_to_model: NotRequired[dict | None]
+
+    sparsify_module: NotRequired[bool]
+    sparse_module_type: NotRequired[str]
+    pruning_module: NotRequired[Any]
+
+    tx_mu_dtype: NotRequired[Any]
+
+    generation_top_p: NotRequired[float | None]
+    generation_top_k: NotRequired[int | None]
+    generation_presence_penalty: NotRequired[float | None]
+    generation_frequency_penalty: NotRequired[float | None]
+    generation_repetition_penalty: NotRequired[float | None]
+    generation_temperature: NotRequired[float | None]
+    generation_do_sample: NotRequired[bool | None]
+    generation_num_return_sequences: NotRequired[int | None]
+    generation_max_new_tokens: NotRequired[int | None]
+    generation_shard_inputs: NotRequired[bool]
+    generation_interval: NotRequired[int | None]
+    generation_prompts: NotRequired[list[str | dict[str, Any]]]
+    generation_use_train_prompts: NotRequired[bool]
+    generation_num_prompts: NotRequired[int]
+    generation_dataset_prompt_field: NotRequired[str | None]
+    generation_extra_kwargs: NotRequired[dict[str, Any] | None]
+    generation_config_overrides: NotRequired[dict[str, Any] | None]
+    generation_seed: NotRequired[int | None]
+    generation_preview_print: NotRequired[bool]
+    generation_log_to_wandb: NotRequired[bool]
+    log_training_generations_to_wandb: NotRequired[bool]
+    benchmark_interval: NotRequired[int | None]
+    benchmarks: NotRequired[list[BenchmarkConfig] | BenchmarkConfig | None]
+
+    use_esurge_generation: NotRequired[bool]
+    esurge_use_tqdm: NotRequired[bool]
+    esurge_hbm_utilization: NotRequired[float | None]
+    esurge_max_cache_tokens: NotRequired[int | None]
+    esurge_max_num_seqs: NotRequired[int | None]
+    esurge_min_input_pad: NotRequired[int | None]
+    esurge_page_size: NotRequired[int | None]
+    esurge_silent_mode: NotRequired[bool]
+    esurge_runner_verbose: NotRequired[bool]
+    esurge_max_num_batched_tokens: NotRequired[int | None]
+    esurge_enable_prefix_caching: NotRequired[bool | None]
+    esurge_data_parallelism_axis: NotRequired[str | None]
+    esurge_async_scheduling: NotRequired[bool | None]
+    esurge_overlap_execution: NotRequired[bool | None]
+    esurge_max_num_seq_buckets: NotRequired[list[int] | None]
+    sequence_packing: NotRequired[bool]
+    bucket_configs: NotRequired[list[dict[str, Any]] | None]
+    bucket_rule: NotRequired[dict[str, Any] | None]
+    bucket_datasets: NotRequired[list[DatasetMixtureCfg] | None]
+
+    # Grain random-access data lanes (see easydel.trainers.data_lanes): ArrayRecord (msgpack rows) and raw
+    # parquet ("parquetra", tokenized in the loader; `parquetra_pack_seq_len > 0` selects the packed lane).
+    arrayrecord_train_files: NotRequired[str | list[str] | None]
+    arrayrecord_train_datasets: NotRequired[dict[str, str | list[str]] | None]
+    arrayrecord_mixture_weights: NotRequired[dict[str, float] | None]
+    arrayrecord_assistant_only: NotRequired[dict[str, bool] | None]
+    arrayrecord_num_threads: NotRequired[int]
+    arrayrecord_prefetch_buffer: NotRequired[int]
+    arrayrecord_read_rate_limit_mb_per_sec: NotRequired[float | None]
+    arrayrecord_read_rate_burst_seconds: NotRequired[float]
+    parquetra_train_datasets: NotRequired[dict[str, str | list[str]] | None]
+    parquetra_mixture_weights: NotRequired[dict[str, float] | None]
+    parquetra_assistant_only: NotRequired[dict[str, bool] | None]
+    parquetra_tokenizer_id: NotRequired[str | None]
+    parquetra_fast_tokenizer: NotRequired[str | None]
+    parquetra_fast_tokenizer_verify_rows: NotRequired[int]
+    parquetra_pack_seq_len: NotRequired[int]
+    parquetra_pack_embed_cap: NotRequired[int]
+    parquetra_pack_misfit_patience: NotRequired[int]
+    parquetra_mp_workers: NotRequired[int]
+    parquetra_mp_worker_cpu_only: NotRequired[bool]
+    parquet_metadata_cache_dir: NotRequired[str | None]
+    # Per-dataset assistant-only supervision: span markers (None = derived from the chat template) and the
+    # zero-supervision census thresholds.
+    assistant_header_text: NotRequired[str | None]
+    assistant_end_text: NotRequired[str | None]
+    zero_supervision_report_fraction: NotRequired[float | None]
+    zero_supervision_abort_fraction: NotRequired[float | None]
+    zero_supervision_dump_limit: NotRequired[int]
+
+
+class DPOTrainerCfg(BaseTrainerCfg):
+    """Configuration for Direct Preference Optimization trainer (DPOConfig).
+
+    DPO is an algorithm for training language models from human preferences
+    without explicit reward modeling. It directly optimizes the policy using
+    a classification loss derived from the Bradley-Terry preference model.
+
+    This configuration extends BaseTrainerCfg with DPO-specific parameters
+    including the beta temperature, loss variants, and reference model settings.
+
+    Attributes:
+        beta: Temperature parameter controlling the deviation from the reference
+            policy. Higher values mean stronger preference for preferred responses.
+            Typical values range from 0.1 to 0.5.
+        label_smoothing: Label smoothing factor for the preference loss.
+            Helps prevent overconfident predictions.
+        loss_type: Type of DPO loss to use. Options include:
+            - "sigmoid": Standard DPO loss (default)
+            - "hinge": Hinge loss variant
+            - "ipo": Identity Policy Optimization
+            - "exo_pair": Exo pair loss
+            - "nca_pair": NCA pair loss
+            - "robust": Robust DPO loss
+            - "bco_pair": BCO pair loss
+            - "sppo_hard": SPPO hard loss
+            - "aot": AOT loss
+            - "aot_pair": AOT pair loss
+            - "apo_zero": APO zero loss
+            - "apo_down": APO down loss
+        use_weighting: Whether to use importance weighting in loss computation.
+        label_pad_token_id: Token ID used for padding labels. Typically -100.
+        padding_value: Value used for padding sequences.
+        max_length: Maximum total sequence length (prompt + completion).
+        max_prompt_length: Maximum length for the prompt portion.
+        max_completion_length: Maximum length for the completion portion.
+            Auto-computed as max_length - max_prompt_length if not specified.
+        is_encoder_decoder: Whether the model is encoder-decoder architecture.
+        disable_dropout: Whether to disable dropout during training for
+            more stable preference learning.
+        precompute_ref_log_probs: Whether to precompute reference model log
+            probabilities before training for memory efficiency.
+        dataset_num_proc: Number of processes for dataset preprocessing.
+        reference_free: Whether to train without a reference model.
+        force_use_ref_model: Force use of reference model even if not needed.
+        sync_ref_model: Whether to synchronize reference model with policy
+            during training.
+        ref_model_mixup_alpha: Mixup alpha for reference model synchronization.
+            Controls interpolation between old and new reference.
+        ref_model_sync_steps: Number of steps between reference model syncs.
+        rpo_alpha: Alpha parameter for RPO loss variant.
+        logprob_vocab_chunk_size: Vocabulary chunk size used when computing
+            selected-token log probabilities for DPO. Set to None to disable
+            chunking.
+        tools: List of tool definitions for tool-use training scenarios.
+
+    Example:
+        >>> config: DPOTrainerCfg = {
+        ...     "trainer_type": "dpo",
+        ...     "learning_rate": 1e-6,
+        ...     "beta": 0.1,
+        ...     "loss_type": "sigmoid",
+        ...     "max_length": 512,
+        ...     "max_prompt_length": 256,
+        ... }
+    """
+
+    beta: NotRequired[float]
+    label_smoothing: NotRequired[float]
+    loss_type: NotRequired[
+        Literal[
+            "sigmoid",
+            "hinge",
+            "ipo",
+            "exo_pair",
+            "nca_pair",
+            "robust",
+            "bco_pair",
+            "sppo_hard",
+            "aot",
+            "aot_pair",
+            "aot_unpaired",
+            "apo_zero",
+            "apo_down",
+            "discopop",
+            "sft",
+            "sigmoid_norm",
+        ]
+    ]
+    use_weighting: NotRequired[bool]
+    label_pad_token_id: NotRequired[int]
+    padding_value: NotRequired[int | None]
+    max_length: NotRequired[int | None]
+    max_prompt_length: NotRequired[int | None]
+    max_completion_length: NotRequired[int | None]
+    is_encoder_decoder: NotRequired[bool | None]
+    disable_dropout: NotRequired[bool]
+    precompute_ref_log_probs: NotRequired[bool]
+    dataset_num_proc: NotRequired[int | None]
+    reference_free: NotRequired[bool]
+    force_use_ref_model: NotRequired[bool]
+    sync_ref_model: NotRequired[bool]
+    ref_model_mixup_alpha: NotRequired[float]
+    ref_model_sync_steps: NotRequired[int]
+    rpo_alpha: NotRequired[float | None]
+    logprob_vocab_chunk_size: NotRequired[int | None]
+    tools: NotRequired[list[dict | Any] | None]
+    activation_offloading: NotRequired[bool]
+    discopop_tau: NotRequired[float]
+    f_alpha_divergence_coef: NotRequired[float]
+    f_divergence_type: NotRequired[Literal["reverse_kl", "forward_kl", "js_divergence", "alpha_divergence"]]
+    generate_during_eval: NotRequired[bool]
+    ld_alpha: NotRequired[float | None]
+    loss_weights: NotRequired[tuple[float, ...] | list[float] | None]
+    pad_to_multiple_of: NotRequired[int | None]
+    pad_token: NotRequired[str | None]
+    padding_free: NotRequired[bool]
+    precompute_ref_batch_size: NotRequired[int | None]
+
+
+class ORPOTrainerCfg(BaseTrainerCfg):
+    """Configuration for Odds Ratio Preference Optimization trainer (ORPOConfig).
+
+    ORPO is a preference optimization method that uses odds ratios to directly
+    optimize the model without requiring a separate reference model. It combines
+    supervised fine-tuning with preference optimization in a single training phase.
+
+    This configuration extends BaseTrainerCfg with ORPO-specific parameters
+    for controlling the preference learning behavior.
+
+    Attributes:
+        beta: Weight for the preference optimization term relative to the
+            language modeling loss. Higher values prioritize preference learning.
+        max_length: Maximum total sequence length (prompt + completion).
+        max_prompt_length: Maximum length for the prompt portion.
+        max_completion_length: Maximum length for the completion portion.
+            Auto-computed as max_length - max_prompt_length if not specified.
+        disable_dropout: Whether to disable dropout during training.
+        label_pad_token_id: Token ID used for padding labels.
+        padding_value: Value used for padding sequences.
+        generate_during_eval: Whether to generate completions during evaluation
+            for qualitative assessment.
+        is_encoder_decoder: Whether the model is encoder-decoder architecture.
+        dataset_num_proc: Number of processes for dataset preprocessing.
+
+    Example:
+        >>> config: ORPOTrainerCfg = {
+        ...     "trainer_type": "orpo",
+        ...     "learning_rate": 1e-6,
+        ...     "beta": 0.1,
+        ...     "max_length": 1024,
+        ...     "max_prompt_length": 512,
+        ... }
+    """
+
+    beta: NotRequired[float]
+    max_length: NotRequired[int | None]
+    max_prompt_length: NotRequired[int | None]
+    max_completion_length: NotRequired[int | None]
+    logprob_vocab_chunk_size: NotRequired[int | None]
+    disable_dropout: NotRequired[bool]
+    label_pad_token_id: NotRequired[int]
+    padding_value: NotRequired[int | None]
+    generate_during_eval: NotRequired[bool]
+    is_encoder_decoder: NotRequired[bool | None]
+    dataset_num_proc: NotRequired[int | None]
+
+
+class GRPOTrainerCfg(BaseTrainerCfg):
+    """Configuration for Group Relative Policy Optimization trainer (GRPOConfig).
+
+    GRPO is a reinforcement learning algorithm that optimizes policies using
+    group-relative rewards. It generates multiple completions per prompt and
+    uses their relative rankings for policy updates.
+
+    This configuration extends BaseTrainerCfg with GRPO-specific parameters
+    for generation, reference model synchronization, and sampling.
+
+    Attributes:
+        beta: KL divergence coefficient controlling deviation from reference policy.
+        max_prompt_length: Maximum length for input prompts.
+        max_completion_length: Maximum length for generated completions.
+        dataset_num_proc: Number of processes for dataset preprocessing.
+        sync_ref_model: Whether to periodically synchronize the reference model
+            with the current policy.
+        ref_model_mixup_alpha: Mixup coefficient for reference model updates.
+            Values closer to 1 mean slower reference updates.
+        ref_model_sync_steps: Number of steps between reference model syncs.
+        tools: List of tool definitions for tool-use scenarios.
+        skip_apply_chat_template: Whether to skip applying chat template to prompts.
+        num_return_sequences: Number of completions to generate per prompt.
+        ref_logps_chunk_size: Chunk size for reference-model log-prob computation.
+            Set to ``None`` to disable chunking.
+        completion_chunk_size: Chunk size for completion-loss computation.
+            Set to ``None`` to disable chunking.
+        max_loss_completion_tokens: Optional cap on completion tokens used by
+            the GRPO loss. Set to ``None`` to disable truncation.
+        logprob_vocab_chunk_size: Vocab-axis chunk size for per-token log-prob
+            and entropy reductions. ``None`` disables chunking.
+        top_p: Top-p (nucleus) sampling probability threshold.
+        top_k: Top-k sampling parameter (``None`` disables top-k).
+        presence_penalty: Presence penalty for generation.
+        frequency_penalty: Frequency penalty for generation.
+        repetition_penalty: Repetition penalty for generation.
+        temperature: Sampling temperature for generation diversity.
+        epsilon: Lower clipping bound for importance-sampling weights in the
+            policy surrogate.
+        epsilon_high: Optional asymmetric upper clip; falls back to ``epsilon``
+            when ``None``.
+        delta: Optional two-sided dynamic clipping bound (DAPO).
+        loss_type: GRPO loss variant. One of ``"grpo"``, ``"bnpo"``,
+            ``"dr_grpo"``, ``"dapo"``, ``"cispo"``, ``"sapo"``, ``"luspo"``,
+            ``"vespo"``, ``"dppo"``.
+        importance_sampling_level: Aggregate the importance-sampling ratio
+            per ``"token"``, per ``"sequence"``, or GSPO-token
+            ``"sequence_token"``.
+        num_iterations: Number of optimizer updates per generated batch.
+        num_generations: Alias for ``num_return_sequences`` kept for TRL
+            parity.
+        reward_weights: Optional weights for combining multiple reward
+            functions. Length must match the number of reward functions.
+        scale_rewards: Reward-scaling strategy: ``"group"`` (default),
+            ``"batch"``, ``"none"``, or the booleans ``True``/``False``
+            (which map to ``"group"`` / ``"none"``).
+        mask_truncated_completions: When ``True``, completions that hit the
+            generation cap without emitting EOS are masked out of the loss.
+        top_entropy_quantile: Keep only the top fraction (by token entropy)
+            in the loss. ``1.0`` disables filtering.
+        min_p: Optional minimum-probability sampling filter (HF "top-p-min").
+        generation_kwargs: Extra kwargs forwarded to the generation config.
+        chat_template_kwargs: Extra kwargs forwarded to chat-template
+            application during generation.
+
+    Example:
+        >>> config: GRPOTrainerCfg = {
+        ...     "trainer_type": "grpo",
+        ...     "learning_rate": 1e-6,
+        ...     "beta": 0.04,
+        ...     "max_prompt_length": 512,
+        ...     "max_completion_length": 256,
+        ...     "num_return_sequences": 4,
+        ...     "loss_type": "dapo",
+        ...     "epsilon": 0.2,
+        ...     "importance_sampling_level": "token",
+        ... }
+    """
+
+    beta: NotRequired[float]
+    max_prompt_length: NotRequired[int]
+    max_completion_length: NotRequired[int]
+    dataset_num_proc: NotRequired[int | None]
+    sync_ref_model: NotRequired[bool]
+    ref_model_mixup_alpha: NotRequired[float]
+    ref_model_sync_steps: NotRequired[int]
+    tools: NotRequired[list[dict | Any] | None]
+    skip_apply_chat_template: NotRequired[bool]
+    num_return_sequences: NotRequired[int]
+    ref_logps_chunk_size: NotRequired[int | None]
+    completion_chunk_size: NotRequired[int | None]
+    max_loss_completion_tokens: NotRequired[int | None]
+    logprob_vocab_chunk_size: NotRequired[int | None]
+    top_p: NotRequired[float]
+    top_k: NotRequired[int | None]
+    presence_penalty: NotRequired[float]
+    frequency_penalty: NotRequired[float]
+    repetition_penalty: NotRequired[float]
+    temperature: NotRequired[float]
+    epsilon: NotRequired[float]
+    epsilon_high: NotRequired[float | None]
+    delta: NotRequired[float | None]
+    loss_type: NotRequired[Literal["grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo", "dppo"]]
+    importance_sampling_level: NotRequired[Literal["token", "sequence", "sequence_token"]]
+    num_iterations: NotRequired[int]
+    num_generations: NotRequired[int | None]
+    reward_weights: NotRequired[list[float] | None]
+    scale_rewards: NotRequired[Literal["group", "batch", "none"] | bool]
+    mask_truncated_completions: NotRequired[bool]
+    top_entropy_quantile: NotRequired[float]
+    min_p: NotRequired[float | None]
+    generation_kwargs: NotRequired[dict | None]
+    chat_template_kwargs: NotRequired[dict | None]
+    cast_lm_head_to_fp32: NotRequired[bool]
+    disable_dropout: NotRequired[bool]
+    environment_factory: NotRequired[Any]
+    esurge_importance_sampling_cap: NotRequired[float]
+    esurge_importance_sampling_correction: NotRequired[bool]
+    esurge_importance_sampling_mode: NotRequired[str]
+    generation_batch_size: NotRequired[int | None]
+    log_completions: NotRequired[bool]
+    log_completions_hub_repo: NotRequired[str | None]
+    log_unique_prompts: NotRequired[bool]
+    max_tool_calling_iterations: NotRequired[int | None]
+    max_tool_calls_per_step: NotRequired[int]
+    multi_objective_aggregation: NotRequired[str]
+    num_completions_to_print: NotRequired[int | None]
+    num_generations_eval: NotRequired[int | None]
+    off_policy_mask_threshold: NotRequired[float | None]
+    pad_to_multiple_of: NotRequired[int | None]
+    sapo_temperature_neg: NotRequired[float]
+    sapo_temperature_pos: NotRequired[float]
+    shuffle_dataset: NotRequired[bool | None]
+    steps_per_generation: NotRequired[int | None]
+    tool_caller: NotRequired[str | None]
+    use_bias_correction_kl: NotRequired[bool]
+    use_transformers_paged: NotRequired[bool]
+    vespo_k_neg: NotRequired[float]
+    vespo_k_pos: NotRequired[float]
+    vespo_lambda_neg: NotRequired[float]
+    vespo_lambda_pos: NotRequired[float]
+
+
+class AgenticMoshPitTrainerCfg(GRPOTrainerCfg):
+    """Configuration for Agentic MoshPit trainer (AgenticMoshPitConfig).
+
+    Agentic MoshPit extends GRPO with multi-turn environment interaction,
+    where the model acts as an agent that interacts with environments
+    over multiple turns with optional tool-calling support.
+
+    Attributes:
+        max_steps: Maximum number of environment steps per episode.
+        group_size: Number of rollouts per environment seed for grouping.
+        num_env_groups: Number of distinct environment seeds per batch.
+        reward_mode: How rewards are computed: "episode", "step", or "gigpo".
+        advantage_estimator: Advantage method: "grpo", "reinforce", "gigpo",
+            "step_reinforce", or "agentic_reinforce".
+        step_reward_gamma: Discount factor for step-level rewards.
+        episode_reward_weight: Weight for episode rewards in GiGPO mode.
+        step_reward_weight: Weight for step rewards in GiGPO mode.
+        system_prompt: System prompt prepended to agent conversations.
+        tool_names: List of registered tool names to make available.
+        tool_call_parser: Tool call parser variant.
+        max_tool_calls_per_step: Maximum tool calls per agent turn.
+        tool_schemas: Explicit tool schemas (list of JSON-schema dicts) that
+            override ``tool_names`` when provided. ``None`` falls back to
+            resolving schemas from ``tool_names``.
+
+    Example:
+        >>> config: AgenticMoshPitTrainerCfg = {
+        ...     "trainer_type": "agentic-moshpit",
+        ...     "max_steps": 10,
+        ...     "group_size": 4,
+        ...     "num_env_groups": 8,
+        ...     "reward_mode": "episode",
+        ...     "advantage_estimator": "grpo",
+        ...     "tool_schemas": [{"name": "search", "parameters": {...}}],
+        ... }
+    """
+
+    max_steps: NotRequired[int]
+    group_size: NotRequired[int]
+    num_env_groups: NotRequired[int]
+    reward_mode: NotRequired[Literal["episode", "step", "gigpo"]]
+    advantage_estimator: NotRequired[Literal["grpo", "reinforce", "gigpo", "step_reinforce", "agentic_reinforce"]]
+    step_reward_gamma: NotRequired[float]
+    episode_reward_weight: NotRequired[float]
+    step_reward_weight: NotRequired[float]
+    system_prompt: NotRequired[str | None]
+    tool_names: NotRequired[list[str] | None]
+    tool_caller: NotRequired[str | None]
+    max_tool_calls_per_step: NotRequired[int]
+    reasoning_parser: NotRequired[str | None]
+    tool_schemas: NotRequired[list[dict] | None]
+
+
+class RLVRTrainerCfg(GRPOTrainerCfg):
+    """Configuration for Reinforcement Learning with Verifiable Rewards (RLVRConfig).
+
+    RLVR uses rule-based verifiable reward functions (math answer checking,
+    code test execution, format compliance) instead of learned reward models.
+
+    Attributes:
+        answer_key: Dataset column containing gold answers.
+        test_key: Dataset column containing code test cases.
+        format_pattern: Regex pattern for format compliance checking.
+        format_reward_weight: Weight for format reward component.
+        length_penalty_target: Target length for length penalty. ``None`` disables.
+        length_penalty_weight: Weight for length penalty component.
+        max_len_mask: Mask completions without EOS from loss.
+        reward_clip_range: Clip rewards to [-range, range]. ``None`` disables.
+        difficulty_key: Dataset column for difficulty scores.
+        difficulty_loss_weight: Weight loss by difficulty.
+
+    Example:
+        >>> config: RLVRTrainerCfg = {
+        ...     "trainer_type": "rlvr",
+        ...     "answer_key": "answer",
+        ...     "num_return_sequences": 8,
+        ...     "max_completion_length": 2048,
+        ... }
+    """
+
+    answer_key: NotRequired[str]
+    test_key: NotRequired[str]
+    format_pattern: NotRequired[str | None]
+    format_reward_weight: NotRequired[float]
+    length_penalty_target: NotRequired[int | None]
+    length_penalty_weight: NotRequired[float]
+    max_len_mask: NotRequired[bool]
+    reward_clip_range: NotRequired[float | None]
+    difficulty_key: NotRequired[str | None]
+    difficulty_loss_weight: NotRequired[bool]
+
+
+class GFPOTrainerCfg(GRPOTrainerCfg):
+    """Configuration for Group Filtered Policy Optimization trainer (GFPOConfig).
+
+    GFPO extends GRPO by filtering completions within each group before
+    the policy update, keeping only the best ``num_remains_in_group``
+    rollouts according to a configurable ranking signal (length and/or
+    efficiency penalties applied on top of the reward).
+
+    All GRPO knobs are inherited; the fields below are GFPO-only.
+
+    Attributes:
+        num_remains_in_group: Number of completions kept per group after
+            filtering. ``None`` disables filtering (vanilla GRPO).
+        filter_by_length: When ``True``, length is folded into the
+            ranking signal used to drop completions.
+        filter_by_efficiency: When ``True``, an efficiency proxy
+            (e.g. tokens-per-reward) is folded into the ranking signal.
+        length_weight: Weight on the length component of the filter
+            signal.
+        efficiency_weight: Weight on the efficiency component of the
+            filter signal.
+
+    Example:
+        >>> config: GFPOTrainerCfg = {
+        ...     "trainer_type": "gfpo",
+        ...     "learning_rate": 1e-6,
+        ...     "num_return_sequences": 8,
+        ...     "num_remains_in_group": 4,
+        ...     "filter_by_length": True,
+        ...     "length_weight": 0.5,
+        ... }
+    """
+
+    num_remains_in_group: NotRequired[int | None]
+    filter_by_length: NotRequired[bool]
+    filter_by_efficiency: NotRequired[bool]
+    length_weight: NotRequired[float]
+    efficiency_weight: NotRequired[float]
+
+
+class GSPOTrainerCfg(GRPOTrainerCfg):
+    """Configuration for Group Sequence Policy Optimization trainer (GSPOConfig).
+
+    GSPO is a GRPO variant that aggregates the importance-sampling ratio
+    over the full completion (``importance_sampling_level="sequence"``)
+    rather than per-token. The shipped defaults also tighten ``epsilon``
+    and reduce the supported ``loss_type`` surface to the variants that
+    are well-defined under sequence-level IS.
+
+    All GRPO knobs are inherited; this class only narrows the ``loss_type``
+    Literal and re-declares the GSPO-relevant fields for documentation.
+
+    Example:
+        >>> config: GSPOTrainerCfg = {
+        ...     "trainer_type": "gspo",
+        ...     "learning_rate": 1e-6,
+        ...     "importance_sampling_level": "sequence",
+        ...     "epsilon": 3e-4,
+        ...     "loss_type": "grpo",
+        ... }
+    """
+
+    importance_sampling_level: NotRequired[Literal["sequence", "token"]]
+    loss_type: NotRequired[Literal["grpo", "dapo", "cispo"]]
+
+
+class SDPOTrainerCfg(GRPOTrainerCfg):
+    """Configuration for Self-Distillation Policy Optimization trainer (SDPOConfig).
+
+    SDPO extends GRPO with token-level self-distillation signals derived from
+    model-generated feedback contexts.
+
+    Attributes:
+        max_feedback_length: Maximum token budget reserved for textual feedback.
+        distillation_type: Distillation objective variant ("kl" or "jsd").
+        beta: KL regularization toward a reference model (defaults to 0.0 in SDPO).
+    """
+
+    max_feedback_length: NotRequired[int]
+    distillation_type: NotRequired[Literal["kl", "jsd"]]
+    beta: NotRequired[float]
+    diagnostics_flat_tolerance: NotRequired[float]
+    diagnostics_warning_interval: NotRequired[int]
+    distillation_add_tail: NotRequired[bool]
+    distillation_alpha: NotRequired[float | None]
+    distillation_is_clip: NotRequired[float | None]
+    distillation_topk: NotRequired[int | None]
+    distillation_weight: NotRequired[float]
+    dont_reprompt_on_self_success: NotRequired[bool]
+    ema_update_rate: NotRequired[float]
+    environment_feedback_only_without_solution: NotRequired[bool]
+    feedback_template: NotRequired[str]
+    full_logit_distillation: NotRequired[bool]
+    include_environment_feedback: NotRequired[bool]
+    max_reprompt_len: NotRequired[int]
+    remove_thinking_from_demonstration: NotRequired[bool]
+    reprompt_template: NotRequired[str]
+    sdpo_policy_loss_mode: NotRequired[str]
+    solution_template: NotRequired[str]
+    success_reward_threshold: NotRequired[float]
+    teacher_regularization: NotRequired[str]
+    teacher_update_rate: NotRequired[float | None]
+    use_successful_as_teacher: NotRequired[bool]
+
+
+class PPOTrainerCfg(BaseTrainerCfg):
+    """Configuration for Proximal Policy Optimization trainer (PPOConfig).
+
+    PPO is a policy gradient algorithm that uses clipped objective functions
+    to ensure stable policy updates. It's widely used for RLHF (Reinforcement
+    Learning from Human Feedback) in language model training.
+
+    This configuration extends BaseTrainerCfg with PPO-specific parameters
+    for reward processing, advantage estimation, and policy clipping.
+
+    Attributes:
+        max_prompt_length: Maximum length for input prompts.
+        max_completion_length: Maximum length for generated completions.
+        dataset_num_proc: Number of processes for dataset preprocessing.
+        reward_weights: Weights for combining multiple reward signals.
+        kl_coef: Coefficient for KL divergence penalty in the reward.
+        kl_estimator: Estimator type for KL divergence ("k1" or "k3").
+        cliprange: Clipping range for the policy ratio in PPO objective.
+        vf_coef: Coefficient for value function loss.
+        cliprange_value: Clipping range for value function updates.
+        gamma: Discount factor for future rewards (0 to 1).
+        lam: Lambda parameter for GAE (Generalized Advantage Estimation).
+        whiten_rewards: Whether to normalize rewards across the batch.
+        whiten_advantages: Whether to normalize advantages across the batch.
+        entropy_coef: Coefficient for entropy bonus to encourage exploration.
+            ``None`` disables the bonus.
+        missing_eos_penalty: Penalty applied when completion lacks EOS token.
+        tools: List of tool definitions for tool-use scenarios.
+        skip_apply_chat_template: Whether to skip applying chat template.
+        num_return_sequences: Number of completions to generate per prompt.
+        num_generations: Alias for ``num_return_sequences`` kept for parity
+            with the rest of the on-policy RL family.
+        num_ppo_epochs: Number of minibatch epochs replayed over each
+            rollout batch before resampling.
+        logprob_vocab_chunk_size: Vocab-axis chunk size for per-token
+            log-prob / entropy reductions. ``None`` disables chunking.
+        top_p: Top-p (nucleus) sampling probability threshold.
+        top_k: Top-k sampling parameter (``None`` disables top-k).
+        presence_penalty: Presence penalty for generation.
+        frequency_penalty: Frequency penalty for generation.
+        repetition_penalty: Repetition penalty for generation.
+        temperature: Sampling temperature for generation.
+        min_p: Optional minimum-probability sampling filter (HF "top-p-min").
+        generation_kwargs: Extra kwargs forwarded to the generation config.
+        chat_template_kwargs: Extra kwargs forwarded to chat-template
+            application during generation.
+        mask_truncated_completions: When ``True``, completions that hit the
+            generation cap without emitting EOS are masked out of the loss.
+
+    Example:
+        >>> config: PPOTrainerCfg = {
+        ...     "trainer_type": "ppo",
+        ...     "learning_rate": 1e-6,
+        ...     "kl_coef": 0.05,
+        ...     "cliprange": 0.2,
+        ...     "gamma": 0.99,
+        ...     "lam": 0.95,
+        ...     "num_ppo_epochs": 4,
+        ... }
+    """
+
+    max_prompt_length: NotRequired[int]
+    max_completion_length: NotRequired[int]
+    dataset_num_proc: NotRequired[int | None]
+    reward_weights: NotRequired[list[float] | None]
+    kl_coef: NotRequired[float]
+    kl_estimator: NotRequired[Literal["k1", "k3"]]
+    cliprange: NotRequired[float]
+    vf_coef: NotRequired[float]
+    cliprange_value: NotRequired[float]
+    gamma: NotRequired[float]
+    lam: NotRequired[float]
+    whiten_rewards: NotRequired[bool]
+    whiten_advantages: NotRequired[bool]
+    entropy_coef: NotRequired[float | None]
+    missing_eos_penalty: NotRequired[float | None]
+    tools: NotRequired[list[dict | Any] | None]
+    skip_apply_chat_template: NotRequired[bool]
+    num_return_sequences: NotRequired[int]
+    num_generations: NotRequired[int | None]
+    num_ppo_epochs: NotRequired[int]
+    logprob_vocab_chunk_size: NotRequired[int | None]
+    top_p: NotRequired[float]
+    top_k: NotRequired[int | None]
+    presence_penalty: NotRequired[float]
+    frequency_penalty: NotRequired[float]
+    repetition_penalty: NotRequired[float]
+    temperature: NotRequired[float]
+    min_p: NotRequired[float | None]
+    generation_kwargs: NotRequired[dict | None]
+    chat_template_kwargs: NotRequired[dict | None]
+    mask_truncated_completions: NotRequired[bool]
+    batch_size: NotRequired[int | None]
+    ds3_gather_for_generation: NotRequired[bool]
+    local_batch_size: NotRequired[int | None]
+    local_mini_batch_size: NotRequired[int | None]
+    local_rollout_forward_batch_size: NotRequired[int | None]
+    micro_batch_size: NotRequired[int | None]
+    mini_batch_size: NotRequired[int | None]
+    model_adapter_name: NotRequired[str | None]
+    num_mini_batches: NotRequired[int]
+    num_sample_generations: NotRequired[int | None]
+    num_total_batches: NotRequired[int | None]
+    push_to_hub: NotRequired[bool]
+    ref_adapter_name: NotRequired[str | None]
+    response_length: NotRequired[int | None]
+    stop_token: NotRequired[Literal["eos"] | None]
+    stop_token_id: NotRequired[int | None]
+    total_episodes: NotRequired[int | None]
+    world_size: NotRequired[int | None]
+
+
+class OnlineActorCriticTrainerCfg(PPOTrainerCfg):
+    """Shared eLarge schema for separately optimized actor/critic trainers.
+
+    Runtime objects such as a critic module, rollout provider, environment
+    factory, or tool guard are intentionally not part of this serializable
+    YAML schema. They are supplied to :meth:`eLargeModel.train` as runtime
+    construction kwargs.
+    """
+
+    critic_learning_rate: NotRequired[float]
+    critic_learning_rate_end: NotRequired[float | None]
+    critic_optimizer: NotRequired[str | None]
+    critic_scheduler: NotRequired[str | None]
+    critic_warmup_steps: NotRequired[int]
+    critic_updates_per_actor_update: NotRequired[int]
+    critic_pretrain_steps: NotRequired[int]
+    critic_cliprange_value: NotRequired[float]
+    critic_gae_lambda: NotRequired[float]
+    critic_gae_mode: NotRequired[Literal["fixed", "match_policy"]]
+    critic_trainable_mode: NotRequired[Literal["full_except_attention", "all"]]
+    policy_gae_mode: NotRequired[Literal["fixed", "length_adaptive"]]
+    length_adaptive_alpha: NotRequired[float]
+    global_token_normalization: NotRequired[bool]
+    rollout_logprob_source: NotRequired[Literal["recompute", "engine"]]
+    max_inflight_rollouts: NotRequired[int]
+    rollout_queue_size: NotRequired[int]
+    weight_sync_steps: NotRequired[int]
+    max_policy_staleness: NotRequired[int | None]
+    rollout_timeout: NotRequired[float | None]
+
+
+class SAOTrainerCfg(OnlineActorCriticTrainerCfg):
+    """eLarge config for Single-Rollout Asynchronous Optimization (SAOConfig).
+
+    SAO consumes one rollout per prompt, trains a distinct critic, and applies
+    direct double-sided importance sampling to action tokens.
+    """
+
+    dis_epsilon_low: NotRequired[float]
+    dis_epsilon_high: NotRequired[float]
+    asynchronous_rollouts: NotRequired[bool]
+
+
+class CompactionRLTrainerCfg(OnlineActorCriticTrainerCfg):
+    """eLarge config for context-compacting agentic RL (CompactionRLConfig).
+
+    The serialized fields describe compaction policy and loss behavior.
+    Runtime environment/tool/controller callables remain construction kwargs.
+    """
+
+    context_budget: NotRequired[int]
+    compaction_threshold: NotRequired[int]
+    max_compactions: NotRequired[int]
+    recent_steps: NotRequired[int]
+    max_assistant_tokens: NotRequired[int]
+    max_summary_tokens: NotRequired[int]
+    max_turns: NotRequired[int]
+    summary_instruction: NotRequired[str]
+    resume_template: NotRequired[str]
+    train_summary_tokens: NotRequired[bool]
+    cross_trajectory_gae: NotRequired[bool]
+    token_level_loss: NotRequired[bool]
+    compaction_failure_policy: NotRequired[Literal["keep_context", "raise"]]
+    guard_failure_policy: NotRequired[Literal["block", "allow"]]
+
+
+class SFTTrainerCfg(BaseTrainerCfg):
+    """Configuration for Supervised Fine-Tuning trainer (SFTConfig).
+
+    SFT is the standard approach for fine-tuning language models on
+    instruction-following or task-specific datasets using next-token
+    prediction loss.
+
+    This configuration extends BaseTrainerCfg with SFT-specific parameters
+    for dataset processing and sequence packing.
+
+    Attributes:
+        dataset_text_field: Name of the field containing text in the dataset.
+            If None, the trainer will attempt to auto-detect.
+        add_special_tokens: Whether to add special tokens (BOS/EOS) to sequences.
+        packing: Whether to pack multiple sequences into a single training
+            example for improved efficiency.
+        packing_strategy: Selects the packing algorithm. ``"bfd"`` (best-fit
+            decreasing) is the SFT default; ``"wrapped"`` falls back to
+            greedy packing.
+        assistant_only_loss: When ``True`` the loss mask is restricted to
+            assistant turns only, ignoring system / user tokens.
+        dataset_num_proc: Number of processes for dataset preprocessing.
+        dataset_batch_size: Batch size for dataset preprocessing operations.
+        dataset_kwargs: Additional keyword arguments for dataset processing.
+        eval_packing: Eval-time override for ``packing``. When ``None``
+            inherits the train-time value.
+        num_of_sequences: Target number of sequences per packed example.
+
+    Example:
+        >>> config: SFTTrainerCfg = {
+        ...     "trainer_type": "sft",
+        ...     "learning_rate": 2e-5,
+        ...     "max_length": 2048,
+        ...     "packing": True,
+        ...     "packing_strategy": "bfd",
+        ...     "assistant_only_loss": True,
+        ...     "dataset_text_field": "text",
+        ... }
+    """
+
+    dataset_text_field: NotRequired[str | None]
+    add_special_tokens: NotRequired[bool]
+    packing: NotRequired[bool]
+    packing_strategy: NotRequired[Literal["bfd", "wrapped"]]
+    assistant_only_loss: NotRequired[bool]
+    dataset_num_proc: NotRequired[int | None]
+    dataset_batch_size: NotRequired[int]
+    dataset_kwargs: NotRequired[dict[str, Any] | None]
+    eval_packing: NotRequired[bool | None]
+    num_of_sequences: NotRequired[int]
+    activation_offloading: NotRequired[bool]
+    chat_template_path: NotRequired[str | None]
+    completion_loss_chunk_size: NotRequired[int | None]
+    completion_only_loss: NotRequired[bool | None]
+    eos_token: NotRequired[str | None]
+    loss_type: NotRequired[Literal["nll", "dft", "chunked_nll"]]
+    pad_to_multiple_of: NotRequired[int | None]
+    pad_token: NotRequired[str | None]
+    padding_free: NotRequired[bool]
+    shuffle_dataset: NotRequired[bool | None]
+
+
+class RewardTrainerCfg(BaseTrainerCfg):
+    """Configuration for Reward Model trainer (RewardConfig).
+
+    Reward training creates models that predict human preferences between
+    response pairs. These models are used to provide reward signals for
+    RLHF training methods like PPO.
+
+    This configuration extends BaseTrainerCfg with reward model-specific
+    parameters for preference learning.
+
+    Attributes:
+        max_length: Maximum sequence length for reward model inputs.
+        disable_dropout: Whether to disable dropout during training for
+            more deterministic reward predictions.
+        dataset_num_proc: Number of processes for dataset preprocessing.
+        center_rewards_coefficient: Coefficient for reward centering
+            regularization. Helps prevent reward hacking.
+
+    Example:
+        >>> config: RewardTrainerCfg = {
+        ...     "trainer_type": "reward",
+        ...     "learning_rate": 1e-5,
+        ...     "max_length": 1024,
+        ...     "center_rewards_coefficient": 0.1,
+        ... }
+    """
+
+    max_length: NotRequired[int | None]
+    disable_dropout: NotRequired[bool]
+    dataset_num_proc: NotRequired[int | None]
+    center_rewards_coefficient: NotRequired[float | None]
+    activation_offloading: NotRequired[bool]
+    chat_template_path: NotRequired[str | None]
+    eos_token: NotRequired[str | None]
+    pad_to_multiple_of: NotRequired[int | None]
+    pad_token: NotRequired[str | None]
+
+
+class DistillationTrainerCfg(BaseTrainerCfg):
+    """Configuration for Knowledge Distillation trainer (DistillationConfig).
+
+    Knowledge distillation transfers knowledge from a larger teacher model
+    to a smaller student model by training on soft probability distributions
+    in addition to hard labels.
+
+    This configuration extends BaseTrainerCfg with distillation-specific
+    parameters for controlling the knowledge transfer process.
+
+    Attributes:
+        temperature: Temperature for softening probability distributions.
+            Higher values create softer distributions that transfer more
+            information about class relationships.
+        alpha: Weight for distillation loss relative to task loss.
+            alpha * distillation_loss + (1 - alpha) * task_loss.
+        cakld_gamma: Optional Confidence-Aware KL coefficient for
+            CAKLD-style blending of reverse and forward KL.
+        logits_chunk_size: Optional sequence-axis chunk size used when
+            running the LM head chunk-by-chunk to bound peak memory.
+            ``None`` materialises the full ``[B, L, V]`` logit tensor.
+        checkpoint_kl_loss: When ``True`` (default) and the chunked LM-head
+            path is active, wrap each chunk's KL/CE body in
+            :func:`jax.checkpoint` to trade compute for memory in the
+            backward pass.
+        dataset_text_field: Name of the dataset field consumed by the
+            SFT-style supervised CE term. ``None`` auto-detects.
+        assistant_only_loss: When ``True`` the supervised CE term is
+            restricted to assistant turns only.
+        completion_only_loss: Deprecated alias for ``assistant_only_loss``;
+            if explicitly set, it overrides.
+        hidden_state_loss_weight: Coefficient on the optional hidden-state
+            matching loss. ``None`` / ``0`` disables.
+        hidden_state_layers: Tuple of layer indices to match in the
+            hidden-state matching loss. ``None`` uses the model default.
+        hidden_state_loss: Distance function for hidden-state matching.
+            Currently only ``"mse"`` is supported.
+        attention_loss_weight: Coefficient on the optional attention-matrix
+            matching loss. ``None`` / ``0`` disables.
+        attention_layers: Tuple of attention-layer indices to match. ``None``
+            uses the model default.
+        attention_normalize: When ``True``, L1-normalize attention matrices
+            before computing the matching loss.
+
+    Example:
+        >>> config: DistillationTrainerCfg = {
+        ...     "trainer_type": "distillation",
+        ...     "learning_rate": 2e-5,
+        ...     "temperature": 2.0,
+        ...     "alpha": 0.9,
+        ...     "hidden_state_loss_weight": 0.1,
+        ...     "attention_loss_weight": 0.05,
+        ... }
+    """
+
+    temperature: NotRequired[float]
+    alpha: NotRequired[float]
+    logits_chunk_size: NotRequired[int | None]
+    checkpoint_kl_loss: NotRequired[bool]
+    # SFT-style supervised CE knobs (used when ``alpha`` < 1).
+    dataset_text_field: NotRequired[str | None]
+    assistant_only_loss: NotRequired[bool]
+    completion_only_loss: NotRequired[bool | None]
+    hidden_state_loss_weight: NotRequired[float | None]
+    hidden_state_layers: NotRequired[tuple[int, ...] | None]
+    hidden_state_loss: NotRequired[Literal["mse"]]
+    attention_loss_weight: NotRequired[float | None]
+    attention_layers: NotRequired[tuple[int, ...] | None]
+    attention_normalize: NotRequired[bool]
+    beta: NotRequired[float | None]
+    cakld_gamma: NotRequired[float | None]
+    disable_dropout: NotRequired[bool]
+    generation_batch_size: NotRequired[int | None]
+    lmbda: NotRequired[float]
+    log_completions: NotRequired[bool]
+    log_completions_steps: NotRequired[int]
+    loss_add_tail: NotRequired[bool]
+    loss_top_k: NotRequired[int]
+    max_completion_length: NotRequired[int | None]
+    max_prompt_length: NotRequired[int | None]
+    mtp_distillation: NotRequired[bool]
+    mtp_draft_tokens: NotRequired[int]
+    mtp_kd_weight: NotRequired[float]
+    num_completions_to_print: NotRequired[int | None]
+    num_generations: NotRequired[int]
+    reverse_kl_top_1_mode: NotRequired[Literal["sampled", "argmax"]]
+    teacher_model_revision: NotRequired[str | None]
+    # Offline teacher cache (easydel.data.teacher_cache): no teacher forward, cached top-k + tail KL.
+    teacher_from_cache: NotRequired[bool]
+    teacher_cache_topk: NotRequired[int]
+    teacher_cache_add_tail: NotRequired[bool]
+    teacher_cache_path: NotRequired[str | None]
+    teacher_cache_teacher_uri: NotRequired[str | None]
+    teacher_cache_tokenizer: NotRequired[str | None]
+    teacher_cache_segment_align: NotRequired[int]
+    loss_group_weights: NotRequired[list[float] | None]
+    loss_group_dataset_map: NotRequired[list[int] | None]
+    loss_group_max_multiplier: NotRequired[float | None]
+    top_k: NotRequired[int]
+    top_p: NotRequired[float]
+    wandb_project: NotRequired[str | None]
+    wandb_run_group: NotRequired[str | None]
+
+
+class SpeculativeDecodingTrainerCfg(BaseTrainerCfg):
+    """Configuration for speculative-decoding drafter training.
+
+    The eLarge ``model`` section is the trainable drafter.  The frozen target
+    model can be supplied through the ``target_model`` section, or through
+    ``teacher_model`` for compatibility with other distillation-style configs.
+    Target logits always supervise the drafter; hidden states are optionally
+    passed through for EAGLE3, DSpark, and DFlash-style drafters.
+    """
+
+    temperature: NotRequired[float]
+    alpha: NotRequired[float]
+    num_draft_tokens: NotRequired[int]
+    draft_target_offset: NotRequired[int]
+    target_logits_attr: NotRequired[str]
+    draft_logits_attr: NotRequired[str | None]
+    draft_chain_method: NotRequired[str | None]
+    drafter_forward_method: NotRequired[str | None]
+    target_forward_method: NotRequired[str | None]
+    target_output_hidden_states: NotRequired[bool]
+    pass_target_outputs: NotRequired[bool]
+    target_model_revision: NotRequired[str | None]
+    disable_dropout: NotRequired[bool]
+    dataset_text_field: NotRequired[str | None]
+    assistant_only_loss: NotRequired[bool]
+    completion_only_loss: NotRequired[bool | None]
+
+
+class OnPolicyDistillationTrainerCfg(DistillationTrainerCfg):
+    """Configuration for On-Policy Knowledge Distillation trainer.
+
+    On-policy distillation generates completions from prompts during training
+    and distills teacher knowledge on the student's own generated sequences,
+    keeping the training distribution on-policy.
+
+    This extends DistillationTrainerCfg with generation-specific parameters.
+
+    Attributes:
+        max_prompt_length: Maximum number of tokens for prompts.
+        max_completion_length: Maximum new tokens to generate per prompt.
+        num_generations_per_prompt: Completions to sample per prompt.
+        temperature_sampling: Sampling temperature for generation.
+        top_k: Top-k sampling parameter for generation.
+        top_p: Top-p sampling parameter for generation.
+        presence_penalty: Presence penalty for generation.
+        frequency_penalty: Frequency penalty for generation.
+        repetition_penalty: Repetition penalty for generation.
+        generate_with_teacher: If True, teacher generates completions.
+        skip_apply_chat_template: Whether to skip applying the chat template
+            to prompts when sampling on-policy completions.
+
+    Example:
+        >>> config: OnPolicyDistillationTrainerCfg = {
+        ...     "trainer_type": "on_policy_distillation",
+        ...     "learning_rate": 2e-5,
+        ...     "temperature": 3.0,
+        ...     "alpha": 0.9,
+        ...     "max_prompt_length": 512,
+        ...     "max_completion_length": 256,
+        ... }
+    """
+
+    max_prompt_length: NotRequired[int]
+    max_completion_length: NotRequired[int]
+    num_generations_per_prompt: NotRequired[int]
+    temperature_sampling: NotRequired[float]
+    top_k: NotRequired[int | None]
+    top_p: NotRequired[float]
+    presence_penalty: NotRequired[float]
+    frequency_penalty: NotRequired[float]
+    repetition_penalty: NotRequired[float]
+    generate_with_teacher: NotRequired[bool]
+    skip_apply_chat_template: NotRequired[bool]
+
+
+class SeqKDTrainerCfg(BaseTrainerCfg):
+    """Configuration for Sequence-level Knowledge Distillation (SeqKD) trainer.
+
+    SeqKD is a black-box distillation method where the teacher generates
+    text completions and the student trains on them with standard CE loss.
+    No teacher logits are required.
+
+    Attributes:
+        max_prompt_length: Maximum number of tokens for prompts.
+        max_completion_length: Maximum new tokens to generate per prompt.
+        num_generations_per_prompt: Completions to sample per prompt.
+        temperature_sampling: Sampling temperature for generation.
+        top_k: Top-k sampling parameter for generation.
+        top_p: Top-p sampling parameter for generation.
+        presence_penalty: Presence penalty for generation.
+        frequency_penalty: Frequency penalty for generation.
+        repetition_penalty: Repetition penalty for generation.
+        skip_apply_chat_template: Whether to skip applying the chat template
+            to prompts when the teacher samples completions for SeqKD.
+    """
+
+    max_prompt_length: NotRequired[int]
+    max_completion_length: NotRequired[int]
+    num_generations_per_prompt: NotRequired[int]
+    temperature_sampling: NotRequired[float]
+    top_k: NotRequired[int | None]
+    top_p: NotRequired[float]
+    presence_penalty: NotRequired[float]
+    frequency_penalty: NotRequired[float]
+    repetition_penalty: NotRequired[float]
+    skip_apply_chat_template: NotRequired[bool]
+
+
+class SparseDistillationTrainerCfg(DistillationTrainerCfg):
+    """Configuration for Sparse (Gray-Box) Distillation trainer.
+
+    Sparse distillation uses only the teacher's top-k logprobs to compute
+    a partial KL divergence loss.  This is compatible with API-based
+    teachers that expose limited logprob information.
+
+    Attributes:
+        top_k_teacher: Number of top logprobs from the teacher.
+        max_prompt_length: Maximum number of tokens for prompts.
+        max_completion_length: Maximum new tokens to generate per prompt.
+        num_generations_per_prompt: Completions to sample per prompt.
+        temperature_sampling: Sampling temperature for generation.
+        top_k: Top-k sampling parameter for generation.
+        top_p: Top-p sampling parameter for generation.
+        presence_penalty: Presence penalty for generation.
+        frequency_penalty: Frequency penalty for generation.
+        repetition_penalty: Repetition penalty for generation.
+        skip_apply_chat_template: Whether to skip applying the chat template
+            to prompts when sampling on-policy completions for distillation.
+    """
+
+    top_k_teacher: NotRequired[int]
+    max_prompt_length: NotRequired[int]
+    max_completion_length: NotRequired[int]
+    num_generations_per_prompt: NotRequired[int]
+    temperature_sampling: NotRequired[float]
+    top_k: NotRequired[int | None]
+    top_p: NotRequired[float]
+    presence_penalty: NotRequired[float]
+    frequency_penalty: NotRequired[float]
+    repetition_penalty: NotRequired[float]
+    skip_apply_chat_template: NotRequired[bool]
+
+
+class KTOTrainerCfg(BaseTrainerCfg):
+    """Configuration for Kahneman-Tversky Optimization trainer (KTOConfig).
+
+    KTO is a preference optimization method inspired by prospect theory that
+    can learn from unpaired preference data (individual good/bad examples)
+    rather than requiring paired comparisons.
+
+    This configuration extends BaseTrainerCfg with KTO-specific parameters
+    for controlling the preference learning with asymmetric weighting.
+
+    Attributes:
+        beta: Temperature parameter for the KTO loss function.
+        desirable_weight: Weight for desirable (positive) examples.
+            Increasing this emphasizes learning from good examples.
+        undesirable_weight: Weight for undesirable (negative) examples.
+            Increasing this emphasizes avoiding bad behaviors.
+        loss_type: Type of KTO loss to use:
+            - "kto": Standard KTO loss
+            - "apo_zero_unpaired": APO zero unpaired variant
+        label_pad_token_id: Token ID used for padding labels.
+        padding_value: Value used for padding sequences.
+        max_length: Maximum total sequence length.
+        max_prompt_length: Maximum length for the prompt portion.
+        max_completion_length: Maximum length for the completion portion.
+        is_encoder_decoder: Whether the model is encoder-decoder architecture.
+        disable_dropout: Whether to disable dropout during training.
+        dataset_num_proc: Number of processes for dataset preprocessing.
+        precompute_ref_log_probs: Whether to precompute reference log probs.
+
+    Example:
+        >>> config: KTOTrainerCfg = {
+        ...     "trainer_type": "kto",
+        ...     "learning_rate": 1e-6,
+        ...     "beta": 0.1,
+        ...     "desirable_weight": 1.0,
+        ...     "undesirable_weight": 1.0,
+        ... }
+    """
+
+    beta: NotRequired[float]
+    desirable_weight: NotRequired[float]
+    undesirable_weight: NotRequired[float]
+    loss_type: NotRequired[Literal["kto", "apo_zero_unpaired"]]
+    label_pad_token_id: NotRequired[int]
+    padding_value: NotRequired[int | None]
+    max_length: NotRequired[int | None]
+    max_prompt_length: NotRequired[int | None]
+    max_completion_length: NotRequired[int | None]
+    logprob_vocab_chunk_size: NotRequired[int | None]
+    is_encoder_decoder: NotRequired[bool | None]
+    disable_dropout: NotRequired[bool]
+    dataset_num_proc: NotRequired[int | None]
+    precompute_ref_log_probs: NotRequired[bool]
+    precompute_ref_batch_size: NotRequired[int | None]
+
+
+class BCOTrainerCfg(BaseTrainerCfg):
+    """Configuration for Binary Classifier Optimization trainer (BCOConfig).
+
+    BCO treats preference optimization as a binary classification problem,
+    using density ratio estimation to distinguish between preferred and
+    non-preferred responses.
+
+    This configuration extends BaseTrainerCfg with BCO-specific parameters
+    for density ratio estimation and classifier training.
+
+    Attributes:
+        beta: Temperature parameter for the BCO loss.
+        label_pad_token_id: Token ID used for padding labels.
+        padding_value: Value used for padding sequences.
+        max_length: Maximum total sequence length.
+        max_prompt_length: Maximum length for the prompt portion.
+        max_completion_length: Maximum length for the completion portion.
+        disable_dropout: Whether to disable dropout during training.
+        generate_during_eval: Whether to generate completions during evaluation.
+        is_encoder_decoder: Whether the model is encoder-decoder architecture.
+        precompute_ref_log_probs: Whether to precompute reference log probs.
+        model_init_kwargs: Keyword arguments for model initialization.
+        ref_model_init_kwargs: Keyword arguments for reference model initialization.
+        dataset_num_proc: Number of processes for dataset preprocessing.
+        prompt_sample_size: Number of prompts to sample for density estimation.
+        min_density_ratio: Minimum value for clamping density ratios.
+        max_density_ratio: Maximum value for clamping density ratios.
+
+    Example:
+        >>> config: BCOTrainerCfg = {
+        ...     "trainer_type": "bco",
+        ...     "learning_rate": 1e-6,
+        ...     "beta": 0.1,
+        ...     "prompt_sample_size": 1024,
+        ...     "min_density_ratio": 0.5,
+        ...     "max_density_ratio": 10.0,
+        ... }
+    """
+
+    beta: NotRequired[float]
+    label_pad_token_id: NotRequired[int]
+    padding_value: NotRequired[int | None]
+    max_length: NotRequired[int | None]
+    max_prompt_length: NotRequired[int | None]
+    max_completion_length: NotRequired[int | None]
+    logprob_vocab_chunk_size: NotRequired[int | None]
+    disable_dropout: NotRequired[bool]
+    generate_during_eval: NotRequired[bool]
+    is_encoder_decoder: NotRequired[bool | None]
+    precompute_ref_log_probs: NotRequired[bool]
+    model_init_kwargs: NotRequired[dict[str, Any] | None]
+    ref_model_init_kwargs: NotRequired[dict[str, Any] | None]
+    dataset_num_proc: NotRequired[int | None]
+    prompt_sample_size: NotRequired[int]
+    min_density_ratio: NotRequired[float]
+    max_density_ratio: NotRequired[float]
+
+
+class CPOTrainerCfg(BaseTrainerCfg):
+    """Configuration for Contrastive Preference Optimization trainer (CPOConfig).
+
+    CPO is a preference optimization method that uses contrastive learning
+    objectives to align model outputs with human preferences without requiring
+    a separate reference model.
+
+    This configuration extends BaseTrainerCfg with CPO-specific parameters
+    including multiple loss variants and SimPO extensions.
+
+    Attributes:
+        beta: Temperature parameter for the preference loss.
+        label_smoothing: Label smoothing factor for regularization.
+        loss_type: Type of CPO loss to use:
+            - "sigmoid": Standard sigmoid loss
+            - "hinge": Hinge loss variant
+            - "ipo": Identity Policy Optimization
+            - "simpo": Simple Preference Optimization
+            - "alphapo": Alpha-weighted Preference Optimization
+        disable_dropout: Whether to disable dropout during training.
+        cpo_alpha: Alpha parameter for CPO loss weighting.
+        simpo_gamma: Gamma parameter for SimPO loss variant.
+        alpha: Additional alpha parameter for loss computation.
+        label_pad_token_id: Token ID used for padding labels.
+        padding_value: Value used for padding sequences.
+        max_length: Maximum total sequence length.
+        max_prompt_length: Maximum length for the prompt portion.
+        max_completion_length: Maximum length for the completion portion.
+        is_encoder_decoder: Whether the model is encoder-decoder architecture.
+        dataset_num_proc: Number of processes for dataset preprocessing.
+
+    Example:
+        >>> config: CPOTrainerCfg = {
+        ...     "trainer_type": "cpo",
+        ...     "learning_rate": 1e-6,
+        ...     "beta": 0.1,
+        ...     "loss_type": "sigmoid",
+        ...     "cpo_alpha": 1.0,
+        ... }
+    """
+
+    beta: NotRequired[float]
+    label_smoothing: NotRequired[float]
+    loss_type: NotRequired[Literal["sigmoid", "hinge", "ipo", "simpo", "alphapo"]]
+    disable_dropout: NotRequired[bool]
+    cpo_alpha: NotRequired[float]
+    simpo_gamma: NotRequired[float]
+    alpha: NotRequired[float]
+    label_pad_token_id: NotRequired[int]
+    padding_value: NotRequired[int | None]
+    max_length: NotRequired[int | None]
+    max_prompt_length: NotRequired[int | None]
+    max_completion_length: NotRequired[int | None]
+    logprob_vocab_chunk_size: NotRequired[int | None]
+    is_encoder_decoder: NotRequired[bool | None]
+    dataset_num_proc: NotRequired[int | None]
+    generate_during_eval: NotRequired[bool]
+
+
+class GKDTrainerCfg(SFTTrainerCfg):
+    """Configuration for Generalized Knowledge Distillation trainer (GKDConfig).
+
+    GKD extends standard knowledge distillation with on-policy data generation,
+    allowing the student model to learn from its own generations evaluated
+    by the teacher model.
+
+    This configuration extends SFTTrainerCfg with GKD-specific parameters
+    for on-policy distillation and sequence-level knowledge distillation.
+
+    Attributes:
+        temperature: Temperature for softening teacher distributions.
+        lmbda: Lambda parameter balancing on-policy and off-policy data.
+            ``None`` disables on-policy sampling.
+        beta: Beta parameter for loss weighting.
+        max_new_tokens: Maximum new tokens to generate for on-policy data.
+        disable_dropout: Whether to disable dropout during training.
+        seq_kd: Whether to use sequence-level knowledge distillation,
+            training on teacher-generated sequences.
+
+    Example:
+        >>> config: GKDTrainerCfg = {
+        ...     "trainer_type": "gkd",
+        ...     "learning_rate": 2e-5,
+        ...     "temperature": 0.9,
+        ...     "lmbda": 0.5,
+        ...     "seq_kd": False,
+        ... }
+    """
+
+    temperature: NotRequired[float]
+    lmbda: NotRequired[float | None]
+    beta: NotRequired[float]
+    max_new_tokens: NotRequired[int]
+    disable_dropout: NotRequired[bool]
+    seq_kd: NotRequired[bool]
+
+
+class NashMDTrainerCfg(GRPOTrainerCfg):
+    """Configuration for Nash Mixture-of-Decoders trainer (NashMDConfig).
+
+    Nash-MD is an online RLHF algorithm that finds Nash equilibrium between
+    multiple decoder policies, promoting diverse and high-quality responses
+    through game-theoretic optimization.
+
+    This configuration extends GRPOTrainerCfg with Nash-MD-specific parameters
+    for mixture modeling and equilibrium computation.
+
+    Attributes:
+        beta: Temperature parameter(s) for KL divergence penalty.
+            Can be a single float or list for multiple decoders.
+        mixture_coef: Coefficient(s) for mixing decoder outputs.
+            Can be a single float or list for multiple decoders.
+        missing_eos_penalty: Penalty for completions lacking EOS token.
+
+    Example:
+        >>> config: NashMDTrainerCfg = {
+        ...     "trainer_type": "nash-md",
+        ...     "learning_rate": 1e-6,
+        ...     "beta": 0.1,
+        ...     "mixture_coef": 0.5,
+        ... }
+    """
+
+    beta: NotRequired[float | list[float]]
+    mixture_coef: NotRequired[float | list[float]]
+    missing_eos_penalty: NotRequired[float | None]
+
+
+class XPOTrainerCfg(GRPOTrainerCfg):
+    """Configuration for Exploratory Preference Optimization trainer (XPOConfig).
+
+    XPO extends preference optimization with exploration bonuses, encouraging
+    the model to explore diverse responses while learning preferences.
+
+    This configuration extends GRPOTrainerCfg with XPO-specific parameters
+    for exploration-exploitation trade-off.
+
+    Attributes:
+        loss_type: Type of XPO loss ("sigmoid" or "ipo").
+        beta: Temperature parameter(s) for preference loss.
+            Can be a single float or list for multiple settings.
+        alpha: Exploration bonus coefficient(s).
+            Can be a single float or list for multiple settings.
+        missing_eos_penalty: Penalty for completions lacking EOS token.
+
+    Example:
+        >>> config: XPOTrainerCfg = {
+        ...     "trainer_type": "xpo",
+        ...     "learning_rate": 1e-6,
+        ...     "beta": 0.1,
+        ...     "alpha": 1e-5,
+        ...     "loss_type": "sigmoid",
+        ... }
+    """
+
+    loss_type: NotRequired[Literal["sigmoid", "ipo"]]
+    beta: NotRequired[float | list[float]]
+    alpha: NotRequired[float | list[float]]
+    missing_eos_penalty: NotRequired[float | None]
+
+
+class EmbeddingTrainerCfg(BaseTrainerCfg):
+    """Configuration for contrastive Embedding trainer (EmbeddingConfig).
+
+    Trains dense text embedding models using contrastive objectives such
+    as InfoNCE, MNRL, or triplet loss. Supports Matryoshka multi-dim
+    training for variable-size embeddings.
+
+    Attributes:
+        loss_type: Contrastive loss: "infonce", "triplet", or "mnrl".
+        temperature: Temperature for InfoNCE/MNRL similarity scaling.
+        margin: Margin for triplet loss.
+        query_field: Dataset column for query/anchor texts.
+        positive_field: Dataset column for positive texts.
+        negative_field: Dataset column for hard negative texts.
+        matryoshka_dims: Embedding dims for Matryoshka training.
+        normalize_embeddings: L2-normalize embeddings before loss.
+        pooling_strategy: Override pooling ("last", "mean", etc.).
+
+    Example:
+        >>> config: EmbeddingTrainerCfg = {
+        ...     "trainer_type": "embedding",
+        ...     "loss_type": "infonce",
+        ...     "temperature": 0.05,
+        ...     "learning_rate": 2e-5,
+        ...     "total_batch_size": 128,
+        ... }
+    """
+
+    loss_type: NotRequired[Literal["infonce", "triplet", "mnrl"]]
+    temperature: NotRequired[float]
+    margin: NotRequired[float]
+    query_field: NotRequired[str]
+    positive_field: NotRequired[str]
+    negative_field: NotRequired[str | None]
+    matryoshka_dims: NotRequired[list[int] | None]
+    normalize_embeddings: NotRequired[bool]
+    pooling_strategy: NotRequired[str | None]
+    dataset_num_proc: NotRequired[int | None]
+
+
+class AsyncGRPOTrainerCfg(GRPOTrainerCfg):
+    """eLarge config for the ``async_grpo`` trainer (AsyncGRPOConfig); extends GRPOTrainerCfg."""
+
+    heartbeat_stale_after_s: NotRequired[float]
+    max_inflight_tasks: NotRequired[int]
+    max_staleness: NotRequired[int]
+    queue_maxsize: NotRequired[int]
+    request_timeout: NotRequired[float]
+    weight_sync_steps: NotRequired[int]
+
+
+class DPPOTrainerCfg(GRPOTrainerCfg):
+    """eLarge config for the ``dppo`` trainer (DPPOConfig); extends GRPOTrainerCfg."""
+
+    clip_ratio_c: NotRequired[float]
+    divergence_topk: NotRequired[int]
+    divergence_type: NotRequired[Literal["binary_tv", "binary_kl", "topk_tv", "topk_kl"]]
+
+
+class GRPOWithReplayBufferTrainerCfg(GRPOTrainerCfg):
+    """eLarge config for the ``grpo_with_replay_buffer`` trainer (GRPOWithReplayBufferConfig); extends GRPOTrainerCfg."""
+
+    replay_buffer_size: NotRequired[int]
+
+
+class GSPOTokenTrainerCfg(GSPOTrainerCfg):
+    """eLarge config for the ``gspo_token`` trainer (GSPOTokenConfig); extends GSPOTrainerCfg."""
+
+
+class MiniLLMTrainerCfg(GRPOTrainerCfg):
+    """eLarge config for the ``minillm`` trainer (MiniLLMConfig); extends GRPOTrainerCfg."""
+
+    gamma: NotRequired[float]
+    kd_temperature: NotRequired[float]
+    length_normalization: NotRequired[bool]
+    rkl_advantage: NotRequired[bool]
+    single_step_decomposition: NotRequired[bool]
+
+
+class NeMoGymTrainerCfg(GRPOTrainerCfg):
+    """eLarge config for the ``nemo_gym`` trainer (NeMoGymConfig); extends GRPOTrainerCfg."""
+
+    agent_ref_key: NotRequired[str]
+    environment_reward_weight: NotRequired[float]
+    metadata_key: NotRequired[str]
+    request_timeout: NotRequired[float]
+
+
+class PAPOTrainerCfg(GRPOTrainerCfg):
+    """eLarge config for the ``papo`` trainer (PAPOConfig); extends GRPOTrainerCfg."""
+
+    der_loss_weight1: NotRequired[float]
+    der_loss_weight2: NotRequired[float]
+    mask_ratio: NotRequired[float]
+    mask_type: NotRequired[str]
+    perception_loss_weight: NotRequired[float]
+
+
+class RLOOTrainerCfg(GRPOTrainerCfg):
+    """eLarge config for the ``rloo`` trainer (RLOOConfig); extends GRPOTrainerCfg."""
+
+    advantage_estimator: NotRequired[Literal["leave_one_out"]]
+
+
+class OnlineDPOTrainerCfg(DPOTrainerCfg):
+    """eLarge config for the ``online_dpo`` trainer (OnlineDPOConfig); extends DPOTrainerCfg."""
+
+    max_new_tokens: NotRequired[int | None]
+    missing_eos_penalty: NotRequired[float | None]
+    repetition_penalty: NotRequired[float]
+    reward_weights: NotRequired[list[float] | tuple[float, ...] | None]
+    temperature: NotRequired[float]
+    top_k: NotRequired[int]
+    top_p: NotRequired[float]
+
+
+class TPOTrainerCfg(DPOTrainerCfg):
+    """eLarge config for the ``tpo`` trainer (TPOConfig); extends DPOTrainerCfg."""
+
+    tpo_alpha: NotRequired[float]
+    tpo_l_gamma: NotRequired[float]
+
+
+class GOLDTrainerCfg(DistillationTrainerCfg):
+    """eLarge config for the ``gold`` trainer (GOLDConfig); extends DistillationTrainerCfg."""
+
+    seq_kd: NotRequired[bool]
+    teacher_tokenizer_name_or_path: NotRequired[str | None]
+    uld_crossentropy_weight: NotRequired[float]
+    uld_distillation_weight: NotRequired[float]
+    uld_hybrid_matched_weight: NotRequired[float | None]
+    uld_hybrid_unmatched_weight: NotRequired[float | None]
+    uld_skip_student_eos: NotRequired[bool]
+    uld_skip_teacher_eos: NotRequired[bool]
+    uld_student_temperature: NotRequired[float]
+    uld_teacher_temperature: NotRequired[float]
+    uld_use_hybrid_loss: NotRequired[bool]
+    use_extended_uld: NotRequired[bool]
+    use_uld_loss: NotRequired[bool]
+
+
+class PRMTrainerCfg(RewardTrainerCfg):
+    """eLarge config for the ``prm`` trainer (PRMConfig); extends RewardTrainerCfg."""
+
+    max_completion_length: NotRequired[int | None]
+    step_separator: NotRequired[str]
+    train_on_last_step_only: NotRequired[bool]
+
+
+class SDFTTrainerCfg(SDPOTrainerCfg):
+    """eLarge config for the ``sdft`` trainer (SDFTConfig); extends SDPOTrainerCfg."""
+
+    generate_from_teacher: NotRequired[bool]
+    num_loss_tokens_to_skip: NotRequired[int]
+    teacher_prompt_template: NotRequired[str | None]
+
+
+class SSDTrainerCfg(SDPOTrainerCfg):
+    """eLarge config for the ``ssd`` trainer (SSDConfig); extends SDPOTrainerCfg."""
+
+    filter_empty: NotRequired[bool]
+
+
+class TrainerConfig(
+    ORPOTrainerCfg,
+    GRPOTrainerCfg,
+    AgenticMoshPitTrainerCfg,
+    RLVRTrainerCfg,
+    SDPOTrainerCfg,
+    GFPOTrainerCfg,
+    GSPOTrainerCfg,
+    PPOTrainerCfg,
+    SAOTrainerCfg,
+    CompactionRLTrainerCfg,
+    SFTTrainerCfg,
+    RewardTrainerCfg,
+    DistillationTrainerCfg,
+    SpeculativeDecodingTrainerCfg,
+    OnPolicyDistillationTrainerCfg,
+    SeqKDTrainerCfg,
+    SparseDistillationTrainerCfg,
+    KTOTrainerCfg,
+    BCOTrainerCfg,
+    CPOTrainerCfg,
+    GKDTrainerCfg,
+    NashMDTrainerCfg,
+    XPOTrainerCfg,
+    EmbeddingTrainerCfg,
+    AsyncGRPOTrainerCfg,
+    DPPOTrainerCfg,
+    GRPOWithReplayBufferTrainerCfg,
+    GSPOTokenTrainerCfg,
+    MiniLLMTrainerCfg,
+    NeMoGymTrainerCfg,
+    PAPOTrainerCfg,
+    RLOOTrainerCfg,
+    OnlineDPOTrainerCfg,
+    TPOTrainerCfg,
+    GOLDTrainerCfg,
+    PRMTrainerCfg,
+    SDFTTrainerCfg,
+    SSDTrainerCfg,
+    BaseTrainerCfg,
+    DPOTrainerCfg,
+):
+    """Unified trainer configuration combining all trainer-specific configs.
+
+    This TypedDict combines all trainer configuration classes through multiple
+    inheritance, providing a single type that can represent any trainer's
+    configuration. This is primarily used for type annotations where the
+    specific trainer type is not known at static analysis time.
+
+    The class inherits from all specialized trainer configs, making it
+    compatible with any trainer type's configuration dictionary.
+
+    Note:
+        Due to TypedDict inheritance limitations, some attributes may appear
+        multiple times in the MRO with the same or compatible types. The
+        actual validation of configuration values happens at runtime through
+        the normalize_trainer_config function.
+
+    Example:
+        >>> def process_config(config: TrainerConfig) -> None:
+        ...     trainer_type = config.get("trainer_type", "sft")
+        ...     if trainer_type == "dpo":
+        ...         beta = config.get("beta", 0.1)
+        ...     # Works for any trainer type
+    """
+
+    ...
+
+
+# Raw eLarge trainer-config keys that ``eLargeModel.build_trainer`` consumes itself
+# and strips before constructing the trainer-arguments dataclass. They describe
+# bucket wiring in eLarge's own vocabulary (plain dicts and a serialized rule)
+# rather than the dataclass field names, so they must never be forwarded as kwargs.
+# Kept here so the builder and the config-compat tests agree on one list.
+ELARGE_ONLY_TRAINER_KEYS: tuple[str, ...] = ("bucket_configs", "bucket_rule", "bucket_datasets")
+
+BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
+    "learning_rate": 5e-5,
+    "num_train_epochs": 10,
+    "total_batch_size": 32,
+    "gradient_accumulation_steps": 1,
+    "optimizer": "adamw",
+    "trainable_selector": "parameters",
+    "scheduler": "none",
+    "warmup_steps": 0,
+    "weight_decay": 0.01,
+    "mpmd_scheduler": None,
+    "dataloader_num_workers": 0,
+    "dataloader_pin_memory": False,
+    "remove_unused_columns": True,
+    "shuffle_train_dataset": True,
+    "shuffle_seed_train": 64871,
+    "use_data_collator": True,
+    "use_grain": True,
+    "offload_dataset": False,
+    "offload_device_type": "cpu",
+    "offload_device_index": 0,
+    "do_train": True,
+    "do_eval": False,
+    "do_last_save": True,
+    "is_fine_tuning": True,
+    "init_tx": True,
+    "train_on_inputs": True,
+    "aux_loss_enabled": False,
+    "step_start_point": None,
+    "force_step_start_point": False,
+    "resume_if_possible": True,
+    "truncation_mode": "keep_end",
+    "max_length": 4096,
+    "save_directory": "EasyDeL-Checkpoints",
+    "save_optimizer_state": True,
+    "merge_lora_before_save": True,
+    "merge_lora_before_tpu_preemption_save": False,
+    "save_tpu_preemption_checkpoints": True,
+    "remove_ckpt_after_load": False,
+    "log_steps": 10,
+    "report_steps": 5,
+    "log_all_workers": False,
+    "log_grad_norms": True,
+    "report_metrics": True,
+    "progress_bar_type": "tqdm",
+    "weight_distribution_pattern": r".*",
+    "weight_distribution_log_steps": 500,
+    "verbose": True,
+    "process_zero_is_admin": True,
+    "use_wandb": True,
+    "auto_shard_states": True,
+    "performance_mode": False,
+    "profiler_path": None,
+    "profiler_log_all_workers": False,
+    "profiler_include_compile": False,
+    "profiler_host_tracer_level": None,
+    "profiler_python_tracer_level": None,
+    "track_memory": False,
+    "low_mem_usage": True,
+    "lmhead_chunksize": None,
+    "sparsify_module": False,
+    "sparse_module_type": "bcoo",
+    "generation_shard_inputs": True,
+    "generation_use_train_prompts": False,
+    "generation_num_prompts": 1,
+    "generation_dataset_prompt_field": "prompt",
+    "generation_preview_print": False,
+    "generation_log_to_wandb": True,
+    "log_training_generations_to_wandb": True,
+    "benchmark_interval": None,
+    "benchmarks": [],
+    "use_esurge_generation": True,
+    # Both KV-cache sizing knobs default to None: when neither is set the trainer
+    # auto-computes a tight token budget from the rollout shape (see
+    # TrainingArguments.esurge_hbm_utilization). Must mirror the dataclass default
+    # — normalize_trainer_config setdefault()s these, so a non-None value here would
+    # silently override the dataclass None and defeat the auto-compute path.
+    "esurge_hbm_utilization": None,
+    "esurge_max_cache_tokens": None,
+    "esurge_page_size": 32,
+    "esurge_silent_mode": True,
+    "esurge_runner_verbose": False,
+    "esurge_max_num_batched_tokens": None,
+    "esurge_enable_prefix_caching": None,
+    "esurge_data_parallelism_axis": None,
+    "esurge_async_scheduling": None,
+    "esurge_overlap_execution": None,
+    "esurge_max_num_seq_buckets": None,
+    "bucket_configs": None,
+    "bucket_rule": None,
+    "bucket_datasets": None,
+}
+# BASE_TRAINER_DEFAULTS: Default configuration values shared across all
+# trainer types.
+#
+# This dictionary provides sensible defaults for the BaseTrainerCfg
+# parameters. These values are applied first, then overridden by
+# trainer-specific defaults from TRAINER_SPECIFIC_DEFAULTS, and finally by
+# user-provided configuration.
+#
+# The defaults are designed to work well for most fine-tuning scenarios on
+# modern hardware, with conservative batch sizes and standard optimization
+# settings.
+
+# Trainer-specific defaults (only overrides, not full configs)
+TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
+    "dpo": {
+        "trainer_prefix": "DPO",
+        "learning_rate": 1e-6,
+        "beta": 0.1,
+        "label_smoothing": 0.0,
+        "loss_type": "sigmoid",
+        "use_weighting": False,
+        "label_pad_token_id": -100,
+        "max_length": 512,
+        "max_prompt_length": 256,
+        "disable_dropout": True,
+        "precompute_ref_log_probs": False,
+        "reference_free": False,
+        "force_use_ref_model": False,
+        "sync_ref_model": False,
+        "ref_model_mixup_alpha": 0.9,
+        "ref_model_sync_steps": 64,
+        "logprob_vocab_chunk_size": None,
+    },
+    "orpo": {
+        "trainer_prefix": "ORPO",
+        "learning_rate": 1e-6,
+        "beta": 0.1,
+        "max_length": 1024,
+        "max_prompt_length": 512,
+        "logprob_vocab_chunk_size": None,
+        "disable_dropout": True,
+        "label_pad_token_id": -100,
+        "generate_during_eval": False,
+    },
+    "grpo": {
+        "trainer_prefix": "GRPO",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "beta": 0.04,
+        "sync_ref_model": False,
+        "ref_model_mixup_alpha": 0.9,
+        "ref_model_sync_steps": 64,
+        "skip_apply_chat_template": False,
+        "num_return_sequences": 1,
+        "ref_logps_chunk_size": None,
+        "completion_chunk_size": None,
+        "max_loss_completion_tokens": None,
+        "logprob_vocab_chunk_size": None,
+        "top_p": 0.95,
+        "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "temperature": 0.7,
+    },
+    "gfpo": {
+        "trainer_prefix": "GFPO",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "beta": 0.04,
+        "sync_ref_model": False,
+        "ref_model_mixup_alpha": 0.9,
+        "ref_model_sync_steps": 64,
+        "skip_apply_chat_template": False,
+        "num_return_sequences": 4,
+        "ref_logps_chunk_size": None,
+        "completion_chunk_size": None,
+        "max_loss_completion_tokens": None,
+        "logprob_vocab_chunk_size": None,
+        "top_p": 0.95,
+        "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "temperature": 0.7,
+    },
+    "gspo": {
+        "trainer_prefix": "GSPO",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "beta": 0.04,
+        "sync_ref_model": False,
+        "ref_model_mixup_alpha": 0.9,
+        "ref_model_sync_steps": 64,
+        "skip_apply_chat_template": False,
+        "num_return_sequences": 4,
+        "ref_logps_chunk_size": None,
+        "completion_chunk_size": None,
+        "max_loss_completion_tokens": None,
+        "logprob_vocab_chunk_size": None,
+        "top_p": 0.95,
+        "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "temperature": 0.7,
+    },
+    "agentic-moshpit": {
+        "trainer_prefix": "AgenticMoshPit",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 1024,
+        "beta": 0.04,
+        "max_steps": 10,
+        "group_size": 4,
+        "num_env_groups": 4,
+        "reward_mode": "episode",
+        "advantage_estimator": "grpo",
+        "step_reward_gamma": 0.95,
+        "episode_reward_weight": 1.0,
+        "step_reward_weight": 1.0,
+        "tool_caller": None,
+        "max_tool_calls_per_step": 5,
+        "ref_logps_chunk_size": None,
+        "completion_chunk_size": None,
+        "max_loss_completion_tokens": None,
+        "logprob_vocab_chunk_size": None,
+        "top_p": 0.95,
+        "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "temperature": 0.7,
+    },
+    "rlvr": {
+        "trainer_prefix": "RLVR",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 1024,
+        "max_completion_length": 2048,
+        "beta": 0.04,
+        "num_return_sequences": 8,
+        "answer_key": "answer",
+        "test_key": "tests",
+        "format_reward_weight": 0.0,
+        "length_penalty_target": None,
+        "length_penalty_weight": 0.0,
+        "max_len_mask": True,
+        "reward_clip_range": None,
+        "difficulty_loss_weight": False,
+        "ref_logps_chunk_size": None,
+        "completion_chunk_size": None,
+        "max_loss_completion_tokens": None,
+        "logprob_vocab_chunk_size": None,
+        "top_p": 0.95,
+        "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "temperature": 0.7,
+    },
+    "sdpo": {
+        "trainer_prefix": "SDPO",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "max_feedback_length": 256,
+        "distillation_type": "jsd",
+        "beta": 0.0,
+        "sync_ref_model": False,
+        "ref_model_mixup_alpha": 0.9,
+        "ref_model_sync_steps": 64,
+        "skip_apply_chat_template": False,
+        "num_return_sequences": 4,
+        "ref_logps_chunk_size": None,
+        "completion_chunk_size": None,
+        "max_loss_completion_tokens": None,
+        "logprob_vocab_chunk_size": None,
+        "top_p": 0.95,
+        "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "temperature": 0.7,
+    },
+    "ppo": {
+        "trainer_prefix": "PPO",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_length": 768,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "reward_weights": None,
+        "kl_coef": 0.05,
+        "kl_estimator": "k1",
+        "cliprange": 0.2,
+        "vf_coef": 0.1,
+        "cliprange_value": 0.2,
+        "gamma": 1.0,
+        "lam": 0.95,
+        "whiten_rewards": False,
+        "whiten_advantages": True,
+        "entropy_coef": None,
+        "missing_eos_penalty": None,
+        "skip_apply_chat_template": False,
+        "num_return_sequences": 1,
+        "logprob_vocab_chunk_size": None,
+        "top_p": 0.95,
+        "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "temperature": 0.7,
+    },
+    "sft": {
+        "trainer_prefix": "SFT",
+        "learning_rate": 2e-5,
+        "add_special_tokens": False,
+        "packing": False,
+        "dataset_batch_size": 1000,
+        "num_of_sequences": 1024,
+    },
+    "reward": {
+        "trainer_prefix": "Reward",
+        "max_length": 1024,
+        "disable_dropout": True,
+        "center_rewards_coefficient": 0.1,
+        "remove_unused_columns": False,
+    },
+    "distillation": {
+        "trainer_prefix": "Distillation",
+        "temperature": 2.0,
+        "alpha": 0.9,
+        "cakld_gamma": None,
+        "logits_chunk_size": None,
+    },
+    "speculative_decoding": {
+        "trainer_prefix": "SpeculativeDecoding",
+        "temperature": 1.0,
+        "alpha": 1.0,
+        "num_draft_tokens": 1,
+        "draft_target_offset": 0,
+        "target_logits_attr": "logits",
+        "draft_logits_attr": None,
+        "draft_chain_method": "auto",
+        "drafter_forward_method": None,
+        "target_forward_method": None,
+        "target_output_hidden_states": True,
+        "pass_target_outputs": True,
+        "target_model_revision": None,
+        "disable_dropout": True,
+        "dataset_text_field": "text",
+        "assistant_only_loss": False,
+        "completion_only_loss": None,
+        "metrics_to_show_in_rich_pbar": [
+            "loss",
+            "draft_accept_rate",
+            "tau_probabilistic",
+            "deepspec_block_ce_loss",
+            "deepspec_block_l1_loss",
+        ],
+    },
+    "on_policy_distillation": {
+        "trainer_prefix": "OnPolicyDistillation",
+        "temperature": 2.0,
+        "alpha": 0.9,
+        "logits_chunk_size": None,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "num_generations_per_prompt": 1,
+        "temperature_sampling": 0.7,
+        "top_p": 0.95,
+        "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "generate_with_teacher": False,
+    },
+    "seq_kd": {
+        "trainer_prefix": "SeqKD",
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "num_generations_per_prompt": 1,
+        "temperature_sampling": 0.7,
+        "top_p": 0.95,
+        "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
+    },
+    "sparse_distillation": {
+        "trainer_prefix": "SparseDistillation",
+        "temperature": 2.0,
+        "alpha": 0.9,
+        "top_k_teacher": 20,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "num_generations_per_prompt": 1,
+        "temperature_sampling": 0.7,
+        "top_p": 0.95,
+        "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
+    },
+    "kto": {
+        "trainer_prefix": "KTO",
+        "learning_rate": 1e-6,
+        "beta": 0.1,
+        "desirable_weight": 1.0,
+        "undesirable_weight": 1.0,
+        "loss_type": "kto",
+        "label_pad_token_id": -100,
+        "max_length": 1024,
+        "max_prompt_length": 512,
+        "logprob_vocab_chunk_size": None,
+        "disable_dropout": True,
+        "precompute_ref_log_probs": False,
+    },
+    "bco": {
+        "trainer_prefix": "BCO",
+        "learning_rate": 1e-6,
+        "beta": 0.1,
+        "label_pad_token_id": -100,
+        "max_length": 1024,
+        "max_prompt_length": 512,
+        "logprob_vocab_chunk_size": None,
+        "disable_dropout": True,
+        "generate_during_eval": False,
+        "precompute_ref_log_probs": False,
+        "prompt_sample_size": 1024,
+        "min_density_ratio": 0.5,
+        "max_density_ratio": 10.0,
+    },
+    "cpo": {
+        "trainer_prefix": "CPO",
+        "learning_rate": 1e-6,
+        "beta": 0.1,
+        "label_smoothing": 0.0,
+        "loss_type": "sigmoid",
+        "disable_dropout": True,
+        "cpo_alpha": 1.0,
+        "simpo_gamma": 0.5,
+        "alpha": 0.0,
+        "label_pad_token_id": -100,
+        "max_length": 1024,
+        "max_prompt_length": 512,
+        "logprob_vocab_chunk_size": None,
+    },
+    "gkd": {
+        "trainer_prefix": "GKD",
+        "learning_rate": 2e-5,
+        "temperature": 0.9,
+        "lmbda": 0.5,
+        "beta": 0.5,
+        "max_new_tokens": 128,
+        "disable_dropout": True,
+        "seq_kd": False,
+        "add_special_tokens": False,
+        "packing": False,
+        "dataset_batch_size": 1000,
+        "num_of_sequences": 1024,
+    },
+    "nash-md": {
+        "trainer_prefix": "NashMD",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "beta": 0.1,
+        "mixture_coef": 0.5,
+        "sync_ref_model": False,
+        "ref_model_mixup_alpha": 0.9,
+        "ref_model_sync_steps": 64,
+        "skip_apply_chat_template": False,
+        "num_return_sequences": 1,
+        "ref_logps_chunk_size": None,
+        "completion_chunk_size": None,
+        "max_loss_completion_tokens": None,
+        "logprob_vocab_chunk_size": None,
+        "top_p": 0.95,
+        "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "temperature": 0.7,
+    },
+    "xpo": {
+        "trainer_prefix": "XPO",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "loss_type": "sigmoid",
+        "beta": 0.1,
+        "alpha": 1e-5,
+        "sync_ref_model": False,
+        "ref_model_mixup_alpha": 0.9,
+        "ref_model_sync_steps": 64,
+        "skip_apply_chat_template": False,
+        "num_return_sequences": 1,
+        "ref_logps_chunk_size": None,
+        "completion_chunk_size": None,
+        "max_loss_completion_tokens": None,
+        "logprob_vocab_chunk_size": None,
+        "top_p": 0.95,
+        "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "temperature": 0.7,
+    },
+    "embedding": {
+        "trainer_prefix": "Embedding",
+        "learning_rate": 2e-5,
+        "loss_type": "infonce",
+        "temperature": 0.05,
+        "margin": 0.2,
+        "query_field": "query",
+        "positive_field": "positive",
+        "normalize_embeddings": True,
+        "max_length": 512,
+        "remove_unused_columns": False,
+    },
+}
+
+TRAINER_SPECIFIC_DEFAULTS.update(
+    {
+        "async_grpo": {
+            **TRAINER_SPECIFIC_DEFAULTS["grpo"],
+            "trainer_prefix": "AsyncGRPO",
+            "max_inflight_tasks": 32,
+            "max_staleness": 1,
+            "queue_maxsize": 0,
+            "weight_sync_steps": 1,
+            "request_timeout": 120.0,
+        },
+        "compaction_rl": {
+            **TRAINER_SPECIFIC_DEFAULTS["ppo"],
+            "trainer_prefix": "CompactionRL",
+            "learning_rate": 2e-6,
+            "total_batch_size": 128,
+            "weight_decay": 0.0,
+            "kl_coef": 0.0,
+            "critic_learning_rate": 3e-6,
+            "critic_learning_rate_end": None,
+            "critic_optimizer": None,
+            "critic_scheduler": None,
+            "critic_warmup_steps": 0,
+            "critic_updates_per_actor_update": 2,
+            "critic_pretrain_steps": 50,
+            "critic_cliprange_value": 0.2,
+            "critic_gae_lambda": 1.0,
+            "critic_gae_mode": "match_policy",
+            "critic_trainable_mode": "all",
+            "policy_gae_mode": "length_adaptive",
+            "length_adaptive_alpha": 1.5,
+            "global_token_normalization": True,
+            "rollout_logprob_source": "recompute",
+            "max_inflight_rollouts": 32,
+            "rollout_queue_size": 0,
+            "weight_sync_steps": 1,
+            "max_policy_staleness": None,
+            "rollout_timeout": 120.0,
+            "max_length": 65_536,
+            "max_prompt_length": 55_296,
+            "max_completion_length": 10_240,
+            "num_return_sequences": 1,
+            "num_generations": 1,
+            "num_ppo_epochs": 1,
+            "context_budget": 65_536,
+            "compaction_threshold": 10_240,
+            "max_compactions": 3,
+            "recent_steps": 2,
+            "max_assistant_tokens": 10_240,
+            "max_summary_tokens": 2_048,
+            "max_turns": 250,
+            "summary_instruction": (
+                "Summarize the completed work, important observations, tool results, "
+                "remaining goals, and constraints so the task can continue from a shorter context."
+            ),
+            "resume_template": (
+                "The previous context was compacted. Continue the original task using this summary:\n\n{summary}"
+            ),
+            "train_summary_tokens": True,
+            "cross_trajectory_gae": True,
+            "token_level_loss": True,
+            "compaction_failure_policy": "raise",
+            "guard_failure_policy": "block",
+        },
+        "dppo": {
+            **TRAINER_SPECIFIC_DEFAULTS["grpo"],
+            "trainer_prefix": "DPPO",
+            "loss_type": "dppo",
+            "divergence_type": "binary_tv",
+            "divergence_topk": 20,
+            "clip_ratio_c": 20.0,
+        },
+        "gold": {
+            **TRAINER_SPECIFIC_DEFAULTS["distillation"],
+            "trainer_prefix": "GOLD",
+        },
+        "grpo_with_replay_buffer": {
+            **TRAINER_SPECIFIC_DEFAULTS["grpo"],
+            "trainer_prefix": "GRPOWithReplayBuffer",
+            "replay_buffer_size": 64,
+        },
+        "gspo_token": {
+            **TRAINER_SPECIFIC_DEFAULTS["gspo"],
+            "trainer_prefix": "GSPOToken",
+            "importance_sampling_level": "sequence_token",
+        },
+        "minillm": {
+            **TRAINER_SPECIFIC_DEFAULTS["grpo"],
+            "trainer_prefix": "MiniLLM",
+            "rkl_advantage": True,
+            "single_step_decomposition": False,
+            "kd_temperature": 1.0,
+            "gamma": 0.0,
+            "length_normalization": True,
+        },
+        "nemo_gym": {
+            **TRAINER_SPECIFIC_DEFAULTS["grpo"],
+            "trainer_prefix": "NeMoGym",
+            "request_timeout": 10800.0,
+            "metadata_key": "metadata",
+            "agent_ref_key": "agent_ref",
+            "environment_reward_weight": 1.0,
+        },
+        "online_dpo": {
+            **TRAINER_SPECIFIC_DEFAULTS["dpo"],
+            "trainer_prefix": "OnlineDPO",
+            "max_new_tokens": 64,
+            "temperature": 0.9,
+            "top_p": 1.0,
+            "top_k": 0,
+            "repetition_penalty": 1.0,
+        },
+        "papo": {
+            **TRAINER_SPECIFIC_DEFAULTS["grpo"],
+            "trainer_prefix": "PAPO",
+            "perception_loss_weight": 0.1,
+            "mask_ratio": 0.3,
+            "mask_type": "random",
+            "der_loss_weight1": 0.03,
+            "der_loss_weight2": 0.03,
+        },
+        "prm": {
+            **TRAINER_SPECIFIC_DEFAULTS["reward"],
+            "trainer_prefix": "PRM",
+            "step_separator": "\n",
+            "train_on_last_step_only": False,
+        },
+        "rloo": {
+            **TRAINER_SPECIFIC_DEFAULTS["grpo"],
+            "trainer_prefix": "RLOO",
+            "num_return_sequences": 2,
+            "num_generations": 2,
+            "advantage_estimator": "leave_one_out",
+            "scale_rewards": "none",
+        },
+        "sao": {
+            **TRAINER_SPECIFIC_DEFAULTS["ppo"],
+            "trainer_prefix": "SAO",
+            "learning_rate": 1e-6,
+            "total_batch_size": 128,
+            "kl_coef": 0.0,
+            "critic_learning_rate": 5e-6,
+            "critic_learning_rate_end": 5e-6,
+            "critic_optimizer": None,
+            "critic_scheduler": "linear",
+            "critic_warmup_steps": 10,
+            "critic_updates_per_actor_update": 2,
+            "critic_pretrain_steps": 0,
+            "critic_cliprange_value": 0.2,
+            "critic_gae_lambda": 1.0,
+            "critic_gae_mode": "fixed",
+            "critic_trainable_mode": "full_except_attention",
+            "policy_gae_mode": "length_adaptive",
+            "length_adaptive_alpha": 1.5,
+            "global_token_normalization": True,
+            "rollout_logprob_source": "engine",
+            "max_inflight_rollouts": 32,
+            "rollout_queue_size": 0,
+            "weight_sync_steps": 1,
+            "max_policy_staleness": None,
+            "rollout_timeout": 120.0,
+            "dis_epsilon_low": 0.3,
+            "dis_epsilon_high": 5.0,
+            "num_return_sequences": 1,
+            "num_generations": 1,
+            "num_ppo_epochs": 1,
+            "asynchronous_rollouts": True,
+        },
+        "sdft": {
+            **TRAINER_SPECIFIC_DEFAULTS["sdpo"],
+            "trainer_prefix": "SDFT",
+            "generate_from_teacher": False,
+            "teacher_prompt_template": None,
+            "num_loss_tokens_to_skip": 0,
+        },
+        "ssd": {
+            **TRAINER_SPECIFIC_DEFAULTS["sdpo"],
+            "trainer_prefix": "SSD",
+            "num_generations": 1,
+            "num_return_sequences": 1,
+            "filter_empty": True,
+        },
+        "tpo": {
+            **TRAINER_SPECIFIC_DEFAULTS["dpo"],
+            "trainer_prefix": "TPO",
+            "reference_free": True,
+            "precompute_ref_log_probs": False,
+            "tpo_alpha": 1.0,
+            "tpo_l_gamma": 0.5,
+        },
+    }
+)
+# TRAINER_SPECIFIC_DEFAULTS: Trainer-specific default configuration overrides.
+#
+# This dictionary maps trainer type identifiers to their specific default
+# values. These defaults override BASE_TRAINER_DEFAULTS for the
+# corresponding trainer type. Only parameters that differ from base defaults
+# need to be specified.
+#
+# New trainer types can be registered dynamically via
+# register_trainer_defaults().
+
+# Set of trainer types that support automatic max_completion_length
+# computation.
+#
+# For these trainers, if max_completion_length is not explicitly set but
+# max_length and max_prompt_length are provided, max_completion_length is
+# computed as: max_length - max_prompt_length.
+_TRAINERS_WITH_COMPLETION_LENGTH = frozenset(
+    {
+        "async_grpo",
+        "bco",
+        "compaction_rl",
+        "cpo",
+        "dpo",
+        "dppo",
+        "gfpo",
+        "grpo",
+        "grpo_with_replay_buffer",
+        "gspo",
+        "gspo_token",
+        "kto",
+        "minillm",
+        "nemo_gym",
+        "online_dpo",
+        "orpo",
+        "papo",
+        "ppo",
+        "rloo",
+        "sao",
+        "sdft",
+        "sdpo",
+        "ssd",
+        "tpo",
+    }
+)
+
+
+def register_trainer_defaults(trainer_type: str, defaults: TrainerConfig) -> None:
+    """Register default configuration for a trainer type.
+
+    This function allows external modules to register their own trainer defaults
+    without modifying this module directly. It enables extensibility for custom
+    trainer implementations while maintaining compatibility with the configuration
+    system.
+
+    The registered defaults will be merged with BASE_TRAINER_DEFAULTS when
+    get_trainer_defaults() or normalize_trainer_config() is called.
+
+    Args:
+        trainer_type: The trainer type identifier. Will be normalized to lowercase
+            and have aliases resolved (e.g., "nash_md" -> "nash-md").
+        defaults: Dictionary of default values for this trainer type. Only
+            parameters that differ from BASE_TRAINER_DEFAULTS need to be specified.
+
+    Example:
+        >>> register_trainer_defaults("my_trainer", {
+        ...     "trainer_prefix": "mytrainer",
+        ...     "learning_rate": 1e-5,
+        ...     "custom_param": 42,
+        ... })
+        >>> # Now "my_trainer" can be used as a trainer_type
+        >>> config = normalize_trainer_config({"trainer_type": "my_trainer"})
+
+    Note:
+        Registering a trainer type that already exists will override the
+        existing defaults entirely.
+    """
+    TRAINER_SPECIFIC_DEFAULTS[_normalize_trainer_type(trainer_type)] = defaults
+
+
+def get_trainer_defaults(trainer_type: str) -> TrainerConfig:
+    """Get merged defaults for a trainer type.
+
+    This function retrieves the complete set of default configuration values
+    for a specific trainer type by merging BASE_TRAINER_DEFAULTS with any
+    trainer-specific overrides from TRAINER_SPECIFIC_DEFAULTS.
+
+    Args:
+        trainer_type: The trainer type identifier (e.g., "dpo", "sft", "grpo").
+            Case-insensitive and aliases are automatically resolved.
+
+    Returns:
+        Complete defaults dictionary for the trainer with all base defaults
+        and trainer-specific overrides applied.
+
+    Example:
+        >>> defaults = get_trainer_defaults("dpo")
+        >>> defaults["beta"]
+        0.1
+        >>> defaults["learning_rate"]
+        1e-06
+        >>> defaults["optimizer"]  # From base defaults
+        'adamw'
+    """
+    from ..processing import clone_config
+
+    trainer_type = _normalize_trainer_type(trainer_type)
+    defaults = dict(BASE_TRAINER_DEFAULTS)
+    if trainer_type in TRAINER_SPECIFIC_DEFAULTS:
+        defaults.update(TRAINER_SPECIFIC_DEFAULTS[trainer_type])
+    return clone_config(defaults)  # type: ignore[return-value]
+
+
+def normalize_trainer_config(config: dict[str, Any]) -> TrainerConfig:
+    """Normalize and validate trainer configuration.
+
+    This function takes raw trainer configuration and applies appropriate defaults
+    based on the trainer type, ensuring all required fields are present with
+    sensible values. It handles deprecated parameter names, auto-computes
+    derived values, and converts nested configurations to appropriate types.
+
+    The normalization process:
+    1. Normalizes trainer_type to canonical form
+    2. Handles deprecated max_sequence_length -> max_length migration
+    3. Merges BASE_TRAINER_DEFAULTS with trainer-specific defaults
+    4. Applies user configuration (user values take precedence)
+    5. Auto-computes max_completion_length for applicable trainers
+    6. Sets eval_batch_size to total_batch_size if not specified
+    7. Converts loss_config dict to LossConfig instance
+
+    Args:
+        config: Raw trainer configuration dictionary. May contain partial
+            configuration with missing values that will be filled from defaults.
+
+    Returns:
+        Normalized trainer configuration with proper type, all defaults applied,
+        and derived values computed.
+
+    Raises:
+        FutureWarning: If deprecated parameter names are used.
+
+    Example:
+        >>> config = {"trainer_type": "dpo", "learning_rate": 2e-6}
+        >>> normalized = normalize_trainer_config(config)
+        >>> normalized["beta"]  # From DPO defaults
+        0.1
+        >>> normalized["optimizer"]  # From base defaults
+        'adamw'
+        >>> normalized["max_completion_length"]  # Auto-computed
+        256
+
+    Note:
+        The input config is deep-copied to prevent mutation of the original.
+    """
+    from copy import deepcopy
+
+    config = deepcopy(config)
+    trainer_type = _normalize_trainer_type(config.get("trainer_type", "sft"))
+
+    if "max_sequence_length" in config and "max_length" not in config:
+        warnings.warn(
+            "`max_sequence_length` is deprecated; use `max_length` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        config["max_length"] = config.pop("max_sequence_length")
+    elif (
+        "max_sequence_length" in config
+        and "max_length" in config
+        and config["max_sequence_length"] != config["max_length"]
+    ):
+        warnings.warn(
+            "Both `max_length` and `max_sequence_length` are set; ignoring `max_sequence_length`.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        config.pop("max_sequence_length", None)
+
+    defaults = get_trainer_defaults(trainer_type)
+
+    # Apply defaults (config values take precedence)
+    for key, value in defaults.items():
+        config.setdefault(key, value)
+
+    config["trainer_type"] = trainer_type
+
+    if "max_completion_length" not in config and trainer_type in _TRAINERS_WITH_COMPLETION_LENGTH:
+        if "max_length" in config and "max_prompt_length" in config:
+            config["max_completion_length"] = config["max_length"] - config["max_prompt_length"]
+
+    if "eval_batch_size" not in config:
+        config["eval_batch_size"] = config.get("total_batch_size", 32)
+
+    if "loss_config" in config and isinstance(config["loss_config"], dict):
+        from easydel.infra.loss_utils import LossConfig
+
+        config["loss_config"] = LossConfig(**config["loss_config"])
+
+    return cast(TrainerConfig, cast(object, config))
+
+
+def get_trainer_class(trainer_type: str):
+    """Get the appropriate trainer class based on type.
+
+    This function maps trainer type strings to their corresponding trainer
+    class implementations using the EasyDeL registry system. It provides
+    a central point for trainer class resolution.
+
+    Args:
+        trainer_type: Type of trainer to retrieve. Supported values include:
+            "sft", "dpo", "orpo", "grpo", "sdpo", "ppo", "reward", "distillation",
+            "kto", "bco", "cpo", "gkd", "nash-md", "xpo", "base",
+            "agentic-moshpit", "rlvr", "sao", "compaction_rl".
+            Case-insensitive with alias support.
+
+    Returns:
+        Trainer class corresponding to the specified type. The class can be
+        instantiated with appropriate configuration and model.
+
+    Raises:
+        KeyError: If the trainer type is not found in the registry.
+
+    Example:
+        >>> trainer_cls = get_trainer_class("dpo")
+        >>> trainer_cls.__name__
+        'DPOTrainer'
+        >>> trainer = trainer_cls(model=model, args=args, ...)
+
+    See Also:
+        get_training_arguments_class: Get the corresponding config class.
+        easydel.utils.Registry: The underlying registry system.
+    """
+    from easydel.utils import Registry
+
+    return Registry.get_or_raise("trainer", _normalize_trainer_type(trainer_type))
+
+
+def get_training_arguments_class(trainer_type: str):
+    """Get the appropriate TrainingArguments class based on trainer type.
+
+    This function maps trainer type strings to their corresponding configuration
+    class implementations using the EasyDeL registry system. The returned class
+    can be used to create type-safe configuration objects.
+
+    Args:
+        trainer_type: Type of trainer configuration to retrieve. Supported values
+            include: "sft", "dpo", "orpo", "grpo", "sdpo", "ppo", "reward", "distillation",
+            "kto", "bco", "cpo", "gkd", "nash-md", "xpo", "base",
+            "agentic-moshpit", "rlvr", "sao", "compaction_rl".
+            Case-insensitive with alias support.
+
+    Returns:
+        TrainingArguments class (or subclass) corresponding to the specified
+        trainer type. Common classes include SFTConfig, DPOConfig, GRPOConfig, etc.
+
+    Raises:
+        KeyError: If the trainer type is not found in the registry.
+
+    Example:
+        >>> args_cls = get_training_arguments_class("sft")
+        >>> args_cls.__name__
+        'SFTConfig'
+        >>> args = args_cls(learning_rate=2e-5, num_train_epochs=3)
+
+    See Also:
+        get_trainer_class: Get the corresponding trainer class.
+        easydel.utils.Registry: The underlying registry system.
+    """
+
+    from easydel.utils import Registry
+
+    return Registry.get_or_raise("trainer-arguments", _normalize_trainer_type(trainer_type))

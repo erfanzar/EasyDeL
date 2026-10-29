@@ -1,0 +1,863 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Per-expert linear layers for Mixture-of-Experts.
+
+This module provides `ParallelMoELinear` with row/column specializations. It is
+designed to consume tokens grouped by expert (ragged layout) and multiply them
+with per-expert weight shards using grouped matmul kernels.
+
+**Key Concepts:**
+
+    **Ragged/Grouped Layout:**
+        Unlike standard batched matmul where all batches have the same size, MoE
+        layers have variable-sized expert batches. The grouped matmul kernel handles
+        this efficiently by processing each expert's tokens as a separate batch.
+
+    **Row vs Column Parallelism:**
+        - **Column Parallel**: Output features are partitioned (e.g., W_i, W_u in FFN)
+          Each device computes a slice of output features, no reduction needed
+        - **Row Parallel**: Input features are partitioned (e.g., W_d in FFN)
+          Each device computes partial results that are summed across devices
+
+    **Expert Tensor Mode:**
+        An alternative sharding where experts are distributed across the TP axis
+        instead of the EP axis. Useful for specific hardware configurations.
+
+Example Workflow:
+    >>> # Complete MoE FFN example with row/column parallelism
+    >>> from easydel.layers import ColumnParallelMoELinear, RowParallelMoELinear
+    >>> import spectrax as spx
+    >>> from spectrax import nn
+    >>>
+    >>> # Column-parallel layers (W_i and W_u)
+    >>> wi_layer = ColumnParallelMoELinear(8, 768, 3072, rngs=rngs)
+    >>> wu_layer = ColumnParallelMoELinear(8, 768, 3072, rngs=rngs)
+    >>>
+    >>> # Row-parallel layer (W_d)
+    >>> wd_layer = RowParallelMoELinear(8, 3072, 768, rngs=rngs)
+    >>>
+    >>> # Forward pass (assumes tokens are already sorted by expert)
+    >>> wi_out = wi_layer(sorted_tokens, group_sizes, sorted_experts)
+    >>> wu_out = wu_layer(sorted_tokens, group_sizes, sorted_experts)
+    >>> intermediate = jax.nn.silu(wi_out) * wu_out
+    >>> output = wd_layer(intermediate, group_sizes, sorted_experts)
+"""
+
+from __future__ import annotations
+
+import typing
+
+import jax
+import spectrax as spx
+from ejkernel.modules import GroupedMatmulConfig, grouped_matmul  # pyright: ignore[reportMissingTypeStubs]
+from jax import numpy as jnp
+from jax.sharding import PartitionSpec
+from jaxtyping import Array, Float, Int
+from spectrax import common_types
+
+from easydel.infra.sharding import (
+    RuntimeShardingResolver,
+    TensorLayout,
+    moe_expert_param_layout_scope,
+    moe_fsdp_shard_expert_weights_enabled,
+    sharding_for_layout,
+)
+
+from ._linear import promote_dtype
+
+BATCH = common_types.BATCH
+EMPTY = common_types.EMPTY
+EMBED = common_types.EMBED
+EXPERT = common_types.EXPERT
+MODE_TRAIN = common_types.MODE_TRAIN
+EP = common_types.EP
+DP = common_types.DP
+FSDP = common_types.FSDP
+TP = common_types.TP
+SP = common_types.SP
+
+
+default_kernel_init = jax.nn.initializers.lecun_normal()
+default_bias_init = jax.nn.initializers.zeros
+Initializer = jax.nn.initializers.Initializer
+
+
+def _moe_parameter_layout(
+    *,
+    direction: typing.Literal["row", "column"] | None,
+    use_expert_tensor_mode: bool,
+    is_bias: bool = False,
+    fsdp_shard_expert_weights: bool | None = None,
+) -> TensorLayout | None:
+    """Build the per-expert parameter layout for an MoE linear weight or bias.
+
+    The layout determines how the parameter is partitioned across the mesh:
+    along the expert (``EP``) axis, the tensor-parallel (``TP``) axis, or
+    the special "expert-on-TP" mode used when experts fit on the TP axis.
+    With ``fsdp_shard_expert_weights`` the expert dimension is additionally
+    sharded over the FSDP axis (ZeRO-3-style at-rest sharding); optimizer
+    states mirror the parameter sharding, so this shrinks per-device expert
+    parameter and optimizer residency by the FSDP world size. Non-divisible
+    expert counts are handled downstream: shape-aware spec sanitization drops
+    the FSDP component instead of failing.
+
+    Args:
+        direction: Parallelism direction of the linear layer. ``"column"``
+            partitions output features, ``"row"`` partitions input features,
+            and ``None`` disables the layout (returns ``None``).
+        use_expert_tensor_mode: When ``True`` experts are placed on the TP
+            axis instead of the EP axis. Useful when ``num_experts`` is small.
+        is_bias: ``True`` for the 2-D bias parameter, ``False`` for the 3-D
+            weight kernel.
+        fsdp_shard_expert_weights: When ``True``, shard the expert (leading)
+            dimension over ``(EP, FSDP)`` instead of ``EP`` alone. ``None``
+            (default) reads the ambient parameter-init scope installed by
+            the EasyDeL base-module constructor from
+            ``config.moe_fsdp_shard_expert_weights``.
+
+    Returns:
+        A :class:`TensorLayout` describing the partitioning of the parameter,
+        or ``None`` when ``direction`` is ``None``.
+    """
+    if direction is None:
+        return None
+    if use_expert_tensor_mode:
+        return TensorLayout((TP, None) if is_bias else (TP, None, None))
+    if fsdp_shard_expert_weights is None:
+        fsdp_shard_expert_weights = moe_fsdp_shard_expert_weights_enabled()
+    expert_entry = (EP, FSDP) if fsdp_shard_expert_weights else EP
+    if is_bias:
+        return TensorLayout((expert_entry, TP))
+    if direction == "column":
+        return TensorLayout((expert_entry, None, TP))
+    return TensorLayout((expert_entry, TP, None))
+
+
+class ParallelMoELinear(spx.Module):
+    """A batched linear transformation layer for Mixture of Experts (MoE) models.
+
+    This layer applies separate linear transformations for each expert in a MoE setup.
+    The inputs are assumed to be sorted and grouped by expert, with `group_sizes`
+    specifying how many tokens belong to each expert. It supports:
+    - **Ragged Matrix Multiplication** via `jax.lax.ragged_dot_general`.
+    - **Grouped Matrix Multiplication (GMM)** via a Pallas kernel for TPUs.
+
+    Can optionally integrate with a runtime sharding resolver to shard parameters and
+    use `shard_map` for distributed execution.
+
+    **Distributed Execution:**
+
+        This layer supports multiple parallelism strategies:
+
+        - **Expert Parallelism (EP)**: Partition experts across devices on the expert axis
+        - **Tensor Parallelism (TP)**: Partition weight matrices within each expert
+        - **Data Parallelism (DP)**: Replicate across data batches
+        - **Row/Column Parallelism**: Control which dimension is partitioned (input vs output)
+
+        The sharding strategy is controlled by:
+        1. `direction`: "row" or "column" determines which dimension is partitioned
+        2. `use_expert_tensor_mode`: Whether experts are on TP axis (True) or EP axis (False)
+        3. `runtime_sharding_resolver`: Provides mesh and axis resolution for sharding
+
+    Attributes:
+        num_experts: Number of experts.
+        in_features: Input feature dimension.
+        out_features: Output feature dimension.
+        out_first: If True, kernel shape is `(num_experts, out_features, in_features)`;
+            otherwise `(num_experts, in_features, out_features)`.
+        dtype: Data type for computation. None means inherits from inputs.
+        param_dtype: Data type for parameters (weights, biases).
+        kernel_init: Initializer function for the kernel weights.
+        bias_init: Initializer function for the bias.
+        kernel: Weight matrix parameter for the transformation.
+            Shape: (num_experts, out_features, in_features) if out_first else
+            (num_experts, in_features, out_features).
+        bias: Optional bias parameter. Shape: (num_experts, out_features) if out_first
+            else (num_experts, in_features). None if use_bias=False.
+        runtime_sharding_resolver: Handles sharding metadata for distributed execution.
+        _direction: Sharding direction for ALT sharding ("row", "column", or None).
+
+
+    Example:
+        >>> from easydel.layers import ParallelMoELinear
+        >>> import spectrax as spx
+        >>> from spectrax import nn
+        >>>
+        >>> # Create a column-parallel MoE linear layer
+        >>> layer = ParallelMoELinear(
+        ...     num_experts=8,
+        ...     in_features=768,
+        ...     out_features=3072,
+        ...     direction="column",
+        ...     rngs=rngs
+        ... )
+        >>>
+        >>> # Inputs are sorted tokens grouped by expert
+        >>> sorted_tokens = jnp.ones((1024, 768))  # 1024 tokens, 768 features
+        >>> group_sizes = jnp.array([128, 132, 125, 130, 127, 129, 126, 127])  # per expert
+        >>> sorted_experts = jnp.repeat(jnp.arange(8), group_sizes)
+        >>>
+        >>> # Apply expert FFN
+        >>> output = layer(sorted_tokens, group_sizes, sorted_experts)
+        >>> # output.shape = (1024, 3072)
+    """
+
+    _direction: typing.Literal["row", "column"] | None = None
+
+    def __init__(
+        self,
+        num_experts: int,
+        in_features: int,
+        out_features: int,
+        *,
+        use_bias: bool = True,
+        out_first: bool = False,
+        kernel_init: Initializer = default_kernel_init,
+        bias_init: Initializer = default_bias_init,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        runtime_sharding_resolver: RuntimeShardingResolver | None = None,
+        partition_manager: RuntimeShardingResolver | None = None,
+        direction: typing.Literal["row", "column"] | None = None,
+        use_expert_tensor_mode: bool = False,
+        weight_modif_fn: typing.Callable[[Array], Array] | None = None,
+        rngs: spx.Rngs,
+    ):
+        """Initialize a ParallelMoELinear layer.
+
+        Creates a batched linear transformation for MoE models with support for
+        distributed execution and various parallelism strategies.
+
+        Args:
+            num_experts: Number of experts in the layer. Each expert has its own
+                weight matrix.
+            in_features: Size of the input feature dimension for each expert.
+            out_features: Size of the output feature dimension for each expert.
+            use_bias: Whether to include a bias term for each expert.
+                Defaults to True.
+            out_first: If True, kernel shape is `(num_experts, out_features, in_features)`,
+                otherwise `(num_experts, in_features, out_features)`. This affects
+                whether transpose_rhs is needed in grouped_matmul. Defaults to False.
+            kernel_init: Initializer for the kernel weights.
+                Defaults to lecun_normal().
+            bias_init: Initializer for the bias. Defaults to zeros.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters (weights, biases).
+                Defaults to jnp.bfloat16.
+            runtime_sharding_resolver: Runtime sharding resolver for parameter
+                placement and axis mapping.
+                When provided, enables distributed execution with shard_map.
+                Defaults to None.
+            partition_manager: Deprecated compatibility alias for
+                ``runtime_sharding_resolver``.
+            direction: ALT-sharding direction, either `"row"`, `"column"`, or None.
+                - "row": Input features are partitioned across TP axis
+                - "column": Output features are partitioned across TP axis
+                Defaults to None (no parallelism).
+            use_expert_tensor_mode: If True, experts are distributed across the
+                TP axis instead of the EP axis. This is useful when the number
+                of experts is small and can fit on the TP dimension for better
+                hardware utilization. Defaults to False.
+            weight_modif_fn: Optional function to modify weights before the forward
+                pass. Useful for applying runtime transformations like LoRA or
+                quantization. Takes and returns an Array. Defaults to None.
+            rngs: Random number generators for parameter initialization.
+        """
+        self.num_experts = num_experts
+        self.in_features = in_features
+        self.out_features = out_features
+        self.out_first = out_first
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.runtime_sharding_resolver = (
+            runtime_sharding_resolver if runtime_sharding_resolver is not None else partition_manager
+        )
+        self.use_expert_tensor_mode = use_expert_tensor_mode
+
+        self.kernel_init = kernel_init
+        self.bias_init = bias_init
+        self.weight_modif_fn = weight_modif_fn
+        if direction is not None:
+            if direction not in ("row", "column"):
+                raise ValueError(f"direction must be 'row' or 'column', got '{direction}'")
+            self._direction = direction
+        kshape = (num_experts, out_features, in_features) if out_first else (num_experts, in_features, out_features)
+        weight_layout = _moe_parameter_layout(
+            direction=self._direction,
+            use_expert_tensor_mode=use_expert_tensor_mode,
+            is_bias=False,
+        )
+        self.weight = spx.Parameter(
+            kernel_init(rngs.param, kshape, param_dtype),
+            sharding=sharding_for_layout(weight_layout),
+        )
+        if use_bias:
+            bshape = (num_experts, out_features)
+            bias_layout = _moe_parameter_layout(
+                direction=self._direction,
+                use_expert_tensor_mode=use_expert_tensor_mode,
+                is_bias=True,
+            )
+            self.bias = spx.Parameter(
+                bias_init(rngs.param, bshape, self.param_dtype),
+                sharding=sharding_for_layout(bias_layout),
+            )
+        else:
+            self.bias = None
+
+    @property
+    def direction(self) -> typing.Literal["row", "column"] | None:
+        """Return the parallelism direction configured for this layer.
+
+        Returns:
+            ``"row"`` for row-wise parallelism (input dimension partitioned),
+            ``"column"`` for column-wise parallelism (output dimension
+            partitioned), or ``None`` if no parallelism direction is set.
+        """
+        return self._direction
+
+    @property
+    def can_use_shard_map(self) -> bool:
+        """Report whether this layer is ready for ``shard_map`` execution.
+
+        Returns:
+            ``True`` if both a runtime sharding resolver and a parallelism
+            direction are configured, indicating the layer can lower under
+            ``shard_map`` for distributed execution.
+        """
+        return self.runtime_sharding_resolver is not None and self._direction is not None
+
+    @property
+    def alt_sharding(self) -> PartitionSpec | None:
+        """Resolve the ALT (Alternative) sharding configuration for this layer.
+
+        ALT sharding provides pre-defined sharding patterns for common parallelism
+        strategies, simplifying the configuration of distributed execution. The
+        layout depends on the configured ``direction`` and on whether experts are
+        distributed on the TP axis (``use_expert_tensor_mode``).
+
+        Returns:
+            A :class:`PartitionSpec` describing the parameter layout, or
+            ``None`` when ``direction`` is unset (no parallelism configured).
+
+        Raises:
+            NotImplementedError: If ``direction`` is not ``None``, ``"row"``,
+                or ``"column"``.
+        """
+
+        from easydel.layers.moe._communication_utils import get_moe_partition_spec
+
+        if self.direction is None:
+            return None
+        if self.use_expert_tensor_mode:
+            # ``is_bias=False``: this is the (3-D) weight layout; the bias layout is built separately in ``__init__``.
+            return get_moe_partition_spec(self.runtime_sharding_resolver, "column", self.use_expert_tensor_mode, False)
+        elif self.direction == "row":
+            return get_moe_partition_spec(self.runtime_sharding_resolver, "row", self.use_expert_tensor_mode, False)
+        elif self.direction == "column":
+            return get_moe_partition_spec(self.runtime_sharding_resolver, "column", self.use_expert_tensor_mode, False)
+        else:
+            direction = self.direction
+            raise NotImplementedError(f"ALT-Sharding Rule for {direction=} is not implemented!.")
+
+    @property
+    def alt_sharding_axis(self) -> list[str] | None:
+        """Return the axis names from the layer's ALT sharding spec.
+
+        Returns:
+            List of axis names (e.g. ``["expert", "tp", "dp"]``) for the
+            configured ALT sharding pattern, or ``None`` if no ALT sharding
+            is configured.
+        """
+        spec = self.alt_sharding
+        if spec is None:
+            return None
+        # ``PartitionSpec`` is a tuple subclass with no ``.axes`` attribute; its entries are the per-dim axis names.
+        return list(spec)
+
+    @property
+    def expert_axis(self) -> str:
+        """Return the semantic mesh-axis name carrying the expert dimension.
+
+        Returns:
+            ``"tp"`` when ``use_expert_tensor_mode`` places experts on the
+            tensor-parallel axis, otherwise the canonical ``"ep"`` expert
+            mesh axis.
+        """
+        return TP if self.use_expert_tensor_mode else EP
+
+    def forward(
+        self,
+        inputs: Float[Array, "tokens_ragged hidden_dim"],
+        group_sizes: Int[Array, "num_groups"],  # noqa
+        sorted_experts: Int[Array, "tokens_ragged"] | None = None,  # noqa
+    ) -> Float[Array, "tokens_ragged out_dim"]:
+        """Apply the per-expert batched linear transformation.
+
+        Casts both operands through :func:`promote_dtype`, runs an ejkernel
+        ``grouped_matmul`` (with ``transpose_rhs`` driven by ``out_first``),
+        and adds the per-expert bias expanded along the ragged token batch
+        when ``use_bias`` is true. Float8 weights are promoted to float4 so
+        the kernel can consume them.
+
+        Args:
+            inputs: The input array, which is a batch of tokens sorted and grouped
+                by expert. Shape: ``(total_tokens, in_features)``.
+            group_sizes: An array indicating the number of tokens assigned to each
+                expert. Shape: ``(num_experts,)``.
+            sorted_experts: Optional expert ids aligned with ``inputs``. Required when
+                ``use_expert_tensor_mode`` so tokens can be localized per shard.
+
+        Returns:
+            The output array after the linear transformation.
+            Shape: ``(total_tokens, out_features)``.
+        """
+        weight = self.weight.value
+        if self.weight_modif_fn is not None:
+            weight = self.weight_modif_fn(weight)
+        if weight.dtype in (
+            jnp.float8_e4m3b11fnuz,
+            jnp.float8_e4m3fn,
+            jnp.float8_e4m3fnuz,
+            jnp.float8_e5m2,
+            jnp.float8_e5m2fnuz,
+        ):
+            weight = weight.astype("f4")
+
+        inputs, weight = promote_dtype((inputs, weight), dtype=self.dtype)
+
+        quant_rule = spx.quantization.rule_for(self, "ragged_dot")
+        if quant_rule is not None and quant_rule.act_qtype is not None and not self.out_first:
+            # Both operands are quantized, so hand the whole contraction to
+            # the quantized ragged dot: the forward runs in the narrow type
+            # and the backward can quantize the cotangent. Only valid in the
+            # ``[experts, contracted, out]`` orientation -- ``out_first``
+            # transposes the kernel, which the ragged dot does not accept.
+            return spx.quantization.qragged_dot(
+                inputs,
+                weight,
+                group_sizes,
+                rule=quant_rule,
+                preferred_element_type=jnp.bfloat16,
+            ) + (
+                self._expand_bias_ragged(group_sizes, sorted_experts=sorted_experts, total_rows=inputs.shape[0])
+                if self.bias is not None
+                else 0
+            )
+
+        if quant_rule is not None:
+            # Stacked expert kernels are ``[experts, contracted, out]``: axis 1
+            # is contracted, so axes 0 and 2 stay channelwise and each expert
+            # keeps an independent range. The grouped matmul below is left
+            # untouched, which is what keeps every backend and tuned tile
+            # configuration working under quantization-aware training.
+            weight = spx.quantization.fake_quant(weight, rule=quant_rule, contracting_axes=(1,), is_weight=True)
+            inputs = spx.quantization.fake_quant(
+                inputs, rule=quant_rule, contracting_axes=(inputs.ndim - 1,), is_weight=False
+            )
+
+        # Accumulate in the compute dtype: a hard bf16 output rounded every f32
+        # expert projection to bf16. An f32 grouped matmul at the default
+        # precision is also a single bf16 MXU pass, so f32 runs at HIGHEST (the
+        # fused MoE path does the same); bf16 operands keep the default.
+        compute_f32 = jnp.dtype(inputs.dtype) == jnp.float32
+        output = grouped_matmul(
+            inputs,
+            weight,
+            group_sizes,
+            preferred_element_type=jnp.float32 if compute_f32 else jnp.bfloat16,
+            precision=jax.lax.Precision.HIGHEST if compute_f32 else jax.lax.Precision.DEFAULT,
+            transpose_rhs=self.out_first,
+            platform="xla",
+            cfg=GroupedMatmulConfig(bypass_xla_tiling=True),
+        )
+
+        if self.bias is not None:
+            output += self._expand_bias_ragged(group_sizes, sorted_experts=sorted_experts, total_rows=inputs.shape[0])
+
+        return output
+
+    def _expand_bias_ragged(
+        self,
+        group_sizes: Int[Array, "num_groups"],  # noqa
+        sorted_experts: Int[Array, "tokens_ragged"] | None = None,  # noqa
+        total_rows: int | None = None,
+    ) -> Float[Array, "tokens_ragged out_dim"]:
+        """Expand the per-expert bias to match the ragged token batch structure.
+
+        This method aligns the per-expert bias with the ragged token layout by
+        repeating each expert's bias according to how many tokens are assigned to it.
+        This is necessary because tokens are sorted and grouped by expert, and each
+        token needs its assigned expert's bias added to the output.
+
+        Two modes of operation:
+        1. If `sorted_experts` is provided (expert tensor mode): Uses the expert IDs
+           directly to index into the bias array, handling cases where not all experts
+           on a shard receive tokens.
+        2. If `sorted_experts` is None (standard mode): Generates expert indices by
+           repeating each expert ID according to its group size.
+
+        Args:
+            group_sizes: The number of tokens assigned to each expert on this shard.
+                Shape: (num_local_experts,). Each element indicates how many tokens
+                were routed to that expert.
+            sorted_experts: Optional pre-computed expert IDs for each token. Shape:
+                (total_tokens,). Required in expert tensor mode where expert distribution
+                may be sparse. If None, expert indices are generated from group_sizes.
+            total_rows: Static input row count used when generating indices under jit.
+                The public forward supplies this from the input shape.
+
+        Returns:
+            Expanded bias array aligned with sorted tokens. Shape: (total_tokens, out_features).
+            Each row contains the bias for the expert assigned to that token.
+
+        Example:
+            >>> # Standard mode: 3 experts with [3, 2, 4] tokens respectively
+            >>> bias = jnp.array([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]])  # (3, 2)
+            >>> group_sizes = jnp.array([3, 2, 4])
+            >>> expanded = _expand_bias_ragged(group_sizes, sorted_experts=None)
+            >>> # expanded = [[0.1, 0.2], [0.1, 0.2], [0.1, 0.2],  # expert 0 repeated 3 times
+            >>> #              [0.3, 0.4], [0.3, 0.4],              # expert 1 repeated 2 times
+            >>> #              [0.5, 0.6], [0.5, 0.6], [0.5, 0.6], [0.5, 0.6]]  # expert 2 repeated 4 times
+            >>>
+            >>> # Expert tensor mode: sparse expert assignment
+            >>> sorted_experts = jnp.array([0, 0, 2, 2, 2])  # 5 tokens, only experts 0 and 2
+            >>> expanded = _expand_bias_ragged(None, sorted_experts=sorted_experts)
+            >>> # expanded = [[0.1, 0.2], [0.1, 0.2], [0.5, 0.6], [0.5, 0.6], [0.5, 0.6]]
+        """
+        if sorted_experts is not None:
+            indices = sorted_experts
+        else:
+            bias_rows = self.bias.value.shape[0]
+            indices = jnp.repeat(jnp.arange(bias_rows), group_sizes, total_repeat_length=total_rows)
+        return self.bias.value[indices]
+
+    def kernel_view(self) -> Array | tuple[Array, Array]:
+        """Return the expert kernel as the fused-MoE path consumes it.
+
+        Dense layers return the bf16 weight array; quantized layers return a
+        ``(codes, scales)`` tuple that the fused-MoE dispatch routes to the
+        w8a8 grouped matmul. Modeling files pass this into ``moe_call``
+        instead of touching ``.weight.value`` directly so quantization stays
+        a drop-in.
+        """
+        return self.weight.value
+
+    def quantization_supported(self, config) -> bool:
+        """Whether :meth:`to_quantized` can handle this layer under *config*.
+
+        Checked by the checkpoint bridge and :class:`EasyQuantizer` before
+        attempting conversion, so unsupported formats silently keep the dense
+        expert weights instead of failing the load.
+        """
+        from easydel.layers.quantization import QuantizationType
+
+        # ``bits`` is optional on the config; CHANNELWISE resolves ``None``
+        # to the mode default of 8 (see ``resolve_ejkernel_quant_params``).
+        bits = 8 if config.bits is None else int(config.bits)
+        return (
+            config.dtype == QuantizationType.CHANNELWISE and bits in (4, 8) and not self.out_first and self.bias is None
+        )
+
+    def to_quantized(self, config, **kwargs) -> "ParallelMoELinearQuantized":
+        """Convert to the channelwise-int8 quantized twin.
+
+        Only ``QuantizationType.CHANNELWISE`` with ``bits=8`` is supported for
+        stacked expert weights (the w8a8 expert path); other formats keep the
+        dense layer untouched by raising, so callers can fall back.
+
+        Args:
+            config: Quantization configuration.
+            **kwargs: Runtime knobs forwarded by the quantizer. Recognized:
+                ``qmm_platform`` (``"xla"`` or ``"pallas"``) selects the
+                grouped-matmul backend the quantized twin uses at call time;
+                ``"pallas"`` streams integer weights on TPU instead of
+                materializing dequantized bf16 kernels. All other keys are
+                ignored for compatibility.
+
+        Returns:
+            A :class:`ParallelMoELinearQuantized` (lazy when weights are
+            abstract; quantized in place when concrete).
+        """
+        grouped_platform = kwargs.get("qmm_platform")
+        if grouped_platform is not None and grouped_platform not in ("xla", "pallas"):
+            raise ValueError(f"qmm_platform must be 'xla' or 'pallas' for MoE experts, got {grouped_platform!r}.")
+        from easydel.layers.quantization import QuantizationType
+
+        if config.dtype != QuantizationType.CHANNELWISE:
+            raise NotImplementedError(f"MoE expert quantization supports channelwise only, got {config.dtype}.")
+        bits = 8 if config.bits is None else int(config.bits)
+        if bits not in (4, 8):
+            raise NotImplementedError(f"MoE expert quantization supports 4/8-bit codes, got {bits}.")
+        if self.out_first:
+            raise NotImplementedError("Quantized MoE experts require out_first=False kernels.")
+        if self.bias is not None:
+            raise NotImplementedError("Quantized MoE experts do not support per-expert bias yet.")
+
+        # Quantize-at-load runs OUTSIDE the parameter-init sharding scope the
+        # model constructor entered, so the ContextVar-backed
+        # ``moe_fsdp_shard_expert_weights`` flag reads its default (False)
+        # here. Re-enter the scope with the layout the DENSE twin was
+        # actually declared with, so quant_kernel/quant_scales keep the
+        # (EP, FSDP) at-rest expert sharding instead of silently dropping to
+        # EP-only.
+        dense_axes = getattr(getattr(self.weight, "sharding", None), "axis_names", None) or ()
+        expert_entry = dense_axes[0] if dense_axes else None
+        expert_axes = expert_entry if isinstance(expert_entry, (tuple, list)) else (expert_entry,)
+        with moe_expert_param_layout_scope(fsdp_shard_expert_weights=FSDP in expert_axes):
+            lazy_module = jax.eval_shape(
+                lambda rngs: ParallelMoELinearQuantized(
+                    num_experts=self.num_experts,
+                    in_features=self.in_features,
+                    out_features=self.out_features,
+                    use_bias=False,
+                    out_first=self.out_first,
+                    kernel_init=self.kernel_init,
+                    bias_init=self.bias_init,
+                    dtype=self.dtype,
+                    param_dtype=self.param_dtype,
+                    runtime_sharding_resolver=self.runtime_sharding_resolver,
+                    direction=self._direction,
+                    use_expert_tensor_mode=self.use_expert_tensor_mode,
+                    quantization_bits=bits,
+                    activation_bits=(
+                        config.activation_bits if getattr(config, "activation_policy", "auto") == "explicit" else None
+                    ),
+                    grouped_platform=grouped_platform,
+                    rngs=rngs,
+                ),
+                spx.Rngs(0),
+            )
+        if isinstance(self.weight.value, jax.ShapeDtypeStruct):
+            return lazy_module
+        return lazy_module.restage_from_dense(self.weight.value, expert_chunk=kwargs.get("expert_chunk"))
+
+
+@jax.tree_util.register_pytree_node_class
+class _QuantizedExpertKernel(tuple):
+    """Two tensor leaves with static per-projection activation precision.
+
+    This ephemeral kernel view does not change stored checkpoint arrays.
+    Tuple compatibility preserves consumers that unpack ``(codes, scales)``.
+    ``grouped_platform`` optionally pins the grouped-matmul backend
+    (``"xla"``/``"pallas"``), overriding the measured-shape auto-selection.
+    """
+
+    def __new__(cls, codes, scales, activation_bits, grouped_platform=None):
+        obj = super().__new__(cls, (codes, scales))
+        obj.activation_bits = activation_bits
+        obj.grouped_platform = grouped_platform
+        return obj
+
+    def tree_flatten(self):
+        return tuple(self), (self.activation_bits, self.grouped_platform)
+
+    @classmethod
+    def tree_unflatten(cls, aux, leaves):
+        activation_bits, grouped_platform = aux
+        return cls(*leaves, activation_bits, grouped_platform)
+
+
+class ParallelMoELinearQuantized(ParallelMoELinear):
+    """Channelwise INT4/INT8 expert weights with explicit or legacy precision.
+
+    ``activation_bits=None`` retains the legacy runtime INT8 path. Explicit
+    16 preserves floating activations; 4/8 request per-row integer quantization.
+    Codes and per-channel scale checkpoint shapes remain unchanged.
+    """
+
+    def __init__(
+        self,
+        *args,
+        quantization_bits: int = 8,
+        activation_bits: int | None = None,
+        grouped_platform: str | None = None,
+        **kwargs,
+    ):
+        self._quantization_bits = int(quantization_bits)
+        self._activation_bits = activation_bits
+        if grouped_platform not in (None, "xla", "pallas"):
+            raise ValueError(f"grouped_platform must be None, 'xla', or 'pallas'; got {grouped_platform!r}.")
+        self._grouped_platform = grouped_platform
+        super().__init__(*args, **kwargs)
+        weight_layout = _moe_parameter_layout(
+            direction=self._direction,
+            use_expert_tensor_mode=self.use_expert_tensor_mode,
+            is_bias=False,
+        )
+        scales_layout = TensorLayout((weight_layout.axes[0], None, weight_layout.axes[2]))
+        kshape = self.weight.value.shape
+        code_dtype = jnp.int8 if self._quantization_bits == 8 else jnp.int4
+        self.quant_kernel = spx.Parameter(
+            jnp.zeros(kshape, code_dtype)
+            if not isinstance(self.weight.value, jax.ShapeDtypeStruct)
+            else jax.ShapeDtypeStruct(kshape, code_dtype),
+            sharding=sharding_for_layout(weight_layout),
+        )
+        self.quant_scales = spx.Parameter(
+            jnp.ones((kshape[0], 1, kshape[2]), jnp.float32)
+            if not isinstance(self.weight.value, jax.ShapeDtypeStruct)
+            else jax.ShapeDtypeStruct((kshape[0], 1, kshape[2]), jnp.float32),
+            sharding=sharding_for_layout(scales_layout),
+        )
+        self.quant_biases = None
+        # The dense kernel slot must not survive: it would double memory and
+        # the checkpoint bridge replaces it with the quant_* leaves.
+        self.weight = None
+
+    def quantization_supported(self, config) -> bool:
+        """Already quantized — report unsupported so conversion loops skip it."""
+        del config
+        return False
+
+    def to_quantized(self, config, **kwargs) -> "ParallelMoELinearQuantized":
+        """Idempotent: a second conversion pass returns the module unchanged."""
+        del config, kwargs
+        return self
+
+    def restage_from_dense(self, dense_kernel: Array, expert_chunk: int | None = None) -> "ParallelMoELinearQuantized":
+        """Fill quant leaves by quantizing a concrete dense kernel in place.
+
+        Args:
+            dense_kernel: Concrete dense stack ``[experts, in, out]``.
+            expert_chunk: Quantize this many experts at a time (``None``: all at once); the result is identical.
+        """
+        from ._linear_quantized import channelwise_quantize_array
+
+        codes, scales, _ = channelwise_quantize_array(dense_kernel, self._quantization_bits, expert_chunk=expert_chunk)
+        self.quant_kernel = spx.Parameter(codes, sharding=self.quant_kernel.sharding)
+        self.quant_scales = spx.Parameter(scales, sharding=self.quant_scales.sharding)
+        return self
+
+    def kernel_view(self) -> tuple[Array, Array]:
+        """Return codes/scales with explicit precision metadata when requested."""
+        if self._activation_bits is not None:
+            return _QuantizedExpertKernel(
+                self.quant_kernel.value,
+                self.quant_scales.value,
+                self._activation_bits,
+                self._grouped_platform,
+            )
+        return (self.quant_kernel.value, self.quant_scales.value)
+
+    def forward(
+        self,
+        inputs: Float[Array, "tokens_ragged hidden_dim"],
+        group_sizes: Int[Array, "num_groups"],  # noqa
+        sorted_experts: Int[Array, "tokens_ragged"] | None = None,  # noqa
+    ) -> Float[Array, "tokens_ragged out_dim"]:
+        """Apply each expert with its configured activation precision."""
+        del sorted_experts
+        if self._activation_bits is not None:
+            from ejkernel.modules import grouped_matmul_channelwise
+
+            return grouped_matmul_channelwise(
+                inputs,
+                self.quant_kernel.value,
+                self.quant_scales.value,
+                group_sizes,
+                activation_bits=self._activation_bits,
+                preferred_element_type=jnp.bfloat16 if self.dtype != jnp.float32 else jnp.float32,
+                platform=self._grouped_platform or "xla",
+            )
+        from ejkernel.modules import grouped_matmul_w8a8  # pyright: ignore[reportMissingTypeStubs]
+
+        codes = self.quant_kernel.value
+        if codes.dtype != jnp.int8:
+            # ``grouped_matmul_w8a8`` requires int8 codes. int4 codes are
+            # valid int8 codes, so the upcast is exact — it keeps this
+            # standalone fallback on the same w8a8 semantics the fused
+            # ``moe_call`` path realises for int4 (which dequantizes the
+            # codes in-VMEM instead of materializing them).
+            codes = codes.astype(jnp.int8)
+        return grouped_matmul_w8a8(
+            inputs,
+            codes,
+            self.quant_scales.value,
+            group_sizes,
+            preferred_element_type=jnp.bfloat16 if self.dtype != jnp.float32 else jnp.float32,
+        )
+
+
+class RowParallelMoELinear(ParallelMoELinear):
+    """Row-parallel variant of ParallelMoELinear.
+
+    This class specializes ParallelMoELinear for row-wise parallelism, where the
+    input dimension is partitioned across devices. In row parallelism, each device
+    holds a subset of input features and computes partial results that are then
+    reduced across devices.
+
+    The weight matrix is partitioned along the input dimension (rows), and an
+    all-reduce operation is performed after the matrix multiplication to combine
+    partial results.
+
+    Attributes:
+        _direction: Fixed to "row" to indicate row-wise parallelism.
+
+    Example:
+        >>> # Create a row-parallel MoE linear layer
+        >>> layer = RowParallelMoELinear(
+        ...     num_experts=8,
+        ...     in_features=768,
+        ...     out_features=3072,
+        ...     rngs=rngs
+        ... )
+    """
+
+    _direction: typing.Literal["row", "column"] | None = "row"
+
+    if typing.TYPE_CHECKING:
+
+        def __call__(
+            self,
+            inputs: Float[Array, "tokens_ragged hidden_dim"],
+            group_sizes: Int[Array, "num_groups"],  # noqa
+            sorted_experts: Int[Array, "tokens_ragged"] | None = None,  # noqa
+        ) -> Float[Array, "tokens_ragged out_dim"]: ...
+
+
+class ColumnParallelMoELinear(ParallelMoELinear):
+    """Column-parallel variant of ParallelMoELinear.
+
+    This class specializes ParallelMoELinear for column-wise parallelism, where the
+    output dimension is partitioned across devices. In column parallelism, each device
+    computes a subset of output features independently without requiring reduction.
+
+    The weight matrix is partitioned along the output dimension (columns), and each
+    device produces its portion of the output directly without communication.
+
+    Attributes:
+        _direction: Fixed to "column" to indicate column-wise parallelism.
+
+    Example:
+        >>> # Create a column-parallel MoE linear layer
+        >>> layer = ColumnParallelMoELinear(
+        ...     num_experts=8,
+        ...     in_features=768,
+        ...     out_features=3072,
+        ...     rngs=rngs
+        ... )
+    """
+
+    _direction: typing.Literal["row", "column"] | None = "column"
+
+    if typing.TYPE_CHECKING:
+
+        def __call__(
+            self,
+            inputs: Float[Array, "tokens_ragged hidden_dim"],
+            group_sizes: Int[Array, "num_groups"],  # noqa
+            sorted_experts: Int[Array, "tokens_ragged"] | None = None,  # noqa
+        ) -> Float[Array, "tokens_ragged out_dim"]: ...

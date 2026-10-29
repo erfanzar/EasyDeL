@@ -1,0 +1,3492 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+"""eLargeModel - Easy Large Models master class for EasyDeL.
+
+This module provides a unified interface for working with large language models
+in the EasyDeL framework, combining configuration management, model building,
+training orchestration, and inference engine initialization.
+
+Key Features:
+    - Unified configuration management for models, training, and inference
+    - Automatic model and tokenizer initialization from HuggingFace or local paths
+    - Support for multiple training paradigms (SFT, DPO, ORPO, GRPO, distillation)
+    - Integration with the eSurge inference engine
+    - Built-in evaluation with lm-evaluation-harness
+    - Flexible dataset mixture configuration
+    - Model sharding and quantization support
+"""
+
+from __future__ import annotations
+
+import inspect
+import json
+import os
+import pprint
+import typing
+from collections.abc import Mapping
+from typing import Any, NotRequired, Unpack
+
+from eformer.loggings import get_logger
+from eformer.paths import ePath, ePathLike
+from transformers import AutoTokenizer
+
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.base_state import EasyDeLState
+from easydel.infra.factory import TaskType
+from easydel.utils.instrumentation import phase_timer
+
+from .benchmarking import (
+    is_benchmark_config_like,
+    normalize_benchmark_configs,
+    run_lm_eval_with_esurge,
+)
+from .builders import (
+    _extract_dataset_name,
+    build_dataset,
+    build_esurge,
+    build_model,
+    build_sharded_source,
+    normalize_esurge_sections,
+    to_data_mixture_kwargs,
+    to_esurge_kwargs,
+    to_from_pretrained_kwargs,
+    to_load_state_kwargs,
+)
+from .processing import (
+    clone_config,
+    load_elm_config,
+    make_serializable,
+    materialize_base_config,
+    normalize,
+    resolve_task,
+    save_elm_config,
+    validate,
+    write_text_atomic,
+)
+from .types import (
+    ELARGE_ONLY_TRAINER_KEYS,
+    BenchmarkConfig,
+    EvalKwargs,
+    eLMConfig,
+    get_trainer_class,
+    get_training_arguments_class,
+    normalize_trainer_config,
+)
+
+if typing.TYPE_CHECKING:
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
+
+    from easydel.data import WriteStats
+    from easydel.data.core.protocols import ShardedDataSource
+    from easydel.data.transforms import ExpandTransform, Transform
+    from easydel.inference import eSurge
+    from easydel.inference.reasoning.abstract_reasoning import ReasoningParserName
+    from easydel.inference.tools.abstract_tool import ToolParserName
+    from easydel.trainers import LogWatcher, Trainer
+    from easydel.trainers.prm_trainer import PRMPreprocessTransform
+    from easydel.trainers.tpo_trainer import TPOPreprocessTransform
+    from easydel.trainers.training_configurations import TrainingArguments
+
+    from .types import TextDatasetInformCfg, VisualDatasetInformCfg
+
+logger = get_logger("eLargeModel")
+_ESURGE_UNSET = object()
+_QUANT_UNSET = object()
+
+
+class BuildTrainerKws(typing.TypedDict, total=False):
+    """Optional, trainer-specific kwargs accepted by :meth:`eLargeModel.train` and friends.
+
+    Every field is ``NotRequired`` and may be safely omitted. The relevance of each
+    field depends on which trainer flavor (``trainer_type``) is selected on the ELM
+    config; supplying a kwarg that the chosen trainer does not understand is simply
+    forwarded to the underlying trainer constructor, which may ignore or reject it.
+
+    Attributes:
+        data_collator: Callable invoked by the trainer's data loader to assemble
+            a batch of pre-tokenized examples into a single padded/packed dict of
+            ``jax.Array``-shaped tensors. Falls back to the trainer's built-in
+            collator (typically :class:`DataCollatorForCompletionOnlyLM` for SFT,
+            preference-pair collator for DPO/ORPO, etc.) when omitted.
+        formatting_func: SFT-specific callable mapping a single dataset row to
+            the rendered string used for tokenization. Useful when the dataset
+            does not already contain a ``text`` field and the user wants to
+            inject a chat template or instruction wrapper.
+        reward_processing_classes: List of HuggingFace ``PreTrainedTokenizer``
+            (or compatible) processors aligned with each entry in
+            ``reward_funcs``. Each processor tokenizes generated completions
+            before the matching reward function scores them; required when a
+            reward function expects pre-tokenized inputs.
+        data_tokenize_fn: Override for the dataset preprocessing step. When set,
+            replaces the trainer's default tokenization pipeline with this
+            callable for every example.
+        reference_model: Frozen reference :class:`EasyDeLBaseModule` used to
+            compute reference log-probabilities for KL/preference objectives
+            (DPO, ORPO, KTO, BCO, CPO, GRPO, ...). When ``None``, the trainer
+            either lazily reuses the policy snapshot or raises if a reference
+            is mandatory.
+        reward_model: Trained scalar :class:`EasyDeLBaseModule` whose forward
+            produces a per-sequence reward used by PPO and GRPO-style trainers.
+            Only consumed when no ``reward_funcs`` list is provided.
+        target_model: Frozen verifier :class:`EasyDeLBaseModule` used by the
+            speculative-decoding trainer to produce target logits and optional
+            hidden states for drafter supervision.
+        teacher_model: :class:`EasyDeLBaseModule` whose logits drive the
+            distillation losses in distillation/on-policy-distillation/SeqKD
+            and sparse distillation trainers.
+        critic_model: Optional base model used to initialize the independently
+            optimized SAO/CompactionRL critic. When omitted, those trainers
+            initialize the critic from the actor.
+        critic_state: Optional prebuilt value-head critic state for
+            SAO/CompactionRL.
+        critic_trainable_selector: Optional SpectraX selector overriding the
+            online actor/critic trainer's structural critic-freezing policy.
+        reward_funcs: Single callable or list of callables of signature
+            ``(prompts, completions, **kwargs) -> list[float]`` consumed by
+            GRPO/SDPO/PPO-flavored trainers in lieu of (or in addition to) a
+            learned reward model.
+        rollout_provider: Runtime callable that produces token-aligned online
+            RL trajectory batches. Used by SAO and CompactionRL for multi-turn
+            or asynchronous rollout collection.
+        external_reward_funcs: Auxiliary list of callables that augment the
+            primary RLVR/GRPO reward signal (e.g. format-checkers, math
+            verifiers, code-test runners) without replacing it.
+        external_reward_processing_classes: Tokenizers/processors paired
+            element-wise with ``external_reward_funcs`` for RLVR scoring.
+        external_reward_weights: Per-function scalar weights, aligned with
+            ``external_reward_funcs``, used to mix the external reward signals
+            into the final reward.
+        feedback_func: Callable returning textual feedback strings for SDPO.
+            Invoked once per (prompt, completion) pair after rollout to build
+            the self-distillation feedback context.
+        env_factory: Callable returning fresh agent environments for the
+            AgenticMoshPit trainer. Each call must return a new environment
+            instance so per-rollout seeding/state remains independent across
+            workers.
+        environment_factory: Alias used by NeMo Gym / async GRPO-style trainers
+            for the same fresh-environment factory.
+        tools: List of tool implementations exposed to the agent under the
+            AgenticMoshPit trainer; typically aligned with ``tool_names`` on
+            the trainer config so that the registered names resolve to these
+            objects.
+        tool_guard: Optional runtime tool-call guard used by CompactionRL.
+        compaction_controller: Optional runtime context-compaction controller
+            used by CompactionRL. The trainer builds its default controller
+            from serializable config fields when this is omitted.
+    """
+
+    data_collator: NotRequired[typing.Callable]
+    formatting_func: NotRequired[typing.Callable]
+    reward_processing_classes: NotRequired[list[typing.Callable]]
+    data_tokenize_fn: NotRequired[typing.Callable]
+    reference_model: NotRequired[EasyDeLBaseModule | None]
+    reward_model: NotRequired[EasyDeLBaseModule | None]
+    target_model: NotRequired[EasyDeLBaseModule | None]
+    teacher_model: NotRequired[EasyDeLBaseModule | None]
+    critic_model: NotRequired[EasyDeLBaseModule | None]
+    critic_state: NotRequired[EasyDeLState | None]
+    critic_trainable_selector: NotRequired[Any | None]
+    reward_funcs: NotRequired[Any | None]
+    rollout_provider: NotRequired[typing.Callable | None]
+    external_reward_funcs: NotRequired[Any | None]
+    external_reward_processing_classes: NotRequired[list[typing.Callable] | None]
+    external_reward_weights: NotRequired[list[float] | None]
+    feedback_func: NotRequired[typing.Callable | None]
+    env_factory: NotRequired[typing.Callable | None]
+    environment_factory: NotRequired[typing.Callable | None]
+    bema_callback: NotRequired[Any | None]
+    tools: NotRequired[list | None]
+    tool_guard: NotRequired[Any | None]
+    compaction_controller: NotRequired[Any | None]
+
+
+class eLargeModel:
+    """Master class for Easy Large Models (ELM) in EasyDeL.
+
+    This class provides a unified interface for:
+    - Configuration management (load, save, create)
+    - Model building and initialization (including teacher/reference models)
+    - Training orchestration with multiple paradigms (SFT, DPO, ORPO, etc.)
+    - eSurge inference engine integration
+    - Tokenizer management
+    - Dataset mixture configuration
+    - Model evaluation with lm-evaluation-harness
+
+    Attributes:
+        config: The normalized ELM configuration dictionary
+        model_name: The model name or path from configuration
+        task: The resolved task type (auto-detected or specified)
+        teacher_model_name: Teacher model name for distillation (if configured)
+        reference_model_name: Reference model name for DPO/ORPO (if configured)
+
+    Example:
+        Basic model loading:
+        >>> elm = eLargeModel({"model": {"name_or_path": "meta-llama/Llama-2-7b"}})
+        >>> model = elm.build_model()
+
+        From pretrained with configuration:
+        >>> elm = eLargeModel.from_pretrained(
+        ...     "meta-llama/Llama-2-7b",
+        ...     task="causal-lm"
+        ... )
+        >>> elm.set_dtype("bf16")
+        >>> elm.set_sharding(axis_dims=(1, 2, 1, -1))
+
+        Loading from JSON configuration:
+        >>> elm = eLargeModel.from_json("config.json")
+        >>> esurge_engine = elm.build_esurge()
+
+        Training with SFT:
+        >>> elm.set_trainer("sft", learning_rate=2e-5, num_train_epochs=3)
+        >>> elm.add_dataset("train.json", dataset_type="json", content_field="text")
+        >>> results = elm.train()
+
+        Evaluation:
+        >>> results = elm.eval(["hellaswag", "mmlu"])
+    """
+
+    def __init__(self, config: eLMConfig | Mapping[str, Any] | str | os.PathLike | ePathLike | None = None):
+        """Initialize eLargeModel with configuration.
+
+        Args:
+            config: Can be:
+                - eLMConfig or dict with configuration
+                - Path to JSON or YAML configuration file
+                - None to create empty configuration
+        """
+        if config is None:
+            self._config = normalize({"model": {"name_or_path": ""}})
+        elif isinstance(config, (str, os.PathLike)) or hasattr(config, "__fspath__"):
+            config_path = ePath(config)
+            suffix = config_path.suffix.lower()
+            if suffix in {".yaml", ".yml"}:
+                self._config = normalize(self._load_yaml_config(config_path))
+            elif suffix == ".json":
+                self._config = load_elm_config(config_path)
+            else:
+                try:
+                    self._config = load_elm_config(config_path)
+                except ValueError as exc:
+                    if not str(exc).startswith("Invalid JSON in config file"):
+                        raise
+                    self._config = normalize(self._load_yaml_config(config_path))
+        else:
+            self._config = normalize(config)
+
+        self._model = None
+        self._state = None
+        self._tokenizer = None
+
+    @staticmethod
+    def _load_yaml_config(yaml_path: str | os.PathLike | ePathLike) -> dict[str, Any]:
+        """Load a raw ELM config mapping from a YAML file.
+
+        Reads the YAML file, accepting either a flat mapping at the root or a
+        wrapped mapping under one of ``config`` / ``elarge_model`` / ``elm``.
+        Any top-level ``actions`` key (used by ``easydel.scripts.elarge``) is
+        ignored when no explicit wrapper key is present.
+
+        Args:
+            yaml_path: Path to the YAML configuration file. Accepts ``str``,
+                ``os.PathLike``, or ``ePathLike`` arguments.
+
+        Returns:
+            Dictionary form of the YAML config mapping, ready to be passed to
+            :func:`normalize` for eLargeModel ingestion.
+
+        Raises:
+            ImportError: If PyYAML is not installed.
+            FileNotFoundError: If *yaml_path* does not exist.
+            ValueError: If the file contents are not valid YAML.
+            TypeError: If the YAML root or extracted config is not a mapping.
+        """
+        try:
+            import yaml
+        except ImportError as e:
+            raise ImportError("PyYAML is required for YAML configs. Install with: pip install pyyaml") from e
+
+        yaml_path = ePath(yaml_path)
+        if not yaml_path.exists():
+            raise FileNotFoundError(f"Config file not found: {yaml_path}")
+
+        try:
+            raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            raise ValueError(f"Invalid YAML in config file {yaml_path}: {exc}") from exc
+
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, Mapping):
+            raise TypeError(f"YAML root must be a mapping/dict, got {type(raw).__name__}.")
+
+        config = None
+        for key in ("config", "elarge_model", "elm"):
+            if key in raw:
+                config = raw[key]
+                break
+        if config is None:
+            config = {k: v for k, v in raw.items() if k != "actions"}
+        if config is None:
+            config = {}
+        if not isinstance(config, Mapping):
+            raise TypeError(f"Config must be a mapping/dict, got {type(config).__name__}.")
+        return dict(config)
+
+    @classmethod
+    def from_json(cls, json_path: str | os.PathLike | ePathLike) -> eLargeModel:
+        """Create eLargeModel from JSON configuration file.
+
+        Args:
+            json_path: Path to JSON configuration file
+
+        Returns:
+            eLargeModel instance
+        """
+        return cls(load_elm_config(json_path))
+
+    @classmethod
+    def from_yaml(cls, yaml_path: str | os.PathLike | ePathLike) -> eLargeModel:
+        """Create eLargeModel from a YAML configuration file.
+
+        The YAML file may either contain the ELM config directly, or wrap it under
+        a `config`/`elarge_model`/`elm` key. If the YAML file also contains a
+        top-level `actions` key (e.g. used by `easydel.scripts.elarge`), that key
+        is ignored when loading the ELM configuration.
+
+        Args:
+            yaml_path: Path to the YAML configuration file. Can be a string path,
+                os.PathLike, or ePathLike object.
+
+        Returns:
+            eLargeModel instance configured from the YAML file.
+
+        Raises:
+            ImportError: If PyYAML is not installed.
+            FileNotFoundError: If the YAML file does not exist.
+            TypeError: If the YAML root or config is not a dict/mapping.
+
+        Example:
+            >>> # YAML file with direct config:
+            >>> # model:
+            >>> #   name_or_path: meta-llama/Llama-2-7b
+            >>> # loader:
+            >>> #   dtype: bf16
+            >>> elm = eLargeModel.from_yaml("config.yaml")
+            >>>
+            >>> # YAML file with wrapped config:
+            >>> # config:
+            >>> #   model:
+            >>> #     name_or_path: meta-llama/Llama-2-7b
+            >>> # actions:
+            >>> #   - train
+            >>> elm = eLargeModel.from_yaml("pipeline.yaml")
+        """
+        return cls(cls._load_yaml_config(yaml_path))
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_name_or_path: str,
+        task: TaskType | str | None = None,
+        **kwargs,
+    ) -> eLargeModel:
+        """Create eLargeModel from pretrained model name or path.
+
+        Args:
+            model_name_or_path: HuggingFace model ID or local path
+            task: Optional task type (auto-detected if not provided or AUTO_BIND)
+            **kwargs: Additional configuration options
+
+        Returns:
+            eLargeModel instance with configuration
+        """
+        from easydel.modules.auto.auto_configuration import infer_task_from_hf_config
+
+        from .processing import normalize_task
+
+        if task is None or task == TaskType.AUTO_BIND or task == "auto-bind":
+            inferred_task = infer_task_from_hf_config(model_name_or_path)
+            if inferred_task is not None:
+                task = inferred_task
+                logger.info(f"Auto-detected task type: {task.value}")
+        else:
+            normalized = normalize_task(task)
+            if normalized is not None:
+                task = normalized
+
+        config = {
+            "model": {
+                "name_or_path": model_name_or_path,
+                **({"task": task} if task else {}),
+            },
+            **kwargs,
+        }
+        return cls(config)
+
+    @property
+    def config(self) -> eLMConfig:
+        """Get the normalized configuration dictionary.
+
+        Returns:
+            The full ELM configuration including model, loader, sharding,
+            quantization, training, and inference settings.
+        """
+        return self._config
+
+    @property
+    def model_name(self) -> str:
+        """Get the model name or path.
+
+        Returns:
+            The HuggingFace model ID or local path to the model.
+        """
+        return self._config["model"]["name_or_path"]
+
+    @property
+    def task(self) -> TaskType:
+        """Get the resolved task type.
+
+        Returns:
+            The task type (e.g., TaskType.CAUSAL_LM) either explicitly
+            configured or auto-detected from the model.
+        """
+        return resolve_task(self._config)
+
+    @property
+    def teacher_model_name(self) -> str | None:
+        """Get the teacher model name or path for distillation.
+
+        Returns:
+            The teacher model path if configured, None otherwise.
+        """
+        return self._config.get("teacher_model", {}).get("name_or_path")
+
+    @property
+    def target_model_name(self) -> str | None:
+        """Get the frozen target model name or path for speculative decoding."""
+        return self._config.get("target_model", {}).get("name_or_path")
+
+    @property
+    def reference_model_name(self) -> str | None:
+        """Get the reference model name or path for DPO/ORPO.
+
+        Returns:
+            The reference model path if configured, None otherwise.
+        """
+        return self._config.get("reference_model", {}).get("name_or_path")
+
+    def update_config(self, updates: Mapping[str, Any]) -> eLargeModel:
+        """Update configuration with new values.
+
+        Performs a deep merge of the updates into the existing configuration,
+        preserving nested structures. The configuration is re-normalized after
+        updating to ensure consistency.
+
+        Args:
+            updates: Dictionary with configuration updates. Can include nested
+                structures like {"model": {"dtype": "bf16"}, "esurge": {"runtime": {"max_num_seqs": 32}}}
+
+        Returns:
+            Self for method chaining
+
+        Example:
+            >>> elm.update_config({
+            ...     "loader": {"dtype": "bf16"},
+            ...     "esurge": {"runtime": {"max_model_len": 4096}}
+            ... })
+        """
+        from .processing import deep_merge
+
+        self._config = normalize(deep_merge(self._config, updates))
+        return self
+
+    def set_model(self, model_name_or_path: str) -> eLargeModel:
+        """Set the model name or path.
+
+        Updates the primary model configuration. This will clear any cached
+        model instance to ensure the new model is loaded on next build.
+
+        Args:
+            model_name_or_path: HuggingFace model ID (e.g., "meta-llama/Llama-2-7b")
+                or local path to model directory
+
+        Returns:
+            Self for method chaining
+
+        Example:
+            >>> elm.set_model("meta-llama/Llama-2-7b-hf")
+            >>> elm.set_model("/path/to/local/model")
+        """
+        self._config["model"]["name_or_path"] = model_name_or_path
+        self._model = None
+        self._state = None
+        self._tokenizer = None
+        return self
+
+    def set_teacher_model(self, model_name_or_path: str) -> eLargeModel:
+        """Set the teacher model name or path for distillation training.
+
+        Configures a teacher model used for knowledge distillation. The teacher
+        model is typically a larger, more capable model that guides the training
+        of the student (primary) model.
+
+        Args:
+            model_name_or_path: HuggingFace model ID or local path for teacher model.
+                Should be a model compatible with the student model's architecture.
+
+        Returns:
+            Self for method chaining
+
+        Example:
+            >>> elm.set_model("meta-llama/Llama-2-7b")  # Student model
+            >>> elm.set_teacher_model("meta-llama/Llama-2-13b")  # Teacher model
+            >>> elm.set_trainer("distillation", temperature=3.0)
+        """
+        if "teacher_model" not in self._config:
+            self._config["teacher_model"] = {}
+        self._config["teacher_model"]["name_or_path"] = model_name_or_path
+        return self
+
+    def set_target_model(self, model_name_or_path: str) -> eLargeModel:
+        """Set the frozen verifier model used for speculative drafter training.
+
+        The primary ``model`` remains the trainable drafter.  The target model
+        is loaded separately and passed to ``SpeculativeDecodingTrainer`` as a
+        frozen state.
+        """
+        if "target_model" not in self._config:
+            self._config["target_model"] = {}
+        self._config["target_model"]["name_or_path"] = model_name_or_path
+        return self
+
+    def set_reference_model(self, model_name_or_path: str) -> eLargeModel:
+        """Set the reference model name or path for preference optimization.
+
+        Configures a reference model used in DPO (Direct Preference Optimization)
+        and similar preference-based training methods. The reference model provides
+        a baseline for computing preference losses.
+
+        Args:
+            model_name_or_path: HuggingFace model ID or local path for reference model.
+                Often the same as the base model before fine-tuning.
+
+        Returns:
+            Self for method chaining
+
+        Example:
+            >>> elm.set_model("meta-llama/Llama-2-7b-hf")  # Model to train
+            >>> elm.set_reference_model("meta-llama/Llama-2-7b-hf")  # Reference
+            >>> elm.set_trainer("dpo", beta=0.1)
+        """
+        if "reference_model" not in self._config:
+            self._config["reference_model"] = {}
+        self._config["reference_model"]["name_or_path"] = model_name_or_path
+        return self
+
+    def set_dtype(self, dtype: str) -> eLargeModel:
+        """Set the data type for model loading.
+
+        Configures both the computation dtype and parameter dtype for the model.
+        This affects memory usage and computation speed.
+
+        Args:
+            dtype: Data type string. Supported values:
+                - "bf16": BFloat16 (recommended for TPU, modern GPUs)
+                - "fp16": Float16 (good for older GPUs)
+                - "fp32": Float32 (highest precision, most memory)
+                - "fp8": Float8 (experimental, requires compatible hardware)
+
+        Returns:
+            Self for method chaining
+
+        Example:
+            >>> elm.set_dtype("bf16")  # Use bfloat16 for training/inference
+        """
+        loader_cfg = self._config.setdefault("loader", {})
+        loader_cfg["dtype"] = dtype
+        loader_cfg["param_dtype"] = dtype
+        return self
+
+    def set_sharding(
+        self,
+        axis_dims: tuple[int, ...] | None = None,
+        axis_names: tuple[str, ...] | None = None,
+        **kwargs,
+    ) -> eLargeModel:
+        """Configure model sharding for distributed training/inference.
+
+        Sets up model parallelism by specifying how to shard model parameters
+        and computations across devices. Essential for training large models
+        that don't fit on a single device.
+
+        Args:
+            axis_dims: Sharding axis dimensions as a tuple. Common patterns:
+                - (1, 1, 1, -1): Data parallel only
+                - (2, 1, 1, -1): 2-way tensor parallel
+                - (1, 2, 1, -1): 2-way pipeline parallel
+                - (2, 2, 1, -1): 2-way tensor + 2-way pipeline parallel
+            axis_names: Sharding axis names (e.g., ("dp", "tp", "pp", "sp"))
+                - dp: Data parallel
+                - tp: Tensor parallel
+                - pp: Pipeline parallel
+                - sp: Sequence parallel
+            **kwargs: Additional sharding options.
+
+        Returns:
+            Self for method chaining
+
+        Example:
+            >>> # 2-way tensor parallel, 2-way data parallel
+            >>> elm.set_sharding(
+            ...     axis_dims=(2, 2, 1, -1),
+            ...     axis_names=("dp", "tp", "pp", "sp")
+            ... )
+        """
+        sharding = self._config.setdefault("sharding", {})
+        if axis_dims is not None:
+            sharding["axis_dims"] = axis_dims
+        if axis_names is not None:
+            sharding["axis_names"] = axis_names
+        sharding.update(kwargs)
+        return self
+
+    def set_quantization(
+        self,
+        method: str | None = None,
+        group_size: int | None = None,
+        use_qmm_best_config: bool | None = None,
+        qmm_platform_override: str | object | None = _QUANT_UNSET,
+        qmm_tpu_path_override: str | object | None = _QUANT_UNSET,
+        **kwargs,
+    ) -> eLargeModel:
+        """Configure quantization settings.
+
+        Enables model quantization to reduce memory usage and potentially
+        improve inference speed at the cost of some accuracy.
+
+        Args:
+            method: Quantization method.
+            group_size: Quantization group size (default: 128).
+                Smaller groups = better accuracy but more overhead.
+            use_qmm_best_config: Whether quantized linear kernels should request
+                ejkernel tuned block configs by default.
+            qmm_platform_override: Optional explicit quantized-matmul platform
+                override. Pass None to clear a previous value.
+            qmm_tpu_path_override: Optional explicit TPU quantized-matmul path
+                override. Pass None to clear a previous value.
+            **kwargs: Additional quantization options:
+                - platform: Target platform ("cpu", "cuda", "tpu")
+                - compute_dtype: Dtype for computation (e.g., "fp16")
+                - double_quant: Enable double quantization for 4bit
+
+        Returns:
+            Self for method chaining
+
+        Example:
+            >>> elm.set_quantization("nf4", group_size=64)
+            >>> elm.set_quantization("a8bit")
+        """
+        quant = self._config.setdefault("quantization", {})
+        if method is not None:
+            quant["method"] = method
+        if group_size is not None:
+            quant["group_size"] = group_size
+            quant["linear_group_size"] = group_size
+        if use_qmm_best_config is not None:
+            quant["use_qmm_best_config"] = bool(use_qmm_best_config)
+        if method is not None:
+            quant["apply_quantization"] = True
+        if qmm_platform_override is not _QUANT_UNSET:
+            quant["qmm_platform_override"] = qmm_platform_override
+        if qmm_tpu_path_override is not _QUANT_UNSET:
+            quant["qmm_tpu_path_override"] = qmm_tpu_path_override
+        quant.update(kwargs)
+        if method is not None or group_size is not None or "linear_pattern" in kwargs or "linear_group_size" in kwargs:
+            current = quant.get("model")
+            values = current.to_dict() if hasattr(current, "to_dict") else dict(current or {})
+            if method is not None:
+                values["dtype"] = "int8" if method == "a8bit" else method
+                values.setdefault("group_size", quant.get("group_size", 128))
+            if group_size is not None:
+                values["group_size"] = group_size
+            if "linear_group_size" in kwargs:
+                values["group_size"] = kwargs["linear_group_size"]
+            if "linear_pattern" in kwargs:
+                values["pattern"] = kwargs["linear_pattern"]
+            quant["model"] = values
+        self._config = normalize(self._config)
+        return self
+
+    def set_operation_configs(
+        self,
+        configs: Mapping[str, Any] | None = None,
+        **kwargs,
+    ) -> eLargeModel:
+        """Configure ejkernel operation overrides.
+
+        Allows overriding ejkernel's autotune behavior for specific attention
+        operations by providing explicit configuration objects. When a config
+        is provided, it's passed directly to the operation instead of using
+        ejkernel's autotune.
+
+        Args:
+            configs: Dictionary mapping operation names to config objects.
+                Valid operation names (must match OperationRegistry):
+                - "flash_attn2": Flash attention 2
+                - "ring": Ring attention
+                - "blocksparse": Block sparse attention
+                - "ragged_page_attention_v2": Ragged page attention v2
+                - "ragged_page_attention_v3": Ragged page attention v3
+                - "unified_attention": Unified paged attention (serving-style)
+                - "paged_flash_attention": Paged FlashAttention (CUDA)
+                - "sdpa": Scaled dot product attention
+                - "vanilla": Vanilla attention
+            **kwargs: Individual operation configs as keyword arguments.
+                These are merged with the configs dict.
+
+        Returns:
+            Self for method chaining
+
+        Example:
+            >>> from easydel import FlashAttentionConfig, RingAttentionConfig
+            >>>
+            >>> # Using dict
+            >>> elm.set_operation_configs({
+            ...     "flash_attn2": FlashAttentionConfig(platform="triton"),
+            ...     "ring": RingAttentionConfig(),
+            ... })
+            >>>
+            >>> # Using kwargs
+            >>> elm.set_operation_configs(
+            ...     flash_attn2=FlashAttentionConfig(platform="pallas"),
+            ... )
+        """
+        base_cfg = self._config.setdefault("base_config", {})
+        op_configs = base_cfg.setdefault("operation_configs", {})
+
+        if configs is not None:
+            op_configs.update(configs)
+        op_configs.update(kwargs)
+        return self
+
+    def set_esurge(
+        self,
+        max_model_len: int | None = None,
+        max_num_seqs: int | None = None,
+        hbm_utilization: float | None = None,
+        enable_window_aware_runtime_cap: bool | object = _ESURGE_UNSET,
+        tool_parser: ToolParserName | object | None = _ESURGE_UNSET,
+        reasoning_parser: ReasoningParserName | object | None = _ESURGE_UNSET,
+        **kwargs,
+    ) -> eLargeModel:
+        """Configure eSurge inference settings.
+
+        eSurge is a high-performance batch inference engine optimized for
+        throughput. It uses PagedAttention for efficient memory management.
+
+        Args:
+            max_model_len: Maximum model sequence length (input + output tokens).
+                If None, uses model's default max position embeddings.
+            max_num_seqs: Maximum number of sequences to process concurrently.
+                Higher values increase throughput but require more memory.
+            hbm_utilization: HBM memory utilization ratio (0.0-1.0).
+                Controls how much device memory to use for KV cache.
+            enable_window_aware_runtime_cap: Optional override for eSurge's
+                window-aware runtime-cap estimator. When False, runtime request
+                caps fall back to the cache metadata's heuristic estimate.
+                When omitted, keeps the current value (default config is False).
+            tool_parser: Tool parser name to use for automatic function-call
+                extraction. Pass None to clear a previously configured parser.
+            reasoning_parser: Reasoning parser name to use for separating
+                reasoning content from final response content. Pass None to
+                clear a previously configured parser.
+            **kwargs: Additional eSurge options:
+                - page_size: PagedAttention page size (default: 128)
+                - data_parallelism_axis: Mesh axis used for KV-cache data-parallel
+                  page sharding (default: "dp", set "ep" for expert-axis DP)
+                - coordination: "replicated" (default) or "zmq". "zmq" builds the
+                  leader/worker step-replication plane for single-ingress serving
+                  on multi-host pods (rank 0 serves; other ranks replay steps).
+                - distributed_auth_token: Shared token, identical on every host.
+                - distributed_leader_addr: Leader host/IP; defaults to the JAX
+                  coordinator host.
+                - distributed_control_port: ZMQ control-plane port (default: 19666).
+                - distributed_auth_token: Shared secret required for control RPC.
+                - enable_prefix_caching: Enable prefix caching optimization
+                - kv_cache_dtype: Dtype for KV cache (None = auto)
+                - decoding_engine: "ring" or "triton" (default: auto)
+                - tool_parser: Name of tool-call parser for automatic function-call
+                  extraction (e.g., "hermes", "mistral", "llama3_json").
+                  See ``ToolParserManager`` for available parsers.
+                - reasoning_parser: Name of reasoning parser for extracting
+                  chain-of-thought content (e.g., "deepseek_r1", "qwen3", "mistral").
+                  See ``ReasoningParserManager`` for available parsers.
+                - extra_stops: Global stop strings (e.g., ["<|user|>"]) merged
+                  into request SamplingParams.stop at runtime.
+                - drafter: Declarative drafter config, e.g.
+                  {"method": "mtp", "num_draft_tokens": 4}. eSurge passes this
+                  through to model.drafter(...) after loading the target model.
+
+        Returns:
+            Self for method chaining
+
+        Example:
+            >>> elm.set_esurge(
+            ...     max_model_len=8192,
+            ...     max_num_seqs=64,
+            ...     hbm_utilization=0.9,
+            ...     enable_prefix_caching=True
+            ... )
+        """
+        esurge = clone_config(self._config.get("esurge", {}))
+        if max_model_len is not None:
+            esurge["max_model_len"] = max_model_len
+        if max_num_seqs is not None:
+            esurge["max_num_seqs"] = max_num_seqs
+        if hbm_utilization is not None:
+            esurge["hbm_utilization"] = hbm_utilization
+        esurge.update(kwargs)
+        if enable_window_aware_runtime_cap is not _ESURGE_UNSET:
+            esurge["enable_window_aware_runtime_cap"] = bool(enable_window_aware_runtime_cap)
+        if tool_parser is not _ESURGE_UNSET:
+            esurge["tool_parser"] = tool_parser
+        if reasoning_parser is not _ESURGE_UNSET:
+            esurge["reasoning_parser"] = reasoning_parser
+        self._config["esurge"] = normalize_esurge_sections(esurge)
+        return self
+
+    def set_mixture(
+        self,
+        informs: list[TextDatasetInformCfg | VisualDatasetInformCfg] | None = None,
+        batch_size: int | None = None,
+        streaming: bool | None = None,
+        use_fast_loader: bool | None = None,
+        **kwargs,
+    ) -> eLargeModel:
+        """Configure data mixture settings for training/evaluation.
+
+        Sets up a mixture of datasets that can be combined and sampled from
+        during training. Supports multiple data sources and formats.
+
+        Args:
+            informs: List of dataset configurations. Each dict should contain:
+                - type: Dataset type ("json", "parquet", "csv", "text", or HF dataset ID)
+                - data_files: Path or pattern to data files
+                - content_field: Field name containing the text content
+                - split: Dataset split to use (default: "train")
+                - weight: Sampling weight for this dataset (optional)
+            batch_size: Batch size for data loading (default: 32)
+            streaming: Use streaming mode for large datasets (default: True).
+                Reduces memory usage but may be slower.
+            use_fast_loader: Enable fast loading with fsspec (default: True).
+                Provides optimized loading for remote/cloud storage.
+            **kwargs: Additional mixture options:
+                - max_samples: Maximum samples per dataset
+                - shuffle: Whether to shuffle data
+                - seed: Random seed for shuffling
+
+        Returns:
+            Self for method chaining
+
+        Example:
+            >>> elm.set_mixture(
+            ...     informs=[
+            ...         {"type": "json", "data_files": "train.json", "content_field": "text", "weight": 0.7},
+            ...         {"type": "parquet", "data_files": "valid/*.parquet", "content_field": "content", "weight": 0.3}
+            ...     ],
+            ...     batch_size=32,
+            ...     streaming=True,
+            ...     shuffle=True,
+            ...     seed=42
+            ... )
+        """
+        mixture = self._config.setdefault("mixture", {})
+        if informs is not None:
+            mixture["informs"] = informs
+        if batch_size is not None:
+            mixture["batch_size"] = batch_size
+        if streaming is not None:
+            mixture["streaming"] = streaming
+        if use_fast_loader is not None:
+            mixture["use_fast_loader"] = use_fast_loader
+        mixture.update(kwargs)
+        return self
+
+    def add_dataset(
+        self,
+        data_files: str | list[str],
+        dataset_type: str | None = None,
+        content_field: str = "content",
+        split: str = "train",
+        **kwargs,
+    ) -> eLargeModel:
+        """Add a dataset to the mixture configuration.
+
+        Appends a new dataset to the existing mixture. Multiple datasets
+        can be added and will be combined during training.
+
+        Args:
+            data_files: Path(s) to data files. Can be:
+                - Single file: "data.json"
+                - Multiple files: ["data1.json", "data2.json"]
+                - Glob pattern: "data/*.parquet"
+                - Remote URL: "https://example.com/data.json"
+            dataset_type: Dataset type or format. Options:
+                - File formats: "json", "jsonl", "parquet", "csv", "text"
+                - HuggingFace dataset ID: "imdb", "squad", etc.
+                - None: Auto-detect from file extension
+            content_field: Field name containing the text content (default: "content").
+                For chat data, might be "messages" or "conversations".
+            split: Dataset split to use (default: "train").
+                Common values: "train", "validation", "test".
+            **kwargs: Additional dataset options:
+                - weight: Sampling weight for this dataset
+                - max_samples: Maximum samples to use
+                - filter_fn: Function to filter samples
+                - map_fn: Function to transform samples
+
+        Returns:
+            Self for method chaining
+
+        Example:
+            >>> # Add a JSON dataset
+            >>> elm.add_dataset("train.json", dataset_type="json", content_field="text")
+            >>>
+            >>> # Add a HuggingFace dataset
+            >>> elm.add_dataset("imdb", dataset_type="imdb", split="train")
+            >>>
+            >>> # Add multiple Parquet files with sampling weight
+            >>> elm.add_dataset(
+            ...     "data/*.parquet",
+            ...     dataset_type="parquet",
+            ...     content_field="content",
+            ...     weight=0.5
+            ... )
+        """
+        mixture = self._config.setdefault("mixture", {})
+        informs = mixture.setdefault("informs", [])
+
+        inform = {
+            "data_files": data_files,
+            "content_field": content_field,
+            "split": split,
+            **kwargs,
+        }
+
+        if dataset_type:
+            inform["type"] = dataset_type
+
+        informs.append(inform)
+        return self
+
+    def set_eval(
+        self,
+        max_new_tokens: int = 8192,
+        hard_max_new_tokens: bool = False,
+        enable_thinking: bool = False,
+        ignore_benchmark_eos_flags: bool = False,
+        temperature: float = 0.0,
+        top_p: float = 0.95,
+        batch_size: int | str | None = None,
+        use_tqdm: bool = True,
+        **kwargs: Unpack[EvalKwargs],
+    ) -> eLargeModel:
+        """Configure evaluation settings for lm-evaluation-harness.
+
+        Sets default parameters for model evaluation on standard benchmarks.
+        These settings apply when using the eval() method.
+
+        Args:
+            max_new_tokens: Maximum tokens to generate per evaluation sample
+                (default: 8192). Lower values speed up evaluation.
+            hard_max_new_tokens: Force `max_new_tokens` for every generation
+                task and ignore task-level lm-eval `max_gen_toks` /
+                `max_tokens` overrides. Default: False.
+            enable_thinking: Whether eval chat templating should explicitly
+                enable tokenizer-side thinking when supported. Default: False.
+            ignore_benchmark_eos_flags: Ignore lm-eval task stop strings and
+                EOS-text stop injection, relying on the model/engine EOS path
+                only. Default: False.
+            temperature: Sampling temperature (default: 0.0 for greedy decoding).
+                0.0 = deterministic/greedy, higher = more random.
+            top_p: Top-p (nucleus) sampling parameter (default: 0.95).
+                Only used when temperature > 0.
+            batch_size: Evaluation batch size (default: engine-specific).
+                Can be int or "auto" (backend-dependent). Higher values
+                increase throughput but use more memory.
+            use_tqdm: Show progress bar during evaluation (default: True)
+            **kwargs: Additional evaluation options typed by ``EvalKwargs``
+                (consumed via ``Unpack[EvalKwargs]``). All keys are stored on
+                the ``"eval"`` config section. Recognized keys include
+                ``num_fewshot``, ``chat_template_args``, ``think_start_token``,
+                ``think_end_token``, ``sampling_params``,
+                ``normalize_math_answers``, ``math_answer_task_hints``,
+                ``code_eval_num_workers``, ``code_eval_timeout``,
+                ``max_batch_size``, ``device``, ``use_cache``, ``limit``,
+                ``cache_requests``, ``rewrite_requests_cache``,
+                ``delete_requests_cache``, ``check_integrity``, ``write_out``,
+                ``log_samples``, ``evaluation_tracker``,
+                ``system_instruction``, ``apply_chat_template``,
+                ``fewshot_as_multiturn``, ``gen_kwargs``, ``task_manager``,
+                ``verbosity``, ``predict_only``, ``samples``,
+                ``bootstrap_iters``, ``random_seed``, ``numpy_random_seed``,
+                ``torch_random_seed``, ``fewshot_random_seed``,
+                ``confirm_run_unsafe_code``, ``metadata``, ``include_path``,
+                and ``include_defaults``.
+
+        Returns:
+            Self for method chaining
+
+        Example:
+            >>> # Configure for deterministic evaluation
+            >>> elm.set_eval(
+            ...     max_new_tokens=8192,
+            ...     temperature=0.0,
+            ...     batch_size=64
+            ... )
+            >>>
+            >>> # Configure for sampling-based evaluation
+            >>> elm.set_eval(
+            ...     temperature=0.7,
+            ...     top_p=0.9,
+            ...     top_k=50
+            ... )
+        """
+        eval_cfg = self._config.setdefault("eval", {})
+        eval_cfg["max_new_tokens"] = max_new_tokens
+        eval_cfg["hard_max_new_tokens"] = hard_max_new_tokens
+        eval_cfg["enable_thinking"] = enable_thinking
+        eval_cfg["ignore_benchmark_eos_flags"] = ignore_benchmark_eos_flags
+        eval_cfg["temperature"] = temperature
+        eval_cfg["top_p"] = top_p
+        if batch_size is not None:
+            eval_cfg["batch_size"] = batch_size
+        eval_cfg["use_tqdm"] = use_tqdm
+        eval_cfg.update(kwargs)
+        return self
+
+    def validate(self) -> None:
+        """Validate the current configuration.
+
+        Checks that all required fields are present and have valid values.
+        This is automatically called before training or building engines.
+
+        Raises:
+            ValueError: If configuration is invalid (e.g., missing model name,
+                invalid dtype, incompatible settings)
+        """
+        validate(self._config)
+
+    def to_json(self, json_path: str | os.PathLike | ePathLike) -> None:
+        """Save configuration to JSON file.
+
+        Exports the current configuration to a JSON file that can be loaded
+        later with from_json() or shared with others.
+
+        Args:
+            json_path: Path where the JSON configuration file will be saved.
+                Will create parent directories if they don't exist.
+
+        Example:
+            >>> elm.to_json("config.json")
+            >>> # Later or on another machine:
+            >>> elm2 = eLargeModel.from_json("config.json")
+        """
+        save_elm_config(self._config, json_path)
+
+    def to_yaml(self, yaml_path: str | os.PathLike | ePathLike) -> None:
+        """Save configuration to a YAML file.
+
+        Exports the current configuration to a YAML file that can be loaded
+        later with from_yaml() or shared with others. The YAML format is often
+        more human-readable than JSON for complex configurations.
+
+        Args:
+            yaml_path: Path where the YAML configuration file will be saved.
+                Will create parent directories if they don't exist.
+
+        Raises:
+            ImportError: If PyYAML is not installed.
+            TypeError: If any configuration value is not YAML serializable.
+
+        Example:
+            >>> elm.to_yaml("config.yaml")
+            >>> # Later or on another machine:
+            >>> elm2 = eLargeModel.from_yaml("config.yaml")
+        """
+        try:
+            import yaml
+        except ImportError as e:
+            raise ImportError("PyYAML is required for YAML configs. Install with: pip install pyyaml") from e
+        data = make_serializable(normalize(self._config))
+        payload = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+        write_text_atomic(yaml_path, payload, encoding="utf-8")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Get configuration as dictionary.
+
+        Returns a copy of the full configuration dictionary that can be
+        modified without affecting the eLargeModel instance.
+
+        Returns:
+            Configuration dictionary with all settings
+
+        Example:
+            >>> config_dict = elm.to_dict()
+            >>> print(config_dict["model"]["name_or_path"])
+            >>> # Modify the dict without affecting elm
+            >>> config_dict["model"]["dtype"] = "fp16"
+        """
+        return clone_config(self._config)
+
+    def get_from_pretrained_kwargs(self) -> dict[str, Any]:
+        """Get kwargs for model.from_pretrained() calls.
+
+        Extracts and formats the configuration options that should be passed
+        to the model's from_pretrained() method, including dtype, sharding,
+        and quantization settings.
+
+        Returns:
+            Dictionary of from_pretrained arguments ready to use with
+            EasyDeL model loading functions
+
+        Example:
+            >>> kwargs = elm.get_from_pretrained_kwargs()
+            >>> # Can be used directly:
+            >>> model = LlamaForCausalLM.from_pretrained(
+            ...     "meta-llama/Llama-2-7b",
+            ...     **kwargs
+            ... )
+        """
+        return to_from_pretrained_kwargs(self._config)
+
+    def get_load_state_kwargs(self) -> dict[str, Any]:
+        """Get kwargs for :meth:`EasyDeLState.load_state`.
+
+        This is the state-loading counterpart to
+        :meth:`get_from_pretrained_kwargs`. It exposes the fully materialized
+        checkpoint-restore arguments derived from the current eLarge
+        configuration, which is useful when callers want to inspect or override
+        restore behavior before calling :meth:`build_state`.
+
+        Returns:
+            Dictionary of load-state arguments derived from the current
+            normalized ELM configuration. The result is ready to be splatted
+            directly into ``EasyDeLState.load_state(...)``.
+
+        Example:
+            >>> elm = eLargeModel({"model": {"name_or_path": "/ckpt"}})
+            >>> kwargs = elm.get_load_state_kwargs()
+            >>> kwargs["load_directory"]
+            '/ckpt'
+
+        See Also:
+            - :meth:`build_state`: Uses these kwargs to load and cache a state.
+            - :func:`easydel.infra.elarge.builders.to_load_state_kwargs`: Shared
+              builder used by this method.
+        """
+        return to_load_state_kwargs(self._config)
+
+    def get_esurge_kwargs(self) -> dict[str, Any]:
+        """Get kwargs for eSurge initialization.
+
+        Extracts and formats the configuration options for creating an
+        eSurge engine instance.
+
+        Returns:
+            Dictionary of eSurge arguments including max_model_len,
+            max_num_seqs, hbm_utilization, and other engine settings
+
+        Example:
+            >>> kwargs = elm.get_esurge_kwargs()
+            >>> # eSurge now takes grouped config sections.
+            >>> engine = elm.build_esurge()
+        """
+        return to_esurge_kwargs(self._config)
+
+    def get_base_config(self, prefer: str = "base") -> Mapping[str, Any]:
+        """Get materialized base configuration.
+
+        Resolves the configuration hierarchy, materializing shared base
+        settings across different configuration sections.
+
+        Args:
+            prefer: Resolution preference when conflicts exist:
+                - "base": Prefer values from base configuration
+                - "section": Prefer values from specific sections
+
+        Returns:
+            Base configuration dictionary with resolved values
+
+        Example:
+            >>> # Get configuration with base values taking precedence
+            >>> base_config = elm.get_base_config(prefer="base")
+            >>> print(base_config["dtype"])  # Shows the base dtype setting
+        """
+        return materialize_base_config(self._config, prefer)
+
+    def build_model(self, force_rebuild: bool = False) -> EasyDeLBaseModule:
+        """Build the EasyDeL model from configuration.
+
+        Loads the model using the configured settings including dtype,
+        sharding, and quantization. The model is cached after first build
+        unless force_rebuild is True.
+
+        Args:
+            force_rebuild: Force rebuilding even if model is already cached.
+                Useful when configuration has changed.
+
+        Returns:
+            EasyDeLBaseModule instance ready for training or inference
+
+        Raises:
+            ValueError: If model name/path is not set
+            RuntimeError: If model loading fails
+
+        Example:
+            >>> elm = eLargeModel.from_pretrained("meta-llama/Llama-2-7b")
+            >>> elm.set_dtype("bf16")
+            >>> model = elm.build_model()
+        """
+        if self._model is None or force_rebuild:
+            if not self.model_name:
+                raise ValueError("Model name/path must be set before building")
+            with phase_timer("build_model", tag="eLargeModel"):
+                self._model = build_model(self._config)
+                # A freshly loaded model cannot share a previously restored
+                # optimizer/parameter state, which build_trainer prefers.
+                self._state = None
+        return self._model
+
+    def build_state(
+        self,
+        force_rebuild: bool = False,
+        state_class: type[EasyDeLState] | None = None,
+        **load_state_overrides: Any,
+    ) -> EasyDeLState:
+        """Build an :class:`EasyDeLState` from a saved EasyDeL checkpoint.
+
+        This method is the checkpoint-oriented sibling of :meth:`build_model`.
+        Instead of loading a plain model object, it restores a full
+        :class:`EasyDeLState` from the checkpoint directory specified by
+        ``model.name_or_path`` using the current loader, sharding, platform,
+        base-config, and quantization settings.
+
+        The restored state is cached on ``self._state``. For convenience, the
+        embedded model from that state is also stored on ``self._model`` so the
+        rest of the eLarge surface can keep working without special-case wiring.
+        In practice this means:
+
+        - repeated calls reuse the cached state unless ``force_rebuild=True``
+        - :meth:`build_model` returns the model extracted from the loaded state
+        - :meth:`build_trainer` can reuse the loaded state directly
+        - :meth:`clear_cache` drops both the model and state caches
+
+        Args:
+            force_rebuild: Force reloading even if a state is already cached.
+                Useful when the checkpoint on disk changed or when different
+                restore overrides should be applied.
+            state_class: Optional custom EasyDeLState subclass to load.
+                Defaults to :class:`EasyDeLState`.
+            **load_state_overrides: Extra keyword arguments forwarded to
+                ``state_class.load_state(...)`` after the config-derived defaults
+                are assembled. This is the escape hatch for restore-time options
+                such as ``tx_template`` or explicit device overrides.
+
+        Returns:
+            Loaded EasyDeLState instance, cached on the eLargeModel instance for
+            later reuse.
+
+        Raises:
+            ValueError: If ``model.name_or_path`` is not configured.
+            Any exception raised by ``state_class.load_state(...)`` when the
+                checkpoint is invalid or incompatible with the supplied config.
+
+        Note:
+            ``model.name_or_path`` must point to an EasyDeL checkpoint directory
+            when using this method. For plain HuggingFace checkpoints, use
+            :meth:`build_model` instead.
+
+        Example:
+            >>> elm = eLargeModel({"model": {"name_or_path": "/checkpoints/step_4000"}})
+            >>> state = elm.build_state()
+            >>> model = elm.build_model()  # reuses state.model
+            >>> state is elm.build_state()
+            True
+
+            >>> # Override restore behavior for a one-off load
+            >>> state = elm.build_state(force_rebuild=True, tx_template=my_tx)
+
+        See Also:
+            - :meth:`get_load_state_kwargs`: Inspect the resolved restore kwargs.
+            - :meth:`build_model`: Loads a model directly rather than a state.
+        """
+        resolved_state_class = state_class or EasyDeLState
+
+        if self._state is None or force_rebuild:
+            if not self.model_name:
+                raise ValueError("Model name/path must be set before building state")
+            load_kwargs = self.get_load_state_kwargs()
+            if load_state_overrides:
+                load_kwargs.update(load_state_overrides)
+            with phase_timer("build_state.load_state", tag="eLargeModel"):
+                self._state = resolved_state_class.load_state(**load_kwargs)
+                self._model = self._state.model
+        return self._state
+
+    def build_tokenizer(self, force_rebuild: bool = False) -> AutoTokenizer:
+        """Build or get the tokenizer for the model.
+
+        Loads the tokenizer from the model path or a separately specified
+        tokenizer path. The tokenizer is cached after first build.
+
+        Args:
+            force_rebuild: Force rebuilding even if tokenizer is already cached.
+                Useful when switching between different tokenizers.
+
+        Returns:
+            AutoTokenizer instance configured for the model
+
+        Raises:
+            ValueError: If tokenizer path cannot be determined
+
+        Example:
+            >>> tokenizer = elm.build_tokenizer()
+            >>> tokens = tokenizer("Hello world", return_tensors="np")
+        """
+        if self._tokenizer is None or force_rebuild:
+            tok_path = self._config["model"].get("tokenizer", self.model_name)
+            if not tok_path:
+                raise ValueError("Tokenizer path must be set")
+            loader_cfg = self._config.get("loader", {})
+            tokenizer_kwargs = dict(loader_cfg.get("tokenizer_kwargs", {}) or {})
+            tokenizer_kwargs.setdefault("trust_remote_code", bool(loader_cfg.get("trust_remote_code", False)))
+            tokenizer_kwargs.setdefault("use_fast", bool(loader_cfg.get("use_fast_tokenizer", True)))
+            with phase_timer("build_tokenizer", tag="eLargeModel"):
+                self._tokenizer = AutoTokenizer.from_pretrained(tok_path, **tokenizer_kwargs)
+            logger.info(
+                "Loaded tokenizer %s (fast=%s)",
+                self._tokenizer.__class__.__name__,
+                getattr(self._tokenizer, "is_fast", None),
+            )
+        return self._tokenizer
+
+    def build_esurge(self) -> "eSurge":
+        """Build the eSurge inference engine.
+
+        Creates an eSurge engine instance configured with the current settings.
+        Automatically builds the model if not already built.
+
+        Returns:
+            eSurge instance ready for batch inference
+
+        Example:
+            >>> elm.set_esurge(max_num_seqs=32, hbm_utilization=0.9)
+            >>> engine = elm.build_esurge()
+            >>> # Use engine for batch inference
+            >>> results = engine.generate(prompts, max_tokens=100)
+        """
+        with phase_timer("build_esurge.total", tag="eLargeModel"):
+            self.build_model()
+            with phase_timer("build_esurge.engine", tag="eLargeModel"):
+                return build_esurge(self._config, self._model)
+
+    def _build_auxiliary_model(
+        self,
+        role: str,
+        model_section: Mapping[str, Any] | None = None,
+    ) -> EasyDeLBaseModule | None:
+        """Build a non-primary model (teacher/target/reference/reward).
+
+        Every auxiliary role shares one contract: the role's model section
+        (``<role>_model``) replaces the primary ``model`` section, and the
+        optional ``<role>_loader`` / ``<role>_sharding`` top-level sections
+        override the shared ``loader`` / ``sharding`` sections, falling back
+        to them when absent.
+
+        Auxiliary models run inside the primary model's compiled step
+        (distillation, preference, reward scoring), so an override may change
+        *how* tensors are partitioned (e.g. a ``partition_axis`` that
+        replicates a frozen teacher's weights over ``fsdp``) but must stay on
+        the same mesh: differing ``axis_dims`` / ``axis_names`` are rejected.
+
+        Args:
+            role: Role prefix (``"teacher"``, ``"target"``, ``"reference"``,
+                ``"reward"``).
+            model_section: Explicit model section to use. Defaults to
+                ``self._config["<role>_model"]``.
+
+        Returns:
+            The built module, or ``None`` when no model section is configured.
+
+        Raises:
+            ValueError: If ``<role>_sharding`` defines a different mesh than
+                the shared ``sharding`` section.
+        """
+        section = model_section if model_section is not None else self._config.get(f"{role}_model")
+        if section is None:
+            return None
+
+        aux_config = dict(self._config)
+        aux_config["model"] = section
+        if self._config.get(f"{role}_loader"):
+            aux_config["loader"] = self._config[f"{role}_loader"]
+        override_sharding = self._config.get(f"{role}_sharding")
+        if override_sharding:
+            base_sharding = self._config.get("sharding", {})
+            for mesh_key in ("axis_dims", "axis_names"):
+                base_val = base_sharding.get(mesh_key)
+                override_val = override_sharding.get(mesh_key)
+                if base_val is not None and override_val is not None and tuple(override_val) != tuple(base_val):
+                    raise ValueError(
+                        f"{role}_sharding.{mesh_key}={tuple(override_val)} differs from "
+                        f"sharding.{mesh_key}={tuple(base_val)}. Auxiliary models run inside the primary "
+                        "model's compiled step and must share its mesh; to lay the "
+                        f"{role} out differently, keep the mesh and override "
+                        f"{role}_sharding.partition_axis instead (e.g. PartitionAxis("
+                        'fully_sharded_data_parallel_axis=None, batch_axis=("fsdp", "dp")) '
+                        "replicates its weights over fsdp)."
+                    )
+            aux_config["sharding"] = override_sharding
+        return build_model(aux_config)
+
+    def build_teacher_model(self) -> EasyDeLBaseModule | None:
+        """Build the teacher model for distillation training.
+
+        Loads the ``teacher_model`` section with the shared ``loader`` /
+        ``sharding`` configuration, unless the optional ``teacher_loader`` /
+        ``teacher_sharding`` sections override them — so a frozen teacher can
+        e.g. keep its weights tp-sharded-but-fsdp-replicated while the
+        student trains fully sharded (see :meth:`_build_auxiliary_model`).
+
+        Returns:
+            EasyDeLBaseModule instance for the teacher model, or None if no
+            teacher model is configured
+
+        Example:
+            >>> elm.set_teacher_model("meta-llama/Llama-2-13b")
+            >>> teacher = elm.build_teacher_model()
+            >>> # Teacher model will be used automatically in distillation training
+        """
+        return self._build_auxiliary_model("teacher")
+
+    def build_target_model(self) -> EasyDeLBaseModule | None:
+        """Build the frozen target/verifier model for speculative decoding.
+
+        ``target_model`` is the canonical eLarge section for speculative
+        drafter training.  If it is absent, ``teacher_model`` is accepted as a
+        distillation-style fallback so existing configs can still express the
+        target model without a second auxiliary-model schema.
+        """
+        if "target_model" in self._config:
+            return self._build_auxiliary_model("target")
+        # Distillation-style fallback: reuse the teacher section (and any
+        # teacher loader/sharding overrides) as the speculative target.
+        return self._build_auxiliary_model("teacher")
+
+    def build_reference_model(self) -> EasyDeLBaseModule | None:
+        """Build the reference model for preference optimization (DPO, etc.).
+
+        Loads the reference model using the same loader configuration as the
+        primary model. The reference model provides a baseline for computing
+        preference losses in DPO, ORPO, and similar methods.
+
+        Returns:
+            EasyDeLBaseModule instance for the reference model, or None if no
+            reference model is configured
+
+        Example:
+            >>> elm.set_reference_model("meta-llama/Llama-2-7b-hf")
+            >>> reference = elm.build_reference_model()
+            >>> # Reference model will be used automatically in DPO training
+        """
+        return self._build_auxiliary_model("reference")
+
+    def build_reward_model(self) -> EasyDeLBaseModule | None:
+        """Build the reward model for RLHF trainers (GRPO/GFPO/GSPO/XPO/Nash-MD).
+
+        Loads the reward model using the same loader configuration as the
+        primary model, but with the `reward_model` configuration block.
+
+        Returns:
+            EasyDeLBaseModule instance for the reward model, or None if no
+            reward model is configured.
+
+        Notes:
+            Reward models are typically sequence-classification heads with `num_labels=1`.
+            In YAML, set for example:
+                reward_model:
+                  name_or_path: Qwen/Qwen2.5-0.5B-Instruct
+                  task: sequence-classification
+                  extra_kwargs:
+                    num_labels: 1
+        """
+        return self._build_auxiliary_model("reward")
+
+    def build_dataset(self) -> "Dataset | IterableDataset | None":
+        """Build dataset from mixture configuration.
+
+        Creates a dataset from the configured mixture of data sources.
+        Supports multiple formats (JSON, Parquet, CSV) and can combine
+        multiple data sources into a single dataset.
+
+        Returns:
+            Dataset: The loaded and processed dataset ready for training,
+                or None if no mixture is configured
+
+        Example:
+            >>> elm = eLargeModel()
+            >>> elm.add_dataset("train.json", dataset_type="json", content_field="text")
+            >>> elm.add_dataset("valid/*.parquet", dataset_type="parquet", content_field="content")
+            >>> dataset = elm.build_dataset()
+            >>> print(f"Dataset size: {len(dataset)}")
+        """
+        return build_dataset(self._config)
+
+    def build_sharded_source(self) -> "ShardedDataSource | None":
+        """Build dataset as ShardedDataSource for use with new data pipeline.
+
+        Creates a ShardedDataSource from the configured mixture of data sources.
+        This uses the new data architecture that supports lazy transforms,
+        efficient streaming, and better integration with trainers.
+
+        Returns:
+            ShardedDataSource: The data source ready for training, or None
+                if no mixture is configured
+
+        Example:
+            >>> elm = eLargeModel()
+            >>> elm.add_dataset("train.json", dataset_type="json", content_field="text")
+            >>> elm.set_mixture(use_sharded_source=True)
+            >>> source = elm.build_sharded_source()
+            >>> for batch in source.open_shard(source.shard_names[0]):
+            ...     process(batch)
+        """
+        return build_sharded_source(self._config)
+
+    def _build_training_arguments_for_type(self, trainer_type: str | None = None):
+        """Build a fresh TrainingArguments instance for the requested trainer family.
+
+        Normalizes the ``trainer`` section against the (optionally overridden)
+        trainer flavor, resolves the matching TrainingArguments class via
+        :func:`get_training_arguments_class`, and instantiates it once. Options
+        unsupported by the selected argument class are filtered before construction
+        so trainer-agnostic overrides remain supported; constructor errors propagate.
+
+        Args:
+            trainer_type: Optional override for the trainer family. When
+                ``None``, the value from ``self._config["trainer"]["trainer_type"]``
+                is used (or ``"sft"`` if missing).
+
+        Returns:
+            Tuple ``(normalized_trainer_cfg, training_arguments)`` containing
+            the normalized config dict (including the resolved
+            ``trainer_type``) and the constructed TrainingArguments instance.
+        """
+        trainer_cfg = dict(self._config.get("trainer", {}))
+        if trainer_type is not None:
+            trainer_cfg["trainer_type"] = trainer_type
+        trainer_cfg = normalize_trainer_config(trainer_cfg)
+        args_class = get_training_arguments_class(trainer_cfg.get("trainer_type", "sft"))
+        return trainer_cfg, self._instantiate_training_arguments(args_class, trainer_cfg)
+
+    def _instantiate_training_arguments(self, args_class, trainer_cfg, explicit_keys=None):
+        """Construct once, filtering routing and trainer-agnostic options.
+
+        Unsupported options retain the historical filtered-constructor behavior.
+        Constructor errors propagate without a retry. ``explicit_keys`` remains
+        accepted for compatibility but does not change option filtering.
+        """
+        config_for_args = {
+            key: value
+            for key, value in trainer_cfg.items()
+            if key != "trainer_type" and key not in ELARGE_ONLY_TRAINER_KEYS
+        }
+        params = inspect.signature(args_class).parameters
+        if not any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+            config_for_args = {key: value for key, value in config_for_args.items() if key in params}
+        return args_class(**config_for_args)
+
+    def _build_pre_tokenize_transform(
+        self,
+        trainer_type: str | None = None,
+        formatting_func: typing.Callable | None = None,
+    ) -> "Transform | ExpandTransform | PRMPreprocessTransform | TPOPreprocessTransform":
+        """Resolve the trainer-flavor-specific preprocessing transform.
+
+        Mirrors the per-trainer-type tokenization that each :class:`Trainer`
+        applies inside its data loader (SFT, DPO, KTO, GRPO, embedding, …)
+        and exposes it as a standalone transform so the data mixture can be
+        pre-tokenized to disk and reused later. The returned transform expects
+        the same raw row layout that the matching trainer would consume.
+
+        Args:
+            trainer_type: Optional override for the trainer family. When
+                ``None``, the active trainer config's ``trainer_type`` is used.
+            formatting_func: SFT-only callable that converts a raw row into the
+                rendered ``text`` string; ignored by every non-SFT branch.
+
+        Returns:
+            A :class:`Transform` (or :class:`ExpandTransform`) configured with
+            the active tokenizer and the trainer-specific length/masking knobs.
+
+        Raises:
+            ValueError: If *trainer_type* is not one of the supported families.
+        """
+        import easydel.trainers  # noqa: F401
+        from easydel.trainers.prm_trainer import PRMPreprocessTransform
+        from easydel.trainers.prompt_transforms import (
+            BCOPreprocessTransform,
+            CPOPreprocessTransform,
+            DPOPreprocessTransform,
+            EmbeddingPreprocessTransform,
+            GRPOPreprocessTransform,
+            KTOPreprocessTransform,
+            ORPOPreprocessTransform,
+            PPOPreprocessTransform,
+            RewardPreprocessTransform,
+            SFTPreprocessTransform,
+        )
+        from easydel.trainers.tpo_trainer import TPOPreprocessTransform
+
+        trainer_cfg, arguments = self._build_training_arguments_for_type(trainer_type)
+        trainer_type = trainer_cfg.get("trainer_type", trainer_type)
+        tokenizer = self.build_tokenizer()
+        mixture_cfg = self._config.get("mixture", {})
+
+        if trainer_type in {"sft", "gkd", "distillation", "gold", "speculative_decoding"}:
+            text_field = getattr(arguments, "dataset_text_field", None) or mixture_cfg.get("text_target_field", "text")
+            mask_prompt = bool(getattr(arguments, "assistant_only_loss", False))
+            completion_only_loss = getattr(arguments, "completion_only_loss", None)
+            if completion_only_loss is not None:
+                mask_prompt = bool(completion_only_loss)
+            return SFTPreprocessTransform(
+                tokenizer=tokenizer,
+                max_length=arguments.max_length,
+                text_field=text_field,
+                mask_prompt=mask_prompt,
+                formatting_func=formatting_func,
+            )
+
+        if trainer_type in {"dpo", "online_dpo"}:
+            return DPOPreprocessTransform(
+                tokenizer=tokenizer,
+                max_prompt_length=arguments.max_prompt_length,
+                max_completion_length=arguments.max_completion_length,
+                tools=getattr(arguments, "tools", None),
+                label_pad_token_id=arguments.label_pad_token_id,
+            )
+
+        if trainer_type == "tpo":
+            return TPOPreprocessTransform(
+                tokenizer=tokenizer,
+                max_prompt_length=arguments.max_prompt_length,
+                max_completion_length=arguments.max_completion_length,
+                tools=getattr(arguments, "tools", None),
+                label_pad_token_id=arguments.label_pad_token_id,
+            )
+
+        if trainer_type == "orpo":
+            return ORPOPreprocessTransform(
+                tokenizer=tokenizer,
+                max_prompt_length=arguments.max_prompt_length,
+                max_completion_length=arguments.max_completion_length,
+                tools=getattr(arguments, "tools", None),
+                label_pad_token_id=arguments.label_pad_token_id,
+            )
+
+        if trainer_type == "cpo":
+            return CPOPreprocessTransform(
+                tokenizer=tokenizer,
+                max_prompt_length=arguments.max_prompt_length,
+                max_completion_length=arguments.max_completion_length,
+                tools=getattr(arguments, "tools", None),
+                label_pad_token_id=arguments.label_pad_token_id,
+            )
+
+        if trainer_type == "kto":
+            return KTOPreprocessTransform(
+                tokenizer=tokenizer,
+                max_prompt_length=arguments.max_prompt_length,
+                max_completion_length=arguments.max_completion_length,
+                label_pad_token_id=arguments.label_pad_token_id,
+                tools=getattr(arguments, "tools", None),
+            )
+
+        if trainer_type == "bco":
+            return BCOPreprocessTransform(
+                tokenizer=tokenizer,
+                max_prompt_length=arguments.max_prompt_length,
+                max_completion_length=arguments.max_completion_length,
+                label_pad_token_id=arguments.label_pad_token_id,
+                tools=getattr(arguments, "tools", None),
+            )
+
+        if trainer_type == "reward":
+            return RewardPreprocessTransform(
+                tokenizer=tokenizer,
+                max_length=arguments.max_length,
+            )
+
+        if trainer_type == "prm":
+            return PRMPreprocessTransform(
+                tokenizer=tokenizer,
+                max_length=arguments.max_length,
+                max_completion_length=arguments.max_completion_length,
+                step_separator=arguments.step_separator,
+                train_on_last_step_only=arguments.train_on_last_step_only,
+                pad_to_multiple_of=arguments.pad_to_multiple_of,
+            )
+
+        if trainer_type == "embedding":
+            return EmbeddingPreprocessTransform(
+                tokenizer=tokenizer,
+                max_length=arguments.max_length or 512,
+                query_field=arguments.query_field,
+                positive_field=arguments.positive_field,
+                negative_field=getattr(arguments, "negative_field", None),
+            )
+
+        prompt_only_trainers = {
+            "agentic-moshpit",
+            "async_grpo",
+            "compaction_rl",
+            "dppo",
+            "gfpo",
+            "grpo",
+            "grpo_with_replay_buffer",
+            "gspo",
+            "gspo_token",
+            "minillm",
+            "nash-md",
+            "nemo_gym",
+            "on_policy_distillation",
+            "papo",
+            "ppo",
+            "rlvr",
+            "rloo",
+            "sao",
+            "sdft",
+            "sdpo",
+            "seq_kd",
+            "sparse_distillation",
+            "ssd",
+            "xpo",
+        }
+        if trainer_type in prompt_only_trainers:
+            transform_cls = (
+                PPOPreprocessTransform if trainer_type in {"compaction_rl", "ppo", "sao"} else GRPOPreprocessTransform
+            )
+            return transform_cls(
+                tokenizer=tokenizer,
+                max_prompt_length=arguments.max_prompt_length,
+                tools=getattr(arguments, "tools", None),
+                skip_apply_chat_template=getattr(arguments, "skip_apply_chat_template", False),
+            )
+
+        raise ValueError(f"pre_tokenize does not know how to build a transform for trainer_type={trainer_type!r}")
+
+    @staticmethod
+    def _sanitize_pre_tokenize_path_part(value: Any, default: str = "NA") -> str:
+        """Make one generated pre-tokenization folder segment path-safe.
+
+        Coerces *value* to a string, replaces any run of non-``[A-Za-z0-9._-]``
+        characters with a single underscore, and strips leading/trailing
+        ``._-`` separators. Used to assemble deterministic folder names for
+        pre-tokenized output directories from arbitrary inputs such as dataset
+        names, sequence lengths, or tokenizer class names.
+
+        Args:
+            value: Raw value to sanitize; ``None`` and the empty string both
+                collapse to *default*.
+            default: Fallback string returned when *value* is empty or sanitizes
+                to an empty string.
+
+        Returns:
+            A safe filename fragment containing only ``[A-Za-z0-9._-]``.
+        """
+        import re
+
+        if value is None:
+            return default
+        text = str(value).strip()
+        if not text:
+            return default
+        text = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+        text = text.strip("._-")
+        return text or default
+
+    def _build_pre_tokenize_folder_name(
+        self,
+        trainer_cfg: Mapping[str, Any],
+        arguments: Any,
+        tokenizer: Any,
+        dataset_name: Any | None = None,
+    ) -> str:
+        """Build the deterministic child folder name for pre-tokenized output.
+
+        Encodes the trainer flavor, tokenizer class, key length limits, and a
+        dataset identifier into a single path-safe segment of the form
+        ``{trainer_type}-{TokenizerClass}-MXL_{max_length}-PL_{max_prompt_length}-CL_{max_completion_length}-{dataset_name}``.
+        The deterministic layout lets repeated runs detect existing
+        pre-tokenized shards and skip re-encoding.
+
+        Args:
+            trainer_cfg: Normalized trainer config used to read ``trainer_type``.
+            arguments: TrainingArguments-like object whose ``max_length`` /
+                ``max_prompt_length`` / ``max_completion_length`` attributes are
+                folded into the folder name when present.
+            tokenizer: Active tokenizer; only its class name is used.
+            dataset_name: Optional explicit dataset label; when ``None``, the
+                folder name is derived from ``mixture.informs`` via
+                :func:`_extract_dataset_name`.
+
+        Returns:
+            A single, slash-free path segment safe to append to an output
+            directory.
+        """
+        if dataset_name is None:
+            mixture_cfg = self._config.get("mixture", {})
+            informs = mixture_cfg.get("informs", [])
+            dataset_names = [
+                self._sanitize_pre_tokenize_path_part(_extract_dataset_name(inform, fallback_index=index))
+                for index, inform in enumerate(informs)
+            ]
+            dataset_name = "_".join(dataset_names) if dataset_names else "mixture"
+        else:
+            dataset_name = self._sanitize_pre_tokenize_path_part(dataset_name)
+        tokenizer_class = self._sanitize_pre_tokenize_path_part(tokenizer.__class__.__name__, default="Tokenizer")
+        trainer_type = self._sanitize_pre_tokenize_path_part(trainer_cfg.get("trainer_type", "sft"))
+        max_length = self._sanitize_pre_tokenize_path_part(getattr(arguments, "max_length", None))
+        max_prompt_length = self._sanitize_pre_tokenize_path_part(getattr(arguments, "max_prompt_length", None))
+        max_completion_length = self._sanitize_pre_tokenize_path_part(getattr(arguments, "max_completion_length", None))
+        return (
+            f"{trainer_type}-{tokenizer_class}-"
+            f"MXL_{max_length}-PL_{max_prompt_length}-CL_{max_completion_length}-{dataset_name}"
+        )
+
+    def _resolve_pre_tokenize_output_path(
+        self,
+        path_to_save: str | os.PathLike | ePathLike | None,
+        trainer_cfg: Mapping[str, Any],
+        arguments: Any,
+        tokenizer: Any,
+        dataset_name: Any | None = None,
+    ) -> str:
+        """Resolve the absolute output directory for pre-tokenized shards.
+
+        Combines an explicit *path_to_save*, ``mixture.save.output_path``, or
+        ``trainer.save_directory`` (in that priority order) with the
+        deterministic folder name produced by
+        :meth:`_build_pre_tokenize_folder_name`. When falling back to
+        ``trainer.save_directory``, a ``pretokenized/`` segment is inserted to
+        keep tokenized data separate from training checkpoints.
+
+        Args:
+            path_to_save: Optional explicit base directory provided by the
+                caller; takes precedence over both config-driven fallbacks.
+            trainer_cfg: Normalized trainer config consumed by the folder-name
+                builder.
+            arguments: TrainingArguments-like object consumed by the
+                folder-name builder for length metadata.
+            tokenizer: Active tokenizer; only its class name is used.
+            dataset_name: Optional explicit dataset label forwarded to the
+                folder-name builder.
+
+        Returns:
+            Absolute (or caller-relative) directory string ending with the
+            generated folder name.
+
+        Raises:
+            ValueError: If no explicit *path_to_save* is provided and neither
+                ``mixture.save.output_path`` nor ``trainer.save_directory`` is
+                configured.
+        """
+        if path_to_save is not None:
+            base_path = os.fspath(path_to_save)
+            folder_name = self._build_pre_tokenize_folder_name(trainer_cfg, arguments, tokenizer, dataset_name)
+            return f"{base_path.rstrip('/')}/{folder_name}"
+
+        mixture_cfg = self._config.get("mixture", {})
+        save_cfg = mixture_cfg.get("save", {})
+        output_path = save_cfg.get("output_path")
+        if output_path:
+            base_path = os.fspath(output_path)
+            folder_name = self._build_pre_tokenize_folder_name(trainer_cfg, arguments, tokenizer, dataset_name)
+            return f"{base_path.rstrip('/')}/{folder_name}"
+
+        raw_trainer_cfg = self._config.get("trainer", {})
+        save_directory = raw_trainer_cfg.get("save_directory")
+        if save_directory:
+            save_directory = os.fspath(save_directory).rstrip("/")
+            folder_name = self._build_pre_tokenize_folder_name(trainer_cfg, arguments, tokenizer, dataset_name)
+            return f"{save_directory}/pretokenized/{folder_name}"
+
+        raise ValueError(
+            "path_to_save is required for pre_tokenize when neither "
+            "mixture.save.output_path nor trainer.save_directory is configured"
+        )
+
+    def pre_tokenize(
+        self,
+        path_to_save: str | os.PathLike | ePathLike | None = None,
+        *,
+        trainer_type: str | None = None,
+        output_format: str | None = None,
+        max_shard_size: str | int | None = None,
+        num_shards: int | None = None,
+        compression: str | None = None,
+        num_proc: int | None = None,
+        show_progress: bool = True,
+        log_process: bool | int | None = None,
+        transform_batch_size: int | None = None,
+        transform_backend: str | None = None,
+        drop_fields: typing.Iterable[str] | None = None,
+        arrays_only: bool | None = None,
+        formatting_func: typing.Callable | None = None,
+    ) -> "WriteStats":
+        """Pre-tokenize the configured data mixture for a trainer and save shards.
+
+        Args:
+            path_to_save: Base output directory for the materialized tokenized
+                shards. The final folder is generated as
+                ``{trainer_type}-{tokenizer_class}-MXL{max_length}-PL{max_prompt_length}-CL{max_completion_length}-{dataset_name}``.
+                Multi-inform mixtures are written as one folder per inform
+                rather than one interleaved materialization.
+                When omitted, uses ``mixture.save.output_path`` and then falls
+                back to ``<trainer.save_directory>/pretokenized`` as the base.
+            trainer_type: Trainer family whose preprocessing should be applied.
+                When omitted, uses ``trainer.trainer_type`` from the eLarge config.
+            output_format: Optional output format override. Defaults to
+                ``mixture.save.format`` and falls back to ``"parquet"``.
+            max_shard_size: Optional shard size override. Defaults to
+                ``mixture.save.max_shard_size`` and falls back to ``"500MB"``.
+            num_shards: Optional fixed shard count override. Defaults to
+                ``mixture.save.num_shards``.
+            compression: Optional compression override. Defaults to
+                ``mixture.save.compression`` and falls back to ``"snappy"``.
+            num_proc: Reserved for the underlying pretokenize helper.
+            show_progress: Whether the underlying helper should show progress.
+            log_process: When enabled, show a tqdm progress bar for transformed
+                examples as they pass into the writer. ``True`` refreshes every
+                1,000 examples; an integer refreshes every N examples. Defaults
+                to ``mixture.save.log_process`` when present.
+            transform_batch_size: Source rows grouped into one transform task
+                during parallel pre-tokenization. Defaults to
+                ``mixture.save.transform_batch_size`` when present.
+            transform_backend: Parallel transform backend, ``"process"`` or
+                ``"thread"``. Defaults to ``mixture.save.transform_backend``
+                and falls back to ``"process"``.
+            drop_fields: Transformed-row fields to remove before saving.
+                Defaults to ``mixture.save.drop_fields``. For SFT/GKD/
+                distillation this defaults to ``("tools",)`` because tools
+                are only needed before tokenization.
+            arrays_only: Keep only numeric tensor-like values in saved
+                pretokenized rows. Defaults to ``mixture.save.arrays_only``
+                and falls back to ``True``.
+            formatting_func: Optional SFT-style formatting callable.
+
+        Returns:
+            WriteStats: Number of written examples, shards, bytes, and paths.
+        """
+        from easydel.data import pretokenize
+
+        mixture_cfg = self._config.get("mixture", {})
+        informs = list(mixture_cfg.get("informs", []) or [])
+        if not informs:
+            raise ValueError("mixture.informs is required for pre_tokenize")
+
+        save_cfg = mixture_cfg.get("save", {})
+        resolved_format = output_format or save_cfg.get("format", "parquet")
+        if resolved_format == "json":
+            resolved_format = "jsonl"
+
+        trainer_cfg, arguments = self._build_training_arguments_for_type(trainer_type)
+        tokenizer = self.build_tokenizer()
+        transform = self._build_pre_tokenize_transform(trainer_type, formatting_func=formatting_func)
+        resolved_drop_fields = drop_fields if drop_fields is not None else save_cfg.get("drop_fields")
+        if resolved_drop_fields is None and trainer_cfg.get("trainer_type") in {
+            "sft",
+            "gkd",
+            "distillation",
+            "speculative_decoding",
+        }:
+            resolved_drop_fields = ("tools",)
+        # Per-dataset sideband carriers are run-local metadata (a dataset id is a position in THIS mixture), so
+        # they never belong in an exported dataset.
+        from easydel.data.transforms.mixture import ASSISTANT_ONLY_FIELD, DATASET_ID_FIELD
+
+        resolved_drop_fields = tuple(
+            dict.fromkeys((*(resolved_drop_fields or ()), ASSISTANT_ONLY_FIELD, DATASET_ID_FIELD))
+        )
+        common_kwargs = {
+            "output_format": resolved_format,
+            "max_shard_size": max_shard_size or save_cfg.get("max_shard_size", "500MB"),
+            "compression": compression if compression is not None else save_cfg.get("compression", "snappy"),
+            "num_shards": num_shards if num_shards is not None else save_cfg.get("num_shards"),
+            "num_proc": num_proc,
+            "show_progress": show_progress,
+            "log_process": log_process if log_process is not None else save_cfg.get("log_process", False),
+            "transform_batch_size": (
+                transform_batch_size if transform_batch_size is not None else save_cfg.get("transform_batch_size", 16)
+            ),
+            "transform_backend": (
+                transform_backend if transform_backend is not None else save_cfg.get("transform_backend", "thread")
+            ),
+            "drop_fields": resolved_drop_fields,
+            "arrays_only": arrays_only if arrays_only is not None else save_cfg.get("arrays_only", True),
+        }
+
+        if len(informs) == 1:
+            source = self.build_sharded_source()
+            if source is None:
+                raise ValueError("mixture.informs is required for pre_tokenize")
+            resolved_output_path = self._resolve_pre_tokenize_output_path(
+                path_to_save,
+                trainer_cfg,
+                arguments,
+                tokenizer,
+            )
+            return pretokenize(source=source, transform=transform, output_path=resolved_output_path, **common_kwargs)
+
+        from easydel.data import WriteStats
+
+        aggregate = WriteStats()
+        seen_names: set[str] = set()
+        for index, inform in enumerate(informs):
+            dataset_name = self._sanitize_pre_tokenize_path_part(_extract_dataset_name(inform, fallback_index=index))
+            if dataset_name in seen_names:
+                dataset_name = f"{dataset_name}-{index}"
+            seen_names.add(dataset_name)
+
+            single_cfg = dict(self._config)
+            single_mixture = dict(mixture_cfg)
+            single_mixture["informs"] = [inform]
+            single_cfg["mixture"] = single_mixture
+            source = build_sharded_source(single_cfg)
+            if source is None:
+                continue
+
+            resolved_output_path = self._resolve_pre_tokenize_output_path(
+                path_to_save,
+                trainer_cfg,
+                arguments,
+                tokenizer,
+                dataset_name=dataset_name,
+            )
+            stats = pretokenize(source=source, transform=transform, output_path=resolved_output_path, **common_kwargs)
+            aggregate.num_examples += stats.num_examples
+            aggregate.num_shards += stats.num_shards
+            aggregate.total_bytes += stats.total_bytes
+            aggregate.output_paths.extend(stats.output_paths)
+
+        return aggregate
+
+    def get_train_source(self) -> "ShardedDataSource | Dataset | IterableDataset | None":
+        """Get training data as ShardedDataSource or Dataset.
+
+        Automatically selects the appropriate data format based on the
+        `use_sharded_source` configuration option.
+
+        Returns:
+            ShardedDataSource if use_sharded_source=True in mixture config,
+            otherwise HuggingFace Dataset. Returns None if no mixture configured.
+
+        Example:
+            >>> elm = eLargeModel()
+            >>> elm.add_dataset("train.json", dataset_type="json")
+            >>> elm.set_mixture(use_sharded_source=True)  # Use new pipeline
+            >>> data = elm.get_train_source()  # Returns ShardedDataSource
+            >>>
+            >>> elm.set_mixture(use_sharded_source=False)  # Use legacy pipeline
+            >>> data = elm.get_train_source()  # Returns HF Dataset
+        """
+        mixture_cfg = self._config.get("mixture", {})
+        if mixture_cfg.get("use_sharded_source", True):
+            if mixture_cfg.get("pack_tokens") or mixture_cfg.get("pack_on_the_fly"):
+                raise ValueError(
+                    "mixture sets pack_tokens/pack_on_the_fly but use_sharded_source=True (the default) routes "
+                    "through build_sharded_source(), which ignores all packing settings — the trainer would "
+                    "silently receive raw, unpacked rows. Set use_sharded_source=False in the mixture config "
+                    "to build a packed dataset, or remove the pack keys."
+                )
+            return self.build_sharded_source()
+        return self.build_dataset()
+
+    def get_data_mixture_kwargs(self) -> dict[str, Any]:
+        """Get kwargs for DatasetMixture initialization.
+
+        Extracts and formats the mixture configuration for use with
+        the DatasetMixture class.
+
+        Returns:
+            Dictionary of DatasetMixture arguments including informs,
+            batch_size, streaming settings, and other mixture options
+        """
+        return to_data_mixture_kwargs(self._config)
+
+    def clear_cache(self) -> None:
+        """Clear cached model, tokenizer, and inference engine instances.
+
+        This is useful when you want to reload models with different
+        configurations or free memory after model operations.
+        """
+        self._model = None
+        self._state = None
+        self._tokenizer = None
+
+    def set_trainer(self, trainer_type: str, **kwargs) -> eLargeModel:
+        """Configure trainer settings.
+
+        Sets the training paradigm and associated hyperparameters.
+
+        Args:
+            trainer_type: Type of trainer to use:
+                - "sft": Supervised Fine-Tuning
+                - "dpo": Direct Preference Optimization
+                - "orpo": Odds Ratio Preference Optimization
+                - "grpo": Group Relative Policy Optimization
+                - "ppo": Proximal Policy Optimization
+                - "sao": Single-Rollout Asynchronous Optimization
+                - "compaction_rl": Compaction Reinforcement Learning
+                - "sdpo": Self-Distillation Policy Optimization
+                - "reward": Reward model training
+                - "distillation": Knowledge distillation
+                - "base": Basic trainer for custom training loops
+            **kwargs: Trainer-specific configuration options:
+                Common options:
+                - learning_rate: Learning rate (default: 5e-5)
+                - num_train_epochs: Number of training epochs
+                - per_device_train_batch_size: Batch size per device
+                - gradient_accumulation_steps: Gradient accumulation steps
+                - warmup_steps: Number of warmup steps
+                - output_dir: Directory to save checkpoints
+                - step_start_point: Initialize training from an explicit global step
+                - force_step_start_point: Force `step_start_point` onto a loaded
+                  state and optimizer counters even when the state was loaded
+                  manually instead of resumed by the trainer
+                - resume_if_possible: Auto-resume from the latest checkpoint if one exists
+                DPO-specific:
+                - beta: KL regularization coefficient
+                - loss_type: "sigmoid", "ipo", "hinge"
+                Distillation-specific:
+                - temperature: Distillation temperature
+                - alpha: Weight for distillation loss
+
+        Returns:
+            Self for method chaining
+
+        Example:
+            >>> # SFT training
+            >>> elm.set_trainer(
+            ...     "sft",
+            ...     learning_rate=2e-5,
+            ...     num_train_epochs=3,
+            ...     per_device_train_batch_size=4
+            ... )
+            >>>
+            >>> # DPO training
+            >>> elm.set_trainer(
+            ...     "dpo",
+            ...     beta=0.1,
+            ...     learning_rate=1e-6
+            ... )
+        """
+        trainer_cfg = self._config.setdefault("trainer", {})
+        trainer_cfg["trainer_type"] = trainer_type
+        trainer_cfg.update(kwargs)
+        return self
+
+    def set_watchers(self, *watchers: LogWatcher) -> eLargeModel:
+        """Register LogWatcher instances for per-parameter metric logging.
+
+        Watchers are evaluated during training at their individual intervals
+        and results are logged through the standard metrics pipeline
+        (wandb / TensorBoard).
+
+        Args:
+            *watchers: One or more ``LogWatcher`` instances to attach.
+
+        Returns:
+            Self for method chaining.
+
+        Example:
+            >>> import jax.numpy as jnp
+            >>> from easydel.trainers import LogWatcher
+            >>> elm.set_watchers(
+            ...     LogWatcher(
+            ...         name="norm",
+            ...         fn=lambda arr: {"l2": float(jnp.linalg.norm(arr))},
+            ...         interval=100,
+            ...     ),
+            ...     LogWatcher(
+            ...         name="sparsity",
+            ...         fn=lambda arr: {"pct_zero": float((arr == 0).mean())},
+            ...         interval=200,
+            ...         pattern=r".*attention.*",
+            ...     ),
+            ... )
+        """
+        trainer_cfg = self._config.setdefault("trainer", {})
+        existing = trainer_cfg.get("watchers", [])
+        trainer_cfg["watchers"] = existing + list(watchers)
+        return self
+
+    def get_trainer_config(self) -> Mapping[str, Any]:
+        """Get normalized trainer configuration.
+
+        This method processes the raw trainer configuration and applies
+        defaults and normalization for the specified trainer type.
+
+        Returns:
+            Normalized trainer configuration dictionary with all required
+            fields populated with defaults where necessary.
+        """
+        raw_config = self._config.get("trainer", {})
+        return normalize_trainer_config(raw_config)
+
+    def train(
+        self,
+        train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
+        eval_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
+        base_state_class: type[EasyDeLState] | None = None,
+        args_class: type[TrainingArguments] | None = None,
+        trainer_class: type[Trainer] | None = None,
+        **build_kwargs: Unpack[BuildTrainerKws],
+    ):
+        """Train the model with the configured settings.
+
+        This is a high-level convenience method that orchestrates the entire
+        training pipeline:
+        1. Validates configuration
+        2. Builds the model if not already built
+        3. Creates the dataset from mixture configuration if not provided
+        4. Builds reference/teacher models if needed
+        5. Creates the appropriate trainer
+        6. Runs training and returns results
+
+        Args:
+            train_dataset: Optional training dataset (Dataset or ShardedDataSource).
+                If None, will build from mixture configuration.
+            eval_dataset: Optional evaluation dataset for validation during training.
+            base_state_class: Optional custom EasyDeLState class for model state
+                management. Use for custom model implementations.
+            args_class: Optional custom TrainingArguments class. If None, will
+                auto-select based on trainer_type.
+            trainer_class: Optional custom Trainer class. If None, will auto-select
+                based on trainer_type.
+            **build_kwargs: Trainer-construction overrides typed by
+                ``BuildTrainerKws`` (consumed via ``Unpack[BuildTrainerKws]``):
+
+                data_collator (Callable): Custom data collator for batching.
+                formatting_func (Callable): Function that formats examples
+                    for SFT training.
+                reward_processing_classes (list[Callable]): Processing classes
+                    for reward models in GRPO.
+                data_tokenize_fn (Callable): Custom tokenization function for
+                    data preprocessing.
+                reference_model (EasyDeLBaseModule | None): Reference model
+                    for DPO/preference optimization.
+                reward_model (EasyDeLBaseModule | None): Reward model for
+                    GRPO training.
+                target_model (EasyDeLBaseModule | None): Frozen verifier model
+                    for speculative-decoding drafter training.
+                teacher_model (EasyDeLBaseModule | None): Teacher model for
+                    distillation training.
+                critic_model (EasyDeLBaseModule | None): Optional critic
+                    initialization model for SAO/CompactionRL.
+                critic_state (EasyDeLState | None): Optional prebuilt critic
+                    state for SAO/CompactionRL.
+                critic_trainable_selector (Any | None): Optional structural
+                    selector for critic parameters.
+                reward_funcs (Any | None): Custom reward functions for
+                    GRPO/SDPO/PPO-style trainers.
+                rollout_provider (Callable | None): Runtime online-RL rollout
+                    provider for SAO/CompactionRL.
+                external_reward_funcs (Any | None): Additional RLVR reward
+                    functions appended after built-in verifiers.
+                external_reward_processing_classes (list[Callable] | None):
+                    Processing classes for RLVR external reward functions.
+                external_reward_weights (list[float] | None): Weights for
+                    RLVR external reward functions.
+                feedback_func (Callable | None): Optional textual feedback
+                    callback for SDPO.
+                env_factory (Callable | None): Environment factory for the
+                    AgenticMoshPit trainer.
+                environment_factory (Callable | None): Environment-factory
+                    alias used by online agentic trainers.
+                tools (list | None): Tool instances for agentic trainers.
+                tool_guard (Any | None): Optional CompactionRL tool guard.
+                compaction_controller (Any | None): Optional CompactionRL
+                    context controller.
+
+        Returns:
+            Training results from the trainer, including metrics and final model state
+
+        Example:
+            Basic SFT training:
+            >>> elm = eLargeModel.from_pretrained("meta-llama/Llama-2-7b")
+            >>> elm.add_dataset("train.json", dataset_type="json")
+            >>> elm.set_trainer("sft", learning_rate=2e-5, num_train_epochs=3)
+            >>> results = elm.train()
+
+            DPO training with custom datasets:
+            >>> train_data = load_dataset("preference_data", split="train")
+            >>> eval_data = load_dataset("preference_data", split="test")
+            >>> elm.set_trainer("dpo", beta=0.1)
+            >>> elm.set_reference_model("meta-llama/Llama-2-7b")
+            >>> results = elm.train(train_dataset=train_data, eval_dataset=eval_data)
+
+            Custom trainer with formatting function:
+            >>> def format_fn(examples):
+            ...     return [f"Question: {q}\nAnswer: {a}"
+            ...             for q, a in zip(examples["question"], examples["answer"])]
+            >>> results = elm.train(formatting_func=format_fn)
+        """
+        self.validate()
+
+        trainer = self.build_trainer(
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            base_state_class=base_state_class,
+            args_class=args_class,
+            trainer_class=trainer_class,
+            **build_kwargs,
+        )
+
+        logger.info("Starting training with configuration:")
+        logger.info(f"  Model: {self.model_name}")
+        logger.info(f"  Trainer Arguments:\n{pprint.pformat(self._config.get('trainer', {}))}")
+
+        logger.info("Beginning training...")
+        results = trainer.train()
+        logger.info("Training completed successfully")
+        # TrainerOutput carries the replacement state, including optimizer
+        # counters. Updating only the model leaves a restored checkpoint cached.
+        self._state = getattr(results, "state", None)
+        self._model = self._state.model if self._state is not None else trainer.model
+        return results
+
+    def build_training_arguments(self, args_class: TrainingArguments | None = None, **overrides):
+        """Build TrainingArguments for the configured trainer.
+
+        Args:
+            args_class: Optional custom TrainingArguments class. If not provided,
+                will automatically select based on trainer_type.
+            **overrides: Override specific configuration values
+
+        Returns:
+            TrainingArguments instance for the configured trainer type
+            (e.g., DPOConfig for DPO training, SFTConfig for SFT)
+        """
+        trainer_cfg = self.get_trainer_config()
+        trainer_cfg.update(overrides)
+
+        if args_class is None:
+            trainer_type = trainer_cfg.get("trainer_type", "sft")
+            args_class = get_training_arguments_class(trainer_type)
+
+        explicit_keys = set(self._config.get("trainer", {})) | set(overrides)
+        return self._instantiate_training_arguments(args_class, trainer_cfg, explicit_keys)
+
+    def build_trainer(
+        self,
+        train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
+        eval_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
+        reference_model: EasyDeLBaseModule | None = None,
+        reward_model: EasyDeLBaseModule | None = None,
+        target_model: EasyDeLBaseModule | None = None,
+        teacher_model: EasyDeLBaseModule | None = None,
+        reward_funcs: Any | None = None,
+        base_state_class: type[EasyDeLState] | None = None,
+        args_class: type[TrainingArguments] | None = None,
+        trainer_class: type[Trainer] | None = None,
+        **kwargs,
+    ) -> Trainer:
+        """Build a trainer instance with the configured settings.
+
+        Creates and configures a trainer based on the trainer_type setting.
+        Automatically builds required models and datasets if not provided.
+
+        Args:
+            train_dataset: Training dataset (Dataset or ShardedDataSource).
+                If None, builds from mixture config using get_train_source().
+            eval_dataset: Evaluation dataset for validation metrics.
+            reference_model: Reference model for DPO/ORPO. If None, builds from
+                reference_model configuration if present.
+            reward_model: Reward model for GRPO/SDPO/PPO-style trainers.
+                If None, builds from config.
+            target_model: Frozen target/verifier model for speculative decoding.
+                If None, builds from target_model or teacher_model config.
+            teacher_model: Teacher model for distillation. If None, builds from
+                teacher_model configuration if present.
+            reward_funcs: Custom reward functions for GRPO/SDPO/PPO-style trainers.
+                Alternative to reward_model.
+            base_state_class: Custom EasyDeLState class for model state management.
+            args_class: Custom TrainingArguments class. Auto-selected if None.
+            trainer_class: Custom Trainer class. Auto-selected if None.
+            **kwargs: Additional trainer configuration overrides
+
+        Returns:
+            Configured trainer instance ready for training
+
+        Raises:
+            ValueError: If required models or datasets are not configured
+
+        Example:
+            >>> # Build trainer with auto-configuration
+            >>> trainer = elm.build_trainer()
+            >>>
+            >>> # Build trainer with custom dataset
+            >>> custom_data = load_dataset("custom_data")
+            >>> trainer = elm.build_trainer(train_dataset=custom_data)
+            >>>
+            >>> # Build DPO trainer with custom reference model
+            >>> ref_model = elm.build_reference_model()
+            >>> trainer = elm.build_trainer(
+            ...     trainer_type="dpo",
+            ...     reference_model=ref_model
+            ... )
+        """
+        trainer_cfg = self.get_trainer_config()
+        trainer_type = trainer_cfg.get("trainer_type", "sft")
+
+        if self._model is None:
+            self.build_model()
+
+        if self._tokenizer is None:
+            self.build_tokenizer()
+
+        if trainer_class is None:
+            with phase_timer(f"build_trainer.resolve_class.{trainer_type}", tag="eLargeModel"):
+                trainer_class = get_trainer_class(trainer_type)
+
+        if args_class is None:
+            args_class = get_training_arguments_class(trainer_type)
+        argument_params = inspect.signature(args_class).parameters
+        constructor_params = inspect.signature(trainer_class).parameters
+        arguments_accept_extra = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in argument_params.values())
+        trainer_accepts_extra = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in constructor_params.values())
+        argument_overrides = {}
+        runtime_overrides = {}
+        for key, value in kwargs.items():
+            # Declared runtime extensions beat an arguments **kwargs catch-all;
+            # declared argument fields remain arguments, never trainer kwargs.
+            if key in BuildTrainerKws.__annotations__:
+                runtime_overrides[key] = value
+            elif key in argument_params:
+                argument_overrides[key] = value
+            elif key in constructor_params:
+                runtime_overrides[key] = value
+            elif arguments_accept_extra:
+                argument_overrides[key] = value
+            elif trainer_accepts_extra:
+                runtime_overrides[key] = value
+            else:
+                raise TypeError(f"Unsupported trainer/argument option: {key}")
+
+        with phase_timer("build_trainer.training_arguments", tag="eLargeModel"):
+            training_args = self.build_training_arguments(args_class=args_class, **argument_overrides)
+
+        if train_dataset is None and "mixture" in self._config:
+            # Use new get_train_source() which auto-selects based on use_sharded_source
+            with phase_timer("build_trainer.get_train_source", tag="eLargeModel"):
+                train_dataset = self.get_train_source()
+
+        # Optional training buckets
+        # Build per-bucket TrainingBucket configs, a BucketRule, and one data
+        # source per bucket from `bucket_datasets`. The model *variants* (one
+        # graphdef per bucket, differing e.g. in attn_mechanism) are constructed
+        # inside the trainer, not here; eLarge only hands over the configs + data.
+        bucket_cfgs = trainer_cfg.get("bucket_configs")
+        bucket_rule_dict = trainer_cfg.get("bucket_rule")
+        bucket_mixture_cfgs = trainer_cfg.get("bucket_datasets")
+        buckets = bucket_rule = bucket_datasets = None
+        if bucket_cfgs:
+            if not bucket_rule_dict:
+                raise ValueError(
+                    "`bucket_rule` must be set in the trainer config when `bucket_configs` is set; "
+                    "e.g. {'kind': 'mod', 'mod': 5, 'on_bucket': 0, 'off_bucket': 1}."
+                )
+            from easydel.trainers.buckets import BucketRule, TrainingBucket
+
+            buckets = [TrainingBucket(**bc) for bc in bucket_cfgs]
+            bucket_rule = BucketRule.from_dict(bucket_rule_dict)
+            bucket_datasets = []
+            original_mixture = self._config.get("mixture")
+            for mc in bucket_mixture_cfgs or []:
+                self._config["mixture"] = mc
+                try:
+                    bucket_datasets.append(self.get_train_source())
+                finally:
+                    # Restore so the base mixture is untouched for the primary loader.
+                    if original_mixture is None:
+                        self._config.pop("mixture", None)
+                    else:
+                        self._config["mixture"] = original_mixture
+
+        trainer_kwargs = {}
+        model = self._state if self._state is not None else self._model
+
+        if base_state_class is not None and not isinstance(model, EasyDeLState):
+            model = model.to_state(base_state_class)
+        if trainer_type == "base":
+            trainer_kwargs["arguments"] = training_args
+            if isinstance(model, EasyDeLState):
+                trainer_kwargs["model_state"] = model
+            else:
+                trainer_kwargs["model"] = model
+            trainer_kwargs["dataset_train"] = train_dataset
+            trainer_kwargs["dataset_eval"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        elif trainer_type == "dpo":
+            if reference_model is None:
+                reference_model = self.build_reference_model()
+
+            if reference_model is not None and base_state_class is not None:
+                reference_model = reference_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reference_model"] = reference_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        elif trainer_type == "online_dpo":
+            if reference_model is None:
+                reference_model = self.build_reference_model()
+
+            if reference_model is not None and base_state_class is not None:
+                reference_model = reference_model.to_state(base_state_class)
+
+            if reward_funcs is None and reward_model is None:
+                reward_model = self.build_reward_model()
+
+            resolved_reward = reward_funcs if reward_funcs is not None else reward_model
+            if resolved_reward is None:
+                raise ValueError(
+                    "online_dpo training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg)."
+                )
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reference_model"] = reference_model
+            trainer_kwargs["reward_funcs"] = resolved_reward
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        elif trainer_type == "tpo":
+            if reference_model is None:
+                reference_model = self.build_reference_model()
+
+            if reference_model is not None and base_state_class is not None:
+                reference_model = reference_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reference_model"] = reference_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        elif trainer_type == "cpo":
+            if reference_model is None:
+                reference_model = self.build_reference_model()
+
+            if reference_model is not None and base_state_class is not None:
+                reference_model = reference_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reference_model"] = reference_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        elif trainer_type in {"bco", "kto"}:
+            if reference_model is None:
+                reference_model = self.build_reference_model()
+
+            if reference_model is not None and base_state_class is not None:
+                reference_model = reference_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reference_model"] = reference_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        elif trainer_type == "orpo":
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        elif trainer_type in {
+            "grpo",
+            "gfpo",
+            "gspo",
+            "async_grpo",
+            "dppo",
+            "grpo_with_replay_buffer",
+            "gspo_token",
+            "papo",
+            "rloo",
+        }:
+            if reward_funcs is None and reward_model is None:
+                reward_model = self.build_reward_model()
+
+            resolved_reward = reward_funcs if reward_funcs is not None else reward_model
+            if resolved_reward is None:
+                raise ValueError(
+                    f"{trainer_type} training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg)."
+                )
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reward_funcs"] = resolved_reward
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
+            trainer_kwargs["tools"] = kwargs.get("tools", None)
+            trainer_kwargs["environment_factory"] = kwargs.get("environment_factory", kwargs.get("env_factory", None))
+
+        elif trainer_type == "nemo_gym":
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reward_funcs"] = reward_funcs
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
+            trainer_kwargs["tools"] = kwargs.get("tools", None)
+            trainer_kwargs["environment_factory"] = kwargs.get("environment_factory", kwargs.get("env_factory", None))
+
+        elif trainer_type == "sdpo":
+            if reward_funcs is None and reward_model is None:
+                reward_model = self.build_reward_model()
+
+            resolved_reward = reward_funcs if reward_funcs is not None else reward_model
+            if resolved_reward is None:
+                raise ValueError("sdpo training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg).")
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reward_funcs"] = resolved_reward
+            trainer_kwargs["feedback_func"] = kwargs.get("feedback_func", None)
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
+
+        elif trainer_type == "sdft":
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reward_funcs"] = reward_funcs
+            trainer_kwargs["feedback_func"] = kwargs.get("feedback_func", None)
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
+
+        elif trainer_type == "ssd":
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
+
+        elif trainer_type == "minillm":
+            if teacher_model is None:
+                teacher_model = self.build_teacher_model()
+
+            if teacher_model is not None and base_state_class is not None:
+                teacher_model = teacher_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["teacher_model"] = teacher_model
+            trainer_kwargs["reward_funcs"] = reward_funcs
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
+
+        elif trainer_type in {"compaction_rl", "sao"}:
+            if reward_funcs is None and reward_model is None:
+                reward_model = self.build_reward_model()
+
+            resolved_reward = reward_funcs if reward_funcs is not None else reward_model
+            if resolved_reward is None:
+                raise ValueError(
+                    f"{trainer_type} training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg)."
+                )
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reward_funcs"] = resolved_reward
+            trainer_kwargs["critic_model"] = kwargs.get("critic_model")
+            trainer_kwargs["critic_state"] = kwargs.get("critic_state")
+            trainer_kwargs["critic_trainable_selector"] = kwargs.get("critic_trainable_selector")
+            trainer_kwargs["rollout_provider"] = kwargs.get("rollout_provider")
+            trainer_kwargs["environment_factory"] = kwargs.get("environment_factory", kwargs.get("env_factory"))
+            trainer_kwargs["tools"] = kwargs.get("tools")
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes")
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn")
+            if trainer_type == "compaction_rl":
+                trainer_kwargs["compaction_controller"] = kwargs.get("compaction_controller")
+                trainer_kwargs["tool_guard"] = kwargs.get("tool_guard")
+
+        elif trainer_type == "ppo":
+            if reward_funcs is None and reward_model is None:
+                reward_model = self.build_reward_model()
+
+            resolved_reward = reward_funcs if reward_funcs is not None else reward_model
+            if resolved_reward is None:
+                raise ValueError("ppo training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg).")
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reward_funcs"] = resolved_reward
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
+
+        elif trainer_type in {"xpo", "nash-md"}:
+            if reward_funcs is None and reward_model is None:
+                reward_model = self.build_reward_model()
+
+            resolved_reward = reward_funcs if reward_funcs is not None else reward_model
+            if resolved_reward is None:
+                raise ValueError(
+                    f"{trainer_type} training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg)."
+                )
+
+            if reference_model is None:
+                reference_model = self.build_reference_model()
+
+            if reference_model is not None and base_state_class is not None:
+                reference_model = reference_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reward_funcs"] = resolved_reward
+            trainer_kwargs["reference_model"] = reference_model
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
+
+        elif trainer_type == "sft":
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["model"] = model
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["formatting_func"] = kwargs.get("formatting_func", None)
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        elif trainer_type == "reward":
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        elif trainer_type == "gkd":
+            if teacher_model is None:
+                teacher_model = self.build_teacher_model()
+
+            if teacher_model is not None and base_state_class is not None:
+                teacher_model = teacher_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["teacher_model"] = teacher_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["formatting_func"] = kwargs.get("formatting_func", None)
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        elif trainer_type in {"distillation", "gold"}:
+            if teacher_model is None:
+                teacher_model = self.build_teacher_model()
+
+            if teacher_model is not None and base_state_class is not None:
+                teacher_model = teacher_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["student_model"] = model
+            trainer_kwargs["teacher_model"] = teacher_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        elif trainer_type == "speculative_decoding":
+            if target_model is None:
+                target_model = self.build_target_model()
+
+            if target_model is not None and base_state_class is not None:
+                target_model = target_model.to_state(base_state_class)
+
+            if target_model is None:
+                raise ValueError("speculative_decoding training requires `target_model` (config key or runtime kwarg).")
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["drafter_model"] = model
+            trainer_kwargs["target_model"] = target_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        elif trainer_type == "prm":
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        elif trainer_type == "on_policy_distillation":
+            if teacher_model is None:
+                teacher_model = self.build_teacher_model()
+
+            if teacher_model is not None and base_state_class is not None:
+                teacher_model = teacher_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["student_model"] = model
+            trainer_kwargs["teacher_model"] = teacher_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+
+        elif trainer_type == "seq_kd":
+            if teacher_model is None:
+                teacher_model = self.build_teacher_model()
+
+            if teacher_model is not None and base_state_class is not None:
+                teacher_model = teacher_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["student_model"] = model
+            trainer_kwargs["teacher_model"] = teacher_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+
+        elif trainer_type == "sparse_distillation":
+            if teacher_model is None:
+                teacher_model = self.build_teacher_model()
+
+            if teacher_model is not None and base_state_class is not None:
+                teacher_model = teacher_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["student_model"] = model
+            trainer_kwargs["teacher_model"] = teacher_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+
+        elif trainer_type == "agentic-moshpit":
+            env_factory = kwargs.get("env_factory")
+            if env_factory is None:
+                raise ValueError(
+                    "agentic-moshpit training requires `env_factory` kwarg — "
+                    "a callable that returns an AgenticEnvironment instance."
+                )
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["env_factory"] = env_factory
+            trainer_kwargs["reward_funcs"] = reward_funcs
+            trainer_kwargs["tools"] = kwargs.get("tools")
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes")
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn")
+
+        elif trainer_type == "rlvr":
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reward_funcs"] = reward_funcs
+            trainer_kwargs["external_reward_funcs"] = kwargs.get("external_reward_funcs")
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes")
+            trainer_kwargs["external_reward_processing_classes"] = kwargs.get("external_reward_processing_classes")
+            trainer_kwargs["external_reward_weights"] = kwargs.get("external_reward_weights")
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn")
+
+        elif trainer_type == "embedding":
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        else:
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+
+        # Attach training buckets (None values are stripped below for non-bucket runs).
+        if buckets is not None:
+            trainer_kwargs["buckets"] = buckets
+            trainer_kwargs["bucket_rule"] = bucket_rule
+            trainer_kwargs["bucket_datasets"] = bucket_datasets
+
+        trainer_kwargs = {k: v for k, v in trainer_kwargs.items() if v is not None}
+
+        for key, value in runtime_overrides.items():
+            # SAO shares online actor/critic options with compaction RL, but
+            # ignores compaction-only controls.
+            if trainer_type == "sao" and key in {"tool_guard", "compaction_controller"}:
+                continue
+            # env_factory is a public alias consumed above by the environment
+            # trainer branches. Do not forward the alias a second time.
+            if key == "env_factory" and "environment_factory" in trainer_kwargs:
+                continue
+            if key not in constructor_params and not trainer_accepts_extra:
+                raise TypeError(f"Unsupported trainer runtime option: {key}")
+            if key not in trainer_kwargs and value is not None:
+                trainer_kwargs[key] = value
+
+        with phase_timer(f"build_trainer.init.{trainer_type}", tag="eLargeModel"):
+            trainer = trainer_class(**trainer_kwargs)
+
+        # Label the per-dataset census with the mixture's own names, from the same walk that assigns the ids.
+        # The grain lanes set their own (sorted-name) map while configuring their loader; keep it.
+        if getattr(trainer, "_dataset_id_names", None) is None:
+            from .builders import resolve_dataset_id_names
+
+            names = resolve_dataset_id_names(self._config.get("mixture", {}) or {})
+            if names:
+                trainer._dataset_id_names = dict(enumerate(names))
+        return trainer
+
+    def eval(
+        self,
+        tasks: str | list[str | dict[str, Any] | Any] | BenchmarkConfig | list[BenchmarkConfig],
+        num_fewshot: int | None = None,
+        output_path: str | None = None,
+        **eval_overrides: Unpack[EvalKwargs],
+    ) -> dict[str, Any]:
+        """Run evaluation on specified tasks using lm-evaluation-harness.
+
+        This method provides a unified interface for evaluating models using the
+        eSurge engine with the lm-evaluation-harness framework.
+
+        Args:
+            tasks: Task name(s) to evaluate on. Can be a single task string,
+                a list of task names, or lm-eval task objects/config dictionaries.
+                Common tasks include:
+                - Language understanding: "hellaswag", "winogrande", "piqa", "arc_easy", "arc_challenge"
+                - Math: "gsm8k", "math", "minerva_math"
+                - Knowledge: "mmlu", "triviaqa", "naturalquestions"
+                - Reasoning: "bbh", "boolq", "copa"
+                - Truthfulness: "truthfulqa_mc1", "truthfulqa_mc2"
+                - Coding: "humaneval", "mbpp"
+                Full list: https://github.com/EleutherAI/lm-evaluation-harness/tree/main/lm_eval/tasks
+            num_fewshot: Number of few-shot examples to use.
+                If None, uses `eval.num_fewshot` when set; otherwise lm-eval
+                task defaults are preserved.
+                Different tasks may have different recommended values:
+                - MMLU: typically 5-shot
+                - GSM8K: typically 8-shot
+                - HellaSwag: typically 0-shot
+            output_path: Optional path to save evaluation results as JSON.
+                Results include detailed metrics, task versions, and configuration.
+            **eval_overrides: Per-call lm-eval overrides typed by
+                ``EvalKwargs`` (consumed via ``Unpack[EvalKwargs]``). These
+                override values from ``set_eval()``/``config["eval"]`` for
+                this call only. Recognized keys are:
+
+                num_fewshot (int | None): Number of few-shot examples; ``None``
+                    keeps the task default.
+                max_new_tokens (int): Maximum tokens to generate per prompt.
+                hard_max_new_tokens (bool): Strictly enforce
+                    ``max_new_tokens`` even when the task asks for more.
+                enable_thinking (bool): Enable chain-of-thought reasoning mode.
+                chat_template_args (dict | None): Extra args forwarded to the
+                    chat template formatter.
+                think_start_token (str | None): Token marking the start of a
+                    thinking block.
+                think_end_token (str | None): Token marking the end of a
+                    thinking block.
+                ignore_benchmark_eos_flags (bool): Ignore EOS flags from the
+                    benchmark task definitions.
+                temperature (float): Sampling temperature (``0.0`` = greedy).
+                top_p (float): Nucleus sampling probability threshold.
+                sampling_params (SamplingParams | dict | None): Optional fixed
+                    SamplingParams template used for all generations.
+                normalize_math_answers (bool): Normalize math answers before
+                    comparison.
+                math_answer_task_hints (Sequence[str] | str | None): Task name
+                    patterns where math normalization should apply.
+                code_eval_num_workers (int | None): Parallel worker count for
+                    code evaluation.
+                code_eval_timeout (float | int | None): Per-sample timeout for
+                    code execution.
+                batch_size (int | str | None): Evaluation batch size; can be
+                    ``"auto"``.
+                max_batch_size (int | None): Upper bound on auto batch size.
+                device (str | None): Device string for lm-eval.
+                use_cache (str | None): Path to cache evaluation requests.
+                limit (int | float | None): Limit number of examples (int) or
+                    fraction (float).
+                cache_requests (bool): Cache individual evaluation requests.
+                rewrite_requests_cache (bool): Overwrite existing request
+                    cache.
+                delete_requests_cache (bool): Delete request cache after
+                    evaluation.
+                check_integrity (bool): Verify dataset integrity before
+                    evaluation.
+                write_out (bool): Write detailed evaluation outputs.
+                log_samples (bool): Log individual sample results.
+                evaluation_tracker (Any | None): Optional evaluation tracker.
+                system_instruction (str | None): System instruction prepended
+                    to all prompts.
+                apply_chat_template (bool | str): Whether/which chat template
+                    to apply.
+                fewshot_as_multiturn (bool): Format few-shot as multi-turn.
+                gen_kwargs (str | dict | None): Additional generation kwargs.
+                task_manager (Any | None): Custom lm-eval TaskManager.
+                verbosity (Any): lm-eval logging verbosity level.
+                predict_only (bool): Run prediction only, skip scoring.
+                samples (dict | None): Pre-computed samples dict.
+                bootstrap_iters (int): Bootstrap iterations for confidence
+                    intervals.
+                random_seed (int | None): Global random seed.
+                numpy_random_seed (int | None): NumPy random seed.
+                torch_random_seed (int | None): PyTorch random seed.
+                fewshot_random_seed (int | None): Few-shot example selection
+                    seed.
+                confirm_run_unsafe_code (bool): Allow execution of untrusted
+                    code in evaluation.
+                metadata (dict | None): Additional metadata attached to
+                    results.
+                include_path (str | None): Path to additional lm-eval task
+                    definitions.
+                include_defaults (bool): Include built-in lm-eval tasks.
+
+        Returns:
+            Dictionary containing evaluation results with structure:
+            {
+                "results": {
+                    task_name: {
+                        metric_name: value,  # e.g., "acc": 0.85, "acc_stderr": 0.02
+                        ...
+                    },
+                    ...
+                },
+                "versions": {task_name: version_string, ...},
+                "config": {"model": ..., "num_fewshot": ..., ...}
+            }
+
+        Example:
+            Basic zero-shot evaluation:
+            >>> elm = eLargeModel.from_pretrained("meta-llama/Llama-2-7b")
+            >>> results = elm.eval("hellaswag")
+            >>> print(f"HellaSwag accuracy: {results['results']['hellaswag']['acc']:.2%}")
+
+            Few-shot evaluation with multiple tasks:
+            >>> elm.set_esurge(max_num_seqs=64, hbm_utilization=0.9)
+            >>> results = elm.eval(
+            ...     ["gsm8k", "mmlu", "truthfulqa_mc1"],
+            ...     num_fewshot=5,
+            ...     output_path="eval_results.json"
+            ... )
+            >>> for task, metrics in results["results"].items():
+            ...     print(f"{task}: {metrics.get('acc', metrics.get('exact_match')):.2%}")
+
+            Evaluation with custom settings:
+            >>> elm.set_eval(
+            ...     max_new_tokens=512,
+            ...     temperature=0.0,  # Greedy decoding
+            ...     batch_size=32
+            ... )
+            >>> results = elm.eval(["humaneval", "mbpp"])
+
+        Raises:
+            ImportError: If lm-eval is not installed (install with: pip install lm-eval)
+            RuntimeError: If evaluation fails during execution
+
+        Note:
+            The evaluation uses settings from set_eval() for generation parameters.
+            Default settings are optimized for deterministic evaluation (temperature=0).
+        """
+
+        def _uses_removed_benchmark_task_alias(task: Any) -> bool:
+            """Check whether a task dict uses the removed ``task`` alias with extra keys.
+
+            The old benchmark config format allowed a ``task`` key alongside
+            arbitrary override keys.  This was replaced by a ``tasks`` key.
+            This helper detects configs that still use the legacy format so
+            callers can raise a clear error.
+
+            Args:
+                task: A candidate task specification to inspect.
+
+            Returns:
+                True if *task* is a mapping that uses the removed ``task``
+                alias with keys beyond the known task-spec fields, False
+                otherwise.
+            """
+            if not isinstance(task, Mapping):
+                return False
+            if "tasks" in task or "task" not in task:
+                return False
+            task_spec_keys = {"task", "alias", "group", "dataset_path", "dataset_name"}
+            return any(key not in task_spec_keys for key in task)
+
+        if _uses_removed_benchmark_task_alias(tasks) or (
+            isinstance(tasks, list) and any(_uses_removed_benchmark_task_alias(task) for task in tasks)
+        ):
+            raise TypeError("benchmark configs must use `tasks`; the `task` alias is no longer supported.")
+
+        should_run_benchmarks = is_benchmark_config_like(tasks) or (
+            isinstance(tasks, list) and tasks and all(isinstance(task, Mapping) and "tasks" in task for task in tasks)
+        )
+        if should_run_benchmarks:
+            benchmark_overrides = dict(eval_overrides)
+            if num_fewshot is not None:
+                benchmark_overrides["num_fewshot"] = num_fewshot
+            return self.run_benchmarks(
+                benchmarks=tasks,
+                output_path=output_path,
+                **benchmark_overrides,
+            )
+
+        if isinstance(tasks, str):
+            task_list = [tasks]
+        else:
+            task_list = list(tasks)
+
+        if self._tokenizer is None:
+            self.build_tokenizer()
+
+        eval_config = self._config.get("eval", {}).copy()
+        if eval_overrides:
+            eval_config.update(eval_overrides)
+        esurge_sections = normalize_esurge_sections(self._config.get("esurge", {}))
+        results = run_lm_eval_with_esurge(
+            surge=self.build_esurge(),
+            processor=self._tokenizer,
+            tasks=task_list,
+            max_length=esurge_sections["runtime"].get("max_model_len", 8192),
+            fallback_batch_size=esurge_sections["runtime"].get("max_num_seqs", 32),
+            num_fewshot=num_fewshot,
+            eval_config=eval_config,
+            stop_engine=True,
+            summary_logger=logger,
+        )
+
+        if output_path:
+            serialized_results = make_serializable(results)
+            write_text_atomic(output_path, json.dumps(serialized_results, indent=2, ensure_ascii=False))
+            logger.info(f"eval results saved to: {output_path}")
+
+        return results
+
+    def run_benchmarks(
+        self,
+        benchmarks: BenchmarkConfig | list[BenchmarkConfig],
+        output_path: str | None = None,
+        engine_instance: eSurge | None = None,
+        **default_eval_overrides: Unpack[EvalKwargs],
+    ) -> dict[str, Any]:
+        """Run one or more named benchmark suites sequentially, sharing a single eSurge engine.
+
+        Unlike :meth:`eval`, which accepts a flat task list, this method accepts
+        :class:`~easydel.infra.elarge.benchmarking.BenchmarkConfig` mappings
+        that can each carry their own ``num_fewshot``, ``temperature``, and other
+        lm-eval settings.  A single eSurge engine is started before the loop and
+        terminated in the ``finally`` block, so GPU/TPU memory is only allocated
+        once for the whole suite.
+
+        Args:
+            benchmarks: A single :class:`BenchmarkConfig` or a list of them.
+                Each must contain a ``"tasks"`` key.
+            output_path: Optional file path.  When provided the combined results
+                dict is serialized to JSON and written atomically.
+            engine_instance: Provided eSurge engine and if it's None eLargeModel will build a new one.
+                This is useful if the caller wants to manage the engine lifecycle themselves
+                (e.g., for running multiple benchmark suites sequentially without restarting the engine each time).
+            **default_eval_overrides: Suite-wide defaults typed by
+                ``EvalKwargs`` (consumed via ``Unpack[EvalKwargs]``); individual
+                benchmark entries may still override them. Recognized keys
+                mirror :meth:`eval`'s ``eval_overrides`` and include
+                ``num_fewshot``, ``max_new_tokens``, ``hard_max_new_tokens``,
+                ``enable_thinking``, ``chat_template_args``,
+                ``think_start_token``, ``think_end_token``,
+                ``ignore_benchmark_eos_flags``, ``temperature``, ``top_p``,
+                ``sampling_params``, ``normalize_math_answers``,
+                ``math_answer_task_hints``, ``code_eval_num_workers``,
+                ``code_eval_timeout``, ``batch_size``, ``max_batch_size``,
+                ``device``, ``use_cache``, ``limit``, ``cache_requests``,
+                ``rewrite_requests_cache``, ``delete_requests_cache``,
+                ``check_integrity``, ``write_out``, ``log_samples``,
+                ``evaluation_tracker``, ``system_instruction``,
+                ``apply_chat_template``, ``fewshot_as_multiturn``,
+                ``gen_kwargs``, ``task_manager``, ``verbosity``,
+                ``predict_only``, ``samples``, ``bootstrap_iters``,
+                ``random_seed``, ``numpy_random_seed``, ``torch_random_seed``,
+                ``fewshot_random_seed``, ``confirm_run_unsafe_code``,
+                ``metadata``, ``include_path``, and ``include_defaults``.
+
+        Returns:
+            A dict of the form ``{"benchmarks": {<name>: <lm-eval result dict>, ...}}``.
+            Each value is the raw dict produced by ``lm_eval.evaluator.simple_evaluate``.
+        """
+
+        if self._tokenizer is None:
+            self.build_tokenizer()
+
+        default_eval_config = self._config.get("eval", {}).copy()
+        if default_eval_overrides:
+            default_eval_config.update(default_eval_overrides)
+
+        resolved_benchmarks = normalize_benchmark_configs(
+            benchmarks,
+            default_eval_config=default_eval_config,
+        )
+        if not resolved_benchmarks:
+            return {"benchmarks": {}}
+        owns_engine = engine_instance is None
+        if owns_engine:
+            engine_instance = self.build_esurge()
+        benchmark_results: dict[str, dict[str, Any]] = {}
+        try:
+            for benchmark in resolved_benchmarks:
+                logger.info(f"Running benchmark {benchmark.name}: {benchmark.tasks}")
+                esurge_sections = normalize_esurge_sections(self._config.get("esurge", {}))
+                benchmark_results[benchmark.name] = run_lm_eval_with_esurge(
+                    surge=engine_instance,
+                    processor=self._tokenizer,
+                    tasks=benchmark.tasks,
+                    max_length=esurge_sections["runtime"].get("max_model_len", 8192),
+                    fallback_batch_size=esurge_sections["runtime"].get("max_num_seqs", 32),
+                    eval_config=benchmark.eval_kwargs,
+                    stop_engine=False,
+                    summary_logger=logger,
+                )
+        finally:
+            if owns_engine:
+                try:
+                    engine_instance.terminate()
+                except Exception:
+                    ...
+
+        results: dict[str, Any] = {"benchmarks": benchmark_results}
+        if output_path:
+            serialized_results = make_serializable(results)
+            write_text_atomic(output_path, json.dumps(serialized_results, indent=2, ensure_ascii=False))
+            logger.info(f"eval results saved to: {output_path}")
+        return results
+
+    def __repr__(self) -> str:
+        """Developer-friendly string representation of eLargeModel.
+
+        Returns:
+            A concise representation showing key configuration like model,
+            task, dtype, quantization, and sharding.
+        """
+        task_str = f"TaskType.{self.task.name}" if self.task else "None"
+        dtype_str = repr(self._config.get("loader", {}).get("dtype", "default"))
+
+        quant = self._config.get("quantization", {})
+        quant_str = f", quantization={quant['method']!r}" if quant.get("method") else ""
+
+        sharding = self._config.get("sharding", {})
+        axis_dims = sharding.get("axis_dims")
+        shard_str = f", sharding={axis_dims}" if axis_dims and axis_dims != (1, 1, 1, 1, -1, 1) else ""
+
+        return f"eLargeModel(model={self.model_name!r}, task={task_str}, dtype={dtype_str}{quant_str}{shard_str})"
+
+    def __str__(self) -> str:
+        """Human-readable string representation with formatted configuration.
+
+        Returns:
+            A nicely formatted multi-line string showing all configured
+            components including model, loading options, sharding,
+            quantization, training, and inference settings.
+        """
+        w = 53  # inner width (content area)
+
+        def _fmt(val: Any) -> str:
+            """Format a value for display, handling enums and special types.
+
+            Args:
+                val: Any value to format for display.
+
+            Returns:
+                A string representation suitable for the configuration display.
+            """
+            if val is None:
+                return "none"
+            if hasattr(val, "value"):
+                return str(val.value) if val.value else "none"
+            if hasattr(val, "name"):
+                return val.name.lower()
+            return str(val)
+
+        def _line(content: str) -> str:
+            """Create a padded line within the box.
+
+            Args:
+                content: The text content to display in the line.
+
+            Returns:
+                A formatted line string with box-drawing characters.
+            """
+            return f"║ {content:<{w}}║"
+
+        def _sep() -> str:
+            """Create a separator line within the box.
+
+            Returns:
+                A horizontal separator line using box-drawing characters.
+            """
+            return f"╟{'─' * (w + 1)}╢"
+
+        lines = []
+        lines.append(f"╔{'═' * (w + 1)}╗")
+        lines.append(f"║{'eLargeModel':^{w + 1}}║")
+        lines.append(f"║{self.model_name or 'not set':^{w + 1}}║")
+        lines.append(f"╠{'═' * (w + 1)}╣")
+
+        loader = self._config.get("loader", {})
+        dtype_str = loader.get("dtype", "default")
+        prec_str = loader.get("precision", "default")
+        task_str = self.task.name.lower() if self.task else "auto"
+        lines.append(_line(f"▸ dtype: {dtype_str:<12} ▸ task: {task_str}"))
+        lines.append(_line(f"▸ precision: {prec_str}"))
+
+        # Sharding
+        sharding = self._config.get("sharding", {})
+        dims = sharding.get("axis_dims")
+        if dims:
+            auto = "auto" if sharding.get("auto_shard_model") else "manual"
+            dims_str = ",".join(str(d) for d in dims)
+            lines.append(_line(f"▸ shard: ({dims_str}) {auto}"))
+
+        lines.append(_sep())
+
+        base_cfg = self._config.get("base_config", {}).get("values", {})
+        if base_cfg:
+            if "attn_mechanism" in base_cfg:
+                lines.append(_line(f"▸ attn: {_fmt(base_cfg['attn_mechanism'])}"))
+            if "mla_attn_mechanism" in base_cfg:
+                lines.append(_line(f"▸ mla_attn: {_fmt(base_cfg['mla_attn_mechanism'])}"))
+            if "moe_method" in base_cfg:
+                lines.append(_line(f"▸ moe:  {_fmt(base_cfg['moe_method'])}"))
+            if "gradient_checkpointing" in base_cfg:
+                gc = base_cfg["gradient_checkpointing"]
+                gc_str = _fmt(gc) or "disabled"
+                lines.append(_line(f"▸ grad_ckpt: {gc_str}"))
+
+        quant = self._config.get("quantization", {})
+        if quant.get("method"):
+            lines.append(_line(f"▸ quant: {quant['method']} (group:{quant.get('group_size', 128)})"))
+
+        esurge = normalize_esurge_sections(self._config.get("esurge", {}))
+        runtime = esurge["runtime"]
+        cache = esurge["cache"]
+        if runtime or cache:
+            lines.append(_sep())
+            lines.append(_line("eSurge"))
+
+            ctx = runtime.get("max_model_len", 0)
+            seqs = runtime.get("max_num_seqs", 0)
+            hbm = cache.get("hbm_utilization", 0)
+            lines.append(_line(f"▸ {ctx:,} context x {seqs} sequences"))
+
+            parts = []
+            if hbm:
+                parts.append(f"{hbm:.0%} HBM")
+            page_size = cache.get("page_size")
+            if page_size:
+                parts.append(f"page:{page_size}")
+            if cache.get("enable_prefix_caching"):
+                parts.append("prefix_cache")
+            min_input_pad = runtime.get("min_input_pad")
+            if min_input_pad:
+                parts.append(f"pad:{min_input_pad}")
+            if parts:
+                lines.append(_line(f"▸ {' │ '.join(parts)}"))
+
+        trainer = self._config.get("trainer", {})
+        trainer_type = trainer.get("trainer_type")
+        if trainer_type:
+            lines.append(_sep())
+            lines.append(_line(f"Training: {str(trainer_type).upper()}"))
+            parts = []
+            learning_rate = trainer.get("learning_rate")
+            if isinstance(learning_rate, (int, float)) and learning_rate:
+                parts.append(f"lr:{learning_rate:.2e}")
+            num_train_epochs = trainer.get("num_train_epochs")
+            if num_train_epochs:
+                parts.append(f"epochs:{num_train_epochs}")
+            total_batch_size = trainer.get("total_batch_size")
+            if total_batch_size:
+                parts.append(f"batch:{total_batch_size}")
+            if parts:
+                lines.append(_line(f"▸ {' │ '.join(parts)}"))
+
+        lines.append(_sep())
+        model_icon = "●" if self._model is not None else "○"
+        tok_icon = "●" if self._tokenizer is not None else "○"
+        model_status = "loaded" if self._model is not None else "not loaded"
+        tok_status = "loaded" if self._tokenizer is not None else "not loaded"
+        lines.append(_line(f"{model_icon} model: {model_status}   {tok_icon} tokenizer: {tok_status}"))
+        lines.append(f"╚{'═' * (w + 1)}╝")
+
+        return "\n".join(lines)

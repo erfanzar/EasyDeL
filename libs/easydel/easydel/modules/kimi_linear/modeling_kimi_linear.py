@@ -1,0 +1,2168 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Kimi Linear model implementation for EasyDeL.
+
+This module implements the Kimi Linear hybrid attention architecture, which combines:
+- MLA (Multi-Latent Attention) for full attention layers (like DeepSeek V3)
+- KDA (Kernel Delta Attention) for linear attention layers
+- MoE (Mixture of Experts) with sigmoid routing and shared experts
+
+The hybrid attention approach allows for efficient long-context processing
+with O(N) complexity in linear attention layers while maintaining
+expressive power through MLA at regular intervals.
+
+References:
+    - Kimi Linear: https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct
+"""
+
+import functools
+import typing
+from functools import cached_property, partial
+from typing import ClassVar
+
+import jax
+import jax.numpy as jnp
+import spectrax as spx
+from eformer.loggings import get_logger
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
+
+from easydel.caching import (
+    HybridCache,
+    KDACacheView,
+    KDAMetadata,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import (
+    AttentionLayerOutput,
+    DecoderLayerOutput,
+    MoeCausalLMOutput,
+    MoeModelOutput,
+)
+from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info
+from easydel.infra.sharding import sharding_for_layout
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
+from easydel.layers import (
+    BaseMoeModule,
+    ColumnParallelLinear,
+    ColumnParallelMoELinear,
+    Embed,
+    MoeLoadBalancingStrategy,
+    MoeRoutingStrategy,
+    RMSNorm,
+    RMSNormGated,
+    RowParallelLinear,
+    RowParallelMoELinear,
+    dense_gate_up_layout,
+    gated_mlp_forward,
+    moe_down_projection_reform_param,
+    moe_fused_gate_up_reform_param,
+    split_fused_gate_up_projection,
+)
+from easydel.layers.attention import UnifiedAttention
+from easydel.layers.linear_attention import apply_conv_with_state, apply_mask_to_padding_states
+from easydel.layers.moe import moe_group_topk_select
+from easydel.layers.norms import lowfloats
+from easydel.modules._base import BaseCausalLMModule
+from easydel.operations import OperationMetadata
+from easydel.operations.kernels import (
+    KDAOutput,
+    KernelDeltaAttnOp,
+    fused_kda_gate_per_channel,
+    kda_packed_rows_forward,
+)
+from easydel.utils.checkpoint_keys import KEEP, KeyRuleSet, Map, Rewrite
+
+from .kimi_linear_configuration import KimiLinearConfig
+
+logger = get_logger(__name__)
+
+
+class KimiRMSNorm(RMSNorm):
+    """Backward-compatible Kimi norm API using the shared fp32-scale implementation."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize the shared norm while preserving the original constructor.
+
+        Args:
+            hidden_size: Trailing feature dimension.
+            eps: Variance epsilon.
+            dtype: Compute dtype.
+            param_dtype: Weight storage dtype.
+            rngs: Random number generator state.
+        """
+        super().__init__(hidden_size, eps, dtype, param_dtype, fp32_scale=True, rngs=rngs)
+        self.hidden_size = hidden_size
+
+
+def _kimi_rms_norm(
+    dim: int,
+    config: KimiLinearConfig,
+    dtype: jnp.dtype,
+    param_dtype: jnp.dtype,
+    rngs: spx.Rngs,
+) -> RMSNorm:
+    """Build the shared :class:`RMSNorm` in Kimi's fp32 order.
+
+    Kimi computes the statistics and the ``weight *`` multiply in float32 and casts once at the end, which is
+    ``RMSNorm(fp32_scale=True)``. The parameter keeps the ``weight`` leaf name, so checkpoints are unchanged.
+
+    Args:
+        dim: Feature width to normalize.
+        config: Model configuration (supplies ``rms_norm_eps``).
+        dtype: Compute dtype.
+        param_dtype: Parameter storage dtype.
+        rngs: Random number generator state.
+
+    Returns:
+        The configured norm layer.
+    """
+    return RMSNorm(dim, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, fp32_scale=True, rngs=rngs)
+
+
+def _attn_res_stream(block_residuals: tuple[Array, ...], partial_block: Array | None) -> Array:
+    """Return the full residual stream implied by Attention-Residuals state.
+
+    Args:
+        block_residuals: Frozen block residuals (block 0 is the embedding output).
+        partial_block: The open partial block, or ``None`` directly after a block boundary.
+
+    Returns:
+        The sum of every block and the partial block, shape ``(batch, seq_len, hidden_dim)``.
+    """
+    total = block_residuals[0]
+    for residual in block_residuals[1:]:
+        total = total + residual
+    return total if partial_block is None else total + partial_block
+
+
+class KimiAttentionResidual(spx.Module):
+    """Attention-Residuals mixer: a softmax over RMS-normed residual candidates.
+
+    Instead of feeding a sublayer the plain running sum, every sublayer reads a learned, depth-wise softmax mix of
+    the stored block residuals and the current partial block. Candidate ``i`` (shape ``(batch, seq, hidden)``) is
+    scored by ``query . RMSNorm(candidate_i)`` with a single learned pseudo-query, and the weights are a softmax
+    over the candidate axis. The pseudo-query starts at zero, so the mix starts as a uniform average.
+
+    Attributes:
+        weight: Learned pseudo-query of shape ``(hidden_size,)``.
+        norm: RMSNorm applied to the candidates before scoring.
+    """
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize the mixer.
+
+        Args:
+            config (KimiLinearConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        self.dtype = dtype
+        self.weight = ArrayParam.bound(
+            shape=(config.hidden_size,),
+            dtype=param_dtype,
+            init_method="constant",
+            init_kwargs={"value": 0.0},
+            key=rngs.parameters,
+            # Like the norm's scale, the depth query is replicated on its owning stage,
+            # not left on the initializer's single default device in an MPMD model.
+            sharding=sharding_for_layout(common_types.Replicated),
+        )
+        self.norm = _kimi_rms_norm(config.hidden_size, config, dtype, param_dtype, rngs)
+
+    def forward(
+        self, candidates: Float[Array, "num batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Mix the candidates with depth-wise softmax attention.
+
+        Args:
+            candidates (Array): Stacked residual candidates, shape ``(num, batch, seq_len, hidden_dim)``.
+
+        Returns:
+            Array: Mixed activation, shape ``(batch, seq_len, hidden_dim)``, in the candidates' dtype.
+        """
+        keys = self.norm(candidates).astype(jnp.float32)
+        query = self.weight.value.astype(jnp.float32)
+        quant_rule = spx.quantization.rule_for(self, "dot_general")
+        if quant_rule is not None:
+            query = spx.quantization.fake_quant(query, rule=quant_rule, contracting_axes=(0,), is_weight=True)
+            keys = spx.quantization.fake_quant(keys, rule=quant_rule, contracting_axes=(keys.ndim - 1,), is_weight=False)
+        logits = jnp.einsum("d,nbtd->nbt", query, keys)
+        alpha = jax.nn.softmax(logits, axis=0)
+        mixed = jnp.einsum("nbt,nbtd->btd", alpha, candidates.astype(jnp.float32))
+        return mixed.astype(candidates.dtype)
+
+
+SITU_ACTIVATION = "situ"
+
+
+def resolve_situ_params(config: KimiLinearConfig) -> tuple[float, float]:
+    """Return the ``(beta, linear_beta)`` pair every SITU consumer must use.
+
+    Single source of truth for the two SITU scales, because they are read
+    from three places that MUST agree: the dense :class:`KimiMLP` fused
+    declaration, the fallback composition, and the routed experts'
+    ``ffn_activation``. The defaulting is ``is None``, not truthiness — an
+    explicitly configured ``0.0`` is a real value, and coercing it to ``1.0``
+    in one consumer while another honors it made the dense MLP and the
+    experts compute different functions.
+
+    ``linear_beta`` uses ``0.0`` as its "no linear-branch squash" sentinel,
+    matching ejkernel's ``resolve_mlp_combine("situ", ...)`` contract.
+
+    Args:
+        config: Model configuration.
+
+    Returns:
+        ``(beta, linear_beta)`` as plain floats.
+
+    Raises:
+        ValueError: If ``activation_situ_beta`` is non-positive; the gate
+            branch divides by it, so ``0.0`` would yield NaN activations
+            rather than a usable model.
+    """
+    beta = getattr(config, "activation_situ_beta", None)
+    linear_beta = getattr(config, "activation_situ_linear_beta", None)
+    beta = 1.0 if beta is None else float(beta)
+    if beta <= 0.0:
+        raise ValueError(f"activation_situ_beta must be > 0 (the SITU gate divides by it); got {beta}.")
+    return beta, 0.0 if linear_beta is None else float(linear_beta)
+
+
+def situ_and_mul(
+    gate: jnp.ndarray,
+    up: jnp.ndarray,
+    *,
+    beta: float,
+    linear_beta: float | None,
+) -> jnp.ndarray:
+    """Apply the SITU gated activation used by Kimi K3.
+
+    ``beta * tanh(gate / beta) * sigmoid(gate)`` bounds the gate branch at
+    ``+/-beta`` while keeping the sigmoid's soft gating, and when
+    ``linear_beta`` is set the *linear* branch is squashed the same way. That
+    second transform is why SITU cannot be expressed as a unary ``ACT2FN``
+    entry composed with a plain multiply -- it touches ``up`` as well as
+    ``gate``.
+
+    Both branches are evaluated in float32 (upstream does the same) and cast
+    back, so bf16 activations do not lose the tanh/sigmoid tails.
+
+    Args:
+        gate: Gate branch of the fused projection.
+        up: Linear branch of the fused projection.
+        beta: Saturation scale for the gate branch.
+        linear_beta: Saturation scale for the linear branch; ``None`` or
+            ``0.0`` leaves ``up`` untouched. The falsy-means-disabled
+            convention matches ejkernel's ``resolve_mlp_combine("situ", ...)``
+            so the fused and fallback paths compute the same function.
+
+    Returns:
+        The activated product, in ``gate``'s dtype.
+    """
+    out_dtype = gate.dtype
+    gate_f32 = gate.astype(jnp.float32)
+    up_f32 = up.astype(jnp.float32)
+    activated = beta * jnp.tanh(gate_f32 / beta) * jax.nn.sigmoid(gate_f32)
+    if linear_beta:
+        up_f32 = linear_beta * jnp.tanh(up_f32 / linear_beta)
+    return (activated * up_f32).astype(out_dtype)
+
+
+def resolve_gated_activation(config: KimiLinearConfig) -> typing.Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+    """Return the ``(gate, up) -> output`` activation for ``config``.
+
+    SITU needs both branches, so it is returned as a fused callable; every
+    other activation keeps the usual ``act_fn(gate) * up`` shape. The result
+    is also what gets handed to :meth:`BaseMoeModule.moe_call` as
+    ``ffn_activation``.
+
+    Args:
+        config: Model configuration whose ``hidden_act`` selects the activation.
+
+    Returns:
+        A callable combining the gate and linear branches.
+    """
+    if config.hidden_act == SITU_ACTIVATION:
+        beta, linear_beta = resolve_situ_params(config)
+        return functools.partial(situ_and_mul, beta=beta, linear_beta=linear_beta)
+    act_fn = ACT2FN[config.hidden_act]
+    return lambda gate, up: act_fn(gate) * up
+
+
+class KimiMLP(spx.Module):
+    """Kimi Linear dense MLP module.
+
+    Implements the feedforward network with SwiGLU activation function
+    for enhanced representation learning. Used in both dense layers
+    and as shared experts in MoE configurations.
+    """
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        intermediate_size: int | None = None,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Kimi MLP block.
+
+        Args:
+            config (KimiLinearConfig): Model configuration with MLP parameters.
+            intermediate_size (int | None, optional): Override intermediate size.
+                Defaults to None (uses config.intermediate_size).
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        intermediate_size = intermediate_size if intermediate_size is not None else config.intermediate_size
+
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (intermediate_size, intermediate_size),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            layout=dense_gate_up_layout(intermediate_size),
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            config.hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+        )
+        self.act_fn = resolve_gated_activation(config)
+        if config.hidden_act == SITU_ACTIVATION:
+            # Same resolver `self.act_fn` and the routed experts use, so the
+            # declared combine and the composed one cannot drift apart.
+            self.fused_act_name = "situ"
+            self.fused_act_params = resolve_situ_params(config)
+
+    @property
+    def reform_param(self):
+        """Checkpoint-reform rules splitting the fused ``gate_up_proj`` kernel.
+
+        Returns:
+            dict: Per-checkpoint-key spec consumed by EasyDeL's state-dict
+            conversion to split the fused gate/up matrix back into the two
+            HuggingFace ``gate_proj`` / ``up_proj`` parameters (or to fuse
+            them on load), driven by :meth:`ParallelLinear.build_reform_param`.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
+
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
+        """Apply SwiGLU feedforward transformation.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+
+        Returns:
+            Array: Transformed hidden states of shape (batch, seq_len, hidden_dim).
+        """
+        if getattr(self, "fused_act_name", None) is not None:
+            # SITU declared: the same combine runs on fused and fallback paths.
+            return gated_mlp_forward(self, hidden_states)
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act_fn(gate_raw, up), "mlp_gate")
+        hidden_states = checkpoint_name(self.down_proj(gate), "mlp_down")
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        return checkpoint_name(hidden_states, "mlp_output")
+
+
+class KimiMoEGate(spx.Module):
+    """Kimi Linear MoE routing gate with sigmoid activation.
+
+    Implements the routing mechanism for Mixture of Experts with:
+    - Sigmoid-based expert scoring with e_score_correction_bias (like DeepSeek V3)
+    - Grouped top-k expert selection for load balancing
+    - Optional probability renormalization
+
+    Attributes:
+        top_k: Number of experts to route each token to.
+        n_routed_experts: Total number of routed experts.
+        routed_scaling_factor: Scaling factor for routed expert outputs.
+        n_group: Number of expert groups for grouped routing.
+        topk_group: Number of groups to select in top-k routing.
+    """
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Kimi MoE routing gate.
+
+        Args:
+            config (KimiLinearConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+
+        assert config.num_experts_per_token is not None, "num_experts_per_token must not be None"
+        assert config.num_experts is not None, "num_experts must not be None"
+        assert config.num_expert_group is not None, "num_expert_group must not be None"
+        self.top_k = config.num_experts_per_token
+        self.n_routed_experts = config.num_experts
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.n_group = config.num_expert_group
+        self.topk_group = config.topk_group
+        self.norm_topk_prob = config.moe_renormalize
+        self.gating_dim = config.hidden_size
+
+        self.weight = ArrayParam.bound(
+            shape=(self.gating_dim, self.n_routed_experts),
+            dtype=param_dtype,
+            init_method="kaiming_uniform",
+            key=rngs.parameters,
+            init_kwargs={},
+        )
+
+        self.e_score_correction_bias = ArrayParam.bound(
+            shape=(self.n_routed_experts,),
+            dtype=jnp.float32,
+            init_method="constant",
+            init_kwargs={"value": 0.0},
+            key=rngs.parameters,
+        )
+
+    def forward(self, hidden_states: Float[Array, "tokens hidden_dim"]) -> Array:
+        """Compute raw fp32 router logits ``(tokens, num_experts)``.
+
+        Selection runs in :meth:`KimiSparseMoeBlock._select_hook`: DeepSeek-V3
+        grouped top-k over ``sigmoid(logits) + e_score_correction_bias``, with
+        the combine weights taken from the un-biased scores, renormalized when
+        ``moe_renormalize`` and scaled by ``routed_scaling_factor``. Returning
+        the full per-expert logits (rather than collapsed top-k values) lets
+        the dispatcher see which experts were picked.
+
+        Args:
+            hidden_states: Per-token features ``(num_tokens, hidden_size)``.
+
+        Returns:
+            jax.Array: Router logits ``(num_tokens, num_experts)`` in float32.
+        """
+        return jnp.dot(
+            hidden_states.astype(jnp.float32),
+            self.weight.value.astype(jnp.float32),
+            precision=self.precision,
+        )
+
+
+class KimiMLPMoE(spx.Module):
+    """Kimi Linear MoE MLP using parallel expert linear layers.
+
+    Implements a collection of expert MLPs that can be efficiently
+    computed in parallel using grouped matrix operations.
+    Each expert follows the same SwiGLU architecture as KimiMLP.
+    """
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        hidden_size: int | None = None,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Kimi MoE MLP experts.
+
+        Args:
+            config (KimiLinearConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            hidden_size (int | None, optional): Width the experts consume and return.
+                Defaults to ``config.hidden_size``; LatentMoE passes the narrower
+                ``routed_expert_hidden_size`` so routed experts run in the latent space.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.hidden_size = config.hidden_size if hidden_size is None else int(hidden_size)
+
+        intermediate_size = config.moe_intermediate_size
+        if intermediate_size is None:
+            intermediate_size = config.intermediate_size
+        self.gate_up_proj = ColumnParallelMoELinear(
+            num_experts=config.num_experts,
+            in_features=self.hidden_size,
+            out_features=2 * intermediate_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            rngs=rngs,
+        )
+        self.down_proj = RowParallelMoELinear(
+            num_experts=config.num_experts,
+            in_features=intermediate_size,
+            out_features=self.hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            rngs=rngs,
+        )
+        self.act_fn = resolve_gated_activation(config)
+
+    @property
+    def reform_param(self):
+        return {
+            **moe_fused_gate_up_reform_param(config=self.config),
+            **moe_down_projection_reform_param(),
+        }
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
+        """Apply MoE expert computation.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+            group_sizes (Array): Number of tokens assigned to each expert.
+            sorted_experts (Array | None, optional): Sorted expert indices for each token.
+                Defaults to None.
+
+        Returns:
+            Array: Expert outputs of shape (batch, seq_len, hidden_dim).
+        """
+        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        return self.down_proj(self.act_fn(gate, up), group_sizes, sorted_experts)
+
+
+class KimiSparseMoeBlock(BaseMoeModule):
+    """Sparse-MoE feed-forward block used by Kimi-Linear.
+
+    Replaces the dense :class:`KimiMLP` on layers ``>= first_k_dense_replace``
+    (and gated by ``moe_layer_freq``). Each token is routed by
+    :class:`KimiMoEGate` to ``num_experts_per_token`` experts among
+    ``num_experts`` routed experts, executed via a single batched
+    ``ColumnParallelMoELinear`` / ``RowParallelMoELinear`` pair (no
+    explicit Python loop over experts, so EP / TP layouts stay efficient).
+    A small block of ``num_shared_experts`` experts is also evaluated on
+    every token and added on top — the shared experts capture
+    "always-useful" features while the routed experts specialize. Routing
+    weights are produced *outside* the softmax (sigmoid-with-bias) and
+    multiplied directly with expert outputs.
+
+    Attributes:
+        config (KimiLinearConfig): Model configuration.
+        gate (KimiMoEGate): Sigmoid grouped top-k router.
+        experts (KimiMLPMoE): Batched SwiGLU experts running ``num_experts``
+            in parallel via grouped GEMM.
+        shared_experts (KimiMLP | None): Always-on dense expert path; ``None``
+            when ``num_shared_experts == 0``.
+    """
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Kimi Sparse MoE block.
+
+        Args:
+            config (KimiLinearConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        # Upstream KimiLinearConfig defaults both to None (MoE disabled); fail
+        # here with a clear message instead of an AttributeError deeper in the
+        # shared MoE module (mirrors the KimiMoEGate asserts).
+        assert config.num_experts is not None, "num_experts must not be None"
+        assert config.num_experts_per_token is not None, "num_experts_per_token must not be None"
+        # LatentMoE (Kimi K3): routed experts run in their own, narrower latent
+        # space. Tokens are projected down before dispatch and back up after
+        # combine, so expert parameters scale with `routed_expert_hidden_size`
+        # rather than `hidden_size`. Resolved before `super().__init__` because
+        # the MoE engine dispatches at the expert width. The router still scores
+        # the FULL-width hidden state (see `gate_hidden_state` in `forward`),
+        # and the shared experts stay on the full width too.
+        use_latent_moe = getattr(config, "routed_expert_hidden_size", None) is not None
+        moe_hidden_size = config.routed_expert_hidden_size if use_latent_moe else config.hidden_size
+        super().__init__(
+            config=config,
+            n_routed_experts=config.num_experts,
+            num_experts_per_tok=config.num_experts_per_token,
+            hidden_size=moe_hidden_size,
+            lbl_coef=None,
+            rzl_coef=None,
+            routing_strategy=MoeRoutingStrategy.TOP_K,
+            load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
+        )
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+
+        self.gate = KimiMoEGate(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        # The gate emits raw logits; `_select_hook` scores and selects.
+        self.moe_hooks = self.moe_hooks.replace(normalize_gate_logits=lambda x: x)
+        self.use_latent_moe = use_latent_moe
+        self.moe_hidden_size = moe_hidden_size
+
+        self.experts = KimiMLPMoE(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            hidden_size=self.moe_hidden_size,
+            rngs=rngs,
+        )
+
+        if self.use_latent_moe:
+            self.routed_expert_down_proj = ColumnParallelLinear(
+                config.hidden_size,
+                self.moe_hidden_size,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                rngs=rngs,
+            )
+            self.routed_expert_up_proj = RowParallelLinear(
+                self.moe_hidden_size,
+                config.hidden_size,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                rngs=rngs,
+            )
+            self.routed_expert_norm = (
+                _kimi_rms_norm(self.moe_hidden_size, config, dtype, param_dtype, rngs)
+                if getattr(config, "latent_moe_use_norm", False)
+                else None
+            )
+
+        if config.num_shared_experts is not None and config.num_shared_experts > 0:
+            assert config.moe_intermediate_size is not None
+            shared_intermediate_size = config.moe_intermediate_size * config.num_shared_experts
+            self.shared_experts = KimiMLP(
+                config=config,
+                intermediate_size=shared_intermediate_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
+
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
+        """Apply Sparse MoE feedforward transformation.
+
+        Routes tokens to top-k experts based on router scores, combines
+        expert outputs with routing weights, and optionally adds shared
+        expert contributions.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+
+        Returns:
+            tuple[Array, Array]: Tuple of (output tensor, router logits).
+                Output has shape (batch, seq_len, hidden_dim).
+        """
+        expert_input = self.routed_expert_down_proj(hidden_states) if self.use_latent_moe else hidden_states
+        n_group = self.gate.n_group if getattr(self.config, "use_grouped_topk", True) else 1
+        # Bound per call so a trained correction bias reaches routing.
+        select_hook = partial(
+            moe_group_topk_select,
+            n_routed_experts=self.gate.n_routed_experts,
+            score_fn=self.config.moe_router_activation_func,
+            e_score_correction_bias=self.gate.e_score_correction_bias.value,
+            n_group=n_group,
+            topk_group=self.gate.topk_group if n_group > 1 else 1,
+            group_topk_k=min(2, self.gate.n_routed_experts // max(n_group, 1)),
+            group_score="topk_sum",
+            # HF renormalizes only when more than one expert is kept.
+            norm_topk_prob=bool(self.gate.norm_topk_prob) and self.gate.top_k > 1,
+            routed_scaling_factor=self.gate.routed_scaling_factor,
+        )
+        out, router_logits = self.moe_call(
+            hidden_state=expert_input,
+            # Routing is scored on the full-width hidden state even when the
+            # experts consume the latent projection, matching upstream.
+            gate_hidden_state=hidden_states if self.use_latent_moe else None,
+            gate_layer=self.gate,
+            expert_layer=self.experts,
+            gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
+            wd_kernel=self.experts.down_proj.kernel_view(),
+            # SITU transforms both branches, so the engine gets the fused
+            # (gate, up) callable rather than a unary activation.
+            ffn_activation=self.experts.act_fn,
+            act_fn=jax.nn.silu,
+            hooks=self.moe_hooks.replace(select_hook=select_hook),
+        )
+
+        if self.use_latent_moe:
+            if self.routed_expert_norm is not None:
+                out = self.routed_expert_norm(out)
+            out = self.routed_expert_up_proj(out)
+
+        if self.config.num_shared_experts is not None and self.config.num_shared_experts > 0:
+            shared_out = self.shared_experts(hidden_states)
+            out = out + shared_out
+
+        return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
+
+
+class KimiMLAAttention(UnifiedAttention):
+    """Kimi-Linear's Multi-Latent Attention block (DeepSeek-V3 MLA layout).
+
+    The "linear" in Kimi-Linear refers to the KDA layers; MLA is used in the
+    *full-attention* layers (those listed in
+    ``config.linear_attn_config["full_attn_layers"]``). MLA reduces KV-cache
+    pressure by storing a single low-rank latent ``c_kv`` of dimension
+    ``kv_lora_rank`` per token instead of full-rank ``num_heads * head_dim``
+    K and V tensors. Per head, K/V are reconstructed on-the-fly from the
+    latent via a fixed projection ``kv_b_proj`` whose two halves give the
+    "nope" (no-RoPE) Q/K dot product and the V tensor. A small per-token
+    ``qk_rope_head_dim``-wide RoPE-carrying tensor is concatenated to the
+    queries and to the *shared* KV latent, separating the rotary subspace
+    from the latent-compressed subspace. Optional LoRA on Q
+    (``q_a_proj -> q_a_layernorm -> q_b_proj``) further compresses query
+    activations during training.
+
+    Per-head dimensions:
+        * Total query/key head dim ``= qk_nope_head_dim + qk_rope_head_dim``.
+        * ``v_head_dim`` is the per-head value dimension.
+
+    Attributes:
+        q_head_dim (int): ``qk_nope_head_dim + qk_rope_head_dim``.
+        qk_nope_head_dim (int): Per-head Q/K dim that does NOT receive RoPE.
+        qk_rope_head_dim (int): Per-head Q/K dim that DOES receive RoPE.
+        v_head_dim (int): Per-head value dim.
+        kv_lora_rank (int): Latent rank stored in the KV cache (replaces the
+            full-rank K and V tensors).
+        head_dim (int): Aliased to ``v_head_dim`` so :class:`UnifiedAttention`
+            shape checks line up with the value path.
+        projection_mapping (ClassVar[dict]): Internal MLA-attribute name to
+            HuggingFace checkpoint name mapping consumed by
+            :meth:`define_network`.
+    """
+
+    projection_mapping: ClassVar[dict[str, str]] = {
+        "mla_q_proj": "q_proj",
+        "mla_q_a_proj": "q_a_proj",
+        "mla_q_a_layernorm": "q_a_layernorm",
+        "mla_q_b_proj": "q_b_proj",
+        "mla_kv_a_proj_with_mqa": "kv_a_proj_with_mqa",
+        "mla_kv_a_layernorm": "kv_a_layernorm",
+        "mla_kv_b_proj": "kv_b_proj",
+        "output_projection": "o_proj",
+    }
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Kimi MLA attention layer.
+
+        Args:
+            config (KimiLinearConfig): Model configuration with MLA parameters.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        self.config = config
+        self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.v_head_dim = config.v_head_dim
+        self.kv_lora_rank = config.kv_lora_rank
+
+        use_mla_lora = config.q_lora_rank is not None and config.q_lora_rank > 0
+
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            attention_type="mla",
+            causal=True,
+            sliding_window=None,
+            use_qk_norm=False,
+            use_mla_lora=use_mla_lora,
+        )
+
+        self.head_dim = self.v_head_dim
+
+    def define_network(
+        self,
+        config: KimiLinearConfig,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.PrecisionLike,
+        rngs: spx.Rngs,
+    ):
+        """Define MLA-specific network structure.
+
+        Creates the query, key-value projections with latent compression,
+        layer norms, and output projection. Uses LoRA-style compression
+        for KV and optionally for queries.
+
+        Args:
+            config (KimiLinearConfig): Model configuration.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.PrecisionLike): Numerical precision.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        self._build_mla_projections(config, dtype, param_dtype, precision, rngs)
+        # Keep the shared projections and checkpoint leaves, but use Kimi's fp32 multiply-then-cast norm order.
+        # Configure the existing norms rather than allocating replacements and advancing the initialization RNG.
+        if self.use_mla_lora:
+            getattr(self, self.projection_mapping["mla_q_a_layernorm"]).fp32_scale = True
+        getattr(self, self.projection_mapping["mla_kv_a_layernorm"]).fp32_scale = True
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
+    ) -> AttentionLayerOutput:
+        """Forward pass using MLA attention mechanism.
+
+        Applies Multi-Latent Attention with LoRA-style KV compression and
+        rotary position embeddings for efficient long-context processing.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch, seq_len).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional):
+                Cache view for KV caching. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies.
+                Defaults to None.
+            alibi (Array | None, optional): ALiBi position bias (not used in MLA).
+                Defaults to None.
+
+        Returns:
+            AttentionLayerOutput: Contains attention output, optional weights, and cache view.
+        """
+        return self.forward_mla(
+            hidden_states=hidden_states,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            mode=mode,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
+            output_attentions=output_attentions,
+            frequencies=frequencies,
+            alibi=alibi,
+        )
+
+
+class KimiDeltaAttention(spx.Module):
+    """Kernel Delta Attention (KDA) — Kimi-Linear's per-layer linear-attention block.
+
+    KDA replaces softmax attention with a recurrent *kernel-feature* state that
+    is updated by the **delta rule** at every token, giving O(seq_len) compute
+    and O(1) decode. Conceptually each head maintains a key/value memory matrix
+    :math:`S \\in \\mathbb{R}^{d_k \\times d_v}` that evolves as
+
+    .. math::
+        S_t = \\alpha_t \\, S_{t-1} \\, (I - \\beta_t k_t k_t^\\top)
+              + \\beta_t \\, k_t v_t^\\top, \\qquad
+        o_t = S_t^\\top q_t
+
+    where :math:`\\alpha_t = \\exp(-e^{A} \\, \\text{softplus}(\\Delta_t))` is a
+    per-channel (one rate per head and key channel) data-dependent decay, :math:`\\beta_t =
+    \\sigma(W_b x_t)` is the per-token *write strength* (the "delta" of the
+    delta rule — large :math:`\\beta` overwrites the existing memory at
+    direction :math:`k_t`, small :math:`\\beta` blends), and :math:`\\Delta_t`
+    is the low-rank ``f_a_proj -> f_b_proj`` output plus ``dt_bias``. Q/K/V are first
+    passed through *separate* causal depthwise 1-D convolutions of width
+    ``d_conv`` so each head still sees a small local window, and the output
+    is fed through a low-rank gate (``g_a_proj -> g_b_proj``) and a gated
+    RMSNorm before the final output projection. The recurrence is realized
+    on hardware by chunking the sequence into ``chunk_size`` blocks and
+    running the kernel :class:`KernelDeltaAttnOp`, which folds the
+    intra-chunk parallel matmul with the inter-chunk recurrent carry.
+
+    State carried across decode steps inside :class:`KDACacheView`:
+        * The three rolling conv windows for Q/K/V (length ``d_conv``).
+        * The recurrent memory ``S`` of shape ``(num_heads, head_k_dim, head_v_dim)``.
+
+    Attributes:
+        q_proj, k_proj, v_proj: Linear projections to Q/K/V before the convs.
+        q_conv1d, k_conv1d, v_conv1d: Per-stream causal depthwise 1-D
+            convolutions (``feature_group_count == channels``) of width ``d_conv``.
+        f_a_proj, f_b_proj: Low-rank projection producing the per-channel
+            decay input :math:`\\Delta` (``num_heads * head_k_dim`` outputs).
+        b_proj: Per-head linear producing the delta-rule write strength
+            :math:`\\beta` (sigmoid-activated).
+        g_a_proj, g_b_proj: Low-rank MLP producing the output gate.
+        o_norm (RMSNormGated): Sigmoid-gated RMS normalization on the head outputs.
+        o_proj: Final output projection back to ``hidden_size``.
+        A_log (ArrayParam): Per-head log decay rate; the decay is
+            ``-exp(A_log) * softplus(f_b(f_a(x)) + dt_bias)``, non-positive.
+        dt_bias (ArrayParam): Per-channel bias on :math:`\\Delta` after the
+            low-rank projection.
+        kda_op (KernelDeltaAttnOp): Fused chunked kernel that runs the
+            recurrence.
+        num_heads, head_k_dim, head_v_dim, d_conv, chunk_size,
+        gate_low_rank_dim, key_dim, value_dim: Mirror their config fields.
+    """
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Kimi KDA (Kernel Delta Attention) layer.
+
+        Args:
+            config (KimiLinearConfig): Model configuration with KDA parameters.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.layer_idx = layer_idx
+
+        linear_config = config.linear_attn_config or {}
+        self.num_heads = linear_config.get("num_heads", config.num_attention_heads)
+        # Moonshot's config names one ``head_dim`` (and ``short_conv_kernel_size``);
+        # the fla-style ``head_k_dim``/``head_v_dim``/``d_conv`` keys override it.
+        head_dim = linear_config.get("head_dim", 128)
+        self.head_k_dim = linear_config.get("head_k_dim", head_dim)
+        self.head_v_dim = linear_config.get("head_v_dim", head_dim)
+        self.d_conv = linear_config.get("d_conv", linear_config.get("short_conv_kernel_size", 4))
+        self.gate_low_rank_dim = linear_config.get("gate_low_rank_dim", head_dim)
+        self.chunk_size = linear_config.get("chunk_size", 64)
+
+        self.key_dim = self.num_heads * self.head_k_dim
+        self.value_dim = self.num_heads * self.head_v_dim
+
+        column_linear = partial(
+            ColumnParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+        )
+
+        self.q_proj = column_linear(config.hidden_size, self.key_dim)
+        self.k_proj = column_linear(config.hidden_size, self.key_dim)
+        self.v_proj = column_linear(config.hidden_size, self.value_dim)
+
+        self.q_conv1d = nn.Conv1d(
+            in_channels=self.key_dim,
+            out_channels=self.key_dim,
+            kernel_size=self.d_conv,
+            groups=self.key_dim,
+            padding=((self.d_conv - 1, 0),),
+            dtype=dtype,
+            rngs=rngs,
+            use_bias=False,
+            precision=precision,
+        )
+        self.k_conv1d = nn.Conv1d(
+            in_channels=self.key_dim,
+            out_channels=self.key_dim,
+            kernel_size=self.d_conv,
+            groups=self.key_dim,
+            padding=((self.d_conv - 1, 0),),
+            dtype=dtype,
+            rngs=rngs,
+            use_bias=False,
+            precision=precision,
+        )
+        self.v_conv1d = nn.Conv1d(
+            in_channels=self.value_dim,
+            out_channels=self.value_dim,
+            kernel_size=self.d_conv,
+            groups=self.value_dim,
+            padding=((self.d_conv - 1, 0),),
+            dtype=dtype,
+            rngs=rngs,
+            use_bias=False,
+            precision=precision,
+        )
+
+        self.f_a_proj = column_linear(config.hidden_size, self.gate_low_rank_dim)
+        # Per-channel decay: one rate per (head, key channel).
+        self.f_b_proj = column_linear(self.gate_low_rank_dim, self.key_dim)
+
+        self.b_proj = column_linear(config.hidden_size, self.num_heads)
+
+        self.g_a_proj = column_linear(config.hidden_size, self.gate_low_rank_dim)
+        self.g_b_proj = column_linear(self.gate_low_rank_dim, self.value_dim)
+
+        self.o_proj = RowParallelLinear(
+            self.value_dim,
+            config.hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+        )
+
+        self.o_norm = RMSNormGated(
+            self.head_v_dim,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            activation="sigmoid",
+            rngs=rngs,
+        )
+
+        self.A_log = ArrayParam.bound(
+            shape=(self.num_heads,),
+            dtype=param_dtype,
+            init_method="constant",
+            init_kwargs={"value": 0.0},
+            key=rngs.parameters,
+        )
+        self.dt_bias = ArrayParam.bound(
+            shape=(self.key_dim,),
+            dtype=param_dtype,
+            init_method="constant",
+            init_kwargs={"value": 1.0},
+            key=rngs.parameters,
+        )
+
+        metadata = OperationMetadata(
+            runtime_dtype=self.dtype,
+            runtime_softmax_dtype=jnp.float32,
+            base_config=self.config,
+        )
+        self.kda_op = KernelDeltaAttnOp(metadata)
+
+    @property
+    def reform_param(self):
+        return {
+            # Checkpoints store ``A_log`` as ``[1, 1, num_heads, 1]``.
+            "A_log$": {
+                "splits": [{"name": "A_log", "spliter": lambda x: x.reshape(-1)}],
+                "inverse_spliter": lambda torch, a_log: a_log.reshape(1, 1, -1, 1),
+            },
+            "q_conv1d.weight$": {
+                "splits": [{"name": "q_conv1d.weight", "spliter": lambda x: x.permute(2, 1, 0)}],
+                "inverse_spliter": lambda torch, kernel: kernel.permute(2, 1, 0),
+            },
+            "k_conv1d.weight$": {
+                "splits": [{"name": "k_conv1d.weight", "spliter": lambda x: x.permute(2, 1, 0)}],
+                "inverse_spliter": lambda torch, kernel: kernel.permute(2, 1, 0),
+            },
+            "v_conv1d.weight$": {
+                "splits": [{"name": "v_conv1d.weight", "spliter": lambda x: x.permute(2, 1, 0)}],
+                "inverse_spliter": lambda torch, kernel: kernel.permute(2, 1, 0),
+            },
+        }
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None = None,
+        cache_view: KDACacheView | None = None,
+        cache_metadata: KDAMetadata | None = None,
+    ) -> AttentionLayerOutput:
+        """Run the chunked delta-rule recurrence over a block of tokens.
+
+        Streaming behavior: when ``cache_view`` carries non-``None`` rolling
+        conv windows and a previous memory ``S``, the kernel splices the new
+        token onto the conv buffers, advances ``S`` by one delta-rule step
+        per chunk, and writes the trailing ``d_conv`` columns plus the
+        updated ``S`` back into the cache. During training / prefill the
+        conv applies left-pad ``d_conv - 1`` and the kernel uses a parallel
+        intra-chunk matmul with a recurrent carry between chunks of size
+        ``chunk_size``.
+
+        Padding tokens are zeroed out of the input *before* projection (via
+        :func:`apply_mask_to_padding_states`) so they contribute neither to
+        the conv windows nor to the recurrent memory.
+
+        Args:
+            hidden_states: ``(batch, seq_len, hidden_size)`` block input.
+            mask_info: Optional :class:`MaskInfo`. KDA only consumes
+                ``q_attention_mask`` to zero out padding; there is no
+                pairwise causal mask because the recurrence is causal by
+                construction.
+            cache_view: Per-layer KDA cache (rolling Q/K/V conv windows and
+                recurrent memory ``S``). ``None`` skips state threading.
+            cache_metadata: Optional :class:`KDAMetadata` for paged cache
+                layouts; not used by the dense layout.
+
+        Returns:
+            AttentionLayerOutput: ``attention_output`` of shape
+            ``(batch, seq_len, hidden_size)``, the updated KDA cache view,
+            and ``attention_weight = None`` (KDA produces no attention
+            matrix).
+        """
+        if mask_info is not None:
+            q_mask: Array | None = typing.cast("Array | None", mask_info.q_attention_mask)
+            if q_mask is not None and q_mask.shape[1] != hidden_states.shape[1]:
+                q_mask = q_mask[:, : hidden_states.shape[1]]
+            hidden_states = apply_mask_to_padding_states(hidden_states, q_mask)
+        segment_ids = packed_segment_ids_from_mask_info(mask_info, hidden_states.shape[1])
+
+        batch_size, seq_len, _ = hidden_states.shape
+        is_inference = seq_len == 1 and cache_view is not None
+
+        query = self.q_proj(hidden_states)
+        key = self.k_proj(hidden_states)
+        value = self.v_proj(hidden_states)
+
+        # eSurge packed-row serving: one flattened token stream [1, T, D] whose
+        # per-request segments are ``cache_metadata.query_start_loc``, with per-request
+        # conv windows / recurrent memory in per-row cache slots. Without this branch the
+        # whole stream would be treated as a single sequence against a per-row cache.
+        qsl = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
+        if cache_view is not None and qsl is not None:
+            if batch_size != 1:
+                raise ValueError(
+                    f"Packed-row KDA serving expects one flattened token stream [1, T, D], got batch_size={batch_size}."
+                )
+            gate = self.f_b_proj(self.f_a_proj(hidden_states))
+            out_packed, new_cache_view = kda_packed_rows_forward(
+                query=query,
+                key=key,
+                value=value,
+                beta=jax.nn.sigmoid(self.b_proj(hidden_states)),
+                decay=fused_kda_gate_per_channel(gate, self.A_log.value, self.dt_bias.value, lower_bound=None),
+                conv_kernels=tuple(getattr(self, f"{n}_conv1d").weight.value.squeeze(1).T for n in ("q", "k", "v")),
+                cache_view=cache_view,
+                query_start_loc=qsl,
+                context_lens=getattr(cache_metadata, "context_lens", None),
+                conv_dtype=jnp.bfloat16 if self.dtype in lowfloats else self.dtype,
+                chunk_size=self.chunk_size,
+                spec_recurrent_commit=getattr(cache_metadata, "spec_recurrent_commit", None),
+            )
+            output_gate = self.g_b_proj(self.g_a_proj(hidden_states))
+            output_gate = output_gate.reshape(batch_size, seq_len, self.num_heads, self.head_v_dim)
+            output = self.o_norm(out_packed.astype(hidden_states.dtype), output_gate)
+            output = output.reshape(batch_size, seq_len, -1)
+            output = self.o_proj(output)
+            return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)
+
+        q_conv_state = cache_view.q_conv_state if cache_view is not None else None
+        k_conv_state = cache_view.k_conv_state if cache_view is not None else None
+        v_conv_state = cache_view.v_conv_state if cache_view is not None else None
+
+        conv_output_dtype = jnp.bfloat16 if self.dtype in lowfloats else self.dtype
+        query, new_q_conv_state = apply_conv_with_state(
+            query,
+            self.q_conv1d,
+            q_conv_state,
+            is_inference=is_inference,
+            d_conv=self.d_conv,
+            output_dtype=conv_output_dtype,
+            reuse_partial_state=True,
+            segment_ids=segment_ids,
+        )
+        key, new_k_conv_state = apply_conv_with_state(
+            key,
+            self.k_conv1d,
+            k_conv_state,
+            is_inference=is_inference,
+            d_conv=self.d_conv,
+            output_dtype=conv_output_dtype,
+            reuse_partial_state=True,
+            segment_ids=segment_ids,
+        )
+        value, new_v_conv_state = apply_conv_with_state(
+            value,
+            self.v_conv1d,
+            v_conv_state,
+            is_inference=is_inference,
+            d_conv=self.d_conv,
+            output_dtype=conv_output_dtype,
+            reuse_partial_state=True,
+            segment_ids=segment_ids,
+        )
+
+        query = query.reshape(batch_size, seq_len, self.num_heads, self.head_k_dim)
+        key = key.reshape(batch_size, seq_len, self.num_heads, self.head_k_dim)
+        value = value.reshape(batch_size, seq_len, self.num_heads, self.head_v_dim)
+        query = apply_logical_sharding(
+            query,
+            dynamic_axes=common_types.AttnQSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        key = apply_logical_sharding(
+            key,
+            dynamic_axes=common_types.AttnKVSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        value = apply_logical_sharding(
+            value,
+            dynamic_axes=common_types.AttnKVSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        gate = self.f_b_proj(self.f_a_proj(hidden_states))
+        decay = fused_kda_gate_per_channel(gate, self.A_log.value, self.dt_bias.value, lower_bound=None)
+
+        beta = jax.nn.sigmoid(self.b_proj(hidden_states))
+
+        output_gate = self.g_b_proj(self.g_a_proj(hidden_states))
+        output_gate = output_gate.reshape(batch_size, seq_len, self.num_heads, self.head_v_dim)
+
+        recurrent_state = cache_view.recurrent_state if cache_view is not None else None
+
+        kda_output: KDAOutput = self.kda_op(
+            query=query,
+            key=key,
+            value=value,
+            beta=beta,
+            decay=decay,
+            q_conv_state=new_q_conv_state,
+            k_conv_state=new_k_conv_state,
+            v_conv_state=new_v_conv_state,
+            recurrent_state=recurrent_state,
+            segment_ids=segment_ids,
+            chunk_size=self.chunk_size,
+            per_channel_decay=True,
+            # A dense cache carries memory from previous chunks. Keep the first
+            # live segment connected while preserving packed-training resets.
+            continue_initial_state=cache_view is not None,
+        )
+
+        output = kda_output.attention_outputs
+
+        # o_norm operates on last dim — skip flatten/unflatten.
+        output = self.o_norm(output, output_gate)
+        output = output.reshape(batch_size, seq_len, -1)
+        output = apply_logical_sharding(
+            output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        output = self.o_proj(output)
+        output = apply_logical_sharding(
+            output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        new_cache_view = cache_view
+        if cache_view is not None:
+            new_cache_view = cache_view.update_kda_states(
+                new_q_conv_state=kda_output.q_conv_state,
+                new_k_conv_state=kda_output.k_conv_state,
+                new_v_conv_state=kda_output.v_conv_state,
+                new_recurrent_state=kda_output.recurrent_state,
+            )
+
+        return AttentionLayerOutput(
+            attention_output=output,
+            attention_weight=None,
+            cache_view=new_cache_view,
+        )
+
+
+class KimiDecoderLayer(spx.Module):
+    """Kimi Linear transformer decoder layer.
+
+    Combines attention (MLA or KDA) with feedforward (MLP or MoE) based on
+    layer configuration. Uses pre-normalization architecture with RMSNorm
+    and residual connections.
+
+    The hybrid attention pattern alternates between:
+        - MLA (Multi-Latent Attention): Full attention with latent KV compression
+        - KDA (Kernel Delta Attention): Linear attention with O(N) complexity
+
+    The feedforward pattern supports:
+        - Dense MLP: Standard SwiGLU feedforward network
+        - Sparse MoE: Mixture of Experts with shared experts
+
+    Attributes:
+        config: Model configuration.
+        layer_idx: Index of this layer in the model.
+        is_kda_layer: Whether this layer uses KDA linear attention.
+        is_moe_layer: Whether this layer uses MoE feedforward.
+    """
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Kimi decoder layer.
+
+        Args:
+            config (KimiLinearConfig): Model configuration.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.layer_idx = layer_idx
+
+        self.is_kda_layer = config.is_kda_layer(layer_idx)
+        self.is_moe_layer = config.is_moe_layer(layer_idx)
+
+        if self.is_kda_layer:
+            self.self_attn = KimiDeltaAttention(
+                config=config,
+                layer_idx=layer_idx,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
+        elif config.is_mla:
+            self.self_attn = KimiMLAAttention(
+                config=config,
+                layer_idx=layer_idx,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
+        else:
+            raise NotImplementedError
+
+        if self.is_moe_layer:
+            self.mlp = KimiSparseMoeBlock(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
+        else:
+            self.mlp = KimiMLP(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
+
+        self.input_layernorm = _kimi_rms_norm(config.hidden_size, config, dtype, param_dtype, rngs)
+        self.post_attention_layernorm = _kimi_rms_norm(config.hidden_size, config, dtype, param_dtype, rngs)
+
+        # Attention Residuals: one depth-wise mixer per sublayer input (attention, then feed-forward).
+        if config.attn_res_block_size is not None:
+            self.attn_res = KimiAttentionResidual(config, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+            self.mlp_res = KimiAttentionResidual(config, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        else:
+            self.attn_res = None
+            self.mlp_res = None
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | KDACacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesCacheView | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        output_router_logits: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        block_residuals: tuple[Array, ...] | None = None,
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + ffn(norm(x)).
+        Uses either MLA or KDA attention based on layer configuration, and either
+        dense MLP or sparse MoE for the feedforward network.
+
+        With Attention Residuals (``config.attn_res_block_size`` set and ``block_residuals`` given) the layer is
+        pre-normalization over a depth-wise softmax mix instead of the plain stream: each sublayer reads
+        ``softmax-mix(block_residuals + [partial_block])`` and its output is added to ``partial_block``.
+
+        Args:
+            hidden_states (Array | None): Input tensor of shape (batch, seq_len, hidden_dim). With attention
+                residuals this is the current partial block, or ``None`` right after a block boundary.
+            block_residuals (tuple[Array, ...] | None, optional): Completed block residuals, each of shape
+                (batch, seq_len, hidden_dim). ``None`` selects the plain residual stream. Defaults to None.
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch, seq_len).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | KDACacheView | None, optional):
+                Cache view for attention caching. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesCacheView | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to False.
+            output_router_logits (bool, optional): Whether to return MoE router logits.
+                Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies.
+                Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, router logits,
+                and updated cache view.
+        """
+        use_attn_res = block_residuals is not None and self.attn_res is not None
+        partial_block = hidden_states
+        if use_attn_res:
+            normed_hidden = self.input_layernorm(self._mix_residuals(self.attn_res, block_residuals, partial_block))
+        else:
+            normed_hidden = self.input_layernorm(hidden_states)
+
+        if self.is_kda_layer:
+            attn_outputs = self.self_attn(
+                normed_hidden,
+                mask_info,
+                cache_view,
+                cache_metadata,
+            )
+        else:
+            attn_outputs = self.self_attn.forward(
+                normed_hidden,
+                mask_info,
+                position_ids,
+                mode,
+                cache_view,
+                cache_metadata,
+                output_attentions,
+                frequencies,
+            )
+
+        attn_output = attn_outputs.attention_output
+        attn_weight = attn_outputs.attention_weight
+        cache_view = attn_outputs.cache_view
+
+        if use_attn_res:
+            partial_block = attn_output if partial_block is None else partial_block + attn_output
+            partial_block = checkpoint_name(partial_block, "residual")
+            feed_forward_input = self.post_attention_layernorm(
+                self._mix_residuals(self.mlp_res, block_residuals, partial_block)
+            )
+        else:
+            hidden_states = checkpoint_name(hidden_states + attn_output, "residual")
+            feed_forward_input = self.post_attention_layernorm(hidden_states)
+
+        router_logits = None
+        if self.is_moe_layer:
+            feed_forward_output, router_logits = self.mlp(feed_forward_input)
+        elif self.config.use_scan_mlp:
+            feed_forward_output = blockwise_ffn(
+                self.mlp,
+                feed_forward_input,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            feed_forward_output = self.mlp(feed_forward_input)
+
+        if use_attn_res:
+            hidden_states = checkpoint_name(partial_block + feed_forward_output, "residual")
+        else:
+            hidden_states = checkpoint_name(hidden_states + feed_forward_output, "residual")
+
+        return DecoderLayerOutput(
+            hidden_states=checkpoint_name(hidden_states, "layer_output"),
+            attention_weight=attn_weight if output_attentions else None,
+            router_logits=router_logits if output_router_logits else None,
+            cache_view=cache_view,
+        )
+
+    @staticmethod
+    def _mix_residuals(
+        mixer: "KimiAttentionResidual",
+        block_residuals: tuple[Array, ...],
+        partial_block: Array | None,
+    ) -> Array:
+        """Softmax-mix the stored block residuals with the current partial block.
+
+        Args:
+            mixer: The sublayer's :class:`KimiAttentionResidual`.
+            block_residuals: Completed block residuals.
+            partial_block: Current partial block, or ``None`` directly after a block boundary.
+
+        Returns:
+            Mixed activation of shape (batch, seq_len, hidden_dim).
+        """
+        candidates = block_residuals if partial_block is None else (*block_residuals, partial_block)
+        return mixer(jnp.stack(candidates, axis=0))
+
+
+#: Moonshot's published Kimi-Linear keys keep MoE layers under ``block_sparse_moe`` with per-expert ``w1``/``w3``/``w2``
+#: (gate/up/down); the runtime (like transformers' port) names the block ``mlp``. Renamed per-expert tensors are then
+#: stacked and fused by the loader. Idempotent on converted keys.
+KIMI_LINEAR_KEY_RULES = KeyRuleSet(
+    [
+        Rewrite(r"\.block_sparse_moe\.", ".mlp."),
+        Map(
+            r"(?P<path>.*\.experts\.\d+\.)(?P<w>w1|w2|w3)\.weight",
+            "{path}{w}.weight",
+            rename={"w": {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}},
+        ),
+    ],
+    otherwise=KEEP,
+    name="kimi_linear",
+)
+
+
+def _upgrade_legacy_kda_gate_state(self, state: dict, expected_leaves: dict) -> dict:
+    """Widen per-head KDA gate leaves from native checkpoints saved before the per-channel fix.
+
+    Older saves of this port kept one decay rate per head: ``f_b_proj`` produced
+    ``num_heads`` outputs and ``dt_bias`` had ``num_heads`` entries. Repeating each
+    head across its ``head_k_dim`` channels gives the per-channel leaves the same
+    ``f_b(f_a(x)) + dt_bias`` term. The rest of that old KDA layer also changed (no
+    SiLU on the low-rank gates, sigmoid output gate), so outputs are not identical
+    to what the checkpoint produced before.
+
+    Args:
+        state: Flat native state ``{(collection, *path): array}``; updated in place.
+        expected_leaves: The model's leaves under the same keys.
+
+    Returns:
+        dict: ``state``.
+    """
+    upgraded = []
+    for key, value in list(state.items()):
+        expected = expected_leaves.get(key)
+        shape = getattr(value, "shape", None)
+        if expected is None or shape is None or tuple(shape) == tuple(expected.shape):
+            continue
+        tail = tuple(str(part) for part in key[-2:])
+        if tail[-1] != "dt_bias" and tail != ("f_b_proj", "weight"):
+            continue
+        want = tuple(expected.shape)
+        if len(shape) != len(want) or tuple(shape[:-1]) != want[:-1] or not shape[-1] or want[-1] % shape[-1]:
+            continue
+        state[key] = jnp.repeat(value, want[-1] // shape[-1], axis=-1)
+        upgraded.append(key)
+    if upgraded:
+        logger.warning(
+            f"Widened {len(upgraded)} per-head KDA gate leaves (f_b_proj/dt_bias) from a checkpoint saved before "
+            "Kimi-Linear used per-channel decay. The old layer also applied SiLU to its low-rank gates and a SiLU "
+            "output gate; those now match Moonshot's model, so this checkpoint's outputs change -- fine-tune or "
+            "re-convert it from the Hugging Face weights."
+        )
+    return state
+
+
+@register_module(TaskType.BASE_MODULE, config=KimiLinearConfig, model_type="kimi_linear")
+class KimiLinearModel(EasyDeLBaseModule):
+    """Kimi Linear base transformer model.
+
+    Implements the hybrid attention architecture combining MLA (Multi-Latent Attention)
+    and KDA (Kernel Delta Attention) for efficient long-context processing. The model
+    alternates between full attention (MLA) and linear attention (KDA) layers,
+    with optional Mixture of Experts (MoE) feedforward layers.
+
+    Key features:
+        - Hybrid attention with O(N) linear attention layers
+        - MLA with latent KV compression (DeepSeek V3 style)
+        - MoE with sigmoid routing and shared experts
+        - Support for very long contexts (100K+ tokens)
+
+    Attributes:
+        config (KimiLinearConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
+
+    _upgrade_legacy_native_state = _upgrade_legacy_kda_gate_state
+    checkpoint_key_rules: ClassVar[KeyRuleSet] = KIMI_LINEAR_KEY_RULES
+
+    fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Kimi Linear base model.
+
+        Args:
+            config (KimiLinearConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                config.vocab_size,
+                config.hidden_size,
+                embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+
+        remat_layer_block = auto_remat(
+            KimiDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(config.num_hidden_layers):
+            with self.assign_layer_stage(layer_idx, total_layers=config.num_hidden_layers):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=layer_idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
+                )
+
+        final_layer_idx = max(0, config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
+            self.norm = _kimi_rms_norm(config.hidden_size, config, dtype, param_dtype, rngs)
+
+    @cached_property
+    def frequencies(self):
+        """RoPE frequencies for the MLA attention layers.
+
+        Upstream Kimi MLA is strictly NoPE when ``mla_use_nope`` is set: no
+        rotary is applied, so no frequencies are built. Otherwise the
+        RoPE-carrying Q/K slice is ``qk_rope_head_dim`` wide (deepseek_v2
+        pattern) — the base module's ``head_dim``-wide frequencies mismatch
+        the packed MLA head layout.
+        """
+        if getattr(self.config, "mla_use_nope", False):
+            return None
+        return self.config.get_basic_frequencies(
+            head_size=self.config.qk_rope_head_dim,
+            rotary_dim=self.config.qk_rope_head_dim,
+            base=self.config.rope_theta,
+        )
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+    ) -> MoeModelOutput:
+        """Forward pass through the Kimi Linear base model.
+
+        Processes input tokens through embedding, hybrid attention layers
+        (MLA and KDA), optional MoE feedforward, and final normalization.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch, seq_len).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch, seq_len, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on
+                padding tokens, shape (batch, seq_len). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch, seq_len). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states
+                from all layers. Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return MoE router logits.
+                Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode).
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+
+        Returns:
+            MoeModelOutput: Contains last_hidden_state, optional hidden_states, attentions,
+                past_key_values, and router_logits.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
+        """
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
+
+        if inputs_embeds is None:
+            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
+
+        sequence_length = inputs_embeds.shape[1]
+        output_router_logits = (
+            output_router_logits if output_router_logits is not None else self.config.output_router_logits
+        )
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        all_router_logits = () if output_router_logits else None
+        all_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+
+        assert sequence_length <= self.config.max_position_embeddings, (
+            f"Maximum Position Embedding Reached! "
+            f"(Expected <= {self.config.max_position_embeddings} got {sequence_length})"
+        )
+
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
+        if position_ids is None:
+            position_ids = mask_info.q_position_ids
+
+        hidden_states = inputs_embeds
+        if mode is None:
+            mode = (
+                common_types.MODE_DECODE
+                if sequence_length == 1 and past_key_values is not None
+                else common_types.MODE_TRAIN
+            )
+
+        if past_key_values is None:
+            past_key_values = HybridCache.init_empty(len(self.layers))
+
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        # Router-logit aggregation grows a Python tuple per layer, which
+        # lax.scan cannot carry — collecting it forces the trace path too.
+        # Attention Residuals grow a per-block residual list as layers run, which lax.scan cannot carry either.
+        attn_res_block_size = self.config.attn_res_block_size
+        use_attn_res = attn_res_block_size is not None
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache or bool(output_router_logits) or use_attn_res,
+        )
+        cache_views = views if trace_layers else None
+        if use_attn_res:
+            # Keep every live candidate in the leading activation carry. ModuleList.scan moves only that
+            # array onto each layer's stage mesh in eager MPMD; a separate residual tuple would stay behind.
+            # Block 0 is the embedding output. The layer index identifies whether the last candidate is
+            # an open partial block, so no placeholder array is needed at block boundaries.
+            hidden_states = hidden_states[None, ...]
+        # Hoisted out of the loop body: the caching property must not be
+        # first materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
+
+        def _layer_loop(block, carry):
+            """Body of the hybrid attention scan over Kimi-Linear layers.
+
+            Each ``block`` may be either an MLA full-attention or a KDA
+            linear-attention decoder layer; the per-layer cache view returned
+            by :meth:`_layer_cache_view_at` adapts to the layer kind via
+            :class:`HybridCache`. The leading carry array contains hidden states, or every live residual
+            candidate stacked along a new leading axis when Attention Residuals are enabled. This keeps eager
+            stage placement and compiled stage transfers aligned. The other carry items are the cache
+            view ``cv``, optional ``all_hidden_states`` / ``all_attentions``
+            tuples, MoE router logits (when ``output_router_logits`` is
+            set), and the layer index. Returns the updated carry for the
+            next iteration.
+            """
+            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
+            block_residuals = None
+            if use_attn_res:
+                candidates = tuple(hidden_states[i] for i in range(hidden_states.shape[0]))
+                if int(idx) % attn_res_block_size == 0:
+                    block_residuals, hidden_states = candidates, None
+                else:
+                    block_residuals, hidden_states = candidates[:-1], candidates[-1]
+            if output_hidden_states:
+                all_hidden_states += (
+                    _attn_res_stream(block_residuals, hidden_states) if use_attn_res else hidden_states,
+                )
+
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hidden_states,
+                    block_residuals=block_residuals,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    output_router_logits=output_router_logits,
+                    frequencies=frequencies,
+                )
+
+            if use_attn_res:
+                # Freeze the partial block implicitly at a block boundary: the next layer then treats every
+                # entry as completed. Otherwise it splits off the last entry as the still-open partial block.
+                hidden_states = jnp.stack((*block_residuals, layer_outputs.hidden_states), axis=0)
+                # Transfer the entire packed state in compiled MPMD too. Wrap it so the boundary helper does
+                # not apply a rank-three hidden-state sharding contract to this rank-four candidate stack.
+                hidden_states = self._mark_layer_stage_boundary((hidden_states,), idx, layers=self.layers)[0]
+            else:
+                hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+
+            if output_attentions:
+                all_attentions += (layer_outputs.attention_weight,)
+
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
+
+            if output_router_logits and layer_outputs.router_logits is not None:
+                all_router_logits += (layer_outputs.router_logits,)
+
+            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
+
+        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
+        )
+        if use_attn_res:
+            # The model output is the full residual stream: every frozen block plus the open partial block.
+            hidden_states = _attn_res_stream(tuple(hidden_states[i] for i in range(hidden_states.shape[0])), None)
+        hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        return MoeModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+            past_key_values=past_key_values,
+            router_logits=all_router_logits,
+        )
+
+    def get_encoder(self):
+        """Return the encoder part of the model.
+
+        Raises:
+            NotImplementedError: This is a decoder-only model and does not have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """Return the decoder part of the model.
+
+        Returns:
+            KimiLinearModel: The decoder (this model itself).
+        """
+        return self
+
+    def get_lm_head(self):
+        """Return the language model head.
+
+        Raises:
+            NotImplementedError: The base model does not have a language model head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self):
+        """Return the token embedding layer.
+
+        Returns:
+            Embed: The token embedding layer.
+        """
+        return self.embed_tokens
+
+
+@register_module(TaskType.CAUSAL_LM, config=KimiLinearConfig, model_type="kimi_linear")
+class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig]):  # type: ignore
+    """Kimi Linear model with a causal language modeling head.
+
+    Extends the base KimiLinearModel with a linear output layer for
+    next-token prediction. Supports MoE auxiliary loss for load balancing.
+
+    This model is a hybrid transformer with causal attention masks
+    applied to perform autoregressive language generation, combining
+    efficient linear attention (KDA) with full attention (MLA).
+
+    Attributes:
+        config (KimiLinearConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
+
+    _upgrade_legacy_native_state = _upgrade_legacy_kda_gate_state
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "kimi_linear"
+    _config_class = KimiLinearConfig
+
+    checkpoint_key_rules: ClassVar[KeyRuleSet] = KIMI_LINEAR_KEY_RULES
+
+    fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Kimi Linear model for causal language modeling.
+
+        Args:
+            config (KimiLinearConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        super().__init__(
+            config=config,
+            base_model_class=KimiLinearModel,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            lm_head_bias=False,
+            # Kimi configs usually carry no coefficient; default to 0.001.
+            router_aux_loss_coef=getattr(config, "router_aux_loss_coef", 0.001),
+        )
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+    ) -> MoeCausalLMOutput:
+        """Forward pass with language modeling head.
+
+        Processes inputs through the base model and applies the language modeling
+        head to produce next-token logits. Computes MoE auxiliary loss if enabled.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch, seq_len).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings.
+                Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask for padding tokens.
+                Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for tokens.
+                Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states.
+                Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return router logits.
+                Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode).
+                Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the LM head projection.
+                Defaults to True.
+
+        Returns:
+            MoeCausalLMOutput: Contains logits, optional hidden_states, attentions,
+                past_key_values, router_logits, and aux_loss.
+        """
+        return self.forward_moe(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            apply_lm_head=apply_lm_head,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+        )
+
+    def _router_top_k(self) -> int:
+        """Kimi's config names the routing width ``num_experts_per_token``."""
+        return self.config.num_experts_per_token
+
+
+__all__ = [
+    "KimiDecoderLayer",
+    "KimiDeltaAttention",
+    "KimiLinearConfig",
+    "KimiLinearForCausalLM",
+    "KimiLinearModel",
+    "KimiMLAAttention",
+    "KimiSparseMoeBlock",
+]

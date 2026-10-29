@@ -1,0 +1,1161 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Spectrax implementation of OpenAI's GPT-2 decoder-only language model.
+
+GPT-2 is the canonical pre-norm decoder transformer with absolute learned
+positional embeddings, multi-head self-attention, and a GeLU-activated MLP.
+This module provides the building blocks and the full GPT-2 backbone /
+LM-head models for inference and training.
+
+Architectural traits:
+    - Absolute learned positional embeddings limited to ``n_positions``.
+    - Pre-norm transformer: LayerNorm placed before attention and MLP.
+    - Standard multi-head attention (no GQA / sliding window).
+    - GeLU (``gelu_new``) MLP, optional embedding tying.
+
+Exports:
+    - :class:`GPT2Model`: Backbone returning hidden states.
+    - :class:`GPT2LMHeadModel`: Decoder LM with optional tied LM head.
+"""
+
+import jax
+import jax.numpy as jnp
+import spectrax as spx
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+from jax import lax
+from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
+from spectrax.common_types import ColumnWise, Replicated, RowWise, SRowWise
+
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import (
+    AttentionLayerOutput,
+    BaseModelOutputWithPastAndCrossAttentions,
+    DecoderLayerOutput,
+)
+from easydel.infra.sharding import sharding_for_layout
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
+from easydel.layers import Embed
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseCausalLMModule
+
+from .gpt2_configuration import GPT2Config as GPT2Config
+
+
+class Conv1D(spx.Module):
+    """OpenAI's "Conv1D" linear layer with the historical ``[out, in]`` weight layout.
+
+    Despite its name this is *not* a convolution — it is the dense linear
+    transformation OpenAI's original GPT-2 codebase mislabeled as
+    ``Conv1D``. The defining property is the kernel shape: ``(out_features,
+    in_features)`` with the bias added on the *input* side. EasyDeL keeps
+    this exact layout so HuggingFace GPT-2 checkpoints load without
+    transposition. Internally :meth:`forward` transposes the kernel back to
+    the ``(in, out)`` orientation expected by ``lax.dot_general``.
+
+    Attributes:
+        weight: Bound :class:`ArrayParam` of shape ``(out_features,
+            in_features)`` initialised from ``Normal(0, 0.02)``.
+        bias: Bound :class:`ArrayParam` of shape ``(out_features,)`` initialised
+            to zeros, or ``None`` when ``use_bias=False``. As in HuggingFace's
+            ``Conv1D`` the bias matches *out_features* and is added to the
+            matmul output, broadcast across all leading axes.
+        use_bias: Whether the bias term is allocated and applied.
+        dtype: Compute dtype the inputs are cast to.
+        param_dtype: Storage dtype for the weight/bias parameters.
+        precision: ``jax.lax.PrecisionLike`` forwarded to ``dot_general``.
+        dot_general: Optional override for the matmul (used by quantisation
+            shims); falls back to ``jax.lax.dot_general`` when ``None``.
+        sharding_axis: Optional axis name driving tensor parallelism.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        use_bias: bool = True,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        dot_general=None,
+        sharding_axis: str | None = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize a GPT-2 :class:`Conv1D` projection.
+
+        Args:
+            in_features: Input feature dim.
+            out_features: Output feature dim.
+            use_bias: Whether to allocate a bias vector.
+            dtype: Computation dtype the inputs are cast to.
+            param_dtype: Storage dtype for ``weight`` / ``bias``.
+            precision: JAX matmul precision.
+            dot_general: Optional matmul override (used by quantisation
+                shims); falls back to ``jax.lax.dot_general``.
+            sharding_axis: Optional axis name driving tensor parallelism.
+            rngs: Random number generator collection.
+        """
+        if sharding_axis not in (None, "column", "row"):
+            raise ValueError(f"`sharding_axis` must be None, 'column' or 'row', got {sharding_axis!r}.")
+        # The stored kernel is ``[out, in]`` (OpenAI layout), i.e. transposed relative to the
+        # ``[in, out]`` layouts ``ColumnParallelLinear``/``RowParallelLinear`` use. A column-parallel
+        # projection therefore shards the leading (output) axis over TP and a row-parallel one
+        # shards the trailing (input) axis over TP.
+        weight_sharding = None
+        bias_sharding = None
+        if sharding_axis == "column":
+            weight_sharding = sharding_for_layout(RowWise)
+            bias_sharding = sharding_for_layout(SRowWise)
+        elif sharding_axis == "row":
+            weight_sharding = sharding_for_layout(ColumnWise)
+            bias_sharding = sharding_for_layout(Replicated)
+
+        self.weight = ArrayParam.bound(
+            shape=(out_features, in_features),
+            dtype=param_dtype,
+            init_method="normal",
+            init_kwargs={"stddev": 0.02},
+            key=rngs.parameters,
+            sharding=weight_sharding,
+        )
+
+        self.bias = (
+            ArrayParam.bound(
+                shape=(out_features,),
+                dtype=param_dtype,
+                init_method="zeros",
+                key=rngs.parameters,
+                sharding=bias_sharding,
+            )
+            if use_bias
+            else None
+        )
+
+        self.use_bias = use_bias
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.dot_general = dot_general
+        self.sharding_axis = sharding_axis
+
+    def forward(self, inputs):
+        """Apply the dense projection ``inputs @ weight.T + bias``.
+
+        The stored kernel is in OpenAI's ``[out, in]`` layout, so it is
+        transposed to ``[in, out]`` before the contracted matmul over the
+        last input axis. Bias addition uses the dtype of the activations.
+
+        Args:
+            inputs: Tensor of shape ``[..., in_features]``.
+
+        Returns:
+            Tensor of shape ``[..., out_features]`` (with the bias broadcast
+            across all leading axes when present).
+        """
+        inputs = jnp.asarray(inputs, self.dtype)
+        bias = self.bias.value if self.bias is not None else None
+        kernel = self.weight.value.transpose().astype(self.dtype)
+        if self.dot_general is not None:
+            dot_general = self.dot_general
+        else:
+            dot_general = lax.dot_general
+
+        y = dot_general(
+            inputs,
+            kernel,
+            (((inputs.ndim - 1,), (0,)), ((), ())),
+            precision=self.precision,
+        )
+        if bias is not None:
+            y = y + bias.astype(self.dtype)
+        return y
+
+
+class GPT2Attention(UnifiedAttention):
+    """Multi-head self/cross-attention with GPT-2's fused ``c_attn`` projection.
+
+    GPT-2 fuses the three Q/K/V projections into a *single* :class:`Conv1D`
+    of width ``3 * embed_dim`` named ``c_attn`` (see :meth:`define_network`),
+    avoiding the launch overhead of three separate matmuls. The output is
+    then split along the trailing axis at attention time. When this layer
+    is configured for cross-attention (``is_cross_attention=True``) the
+    layout changes: ``c_attn`` becomes a ``2 * embed_dim`` projection over
+    the encoder states (K, V only) and a separate ``q_attn`` of width
+    ``embed_dim`` projects the decoder hidden states for the queries.
+    Output goes through a Row-sharded ``c_proj`` and a residual dropout
+    (``resid_pdrop``) before returning to the residual stream.
+
+    Position information is supplied externally — GPT-2 uses *learned*
+    absolute positional embeddings added at the model embedding step, not
+    rotary embeddings — so :class:`UnifiedAttention`'s rotary path is not
+    invoked here. Attention type is fixed to ``"standard"`` (full softmax,
+    optionally causal) and there is no GQA / sliding window.
+
+    Attributes:
+        config: Source ``GPT2Config``.
+        dtype: Activation dtype.
+        param_dtype: Parameter dtype.
+        precision: ``jax.lax.PrecisionLike`` for matmuls.
+        causal: Whether the lower-triangular causal mask is applied.
+        is_cross_attention: Whether this block does encoder-decoder
+            cross-attention (``c_attn`` projects K/V only and ``q_attn``
+            handles the queries) instead of self-attention.
+        rngs: Random key container used for dropout / init.
+    """
+
+    def __init__(
+        self,
+        config: GPT2Config,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        causal: bool = True,
+        is_cross_attention: bool = False,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize a GPT-2 attention block.
+
+        Args:
+            config: Model configuration.
+            layer_idx: Index of this layer in the decoder stack.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            causal: Whether to apply the lower-triangular causal mask.
+            is_cross_attention: Whether the block is the encoder/decoder
+                cross-attention variant (queries come from the decoder
+                hidden state and K/V come from the encoder output).
+            rngs: Random number generator collection.
+        """
+        self.is_cross_attention = is_cross_attention
+        self.embed_dim = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            attention_type="standard",
+            causal=causal,
+        )
+        self.precision = precision
+        self.dtype = dtype
+        self.causal = causal
+        self.head_dim = self.embed_dim // self.num_heads
+
+    def define_network(
+        self,
+        config: GPT2Config,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.PrecisionLike,
+        rngs: spx.Rngs,
+    ) -> None:
+        """Create GPT-2 specific projection layers."""
+        if self.is_cross_attention:
+            self.c_attn = Conv1D(
+                self.embed_dim,
+                2 * self.embed_dim,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                sharding_axis="column",
+                rngs=rngs,
+            )
+            self.q_attn = Conv1D(
+                self.embed_dim,
+                self.embed_dim,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                sharding_axis="column",
+                rngs=rngs,
+            )
+        else:
+            self.c_attn = Conv1D(
+                self.embed_dim,
+                3 * self.embed_dim,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                sharding_axis="column",
+                rngs=rngs,
+            )
+            self.q_attn = None
+
+        self.c_proj = Conv1D(
+            self.embed_dim,
+            self.embed_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            sharding_axis="row",
+            rngs=rngs,
+        )
+        self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
+        self.attention_performer = self._create_attention_performer(self.config, rngs)
+
+    def _create_attention_performer(self, config: GPT2Config, rngs: spx.Rngs) -> FlexibleAttentionModule:
+        """Use GPT-2 specific attention dropout setting."""
+        # HF GPT-2 semantics: ``scale_attn_weights`` divides the scores by sqrt(head_dim) and
+        # ``scale_attn_by_inverse_layer_idx`` additionally divides them by ``layer_idx + 1``.
+        softmax_scale = self.head_dim**-0.5 if getattr(config, "scale_attn_weights", True) else 1.0
+        if getattr(config, "scale_attn_by_inverse_layer_idx", False):
+            softmax_scale = softmax_scale / float(self.layer_idx + 1)
+        performer = FlexibleAttentionModule(
+            rngs=rngs,
+            dropout_prob=config.attn_pdrop,
+            base_config=config,
+            softmax_scale=softmax_scale,
+        )
+        if getattr(config, "reorder_and_upcast_attn", False):
+            # Flash, SDPA and Ring read their compute dtype from operation metadata, not the
+            # per-call compute_dtype kwarg. Bind the override after auto backend resolution;
+            # this metadata is shared by the registered prefill/decode ops and their fallbacks.
+            # Keep the model/cache configuration and the selected backends unchanged.
+            performer.metadata.runtime_dtype = jnp.float32
+            performer.metadata.runtime_softmax_dtype = jnp.float32
+        return performer
+
+    def _split_heads(self, hidden_states):
+        """Reshape ``[batch, seq, embed]`` into ``[batch, seq, heads, head_dim]``.
+
+        Args:
+            hidden_states: Tensor with the per-token embedding axis last.
+
+        Returns:
+            View of the input with the last axis split into
+            ``(num_heads, head_dim)``.
+        """
+        return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads, self.head_dim))
+
+    def _merge_heads(self, hidden_states):
+        """Merge the per-head representations back into a single embedding axis.
+
+        Inverse of :meth:`_split_heads`: collapses the trailing
+        ``(num_heads, head_dim)`` pair into a flat ``embed_dim`` axis.
+
+        Args:
+            hidden_states: Tensor of shape ``[batch, seq, num_heads, head_dim]``.
+
+        Returns:
+            Tensor of shape ``[batch, seq, embed_dim]``.
+        """
+        return hidden_states.reshape((*hidden_states.shape[:2], self.embed_dim))
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        key_value_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
+    ) -> AttentionLayerOutput:
+        """Run GPT-2 self- or cross-attention and produce a residual-ready output.
+
+        Splits the fused ``c_attn`` projection into Q/K/V (or, for cross
+        attention, runs ``q_attn`` on the decoder hidden states and
+        ``c_attn`` on the encoder hidden states), reshapes the per-head
+        view, optionally concatenates against the KV cache, dispatches to
+        the underlying attention performer, and applies the row-sharded
+        ``c_proj`` output projection with residual dropout.
+
+        Args:
+            hidden_states: Decoder hidden states of shape
+                ``[batch, seq_len, hidden_dim]``.
+            mask_info: Pre-computed attention mask information (segments
+                or boolean mask). ``None`` to skip masking.
+            position_ids: Position indices of shape ``[batch, seq_len]``;
+                unused by GPT-2 attention itself (positions are absorbed
+                in the embedding step) but kept for interface uniformity.
+            mode: Runtime mode (train / decode / infer) used by the
+                attention performer for path selection.
+            cache_view: Optional KV-cache view to append the new K/V into.
+            cache_metadata: Optional paged/ragged metadata accompanying
+                ``cache_view``.
+            output_attentions: When True, the returned
+                :class:`AttentionLayerOutput` carries the per-head
+                attention weight tensor.
+            frequencies: Unused for GPT-2 (no RoPE); accepted for
+                signature uniformity with other attention blocks.
+            key_value_states: Optional encoder states of shape
+                ``[batch, src_len, hidden_dim]`` enabling cross-attention.
+                When ``None`` the layer runs self-attention.
+
+        Returns:
+            :class:`AttentionLayerOutput` carrying the post-projection
+            attention output, the optional attention weights, and the
+            updated cache view.
+        """
+        is_cross_attention = key_value_states is not None
+
+        if not is_cross_attention:
+            qkv_out = checkpoint_name(self.c_attn(hidden_states), "attn_query")
+            query, key, value = jnp.split(qkv_out, 3, axis=2)
+        else:
+            q_out = self.q_attn(hidden_states)
+            (query,) = jnp.split(q_out, 1, axis=2)
+            kv_out = self.c_attn(key_value_states)
+            key, value = jnp.split(kv_out, 2, axis=2)
+
+        query = self._split_heads(query)
+        key = self._split_heads(key)
+        value = self._split_heads(value)
+
+        init_attention_bias = lambda: None  # noqa
+        if self.causal:
+            (
+                key,
+                value,
+                mask_info,
+                init_attention_bias,
+                cache_view,
+                cache_metadata,
+            ) = self.concatenate(
+                query=query,
+                key=key,
+                value=value,
+                cache_view=cache_view,
+                cache_metadata=cache_metadata,
+                mask_info=mask_info,
+            )
+
+        output_dtype = query.dtype
+        if getattr(self.config, "reorder_and_upcast_attn", False):
+            # HF ``reorder_and_upcast_attn``: run the score/softmax/value product in float32.
+            query = query.astype(jnp.float32)
+            key = key.astype(jnp.float32)
+            value = value.astype(jnp.float32)
+
+        attn = self.attention_performer.forward(
+            query_states=query,
+            key_states=key,
+            value_states=value,
+            mode=mode,
+            init_bias=init_attention_bias,
+            cache_metadata=cache_metadata,
+            cache_view=cache_view,
+            mask_info=mask_info,
+            causal=self.causal,
+            output_attentions=output_attentions,
+            precision=self.precision,
+            compute_dtype=jnp.float32 if getattr(self.config, "reorder_and_upcast_attn", False) else None,
+        )
+        attn_output = self.shard_attention_prod(self._merge_heads(attn.attention_outputs.astype(output_dtype)))
+        attn_output = checkpoint_name(self.c_proj(attn_output), "attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
+        attn_output = self.resid_dropout(attn_output)
+
+        return AttentionLayerOutput(
+            attention_output=attn_output,
+            attention_weight=attn.attention_weights if output_attentions else None,
+            cache_view=cache_view,
+        )
+
+
+class GPT2MLP(spx.Module):
+    """Two-layer FFN ``c_fc → activation → c_proj`` with residual dropout.
+
+    GPT-2's classic non-gated MLP: an up-projection ``c_fc`` to
+    ``intermediate_size`` (Column-sharded), an activation read from
+    ``config.activation_function`` (typically ``"gelu_new"`` — the
+    approximate GeLU), and a down-projection ``c_proj`` back to
+    ``hidden_size`` (Row-sharded). Both projections are :class:`Conv1D`
+    instances to preserve OpenAI's ``[out, in]`` weight orientation, and
+    the residual stream is regularised by an output dropout at
+    ``config.resid_pdrop`` before the addition.
+
+    Attributes:
+        config: Source ``GPT2Config``.
+        precision: ``jax.lax.PrecisionLike`` for the two matmuls.
+        dtype: Activation dtype.
+        c_fc: ``Conv1D(hidden, intermediate)`` up-projection (column-sharded).
+        c_proj: ``Conv1D(intermediate, hidden)`` down-projection (row-sharded).
+        act: Activation function looked up from ``ACT2FN``.
+        dropout: Output dropout applied prior to the residual add.
+    """
+
+    def __init__(
+        self,
+        config: GPT2Config,
+        intermediate_size: int,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.Precision | None = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize the GPT-2 MLP block.
+
+        Args:
+            config: Model configuration.
+            intermediate_size: Width of the up/down projections (commonly
+                ``4 * hidden_size`` for GPT-2).
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
+        super().__init__()
+        self.config = config
+        self.precision = precision
+        self.dtype = dtype
+        embed_dim = config.hidden_size
+        self.c_fc = Conv1D(
+            embed_dim,
+            intermediate_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            sharding_axis="column",
+            rngs=rngs,
+        )
+        self.c_proj = Conv1D(
+            intermediate_size,
+            embed_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            sharding_axis="row",
+            rngs=rngs,
+        )
+        self.act = ACT2FN[config.activation_function]
+        self.dropout = nn.Dropout(
+            rate=config.resid_pdrop,
+            rngs=rngs,
+        )
+
+    def forward(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply the GPT-2 MLP (``c_fc → act → c_proj → dropout``).
+
+        Args:
+            hidden_states: Input tensor of shape
+                ``[batch, seq_len, hidden_dim]``.
+
+        Returns:
+            Tensor of shape ``[batch, seq_len, hidden_dim]`` representing
+            the residual-ready MLP output.
+        """
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        gate = checkpoint_name(self.act(self.c_fc(hidden_states)), "mlp_gate")
+        hidden_states = checkpoint_name(self.dropout(self.c_proj(gate)), "mlp_output")
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        return hidden_states
+
+
+class GPT2Block(spx.Module):
+    """GPT-2 Transformer block.
+
+    This module represents a single transformer block in the GPT-2 model,
+    containing self-attention and MLP sub-layers with residual connections
+    and layer normalization. It can optionally include cross-attention layers.
+
+    Attributes:
+            config (GPT2Config): Configuration object for the model.
+            dtype (jnp.dtype): Data type for computations.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+            rngs (spx.Rngs): Random number generators.
+    """
+
+    def __init__(
+        self,
+        config: GPT2Config,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.Precision | None = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize a GPT-2 transformer block.
+
+        Args:
+            config: Model configuration. ``add_cross_attention`` toggles a
+                cross-attention sub-block; ``n_inner`` overrides the MLP
+                inner width (defaults to ``4 * hidden_size``).
+            layer_idx: Index of this layer in the decoder stack.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        hidden_size = self.config.hidden_size
+        inner_dim = self.config.n_inner if self.config.n_inner is not None else 4 * hidden_size
+
+        self.ln_1 = LayerNorm(
+            config.hidden_size,
+            epsilon=config.layer_norm_epsilon,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+        self.attn = GPT2Attention(
+            config,
+            layer_idx=layer_idx,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.ln_2 = LayerNorm(
+            config.hidden_size,
+            epsilon=config.layer_norm_epsilon,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+        if config.add_cross_attention:
+            self.crossattention = GPT2Attention(
+                config=config,
+                layer_idx=layer_idx,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                causal=False,
+                is_cross_attention=True,
+                rngs=rngs,
+            )
+            self.ln_cross_attn = LayerNorm(
+                config.hidden_size,
+                epsilon=config.layer_norm_epsilon,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+
+        self.mlp = GPT2MLP(
+            config=config,
+            intermediate_size=inner_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        encoder_mask_info: MaskInfo | None = None,
+    ) -> DecoderLayerOutput:
+        """Run a single GPT-2 pre-norm transformer block.
+
+        Pre-norm flow: ``x + attn(ln_1(x))`` followed (when configured)
+        by ``x + crossattn(ln_cross_attn(x), enc)`` and finally
+        ``x + mlp(ln_2(x))``. Optionally chunked via
+        :func:`blockwise_ffn` when ``config.use_scan_mlp`` is set.
+
+        Args:
+            hidden_states: Input tensor of shape
+                ``[batch, seq_len, hidden_dim]``.
+            mask_info: Self-attention mask information.
+            position_ids: Position indices of shape ``[batch, seq_len]``.
+            mode: Runtime mode forwarded to the attention sub-layers.
+            cache_view: Optional KV-cache view used by self-attention.
+            cache_metadata: Optional metadata accompanying ``cache_view``.
+            output_attentions: When True, attention weights are returned
+                on the :class:`DecoderLayerOutput`.
+            frequencies: Unused (kept for interface uniformity).
+            encoder_hidden_states: Optional encoder output of shape
+                ``[batch, src_len, hidden_dim]`` enabling cross-attention;
+                requires ``config.add_cross_attention=True``.
+            encoder_mask_info: Optional mask info paired with
+                ``encoder_hidden_states``.
+
+        Returns:
+            :class:`DecoderLayerOutput` containing the residual stream
+            after this block, self-attention weights (optional),
+            cross-attention weights (optional), and the updated cache
+            view.
+
+        Raises:
+            ValueError: If ``encoder_hidden_states`` is provided but the
+                block was constructed without ``add_cross_attention``.
+        """
+        residual = hidden_states
+        hidden_states = self.ln_1(hidden_states)
+
+        attn_outputs = self.attn(
+            hidden_states,
+            mask_info,
+            position_ids,
+            mode,
+            cache_view,
+            cache_metadata,
+            output_attentions,
+            frequencies,
+        )
+
+        hidden_states = checkpoint_name(attn_outputs.attention_output + residual, "residual")
+        cross_attention = None
+        if encoder_hidden_states is not None:
+            if not hasattr(self, "crossattention"):
+                raise ValueError(
+                    f"If `encoder_hidden_states` are passed, {self} has to be instantiated with "
+                    "cross-attention layers by setting `config.add_cross_attention=True`"
+                )
+            residual = hidden_states
+            hidden_states = self.ln_cross_attn(hidden_states)
+
+            cross_attn_outputs = self.crossattention(
+                hidden_states,
+                encoder_mask_info,
+                position_ids,
+                mode,
+                None,
+                None,
+                output_attentions,
+                frequencies,
+                encoder_hidden_states,
+            )
+            cross_attention = cross_attn_outputs.attention_weight
+            hidden_states = checkpoint_name(residual + cross_attn_outputs.attention_output, "residual")
+
+        residual = hidden_states
+        hidden_states = self.ln_2(hidden_states)
+        if self.config.use_scan_mlp:
+            feed_forward_hidden_states = blockwise_ffn(
+                self.mlp,
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            feed_forward_hidden_states = self.mlp(hidden_states)
+        hidden_states = checkpoint_name(residual + feed_forward_hidden_states, "residual")
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        return DecoderLayerOutput(
+            hidden_states=checkpoint_name(hidden_states, "layer_output"),
+            attention_weight=attn_outputs.attention_weight,
+            cross_attention=cross_attention,
+            cache_view=attn_outputs.cache_view,
+        )
+
+
+@register_module(TaskType.BASE_MODULE, config=GPT2Config, model_type="gpt2")
+class GPT2Model(EasyDeLBaseModule):
+    """GPT-2 model implementation.
+
+    This class implements the main GPT-2 transformer model architecture, consisting of
+    embedding layers (token and position), multiple GPT2Block layers, and a final
+    layer normalization.
+
+    Attributes:
+            config (GPT2Config): Configuration object for the model.
+            dtype (jnp.dtype): Data type for computations.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+            rngs (spx.Rngs): Random number generators.
+    """
+
+    def __init__(
+        self,
+        config: GPT2Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize the GPT-2 backbone.
+
+        Builds the token embedding (``wte``), the learned absolute
+        position embedding (``wpe``), the dropout layer, the stack of
+        :class:`GPT2Block` layers (``h``), and the final layer norm.
+
+        Args:
+            config: Model configuration.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.embed_dim = self.config.hidden_size
+
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.wte = Embed(
+                self.config.vocab_size,
+                self.embed_dim,
+                embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+                dtype=self.dtype,
+                rngs=rngs,
+                param_dtype=param_dtype,
+            )
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.wpe = Embed(
+                self.config.max_position_embeddings,
+                self.embed_dim,
+                embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+                dtype=self.dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+
+        self.dropout = nn.Dropout(rate=self.config.embd_pdrop, rngs=rngs)
+        remat_layer_block = auto_remat(
+            GPT2Block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.h = nn.ModuleList([])
+        for i in range(self.config.num_hidden_layers):
+            with self.assign_layer_stage(i, total_layers=self.config.num_hidden_layers):
+                self.h.append(
+                    remat_layer_block(
+                        self.config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
+                )
+        final_layer_idx = max(0, self.config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
+            self.ln_f = LayerNorm(
+                self.config.hidden_size,
+                epsilon=self.config.layer_norm_epsilon,
+                dtype=self.dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ):
+        """Performs forward pass through the GPT-2 transformer model.
+
+        Processes input tokens through learned token and position embeddings, multiple
+        transformer blocks with pre-norm architecture and absolute positional encoding,
+        and final layer normalization. Supports optional cross-attention for encoder-decoder tasks.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Either this
+                or `inputs_embeds` must be provided but not both.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length,
+                hidden_size). Use instead of `input_ids` for custom embeddings.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) indicating
+                which tokens to attend to (True) and which to ignore (False).
+            mask_info: Pre-computed mask information. If provided, overrides `attention_mask`.
+            position_ids: Explicit position indices of shape (batch_size, sequence_length).
+                Must be within [0, max_position_embeddings). Auto-generated if not provided.
+            encoder_hidden_states: Hidden states from encoder of shape (batch_size, encoder_length,
+                hidden_size) for cross-attention in encoder-decoder configurations.
+            encoder_attention_mask: Boolean mask for encoder hidden states.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER). Auto-detected if None.
+            past_key_values: Cached key/value states for efficient autoregressive generation.
+            cache_metadata: Metadata for paged attention mechanisms.
+            output_attentions: Whether to return self-attention and cross-attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutputWithPastAndCrossAttentions containing:
+                - last_hidden_state: Final layer output of shape (batch, seq_len, hidden_size)
+                - past_key_values: Updated cache for next generation step
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True
+                - attentions: Tuple of self-attention weights if output_attentions=True
+                - cross_attentions: Tuple of cross-attention weights if cross-attention enabled
+
+        Raises:
+            ValueError: If both `input_ids` and `inputs_embeds` are provided, or if neither
+                is provided.
+        """
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            _batch_size, sequence_length = input_ids.shape
+        elif inputs_embeds is not None:
+            sequence_length = inputs_embeds.shape[1]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
+        encoder_mask_info = None
+        if encoder_attention_mask is not None:
+            if encoder_attention_mask.ndim == 2:
+                # Encoder padding is independent of the decoder query positions:
+                # every decoder token may attend to every non-padding encoder key.
+                encoder_mask_info = MaskInfo.from_attention_mask(
+                    jnp.broadcast_to(
+                        encoder_attention_mask[:, None, None, :].astype(jnp.bool_),
+                        (encoder_attention_mask.shape[0], 1, sequence_length, encoder_attention_mask.shape[1]),
+                    )
+                )
+            else:
+                encoder_mask_info = MaskInfo.from_attention_mask(encoder_attention_mask)
+        if position_ids is None:
+            position_ids = mask_info.q_position_ids
+
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("input_ids must be provided when inputs_embeds is None.")
+            inputs_embeds = checkpoint_name(self.wte(input_ids.astype("i4")), "embeddings")
+
+        position_embeds = self.wpe(position_ids.astype("i4"))
+
+        assert inputs_embeds is not None
+        hidden_states = inputs_embeds + position_embeds
+        hidden_states = self.dropout(hidden_states)
+
+        all_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+        all_cross_attentions = () if (output_attentions and encoder_hidden_states is not None) else None
+        if mode is None:
+            mode = (
+                common_types.MODE_DECODE
+                if sequence_length == 1 and past_key_values is not None
+                else common_types.MODE_TRAIN
+            )
+        if past_key_values is None:
+            past_key_values = TransformerCache.init_empty(len(self.h))
+
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        # Cross-attention aggregation grows a python tuple per layer, which
+        # lax.scan cannot carry — encoder-decoder runs force the trace path.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache or encoder_hidden_states is not None,
+        )
+        cache_views = views if trace_layers else None
+
+        def _layer_loop(block, carry):
+            """Run one GPT-2 block inside ``self.h.scan``.
+
+            Threads ``(hidden_states, cache_views, all_hidden_states,
+            all_attentions, all_cross_attentions, layer_index)`` through the
+            scan and collects optional intermediate states / self-attention /
+            cross-attention weights when the outer ``forward`` enabled
+            them.
+            """
+            hidden_states, cv, all_hidden_states, all_attentions, all_cross_attentions, idx = carry
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            with self._layer_stage_context(idx, layers=self.h):
+                layer_outputs = block(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    frequencies=None,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_mask_info=encoder_mask_info,
+                )
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.h)
+
+            if output_attentions:
+                all_attentions += (layer_outputs.attention_weight,)
+
+            if output_attentions and encoder_hidden_states is not None:
+                all_cross_attentions += (layer_outputs.cross_attention,)
+
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
+
+            return hidden_states, cv, all_hidden_states, all_attentions, all_cross_attentions, idx + 1
+
+        hidden_states, _, all_hidden_states, all_attentions, all_cross_attentions, _ = self.h.scan(
+            _layer_loop,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, all_cross_attentions, 0),
+            trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
+        )
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        hidden_states = checkpoint_name(self.ln_f(hidden_states), "model_output")
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        return BaseModelOutputWithPastAndCrossAttentions(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+            cross_attentions=all_cross_attentions,
+            past_key_values=past_key_values,
+        )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.wte
+
+
+@register_module(TaskType.CAUSAL_LM, config=GPT2Config, model_type="gpt2")
+class GPT2LMHeadModel(BaseCausalLMModule[GPT2Model, GPT2Config]):  # type: ignore
+    """GPT-2 model with a language modeling head.
+
+    This model extends the base GPT2Model by adding a linear layer on top to
+    predict the next token in a sequence, making it suitable for causal language
+    modeling tasks.
+
+    Attributes:
+            config (GPT2Config): Configuration object for the model.
+            dtype (jnp.dtype): Data type for computations.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+            rngs (spx.Rngs): Random number generators.
+    """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "gpt2"
+    _config_class = GPT2Config
+
+    loss_type: str = "ForCausalLM"
+
+    def __init__(
+        self,
+        config: GPT2Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize the causal-LM wrapper around :class:`GPT2Model`.
+
+        Args:
+            config: Model configuration.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
+        super().__init__(
+            config=config,
+            base_model_class=GPT2Model,
+            base_model_name="transformer",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            lm_head_bias=False,
+        )
+
+    def get_embedding(self):
+        """Returns the embedding layer of the module."""
+        return self.base_model.wte
