@@ -72,6 +72,24 @@ def fp32_router_logits(hidden_states: Array, weight: Array, hidden_size: int) ->
     )
 
 
+def _take_topk(scores: Array, indices: Array) -> Array:
+    """``jnp.take_along_axis(scores, indices, axis=-1)`` as a one-hot select-and-sum.
+
+    Each output is one selected score plus exact zeros, so values match the gather. TPU lowers the
+    ``[tokens, experts] -> [tokens, k]`` lookup as a batched gather, and its transpose as a scatter-add.
+    The select-and-sum avoids both: the select fuses into the sum, and its transpose is a masked broadcast.
+
+    Args:
+        scores: ``(tokens, experts)`` scores.
+        indices: ``(tokens, k)`` integer expert ids.
+
+    Returns:
+        ``(tokens, k)`` scores at ``indices``.
+    """
+    hit = indices[..., None] == jnp.arange(scores.shape[-1], dtype=indices.dtype)
+    return jnp.sum(jnp.where(hit, scores[..., None, :], jnp.zeros((), scores.dtype)), axis=-1)
+
+
 def _score(gate_logits: Array, score_fn: ScoreFn) -> Array:
     """Map raw router logits to per-expert scores in fp32."""
     logits = gate_logits.astype(jnp.float32)
@@ -198,7 +216,7 @@ def moe_group_topk_select(
         )
 
     topk_indices = jax.lax.top_k(scores_for_choice, k=k)[1]
-    topk_weights = jnp.take_along_axis(scores, topk_indices, axis=-1)
+    topk_weights = _take_topk(scores, topk_indices)
 
     if norm_topk_prob:
         topk_weights = topk_weights / (jnp.sum(topk_weights, axis=-1, keepdims=True) + norm_eps)

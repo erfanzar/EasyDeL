@@ -383,6 +383,89 @@ def set_attrs_smartly(self, attr_name: str, default: tp.Any, new_attr: tp.Any):
         setattr(self, attr_name, new_attr)
 
 
+def _positive_int_or_none(name: str, value: tp.Any) -> int | None:
+    """Validate an optional positive integer config field (``None`` passes through).
+
+    Args:
+        name: Field name used in the error message.
+        value: Candidate value.
+
+    Returns:
+        ``value`` as a Python ``int``, or ``None``.
+
+    Raises:
+        TypeError: If ``value`` is not an integer (``bool`` and floats are rejected rather than truncated).
+        ValueError: If ``value`` is not positive.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"`{name}` must be an int when provided, got {type(value).__name__}: {value!r}")
+    if int(value) <= 0:
+        raise ValueError(f"`{name}` must be positive when provided.")
+    return int(value)
+
+
+def _one_of(name: str, value: tp.Any, choices: tuple[str, ...]) -> str:
+    """Validate a string config field against its allowed values.
+
+    Args:
+        name: Field name used in the error message.
+        value: Candidate value.
+        choices: Allowed values.
+
+    Returns:
+        ``value``.
+
+    Raises:
+        ValueError: If ``value`` is not one of ``choices``.
+    """
+    if value not in choices:
+        raise ValueError(f"`{name}` must be one of {choices}, got {value!r}.")
+    return value
+
+
+def _positive_int(name: str, value: tp.Any) -> int:
+    """Validate a required positive integer config field.
+
+    Args:
+        name: Field name used in the error message.
+        value: Candidate value.
+
+    Returns:
+        ``value`` as a Python ``int``.
+
+    Raises:
+        TypeError: If ``value`` is not an integer (``None``, ``bool`` and floats are rejected).
+        ValueError: If ``value`` is not positive.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"`{name}` must be an int, got {type(value).__name__}: {value!r}")
+    if int(value) <= 0:
+        raise ValueError(f"`{name}` must be positive, got {value!r}.")
+    return int(value)
+
+
+def _optional_bool(name: str, value: tp.Any) -> bool | None:
+    """Validate a tri-state config flag (``None`` = automatic).
+
+    Args:
+        name: Field name used in the error message.
+        value: Candidate value.
+
+    Returns:
+        ``value`` as a Python ``bool``, or ``None``.
+
+    Raises:
+        TypeError: If ``value`` is neither ``None`` nor a boolean.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"`{name}` must be True, False or None, got {type(value).__name__}: {value!r}")
+    return bool(value)
+
+
 @auto_pytree
 class EasyMethod:
     """Constants for EasyDeL operation modes.
@@ -536,11 +619,36 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             buffer at ``moe_chunk_size * num_experts_per_tok * hidden_size``
             elements per core regardless of batch/sequence size. ``None``
             (default) keeps the single-pass dispatch.
+        moe_defer_tp_reduce: In the chunked fused-MoE dispatch (``moe_chunk_size`` set, tp > 1, ep == 1, no ring,
+            no down-projection bias), apply the tensor-parallel ``psum_scatter`` to the combined ``[chunk, H]``
+            output instead of the top-k-expanded ``[chunk * top_k, H]`` rows. The combine is linear, so only the
+            summation order changes while the reduction moves ``1 / top_k`` of the bytes. Warns once when set but
+            inapplicable. Default ``False``.
+        moe_row_gather_kernel: In the fused-MoE path, run the token dispatch gather and the expert-output
+            unsort + top-k combine through the ejkernel Pallas TPU row-gather kernels (``moe_row_gather`` /
+            ``moe_row_gather_sum``) instead of XLA gathers. Forward dispatch is bit-identical; the combine
+            accumulates in fp32 like the XLA path. Needs bfloat16 rows with a hidden width that is a multiple of 2048
+            and ``tokens * top_k`` a multiple of 1024; first-order reverse mode only. Warns once and keeps the
+            XLA path where it cannot apply. Default ``False``.
+        moe_local_expert_ffn: In expert tensor mode (experts sharded over tp), run each shard's own experts over
+            its tp-replicated tokens through ejkernel's ``moe_local_ffn`` op: one custom VJP over dropless dynamic
+            row windows (empty windows are skipped) with in-place weight gradients, then reduce-scatter the partial
+            sums over tp on the hidden dim. ``moe_chunk_size`` sets its token chunk.
+            The op picks its own kernels (Pallas TPU row gathers and grouped matmuls on TPU, XLA under
+            ``moe_force_xla_gmm`` or elsewhere), and it always reduces the combined ``[tokens, H]`` output, so
+            ``moe_row_gather_kernel``, ``moe_defer_tp_reduce`` and the ``moe_tiling_size_*`` tiles do not apply on
+            this path. Warns once and keeps the regular dispatch where it cannot run (expert tensor mode off,
+            quantized kernels, biases, ungated experts, ring of experts, ...). Default ``False``.
+        moe_local_ffn_window_rows: Rows per ``moe_local_expert_ffn`` row window; ``None`` picks ``9/8`` of a
+            chunk's expected local rows (rounded up to the kernel's 1024-row step on TPU).
         moe_fsdp_shard_expert_weights: Shard the expert (leading) dimension
             of MoE expert weights over the FSDP axis at rest and all-gather
             them over FSDP inside the fused-MoE ``shard_map`` right before
             use (ZeRO-3 style). Only takes effect when the FSDP axis is not
-            expert-bound (``fsdp_is_ep_bound=False``). Default ``False``.
+            expert-bound (``fsdp_is_ep_bound=False``). In expert tensor mode
+            the FSDP axis shards each expert kernel's second (feature)
+            dimension instead (expert counts rarely divide tp * fsdp).
+            Default ``False``.
         moe_ep_carries_batch: Shard the token batch over the expert axis as
             well (MaxText-style "ep carries batch"). Activations resolve the
             logical BATCH axis to ``(fsdp, dp, ep)`` instead of
@@ -635,6 +743,10 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     fsdp_is_ep_bound: NotRequired[bool]
     sp_is_ep_bound: NotRequired[bool]
     moe_chunk_size: NotRequired[int | None]
+    moe_defer_tp_reduce: NotRequired[bool]
+    moe_row_gather_kernel: NotRequired[bool]
+    moe_local_expert_ffn: NotRequired[bool]
+    moe_local_ffn_window_rows: NotRequired[int | None]
     moe_fsdp_shard_expert_weights: NotRequired[bool]
     moe_ep_carries_batch: NotRequired[bool]
     moe_batch_axes_follow_resolver: NotRequired[bool]
@@ -724,6 +836,11 @@ class EasyDeLBaseConfig(PretrainedConfig):
         fsdp_is_ep_bound: Fold the FSDP axis into the expert axis when building expert meshes.
         sp_is_ep_bound: Fold the sequence-parallel axis into the expert axis when building expert meshes.
         moe_chunk_size: Optional token chunk size for chunk-scanned fused-MoE dispatch (``None`` disables).
+        moe_defer_tp_reduce: Reduce the chunked MoE output over TP after the top-k combine (default ``False``).
+        moe_row_gather_kernel: Fused-MoE dispatch/combine row gathers via the Pallas TPU kernels (default ``False``).
+        moe_local_expert_ffn: In expert-tensor mode, run each device's experts through the ejkernel
+            ``moe_local_ffn`` op (dropless dynamic row windows, custom VJP; default ``False``).
+        moe_local_ffn_window_rows: Rows per ``moe_local_expert_ffn`` window (``None``: automatic).
         moe_fsdp_shard_expert_weights: Shard MoE expert weights over FSDP at rest and gather at use.
         moe_ep_carries_batch: Shard the token batch over the expert axis and dispatch tokens to their
             expert-owning shard (MaxText-style "ep carries batch"; default ``False``).
@@ -1262,6 +1379,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
         fsdp_is_ep_bound: bool = FSDP_IS_EP_BOUND,
         sp_is_ep_bound: bool = SP_IS_EP_BOUND,
         moe_chunk_size: int | None = None,
+        moe_defer_tp_reduce: bool = False,
+        moe_row_gather_kernel: bool = False,
+        moe_local_expert_ffn: bool = False,
+        moe_local_ffn_window_rows: int | None = None,
         moe_fsdp_shard_expert_weights: bool = False,
         moe_ep_carries_batch: bool = False,
         moe_batch_axes_follow_resolver: bool = False,
@@ -1403,16 +1524,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.use_expert_tensor_mode = getattr(self, "use_expert_tensor_mode", use_expert_tensor_mode)
         self.fsdp_is_ep_bound = getattr(self, "fsdp_is_ep_bound", fsdp_is_ep_bound)
         self.sp_is_ep_bound = getattr(self, "sp_is_ep_bound", sp_is_ep_bound)
-        self.moe_chunk_size = getattr(self, "moe_chunk_size", moe_chunk_size)
-        if self.moe_chunk_size is not None:
-            if not isinstance(self.moe_chunk_size, (int, np.integer)):
-                raise TypeError(
-                    "`moe_chunk_size` must be an int when provided, got "
-                    f"{type(self.moe_chunk_size).__name__}: {self.moe_chunk_size!r}"
-                )
-            self.moe_chunk_size = int(self.moe_chunk_size)
-            if self.moe_chunk_size <= 0:
-                raise ValueError("`moe_chunk_size` must be positive when provided.")
+        self.moe_chunk_size = _positive_int_or_none("moe_chunk_size", getattr(self, "moe_chunk_size", moe_chunk_size))
+        self.moe_defer_tp_reduce = bool(getattr(self, "moe_defer_tp_reduce", moe_defer_tp_reduce))
+        self.moe_row_gather_kernel = bool(getattr(self, "moe_row_gather_kernel", moe_row_gather_kernel))
+        self.moe_local_expert_ffn = bool(getattr(self, "moe_local_expert_ffn", moe_local_expert_ffn))
+        self.moe_local_ffn_window_rows = _positive_int_or_none(
+            "moe_local_ffn_window_rows", getattr(self, "moe_local_ffn_window_rows", moe_local_ffn_window_rows)
+        )
         self.moe_fsdp_shard_expert_weights = getattr(
             self, "moe_fsdp_shard_expert_weights", moe_fsdp_shard_expert_weights
         )
@@ -2064,6 +2182,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "fsdp_is_ep_bound",
             "sp_is_ep_bound",
             "moe_chunk_size",
+            "moe_defer_tp_reduce",
+            "moe_row_gather_kernel",
+            "moe_local_expert_ffn",
+            "moe_local_ffn_window_rows",
             "moe_fsdp_shard_expert_weights",
             "moe_ep_carries_batch",
             "moe_batch_axes_follow_resolver",
@@ -2232,6 +2354,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
         fsdp_is_ep_bound: bool = NOT_GIVEN,
         sp_is_ep_bound: bool = NOT_GIVEN,
         moe_chunk_size: int | None = NOT_GIVEN,
+        moe_defer_tp_reduce: bool = NOT_GIVEN,
+        moe_row_gather_kernel: bool = NOT_GIVEN,
+        moe_local_expert_ffn: bool = NOT_GIVEN,
+        moe_local_ffn_window_rows: int | None = NOT_GIVEN,
         moe_fsdp_shard_expert_weights: bool = NOT_GIVEN,
         moe_ep_carries_batch: bool = NOT_GIVEN,
         moe_batch_axes_follow_resolver: bool = NOT_GIVEN,
@@ -2305,6 +2431,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
             fsdp_is_ep_bound: Fold FSDP into the expert axis when building expert meshes.
             sp_is_ep_bound: Fold sequence-parallel into the expert axis when building expert meshes.
             moe_chunk_size: Token chunk size for chunk-scanned fused-MoE dispatch (default ``None`` = disabled).
+            moe_defer_tp_reduce: Reduce the chunked MoE output over TP after the top-k combine
+                (default ``False``).
+            moe_row_gather_kernel: Run the fused-MoE dispatch/combine row gathers through the Pallas TPU
+                row-gather kernels (default ``False``).
+            moe_local_expert_ffn: In expert-tensor mode, run each device's experts through the ejkernel
+                ``moe_local_ffn`` op (default ``False``).
+            moe_local_ffn_window_rows: Rows per ``moe_local_expert_ffn`` window (default ``None`` = automatic).
             moe_fsdp_shard_expert_weights: Shard MoE expert weights over FSDP at rest and gather at use
                 (default ``False``).
             moe_ep_carries_batch: Shard the token batch over the expert axis and dispatch tokens to
@@ -2392,6 +2525,14 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "fsdp_is_ep_bound", FSDP_IS_EP_BOUND, fsdp_is_ep_bound)
         set_attrs_smartly(self, "sp_is_ep_bound", SP_IS_EP_BOUND, sp_is_ep_bound)
         set_attrs_smartly(self, "moe_chunk_size", None, moe_chunk_size)
+        self.moe_chunk_size = _positive_int_or_none("moe_chunk_size", self.moe_chunk_size)
+        set_attrs_smartly(self, "moe_defer_tp_reduce", False, moe_defer_tp_reduce)
+        set_attrs_smartly(self, "moe_row_gather_kernel", False, moe_row_gather_kernel)
+        set_attrs_smartly(self, "moe_local_expert_ffn", False, moe_local_expert_ffn)
+        set_attrs_smartly(self, "moe_local_ffn_window_rows", None, moe_local_ffn_window_rows)
+        self.moe_local_ffn_window_rows = _positive_int_or_none(
+            "moe_local_ffn_window_rows", self.moe_local_ffn_window_rows
+        )
         set_attrs_smartly(self, "moe_fsdp_shard_expert_weights", False, moe_fsdp_shard_expert_weights)
         set_attrs_smartly(self, "moe_ep_carries_batch", False, moe_ep_carries_batch)
         set_attrs_smartly(self, "moe_batch_axes_follow_resolver", False, moe_batch_axes_follow_resolver)

@@ -206,10 +206,6 @@ def test_already_correct_families_still_thread_the_live_bias(family):
     assert "e_score_correction_bias=self" in source
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-q"]))
-
-
 def test_excluded_negative_score_group_cannot_win():
     """Masking must work even when every valid routing score is negative."""
     logits = jnp.asarray([[-1.0, -2.0, -3.0, -4.0]], dtype=jnp.float32)
@@ -225,6 +221,52 @@ def test_excluded_negative_score_group_cannot_win():
         norm_topk_prob=False,
     )
     assert np.asarray(indices).tolist() == [[0]]
+
+
+def test_topk_lookup_matches_the_gather_and_its_scatter_gradient():
+    """The one-hot select-and-sum lookup equals ``take_along_axis`` exactly; its gradient is the scatter-add."""
+    from easydel.layers.moe._routing import _take_topk
+
+    rng = np.random.default_rng(5)
+    tokens, experts, k = 512, 288, 8
+    scores = jax.nn.sigmoid(jnp.asarray(rng.standard_normal((tokens, experts)), jnp.float32))
+    indices = jax.lax.top_k(scores + jnp.asarray(rng.standard_normal(experts), jnp.float32), k)[1]
+    ct = jnp.asarray(rng.standard_normal((tokens, k)), jnp.float32)
+
+    got = jax.jit(_take_topk)(scores, indices)
+    want = jax.jit(lambda s, i: jnp.take_along_axis(s, i, axis=-1))(scores, indices)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+    grad = jax.jit(jax.grad(lambda s: jnp.sum(_take_topk(s, indices) * ct)))(scores)
+    ref = np.zeros((tokens, experts), np.float64)
+    np.add.at(ref, (np.arange(tokens)[:, None], np.asarray(indices)), np.asarray(ct, np.float64))
+    np.testing.assert_allclose(np.asarray(grad, np.float64), ref, rtol=0, atol=1e-6)
+
+
+def test_flat_selector_lowers_without_a_gather():
+    """With one group, selection is top-k + the select-and-sum lookup: no gather (or its scatter transpose)."""
+    flat = dict(GROUPED, n_group=1, topk_group=1)
+    logits = jnp.asarray(np.random.default_rng(6).standard_normal((64, 288)), jnp.float32)
+
+    def loss(lg):
+        weights, _ = moe_group_topk_select(
+            lg, None, 8, e_score_correction_bias=jnp.zeros((288,), jnp.float32), **{**flat, "n_routed_experts": 288}
+        )
+        return jnp.sum(weights)
+
+    names = set()
+
+    def walk(jaxpr):
+        for eqn in jaxpr.eqns:
+            names.add(eqn.primitive.name)
+            for param in eqn.params.values():
+                for sub in param if isinstance(param, (tuple, list)) else (param,):
+                    sub = getattr(sub, "jaxpr", sub)
+                    if hasattr(sub, "eqns"):
+                        walk(sub)
+
+    walk(jax.make_jaxpr(jax.value_and_grad(loss))(logits).jaxpr)
+    assert not {"gather", "scatter-add", "scatter_add"} & names, sorted(names)
 
 
 @pytest.mark.parametrize("family", ["glm4_moe", "glm4_moe_lite", "glm_moe_dsa"])
@@ -255,3 +297,7 @@ def test_family_select_hook_observes_changed_live_bias(family):
     unbiased = jnp.take_along_axis(jax.nn.sigmoid(logits), selected, axis=-1)
     expected = unbiased / jnp.sum(unbiased, axis=-1, keepdims=True) * 2.5
     np.testing.assert_allclose(weights, expected, rtol=1e-6, atol=1e-6)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))

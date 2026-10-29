@@ -122,10 +122,12 @@ def _moe_parameter_layout(
         is_bias: ``True`` for the 2-D bias parameter, ``False`` for the 3-D
             weight kernel.
         fsdp_shard_expert_weights: When ``True``, shard the expert (leading)
-            dimension over ``(EP, FSDP)`` instead of ``EP`` alone. ``None``
-            (default) reads the ambient parameter-init scope installed by
-            the EasyDeL base-module constructor from
-            ``config.moe_fsdp_shard_expert_weights``.
+            dimension over ``(EP, FSDP)`` instead of ``EP`` alone. In expert
+            tensor mode (experts on ``TP``) the weight's second (feature)
+            dimension is sharded over ``FSDP`` instead (``(TP, FSDP, None)``)
+            and biases stay FSDP-replicated. ``None`` (default) reads the
+            ambient parameter-init scope installed by the EasyDeL base-module
+            constructor from ``config.moe_fsdp_shard_expert_weights``.
 
     Returns:
         A :class:`TensorLayout` describing the partitioning of the parameter,
@@ -133,10 +135,15 @@ def _moe_parameter_layout(
     """
     if direction is None:
         return None
-    if use_expert_tensor_mode:
-        return TensorLayout((TP, None) if is_bias else (TP, None, None))
     if fsdp_shard_expert_weights is None:
         fsdp_shard_expert_weights = moe_fsdp_shard_expert_weights_enabled()
+    if use_expert_tensor_mode:
+        # Experts already carry the tensor-parallel axis and their count rarely divides tp * fsdp, so FSDP shards the
+        # second (feature) dimension instead; the fused MoE all-gathers it over fsdp on that dimension right before
+        # use, at the same cost as the expert-dimension gather.
+        if is_bias:
+            return TensorLayout((TP, None))
+        return TensorLayout((TP, FSDP, None) if fsdp_shard_expert_weights else (TP, None, None))
     expert_entry = (EP, FSDP) if fsdp_shard_expert_weights else EP
     if is_bias:
         return TensorLayout((expert_entry, TP))
@@ -613,10 +620,10 @@ class ParallelMoELinear(spx.Module):
         # actually declared with, so quant_kernel/quant_scales keep the
         # (EP, FSDP) at-rest expert sharding instead of silently dropping to
         # EP-only.
+        # Expert-tensor mode puts FSDP on the second dimension, so look at every entry, not only the expert one.
         dense_axes = getattr(getattr(self.weight, "sharding", None), "axis_names", None) or ()
-        expert_entry = dense_axes[0] if dense_axes else None
-        expert_axes = expert_entry if isinstance(expert_entry, (tuple, list)) else (expert_entry,)
-        with moe_expert_param_layout_scope(fsdp_shard_expert_weights=FSDP in expert_axes):
+        fsdp_sharded = any(FSDP in (entry if isinstance(entry, (tuple, list)) else (entry,)) for entry in dense_axes)
+        with moe_expert_param_layout_scope(fsdp_shard_expert_weights=fsdp_sharded):
             lazy_module = jax.eval_shape(
                 lambda rngs: ParallelMoELinearQuantized(
                     num_experts=self.num_experts,
