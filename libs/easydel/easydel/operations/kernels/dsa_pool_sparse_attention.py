@@ -142,7 +142,7 @@ class DsaPoolSparseAttn(OperationImpl):
         out = _ejkernel_dsa_sparse_attention(
             query.astype(runtime_dtype),
             latent.astype(runtime_dtype),
-            pool_mask.astype(jnp.bool_),
+            pool_mask if pool_mask.dtype == jnp.bool_ else pool_mask.astype(jnp.int32),
             None if tails is None else tails.astype(jnp.int32),
             None if ste_pool is None else ste_pool.astype(jnp.float32),
             kpool=int(kpool),

@@ -21,6 +21,7 @@ from functools import partial
 
 import jax
 import spectrax as spx
+from ejkernel.modules import pack_pool_bits  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float
@@ -28,7 +29,7 @@ from jaxtyping import Array, Bool, Float
 from easydel.layers.linears import ColumnParallelLinear
 
 from ._config import IndexerConfig, IndexerKind
-from ._primitives import indices_to_bool_mask, visible_causal_mask
+from ._primitives import CompactLayout, compact_valid_layout, indices_to_bool_mask, visible_causal_mask
 from ._rope import apply_indexer_rope, truncate_cos_sin
 from ._selection import BaseIndexer, IndexerSelection, SelectionSpec, top_k_indices
 from ._shared_key import fused_head_scores
@@ -614,6 +615,7 @@ class SparseIndexer(BaseIndexer):
         query: Float[Array, "batch seq heads head_dim"],
         keys: Float[Array, "batch n head_dim"],
         hidden_states: Float[Array, "batch seq hidden"],
+        mesh_source: object | None = None,
     ) -> Float[Array, "batch seq n"]:
         """Head-reduced relu scores ``[batch, seq, n]`` through :func:`fused_head_scores`.
 
@@ -624,6 +626,7 @@ class SparseIndexer(BaseIndexer):
             query: Roped indexer queries.
             keys: Candidate keys (tokens or pool summaries).
             hidden_states: Layer input for the learned head weights.
+            mesh_source: Row-layout provider overriding ``self.mesh_source`` (e.g. a ``ScoreRowSplit``).
 
         Returns:
             fp32 scores equal to the dense ``_reduce_heads(relu(scale * q.k))`` path.
@@ -632,7 +635,8 @@ class SparseIndexer(BaseIndexer):
             weights = jnp.full(query.shape[:3], self.softmax_scale, jnp.float32)
         else:
             weights = self.weights_proj(hidden_states).astype(jnp.float32) * (self.n_heads**-0.5 * self.softmax_scale)
-        return fused_head_scores(query, keys, weights, precision=self.precision, mesh_source=self.mesh_source)
+        source = self.mesh_source if mesh_source is None else mesh_source
+        return fused_head_scores(query, keys, weights, precision=self.precision, mesh_source=source)
 
     def _select_token(
         self,
@@ -863,6 +867,149 @@ class SparseIndexer(BaseIndexer):
         topk_indices = jnp.where(attention_mask[..., None], topk_indices, -1)
         topk_mask = topk_mask & attention_mask[..., None]
         return topk_indices.astype("i4"), topk_mask
+
+    def select_pools_chunked(
+        self,
+        hidden_states: Float[Array, "batch seq hidden"],
+        q_resid: Array | None = None,
+        attention_mask: Bool[Array, "batch seq"] | None = None,
+        *,
+        query_chunk_size: int = 2048,
+        packed: bool = False,
+        as_indices: bool = False,
+        row_split: object | None = None,
+        layout: CompactLayout | None = None,
+    ) -> tuple[Array, Array | None]:
+        """Training-time pool selection without any ``[seq, seq]`` or ``[seq, heads, pools]`` tensor.
+
+        Same selection as the stateless :meth:`forward` of the ``pool`` strategy (learned softmax-gated pool
+        keys, causal pool visibility, top ``index_topk // kpool_size`` pools, optional incomplete tail), but the
+        queries are scored in chunks of ``query_chunk_size`` so the largest transient is ``[batch, chunk, pools]``
+        (or ``[batch, chunk, heads, pools]`` on the unfused XLA scorer) and causality is derived from positions.
+
+        Pools group consecutive *valid* tokens, as in the dense strategy: the selection indexes the compact key grid
+        of ``layout`` (see :func:`~._primitives.compact_valid_layout`), where pool ``p`` covers compact keys
+        ``p * kpool .. p * kpool + kpool - 1``. Every query keeps its own slot and its compact rank is its causal
+        position, so an attention consuming the selection reads its keys in ``layout`` order (``layout.gather``) and
+        uses ``layout.rank`` as the query positions. Any per-row padding is supported; packed documents (segment ids)
+        are not.
+
+        Args:
+            hidden_states: Layer input ``[batch, seq, hidden]``.
+            q_resid: MLA low-rank residual (``query_source="q_lora"``).
+            attention_mask: Token validity ``[batch, seq]`` (any padding pattern), or ``None`` for all-valid rows.
+            query_chunk_size: Queries scored per chunk.
+            packed: Return the selection as packed int32 words, one bit per pool (bit ``p % 32`` of word ``p // 32``
+                = pool ``p``, the ``dsa_sparse_attention`` kernels' own layout), packed inside each chunk so no
+                ``[batch, seq, pools]`` tensor is ever materialised.
+            as_indices: Return the selected pool ids ``[batch, seq, min(index_topk // kpool, pools)]`` int32
+                (``-1`` = unused slot) instead of a mask, the form the ``dsa_gather_attention`` operation reads.
+            row_split: Optional :class:`~._selection.ScoreRowSplit` placing each chunk's score rows ``[batch,
+                chunk]`` for the fused scorer and the top-k instead of the resolved activation layout; the selection
+                is unchanged.
+            layout: The :class:`~._primitives.CompactLayout` the consuming attention uses for its keys; computed from
+                ``attention_mask`` when omitted. With both ``None`` every token is valid and the grid is physical.
+
+        Returns:
+            ``(pool_mask [batch, seq, ceil(seq / kpool)] bool, tails [batch, seq, kpool - 1] int32 or None)``; with
+            ``packed=True`` the first entry is ``[batch, seq, ceil(ceil(seq / kpool) / 32)]`` int32 words; with
+            ``as_indices=True`` it is the ``[batch, seq, k]`` int32 pool ids.
+            ``tails`` holds each query's incomplete-pool tokens as compact key ids (``-1`` padded); ``None`` when
+            ``select_tail`` is off or ``kpool_size == 1``.
+
+        Raises:
+            ValueError: If the indexer is not a ``pool`` strategy with ``key_gate_valid`` packing, or if both
+                ``packed`` and ``as_indices`` are set.
+        """
+        if self.config.kind != IndexerKind.POOL or self.config.packed_state != "key_gate_valid":
+            raise ValueError("select_pools_chunked requires the pool strategy with key_gate_valid packing.")
+        if packed and as_indices:
+            raise ValueError("select_pools_chunked: `packed` and `as_indices` are mutually exclusive.")
+        batch_size, seq_len, _ = hidden_states.shape
+        kpool = self.config.kpool_size
+        if layout is None and attention_mask is not None:
+            layout = compact_valid_layout(attention_mask.astype(jnp.bool_))
+        query, key, gate_scores = self._project(hidden_states, q_resid, None, None)
+        if self.config.stop_gradient:
+            query, key, gate_scores, hidden_states = jax.lax.stop_gradient((query, key, gate_scores, hidden_states))
+        # The dense strategy stores gate scores in the key-dtype packed state before pooling; round the same way.
+        gates = gate_scores.astype(key.dtype).astype(jnp.float32)
+        if layout is None:
+            positions = jnp.broadcast_to(jnp.arange(seq_len, dtype=jnp.int32)[None, :], (batch_size, seq_len))
+            valid = jnp.ones((batch_size, seq_len), dtype=jnp.bool_)
+            key_valid = valid
+        else:
+            # Keys (and the gate scores that weight them) in each row's valid-first order; queries stay in place and
+            # take their compact rank as causal position.
+            key, gates = layout.gather(key), layout.gather(gates)
+            positions = layout.rank
+            valid = positions >= 0
+            num_valid = jnp.sum(valid, axis=1, keepdims=True, dtype=jnp.int32)
+            key_valid = jnp.arange(seq_len, dtype=jnp.int32)[None, :] < num_valid
+
+        # Pool summaries over the compact kpool grid.
+        num_pools = -(-seq_len // kpool)
+        pad = num_pools * kpool - seq_len
+        grouped_keys = jnp.pad(key, ((0, 0), (0, pad), (0, 0))).reshape(batch_size, num_pools, kpool, -1)
+        grouped_gates = jnp.pad(gates, ((0, 0), (0, pad), (0, 0))).reshape(batch_size, num_pools, kpool, -1)
+        grouped_valid = jnp.pad(key_valid, ((0, 0), (0, pad))).reshape(batch_size, num_pools, kpool)
+        ape = self.index_kpool_compress_ape.value.astype(jnp.float32)
+        logits = jnp.where(grouped_valid[..., None], grouped_gates + ape[None, None], -1e30)
+        probabilities = jnp.nan_to_num(jax.nn.softmax(logits, axis=2), nan=0.0)
+        pool_keys = jnp.sum(probabilities * grouped_keys.astype(jnp.float32), axis=2).astype(key.dtype)
+        pool_keys_f32 = pool_keys.astype(jnp.float32)
+        pool_valid = jnp.all(grouped_valid, axis=-1)
+        pool_end = jnp.arange(num_pools, dtype=jnp.int32) * kpool + (kpool - 1)
+        select_k = min(self.index_topk // kpool, num_pools)
+
+        row_source = self.mesh_source if row_split is None else row_split
+        chunk = max(1, min(int(query_chunk_size), seq_len))
+        num_chunks = -(-seq_len // chunk)
+        qpad = num_chunks * chunk - seq_len
+
+        def to_chunks(x: Array) -> Array:
+            x = jnp.pad(x, [(0, 0), (0, qpad)] + [(0, 0)] * (x.ndim - 2))
+            return jnp.moveaxis(x.reshape(batch_size, num_chunks, chunk, *x.shape[2:]), 1, 0)
+
+        def select_chunk(inputs):
+            q_chunk, h_chunk, v_chunk, p_chunk = inputs
+            if self._uses_fused_scoring(q_chunk):
+                scores = self._fused_scores(q_chunk, pool_keys_f32, h_chunk, mesh_source=row_source)
+            else:
+                scores = jnp.einsum(
+                    "bshd,bpd->bshp", q_chunk.astype(jnp.float32), pool_keys_f32, precision=self.precision
+                )
+                scores = scores * self.softmax_scale
+                if self.config.score_activation == "relu":
+                    scores = jax.nn.relu(scores)
+                scores = self._reduce_heads(scores, h_chunk)
+            candidates = (pool_end[None, None, :] <= p_chunk[:, :, None]) & pool_valid[:, None, :] & v_chunk[:, :, None]
+            scores = jnp.where(candidates, scores, jnp.finfo(jnp.float32).min)
+            selection = self.select_candidates(scores, select_k, candidates, row_source)
+            if as_indices:
+                # Eligible picks only (ineligible slots are already -1); the unused mask is dead code under jit.
+                return selection.indices.astype(jnp.int32)
+            mask = selection.mask
+            if mask is None:
+                mask = jnp.zeros(scores.shape, dtype=jnp.bool_)
+            mask = mask & candidates
+            return pack_pool_bits(mask) if packed else mask
+
+        masks = jax.lax.map(
+            select_chunk, (to_chunks(query), to_chunks(hidden_states), to_chunks(valid), to_chunks(positions))
+        )
+        width = masks.shape[-1]
+        pool_mask = jnp.moveaxis(masks, 0, 1).reshape(batch_size, num_chunks * chunk, width)[:, :seq_len]
+
+        tails = None
+        if self.config.select_tail and kpool > 1:
+            # The query's own incomplete pool: compact keys kpool * ((pos + 1) // kpool) .. pos.
+            visible_count = jnp.where(valid, positions + 1, 0)
+            tail_count = visible_count % kpool
+            tail_start = visible_count - tail_count
+            offsets = jnp.arange(kpool - 1, dtype=jnp.int32)
+            tails = jnp.where(offsets < tail_count[..., None], tail_start[..., None] + offsets, -1).astype(jnp.int32)
+        return jax.lax.stop_gradient(pool_mask), tails
 
     @staticmethod
     def _compact_valid_indices(key_valid: Bool[Array, "batch kv"]) -> Array:

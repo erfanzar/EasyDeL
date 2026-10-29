@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import dataclasses
 
+from easydel.infra.etils import INDEX_SCORING_KERNELS
+
 __all__ = ("IndexerConfig", "IndexerKind")
 
 
@@ -113,8 +115,8 @@ class IndexerConfig:
     def __post_init__(self):
         if self.kind not in (IndexerKind.TOKEN, IndexerKind.POOL):
             raise ValueError(f"IndexerConfig.kind must be 'token' or 'pool', got {self.kind!r}.")
-        if self.scoring_kernel not in ("xla", "pallas"):
-            raise ValueError(f"scoring_kernel must be 'xla' or 'pallas', got {self.scoring_kernel!r}.")
+        if self.scoring_kernel not in INDEX_SCORING_KERNELS:
+            raise ValueError(f"scoring_kernel must be one of {INDEX_SCORING_KERNELS}, got {self.scoring_kernel!r}.")
         if self.scoring_kernel == "pallas" and self.score_activation != "relu":
             raise ValueError("scoring_kernel='pallas' fuses a per-head relu; it requires score_activation='relu'.")
         if self.score_activation not in ("none", "relu"):
