@@ -139,6 +139,116 @@ def test_bf16_inputs_and_default_precision():
     assert rel(out_d, o_ref) < 5e-2  # bf16 MXU passes for the non-inverse dots
 
 
+def _grads(fn, args, w_out, w_fin):
+    def loss(*a):
+        out, fin = fn(*a)[:2]
+        return jnp.sum(out * w_out) + jnp.sum(fin * w_fin)
+
+    return jax.jit(jax.grad(loss, argnums=range(6)))(*args)
+
+
+def _nrel(a, b):
+    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    return float(np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-30))
+
+
+@pytest.mark.parametrize("block_h", [1, 2])
+@pytest.mark.parametrize("segmented", [False, True], ids=["plain", "packed"])
+def test_factored_pairwise_values_and_gradients_match_oracle(segmented, block_h):
+    """With the gate bound the kernel factors the pairwise decay into MXU matmuls; at HIGHEST it matches the oracle."""
+    q, k, v, beta, g, s0 = make_inputs(20, L=192, strong=True)
+    assert float(g.min()) >= -5.0
+    seg = packed_ids(2, 192, boundaries=(37, 64, 65, 130), pad_rows=((1, 170, None),)) if segmented else None
+    rng = np.random.RandomState(21)
+    w_out = jnp.asarray(rng.randn(2, 2, 192, 128).astype(np.float32))
+    w_fin = jnp.asarray(rng.randn(2, 2, 128, 128).astype(np.float32))
+    f_k = functools.partial(PALLAS, chunk_size=64, block_h=block_h, decay_lower_bound=-5.0)
+    args = (q, k, v, beta, g, s0, seg)
+    out, fin = jax.jit(f_k)(*args)
+    o_ref, f_ref, _ = recurrent_oracle(*args)
+    assert rel(out, o_ref) < 2e-5 and rel(fin, f_ref) < 2e-5
+    g_k = _grads(f_k, args, w_out, w_fin)
+    g_r = _grads(recurrent_oracle, args, w_out, w_fin)
+    for a, b, name in zip(g_k, g_r, ("dq", "dk", "dv", "dbeta", "dg", "ds0"), strict=True):
+        assert np.isfinite(np.asarray(a)).all(), name
+        assert rel(a, b) < 1e-4, (name, rel(a, b))
+
+
+def test_factored_pairwise_default_precision_keeps_the_dense_error_budget():
+    """At ``precision="default"`` the factored path's error vs fp32 stays within 2x the dense kernel's.
+
+    A single bf16 pass on the backward's decay reductions loses accuracy in the log-decay gradient, so the factored
+    path runs them (and the chunk inverse) at bf16x3.
+    """
+    q, k, v, beta, g, s0 = make_inputs(22, L=256, strong=True)
+    rng = np.random.RandomState(23)
+    w_out = jnp.asarray(rng.randn(2, 2, 256, 128).astype(np.float32))
+    w_fin = jnp.asarray(rng.randn(2, 2, 128, 128).astype(np.float32))
+    args = (q, k, v, beta, g, s0, None)
+    dense = functools.partial(PALLAS, chunk_size=64, precision="default")
+    factored = functools.partial(PALLAS, chunk_size=64, precision="default", decay_lower_bound=-5.0)
+    o_ref, _, _ = recurrent_oracle(*args)
+    e_dense, e_fact = _nrel(jax.jit(dense)(*args)[0], o_ref), _nrel(jax.jit(factored)(*args)[0], o_ref)
+    assert e_fact <= 2.0 * e_dense + 1e-4, (e_fact, e_dense)
+    g_r = _grads(recurrent_oracle, args, w_out, w_fin)
+    g_d = _grads(dense, args, w_out, w_fin)
+    g_f = _grads(factored, args, w_out, w_fin)
+    for a, b, r, name in zip(g_f, g_d, g_r, ("dq", "dk", "dv", "dbeta", "dg", "ds0"), strict=True):
+        assert np.isfinite(np.asarray(a)).all(), name
+        assert _nrel(a, r) <= 2.0 * _nrel(b, r) + 1e-4, (name, _nrel(a, r), _nrel(b, r))
+
+
+@pytest.mark.parametrize("precision", ["highest", "default"])
+@pytest.mark.parametrize("segmented", [False, True], ids=["plain", "packed"])
+def test_factored_head_batched_block_matches_single_head_blocks(segmented, precision):
+    """``block_h=4`` runs the factored chunk math as one head-batched program; it must equal ``block_h=1``.
+
+    Covers the forward outputs, the final and per-chunk states, and every gradient, with the chunk-state cotangent in
+    the loss so the backward's ``d_chunk_states_in`` path is exercised; at HIGHEST it also matches the oracle.
+    """
+    q, k, v, beta, g, s0 = make_inputs(30, H=4, L=192, strong=True)
+    assert float(g.min()) >= -5.0
+    seg = packed_ids(2, 192, boundaries=(37, 64, 65, 130), pad_rows=((1, 170, None),)) if segmented else None
+    rng = np.random.RandomState(31)
+    w_out = jnp.asarray(rng.randn(2, 4, 192, 128).astype(np.float32))
+    w_fin = jnp.asarray(rng.randn(2, 4, 128, 128).astype(np.float32))
+    w_st = jnp.asarray(rng.randn(2, 3, 4, 128, 128).astype(np.float32))
+    args = (q, k, v, beta, g, s0, seg)
+
+    def fn(block_h):
+        return functools.partial(
+            PALLAS, chunk_size=64, block_h=block_h, precision=precision, decay_lower_bound=-5.0, return_chunk_states=True
+        )
+
+    def loss(f, *a):
+        out, fin, st = f(*a)
+        return jnp.sum(out * w_out) + jnp.sum(fin * w_fin) + jnp.sum(st * w_st)
+
+    one, four = fn(1), fn(4)
+    vals_1, vals_4 = jax.jit(one)(*args), jax.jit(four)(*args)
+    for a, b, name in zip(vals_4, vals_1, ("out", "final", "chunk_states"), strict=True):
+        assert a.shape == b.shape and a.dtype == jnp.float32, name
+        assert rel(a, b) <= 1e-6, (name, rel(a, b))
+    grads_1 = jax.jit(jax.grad(functools.partial(loss, one), argnums=range(6)))(*args)
+    grads_4 = jax.jit(jax.grad(functools.partial(loss, four), argnums=range(6)))(*args)
+    for a, b, name in zip(grads_4, grads_1, ("dq", "dk", "dv", "dbeta", "dg", "ds0"), strict=True):
+        assert np.isfinite(np.asarray(a)).all(), name
+        assert rel(a, b) <= 1e-6, (name, rel(a, b))
+    if precision == "highest":
+        o_ref, f_ref, st_ref = recurrent_oracle(*args, chunk_size=64)
+        assert rel(vals_4[0], o_ref) < 2e-5 and rel(vals_4[1], f_ref) < 2e-5 and rel(vals_4[2], st_ref) < 2e-5
+
+
+def test_dense_pairwise_opts_out_and_the_bound_changes_the_kernel():
+    q, k, v, beta, g, s0 = make_inputs(24, L=128, strong=True)
+    plain = run(PALLAS, q, k, v, beta, g, s0, chunk_size=64)
+    dense = run(PALLAS, q, k, v, beta, g, s0, chunk_size=64, decay_lower_bound=-5.0, pairwise="dense")
+    factored = run(PALLAS, q, k, v, beta, g, s0, chunk_size=64, decay_lower_bound=-5.0)
+    for a, b in zip(dense, plain, strict=True):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    assert not np.array_equal(np.asarray(factored[0]), np.asarray(plain[0]))
+
+
 @pytest.mark.parametrize(
     ("dims", "chunk_size", "heads", "block_h"),
     [((64, 128), 64, 2, 1), ((128, 96), 64, 2, 1), ((128, 128), 48, 2, 1), ((128, 128), 64, 3, 2)],
@@ -151,6 +261,42 @@ def test_untileable_shapes_route_to_xla(dims, chunk_size, heads, block_h):
     o_x, f_x = run(XLA, q, k, v, beta, g, s0, chunk_size=chunk_size)
     np.testing.assert_array_equal(np.asarray(out), np.asarray(o_x))
     np.testing.assert_array_equal(np.asarray(fin), np.asarray(f_x))
+
+
+@pytest.mark.parametrize("reverse", [False, True], ids=["prefix", "suffix"])
+def test_in_kernel_chunk_cumsum_keeps_fp32_accuracy(reverse):
+    """``chunk_cumsum`` inside a ``pallas_call`` matches float64 prefix / suffix sums to fp32 rounding.
+
+    It computes the kernels' chunk prefix sums of ``g`` (and the backward's suffix sums of ``dg_cumsum``) as a
+    triangular ones-matrix MXU matmul at HIGHEST; a single bfloat16 pass would round every term to 8 mantissa bits
+    (error ~1e-3 of the running magnitude).
+    """
+    from ejkernel.kernels._pallas.tpu.kda_chunk._pallas_impl_fwd import chunk_cumsum
+    from jax.experimental import pallas as pl
+
+    h, cs, kdim = 8, 64, 128
+    rng = np.random.default_rng(31)
+    gate = rng.uniform(-5.0, 0.0, (2, h // 2, cs, kdim))  # strongly decaying log-gates down to the -5 bound
+    mixed = 5.0 * rng.standard_normal((2, h // 2, cs, kdim))  # mixed-sign cotangents
+    x = np.concatenate([gate, mixed], axis=1).astype(np.float32)
+
+    def kernel(x_ref, o_ref):
+        o_ref[...] = chunk_cumsum(x_ref[...], reverse=reverse)
+
+    spec = pl.BlockSpec((None, h, cs, kdim), lambda i: (i, 0, 0, 0))
+    out = pl.pallas_call(
+        kernel, grid=(2,), in_specs=[spec], out_specs=spec, out_shape=jax.ShapeDtypeStruct(x.shape, jnp.float32)
+    )(jnp.asarray(x))
+    x64 = x.astype(np.float64)
+    if reverse:
+        ref = np.cumsum(x64[..., ::-1, :], axis=-2)[..., ::-1, :]
+        scale = np.cumsum(np.abs(x64)[..., ::-1, :], axis=-2)[..., ::-1, :]
+    else:
+        ref = np.cumsum(x64, axis=-2)
+        scale = np.cumsum(np.abs(x64), axis=-2)
+    out = np.asarray(out, np.float64)
+    assert out.shape == x.shape
+    assert np.max(np.abs(out - ref) / scale) < 1e-5
 
 
 @pytest.mark.parametrize("kw", [dict(backward="cuda"), dict(bwd_reduce="tensor"), dict(precision="bf16")])

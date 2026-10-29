@@ -84,7 +84,14 @@ def resolve_precision(precision: PrecisionLike) -> lax.Precision:
     raise ValueError(f"precision must be 'highest' or 'default', got {precision!r}")
 
 
-def validate_options(chunk_size: int, precision: PrecisionLike, backward: str, bwd_reduce: str) -> None:
+def validate_options(
+    chunk_size: int,
+    precision: PrecisionLike,
+    backward: str,
+    bwd_reduce: str,
+    pairwise: str = "auto",
+    decay_lower_bound: float | None = None,
+) -> None:
     """Validate the static options shared by every ``kda_chunk`` backend.
 
     Args:
@@ -92,6 +99,8 @@ def validate_options(chunk_size: int, precision: PrecisionLike, backward: str, b
         precision: Precision of the non-inverse dots.
         backward: ``"pallas"`` or ``"xla"``.
         bwd_reduce: ``"vpu"`` or ``"mxu"``.
+        pairwise: ``"auto"`` or ``"dense"``.
+        decay_lower_bound: ``None`` or a finite log-decay bound ``<= 0``.
 
     Raises:
         ValueError: On any invalid option.
@@ -103,11 +112,138 @@ def validate_options(chunk_size: int, precision: PrecisionLike, backward: str, b
         raise ValueError(f"backward must be 'pallas' or 'xla', got {backward!r}")
     if bwd_reduce not in ("vpu", "mxu"):
         raise ValueError(f"bwd_reduce must be 'vpu' or 'mxu', got {bwd_reduce!r}")
+    if pairwise not in ("auto", "dense"):
+        raise ValueError(f"pairwise must be 'auto' or 'dense', got {pairwise!r}")
+    validate_decay_lower_bound(decay_lower_bound)
 
 
 def _nan_to_num(x: Array) -> Array:
     """``nan_to_num(x, 0, 0, 0)`` written with Mosaic-lowerable primitives."""
     return jnp.where(jnp.isfinite(x), x, jnp.zeros_like(x))
+
+
+DECAY_FACTOR_MAX_LOG = 80.0
+"""Largest exponent a factored-decay term may reach (fp32 overflows past ~88.7; the margin covers the K-sum)."""
+
+
+def companion_precision(precision: lax.Precision) -> lax.Precision:
+    """Precision of the chunk inverse and the factored-decay weighted reductions for a given dot ``precision``.
+
+    ``HIGHEST`` stays ``HIGHEST``. Below it (the bf16 ``"default"`` MXU passes) these terms run at ``HIGH`` (bf16x3):
+    a single bf16 pass on the backward's decay reductions loses accuracy in the log-decay gradient, while ``HIGH``
+    matches ``HIGHEST`` to within the bf16 floor that the other dots already set.
+
+    Args:
+        precision: Precision of the non-inverse dots.
+
+    Returns:
+        ``HIGHEST`` for ``HIGHEST``, otherwise ``HIGH``.
+    """
+    return lax.Precision.HIGHEST if precision == lax.Precision.HIGHEST else lax.Precision.HIGH
+
+
+def validate_decay_lower_bound(decay_lower_bound: float | None) -> float | None:
+    """Return the bound as a float, or raise unless it is ``None`` or a finite value ``<= 0``.
+
+    Args:
+        decay_lower_bound: Promised lower bound of every per-token log-decay ``g`` (``g >= bound``), or ``None``.
+
+    Returns:
+        The bound as a Python float, or ``None``.
+
+    Raises:
+        ValueError: For a positive or non-finite bound.
+    """
+    if decay_lower_bound is None:
+        return None
+    bound = float(decay_lower_bound)
+    if not math.isfinite(bound) or bound > 0.0:
+        raise ValueError(f"decay_lower_bound must be a finite log-decay bound <= 0, got {decay_lower_bound!r}")
+    return bound
+
+
+def pairwise_sub_block(decay_lower_bound: float | None, chunk_size: int) -> int:
+    """Sub-block size of the factored (MXU) pairwise decay, or ``0`` for the dense ``[cs, cs, K]`` form.
+
+    With every per-token log-decay ``g >= decay_lower_bound``, the pairwise decay ``exp(gc[i] - gc[j])`` of a row
+    ``i`` in sub-block ``p`` factors as ``exp(gc[i] - r_p) * exp(r_p - gc[j])`` around the prefix-sum row ``r_p`` at
+    the sub-block's middle, for every ``j`` up to the end of ``p``. Every factor and every product the masked matmuls
+    form (including the masked-out ones above the diagonal) stays below ``exp((sub - 1) * |bound|)``, so the largest
+    power-of-two divisor of ``chunk_size`` (at least 8) with ``(sub - 1) * |bound| <= DECAY_FACTOR_MAX_LOG`` is used.
+    An unknown or looser bound keeps the dense form. Far-back columns may underflow to zero; their true decay is then
+    below ``exp(-DECAY_FACTOR_MAX_LOG / 2)``.
+
+    Args:
+        decay_lower_bound: Lower bound of the per-token log-decay, or ``None``.
+        chunk_size: Chunk length ``cs``.
+
+    Returns:
+        The sub-block size (a power of two in ``[8, cs]`` dividing ``cs``), or ``0``.
+
+    Raises:
+        ValueError: For an invalid bound (see :func:`validate_decay_lower_bound`).
+    """
+    bound = validate_decay_lower_bound(decay_lower_bound)
+    cs = int(chunk_size)
+    if bound is None or cs < 8:
+        return 0
+    sub = 1 << (cs.bit_length() - 1)
+    while sub >= 8 and (cs % sub or (sub - 1) * -bound > DECAY_FACTOR_MAX_LOG):
+        sub //= 2
+    return sub if sub >= 8 else 0
+
+
+def dot_nt(a: Array, b: Array, precision) -> Array:
+    """``a @ b.T`` as a ``dot_general`` contracting the last dims of both."""
+    return lax.dot_general(a, b, (((1,), (1,)), ((), ())), precision=precision)
+
+
+def factored_decay(g_cumsum: Array, sub: int) -> tuple[Array, list[Array], list[Array]]:
+    """Row factor, per-sub-block column factors and row masks of the factored pairwise decay.
+
+    For ``i`` in sub-block ``p`` and ``j`` up to the end of ``p``: ``exp(gc[i] - gc[j]) = a[i] * b[p][j]``. Past the
+    end of ``p`` the column factor is 1 (those pairs lie above the diagonal and every caller masks them).
+
+    Args:
+        g_cumsum: Within-chunk prefix sums of the log-decay ``[cs, K]``.
+        sub: Sub-block size from :func:`pairwise_sub_block`.
+
+    Returns:
+        ``(a [cs, K], b [cs, K] per sub-block, rows [cs, K] bool per sub-block)``.
+    """
+    cs, kdim = g_cumsum.shape
+    nb = cs // sub
+    row = lax.broadcasted_iota(jnp.int32, (cs, kdim), 0)
+    blk = lax.shift_right_logical(row, _log2_int(sub))
+    refs = [jnp.sum(jnp.where(row == p * sub + sub // 2 - 1, g_cumsum, 0.0), axis=0, keepdims=True) for p in range(nb)]
+    ref_rows = jnp.broadcast_to(refs[0], (cs, kdim))
+    for p in range(1, nb):
+        ref_rows = jnp.where(blk == p, refs[p], ref_rows)
+    a = jnp.exp(g_cumsum - ref_rows)
+    b = [jnp.exp(jnp.where(row < (p + 1) * sub, refs[p] - g_cumsum, 0.0)) for p in range(nb)]
+    rows = [blk == p for p in range(nb)]
+    return a, b, rows
+
+
+def factored_pair_dot(x: Array, a: Array, k_cols: list[Array], rows: list[Array], precision) -> Array:
+    """``out[i, j] = sum_k x[i, k] k[j, k] exp(gc[i, k] - gc[j, k])`` (valid for ``j`` up to ``i``'s sub-block end).
+
+    Args:
+        x: Row operand ``[cs, K]``.
+        a: Row factor from :func:`factored_decay`.
+        k_cols: ``k * b[p]`` per sub-block.
+        rows: Sub-block row masks.
+        precision: Dot precision.
+
+    Returns:
+        ``[cs, cs]``; entries above the diagonal are finite garbage the caller masks.
+    """
+    xa = x * a
+    out = None
+    for m, kp in zip(rows, k_cols, strict=True):
+        t = dot_nt(jnp.where(m, xa, 0.0), kp, precision)
+        out = t if out is None else out + t
+    return out
 
 
 def iota_rc(n: int) -> tuple[Array, Array]:
@@ -121,7 +257,9 @@ def _log2_int(n: int) -> int:
     return n.bit_length() - 1
 
 
-def unit_lower_inverse_masked(a: Array, chunk_size: int, leaf: int = INVERSE_LEAF) -> Array:
+def unit_lower_inverse_masked(
+    a: Array, chunk_size: int, leaf: int = INVERSE_LEAF, precision: lax.Precision = lax.Precision.HIGHEST
+) -> Array:
     """``(I - A)^-1`` for strictly lower-triangular ``A`` ``[cs, cs]``, block-recursive on full tiles.
 
     Leaves: the nilpotent squaring series ``(I + A)(I + A^2)(I + A^4)`` on the ``leaf x leaf`` diagonal blocks. The
@@ -130,19 +268,21 @@ def unit_lower_inverse_masked(a: Array, chunk_size: int, leaf: int = INVERSE_LEA
     Merges: ``log2(cs / leaf)`` levels of the lower-triangular block identity
     ``[[T, 0], [-A_L, B]]^-1 = [[T^-1, 0], [B^-1 A_L T^-1, B^-1]]``. ``inv`` is kept as a full block-diagonal
     ``[cs, cs]`` matrix and each level adds ``inv @ mask_pair(A) @ inv``: the extra product terms are exact zeros,
-    so no sub-block extraction, strided slice or concatenate is needed (Mosaic-lowerable). Always HIGHEST.
+    so no sub-block extraction, strided slice or concatenate is needed (Mosaic-lowerable).
 
     Args:
         a: Strictly lower-triangular ``[cs, cs]`` (entries on/above the diagonal are ignored).
         chunk_size: ``cs``, a power of two ``>= leaf``.
         leaf: Leaf block size.
+        precision: Dot precision (``HIGHEST`` by default; the factored-decay path passes
+            :func:`companion_precision`).
 
     Returns:
         ``(I - A)^-1`` (lower triangular, unit diagonal), non-finite entries zeroed.
     """
     if chunk_size < leaf or chunk_size & (chunk_size - 1):
         raise ValueError(f"chunk_size={chunk_size} must be a power of two >= {leaf}")
-    hi = lax.Precision.HIGHEST
+    hi = precision
     row, col = iota_rc(chunk_size)
     eye = (row == col).astype(jnp.float32)
     a32 = _nan_to_num(jnp.where(col < row, a.astype(jnp.float32), 0.0))
@@ -243,13 +383,19 @@ def chunk_core(
     seg: SegmentMasks | None,
     precision: lax.Precision,
     inverse: str = "masked",
+    sub: int = 0,
 ) -> tuple[Array, Array]:
     """One head, one chunk, on 2-D tiles: the per-chunk KDA math (see the module docstring).
 
-    The pairwise decay ``exp(gc[i] - gc[j])`` is masked to the static lower triangle in log space before the
-    ``exp`` (3-D iotas; no 2-D -> 3-D mask relayout); same-run masking is applied to the two ``[cs, cs]`` results
-    after the K-reduction, which is exact because masked entries are zeroed either way. Both pairwise contractions
-    are fp32 VPU multiply + lane reduce.
+    Dense form (``sub == 0``): the pairwise decay ``exp(gc[i] - gc[j])`` is masked to the static lower triangle in
+    log space before the ``exp`` (3-D iotas; no 2-D -> 3-D mask relayout); same-run masking is applied to the two
+    ``[cs, cs]`` results after the K-reduction, which is exact because masked entries are zeroed either way. Both
+    pairwise contractions are fp32 VPU multiply + lane reduce over a ``[cs, cs, K]`` tensor.
+
+    Factored form (``sub > 0``, see :func:`pairwise_sub_block`): both pairwise contractions are ``cs / sub`` masked
+    MXU matmuls on per-sub-block decay factors (:func:`factored_pair_dot`); no ``[cs, cs, K]`` tensor exists.
+    ``pair`` (it feeds the inverse) runs at HIGHEST, ``attn_qk`` at ``precision``, and the masked inverse at
+    :func:`companion_precision`.
 
     Args:
         state: Carried state ``[K, V]`` fp32.
@@ -260,9 +406,10 @@ def chunk_core(
         g_cumsum: Within-chunk prefix sums of the per-channel log-decay ``[cs, K]``.
         g_last: Its last row ``[1, K]``.
         seg: ``None`` (unsegmented) or the chunk's :class:`SegmentMasks`.
-        precision: Precision of every dot except the chunk inverse (always HIGHEST / exact).
+        precision: Precision of the non-inverse dots (dense form: the inverse is always HIGHEST / exact).
         inverse: ``"masked"`` (:func:`unit_lower_inverse_masked`, power-of-two ``cs``) or ``"solve"``
             (:func:`unit_lower_inverse_solve`, XLA only).
+        sub: Factored-decay sub-block size, or ``0`` for the dense form.
 
     Returns:
         ``(new_state [K, V], core_out [cs, V])`` fp32.
@@ -274,14 +421,31 @@ def chunk_core(
     else:
         incl, strict = seg.incl, seg.strict
 
-    i3 = lax.broadcasted_iota(jnp.int32, (cs, cs, kdim), 0)
-    j3 = lax.broadcasted_iota(jnp.int32, (cs, cs, kdim), 1)
-    g_diff = jnp.where(j3 <= i3, g_cumsum[:, None, :] - g_cumsum[None, :, :], -jnp.inf)
-    decay_mask = jnp.exp(g_diff)
+    if sub:
+        fa, fb, frows = factored_decay(g_cumsum, sub)
+        k_cols = [k * bp for bp in fb]
+        inv_precision = companion_precision(precision)
 
-    pair = jnp.sum(k_beta[:, None, :] * k[None, :, :] * decay_mask, axis=-1)
+        def pair_dot(x: Array, prec) -> Array:
+            return factored_pair_dot(x, fa, k_cols, frows, prec)
+
+    else:
+        i3 = lax.broadcasted_iota(jnp.int32, (cs, cs, kdim), 0)
+        j3 = lax.broadcasted_iota(jnp.int32, (cs, cs, kdim), 1)
+        g_diff = jnp.where(j3 <= i3, g_cumsum[:, None, :] - g_cumsum[None, :, :], -jnp.inf)
+        decay_mask = jnp.exp(g_diff)
+        inv_precision = lax.Precision.HIGHEST
+
+        def pair_dot(x: Array, prec) -> Array:
+            del prec  # exact fp32 VPU reduction
+            return jnp.sum(x[:, None, :] * k[None, :, :] * decay_mask, axis=-1)
+
+    pair = pair_dot(k_beta, lax.Precision.HIGHEST)
     a = jnp.where(strict, -pair, 0.0)
-    attn = unit_lower_inverse_masked(a, cs) if inverse == "masked" else unit_lower_inverse_solve(a)
+    if inverse == "masked":
+        attn = unit_lower_inverse_masked(a, cs, precision=inv_precision)
+    else:
+        attn = unit_lower_inverse_solve(a)
 
     exp_gc = jnp.exp(g_cumsum)
     value_local = lax.dot(attn, v_beta, precision=precision)
@@ -293,7 +457,7 @@ def chunk_core(
         attn_inter = attn_inter * seg.uses_state
     v_new = value_local - v_prime
 
-    attn_qk = jnp.where(incl, jnp.sum(q[:, None, :] * k[None, :, :] * decay_mask, axis=-1), 0.0)
+    attn_qk = jnp.where(incl, pair_dot(q, precision), 0.0)
     core_out = attn_inter + lax.dot(attn_qk, v_new, precision=precision)
 
     k_scaled = k * jnp.exp(g_last - g_cumsum)
@@ -310,19 +474,6 @@ def chunk_core(
 def l2norm(x: Array, eps: float = 1e-6) -> Array:
     """``x * rsqrt(sum(x * x) + eps)`` over the trailing axis."""
     return x * lax.rsqrt(jnp.sum(x * x, axis=-1, keepdims=True) + eps)
-
-
-def per_chunk_cumsum(g: Array, chunk_size: int) -> Array:
-    """Prefix sums of ``g [B, H, Lp, K]`` restarted at every chunk boundary."""
-    B, H, Lp, K = g.shape
-    return jnp.cumsum(g.reshape(B, H, Lp // chunk_size, chunk_size, K), axis=-2).reshape(B, H, Lp, K)
-
-
-def per_chunk_reverse_cumsum(dgc: Array, chunk_size: int) -> Array:
-    """Cotangent of :func:`per_chunk_cumsum`: suffix sums within every chunk."""
-    B, H, Lp, K = dgc.shape
-    x = dgc.reshape(B, H, Lp // chunk_size, chunk_size, K)[..., ::-1, :]
-    return jnp.cumsum(x, axis=-2)[..., ::-1, :].reshape(B, H, Lp, K)
 
 
 def local_run_index(
@@ -459,6 +610,7 @@ def batched_chunk_step(
     local_run: Array | None,
     precision: lax.Precision,
     inverse: str,
+    sub: int = 0,
 ) -> tuple[Array, Array]:
     """One chunk for every ``(B, H)``: prefix sums + :func:`chunk_core` vmapped over heads and rows.
 
@@ -472,6 +624,7 @@ def batched_chunk_step(
         local_run: ``[B, cs]`` local run indices or ``None``.
         precision: Non-inverse dot precision.
         inverse: Chunk-inverse method (see :func:`chunk_core`).
+        sub: Factored-decay sub-block size, or ``0`` for the dense form (see :func:`pairwise_sub_block`).
 
     Returns:
         ``(new_state [B, H, K, V], core_out [B, H, cs, V])``.
@@ -481,7 +634,7 @@ def batched_chunk_step(
     seg = None
     if local_run is not None:
         seg = jax.vmap(lambda r: segment_masks(r[None, :], cs))(local_run)
-    core = functools.partial(chunk_core, precision=precision, inverse=inverse)
+    core = functools.partial(chunk_core, precision=precision, inverse=inverse, sub=sub)
     over_h = jax.vmap(core, in_axes=(0, 0, 0, 0, 0, 0, 0, None))
     over_b = jax.vmap(over_h, in_axes=(0, 0, 0, 0, 0, 0, 0, 0 if seg is not None else None))
     kb = k * beta[..., None]
@@ -503,12 +656,15 @@ def kda_chunk_xla(
     continue_initial_state: bool = False,
     return_chunk_states: bool = False,
     precision: PrecisionLike = "highest",
+    decay_lower_bound: float | None = None,
+    pairwise: str = "auto",
 ) -> tuple[Array, ...]:
     """XLA chunked KDA: ``lax.scan`` over chunks, each step rematerialised under autodiff.
 
-    The scan carry is the ``[B, H, K, V]`` fp32 state; the per-chunk ``[cs, cs, K]`` decay tensors are rebuilt in
-    the backward (``jax.checkpoint`` around the step), so residuals stay at the chunk inputs plus one state per
-    chunk. The chunk inverse is an exact batched ``triangular_solve``.
+    The scan carry is the ``[B, H, K, V]`` fp32 state; the per-chunk ``[cs, cs, K]`` decay tensors (or, with a
+    ``decay_lower_bound``, their factored form) are rebuilt in the backward (``jax.checkpoint`` around the step), so
+    residuals stay at the chunk inputs plus one state per chunk. The chunk inverse is an exact batched
+    ``triangular_solve``.
 
     Args:
         query: ``[B, H, L, K]``.
@@ -523,12 +679,16 @@ def kda_chunk_xla(
         continue_initial_state: Cached-continuation segment semantics (see :func:`local_run_index`).
         return_chunk_states: Also return the state after every chunk ``[B, C, H, K, V]``.
         precision: Precision of the non-inverse dots.
+        decay_lower_bound: Promise that every log-decay ``g >= decay_lower_bound`` (e.g. a safe-gate bound). It
+            enables the factored pairwise decay (see :func:`pairwise_sub_block`); ``None`` keeps the dense form.
+        pairwise: ``"auto"`` (factored whenever the bound allows it) or ``"dense"``.
 
     Returns:
         ``(out [B, H, L, V] fp32, final_state [B, H, K, V] fp32)`` (+ ``chunk_states``).
     """
     L = query.shape[2]
     prec = resolve_precision(precision)
+    sub = pairwise_sub_block(decay_lower_bound, chunk_size) if pairwise == "auto" else 0
     p = prepare_inputs(
         query, key, value, beta, decay, initial_state, segment_ids, chunk_size, use_qk_l2norm, continue_initial_state
     )
@@ -544,7 +704,7 @@ def kda_chunk_xla(
 
     def step(state, x):
         new_state, out = batched_chunk_step(
-            state, x["q"], x["k"], x["v"], x["beta"], x["g"], x.get("run"), prec, inverse="solve"
+            state, x["q"], x["k"], x["v"], x["beta"], x["g"], x.get("run"), prec, inverse="solve", sub=sub
         )
         return new_state, ((out, new_state) if return_chunk_states else out)
 

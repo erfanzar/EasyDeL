@@ -87,6 +87,7 @@ class KdaChunk(Kernel[KdaChunkConfig, tuple[Array, ...]]):
         continue_initial_state: bool = False,
         return_chunk_states: bool = False,
         precision: str = "highest",
+        decay_lower_bound: float | None = None,
         platform: Literal["pallas", "xla", "auto"] | None = None,
         cfg: KdaChunkConfig,
         **_,
@@ -106,8 +107,10 @@ class KdaChunk(Kernel[KdaChunkConfig, tuple[Array, ...]]):
             continue_initial_state: Cached-continuation packed-row semantics.
             return_chunk_states: Also return the state after every chunk.
             precision: Precision of the non-inverse dots.
+            decay_lower_bound: Promise that every log-decay ``decay >= decay_lower_bound`` (enables the factored
+                MXU pairwise decay under ``cfg.pairwise="auto"``), or ``None``.
             platform: Optional platform override.
-            cfg: Operation config (block_h, backward, bwd_reduce).
+            cfg: Operation config (block_h, backward, bwd_reduce, pairwise).
 
         Returns:
             ``(out, final_state)`` (+ ``chunk_states``).
@@ -118,6 +121,7 @@ class KdaChunk(Kernel[KdaChunkConfig, tuple[Array, ...]]):
                 block_h=cfg.block_h,
                 backward=cfg.backward,
                 bwd_reduce=cfg.bwd_reduce,
+                pairwise=cfg.pairwise,
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
@@ -138,6 +142,8 @@ class KdaChunk(Kernel[KdaChunkConfig, tuple[Array, ...]]):
             block_h=cfg.block_h,
             backward=cfg.backward,
             bwd_reduce=cfg.bwd_reduce,
+            decay_lower_bound=decay_lower_bound,
+            pairwise=cfg.pairwise,
         )
 
     def create_shard_map_wrapper(
@@ -155,6 +161,7 @@ class KdaChunk(Kernel[KdaChunkConfig, tuple[Array, ...]]):
         continue_initial_state: bool = False,
         return_chunk_states: bool = False,
         precision: str = "highest",
+        decay_lower_bound: float | None = None,
         platform: Literal["pallas", "xla", "auto"] | None = None,
         cfg: KdaChunkConfig | None = None,
         mesh: Mesh | None = None,
@@ -181,6 +188,7 @@ class KdaChunk(Kernel[KdaChunkConfig, tuple[Array, ...]]):
             continue_initial_state: Cached-continuation packed-row semantics.
             return_chunk_states: Also return the per-chunk states.
             precision: Precision of the non-inverse dots.
+            decay_lower_bound: Promised lower bound of the log-decay, or ``None`` (see :meth:`run`).
             platform: Optional platform override.
             cfg: Operation config.
             mesh: Device mesh.
@@ -217,6 +225,7 @@ class KdaChunk(Kernel[KdaChunkConfig, tuple[Array, ...]]):
                 continue_initial_state=continue_initial_state,
                 return_chunk_states=return_chunk_states,
                 precision=precision,
+                decay_lower_bound=decay_lower_bound,
                 platform=platform,
                 cfg=run_cfg,
             )
@@ -231,8 +240,15 @@ class KdaChunk(Kernel[KdaChunkConfig, tuple[Array, ...]]):
         return shard_map_fn, tuple(arrays[i] for i in present)
 
     def heuristic_cfg(self, inv: Invocation[KdaChunkConfig, tuple[Array, ...]]) -> KdaChunkConfig:
-        """Return the measured default: one head per grid step, Pallas backward, VPU reductions."""
-        return KdaChunkConfig(block_h=1, backward="pallas", bwd_reduce="vpu", platform="auto", backend="any")
+        """Return the default config: one head per grid step, Pallas backward, VPU reductions, auto pairwise."""
+        return KdaChunkConfig(
+            block_h=1,
+            backward="pallas",
+            bwd_reduce="vpu",
+            pairwise="auto",
+            platform="auto",
+            backend="any",
+        )
 
     def candidate_cfgs(self, inv: Invocation[KdaChunkConfig, tuple[Array, ...]]):
         """Return the candidate configs (the heuristic only; nothing is autotuned)."""
@@ -268,6 +284,7 @@ def kda_chunk(
     continue_initial_state: bool = False,
     return_chunk_states: bool = False,
     precision: str = "highest",
+    decay_lower_bound: float | None = None,
     platform: Literal["pallas", "xla", "auto"] | None = None,
     cfg: KdaChunkConfig | None = None,
     mesh: Mesh | None = None,
@@ -294,6 +311,10 @@ def kda_chunk(
             ``initial_state``.
         return_chunk_states: Also return the state after every chunk ``[B, C, H, K, V]``.
         precision: ``"highest"`` or ``"default"`` for the non-inverse dots.
+        decay_lower_bound: Promise that every log-decay ``decay >= decay_lower_bound`` (e.g. a safe-gate bound).
+            With ``cfg.pairwise="auto"`` (default) a tight enough bound selects the factored MXU pairwise decay: no
+            ``[cs, cs, K]`` tensor, and the chunk inverse and backward reductions run at bf16x3 below ``"highest"``.
+            ``None`` keeps the dense form. Values below the bound are a contract violation (possible overflow).
         platform: Optional platform override (``"pallas"`` / ``"xla"``).
         cfg: Optional :class:`KdaChunkConfig`.
         mesh: Optional mesh for ``shard_map`` execution (required for the Pallas kernel on a multi-device mesh).
@@ -318,6 +339,7 @@ def kda_chunk(
         continue_initial_state=continue_initial_state,
         return_chunk_states=return_chunk_states,
         precision=precision,
+        decay_lower_bound=decay_lower_bound,
         platform=platform,
         method=method,
         mesh=mesh,

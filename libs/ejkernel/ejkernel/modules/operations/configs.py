@@ -1007,6 +1007,8 @@ class KdaChunkConfig(BaseOperationConfig):
             ``[cs, cs, K]`` temporaries at one head).
         backward: ``"pallas"`` (fused reverse-sweep kernel) or ``"xla"`` (reversed-scan recompute).
         bwd_reduce: ``"vpu"`` or ``"mxu"`` evaluation of the backward's weighted reductions (both exact).
+        pairwise: ``"auto"`` (factored MXU pairwise decay whenever the call passes a ``decay_lower_bound`` that
+            allows it) or ``"dense"`` (always the ``[cs, cs, K]`` VPU form).
         platform: Target platform (pallas/xla/auto).
         backend: Backend specification (default: "any").
     """
@@ -1014,6 +1016,7 @@ class KdaChunkConfig(BaseOperationConfig):
     block_h: int = 1
     backward: str = "pallas"
     bwd_reduce: str = "vpu"
+    pairwise: str = "auto"
 
     __hash__ = hash_fn
 

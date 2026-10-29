@@ -40,6 +40,8 @@ def kda_chunk(
     block_h: int = 1,
     backward: str = "pallas",
     bwd_reduce: str = "vpu",
+    decay_lower_bound: float | None = None,
+    pairwise: str = "auto",
 ) -> tuple[Array, ...]:
     """Chunked KDA with per-channel decay (differentiable through plain autodiff).
 
@@ -61,11 +63,14 @@ def kda_chunk(
         block_h: Pallas tuning knob (heads per grid step); ignored here.
         backward: Pallas backward selector; validated, ignored here.
         bwd_reduce: Pallas backward reduction mode; validated, ignored here.
+        decay_lower_bound: Promise that every log-decay ``decay >= decay_lower_bound``; enables the factored
+            pairwise decay (no ``[cs, cs, K]`` tensor). ``None`` keeps the dense form.
+        pairwise: ``"auto"`` (factored whenever the bound allows it) or ``"dense"``.
 
     Returns:
         ``(out [B, H, L, V] fp32, final_state [B, H, K, V] fp32)`` (+ ``chunk_states``).
     """
-    validate_options(chunk_size, precision, backward, bwd_reduce)
+    validate_options(chunk_size, precision, backward, bwd_reduce, pairwise, decay_lower_bound)
     if int(block_h) <= 0:
         raise ValueError(f"block_h must be positive, got {block_h}")
     return kda_chunk_xla(
@@ -81,6 +86,8 @@ def kda_chunk(
         continue_initial_state=continue_initial_state,
         return_chunk_states=return_chunk_states,
         precision=precision,
+        decay_lower_bound=decay_lower_bound,
+        pairwise=pairwise,
     )
 
 
