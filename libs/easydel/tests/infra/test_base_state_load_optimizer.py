@@ -551,3 +551,37 @@ def test_load_state_metadata_can_disable_stale_resume_model(tmp_path, monkeypatc
     assert [str(path) for path in config_paths] == [str(tmp_path)]
     assert [str(path) for path in model_paths] == [str(tmp_path)]
     assert optimizer_paths == []
+
+
+def test_bf16_saved_optimizer_restores_with_live_fp32_dtypes_and_resumes(tmp_path):
+    """A real ``save_optimizer(float_dtype=bf16)`` checkpoint reloads with fp32 moments and keeps training."""
+    model = _build_tiny_llama(0)
+    tx = optax.adam(1e-3)
+    state = EasyDeLState.create(model=model, tx=tx, init_opt_state=True)
+    grads = jax.tree_util.tree_map(lambda x: jnp.full_like(x, 0.3), state.graphstate)
+    state = state.apply_gradients(grads=grads)
+    state.save_optimizer(tmp_path, float_dtype=jnp.bfloat16, step=1)
+
+    fresh_state = EasyDeLState.create(model=_build_tiny_llama(1), tx=tx, init_opt_state=False)
+    restored = fresh_state.load_optimizer(tmp_path, tx_template=tx)
+
+    orig_leaves, orig_treedef = jax.tree_util.tree_flatten(state.opt_state)
+    restored_leaves, restored_treedef = jax.tree_util.tree_flatten(restored.opt_state)
+    assert restored_treedef == orig_treedef
+    floating = 0
+    for original, loaded in zip(orig_leaves, restored_leaves, strict=True):
+        assert loaded.dtype == original.dtype
+        assert loaded.shape == original.shape
+        if jnp.issubdtype(original.dtype, jnp.floating):
+            floating += 1
+            expected = np.asarray(jax.device_get(original.astype(jnp.bfloat16).astype(original.dtype)))
+            np.testing.assert_array_equal(np.asarray(jax.device_get(loaded)), expected)
+        else:
+            np.testing.assert_array_equal(np.asarray(jax.device_get(loaded)), np.asarray(jax.device_get(original)))
+    assert floating > 0
+
+    resumed = restored.apply_gradients(grads=grads)
+    for leaf in jax.tree_util.tree_leaves(resumed.opt_state):
+        if jnp.issubdtype(leaf.dtype, jnp.floating):
+            assert leaf.dtype == jnp.float32
+            assert bool(jnp.all(jnp.isfinite(leaf)))

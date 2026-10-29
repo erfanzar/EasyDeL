@@ -804,6 +804,8 @@ class Glm4MoeLiteModel(EasyDeLBaseModule):
     dense-to-sparse MLP schedule across layers.
     """
 
+    fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
+
     def __init__(
         self,
         config: Glm4MoeLiteConfig,
@@ -1065,6 +1067,8 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
     _task_type = TaskType.CAUSAL_LM
     _model_type = "glm4_moe_lite"
     _config_class = Glm4MoeLiteConfig
+
+    fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 
     def __init__(
         self,

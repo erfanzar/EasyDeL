@@ -299,9 +299,12 @@ class RayResources:
             try:
                 result = underlying_function(*args, **kwargs)
                 queue.put((True, result))
-            except Exception as e:
+            except BaseException as e:
+                # SystemExit/KeyboardInterrupt must also reach the parent, otherwise it only sees an empty queue.
                 info = ExceptionInfo.ser_exc_info(e)
                 queue.put((False, info))
+                if isinstance(e, KeyboardInterrupt | SystemExit):
+                    raise
 
         # Escape hatch (see :func:`set_forkify_disabled`): run inline in this
         # process instead of forking. When the child dies hard the parent can
@@ -329,14 +332,18 @@ class RayResources:
         try:
             success, value = queue.get(timeout=5)
         except QueueEmpty as e:
-            logger.error("Process timed out")
+            # The join above already returned, so this is a hard child death (signal/os._exit), not a timeout.
+            exitcode = process.exitcode
+            logger.error("Process finished without result (exitcode=%s)", exitcode)
             process.terminate()
-            raise RuntimeError("Process timed out") from e
+            raise RuntimeError(f"Process finished without result (exitcode={exitcode})") from e
 
         if success:
             return value
-        else:
-            raise ValueError(value)
+        exc = getattr(value, "ex", None)
+        if isinstance(exc, SystemExit) and exc.code in (0, None):
+            return None
+        raise ValueError(value)
 
     @staticmethod
     def update_fn_resource_env(

@@ -2374,6 +2374,8 @@ class Glm5NextTextModel(_Glm5NextIndexerCacheMixin, EasyDeLBaseModule):
         rngs: PRNG key container.
     """
 
+    fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
+
     def __init__(
         self,
         config: Glm5NextTextConfig,
@@ -2673,6 +2675,8 @@ class Glm5NextForCausalLM(_Glm5NextIndexerCacheMixin, BaseCausalLMModule[Glm5Nex
     _task_type = TaskType.CAUSAL_LM
     _model_type = "glm5_next_text"
     _config_class = Glm5NextTextConfig
+
+    fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 
     def __init__(
         self,

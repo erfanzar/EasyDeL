@@ -1009,6 +1009,7 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
     _auto_register = False
 
     loss_type = "ForCausalLM"
+    fp32_param_patterns: typing.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 
     def __init__(
         self,

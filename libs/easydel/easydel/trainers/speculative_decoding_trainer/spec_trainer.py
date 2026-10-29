@@ -38,6 +38,7 @@ from easydel.utils import Registry
 
 from .._shared import drop_optimizer_state
 from ..assistant_only_mask import AssistantOnlyMaskMixin
+from ..batch_placement import release_batch_slot, replicated_batch_slot_spec, wrap_batch_placed
 from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import SFTPreprocessTransform
 from ..trainer import Trainer
@@ -405,14 +406,18 @@ class SpeculativeDecodingTrainer(AssistantOnlyMaskMixin, Trainer):
         if getattr(self.arguments, "xla_compiler_options", None):
             _step_jit_options["compiler_options"] = dict(self.arguments.xla_compiler_options)
         self._runtime_trace("train.compile_wrapper.begin")
+        batch_spec = replicated_batch_slot_spec(self.arguments, self.model.mesh, in_shardings)
         if self.arguments.mpmd_scheduler is None:
             sharded_training_step_function = spx.jit(
                 speculative_decoding_step,
-                in_shardings=in_shardings,
+                in_shardings=release_batch_slot(in_shardings, batch_spec),
                 out_shardings=(self.state_shardings, empty_sharding),
                 donate_argnums=(0,),
                 static_argnums=static_argnums,
                 **_step_jit_options,
+            )
+            sharded_training_step_function = wrap_batch_placed(
+                sharded_training_step_function, batch_spec, self.model.mesh
             )
         else:
             sharded_training_step_function = compile_trainer_step(
@@ -431,10 +436,13 @@ class SpeculativeDecodingTrainer(AssistantOnlyMaskMixin, Trainer):
         if self.arguments.mpmd_scheduler is None:
             sharded_evaluation_step_function = spx.jit(
                 speculative_decoding_step,
-                in_shardings=in_shardings,
+                in_shardings=release_batch_slot(in_shardings, batch_spec),
                 out_shardings=empty_sharding,
                 static_argnums=static_argnums,
                 **_step_jit_options,
+            )
+            sharded_evaluation_step_function = wrap_batch_placed(
+                sharded_evaluation_step_function, batch_spec, self.model.mesh
             )
         else:
             sharded_evaluation_step_function = compile_trainer_step(

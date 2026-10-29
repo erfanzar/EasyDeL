@@ -36,6 +36,7 @@ family; it is *not* the lightning-attention MiniMax-Text-01 architecture in
   followed by a ``spatial_merge_size**2`` patch-merge MLP.
 """
 
+import typing as tp
 from functools import partial
 
 import jax
@@ -1022,6 +1023,8 @@ class MiniMaxM3VLTextModel(EasyDeLBaseModule):
         precision: Precision setting for JAX operations.
     """
 
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
+
     def __init__(
         self,
         config: MiniMaxM3VLTextConfig,
@@ -1310,6 +1313,8 @@ class MiniMaxM3VLForCausalLM(BaseCausalLMModule[MiniMaxM3VLTextModel, MiniMaxM3V
     _task_type = TaskType.CAUSAL_LM
     _model_type = "minimax_m3_vl_text"
     _config_class = MiniMaxM3VLTextConfig
+
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 
     def __init__(
         self,
@@ -1927,6 +1932,8 @@ class MiniMaxM3VLModel(EasyDeLBaseModule):
         language_model (MiniMaxM3VLTextModel): MoE text decoder trunk.
     """
 
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
+
     def __init__(
         self,
         config: MiniMaxM3VLConfig,
@@ -2292,6 +2299,8 @@ class MiniMaxM3VLForConditionalGeneration(BaseVisionLanguageModule[MiniMaxM3VLMo
     _language_model_name = "language_model"
 
     loss_type = "ForCausalLM"
+
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 
     def __init__(
         self,

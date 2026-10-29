@@ -30,6 +30,42 @@ def _raise_value_error():
     raise ValueError("original traceback marker")
 
 
+def _exit_with_code():
+    """Raise SystemExit in the child, as a library calling ``sys.exit`` would."""
+    raise SystemExit(3)
+
+
+def _hard_exit():
+    """Kill the child without unwinding, so nothing reaches the result queue."""
+    os._exit(7)
+
+
+def test_separate_process_fn_reports_child_system_exit():
+    """SystemExit in the child is forwarded instead of looking like a timeout."""
+    with pytest.raises(ValueError) as excinfo:
+        RayResources.separate_process_fn(_exit_with_code, (), {})
+    info = excinfo.value.args[0]
+    assert isinstance(info.ex, SystemExit)
+    assert info.ex.code == 3
+
+
+def _clean_exit(code):
+    """Raise a successful SystemExit in the child."""
+    raise SystemExit(code)
+
+
+@pytest.mark.parametrize("code", [0, None])
+def test_separate_process_fn_successful_system_exit_returns_none(code):
+    """``sys.exit(0)`` / ``sys.exit()`` in the child is a successful return, not an error."""
+    assert RayResources.separate_process_fn(_clean_exit, (code,), {}) is None
+
+
+def test_separate_process_fn_reports_exitcode_on_hard_child_death():
+    """A child that dies without queueing a result reports its exit code."""
+    with pytest.raises(RuntimeError, match=r"without result \(exitcode=7\)"):
+        RayResources.separate_process_fn(_hard_exit, (), {})
+
+
 def test_separate_process_fn_forks_by_default():
     """Default behavior isolates the call in a subprocess."""
     pid, doubled = RayResources.separate_process_fn(_pid_and_double, (21,), {})

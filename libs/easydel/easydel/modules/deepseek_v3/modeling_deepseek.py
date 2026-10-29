@@ -284,7 +284,7 @@ class MoEGate(spx.Module):
         if self.topk_method == "noaux_tc":
             self.e_score_correction_bias = ArrayParam.bound(
                 shape=(self.n_routed_experts,),
-                dtype=param_dtype,
+                dtype=jnp.float32,
                 init_method="zeros",
                 key=rngs.parameters,
             )
@@ -940,6 +940,8 @@ class DeepseekV3Model(EasyDeLBaseModule):
         precision: Precision setting for JAX operations.
     """
 
+    fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
+
     def __init__(
         self,
         config: DeepseekV3Config,
@@ -1246,6 +1248,8 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
     _task_type = TaskType.CAUSAL_LM
     _model_type = "deepseek_v3"
     _config_class = DeepseekV3Config
+
+    fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 
     def __init__(
         self,

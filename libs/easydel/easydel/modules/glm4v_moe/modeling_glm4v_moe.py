@@ -33,6 +33,8 @@ Exports:
     - :class:`Glm4vMoeForConditionalGeneration`: VLM with LM head.
 """
 
+import typing as tp
+
 import jax
 import spectrax as spx
 from eformer.pytree import auto_pytree
@@ -330,6 +332,7 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
     """
 
     config_class = Glm4vMoeTextConfig
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 
     def __init__(
         self,
@@ -632,6 +635,8 @@ class Glm4vMoeModel(Glm4vModel):
         language_model (Glm4vMoeTextModel): MoE-enhanced text decoder for language understanding.
     """
 
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
+
     def __init__(
         self,
         config: Glm4vMoeConfig,
@@ -818,6 +823,7 @@ class Glm4vMoeForConditionalGeneration(BaseVisionLanguageModule[Glm4vMoeModel, G
     _language_model_name = "language_model"
 
     loss_type = "ForCausalLM"
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 
     def __init__(
         self,

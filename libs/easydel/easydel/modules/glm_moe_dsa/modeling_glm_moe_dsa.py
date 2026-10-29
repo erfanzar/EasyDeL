@@ -1553,6 +1553,8 @@ class GlmMoeDsaModel(_GlmMoeDsaIndexerCacheMixin, EasyDeLBaseModule):
         rngs: PRNG key container.
     """
 
+    fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
+
     def __init__(
         self,
         config: GlmMoeDsaConfig,
@@ -1845,6 +1847,8 @@ class GlmMoeDsaForCausalLM(_GlmMoeDsaIndexerCacheMixin, BaseCausalLMModule[GlmMo
     _task_type = TaskType.CAUSAL_LM
     _model_type = "glm_moe_dsa"
     _config_class = GlmMoeDsaConfig
+
+    fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 
     def __init__(
         self,

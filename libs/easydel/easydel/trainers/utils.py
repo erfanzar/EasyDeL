@@ -1829,6 +1829,26 @@ def _stack_prompt_aligned_arrays(
     return jnp.stack(jax_arrays, axis=0)
 
 
+def is_numeric_dtype(dtype: tp.Any) -> bool:
+    """Return whether ``dtype`` is a numeric or boolean dtype, including bf16/fp8.
+
+    ``np.issubdtype`` does not recognise ``ml_dtypes`` types (bfloat16, float8_*)
+    as ``np.number``; ``jnp.issubdtype`` does.
+
+    Args:
+        dtype: A NumPy/JAX dtype or anything ``np.dtype`` accepts.
+
+    Returns:
+        ``True`` for integer, floating, complex and boolean dtypes; ``False`` for
+        string, object and unrecognised dtypes.
+    """
+    try:
+        dtype = np.dtype(dtype)
+        return bool(jnp.issubdtype(dtype, jnp.number) or dtype == np.bool_)
+    except TypeError:
+        return False
+
+
 def _prompt_aligned_padding_value(
     key: str,
     array: np.ndarray,
@@ -1838,7 +1858,7 @@ def _prompt_aligned_padding_value(
 
     if key in {"position_ids", "cache_position", "decoder_position_ids", "token_type_ids", "mm_token_type_ids"}:
         return np.array(0, dtype=array.dtype).item()
-    if np.issubdtype(array.dtype, np.floating):
+    if jnp.issubdtype(array.dtype, jnp.floating):
         return np.array(0.0, dtype=array.dtype).item()
     return np.array(pad_token_id, dtype=array.dtype).item()
 
