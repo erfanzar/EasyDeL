@@ -2268,6 +2268,27 @@ def _mpmd_host_replicate_scalar(value: tp.Any) -> tp.Any:
     return jnp.asarray(np.asarray(gathered).reshape(()))
 
 
+def _stage_local_gradients_finite(gradients: tp.Any) -> bool:
+    """Host-side check that every floating leaf of a stage-local gradient tree is finite.
+
+    Leaves are reduced per device set (one pipeline stage each) and every stage's flag is made
+    host-fetchable on all controllers, so each process takes the same skip decision.
+    """
+    groups: dict[tp.Any, jax.Array] = {}
+    for leaf in tu.tree_leaves(gradients):
+        if not hasattr(leaf, "dtype") or not jnp.issubdtype(leaf.dtype, jnp.inexact):
+            continue
+        sharding = getattr(leaf, "sharding", None)
+        key = frozenset(sharding.device_set) if sharding is not None else None
+        flag = jnp.all(jnp.isfinite(leaf))
+        groups[key] = flag if key not in groups else jnp.logical_and(groups[key], flag)
+    for flag in groups.values():
+        value = _mpmd_host_replicate_scalar(flag.astype(jnp.float32))
+        if not bool(jax.device_get(value) > 0.5):
+            return False
+    return True
+
+
 def _apply_stage_local_gradients(
     *,
     state: EasyDeLState,
@@ -2282,7 +2303,8 @@ def _apply_stage_local_gradients(
     Used by the scheduled training-step path so each pipeline stage updates
     only its local shard of parameters and optimizer state.  Honors a
     ``break_on_nan`` LossConfig by returning the unchanged state when the
-    loss is ``NaN``.
+    loss is ``NaN``, and ``skip_nonfinite_updates`` by returning it when the
+    loss or any floating gradient leaf is non-finite.
 
     Args:
         state: Current model/optimizer state.
@@ -2317,7 +2339,10 @@ def _apply_stage_local_gradients(
         step=state.step,
         gradients=None,
     )
-    if loss_config is not None and bool(getattr(loss_config, "break_on_nan", False)):
+    if loss_config is not None and bool(getattr(loss_config, "skip_nonfinite_updates", False)):
+        if not bool(jax.device_get(jnp.isfinite(loss))) or not _stage_local_gradients_finite(gradients):
+            return state, metrics
+    elif loss_config is not None and bool(getattr(loss_config, "break_on_nan", False)):
         if bool(jax.device_get(jnp.isnan(loss))):
             return state, metrics
 

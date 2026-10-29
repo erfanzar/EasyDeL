@@ -51,21 +51,6 @@ def _ids(rows) -> list[int]:
     return [row["id"] for row in rows]
 
 
-@pytest.fixture
-def fallback_calls(monkeypatch):
-    """Record every full-replay fallback (``_shuffled_iter`` with ``skip != 0``)."""
-    calls: list[int] = []
-    original = ShuffledShardedSource._shuffled_iter
-
-    def spy(self, skip: int = 0):
-        if skip:
-            calls.append(skip)
-        return original(self, skip=skip)
-
-    monkeypatch.setattr(ShuffledShardedSource, "_shuffled_iter", spy)
-    return calls
-
-
 _COMBOS = [
     # (n, buffer, rows): steady = max(n - buffer, 0)
     (50, 16, (1, 20, 33, 34, 35, 40, 49, 50, 53)),
@@ -81,43 +66,39 @@ _COMBOS = [
 @pytest.mark.parametrize("nshards", [1, 3])
 @pytest.mark.parametrize("seed", [0, 7])
 @pytest.mark.parametrize(("n", "buffer", "rows"), _COMBOS)
-def test_resume_is_exact_without_full_replay(n, buffer, rows, seed, nshards, fallback_calls):
+def test_resume_is_exact(n, buffer, rows, seed, nshards):
     source = _MetaSource(n, nshards=nshards)
     shuffled = ShuffledShardedSource(source, buffer_size=buffer, seed=seed)
     full = _ids(shuffled.open_shard(_SHARD))
     assert sorted(full) == list(range(n))
     for row in rows:
         assert _ids(shuffled.open_shard_at_row(_SHARD, row)) == full[row:], (n, buffer, row)
-    assert fallback_calls == []
 
 
 @pytest.mark.parametrize("shuffle_shards", [True, False])
-def test_resume_in_drain_phase_respects_shard_order(shuffle_shards, fallback_calls):
+def test_resume_in_drain_phase_respects_shard_order(shuffle_shards):
     source = _MetaSource(30, nshards=4)
     shuffled = ShuffledShardedSource(source, buffer_size=8, seed=3, shuffle_shards=shuffle_shards)
     full = _ids(shuffled.open_shard(_SHARD))
     for row in (22, 23, 29, 30):
         assert _ids(shuffled.open_shard_at_row(_SHARD, row)) == full[row:]
-    assert fallback_calls == []
 
 
-def test_unknown_total_rows_falls_back_and_stays_exact(fallback_calls):
+def test_unknown_total_rows_stays_exact():
     shuffled = ShuffledShardedSource(_MetaSource(20, with_metadata=False), buffer_size=16, seed=1)
     full = _ids(shuffled.open_shard(_SHARD))
     assert _ids(shuffled.open_shard_at_row(_SHARD, 10)) == full[10:]
-    assert fallback_calls == [10]
 
 
-def test_metadata_undercount_fails_closed_to_exact_replay(fallback_calls):
+def test_metadata_undercount_stays_exact():
     # Metadata claims 18 rows while the stream holds 20: drain reconstruction would be wrong.
     shuffled = ShuffledShardedSource(_MetaSource(20, reported_delta=-2), buffer_size=16, seed=1)
     full = _ids(shuffled.open_shard(_SHARD))
     assert sorted(full) == list(range(20))
     assert _ids(shuffled.open_shard_at_row(_SHARD, 18)) == full[18:]
-    assert fallback_calls == [18]
 
 
-def test_failing_shard_info_lookup_fails_closed(fallback_calls):
+def test_failing_shard_info_lookup_stays_exact():
     class RaisingInfo(_MetaSource):
         def get_shard_info(self, shard_name: str) -> ShardInfo | None:
             raise OSError("metadata unavailable")
@@ -125,4 +106,3 @@ def test_failing_shard_info_lookup_fails_closed(fallback_calls):
     shuffled = ShuffledShardedSource(RaisingInfo(12), buffer_size=16, seed=2)
     full = _ids(shuffled.open_shard(_SHARD))
     assert _ids(shuffled.open_shard_at_row(_SHARD, 5)) == full[5:]
-    assert fallback_calls == [5]

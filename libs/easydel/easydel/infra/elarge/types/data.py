@@ -237,8 +237,8 @@ class DatasetMixtureCfg(TypedDict, total=False):
             "restart", "stop").
         mixture_weights: Per-dataset sampling weights. None for uniform mixing.
         reshuffle_on_restart: Visit a restarted constituent's shards in a fresh
-            per-epoch permutation (sharded lane). Unset enables it for multi-source
-            ``"restart"`` mixes; ``False`` keeps the identical order every pass.
+            per-epoch permutation (sharded lane). Off by default; enable it only for a
+            fresh run, since a run checkpointed without it resumes onto a different order.
         attach_dataset_ids: Stamp ``_dataset_id`` (inform position) on rows.
         assistant_only: Mixture-wide default per-dataset assistant-only choice.
         parquet_access: Default parquet reader (``"stream"``,

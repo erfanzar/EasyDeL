@@ -16,9 +16,10 @@
 
 from __future__ import annotations
 
+import functools
 import json
+import os
 from types import SimpleNamespace
-from unittest import mock
 
 import ml_dtypes
 import numpy as np
@@ -237,68 +238,72 @@ def test_full_slice_of_packed_batch_and_plain_batches_are_unchanged():
     np.testing.assert_array_equal(plain["input_ids"], np.arange(8).reshape(4, 2)[2:4])
 
 
-def _terminal_save_trainer(*, last_saved, step_for_save):
-    arguments = SimpleNamespace(do_last_save=True, merge_lora_before_save=False, save_directory=None)
-    trainer = SimpleNamespace(
-        arguments=arguments,
-        mesh=None,
-        _preemption_checkpoint_path=None,
-        _last_saved_checkpoint=last_saved,
-        _train_end_callbacks_dispatched=True,
-        _save_checkpoint_for_step=mock.Mock(return_value=f"/ckpt/run-{step_for_save}"),
-    )
-    return trainer
+class _DiskCheckpointer:
+    """Writes one directory per save; periodic saves may be temporary, forced saves never are."""
 
-
-def test_terminal_save_reuses_checkpoint_already_written_for_the_same_step():
-    trainer = _terminal_save_trainer(last_saved=(10, "/ckpt/run-10"), step_for_save=10)
-
-    out = BaseTrainer._prepare_training_output(trainer, SimpleNamespace(step=10))
-
-    trainer._save_checkpoint_for_step.assert_not_called()
-    assert out.checkpoint_path == "/ckpt/run-10"
-    assert out.last_save_file_name == "/ckpt/run-10"
-
-
-def test_terminal_save_writes_when_last_save_was_an_earlier_step():
-    trainer = _terminal_save_trainer(last_saved=(5, "/ckpt/run-5"), step_for_save=10)
-
-    out = BaseTrainer._prepare_training_output(trainer, SimpleNamespace(step=10))
-
-    trainer._save_checkpoint_for_step.assert_called_once()
-    assert out.checkpoint_path == "/ckpt/run-10"
-
-
-class _FakeCheckpointer:
-    def __init__(self, meta):
-        self.meta = meta
+    def __init__(self, root, periodic_is_temporary):
+        self.root = root
+        self.periodic_is_temporary = periodic_is_temporary
 
     def on_step(self, *, mesh, pytree, step, force, true_callbacks):
-        del mesh, pytree, force
+        del mesh, pytree
+        dest = self.root / f"run-{step}-{len(list(self.root.iterdir()))}"
+        meta = {"step": step, "is_temporary": self.periodic_is_temporary and not force}
         for callback in true_callbacks:
-            callback(self.dest, None, dict(self.meta, step=step))
+            callback(str(dest), None, meta)
 
 
-@pytest.mark.parametrize(("is_temporary", "reused"), [(False, True), (True, False)])
-def test_only_permanent_checkpoints_stand_in_for_the_terminal_save(tmp_path, is_temporary, reused):
-    checkpointer = _FakeCheckpointer({"is_temporary": is_temporary})
-    checkpointer.dest = str(tmp_path / "run-10")
+def _disk_trainer(root, *, periodic_is_temporary=False):
+    def save_state(*, state, save_directory, merge_lora_before_save):
+        os.makedirs(save_directory)
+        return save_directory
+
     trainer = SimpleNamespace(
-        checkpointer=checkpointer,
+        checkpointer=_DiskCheckpointer(root, periodic_is_temporary),
         mesh=None,
-        arguments=SimpleNamespace(_get_save_directory=lambda: None),
-        _save_state=lambda *, state, save_directory, merge_lora_before_save: save_directory,
+        arguments=SimpleNamespace(
+            do_last_save=True, merge_lora_before_save=False, save_directory=None, _get_save_directory=lambda: None
+        ),
+        _preemption_checkpoint_path=None,
+        _train_end_callbacks_dispatched=True,
+        _last_saved_checkpoint=None,
+        _save_state=save_state,
         _save_data_lane_state=lambda path, step: None,
         _cleanup_old_checkpoints=lambda: None,
         _sync_checkpointer_after_callback_save=lambda *, step: None,
         _dispatch_callbacks=lambda *args, **kwargs: None,
-        _last_saved_checkpoint=None,
     )
+    trainer._save_checkpoint_for_step = functools.partial(BaseTrainer._save_checkpoint_for_step, trainer)
+    return trainer
 
-    saved = BaseTrainer._save_checkpoint_for_step(trainer, SimpleNamespace(step=10), step=10)
 
-    assert saved == checkpointer.dest
-    assert trainer._last_saved_checkpoint == ((10, checkpointer.dest) if reused else None)
+def _train_then_finish(trainer, *, periodic_step, final_step):
+    periodic = trainer._save_checkpoint_for_step(SimpleNamespace(step=periodic_step), step=periodic_step)
+    out = BaseTrainer._prepare_training_output(trainer, SimpleNamespace(step=final_step))
+    return periodic, out
+
+
+def test_terminal_save_reuses_permanent_checkpoint_of_the_same_step(tmp_path):
+    periodic, out = _train_then_finish(_disk_trainer(tmp_path), periodic_step=10, final_step=10)
+
+    assert out.checkpoint_path == periodic
+    assert out.last_save_file_name == periodic
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["run-10-0"]
+
+
+def test_terminal_save_writes_when_last_save_was_an_earlier_step(tmp_path):
+    periodic, out = _train_then_finish(_disk_trainer(tmp_path), periodic_step=5, final_step=10)
+
+    assert out.checkpoint_path != periodic
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["run-10-1", "run-5-0"]
+
+
+def test_temporary_checkpoint_does_not_stand_in_for_the_terminal_save(tmp_path):
+    trainer = _disk_trainer(tmp_path, periodic_is_temporary=True)
+    periodic, out = _train_then_finish(trainer, periodic_step=10, final_step=10)
+
+    assert out.checkpoint_path != periodic
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["run-10-0", "run-10-1"]
 
 
 def test_normalize_message_payload_none_content_and_tool_calls():

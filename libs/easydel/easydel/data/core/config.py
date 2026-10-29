@@ -417,11 +417,11 @@ class MixStageConfig:
             protocols where repeating data means the config is wrong).
         seed (int | None): RNG seed for the mixer's per-block sampler;
             making mixing deterministic across runs/processes when set.
-        reshuffle_on_restart (bool | None): Visit a restarted constituent's shards
+        reshuffle_on_restart (bool): Visit a restarted constituent's shards
             in a fresh deterministic per-epoch permutation instead of
             replaying the identical order. Only meaningful with
-            ``stop_strategy="restart"``. ``None`` enables it for ``"restart"``;
-            ``False`` keeps the identical order every pass.
+            ``stop_strategy="restart"``. Enable it only for a fresh run: a
+            run checkpointed without it resumes onto a different order.
         attach_dataset_ids (bool): Stamp the integer dataset-attribution
             column (``easydel.data.DATASET_ID_FIELD``) on every mixed row so
             trainers can split metrics or losses per source.
@@ -433,7 +433,7 @@ class MixStageConfig:
     block_size: int = 1000
     stop_strategy: Literal["restart", "first_exhausted", "all_exhausted", "error"] = "restart"
     seed: int | None = None
-    reshuffle_on_restart: bool | None = None
+    reshuffle_on_restart: bool = False
     attach_dataset_ids: bool = False
 
     def __post_init__(self):

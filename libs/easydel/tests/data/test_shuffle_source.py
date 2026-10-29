@@ -315,7 +315,7 @@ def test_shuffled_filtered_source_resumes_by_delivered_rows():
     assert [row["id"] for row in shuffled.open_shard_at_row(shuffled.shard_names[0], 2)] == full[2:]
 
 
-@pytest.mark.parametrize("reshuffle", [False, None], ids=["fixed-order", "default-reshuffle"])
+@pytest.mark.parametrize("reshuffle", [False, True], ids=["fixed-order", "reshuffle"])
 @pytest.mark.parametrize("split", [2, 4, 5])
 def test_restart_mixture_filtered_source_resumes_by_delivered_rows(reshuffle, split):
     source = _MetadataRowsSource({"s0": list(range(4)), "s1": list(range(4, 8))})

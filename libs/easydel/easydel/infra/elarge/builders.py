@@ -1978,9 +1978,9 @@ def build_sharded_source(cfg_like: eLMConfig | Mapping[str, Any]) -> "ShardedDat
 
         sources[name] = source
 
-    reshuffle_on_restart = mixture_cfg.get("reshuffle_on_restart")
+    reshuffle_on_restart = bool(mixture_cfg.get("reshuffle_on_restart", False))
     # reshuffle_on_restart is implemented by the mixer's per-epoch shard permutation, so a single-inform config
-    # with the flag explicitly set still routes through a one-constituent MixedShardedSource.
+    # with the flag set still routes through a one-constituent MixedShardedSource.
     if len(sources) > 1 or reshuffle_on_restart:
         weights = _mixture_weights(mixture_cfg, list(sources))
 
