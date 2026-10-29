@@ -60,6 +60,10 @@ import numpy as np
 from jax.experimental.mesh_utils import create_device_mesh, create_hybrid_device_mesh
 from jax.sharding import AxisType, Mesh
 
+from eformer.loggings import get_logger
+
+logger = get_logger(__name__)
+
 DEFAULT_SHARDING_STG = (1, -1, 1, 1, 1)
 DEFAULT_NAMED_SHARDING_STG = ("dp", "fsdp", "ep", "tp", "sp")
 
@@ -254,6 +258,55 @@ def _cached_mesh(
     )
 
 
+def _single_slice_tpu_mesh_devices(
+    global_mesh_shape: tp.Sequence[int],
+    axis_names: tp.Sequence[str],
+    devices: tp.Sequence[tp.Any],
+    *,
+    dcn_mesh_dims: tp.Sequence[int] | None,
+    allow_split_physical_axes: bool,
+) -> np.ndarray | None:
+    """Torus-aware device array for a multi-process job on a single TPU slice, or ``None`` when it does not apply.
+
+    A single TPU slice is one ICI torus, so its hosts are not network granules. ``create_device_mesh`` over all
+    devices lays the mesh axes on physical rings (as ``jax.make_mesh`` and MaxText's single-slice path do), while the
+    per-host hybrid mesh confines the trailing axes to one host's chips and strides the leading axes across hosts.
+    For example, an ``(fsdp=16, tp=4)`` mesh on a 4x4x4 torus gets each tp group on an x ring and each fsdp group
+    on a y/z plane, so the collectives over both axes run along the torus's ICI rings (faster than the hybrid mesh).
+
+    Args:
+        global_mesh_shape: Resolved global mesh shape (no ``-1``).
+        axis_names: Mesh axis names, aligned with ``global_mesh_shape``.
+        devices: Every device of the job.
+        dcn_mesh_dims: Explicit inter-granule layout requested by the caller, if any.
+        allow_split_physical_axes: Forwarded to ``create_device_mesh``.
+
+    Returns:
+        The device array shaped ``global_mesh_shape``, or ``None`` (the caller keeps the per-host hybrid mesh) when
+        the devices are not TPUs (GPU / CPU hosts are real network granules), when ``dcn_mesh_dims`` is given (an
+        explicit inter-host layout is honored), when a ``pp`` axis is larger than 1 (pipeline stages stay whole-host
+        blocks), or when ``create_device_mesh`` cannot map the shape onto the torus (warned once).
+    """
+    if not devices or getattr(devices[0], "platform", None) != "tpu" or dcn_mesh_dims is not None:
+        return None
+    shape = dict(zip(axis_names, global_mesh_shape, strict=False))
+    if int(shape.get("pp", 1)) > 1:
+        return None
+    try:
+        return create_device_mesh(
+            mesh_shape=tuple(int(d) for d in global_mesh_shape),
+            devices=devices,
+            allow_split_physical_axes=allow_split_physical_axes,
+        )
+    except (AssertionError, NotImplementedError, TypeError, ValueError) as exc:
+        logger.warn_once(
+            f"eformer create_mesh: could not lay mesh {tuple(global_mesh_shape)} over the single-slice TPU torus "
+            f"({type(exc).__name__}: {str(exc).splitlines()[0][:200] if str(exc) else ''}); falling back to the "
+            "per-host hybrid mesh, whose trailing axes stay inside one host."
+        )
+        return None
+
+
 @functools.cache
 def _cached_mesh_impl(
     axis_dims: tuple[int, ...],
@@ -266,12 +319,16 @@ def _cached_mesh_impl(
 ):
     """Cached implementation of mesh creation logic.
 
-    This function handles three main scenarios:
+    This function handles four main scenarios:
     1. Multi-slice environments (TPU pods): Creates per-slice meshes with
        appropriate DCN configuration for inter-slice communication.
-    2. Multi-process environments: Distributes mesh across processes,
+    2. Multi-process jobs on a single TPU slice: one ICI torus, so a plain
+       torus-aware ``create_device_mesh`` over every device (see
+       :func:`_single_slice_tpu_mesh_devices`; ``dcn_mesh_dims`` or
+       ``pp > 1`` keep the per-host layout of scenario 3).
+    3. Other multi-process environments: Distributes mesh across processes,
        calculating DCN dimensions to map logical to physical topology.
-    3. Single-process environments: Creates a simple device mesh.
+    4. Single-process environments: Creates a simple device mesh.
 
     The function automatically detects the environment type and applies
     the appropriate mesh creation strategy.
@@ -360,6 +417,21 @@ def _cached_mesh_impl(
             process_is_granule=False,
             should_sort_granules_by_key=should_sort_granules_by_key,
         )
+
+    elif (
+        process_count > 1
+        and (
+            topology_devices := _single_slice_tpu_mesh_devices(
+                global_mesh_shape,
+                axis_names,
+                devices,
+                dcn_mesh_dims=dcn_mesh_dims,
+                allow_split_physical_axes=allow_split_physical_axes,
+            )
+        )
+        is not None
+    ):
+        ndarray = topology_devices
 
     elif process_count > 1:
         local_mesh_shape = calculate_host_mesh_shape(
