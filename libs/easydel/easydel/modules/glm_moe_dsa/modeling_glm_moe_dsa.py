@@ -91,6 +91,7 @@ from easydel.layers.indexer import (
     indexer_distillation_loss,
     paged_token_select,
     use_sparse_training_attention,
+    warn_unsupported_scoring_kernel,
 )
 from easydel.layers.moe import fp32_router_logits, moe_group_topk_select
 from easydel.layers.rotary import apply_rope_interleaved, apply_rope_split_half, yarn_get_mscale
@@ -550,6 +551,7 @@ class GlmMoeDsaIndexer(TokenIndexer):
             ),
         )
         self.config = config
+        warn_unsupported_scoring_kernel(config, "GLM-MoE-DSA token")
 
     def distillation_scores(self, hidden_states, q_resid, position_ids, frequencies, visible):
         """Return differentiable stateless pre-top-k scores, with unreachable tokens at ``-inf``.
@@ -689,6 +691,11 @@ class GlmMoeDsaAttention(UnifiedAttention):
             use_mla_lora=config.q_lora_rank is not None and config.q_lora_rank > 0,
         )
         self.head_dim = self.v_head_dim
+        if config.dsa_pool_training:
+            logger.warning_once(
+                "GLM-MoE-DSA: dsa_pool_training needs a pooled indexer and this model's token indexer has none; "
+                "its DSA layers keep the dense / sparse-selected path."
+            )
 
     def define_network(
         self,
@@ -1238,7 +1245,7 @@ class GlmMoeDsaAttention(UnifiedAttention):
                 output_attentions=output_attentions,
                 sliding_window=sliding_window_for_kernel,
                 softmax_aux=self.get_softmax_aux(),
-                sparse_training=getattr(self.config, "dsa_sparse_training", None),
+                sparse_training=self.config.dsa_sparse_training,
                 seq_len=q_len,
             )
         ):

@@ -313,14 +313,17 @@ class DeepseekV41Indexer(SharedKeyIndexer):
                 candidate_block_size=config.candidate_block_size,
                 rms_norm_eps=config.rms_norm_eps,
                 initializer_range=config.initializer_range,
+                scoring_kernel=config.index_scoring_kernel,
             ),
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
         )
-        # Mesh source for the replicated-key Pallas selector dispatch (same pattern as the attention module).
+        # Mesh source for the replicated-key Pallas selector dispatch and the fused ``index_scoring_kernel="pallas"``
+        # scores, which otherwise fall back to the operation's XLA reference on a multi-device mesh.
         self.config = config
+        self.mesh_source = config
 
     def index_keys(self, latent: Array, cos: Array, sin: Array) -> Array:
         """Index keys ``[B, T, index_head_dim]`` from the KV source's pre-RoPE latent, roped at group positions."""

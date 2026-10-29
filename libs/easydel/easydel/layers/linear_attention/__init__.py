@@ -25,8 +25,10 @@ linear-attention architectures (GatedDeltaNet, KDA, etc.):
     Masking:
         - ``apply_mask_to_padding_states``: Zero out padding positions in hidden states.
 
-These are intentionally free functions (not classes) so that XLA can inline them
-without vtable dispatch overhead on the TPU decode hot path.
+    Kernel Delta Attention (every KDA model family: Kimi-Linear, GLM-5-Next):
+        - ``KernelDeltaAttention``: The shared KDA layer, subclassed per model family.
+        - ``kda_layer_spec`` / ``KDALayerSpec``: Layer (and cache) shapes from ``config.linear_attn_config``.
+        - ``unnest_legacy_kda_forget_gate``: Native-checkpoint hook for saves with a nested ``forget_gate``.
 """
 
 from ._conv_state import (
@@ -35,12 +37,17 @@ from ._conv_state import (
     shift_conv_state_left,
 )
 from ._depthwise_conv import ChannelMajorConv1D
+from ._kda import KDALayerSpec, KernelDeltaAttention, kda_layer_spec, unnest_legacy_kda_forget_gate
 from ._masking import apply_mask_to_padding_states
 
 __all__ = (
     "ChannelMajorConv1D",
+    "KDALayerSpec",
+    "KernelDeltaAttention",
     "apply_conv_with_state",
     "apply_manual_depthwise_conv",
     "apply_mask_to_padding_states",
+    "kda_layer_spec",
     "shift_conv_state_left",
+    "unnest_legacy_kda_forget_gate",
 )

@@ -90,7 +90,7 @@ from easydel.layers import (
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.embeddings._vision import VisionPatchEmbed as Qwen2VLPatchEmbed
-from easydel.layers.indexer import BlockMaxIndexer, BlockMaxIndexerConfig
+from easydel.layers.indexer import BlockMaxIndexer, BlockMaxIndexerConfig, warn_unsupported_scoring_kernel
 from easydel.layers.moe import moe_group_topk_select
 from easydel.layers.norms import LayerNorm, RMSNorm
 from easydel.layers.rotary import apply_rope_split_half
@@ -623,6 +623,7 @@ class MiniMaxM3VLIndexer(BlockMaxIndexer):
         # Row-parallel TPU top-k resolves its layout from the model mesh.
         self.mesh_source = config
         self.config = config
+        warn_unsupported_scoring_kernel(config, "MiniMax-M3 block-max")
 
 
 class MiniMaxM3VLAttention(UnifiedAttention):

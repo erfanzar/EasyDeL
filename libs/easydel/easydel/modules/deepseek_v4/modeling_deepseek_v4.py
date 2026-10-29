@@ -549,6 +549,7 @@ def _compressed_indexer_config(config: DeepseekV4Config) -> CompressedIndexerCon
         compress_rate=config.compress_rates["compressed_sparse_attention"],
         rms_norm_eps=config.rms_norm_eps,
         initializer_range=config.initializer_range,
+        scoring_kernel=config.index_scoring_kernel,
     )
 
 

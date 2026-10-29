@@ -91,6 +91,10 @@ from .etils import (
     AVAILABLE_MOE_METHODS,
     DEFAULT_ATTENTION_MECHANISM,
     DEFAULT_MLA_ATTENTION_MECHANISM,
+    DSA_POOL_KERNELS,
+    INDEX_SCORING_KERNELS,
+    KDA_CHUNK_IMPLS,
+    KDA_CHUNK_PRECISIONS,
     EasyDeLBackends,
     EasyDeLGradientCheckPointers,
     EasyDeLPlatforms,
@@ -667,6 +671,41 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             mapped to ep when ``fsdp_is_ep_bound``) so the block-boundary specs
             match the residual stream and GSPMD emits no whole-shard
             collective-permute at MoE entry/exit. Default ``False``.
+        gather_shared_projection_input: All-gather a hidden state that several column-parallel projections read
+            (for example the KDA ``q/k/v``, beta and gate projections) over tensor parallelism once, so the
+            rematerialized backward does not re-gather it for every projection's weight gradient (see
+            :func:`easydel.layers.linears.gather_shared_input`). Projections keep their own module calls (quantized /
+            LoRA layers unaffected) and parameters and checkpoints do not change; layers that do not call the helper
+            ignore the flag. Default ``False``.
+        kda_chunk_impl: Chunked (multi-token) implementation of every Kernel Delta Attention layer
+            (:class:`easydel.layers.linear_attention.KernelDeltaAttention`: Kimi-Linear, GLM-5-Next):
+            ``"scan"`` (XLA per-channel chunk scan) or ``"kda_chunk"`` (fused ejkernel ``kda_chunk`` kernel; Pallas
+            forward + backward on TPU, its XLA implementation elsewhere). Default ``"scan"``.
+        kda_chunk_precision: Precision of the non-inverse dots of ``kda_chunk_impl="kda_chunk"``: ``"highest"`` or
+            ``"default"`` (bf16 MXU passes). Default ``"highest"``.
+        index_scoring_kernel: Dense multi-query scoring of every learned sparse-attention indexer that has a fused
+            path (GLM-5-Next's pooled indexer, DeepSeek-V4's compressed and DeepSeek-V4.1's shared-key indexers):
+            ``"xla"`` (per-head logits as XLA ops) or ``"pallas"`` (the fused ``indexer_scores`` operation; Pallas
+            on TPU, its XLA reference elsewhere). Indexers without a fused path (GLM-MoE-DSA's token indexer, the
+            block-max and block-top-k indexers) warn once and keep ``"xla"``. Default ``"xla"``.
+        dsa_sparse_training: DeepSeek-Sparse-Attention stateless forwards: ``True`` / ``False`` force the tiled
+            sparse-selected kernel / the dense masked path; ``None`` (default) picks the sparse kernel on TPU for
+            sequences of at least ``AUTO_SPARSE_MIN_SEQ`` tokens and the dense path otherwise. Read by the MLA layers
+            with a learned indexer (GLM-5-Next, GLM-MoE-DSA); DeepSeek-V4 / V4.1 compressed-window attention and
+            models without DSA layers do not read it.
+        dsa_pool_training: Run DSA layers with a pooled indexer (GLM-5-Next) through query-chunked pool selection
+            and the ``dsa_pool_kernel`` attention on stateless forwards, so no ``[seq, seq]`` mask or
+            ``[seq, heads, pools]`` score tensor is built. Handles any per-row padding; calls that need the dense
+            path (packed documents or custom masks, shared indexers, indexer aux loss, attention outputs, dropout)
+            keep it and warn once. DSA layers with a token indexer (GLM-MoE-DSA) warn once and keep the dense path.
+            DeepSeek-V4 / V4.1 compressed-window attention and models without DSA layers do not read it (nor
+            ``dsa_pool_query_chunk`` / ``dsa_pool_kernel``). Default ``False``.
+        dsa_pool_query_chunk: Queries scored per chunk by the ``dsa_pool_training`` selection. Default ``2048``.
+        dsa_pool_kernel: Attention kernel of ``dsa_pool_training``: ``"bitmap"`` (block-sparse
+            ``dsa_pool_sparse_attention``; heads split over tensor parallelism) or ``"gather"`` (per-query
+            ``dsa_gather_attention``; each query DMA-gathers exactly its selected pools, the query sequence split
+            over tensor parallelism). Model families add their own constraints (GLM-5-Next: ``"gather"`` needs an
+            even ``index_kpool``). Default ``"bitmap"``.
         layer_scan_options: Lowering options for lowered repeated-layer scans
             (``block_scan``, ``barrier``, ``prefetch_axes``, ``prefetch_exclude``,
             ``prefetch_defer_dw``, ``unroll``); top-level keys apply to every scan,
@@ -750,6 +789,14 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     moe_fsdp_shard_expert_weights: NotRequired[bool]
     moe_ep_carries_batch: NotRequired[bool]
     moe_batch_axes_follow_resolver: NotRequired[bool]
+    gather_shared_projection_input: NotRequired[bool]
+    kda_chunk_impl: NotRequired[str]
+    kda_chunk_precision: NotRequired[str]
+    index_scoring_kernel: NotRequired[str]
+    dsa_sparse_training: NotRequired[bool | None]
+    dsa_pool_training: NotRequired[bool]
+    dsa_pool_query_chunk: NotRequired[int]
+    dsa_pool_kernel: NotRequired[str]
     layer_scan_options: NotRequired[dict[str, tp.Any] | None]
     quantization_config: NotRequired[QuantizationConfig | None]
     operation_configs: NotRequired[dict[str, BaseOperationConfig] | None]
@@ -846,6 +893,18 @@ class EasyDeLBaseConfig(PretrainedConfig):
             expert-owning shard (MaxText-style "ep carries batch"; default ``False``).
         moe_batch_axes_follow_resolver: Order the fused-MoE batch axes like the runtime resolver's
             hidden-state spec (no block-boundary relayout; default ``False``).
+        gather_shared_projection_input: All-gather a hidden state shared by several column projections over tp
+            once (one gather and one reduce-scatter instead of one gather per projection; default ``False``).
+        kda_chunk_impl: Chunked KDA implementation, ``"scan"`` or ``"kda_chunk"`` (default ``"scan"``).
+        kda_chunk_precision: Non-inverse dot precision of ``"kda_chunk"``, ``"highest"`` or ``"default"``
+            (default ``"highest"``).
+        index_scoring_kernel: Indexer multi-query scoring, ``"xla"`` or ``"pallas"`` (default ``"xla"``).
+        dsa_sparse_training: Force (``True``) / forbid (``False``) the sparse DSA training kernel; ``None``
+            (default) picks it automatically.
+        dsa_pool_training: Pool-selection DSA training path for pooled indexers (default ``False``).
+        dsa_pool_query_chunk: Queries per ``dsa_pool_training`` selection chunk (default ``2048``).
+        dsa_pool_kernel: ``dsa_pool_training`` attention kernel, ``"bitmap"`` or ``"gather"`` (default
+            ``"bitmap"``).
         layer_scan_options: Per-scope ``ModuleList.scan`` lowering options (default ``None``).
         **kwargs: Forwarded to `PretrainedConfig`.
 
@@ -1386,6 +1445,14 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_fsdp_shard_expert_weights: bool = False,
         moe_ep_carries_batch: bool = False,
         moe_batch_axes_follow_resolver: bool = False,
+        gather_shared_projection_input: bool = False,
+        kda_chunk_impl: str = "scan",
+        kda_chunk_precision: str = "highest",
+        index_scoring_kernel: str = "xla",
+        dsa_sparse_training: bool | None = None,
+        dsa_pool_training: bool = False,
+        dsa_pool_query_chunk: int = 2048,
+        dsa_pool_kernel: str = "bitmap",
         layer_scan_options: dict[str, tp.Any] | None = None,
         operation_configs: dict[str, BaseOperationConfig] | None = None,
         **kwargs,
@@ -1537,6 +1604,26 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.moe_ep_carries_batch = bool(getattr(self, "moe_ep_carries_batch", moe_ep_carries_batch))
         self.moe_batch_axes_follow_resolver = bool(
             getattr(self, "moe_batch_axes_follow_resolver", moe_batch_axes_follow_resolver)
+        )
+        self.gather_shared_projection_input = bool(
+            getattr(self, "gather_shared_projection_input", gather_shared_projection_input)
+        )
+        self.kda_chunk_impl = _one_of("kda_chunk_impl", getattr(self, "kda_chunk_impl", kda_chunk_impl), KDA_CHUNK_IMPLS)
+        self.kda_chunk_precision = _one_of(
+            "kda_chunk_precision", getattr(self, "kda_chunk_precision", kda_chunk_precision), KDA_CHUNK_PRECISIONS
+        )
+        self.index_scoring_kernel = _one_of(
+            "index_scoring_kernel", getattr(self, "index_scoring_kernel", index_scoring_kernel), INDEX_SCORING_KERNELS
+        )
+        self.dsa_sparse_training = _optional_bool(
+            "dsa_sparse_training", getattr(self, "dsa_sparse_training", dsa_sparse_training)
+        )
+        self.dsa_pool_training = bool(getattr(self, "dsa_pool_training", dsa_pool_training))
+        self.dsa_pool_query_chunk = _positive_int(
+            "dsa_pool_query_chunk", getattr(self, "dsa_pool_query_chunk", dsa_pool_query_chunk)
+        )
+        self.dsa_pool_kernel = _one_of(
+            "dsa_pool_kernel", getattr(self, "dsa_pool_kernel", dsa_pool_kernel), DSA_POOL_KERNELS
         )
         self.layer_scan_options = getattr(self, "layer_scan_options", layer_scan_options)
         normalize_layer_scan_options(self.layer_scan_options)
@@ -2189,6 +2276,14 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "moe_fsdp_shard_expert_weights",
             "moe_ep_carries_batch",
             "moe_batch_axes_follow_resolver",
+            "gather_shared_projection_input",
+            "kda_chunk_impl",
+            "kda_chunk_precision",
+            "index_scoring_kernel",
+            "dsa_sparse_training",
+            "dsa_pool_training",
+            "dsa_pool_query_chunk",
+            "dsa_pool_kernel",
             "layer_scan_options",
             "use_fused_mlp",
             "collective_matmul_impl",
@@ -2361,6 +2456,14 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_fsdp_shard_expert_weights: bool = NOT_GIVEN,
         moe_ep_carries_batch: bool = NOT_GIVEN,
         moe_batch_axes_follow_resolver: bool = NOT_GIVEN,
+        gather_shared_projection_input: bool = NOT_GIVEN,
+        kda_chunk_impl: str = NOT_GIVEN,
+        kda_chunk_precision: str = NOT_GIVEN,
+        index_scoring_kernel: str = NOT_GIVEN,
+        dsa_sparse_training: bool | None = NOT_GIVEN,
+        dsa_pool_training: bool = NOT_GIVEN,
+        dsa_pool_query_chunk: int = NOT_GIVEN,
+        dsa_pool_kernel: str = NOT_GIVEN,
         layer_scan_options: dict[str, tp.Any] | None = NOT_GIVEN,
         **kwargs,
     ):
@@ -2444,6 +2547,16 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 their expert-owning shard (MaxText-style "ep carries batch"; default ``False``).
             moe_batch_axes_follow_resolver: Order the fused-MoE batch axes like the runtime resolver's
                 hidden-state spec (default ``False``).
+            gather_shared_projection_input: All-gather a hidden state shared by several column projections over tp
+                once (default ``False``).
+            kda_chunk_impl: Chunked KDA implementation, ``"scan"`` or ``"kda_chunk"`` (default ``"scan"``).
+            kda_chunk_precision: Non-inverse dot precision of ``"kda_chunk"`` (default ``"highest"``).
+            index_scoring_kernel: Indexer multi-query scoring, ``"xla"`` or ``"pallas"`` (default ``"xla"``).
+            dsa_sparse_training: Force / forbid the sparse DSA training kernel; ``None`` = automatic (default).
+            dsa_pool_training: Pool-selection DSA training path for pooled indexers (default ``False``).
+            dsa_pool_query_chunk: Queries per ``dsa_pool_training`` selection chunk (default ``2048``).
+            dsa_pool_kernel: ``dsa_pool_training`` attention kernel, ``"bitmap"`` or ``"gather"`` (default
+                ``"bitmap"``).
             layer_scan_options: Per-scope ``ModuleList.scan`` lowering options (default ``None``).
             **kwargs: Extra attributes to attach to this config and any defined ``sub_configs``.
         """
@@ -2536,6 +2649,21 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "moe_fsdp_shard_expert_weights", False, moe_fsdp_shard_expert_weights)
         set_attrs_smartly(self, "moe_ep_carries_batch", False, moe_ep_carries_batch)
         set_attrs_smartly(self, "moe_batch_axes_follow_resolver", False, moe_batch_axes_follow_resolver)
+        set_attrs_smartly(self, "gather_shared_projection_input", False, gather_shared_projection_input)
+        set_attrs_smartly(self, "kda_chunk_impl", "scan", kda_chunk_impl)
+        self.kda_chunk_impl = _one_of("kda_chunk_impl", self.kda_chunk_impl, KDA_CHUNK_IMPLS)
+        set_attrs_smartly(self, "kda_chunk_precision", "highest", kda_chunk_precision)
+        self.kda_chunk_precision = _one_of("kda_chunk_precision", self.kda_chunk_precision, KDA_CHUNK_PRECISIONS)
+        set_attrs_smartly(self, "index_scoring_kernel", "xla", index_scoring_kernel)
+        self.index_scoring_kernel = _one_of("index_scoring_kernel", self.index_scoring_kernel, INDEX_SCORING_KERNELS)
+        set_attrs_smartly(self, "dsa_sparse_training", None, dsa_sparse_training)
+        self.dsa_sparse_training = _optional_bool("dsa_sparse_training", self.dsa_sparse_training)
+        set_attrs_smartly(self, "dsa_pool_training", False, dsa_pool_training)
+        self.dsa_pool_training = bool(self.dsa_pool_training)
+        set_attrs_smartly(self, "dsa_pool_query_chunk", 2048, dsa_pool_query_chunk)
+        self.dsa_pool_query_chunk = _positive_int("dsa_pool_query_chunk", self.dsa_pool_query_chunk)
+        set_attrs_smartly(self, "dsa_pool_kernel", "bitmap", dsa_pool_kernel)
+        self.dsa_pool_kernel = _one_of("dsa_pool_kernel", self.dsa_pool_kernel, DSA_POOL_KERNELS)
         set_attrs_smartly(self, "layer_scan_options", None, layer_scan_options)
         normalize_layer_scan_options(self.layer_scan_options)
         self._maybe_extend_batch_axis_for_ep()
