@@ -56,6 +56,7 @@ from .blocksparse_attention import blocksparse_attention as blocksparse_attentio
 from .compressed_window_attention import compressed_window_attention
 from .compressed_window_decode import compressed_window_decode
 from .deepseek_attn import deepseek_attn
+from .dsa_gather_attention import dsa_gather_attention
 from .dsa_sparse_attention import dsa_sparse_attention
 from .flash_attention import flash_attention
 from .flash_mla import flash_mla
@@ -104,6 +105,7 @@ __all__ = (
     "compressed_window_attention",
     "compressed_window_decode",
     "deepseek_attn",
+    "dsa_gather_attention",
     "dsa_sparse_attention",
     "flash_attention",
     "flash_mla",

@@ -106,6 +106,7 @@ Example:
 """
 
 from .operations import (
+    DSA_SPARSE_MAX_TAIL_KEYS,
     KERNEL_TILE_POLICIES,
     RWKV4,
     RWKV6,
@@ -132,6 +133,8 @@ from .operations import (
     DecodeAttentionConfig,
     DeepSeekAttention,
     DeepSeekAttentionConfig,
+    DsaGatherAttention,
+    DsaGatherAttentionConfig,
     DsaSparseAttention,
     DsaSparseAttentionConfig,
     FlashAttention,
@@ -240,6 +243,7 @@ from .operations import (
     compute_schedule_table_v2,
     decode_attention,
     deepseek_attn,
+    dsa_gather_attention,
     dsa_sparse_attention,
     flash_attention,
     flash_mla,
@@ -271,6 +275,7 @@ from .operations import (
     native_sparse_attention,
     normalize_kernel_tile_policy,
     pack_int4_adjacent,
+    pack_pool_bits,
     page_attention,
     prefill_page_attention,
     quantized_matmul,
@@ -312,6 +317,7 @@ from .operations import (
 )
 
 __all__ = (
+    "DSA_SPARSE_MAX_TAIL_KEYS",
     "KERNEL_TILE_POLICIES",
     "RWKV4",
     "RWKV6",
@@ -338,6 +344,8 @@ __all__ = (
     "DecodeAttentionConfig",
     "DeepSeekAttention",
     "DeepSeekAttentionConfig",
+    "DsaGatherAttention",
+    "DsaGatherAttentionConfig",
     "DsaSparseAttention",
     "DsaSparseAttentionConfig",
     "FlashAttention",
@@ -446,6 +454,7 @@ __all__ = (
     "compute_schedule_table_v2",
     "decode_attention",
     "deepseek_attn",
+    "dsa_gather_attention",
     "dsa_sparse_attention",
     "flash_attention",
     "flash_mla",
@@ -477,6 +486,7 @@ __all__ = (
     "native_sparse_attention",
     "normalize_kernel_tile_policy",
     "pack_int4_adjacent",
+    "pack_pool_bits",
     "page_attention",
     "prefill_page_attention",
     "quantized_matmul",

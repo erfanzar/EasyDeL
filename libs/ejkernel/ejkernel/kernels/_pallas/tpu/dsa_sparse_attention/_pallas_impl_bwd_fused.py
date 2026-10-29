@@ -65,15 +65,7 @@ def _fused_kernel(
     m_ref,  # [H, 8, bq]
     logl_ref,
     delta_ref,
-    dpool_init_ref,  # ANY, aliased to dpool's array (zeros); never read
-    dkv_init_ref,  # ANY, aliased to dkv_hbm_ref (zeros); never read
-    dq_ref,  # [H, bq, D]
-    dpool_ref,  # [bk/kpool, bq] fp32
-    dkv_hbm_ref,  # ANY: dkv_partial [G, B, S, D] fp32
-    dq_scr,  # [H, D, bq] fp32
-    dkv_vmem,  # [bk, D] fp32
-    sem,  # DMA semaphores (2,)
-    *,
+    *rest,
     softmax_scale: float,
     kpool: int,
     block_kv: int,
@@ -81,8 +73,17 @@ def _fused_kernel(
     n_tails: int,
     n_groups: int,
     pool_sum_how: str,
+    with_pool: bool = True,
 ):
-    del dpool_init_ref, dkv_init_ref
+    # with_pool:    dpool_init (ANY, aliased; never read), dkv_init (ANY, aliased; never read),
+    #               dq [H, bq, D], dpool [bk/kpool, bq] fp32, dkv_hbm (ANY) [G, B, S, D] fp32,
+    #               dq_scr [H, D, bq] fp32, dkv_vmem [bk, D] fp32, sem (2,)
+    # without pool: the same minus dpool_init / dpool (no pool cotangent is accumulated or written).
+    if with_pool:
+        _dpool_init_ref, _dkv_init_ref, dq_ref, dpool_ref, dkv_hbm_ref, dq_scr, dkv_vmem, sem = rest
+    else:
+        _dkv_init_ref, dq_ref, dkv_hbm_ref, dq_scr, dkv_vmem, sem = rest
+        dpool_ref = None
     g, b, j, i = pl.program_id(0), pl.program_id(1), pl.program_id(2), pl.program_id(3)
     qb = j * n_groups + g
     num_heads, block_q, _ = q_ref.shape
@@ -94,9 +95,11 @@ def _fused_kernel(
     def _init():
         dq_scr[...] = jnp.zeros(dq_scr.shape, dq_scr.dtype)
 
-    @pl.when((i == 0) & (count == 0))
-    def _no_block():
-        dpool_ref[...] = jnp.zeros(dpool_ref.shape, dpool_ref.dtype)
+    if with_pool:
+
+        @pl.when((i == 0) & (count == 0))
+        def _no_block():
+            dpool_ref[...] = jnp.zeros(dpool_ref.shape, dpool_ref.dtype)
 
     @pl.when(i < count)
     def _step():
@@ -109,7 +112,7 @@ def _fused_kernel(
         fetch.start()
         fetch.wait()
         acc = dkv_vmem[...]
-        ds_sum = jnp.zeros((block_kv, block_q), jnp.float32)
+        ds_sum = jnp.zeros((block_kv, block_q), jnp.float32) if with_pool else None
         for h in range(num_heads):
             q_h = q_ref[h]
             do_h = do_ref[h]
@@ -125,7 +128,8 @@ def _fused_kernel(
                 prec,
                 lean=True,
             )
-            ds_sum = ds_sum + ds
+            if with_pool:
+                ds_sum = ds_sum + ds
             dq_scr[h] = dq_scr[h] + lax.dot(kt, ds.astype(mm_dtype), preferred_element_type=jnp.float32, precision=prec)
             lhs = jnp.concatenate([p.astype(mm_dtype), (ds * softmax_scale).astype(mm_dtype)], axis=1)  # [bk, 2bq]
             rhs = jnp.concatenate([do_h, q_h], axis=0)  # [2bq, D]
@@ -134,7 +138,8 @@ def _fused_kernel(
         store = pltpu.make_async_copy(dkv_vmem, dkv_hbm_ref.at[g, b, rows], sem.at[1])
         store.start()
         store.wait()
-        dpool_ref[...] = pool_sum(ds_sum, kpool, pool_sum_how)
+        if with_pool:
+            dpool_ref[...] = pool_sum(ds_sum, kpool, pool_sum_how)
 
     @pl.when(i == n_kb - 1)
     def _finish():
@@ -185,7 +190,8 @@ def dsa_sparse_attention_pallas_bwd_fused(
     vmem_limit_bytes: int | None = None,
     pool_sum_how: str = "reshape",
     fused_groups: int | None = None,
-) -> tuple[Array, Array, Array]:
+    with_pool: bool = True,
+) -> tuple[Array, Array, Array | None]:
     """The fused backward (see the module docstring); same arguments as the two-pass backward minus the q-tables.
 
     Args:
@@ -209,9 +215,12 @@ def dsa_sparse_attention_pallas_bwd_fused(
         vmem_limit_bytes: Scoped VMEM request (default 63 MiB).
         pool_sum_how: ``"reshape"`` or ``"matmul"``.
         fused_groups: Core groups (see :func:`fused_groups_for`).
+        with_pool: Accumulate and return the pool cotangent. ``False`` skips the ``[B, S // kpool, S]`` fp32
+            output (and its zero-initialised alias) entirely; ``dq`` and ``d_latent`` are unchanged.
 
     Returns:
-        ``(dq [B, H, S, D], d_latent [B, S, D], d_pool_t [B, S // kpool, S] fp32)``.
+        ``(dq [B, H, S, D], d_latent [B, S, D], d_pool_t [B, S // kpool, S] fp32)``; ``d_pool_t`` is ``None``
+        when ``with_pool`` is ``False``.
     """
     batch, num_heads, seq, head_dim = query.shape
     if seq % block_q or seq % block_kv:
@@ -240,9 +249,38 @@ def dsa_sparse_attention_pallas_bwd_fused(
     def kv_of(g, b, j, i, c, kl):
         return kv_block_index(c, kl, b, qb_of(g, j), i, n_kb)
 
-    dpool_init = jnp.zeros((batch, seq // kpool, seq), f32)
     dkv_init = jnp.zeros((n_groups, batch, seq, head_dim), f32)
-    dq, d_pool_t, dkv_partial = pl.pallas_call(
+    in_specs = [
+        pl.BlockSpec(lay["q"], lambda g, b, j, i, c, kl: (b, 0, qb_of(g, j), 0)),
+        pl.BlockSpec(lay["latent"], lambda g, b, j, i, c, kl: (b, kv_of(g, b, j, i, c, kl), 0)),
+        pl.BlockSpec(lay["bits_t"], lambda g, b, j, i, c, kl: (b, 0, qb_of(g, j))),
+        pl.BlockSpec(lay["tails_t"], lambda g, b, j, i, c, kl: (b, 0, qb_of(g, j))),
+        pl.BlockSpec(lay["dO"], lambda g, b, j, i, c, kl: (b, 0, qb_of(g, j), 0)),
+        pl.BlockSpec(lay["stats"], lambda g, b, j, i, c, kl: (b, 0, 0, qb_of(g, j))),
+        pl.BlockSpec(lay["stats"], lambda g, b, j, i, c, kl: (b, 0, 0, qb_of(g, j))),
+        pl.BlockSpec(lay["stats"], lambda g, b, j, i, c, kl: (b, 0, 0, qb_of(g, j))),
+    ]
+    dq_spec = pl.BlockSpec(lay["dq"], lambda g, b, j, i, c, kl: (b, 0, qb_of(g, j), 0))
+    dq_shape = jax.ShapeDtypeStruct((batch, num_heads, seq, head_dim), query.dtype)
+    dkv_shape = jax.ShapeDtypeStruct((n_groups, batch, seq, head_dim), f32)
+    operands = [count, kv_list, query, latent, bits_t, tails_t, grad, m, logl, delta]
+    if with_pool:
+        in_specs += [pl.BlockSpec(memory_space=pl.ANY), pl.BlockSpec(memory_space=pl.ANY)]
+        out_specs = [
+            dq_spec,
+            pl.BlockSpec(lay["d_pool_t"], lambda g, b, j, i, c, kl: (b, kv_of(g, b, j, i, c, kl), qb_of(g, j))),
+            pl.BlockSpec(memory_space=pl.ANY),
+        ]
+        out_shape = [dq_shape, jax.ShapeDtypeStruct((batch, seq // kpool, seq), f32), dkv_shape]
+        aliases = {10: 1, 11: 2}  # operand indices include the 2 scalar-prefetch tables
+        operands += [jnp.zeros((batch, seq // kpool, seq), f32), dkv_init]
+    else:
+        in_specs += [pl.BlockSpec(memory_space=pl.ANY)]
+        out_specs = [dq_spec, pl.BlockSpec(memory_space=pl.ANY)]
+        out_shape = [dq_shape, dkv_shape]
+        aliases = {10: 1}
+        operands += [dkv_init]
+    outs = pl.pallas_call(
         functools.partial(
             _fused_kernel,
             softmax_scale=float(softmax_scale),
@@ -252,44 +290,30 @@ def dsa_sparse_attention_pallas_bwd_fused(
             n_tails=n_tails,
             n_groups=n_groups,
             pool_sum_how=pool_sum_how,
+            with_pool=with_pool,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             grid=(n_groups, batch, n_qb // n_groups, n_kb),
-            in_specs=[
-                pl.BlockSpec(lay["q"], lambda g, b, j, i, c, kl: (b, 0, qb_of(g, j), 0)),
-                pl.BlockSpec(lay["latent"], lambda g, b, j, i, c, kl: (b, kv_of(g, b, j, i, c, kl), 0)),
-                pl.BlockSpec(lay["bits_t"], lambda g, b, j, i, c, kl: (b, 0, qb_of(g, j))),
-                pl.BlockSpec(lay["tails_t"], lambda g, b, j, i, c, kl: (b, 0, qb_of(g, j))),
-                pl.BlockSpec(lay["dO"], lambda g, b, j, i, c, kl: (b, 0, qb_of(g, j), 0)),
-                pl.BlockSpec(lay["stats"], lambda g, b, j, i, c, kl: (b, 0, 0, qb_of(g, j))),
-                pl.BlockSpec(lay["stats"], lambda g, b, j, i, c, kl: (b, 0, 0, qb_of(g, j))),
-                pl.BlockSpec(lay["stats"], lambda g, b, j, i, c, kl: (b, 0, 0, qb_of(g, j))),
-                pl.BlockSpec(memory_space=pl.ANY),
-                pl.BlockSpec(memory_space=pl.ANY),
-            ],
-            out_specs=[
-                pl.BlockSpec(lay["dq"], lambda g, b, j, i, c, kl: (b, 0, qb_of(g, j), 0)),
-                pl.BlockSpec(lay["d_pool_t"], lambda g, b, j, i, c, kl: (b, kv_of(g, b, j, i, c, kl), qb_of(g, j))),
-                pl.BlockSpec(memory_space=pl.ANY),
-            ],
+            in_specs=in_specs,
+            out_specs=out_specs,
             scratch_shapes=[
                 pltpu.VMEM(lay["scratch:dq"], f32),
                 pltpu.VMEM(lay["scratch:dkv"], f32),
                 pltpu.SemaphoreType.DMA((2,)),
             ],
         ),
-        out_shape=[
-            jax.ShapeDtypeStruct((batch, num_heads, seq, head_dim), query.dtype),
-            jax.ShapeDtypeStruct((batch, seq // kpool, seq), f32),
-            jax.ShapeDtypeStruct((n_groups, batch, seq, head_dim), f32),
-        ],
-        input_output_aliases={10: 1, 11: 2},  # operands counted after the 2 scalar-prefetch tables
+        out_shape=out_shape,
+        input_output_aliases=aliases,
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "arbitrary", "arbitrary", "arbitrary"),
             vmem_limit_bytes=int(vmem_limit_bytes or DEFAULT_BWD_VMEM_LIMIT),
         ),
         interpret=interpret,
-    )(count, kv_list, query, latent, bits_t, tails_t, grad, m, logl, delta, dpool_init, dkv_init)
+    )(*operands)
+    if with_pool:
+        dq, d_pool_t, dkv_partial = outs
+    else:
+        (dq, dkv_partial), d_pool_t = outs, None
     d_latent = jnp.sum(dkv_partial, axis=0).astype(latent.dtype)
     return dq, d_latent, d_pool_t

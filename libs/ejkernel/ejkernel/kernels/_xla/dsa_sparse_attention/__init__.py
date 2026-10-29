@@ -15,15 +15,27 @@
 """Pool-bitmap block-sparse DSA attention: block tables and the dense XLA reference."""
 
 from ._interface import dsa_sparse_attention
-from ._tables import build_q_tables, build_tables, expand_open_mask, parse_sparse_mode, visited_open_mask
+from ._tables import (
+    as_pool_bits,
+    build_q_tables,
+    build_tables,
+    expand_open_mask,
+    pack_pool_bits,
+    parse_sparse_mode,
+    unpack_pool_bits,
+    visited_open_mask,
+)
 from ._xla_impl import dsa_sparse_attention_xla
 
 __all__ = (
+    "as_pool_bits",
     "build_q_tables",
     "build_tables",
     "dsa_sparse_attention",
     "dsa_sparse_attention_xla",
     "expand_open_mask",
+    "pack_pool_bits",
     "parse_sparse_mode",
+    "unpack_pool_bits",
     "visited_open_mask",
 )

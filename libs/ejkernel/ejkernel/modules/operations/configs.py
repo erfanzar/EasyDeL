@@ -1659,3 +1659,33 @@ class DsaSparseAttentionConfig(BaseOperationConfig):
     fused_groups: int | None = None
 
     __hash__ = hash_fn
+
+
+@dataclass
+class DsaGatherAttentionConfig(BaseOperationConfig):
+    """Configuration for the per-query DMA-gather DSA attention.
+
+    Every field is a cost option of the Pallas TPU kernels (the attended keys, and therefore the numerics up to fp32
+    reassociation, never change); the XLA reference ignores them.
+
+    Args:
+        block_q: Queries per grid step. Default 16.
+        pools_per_step: Pools fetched per DMA group; ``None`` (default) = the kernel's automatic plan (the fewest
+            evenly split groups whose working set fits VMEM).
+        num_buffers: DMA ring depth (``num_buffers - 1`` groups in flight); ``None`` = 2 for one group per query,
+            else 4.
+        num_cores: Backward TensorCore split, ``None`` (2 when the query-block count is even, else 1).
+        fused_backward: Fused-row backward (one fp32 accumulator+key HBM row per pool, 2 DMAs per (query, pool)
+            instead of 3). ``None`` (default) = on when a query's pools form one group and it fits VMEM,
+            ``True`` = required (error otherwise), ``False`` = the three-DMA backward.
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    block_q: int = 16
+    pools_per_step: int | None = None
+    num_buffers: int | None = None
+    num_cores: int | None = None
+    fused_backward: bool | None = None
+
+    __hash__ = hash_fn

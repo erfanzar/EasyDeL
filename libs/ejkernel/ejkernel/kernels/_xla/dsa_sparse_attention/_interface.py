@@ -30,7 +30,7 @@ from ._xla_impl import dsa_sparse_attention_xla
 def dsa_sparse_attention(
     query: Float[Array, "batch num_heads seq head_dim"],
     latent: Float[Array, "batch seq head_dim"],
-    pool_mask: Bool[Array, "batch seq num_pools"],
+    pool_mask: Bool[Array, "batch seq num_pools"] | Int[Array, "batch seq num_words"],
     tails: Int[Array, "batch seq num_tails"] | None = None,
     ste_pool: Float[Array, "batch seq num_pools"] | None = None,
     *,
@@ -58,7 +58,8 @@ def dsa_sparse_attention(
     Args:
         query: ``[B, H, S, D]`` queries (absorbed-MLA queries for GLM-5-style DSA).
         latent: ``[B, S, D]`` shared ``K == V`` latent.
-        pool_mask: ``[B, S, P]`` bool selected pools; pool ``p`` = keys ``p*kpool .. p*kpool + kpool - 1``.
+        pool_mask: ``[B, S, P]`` bool selected pools; pool ``p`` = keys ``p*kpool .. p*kpool + kpool - 1``. Or the
+            same selection as ``[B, S, W]`` int32 packed words (bit ``p % 32`` of word ``p // 32`` = pool ``p``).
         tails: ``[B, S, T]`` int32 always-selected tail keys (``-1`` = none, ``T <= 8``) or ``None``.
         ste_pool: ``[B, S, P]`` pooled straight-through term (value 0; its cotangent reaches the indexer).
         kpool: Keys per pool.

@@ -192,6 +192,7 @@ from .configs import (
     CompressedWindowDecodeConfig,
     DecodeAttentionConfig,
     DeepSeekAttentionConfig,
+    DsaGatherAttentionConfig,
     DsaSparseAttentionConfig,
     FlashAttentionConfig,
     FlashMLAConfig,
@@ -244,7 +245,8 @@ from .configs import (
 )
 from .decode_attention import DecodeAttention, decode_attention
 from .deepseek_attn import DeepSeekAttention, deepseek_attn
-from .dsa_sparse_attention import DsaSparseAttention, dsa_sparse_attention
+from .dsa_gather_attention import DsaGatherAttention, dsa_gather_attention
+from .dsa_sparse_attention import DSA_SPARSE_MAX_TAIL_KEYS, DsaSparseAttention, dsa_sparse_attention, pack_pool_bits
 from .flash_attention import FlashAttention, flash_attention
 from .fused_cakld_tv import CakldTvOutput, FusedCakldTv, fused_cakld_tv
 from .fused_conv_decode import FusedConvDecode, fused_conv_decode, fused_conv_decode_op
@@ -354,6 +356,7 @@ from .unified_attention import UnifiedAttention, unified_attention
 gdr_attention = gated_delta_rule
 
 __all__ = (
+    "DSA_SPARSE_MAX_TAIL_KEYS",
     "KERNEL_TILE_POLICIES",
     "RWKV4",
     "RWKV6",
@@ -382,6 +385,8 @@ __all__ = (
     "DecodeAttentionConfig",
     "DeepSeekAttention",
     "DeepSeekAttentionConfig",
+    "DsaGatherAttention",
+    "DsaGatherAttentionConfig",
     "DsaSparseAttention",
     "DsaSparseAttentionConfig",
     "FlashAttention",
@@ -502,6 +507,7 @@ __all__ = (
     "compute_schedule_table_v2",
     "decode_attention",
     "deepseek_attn",
+    "dsa_gather_attention",
     "dsa_sparse_attention",
     "flash_attention",
     "flash_mla",
@@ -537,6 +543,7 @@ __all__ = (
     "native_sparse_attention",
     "normalize_kernel_tile_policy",
     "pack_int4_adjacent",
+    "pack_pool_bits",
     "page_attention",
     "prefill_page_attention",
     "quantized_matmul",
