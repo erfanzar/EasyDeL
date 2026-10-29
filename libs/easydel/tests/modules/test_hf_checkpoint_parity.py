@@ -45,6 +45,17 @@ LOAD_KWARGS = dict(
 )
 
 
+@pytest.fixture(autouse=True)
+def _seeded_torch():
+    """Build every reference HF model from a fixed torch RNG state.
+
+    The HF constructors initialise weights from torch's global generator. Unseeded, the reference model depends on
+    how much of that generator earlier tests in the session consumed, and the argmax-agreement bound of
+    :func:`_assert_close` (at most one mismatch in 64 tokens) then flips with test order.
+    """
+    torch.manual_seed(0)
+
+
 def _perturbed(model):
     torch.manual_seed(0)
     with torch.no_grad():
