@@ -76,6 +76,7 @@ from ejkernel.kernels._pallas.tpu.ragged_page_attention_v3._utils import (
     get_tuned_block_sizes_h64,
 )
 from ejkernel.kernels._registry import Backend, Platform, kernel_registry
+from ejkernel.kernels._xla.ragged_page_attention_v3._sinks import reduce_sinks_to_heads
 from ejkernel.ops import (
     AutotunePolicy,
     ConfigCache,
@@ -89,6 +90,8 @@ from ejkernel.ops.config.persistent import PersistentCache
 
 from ..base import detect_platform
 from .configs import RaggedPageAttentionv3Config
+
+__all__ = ("RaggedPageAttentionv3", "ragged_page_attention_v3", "reduce_sinks_to_heads")
 
 
 @dataclass(frozen=True)

@@ -418,7 +418,7 @@ def row_gather_dispatch_unsupported_reason(inputs: jax.Array, repeats: int) -> s
 
     Checks the forward gather and the backward gather-sum. Only shapes and dtypes are read.
     """
-    from ejkernel.kernels._pallas.tpu.moe_row_gather import (  # pyright: ignore[reportMissingTypeStubs]
+    from ejkernel.modules import (  # pyright: ignore[reportMissingTypeStubs]
         row_gather_sum_unsupported_reason,
         row_gather_unsupported_reason,
     )
@@ -446,7 +446,7 @@ def row_gather_combine_unsupported_reason(
 
     Checks the forward gather-sum and the backward scaled gather with its fused row dot.
     """
-    from ejkernel.kernels._pallas.tpu.moe_row_gather import (  # pyright: ignore[reportMissingTypeStubs]
+    from ejkernel.modules import (  # pyright: ignore[reportMissingTypeStubs]
         row_gather_sum_unsupported_reason,
         row_gather_unsupported_reason,
     )

@@ -287,6 +287,7 @@ from .kernel_delta_attention import KernelDeltaAttention, kda_attention, kernel_
 from .lightning_attention import LightningAttention, lightning_attention
 from .mhc import MHCCollapse, MHCExpand, MHCFusedConfig, mhc_collapse, mhc_expand
 from .mhc_coefficients import MHCCoefficients, MHCCoefficientsConfig, mhc_coefficients
+from .moe_row_gather import row_gather_sum_unsupported_reason, row_gather_unsupported_reason
 from .multi_head_latent_attention import FlashMLA, flash_mla
 from .multi_latent_ragged_page_attention import (
     MultiLatentRaggedPageAttention,
@@ -329,7 +330,7 @@ from .ragged_page_attention_v2_turboquant import (
     RaggedPageAttentionv2TurboQuant,
     ragged_page_attention_v2_turboquant,
 )
-from .ragged_page_attention_v3 import RaggedPageAttentionv3, ragged_page_attention_v3
+from .ragged_page_attention_v3 import RaggedPageAttentionv3, ragged_page_attention_v3, reduce_sinks_to_heads
 from .ragged_page_attention_v3_turboquant import (
     RaggedPageAttentionv3TurboQuant,
     ragged_page_attention_v3_turboquant,
@@ -566,9 +567,12 @@ __all__ = (
     "recurrent_attention",
     "reduce_scatter",
     "reduce_scatter_matmul",
+    "reduce_sinks_to_heads",
     "reorder_conv_features_for_sharding",
     "resolve_mlp_combine",
     "ring_attention",
+    "row_gather_sum_unsupported_reason",
+    "row_gather_unsupported_reason",
     "row_permute",
     "rwkv4",
     "rwkv6",
