@@ -26,11 +26,14 @@ gathered from the unbiased scores, which is what makes the routing
 auxiliary-loss-free: expert load moves without perturbing the combine.
 """
 
+import functools
+
 import jax
 import numpy as np
 import pytest
 from easydel.layers.moe import moe_group_topk_select
 from jax import numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 EXPERTS = 16
 TOKENS = 12
@@ -297,6 +300,39 @@ def test_family_select_hook_observes_changed_live_bias(family):
     unbiased = jnp.take_along_axis(jax.nn.sigmoid(logits), selected, axis=-1)
     expected = unbiased / jnp.sum(unbiased, axis=-1, keepdims=True) * 2.5
     np.testing.assert_allclose(weights, expected, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("sharded", [False, True])
+def test_grouped_selection_matches_stable_host_reference_on_token_sharded_inputs(sharded, compiled):
+    """Group ranking and expert picks match a stable host reference, also with tokens sharded over devices."""
+    devices = jax.devices()
+    tokens = 4 * len(devices)
+    rng = np.random.default_rng(21)
+    logits = rng.standard_normal((tokens, EXPERTS)).astype(np.float32)
+    bias = rng.standard_normal(EXPERTS).astype(np.float32)
+    inputs = jnp.asarray(logits)
+    if sharded:
+        mesh = Mesh(np.asarray(devices), ("tokens",))
+        inputs = jax.device_put(inputs, NamedSharding(mesh, PartitionSpec("tokens", None)))
+    select = functools.partial(
+        moe_group_topk_select, pre_bias_logits=None, k=4, e_score_correction_bias=jnp.asarray(bias), **GROUPED
+    )
+    weights, indices = (jax.jit(select) if compiled else select)(inputs)
+
+    scores = np.asarray(jax.nn.sigmoid(jnp.asarray(logits)))
+    choices = scores + bias
+    group_mass = np.sort(choices.reshape(tokens, 4, EXPERTS // 4), axis=-1)[..., -2:].sum(axis=-1)
+    winning = np.argsort(-group_mass, axis=-1, kind="stable")[:, :2]
+    eligible = np.zeros((tokens, 4), dtype=bool)
+    np.put_along_axis(eligible, winning, True, axis=-1)
+    eligible = np.repeat(eligible, EXPERTS // 4, axis=-1)
+    expected_indices = np.argsort(-np.where(eligible, choices, -np.inf), axis=-1, kind="stable")[:, :4]
+    expected_weights = np.take_along_axis(scores, expected_indices, axis=-1)
+    expected_weights = expected_weights / (expected_weights.sum(axis=-1, keepdims=True) + 1e-20) * 2.5
+
+    np.testing.assert_array_equal(np.asarray(indices), expected_indices)
+    np.testing.assert_allclose(np.asarray(weights), expected_weights, rtol=1e-5, atol=1e-6)
 
 
 if __name__ == "__main__":
