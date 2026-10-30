@@ -922,9 +922,10 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
           with that explicit mechanism, enabling mixed MLA / non-MLA
           stacks (e.g. dense layers run flash attention while MLA layers
           run a paged kernel).
-        * When ``mla_attn_dtype`` / ``mla_attn_softmax_dtype`` are set,
-          a shallow-copied config is used so the MLA performer sees
-          different dtypes without mutating the shared config.
+        * MLA performers are always built from a shallow copy of the config.
+          ``mla_attn_dtype`` / ``mla_attn_softmax_dtype`` (when set) are
+          applied to the copy, and the performer's own dtype resolution
+          (``attn_mechanism="auto"``) stays off the shared config.
 
         Override to customize attention dropout or softmax scale (e.g.
         muP / DeepSeek mscale).

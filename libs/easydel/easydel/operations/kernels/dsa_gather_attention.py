@@ -23,7 +23,7 @@ Layout on a multi-device TPU mesh: the Mosaic call runs under ``shard_map`` with
 that would otherwise split heads (and over the query-length axes), every head local, and the latent replicated over
 those axes. Splitting the sequence instead of the heads keeps the matmuls ``H``-wide (more MXU rows filled) and divides
 the per-chip gather traffic by the split. :func:`gather_attention_layout` exposes the same layout so a model can move
-the split onto a cheaper tensor before the call (see ``Glm5NextDSAAttention``).
+the split onto a cheaper tensor before the call (see ``DeepSeekSparseAttention._forward_dsa_pool_gather``).
 
 Tiles come from the explicit ``cfg`` argument, else from the ``dsa_gather_attention`` entry of
 ``OperationMetadata.operation_configs`` (a ``DsaGatherAttentionConfig`` or a dict of its fields).

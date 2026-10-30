@@ -19,6 +19,7 @@ from __future__ import annotations
 import easydel as ed
 import jax.numpy as jnp
 import spectrax as spx
+from easydel.layers.attention import get_optimal_config
 from easydel.modules.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaAttention
 
 
@@ -66,8 +67,18 @@ def test_unset_mla_dtype_follows_attn_dtype_changed_after_construction():
     config.attn_dtype = jnp.float32
     attention = _attention(config)
     assert jnp.dtype(attention.attention_performer.metadata.runtime_dtype) == jnp.float32
-    # The sparse-selected and pool paths compute in the dense performer's dtype.
-    assert jnp.dtype(attention._attention_dtype) == jnp.float32
+
+
+def test_auto_mechanism_resolves_the_dtype_on_the_performer_only():
+    """``attn_mechanism="auto"`` picks a backend dtype for the MLA performer without rewriting the model config."""
+    _, auto_dtype = get_optimal_config()
+    model_dtype = jnp.float32 if jnp.dtype(auto_dtype) != jnp.float32 else jnp.bfloat16
+    config = _config(attn_mechanism="auto")
+    config.attn_dtype = model_dtype
+    attention = _attention(config)
+    assert jnp.dtype(attention.attention_performer.metadata.runtime_dtype) == jnp.dtype(auto_dtype)
+    assert jnp.dtype(config.attn_dtype) == jnp.dtype(model_dtype)
+    assert config.mla_attn_dtype is None
 
 
 def test_explicit_mla_dtypes_override_attn_dtypes():

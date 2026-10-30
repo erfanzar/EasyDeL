@@ -1088,7 +1088,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         keeps the top-level value it ran with (older EasyDeL saves could leave
         a stale ``rope_parameters`` theta behind) and the dict is aligned to it.
         ``partial_rotary_factor`` is only lifted for constructors that accept it
-        (or when it is already top-level).
+        (or when it is already top-level). MLA dtype fields equal to the dense
+        dtypes they fall back to are cleared first (see
+        :meth:`_unpin_saved_mla_dtypes`).
 
         Args:
             config_dict: Serialized configuration mapping.
@@ -1098,6 +1100,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
             The instantiated configuration (or ``(config, unused_kwargs)``
             when ``return_unused_kwargs=True``).
         """
+        if isinstance(config_dict, dict):
+            config_dict = cls._unpin_saved_mla_dtypes(config_dict)
         rope_parameters = config_dict.get("rope_parameters") if isinstance(config_dict, dict) else None
         if cls._is_flat_rope_parameters(rope_parameters):
             config_dict = dict(config_dict)
@@ -3022,6 +3026,44 @@ class EasyDeLBaseConfig(PretrainedConfig):
         ):
             if hasattr(self, field_name):
                 setattr(self, field_name, self._coerce_dtype_spec(getattr(self, field_name)))
+
+    @classmethod
+    def _unpin_saved_mla_dtypes(cls, config_dict: dict[str, tp.Any]) -> dict[str, tp.Any]:
+        """Clear saved MLA dtype fields that only repeat the dense dtype they fall back to.
+
+        Saved configs can carry ``mla_attn_dtype == attn_dtype`` and
+        ``mla_attn_softmax_dtype == attn_softmax_dtype`` as filled-in copies rather
+        than explicit overrides. ``None`` resolves
+        to the same dtype when the attention is built, and keeps following
+        ``attn_dtype`` / ``attn_softmax_dtype`` when those change after loading.
+        A field that differs from its fallback is an explicit override and is
+        kept. Nested sub-config mappings (e.g. ``text_config``) are handled too.
+
+        Args:
+            config_dict: Serialized configuration mapping; not modified.
+
+        Returns:
+            The mapping with redundant MLA dtype fields set to ``None`` (a copy
+            when anything changed, else ``config_dict`` itself).
+        """
+        updated: dict[str, tp.Any] | None = None
+        for key, value in config_dict.items():
+            if isinstance(value, dict):
+                nested = cls._unpin_saved_mla_dtypes(value)
+                if nested is not value:
+                    if updated is None:
+                        updated = dict(config_dict)
+                    updated[key] = nested
+        for field_name, fallback in (("mla_attn_dtype", "attn_dtype"), ("mla_attn_softmax_dtype", "attn_softmax_dtype")):
+            if config_dict.get(field_name) is None or fallback not in config_dict:
+                continue
+            saved = cls._coerce_dtype_spec(config_dict[field_name])
+            dense = cls._coerce_dtype_spec(config_dict[fallback])
+            if isinstance(saved, np.dtype) and isinstance(dense, np.dtype) and saved == dense:
+                if updated is None:
+                    updated = dict(config_dict)
+                updated[field_name] = None
+        return config_dict if updated is None else updated
 
     @classmethod
     def _normalize_json_value(cls, value: tp.Any) -> tp.Any:

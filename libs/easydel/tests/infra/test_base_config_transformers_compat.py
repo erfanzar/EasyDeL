@@ -67,8 +67,8 @@ def test_from_pretrained_rehydrates_dtype_strings(tmp_path):
         attn_dtype="bfloat16",
         kvdtype="float16",
         attn_softmax_dtype="float32",
-        mla_attn_dtype="bf16",
-        mla_attn_softmax_dtype="fp32",
+        mla_attn_dtype="fp32",
+        mla_attn_softmax_dtype="bf16",
     )
     config.save_pretrained(tmp_path)
 
@@ -76,8 +76,36 @@ def test_from_pretrained_rehydrates_dtype_strings(tmp_path):
     assert reloaded.attn_dtype == jnp.dtype(jnp.bfloat16)
     assert reloaded.kvdtype == jnp.dtype(jnp.float16)
     assert reloaded.attn_softmax_dtype == jnp.dtype(jnp.float32)
-    assert reloaded.mla_attn_dtype == jnp.dtype(jnp.bfloat16)
-    assert reloaded.mla_attn_softmax_dtype == jnp.dtype(jnp.float32)
+    assert reloaded.mla_attn_dtype == jnp.dtype(jnp.float32)
+    assert reloaded.mla_attn_softmax_dtype == jnp.dtype(jnp.bfloat16)
+
+
+def test_from_pretrained_unpins_mla_dtypes_saved_as_copies_of_the_dense_dtypes(tmp_path):
+    """A saved ``mla_attn_dtype == attn_dtype`` reloads as ``None`` and follows later ``attn_dtype`` changes."""
+    config = EasyDeLBaseConfig(
+        attn_dtype="float32",
+        attn_softmax_dtype="float32",
+        mla_attn_dtype="float32",
+        mla_attn_softmax_dtype="float32",
+    )
+    config.save_pretrained(tmp_path)
+    saved = json.loads((tmp_path / "config.json").read_text())
+    assert saved["mla_attn_dtype"] == saved["attn_dtype"] == "float32"
+
+    reloaded = EasyDeLBaseConfig.from_pretrained(tmp_path)
+    assert reloaded.attn_dtype == jnp.dtype(jnp.float32)
+    assert reloaded.mla_attn_dtype is None
+    assert reloaded.mla_attn_softmax_dtype is None
+
+
+def test_from_dict_unpins_mla_dtype_copies_inside_nested_text_config():
+    from easydel.modules.glm5_next.glm5_next_configuration import Glm5NextConfig
+
+    text = {"attn_dtype": "bfloat16", "mla_attn_dtype": "bfloat16", "mla_attn_softmax_dtype": "bfloat16"}
+    config = Glm5NextConfig.from_dict({"model_type": "glm5_next", "text_config": text})
+    assert config.text_config.mla_attn_dtype is None
+    # Differs from the default float32 softmax fallback, so it is an explicit override and stays.
+    assert config.text_config.mla_attn_softmax_dtype == jnp.dtype(jnp.bfloat16)
 
 
 def test_to_json_string_normalizes_dtype_inside_to_dict_objects(monkeypatch):
