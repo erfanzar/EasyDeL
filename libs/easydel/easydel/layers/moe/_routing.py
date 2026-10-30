@@ -12,23 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared top-k expert selection for auxiliary-loss-free (``noaux_tc``) routing.
+"""Shared top-k expert selection for MoE routers.
 
-Ten model families implemented the same routing pipeline independently — three
-of them byte-identically. This module holds the one implementation they all
-delegate to, as a :attr:`MoeFusedHooks.select_hook`.
+The families listed in :func:`moe_group_topk_select` route through this one implementation, installed as a
+:attr:`MoeFusedHooks.select_hook`.
 
 The pipeline, in order:
 
 1. Turn router logits into scores (``sigmoid``, ``softmax``, or pass through
    already-scored logits).
-2. Add the per-expert selection bias, if any. **The bias steers selection
-   only** — the returned weights are gathered from the *unbiased* scores. This
-   is what makes the routing auxiliary-loss-free: the bias moves load between
-   experts without perturbing the values that reach the combine.
+2. Add the selection bias, if any (per expert, or per token and expert).
+   **The bias steers selection only** — the returned weights are gathered from
+   the *unbiased* scores. This is what makes the routing auxiliary-loss-free:
+   the bias moves load between experts without perturbing the values that
+   reach the combine.
 3. Optionally restrict the candidates to the ``topk_group`` best expert groups,
    where a group scores as the sum of its top-``group_topk_k`` members (or as
-   its single best member).
+   its single best member). Experts outside the kept groups rank below every
+   eligible expert and carry zero weight, so a ``k`` above the kept groups'
+   capacity yields zero-weight slots.
 4. Take a flat top-``k`` over the survivors, gather the unbiased scores, and
    optionally renormalise and rescale them.
 
@@ -38,17 +40,18 @@ Every knob exists because some family needed it; none is speculative. See
 
 from __future__ import annotations
 
+import functools
 import typing as tp
 
 import jax
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, Bool, Float, Int
 
 ScoreFn = tp.Literal["sigmoid", "softmax", "none"]
 GroupScore = tp.Literal["topk_sum", "max"]
 
-__all__ = ("fp32_router_logits", "moe_group_topk_select")
+__all__ = ("fp32_router_logits", "moe_group_topk_select", "normalize_topk_weights")
 
 
 def fp32_router_logits(hidden_states: Array, weight: Array, hidden_size: int) -> Float[Array, "tokens experts"]:
@@ -72,6 +75,45 @@ def fp32_router_logits(hidden_states: Array, weight: Array, hidden_size: int) ->
     )
 
 
+@functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
+def _normalize(weights: Array, eps: float) -> Array:
+    """Row-normalize ``weights``; an all-zero row keeps the constant denominator ``1``."""
+    mass = jnp.sum(weights, axis=-1, keepdims=True)
+    return weights / jnp.where(mass == 0, 1.0, mass + eps)
+
+
+@_normalize.defjvp
+def _normalize_jvp(eps: float, primals: tuple[Array], tangents: tuple[Array]) -> tuple[Array, Array]:
+    """Differentiate the quotient through its normalized output instead of ``denominator ** -2``.
+
+    The division rule forms ``denominator ** -2``, which overflows float32 for a selected mass below about ``1e-19``
+    (saturated sigmoid scores). This equivalent linear rule stays finite there; an all-zero row keeps its constant
+    denominator, so its mass tangent is dropped.
+    """
+    (weights,), (weights_dot,) = primals, tangents
+    mass = jnp.sum(weights, axis=-1, keepdims=True)
+    denominator = jnp.where(mass == 0, 1.0, mass + eps)
+    normalized = _normalize(weights, eps)
+    mass_dot = jnp.where(mass == 0, 0.0, jnp.sum(weights_dot, axis=-1, keepdims=True))
+    return normalized, (weights_dot - normalized * mass_dot) / denominator
+
+
+def normalize_topk_weights(weights: Float[Array, "tokens k"], eps: float = 1e-20) -> Float[Array, "tokens k"]:
+    """Divide each row of selected expert weights by its sum plus ``eps``; an all-zero row stays zero.
+
+    The derivative is taken through the normalized output, which keeps it finite for a tiny selected mass, where
+    differentiating the plain quotient overflows float32.
+
+    Args:
+        weights: Selected expert weights ``(num_tokens, k)``.
+        eps: Added to each row sum. ``0.0`` divides by the bare sum.
+
+    Returns:
+        The normalized weights.
+    """
+    return _normalize(weights, float(eps))
+
+
 def _take_topk(scores: Array, indices: Array) -> Array:
     """``jnp.take_along_axis(scores, indices, axis=-1)`` as a one-hot select-and-sum.
 
@@ -90,6 +132,25 @@ def _take_topk(scores: Array, indices: Array) -> Array:
     return jnp.sum(jnp.where(hit, scores[..., None, :], jnp.zeros((), scores.dtype)), axis=-1)
 
 
+def _topk_indices(scores: Array, k: int) -> Int[Array, "tokens k"]:
+    """Indices of the ``k`` largest scores per row, the lower index first on ties.
+
+    On TPU, ``jax.lax.top_k`` over an operand sharded along the token axis outside ``shard_map`` (an auxiliary loss,
+    the unfused MoE path, a direct call) returns wrong indices with correct values at ``k == 1``, and at some small
+    ``k`` on wide rows. ``argmax`` does not, so ``k == 1`` uses it.
+
+    Args:
+        scores: ``(tokens, experts)`` selection scores.
+        k: Entries kept per row.
+
+    Returns:
+        ``(tokens, k)`` int32 indices.
+    """
+    if k == 1:
+        return jnp.argmax(scores, axis=-1, keepdims=True).astype(jnp.int32)
+    return jax.lax.top_k(scores, k=k)[1]
+
+
 def _score(gate_logits: Array, score_fn: ScoreFn) -> Array:
     """Map raw router logits to per-expert scores in fp32."""
     logits = gate_logits.astype(jnp.float32)
@@ -102,7 +163,7 @@ def _score(gate_logits: Array, score_fn: ScoreFn) -> Array:
     raise ValueError(f"unknown score_fn {score_fn!r}; expected 'sigmoid', 'softmax' or 'none'")
 
 
-def _group_restrict(
+def _group_eligibility(
     scores_for_choice: Array,
     *,
     n_routed_experts: int,
@@ -110,8 +171,8 @@ def _group_restrict(
     topk_group: int,
     group_topk_k: int,
     group_score: GroupScore,
-) -> Array:
-    """Zero every expert outside the ``topk_group`` best groups.
+) -> Bool[Array, "tokens experts"]:
+    """Mark the experts inside each token's ``topk_group`` best groups.
 
     Args:
         scores_for_choice: Selection scores ``(num_tokens, n_routed_experts)``.
@@ -122,7 +183,7 @@ def _group_restrict(
         group_score: How a group is scored from its members.
 
     Returns:
-        ``scores_for_choice`` with non-surviving groups set to ``-inf``.
+        Boolean eligibility ``(num_tokens, n_routed_experts)``.
     """
     num_tokens = scores_for_choice.shape[0]
     group_size = n_routed_experts // n_group
@@ -135,10 +196,13 @@ def _group_restrict(
     else:
         raise ValueError(f"unknown group_score {group_score!r}; expected 'topk_sum' or 'max'")
 
-    group_idx = jax.lax.top_k(group_scores, k=min(topk_group, n_group))[1]
+    # A stable sort keeps each group paired with its score on token-sharded operands, where ``top_k`` indices are
+    # unreliable (see :func:`_topk_indices`); ties keep the lower group first, as ``top_k`` does.
+    group_ids = jnp.broadcast_to(jnp.arange(n_group, dtype=jnp.int32), group_scores.shape)
+    _, ranked = jax.lax.sort_key_val(-group_scores, group_ids, dimension=-1, is_stable=True)
+    group_idx = ranked[:, : min(topk_group, n_group)]
     group_mask = jnp.sum(jax.nn.one_hot(group_idx, n_group, dtype=scores_for_choice.dtype), axis=1)
-    score_mask = jnp.repeat(group_mask, group_size, axis=1)
-    return jnp.where(score_mask > 0, scores_for_choice, -jnp.inf)
+    return jnp.repeat(group_mask > 0, group_size, axis=1)
 
 
 def moe_group_topk_select(
@@ -166,11 +230,15 @@ def moe_group_topk_select(
 
     Settings by family:
 
-    - GLM-4-MoE / GLM-4-MoE-Lite / GLM-MoE-DSA, DeepSeek-V3, Kimi-Linear:
-      ``score_fn='sigmoid'``, grouped, ``group_score='topk_sum'``.
-    - DeepSeek-V2: ``score_fn='softmax'``, grouped, ``group_score='max'``.
-    - Mistral-4: ``score_fn='none'`` (the gate already softmaxed), grouped.
-    - Hunyuan-V3, DeepSeek-V4: flat (``n_group=1``), ``score_fn='sigmoid'``.
+    - GLM-4-MoE / GLM-4-MoE-Lite / GLM-MoE-DSA / GLM-5-Next, DeepSeek-V3:
+      ``score_fn='sigmoid'``, ``group_score='topk_sum'`` (grouped when ``n_group > 1``).
+    - Kimi-Linear: ``score_fn`` from the config, ``group_score='topk_sum'``.
+    - DeepSeek-V2: ``score_fn='softmax'``, ``group_score='max'`` (grouped for
+      ``group_limited_greedy``).
+    - Mistral-4: ``score_fn='none'`` (the MoE softmaxes the logits first), grouped.
+    - DeepSeek-V4 / V4.1: ``score_fn='none'`` (the gate already scores), flat;
+      V4.1 vision tokens pass a per-token bias.
+    - Hunyuan-V3: flat, ``score_fn='sigmoid'``.
     - MiniMax-M3-VL: flat, ``score_fn='sigmoid'``, ``norm_eps=0.0``.
 
     Args:
@@ -181,20 +249,23 @@ def moe_group_topk_select(
         n_routed_experts: Total routed experts.
         score_fn: ``'sigmoid'``, ``'softmax'``, or ``'none'`` when the caller
             already produced scores.
-        e_score_correction_bias: Per-expert selection bias, or ``None`` for no
-            bias. Added to the selection scores only; never to the returned
-            weights.
+        e_score_correction_bias: Selection bias ``(n_routed_experts,)`` or per
+            token ``(num_tokens, n_routed_experts)``, or ``None`` for no bias.
+            Added to the selection scores only; never to the returned weights.
         n_group: Expert groups. ``1`` disables the group stage entirely.
         topk_group: Groups kept per token.
         group_topk_k: Members summed to score a group under ``'topk_sum'``.
         group_score: ``'topk_sum'`` or ``'max'``.
-        norm_topk_prob: Divide the selected weights by their sum.
+        norm_topk_prob: Divide the selected weights by their sum (see
+            :func:`normalize_topk_weights`).
         routed_scaling_factor: Final multiplier on the weights.
         norm_eps: Added to the normalisation denominator. ``1e-20`` guards a
-            degenerate all-zero row; pass ``0.0`` to reproduce a bare sum.
+            vanishing sum; pass ``0.0`` to divide by the bare sum. An all-zero
+            row stays zero either way.
 
     Returns:
-        ``(topk_weights, topk_indices)``, both ``(num_tokens, k)``.
+        ``(topk_weights, topk_indices)``, both ``(num_tokens, k)``. Slots past
+        the kept groups' capacity carry zero weight.
     """
     del pre_bias_logits
 
@@ -205,8 +276,9 @@ def moe_group_topk_select(
     else:
         scores_for_choice = scores + e_score_correction_bias.astype(jnp.float32)
 
+    eligible = None
     if n_group > 1:
-        scores_for_choice = _group_restrict(
+        eligible = _group_eligibility(
             scores_for_choice,
             n_routed_experts=n_routed_experts,
             n_group=n_group,
@@ -214,11 +286,13 @@ def moe_group_topk_select(
             group_topk_k=group_topk_k,
             group_score=group_score,
         )
+        scores_for_choice = jnp.where(eligible, scores_for_choice, -jnp.inf)
 
-    topk_indices = jax.lax.top_k(scores_for_choice, k=k)[1]
-    topk_weights = _take_topk(scores, topk_indices)
+    topk_indices = _topk_indices(scores_for_choice, k)
+    combine = scores if eligible is None else jnp.where(eligible, scores, jnp.zeros((), scores.dtype))
+    topk_weights = _take_topk(combine, topk_indices)
 
     if norm_topk_prob:
-        topk_weights = topk_weights / (jnp.sum(topk_weights, axis=-1, keepdims=True) + norm_eps)
+        topk_weights = normalize_topk_weights(topk_weights, norm_eps)
 
     return topk_weights * routed_scaling_factor, topk_indices

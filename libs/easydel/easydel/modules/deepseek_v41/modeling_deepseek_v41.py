@@ -1136,13 +1136,9 @@ class DeepseekV41SparseMoeBlock(DeepseekV4SparseMoeBlock):
             return jnp.concatenate([scores, flag[:, None].astype(scores.dtype)], axis=-1)
 
         def _select_with_image_bias(augmented: Array, pre_bias_logits: Array | None, k: int) -> tuple[Array, Array]:
-            del pre_bias_logits
-            scores = augmented[:, :num_experts].astype(jnp.float32)
             is_image = augmented[:, num_experts:] > 0.5
             bias = jnp.where(is_image, image_bias[None, :], correction_bias[None, :])
-            _, indices = jax.lax.top_k(scores + bias, k)
-            weights = jnp.take_along_axis(scores, indices, axis=-1)
-            return self._normalize_and_scale(weights), indices
+            return self._select_hook(bias)(augmented[:, :num_experts], pre_bias_logits, k)
 
         hooks = self.moe_hooks.replace(
             normalize_gate_logits=lambda logits: logits,

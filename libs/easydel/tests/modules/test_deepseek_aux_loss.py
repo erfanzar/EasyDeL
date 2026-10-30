@@ -159,44 +159,42 @@ def _v2_routing_diagnostics(records, config):
 def test_v2_router_logits_forward_uses_aux_loss_alpha(masked, seq_aux, topk_method, monkeypatch):
     """Use real routed assignments and the configured reduction, not the generic Switch objective."""
     records = []
-    selector = DeepseekV2MoE._select_experts_static
+    build_selector = DeepseekV2MoE._select_hook
 
-    def record_selection(logits, *args, **kwargs):
-        # Fused dispatch traces this function inside shard_map. Observe only
-        # concrete calls (including the auxiliary objective); never leak tracers.
-        if isinstance(logits, jax.core.Tracer):
-            return selector(logits, *args, **kwargs)
-        probabilities, topk_calls = [], []
-        softmax, top_k, sort_key_val = jax.nn.softmax, jax.lax.top_k, jax.lax.sort_key_val
+    def recording_selector(config):
+        selector = build_selector(config)
 
-        def record_softmax(*inputs, **options):
-            scores = softmax(*inputs, **options)
-            probabilities.append(scores)
-            return scores
+        def record_selection(logits, *args, **kwargs):
+            # Fused dispatch traces this function inside shard_map. Observe only
+            # concrete calls (including the auxiliary objective); never leak tracers.
+            if isinstance(logits, jax.core.Tracer):
+                return selector(logits, *args, **kwargs)
+            probabilities, topk_calls = [], []
+            softmax, top_k = jax.nn.softmax, jax.lax.top_k
 
-        def record_top_k(operand, *inputs, **options):
-            result = top_k(operand, *inputs, **options)
-            topk_calls.append((operand, result))
-            return result
+            def record_softmax(*inputs, **options):
+                scores = softmax(*inputs, **options)
+                probabilities.append(scores)
+                return scores
 
-        def record_group_sort(keys, values, *inputs, **options):
-            result = sort_key_val(keys, values, *inputs, **options)
-            groups = kwargs["topk_group"]
-            topk_calls.append((-keys, (-result[0][:, :groups], result[1][:, :groups])))
-            return result
+            def record_top_k(operand, *inputs, **options):
+                result = top_k(operand, *inputs, **options)
+                topk_calls.append((operand, result))
+                return result
 
-        # These wrappers return the original operation results unchanged and
-        # are restored even on failure. They observe the real group mask and
-        # selection, rather than trying to reconstruct a device discrepancy.
-        with monkeypatch.context() as observation:
-            observation.setattr(jax.nn, "softmax", record_softmax)
-            observation.setattr(jax.lax, "top_k", record_top_k)
-            observation.setattr(jax.lax, "sort_key_val", record_group_sort)
-            weights, selected = selector(logits, *args, **kwargs)
-        records.append((logits, probabilities[0], topk_calls, weights, selected))
-        return weights, selected
+            # These wrappers return the original operation results unchanged and
+            # are restored even on failure. They observe the real group mask and
+            # selection, rather than trying to reconstruct a device discrepancy.
+            with monkeypatch.context() as observation:
+                observation.setattr(jax.nn, "softmax", record_softmax)
+                observation.setattr(jax.lax, "top_k", record_top_k)
+                weights, selected = selector(logits, *args, **kwargs)
+            records.append((logits, probabilities[0], topk_calls, weights, selected))
+            return weights, selected
 
-    monkeypatch.setattr(DeepseekV2MoE, "_select_experts_static", staticmethod(record_selection))
+        return record_selection
+
+    monkeypatch.setattr(DeepseekV2MoE, "_select_hook", staticmethod(recording_selector))
     model = _v2_model(seq_aux=seq_aux, topk_method=topk_method, n_group=2, topk_group=1)
     mask = np.asarray([[1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 0, 0, 0, 0, 0]] * 2, dtype=np.float32)
     if not masked:
@@ -328,9 +326,9 @@ def test_v3_aux_loss_uses_unbiased_sigmoid_scores_and_grouped_selections(seq_aux
     out = model(input_ids=ids, attention_mask=jnp.asarray(mask), output_router_logits=True)
     assert len(out.router_logits) == 2
     reference_losses = []
-    for router_scores in out.router_logits:
-        choices = np.asarray(router_scores).reshape(-1, 8)
-        scores = choices - bias
+    for router_logits in out.router_logits:
+        scores = 1 / (1 + np.exp(-np.asarray(router_logits, dtype=np.float64).reshape(-1, 8)))
+        choices = scores + bias
         probabilities = scores / scores.sum(axis=-1, keepdims=True)
         groups = choices.reshape(-1, 2, 4)
         group_mass = np.sort(groups, axis=-1)[..., -2:].sum(axis=-1)

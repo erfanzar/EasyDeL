@@ -94,6 +94,7 @@ Note:
     faster kernel is not the same thing as a faster model.
 """
 
+import functools
 import typing as tp
 
 import jax
@@ -159,6 +160,7 @@ from easydel.layers.indexer import (
     is_vacuous_selection,
     selection_bias,
 )
+from easydel.layers.moe import moe_group_topk_select, normalize_topk_weights
 from easydel.layers.residual import (
     HyperStreamSharding,
     ManifoldHyperConnection,
@@ -1798,8 +1800,8 @@ class DeepseekV4SparseMoeBlock(BaseMoeModule):
     Selection: top-k on ``scores + e_score_correction_bias`` (learned layers)
     or a frozen ``tid2eid[input_ids]`` lookup (hash layers). Weights: raw
     scores gathered at the selected indices, normalized
-    (``/(sum + 1e-20)``), scaled by ``routed_scaling_factor``. Output:
-    ``routed + shared_experts(residual)``.
+    (``/(sum + 1e-20)``) when ``norm_topk_prob``, scaled by
+    ``routed_scaling_factor``. Output: ``routed + shared_experts(residual)``.
     """
 
     def __init__(
@@ -1868,10 +1870,28 @@ class DeepseekV4SparseMoeBlock(BaseMoeModule):
             rngs=rngs,
         )
 
-    def _normalize_and_scale(self, weights: Array) -> Array:
-        """Normalize gathered raw scores and apply ``routed_scaling_factor``."""
-        weights = weights / (jnp.sum(weights, axis=-1, keepdims=True) + 1e-20)
-        return weights * self.routed_scaling_factor
+    def _select_hook(self, e_score_correction_bias: Array) -> functools.partial:
+        """Learned-layer routing as a :func:`moe_group_topk_select` ``select_hook``.
+
+        Selects the top-k of ``scores + e_score_correction_bias`` over the gate's already-scored output and weights
+        them with the unbiased scores, renormalized when ``norm_topk_prob`` and scaled by ``routed_scaling_factor``.
+
+        Args:
+            e_score_correction_bias: Selection bias ``[n_routed_experts]`` or per token
+                ``[tokens, n_routed_experts]``.
+
+        Returns:
+            functools.partial: A ``select_hook`` taking ``(gate_scores, pre_bias_logits, k)``.
+        """
+        return functools.partial(
+            moe_group_topk_select,
+            n_routed_experts=self.config.n_routed_experts,
+            score_fn="none",
+            e_score_correction_bias=e_score_correction_bias,
+            n_group=1,
+            norm_topk_prob=self.config.norm_topk_prob,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
 
     def forward(
         self,
@@ -1913,25 +1933,20 @@ class DeepseekV4SparseMoeBlock(BaseMoeModule):
 
             gate_layer = _hash_gate
 
+            norm_topk_prob = self.config.norm_topk_prob
+
             def _select_hash(augmented_scores: Array, pre_bias_logits: Array | None, k: int) -> tuple[Array, Array]:
                 del pre_bias_logits, k
                 scores = augmented_scores[:, :num_experts].astype(jnp.float32)
                 indices = augmented_scores[:, num_experts:].astype(jnp.int32)
                 weights = jnp.take_along_axis(scores, indices, axis=-1)
-                return self._normalize_and_scale(weights), indices
+                if norm_topk_prob:
+                    weights = normalize_topk_weights(weights)
+                return weights * self.routed_scaling_factor, indices
 
             select_hook = _select_hash
         else:
-            correction_bias = self.gate.e_score_correction_bias.value.astype(jnp.float32)
-
-            def _select_topk(gate_scores: Array, pre_bias_logits: Array | None, k: int) -> tuple[Array, Array]:
-                del pre_bias_logits
-                scores = gate_scores.astype(jnp.float32)
-                _, indices = jax.lax.top_k(scores + correction_bias, k)
-                weights = jnp.take_along_axis(scores, indices, axis=-1)
-                return self._normalize_and_scale(weights), indices
-
-            select_hook = _select_topk
+            select_hook = self._select_hook(self.gate.e_score_correction_bias.value)
 
         hooks = self.moe_hooks.replace(
             normalize_gate_logits=lambda logits: logits,

@@ -63,8 +63,9 @@ def test_v3_negative_correction_scores_dispatch_only_to_winning_group(top_k, win
         np.broadcast_to(coefficients[:, None, None], moe.experts.down_proj.weight.value.shape).copy()
     )
     hidden = jnp.full((4, 2, 4), 0.25, dtype=jnp.float32)
-    actual, choices = moe(hidden)
-    np.testing.assert_allclose(choices, np.broadcast_to(0.5 + bias, choices.shape), rtol=1e-6, atol=1e-6)
+    actual, router_logits = moe(hidden)
+    # The router returns raw logits; the correction bias enters selection only.
+    np.testing.assert_array_equal(router_logits, np.zeros(router_logits.shape, np.float32))
     # Each expert emits 4*silu(1)*its_coefficient. Selection-only biases
     # must not change the combine weights: sigmoid(0)=0.5 for each expert.
     selected = np.arange(2 * winning_group, 2 * winning_group + min(top_k, 2))
