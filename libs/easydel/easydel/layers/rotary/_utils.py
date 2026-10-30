@@ -470,3 +470,30 @@ def gather_mla_cos_sin(frequencies, position_ids, dtype):
     freqs = table[position_ids]
     cos, sin = jnp.split(freqs, 2, -1)
     return cos[:, None, :, :].astype(dtype), sin[:, None, :, :].astype(dtype)
+
+
+def apply_mla_rope(
+    q_pe: Array, k_pe: Array, frequencies, position_ids: Array, *, interleave: bool
+) -> tuple[Array, Array]:
+    """Rotate the positional MLA query and key components at ``position_ids``.
+
+    Args:
+        q_pe: Query rotary components ``[batch, heads, seq, rope_dim]``.
+        k_pe: Shared key rotary component ``[batch, 1, seq, rope_dim]``.
+        frequencies: MLA frequency table (see :func:`gather_mla_cos_sin`), or a wrapper exposing ``.value``.
+        position_ids: Positions ``[batch, seq]``.
+        interleave: Pair channels ``(2i, 2i + 1)`` as DeepSeek checkpoints do, instead of the split-half (NeoX)
+            pairing.
+
+    Returns:
+        The rotated ``(q_pe, k_pe)``, in ``q_pe``'s dtype for the tables.
+    """
+    cos, sin = gather_mla_cos_sin(frequencies, position_ids, q_pe.dtype)
+    if interleave:
+        return apply_rope_interleaved(q_pe, cos, sin), apply_rope_interleaved(k_pe, cos, sin)
+    q1, q2 = jnp.split(q_pe, 2, axis=-1)
+    k1, k2 = jnp.split(k_pe, 2, axis=-1)
+    return (
+        jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1),
+        jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1),
+    )

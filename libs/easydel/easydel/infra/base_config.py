@@ -1572,16 +1572,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.attn_dtype = getattr(self, "attn_dtype", attn_dtype)
         self.kvdtype = getattr(self, "kvdtype", kvdtype if kvdtype is not None else self.attn_dtype)
         self.attn_softmax_dtype = getattr(self, "attn_softmax_dtype", attn_softmax_dtype)
-        self.mla_attn_dtype = getattr(
-            self,
-            "mla_attn_dtype",
-            mla_attn_dtype if mla_attn_dtype is not None else self.attn_dtype,
-        )
-        self.mla_attn_softmax_dtype = getattr(
-            self,
-            "mla_attn_softmax_dtype",
-            mla_attn_softmax_dtype if mla_attn_softmax_dtype is not None else self.attn_softmax_dtype,
-        )
+        # ``None`` resolves to ``attn_dtype`` / ``attn_softmax_dtype`` when the MLA attention is built, so later
+        # changes to those reach MLA layers too.
+        self.mla_attn_dtype = getattr(self, "mla_attn_dtype", mla_attn_dtype)
+        self.mla_attn_softmax_dtype = getattr(self, "mla_attn_softmax_dtype", mla_attn_softmax_dtype)
         self._coerce_runtime_dtype_fields()
         self.fcm_max_ratio = getattr(self, "fcm_max_ratio", fcm_max_ratio)
         self.fcm_min_ratio = getattr(self, "fcm_min_ratio", fcm_min_ratio)
@@ -2628,8 +2622,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "attn_dtype", jnp.bfloat16, attn_dtype)
         set_attrs_smartly(self, "kvdtype", jnp.bfloat16, kvdtype if kvdtype is not None else self.attn_dtype)
         set_attrs_smartly(self, "attn_softmax_dtype", jnp.float32, attn_softmax_dtype)
-        set_attrs_smartly(self, "mla_attn_dtype", self.attn_dtype, mla_attn_dtype)
-        set_attrs_smartly(self, "mla_attn_softmax_dtype", self.attn_softmax_dtype, mla_attn_softmax_dtype)
+        set_attrs_smartly(self, "mla_attn_dtype", None, mla_attn_dtype)
+        set_attrs_smartly(self, "mla_attn_softmax_dtype", None, mla_attn_softmax_dtype)
         self._coerce_runtime_dtype_fields()
         set_attrs_smartly(self, "moe_method", DEFAULT_MOE_METHOD, moe_method)
         set_attrs_smartly(self, "moe_force_xla_gmm", False, moe_force_xla_gmm)

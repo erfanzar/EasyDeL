@@ -26,13 +26,19 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float
 
+from easydel.infra.sequence_packing import document_segment_ids, pairwise_attention_mask_from_mask_info
 from easydel.layers.linears import ColumnParallelLinear
 
 from ._config import IndexerConfig, IndexerKind
+from ._distill import indexer_distillation_loss
+from ._paged import paged_pool_select
 from ._primitives import CompactLayout, compact_valid_layout, indices_to_bool_mask, visible_causal_mask
 from ._rope import apply_indexer_rope, truncate_cos_sin
 from ._selection import BaseIndexer, IndexerSelection, SelectionSpec, top_k_indices
 from ._shared_key import fused_head_scores
+
+if tp.TYPE_CHECKING:
+    from ejkernel.types import MaskInfo
 
 __all__ = ("IndexerLayerNorm", "IndexerOutput", "SparseIndexer")
 
@@ -482,6 +488,262 @@ class SparseIndexer(BaseIndexer):
             score_proxy=score_proxy,
             topk_mask=topk_mask,
         )
+
+    @property
+    def selection_chunk_size(self) -> int:
+        """Tokens per selected id of :meth:`select_with_pages`: the pool size for ``pool``, else 1."""
+        return self.config.kpool_size if self.config.kind == IndexerKind.POOL else 1
+
+    @property
+    def supports_pool_training(self) -> bool:
+        """Whether :meth:`select_pools_chunked` (the ``dsa_pool_training`` selection) is available."""
+        return self.config.kind == IndexerKind.POOL and self.config.packed_state == "key_gate_valid"
+
+    def select_uncached(
+        self,
+        hidden_states: Array,
+        q_resid: Array | None,
+        position_ids: Array | None,
+        frequencies: Array | None,
+        mask_info: MaskInfo,
+    ) -> IndexerSelection:
+        """Selection for a call without a cache: the keys are the current tokens.
+
+        Pairwise-only masks label every valid token 0, so document identities are recovered from the mask
+        (:func:`~easydel.infra.sequence_packing.document_segment_ids`) before pooling.
+
+        Args:
+            hidden_states: Layer input ``[batch, seq, hidden]``.
+            q_resid: Query residual (``query_source="q_lora"``), or ``None``.
+            position_ids: RoPE positions ``[batch, seq]`` (``rope_style != "none"``).
+            frequencies: RoPE tables (``rope_style != "none"``).
+            mask_info: Self-attention mask metadata.
+
+        Returns:
+            The selection over the current tokens.
+        """
+        q_len = hidden_states.shape[1]
+        pairwise = pairwise_attention_mask_from_mask_info(mask_info, q_len, q_len)
+        segment_ids, key_segment_ids = document_segment_ids(mask_info, pairwise)
+        return self(
+            hidden_states,
+            q_resid=q_resid,
+            attention_mask=mask_info.q_attention_mask[:, :q_len].astype(jnp.bool_),
+            position_ids=position_ids,
+            frequencies=frequencies,
+            pairwise_mask=pairwise,
+            segment_ids=segment_ids,
+            key_segment_ids=key_segment_ids,
+        ).selection
+
+    def select_with_cache(
+        self,
+        hidden_states: Array,
+        q_resid: Array | None,
+        position_ids: Array | None,
+        frequencies: Array | None,
+        cache_view: tp.Any,
+        mask_info: MaskInfo,
+        cache_metadata: tp.Any,
+        *,
+        causal: bool,
+        mode: tp.Any,
+        runtime_sharding_resolver: tp.Any,
+    ) -> tuple[IndexerSelection, tp.Any]:
+        """Selection over a transformer cache, storing this step's packed state in its auxiliary channel.
+
+        The cache resolves the current rows' validity and physical slots (per-row offsets, post-padding, sliding
+        tails) so the packed state stays in the same layout as the KV.
+
+        Args:
+            hidden_states: Layer input ``[batch, seq, hidden]``.
+            q_resid: Query residual, or ``None``.
+            position_ids: RoPE positions ``[batch, seq]``.
+            frequencies: RoPE tables, or ``None``.
+            cache_view: A ``TransformerCacheView`` with ``auxiliary_dim == packed_state_dim``.
+            mask_info: Attention mask metadata of the current step.
+            cache_metadata: Cache metadata.
+            causal: Whether the owning attention is causal.
+            mode: Runtime mode.
+            runtime_sharding_resolver: Sharding resolver for the cache update.
+
+        Returns:
+            ``(selection over the cache rows, updated cache_view)``.
+        """
+
+        def update(states, view):
+            return view.update_auxiliary(
+                states,
+                mask_info,
+                cache_metadata,
+                causal=causal,
+                mode=mode,
+                runtime_sharding_resolver=runtime_sharding_resolver,
+            )
+
+        bsz, q_len, _ = hidden_states.shape
+        _, current_mask, _ = update(jnp.zeros((bsz, q_len, self.packed_state_dim), jnp.float32), cache_view)
+        q_mask = jnp.any(current_mask.get_or_compute_attention_mask(dtype=jnp.bool_), axis=(1, 3))
+        query, packed = self.project_state(
+            hidden_states, q_resid=q_resid, attention_mask=q_mask, position_ids=position_ids, frequencies=frequencies
+        )
+        packed_states, index_mask, cache_view = update(packed, cache_view)
+        segment_ids, key_segment_ids = index_mask.get_or_compute_segment_ids()
+        output = self.select_from_state(
+            hidden_states,
+            query,
+            packed_states,
+            attention_mask=q_mask,
+            pairwise_mask=index_mask.get_or_compute_attention_mask(dtype=jnp.bool_),
+            query_positions=index_mask.q_positions,
+            key_positions=index_mask.kv_positions,
+            segment_ids=segment_ids,
+            key_segment_ids=key_segment_ids,
+        )
+        return output.selection, cache_view
+
+    def select_with_pages(
+        self,
+        hidden_states: Array,
+        q_resid: Array | None,
+        frequencies: Array | None,
+        cache_view: tp.Any,
+        cache_metadata: tp.Any,
+    ) -> tuple[Array, tp.Any]:
+        """Pool selection over an MLA ragged-pages cache with indexer pages (:func:`~._paged.paged_pool_select`).
+
+        Args:
+            hidden_states: Packed layer input ``[1, tokens, hidden]`` (or ``[batch, seq, hidden]``, flattened).
+            q_resid: Query residual of the same layout.
+            frequencies: Unused; paged pool selection supports ``rope_style="none"`` only.
+            cache_view: An ``MLARaggedPagesCacheView`` carrying indexer token and pool pages.
+            cache_metadata: Ragged-pages metadata of the step.
+
+        Returns:
+            ``(pool ids [tokens, width], cache_view with updated indexer pages)``.
+
+        Raises:
+            ValueError: If the indexer is not a pool strategy without rotary components.
+        """
+        from easydel.operations.kernels.multi_latent_ragged_page_attention import _resolve_distribution
+
+        del frequencies
+        if self.config.rope_style != "none":
+            raise ValueError("Paged pool selection supports indexers with rope_style='none' only.")
+        tokens = hidden_states.shape[0] * hidden_states.shape[1]
+        selected, token_pages, pool_pages = paged_pool_select(
+            self,
+            hidden_states.reshape(tokens, hidden_states.shape[-1]),
+            None if q_resid is None else q_resid.reshape(tokens, q_resid.shape[-1]),
+            cache_view.indexer_token_pages,
+            cache_view.indexer_pool_pages,
+            jnp.asarray(cache_metadata.pages_tables, jnp.int32),
+            jnp.asarray(cache_metadata.context_lens, jnp.int32),
+            jnp.asarray(cache_metadata.query_start_loc, jnp.int32),
+            # ``[..., 2]``: the live count, per rank for rank-major ([dp, 3]) distributions.
+            _resolve_distribution(cache_metadata)[..., 2],
+            constrain_rows=cache_view.constrain_indexer_rows,
+            constrain_pages=cache_view.constrain_indexer_pages,
+            kernel_mesh=cache_view.indexer_kernel_mesh(),
+            dp_sharding=cache_view.indexer_dp_sharding(),
+        )
+        return selected, cache_view.replace(indexer_token_pages=token_pages, indexer_pool_pages=pool_pages)
+
+    def distillation_loss(
+        self,
+        hidden_states: Array,
+        q_resid: Array | None,
+        attention_query: Array,
+        attention_key: Array,
+        visibility: Array,
+        query_segment_ids: Array,
+        key_segment_ids: Array,
+        *,
+        scaling: float,
+        sinks: Array | None = None,
+        position_ids: Array | None = None,
+        frequencies: Array | None = None,
+    ) -> Array:
+        """Indexer warm-up loss: dense attention mass distilled onto the scored, complete pools.
+
+        Selection is not differentiable, so this reuses the projections, learned pooling and head reduction without
+        the hard top-k. Inputs are detached so only indexer parameters train. Incomplete tails are always-selected
+        tokens, not scored candidates.
+
+        Args:
+            hidden_states: Indexer inputs ``[B, S, D]``.
+            q_resid: Query residual ``[B, S, R]``, or ``None``.
+            attention_query: The attention's queries ``[B, S, H, Dq]``.
+            attention_key: The attention's per-head keys ``[B, T, H, Dq]``.
+            visibility: Pre-selection causal/padding/document mask ``[B, S, T]``.
+            query_segment_ids: Query document identities ``[B, S]``.
+            key_segment_ids: Key document identities ``[B, T]``; negative means padding.
+            scaling: Attention softmax scale, not the indexer's projection scale.
+            sinks: Optional attention sinks, one per attention head.
+            position_ids: RoPE positions ``[B, S]`` (``rope_style != "none"``).
+            frequencies: RoPE tables (``rope_style != "none"``).
+
+        Returns:
+            Unscaled scalar mean KL over queries reaching a complete pool.
+
+        Raises:
+            ValueError: If the indexer is not a ``pool`` strategy.
+        """
+        if self.config.kind != IndexerKind.POOL:
+            raise ValueError("SparseIndexer.distillation_loss supports the pool strategy only.")
+        hidden_states = jax.lax.stop_gradient(hidden_states)
+        q_resid = None if q_resid is None else jax.lax.stop_gradient(q_resid)
+        attention_query = jax.lax.stop_gradient(attention_query)
+        attention_key = jax.lax.stop_gradient(attention_key)
+        valid = jnp.any(visibility, axis=1)
+        query, packed = self.project_state(
+            hidden_states, q_resid=q_resid, attention_mask=valid, position_ids=position_ids, frequencies=frequencies
+        )
+        kpool = self.config.kpool_size
+        token_positions = jnp.broadcast_to(jnp.arange(packed.shape[1]), valid.shape)
+
+        def query_loss(inputs):
+            hidden, projected, target_query, visible, position = inputs
+            # Pools are built from each query's visible tokens, so non-prefix masks (padding, packed documents,
+            # arbitrary pairwise masks) get the same complete candidates as storage-wide pooling of a prefix,
+            # without a [B, S, T, D] temporary.
+            local = packed.at[..., -1].set(visible.astype(packed.dtype))
+            pool_keys, members, pool_valid = self._pooled_states(local, key_segment_ids)
+            dots = jnp.einsum(
+                "bhd,bpd->bhp", projected.astype(jnp.float32), pool_keys.astype(jnp.float32), precision=self.precision
+            )
+            scores = self._reduce_heads(jax.nn.relu(dots * self.softmax_scale)[:, None], hidden[:, None])
+            scores = jnp.where(pool_valid[:, None], scores, -jnp.inf)
+            # Pool members are compacted valid tokens, not necessarily consecutive rows; gather the target keys in
+            # that order so the operation sums token mass per pool.
+            indices = jnp.maximum(members.reshape(members.shape[0], -1), 0)
+            entries = jnp.take_along_axis(attention_key, indices[..., None, None], axis=1).transpose(0, 2, 1, 3)
+            entry_positions = jnp.take_along_axis(token_positions, indices, axis=1)
+            entry_segments = jnp.take_along_axis(key_segment_ids, indices, axis=1)
+            entry_valid = jnp.repeat(pool_valid, kpool, axis=-1)
+            loss = indexer_distillation_loss(
+                target_query[:, :, None, :],
+                entries,
+                scores,
+                scaling=scaling,
+                sinks=sinks,
+                entry_group=kpool,
+                entry_valid=entry_valid,
+                q_positions=position[:, None],
+                entry_positions=entry_positions,
+                q_segment_ids=jnp.take_along_axis(query_segment_ids, position[:, None], axis=1),
+                entry_segment_ids=entry_segments,
+                precision=self.precision,
+                block_q=1,
+            )
+            count = jnp.sum(jnp.any(pool_valid, axis=-1), dtype=jnp.float32)
+            return loss * count, count
+
+        sums, counts = jax.lax.map(
+            query_loss,
+            tuple(jnp.swapaxes(x, 0, 1) for x in (hidden_states, query, attention_query, visibility, token_positions)),
+        )
+        return jnp.sum(sums) / jnp.maximum(jnp.sum(counts), 1.0)
 
     def _project(
         self,

@@ -565,6 +565,25 @@ class DecoderLayerOutput(ModelOutput):
 
 
 @auto_pytree
+class SparseAttentionLayerOutput(AttentionLayerOutput):
+    """Attention output of a learned sparse-attention layer.
+
+    Attributes:
+        indexer_aux_loss: Unscaled indexer warm-up loss (distillation of dense attention onto the indexer scores), or
+            ``None`` when it is not computed for this call.
+    """
+
+    indexer_aux_loss: Array | None = None
+
+
+@auto_pytree
+class SparseDecoderLayerOutput(DecoderLayerOutput):
+    """Decoder layer output carrying its attention's unscaled indexer warm-up loss (``None`` when not computed)."""
+
+    indexer_aux_loss: Array | None = None
+
+
+@auto_pytree
 class BaseModelOutput(ModelOutput):
     """Base class for model outputs with potential hidden states and attentions.
 

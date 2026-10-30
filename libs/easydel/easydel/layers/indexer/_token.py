@@ -24,11 +24,18 @@ import jax
 import spectrax as spx
 from jax import numpy as jnp
 
+from easydel.infra.sequence_packing import pairwise_attention_mask_from_mask_info
 from easydel.layers.linears import ColumnParallelLinear
+from easydel.layers.rotary import apply_rope_interleaved, apply_rope_split_half
 
+from ._distill import indexer_distillation_loss
+from ._paged import paged_token_select
 from ._selection import BaseIndexer, IndexerSelection, SelectionSpec
 
 if tp.TYPE_CHECKING:
+    from ejkernel.types import MaskInfo
+    from jaxtyping import Array
+
     from easydel.operations.kernels.glm_moe_dsa_indexer import GlmMoeDsaIndexerOutput
 
 
@@ -56,6 +63,9 @@ class TokenIndexer(BaseIndexer):
     """
 
     selection_spec = SelectionSpec(candidate_unit="token", output_unit="token")
+    # Selected ids are token ids; there is no pooled ``dsa_pool_training`` selection.
+    selection_chunk_size: tp.ClassVar[int] = 1
+    supports_pool_training: tp.ClassVar[bool] = False
 
     def __init__(
         self,
@@ -206,4 +216,244 @@ class TokenIndexer(BaseIndexer):
             indexer_rope_interleave=self.indexer_rope_interleave,
             precision=self.precision,
             **indexed_metadata,
+        )
+
+    def select_uncached(
+        self,
+        hidden_states: Array,
+        q_resid: Array | None,
+        position_ids: Array,
+        frequencies: Array | None,
+        mask_info: MaskInfo,
+    ) -> IndexerSelection:
+        """Selection for a call without a cache: the keys are the current tokens.
+
+        Args:
+            hidden_states: Layer input ``[batch, seq, hidden]``.
+            q_resid: Low-rank query input, or ``None`` to use ``hidden_states``.
+            position_ids: RoPE positions ``[batch, seq]``.
+            frequencies: RoPE table, or ``None``.
+            mask_info: Self-attention mask metadata.
+
+        Returns:
+            The selection, with lanes the operation filled past the visible keys set to ``-1``.
+        """
+        q_len = hidden_states.shape[1]
+        output = self(
+            hidden_states=hidden_states,
+            q_resid=q_resid,
+            position_ids=position_ids,
+            frequencies=frequencies,
+            attention_mask=pairwise_attention_mask_from_mask_info(mask_info, q_len, q_len),
+        )
+        return self.selection_from_output(output)
+
+    def select_with_cache(
+        self,
+        hidden_states: Array,
+        q_resid: Array | None,
+        position_ids: Array,
+        frequencies: Array | None,
+        cache_view: tp.Any,
+        mask_info: MaskInfo,
+        cache_metadata: tp.Any,
+        *,
+        causal: bool,
+        mode: tp.Any,
+        runtime_sharding_resolver: tp.Any,
+    ) -> tuple[IndexerSelection, tp.Any]:
+        """Selection over a transformer cache whose auxiliary channel stores the rotated indexer keys.
+
+        The cache first reports its attention-time layout (placeholder rows at the current physical slots); the
+        operation writes the current keys into those slots, and the same public append stores them, so sliding
+        caches keep only their fixed-capacity window.
+
+        Args:
+            hidden_states: Layer input ``[batch, seq, hidden]``.
+            q_resid: Low-rank query input, or ``None``.
+            position_ids: RoPE positions ``[batch, seq]``.
+            frequencies: RoPE table, or ``None``.
+            cache_view: A ``TransformerCacheView`` with ``auxiliary_dim == head_dim``.
+            mask_info: Attention mask metadata of the current step.
+            cache_metadata: Cache metadata.
+            causal: Whether the owning attention is causal.
+            mode: Runtime mode.
+            runtime_sharding_resolver: Sharding resolver for the cache update.
+
+        Returns:
+            ``(selection over the cache rows, updated cache_view)``.
+        """
+
+        def update(states, view):
+            return view.update_auxiliary(
+                states,
+                mask_info,
+                cache_metadata,
+                causal=causal,
+                mode=mode,
+                runtime_sharding_resolver=runtime_sharding_resolver,
+            )
+
+        bsz, q_len, _ = hidden_states.shape
+        aligned_keys, index_mask, _ = update(jnp.zeros((bsz, q_len, self.index_head_dim), jnp.float32), cache_view)
+        pairwise_mask = index_mask.get_or_compute_attention_mask(dtype=jnp.bool_)[:, 0]
+        slots = index_mask.q_positions - index_mask.kv_positions[:, :1]
+        slots = jnp.where(jnp.any(pairwise_mask, axis=-1), slots, -1)
+        segment_ids, key_segment_ids = index_mask.get_or_compute_segment_ids()
+        output = self(
+            hidden_states=hidden_states,
+            q_resid=q_resid,
+            position_ids=position_ids,
+            frequencies=frequencies,
+            attention_mask=pairwise_mask,
+            cached_keys=aligned_keys,
+            use_cache=True,
+            cache_positions=slots,
+            key_valid_mask=jnp.any(pairwise_mask, axis=-2),
+            query_positions=index_mask.q_positions,
+            key_positions=index_mask.kv_positions,
+            segment_ids=segment_ids,
+            key_segment_ids=key_segment_ids,
+        )
+        current_keys = jnp.take_along_axis(output.cached_keys, jnp.maximum(slots, 0)[..., None], axis=1)
+        _, _, cache_view = update(current_keys, cache_view)
+        return self.selection_from_output(output), cache_view
+
+    def select_with_pages(
+        self,
+        hidden_states: Array,
+        q_resid: Array | None,
+        frequencies: Array | None,
+        cache_view: tp.Any,
+        cache_metadata: tp.Any,
+    ) -> tuple[Array, tp.Any]:
+        """Token selection over an MLA ragged-pages cache with indexer pages (:func:`~._paged.paged_token_select`).
+
+        Args:
+            hidden_states: Packed layer input ``[1, tokens, hidden]`` (or ``[batch, seq, hidden]``, flattened).
+            q_resid: Low-rank query input of the same layout, or ``None``.
+            frequencies: RoPE table, or ``None``.
+            cache_view: An ``MLARaggedPagesCacheView`` carrying indexer token pages.
+            cache_metadata: Ragged-pages metadata of the step.
+
+        Returns:
+            ``(token ids [tokens, index_topk], cache_view with updated indexer pages)``.
+        """
+        from easydel.operations.kernels.multi_latent_ragged_page_attention import _resolve_distribution
+
+        tokens = hidden_states.shape[0] * hidden_states.shape[1]
+        selected, token_pages = paged_token_select(
+            self,
+            hidden_states.reshape(tokens, hidden_states.shape[-1]),
+            None if q_resid is None else q_resid.reshape(tokens, q_resid.shape[-1]),
+            frequencies,
+            cache_view.indexer_token_pages,
+            jnp.asarray(cache_metadata.pages_tables, jnp.int32),
+            jnp.asarray(cache_metadata.context_lens, jnp.int32),
+            jnp.asarray(cache_metadata.query_start_loc, jnp.int32),
+            # ``[..., 2]``: the live count, per rank for rank-major ([dp, 3]) distributions.
+            _resolve_distribution(cache_metadata)[..., 2],
+            constrain_rows=cache_view.constrain_indexer_rows,
+            constrain_pages=cache_view.constrain_indexer_pages,
+            dp_sharding=cache_view.indexer_dp_sharding(),
+        )
+        return selected, cache_view.replace(indexer_token_pages=token_pages)
+
+    def distillation_scores(
+        self,
+        hidden_states: Array,
+        q_resid: Array | None,
+        position_ids: Array | None,
+        frequencies: Array | None,
+        visible: Array,
+    ) -> Array:
+        """Differentiable pre-top-k scores, with unreachable tokens at ``-inf``.
+
+        Reproduces the operation's fp32 prefix RoPE, per-head ReLU and learned head weighting with the same
+        parameters. Inputs are detached so only indexer parameters train.
+
+        Args:
+            hidden_states: Layer inputs ``[B, S, hidden]``.
+            q_resid: Optional low-rank query inputs ``[B, S, rank]``.
+            position_ids: RoPE positions ``[B, S]``.
+            frequencies: Optional concatenated half-width cosine/sine table.
+            visible: Boolean causal/padding/document reachability ``[B, S, S]``.
+
+        Returns:
+            Float32 indexer scores ``[B, S, S]``.
+        """
+        hidden_states = jax.lax.stop_gradient(hidden_states)
+        q_input = hidden_states if q_resid is None else jax.lax.stop_gradient(q_resid)
+        query = self.wq_b(q_input).reshape(*hidden_states.shape[:2], self.index_n_heads, self.index_head_dim)
+        key = self.k_norm(self.wk(hidden_states))
+        weights = self.kernels_proj(hidden_states).astype(jnp.float32) * (self.index_n_heads**-0.5)
+        query, key = query.astype(jnp.float32), key.astype(jnp.float32)
+        if frequencies is not None:
+            cos, sin = jnp.split(frequencies[position_ids], 2, axis=-1)
+            rope_dim = min(self.indexer_config.rope_dim, self.index_head_dim, cos.shape[-1] * 2)
+            rope_dim -= rope_dim % 2
+            if rope_dim > 0:
+                cos, sin = cos[..., : rope_dim // 2], sin[..., : rope_dim // 2]
+                q_pe, k_pe = query[..., :rope_dim], key[..., :rope_dim]
+                if self.indexer_rope_interleave:
+                    q_pe = apply_rope_interleaved(q_pe, cos[..., None, :], sin[..., None, :])
+                    k_pe = apply_rope_interleaved(k_pe, cos, sin)
+                else:
+                    cos, sin = jnp.concatenate((cos, cos), -1), jnp.concatenate((sin, sin), -1)
+                    q_pe = apply_rope_split_half(q_pe, cos, sin, unsqueeze_dim=-2)
+                    k_pe = apply_rope_split_half(k_pe, cos, sin, unsqueeze_dim=None)
+                query = jnp.concatenate((q_pe, query[..., rope_dim:]), -1)
+                key = jnp.concatenate((k_pe, key[..., rope_dim:]), -1)
+        scores = jnp.einsum("bshd,btd->bsht", query, key, precision=self.precision) * self.softmax_scale
+        scores = jnp.einsum("bsht,bsh->bst", jax.nn.relu(scores), weights, precision=self.precision)
+        return jnp.where(visible, scores, -jnp.inf)
+
+    def distillation_loss(
+        self,
+        hidden_states: Array,
+        q_resid: Array | None,
+        attention_query: Array,
+        attention_key: Array,
+        visibility: Array,
+        query_segment_ids: Array,
+        key_segment_ids: Array,
+        *,
+        scaling: float,
+        sinks: Array | None = None,
+        position_ids: Array | None = None,
+        frequencies: Array | None = None,
+    ) -> Array:
+        """Indexer warm-up loss: dense attention distilled onto :meth:`distillation_scores`.
+
+        Args:
+            hidden_states: Layer inputs ``[B, S, hidden]``.
+            q_resid: Optional low-rank query inputs ``[B, S, rank]``.
+            attention_query: The attention's queries ``[B, S, H, Dq]``.
+            attention_key: The attention's per-head keys ``[B, S, H, Dq]``.
+            visibility: Pre-selection causal/padding/document mask ``[B, S, S]``.
+            query_segment_ids: Query document identities ``[B, S]``.
+            key_segment_ids: Key document identities ``[B, S]``; negative means padding.
+            scaling: Attention softmax scale.
+            sinks: Optional attention sinks, one per attention head.
+            position_ids: RoPE positions ``[B, S]``.
+            frequencies: RoPE table, or ``None``.
+
+        Returns:
+            Unscaled scalar loss.
+        """
+        scores = self.distillation_scores(hidden_states, q_resid, position_ids, frequencies, visibility)
+        batch, seq = hidden_states.shape[:2]
+        positions = jnp.broadcast_to(jnp.arange(seq, dtype=jnp.int32), (batch, seq))
+        return indexer_distillation_loss(
+            attention_query.transpose(0, 2, 1, 3),
+            attention_key.transpose(0, 2, 1, 3),
+            scores,
+            scaling=scaling,
+            sinks=sinks,
+            precision=self.precision,
+            entry_valid=jnp.any(visibility, axis=-2),
+            q_positions=positions,
+            entry_positions=positions,
+            q_segment_ids=query_segment_ids,
+            entry_segment_ids=key_segment_ids,
         )

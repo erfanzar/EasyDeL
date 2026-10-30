@@ -85,6 +85,7 @@ from jaxtyping import Array as JAXArray
 from jaxtyping import Float, Int
 from spectrax import PartitionManager, apply_logical_sharding, common_types
 
+from easydel.infra.sequence_packing import visible_interval_runs
 from easydel.infra.sharding import (
     MeshLike,
     RuntimeShardingResolver,
@@ -248,18 +249,10 @@ def _recover_pairwise_segment_ids(
         return mask_info
     q_segments, kv_segments = mask_info.get_or_compute_segment_ids()
     padding_labels = jnp.all(q_segments <= 0, axis=-1) & jnp.all(kv_segments <= 0, axis=-1)
+    # A query's visible keys (over every head) must all receive the same ownership label.
     pairwise = jnp.any(attn, axis=1)
     valid_keys = jnp.any(pairwise, axis=-2)
-    first_visible_key = jnp.argmax(pairwise, axis=-1)
-    key_positions = jnp.arange(pairwise.shape[-1], dtype=jnp.int32)
-    last_visible_key = jnp.max(jnp.where(pairwise, key_positions, -1), axis=-1)
-    # A query's visible keys must all receive the same ownership label. Infer
-    # boundaries from complete visible intervals, including across heads, rather
-    # than just the super/subdiagonal of an arbitrary pairwise mask.
-    splits = key_positions[:-1]
-    crosses = (first_visible_key[:, :, None] <= splits) & (last_visible_key[:, :, None] > splits)
-    boundaries = jnp.pad(~jnp.any(crosses, axis=-2), ((0, 0), (1, 0)), constant_values=False)
-    recovered = jnp.cumsum(boundaries, axis=-1, dtype=jnp.int32)
+    recovered, first_visible_key = visible_interval_runs(pairwise)
     continuation = jnp.zeros_like(write_index)
     label_origin = continuation
     if cached_segment_ids is not None:

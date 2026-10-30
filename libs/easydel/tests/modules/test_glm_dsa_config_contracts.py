@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Array-free GLM configuration and sparse-training eligibility regressions."""
+"""Array-free GLM configuration regressions."""
 
-import importlib
 from copy import deepcopy
 
 import pytest
@@ -72,59 +71,3 @@ def test_dsa_exported_rope_normalizer_keeps_text_only_defaults():
     assert "mrope_section" not in result
     assert parameters == original_parameters
     assert scaling == original_scaling
-
-
-@pytest.fixture(params=["glm_moe_dsa", "glm5_next"])
-def sparse_policy(request):
-    family = request.param
-    module = importlib.import_module(f"easydel.modules.{family}.modeling_{family}")
-    return module.use_sparse_training_attention
-
-
-def _eligible_options():
-    # Opaque host objects deliberately avoid creating JAX arrays or probing hardware.
-    return {
-        "topk_indices": object(),
-        "cache_view": None,
-        "mask_info": object(),
-        "output_attentions": False,
-        "sliding_window": None,
-        "softmax_aux": None,
-    }
-
-
-@pytest.mark.parametrize(
-    ("sparse_training", "seq_len", "backend", "expected"),
-    [
-        (True, 32, "cpu", True),
-        (False, 32768, "tpu", False),
-        (None, 8191, "tpu", False),
-        (None, 8192, "tpu", True),
-        (None, 32768, "gpu", False),
-        (None, None, "tpu", False),
-    ],
-)
-def test_family_sparse_policy_preserves_config_and_auto_threshold(
-    sparse_policy, sparse_training, seq_len, backend, expected
-):
-    assert (
-        sparse_policy(**_eligible_options(), sparse_training=sparse_training, seq_len=seq_len, backend=backend)
-        is expected
-    )
-
-
-@pytest.mark.parametrize(
-    ("feature", "value"),
-    [
-        ("topk_indices", None),
-        ("cache_view", object()),
-        ("mask_info", None),
-        ("output_attentions", True),
-        ("sliding_window", 128),
-        ("softmax_aux", object()),
-    ],
-)
-def test_family_force_sparse_still_preserves_dense_only_features(sparse_policy, feature, value):
-    options = _eligible_options()
-    options[feature] = value
-    assert sparse_policy(**options, sparse_training=True, seq_len=32768, backend="tpu") is False

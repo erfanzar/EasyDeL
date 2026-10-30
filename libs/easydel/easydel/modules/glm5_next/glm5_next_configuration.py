@@ -598,16 +598,9 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
         Returns:
             The error message, or ``None``.
         """
-        from ejkernel.modules import DSA_SPARSE_MAX_TAIL_KEYS  # pyright: ignore[reportMissingTypeStubs]
+        from easydel.layers.indexer import pool_bitmap_tail_error
 
-        tails = self.index_kpool - 1 if self.index_kpool_always_select_tail else 0
-        if tails <= DSA_SPARSE_MAX_TAIL_KEYS:
-            return None
-        return (
-            f"dsa_pool_kernel='bitmap' takes at most {DSA_SPARSE_MAX_TAIL_KEYS} always-selected tail keys per query, "
-            f"but index_kpool={self.index_kpool} with index_kpool_always_select_tail=True gives {tails}. Use "
-            f"dsa_pool_kernel='gather' or index_kpool <= {DSA_SPARSE_MAX_TAIL_KEYS + 1}."
-        )
+        return pool_bitmap_tail_error(self.index_kpool, self.index_kpool_always_select_tail)
 
     def is_kda_layer(self, layer_idx: int) -> bool:
         """Check whether ``layer_idx`` is a KDA linear-attention layer.
