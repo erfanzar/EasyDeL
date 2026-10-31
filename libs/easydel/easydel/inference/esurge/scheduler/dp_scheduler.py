@@ -433,6 +433,7 @@ class DPScheduler(SchedulerInterface):
         include_finished_set: bool = False,
         use_worker_processes: bool = True,
         worker_start_method: str | None = None,
+        recurrent_prefix_snapshot_slots: int = 0,
     ) -> None:
         self.dp_size = int(dp_size)
         if self.dp_size <= 1:
@@ -476,17 +477,22 @@ class DPScheduler(SchedulerInterface):
         else:
             scheduler_cls = Scheduler
 
+        # The runner owns ``max_num_seqs // dp_size`` sequence rows per rank; a rank scheduler admitting more
+        # than that (e.g. when prefix-cache affinity routes repeated prompts to one rank) overflows its shard.
+        rows_per_rank = max(1, int(max_num_seqs) // self.dp_size)
+        rank_buckets = sorted({int(b) for b in (max_num_seq_buckets or []) if 0 < int(b) <= rows_per_rank}) or None
+
         self.schedulers: list[Scheduler | _SchedulerWorkerClient] = []
         for rank in range(self.dp_size):
             scheduler_kwargs = dict(
                 kv_cache_config=per_rank_config,
-                max_num_seqs=max_num_seqs,
+                max_num_seqs=rows_per_rank,
                 max_num_batched_tokens=max_num_batched_tokens,
                 max_model_len=max_model_len,
                 num_pages=self.pages_per_rank,
                 page_size=page_size,
                 enable_prefix_caching=enable_prefix_caching,
-                max_num_seq_buckets=max_num_seq_buckets,
+                max_num_seq_buckets=rank_buckets,
                 async_scheduling=async_scheduling,
                 long_prefill_token_threshold=long_prefill_token_threshold,
                 chunked_prefill_enabled=chunked_prefill_enabled,
@@ -496,6 +502,10 @@ class DPScheduler(SchedulerInterface):
                 use_eagle=use_eagle,
                 include_finished_set=include_finished_set,
             )
+            if int(recurrent_prefix_snapshot_slots) > 0:
+                # Each rank owns a disjoint block of the runner's snapshot store.
+                scheduler_kwargs["recurrent_prefix_snapshot_slots"] = int(recurrent_prefix_snapshot_slots)
+                scheduler_kwargs["recurrent_prefix_snapshot_offset"] = rank * int(recurrent_prefix_snapshot_slots)
             if self.use_worker_processes:
                 scheduler = _SchedulerWorkerClient(
                     rank=rank,
@@ -549,6 +559,7 @@ class DPScheduler(SchedulerInterface):
         chunked_prefill_enabled: bool = False,
         token_safety_margin: int | None = None,
         include_finished_set: bool = False,
+        recurrent_prefix_snapshot_slots: int = 0,
     ) -> DPScheduler:
         from ..core.interface import create_kv_cache_specs_from_config
 
@@ -584,6 +595,7 @@ class DPScheduler(SchedulerInterface):
             chunked_prefill_enabled=chunked_prefill_enabled,
             token_safety_margin=token_safety_margin,
             include_finished_set=include_finished_set,
+            recurrent_prefix_snapshot_slots=recurrent_prefix_snapshot_slots,
         )
         image_expander_builder = getattr(type(runner.model), "esurge_image_expander_builder", None)
         if image_expander_builder is not None:
@@ -826,6 +838,16 @@ class DPScheduler(SchedulerInterface):
             max_num_scheduled_tokens_per_dp_rank=max_tokens_per_rank,
             req_ids_per_rank=req_ids_per_rank,
             pending_structured_output_tokens=pending_structured_output_tokens,
+            recurrent_snapshot_restores={
+                req_id: slot
+                for output in rank_outputs
+                for req_id, slot in getattr(output, "recurrent_snapshot_restores", {}).items()
+            },
+            recurrent_snapshot_saves={
+                req_id: slot
+                for output in rank_outputs
+                for req_id, slot in getattr(output, "recurrent_snapshot_saves", {}).items()
+            },
         )
 
     def _combine_cached_request_data(self, rank_outputs: list[SchedulerOutput]) -> CachedRequestData:
@@ -968,6 +990,16 @@ class DPScheduler(SchedulerInterface):
             async_scheduling=scheduler_output.async_scheduling,
             pending_structured_output_tokens=scheduler_output.pending_structured_output_tokens,
             req_id_to_dp_rank={req_id: rank for req_id in rank_req_ids if req_id in scheduler_output.req_id_to_dp_rank},
+            recurrent_snapshot_restores={
+                req_id: slot
+                for req_id, slot in scheduler_output.recurrent_snapshot_restores.items()
+                if req_id in rank_req_ids
+            },
+            recurrent_snapshot_saves={
+                req_id: slot
+                for req_id, slot in scheduler_output.recurrent_snapshot_saves.items()
+                if req_id in rank_req_ids
+            },
         )
 
     def _split_model_output_by_rank(

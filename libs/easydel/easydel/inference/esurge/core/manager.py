@@ -196,6 +196,7 @@ class CacheManager:
         *,
         dp_shard_hint: int | None = None,
         data_parallel_size: int | None = None,
+        max_cache_hit_tokens: int | None = None,
     ) -> tuple[CachePages, int]:
         """Get the computed (cached) pages for the request.
 
@@ -208,6 +209,7 @@ class CacheManager:
             dp_shard_hint: Optional request shard hint used to select
                 shard-local prefix cache pages.
             data_parallel_size: Total data-parallel shard count.
+            max_cache_hit_tokens: Optional tighter cap on the hit length in tokens.
 
         Returns:
             A tuple containing:
@@ -229,6 +231,8 @@ class CacheManager:
             return self.create_empty_page_list(), 0
 
         max_cache_hit_length = request.num_tokens - 1
+        if max_cache_hit_tokens is not None:
+            max_cache_hit_length = min(max_cache_hit_length, int(max_cache_hit_tokens))
         computed_pages, num_new_computed_tokens = self.coordinator.find_longest_cache_hit(
             page_hashes,
             max_cache_hit_length,
@@ -237,6 +241,15 @@ class CacheManager:
         )
 
         return CachePages(computed_pages), num_new_computed_tokens
+
+    def request_page_hashes(self, request: EngineRequest) -> list[PageHash]:
+        """Return (computing and caching on first use) the chained full-page hashes of ``request``."""
+        page_hashes = self.req_to_page_hashes[request.request_id]
+        if not page_hashes:
+            assert self.page_size is not None
+            page_hashes = hash_request_tokens(hash, self.page_size, request)
+            self.req_to_page_hashes[request.request_id] = page_hashes
+        return page_hashes
 
     def probe_num_computed_tokens(self, request: EngineRequest) -> int:
         """Read-only prefix-cache probe returning the cached-token count.

@@ -63,6 +63,7 @@ from eformer.loggings import get_logger
 from ..core.dp_sharding import dp_shard_for_page_id, pages_per_dp_shard
 from ..core.interface import CacheGroupsConfig
 from ..core.manager import CacheManager
+from ..core.recurrent_snapshots import RecurrentSnapshotIndex
 from ..engine_types import EngineCoreOutput, EngineCoreOutputs
 from ..metrics import get_metrics_collector
 from ..outputs import ModelRunnerOutput
@@ -78,6 +79,21 @@ if typing.TYPE_CHECKING:
     from ..runners.model_runner import eSurgeRunner
 
 logger = get_logger("eSurgeScheduler")
+
+_RECURRENT_LAYER_TYPES = frozenset({"linear_attention", "kda_linear_attention", "parallel_hybrid", "hybrid"})
+
+
+def _runner_has_recurrent_state(runner: typing.Any) -> bool:
+    """Whether the runner's model keeps per-request recurrent (linear-attention/SSM) state."""
+    flag = getattr(runner, "_has_recurrent_layers", None)
+    if flag is not None:
+        return bool(flag)
+    config = getattr(getattr(runner, "model", None), "config", None)
+    if config is None:
+        return False
+    text_config = config.get_text_config() if hasattr(config, "get_text_config") else config
+    layer_types = getattr(text_config, "layer_types", None) or ()
+    return any(str(layer_type).lower() in _RECURRENT_LAYER_TYPES for layer_type in layer_types)
 
 
 class Scheduler(SchedulerInterface):
@@ -149,6 +165,8 @@ class Scheduler(SchedulerInterface):
         num_draft_tokens: int = 0,
         use_eagle: bool = False,
         include_finished_set: bool = False,
+        recurrent_prefix_snapshot_slots: int = 0,
+        recurrent_prefix_snapshot_offset: int = 0,
     ) -> None:
         """Initialize the Scheduler.
 
@@ -174,6 +192,10 @@ class Scheduler(SchedulerInterface):
             num_draft_tokens: Number of speculative tokens (0 disables).
             use_eagle: Enable EAGLE-style speculative decoding.
             include_finished_set: Track finished request IDs per client.
+            recurrent_prefix_snapshot_slots: Number of recurrent-state snapshot slots backing prefix-cache hits
+                for linear-attention/SSM models; ``0`` means the model keeps no recurrent state.
+            recurrent_prefix_snapshot_offset: First global snapshot slot owned by this scheduler (DP ranks
+                each own a disjoint block of the runner's snapshot store).
 
         Raises:
             ValueError: For unknown scheduling policy or non-positive num_pages.
@@ -250,6 +272,12 @@ class Scheduler(SchedulerInterface):
             enable_caching=self.enable_prefix_caching,
             use_eagle=self.use_eagle,
         )
+        self._recurrent_snapshots: RecurrentSnapshotIndex | None = (
+            RecurrentSnapshotIndex(int(recurrent_prefix_snapshot_slots), int(recurrent_prefix_snapshot_offset))
+            if self.enable_prefix_caching and int(recurrent_prefix_snapshot_slots) > 0
+            else None
+        )
+        self._recurrent_save_targets: dict[str, tuple[int, typing.Hashable]] = {}
 
         buckets = max_num_seq_buckets or []
         if not buckets:
@@ -320,6 +348,17 @@ class Scheduler(SchedulerInterface):
             # cache from the stream. Force prefix caching off for this family.
             logger.warning("Disabling prefix caching: compressed-window cache models must process every prompt token.")
             enable_prefix_caching = False
+        recurrent_prefix_snapshot_slots = 0
+        if enable_prefix_caching and _runner_has_recurrent_state(runner):
+            # Page hashes only cover attention KV; a prefix hit is only valid together with a snapshot of the
+            # linear-attention/SSM state at the same page boundary.
+            recurrent_prefix_snapshot_slots = int(getattr(runner, "recurrent_prefix_snapshot_slots", 0) or 0)
+            if recurrent_prefix_snapshot_slots <= 0:
+                logger.warning(
+                    "Disabling prefix caching: recurrent-state prefix snapshots are unavailable for this runner "
+                    "(speculative decoding, compressed-window caches, or cache.recurrent_prefix_snapshots=0)."
+                )
+                enable_prefix_caching = False
 
         if max_num_batched_tokens is None:
             max_num_batched_tokens = runner.max_model_len
@@ -352,6 +391,8 @@ class Scheduler(SchedulerInterface):
             token_safety_margin=token_safety_margin,
             include_finished_set=include_finished_set,
         )
+        if recurrent_prefix_snapshot_slots > 0:
+            scheduler_kwargs["recurrent_prefix_snapshot_slots"] = recurrent_prefix_snapshot_slots
 
         data_parallel_size = int(getattr(metadata, "data_parallel_size", 1) or 1)
         if data_parallel_size > 1:
@@ -367,6 +408,7 @@ class Scheduler(SchedulerInterface):
                 chunked_prefill_enabled=chunked_prefill_enabled,
                 token_safety_margin=token_safety_margin,
                 include_finished_set=include_finished_set,
+                recurrent_prefix_snapshot_slots=recurrent_prefix_snapshot_slots,
             )
 
         if async_scheduling:
@@ -380,6 +422,72 @@ class Scheduler(SchedulerInterface):
         if image_expander_builder is not None:
             scheduler.image_expander = image_expander_builder(runner.model)
         return scheduler
+
+    def _recurrent_prefix_hit(
+        self, request: EngineRequest, dp_shard_hint: int | None
+    ) -> tuple[typing.Any, int, typing.Hashable | None]:
+        """Longest prefix hit whose boundary has a recurrent snapshot, and register the request's save target.
+
+        Returns:
+            ``(computed_pages, num_hit_tokens, snapshot_key)``; the key is ``None`` when there is no hit.
+        """
+        assert self._recurrent_snapshots is not None
+        page_size = self.page_size
+        keys = list(self.kv_cache_manager.request_page_hashes(request))
+        last_boundary_pages = min(len(keys), (request.num_tokens - 1) // page_size)
+
+        hit_pages, hit_tokens, hit_key = self.kv_cache_manager.create_empty_page_list(), 0, None
+        upper = last_boundary_pages * page_size
+        for num_pages in range(last_boundary_pages, 0, -1):
+            if num_pages * page_size > upper or not self._recurrent_snapshots.is_ready(keys[num_pages - 1]):
+                continue
+            pages, tokens = self.kv_cache_manager.get_computed_pages(
+                request,
+                dp_shard_hint=dp_shard_hint,
+                data_parallel_size=self.data_parallel_size,
+                max_cache_hit_tokens=num_pages * page_size,
+            )
+            if tokens == num_pages * page_size:
+                hit_pages, hit_tokens, hit_key = pages, tokens, keys[num_pages - 1]
+                break
+            upper = tokens
+
+        self._recurrent_save_targets.pop(request.request_id, None)
+        if last_boundary_pages * page_size > hit_tokens and not getattr(request, "image_spans", None):
+            self._recurrent_save_targets[request.request_id] = (
+                last_boundary_pages * page_size,
+                keys[last_boundary_pages - 1],
+            )
+        return hit_pages, hit_tokens, hit_key
+
+    def _clip_to_snapshot_boundary(self, request: EngineRequest, num_computed: int, num_new: int) -> int:
+        """End a prefill chunk on the request's snapshot boundary so its recurrent state can be saved there."""
+        target = self._recurrent_save_targets.get(request.request_id)
+        if target is None or self._recurrent_snapshots is None:
+            return num_new
+        boundary, key = target
+        if num_computed >= boundary or self._recurrent_snapshots.contains(key):
+            self._recurrent_save_targets.pop(request.request_id, None)
+            return num_new
+        return min(num_new, boundary - num_computed)
+
+    def _record_snapshot_save(
+        self, request: EngineRequest, end: int, saves: dict[str, int], restores: dict[str, int]
+    ) -> None:
+        """Reserve a snapshot slot when this step's chunk ends exactly on the request's boundary."""
+        target = self._recurrent_save_targets.get(request.request_id)
+        if target is None or self._recurrent_snapshots is None or end != target[0]:
+            return
+        self._recurrent_save_targets.pop(request.request_id, None)
+        slot = self._recurrent_snapshots.reserve(target[1], exclude=set(restores.values()))
+        if slot is not None:
+            saves[request.request_id] = slot
+
+    def _cancel_snapshot_save(self, request_id: str, saves: dict[str, int]) -> None:
+        """Release a reserved save slot of a request that was un-scheduled."""
+        slot = saves.pop(request_id, None)
+        if slot is not None and self._recurrent_snapshots is not None:
+            self._recurrent_snapshots.cancel(slot)
 
     def _select_seq_bucket(self, num_reqs: int) -> int:
         """Select the appropriate sequence bucket for the given request count.
@@ -453,6 +561,8 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_page_ids: dict[str, tuple[list[int], ...]] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        snapshot_restores: dict[str, int] = {}
+        snapshot_saves: dict[str, int] = {}
         if self._token_budget_manager:
             # Free pages constrain new admissions, not progress in pages that a running request
             # already owns. Keep allocation/preemption reachable when the pool is full.
@@ -609,6 +719,8 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = align_prefill_chunk(
                     request.image_spans, request.num_computed_tokens, num_new_tokens, token_budget
                 )
+            if num_new_tokens > 0:
+                num_new_tokens = self._clip_to_snapshot_boundary(request, request.num_computed_tokens, num_new_tokens)
 
             if num_new_tokens <= 0:
                 req_index += 1
@@ -656,6 +768,7 @@ class Scheduler(SchedulerInterface):
                             scheduled_running_reqs.remove(preempted_req)
                             refunded_tokens = num_scheduled_tokens.pop(preempted_req.request_id, 0)
                             req_to_new_page_ids.pop(preempted_req.request_id, None)
+                            self._cancel_snapshot_save(preempted_req.request_id, snapshot_saves)
                             if self._token_budget_manager:
                                 self._token_budget_manager.release(refunded_tokens)
                                 token_budget = self._token_budget_manager.remaining
@@ -695,6 +808,9 @@ class Scheduler(SchedulerInterface):
             scheduled_running_reqs.append(request)
             req_to_new_page_ids[request.request_id] = new_pages.get_page_ids()
             num_scheduled_tokens[request.request_id] = num_new_tokens
+            self._record_snapshot_save(
+                request, request.num_computed_tokens + num_new_tokens, snapshot_saves, snapshot_restores
+            )
             if self._token_budget_manager:
                 self._token_budget_manager.consume(num_new_tokens)
                 token_budget = self._token_budget_manager.remaining
@@ -748,7 +864,13 @@ class Scheduler(SchedulerInterface):
                     skipped_waiting_requests.add_request(request)
                     continue
 
-                if request.num_computed_tokens == 0:
+                restore_key = None
+                if request.num_computed_tokens == 0 and self._recurrent_snapshots is not None:
+                    new_computed_pages, num_new_local_computed_tokens, restore_key = self._recurrent_prefix_hit(
+                        request, row_shard_hint
+                    )
+                    num_computed_tokens = num_new_local_computed_tokens
+                elif request.num_computed_tokens == 0:
                     new_computed_pages, num_new_local_computed_tokens = self.kv_cache_manager.get_computed_pages(
                         request,
                         dp_shard_hint=row_shard_hint,
@@ -809,6 +931,7 @@ class Scheduler(SchedulerInterface):
                         skipped_waiting_requests.add_request(request)
                         continue
                     num_new_tokens = aligned_tokens
+                num_new_tokens = self._clip_to_snapshot_boundary(request, num_computed_tokens, num_new_tokens)
                 new_pages = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -842,6 +965,15 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 request.status = EngineRequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                if restore_key is not None:
+                    assert self._recurrent_snapshots is not None
+                    restore_slot = self._recurrent_snapshots.lookup(restore_key)
+                    if restore_slot is None:
+                        raise RuntimeError(f"recurrent snapshot for the prefix hit of {request.request_id} vanished")
+                    snapshot_restores[request.request_id] = restore_slot
+                self._record_snapshot_save(
+                    request, num_computed_tokens + num_new_tokens, snapshot_saves, snapshot_restores
+                )
 
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_computed_tokens
@@ -938,6 +1070,8 @@ class Scheduler(SchedulerInterface):
             token_budget_initial=token_budget_initial,
             token_budget_remaining=int(token_budget),
             req_id_to_dp_rank=output_req_id_to_dp_rank,
+            recurrent_snapshot_restores=snapshot_restores,
+            recurrent_snapshot_saves=snapshot_saves,
         )
         self._update_after_schedule(scheduler_output)
         schedule_time = time.time() - schedule_start_time
@@ -1061,6 +1195,13 @@ class Scheduler(SchedulerInterface):
                 EngineCoreOutputs containing per-request outputs. Each
                 output includes new tokens, finish reason, and metadata.
         """
+        if self._recurrent_snapshots is not None:
+            executed = model_runner_output.req_id_to_index or {}
+            for req_id, slot in getattr(scheduler_output, "recurrent_snapshot_saves", {}).items():
+                if req_id in executed:
+                    self._recurrent_snapshots.commit(slot)
+                else:
+                    self._recurrent_snapshots.cancel(slot)
         sampled_token_ids = model_runner_output.sampled_token_ids
         spec_token_ids = model_runner_output.spec_token_ids
         num_accepted_spec_tokens = model_runner_output.num_accepted_spec_tokens or {}
@@ -1313,6 +1454,7 @@ class Scheduler(SchedulerInterface):
             raise RuntimeError(f"request {request.request_id} must be finished before freeing resources")
 
         request_id = request.request_id
+        self._recurrent_save_targets.pop(request_id, None)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
@@ -1360,7 +1502,11 @@ class Scheduler(SchedulerInterface):
         Returns:
             bool: True if reset was successful.
         """
-        return self.kv_cache_manager.reset_prefix_cache()
+        if not self.kv_cache_manager.reset_prefix_cache():
+            return False
+        if self._recurrent_snapshots is not None:
+            self._recurrent_snapshots.reset()
+        return True
 
     def shutdown(self) -> None:
         """Shutdown the scheduler.
