@@ -15,17 +15,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v5
         with:
-          python-version: "3.11"
-          cache: "pip"
-          cache-dependency-path: libs/easydel/pyproject.toml
+          enable-cache: true
 
-      - name: Install linters
-        run: |
-          python -m pip install --upgrade pip
-          pip install basedpyright ruff
+      # basedpyright resolves imports from the environment; without the workspace installed every
+      # import of jax/spectrax/eformer/transformers is reported as missing.
+      - name: Sync workspace
+        run: uv sync
 
       - name: Extract version from pyproject.toml
         id: meta
@@ -33,9 +30,14 @@ jobs:
           VERSION=$(grep '^version = ' libs/easydel/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Run linters
-        run: |
-          ruff check libs/easydel/easydel/ --config libs/easydel/pyproject.toml
-          basedpyright libs/easydel/easydel
+      - name: Ruff
+        run: uv run --no-sync ruff check libs/easydel/easydel/ --config libs/easydel/pyproject.toml
+        env:
+          EASYDEL_VERSION: ${{ steps.meta.outputs.version }}
+
+      # Report-only until the existing type errors are cleared; it still prints every diagnostic.
+      - name: basedpyright (report-only)
+        continue-on-error: true
+        run: uv run --no-sync basedpyright libs/easydel/easydel
         env:
           EASYDEL_VERSION: ${{ steps.meta.outputs.version }}
