@@ -996,6 +996,12 @@ class MaskInfo:
         sliding_window_baked_in: Flag indicating if sliding window masking has been applied
         chunked_mask_baked_in: Flag indicating if chunked masking has been applied
         token_type_ids_baked_in: Flag indicating if token type ID masking has been applied
+        padding_only: Static promise that the mask encodes nothing but per-row padding (one document per row, no
+            packed segments, no custom pairwise structure; causal masking may be applied on top). Set only by the
+            constructors that cannot express more (a 2-D padding mask, ``cu_seqlens``, ``from_segments(...,
+            is_attn_mask=True)``) and kept by the transforms that preserve that meaning (:meth:`replace` documents
+            when it is cleared). Consumers that only handle unpacked rows check it at trace time, because packed and
+            padded segment ids look alike as values.
     """
 
     _attention_mask: Bool[Array, "batch nheads_or_1 q k"] | Int[Array, "batch nheads_or_1 q k"] | None = None
@@ -1016,6 +1022,7 @@ class MaskInfo:
     qheads_axis_name: tuple[str, ...] | str | None = field(default="tp")
     kvheads_axis_name: tuple[str, ...] | str | None = field(default="tp")
     sequence_axis_name: tuple[str, ...] | str | None = field(default="sp")
+    padding_only: bool = field(default=False)
 
     @property
     def attention_mask(self) -> Array | None:
@@ -1312,12 +1319,12 @@ class MaskInfo:
             return (
                 self
                 if self._attention_mask.dtype == dtype
-                else self.replace(attention_mask=self._attention_mask.astype(dtype))
+                else self.replace(attention_mask=self._attention_mask.astype(dtype), padding_only=self.padding_only)
             )
 
         if self._q_segment_ids is not None and self._kv_segment_ids is not None:
             m = segment_ids_to_mask((self._q_segment_ids, self._kv_segment_ids), dtype=dtype)
-            return self.replace(attention_mask=m)
+            return self.replace(attention_mask=m, padding_only=self.padding_only)
         raise ValueError(
             "Cannot materialize attention_mask: no source data available. "
             "Either provide an attention_mask directly, or provide both q_segment_ids and kv_segment_ids "
@@ -1365,7 +1372,7 @@ class MaskInfo:
 
         q_ids = jnp.asarray(q_ids, jnp.int32)
         kv_ids = jnp.asarray(kv_ids, jnp.int32)
-        return self.replace(q_segment_ids=q_ids, kv_segment_ids=kv_ids)
+        return self.replace(q_segment_ids=q_ids, kv_segment_ids=kv_ids, padding_only=self.padding_only)
 
     @classmethod
     @_debug_trace
@@ -1408,7 +1415,7 @@ class MaskInfo:
                 inputs as flat padding masks (non-zero = valid, 0 = padding) rather than
                 segment IDs. A pairwise outer-product attention mask is built from the
                 validity flags, and segment IDs are derived as 0 for valid / -1 for
-                padding. Default: ``False``.
+                padding; the result is marked ``padding_only``. Default: ``False``.
 
         Returns:
             MaskInfo with segment IDs, computed attention mask, optional positions, and sharding configuration
@@ -1446,6 +1453,7 @@ class MaskInfo:
             qheads_axis_name=qheads_axis_name,
             kvheads_axis_name=kvheads_axis_name,
             sequence_axis_name=sequence_axis_name,
+            padding_only=bool(is_attn_mask),
         )
 
     @classmethod
@@ -1519,6 +1527,7 @@ class MaskInfo:
                 qheads_axis_name=qheads_axis_name,
                 kvheads_axis_name=kvheads_axis_name,
                 sequence_axis_name=sequence_axis_name,
+                padding_only=True,
             )
 
         if m.ndim == 3:
@@ -1625,6 +1634,7 @@ class MaskInfo:
             qheads_axis_name=qheads_axis_name,
             kvheads_axis_name=kvheads_axis_name,
             sequence_axis_name=sequence_axis_name,
+            padding_only=True,
         )
 
     @classmethod
@@ -2127,7 +2137,7 @@ class MaskInfo:
         if mask.dtype == dtype:
             return self
 
-        return self.replace(attention_mask=mask.astype(dtype))
+        return self.replace(attention_mask=mask.astype(dtype), padding_only=self.padding_only)
 
     @property
     def batch_size(self) -> int | None:
@@ -2278,7 +2288,9 @@ class MaskInfo:
 
             attn, kv_seg = jax.vmap(_slice_k, in_axes=(0, 0, seg_idx), out_axes=(0, seg_idx))(attn, kv_lengths, kv_seg)
 
-        return self.replace(attention_mask=attn, q_segment_ids=q_seg, kv_segment_ids=kv_seg)
+        return self.replace(
+            attention_mask=attn, q_segment_ids=q_seg, kv_segment_ids=kv_seg, padding_only=self.padding_only
+        )
 
     @_debug_trace
     def apply_causal(self, offset: int | Int[Array, "batch"] = 0) -> "MaskInfo":
@@ -2336,7 +2348,7 @@ class MaskInfo:
         causal = jax.vmap(_mk_causal, in_axes=(None, None, 0))(Q, K, off)
         causal = causal[:, None, :, :]
 
-        return self.replace(attention_mask=base_mask & causal, causal_mask_baked_in=True)
+        return self.replace(attention_mask=base_mask & causal, causal_mask_baked_in=True, padding_only=self.padding_only)
 
     @_debug_trace
     def apply_sliding_window(
@@ -2822,6 +2834,8 @@ class MaskInfo:
         baked = [k for k, v in self.baked_in_masks.items() if v]
         if baked:
             items.append(f"baked_in={baked}")
+        if self.padding_only:
+            items.append("padding_only=True")
 
         return f"MaskInfo({', '.join(items)})"
 
@@ -2839,9 +2853,9 @@ class MaskInfo:
             Tuple of (children, aux_data) where:
             - children: 7-tuple ``(attention_mask, q_segment_ids, kv_segment_ids, cu_seqlens_q,
               cu_seqlens_kv, q_positions, kv_positions)`` — the array leaves.
-            - aux_data: 8-tuple ``(batch_axis_name, qheads_axis_name, kvheads_axis_name,
+            - aux_data: 9-tuple ``(batch_axis_name, qheads_axis_name, kvheads_axis_name,
               sequence_axis_name, causal_mask_baked_in, sliding_window_baked_in,
-              chunked_mask_baked_in, token_type_ids_baked_in)`` — static metadata.
+              chunked_mask_baked_in, token_type_ids_baked_in, padding_only)`` — static metadata.
 
         Notes:
             - This method is automatically called by JAX during pytree operations
@@ -2868,6 +2882,7 @@ class MaskInfo:
             self.sliding_window_baked_in,
             self.chunked_mask_baked_in,
             self.token_type_ids_baked_in,
+            self.padding_only,
         )
         return children, aux_data
 
@@ -2881,10 +2896,10 @@ class MaskInfo:
         transformations have been applied.
 
         Args:
-            aux_data: Static metadata tuple of 8 elements:
+            aux_data: Static metadata tuple of 9 elements:
                 ``(batch_axis_name, qheads_axis_name, kvheads_axis_name, sequence_axis_name,
                 causal_mask_baked_in, sliding_window_baked_in, chunked_mask_baked_in,
-                token_type_ids_baked_in)``.
+                token_type_ids_baked_in, padding_only)``.
             children: Traced array tuple of 7 elements:
                 ``(attention_mask, q_segment_ids, kv_segment_ids, cu_seqlens_q, cu_seqlens_kv,
                 q_positions, kv_positions)``.
@@ -2907,6 +2922,7 @@ class MaskInfo:
             sliding_window_baked_in,
             chunked_mask_baked_in,
             token_type_ids_baked_in,
+            padding_only,
         ) = aux_data
         return cls(
             _attention_mask=attention_mask,
@@ -2924,6 +2940,7 @@ class MaskInfo:
             qheads_axis_name=qheads_axis_name,
             kvheads_axis_name=kvheads_axis_name,
             sequence_axis_name=sequence_axis_name,
+            padding_only=padding_only,
         )
 
     @_debug_trace
@@ -2957,6 +2974,9 @@ class MaskInfo:
                 - qheads_axis_name: New query heads axis name(s)
                 - kvheads_axis_name: New key-value heads axis name(s)
                 - sequence_axis_name: New sequence axis name(s)
+                - padding_only: New ``padding_only`` promise. When omitted it is kept, except that a new
+                  ``attention_mask`` or new segment ids clear it (the replacement may encode documents or a
+                  custom pairwise mask).
 
         Returns:
             New MaskInfo instance with specified fields replaced
@@ -2985,6 +3005,8 @@ class MaskInfo:
         if mask_rep_changed and cu_seqlens_q is None and cu_seqlens_kv is None:
             replace_kwargs["_cu_seqlens_q"] = None
             replace_kwargs["_cu_seqlens_kv"] = None
+        if mask_rep_changed and "padding_only" not in kw:
+            replace_kwargs["padding_only"] = False
 
         replace_kwargs.update(kw)
 

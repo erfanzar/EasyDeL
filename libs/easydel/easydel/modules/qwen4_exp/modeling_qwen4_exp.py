@@ -107,6 +107,7 @@ from easydel.layers.indexer import (
     indexer_distillation_loss,
     paged_block_topk,
     ste_score_proxy,
+    warn_unsupported_scoring_kernel,
 )
 from easydel.layers.mlp import moe_gated_expert_forward
 from easydel.layers.norms import lowfloats
@@ -645,6 +646,7 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
         if self.indexer is not None:
             # Row-parallel TPU top-k resolves its layout from the model mesh.
             self.indexer.mesh_source = config
+            warn_unsupported_scoring_kernel(config, "Qwen4-Exp block-top-k")
 
     def _paged_indexer_select(
         self,

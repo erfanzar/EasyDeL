@@ -71,6 +71,48 @@ def pack_pool_bits(pool_mask: Array) -> Array:
     return lax.bitcast_convert_type(packed, jnp.int32)
 
 
+def as_pool_bits(selection: Array) -> Array:
+    """Normalise a pool selection to packed words.
+
+    Args:
+        selection: ``[B, S, P]`` bool selected pools, or ``[B, S, W]`` int32 / uint32 words already in the
+            :func:`pack_pool_bits` layout (bit ``p % 32`` of word ``p // 32`` = pool ``p``; bits of pools that do
+            not exist must be 0).
+
+    Returns:
+        ``[B, S, W]`` int32 packed words.
+
+    Raises:
+        ValueError: On any other dtype (an integer 0/1 mask is not a packed selection).
+    """
+    if selection.dtype == jnp.bool_:
+        return pack_pool_bits(selection)
+    if selection.dtype == jnp.int32:
+        return selection
+    if selection.dtype == jnp.uint32:
+        return lax.bitcast_convert_type(selection, jnp.int32)
+    raise ValueError(
+        f"dsa_sparse_attention: the pool selection must be a bool [B, S, P] mask or int32 [B, S, W] packed words, "
+        f"got dtype {selection.dtype}"
+    )
+
+
+def unpack_pool_bits(bits: Array, num_pools: int) -> Array:
+    """Inverse of :func:`pack_pool_bits`.
+
+    Args:
+        bits: ``[B, S, W]`` int32 / uint32 packed words (a bool mask is packed first).
+        num_pools: Pools to unpack (``<= 32 * W``).
+
+    Returns:
+        ``[B, S, num_pools]`` bool.
+    """
+    words = lax.bitcast_convert_type(as_pool_bits(bits), jnp.uint32)
+    pools = jnp.arange(num_pools, dtype=jnp.int32)
+    shift = (pools % WORD).astype(jnp.uint32)
+    return ((words[..., pools // WORD] >> shift) & jnp.uint32(1)).astype(jnp.bool_)
+
+
 def parse_sparse_mode(mode: str | None) -> tuple[str, int]:
     """Parse a visit mode.
 
@@ -163,8 +205,12 @@ def build_tables(
 ) -> tuple[Array, Array, Array, Array]:
     """Build the kernels' tables from the pool selection and the tail keys (see the module docstring).
 
+    Every per-query quantity is derived from the packed words, so a packed selection never expands to a
+    ``[B, S, P]`` tensor here.
+
     Args:
-        pool_mask: ``[B, S, P]`` bool selected pools (``P <= ceil(S / kpool)``).
+        pool_mask: ``[B, S, P]`` bool selected pools (``P <= ceil(S / kpool)``), or the same selection as
+            ``[B, S, W]`` int32 packed words (:func:`pack_pool_bits` layout).
         tails: ``[B, S, T]`` int32 tail keys, ``-1`` = none, ``T <= 8``; ``None`` = no tails.
         kpool: Keys per pool.
         block_q: Query block (multiple of 128).
@@ -175,18 +221,27 @@ def build_tables(
         ``(bits_t [B, W_pad, S], tails_t [B, 8, S], count [B, nQB], kv_list [B, nQB, nKB])``.
 
     Raises:
-        ValueError: On invalid tiles, mode, pool count or tail count.
+        ValueError: On invalid tiles, mode, pool or word count, tail count or selection dtype.
     """
     kind, budget = parse_sparse_mode(mode)
     validate_blocks(block_q, block_kv, kpool)
-    batch, seq, num_pools = pool_mask.shape
+    batch, seq = pool_mask.shape[:2]
     n_qb = -(-seq // block_q)
     n_kb = -(-seq // block_kv)
     pools_per_kb = block_kv // kpool
-    if num_pools > n_kb * pools_per_kb:
-        raise ValueError(f"dsa_sparse_attention: {num_pools} pools exceed the {n_kb * pools_per_kb} the keys can hold")
+    words_per_kb = pools_per_kb // WORD  # exact: validate_blocks requires block_kv % (32 * kpool) == 0
+    if pool_mask.dtype == jnp.bool_ and pool_mask.shape[-1] > n_kb * pools_per_kb:
+        raise ValueError(
+            f"dsa_sparse_attention: {pool_mask.shape[-1]} pools exceed the {n_kb * pools_per_kb} the keys can hold"
+        )
 
-    bits = pack_pool_bits(pool_mask)  # [B, S, W]
+    bits = as_pool_bits(pool_mask)  # [B, S, W]
+    if bits.shape[-1] > n_kb * words_per_kb:
+        raise ValueError(
+            f"dsa_sparse_attention: {bits.shape[-1]} pool words exceed the {n_kb * words_per_kb} the keys can hold"
+        )
+    kb_words = jnp.pad(bits, ((0, 0), (0, 0), (0, n_kb * words_per_kb - bits.shape[-1])))
+    kb_words = kb_words.reshape(batch, seq, n_kb, words_per_kb)  # [B, S, nKB, words per kv-block]
     w_pad = _round_up(bits.shape[-1], 8)
     bits = jnp.pad(bits, ((0, 0), (0, 0), (0, w_pad - bits.shape[-1])))
     bits_t = jnp.transpose(bits, (0, 2, 1))  # [B, W_pad, S]
@@ -201,8 +256,7 @@ def build_tables(
     )
 
     # per-query kv-block hits: any selected pool inside the block, or a tail key inside it
-    pm = jnp.pad(pool_mask, ((0, 0), (0, 0), (0, n_kb * pools_per_kb - num_pools)))
-    hit = jnp.any(pm.reshape(batch, seq, n_kb, pools_per_kb), axis=-1)  # [B, S, nKB]
+    hit = jnp.any(kb_words != 0, axis=-1)  # [B, S, nKB]
     tail_kb = jnp.where(tails >= 0, tails // block_kv, -1)  # [B, S, T]
     hit = hit | jnp.any(tail_kb[..., None] == jnp.arange(n_kb)[None, None, None, :], axis=2)
     pad_q = n_qb * block_q - seq
@@ -216,24 +270,21 @@ def build_tables(
     if kind == "dense":
         active = jnp.broadcast_to(causal, active.shape)
     elif kind == "budget":
-        active = _budget_active(active, pm, tail_kb, n_qb, n_kb, block_q, pools_per_kb, kpool, pad_q, budget)
+        active = _budget_active(active, kb_words, tail_kb, n_qb, n_kb, block_q, kpool, pad_q, budget)
     count = jnp.sum(active, axis=-1, dtype=jnp.int32)
     kv_list = jnp.sort(jnp.where(active, jnp.arange(n_kb, dtype=jnp.int32)[None, None, :], n_kb), axis=-1)
     return bits_t, tails_t, count, kv_list.astype(jnp.int32)
 
 
-def pair_weights(
-    pm: Array, tail_kb: Array, n_qb: int, n_kb: int, block_q: int, pools_per_kb: int, kpool: int, pad_q: int
-) -> Array:
+def pair_weights(kb_words: Array, tail_kb: Array, n_qb: int, n_kb: int, block_q: int, kpool: int, pad_q: int) -> Array:
     """Selected-key weight of every (q-block, kv-block) pair.
 
     Args:
-        pm: ``[B, S, nKB * pools_per_kb]`` bool pool mask padded to whole kv-blocks.
+        kb_words: ``[B, S, nKB, block_kv // (32 * kpool)]`` int32 packed pool words grouped by kv-block.
         tail_kb: ``[B, S, T]`` kv-block of every tail key (``-1`` = none).
         n_qb: Number of q-blocks.
         n_kb: Number of kv-blocks.
         block_q: Query block.
-        pools_per_kb: Pools per kv-block.
         kpool: Keys per pool.
         pad_q: Padding queries appended to reach ``n_qb * block_q``.
 
@@ -241,8 +292,8 @@ def pair_weights(
         ``[B, nQB, nKB]`` int32: ``kpool`` per selected pool plus one per tail key of the q-block's queries (a tail
         repeating a pool key counts twice; a ranking weight, not the open set).
     """
-    batch, seq = pm.shape[:2]
-    pools = jnp.sum(pm.reshape(batch, seq, n_kb, pools_per_kb), axis=-1, dtype=jnp.int32) * kpool
+    batch = kb_words.shape[0]
+    pools = jnp.sum(lax.population_count(kb_words), axis=-1, dtype=jnp.int32) * kpool
     tails_hit = jnp.sum(
         tail_kb[..., None] == jnp.arange(n_kb, dtype=jnp.int32)[None, None, None, :], axis=2, dtype=jnp.int32
     )
@@ -252,11 +303,11 @@ def pair_weights(
     return jnp.sum(per_query.reshape(batch, n_qb, block_q, n_kb), axis=2, dtype=jnp.int32)
 
 
-def _budget_active(active, pm, tail_kb, n_qb, n_kb, block_q, pools_per_kb, kpool, pad_q, budget: int):
+def _budget_active(active, kb_words, tail_kb, n_qb, n_kb, block_q, kpool, pad_q, budget: int):
     """Keep, per q-block, the ``budget`` active kv-blocks with the most selected keys (ties -> the later block)."""
     if budget >= n_kb:
         return active
-    weight = pair_weights(pm, tail_kb, n_qb, n_kb, block_q, pools_per_kb, kpool, pad_q)
+    weight = pair_weights(kb_words, tail_kb, n_qb, n_kb, block_q, kpool, pad_q)
     kb_ids = jnp.arange(n_kb, dtype=jnp.int32)
     key = jnp.where(active, weight * n_kb + kb_ids[None, None, :], -1)  # rank by weight, then by block id
     vals, idx = lax.top_k(key, budget)  # [B, nQB, budget]
@@ -379,6 +430,7 @@ __all__ = (
     "POOL_SUMS",
     "TAIL_ROWS",
     "WORD",
+    "as_pool_bits",
     "build_q_tables",
     "build_tables",
     "dma_block_indices",
@@ -387,6 +439,7 @@ __all__ = (
     "pack_pool_bits",
     "pair_weights",
     "parse_sparse_mode",
+    "unpack_pool_bits",
     "validate_blocks",
     "validate_options",
     "visited_open_mask",

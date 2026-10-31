@@ -49,8 +49,37 @@ class IndexerScoreSharding(common_types.DynamicShardingAxes):
     mode: tp.ClassVar = 1
 
 
+@dataclasses.dataclass(frozen=True)
+class ScoreRowSplit:
+    """Explicit row layout for indexer scoring and selection, in place of the resolver's.
+
+    Pass it as ``mesh_source`` to :func:`top_k_values_indices`, :func:`top_k_mask`, :func:`top_k_threshold` or
+    ``fused_head_scores``: score rows ``[batch, query]`` are split over ``rows`` (two PartitionSpec entries) instead of
+    the resolved ``[BATCH, QUERY_LENGTH]`` layout. A caller whose queries are split over more axes than the activation
+    layout (e.g. sequence-parallel attention over the tensor axes) uses it so every device ranks only its own rows
+    rather than all of them redundantly. Entries that do not divide a dimension are dropped (that dimension is then
+    replicated), as with the resolved layout.
+
+    Attributes:
+        mesh: The JAX mesh.
+        rows: ``(batch_entry, query_entry)`` PartitionSpec entries.
+    """
+
+    mesh: jax.sharding.Mesh
+    rows: tuple[tp.Any, tp.Any]
+
+
 def _score_row_layout(mesh_source: object | None, shape: tuple[int, ...]):
     """Resolve ``(mesh, spec)`` for row-parallel selection, or ``(None, None)``."""
+    if isinstance(mesh_source, ScoreRowSplit):
+        if len(shape) < 3:
+            return None, None
+        sizes = dict(mesh_source.mesh.shape)
+        rows = []
+        for dim, entry in zip(shape[:2], mesh_source.rows, strict=True):
+            axes = entry if isinstance(entry, tuple) else (() if entry is None else (entry,))
+            rows.append(entry if dim % math.prod(sizes[axis] for axis in axes) == 0 else None)
+        return mesh_source.mesh, PartitionSpec(*rows, *([None] * (len(shape) - 2)))
     mesh = getattr(mesh_source, "mesh", mesh_source)
     mesh = getattr(mesh, "jax_mesh", mesh)
     resolver = getattr(mesh_source, "runtime_sharding_resolver", None)

@@ -80,7 +80,7 @@ def _token_rope_split(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array
 
 def _paged_pool_topk_impl(platform: str):
     """Registered ``paged_pool_topk`` implementation for ``platform`` (``pallas`` or ``xla``)."""
-    from ejkernel.kernels._registry import kernel_registry  # pyright: ignore[reportMissingTypeStubs]
+    from ejkernel.kernels import kernel_registry  # pyright: ignore[reportMissingTypeStubs]
 
     return kernel_registry.get("paged_pool_topk", platform=platform, backend="any")
 

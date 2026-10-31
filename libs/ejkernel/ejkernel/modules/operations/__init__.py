@@ -192,6 +192,7 @@ from .configs import (
     CompressedWindowDecodeConfig,
     DecodeAttentionConfig,
     DeepSeekAttentionConfig,
+    DsaGatherAttentionConfig,
     DsaSparseAttentionConfig,
     FlashAttentionConfig,
     FlashMLAConfig,
@@ -244,7 +245,8 @@ from .configs import (
 )
 from .decode_attention import DecodeAttention, decode_attention
 from .deepseek_attn import DeepSeekAttention, deepseek_attn
-from .dsa_sparse_attention import DsaSparseAttention, dsa_sparse_attention
+from .dsa_gather_attention import DsaGatherAttention, dsa_gather_attention
+from .dsa_sparse_attention import DSA_SPARSE_MAX_TAIL_KEYS, DsaSparseAttention, dsa_sparse_attention, pack_pool_bits
 from .flash_attention import FlashAttention, flash_attention
 from .fused_cakld_tv import CakldTvOutput, FusedCakldTv, fused_cakld_tv
 from .fused_conv_decode import FusedConvDecode, fused_conv_decode, fused_conv_decode_op
@@ -285,6 +287,7 @@ from .kernel_delta_attention import KernelDeltaAttention, kda_attention, kernel_
 from .lightning_attention import LightningAttention, lightning_attention
 from .mhc import MHCCollapse, MHCExpand, MHCFusedConfig, mhc_collapse, mhc_expand
 from .mhc_coefficients import MHCCoefficients, MHCCoefficientsConfig, mhc_coefficients
+from .moe_row_gather import row_gather_sum_unsupported_reason, row_gather_unsupported_reason
 from .multi_head_latent_attention import FlashMLA, flash_mla
 from .multi_latent_ragged_page_attention import (
     MultiLatentRaggedPageAttention,
@@ -327,7 +330,7 @@ from .ragged_page_attention_v2_turboquant import (
     RaggedPageAttentionv2TurboQuant,
     ragged_page_attention_v2_turboquant,
 )
-from .ragged_page_attention_v3 import RaggedPageAttentionv3, ragged_page_attention_v3
+from .ragged_page_attention_v3 import RaggedPageAttentionv3, ragged_page_attention_v3, reduce_sinks_to_heads
 from .ragged_page_attention_v3_turboquant import (
     RaggedPageAttentionv3TurboQuant,
     ragged_page_attention_v3_turboquant,
@@ -354,6 +357,7 @@ from .unified_attention import UnifiedAttention, unified_attention
 gdr_attention = gated_delta_rule
 
 __all__ = (
+    "DSA_SPARSE_MAX_TAIL_KEYS",
     "KERNEL_TILE_POLICIES",
     "RWKV4",
     "RWKV6",
@@ -382,6 +386,8 @@ __all__ = (
     "DecodeAttentionConfig",
     "DeepSeekAttention",
     "DeepSeekAttentionConfig",
+    "DsaGatherAttention",
+    "DsaGatherAttentionConfig",
     "DsaSparseAttention",
     "DsaSparseAttentionConfig",
     "FlashAttention",
@@ -502,6 +508,7 @@ __all__ = (
     "compute_schedule_table_v2",
     "decode_attention",
     "deepseek_attn",
+    "dsa_gather_attention",
     "dsa_sparse_attention",
     "flash_attention",
     "flash_mla",
@@ -537,6 +544,7 @@ __all__ = (
     "native_sparse_attention",
     "normalize_kernel_tile_policy",
     "pack_int4_adjacent",
+    "pack_pool_bits",
     "page_attention",
     "prefill_page_attention",
     "quantized_matmul",
@@ -559,9 +567,12 @@ __all__ = (
     "recurrent_attention",
     "reduce_scatter",
     "reduce_scatter_matmul",
+    "reduce_sinks_to_heads",
     "reorder_conv_features_for_sharding",
     "resolve_mlp_combine",
     "ring_attention",
+    "row_gather_sum_unsupported_reason",
+    "row_gather_unsupported_reason",
     "row_permute",
     "rwkv4",
     "rwkv6",

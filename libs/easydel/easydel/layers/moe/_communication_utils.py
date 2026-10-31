@@ -23,11 +23,14 @@ fused policies and metrics.
 from __future__ import annotations
 
 import enum
+import functools
 import typing
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import jax
+import numpy as np
+from eformer.loggings import get_logger
 from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Float, Int
@@ -36,6 +39,8 @@ from spectrax import common_types
 from easydel.infra.sharding import MeshLike, RuntimeShardingResolver, coerce_runtime_sharding_resolver
 
 from ._expert_stats import maybe_record_group_sizes
+
+logger = get_logger(__name__)
 
 BATCH = common_types.BATCH
 EMPTY = common_types.EMPTY
@@ -334,6 +339,246 @@ def sort_activations_custom(
         solve=lambda _, rows: rows[sort_indices, ...],
         transpose_solve=lambda _, rows: rows[inverse_indices, ...],
     )
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(3,))
+def _repeat_sort(inputs: jax.Array, sort_indices: jax.Array, inverse_indices: jax.Array, repeats: int) -> jax.Array:
+    """``jnp.repeat(inputs, repeats, axis=0)[sort_indices]`` as one row gather from ``inputs``."""
+    del inverse_indices
+    rows = jax.lax.div(sort_indices, jnp.asarray(repeats, dtype=sort_indices.dtype))
+    return inputs[rows, ...]
+
+
+@_repeat_sort.defjvp
+def _repeat_sort_jvp(repeats, primals, tangents):
+    """The tangent is the repeat-then-sort composition, so reverse mode transposes to an inverse gather + row sum."""
+    inputs, sort_indices, inverse_indices = primals
+    d_inputs = tangents[0]
+    out = _repeat_sort(inputs, sort_indices, inverse_indices, repeats)
+    d_out = sort_activations_custom(jnp.repeat(d_inputs, repeats, axis=0), sort_indices, inverse_indices)
+    return out, d_out
+
+
+def repeat_sort_activations(
+    inputs: jax.Array,
+    sort_indices: jax.Array,
+    repeats: int,
+    inverse_indices: jax.Array | None = None,
+) -> jax.Array:
+    """``jnp.repeat(inputs, repeats, axis=0)[sort_indices]`` without materializing the repeat.
+
+    The MoE dispatch replicates every token ``top_k`` times and sorts the copies by expert. Built literally, the
+    repeat is a ``[tokens * top_k, H]`` buffer that XLA keeps (and that a remat recomputes) before the sorting gather.
+    Here the forward gathers each sorted row straight from its token (``inputs[sort_indices // repeats]``); the tangent
+    is the literal repeat followed by :func:`sort_activations_custom`, so reverse mode is an inverse-permutation gather
+    of the cotangent followed by a sum over each token's ``repeats`` copies — the same backward as the literal form,
+    with no scatter. Forward and reverse mode, higher derivatives and ``vmap`` all work. Values are bit-identical to
+    the literal form (rows are moved, not computed).
+
+    Args:
+        inputs: Token rows ``[tokens, ...]``.
+        sort_indices: Permutation of ``range(tokens * repeats)`` ordering the repeated rows.
+        repeats: Copies per token (static).
+        inverse_indices: Inverse of ``sort_indices``; computed when omitted.
+
+    Returns:
+        ``[tokens * repeats, ...]`` rows with ``out[i] = inputs[sort_indices[i] // repeats]``.
+
+    Raises:
+        ValueError: If ``sort_indices`` does not have ``tokens * repeats`` entries.
+    """
+    repeats = int(repeats)
+    if inputs.shape[0] * repeats != sort_indices.shape[0]:
+        raise ValueError(
+            f"sort_indices must order the {inputs.shape[0]} x {repeats} repeated rows, got {sort_indices.shape[0]}"
+        )
+    if repeats == 1:
+        return sort_activations_custom(inputs, sort_indices, inverse_indices)
+    if inverse_indices is None:
+        inverse_indices = _inverse_permutation(sort_indices)
+    return _repeat_sort(inputs, sort_indices, inverse_indices, repeats)
+
+
+def _moe_row_gather_kernels():
+    """The registered Pallas TPU ``moe_row_gather`` / ``moe_row_gather_sum`` entries (each has an XLA fallback)."""
+    from ejkernel.kernels import Backend, Platform, kernel_registry  # pyright: ignore[reportMissingTypeStubs]
+
+    return (
+        kernel_registry.get("moe_row_gather", platform=Platform.PALLAS, backend=Backend.TPU),
+        kernel_registry.get("moe_row_gather_sum", platform=Platform.PALLAS, backend=Backend.TPU),
+    )
+
+
+def _float0_zeros(x: jax.Array) -> np.ndarray:
+    return np.zeros(x.shape, dtype=jax.dtypes.float0)
+
+
+def row_gather_dispatch_unsupported_reason(inputs: jax.Array, repeats: int) -> str | None:
+    """Why :func:`kernel_repeat_sort_activations` cannot run its Pallas kernels here (``None``: it can).
+
+    Checks the forward gather and the backward gather-sum. Only shapes and dtypes are read.
+    """
+    from ejkernel.modules import (  # pyright: ignore[reportMissingTypeStubs]
+        row_gather_sum_unsupported_reason,
+        row_gather_unsupported_reason,
+    )
+
+    if inputs.ndim != 2:
+        return f"rank-{inputs.ndim} inputs"
+    tokens, hidden = inputs.shape
+    rows = tokens * int(repeats)
+    reason = row_gather_unsupported_reason(inputs, jax.ShapeDtypeStruct((rows,), jnp.int32))
+    if reason is not None:
+        return f"forward gather: {reason}"
+    reason = row_gather_sum_unsupported_reason(
+        jax.ShapeDtypeStruct((rows, hidden), inputs.dtype),
+        jax.ShapeDtypeStruct((tokens, int(repeats)), jnp.int32),
+        jax.ShapeDtypeStruct((tokens, int(repeats)), jnp.float32),
+        inputs.dtype,
+    )
+    return None if reason is None else f"backward gather-sum: {reason}"
+
+
+def row_gather_combine_unsupported_reason(
+    intermediate: jax.Array, weights: jax.Array, out_dtype: jnp.dtype
+) -> str | None:
+    """Why :func:`kernel_unsort_combine` cannot run its Pallas kernels here (``None``: it can).
+
+    Checks the forward gather-sum and the backward scaled gather with its fused row dot.
+    """
+    from ejkernel.modules import (  # pyright: ignore[reportMissingTypeStubs]
+        row_gather_sum_unsupported_reason,
+        row_gather_unsupported_reason,
+    )
+
+    if intermediate.ndim != 2 or weights.ndim != 2:
+        return f"intermediate {tuple(intermediate.shape)} / weights {tuple(weights.shape)} must be 2-D"
+    tokens, k = weights.shape
+    rows, hidden = intermediate.shape
+    if rows != tokens * k:
+        return f"{rows} expert rows != {tokens} tokens x {k}"
+    reason = row_gather_sum_unsupported_reason(
+        intermediate, jax.ShapeDtypeStruct((tokens, k), jnp.int32), weights, out_dtype
+    )
+    if reason is not None:
+        return f"forward gather-sum: {reason}"
+    reason = row_gather_unsupported_reason(
+        jax.ShapeDtypeStruct((tokens, hidden), jnp.dtype(out_dtype)),
+        jax.ShapeDtypeStruct((rows,), jnp.int32),
+        jax.ShapeDtypeStruct((rows,), jnp.float32),
+        intermediate,
+    )
+    return None if reason is None else f"backward gather: {reason}"
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
+def _kernel_repeat_sort(inputs: jax.Array, sort_indices: jax.Array, inverse_indices: jax.Array, repeats: int):
+    gather, _ = _moe_row_gather_kernels()
+    rows = jax.lax.div(sort_indices, jnp.asarray(repeats, dtype=sort_indices.dtype))
+    return gather(inputs, rows)[0]
+
+
+def _kernel_repeat_sort_fwd(inputs, sort_indices, inverse_indices, repeats):
+    return _kernel_repeat_sort(inputs, sort_indices, inverse_indices, repeats), (sort_indices, inverse_indices)
+
+
+def _kernel_repeat_sort_bwd(repeats, residuals, ct):
+    sort_indices, inverse_indices = residuals
+    _, gather_sum = _moe_row_gather_kernels()
+    tokens = inverse_indices.shape[0] // repeats
+    ones = jnp.ones((tokens, repeats), jnp.float32)
+    d_inputs = gather_sum(ct, inverse_indices.reshape(tokens, repeats), ones, ct.dtype)
+    return d_inputs, _float0_zeros(sort_indices), _float0_zeros(inverse_indices)
+
+
+_kernel_repeat_sort.defvjp(_kernel_repeat_sort_fwd, _kernel_repeat_sort_bwd)
+
+
+def kernel_repeat_sort_activations(
+    inputs: jax.Array,
+    sort_indices: jax.Array,
+    repeats: int,
+    inverse_indices: jax.Array | None = None,
+) -> jax.Array:
+    """:func:`repeat_sort_activations` through the ejkernel Pallas TPU row-gather kernels.
+
+    Forward: ``out[i] = inputs[sort_indices[i] // repeats]`` by per-row DMA (``moe_row_gather``), bit-identical to the
+    gather. Backward: ``d_inputs[t] = sum_j ct[inverse_indices[t * repeats + j]]`` by a fused gather-sum
+    (``moe_row_gather_sum``, fp32 accumulation). A ``jax.custom_vjp``: first-order reverse mode only (no ``jvp``).
+    Callers check :func:`row_gather_dispatch_unsupported_reason` first; unsupported shapes would still compute
+    through the kernels' XLA fallback.
+
+    Args:
+        inputs: Token rows ``[tokens, H]``.
+        sort_indices: Permutation of ``range(tokens * repeats)``.
+        repeats: Copies per token (static).
+        inverse_indices: Inverse of ``sort_indices``; computed when omitted.
+
+    Returns:
+        ``[tokens * repeats, H]`` rows in ``inputs.dtype``.
+    """
+    if inverse_indices is None:
+        inverse_indices = _inverse_permutation(sort_indices)
+    return _kernel_repeat_sort(inputs, sort_indices.astype(jnp.int32), inverse_indices.astype(jnp.int32), int(repeats))
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(4,))
+def _kernel_unsort_combine(intermediate, weights, sort_indices, inverse_indices, out_dtype):
+    _, gather_sum = _moe_row_gather_kernels()
+    return gather_sum(intermediate, inverse_indices.reshape(weights.shape), weights, out_dtype)
+
+
+def _kernel_unsort_combine_fwd(intermediate, weights, sort_indices, inverse_indices, out_dtype):
+    out = _kernel_unsort_combine(intermediate, weights, sort_indices, inverse_indices, out_dtype)
+    return out, (intermediate, weights, sort_indices, inverse_indices)
+
+
+def _kernel_unsort_combine_bwd(out_dtype, residuals, d_out):
+    intermediate, weights, sort_indices, inverse_indices = residuals
+    gather, _ = _moe_row_gather_kernels()
+    k = weights.shape[1]
+    rows = jax.lax.div(sort_indices, jnp.asarray(k, dtype=sort_indices.dtype))
+    scale = weights.reshape(-1).astype(jnp.float32)[sort_indices]
+    # Expert row i belongs to route sort_indices[i]: d_intermediate[i] = w[route] * d_out[token], and the weight's
+    # gradient is the dot of that token's output cotangent with the (unscaled) expert row.
+    d_intermediate, d_sorted = gather(d_out, rows, scale, intermediate)
+    d_weights = d_sorted[inverse_indices].reshape(weights.shape).astype(weights.dtype)
+    return (
+        d_intermediate.astype(intermediate.dtype),
+        d_weights,
+        _float0_zeros(sort_indices),
+        _float0_zeros(inverse_indices),
+    )
+
+
+_kernel_unsort_combine.defvjp(_kernel_unsort_combine_fwd, _kernel_unsort_combine_bwd)
+
+
+def kernel_unsort_combine(
+    intermediate: jax.Array,
+    sort_indices: jax.Array,
+    weights: jax.Array,
+    out_dtype: jnp.dtype,
+) -> jax.Array:
+    """The :func:`unpermute` unsort + weighted top-k sum through the ejkernel Pallas TPU row-gather kernels.
+
+    Forward: ``out[t] = sum_j weights[t, j] * intermediate[inverse[t * k + j]]`` (``moe_row_gather_sum``, fp32
+    accumulation, one cast to ``out_dtype``) without materializing the unsorted ``[tokens * k, H]`` copy. Backward:
+    one scaled row gather of the output cotangent with a fused row dot against ``intermediate``
+    (``moe_row_gather``), giving both input gradients. A ``jax.custom_vjp``: first-order reverse mode only.
+
+    Args:
+        intermediate: Expert outputs in expert-sorted order ``[tokens * k, H]``.
+        sort_indices: The dispatch permutation (``permute``'s ``sorted_selected_experts``).
+        weights: Combine weights ``[tokens, k]``.
+        out_dtype: Output dtype.
+
+    Returns:
+        ``[tokens, H]`` in ``out_dtype``.
+    """
+    sort_indices = sort_indices.astype(jnp.int32)
+    inverse_indices = _inverse_permutation(sort_indices)
+    return _kernel_unsort_combine(intermediate, weights, sort_indices, inverse_indices, jnp.dtype(out_dtype))
 
 
 @dataclass(frozen=True)
@@ -657,6 +902,7 @@ def replicated_expert_psum_unpermute(
     num_experts_per_tok: int,
     dtype: jnp.dtype,
     weight_modif_fn: typing.Callable[[jax.Array], jax.Array] | None = None,
+    row_gather_kernel: bool = False,
 ) -> jax.Array:
     """Inference combine for replicated-batch expert parallelism: local unpermute + one ``psum``.
 
@@ -688,6 +934,8 @@ def replicated_expert_psum_unpermute(
         num_experts_per_tok: ``k``.
         dtype: Output dtype.
         weight_modif_fn: Optional weight post-processing, as in :func:`unpermute`.
+        row_gather_kernel: Forwarded to :func:`unpermute` (``moe_row_gather_kernel``); the fp32 partial combine is
+            outside the kernels' bfloat16 contract, so :func:`unpermute` warns once and keeps the XLA combine.
 
     Returns:
         Combined outputs ``[batch_size, sequence_length, H]`` in ``dtype``, identical on every shard.
@@ -706,6 +954,7 @@ def replicated_expert_psum_unpermute(
         batch_size=batch_size,
         sequence_length=sequence_length,
         use_custom_sort_vjp=True,
+        row_gather_kernel=row_gather_kernel,
         weight_modif_fn=weight_modif_fn,
         num_experts_per_tok=num_experts_per_tok,
         dtype=jnp.float32,
@@ -860,6 +1109,7 @@ def permute(
     scale_replicated_inputs: typing.Callable[[jax.Array, jax.Array], jax.Array] | None = None,
     preselected_routing: tuple[jax.Array, jax.Array] | None = None,
     record_replica_id: jax.Array | int | None = None,
+    row_gather_kernel: bool = False,
 ) -> tuple[Array, Array, Array, Array, Array]:
     """Permute tokens by expert assignment for grouped matmul.
 
@@ -908,6 +1158,10 @@ def permute(
         record_replica_id: Optional index among shards holding identical router
             histograms. Only replica zero is recorded; distinct token shards must
             each use zero so genuine calls/chunks remain additive.
+        row_gather_kernel: Gather the sorted token copies with the ejkernel Pallas TPU row-gather kernels
+            (:func:`kernel_repeat_sort_activations`; first-order reverse mode only). Applies with
+            ``use_custom_sort_vjp`` and no ``scale_replicated_inputs``; when the kernels cannot run these shapes
+            (see :func:`row_gather_dispatch_unsupported_reason`) it warns once and keeps the default gather.
 
     Returns:
         A 5-tuple `(sorted_inputs, sorted_selected_experts, weights, group_size, sorted_experts)`
@@ -966,15 +1220,38 @@ def permute(
         flatten_selected_experts = (flatten_selected_experts - roll_to_expert_id) % num_experts
 
     sorted_selected_experts = jnp.argsort(flatten_selected_experts)
-    replicated_inputs_2d = jnp.repeat(inputs_2d, num_experts_per_tok, axis=0)
+    use_kernel = False
+    if row_gather_kernel:
+        blockers = []
+        if scale_replicated_inputs is not None:
+            blockers.append("a scale_replicated_inputs hook")
+        if not use_custom_sort_vjp:
+            blockers.append("use_custom_sort_vjp=False")
+        reason = row_gather_dispatch_unsupported_reason(inputs_2d, num_experts_per_tok)
+        if reason is not None:
+            blockers.append(reason)
+        if blockers:
+            logger.warn_once(f"moe_row_gather_kernel: dispatch uses the XLA gather here ({'; '.join(blockers)}).")
+        else:
+            use_kernel = True
+    if use_kernel:
+        sorted_inputs = kernel_repeat_sort_activations(inputs_2d, sorted_selected_experts, num_experts_per_tok).astype(
+            dtype
+        )
+    elif scale_replicated_inputs is None and use_custom_sort_vjp:
+        # Gather the sorted copies straight from the token rows: no [tokens*k, H] repeat buffer.
+        sorted_inputs = repeat_sort_activations(inputs_2d, sorted_selected_experts, num_experts_per_tok).astype(dtype)
+    else:
+        replicated_inputs_2d = jnp.repeat(inputs_2d, num_experts_per_tok, axis=0)
 
-    # Apply input scaling if hook is provided (for input-scaling MoE like Llama4)
-    # weights shape: (tokens, k), flatten to (tokens*k,) to match replicated_inputs_2d
-    if scale_replicated_inputs is not None:
-        flattened_weights = jnp.ravel(weights)  # (tokens*k,)
-        replicated_inputs_2d = scale_replicated_inputs(replicated_inputs_2d, flattened_weights)
+        # Input-scaling MoE (e.g. Llama4): scale each replicated row by its flattened (tokens, k) routing weight.
+        if scale_replicated_inputs is not None:
+            flattened_weights = jnp.ravel(weights)  # (tokens*k,)
+            replicated_inputs_2d = scale_replicated_inputs(replicated_inputs_2d, flattened_weights)
 
-    sorted_inputs = sort_activations(replicated_inputs_2d, sorted_selected_experts, use_custom_sort_vjp).astype(dtype)
+        sorted_inputs = sort_activations(replicated_inputs_2d, sorted_selected_experts, use_custom_sort_vjp).astype(
+            dtype
+        )
     group_size = jnp.bincount(flatten_selected_experts, length=num_experts)
     maybe_record_group_sizes(
         group_size,
@@ -1010,6 +1287,7 @@ def unpermute(
     *,
     num_experts_per_tok: int,
     dtype: jnp.dtype,
+    row_gather_kernel: bool = False,
 ):
     """Invert expert permutation and combine expert outputs per token.
 
@@ -1041,6 +1319,10 @@ def unpermute(
             combining (e.g., re-normalization).
         num_experts_per_tok: Number of experts per token (k).
         dtype: Output dtype after combining.
+        row_gather_kernel: Unsort and combine in one ejkernel Pallas TPU gather-sum
+            (:func:`kernel_unsort_combine`; fp32 accumulation, first-order reverse mode only) instead of a sorted
+            copy plus an einsum. Applies with ``use_custom_sort_vjp``; when the kernels cannot run these shapes (see
+            :func:`row_gather_combine_unsupported_reason`) it warns once and keeps the default combine.
 
     Returns:
         Output tensor with original layout. Shape: (batch_size, sequence_length, out_dim).
@@ -1066,6 +1348,19 @@ def unpermute(
         >>> # output[0,0] = 0.6*expert0_out + 0.7*expert2_out  # token 0's combined output
         >>> # output[0,1] = 0.4*expert1_out + 0.3*expert3_out  # token 1's combined output
     """
+
+    if row_gather_kernel:
+        kernel_weights = jnp.reshape(weights, (-1, num_experts_per_tok))
+        if weight_modif_fn is not None:
+            kernel_weights = weight_modif_fn(kernel_weights)
+        blockers = [] if use_custom_sort_vjp else ["use_custom_sort_vjp=False"]
+        reason = row_gather_combine_unsupported_reason(intermediate, kernel_weights, dtype)
+        if reason is not None:
+            blockers.append(reason)
+        if not blockers:
+            output = kernel_unsort_combine(intermediate, sorted_selected_experts, kernel_weights, dtype)
+            return output.reshape(batch_size, sequence_length, -1)
+        logger.warn_once(f"moe_row_gather_kernel: combine uses the XLA path here ({'; '.join(blockers)}).")
 
     unsort_intermediate = sort_activations(
         intermediate,
@@ -1353,7 +1648,9 @@ def get_moe_partition_spec(
               on M (intermediate) dimension.
         tensors_are_expert: Sharding mode selector:
             - True: Expert tensor mode - all experts sharded across TP axis.
-              Returns [tp, None, None] for weights, [tp, None] for bias.
+              Returns [tp, None, None] for weights ([tp, fsdp, None] with
+              ``fsdp_shards_experts`` and an fsdp axis that is not ep-bound),
+              [tp, None] for bias.
             - False: Standard mode - experts on EP axis, features on TP axis.
               Returns [expert, None, tp] or [expert, tp, None] based on direction.
         is_bias: Whether generating spec for bias (2D) vs weight (3D) tensor.
@@ -1368,8 +1665,9 @@ def get_moe_partition_spec(
         fsdp_shards_experts: If True (and fsdp is not ep-bound), append the
             FSDP axis to the expert-dimension placement so specs match
             expert weights that are FSDP-sharded at rest
-            (``moe_fsdp_shard_expert_weights``). Ignored in expert tensor
-            mode.
+            (``moe_fsdp_shard_expert_weights``). In expert tensor mode the
+            FSDP axis shards the second (feature) dimension of weights
+            instead; biases stay FSDP-replicated.
 
     Returns:
         PartitionSpec appropriate for the tensor configuration. Examples:
@@ -1417,11 +1715,13 @@ def get_moe_partition_spec(
     if len(expert_place) == 1:
         expert_place = expert_place[0]
     if tensors_are_expert:
-        # Expert tensor mode: all experts sharded across TP axis
+        # Expert tensor mode: all experts sharded across TP axis. FSDP-sharded expert weights split the second
+        # (feature) dimension, matching ``_moe_parameter_layout``; biases stay fsdp-replicated.
         if is_bias:
             return jax.sharding.PartitionSpec(tensor_axis_name, None)
-        else:
-            return jax.sharding.PartitionSpec(tensor_axis_name, None, None)
+        if fsdp_shards_experts and not fsdp_is_ep_bound:
+            return jax.sharding.PartitionSpec(tensor_axis_name, fsdp_axis_name, None)
+        return jax.sharding.PartitionSpec(tensor_axis_name, None, None)
     else:
         # Standard mode: experts on EP, features on TP
         if is_bias:

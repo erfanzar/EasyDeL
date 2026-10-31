@@ -432,6 +432,61 @@ def pairwise_attention_mask_from_mask_info(
     return pairwise
 
 
+def visible_interval_runs(pairwise: Array) -> tuple[Array, Array]:
+    """Split keys into runs that no query's visible interval crosses.
+
+    A packed-document boundary is possible only between two keys that no query sees on both sides of. Missing adjacent
+    edges are not enough, because a longer-range edge can span the apparent boundary, so each query's whole visible key
+    interval stays inside one run and every allowed pairwise edge is kept.
+
+    Args:
+        pairwise: Boolean visibility ``[batch, query, key]``.
+
+    Returns:
+        ``(runs, first_visible_key)``: run labels ``[batch, key]`` counted from 0 (keys no query sees still get a
+        label) and each query's first visible key ``[batch, query]`` (0 for a query that sees none).
+    """
+    key_positions = jnp.arange(pairwise.shape[-1], dtype=jnp.int32)
+    first_visible_key = jnp.argmax(pairwise, axis=-1)
+    last_visible_key = jnp.max(jnp.where(pairwise, key_positions, -1), axis=-1)
+    splits = key_positions[:-1]
+    crosses = (first_visible_key[:, :, None] <= splits) & (last_visible_key[:, :, None] > splits)
+    boundaries = jnp.pad(~jnp.any(crosses, axis=-2), ((0, 0), (1, 0)), constant_values=False)
+    return jnp.cumsum(boundaries, axis=-1, dtype=jnp.int32), first_visible_key
+
+
+def document_segment_ids(mask_info: MaskInfo, pairwise_mask: Array | None) -> tuple[Array, Array]:
+    """Query and key document identities of an uncached self-attention mask, ``-1`` for padding.
+
+    A ``MaskInfo`` built from a pairwise mask labels every valid token 0, so packed documents are recovered from the
+    mask itself (:func:`visible_interval_runs`); a query belongs to the run of its first visible key. Explicit nonzero
+    segment identities remain authoritative.
+
+    Args:
+        mask_info: Current self-attention metadata.
+        pairwise_mask: Boolean visibility ``[batch, query, key]``, or ``None`` to return the stored identities.
+
+    Returns:
+        ``(query_segment_ids [batch, query], key_segment_ids [batch, key])``.
+    """
+    query_segments, key_segments = mask_info.get_or_compute_segment_ids()
+    if query_segments.ndim == 3:
+        query_segments = query_segments[:, 0]
+    if key_segments.ndim == 3:
+        key_segments = key_segments[:, 0]
+    if pairwise_mask is None:
+        return query_segments, key_segments
+    padding_labels = jnp.all(query_segments <= 0, axis=-1) & jnp.all(key_segments <= 0, axis=-1)
+    runs, first_visible_key = visible_interval_runs(pairwise_mask)
+    recovered_keys = jnp.where(jnp.any(pairwise_mask, axis=-2), runs, -1)
+    recovered_queries = jnp.take_along_axis(recovered_keys, first_visible_key, axis=-1)
+    recovered_queries = jnp.where(jnp.any(pairwise_mask, axis=-1), recovered_queries, -1)
+    return (
+        jnp.where(padding_labels[:, None], recovered_queries, query_segments),
+        jnp.where(padding_labels[:, None], recovered_keys, key_segments),
+    )
+
+
 def _shared_segment_ids(segment_ids: tp.Any) -> jnp.ndarray:
     """Normalize shared-head segments without silently dropping head restrictions."""
     segment_ids = jnp.asarray(segment_ids)

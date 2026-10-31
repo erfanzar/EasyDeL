@@ -70,6 +70,7 @@ from ._ejit import (
     load_compiled_fn,
     save_compiled_fn,
 )
+from ._ejit import _get_args_signature as get_args_signature
 from ._pallas_call import buffered_pallas_call
 from ._utils import (
     cdiv,
@@ -233,6 +234,7 @@ __all__ = (
     "check_bool_flag",
     "cute_call",
     "ejit",
+    "get_args_signature",
     "get_cache_dir",
     "get_effective_compile_dir",
     "get_hash_of_lowering",

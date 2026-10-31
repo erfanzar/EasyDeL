@@ -22,7 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
-from easydel.modules.glm_moe_dsa import modeling_glm_moe_dsa
+from easydel.layers.attention import _dsa as dsa_attention
 from ejkernel.types import MaskInfo
 from jax.sharding import NamedSharding, PartitionSpec
 from spectrax import common_types
@@ -75,13 +75,13 @@ def _rel(a, b):
 
 def test_sharded_sparse_matches_dense(monkeypatch):
     calls = {"n": 0}
-    real = modeling_glm_moe_dsa.sparse_selected_training_attention
+    real = dsa_attention.sparse_selected_training_attention
 
     def counting(**kw):
         calls["n"] += 1
         return real(**kw)
 
-    monkeypatch.setattr(modeling_glm_moe_dsa, "sparse_selected_training_attention", counting)
+    monkeypatch.setattr(dsa_attention, "sparse_selected_training_attention", counting)
     _, _ref_model, ref_layer = _build(sparse=False)
     config, model, layer = _build(sparse=True)
     rng = np.random.default_rng(0)

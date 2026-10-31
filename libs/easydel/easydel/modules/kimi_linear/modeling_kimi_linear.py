@@ -44,7 +44,6 @@ from spectrax import apply_logical_sharding, common_types, nn
 from easydel.caching import (
     HybridCache,
     KDACacheView,
-    KDAMetadata,
     OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -61,7 +60,6 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     MoeModelOutput,
 )
-from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info
 from easydel.infra.sharding import sharding_for_layout
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import (
@@ -72,7 +70,6 @@ from easydel.layers import (
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
     RMSNorm,
-    RMSNormGated,
     RowParallelLinear,
     RowParallelMoELinear,
     dense_gate_up_layout,
@@ -82,17 +79,9 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import UnifiedAttention
-from easydel.layers.linear_attention import apply_conv_with_state, apply_mask_to_padding_states
+from easydel.layers.linear_attention import KernelDeltaAttention
 from easydel.layers.moe import moe_group_topk_select
-from easydel.layers.norms import lowfloats
 from easydel.modules._base import BaseCausalLMModule
-from easydel.operations import OperationMetadata
-from easydel.operations.kernels import (
-    KDAOutput,
-    KernelDeltaAttnOp,
-    fused_kda_gate_per_channel,
-    kda_packed_rows_forward,
-)
 from easydel.utils.checkpoint_keys import KEEP, KeyRuleSet, Map, Rewrite
 
 from .kimi_linear_configuration import KimiLinearConfig
@@ -973,56 +962,20 @@ class KimiMLAAttention(UnifiedAttention):
         )
 
 
-class KimiDeltaAttention(spx.Module):
-    """Kernel Delta Attention (KDA) — Kimi-Linear's per-layer linear-attention block.
+class KimiDeltaAttention(KernelDeltaAttention):
+    """Kimi-Linear KDA linear-attention layer: the shared :class:`KernelDeltaAttention` with the softplus gate.
 
-    KDA replaces softmax attention with a recurrent *kernel-feature* state that
-    is updated by the **delta rule** at every token, giving O(seq_len) compute
-    and O(1) decode. Conceptually each head maintains a key/value memory matrix
-    :math:`S \\in \\mathbb{R}^{d_k \\times d_v}` that evolves as
+    The per-channel log-decay is ``-exp(A_log) * softplus(f_b(f_a(x)) + dt_bias)`` (no lower bound, so the fused
+    ``kda_chunk`` kernel keeps the dense pairwise decay). Moonshot's checkpoints store ``A_log`` as
+    ``[1, 1, num_heads, 1]`` and the three depthwise convolutions separately; :attr:`reform_param` maps both.
 
-    .. math::
-        S_t = \\alpha_t \\, S_{t-1} \\, (I - \\beta_t k_t k_t^\\top)
-              + \\beta_t \\, k_t v_t^\\top, \\qquad
-        o_t = S_t^\\top q_t
-
-    where :math:`\\alpha_t = \\exp(-e^{A} \\, \\text{softplus}(\\Delta_t))` is a
-    per-channel (one rate per head and key channel) data-dependent decay, :math:`\\beta_t =
-    \\sigma(W_b x_t)` is the per-token *write strength* (the "delta" of the
-    delta rule — large :math:`\\beta` overwrites the existing memory at
-    direction :math:`k_t`, small :math:`\\beta` blends), and :math:`\\Delta_t`
-    is the low-rank ``f_a_proj -> f_b_proj`` output plus ``dt_bias``. Q/K/V are first
-    passed through *separate* causal depthwise 1-D convolutions of width
-    ``d_conv`` so each head still sees a small local window, and the output
-    is fed through a low-rank gate (``g_a_proj -> g_b_proj``) and a gated
-    RMSNorm before the final output projection. The recurrence is realized
-    on hardware by chunking the sequence into ``chunk_size`` blocks and
-    running the kernel :class:`KernelDeltaAttnOp`, which folds the
-    intra-chunk parallel matmul with the inter-chunk recurrent carry.
-
-    State carried across decode steps inside :class:`KDACacheView`:
-        * The three rolling conv windows for Q/K/V (length ``d_conv``).
-        * The recurrent memory ``S`` of shape ``(num_heads, head_k_dim, head_v_dim)``.
-
-    Attributes:
-        q_proj, k_proj, v_proj: Linear projections to Q/K/V before the convs.
-        q_conv1d, k_conv1d, v_conv1d: Per-stream causal depthwise 1-D
-            convolutions (``feature_group_count == channels``) of width ``d_conv``.
-        f_a_proj, f_b_proj: Low-rank projection producing the per-channel
-            decay input :math:`\\Delta` (``num_heads * head_k_dim`` outputs).
-        b_proj: Per-head linear producing the delta-rule write strength
-            :math:`\\beta` (sigmoid-activated).
-        g_a_proj, g_b_proj: Low-rank MLP producing the output gate.
-        o_norm (RMSNormGated): Sigmoid-gated RMS normalization on the head outputs.
-        o_proj: Final output projection back to ``hidden_size``.
-        A_log (ArrayParam): Per-head log decay rate; the decay is
-            ``-exp(A_log) * softplus(f_b(f_a(x)) + dt_bias)``, non-positive.
-        dt_bias (ArrayParam): Per-channel bias on :math:`\\Delta` after the
-            low-rank projection.
-        kda_op (KernelDeltaAttnOp): Fused chunked kernel that runs the
-            recurrence.
-        num_heads, head_k_dim, head_v_dim, d_conv, chunk_size,
-        gate_low_rank_dim, key_dim, value_dim: Mirror their config fields.
+    Args:
+        config: Model configuration (``linear_attn_config`` gives the KDA shapes).
+        layer_idx: Index of this layer in the decoder stack.
+        dtype: Computation dtype.
+        param_dtype: Parameter storage dtype.
+        precision: JAX matmul precision.
+        rngs: PRNG key container.
     """
 
     def __init__(
@@ -1035,139 +988,17 @@ class KimiDeltaAttention(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
-        """Initialize Kimi KDA (Kernel Delta Attention) layer.
-
-        Args:
-            config (KimiLinearConfig): Model configuration with KDA parameters.
-            layer_idx (int): Index of this layer in the model.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-        """
-        self.config = config
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.layer_idx = layer_idx
-
-        linear_config = config.linear_attn_config or {}
-        self.num_heads = linear_config.get("num_heads", config.num_attention_heads)
-        # Moonshot's config names one ``head_dim`` (and ``short_conv_kernel_size``);
-        # the fla-style ``head_k_dim``/``head_v_dim``/``d_conv`` keys override it.
-        head_dim = linear_config.get("head_dim", 128)
-        self.head_k_dim = linear_config.get("head_k_dim", head_dim)
-        self.head_v_dim = linear_config.get("head_v_dim", head_dim)
-        self.d_conv = linear_config.get("d_conv", linear_config.get("short_conv_kernel_size", 4))
-        self.gate_low_rank_dim = linear_config.get("gate_low_rank_dim", head_dim)
-        self.chunk_size = linear_config.get("chunk_size", 64)
-
-        self.key_dim = self.num_heads * self.head_k_dim
-        self.value_dim = self.num_heads * self.head_v_dim
-
-        column_linear = partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-
-        self.q_proj = column_linear(config.hidden_size, self.key_dim)
-        self.k_proj = column_linear(config.hidden_size, self.key_dim)
-        self.v_proj = column_linear(config.hidden_size, self.value_dim)
-
-        self.q_conv1d = nn.Conv1d(
-            in_channels=self.key_dim,
-            out_channels=self.key_dim,
-            kernel_size=self.d_conv,
-            groups=self.key_dim,
-            padding=((self.d_conv - 1, 0),),
-            dtype=dtype,
-            rngs=rngs,
-            use_bias=False,
-            precision=precision,
-        )
-        self.k_conv1d = nn.Conv1d(
-            in_channels=self.key_dim,
-            out_channels=self.key_dim,
-            kernel_size=self.d_conv,
-            groups=self.key_dim,
-            padding=((self.d_conv - 1, 0),),
-            dtype=dtype,
-            rngs=rngs,
-            use_bias=False,
-            precision=precision,
-        )
-        self.v_conv1d = nn.Conv1d(
-            in_channels=self.value_dim,
-            out_channels=self.value_dim,
-            kernel_size=self.d_conv,
-            groups=self.value_dim,
-            padding=((self.d_conv - 1, 0),),
-            dtype=dtype,
-            rngs=rngs,
-            use_bias=False,
-            precision=precision,
-        )
-
-        self.f_a_proj = column_linear(config.hidden_size, self.gate_low_rank_dim)
-        # Per-channel decay: one rate per (head, key channel).
-        self.f_b_proj = column_linear(self.gate_low_rank_dim, self.key_dim)
-
-        self.b_proj = column_linear(config.hidden_size, self.num_heads)
-
-        self.g_a_proj = column_linear(config.hidden_size, self.gate_low_rank_dim)
-        self.g_b_proj = column_linear(self.gate_low_rank_dim, self.value_dim)
-
-        self.o_proj = RowParallelLinear(
-            self.value_dim,
-            config.hidden_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-
-        self.o_norm = RMSNormGated(
-            self.head_v_dim,
-            eps=config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            activation="sigmoid",
-            rngs=rngs,
-        )
-
-        self.A_log = ArrayParam.bound(
-            shape=(self.num_heads,),
-            dtype=param_dtype,
-            init_method="constant",
-            init_kwargs={"value": 0.0},
-            key=rngs.parameters,
-        )
-        self.dt_bias = ArrayParam.bound(
-            shape=(self.key_dim,),
-            dtype=param_dtype,
-            init_method="constant",
-            init_kwargs={"value": 1.0},
-            key=rngs.parameters,
-        )
-
-        metadata = OperationMetadata(
-            runtime_dtype=self.dtype,
-            runtime_softmax_dtype=jnp.float32,
-            base_config=self.config,
-        )
-        self.kda_op = KernelDeltaAttnOp(metadata)
+        """Build the shared KDA layer with the unbounded softplus gate (``gate_lower_bound=None``)."""
+        super().__init__(config, layer_idx, dtype, param_dtype, precision, gate_lower_bound=None, rngs=rngs)
 
     @property
     def reform_param(self):
+        """Moonshot checkpoint layout: ``A_log`` ``[1, 1, num_heads, 1]`` and per-stream ``[C, 1, d_conv]`` convs.
+
+        Returns:
+            dict: Reform rules, module-relative.
+        """
         return {
-            # Checkpoints store ``A_log`` as ``[1, 1, num_heads, 1]``.
             "A_log$": {
                 "splits": [{"name": "A_log", "spliter": lambda x: x.reshape(-1)}],
                 "inverse_spliter": lambda torch, a_log: a_log.reshape(1, 1, -1, 1),
@@ -1185,206 +1016,6 @@ class KimiDeltaAttention(spx.Module):
                 "inverse_spliter": lambda torch, kernel: kernel.permute(2, 1, 0),
             },
         }
-
-    def forward(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo | None = None,
-        cache_view: KDACacheView | None = None,
-        cache_metadata: KDAMetadata | None = None,
-    ) -> AttentionLayerOutput:
-        """Run the chunked delta-rule recurrence over a block of tokens.
-
-        Streaming behavior: when ``cache_view`` carries non-``None`` rolling
-        conv windows and a previous memory ``S``, the kernel splices the new
-        token onto the conv buffers, advances ``S`` by one delta-rule step
-        per chunk, and writes the trailing ``d_conv`` columns plus the
-        updated ``S`` back into the cache. During training / prefill the
-        conv applies left-pad ``d_conv - 1`` and the kernel uses a parallel
-        intra-chunk matmul with a recurrent carry between chunks of size
-        ``chunk_size``.
-
-        Padding tokens are zeroed out of the input *before* projection (via
-        :func:`apply_mask_to_padding_states`) so they contribute neither to
-        the conv windows nor to the recurrent memory.
-
-        Args:
-            hidden_states: ``(batch, seq_len, hidden_size)`` block input.
-            mask_info: Optional :class:`MaskInfo`. KDA only consumes
-                ``q_attention_mask`` to zero out padding; there is no
-                pairwise causal mask because the recurrence is causal by
-                construction.
-            cache_view: Per-layer KDA cache (rolling Q/K/V conv windows and
-                recurrent memory ``S``). ``None`` skips state threading.
-            cache_metadata: Optional :class:`KDAMetadata` for paged cache
-                layouts; not used by the dense layout.
-
-        Returns:
-            AttentionLayerOutput: ``attention_output`` of shape
-            ``(batch, seq_len, hidden_size)``, the updated KDA cache view,
-            and ``attention_weight = None`` (KDA produces no attention
-            matrix).
-        """
-        if mask_info is not None:
-            q_mask: Array | None = typing.cast("Array | None", mask_info.q_attention_mask)
-            if q_mask is not None and q_mask.shape[1] != hidden_states.shape[1]:
-                q_mask = q_mask[:, : hidden_states.shape[1]]
-            hidden_states = apply_mask_to_padding_states(hidden_states, q_mask)
-        segment_ids = packed_segment_ids_from_mask_info(mask_info, hidden_states.shape[1])
-
-        batch_size, seq_len, _ = hidden_states.shape
-        is_inference = seq_len == 1 and cache_view is not None
-
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        value = self.v_proj(hidden_states)
-
-        # eSurge packed-row serving: one flattened token stream [1, T, D] whose
-        # per-request segments are ``cache_metadata.query_start_loc``, with per-request
-        # conv windows / recurrent memory in per-row cache slots. Without this branch the
-        # whole stream would be treated as a single sequence against a per-row cache.
-        qsl = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
-        if cache_view is not None and qsl is not None:
-            if batch_size != 1:
-                raise ValueError(
-                    f"Packed-row KDA serving expects one flattened token stream [1, T, D], got batch_size={batch_size}."
-                )
-            gate = self.f_b_proj(self.f_a_proj(hidden_states))
-            out_packed, new_cache_view = kda_packed_rows_forward(
-                query=query,
-                key=key,
-                value=value,
-                beta=jax.nn.sigmoid(self.b_proj(hidden_states)),
-                decay=fused_kda_gate_per_channel(gate, self.A_log.value, self.dt_bias.value, lower_bound=None),
-                conv_kernels=tuple(getattr(self, f"{n}_conv1d").weight.value.squeeze(1).T for n in ("q", "k", "v")),
-                cache_view=cache_view,
-                query_start_loc=qsl,
-                context_lens=getattr(cache_metadata, "context_lens", None),
-                conv_dtype=jnp.bfloat16 if self.dtype in lowfloats else self.dtype,
-                chunk_size=self.chunk_size,
-                spec_recurrent_commit=getattr(cache_metadata, "spec_recurrent_commit", None),
-            )
-            output_gate = self.g_b_proj(self.g_a_proj(hidden_states))
-            output_gate = output_gate.reshape(batch_size, seq_len, self.num_heads, self.head_v_dim)
-            output = self.o_norm(out_packed.astype(hidden_states.dtype), output_gate)
-            output = output.reshape(batch_size, seq_len, -1)
-            output = self.o_proj(output)
-            return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)
-
-        q_conv_state = cache_view.q_conv_state if cache_view is not None else None
-        k_conv_state = cache_view.k_conv_state if cache_view is not None else None
-        v_conv_state = cache_view.v_conv_state if cache_view is not None else None
-
-        conv_output_dtype = jnp.bfloat16 if self.dtype in lowfloats else self.dtype
-        query, new_q_conv_state = apply_conv_with_state(
-            query,
-            self.q_conv1d,
-            q_conv_state,
-            is_inference=is_inference,
-            d_conv=self.d_conv,
-            output_dtype=conv_output_dtype,
-            reuse_partial_state=True,
-            segment_ids=segment_ids,
-        )
-        key, new_k_conv_state = apply_conv_with_state(
-            key,
-            self.k_conv1d,
-            k_conv_state,
-            is_inference=is_inference,
-            d_conv=self.d_conv,
-            output_dtype=conv_output_dtype,
-            reuse_partial_state=True,
-            segment_ids=segment_ids,
-        )
-        value, new_v_conv_state = apply_conv_with_state(
-            value,
-            self.v_conv1d,
-            v_conv_state,
-            is_inference=is_inference,
-            d_conv=self.d_conv,
-            output_dtype=conv_output_dtype,
-            reuse_partial_state=True,
-            segment_ids=segment_ids,
-        )
-
-        query = query.reshape(batch_size, seq_len, self.num_heads, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, self.num_heads, self.head_k_dim)
-        value = value.reshape(batch_size, seq_len, self.num_heads, self.head_v_dim)
-        query = apply_logical_sharding(
-            query,
-            dynamic_axes=common_types.AttnQSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        key = apply_logical_sharding(
-            key,
-            dynamic_axes=common_types.AttnKVSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        value = apply_logical_sharding(
-            value,
-            dynamic_axes=common_types.AttnKVSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-
-        gate = self.f_b_proj(self.f_a_proj(hidden_states))
-        decay = fused_kda_gate_per_channel(gate, self.A_log.value, self.dt_bias.value, lower_bound=None)
-
-        beta = jax.nn.sigmoid(self.b_proj(hidden_states))
-
-        output_gate = self.g_b_proj(self.g_a_proj(hidden_states))
-        output_gate = output_gate.reshape(batch_size, seq_len, self.num_heads, self.head_v_dim)
-
-        recurrent_state = cache_view.recurrent_state if cache_view is not None else None
-
-        kda_output: KDAOutput = self.kda_op(
-            query=query,
-            key=key,
-            value=value,
-            beta=beta,
-            decay=decay,
-            q_conv_state=new_q_conv_state,
-            k_conv_state=new_k_conv_state,
-            v_conv_state=new_v_conv_state,
-            recurrent_state=recurrent_state,
-            segment_ids=segment_ids,
-            chunk_size=self.chunk_size,
-            per_channel_decay=True,
-            # A dense cache carries memory from previous chunks. Keep the first
-            # live segment connected while preserving packed-training resets.
-            continue_initial_state=cache_view is not None,
-        )
-
-        output = kda_output.attention_outputs
-
-        # o_norm operates on last dim — skip flatten/unflatten.
-        output = self.o_norm(output, output_gate)
-        output = output.reshape(batch_size, seq_len, -1)
-        output = apply_logical_sharding(
-            output,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        output = self.o_proj(output)
-        output = apply_logical_sharding(
-            output,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-
-        new_cache_view = cache_view
-        if cache_view is not None:
-            new_cache_view = cache_view.update_kda_states(
-                new_q_conv_state=kda_output.q_conv_state,
-                new_k_conv_state=kda_output.k_conv_state,
-                new_v_conv_state=kda_output.v_conv_state,
-                new_recurrent_state=kda_output.recurrent_state,
-            )
-
-        return AttentionLayerOutput(
-            attention_output=output,
-            attention_weight=None,
-            cache_view=new_cache_view,
-        )
 
 
 class KimiDecoderLayer(spx.Module):

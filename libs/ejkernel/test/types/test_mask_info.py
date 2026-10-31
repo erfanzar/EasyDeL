@@ -1208,5 +1208,42 @@ def test_maskinfo_cu_seqlens_fields_and_pytree_roundtrip():
     print("  ✓ MaskInfo cu_seqlens fields + pytree: OK")
 
 
+def test_padding_only_marks_pure_padding_masks():
+    """``padding_only`` is set by the constructors that can only express per-row padding, and nowhere else."""
+    valid = jnp.array([[1, 1, 1, 0], [0, 1, 1, 1]], dtype=jnp.int32)
+    assert MaskInfo.dynamic_init(attention_mask=valid).padding_only
+    assert MaskInfo.dynamic_init(input_ids=valid).padding_only
+    assert MaskInfo.from_attention_mask(valid.astype(jnp.bool_)).padding_only
+    assert MaskInfo.from_segments(valid, is_attn_mask=True).padding_only
+    cu_q = jnp.array([0, 3, 0, 2], dtype=jnp.int32)
+    cu_kv = jnp.array([0, 2, 0, 4], dtype=jnp.int32)
+    assert MaskInfo.from_cu_seqlens(cu_q, max_q_len=4, cu_seqlens_kv=cu_kv, max_kv_len=6).padding_only
+    # Packed documents and custom pairwise masks are not padding.
+    assert not MaskInfo.from_segments(jnp.array([[0, 0, 1, 1]], dtype=jnp.int32)).padding_only
+    assert not MaskInfo.from_attention_mask(jnp.tril(jnp.ones((1, 1, 4, 4), jnp.bool_))).padding_only
+
+
+def test_padding_only_survives_meaning_preserving_transforms_and_pytrees():
+    info = MaskInfo.dynamic_init(attention_mask=jnp.array([[1, 1, 1, 0], [1, 1, 0, 0]], dtype=jnp.int32))
+    assert info.apply_causal().padding_only
+    assert info.materialize_attention_mask().padding_only
+    assert info.materialize_segment_ids().padding_only
+    assert info.to_dtype(jnp.int32).padding_only
+    assert info.replace(batch_axis_name="dp").padding_only
+    leaves, treedef = jax.tree_util.tree_flatten(info)
+    assert jax.tree_util.tree_unflatten(treedef, leaves).padding_only
+    assert jax.jit(lambda m: m)(info).padding_only
+    # The flag is static metadata: a mask that only differs in it is a different pytree structure.
+    assert treedef != jax.tree_util.tree_structure(info.replace(padding_only=False))
+
+
+def test_padding_only_is_cleared_by_new_masks_or_segments():
+    info = MaskInfo.dynamic_init(attention_mask=jnp.ones((2, 4), dtype=jnp.int32))
+    assert not info.replace(q_segment_ids=jnp.array([[0, 0, 1, 1]] * 2, dtype=jnp.int32)).padding_only
+    assert not info.replace(attention_mask=jnp.ones((2, 1, 4, 4), jnp.bool_)).padding_only
+    assert not info.apply_sliding_window(2).padding_only
+    assert info.replace(attention_mask=jnp.ones((2, 1, 4, 4), jnp.bool_), padding_only=True).padding_only
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

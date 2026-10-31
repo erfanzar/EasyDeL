@@ -18,15 +18,17 @@
 
     grid = (batch, num_heads // block_h, num_chunks)      # ("parallel", "parallel", "arbitrary")
     per (b, hb, c):  chunk = C - 1 - c   (reverse index maps)
-        load q, k, k_beta, v_beta, g_cumsum, the state entering the chunk (forward residual), d_out of this chunk
+        load q, k, k_beta, v_beta, g, the state entering the chunk (forward residual), d_out of this chunk
+        g_cumsum <- tril(ones) @ g                              (chunk_cumsum, into a VMEM scratch)
         c == 0: dS <- d_final                                   (dS [block_h, K, V] fp32 in a VMEM scratch)
         per head: recompute the chunk's forward terms from the saved state and apply the hand-derived cotangents
-                  (chunk_core_bwd); emit dq, dk, dk_beta, dv_beta, dg_cumsum; dS <- dS_in (+ d_chunk_states_in)
+                  (chunk_core_bwd); emit dq, dk, dk_beta, dv_beta and dg = triu(ones) @ dg_cumsum;
+                  dS <- dS_in (+ d_chunk_states_in)
         c == C-1: d_initial_state <- dS
 
 The kernel emits cotangents of the KERNEL operands; the wrapper folds them with elementwise XLA ops
-(``dk += dk_beta * beta``, ``dv = dv_beta * beta``, ``dbeta = sum(dk_beta * k + dv_beta * v)``, ``dg`` = suffix sums
-of ``dg_cumsum`` within each chunk).
+(``dk += dk_beta * beta``, ``dv = dv_beta * beta``, ``dbeta = sum(dk_beta * k + dv_beta * v)``). The within-chunk
+suffix sums that turn ``dg_cumsum`` into ``dg`` run in the kernel (``chunk_cumsum(..., reverse=True)``).
 
 No ``[cs, cs, K]`` cotangent tensor is formed. With ``D[i, j, k] = exp(gc[i, k] - gc[j, k])`` (lower triangle) and
 the two 2-D cotangents ``d_aqk`` (of ``attn_qk``) and ``d_pair`` (of ``pair``), four weighted reductions over ``D``::
@@ -37,7 +39,8 @@ the two 2-D cotangents ``d_aqk`` (of ``attn_qk``) and ``d_pair`` (of ``pair``), 
 give ``dq``, ``dk``, ``dk_beta`` and, because ``dD * D`` factors, ``dg_cumsum += q dq_a + kb dkb_p - k (dk_a + dk_p)``.
 The reductions run on the VPU (``"vpu"``: broadcast + fp32 reduce) or as batched ``[cs, 1, cs] x [cs, cs, K]`` MXU dots
 at HIGHEST (``"mxu"``: builds the j-major twin of ``D``); both are exact to fp32, ``"mxu"`` exists as a lowering
-alternative.
+alternative. With a bounded log-decay (``sub > 0``) ``D`` is never formed: it factors per sub-block as
+``a[i] * b_p[j]`` and every reduction is a plain ``[cs, cs] x [cs, K]`` MXU matmul (``_factored_reductions``).
 """
 
 from __future__ import annotations
@@ -56,12 +59,15 @@ from ...._xla.kda_chunk._xla_impl import (
     META_ROW_RUN,
     SUBLANES,
     SegmentMasks,
+    companion_precision,
+    factored_decay,
+    factored_pair_dot,
     iota_rc,
     resolve_precision,
     segment_masks,
     unit_lower_inverse_masked,
 )
-from ._pallas_impl_fwd import check_tile_alignment
+from ._pallas_impl_fwd import check_tile_alignment, chunk_cumsum
 
 DEFAULT_BWD_VMEM_LIMIT = 48 * 2**20
 
@@ -91,6 +97,52 @@ def _reduce_over_i(w: Array, x: Array, decay: Array, decay_t: Array | None, mode
     return jnp.sum(w[:, :, None] * (x[:, None, :] * decay), axis=0)
 
 
+def _factored_reductions(
+    d_aqk: Array,
+    d_pair: Array,
+    q: Array,
+    k_beta: Array,
+    a: Array,
+    b: list[Array],
+    k_cols: list[Array],
+    rows: list[Array],
+    precision,
+) -> tuple[Array, Array, Array]:
+    """The four weighted decay reductions on the factored decay ``D[i, j] = a[i] * b[p(i)][j]``, as MXU matmuls.
+
+    ``d_aqk`` and ``d_pair`` are zero above the diagonal, so the pairs past each sub-block's end (where the factored
+    form does not hold) contribute nothing.
+
+    Args:
+        d_aqk: Cotangent of ``attn_qk`` ``[cs, cs]``.
+        d_pair: Cotangent of ``pair`` ``[cs, cs]``.
+        q: Scaled queries ``[cs, K]``.
+        k_beta: ``k * beta`` ``[cs, K]``.
+        a: Row factor from ``factored_decay``.
+        b: Column factors per sub-block.
+        k_cols: ``k * b[p]`` per sub-block.
+        rows: Sub-block row masks.
+        precision: Dot precision.
+
+    Returns:
+        ``(dq_a, dkb_p, dk_a + dk_p)``, each ``[cs, K]``, as in the dense ``_reduce_over_j`` / ``_reduce_over_i``.
+    """
+    d_aqk_t, d_pair_t = d_aqk.T, d_pair.T
+    qa, kba = q * a, k_beta * a
+    dq_a = dkb_p = dk_ap = None
+    for m, bp, kp in zip(rows, b, k_cols, strict=True):
+        t_q = jnp.where(m, lax.dot(d_aqk, kp, precision=precision), 0.0)
+        t_kb = jnp.where(m, lax.dot(d_pair, kp, precision=precision), 0.0)
+        t_k = bp * (
+            lax.dot(d_aqk_t, jnp.where(m, qa, 0.0), precision=precision)
+            + lax.dot(d_pair_t, jnp.where(m, kba, 0.0), precision=precision)
+        )
+        dq_a = t_q if dq_a is None else dq_a + t_q
+        dkb_p = t_kb if dkb_p is None else dkb_p + t_kb
+        dk_ap = t_k if dk_ap is None else dk_ap + t_k
+    return dq_a * a, dkb_p * a, dk_ap
+
+
 def chunk_core_bwd(
     state: Array,
     q: Array,
@@ -104,8 +156,13 @@ def chunk_core_bwd(
     d_new_state: Array,
     precision: lax.Precision,
     reduce_mode: str = "vpu",
+    sub: int = 0,
 ) -> tuple[Array, Array, Array, Array, Array, Array]:
     """One head, one chunk: recompute ``chunk_core``'s terms and return the cotangents of its inputs.
+
+    With ``sub > 0`` the pairwise decay is factored per sub-block (``factored_decay``): ``pair`` / ``attn_qk`` and the
+    four weighted reductions become masked MXU matmuls, the chunk inverse and the reductions run at
+    ``companion_precision(precision)``, and ``reduce_mode`` is unused.
 
     Args:
         state: State entering the chunk ``[K, V]``.
@@ -119,7 +176,8 @@ def chunk_core_bwd(
         d_out: Cotangent of ``core_out`` ``[cs, V]``.
         d_new_state: Cotangent of ``new_state`` ``[K, V]``.
         precision: Precision of the non-inverse dots.
-        reduce_mode: ``"vpu"`` or ``"mxu"``.
+        reduce_mode: ``"vpu"`` or ``"mxu"`` (dense form only).
+        sub: Factored-decay sub-block size, or ``0`` for the dense ``[cs, cs, K]`` form.
 
     Returns:
         ``(d_state, dq, dk, dk_beta, dv_beta, dg_cumsum)``; ``dg_cumsum`` includes the ``g_last`` share.
@@ -132,12 +190,19 @@ def chunk_core_bwd(
     else:
         incl, strict = seg.incl, seg.strict
 
-    i3 = lax.broadcasted_iota(jnp.int32, (cs, cs, kdim), 0)
-    j3 = lax.broadcasted_iota(jnp.int32, (cs, cs, kdim), 1)
-    decay_mask = jnp.exp(jnp.where(j3 <= i3, g_cumsum[:, None, :] - g_cumsum[None, :, :], -jnp.inf))
-    k3 = k[None, :, :]
-    pair = jnp.sum(k_beta[:, None, :] * k3 * decay_mask, axis=-1)
-    attn = unit_lower_inverse_masked(jnp.where(strict, -pair, 0.0), cs)
+    if sub:
+        fa, fb, frows = factored_decay(g_cumsum, sub)
+        k_cols = [k * bp for bp in fb]
+        cp = companion_precision(precision)
+        pair = factored_pair_dot(k_beta, fa, k_cols, frows, hi)
+        attn = unit_lower_inverse_masked(jnp.where(strict, -pair, 0.0), cs, precision=cp)
+    else:
+        i3 = lax.broadcasted_iota(jnp.int32, (cs, cs, kdim), 0)
+        j3 = lax.broadcasted_iota(jnp.int32, (cs, cs, kdim), 1)
+        decay_mask = jnp.exp(jnp.where(j3 <= i3, g_cumsum[:, None, :] - g_cumsum[None, :, :], -jnp.inf))
+        k3 = k[None, :, :]
+        pair = jnp.sum(k_beta[:, None, :] * k3 * decay_mask, axis=-1)
+        attn = unit_lower_inverse_masked(jnp.where(strict, -pair, 0.0), cs)
     exp_gc = jnp.exp(g_cumsum)
     kb_eg = k_beta * exp_gc
     q_eg = q * exp_gc
@@ -147,7 +212,10 @@ def chunk_core_bwd(
     if seg is not None:
         v_prime = v_prime * seg.uses_state
     v_new = value_local - v_prime
-    attn_qk = jnp.where(incl, jnp.sum(q[:, None, :] * k3 * decay_mask, axis=-1), 0.0)
+    if sub:
+        attn_qk = jnp.where(incl, factored_pair_dot(q, fa, k_cols, frows, precision), 0.0)
+    else:
+        attn_qk = jnp.where(incl, jnp.sum(q[:, None, :] * k3 * decay_mask, axis=-1), 0.0)
     e_ks = jnp.exp(g_last - g_cumsum)
     k_scaled = k * e_ks
     if seg is not None:
@@ -193,16 +261,19 @@ def chunk_core_bwd(
     # T = (I - A)^-1 -> dA = T^T dT T^T ; A = -pair on the strict (same-run) triangle
     d_A = lax.dot(lax.dot(attn_t, d_T, precision=hi), attn_t, precision=hi)
     d_pair = jnp.where(strict, -d_A, 0.0)
-    decay_t = None
-    if reduce_mode == "mxu":
-        decay_t = jnp.exp(jnp.where(i3 <= j3, g_cumsum[None, :, :] - g_cumsum[:, None, :], -jnp.inf))
-    k_decay = k3 * decay_mask
-    dq_a = _reduce_over_j(d_aqk, k_decay, reduce_mode)
-    dkb_p = _reduce_over_j(d_pair, k_decay, reduce_mode)
-    dk_a = _reduce_over_i(d_aqk, q, decay_mask, decay_t, reduce_mode)
-    dk_p = _reduce_over_i(d_pair, k_beta, decay_mask, decay_t, reduce_mode)
+    if sub:
+        dq_a, dkb_p, dk_a_p = _factored_reductions(d_aqk, d_pair, q, k_beta, fa, fb, k_cols, frows, cp)
+    else:
+        decay_t = None
+        if reduce_mode == "mxu":
+            decay_t = jnp.exp(jnp.where(i3 <= j3, g_cumsum[None, :, :] - g_cumsum[:, None, :], -jnp.inf))
+        k_decay = k3 * decay_mask
+        dq_a = _reduce_over_j(d_aqk, k_decay, reduce_mode)
+        dkb_p = _reduce_over_j(d_pair, k_decay, reduce_mode)
+        dk_a = _reduce_over_i(d_aqk, q, decay_mask, decay_t, reduce_mode)
+        dk_p = _reduce_over_i(d_pair, k_beta, decay_mask, decay_t, reduce_mode)
+        dk_a_p = dk_a + dk_p
     dq = dq + dq_a
-    dk_a_p = dk_a + dk_p
     dk = dk + dk_a_p
     dk_beta = dk_beta + dkb_p
     dgc = dgc + q * dq_a + k_beta * dkb_p - k * dk_a_p
@@ -219,7 +290,7 @@ def bwd_block_layout(block_h: int, chunk_size: int, k_dim: int, v_dim: int, segm
         "k": (None, block_h, cs, k_dim),
         "k_beta": (None, block_h, cs, k_dim),
         "v_beta": (None, block_h, cs, v_dim),
-        "g_cumsum": (None, block_h, cs, k_dim),
+        "g": (None, block_h, cs, k_dim),
         "chunk_states_in": (None, block_h, None, k_dim, v_dim),
         "d_out": (None, block_h, cs, v_dim),
         "d_final": (None, block_h, k_dim, v_dim),
@@ -234,17 +305,25 @@ def bwd_block_layout(block_h: int, chunk_size: int, k_dim: int, v_dim: int, segm
             "dk": (None, block_h, cs, k_dim),
             "dk_beta": (None, block_h, cs, k_dim),
             "dv_beta": (None, block_h, cs, v_dim),
-            "dg_cumsum": (None, block_h, cs, k_dim),
+            "dg": (None, block_h, cs, k_dim),
             "d_initial_state": (None, block_h, k_dim, v_dim),
             "scratch:d_state": (block_h, k_dim, v_dim),
+            "scratch:g_cumsum": (block_h, cs, k_dim),
         }
     )
     return lay
 
 
-def _bwd_kernel(*refs, block_h: int, num_chunks: int, segmented: bool, use_states: bool, precision, reduce_mode):
-    """Grid step ``(b, hb, c)``: chunk ``C - 1 - c`` of ``block_h`` heads, state cotangent carried in VMEM."""
-    q_ref, k_ref, kb_ref, vb_ref, gc_ref, states_ref, dout_ref, dfinal_ref = refs[:8]
+def _bwd_kernel(
+    *refs, block_h: int, num_chunks: int, segmented: bool, use_states: bool, precision, reduce_mode, sub: int = 0
+):
+    """Grid step ``(b, hb, c)``: chunk ``C - 1 - c`` of ``block_h`` heads, state cotangent carried in VMEM.
+
+    Factored form (``sub > 0``): like the forward, the ``block_h`` heads' per-chunk backward runs as one head-batched
+    program (``jax.vmap`` of :func:`chunk_core_bwd`), so the independent heads' dependent matmul chains overlap. The
+    dense form keeps a per-head loop (batching would multiply its ``[cs, cs, K]`` decay tensors' VMEM by ``block_h``).
+    """
+    q_ref, k_ref, kb_ref, vb_ref, g_ref, states_ref, dout_ref, dfinal_ref = refs[:8]
     pos = 8
     dstates_ref = meta_ref = None
     if use_states:
@@ -253,7 +332,7 @@ def _bwd_kernel(*refs, block_h: int, num_chunks: int, segmented: bool, use_state
     if segmented:
         meta_ref = refs[pos]
         pos += 1
-    dq_ref, dk_ref, dkb_ref, dvb_ref, dgc_ref, dinit_ref, ds_scr = refs[pos : pos + 7]
+    dq_ref, dk_ref, dkb_ref, dvb_ref, dg_ref, dinit_ref, ds_scr, gc_ref = refs[pos : pos + 8]
 
     cs = q_ref.shape[1]
     c = pl.program_id(2)
@@ -262,32 +341,57 @@ def _bwd_kernel(*refs, block_h: int, num_chunks: int, segmented: bool, use_state
     def _seed():
         ds_scr[...] = dfinal_ref[...]
 
+    gc_ref[...] = chunk_cumsum(g_ref[...])
+
     seg = None
     if segmented:
         seg = segment_masks(meta_ref[pl.ds(META_ROW_RUN, 1), pl.ds(0, cs)], cs)
 
-    for h in range(block_h):
-        g_last = gc_ref[h, pl.ds(cs - 1, 1), :]
-        d_state, dq, dk, dkb, dvb, dgc = chunk_core_bwd(
-            states_ref[h],
-            q_ref[h],
-            k_ref[h],
-            kb_ref[h],
-            vb_ref[h],
-            gc_ref[h],
-            g_last,
-            seg,
-            dout_ref[h],
-            ds_scr[h],
-            precision,
-            reduce_mode,
+    if sub:
+
+        def one_head(st, q, k, kb, vb, gc, gl, d_out, d_ns):
+            return chunk_core_bwd(st, q, k, kb, vb, gc, gl, seg, d_out, d_ns, precision, reduce_mode, sub=sub)
+
+        d_state, dq, dk, dkb, dvb, dgc = jax.vmap(one_head)(
+            states_ref[...],
+            q_ref[...],
+            k_ref[...],
+            kb_ref[...],
+            vb_ref[...],
+            gc_ref[...],
+            gc_ref[:, pl.ds(cs - 1, 1), :],
+            dout_ref[...],
+            ds_scr[...],
         )
-        dq_ref[h] = dq
-        dk_ref[h] = dk
-        dkb_ref[h] = dkb
-        dvb_ref[h] = dvb
-        dgc_ref[h] = dgc
-        ds_scr[h] = d_state + dstates_ref[h] if use_states else d_state
+        dq_ref[...] = dq
+        dk_ref[...] = dk
+        dkb_ref[...] = dkb
+        dvb_ref[...] = dvb
+        dg_ref[...] = chunk_cumsum(dgc, reverse=True)
+        ds_scr[...] = d_state + dstates_ref[...] if use_states else d_state
+    else:
+        for h in range(block_h):
+            g_last = gc_ref[h, pl.ds(cs - 1, 1), :]
+            d_state, dq, dk, dkb, dvb, dgc = chunk_core_bwd(
+                states_ref[h],
+                q_ref[h],
+                k_ref[h],
+                kb_ref[h],
+                vb_ref[h],
+                gc_ref[h],
+                g_last,
+                seg,
+                dout_ref[h],
+                ds_scr[h],
+                precision,
+                reduce_mode,
+            )
+            dq_ref[h] = dq
+            dk_ref[h] = dk
+            dkb_ref[h] = dkb
+            dvb_ref[h] = dvb
+            dg_ref[h] = chunk_cumsum(dgc[None], reverse=True)[0]
+            ds_scr[h] = d_state + dstates_ref[h] if use_states else d_state
 
     @pl.when(c == num_chunks - 1)
     def _finish():
@@ -299,7 +403,7 @@ def kda_chunk_pallas_bwd(
     k: Array,
     k_beta: Array,
     v_beta: Array,
-    g_cumsum: Array,
+    g: Array,
     chunk_states_in: Array,
     d_out: Array,
     d_final: Array,
@@ -310,6 +414,7 @@ def kda_chunk_pallas_bwd(
     block_h: int = 1,
     precision: str = "highest",
     reduce_mode: str = "vpu",
+    sub: int = 0,
     vmem_limit_bytes: int = DEFAULT_BWD_VMEM_LIMIT,
 ) -> tuple[Array, Array, Array, Array, Array, Array]:
     """Launch the fused chunked-KDA backward (reverse chunk sweep).
@@ -319,7 +424,7 @@ def kda_chunk_pallas_bwd(
         k: Forward operand ``[B, H, Lp, K]``.
         k_beta: Forward operand ``[B, H, Lp, K]``.
         v_beta: Forward operand ``[B, H, Lp, V]``.
-        g_cumsum: Forward operand ``[B, H, Lp, K]``.
+        g: Forward operand (per-token log-decay, NOT its prefix sums) ``[B, H, Lp, K]``.
         chunk_states_in: State entering every chunk ``[B, H, C, K, V]`` (forward residual).
         d_out: Cotangent of the padded output ``[B, H, Lp, V]``.
         d_final: Cotangent of the final state ``[B, H, K, V]``.
@@ -328,11 +433,12 @@ def kda_chunk_pallas_bwd(
         chunk_size: ``cs``.
         block_h: Heads per grid step.
         precision: Precision of the non-inverse dots.
-        reduce_mode: ``"vpu"`` or ``"mxu"`` for the four weighted reductions.
+        reduce_mode: ``"vpu"`` or ``"mxu"`` for the four weighted reductions (dense form only).
+        sub: Factored-decay sub-block size (``pairwise_sub_block``), or ``0`` for the dense form.
         vmem_limit_bytes: Scoped VMEM requested from Mosaic.
 
     Returns:
-        ``(dq, dk, dk_beta, dv_beta, dg_cumsum, d_initial_state)`` fp32 cotangents of the kernel operands.
+        ``(dq, dk, dk_beta, dv_beta, dg, d_initial_state)`` fp32 cotangents of the kernel operands.
     """
     B, H, Lp, K = q.shape
     V = v_beta.shape[-1]
@@ -357,12 +463,12 @@ def kda_chunk_pallas_bwd(
         chunk_spec("k"),
         chunk_spec("k_beta"),
         chunk_spec("v_beta"),
-        chunk_spec("g_cumsum"),
+        chunk_spec("g"),
         states_spec("chunk_states_in"),
         chunk_spec("d_out"),
         state_spec("d_final"),
     ]
-    args = [q, k, k_beta, v_beta, g_cumsum, chunk_states_in, d_out, d_final]
+    args = [q, k, k_beta, v_beta, g, chunk_states_in, d_out, d_final]
     if use_states:
         in_specs.append(states_spec("d_chunk_states_in"))
         args.append(d_chunk_states_in)
@@ -374,7 +480,7 @@ def kda_chunk_pallas_bwd(
         chunk_spec("dk"),
         chunk_spec("dk_beta"),
         chunk_spec("dv_beta"),
-        chunk_spec("dg_cumsum"),
+        chunk_spec("dg"),
         state_spec("d_initial_state"),
     ]
     f32 = jnp.float32
@@ -394,6 +500,7 @@ def kda_chunk_pallas_bwd(
         use_states=use_states,
         precision=resolve_precision(precision),
         reduce_mode=reduce_mode,
+        sub=int(sub),
     )
     outs = pl.pallas_call(
         kernel,
@@ -401,7 +508,7 @@ def kda_chunk_pallas_bwd(
         in_specs=in_specs,
         out_specs=out_specs,
         out_shape=out_shape,
-        scratch_shapes=[pltpu.VMEM(lay["scratch:d_state"], f32)],
+        scratch_shapes=[pltpu.VMEM(lay["scratch:d_state"], f32), pltpu.VMEM(lay["scratch:g_cumsum"], f32)],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "arbitrary"),
             vmem_limit_bytes=int(vmem_limit_bytes),

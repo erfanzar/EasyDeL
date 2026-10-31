@@ -313,14 +313,17 @@ class DeepseekV41Indexer(SharedKeyIndexer):
                 candidate_block_size=config.candidate_block_size,
                 rms_norm_eps=config.rms_norm_eps,
                 initializer_range=config.initializer_range,
+                scoring_kernel=config.index_scoring_kernel,
             ),
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
         )
-        # Mesh source for the replicated-key Pallas selector dispatch (same pattern as the attention module).
+        # Mesh source for the replicated-key Pallas selector dispatch and the fused ``index_scoring_kernel="pallas"``
+        # scores, which otherwise fall back to the operation's XLA reference on a multi-device mesh.
         self.config = config
+        self.mesh_source = config
 
     def index_keys(self, latent: Array, cos: Array, sin: Array) -> Array:
         """Index keys ``[B, T, index_head_dim]`` from the KV source's pre-RoPE latent, roped at group positions."""
@@ -1133,13 +1136,9 @@ class DeepseekV41SparseMoeBlock(DeepseekV4SparseMoeBlock):
             return jnp.concatenate([scores, flag[:, None].astype(scores.dtype)], axis=-1)
 
         def _select_with_image_bias(augmented: Array, pre_bias_logits: Array | None, k: int) -> tuple[Array, Array]:
-            del pre_bias_logits
-            scores = augmented[:, :num_experts].astype(jnp.float32)
             is_image = augmented[:, num_experts:] > 0.5
             bias = jnp.where(is_image, image_bias[None, :], correction_bias[None, :])
-            _, indices = jax.lax.top_k(scores + bias, k)
-            weights = jnp.take_along_axis(scores, indices, axis=-1)
-            return self._normalize_and_scale(weights), indices
+            return self._select_hook(bias)(augmented[:, :num_experts], pre_bias_logits, k)
 
         hooks = self.moe_hooks.replace(
             normalize_gate_logits=lambda logits: logits,

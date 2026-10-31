@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from ejkernel.kernels import Backend, Platform, kernel_registry
-from ejkernel.kernels._xla.dsa_sparse_attention._tables import build_tables
+from ejkernel.kernels._xla.dsa_sparse_attention._tables import build_tables, pack_pool_bits
 from ejkernel.modules import DsaSparseAttention, DsaSparseAttentionConfig
 from ejkernel.modules import dsa_sparse_attention as dsa_op
 from jax.sharding import Mesh, PartitionSpec
@@ -179,6 +179,100 @@ def test_variants_match_base(variant):
             np.testing.assert_array_equal(np.asarray(a), np.asarray(b), err_msg=f"{name}: must be bitwise the base")
         else:
             _assert_close(a, b, 1e-4, name)
+
+
+@pytest.mark.parametrize("backward", ["fused", "two_pass"])
+def test_no_pool_gradient_matches_full_backward(backward):
+    """``ste_pool=None`` skips the pool cotangent; output, dq and d_latent equal the full backward."""
+    seq, kpool, bq, bk = 1024, 4, 256, 256
+    pool_mask, tails = adversarial_selection(seq, kpool)
+    q, lat, g = _arrays(np.random.default_rng(5), 3, 2, seq, 128, jnp.float32)
+    kw = dict(kpool=kpool, block_q=bq, block_kv=bk, backward=backward)
+    full = _value_and_grads(PALLAS, q, lat, pool_mask, tails, g, **kw)
+
+    def loss(q, lat):
+        out = PALLAS(q, lat, pool_mask, tails, None, **kw)
+        return jnp.sum(out.astype(jnp.float32) * g.astype(jnp.float32)), out
+
+    (_, out), (dq, dlat) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1), has_aux=True))(q, lat)
+    for a, b, name in zip((out, dq, dlat), full[:3], NAMES[:3], strict=True):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b), err_msg=f"{name}: must be bitwise the full path")
+    if backward == "fused":
+        text = jax.jit(jax.grad(lambda q, lat: loss(q, lat)[0], argnums=(0, 1))).lower(q, lat).as_text()
+        assert f"{seq // kpool}x{seq}xf32" not in text, "the [B, P, S] fp32 pool cotangent is still allocated"
+
+
+@pytest.mark.parametrize("seq", [1024, 1000])
+@pytest.mark.parametrize("backward", ["fused", "two_pass"])
+def test_packed_selection_is_bitwise_the_bool_selection(seq, backward):
+    """``[B, S, W]`` int32 packed words give bitwise the bool-mask value and gradients (incl. ``d_ste_pool``)."""
+    kpool, bq, bk = 4, 256, 256
+    pool_mask, tails = adversarial_selection(seq, kpool)
+    q, lat, g = _arrays(np.random.default_rng(9), 3, 2, seq, 128, jnp.float32)
+    kw = dict(kpool=kpool, block_q=bq, block_kv=bk, backward=backward)
+    want = _value_and_grads(PALLAS, q, lat, pool_mask, tails, g, **kw)
+    words = pack_pool_bits(pool_mask)
+    assert words.dtype == jnp.int32 and words.shape[-1] == -(-pool_mask.shape[-1] // 32)
+
+    def loss(q, lat, ste):
+        out = PALLAS(q, lat, words, tails, ste, **kw)
+        return jnp.sum(out.astype(jnp.float32) * g.astype(jnp.float32)), out
+
+    ste = jnp.zeros(pool_mask.shape, jnp.float32)
+    (_, out), grads = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True))(q, lat, ste)
+    for a, b, name in zip((out, *grads), want, NAMES, strict=True):
+        assert a.shape == b.shape, name
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b), err_msg=f"{name}: packed must be bitwise bool")
+
+
+def test_packed_no_pool_path_holds_no_per_pool_tensor():
+    """Packed words + ``ste_pool=None``: no ``[B, S, P]`` or ``[B, P, S]`` tensor of any dtype in the fwd+bwd graph."""
+    seq, kpool = 2048, 4
+    pool_mask, tails = random_selection(np.random.default_rng(10), 1, seq, kpool, select=256)
+    words = pack_pool_bits(pool_mask)
+    q, lat, _ = _arrays(np.random.default_rng(10), 1, 2, seq, 128, jnp.float32)
+    kw = dict(kpool=kpool, block_q=256, block_kv=512)
+
+    def loss(q, lat):
+        return jnp.sum(PALLAS(q, lat, words, tails, None, **kw) ** 2)
+
+    text = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(q, lat).as_text()
+    per_pool = f"{seq}x{seq // kpool}x"
+    assert per_pool not in text, "a [B, S, P] tensor is still built from the packed selection"
+    assert f"{seq // kpool}x{seq}x" not in text, "a [B, P, S] tensor is still built from the packed selection"
+
+
+def test_named_residuals_skip_the_forward_recompute():
+    """Saving the tagged residuals under remat: bitwise gradients and one forward kernel call instead of two."""
+    from ejkernel.kernels._pallas.tpu.dsa_sparse_attention._interface import RESIDUAL_NAME, TABLES_NAME
+
+    seq, kpool = 1024, 4
+    pool_mask, tails = adversarial_selection(seq, kpool)
+    words = pack_pool_bits(pool_mask)
+    q, lat, g = _arrays(np.random.default_rng(12), 3, 2, seq, 128, jnp.float32)
+    kw = dict(kpool=kpool, block_q=256, block_kv=256)
+
+    def body(q, lat):
+        return jnp.tanh(PALLAS(q, lat, words, tails, None, **kw))
+
+    def grad_fn(policy):
+        f = jax.checkpoint(body, policy=policy)
+        # value_and_grad keeps the primal forward live: under plain grad XLA drops it as dead code and only the
+        # remat recompute remains, so both policies would show the same number of kernel launches.
+        return jax.jit(jax.value_and_grad(lambda q, lat: jnp.sum(f(q, lat) * g), argnums=(0, 1)))
+
+    recompute = grad_fn(jax.checkpoint_policies.nothing_saveable)
+    saved = grad_fn(jax.checkpoint_policies.save_only_these_names(RESIDUAL_NAME, TABLES_NAME))
+    (v_saved, g_saved), (v_recompute, g_recompute) = saved(q, lat), recompute(q, lat)
+    np.testing.assert_array_equal(np.asarray(v_saved), np.asarray(v_recompute), err_msg="loss")
+    for a, b, name in zip(g_saved, g_recompute, ("dq", "d_latent"), strict=True):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b), err_msg=f"{name}: saving residuals is bitwise")
+    # Count kernel launches in the COMPILED module: the lowered StableHLO outlines a jitted kernel into one private
+    # function called from several sites, so its text count does not see the remat recompute.
+    target = 'custom_call_target="tpu_custom_call"'
+    n_recompute = recompute.lower(q, lat).compile().as_text().count(target)
+    n_saved = saved.lower(q, lat).compile().as_text().count(target)
+    assert n_saved == n_recompute - 1, (n_saved, n_recompute)
 
 
 def test_fused_group_split_is_a_reorder():

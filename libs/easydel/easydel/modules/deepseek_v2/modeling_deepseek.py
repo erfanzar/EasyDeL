@@ -50,7 +50,6 @@ from typing import ClassVar
 import jax
 import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from jax import lax
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -91,6 +90,7 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import UnifiedAttention
+from easydel.layers.moe import moe_group_topk_select
 from easydel.modules._base import BaseCausalLMModule
 
 from .deepseek_configuration import DeepseekV2Config
@@ -313,24 +313,12 @@ class DeepseekV2MLP(spx.Module):
 
 
 class MoEGate(spx.Module):
-    """DeepSeek-V2 router with optional group routing and aux load-balancing loss.
+    """DeepSeek-V2 router projection: ``hidden -> n_routed_experts`` fp32 logits (no bias).
 
-    Pipeline per token:
-
-    1. ``hidden -> n_routed_experts`` linear (no bias) -> per-expert score.
-    2. Score is softmaxed (or sigmoid-normalised, depending on
-       ``config.scoring_func``).
-    3. **Group routing.** When ``config.topk_method == "group_limited_greedy"``,
-       experts are partitioned into ``n_group`` groups and only the top
-       ``topk_group`` groups (ranked by their best member score per token)
-       remain eligible; this caps cross-device routing fan-out.
-    4. ``num_experts_per_tok`` experts are picked from eligible scores; if
-       ``norm_topk_prob`` is true the chosen weights are renormalised to sum
-       to 1.
-    5. When ``alpha > 0``, an auxiliary sequence-level load-balancing loss
-       is accumulated for the trainer to consume.
-
-    Returned tuple: ``(top_idx, top_weight, aux_loss)``.
+    Expert selection (softmax scores, optional ``group_limited_greedy`` group
+    restriction, renormalisation and ``routed_scaling_factor``) is
+    :meth:`DeepseekV2MoE._select_hook`; the causal LM computes the
+    ``aux_loss_alpha`` load-balancing loss from these logits.
     """
 
     def __init__(
@@ -419,9 +407,9 @@ class DeepseekV2MoE(BaseMoeModule):
     Composes the routing path and the dense fall-back path used by
     DeepSeekMoE:
 
-    * **Router** (:class:`MoEGate`) scores tokens, optionally groups
-      experts, and emits ``num_experts_per_tok`` (top-k) expert ids per
-      token together with normalised gating weights.
+    * **Router** (:class:`MoEGate`) emits per-expert logits; the
+      ``select_hook`` (:meth:`_select_hook`) picks ``num_experts_per_tok``
+      experts per token and their combine weights.
     * **Routed experts** (:class:`DeepseekV2MLPMoE`) run a SwiGLU FFN per
       expert; tokens are dispatched through ``BaseMoeModule.moe_call`` with
       ``MoeLoadBalancingStrategy.STANDARD`` (the auxiliary loss is the one
@@ -497,107 +485,46 @@ class DeepseekV2MoE(BaseMoeModule):
             )
         self.moe_hooks = self.moe_hooks.replace(
             normalize_gate_logits=lambda x: x,
-            select_hook=functools.partial(
-                self._select_experts_static,
-                topk_method=config.topk_method,
-                n_group=config.n_group,
-                topk_group=config.topk_group,
-                n_routed_experts=config.n_routed_experts,
-                norm_topk_prob=config.norm_topk_prob,
-                routed_scaling_factor=config.routed_scaling_factor,
-            ),
+            select_hook=self._select_hook(config),
         )
 
     @staticmethod
-    def _select_experts_static(
-        gate_logits: Array,
-        pre_bias_logits: Array | None,
-        k: int,
-        *,
-        topk_method: str,
-        n_group: int,
-        topk_group: int,
-        n_routed_experts: int,
-        norm_topk_prob: bool,
-        routed_scaling_factor: float,
-    ) -> tuple[Array, Array]:
-        """Top-k routing for DeepSeek-V2 MoE gating.
+    def _select_hook(config: DeepseekV2Config) -> functools.partial:
+        """DeepSeek-V2 routing as a :func:`moe_group_topk_select` ``select_hook``.
 
-        Implements both DeepSeek-V2 routing methods on top of softmax-scored
-        gate logits:
-
-        - ``"gready"`` / ``"greedy"``: standard global top-k.
-        - ``"group_limited_greedy"``: partitions the experts into ``n_group``
-          contiguous groups, picks the ``topk_group`` highest-scoring groups
-          per token (using each group's max score as the group score), and
-          then runs top-k restricted to those groups.
-
-        Optionally renormalizes the selected weights (when ``k > 1`` and
-        ``norm_topk_prob``) and finally rescales by ``routed_scaling_factor``.
-        If ``k`` exceeds the retained groups' capacity, extra selections carry
-        zero combine weight, preserving finite zero-padded routing.
+        Experts are scored with a softmax over the router logits. ``"gready"`` / ``"greedy"`` take a global top-k;
+        ``"group_limited_greedy"`` first keeps the ``topk_group`` groups whose best member scores highest. The
+        selected scores are renormalized when ``norm_topk_prob`` is set and more than one expert is kept, then scaled
+        by ``routed_scaling_factor``. Only the config is read, so the causal LM's auxiliary loss counts the same
+        selections as the MoE layers.
 
         Args:
-            gate_logits: Per-token expert logits, ``[tokens, n_experts]``.
-            pre_bias_logits: Unused for V2 (kept for API parity with V3's
-                auxiliary-free routing). Discarded.
-            k: Number of experts to select per token.
-            topk_method: Routing method (``"gready"``/``"greedy"`` or
-                ``"group_limited_greedy"``).
-            n_group: Number of expert groups (group-limited only).
-            topk_group: Active groups per token (group-limited only).
-            n_routed_experts: Total routed experts (must be divisible by
-                ``n_group`` for the group-limited path).
-            norm_topk_prob: If ``True`` and ``k > 1``, renormalize selected
-                weights to sum to 1 before scaling.
-            routed_scaling_factor: Multiplicative scale on the final weights.
+            config: Model configuration.
 
         Returns:
-            tuple[Array, Array]: ``(topk_weight, topk_idx)`` of shape
-            ``[tokens, k]`` each.
+            functools.partial: A ``select_hook`` taking ``(gate_logits, pre_bias_logits, k)``.
 
         Raises:
-            ValueError: If ``topk_method`` is not one of the supported values.
+            ValueError: If ``scoring_func`` is not ``"softmax"`` or ``topk_method`` is unsupported.
         """
-        del pre_bias_logits
-        scores = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1)
-
-        if topk_method in {"gready", "greedy"}:
-            topk_weight, topk_idx = jax.lax.top_k(scores, k=k)
-        elif topk_method == "group_limited_greedy":
-            token_count = scores.shape[0]
-            group_scores = scores.reshape(token_count, n_group, n_routed_experts // n_group).max(axis=-1)
-            # Keep group indices paired with their scores through a stable
-            # sort. The narrow top_k index lowering can return all-zero group
-            # indices for token-sharded TPU inputs (even with distinct maxima).
-            # Sorting negative scores retains top_k's lower-index tie break.
-            group_indices = jnp.broadcast_to(jnp.arange(n_group, dtype=jnp.int32), group_scores.shape)
-            _, ranked_groups = lax.sort_key_val(-group_scores, group_indices, dimension=-1, is_stable=True)
-            selected_groups = ranked_groups[:, : min(topk_group, n_group)]
-
-            # Eligibility is a per-token membership predicate, not a sparse
-            # update into a global [token, group] buffer. Construct it directly
-            # so token sharding needs neither global row indices nor a scatter
-            # to recover this local routing decision.
-            expert_groups = jnp.arange(n_routed_experts) // (n_routed_experts // n_group)
-            score_mask = jnp.any(selected_groups[:, :, None] == expert_groups[None, None, :], axis=1)
-            masked_scores = jnp.where(score_mask, scores, -jnp.inf)
-            _, topk_idx = lax.top_k(masked_scores, k=k)
-            # Selection sentinels must never become combine weights. Preserve
-            # finite zero padding when k exceeds the retained-group capacity,
-            # without allowing underflowed eligible probabilities to tie with
-            # excluded experts during selection.
-            combine_scores = jnp.where(score_mask, scores, 0.0)
-            topk_weight = jnp.take_along_axis(combine_scores, topk_idx, axis=-1)
+        if config.scoring_func != "softmax":
+            raise ValueError(f"DeepSeek-V2 routes on softmax scores; got scoring_func={config.scoring_func!r}.")
+        if config.topk_method in {"gready", "greedy"}:
+            n_group, topk_group = 1, 1
+        elif config.topk_method == "group_limited_greedy":
+            n_group, topk_group = config.n_group, config.topk_group
         else:
-            raise ValueError(f"Unsupported top-k method: {topk_method}")
-
-        if k > 1 and norm_topk_prob:
-            denominator = jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20
-            topk_weight = topk_weight / denominator
-
-        topk_weight = topk_weight * routed_scaling_factor
-        return topk_weight, topk_idx
+            raise ValueError(f"Unsupported top-k method: {config.topk_method}")
+        return functools.partial(
+            moe_group_topk_select,
+            n_routed_experts=config.n_routed_experts,
+            score_fn="softmax",
+            n_group=n_group,
+            topk_group=topk_group,
+            group_score="max",
+            norm_topk_prob=bool(config.norm_topk_prob) and config.num_experts_per_tok > 1,
+            routed_scaling_factor=config.routed_scaling_factor,
+        )
 
     def forward(self, hidden_states: Array):
         """Process tokens through MoE experts with routing.
@@ -1350,17 +1277,7 @@ class DeepseekV2ForCausalLM(BaseCausalLMModule[DeepseekV2Model, DeepseekV2Config
             # Balance the experts actually dispatched to, including group-limited
             # routing. Counts are fractions of all token/expert assignments, not
             # the sum of top-k independent Switch objectives.
-            _, selected = DeepseekV2MoE._select_experts_static(
-                logits,
-                None,
-                top_k,
-                topk_method=self.config.topk_method,
-                n_group=self.config.n_group,
-                topk_group=self.config.topk_group,
-                n_routed_experts=num_experts,
-                norm_topk_prob=False,
-                routed_scaling_factor=1.0,
-            )
+            _, selected = DeepseekV2MoE._select_hook(self.config)(logits, None, top_k)
             counts = jax.nn.one_hot(selected, num_experts, dtype=jnp.float32).sum(axis=-2)
             counts = counts.reshape(*mask.shape, num_experts)
             probabilities = probabilities.reshape(*mask.shape, num_experts)

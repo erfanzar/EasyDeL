@@ -103,6 +103,7 @@ from .compressed_window_attention import compressed_window_attention
 from .compressed_window_decode import compressed_window_decode
 from .decode_attention import decode_attention
 from .deepseek_attn import deepseek_attn
+from .dsa_gather_attention import dsa_gather_attention
 from .dsa_sparse_attention import dsa_sparse_attention
 from .flash_attention import flash_attention
 from .flash_mla import flash_mla
@@ -127,6 +128,8 @@ from .lightning_attn import lightning_attn
 from .mean_pooling import mean_pooling
 from .mhc_coefficients import mhc_coefficients
 from .mhc_fused import mhc_collapse, mhc_expand
+from .moe_local_ffn import moe_local_ffn
+from .moe_row_gather import moe_row_gather, moe_row_gather_sum
 from .multi_latent_ragged_page_attention import multi_latent_ragged_page_attention
 from .multi_latent_ragged_page_attention_v2 import multi_latent_ragged_page_attention_v2
 from .native_sparse_attention import apply_native_sparse_attention
@@ -175,6 +178,7 @@ __all__ = [
     "compute_schedule_table_v2",
     "decode_attention",
     "deepseek_attn",
+    "dsa_gather_attention",
     "dsa_sparse_attention",
     "flash_attention",
     "flash_mla",
@@ -201,6 +205,9 @@ __all__ = [
     "mhc_coefficients",
     "mhc_collapse",
     "mhc_expand",
+    "moe_local_ffn",
+    "moe_row_gather",
+    "moe_row_gather_sum",
     "multi_latent_ragged_page_attention",
     "multi_latent_ragged_page_attention_v2",
     "page_attention",

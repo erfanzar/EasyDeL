@@ -32,24 +32,23 @@ def test_grouped_selection_matches_independent_assignment_and_weight_reference(
         dtype=np.float32,
     )
     experts = logits.shape[-1]
-    config = DeepseekV2Config(hidden_size=8, n_routed_experts=experts, num_experts_per_tok=k)
+    config = DeepseekV2Config(
+        hidden_size=8,
+        n_routed_experts=experts,
+        num_experts_per_tok=k,
+        topk_method="group_limited_greedy",
+        n_group=groups,
+        topk_group=active_groups,
+        norm_topk_prob=norm_topk_prob,
+        routed_scaling_factor=1.7,
+    )
     device_logits = jnp.asarray(logits)
     if sharded:
         device_logits = jax.device_put(
             device_logits,
             jax.sharding.NamedSharding(config.mesh.jax_mesh, jax.sharding.PartitionSpec("fsdp", None)),
         )
-    selector = functools.partial(
-        DeepseekV2MoE._select_experts_static,
-        pre_bias_logits=None,
-        k=k,
-        topk_method="group_limited_greedy",
-        n_group=groups,
-        topk_group=active_groups,
-        n_routed_experts=experts,
-        norm_topk_prob=norm_topk_prob,
-        routed_scaling_factor=1.7,
-    )
+    selector = functools.partial(DeepseekV2MoE._select_hook(config), pre_bias_logits=None, k=k)
     compute = jax.jit(selector) if compiled else selector
     actual_weights, actual_indices = compute(device_logits)
     probabilities = np.exp(logits - logits.max(axis=-1, keepdims=True))

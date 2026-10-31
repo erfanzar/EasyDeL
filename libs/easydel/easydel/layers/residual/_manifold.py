@@ -117,18 +117,37 @@ def _project_streams(x: Array, weight: Array, eps: float, precision, mesh, spec)
     feature = spec[3] if spec is not None else None
     axes = feature if isinstance(feature, tuple) else (() if feature is None else (feature,))
     axes = tuple(axis for axis in axes if mesh.shape[axis] > 1)
+    # The RMS scale is one scalar per token, so it is applied to the [.., hc*(hc+2)] logits instead of the
+    # [.., hc*D] streams: the sum of squares is an fp32 reduce and the projection reads the streams in their own
+    # dtype with fp32 accumulation, so no fp32 copy of the stream (or of its normalized form) is materialized in
+    # the forward or kept for the weight gradient.
+    compute_dtype = jnp.result_type(x.dtype, weight.dtype)
     if not axes:
-        return jnp.matmul(_normalized_flat_streams(x, eps), weight.astype(jnp.float32).T, precision=precision)
+        flat = x.reshape(*x.shape[:2], -1)
+        scale = jax.lax.rsqrt(jnp.mean(jnp.square(flat.astype(jnp.float32)), axis=-1, keepdims=True) + eps)
+        logits = jnp.matmul(
+            flat.astype(compute_dtype),
+            weight.astype(compute_dtype).T,
+            precision=precision,
+            preferred_element_type=jnp.float32,
+        )
+        return logits * scale
 
     width = weight.shape[0]
     global_width = x.shape[2] * x.shape[3]
 
     def project(local_x, local_weight):
-        flat = local_x.reshape(*local_x.shape[:2], -1).astype(jnp.float32)
-        square_sum = jax.lax.psum(jnp.sum(jnp.square(flat), axis=-1, keepdims=True), axes)
-        normalized = flat * jax.lax.rsqrt(square_sum / global_width + eps)
-        logits = jnp.matmul(normalized, local_weight.reshape(width, -1).astype(jnp.float32).T, precision=precision)
-        return jax.lax.psum(logits, axes)
+        flat = local_x.reshape(*local_x.shape[:2], -1)
+        square_sum = jax.lax.psum(jnp.sum(jnp.square(flat.astype(jnp.float32)), axis=-1, keepdims=True), axes)
+        scale = jax.lax.rsqrt(square_sum / global_width + eps)
+        logits = jnp.matmul(
+            flat.astype(compute_dtype),
+            local_weight.reshape(width, -1).astype(compute_dtype).T,
+            precision=precision,
+            preferred_element_type=jnp.float32,
+        )
+        # ``scale`` is already identical on every feature shard, so it commutes with the psum.
+        return jax.lax.psum(logits, axes) * scale
 
     return jax.shard_map(
         project,

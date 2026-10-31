@@ -11,6 +11,19 @@ from easydel.modules.deepseek_v3.modeling_deepseek import DeepseekV3MoE
 from jax import numpy as jnp
 
 
+def _score_selector(config, bias, k):
+    """DeepSeek-V3's select hook fed scores directly, so the references need no sigmoid inversion."""
+    hook = DeepseekV3MoE._select_hook(config, None if bias is None else jnp.asarray(bias))
+    return functools.partial(hook, pre_bias_logits=None, k=k, score_fn="none")
+
+
+def _token_sharded(config, array):
+    return jax.device_put(
+        array,
+        jax.sharding.NamedSharding(config.mesh.jax_mesh, jax.sharding.PartitionSpec("fsdp", None)),
+    )
+
+
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("sharded", [False, True])
 @pytest.mark.parametrize("norm_topk_prob", [False, True])
@@ -26,26 +39,21 @@ def test_excess_capacity_has_finite_eligibility_masked_weights(bias_kind, norm_t
         # Reverse group membership for some rows and permit negative choice scores.
         bias = np.asarray([-0.8, -0.7, -0.1, -0.2], dtype=np.float32)
     choices = probabilities if bias is None else probabilities + bias
-    config = DeepseekV3Config(hidden_size=4, n_routed_experts=4, num_experts_per_tok=3, n_group=2, topk_group=1)
-    device_choices = jnp.asarray(choices)
-    if sharded:
-        device_choices = jax.device_put(
-            device_choices,
-            jax.sharding.NamedSharding(config.mesh.jax_mesh, jax.sharding.PartitionSpec("fsdp", None)),
-        )
-    selector = functools.partial(
-        DeepseekV3MoE._select_experts_static,
-        pre_bias_logits=None,
-        k=3,
+    config = DeepseekV3Config(
+        hidden_size=4,
+        n_routed_experts=4,
+        num_experts_per_tok=3,
         n_group=2,
         topk_group=1,
-        n_routed_experts=4,
         norm_topk_prob=norm_topk_prob,
         routed_scaling_factor=1.7,
-        e_score_correction_bias=None if bias is None else jnp.asarray(bias),
     )
+    device_scores = jnp.asarray(probabilities)
+    if sharded:
+        device_scores = _token_sharded(config, device_scores)
+    selector = _score_selector(config, bias, k=3)
     compute = jax.jit(selector) if compiled else selector
-    actual_weights, actual_indices = compute(device_choices)
+    actual_weights, actual_indices = compute(device_scores)
     # Independent noaux_tc reference: two experts per group means group rank
     # is the sum of both choice scores; only unbiased eligible scores combine.
     winning_group = choices.reshape(4, 2, 2).sum(axis=-1).argmax(axis=-1)
@@ -59,7 +67,7 @@ def test_excess_capacity_has_finite_eligibility_masked_weights(bias_kind, norm_t
     np.testing.assert_allclose(actual_weights, expected_weights, rtol=1e-5, atol=1e-7)
     assert np.isfinite(np.asarray(actual_weights)).all()
     assert np.all(np.asarray(actual_weights)[:, -1] == 0)
-    gradient = jax.jit(jax.grad(lambda x: jnp.sum(selector(x)[0] ** 2)))(device_choices)
+    gradient = jax.jit(jax.grad(lambda x: jnp.sum(selector(x)[0] ** 2)))(device_scores)
     assert np.isfinite(np.asarray(gradient)).all()
 
 
@@ -84,25 +92,20 @@ def test_multiple_groups_rank_by_top_two_mass_with_stable_ties(biased, norm_topk
     )
     bias = np.repeat(np.asarray([0, -0.125, 0.125, -0.25], dtype=np.float32), 4) if biased else None
     choices = probabilities if bias is None else probabilities + bias
-    config = DeepseekV3Config(hidden_size=4, n_routed_experts=16, num_experts_per_tok=9, n_group=4, topk_group=2)
-    device_choices = jnp.asarray(choices)
-    if sharded:
-        device_choices = jax.device_put(
-            device_choices,
-            jax.sharding.NamedSharding(config.mesh.jax_mesh, jax.sharding.PartitionSpec("fsdp", None)),
-        )
-    selector = functools.partial(
-        DeepseekV3MoE._select_experts_static,
-        pre_bias_logits=None,
-        k=9,
+    config = DeepseekV3Config(
+        hidden_size=4,
+        n_routed_experts=16,
+        num_experts_per_tok=9,
         n_group=4,
         topk_group=2,
-        n_routed_experts=16,
         norm_topk_prob=norm_topk_prob,
         routed_scaling_factor=1.7,
-        e_score_correction_bias=None if bias is None else jnp.asarray(bias),
     )
-    actual_weights, actual_indices = (jax.jit(selector) if compiled else selector)(device_choices)
+    device_scores = jnp.asarray(probabilities)
+    if sharded:
+        device_scores = _token_sharded(config, device_scores)
+    selector = _score_selector(config, bias, k=9)
+    actual_weights, actual_indices = (jax.jit(selector) if compiled else selector)(device_scores)
     group_mass = np.sort(choices.reshape(8, 4, 4), axis=-1)[..., -2:].sum(axis=-1)
     winning_groups = np.argsort(-group_mass, axis=-1, kind="stable")[:, :2]
     eligible_groups = np.zeros((8, 4), dtype=bool)
@@ -117,7 +120,7 @@ def test_multiple_groups_rank_by_top_two_mass_with_stable_ties(biased, norm_topk
     np.testing.assert_allclose(actual_weights, expected_weights, rtol=1e-5, atol=1e-7)
     assert np.isfinite(np.asarray(actual_weights)).all()
     assert np.all(np.asarray(actual_weights)[:, -1] == 0)
-    gradient = jax.jit(jax.grad(lambda x: jnp.sum(selector(x)[0] ** 2)))(device_choices)
+    gradient = jax.jit(jax.grad(lambda x: jnp.sum(selector(x)[0] ** 2)))(device_scores)
     assert np.isfinite(np.asarray(gradient)).all()
 
 
@@ -126,27 +129,20 @@ def test_multiple_groups_rank_by_top_two_mass_with_stable_ties(biased, norm_topk
 @pytest.mark.parametrize("logit", [-45.0, -46.0, -50.0])
 def test_small_positive_sigmoid_mass_has_correct_finite_gradients(logit, sharded, compiled):
     """Tiny positive mass needs a stable quotient derivative, not just a zero guard."""
-    logits = jnp.full((4, 4), logit, dtype=jnp.float32)
-    if sharded:
-        config = DeepseekV3Config(hidden_size=4, n_routed_experts=4, num_experts_per_tok=3, n_group=2, topk_group=1)
-        logits = jax.device_put(
-            logits,
-            jax.sharding.NamedSharding(config.mesh.jax_mesh, jax.sharding.PartitionSpec("fsdp", None)),
-        )
     scale = 1.7
-    selector = functools.partial(
-        DeepseekV3MoE._select_experts_static,
-        pre_bias_logits=None,
-        k=3,
+    config = DeepseekV3Config(
+        hidden_size=4,
+        n_routed_experts=4,
+        num_experts_per_tok=3,
         n_group=2,
         topk_group=1,
-        n_routed_experts=4,
         norm_topk_prob=True,
         routed_scaling_factor=scale,
     )
-
-    def route(x):
-        return selector(jax.nn.sigmoid(x))
+    logits = jnp.full((4, 4), logit, dtype=jnp.float32)
+    if sharded:
+        logits = _token_sharded(config, logits)
+    route = functools.partial(DeepseekV3MoE._select_hook(config, None), pre_bias_logits=None, k=3)
 
     def loss(x):
         return jnp.sum(route(x)[0] ** 2)
@@ -211,8 +207,8 @@ def test_public_dispatch_with_zero_live_bias_drops_excluded_expert_contribution(
         np.broadcast_to(coefficients[:, None, None], moe.experts.down_proj.weight.value.shape).copy()
     )
     hidden = jnp.full((4, 2, 4), 0.25, dtype=jnp.float32)
-    actual, choices = moe(hidden)
-    np.testing.assert_allclose(choices, np.broadcast_to(probabilities, choices.shape), rtol=1e-6, atol=1e-6)
+    actual, router_logits = moe(hidden)
+    np.testing.assert_allclose(router_logits, np.broadcast_to(logits, router_logits.shape), rtol=1e-6, atol=1e-6)
     weights = probabilities[:2].copy()
     if norm_topk_prob:
         weights /= weights.sum()

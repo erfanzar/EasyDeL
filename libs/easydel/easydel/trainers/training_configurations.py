@@ -453,11 +453,18 @@ class TrainingArguments:
     )
     grain_shard_index: int | None = field(
         default=None,
-        metadata={"help": "sharding index to be used for grain dataloaders in both train and eval steps."},
+        metadata={
+            "help": "sharding index to be used for grain dataloaders in both train and eval steps. For the "
+            "parquetra / ArrayRecord lanes, None groups hosts by the batch shards their devices hold (hosts that "
+            "share a shard read the same rows); set both index and count to override."
+        },
     )
     grain_shard_count: int | None = field(
         default=None,
-        metadata={"help": "sharding count to be used for grain dataloaders in both train and eval steps."},
+        metadata={
+            "help": "sharding count to be used for grain dataloaders in both train and eval steps (lanes: None = "
+            "number of batch-shard host groups, see grain_shard_index)."
+        },
     )
     arrayrecord_train_files: str | list[str] | None = field(
         default=None,

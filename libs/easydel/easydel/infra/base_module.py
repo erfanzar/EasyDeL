@@ -4190,14 +4190,14 @@ class EasyDeLBaseModule(
         Note:
             The hash is deterministic - identical states produce identical hashes.
         """
-        from ejkernel.callib._ejit import _get_args_signature  # pyright: ignore[reportMissingTypeStubs]
+        from ejkernel.callib import get_args_signature  # pyright: ignore[reportMissingTypeStubs]
 
         dict_config = self.config.to_dict()
         if pop_things:
             for pops in pop_things:
                 dict_config.pop(pops)
         # Config values (strings, dtypes, tuples) are static: hash them by value, not as traceable leaves.
-        tree_hash = _get_args_signature(
+        tree_hash = get_args_signature(
             (self.graphstate, self.graphother),
             dict_config,
             static_argnames=tuple(dict_config),

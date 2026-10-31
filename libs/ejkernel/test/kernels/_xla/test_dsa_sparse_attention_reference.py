@@ -27,12 +27,14 @@ import numpy as np
 import pytest
 from ejkernel.kernels import Backend, Platform, kernel_registry
 from ejkernel.kernels._xla.dsa_sparse_attention._tables import (
+    as_pool_bits,
     build_q_tables,
     build_tables,
     dma_block_indices,
     expand_open_mask,
     pack_pool_bits,
     parse_sparse_mode,
+    unpack_pool_bits,
     validate_blocks,
     validate_options,
     visited_open_mask,
@@ -307,3 +309,48 @@ def test_invalid_arguments_raise():
         build_tables(pm, -jnp.ones((1, 256, 9), jnp.int32), kpool=4, block_q=128, block_kv=128)
     with pytest.raises(ValueError, match="pools exceed"):
         build_tables(jnp.zeros((1, 256, 65), bool), None, kpool=4, block_q=128, block_kv=128)
+    with pytest.raises(ValueError, match="pool words exceed"):
+        build_tables(jnp.zeros((1, 256, 3), jnp.int32), None, kpool=4, block_q=128, block_kv=128)
+    with pytest.raises(ValueError, match="packed words"):
+        as_pool_bits(jnp.zeros((1, 256, 2), jnp.int8))
+
+
+@pytest.mark.parametrize("mode", ["sparse", "dense", "budget:2"])
+def test_packed_words_give_the_bool_tables(mode):
+    """A ``[B, S, W]`` int32 / uint32 selection builds exactly the tables of the ``[B, S, P]`` bool selection."""
+    seq, kpool, bq, bk = 1024, 4, 256, 256
+    pool_mask, tails = adversarial_selection(seq, kpool)
+    pm, tl = jnp.asarray(pool_mask), jnp.asarray(tails)
+    words = pack_pool_bits(pm)
+    assert words.dtype == jnp.int32 and words.shape == (3, seq, seq // kpool // 32)
+    np.testing.assert_array_equal(np.asarray(unpack_pool_bits(words, pool_mask.shape[-1])), pool_mask)
+    want = build_tables(pm, tl, kpool=kpool, block_q=bq, block_kv=bk, mode=mode)
+    for sel in (words, jax.lax.bitcast_convert_type(words, jnp.uint32)):
+        got = build_tables(sel, tl, kpool=kpool, block_q=bq, block_kv=bk, mode=mode)
+        for a, b, name in zip(got, want, ("bits_t", "tails_t", "count", "kv_list"), strict=True):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b), err_msg=name)
+    if mode == "sparse":
+        c_np, l_np = np_tables(pool_mask, tails, kpool, bq, bk)
+    elif mode == "dense":
+        n_qb, n_kb = seq // bq, seq // bk
+        causal = (np.arange(n_kb)[None, :] * bk) <= ((np.arange(n_qb)[:, None] + 1) * bq - 1)
+        c_np = np.broadcast_to(causal.sum(-1), (3, n_qb))
+        l_np = np.broadcast_to(np.sort(np.where(causal, np.arange(n_kb)[None, :], n_kb), -1), (3, n_qb, n_kb))
+    else:
+        c_np, l_np = np_budget_tables(pool_mask, tails, kpool, bq, bk, 2)
+    np.testing.assert_array_equal(np.asarray(want[2]), c_np)
+    np.testing.assert_array_equal(np.asarray(want[3]), l_np)
+
+
+def test_reference_accepts_packed_words():
+    rng = np.random.default_rng(11)
+    batch, heads, seq, dim, kpool = 2, 2, 256, 64, 4
+    pool_mask, tails = random_selection(rng, batch, seq, kpool, select=48)
+    q = jnp.asarray(rng.standard_normal((batch, heads, seq, dim)), jnp.float32)
+    lat = jnp.asarray(rng.standard_normal((batch, seq, dim)), jnp.float32)
+    pm, tl = jnp.asarray(pool_mask), jnp.asarray(tails)
+    for mode in ("sparse", "budget:1"):
+        kw = dict(kpool=kpool, mode=mode, block_q=128, block_kv=128)
+        want = XLA_REF(q, lat, pm, tl, **kw)
+        got = XLA_REF(q, lat, pack_pool_bits(pm), tl, **kw)
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want), err_msg=mode)

@@ -49,7 +49,6 @@ Exports:
 """
 
 import functools
-import math
 import typing
 from functools import partial
 from typing import ClassVar
@@ -58,7 +57,6 @@ import jax
 import jax.numpy as jnp
 import spectrax as spx
 from eformer.loggings import get_logger
-from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -66,27 +64,18 @@ from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
-    KDACacheView,
-    KDAMetadata,
-    MLARaggedPagesCacheView,
     OperationsMetadata,
     RaggedPagesCache,
-    RaggedPagesCacheView,
     RaggedPagesMetadata,
     TransformerCache,
-    TransformerCacheView,
     TransformerMetadata,
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
     DecoderLayerOutput,
     MoeModelOutput,
-)
-from easydel.infra.sequence_packing import (
-    packed_segment_ids_from_mask_info,
-    pairwise_attention_mask_from_mask_info,
+    SparseDecoderLayerOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import (
@@ -98,7 +87,6 @@ from easydel.layers import (
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
     RMSNorm,
-    RMSNormGated,
     RowParallelLinear,
     RowParallelMoELinear,
     clamped_swiglu,
@@ -106,19 +94,14 @@ from easydel.layers import (
     gated_mlp_forward,
     split_fused_gate_up_projection,
 )
-from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.attention import DeepSeekSparseAttention
 from easydel.layers.indexer import (
     IndexerConfig,
     IndexerKind,
-    IndexerSelection,
     SparseIndexer,
-    indexer_distillation_loss,
-    paged_pool_select,
-    use_sparse_training_attention,
 )
-from easydel.layers.linear_attention import apply_conv_with_state, apply_mask_to_padding_states
+from easydel.layers.linear_attention import KernelDeltaAttention, unnest_legacy_kda_forget_gate
 from easydel.layers.moe import fp32_router_logits, moe_group_topk_select
-from easydel.layers.norms import lowfloats
 from easydel.layers.residual import (
     HyperStreamSharding,
     ManifoldHyperConnection,
@@ -127,14 +110,6 @@ from easydel.layers.residual import (
     mean_hyper_head,
 )
 from easydel.modules._base import BaseCausalLMModule
-from easydel.operations import OperationMetadata
-from easydel.operations.kernels import (
-    KDAOutput,
-    KernelDeltaAttnOp,
-    fused_kda_gate_per_channel,
-)
-from easydel.operations.kernels.dsa_sparse_attention import sparse_selected_training_attention
-from easydel.operations.kernels.kda import kda_packed_rows_forward
 from easydel.utils.checkpoint_keys import KEEP, KeyRuleSet, Map
 
 from .glm5_next_configuration import (
@@ -143,44 +118,6 @@ from .glm5_next_configuration import (
 )
 
 logger = get_logger(__name__)
-
-_KDA_CHUNK_SIZE = 64
-
-
-def _pool_indexer_segment_ids(mask_info: MaskInfo, pairwise_mask: Array | None) -> tuple[Array, Array]:
-    """Recover document ownership before pooling uncached pairwise-only inputs.
-
-    Pairwise ``MaskInfo`` inputs carry padding labels, not document identities.
-    As in the TransformerCache auxiliary append, a boundary exists only when
-    no query's visible key interval spans it. This works for both causal and
-    bidirectional document masks without mistaking holes in a sparse mask for
-    document boundaries. Explicit nonzero segment identities remain authoritative.
-
-    Args:
-        mask_info: Current self-attention metadata.
-        pairwise_mask: Boolean visibility in ``[batch, query, key]`` layout.
-
-    Returns:
-        Query and key document identities, with ``-1`` for padding.
-    """
-    query_segments, key_segments = mask_info.get_or_compute_segment_ids()
-    if pairwise_mask is None:
-        return query_segments, key_segments
-    padding_labels = jnp.all(query_segments <= 0, axis=-1) & jnp.all(key_segments <= 0, axis=-1)
-    key_positions = jnp.arange(pairwise_mask.shape[-1], dtype=jnp.int32)
-    first_visible = jnp.argmax(pairwise_mask, axis=-1)
-    last_visible = jnp.max(jnp.where(pairwise_mask, key_positions, -1), axis=-1)
-    splits = key_positions[:-1]
-    crosses = (first_visible[:, :, None] <= splits) & (last_visible[:, :, None] > splits)
-    boundaries = jnp.pad(~jnp.any(crosses, axis=-2), ((0, 0), (1, 0)), constant_values=False)
-    recovered_keys = jnp.cumsum(boundaries, axis=-1, dtype=jnp.int32)
-    recovered_keys = jnp.where(jnp.any(pairwise_mask, axis=-2), recovered_keys, -1)
-    recovered_queries = jnp.take_along_axis(recovered_keys, first_visible, axis=-1)
-    recovered_queries = jnp.where(jnp.any(pairwise_mask, axis=-1), recovered_queries, -1)
-    return (
-        jnp.where(padding_labels[:, None], recovered_queries, query_segments),
-        jnp.where(padding_labels[:, None], recovered_keys, key_segments),
-    )
 
 
 class Glm5NextTextMLP(spx.Module):
@@ -725,145 +662,14 @@ def _hc_head_collapse(hidden_streams: Float[Array, "batch seq hc hidden"]) -> Ar
     return mean_hyper_head(hidden_streams)
 
 
-class Glm5NextForgetGate(spx.Module):
-    """GLM-5 per-channel KDA forget gate.
+class Glm5NextLinearAttention(KernelDeltaAttention):
+    """GLM-5-Next KDA linear-attention layer: the shared :class:`KernelDeltaAttention` with the safe forget gate.
 
-    Two-layer MLP ``f_b(f_a(x))`` whose ``qkv_dim`` output is viewed as
-    ``(num_heads, head_dim)``; the log-decay is
-    ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`` per channel (safe
-    gate) or ``-exp(A_log) * softplus(g + dt_bias)`` without the bound.
-    ``A_log`` stays per-head ``(num_heads,)`` and broadcasts across each
-    head's channels.
-
-    Args:
-        config: Model configuration.
-        dtype: Computation dtype.
-        param_dtype: Parameter storage dtype.
-        precision: JAX matmul precision.
-        rngs: PRNG key container.
-    """
-
-    def __init__(
-        self,
-        config: Glm5NextTextConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: spx.Rngs,
-    ):
-        """Initialize the forget gate projections and decay parameters.
-
-        Args:
-            config: Model configuration.
-            dtype: Computation dtype.
-            param_dtype: Parameter dtype.
-            precision: JAX matmul precision.
-            rngs: Random number generator collection.
-        """
-        self.config = config
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.head_dim = config.linear_head_dim
-        self.num_heads = config.linear_num_heads
-        self.qkv_dim = self.head_dim * self.num_heads
-        self.lower_bound = config.linear_lower_bound
-
-        self.f_a_proj = ColumnParallelLinear(
-            config.hidden_size,
-            self.head_dim,
-            rngs=rngs,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-        )
-        self.f_b_proj = ColumnParallelLinear(
-            self.head_dim,
-            self.qkv_dim,
-            rngs=rngs,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-        )
-        # FLA initialization (HF `_init_weights`): A_log = 0 with the safe gate.
-        # dt_bias: HF draws dt ~ U(1e-3, 1e-1) and stores its inverse softplus
-        # (support ≈ [-6.9, -2.25]); ArrayParam initializers are standard JAX
-        # factories, so we use the support midpoint via `constant` — matching
-        # the kimi_linear precedent. From-pretrained loads overwrite both.
-        # Both stay float32 (HF keeps them in strict-fp32 modules).
-        self.A_log = ArrayParam.bound(
-            shape=(self.num_heads,),
-            dtype=jnp.float32,
-            init_method="zeros",
-            key=rngs.param,
-        )
-        dt_bias_mid = 0.5 * (math.log(math.expm1(1e-3)) + math.log(math.expm1(1e-1)))
-        self.dt_bias = ArrayParam.bound(
-            shape=(self.qkv_dim,),
-            dtype=jnp.float32,
-            init_method="constant",
-            init_kwargs={"value": dt_bias_mid},
-            key=rngs.param,
-        )
-
-    def forward(self, hidden_states: Float[Array, "batch seq hidden"]) -> Float[Array, "batch seq num_heads head_dim"]:
-        """Materialise the per-channel log-decay for the KDA kernels.
-
-        Args:
-            hidden_states: Layer input ``(batch, seq, hidden_size)``.
-
-        Returns:
-            Float32 per-channel log-decay ``(batch, seq, num_heads, head_dim)``
-            with values in ``[lower_bound, 0)`` (safe gate) or non-positive
-            (softplus).
-        """
-        gate = self.f_b_proj(self.f_a_proj(hidden_states))
-        return fused_kda_gate_per_channel(
-            gate,
-            self.A_log.value,
-            self.dt_bias.value,
-            lower_bound=self.lower_bound,
-        )
-
-
-class _Glm5NextConv1d(nn.Conv1d):
-    """Keep convolution storage independent of projection computation dtype."""
-
-    def forward(self, x, **kwargs):
-        """Convolve in the incoming projection dtype without changing parameters."""
-        return spx.functional.conv(
-            x,
-            self.weight.value.astype(x.dtype),
-            self.bias.value.astype(x.dtype) if self.use_bias else None,
-            stride=self.stride,
-            padding=self.padding,
-            dilation=self.dilation,
-            groups=self.groups,
-            precision=self.precision,
-        )
-
-
-class Glm5NextLinearAttention(spx.Module):
-    """KDA (Kimi-style kernel delta attention) block for GLM-5 linear layers.
-
-    Differences from the Kimi-Linear donor layer:
-
-    - **One fused conv**: HF stores a single depthwise ``conv1d`` over the
-      concatenated ``3 * qkv_dim`` channels. EasyDeL keeps three per-stream
-      depthwise convs (``q/k/v_conv1d``) — mathematically identical for a
-      depthwise conv — so the KDACacheView conv-state slots can be reused
-      directly; the ``reform_param`` rules slice the HF fused weight.
-    - **Per-channel decay**: the forget gate produces an
-      ``(num_heads, head_dim)`` log-decay (see :class:`Glm5NextForgetGate`)
-      dispatched into :class:`KernelDeltaAttnOp` with
-      ``per_channel_decay=True``.
-    - **Low-rank output gate**: ``g_a_proj`` maps to ``head_dim`` (GLM-5's
-      bottleneck), then ``g_b_proj`` back to ``qkv_dim``.
+    The per-channel log-decay is ``linear_lower_bound * sigmoid(exp(A_log) * (f_b(f_a(x)) + dt_bias))``, in
+    ``[linear_lower_bound, 0)``; the bound also lets the fused ``kda_chunk`` kernel
+    factor the pairwise decay into MXU matmuls. Hugging Face stores one fused depthwise ``conv1d`` over the
+    concatenated q/k/v channels; :attr:`reform_param` slices it into the three per-stream convolutions (identical for a
+    depthwise conv), so the layer shares the KDA cache layout with Kimi-Linear.
 
     Args:
         config: Model configuration.
@@ -884,148 +690,28 @@ class Glm5NextLinearAttention(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
-        """Initialize the GLM-5 KDA linear-attention block.
-
-        Args:
-            config: Model configuration.
-            layer_idx: Index of this layer in the decoder stack.
-            dtype: Computation dtype.
-            param_dtype: Parameter dtype.
-            precision: JAX matmul precision.
-            rngs: Random number generator collection.
-        """
-        self.config = config
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.layer_idx = layer_idx
-
-        self.num_heads = config.linear_num_heads
-        self.head_dim = config.linear_head_dim
-        self.d_conv = config.linear_conv_kernel_dim
-        self.chunk_size = _KDA_CHUNK_SIZE
-
-        self.key_dim = self.num_heads * self.head_dim
-        self.value_dim = self.key_dim
-
-        column_linear = partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
+        """Build the shared KDA layer with ``gate_lower_bound=config.linear_lower_bound``."""
+        super().__init__(
+            config,
+            layer_idx,
+            dtype,
+            param_dtype,
+            precision,
+            gate_lower_bound=config.linear_lower_bound,
             rngs=rngs,
         )
-
-        self.q_proj = column_linear(config.hidden_size, self.key_dim)
-        self.k_proj = column_linear(config.hidden_size, self.key_dim)
-        self.v_proj = column_linear(config.hidden_size, self.value_dim)
-
-        # Three depthwise causal convs (slices of HF's fused conv1d weight).
-        self.q_conv1d = _Glm5NextConv1d(
-            in_channels=self.key_dim,
-            out_channels=self.key_dim,
-            kernel_size=self.d_conv,
-            groups=self.key_dim,
-            padding=((self.d_conv - 1, 0),),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-            use_bias=False,
-            precision=precision,
-        )
-        self.k_conv1d = _Glm5NextConv1d(
-            in_channels=self.key_dim,
-            out_channels=self.key_dim,
-            kernel_size=self.d_conv,
-            groups=self.key_dim,
-            padding=((self.d_conv - 1, 0),),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-            use_bias=False,
-            precision=precision,
-        )
-        self.v_conv1d = _Glm5NextConv1d(
-            in_channels=self.value_dim,
-            out_channels=self.value_dim,
-            kernel_size=self.d_conv,
-            groups=self.value_dim,
-            padding=((self.d_conv - 1, 0),),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-            use_bias=False,
-            precision=precision,
-        )
-
-        self.forget_gate = Glm5NextForgetGate(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.b_proj = column_linear(config.hidden_size, self.num_heads)
-
-        self.g_a_proj = column_linear(config.hidden_size, self.head_dim)
-        self.g_b_proj = column_linear(self.head_dim, self.value_dim)
-
-        self.o_proj = RowParallelLinear(
-            self.value_dim,
-            config.hidden_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-        self.o_norm = RMSNormGated(
-            self.head_dim,
-            eps=config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            activation="sigmoid",
-            rngs=rngs,
-        )
-
-        metadata = OperationMetadata(
-            runtime_dtype=self.dtype,
-            runtime_softmax_dtype=jnp.float32,
-            base_config=self.config,
-        )
-        self.kda_op = KernelDeltaAttnOp(metadata)
 
     @property
     def reform_param(self):
-        """Checkpoint reform rules for this attention block.
+        """Split HF's fused depthwise ``conv1d.weight`` ``[2 * key_dim + value_dim, 1, d_conv]`` into ``q/k/v_conv1d``.
 
-        Two families of HF→EasyDeL renames:
-
-        - HF nests the forget gate flat under ``self_attn`` (``A_log``,
-          ``dt_bias``, ``f_a_proj``, ``f_b_proj``) while EasyDeL groups it
-          under the :class:`Glm5NextForgetGate` sub-module; the 2-D
-          projections also need the standard transpose.
-        - The conv kernels: HF ``conv1d.weight`` (a single fused depthwise
-          conv over 3*qkv channels) is split into the per-stream
-          ``q/k/v_conv1d`` kernels (identity on checkpoints that, like the
-          published bf16 extraction, already ship separate convs — those
-          convert through the default 3-D permute).
+        Checkpoints that already ship separate convolutions convert through the default 3-D permute; every other
+        tensor (including the flat forget-gate ``A_log`` / ``dt_bias`` / ``f_a_proj`` / ``f_b_proj``) maps by name.
 
         Returns:
             dict: Reform rules, module-relative.
         """
         qkv = self.key_dim
-        transpose = lambda x: x.permute(1, 0)  # noqa: E731
-
-        def _rename(hf_name: str, easydel_name: str, spliter=lambda x: x):
-            return {
-                "splits": [{"name": easydel_name, "spliter": spliter}],
-                "inverse_spliter": spliter,
-            }
-
         return {
             "conv1d.weight$": {
                 "splits": [
@@ -1037,283 +723,7 @@ class Glm5NextLinearAttention(spx.Module):
                     [q.permute(2, 1, 0), k.permute(2, 1, 0), v.permute(2, 1, 0)], dim=0
                 ),
             },
-            # HF keeps the forget-gate tensors flat on ``self_attn``; EasyDeL
-            # nests them under the Glm5NextForgetGate sub-module.
-            "A_log$": _rename("A_log", "forget_gate.A_log"),
-            "dt_bias$": _rename("dt_bias", "forget_gate.dt_bias"),
-            "f_a_proj.weight$": _rename(
-                "f_a_proj.weight",
-                "forget_gate.f_a_proj.weight",
-                transpose,
-            ),
-            "f_b_proj.weight$": _rename(
-                "f_b_proj.weight",
-                "forget_gate.f_b_proj.weight",
-                transpose,
-            ),
         }
-
-    def forward(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo | None = None,
-        cache_view: KDACacheView | None = None,
-        cache_metadata: KDAMetadata | None = None,
-    ) -> AttentionLayerOutput:
-        """Run the per-channel-decay delta rule over a block of tokens.
-
-        Streaming behaviour matches the Kimi donor: with a cache view carrying
-        rolling conv windows and the recurrent memory, a single new token is
-        spliced onto the conv buffers and the memory advances one step;
-        otherwise the conv applies left-padding and the chunked kernel runs
-        the parallel intra-chunk / recurrent inter-chunk decomposition.
-
-        Args:
-            hidden_states: ``(batch, seq_len, hidden_size)`` layer input.
-            mask_info: Optional :class:`MaskInfo`; only the padding mask is
-                consumed (the recurrence is causal by construction).
-            cache_view: Per-layer KDA cache (conv windows + recurrent state).
-            cache_metadata: Optional :class:`KDAMetadata`; unused on the
-                dense layout.
-
-        Returns:
-            :class:`AttentionLayerOutput` with ``(batch, seq_len,
-            hidden_size)`` output, ``attention_weight=None`` and the updated
-            cache view.
-        """
-        if mask_info is not None:
-            q_mask: Array | None = typing.cast("Array | None", mask_info.q_attention_mask)
-            if q_mask is not None and q_mask.shape[1] != hidden_states.shape[1]:
-                q_mask = q_mask[:, : hidden_states.shape[1]]
-            hidden_states = apply_mask_to_padding_states(hidden_states, q_mask)
-        # Packed-segment resets (kimi's ``segment_ids`` threading): when the
-        # batch carries packing metadata, both the depthwise conv and the
-        # delta-rule recurrence reset their state at document boundaries so
-        # document n+1 never attends to document n's state. Unpacked batches
-        # derive no segment ids and keep today's plain (faster chunked)
-        # paths; decode (seq_len == 1) is unaffected — the conv decode branch
-        # ignores segment ids and the single-step kernel never sees them.
-        segment_ids = None
-        if mask_info is not None:
-            segment_ids = packed_segment_ids_from_mask_info(mask_info, hidden_states.shape[1])
-
-        batch_size, seq_len, _ = hidden_states.shape
-        is_inference = seq_len == 1 and cache_view is not None
-
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        value = self.v_proj(hidden_states)
-
-        # eSurge packed-row serving: the runner feeds one flattened token
-        # stream [1, T, D] whose per-request segments are described by
-        # ``cache_metadata.query_start_loc``. Per-request state lives in
-        # per-row cache slots [max_num_reqs, ...], so the layer must split
-        # the stream into rows, advance each row's conv window / recurrent
-        # state independently, and scatter the outputs back.
-        qsl = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
-        if cache_view is not None and qsl is not None:
-            return self._forward_packed_rows(
-                hidden_states=hidden_states,
-                query=query,
-                key=key,
-                value=value,
-                beta=jax.nn.sigmoid(self.b_proj(hidden_states)),
-                decay=self.forget_gate(hidden_states),
-                cache_view=cache_view,
-                query_start_loc=qsl,
-                cache_metadata=cache_metadata,
-            )
-
-        q_conv_state = cache_view.q_conv_state if cache_view is not None else None
-        k_conv_state = cache_view.k_conv_state if cache_view is not None else None
-        v_conv_state = cache_view.v_conv_state if cache_view is not None else None
-
-        conv_output_dtype = jnp.bfloat16 if self.dtype in lowfloats else self.dtype
-
-        query, new_q_conv_state = apply_conv_with_state(
-            query,
-            self.q_conv1d,
-            q_conv_state,
-            is_inference=is_inference,
-            d_conv=self.d_conv,
-            output_dtype=conv_output_dtype,
-            reuse_partial_state=True,
-            segment_ids=segment_ids,
-        )
-        key, new_k_conv_state = apply_conv_with_state(
-            key,
-            self.k_conv1d,
-            k_conv_state,
-            is_inference=is_inference,
-            d_conv=self.d_conv,
-            output_dtype=conv_output_dtype,
-            reuse_partial_state=True,
-            segment_ids=segment_ids,
-        )
-        value, new_v_conv_state = apply_conv_with_state(
-            value,
-            self.v_conv1d,
-            v_conv_state,
-            is_inference=is_inference,
-            d_conv=self.d_conv,
-            output_dtype=conv_output_dtype,
-            reuse_partial_state=True,
-            segment_ids=segment_ids,
-        )
-
-        query = query.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        key = key.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        value = value.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        query = apply_logical_sharding(
-            query,
-            dynamic_axes=common_types.AttnQSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        key = apply_logical_sharding(
-            key,
-            dynamic_axes=common_types.AttnKVSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        value = apply_logical_sharding(
-            value,
-            dynamic_axes=common_types.AttnKVSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-
-        decay = self.forget_gate(hidden_states)
-        beta = jax.nn.sigmoid(self.b_proj(hidden_states))
-
-        output_gate = self.g_b_proj(self.g_a_proj(hidden_states))
-        output_gate = output_gate.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-
-        recurrent_state = cache_view.recurrent_state if cache_view is not None else None
-
-        kda_output: KDAOutput = self.kda_op(
-            query=query,
-            key=key,
-            value=value,
-            beta=beta,
-            decay=decay,
-            q_conv_state=new_q_conv_state,
-            k_conv_state=new_k_conv_state,
-            v_conv_state=new_v_conv_state,
-            recurrent_state=recurrent_state,
-            chunk_size=self.chunk_size,
-            per_channel_decay=True,
-            segment_ids=segment_ids,
-            continue_initial_state=cache_view is not None,
-        )
-
-        output = kda_output.attention_outputs
-
-        output = self.o_norm(output, output_gate)
-        output = output.reshape(batch_size, seq_len, -1)
-        output = apply_logical_sharding(
-            output,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        output = checkpoint_name(self.o_proj(output), name="attn_output")
-        output = apply_logical_sharding(
-            output,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-
-        new_cache_view = cache_view
-        if cache_view is not None:
-            new_cache_view = cache_view.update_kda_states(
-                new_q_conv_state=kda_output.q_conv_state,
-                new_k_conv_state=kda_output.k_conv_state,
-                new_v_conv_state=kda_output.v_conv_state,
-                new_recurrent_state=kda_output.recurrent_state,
-            )
-
-        return AttentionLayerOutput(
-            attention_output=output,
-            attention_weight=None,
-            cache_view=new_cache_view,
-        )
-
-    def _forward_packed_rows(
-        self,
-        hidden_states: Float[Array, "1 seq_len hidden_dim"],
-        query: Float[Array, "1 seq_len key_dim"],
-        key: Float[Array, "1 seq_len key_dim"],
-        value: Float[Array, "1 seq_len value_dim"],
-        beta: Float[Array, "1 seq_len num_heads"],
-        decay: Float[Array, "1 seq_len num_heads head_dim"],
-        cache_view: KDACacheView,
-        query_start_loc: Array,
-        cache_metadata: Array | None = None,
-    ) -> AttentionLayerOutput:
-        """Advance per-request KDA state over an eSurge packed token stream.
-
-        The runner flattens all scheduled requests into one token stream
-        ``[1, T, D]``; ``query_start_loc`` gives each request's (row's)
-        segment as ``[start_i, start_{i+1})``. Per-request conv windows and
-        recurrent memory live in per-row cache slots, so this method splits
-        the stream into rows, runs the causal conv per row (with the carried
-        window as prefix for rows that already hold context), advances the
-        per-channel delta-rule state per row — single-step on pure decode
-        steps, memory-bounded chunk scan otherwise — and gathers the
-        per-row outputs back into the packed stream.
-
-        Args:
-            hidden_states: Packed layer input ``[1, T, D]``.
-            query: Packed Q projection ``[1, T, key_dim]``.
-            key: Packed K projection ``[1, T, key_dim]``.
-            value: Packed V projection ``[1, T, value_dim]``.
-            beta: Packed per-head gating ``[1, T, heads]`` (sigmoid applied).
-            decay: Packed fused per-channel log-decay ``[1, T, heads, head_dim]``.
-            cache_view: Per-layer KDA cache view (per-row slots).
-            query_start_loc: Cumulative segment offsets ``[rows + 1]``.
-
-        Returns:
-            :class:`AttentionLayerOutput` with the packed output row and the
-            updated cache view.
-        """
-        seq = hidden_states.shape[1]
-        conv_dtype = jnp.bfloat16 if self.dtype in lowfloats else self.dtype
-        out_packed, new_cache_view = kda_packed_rows_forward(
-            query=query,
-            key=key,
-            value=value,
-            beta=beta,
-            decay=decay,
-            conv_kernels=tuple(getattr(self, f"{n}_conv1d").weight.value.squeeze(1).T for n in ("q", "k", "v")),
-            cache_view=cache_view,
-            query_start_loc=query_start_loc,
-            context_lens=getattr(cache_metadata, "context_lens", None),
-            conv_dtype=conv_dtype,
-            chunk_size=_KDA_CHUNK_SIZE,
-            spec_recurrent_commit=getattr(cache_metadata, "spec_recurrent_commit", None),
-        )
-        num_heads, head_v_dim = out_packed.shape[2], out_packed.shape[3]
-        output_gate = self.g_b_proj(self.g_a_proj(hidden_states))
-        output_gate = output_gate.reshape(1, seq, num_heads, head_v_dim)
-        output = self.o_norm(out_packed.astype(hidden_states.dtype), output_gate)
-        output = output.reshape(1, seq, -1)
-        output = checkpoint_name(self.o_proj(output), name="attn_output")
-        return AttentionLayerOutput(
-            attention_output=output,
-            attention_weight=None,
-            cache_view=new_cache_view,
-        )
-
-
-@auto_pytree
-class _Glm5NextAttentionOutput(AttentionLayerOutput):
-    """Attention output carrying an optional unscaled indexer warm-up loss."""
-
-    indexer_aux_loss: Array | None = None
-
-
-@auto_pytree
-class _Glm5NextDecoderOutput(DecoderLayerOutput):
-    """Decoder output carrying an optional unscaled indexer warm-up loss."""
-
-    indexer_aux_loss: Array | None = None
 
 
 class Glm5NextIndexer(SparseIndexer):
@@ -1328,6 +738,9 @@ class Glm5NextIndexer(SparseIndexer):
     ``index_kpool_compress_ape`` / ``index_kpool_compress_gate``) are owned by
     the parent class and are unchanged.
     """
+
+    # ``layer_idx`` is informational on the indexer, so it does not split the layer scan.
+    _spx_scan_safe_static_fields: ClassVar[frozenset[str]] = frozenset({"layer_idx"})
 
     def __init__(
         self,
@@ -1369,6 +782,7 @@ class Glm5NextIndexer(SparseIndexer):
                 kpool_size=config.index_kpool,
                 select_tail=config.index_kpool_always_select_tail,
                 initializer_range=config.initializer_range,
+                scoring_kernel=config.index_scoring_kernel,
             ),
             layer_idx=layer_idx,
             dtype=dtype,
@@ -1379,116 +793,13 @@ class Glm5NextIndexer(SparseIndexer):
         # Row-parallel TPU top-k resolves its layout from the model mesh.
         self.mesh_source = config
 
-    def distillation_loss(
-        self,
-        hidden_states: Array,
-        q_resid: Array,
-        attention_query: Array,
-        attention_key: Array,
-        visibility: Array,
-        query_segment_ids: Array,
-        key_segment_ids: Array,
-        *,
-        scaling: float,
-        sinks: Array | None = None,
-    ) -> Array:
-        """Distil dense MLA attention mass onto the scored, complete k-pools.
 
-        The shared pool indexer exposes selections, not differentiable scores.
-        Reuse its projections, learned pooling and head reduction here, without
-        its hard top-k. Inputs are detached so only indexer parameters train.
-        Incomplete tails are always-selected tokens, not scored candidates.
+class Glm5NextDSAAttention(DeepSeekSparseAttention):
+    """GLM-5-Next DSA attention: NoPE MLA (``qk_rope_head_dim=0``) restricted by the k-pool :class:`Glm5NextIndexer`.
 
-        Args:
-            hidden_states: Indexer inputs ``[B, S, D]``.
-            q_resid: MLA query residual ``[B, S, R]``.
-            attention_query: Actual NoPE MLA queries ``[B, S, H, Dq]``.
-            attention_key: Actual per-head MLA keys ``[B, T, H, Dq]``.
-            visibility: Pre-selection causal/padding/document mask ``[B, S, T]``.
-            query_segment_ids: Query document identities ``[B, S]``.
-            key_segment_ids: Key document identities ``[B, T]``; negative means padding.
-            scaling: MLA softmax scale, not the indexer's projection scale.
-            sinks: Optional attention sinks, one per MLA head.
-
-        Returns:
-            Unscaled scalar mean KL over queries reaching a complete pool.
-        """
-        hidden_states = jax.lax.stop_gradient(hidden_states)
-        q_resid = jax.lax.stop_gradient(q_resid)
-        attention_query = jax.lax.stop_gradient(attention_query)
-        attention_key = jax.lax.stop_gradient(attention_key)
-        valid = jnp.any(visibility, axis=1)
-        query, packed = self.project_state(hidden_states, q_resid=q_resid, attention_mask=valid)
-        kpool = self.config.kpool_size
-        token_positions = jnp.broadcast_to(jnp.arange(packed.shape[1]), valid.shape)
-
-        def query_loss(inputs):
-            hidden, projected, target_query, visible, position = inputs
-            # Pooling compacts visible tokens before grouping when masks are not
-            # prefixes (padding, packed documents or arbitrary pairwise masks).
-            # For prefixes this produces exactly the same complete candidates as
-            # storage-wide pooling. No [B, S, T, D] temporary is materialized.
-            local = packed.at[..., -1].set(visible.astype(packed.dtype))
-            pool_keys, members, pool_valid = self._pooled_states(local, key_segment_ids)
-            dots = jnp.einsum(
-                "bhd,bpd->bhp", projected.astype(jnp.float32), pool_keys.astype(jnp.float32), precision=self.precision
-            )
-            scores = self._reduce_heads(jax.nn.relu(dots * self.softmax_scale)[:, None], hidden[:, None])
-            scores = jnp.where(pool_valid[:, None], scores, -jnp.inf)
-            # Candidate groups are over compacted valid tokens, not necessarily
-            # consecutive physical rows. Gather the target keys into that exact
-            # group order before asking the shared op to sum token mass per pool.
-            indices = jnp.maximum(members.reshape(members.shape[0], -1), 0)
-            entries = jnp.take_along_axis(attention_key, indices[..., None, None], axis=1).transpose(0, 2, 1, 3)
-            entry_positions = jnp.take_along_axis(token_positions, indices, axis=1)
-            entry_segments = jnp.take_along_axis(key_segment_ids, indices, axis=1)
-            entry_valid = jnp.repeat(pool_valid, kpool, axis=-1)
-            loss = indexer_distillation_loss(
-                target_query[:, :, None, :],
-                entries,
-                scores,
-                scaling=scaling,
-                sinks=sinks,
-                entry_group=kpool,
-                entry_valid=entry_valid,
-                q_positions=position[:, None],
-                entry_positions=entry_positions,
-                q_segment_ids=jnp.take_along_axis(query_segment_ids, position[:, None], axis=1),
-                entry_segment_ids=entry_segments,
-                precision=self.precision,
-                block_q=1,
-            )
-            count = jnp.sum(jnp.any(pool_valid, axis=-1), dtype=jnp.float32)
-            return loss * count, count
-
-        sums, counts = jax.lax.map(
-            query_loss,
-            tuple(jnp.swapaxes(x, 0, 1) for x in (hidden_states, query, attention_query, visibility, token_positions)),
-        )
-        return jnp.sum(sums) / jnp.maximum(jnp.sum(counts), 1.0)
-
-
-class Glm5NextDSAAttention(UnifiedAttention):
-    """Multi-head Latent Attention (NoPE) with k-pool DSA sparse gating.
-
-    Standard DeepSeek MLA: queries factor through the ``q_lora_rank``
-    bottleneck; keys/values through the compressed ``kv_lora_rank`` latent
-    (``kv_a_proj_with_mqa`` + ``kv_a_layernorm`` + ``kv_b_proj``). GLM-5 is
-    fully NoPE (``qk_rope_head_dim=0``): there is no rotary module and the
-    whole head dim is the non-positional slice.
-
-    The indexer (:class:`Glm5NextIndexer`) restricts each query's attention
-    to the selected ``index_topk`` (+ tail pool) tokens by ANDing a
-    scatter mask into the pairwise ``mask_info`` attention mask.
-
-    Cache: full-attention KV pages via ``UnifiedAttention.concatenate``;
-    ordinary transformer views keep packed per-token indexer features in
-    position-aligned ``auxiliary_state``. Legacy recurrent-state views and
-    paged serving retain their existing storage contracts.
-
-    The ``projection_mapping`` class variable rewrites attribute names into
-    HF-checkpoint-compatible names (``q_a_proj``, ``kv_a_proj_with_mqa``,
-    ``indexer.wq_b``, ...).
+    Ordinary transformer caches keep the packed indexer features in their position-aligned auxiliary channel; MLA
+    ragged-pages serving keeps them in indexer pages and selects pools of ``index_kpool`` tokens. The
+    ``projection_mapping`` binds the HF checkpoint attribute names.
     """
 
     projection_mapping: ClassVar[dict[str, str]] = {
@@ -1499,168 +810,11 @@ class Glm5NextDSAAttention(UnifiedAttention):
         "mla_kv_a_layernorm": "kv_a_layernorm",
         "mla_kv_b_proj": "kv_b_proj",
         "output_projection": "o_proj",
-        "dsa_indexer_wq_b": "indexer.wq_b",
-        "dsa_indexer_wk": "indexer.wk",
-        "dsa_indexer_k_norm": "indexer.k_norm",
-        "dsa_indexer_weights_proj": "indexer.weights_proj",
     }
 
-    def __init__(
-        self,
-        config: Glm5NextTextConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: spx.Rngs,
-        layer_idx: int,
-    ):
-        """Initialize the MLA + DSA attention block.
-
-        Args:
-            config: Model configuration.
-            dtype: Computation dtype.
-            param_dtype: Parameter dtype.
-            precision: JAX matmul precision.
-            rngs: Random number generator collection.
-            layer_idx: Index of this layer in the decoder stack.
-        """
-        self.config = config
-        self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.v_head_dim = config.v_head_dim
-        self.kv_lora_rank = config.kv_lora_rank
-        self.index_topk = config.index_topk
-
-        super().__init__(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-            layer_idx=layer_idx,
-            attention_type="mla",
-            causal=True,
-            use_mla_lora=True,
-        )
-        self.head_dim = self.v_head_dim
-
-    def define_network(
-        self,
-        config: Glm5NextTextConfig,
-        dtype: jnp.dtype,
-        param_dtype: jnp.dtype,
-        precision: jax.lax.Precision,
-        rngs: spx.Rngs,
-    ):
-        """Creates the MLA projections, attention performer, and k-pool indexer.
-
-        NoPE model: no rotary embedding is created.
-
-        Args:
-            config: Model configuration.
-            dtype: Computation dtype.
-            param_dtype: Parameter storage dtype.
-            precision: JAX matmul precision.
-            rngs: PRNG key container.
-        """
-        setattr(
-            self,
-            self.projection_mapping["mla_q_a_proj"],
-            ColumnParallelLinear(
-                config.hidden_size,
-                config.q_lora_rank,
-                rngs=rngs,
-                use_bias=config.attention_bias,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-        setattr(
-            self,
-            self.projection_mapping["mla_q_a_layernorm"],
-            RMSNorm(
-                config.q_lora_rank,
-                # HF builds these RMSNorms with `config.rms_norm_eps` (1e-5);
-                # the indexer's k_norm below keeps its own LayerNorm eps 1e-6.
-                eps=config.rms_norm_eps,
-                rngs=rngs,
-                dtype=dtype,
-                param_dtype=param_dtype,
-            ),
-        )
-        setattr(
-            self,
-            self.projection_mapping["mla_q_b_proj"],
-            ColumnParallelLinear(
-                config.q_lora_rank,
-                config.num_attention_heads * self.q_head_dim,
-                rngs=rngs,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-        setattr(
-            self,
-            self.projection_mapping["mla_kv_a_proj_with_mqa"],
-            ColumnParallelLinear(
-                config.hidden_size,
-                config.kv_lora_rank + config.qk_rope_head_dim,
-                rngs=rngs,
-                use_bias=config.attention_bias,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-        setattr(
-            self,
-            self.projection_mapping["mla_kv_a_layernorm"],
-            RMSNorm(
-                config.kv_lora_rank,
-                eps=config.rms_norm_eps,
-                rngs=rngs,
-                dtype=dtype,
-                param_dtype=param_dtype,
-            ),
-        )
-        setattr(
-            self,
-            self.projection_mapping["mla_kv_b_proj"],
-            ColumnParallelLinear(
-                config.kv_lora_rank,
-                config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
-                rngs=rngs,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-        setattr(
-            self,
-            self.projection_mapping["output_projection"],
-            RowParallelLinear(
-                config.num_attention_heads * self.v_head_dim,
-                config.hidden_size,
-                rngs=rngs,
-                use_bias=config.attention_bias,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-        self.attention_performer = self._create_attention_performer(config, rngs)
-        self.indexer = Glm5NextIndexer(
+    def _create_indexer(self, config, dtype, param_dtype, precision, rngs) -> Glm5NextIndexer:
+        """This layer's k-pool indexer (see :meth:`DeepSeekSparseAttention._create_indexer`)."""
+        return Glm5NextIndexer(
             config=config,
             layer_idx=self.layer_idx,
             dtype=dtype,
@@ -1669,435 +823,9 @@ class Glm5NextDSAAttention(UnifiedAttention):
             rngs=rngs,
         )
 
-    def _create_attention_performer(self, config, rngs):
-        """Construct the flexible attention kernel (NoPE — no rope scaling).
-
-        Args:
-            config: Model configuration.
-            rngs: Random number generator collection.
-
-        Returns:
-            A :class:`FlexibleAttentionModule` configured for MLA + DSA.
-        """
-        softmax_scale = self.q_head_dim**-0.5
-        return FlexibleAttentionModule(
-            rngs=rngs,
-            base_config=config,
-            softmax_scale=softmax_scale,
-            dropout_prob=getattr(config, "attention_dropout", 0.0),
-        )
-
-    @property
-    def reform_param(self):
-        """No extra reform rules (all projections load with plain transposes).
-
-        Returns:
-            dict: Empty mapping.
-        """
-        return {}
-
-    def forward_mla(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo | None,
-        position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-        alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
-        previous_topk_indices: Array | None = None,
-        return_topk_indices: bool = False,
-    ):
-        """Run the NoPE MLA forward with the k-pool DSA top-k mask.
-
-        Args:
-            hidden_states: Layer input ``(batch, seq_len, hidden_size)``.
-            mask_info: Attention mask metadata.
-            position_ids: Position indices (unused — NoPE; kept for the
-                UnifiedAttention call contract).
-            mode: Runtime mode propagated to the kernel.
-            cache_view: KV cache view (full-attention hybrid or transformer).
-            cache_metadata: Cache metadata.
-            output_attentions: Whether to return attention weights.
-            frequencies: Unused (NoPE).
-            alibi: Unused.
-
-        Returns:
-            :class:`AttentionLayerOutput` with the attention output, optional
-            weights, and the updated cache view with position-aligned
-            persistent indexer features.
-        """
-        del position_ids, frequencies, alibi
-        bsz, q_len, _ = hidden_states.shape
-
-        q_resid = self.mla_q_a_layernorm(checkpoint_name(self.mla_q_a_proj(hidden_states), name="attn_query_a"))
-        query_states = checkpoint_name(self.mla_q_b_proj(q_resid), name="attn_query")
-        query_states = query_states.reshape(bsz, q_len, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
-
-        compressed_kv = self.mla_kv_a_proj_with_mqa(hidden_states)
-        compressed_kv = self.mla_kv_a_layernorm(compressed_kv[..., : self.kv_lora_rank])
-        kv = (
-            self.mla_kv_b_proj(compressed_kv)
-            .reshape(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-        key_states = kv[..., : self.qk_nope_head_dim]
-        value_states = kv[..., self.qk_nope_head_dim :]
-
-        # BTHD at the op boundary (matches the concatenate contract).
-        query_states = query_states.transpose(0, 2, 1, 3)
-        key_states = key_states.transpose(0, 2, 1, 3)
-        value_states = value_states.transpose(0, 2, 1, 3)
-
-        cached_packed_states = None
-        has_recurrent_slot = cache_view is not None and hasattr(cache_view, "recurrent_state")
-        if has_recurrent_slot:
-            maybe_cached = getattr(cache_view, "recurrent_state", None)
-            if (
-                maybe_cached is not None
-                and getattr(maybe_cached, "ndim", 0) == 3
-                and maybe_cached.shape[0] == bsz
-                and maybe_cached.shape[-1] == self.indexer.packed_state_dim
-            ):
-                cached_packed_states = maybe_cached
-
-        mask_info = MaskInfo.dynamic_init(
-            mask_info=mask_info, input_ids=None, inputs_embeds=hidden_states, attention_mask=None
-        )
-        q_mask = None
-        if mask_info is not None and not isinstance(cache_view, TransformerCacheView):
-            q_mask = typing.cast("Array | None", mask_info.q_attention_mask)
-            if q_mask is not None:
-                if q_mask.shape[1] != q_len:
-                    q_mask = q_mask[:, :q_len]
-                q_mask = q_mask.astype(bool)
-
-        # Ragged serving with paged indexer state: selections are chunk (pool) ids over the
-        # real per-request history and attention runs through the sparse MLA op.
-        qsl = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
-        # Decided from the shared cache config, not this view's buffers: "shared" indexer
-        # layers own no indexer pages but must still route the reused chunk ids to the sparse op.
-        paged_indexer = (
-            isinstance(cache_view, MLARaggedPagesCacheView)
-            and bool(getattr(getattr(cache_view, "metadata", None), "has_indexer_pages", False))
-            and getattr(cache_metadata, "pages_tables", None) is not None
-            and qsl is not None
-            # 1-D (single replica) or rank-major [dp, rows + 1] (data-parallel serving).
-            and qsl.ndim in (1, 2)
-        )
-
-        shared_indexer = self.config.indexer_types[self.layer_idx] == "shared"
-        aux_active = cache_view is None and not shared_indexer and self.config.indexer_aux_loss_coef > 0.0
-        indexer_aux_loss = None
-        if shared_indexer:
-            if previous_topk_indices is None:
-                raise ValueError("A shared GLM-5 indexer requires a preceding full layer's top-k selection.")
-            topk_indices = previous_topk_indices
-            indexer_out = None
-        elif paged_indexer:
-            from easydel.operations.kernels.multi_latent_ragged_page_attention import _resolve_distribution
-
-            # ``[..., 2]``: the live count, per rank for rank-major ([dp, 3]) distributions.
-            num_seqs = _resolve_distribution(cache_metadata)[..., 2]
-            topk_indices, token_pages, pool_pages = paged_pool_select(
-                self.indexer,
-                hidden_states.reshape(bsz * q_len, hidden_states.shape[-1]),
-                q_resid.reshape(bsz * q_len, q_resid.shape[-1]),
-                cache_view.indexer_token_pages,
-                cache_view.indexer_pool_pages,
-                jnp.asarray(cache_metadata.pages_tables, jnp.int32),
-                jnp.asarray(cache_metadata.context_lens, jnp.int32),
-                jnp.asarray(qsl, jnp.int32),
-                num_seqs,
-                constrain_rows=cache_view.constrain_indexer_rows,
-                constrain_pages=cache_view.constrain_indexer_pages,
-                kernel_mesh=cache_view.indexer_kernel_mesh(),
-                dp_sharding=cache_view.indexer_dp_sharding(),
-            )
-            cache_view = cache_view.replace(indexer_token_pages=token_pages, indexer_pool_pages=pool_pages)
-            indexer_out = None
-        elif isinstance(cache_view, TransformerCacheView):
-            # Query validity must follow the owning cache's selected query rows,
-            # not the prefix of a full-history mask. Let the cache resolve
-            # per-row insertion offsets (including metadata overrides), padding
-            # and sliding coordinates before packing current indexer features.
-            _, current_index_mask, _ = cache_view.update_auxiliary(
-                jnp.zeros((bsz, q_len, self.indexer.packed_state_dim), dtype=jnp.float32),
-                mask_info,
-                cache_metadata,
-                causal=self.causal,
-                mode=mode,
-                runtime_sharding_resolver=self.config.runtime_sharding_resolver,
-            )
-            q_mask = jnp.any(current_index_mask.get_or_compute_attention_mask(dtype=jnp.bool_), axis=(1, 3))
-            index_query, current_packed = self.indexer.project_state(
-                hidden_states, q_resid=q_resid, attention_mask=q_mask
-            )
-            # Keep indexer features in exactly the same physical layout as KV,
-            # including per-row offsets, postpadding and sliding block tails.
-            packed_states, index_mask, cache_view = cache_view.update_auxiliary(
-                current_packed,
-                mask_info,
-                cache_metadata,
-                causal=self.causal,
-                mode=mode,
-                runtime_sharding_resolver=self.config.runtime_sharding_resolver,
-            )
-            query_segments, key_segments = index_mask.get_or_compute_segment_ids()
-            indexer_out = self.indexer.select_from_state(
-                hidden_states,
-                index_query,
-                packed_states,
-                attention_mask=q_mask,
-                pairwise_mask=index_mask.get_or_compute_attention_mask(dtype=jnp.bool_),
-                query_positions=index_mask.q_positions,
-                key_positions=index_mask.kv_positions,
-                segment_ids=query_segments,
-                key_segment_ids=key_segments,
-            )
-            topk_indices = indexer_out.topk_indices
-        else:
-            pairwise_mask = (
-                pairwise_attention_mask_from_mask_info(mask_info, q_len, q_len) if cached_packed_states is None else None
-            )
-            query_segments, key_segments = (
-                _pool_indexer_segment_ids(mask_info, pairwise_mask) if cached_packed_states is None else (None, None)
-            )
-            indexer_out = self.indexer(
-                hidden_states=jax.lax.stop_gradient(hidden_states) if aux_active else hidden_states,
-                q_resid=jax.lax.stop_gradient(q_resid) if aux_active else q_resid,
-                attention_mask=q_mask,
-                cached_packed=cached_packed_states,
-                pairwise_mask=pairwise_mask,
-                segment_ids=query_segments,
-                key_segment_ids=key_segments,
-            )
-            topk_indices, packed_states = indexer_out.topk_indices, indexer_out.packed_state
-            if aux_active:
-                positions = jnp.arange(q_len)
-                visible = jnp.broadcast_to(positions[None, None, :] <= positions[None, :, None], (bsz, q_len, q_len))
-                if pairwise_mask is not None:
-                    visible = visible & pairwise_mask
-                if q_mask is not None:
-                    visible = visible & q_mask[:, :, None] & q_mask[:, None, :]
-                visible = visible & (query_segments[:, :, None] == key_segments[:, None, :])
-                visible = visible & (query_segments[:, :, None] >= 0) & (key_segments[:, None, :] >= 0)
-                indexer_aux_loss = self.indexer.distillation_loss(
-                    hidden_states,
-                    q_resid,
-                    query_states,
-                    key_states,
-                    visible,
-                    query_segments,
-                    key_segments,
-                    scaling=self.attention_performer.softmax_scale,
-                    sinks=self._softmax_aux(),
-                )
-
-            if has_recurrent_slot and hasattr(cache_view, "replace"):
-                try:
-                    cache_view = cache_view.replace(recurrent_state=packed_states.astype(cache_view.key.dtype))
-                except TypeError:
-                    logger.warning_once(
-                        "Failed to store indexer packed states in cache_view.recurrent_state; "
-                        "cache structure may not support recurrent_state."
-                    )
-
-        causal_for_kernel = self.causal
-        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
-            causal_for_kernel = False
-        sliding_window_for_kernel = self.sliding_window
-        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
-            sliding_window_for_kernel = None
-
-        # The MLA ragged-pages kernel consumes the weight-absorbed form
-        # (q_nope @ W_k, latent kv) rather than decompressed per-head
-        # states; the latent (compressed_kv + rope) is what the
-        # MLARaggedPagesCacheView stores. GLM-5 is NoPE, so the rope
-        # components carry no information — they are zero-padded to the
-        # cache rope width (``mla_cache_rope_width``, 128-aligned for the
-        # Pallas MLA kernel), which contributes nothing to the scores.
-        absorbed_w_v = None
-        mla_kwargs: dict = {}
-        if isinstance(cache_view, MLARaggedPagesCacheView):
-            w = self.mla_kv_b_proj.weight.value
-            local_heads = w.shape[1] // (self.qk_nope_head_dim + self.v_head_dim)
-            w = w.reshape(self.kv_lora_rank, local_heads, self.qk_nope_head_dim + self.v_head_dim)
-            w_nope = w[:, :, : self.qk_nope_head_dim]
-            absorbed_w_v = w[:, :, self.qk_nope_head_dim :]
-
-            q_nope = query_states  # [B, S, N, qk_nope] (BTHD)
-            q_absorbed = jnp.einsum(
-                "bsnd,knd->bsnk",
-                q_nope.astype(jnp.float32),
-                w_nope.astype(jnp.float32),
-            ).astype(q_nope.dtype)
-
-            rope_width = int(getattr(self.config, "mla_cache_rope_width", 0) or 0)
-            query_states = q_absorbed  # [B, S, N, kv_lora_rank]
-            key_states = jnp.concatenate(
-                [compressed_kv[:, :, None, :], jnp.zeros((bsz, q_len, 1, rope_width), compressed_kv.dtype)],
-                axis=-1,
-            )
-            value_states = key_states
-
-            mla_kwargs = {
-                "queries_nope": query_states,
-                "queries_pe": jnp.zeros((bsz, q_len, self.num_heads, rope_width), query_states.dtype),
-                "keys_values": compressed_kv,
-                "keys_pe": jnp.zeros((bsz, q_len, rope_width), compressed_kv.dtype),
-                "softmax_scale": self.attention_performer.softmax_scale,
-            }
-            if paged_indexer and topk_indices is not None:
-                mla_kwargs["sparse_selected"] = topk_indices
-                mla_kwargs["sparse_chunk_size"] = int(self.config.index_kpool)
-            elif topk_indices is not None:
-                # No paged indexer state (cache built without indexer pages, or rank-major DP
-                # metadata): the selection cannot reach the MLA ragged kernel, so DSA layers
-                # attend densely. Say so, as glm_moe_dsa does.
-                logger.warning_once(
-                    "GLM-5-Next: MLA ragged-pages serving without paged indexer state (cache has no "
-                    "indexer pages, or rank-major DP metadata); DSA layers attend densely, which "
-                    "diverges from the reference once the context exceeds index_topk=%s tokens.",
-                    self.config.index_topk,
-                )
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-        )
-
-        topk_mask = None
-        combined_mask = None
-        if topk_indices is not None and not isinstance(cache_view, MLARaggedPagesCacheView):
-            # The ragged-pages MLA kernel has no per-query mask input, so a
-            # top-k mask built here is dead weight on the serving path — and
-            # its indices span the full cached context while kv_len is only
-            # the packed window (garbage mask). Restrict the mask build to
-            # dense (non-ragged) cache consumers, which do honor mask_info.
-            kv_len = key_states.shape[1]
-            selection = IndexerSelection(topk_indices) if shared_indexer else indexer_out.selection
-            topk_mask = selection.to_mask(kv_len)
-            attention_mask = pairwise_attention_mask_from_mask_info(mask_info, q_len, kv_len)
-            combined_mask = topk_mask if attention_mask is None else attention_mask & topk_mask
-            # Pool selection already enforces causality in the aligned cache's
-            # absolute positions (also for selections reused by shared layers).
-            # An absolute history mask need not carry the cache's baked-causal
-            # flag: passing causal=True would then add a chunk-relative triangle
-            # and incorrectly hide live historical keys in continuation blocks.
-            mask_info = mask_info.replace(
-                attention_mask=combined_mask[:, None, :, :],
-                causal_mask_baked_in=mask_info.causal_mask_baked_in or self.causal,
-            )
-            causal_for_kernel = False
-
-        # The sparse training operation has no dropout/RNG contract. Match the
-        # dispatcher's effective training state before allowing that fast path.
-        deterministic = self.attention_performer.deterministic
-        if deterministic is None:
-            deterministic = mode != common_types.MODE_TRAIN or not self.attention_performer.training
-        attention_dropout_active = not deterministic and self.attention_performer.dropout_prob > 0.0
-        if (
-            combined_mask is not None
-            and not attention_dropout_active
-            and use_sparse_training_attention(
-                topk_indices=topk_indices,
-                cache_view=cache_view,
-                mask_info=mask_info,
-                output_attentions=output_attentions,
-                sliding_window=sliding_window_for_kernel,
-                softmax_aux=self.get_softmax_aux(),
-                sparse_training=getattr(self.config, "dsa_sparse_training", None),
-                seq_len=q_len,
-            )
-        ):
-            # Training/no-cache: same per-head q/k/v and top-k mask as the dense path, but a
-            # tile-skipping flash kernel instead of materialized [B, H, S, S] masked scores.
-            attn_heads = sparse_selected_training_attention(
-                query=query_states,
-                key=key_states,
-                value=value_states,
-                selection_mask=combined_mask,  # already includes padding / segments
-                mask_info=None,
-                softmax_scale=self.attention_performer.softmax_scale,
-                # Same causal flag as the dense path: False when the mask already bakes causality in.
-                causal=bool(causal_for_kernel),
-                dtype=getattr(self.config, "attn_dtype", None),
-                metadata=getattr(self.attention_performer, "metadata", None),
-            )
-            attn_output = attn_heads.astype(hidden_states.dtype).reshape(bsz, q_len, -1)
-            attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
-            attn_output = self.shard_attention_prod(attn_output)
-            result = _Glm5NextAttentionOutput(
-                attention_output=attn_output,
-                attention_weight=None,
-                cache_view=cache_view,
-                indexer_aux_loss=indexer_aux_loss,
-            )
-            return (result, topk_indices) if return_topk_indices else result
-
-        softmax_aux = self._softmax_aux()
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=causal_for_kernel,
-            sliding_window=sliding_window_for_kernel,
-            softmax_aux=softmax_aux,
-            output_attentions=output_attentions,
-            **mla_kwargs,
-        )
-
-        attn_out = attentions.attention_outputs
-        if absorbed_w_v is not None and attn_out.ndim == 3:
-            # Kernel output: [total_tokens, N, kv_lora_rank] -> project W_v.
-            attn_out = jnp.einsum(
-                "thk,khv->thv",
-                attn_out.astype(jnp.float32),
-                absorbed_w_v.astype(jnp.float32),
-            ).astype(attn_out.dtype)
-            attn_output = attn_out.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
-        else:
-            attn_output = self._merge_heads(attentions.attention_outputs)
-        expected_attn_dim = self.num_heads * self.v_head_dim
-        if attn_output.shape[-1] != expected_attn_dim:
-            actual_attn_dim = int(attn_output.shape[-1])
-            if actual_attn_dim > expected_attn_dim:
-                attn_output = attn_output[..., :expected_attn_dim]
-            else:
-                pad_width = [(0, 0)] * attn_output.ndim
-                pad_width[-1] = (0, expected_attn_dim - actual_attn_dim)
-                attn_output = jnp.pad(attn_output, pad_width)
-        attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
-        attn_output = self.shard_attention_prod(attn_output)
-
-        result = _Glm5NextAttentionOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
-            indexer_aux_loss=indexer_aux_loss,
-        )
-        return (result, topk_indices) if return_topk_indices else result
+    def _mla_softmax_scale(self, config) -> float:
+        """``q_head_dim ** -0.5``: the reference applies no YaRN ``mscale`` correction."""
+        return self.q_head_dim**-0.5
 
 
 class Glm5NextDecoderLayer(spx.Module):
@@ -2121,6 +849,10 @@ class Glm5NextDecoderLayer(spx.Module):
         precision: JAX matmul precision.
         rngs: PRNG key container.
     """
+
+    # ``layer_idx`` only selects the sub-module classes at init (recorded in ``block_type``), so layers of the same
+    # type share one lowered scan body.
+    _spx_scan_safe_static_fields: ClassVar[frozenset[str]] = frozenset({"layer_idx"})
 
     def __init__(
         self,
@@ -2146,7 +878,8 @@ class Glm5NextDecoderLayer(spx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.rngs = rngs
+        # ``rngs`` is consumed by sub-module initialisers only; it is not kept on the layer (an unused shared RNG
+        # would force the sequential-carry scan lowering).
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.block_type = config.layer_types[layer_idx]
@@ -2339,7 +1072,7 @@ class Glm5NextDecoderLayer(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        result = _Glm5NextDecoderOutput(
+        result = SparseDecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
             cache_view=attn_outputs.cache_view,
@@ -2375,6 +1108,8 @@ class Glm5NextTextModel(_Glm5NextIndexerCacheMixin, EasyDeLBaseModule):
     """
 
     fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
+    # Accepts native checkpoints that nest the forget gate under ``self_attn.forget_gate``.
+    _upgrade_legacy_native_state = staticmethod(unnest_legacy_kda_forget_gate)
 
     def __init__(
         self,
@@ -2549,16 +1284,19 @@ class Glm5NextTextModel(_Glm5NextIndexerCacheMixin, EasyDeLBaseModule):
         views = past_key_values.views if past_key_values is not None else None
         has_cache_views = views is not None and any(v is not None for v in views)
         needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
-        # Heterogeneous stack (KDA vs DSA layers) — always Python-trace.
+        has_shared_indexers = "shared" in self.config.indexer_types
+        # With ``config.scan_layers`` the heterogeneous stack is scanned as one segment per run of identical layers
+        # (KDA vs DSA, dense vs sparse MLP). A scan needs a fixed carry structure, so stacks whose carry gains
+        # entries mid-stack (shared-indexer selections, the indexer aux loss) stay Python-traced.
+        indexer_aux_active = float(getattr(self.config, "indexer_aux_loss_coef", 0.0) or 0.0) > 0.0
         trace_layers = self._layer_scan_trace(
-            True,
+            False,
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache or bool(output_router_logits),
+            extra=needs_trace_cache or bool(output_router_logits) or has_shared_indexers or indexer_aux_active,
         )
         cache_views = views if trace_layers else None
-        has_shared_indexers = "shared" in self.config.indexer_types
 
         def _layer_loop(block, carry):
             """Run one heterogeneous decoder layer inside the stack loop.
@@ -2675,6 +1413,7 @@ class Glm5NextForCausalLM(_Glm5NextIndexerCacheMixin, BaseCausalLMModule[Glm5Nex
     _task_type = TaskType.CAUSAL_LM
     _model_type = "glm5_next_text"
     _config_class = Glm5NextTextConfig
+    _upgrade_legacy_native_state = staticmethod(unnest_legacy_kda_forget_gate)
 
     fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 

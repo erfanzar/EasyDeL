@@ -82,7 +82,9 @@ from ._pallas_impl import LutFn
 from ._pallas_impl import grouped_matmul as back_grouped_matmul
 from ._pallas_impl import transposed_grouped_matmul as back_tgrouped_matmul
 
-_back_grouped_matmul = jax.custom_vjp(back_grouped_matmul, nondiff_argnums=(3, 4, 7, 8))
+# Index 9 is ``vmem_limit_bytes``: custom_vjp binds every default, so each trailing static parameter of the impl
+# must be listed here and accepted by both rules.
+_back_grouped_matmul = jax.custom_vjp(back_grouped_matmul, nondiff_argnums=(3, 4, 7, 8, 9))
 
 
 def _grouped_matmul_fwd(
@@ -95,6 +97,7 @@ def _grouped_matmul_fwd(
     existing_out: jnp.ndarray | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,
+    vmem_limit_bytes: int | None = None,
 ) -> tuple[
     jnp.ndarray,
     tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray | None, int],
@@ -117,6 +120,7 @@ def _grouped_matmul_fwd(
         existing_out: Optional existing output array to accumulate into.
         transpose_rhs: Whether to transpose the last two dimensions of rhs.
         interpret: Whether to run in interpret mode for debugging.
+        vmem_limit_bytes: Scoped-VMEM limit of the kernels (``None``: Mosaic's default).
 
     Returns:
         Tuple of:
@@ -134,6 +138,7 @@ def _grouped_matmul_fwd(
         existing_out,
         transpose_rhs=transpose_rhs,
         interpret=interpret,
+        vmem_limit_bytes=vmem_limit_bytes,
     )
     return out, (lhs, rhs, group_sizes, group_offset, rhs.shape[0])
 
@@ -143,6 +148,7 @@ def _grouped_matmul_bwd(
     tiling: tuple[int, int, int],
     transpose_rhs: bool,
     interpret: bool,
+    vmem_limit_bytes: int | None,
     residual: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray | None, int],
     grad: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray, None, None, jnp.ndarray]:
@@ -157,6 +163,7 @@ def _grouped_matmul_bwd(
         tiling: Tile dimensions (tm, tk, tn) for kernel execution.
         transpose_rhs: Whether rhs was transposed in forward pass.
         interpret: Whether to run in interpret mode for debugging.
+        vmem_limit_bytes: Scoped-VMEM limit of the backward kernels (``None``: Mosaic's default).
         residual: Saved tensors from forward pass containing
             (lhs, rhs, group_sizes, group_offset, num_actual_groups).
         grad: Gradient of the loss with respect to the output, shape [m, n].
@@ -181,6 +188,7 @@ def _grouped_matmul_bwd(
         group_offset,
         transpose_rhs=not transpose_rhs,
         interpret=interpret,
+        vmem_limit_bytes=vmem_limit_bytes,
     )
     grad_rhs = back_tgrouped_matmul(
         lhs.swapaxes(0, 1),
@@ -191,6 +199,7 @@ def _grouped_matmul_bwd(
         group_offset,
         num_actual_groups,
         interpret=interpret,
+        vmem_limit_bytes=vmem_limit_bytes,
     )
 
     grad_rhs = grad_rhs.swapaxes(1, 2) if transpose_rhs else grad_rhs

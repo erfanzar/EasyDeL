@@ -26,10 +26,12 @@ from dataclasses import dataclass
 
 import jax
 import spectrax as spx
+from eformer.loggings import get_logger
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
 
+from easydel.infra.etils import INDEX_SCORING_KERNELS
 from easydel.layers.compressed_window import MASK_MIN, entry_reach
 from easydel.layers.linears import ColumnParallelLinear
 from easydel.layers.norms import RMSNorm
@@ -46,9 +48,13 @@ __all__ = (
     "select_candidate_blocks",
     "selection_bias",
     "shared_key_scores",
+    "warn_unsupported_scoring_kernel",
 )
 
-SCORING_KERNELS = ("xla", "pallas")
+logger = get_logger(__name__)
+
+# Valid ``scoring_kernel`` values: the set behind ``EasyDeLBaseConfig.index_scoring_kernel``.
+SCORING_KERNELS = INDEX_SCORING_KERNELS
 
 
 def check_scoring_kernel(scoring_kernel: str) -> str:
@@ -66,6 +72,25 @@ def check_scoring_kernel(scoring_kernel: str) -> str:
     if scoring_kernel not in SCORING_KERNELS:
         raise ValueError(f"scoring_kernel must be one of {SCORING_KERNELS}, got {scoring_kernel!r}.")
     return scoring_kernel
+
+
+def warn_unsupported_scoring_kernel(config: tp.Any, indexer: str) -> None:
+    """Warn once when ``config.index_scoring_kernel`` asks for a fused scoring path an indexer does not have.
+
+    ``index_scoring_kernel`` is a base-config setting; indexers with a fused path (pooled, compressed, shared-key)
+    take it through their config. Indexers without one call this from their constructor to report the unsupported
+    request; they keep scoring with the ``"xla"`` path.
+
+    Args:
+        config: Model config carrying ``index_scoring_kernel``.
+        indexer: Indexer description used in the message (for example ``"GLM-MoE-DSA token"``).
+    """
+    requested = getattr(config, "index_scoring_kernel", "xla")
+    if requested != "xla":
+        logger.warning_once(
+            f"index_scoring_kernel={requested!r} is not supported by the {indexer} indexer (it has no fused scoring "
+            "path); it scores with the 'xla' path."
+        )
 
 
 def fused_head_scores(

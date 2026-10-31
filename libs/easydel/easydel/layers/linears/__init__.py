@@ -107,6 +107,7 @@ from ._linear_quantized import (
     RowParallelLinearQuantized,
 )
 from ._lora import eLoRA
+from ._shared_input import gather_shared_input
 
 __all__ = (
     "W4A4_FUSED_PAIR_MIN_PACKED_BYTES",
@@ -121,5 +122,6 @@ __all__ = (
     "RowParallelLinearQuantized",
     "RowParallelMoELinear",
     "eLoRA",
+    "gather_shared_input",
     "rescaled_residual_init",
 )

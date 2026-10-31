@@ -60,6 +60,17 @@ GLM5_NEXT_INDEXER_TYPES: tuple[str, str] = ("full", "shared")
 class Glm5NextTextConfig(EasyDeLBaseConfig):
     """Configuration class for the GLM-5-Next text decoder.
 
+    The DSA runtime settings (``dsa_pool_training``, ``dsa_pool_query_chunk``,
+    ``dsa_pool_kernel``, ``dsa_sparse_training``, ``index_scoring_kernel``) and
+    the KDA runtime settings (``kda_chunk_impl``, ``kda_chunk_precision``,
+    ``gather_shared_projection_input``) are
+    :class:`~easydel.infra.base_config.EasyDeLBaseConfig` fields shared by every
+    DSA and KDA model. :meth:`validate_architecture` adds two GLM-5-Next
+    constraints: ``dsa_pool_kernel="gather"`` needs an even ``index_kpool``, and
+    with ``dsa_pool_training`` and ``index_kpool_always_select_tail`` the
+    ``"bitmap"`` kernel takes at most
+    ``ejkernel.modules.DSA_SPARSE_MAX_TAIL_KEYS + 1`` keys per pool.
+
     Args:
         vocab_size (`int`, *optional*, defaults to 154880):
             Vocabulary size of the model.
@@ -555,8 +566,17 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
             raise ValueError(f"index_kpool must be positive, got {self.index_kpool}.")
         if not self.indexer_aux_loss_coef >= 0.0:
             raise ValueError("indexer_aux_loss_coef must be non-negative.")
+        if self.dsa_pool_kernel == "gather" and self.index_kpool % 2:
+            raise ValueError(
+                f"dsa_pool_kernel='gather' requires an even index_kpool (one pool per 32-bit DMA word pair), "
+                f"got {self.index_kpool}."
+            )
         if self.index_topk % self.index_kpool != 0:
             raise ValueError(f"index_topk ({self.index_topk}) must be divisible by index_kpool ({self.index_kpool}).")
+        if self.dsa_pool_training and self.dsa_pool_kernel == "bitmap":
+            tail_error = self.dsa_pool_bitmap_tail_error()
+            if tail_error is not None:
+                raise ValueError(tail_error)
         if self.q_lora_rank is None:
             raise ValueError("For DSA usage in the attention layers, the `q_lora_rank` is strictly required!")
         if self.qk_rope_head_dim > 0:
@@ -567,6 +587,20 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
             raise ValueError(
                 f"n_routed_experts ({self.n_routed_experts}) must be divisible by n_group ({self.n_group})."
             )
+
+    def dsa_pool_bitmap_tail_error(self) -> str | None:
+        """Why the ``dsa_pool_kernel="bitmap"`` kernel cannot take this config's tail keys (``None`` when it can).
+
+        With ``index_kpool_always_select_tail`` every query also attends to its own incomplete pool: up to
+        ``index_kpool - 1`` tail keys, which the bitmap kernel carries in a fixed number of rows
+        (``ejkernel.modules.DSA_SPARSE_MAX_TAIL_KEYS``). The ``"gather"`` kernel has no such limit.
+
+        Returns:
+            The error message, or ``None``.
+        """
+        from easydel.layers.indexer import pool_bitmap_tail_error
+
+        return pool_bitmap_tail_error(self.index_kpool, self.index_kpool_always_select_tail)
 
     def is_kda_layer(self, layer_idx: int) -> bool:
         """Check whether ``layer_idx`` is a KDA linear-attention layer.
