@@ -11,7 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
+"""Chunked HF -> GCS (or local) downloader for huge directory-style repos.
+
+Designed for repos that contain many small files (Zarr trees, sharded tokenizer
+artifacts, ...) where a single ``snapshot_download`` would either exhaust local
+disk or stall on rate-limit recovery. The loop is:
+
+    walk repo file metadata -> accumulate items into ~N GiB staging batches
+    -> download a batch in parallel -> ``rsync`` / ``gsutil rsync`` the staging
+    payload to the destination -> drop the staging payload -> repeat
+
+The destination can be a local path (including a gcsfuse mount) or a
+``gs://bucket/prefix`` URI; the script picks the right sync command based on
+the prefix.
+
+Side effects:
+    - Issues HTTP requests against the HF Hub.
+    - Writes to ``--staging-dir`` (deleted between batches unless
+      ``--keep-staging`` is set).
+    - Writes downloaded files to ``--out-root`` (local or ``gs://`` via
+      ``gsutil``).
+    - May enable ``hf_transfer`` via ``HF_HUB_ENABLE_HF_TRANSFER`` env var.
+
 How to use
 
 Chunked downloader for Hugging Face repos with many files (e.g. Zarr).
@@ -61,20 +82,60 @@ GiB = 1024**3
 
 @dataclass(frozen=True)
 class DownloadItem:
+    """One file entry queued for chunked download.
+
+    Attributes:
+        path: Path of the file within the source repo.
+        size: File size in bytes.
+    """
+
     path: str
     size: int
 
 
 @dataclass
 class ChunkedDownloadArgs:
+    """CLI arguments for :func:`main`.
+
+    Attributes:
+        out_root: Destination root (local path or ``gs://bucket/prefix`` URI).
+        repo_id: Explicit repo ids (repeatable).
+        repos_file: Optional file with one repo id per line.
+        repo_type: HF repo type (``model``, ``dataset``, ``space``).
+        revision: HF revision to read from.
+        token: HF access token.
+        staging_dir: Local staging directory (created/emptied per repo batch).
+        chunk_gb: Target download batch size in GiB.
+        download_workers: Number of parallel download threads per batch.
+        path_in_repo: Restrict the download to a subfolder.
+        only_zarr: Only download files under ``*.zarr/`` directories.
+        include: Whitelist globs (repeatable).
+        exclude: Blacklist globs (repeatable).
+        skip_existing: Skip files already present at the local destination
+            with matching size.
+        force_download: Re-download even if a staging file already exists.
+        local_files_only: Skip HF Hub access entirely.
+        dry_run: Print actions but do nothing.
+        continue_on_error: Continue past per-file failures.
+        keep_staging: Do not delete staging payloads (useful for debugging).
+        gsutil_parallel: Use ``gsutil -m`` for ``gs://`` rsync.
+        enable_hf_transfer: Toggle the ``hf_transfer`` accelerated downloader.
+    """
+
     out_root: str = field(
         metadata={"help": "Destination root: a local path (including gcsfuse mount) or a gs://bucket/prefix URI."}
     )
 
-    repo_id: str = field(default_factory=list, metadata={"action": "append", "help": "HF repo id (repeatable)."})
+    repo_id: str = field(
+        default_factory=list,
+        metadata={"action": "append", "help": "HF repo id (repeatable)."},
+    )
     repos_file: str | None = field(default=None, metadata={"help": "File with one repo id per line."})
     repo_type: str = field(default="model", metadata={"help": "HF repo type (model|dataset|space)."})
-    revision: str | None = field(default=None, metadata={"help": "HF revision/branch/tag/commit (default: main)."})
+    revision: str | None = field(
+        default=None,
+        metadata={"help": "HF revision/branch/tag/commit (default: main)."},
+    )
     token: str | None = field(
         default=None,
         metadata={"help": "HF token (or use HF_TOKEN env / `huggingface-cli login`)."},
@@ -97,21 +158,35 @@ class ChunkedDownloadArgs:
         default=False,
         metadata={"help": "Only download files under '*.zarr/' directories (matches paths containing '.zarr/')."},
     )
-    include: str = field(default_factory=list, metadata={"action": "append", "help": "Glob to include (repeatable)."})
-    exclude: str = field(default_factory=list, metadata={"action": "append", "help": "Glob to exclude (repeatable)."})
+    include: str = field(
+        default_factory=list,
+        metadata={"action": "append", "help": "Glob to include (repeatable)."},
+    )
+    exclude: str = field(
+        default_factory=list,
+        metadata={"action": "append", "help": "Glob to exclude (repeatable)."},
+    )
 
-    skip_existing: bool = field(default=False, metadata={"help": "Skip files that already exist (local out only)."})
+    skip_existing: bool = field(
+        default=False,
+        metadata={"help": "Skip files that already exist (local out only)."},
+    )
     force_download: bool = field(default=False, metadata={"help": "Re-download even if staging file exists."})
     local_files_only: bool = field(default=False, metadata={"help": "Do not download from HF Hub."})
     dry_run: bool = field(default=False, metadata={"help": "Print actions but do nothing."})
     continue_on_error: bool = field(
-        default=False, metadata={"help": "Continue with remaining files if one download fails."}
+        default=False,
+        metadata={"help": "Continue with remaining files if one download fails."},
     )
     keep_staging: bool = field(
-        default=False, metadata={"help": "Do not delete staging payload after each sync (useful for debugging)."}
+        default=False,
+        metadata={"help": "Do not delete staging payload after each sync (useful for debugging)."},
     )
 
-    gsutil_parallel: bool = field(default=True, metadata={"help": "Use `gsutil -m` when syncing to gs:// destinations."})
+    gsutil_parallel: bool = field(
+        default=True,
+        metadata={"help": "Use `gsutil -m` when syncing to gs:// destinations."},
+    )
     enable_hf_transfer: bool = field(
         default=False,
         metadata={"help": "Enable hf_transfer accelerated HF downloads (requires `pip install hf_transfer`)."},
@@ -119,6 +194,14 @@ class ChunkedDownloadArgs:
 
 
 def _read_repos_file(path: str | os.PathLike) -> list[str]:
+    """Read one-repo-id-per-line file, stripping comments and blank lines.
+
+    Args:
+        path: UTF-8 text file path.
+
+    Returns:
+        list[str]: Repo ids in file order.
+    """
     text = Path(path).read_text(encoding="utf-8")
     repo_ids: list[str] = []
     for raw_line in text.splitlines():
@@ -130,10 +213,28 @@ def _read_repos_file(path: str | os.PathLike) -> list[str]:
 
 
 def _sanitize_repo_id(repo_id: str) -> str:
+    """Turn a repo id into a path-safe staging subfolder name.
+
+    Args:
+        repo_id: HF repo id (``"owner/name"``).
+
+    Returns:
+        str: Filesystem-safe identifier (``/`` -> ``__``, ``:`` -> ``_``).
+    """
     return repo_id.replace("/", "__").replace(":", "_")
 
 
 def _repo_out_dir_local(out_root: Path, repo_id: str) -> Path:
+    """Compute the local per-repo destination directory under ``out_root``.
+
+    Args:
+        out_root: Output root directory.
+        repo_id: HF repo id.
+
+    Returns:
+        Path: ``out_root/owner/name`` for ``"owner/name"`` ids, otherwise
+            ``out_root/repo_id``.
+    """
     if "/" in repo_id:
         owner, name = repo_id.split("/", 1)
         return out_root / owner / name
@@ -141,6 +242,15 @@ def _repo_out_dir_local(out_root: Path, repo_id: str) -> Path:
 
 
 def _repo_out_dir_gs(out_root: str, repo_id: str) -> str:
+    """Compute the per-repo destination prefix under a ``gs://`` root.
+
+    Args:
+        out_root: ``gs://bucket/prefix`` style root URI.
+        repo_id: HF repo id.
+
+    Returns:
+        str: Concatenated ``gs://`` destination prefix for the repo.
+    """
     out_root = out_root.rstrip("/")
     if "/" in repo_id:
         owner, name = repo_id.split("/", 1)
@@ -149,6 +259,15 @@ def _repo_out_dir_gs(out_root: str, repo_id: str) -> str:
 
 
 def _matches_any_glob(name: str, globs: tuple[str, ...]) -> bool:
+    """Return ``True`` if ``name`` matches any glob in ``globs``.
+
+    Args:
+        name: File name or path to test.
+        globs: Tuple of ``fnmatch``-style patterns.
+
+    Returns:
+        bool: Whether at least one glob matched.
+    """
     return any(fnmatch.fnmatch(name, pattern) for pattern in globs)
 
 
@@ -159,6 +278,17 @@ def _should_keep_path(
     include_globs: tuple[str, ...],
     exclude_globs: tuple[str, ...],
 ) -> bool:
+    """Decide whether a repo file path should be downloaded.
+
+    Args:
+        path: File path within the repo.
+        only_zarr: Restrict to paths containing ``.zarr/``.
+        include_globs: Whitelist globs; empty disables.
+        exclude_globs: Blacklist globs.
+
+    Returns:
+        bool: ``True`` if the file should be queued for download.
+    """
     if only_zarr and ".zarr/" not in path:
         return False
     if include_globs and not _matches_any_glob(path, include_globs):
@@ -177,6 +307,19 @@ def _iter_repo_files(
     token: str | None,
     path_in_repo: str | None,
 ) -> Iterable[DownloadItem]:
+    """Yield :class:`DownloadItem` entries for every file in a repo tree.
+
+    Args:
+        api: Authenticated :class:`huggingface_hub.HfApi`.
+        repo_id: Source repo id.
+        repo_type: HF repo type (``model``, ``dataset``, ``space``).
+        revision: HF revision to walk.
+        token: HF access token.
+        path_in_repo: Optional subfolder to restrict the listing to.
+
+    Yields:
+        DownloadItem: One entry per file (directories and submodules skipped).
+    """
     for item in api.list_repo_tree(
         repo_id=repo_id,
         path_in_repo=path_in_repo,
@@ -191,6 +334,17 @@ def _iter_repo_files(
 
 
 def _warn_if_mnt_gcs_unmounted(out_root: Path) -> None:
+    """Emit a stderr warning when writing under ``/mnt/gcs`` without a mount.
+
+    Helps avoid the silent failure where a missing gcsfuse mount causes
+    downloads to land on the root filesystem and fill the boot disk.
+
+    Args:
+        out_root: Resolved local output root path.
+
+    Returns:
+        None.
+    """
     try:
         if str(out_root).startswith("/mnt/gcs") and not os.path.ismount("/mnt/gcs"):
             print(
@@ -204,6 +358,15 @@ def _warn_if_mnt_gcs_unmounted(out_root: Path) -> None:
 
 
 def _run(cmd: list[str], *, dry_run: bool) -> None:
+    """Run a subprocess command, or print it when ``dry_run`` is set.
+
+    Args:
+        cmd: Argv list to execute.
+        dry_run: If ``True`` only print the command prefixed with ``[dry-run]``.
+
+    Returns:
+        None.
+    """
     printable = shlex.join(cmd)
     if dry_run:
         print(f"[dry-run] {printable}")
@@ -212,6 +375,20 @@ def _run(cmd: list[str], *, dry_run: bool) -> None:
 
 
 def _sync_payload(payload_dir: Path, dest: str | Path, *, dry_run: bool, gsutil_parallel: bool) -> None:
+    """Sync the contents of ``payload_dir`` to ``dest`` (local or ``gs://``).
+
+    Dispatches to ``gsutil rsync`` (optionally with ``-m`` parallelism) for
+    ``gs://`` destinations and to ``rsync -a`` otherwise.
+
+    Args:
+        payload_dir: Local staging directory with the downloaded files.
+        dest: Destination path (``Path``) or ``gs://...`` URI.
+        dry_run: If ``True``, only print the sync command.
+        gsutil_parallel: Pass ``-m`` to ``gsutil`` when syncing to ``gs://``.
+
+    Returns:
+        None.
+    """
     if isinstance(dest, str) and dest.startswith("gs://"):
         cmd = ["gsutil"]
         if gsutil_parallel:
@@ -240,6 +417,35 @@ def _download_batch(
     dry_run: bool,
     continue_on_error: bool,
 ) -> tuple[int, int]:
+    """Download one batch of files into ``staging_payload_dir``.
+
+    Recreates the staging directory, then dispatches each file via
+    ``hf_hub_download`` either serially or through a
+    :class:`ThreadPoolExecutor` when more than one worker is requested. The
+    HF metadata cache directory written into ``staging_payload_dir/.cache``
+    is removed before returning so it does not get rsynced to the
+    destination.
+
+    Args:
+        batch: Files to download.
+        repo_id: Source repo id.
+        repo_type: HF repo type.
+        revision: HF revision to read from.
+        token: HF access token.
+        staging_payload_dir: Local staging directory to populate.
+        download_workers: Maximum thread pool size (``1`` = serial).
+        force_download: Re-download files already present in staging.
+        local_files_only: Skip HF Hub access entirely.
+        dry_run: Print actions but do not download.
+        continue_on_error: Continue when individual downloads fail.
+
+    Returns:
+        tuple[int, int]: ``(ok, failed)`` counts for this batch.
+
+    Raises:
+        Exception: Propagates the first underlying download error when
+            ``continue_on_error`` is ``False``.
+    """
     if staging_payload_dir.exists():
         shutil.rmtree(staging_payload_dir)
     staging_payload_dir.mkdir(parents=True, exist_ok=True)
@@ -253,6 +459,7 @@ def _download_batch(
         return len(batch), 0
 
     def _download_one(item: DownloadItem) -> None:
+        """Download a single file into the staging directory via ``hf_hub_download``."""
         hf_hub_download(
             repo_id=repo_id,
             filename=item.path,
@@ -298,6 +505,21 @@ def _download_batch(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point for the chunked HF repo downloader.
+
+    Resolves the dedup'd repo set, then for each repo iterates the file tree
+    in order, accumulating batches up to ``--chunk-gb`` and flushing each
+    batch through :func:`_download_batch` + :func:`_sync_payload`.
+
+    Args:
+        argv: Optional list of CLI tokens. ``None`` reads from ``sys.argv``.
+
+    Returns:
+        int: ``0`` if every repo's downloads succeeded, otherwise ``2``.
+
+    Raises:
+        SystemExit: If no repos were selected.
+    """
     parser = DataClassArgumentParser(
         ChunkedDownloadArgs,
         description=(
@@ -312,7 +534,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             import hf_transfer  # noqa: F401 #type:ignore
         except Exception:
-            print("warning: `hf_transfer` is not installed. Run: pip install -U hf_transfer", file=sys.stderr)
+            print(
+                "warning: `hf_transfer` is not installed. Run: pip install -U hf_transfer",
+                file=sys.stderr,
+            )
 
     repo_ids: list[str] = []
     repo_ids.extend([rid for rid in args.repo_id if rid])
@@ -375,6 +600,19 @@ def main(argv: list[str] | None = None) -> int:
             _payload_dir: Path = payload_dir,
             _dest_repo_root: str | Path = dest_repo_root,
         ) -> None:
+            """Download the pending batch, sync the payload, and reset counters.
+
+            The default args bind the current loop variables so the closure
+            stays correct if the surrounding repo iteration advances.
+
+            Args:
+                _repo_id: Bound default of the active repo id.
+                _payload_dir: Bound default of the staging payload directory.
+                _dest_repo_root: Bound default of the destination root.
+
+            Returns:
+                None. Mutates the enclosing function's batch / counter state.
+            """
             nonlocal batch, batch_bytes, batch_num, downloaded_ok, repo_failed, total_failed
             if not batch:
                 return
@@ -398,7 +636,12 @@ def main(argv: list[str] | None = None) -> int:
             repo_failed += failed
             total_failed += failed
 
-            _sync_payload(_payload_dir, _dest_repo_root, dry_run=args.dry_run, gsutil_parallel=args.gsutil_parallel)
+            _sync_payload(
+                _payload_dir,
+                _dest_repo_root,
+                dry_run=args.dry_run,
+                gsutil_parallel=args.gsutil_parallel,
+            )
 
             if not args.keep_staging and _payload_dir.exists():
                 shutil.rmtree(_payload_dir)

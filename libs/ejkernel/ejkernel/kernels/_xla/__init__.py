@@ -1,0 +1,244 @@
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+"""XLA-based kernel implementations for attention and related operations.
+
+Pure JAX/XLA implementations of attention mechanisms and related kernels.
+These kernels compile to XLA and run on any XLA-supported backend (GPU, TPU,
+CPU) without platform-specific dependencies.  They serve as the canonical
+numerical reference that all other backends (Triton, Pallas, CUDA) must match.
+
+XLA kernels provide:
+    - Cross-platform compatibility (GPU/TPU/CPU)
+    - Automatic gradient computation via JAX autodiff (or custom VJP)
+    - XLA compilation and device-placement optimisations
+    - No platform-specific dependencies
+
+Available Operations:
+    Dense Attention:
+        - attention: Standard multi-head / GQA / MQA attention (BSHD layout)
+        - flash_attention: Memory-efficient chunked attention (O(N) memory)
+        - flash_mla: Multi-head Latent Attention (MLA)
+        - deepseek_attn: DeepSeek Sparse Attention (MLA + Lightning Indexer)
+        - blocksparse_attention: Block-sparse / packed-sequence attention
+        - native_sparse_attention: Sparse attention with flexible patterns
+        - ring_attention: Distributed ring attention for long sequences
+        - scaled_dot_product_attention: Basic scaled dot-product attention
+        - unified_attention: Unified paged-decode attention API
+
+    Serving / Paged Attention:
+        - page_attention: Single-batch paged KV-cache attention
+        - prefill_page_attention: Paged attention for prefill phase
+        - decode_attention: Single-token decode over a paged KV buffer
+        - chunked_prefill_paged_decode: Mixed prefill+decode with paged cache
+        - ragged_decode_attention: Ragged-batch decode attention
+        - ragged_page_attention_v2/v3: Variable-length paged attention
+        - ragged_page_attention_v2_turboquant: v2 with turboquant KV cache
+        - ragged_page_attention_v3_turboquant: v3 with turboquant KV cache
+        - multi_latent_ragged_page_attention: MLA ragged paged attention
+        - multi_latent_ragged_page_attention_v2: MLA ragged paged attention v2
+
+    Linear / Recurrent Attention:
+        - recurrent_gla: Gated linear attention (recurrent form)
+        - gated_delta_rule: Gated delta rule linear attention
+        - gated_delta_rule_grouped_decode: Grouped-head single-step GDR decode
+        - ragged_gated_delta_rule: Ragged-batch gated delta rule
+        - ragged_gated_delta_rule_v2: Packed continuous-batch GDN v2 (mixed prefill+decode)
+        - lightning_attn: Lightning attention with exponential decay
+        - recurrent: General recurrent state-space attention
+        - kernel_delta_attention (kda / kda_decay): Delta-rule linear attention
+
+    GDN / Conv-State Inference Helpers:
+        - compute_schedule_table_v2: Build the GDN v2 packed-batch schedule table
+        - ragged_causal_conv1d: Short causal depthwise conv1d over a packed token buffer
+        - fused_conv_decode: Single-token conv-state shift + depthwise conv + activation
+
+    Losses:
+        - fused_cross_entropy: Fused cross-entropy loss
+        - fused_kl_divergence: Fused KL-divergence loss
+        - fused_cakld_tv: Fused dynamic-CAKLD + TV distillation loss
+        - fused_renyi_entropy: Fused per-row Renyi entropy
+
+    State Space Models:
+        - state_space_v1: Mamba1-style SSM
+        - state_space_v2: Mamba2-style SSM
+        - rwkv4 / rwkv6 / rwkv7 / rwkv7_mul: RWKV recurrent architectures
+
+    Matrix Operations:
+        - all_gather_matmul: All-gather + matmul across a device mesh
+        - reduce_scatter_matmul: Matmul + reduce-scatter across a device mesh
+        - grouped_matmul: Grouped (MoE-style) matrix multiplication
+        - grouped_matmulv3: Grouped matmul v3
+        - quantized_matmul: Packed-uint32 quantized matmul
+
+    Utilities:
+        - mean_pooling: Masked sequence mean pooling
+
+Note:
+    XLA implementations are the fallback when platform-specific kernels
+    (Triton, Pallas, CUDA) are unavailable for the current hardware.  They
+    are also used as the numerical gold standard in test suites.
+"""
+
+from .all_gather import all_gather
+from .all_gather_matmul import all_gather_matmul
+from .all_reduce import all_reduce
+from .all_to_all import all_to_all
+from .attention import attention
+from .blocksparse_attention import blocksparse_attention
+from .chunked_prefill_paged_decode import chunked_prefill_paged_decode
+from .compressed_window_attention import compressed_window_attention
+from .compressed_window_decode import compressed_window_decode
+from .decode_attention import decode_attention
+from .deepseek_attn import deepseek_attn
+from .dsa_gather_attention import dsa_gather_attention
+from .dsa_sparse_attention import dsa_sparse_attention
+from .flash_attention import flash_attention
+from .flash_mla import flash_mla
+from .fused_cakld_tv import fused_cakld_tv
+from .fused_conv_decode import fused_conv_decode
+from .fused_cross_entropy import fused_cross_entropy
+from .fused_kl_divergence import fused_kl_divergence
+from .fused_renyi_entropy import fused_renyi_entropy
+from .gated_delta_rule import gated_delta_rule
+from .gated_delta_rule_grouped_decode import gated_delta_rule_grouped_decode
+from .gdn_compute_schedule_v2 import compute_schedule_table_v2
+from .gdn_spec_window import gdn_spec_window_states
+from .gla import recurrent_gla
+from .grouped_matmul import grouped_matmul
+from .grouped_matmul_quant import grouped_matmul_quant, grouped_matmul_w8a8
+from .grouped_matmulv3 import grouped_matmulv3
+from .indexer_scores import indexer_scores
+from .kda_chunk import kda_chunk
+from .kda_chunk_local import kda_chunk_local
+from .kernel_delta_attention import kda, kda_decay, kernel_delta_attention
+from .lightning_attn import lightning_attn
+from .mean_pooling import mean_pooling
+from .mhc_coefficients import mhc_coefficients
+from .mhc_fused import mhc_collapse, mhc_expand
+from .moe_local_ffn import moe_local_ffn
+from .moe_row_gather import moe_row_gather, moe_row_gather_sum
+from .multi_latent_ragged_page_attention import multi_latent_ragged_page_attention
+from .multi_latent_ragged_page_attention_v2 import multi_latent_ragged_page_attention_v2
+from .native_sparse_attention import apply_native_sparse_attention
+from .page_attention import page_attention
+from .paged_pool_topk import paged_pool_topk
+from .prefill_page_attention import prefill_page_attention
+from .quantized_matmul import quantized_matmul
+from .ragged_causal_conv1d import ragged_causal_conv1d
+from .ragged_decode_attention import ragged_decode_attention
+from .ragged_gated_delta_rule import ragged_gated_delta_rule as ragged_gated_delta_rule
+from .ragged_gated_delta_rule_v2 import ragged_gated_delta_rule_v2
+from .ragged_gather import ragged_gather
+from .ragged_gather_reduce import ragged_gather_reduce
+from .ragged_page_attention_v2 import ragged_page_attention_v2
+from .ragged_page_attention_v2_turboquant import ragged_page_attention_v2_turboquant
+from .ragged_page_attention_v3 import ragged_page_attention_v3
+from .ragged_page_attention_v3_turboquant import ragged_page_attention_v3_turboquant
+from .recurrent import recurrent
+from .reduce_scatter import reduce_scatter
+from .reduce_scatter_matmul import reduce_scatter_matmul
+from .ring_attention import ring_attention
+from .row_permute import row_permute
+from .rwkv4 import rwkv4
+from .rwkv6 import rwkv6
+from .rwkv7 import rwkv7, rwkv7_mul
+from .scaled_dot_product_attention import scaled_dot_product_attention
+from .sinkhorn_knopp import sinkhorn_knopp
+from .sparse_multi_latent_ragged_page_attention import sparse_multi_latent_ragged_page_attention
+from .sparse_selected_attention import sparse_selected_attention
+from .state_space_v1 import state_space_v1
+from .state_space_v2 import state_space_v2
+from .topk import topk as topk
+from .unified_attention import unified_attention
+
+__all__ = [
+    "all_gather",
+    "all_gather_matmul",
+    "all_reduce",
+    "all_to_all",
+    "apply_native_sparse_attention",
+    "attention",
+    "blocksparse_attention",
+    "chunked_prefill_paged_decode",
+    "compressed_window_attention",
+    "compressed_window_decode",
+    "compute_schedule_table_v2",
+    "decode_attention",
+    "deepseek_attn",
+    "dsa_gather_attention",
+    "dsa_sparse_attention",
+    "flash_attention",
+    "flash_mla",
+    "fused_cakld_tv",
+    "fused_conv_decode",
+    "fused_cross_entropy",
+    "fused_kl_divergence",
+    "fused_renyi_entropy",
+    "gated_delta_rule",
+    "gated_delta_rule_grouped_decode",
+    "gdn_spec_window_states",
+    "grouped_matmul",
+    "grouped_matmul_quant",
+    "grouped_matmul_w8a8",
+    "grouped_matmulv3",
+    "indexer_scores",
+    "kda",
+    "kda_chunk",
+    "kda_chunk_local",
+    "kda_decay",
+    "kernel_delta_attention",
+    "lightning_attn",
+    "mean_pooling",
+    "mhc_coefficients",
+    "mhc_collapse",
+    "mhc_expand",
+    "moe_local_ffn",
+    "moe_row_gather",
+    "moe_row_gather_sum",
+    "multi_latent_ragged_page_attention",
+    "multi_latent_ragged_page_attention_v2",
+    "page_attention",
+    "paged_pool_topk",
+    "prefill_page_attention",
+    "quantized_matmul",
+    "ragged_causal_conv1d",
+    "ragged_decode_attention",
+    "ragged_gated_delta_rule",
+    "ragged_gated_delta_rule_v2",
+    "ragged_gather",
+    "ragged_gather_reduce",
+    "ragged_page_attention_v2",
+    "ragged_page_attention_v2_turboquant",
+    "ragged_page_attention_v3",
+    "ragged_page_attention_v3_turboquant",
+    "recurrent",
+    "recurrent_gla",
+    "reduce_scatter",
+    "reduce_scatter_matmul",
+    "ring_attention",
+    "row_permute",
+    "rwkv4",
+    "rwkv6",
+    "rwkv7",
+    "rwkv7_mul",
+    "scaled_dot_product_attention",
+    "sinkhorn_knopp",
+    "sparse_multi_latent_ragged_page_attention",
+    "sparse_selected_attention",
+    "state_space_v1",
+    "state_space_v2",
+    "unified_attention",
+]

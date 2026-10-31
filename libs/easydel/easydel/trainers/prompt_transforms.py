@@ -1,0 +1,1819 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Base transform classes for trainer preprocessing.
+
+This module re-exports the base Transform class from data_managers
+and provides trainer-specific utilities.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import typing as tp
+import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
+
+# Re-export base classes from data_managers
+from easydel.data.transforms.base import Example, ExpandTransform, Transform
+from easydel.data.transforms.mixture import ASSISTANT_ONLY_FIELD, DATASET_ID_FIELD
+
+from ._assistant_tracker import assistant_tracker_lock
+from ._reward_sideband import is_reward_sideband
+from .prompt_utils import apply_chat_template as apply_conversational_template
+from .prompt_utils import (
+    maybe_apply_chat_template,
+    maybe_convert_to_chatml,
+    maybe_extract_prompt,
+    normalize_message_payload,
+    resolve_example_tools,
+)
+
+_DEFAULT_SFT_PADDING = object()
+_GENERATION_TAG_RE = re.compile(r"\{%-?\s*generation\s*-?%\}")
+_TOKENIZED_FIELDS = {
+    "input_ids",
+    "attention_mask",
+    "labels",
+    "position_ids",
+    "pixel_values",
+    "pixel_attention_mask",
+    "pixel_values_videos",
+    "image_sizes",
+    "completion_mask",
+    "assistant_masks",
+    # Per-row sideband carriers stamped by the mixture builders. They must survive
+    # purification so the packing collator / trainer can read them; the trainer pops
+    # both before any model call. Imported, not spelled, so the names cannot drift.
+    ASSISTANT_ONLY_FIELD,
+    DATASET_ID_FIELD,
+    "prompt_input_ids",
+    "prompt_attention_mask",
+    "chosen_input_ids",
+    "chosen_attention_mask",
+    "rejected_input_ids",
+    "rejected_attention_mask",
+    "reference_input_ids",
+    "reference_attention_mask",
+    "chosen_labels",
+    "rejected_labels",
+    "reference_labels",
+    "completion_input_ids",
+    "completion_attention_mask",
+    "completion_labels",
+    "input_ids_chosen",
+    "input_ids_rejected",
+    "attention_mask_chosen",
+    "attention_mask_rejected",
+    "label",
+    "embedding_input_ids",
+    "embedding_attention_mask",
+    "reference_logps",
+    "ref_chosen_logps",
+    "ref_rejected_logps",
+    "reference_chosen_log_probs",
+    "reference_rejected_log_probs",
+}
+
+
+def preprocess_dataset_with_num_proc(dataset: tp.Any, transform: tp.Callable, num_proc: int | None) -> tp.Any:
+    """Preprocess datasets through the trainers' shared source boundary.
+
+    The default ``None`` leaves preprocessing to the trainer. Explicit worker
+    counts use process-backed mapping for materialized HF datasets, including
+    wrapped datasets, and retain lazy transforms for streaming/custom sources.
+    Named evaluation datasets are processed independently.
+
+    Args:
+        dataset: HuggingFace dataset, sharded source, mapping of datasets, or None.
+        transform: Per-row preprocessing callable.
+        num_proc: Optional positive number of worker processes.
+
+    Returns:
+        Preprocessed datasets, or the original input when no workers are configured.
+
+    Raises:
+        ValueError: If the worker count is invalid.
+    """
+    if num_proc is None or dataset is None:
+        return dataset
+    from types import SimpleNamespace
+
+    from datasets import Dataset
+
+    from easydel.data.core.protocols import ShardedDataSource
+    from easydel.data.sources.hf_wrapper import HFDatasetShardedSource
+
+    from .base_trainer import BaseTrainer
+
+    # Reuse both validation and mapping without constructing a model/trainer.
+    context = SimpleNamespace(arguments=SimpleNamespace(dataset_num_proc=num_proc))
+    workers = BaseTrainer._dataset_preprocess_workers(context)
+    context._dataset_preprocess_workers = lambda: workers
+    if isinstance(dataset, dict):
+        return {key: preprocess_dataset_with_num_proc(value, transform, workers) for key, value in dataset.items()}
+    source = dataset if isinstance(dataset, ShardedDataSource) else HFDatasetShardedSource(dataset)
+    result = BaseTrainer._preprocess_source(context, source, transform)
+    return result._dataset if isinstance(dataset, Dataset) else result
+
+
+_GRPO_CONSUMED_TEXT_FIELDS = frozenset({"prompt", "chosen", "rejected", "messages", "conversations", "completion"})
+
+
+def purify_example(example: dict, keep_fields: set[str] | None = None) -> dict:
+    """Remove non-tokenized fields from example, keeping only JAX-compatible arrays.
+
+    This function filters out text fields (messages, prompt, chosen, rejected, etc.)
+    and keeps only tokenized fields that can be passed to JAX functions.
+
+    Args:
+        example: Example dict that may contain both text and tokenized fields.
+        keep_fields: Optional set of additional field names to keep. ``tools``
+            is always preserved when present.
+
+    Returns:
+        Purified example with only JAX-compatible fields.
+    """
+    fields_to_keep = _TOKENIZED_FIELDS.copy()
+    fields_to_keep.add("tools")
+    if keep_fields:
+        fields_to_keep.update(keep_fields)
+
+    return {k: v for k, v in example.items() if k in fields_to_keep}
+
+
+def extract_prompt_from_preference(example: dict) -> dict:
+    """Extract shared prompt from chosen/rejected if not present.
+
+    For preference datasets where chosen and rejected share a common prefix,
+    this extracts that prefix as the prompt. Uses the same logic as TRL's
+    maybe_extract_prompt from prompt_utils.
+
+    Args:
+        example: Example with 'chosen' and 'rejected' fields.
+
+    Returns:
+        Example with 'prompt' field extracted if applicable.
+    """
+    # Preserve auxiliary payload columns (e.g. multimodal tensors) when prompt
+    # extraction rebuilds the text fields from chosen/rejected, but drop the
+    # reserved conversational keys that would collide with prompt/chosen/rejected
+    # chat-templating afterwards.
+    sideband = {key: value for key, value in dict(example).items() if key not in {"messages"}}
+    result = {**sideband, **maybe_extract_prompt(example)}
+    if "prompt" in result:
+        return result
+    # Some RL datasets store the prompt as a single-turn chat under `messages`.
+    # GRPO/PPO expect a prompt field (string or list-of-messages), so normalize it.
+    messages = example.get("messages")
+    if isinstance(messages, list):
+        out = dict(result)
+        out["prompt"] = messages
+        return out
+    return result
+
+
+def apply_chat_template_to_preference(
+    example: dict,
+    tokenizer: tp.Any,
+    tools: list | None = None,
+) -> dict:
+    """Apply chat template to prompt/chosen/rejected for DPO.
+
+    Args:
+        example: Example with prompt, chosen, rejected fields.
+        tokenizer: Tokenizer with apply_chat_template method.
+        tools: Optional tools for function calling.
+
+    Returns:
+        Example with text formatted using chat template.
+
+    Raises:
+        KeyError: If required fields (prompt, chosen, rejected) are missing.
+    """
+    return apply_conversational_template(example, tokenizer, tools)
+
+
+class GRPOPreprocessTransform(Transform):
+    """Preprocessing transform for Group Relative Policy Optimization.
+
+    GRPO only needs tokenized prompts since completions are generated online.
+    Uses left-padding for efficient batch generation.
+
+    Produces:
+        - input_ids: Left-padded prompt token IDs
+        - attention_mask: Attention mask for prompt
+
+    Args:
+        tokenizer: Tokenizer for text encoding.
+        max_prompt_length: Maximum tokens for prompt.
+        tools: Optional tools for function calling.
+        skip_apply_chat_template: If True, skip chat template application.
+        chat_template_kwargs: Additional keyword arguments forwarded to
+            ``tokenizer.apply_chat_template``.
+
+    Example:
+        >>> transform = GRPOPreprocessTransform(
+        ...     tokenizer=tokenizer,
+        ...     max_prompt_length=512,
+        ... )
+        >>> result = transform({
+        ...     "prompt": "Question: What is 2+2?",
+        ... })
+    """
+
+    def __init__(
+        self,
+        tokenizer: tp.Any,
+        max_prompt_length: int | None = None,
+        tools: list | None = None,
+        skip_apply_chat_template: bool = False,
+        pad_to_multiple_of: int | None = None,
+        chat_template_kwargs: dict[str, object] | None = None,
+    ):
+        """Cache the tokenizer plus prompt-length and special-token configuration.
+
+        Args:
+            tokenizer: Tokenizer used for chat templating and encoding.
+            max_prompt_length: Optional max length to enforce on the prompt.
+            tools: Optional default list of tool schemas; can be overridden
+                per example via ``example["tools"]``.
+            skip_apply_chat_template: If ``True``, the tokenizer's chat
+                template is bypassed even for list-of-messages prompts.
+            pad_to_multiple_of: Optional prompt-padding multiple.
+            chat_template_kwargs: Additional keyword arguments forwarded
+                to the tokenizer chat template call.
+        """
+        self._tokenizer = tokenizer
+        self._max_prompt_length = max_prompt_length
+        self._tools = tools
+        self._skip_apply_chat_template = skip_apply_chat_template
+        self._pad_to_multiple_of = pad_to_multiple_of
+        self._chat_template_kwargs = dict(chat_template_kwargs or {})
+        self._pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
+        self._fallback_prompt_token_id = (
+            getattr(tokenizer, "eos_token_id", None)
+            or getattr(tokenizer, "bos_token_id", None)
+            or getattr(tokenizer, "unk_token_id", None)
+            or self._pad_token_id
+        )
+
+    def __call__(self, example: Example) -> Example:
+        """Apply GRPO preprocessing to example.
+
+        Args:
+            example: Input example with prompt field or chosen/rejected fields.
+
+        Returns:
+            Preprocessed example with input_ids and attention_mask.
+        """
+        if "input_ids" in example:
+            return example
+
+        # Convert from/value format to role/content if needed (ShareGPT → ChatML)
+        example = maybe_convert_to_chatml(example)
+
+        def _has_non_empty_prompt(value: tp.Any) -> bool:
+            """Return ``True`` if ``value`` is a non-empty prompt-shaped object.
+
+            Strings are non-empty after ``strip``; lists must have at least
+            one element; anything else (excluding ``None``) is treated as
+            non-empty.
+
+            Args:
+                value: Candidate prompt value.
+
+            Returns:
+                ``True`` for non-empty prompts, ``False`` otherwise.
+            """
+            if value is None:
+                return False
+            if isinstance(value, str):
+                return value.strip() != ""
+            if isinstance(value, list):
+                return len(value) > 0
+            return True
+
+        # Preserve explicit non-empty prompts as-is. This avoids converting mixed
+        # preference rows (string `prompt` + conversational `chosen/rejected`) into
+        # an empty extracted prefix, which would produce all-zero prompt masks.
+        prompt_value = example.get("prompt")
+        if "prompt" in example and _has_non_empty_prompt(prompt_value):
+            result = dict(example)
+        else:
+            # Extract prompt from preference data if needed (chosen/rejected → prompt)
+            result = extract_prompt_from_preference(example)
+
+        # Strict field access - will raise KeyError if prompt is missing
+        prompt = result["prompt"]
+
+        if isinstance(prompt, list) and not self._skip_apply_chat_template:
+            prompt = self._tokenizer.apply_chat_template(
+                prompt,
+                tokenize=False,
+                add_generation_prompt=True,
+                tools=resolve_example_tools(result, self._tools),
+                **self._chat_template_kwargs,
+            )
+
+        # Tokenize with left padding for generation
+        tokenized = self._tokenizer(
+            prompt,
+            padding=False,
+            max_length=self._max_prompt_length,
+            truncation=self._max_prompt_length is not None,
+            add_special_tokens=False,
+            return_attention_mask=True,
+        )
+
+        input_ids = tokenized["input_ids"]
+        attention_mask = tokenized["attention_mask"]
+
+        # Guard against empty prompts: some preference rows can resolve to an empty
+        # extracted prefix, which would otherwise produce an all-zero attention mask
+        # and trigger prompt_len=0 in generation.
+        if len(input_ids) == 0 or sum(attention_mask) == 0:
+            input_ids = [int(self._fallback_prompt_token_id)]
+            attention_mask = [1]
+
+        target_length = self._resolve_prompt_pad_length(len(input_ids))
+
+        if target_length is not None and len(input_ids) < target_length:
+            pad_len = target_length - len(input_ids)
+            input_ids = [self._pad_token_id] * pad_len + input_ids
+            attention_mask = [0] * pad_len + attention_mask
+
+        result["input_ids"] = input_ids
+        result["attention_mask"] = attention_mask
+
+        # Reward functions read per-example metadata (gold `answer`, `tools`, ...) from `batch`.
+        keep_fields = {
+            key
+            for key, value in result.items()
+            if key == "tools" or (key not in _GRPO_CONSUMED_TEXT_FIELDS and is_reward_sideband(value))
+        }
+        return purify_example(result, keep_fields=keep_fields)
+
+    def _resolve_prompt_pad_length(self, prompt_length: int) -> int | None:
+        """Return the prompt pad length after applying the optional multiple."""
+        target_length = self._max_prompt_length if self._max_prompt_length is not None else prompt_length
+        if self._pad_to_multiple_of is not None and target_length % self._pad_to_multiple_of != 0:
+            target_length = ((target_length // self._pad_to_multiple_of) + 1) * self._pad_to_multiple_of
+        return target_length
+
+    def __repr__(self) -> str:
+        """Return a debug-friendly representation including the prompt cap."""
+        return f"GRPOPreprocessTransform(max_prompt={self._max_prompt_length})"
+
+
+class PPOPreprocessTransform(GRPOPreprocessTransform):
+    """Preprocessing transform for PPO training.
+
+    PPO uses the same prompt-only preprocessing as GRPO: prompts are tokenized and
+    left-padded; completions are generated online.
+    """
+
+    def __repr__(self) -> str:
+        """Return a debug-friendly representation including the prompt cap."""
+        return f"PPOPreprocessTransform(max_prompt={self._max_prompt_length})"
+
+
+class KTOPreprocessTransform(Transform):
+    """Preprocessing transform for Kahneman-Tversky Optimization.
+
+    KTO works with unpaired preference data (prompt + completion + label).
+
+    Produces:
+        - prompt_input_ids, prompt_attention_mask: Just the prompt
+        - completion_input_ids, completion_attention_mask, completion_labels: Full sequence
+        - label: Boolean indicating desirable (True) or undesirable (False)
+
+    Labels have prompt tokens masked with label_pad_token_id (-100).
+
+    Args:
+        tokenizer: Tokenizer for text encoding.
+        max_prompt_length: Maximum tokens for prompt.
+        max_completion_length: Maximum tokens for completion.
+        add_special_tokens: Whether to add BOS/EOS tokens.
+        label_pad_token_id: Token ID for masking prompt tokens in labels.
+        embedding_tokenizer: Optional tokenizer for BCO UDM embeddings.
+
+    Example:
+        >>> transform = KTOPreprocessTransform(
+        ...     tokenizer=tokenizer,
+        ...     max_prompt_length=512,
+        ...     max_completion_length=256,
+        ... )
+        >>> result = transform({
+        ...     "prompt": "Question?",
+        ...     "completion": "Answer",
+        ...     "label": True,  # Good completion
+        ... })
+    """
+
+    def __init__(
+        self,
+        tokenizer: tp.Any,
+        max_prompt_length: int | None = None,
+        max_completion_length: int | None = None,
+        add_special_tokens: bool = False,
+        label_pad_token_id: int = -100,
+        embedding_tokenizer: tp.Any = None,
+        tools: list | None = None,
+    ):
+        """Cache the tokenizer and configuration for KTO preprocessing.
+
+        Args:
+            tokenizer: Tokenizer used for chat templating and encoding.
+            max_prompt_length: Optional cap on prompt length (left-truncated).
+            max_completion_length: Optional cap on completion length
+                (right-truncated).
+            add_special_tokens: Whether to prepend the BOS token to the
+                prompt and append the EOS token to the completion.
+            label_pad_token_id: Token id used to mask prompt positions in
+                ``completion_labels`` (defaults to ``-100``).
+            embedding_tokenizer: Optional separate tokenizer used for the
+                UDM embedding feed (BCO compatibility).
+            tools: Optional default tool schemas for chat templating.
+        """
+        self._tokenizer = tokenizer
+        self._max_prompt_length = max_prompt_length
+        self._max_completion_length = max_completion_length
+        self._add_special_tokens = add_special_tokens
+        self._label_pad_token_id = label_pad_token_id
+        self._pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
+        self._embedding_tokenizer = embedding_tokenizer
+        self._tools = tools
+
+    def __call__(self, example: Example) -> Example:
+        """Apply KTO preprocessing to example.
+
+        Args:
+            example: Input example with prompt, completion, label.
+
+        Returns:
+            Preprocessed example with all tokenized fields.
+
+        Raises:
+            KeyError: If required fields (prompt, completion, label) are missing.
+        """
+        if "prompt_input_ids" in example:
+            return example
+
+        # Convert from/value format to role/content if needed (ShareGPT → ChatML)
+        example = maybe_convert_to_chatml(example)
+        result = maybe_apply_chat_template(
+            dict(example),
+            self._tokenizer,
+            resolve_example_tools(example, self._tools),
+        )
+
+        # Strict field access - will raise KeyError if missing
+        prompt = result["prompt"]
+        completion = result["completion"]
+        label = result["label"]
+
+        # Tokenize prompt and completion separately
+        prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        completion_ids = self._tokenizer(completion, add_special_tokens=False)["input_ids"]
+
+        bos_token_id = self._tokenizer.bos_token_id
+        eos_token_id = self._tokenizer.eos_token_id
+
+        if self._add_special_tokens and bos_token_id is not None:
+            prompt_ids = [bos_token_id, *prompt_ids]
+
+        if eos_token_id is not None:
+            completion_ids = [*completion_ids, eos_token_id]
+
+        # Truncate prompt (from left, keep most recent context)
+        if self._max_prompt_length is not None:
+            prompt_ids = prompt_ids[-self._max_prompt_length :]
+
+        # Truncate completion (from right)
+        if self._max_completion_length is not None:
+            completion_ids = completion_ids[: self._max_completion_length]
+
+        full_ids = prompt_ids + completion_ids
+        prompt_len = len(prompt_ids)
+
+        # Create labels: mask prompt tokens with label_pad_token_id
+        full_labels = [self._label_pad_token_id] * prompt_len + completion_ids
+
+        # Create attention masks (all 1s for actual tokens)
+        prompt_mask = [1] * len(prompt_ids)
+        full_mask = [1] * len(full_ids)
+
+        result["prompt_input_ids"] = prompt_ids
+        result["prompt_attention_mask"] = prompt_mask
+        result["completion_input_ids"] = full_ids
+        result["completion_attention_mask"] = full_mask
+        result["completion_labels"] = full_labels
+        result["label"] = bool(label)
+
+        if self._embedding_tokenizer is not None:
+            emb_tokenized = self._embedding_tokenizer(
+                prompt,
+                truncation=True,
+                add_special_tokens=False,
+            )
+            result["embedding_input_ids"] = emb_tokenized["input_ids"]
+            result["embedding_attention_mask"] = emb_tokenized["attention_mask"]
+
+        return purify_example(result)
+
+    def __repr__(self) -> str:
+        """Return a debug-friendly representation including the length caps."""
+        return (
+            f"KTOPreprocessTransform(max_prompt={self._max_prompt_length}, max_completion={self._max_completion_length})"
+        )
+
+
+class BCOPreprocessTransform(ExpandTransform):
+    """Preprocessing transform for Binary Classifier Optimization.
+
+    BCO works with unpaired preference data (prompt + completion + label).
+    This transform handles the full preprocessing pipeline per-example:
+    1. Extract shared prompt from chosen/rejected conversations
+    2. Apply chat template to convert conversations to text
+    3. Unpair: yield TWO examples from one paired input (chosen + rejected)
+    4. Tokenize prompt and completion with proper masking
+
+    As an ExpandTransform, this yields multiple examples from each input:
+    - For paired data (chosen/rejected): yields 2 examples
+    - For unpaired data (prompt/completion/label): yields 1 example
+
+    Produces per example:
+        - prompt_input_ids, prompt_attention_mask: Just the prompt
+        - completion_input_ids, completion_attention_mask, completion_labels: Full sequence
+        - label: Boolean indicating desirable (True) or undesirable (False)
+
+    Args:
+        tokenizer: Tokenizer for text encoding.
+        max_prompt_length: Maximum tokens for prompt.
+        max_completion_length: Maximum tokens for completion.
+        add_special_tokens: Whether to add BOS/EOS tokens.
+        label_pad_token_id: Token ID for masking prompt tokens in labels.
+        embedding_tokenizer: Optional tokenizer for BCO UDM embeddings.
+        tools: Optional tools for function calling in chat template.
+
+    Example:
+        >>> transform = BCOPreprocessTransform(
+        ...     tokenizer=tokenizer,
+        ...     max_prompt_length=512,
+        ...     max_completion_length=256,
+        ... )
+        >>> # Paired input yields 2 examples
+        >>> for result in transform({"chosen": [...], "rejected": [...]}):
+        ...     print(result["label"])  # True, then False
+    """
+
+    def __init__(
+        self,
+        tokenizer: tp.Any,
+        max_prompt_length: int | None = None,
+        max_completion_length: int | None = None,
+        add_special_tokens: bool = False,
+        label_pad_token_id: int = -100,
+        embedding_tokenizer: tp.Any = None,
+        tools: list | None = None,
+    ):
+        """Cache the tokenizer and configuration for BCO preprocessing.
+
+        Args:
+            tokenizer: Tokenizer used for chat templating and encoding.
+            max_prompt_length: Optional cap on prompt length (left-truncated).
+            max_completion_length: Optional cap on completion length
+                (right-truncated).
+            add_special_tokens: Whether to prepend BOS and append EOS.
+            label_pad_token_id: Token id used to mask prompt positions in
+                ``completion_labels``.
+            embedding_tokenizer: Optional separate tokenizer for the BCO
+                User-Driven Model (UDM) embedding feed.
+            tools: Optional default tool schemas for chat templating.
+        """
+        self._tokenizer = tokenizer
+        self._max_prompt_length = max_prompt_length
+        self._max_completion_length = max_completion_length
+        self._add_special_tokens = add_special_tokens
+        self._label_pad_token_id = label_pad_token_id
+        self._pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
+        self._embedding_tokenizer = embedding_tokenizer
+        self._tools = tools
+        self._unpaired_transform = KTOPreprocessTransform(
+            tokenizer=tokenizer,
+            max_prompt_length=max_prompt_length,
+            max_completion_length=max_completion_length,
+            add_special_tokens=add_special_tokens,
+            label_pad_token_id=label_pad_token_id,
+            embedding_tokenizer=embedding_tokenizer,
+            tools=tools,
+        )
+
+    def __call__(self, example: Example) -> Iterator[Example]:
+        """Process example and yield one or more tokenized examples.
+
+        For paired data (chosen/rejected): yields 2 examples.
+        For unpaired data (prompt/completion/label): yields 1 example.
+
+        Args:
+            example: Input example with either:
+                - chosen/rejected fields (paired preference data)
+                - prompt/completion/label fields (unpaired data)
+
+        Yields:
+            Tokenized examples with prompt_input_ids, completion_input_ids, label, etc.
+
+        Raises:
+            KeyError: If required fields are missing from the example.
+        """
+        if "prompt_input_ids" in example:
+            yield example
+            return
+
+        # Check if already unpaired (has prompt/completion/label)
+        if "completion" in example and "label" in example:
+            yield self._tokenize_unpaired(example)
+            return
+
+        # Paired data: extract prompt, apply chat template, yield 2 examples
+
+        # Step 1: Convert from/value format to role/content if needed (ShareGPT → ChatML)
+        example = maybe_convert_to_chatml(example)
+
+        example = extract_prompt_from_preference(example)
+
+        # Step 3: Apply chat template if conversational (uses maybe_apply_chat_template)
+        example = maybe_apply_chat_template(
+            example,
+            self._tokenizer,
+            resolve_example_tools(example, self._tools),
+        )
+
+        # Step 4: Get fields with strict access - missing fields will raise KeyError
+        prompt = example["prompt"]
+        chosen = example["chosen"]
+        rejected = example["rejected"]
+        sideband_fields = {
+            key: value
+            for key, value in example.items()
+            if key not in {"prompt", "chosen", "rejected", "completion", "label", "messages", "text"}
+        }
+
+        # Step 5: Yield TWO tokenized examples (unpair operation)
+        # Chosen example (label=True)
+        yield self._tokenize_unpaired(
+            {
+                **sideband_fields,
+                "prompt": prompt,
+                "completion": chosen,
+                "label": True,
+            }
+        )
+
+        # Rejected example (label=False)
+        yield self._tokenize_unpaired(
+            {
+                **sideband_fields,
+                "prompt": prompt,
+                "completion": rejected,
+                "label": False,
+            }
+        )
+
+    def _tokenize_unpaired(self, example: dict) -> dict:
+        """Use the shared KTO unpaired-preference tokenizer for each BCO branch."""
+        return self._unpaired_transform(example)
+
+    def __repr__(self) -> str:
+        """Return a debug-friendly representation including the length caps."""
+        return (
+            f"BCOPreprocessTransform(max_prompt={self._max_prompt_length}, max_completion={self._max_completion_length})"
+        )
+
+
+class DPOPreprocessTransform(Transform):
+    """Preprocessing transform for Direct Preference Optimization.
+
+    Handles the full DPO preprocessing pipeline:
+    1. Extract shared prompt from chosen/rejected if needed
+    2. Apply chat template to conversational data
+    3. Tokenize prompt, chosen, and rejected sequences
+
+    Supports pre-tokenized data - if prompt_input_ids exists, passes through.
+
+    Args:
+        tokenizer: Tokenizer for text encoding.
+        max_prompt_length: Maximum tokens for prompt.
+        max_completion_length: Maximum tokens for chosen/rejected.
+        add_special_tokens: Whether to add BOS/EOS tokens.
+        tools: Optional tools for function calling.
+
+    Example:
+        >>> transform = DPOPreprocessTransform(
+        ...     tokenizer=tokenizer,
+        ...     max_prompt_length=512,
+        ...     max_completion_length=256,
+        ... )
+        >>> result = transform({
+        ...     "prompt": "What is 2+2?",
+        ...     "chosen": "4",
+        ...     "rejected": "5",
+        ... })
+    """
+
+    def __init__(
+        self,
+        tokenizer: tp.Any,
+        max_prompt_length: int | None = None,
+        max_completion_length: int | None = None,
+        add_special_tokens: bool = False,
+        tools: list | None = None,
+        label_pad_token_id: int = -100,
+    ):
+        """Cache the tokenizer and configuration for DPO preprocessing.
+
+        Args:
+            tokenizer: Tokenizer used for chat templating and encoding.
+            max_prompt_length: Optional cap on prompt length (left-truncated).
+            max_completion_length: Optional cap on chosen/rejected length
+                (right-truncated).
+            add_special_tokens: Whether to prepend BOS / append EOS.
+            tools: Optional default tool schemas for chat templating.
+            label_pad_token_id: Token id used to mask prompt positions in
+                ``chosen_labels`` and ``rejected_labels``.
+        """
+        self._tokenizer = tokenizer
+        self._max_prompt_length = max_prompt_length
+        self._max_completion_length = max_completion_length
+        self._add_special_tokens = add_special_tokens
+        self._tools = tools
+        self._label_pad_token_id = label_pad_token_id
+        self._pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
+
+    def __call__(self, example: Example) -> Example:
+        """Apply DPO preprocessing to example.
+
+        Args:
+            example: Input example with prompt, chosen, rejected.
+
+        Returns:
+            Preprocessed example with prompt_input_ids, chosen_input_ids,
+            rejected_input_ids.
+        """
+        if "prompt_input_ids" in example:
+            return example
+
+        # Step 1: Convert from/value format to role/content if needed (ShareGPT → ChatML)
+        example = maybe_convert_to_chatml(example)
+
+        result = extract_prompt_from_preference(example)
+
+        result = maybe_apply_chat_template(
+            result,
+            self._tokenizer,
+            resolve_example_tools(result, self._tools),
+        )
+
+        return self._tokenize(result)
+
+    def _tokenize(self, example: dict) -> dict:
+        """Tokenize prompt, chosen, and rejected sequences.
+
+        Produces:
+            - prompt_input_ids, prompt_attention_mask: Just the prompt
+            - chosen_input_ids, chosen_attention_mask, chosen_labels: Full chosen sequence
+            - rejected_input_ids, rejected_attention_mask, rejected_labels: Full rejected sequence
+
+        Labels have prompt tokens masked with label_pad_token_id (-100).
+
+        Raises:
+            KeyError: If required fields (prompt, chosen, rejected) are missing.
+        """
+        result = dict(example)
+
+        # Strict field access - will raise KeyError if missing
+        prompt = example["prompt"]
+        chosen = example["chosen"]
+        rejected = example["rejected"]
+
+        prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        chosen_completion_ids = self._tokenizer(chosen, add_special_tokens=False)["input_ids"]
+        rejected_completion_ids = self._tokenizer(rejected, add_special_tokens=False)["input_ids"]
+
+        if self._add_special_tokens and self._tokenizer.bos_token_id is not None:
+            prompt_ids = [self._tokenizer.bos_token_id, *prompt_ids]
+
+        if self._tokenizer.eos_token_id is not None:
+            chosen_completion_ids = [*chosen_completion_ids, self._tokenizer.eos_token_id]
+            rejected_completion_ids = [*rejected_completion_ids, self._tokenizer.eos_token_id]
+
+        # Truncate prompt (from left, keep most recent context)
+        if self._max_prompt_length is not None:
+            prompt_ids = prompt_ids[-self._max_prompt_length :]
+
+        # Truncate completions (from right)
+        if self._max_completion_length is not None:
+            chosen_completion_ids = chosen_completion_ids[: self._max_completion_length]
+            rejected_completion_ids = rejected_completion_ids[: self._max_completion_length]
+
+        chosen_full_ids = prompt_ids + chosen_completion_ids
+        rejected_full_ids = prompt_ids + rejected_completion_ids
+
+        # Create labels: mask prompt tokens with label_pad_token_id
+        prompt_len = len(prompt_ids)
+        chosen_labels = [self._label_pad_token_id] * prompt_len + chosen_completion_ids
+        rejected_labels = [self._label_pad_token_id] * prompt_len + rejected_completion_ids
+
+        max_seq_length = (self._max_prompt_length or 0) + (self._max_completion_length or 0)
+
+        def _pad_sequence(seq, max_len, pad_value):
+            """Right-pad ``seq`` with ``pad_value`` up to ``max_len``.
+
+            Args:
+                seq: List of token ids.
+                max_len: Target length; ``None`` or ``0`` disables padding.
+                pad_value: Value to append.
+
+            Returns:
+                The (possibly extended) list.
+            """
+            if max_len and len(seq) < max_len:
+                return seq + [pad_value] * (max_len - len(seq))
+            return seq
+
+        prompt_max = self._max_prompt_length
+        if prompt_max:
+            if len(prompt_ids) < prompt_max:
+                pad_len = prompt_max - len(prompt_ids)
+                prompt_ids = [self._pad_token_id] * pad_len + prompt_ids
+                prompt_attention_mask = [0] * pad_len + [1] * (prompt_max - pad_len)
+            else:
+                prompt_attention_mask = [1] * len(prompt_ids)
+        else:
+            prompt_attention_mask = [1] * len(prompt_ids)
+
+        # Pad full sequences (right-pad)
+        if max_seq_length:
+            chosen_attention_mask = [1] * len(chosen_full_ids)
+            rejected_attention_mask = [1] * len(rejected_full_ids)
+
+            chosen_full_ids = _pad_sequence(chosen_full_ids, max_seq_length, self._pad_token_id)
+            rejected_full_ids = _pad_sequence(rejected_full_ids, max_seq_length, self._pad_token_id)
+            chosen_labels = _pad_sequence(chosen_labels, max_seq_length, self._label_pad_token_id)
+            rejected_labels = _pad_sequence(rejected_labels, max_seq_length, self._label_pad_token_id)
+            chosen_attention_mask = _pad_sequence(chosen_attention_mask, max_seq_length, 0)
+            rejected_attention_mask = _pad_sequence(rejected_attention_mask, max_seq_length, 0)
+        else:
+            chosen_attention_mask = [1] * len(chosen_full_ids)
+            rejected_attention_mask = [1] * len(rejected_full_ids)
+
+        result["prompt_input_ids"] = prompt_ids
+        result["prompt_attention_mask"] = prompt_attention_mask
+        result["chosen_input_ids"] = chosen_full_ids
+        result["chosen_attention_mask"] = chosen_attention_mask
+        result["chosen_labels"] = chosen_labels
+        result["rejected_input_ids"] = rejected_full_ids
+        result["rejected_attention_mask"] = rejected_attention_mask
+        result["rejected_labels"] = rejected_labels
+
+        return purify_example(result)
+
+    def __repr__(self) -> str:
+        """Return a debug-friendly representation including the length caps."""
+        return (
+            f"DPOPreprocessTransform(max_prompt={self._max_prompt_length}, max_completion={self._max_completion_length})"
+        )
+
+
+class ORPOPreprocessTransform(DPOPreprocessTransform):
+    """Preprocessing transform for Odds Ratio Preference Optimization.
+
+    Uses the same preprocessing as DPO since the input format is identical.
+
+    Example:
+        >>> transform = ORPOPreprocessTransform(
+        ...     tokenizer=tokenizer,
+        ...     max_prompt_length=512,
+        ...     max_completion_length=256,
+        ... )
+    """
+
+    def __call__(self, example: Example) -> Example:
+        """Reject empty preference targets instead of creating undefined log odds."""
+        if self._max_completion_length is not None and self._max_completion_length <= 0:
+            raise ValueError("ORPO requires a positive max_completion_length.")
+        result = super().__call__(example)
+        for branch in ("chosen", "rejected"):
+            if not any(
+                label != self._label_pad_token_id and bool(active)
+                for label, active in zip(result[f"{branch}_labels"], result[f"{branch}_attention_mask"], strict=True)
+            ):
+                raise ValueError(f"ORPO {branch} sequence has no scoreable completion labels.")
+        return result
+
+    def __repr__(self) -> str:
+        """Return a debug-friendly representation including the length caps."""
+        return (
+            f"ORPOPreprocessTransform(max_prompt={self._max_prompt_length}, "
+            f"max_completion={self._max_completion_length})"
+        )
+
+
+# CPO uses the same preprocessing as DPO
+CPOPreprocessTransform = DPOPreprocessTransform
+
+
+class RewardPreprocessTransform(Transform):
+    """Preprocessing transform for Reward Model training.
+
+    Similar to DPO but focused on scoring completions.
+
+    Args:
+        tokenizer: Tokenizer for text encoding.
+        max_length: Maximum sequence length.
+        truncation: Whether to truncate sequences.
+
+    Example:
+        >>> transform = RewardPreprocessTransform(
+        ...     tokenizer=tokenizer,
+        ...     max_length=512,
+        ... )
+    """
+
+    def __init__(
+        self,
+        tokenizer: tp.Any,
+        max_length: int,
+        truncation: bool = True,
+        pad_to_multiple_of: int | None = None,
+    ):
+        """Cache the tokenizer and configuration for reward-model preprocessing.
+
+        Args:
+            tokenizer: Tokenizer used for chat templating and encoding.
+            max_length: Maximum length of the tokenized chosen/rejected
+                sequences (used for both truncation and padding).
+            truncation: Whether to truncate to ``max_length``.
+            pad_to_multiple_of: Optional row-length multiple forwarded to
+                tokenization when supported.
+        """
+        self._tokenizer = tokenizer
+        self._max_length = max_length
+        self._truncation = truncation
+        self._pad_to_multiple_of = pad_to_multiple_of
+
+    def __call__(self, example: Example) -> Example:
+        """Apply reward model preprocessing.
+
+        Raises:
+            KeyError: If required fields (chosen, rejected) are missing.
+        """
+        if "input_ids_chosen" in example:
+            return example
+
+        # Convert from/value format to role/content if needed (ShareGPT → ChatML)
+        example = maybe_convert_to_chatml(example)
+        had_prompt = "prompt" in example
+        had_conversational_prompt = isinstance(example.get("prompt"), list)
+        had_conversational_pair = any(isinstance(example.get(key), list) for key in ("chosen", "rejected"))
+        result = extract_prompt_from_preference(example)
+        result = maybe_apply_chat_template(
+            result,
+            self._tokenizer,
+            resolve_example_tools(result),
+        )
+
+        # Strict field access - will raise KeyError if missing
+        chosen = result["chosen"]
+        rejected = result["rejected"]
+        prompt = result.get("prompt", "")
+
+        prompt_was_extracted = (not had_prompt) and ("prompt" in result)
+        should_prefix_prompt = prompt_was_extracted or had_conversational_prompt or had_conversational_pair
+
+        if should_prefix_prompt and prompt:
+            chosen = prompt + chosen
+            rejected = prompt + rejected
+
+        chosen_tokens = self._tokenizer(
+            chosen,
+            truncation=self._truncation,
+            max_length=self._max_length,
+            padding="max_length" if self._max_length else False,
+            pad_to_multiple_of=self._pad_to_multiple_of,
+            return_attention_mask=True,
+        )
+        rejected_tokens = self._tokenizer(
+            rejected,
+            truncation=self._truncation,
+            max_length=self._max_length,
+            padding="max_length" if self._max_length else False,
+            pad_to_multiple_of=self._pad_to_multiple_of,
+            return_attention_mask=True,
+        )
+
+        result["input_ids_chosen"] = chosen_tokens["input_ids"]
+        result["attention_mask_chosen"] = chosen_tokens["attention_mask"]
+        result["input_ids_rejected"] = rejected_tokens["input_ids"]
+        result["attention_mask_rejected"] = rejected_tokens["attention_mask"]
+
+        return purify_example(result)
+
+    def __repr__(self) -> str:
+        """Return a debug-friendly representation including the length cap."""
+        return f"RewardPreprocessTransform(max_length={self._max_length})"
+
+
+class SFTPreprocessTransform(Transform):
+    """Preprocessing transform for Supervised Fine-Tuning.
+
+    Handles the full SFT preprocessing pipeline:
+    1. Apply formatting function if provided
+    2. Format detection (conversational vs text)
+    3. Convert from/value format to ChatML if needed
+    4. Apply chat template for conversational data
+    5. Tokenization with optional completion masking
+
+    Supports pre-tokenized data - if input_ids already exists, passes through.
+
+    Args:
+        tokenizer: Tokenizer for text encoding.
+        max_length: Maximum sequence length.
+        text_field: Field name for text data (default: "text").
+        messages_field: Field name for messages (default: "messages").
+        mask_prompt: Whether to create completion mask for completion-only loss.
+        add_eos: Whether to add EOS token to text.
+        truncation: Whether to truncate to max_length.
+        formatting_func: Optional function to format examples before tokenization.
+            Should take an example dict and return a string or dict with "text" field.
+
+    Example:
+        >>> transform = SFTPreprocessTransform(
+        ...     tokenizer=tokenizer,
+        ...     max_length=2048,
+        ...     mask_prompt=True,
+        ...     formatting_func=lambda x: x["instruction"] + x["response"],
+        ... )
+        >>> result = transform({"instruction": "Hi", "response": "Hello!"})
+    """
+
+    preserves_row_count = True
+
+    def __init__(
+        self,
+        tokenizer: tp.Any,
+        max_length: int,
+        text_field: str = "text",
+        messages_field: str = "messages",
+        mask_prompt: bool = False,
+        add_eos: bool = True,
+        truncation: bool = True,
+        truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_start",
+        padding: bool | str | object = _DEFAULT_SFT_PADDING,
+        pad_to_multiple_of: int | None = None,
+        formatting_func: tp.Callable | None = None,
+        packing_mode: bool = False,
+    ):
+        """Cache the tokenizer and configuration for SFT preprocessing.
+
+        Args:
+            tokenizer: Tokenizer used for chat templating and encoding.
+            max_length: Target sequence length used for truncation and
+                padding.
+            text_field: Dataset field that holds plain text rows.
+            messages_field: Dataset field that holds chat messages.
+            mask_prompt: When ``True``, attempt to build a completion mask
+                that excludes prompt tokens from the loss.
+            add_eos: When ``True``, ensure the EOS token is appended to
+                non-templated text.
+            truncation: Whether to truncate to ``max_length``.
+            truncation_mode: ``"keep_start"`` keeps the first tokens;
+                ``"keep_end"`` keeps the final tokens.
+            padding: Tokenizer padding mode. Defaults to ``"max_length"``
+                for backward compatibility; SFT packing/padding-free
+                paths pass ``False`` so short rows remain packable.
+            pad_to_multiple_of: Optional row-length multiple used after
+                tokenization. This mirrors tokenizer ``pad_to_multiple_of``
+                behavior for tokenizers that do not implement it.
+            formatting_func: Optional callable that turns a raw example
+                into a formatted dict or string before tokenization.
+            packing_mode: When ``True``, override ``padding`` to ``False``
+                so rows stay unpadded and can be efficiently packed by a
+                downstream :class:`~easydel.data.transforms.pack.PackStage`.
+                This is the recommended setting when training with
+                sequence packing.
+        """
+        self._tokenizer = tokenizer
+        self._max_length = max_length
+        self._text_field = text_field
+        self._messages_field = messages_field
+        self._mask_prompt = mask_prompt
+        self._add_eos = add_eos
+        self._truncation = truncation
+        self._truncation_mode = truncation_mode
+        self._pad_to_multiple_of = pad_to_multiple_of
+        self._formatting_func = formatting_func
+
+        if packing_mode:
+            self._padding = False
+            self._padding_explicitly_set = False
+            if padding is not _DEFAULT_SFT_PADDING and padding not in (False, "do_not_pad"):
+                warnings.warn(
+                    "SFTPreprocessTransform: packing_mode=True overrides padding to False. "
+                    f"Ignoring requested padding={padding!r}.",
+                    stacklevel=2,
+                )
+        elif padding is _DEFAULT_SFT_PADDING:
+            self._padding = "max_length"
+            self._padding_explicitly_set = False
+        else:
+            self._padding = tp.cast(bool | str, padding)
+            self._padding_explicitly_set = True
+            if self._padding in ("max_length", True) and self._max_length:
+                warnings.warn(
+                    "SFTPreprocessTransform: padding='max_length' pads every row to max_length, "
+                    "which makes downstream sequence packing inefficient. "
+                    "Use packing_mode=True or pass padding=False when packing.",
+                    stacklevel=2,
+                )
+
+        self._packing_mode = packing_mode
+        chat_template = getattr(tokenizer, "chat_template", None)
+        self._return_assistant_tokens_mask = bool(
+            mask_prompt and isinstance(chat_template, str) and _GENERATION_TAG_RE.search(chat_template) is not None
+        )
+
+    def __call__(self, example: Example) -> Example:
+        """Apply SFT preprocessing to example.
+
+        Args:
+            example: Input example.
+
+        Returns:
+            Preprocessed example with input_ids, attention_mask, etc.
+        """
+        if "input_ids" in example:
+            return example
+
+        result = dict(example)
+
+        if self._formatting_func is not None:
+            formatted = self._formatting_func(example)
+            if isinstance(formatted, str):
+                result = dict(example)
+                result[self._text_field] = formatted
+            elif isinstance(formatted, dict):
+                result = formatted
+            else:
+                result = dict(example)
+                result[self._text_field] = str(formatted)
+
+        # Step 1: Normalize conversational payloads (ChatML / stringified JSON / tools)
+        result = maybe_convert_to_chatml(result)
+
+        raw_messages = result.get(self._messages_field)
+        if raw_messages is None and self._messages_field != "messages":
+            raw_messages = result.get("messages")
+        messages = normalize_message_payload(raw_messages, allow_plain_text=True)
+        if messages:
+            if self._messages_field in result:
+                result[self._messages_field] = messages
+            elif "messages" in result:
+                result["messages"] = messages
+            return self._tokenize_conversational(result, messages)
+
+        text_value = result.get(self._text_field)
+        messages = self._normalize_message_list(text_value)
+        if messages:
+            return self._tokenize_conversational(result, messages)
+
+        if "prompt" in result and "completion" in result:
+            return self._tokenize_prompt_completion(result)
+
+        if self._text_field in result:
+            return self._tokenize_text(result)
+
+        return result
+
+    def map_batch(self, examples: list[Example]) -> list[Example]:
+        """Apply SFT preprocessing to a small row batch.
+
+        Chat templates are still rendered per example because tool schemas and
+        message structure can differ by row, but the expensive tokenizer call is
+        batched whenever the row shape can be handled without changing labels or
+        masks.
+        """
+        if self._formatting_func is not None or self._return_assistant_tokens_mask:
+            return [self(example) for example in examples]
+
+        outputs: list[Example | None] = [None] * len(examples)
+        tokenization_jobs: dict[bool, list[tuple[int, dict, str]]] = {False: [], True: []}
+        conversational_jobs: dict[str, tuple[list | None, list[tuple[int, dict, list]]]] = {}
+
+        for index, example in enumerate(examples):
+            if "input_ids" in example:
+                outputs[index] = example
+                continue
+
+            result = maybe_convert_to_chatml(dict(example))
+            raw_messages = result.get(self._messages_field)
+            if raw_messages is None and self._messages_field != "messages":
+                raw_messages = result.get("messages")
+            messages = normalize_message_payload(raw_messages, allow_plain_text=True)
+            if messages:
+                if self._messages_field in result:
+                    result[self._messages_field] = messages
+                elif "messages" in result:
+                    result["messages"] = messages
+                self._prepare_batched_conversational(index, result, messages, conversational_jobs)
+                continue
+
+            text_value = result.get(self._text_field)
+            messages = self._normalize_message_list(text_value)
+            if messages:
+                self._prepare_batched_conversational(index, result, messages, conversational_jobs)
+                continue
+
+            if "prompt" in result and "completion" in result:
+                outputs[index] = self._tokenize_prompt_completion(result)
+                continue
+
+            if self._text_field in result:
+                text = result[self._text_field]
+                if self._add_eos and not text.endswith(self._tokenizer.eos_token):
+                    text = text + self._tokenizer.eos_token
+                tokenization_jobs[True].append((index, result, text))
+                continue
+
+            outputs[index] = result
+
+        for _, (tools, jobs) in conversational_jobs.items():
+            if len(jobs) == 1:
+                # Singleton tool-schema group: agentic mixtures commonly carry a
+                # distinct `tools` list per row, which would degrade this loop to
+                # one template+encode call per row. Render the template per row
+                # instead (cheap, GIL-bound either way) and queue the rendered
+                # text so the shared batched tokenizer call below encodes it
+                # together with every other row of the chunk.
+                example_index, result, messages = jobs[0]
+                self._prepare_rendered_conversational(example_index, result, messages, tools, tokenization_jobs)
+                continue
+            try:
+                with self._temporary_truncation_side():
+                    tokens = self._tokenizer.apply_chat_template(
+                        [messages for _, _, messages in jobs],
+                        tools=tools,
+                        tokenize=True,
+                        return_dict=True,
+                        return_attention_mask=True,
+                        truncation=self._truncation,
+                        max_length=self._max_length,
+                        padding=self._tokenizer_padding(),
+                        pad_to_multiple_of=self._pad_to_multiple_of,
+                        return_tensors="np",
+                    )
+                input_ids_rows = self._as_int32_rows(tokens["input_ids"])
+                attention_mask_rows = self._as_int32_rows(tokens["attention_mask"])
+                for row_index, (example_index, result, _) in enumerate(jobs):
+                    outputs[example_index] = self._finalize_batched_row(
+                        result,
+                        input_ids_rows[row_index],
+                        attention_mask_rows[row_index],
+                    )
+            except Exception:
+                for example_index, result, messages in jobs:
+                    self._prepare_rendered_conversational(
+                        example_index,
+                        result,
+                        messages,
+                        tools,
+                        tokenization_jobs,
+                    )
+
+        for add_special_tokens, jobs in tokenization_jobs.items():
+            if not jobs:
+                continue
+            with self._temporary_truncation_side():
+                tokens = self._tokenizer(
+                    [text for _, _, text in jobs],
+                    truncation=self._truncation,
+                    max_length=self._max_length,
+                    padding=self._tokenizer_padding(),
+                    pad_to_multiple_of=self._pad_to_multiple_of,
+                    return_attention_mask=True,
+                    add_special_tokens=add_special_tokens,
+                    return_tensors="np",
+                )
+            input_ids_rows = self._as_int32_rows(tokens["input_ids"])
+            attention_mask_rows = self._as_int32_rows(tokens["attention_mask"])
+            for row_index, (example_index, result, _) in enumerate(jobs):
+                outputs[example_index] = self._finalize_batched_row(
+                    result,
+                    input_ids_rows[row_index],
+                    attention_mask_rows[row_index],
+                )
+
+        return [tp.cast(Example, output) for output in outputs if output is not None]
+
+    def _finalize_batched_row(self, result: dict, input_ids: tp.Any, attention_mask: tp.Any) -> Example:
+        """Attach one batched-tokenization row to its example, matching per-row output.
+
+        Mirrors the tail of the per-row tokenization paths
+        (:meth:`_tokenize_conversational` / :meth:`_tokenize_text`): when
+        ``pad_to_multiple_of`` is configured, rows are converted to plain int
+        lists first so :meth:`_pad_row_to_multiple` applies the same
+        safety-net padding the per-row path applies (tokenizers ignore
+        ``pad_to_multiple_of`` when padding is disabled).
+
+        Args:
+            result: Example dict the token rows belong to (mutated in place).
+            input_ids: This example's row from the batched tokenizer output.
+            attention_mask: This example's attention-mask row.
+
+        Returns:
+            The purified example, exactly as the per-row path would emit it.
+        """
+        if self._pad_to_multiple_of is not None:
+            if not isinstance(input_ids, list):
+                input_ids = [int(token) for token in input_ids]
+            if not isinstance(attention_mask, list):
+                attention_mask = [int(value) for value in attention_mask]
+        result["input_ids"] = input_ids
+        result["attention_mask"] = attention_mask
+        return purify_example(self._pad_row_to_multiple(result))
+
+    def _prepare_batched_conversational(
+        self,
+        index: int,
+        result: dict,
+        messages: list,
+        conversational_jobs: dict[str, tuple[list | None, list[tuple[int, dict, list]]]],
+    ) -> None:
+        """Normalize one conversational row and queue it for batched chat templating."""
+        normalized_messages = normalize_message_payload(messages, allow_plain_text=True)
+        if normalized_messages:
+            messages = normalized_messages
+
+        tools = resolve_example_tools(result)
+        key = self._tool_cache_key(tools)
+        if key not in conversational_jobs:
+            conversational_jobs[key] = (tools, [])
+        conversational_jobs[key][1].append((index, result, messages))
+
+    def _prepare_rendered_conversational(
+        self,
+        index: int,
+        result: dict,
+        messages: list,
+        tools: list | None,
+        tokenization_jobs: dict[bool, list[tuple[int, dict, str]]],
+    ) -> None:
+        """Render one conversational row and queue fallback batched tokenization."""
+        try:
+            text = self._tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                tools=tools,
+            )
+            tokenization_jobs[False].append((index, result, text))
+        except Exception:
+            try:
+                text = self._tokenizer.apply_chat_template(messages, tokenize=False)
+            except Exception:
+                text = self._simple_format_messages(messages)
+
+            if self._add_eos and not text.endswith(self._tokenizer.eos_token):
+                text = text + self._tokenizer.eos_token
+            tokenization_jobs[True].append((index, result, text))
+
+    @staticmethod
+    def _tool_cache_key(tools: list | None) -> str:
+        """Return a stable grouping key for per-example tool schemas."""
+        if tools is None:
+            return ""
+        try:
+            return json.dumps(tools, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return repr(tools)
+
+    @staticmethod
+    def _as_int32_rows(value: tp.Any) -> tp.Any:
+        """Convert batched tokenizer integer output to int32 rows when possible."""
+        try:
+            import numpy as np
+
+            return np.asarray(value, dtype=np.int32)
+        except Exception:
+            return value
+
+    @staticmethod
+    def _normalize_message_list(messages: tp.Any) -> list[dict[str, tp.Any]] | None:
+        """Normalize an arbitrary message payload to the canonical chat format.
+
+        Args:
+            messages: Raw value as found in the dataset (string, JSON
+                string, list of dicts, ...).
+
+        Returns:
+            A list of role/content dicts, or ``None`` if the payload could
+            not be interpreted as a non-plain-text chat list.
+        """
+        return normalize_message_payload(messages, allow_plain_text=False)
+
+    def _tokenize_conversational(self, example: dict, messages: list) -> dict:
+        """Tokenize conversational data using chat template."""
+        result = dict(example)
+        normalized_messages = normalize_message_payload(messages, allow_plain_text=True)
+        if normalized_messages:
+            messages = normalized_messages
+
+        tools = resolve_example_tools(result)
+
+        try:
+            with self._assistant_tracker_guard(), self._temporary_truncation_side():
+                if self._return_assistant_tokens_mask:
+                    # HF's mask stops at the first truncated span; render untruncated and cut everything together.
+                    processed = self._tokenizer.apply_chat_template(
+                        messages,
+                        return_dict=True,
+                        return_attention_mask=True,
+                        return_assistant_tokens_mask=True,
+                        truncation=False,
+                        padding=False,
+                        tools=tools,
+                    )
+                    processed = self._truncate_and_pad_masked_row(processed)
+                else:
+                    processed = self._tokenizer.apply_chat_template(
+                        messages,
+                        return_dict=True,
+                        return_attention_mask=True,
+                        return_assistant_tokens_mask=False,
+                        truncation=self._truncation,
+                        max_length=self._max_length,
+                        padding=self._tokenizer_padding(),
+                        pad_to_multiple_of=self._pad_to_multiple_of,
+                        tools=tools,
+                    )
+            result.update(processed)
+        except Exception:
+            # Fallback if chat template fails - try without tools first
+            try:
+                text = self._tokenizer.apply_chat_template(messages, tokenize=False)
+            except Exception:
+                # Final fallback: simple formatting without chat template
+                text = self._simple_format_messages(messages)
+
+            if self._add_eos and not text.endswith(self._tokenizer.eos_token):
+                text = text + self._tokenizer.eos_token
+
+            with self._temporary_truncation_side():
+                tokens = self._tokenizer(
+                    text,
+                    truncation=self._truncation,
+                    max_length=self._max_length,
+                    padding=self._tokenizer_padding(),
+                    pad_to_multiple_of=self._pad_to_multiple_of,
+                    return_attention_mask=True,
+                )
+            result["input_ids"] = tokens["input_ids"]
+            result["attention_mask"] = tokens["attention_mask"]
+
+        result = self._pad_row_to_multiple(result)
+        return purify_example(result)
+
+    def _assistant_tracker_guard(self) -> tp.ContextManager[tp.Any]:
+        """Return the lock serialising assistant-mask renders, or a no-op when no mask is requested.
+
+        HF's Jinja ``AssistantTracker`` is process-global and not thread-safe; concurrent renders either
+        raise or silently return an empty assistant mask. The lock is fetched per call rather than stored on
+        ``self`` because it is not picklable and transforms are shipped to worker processes.
+
+        Returns:
+            The shared re-entrant tracker lock when ``return_assistant_tokens_mask`` is in use, otherwise a
+            null context.
+        """
+        if not self._return_assistant_tokens_mask:
+            return nullcontext()
+        return assistant_tracker_lock()
+
+    def _truncate_and_pad_masked_row(self, processed: tp.Mapping[str, tp.Any]) -> dict[str, tp.Any]:
+        """Apply this transform's truncation and padding to an untruncated masked render.
+
+        Every per-token field (``input_ids``, ``attention_mask``, ``assistant_masks`` and any other list of
+        the same length) is cut on the same side: ``keep_end`` drops the head, ``keep_start`` the tail.
+        Padding then follows the tokenizer's ``padding_side`` using ``pad_token_id`` (or 0).
+        ``pad_to_multiple_of`` is left to :meth:`_pad_row_to_multiple`.
+
+        Args:
+            processed: Untruncated, unpadded ``apply_chat_template`` output.
+
+        Returns:
+            A new dict with all per-token fields truncated and padded consistently.
+        """
+        row = {key: (list(value) if isinstance(value, (list, tuple)) else value) for key, value in processed.items()}
+        ids = row.get("input_ids")
+        if not isinstance(ids, list):
+            return row
+        length = len(ids)
+        per_token = [key for key, value in row.items() if isinstance(value, list) and len(value) == length]
+        if self._truncation and self._max_length and length > self._max_length:
+            if self._truncation_mode == "keep_end":
+                cut = slice(length - self._max_length, None)
+            else:
+                cut = slice(0, self._max_length)
+            for key in per_token:
+                row[key] = row[key][cut]
+        if self._tokenizer_padding() in ("max_length", True) and self._max_length:
+            pad_len = self._max_length - len(row["input_ids"])
+            if pad_len > 0:
+                pad_id = getattr(self._tokenizer, "pad_token_id", 0) or 0
+                left = getattr(self._tokenizer, "padding_side", "right") == "left"
+                for key in per_token:
+                    fill = [pad_id if key == "input_ids" else 0] * pad_len
+                    row[key] = fill + row[key] if left else row[key] + fill
+        return row
+
+    def _simple_format_messages(self, messages: list) -> str:
+        """Simple fallback formatting when chat template fails.
+
+        This handles cases where the tokenizer's chat template has strict
+        requirements (e.g., tool messages must follow assistant tool calls).
+        """
+        normalized_messages = normalize_message_payload(messages, allow_plain_text=True)
+        if normalized_messages:
+            messages = normalized_messages
+
+        parts = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                parts.append(f"<|user|>\n{msg}")
+                continue
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            if role == "assistant" and "tool_calls" in msg:
+                tool_calls = msg.get("tool_calls", [])
+                if tool_calls:
+                    tool_str = json.dumps(tool_calls, ensure_ascii=False)
+                    content = (
+                        f"{content}\n<tool_calls>{tool_str}</tool_calls>"
+                        if content
+                        else f"<tool_calls>{tool_str}</tool_calls>"
+                    )
+
+            if role == "tool":
+                tool_name = msg.get("name", "tool")
+                content = f'<tool_response name="{tool_name}">{content}</tool_response>'
+
+            parts.append(f"<|{role}|>\n{content}")
+
+        return "\n".join(parts)
+
+    def _tokenize_prompt_completion(self, example: dict) -> dict:
+        """Tokenize prompt/completion format with optional masking."""
+        raw_example = maybe_convert_to_chatml(dict(example))
+        raw_prompt = raw_example.get("prompt")
+        result = maybe_apply_chat_template(
+            raw_example,
+            self._tokenizer,
+            resolve_example_tools(raw_example),
+        )
+
+        prompt = result["prompt"]
+        completion = result["completion"]
+
+        if self._add_eos and not completion.endswith(self._tokenizer.eos_token):
+            completion = completion + self._tokenizer.eos_token
+
+        if isinstance(raw_prompt, list):
+            prompt_ids = self._tokenizer.apply_chat_template(
+                raw_prompt,
+                add_generation_prompt=True,
+                tools=resolve_example_tools(raw_example),
+            )
+        else:
+            prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        full_text = prompt + completion
+
+        # Use tokenizer for truncation and padding
+        with self._temporary_truncation_side():
+            tokens = self._tokenizer(
+                full_text,
+                truncation=self._truncation,
+                max_length=self._max_length,
+                padding=self._tokenizer_padding(),
+                pad_to_multiple_of=self._pad_to_multiple_of,
+                return_attention_mask=True,
+                add_special_tokens=False,
+            )
+
+        result["input_ids"] = tokens["input_ids"]
+        result["attention_mask"] = tokens["attention_mask"]
+
+        if self._mask_prompt:
+            # Work in unpadded token coordinates. Left truncation discards prompt
+            # tokens first; left padding shifts the retained boundary again.
+            retained_length = sum(tokens["attention_mask"])
+            removed_left = 0
+            if self._truncation and self._truncation_mode == "keep_end":
+                full_ids = self._tokenizer(full_text, add_special_tokens=False, truncation=False, padding=False)[
+                    "input_ids"
+                ]
+                removed_left = max(len(full_ids) - retained_length, 0)
+            prompt_len = max(len(prompt_ids) - removed_left, 0)
+            token_index = 0
+            completion_mask = []
+            for active in tokens["attention_mask"]:
+                completion_mask.append(int(bool(active) and token_index >= prompt_len))
+                token_index += int(bool(active))
+            result["completion_mask"] = completion_mask
+
+        result = self._pad_row_to_multiple(result)
+        return purify_example(result)
+
+    def _tokenize_text(self, example: dict) -> dict:
+        """Tokenize plain text format."""
+        result = dict(example)
+
+        text = example[self._text_field]
+
+        if self._add_eos and not text.endswith(self._tokenizer.eos_token):
+            text = text + self._tokenizer.eos_token
+
+        with self._temporary_truncation_side():
+            tokens = self._tokenizer(
+                text,
+                truncation=self._truncation,
+                max_length=self._max_length,
+                padding=self._tokenizer_padding(),
+                pad_to_multiple_of=self._pad_to_multiple_of,
+                return_attention_mask=True,
+            )
+
+        result["input_ids"] = tokens["input_ids"]
+        result["attention_mask"] = tokens["attention_mask"]
+
+        result = self._pad_row_to_multiple(result)
+        return purify_example(result)
+
+    def __repr__(self) -> str:
+        """Return a debug-friendly representation including the length cap."""
+        return f"SFTPreprocessTransform(max_length={self._max_length}, mask_prompt={self._mask_prompt})"
+
+    def _tokenizer_padding(self) -> bool | str:
+        """Resolve tokenizer padding mode for the current max-length settings."""
+        if self._padding == "max_length" and not self._max_length:
+            return False
+        return self._padding
+
+    @contextmanager
+    def _temporary_truncation_side(self) -> Iterator[None]:
+        """Temporarily set tokenizer truncation side for one preprocessing call."""
+        if not self._truncation or not hasattr(self._tokenizer, "truncation_side"):
+            yield
+            return
+        previous_side = self._tokenizer.truncation_side
+        self._tokenizer.truncation_side = "left" if self._truncation_mode == "keep_end" else "right"
+        try:
+            yield
+        finally:
+            self._tokenizer.truncation_side = previous_side
+
+    def _pad_row_to_multiple(self, result: dict) -> dict:
+        """Pad token-aligned row fields to ``pad_to_multiple_of`` when needed."""
+        if self._pad_to_multiple_of is None:
+            return result
+        input_ids = result.get("input_ids")
+        if not isinstance(input_ids, list):
+            return result
+        multiple = self._pad_to_multiple_of
+        remainder = len(input_ids) % multiple
+        if remainder == 0:
+            return result
+        pad_len = multiple - remainder
+        pad_token_id = getattr(self._tokenizer, "pad_token_id", 0) or 0
+        padded = dict(result)
+        padded["input_ids"] = [*input_ids, *([pad_token_id] * pad_len)]
+        for key, pad_value in (
+            ("attention_mask", 0),
+            ("completion_mask", 0),
+            ("assistant_masks", 0),
+        ):
+            value = padded.get(key)
+            if isinstance(value, list):
+                padded[key] = [*value, *([pad_value] * pad_len)]
+        return padded
+
+
+class EmbeddingPreprocessTransform(Transform):
+    """Transform that tokenizes query/positive/negative text columns for contrastive embedding training.
+
+    Converts raw text strings from dataset columns into tokenized ``input_ids``
+    and ``attention_mask`` arrays with ``query_``/``positive_``/``negative_``
+    prefixes expected by the ``EmbeddingTrainer``.
+
+    Args:
+        tokenizer: Tokenizer instance for text encoding.
+        max_length: Maximum sequence length for tokenization.
+        query_field: Dataset column name containing query/anchor texts.
+        positive_field: Dataset column name containing positive texts.
+        negative_field: Optional column name for hard negative texts.
+
+    Example:
+        >>> transform = EmbeddingPreprocessTransform(
+        ...     tokenizer=tokenizer,
+        ...     max_length=512,
+        ...     query_field="query",
+        ...     positive_field="positive",
+        ... )
+        >>> result = transform({"query": "What is JAX?", "positive": "JAX is a NumPy library."})
+        >>> list(result.keys())
+        ['query_input_ids', 'query_attention_mask', 'positive_input_ids', 'positive_attention_mask']
+    """
+
+    def __init__(
+        self,
+        tokenizer: tp.Any,
+        max_length: int = 512,
+        query_field: str = "query",
+        positive_field: str = "positive",
+        negative_field: str | None = None,
+    ):
+        """Cache the tokenizer and dataset-column configuration.
+
+        Args:
+            tokenizer: Tokenizer used to encode each text field.
+            max_length: Sequence length used for both truncation and
+                padding (defaults to 512).
+            query_field: Dataset column carrying anchor/query strings.
+            positive_field: Dataset column carrying positive examples.
+            negative_field: Optional dataset column carrying hard negatives.
+        """
+        self._tokenizer = tokenizer
+        self._max_length = max_length
+        self._query_field = query_field
+        self._positive_field = positive_field
+        self._negative_field = negative_field
+
+    def __call__(self, example: Example) -> Example:
+        """Tokenize the configured query/positive (and optional negative) fields.
+
+        Args:
+            example: Source example mapping with the configured text fields.
+
+        Returns:
+            A dict with ``query_*``, ``positive_*`` and (optionally)
+            ``negative_*`` ``input_ids`` / ``attention_mask`` arrays.
+        """
+        result: dict[str, tp.Any] = {}
+
+        for prefix, field_name in [
+            ("query", self._query_field),
+            ("positive", self._positive_field),
+        ]:
+            text = example[field_name]
+            encoded = self._tokenizer(
+                text,
+                truncation=True,
+                max_length=self._max_length,
+                padding="max_length",
+                return_attention_mask=True,
+            )
+            result[f"{prefix}_input_ids"] = encoded["input_ids"]
+            result[f"{prefix}_attention_mask"] = encoded["attention_mask"]
+
+        if self._negative_field and self._negative_field in example:
+            encoded = self._tokenizer(
+                example[self._negative_field],
+                truncation=True,
+                max_length=self._max_length,
+                padding="max_length",
+                return_attention_mask=True,
+            )
+            result["negative_input_ids"] = encoded["input_ids"]
+            result["negative_attention_mask"] = encoded["attention_mask"]
+
+        return result
+
+    def __repr__(self) -> str:
+        """Return a debug-friendly representation including the length cap and field names."""
+        return (
+            f"EmbeddingPreprocessTransform(max_length={self._max_length}, "
+            f"query={self._query_field}, positive={self._positive_field}, "
+            f"negative={self._negative_field})"
+        )

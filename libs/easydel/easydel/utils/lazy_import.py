@@ -1,0 +1,282 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Lazy-import infrastructure used by EasyDeL packages.
+
+Provides :class:`LazyModule`, a ``ModuleType`` subclass that defers
+sub-module imports until the first attribute access. EasyDeL's top-level
+``__init__`` swaps itself for a ``LazyModule`` so that ``import easydel`` is
+fast and individual heavy sub-modules (modeling, trainers, kernels, etc.)
+are only imported when actually used. The implementation is adapted from
+HuggingFace's lazy-module pattern.
+
+Also provides the :func:`is_package_available` import-checking helper.
+"""
+
+import importlib
+import os
+import typing as tp
+from itertools import chain
+from types import ModuleType
+from typing import Any
+
+BACKENDS_T = frozenset[str]
+IMPORT_STRUCTURE_T = dict[BACKENDS_T, dict[str, set[str]]]
+
+
+class DummyObject(type):
+    """Metaclass for lazy placeholders whose optional backends are missing.
+
+    Used by :class:`LazyModule` to manufacture stub classes whose every
+    attribute access or instantiation raises an :class:`ImportError`
+    describing the optional dependency that should be installed.
+    """
+
+    def _missing_backend_message(cls) -> str:
+        """Build the human-readable optional-backend error message.
+
+        Returns:
+            A string listing the missing backends recorded on ``cls._backends``.
+        """
+        backends = getattr(cls, "_backends", ())
+        if isinstance(backends, str):
+            backend_names = backends
+        else:
+            backend_names = ", ".join(str(backend) for backend in backends)
+        return f"{cls.__name__} requires missing optional backend(s): {backend_names}."
+
+    def __getattribute__(cls, name: str) -> tp.Any:
+        """Raise a clear optional-dependency error on placeholder use.
+
+        Args:
+            name: Attribute being accessed.
+
+        Returns:
+            The dunder attribute when ``name`` starts with ``_`` or is one of
+            the safe introspection attributes.
+
+        Raises:
+            ImportError: When any non-dunder attribute is accessed on the
+                placeholder, listing the missing optional backend(s).
+        """
+        if name.startswith("_") or name in {"__class__", "__doc__", "__module__", "__name__", "__qualname__"}:
+            return super().__getattribute__(name)
+        raise ImportError(cls._missing_backend_message())
+
+    def __call__(cls, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
+        """Prevent instantiating placeholders for missing optional backends.
+
+        Args:
+            *args: Ignored.
+            **kwargs: Ignored.
+
+        Raises:
+            ImportError: Always, listing the missing optional backend(s).
+        """
+        del args, kwargs
+        raise ImportError(cls._missing_backend_message())
+
+
+class LazyModule(ModuleType):
+    """Module subclass that defers sub-module imports until first access.
+
+    Used as the top-level ``__init__`` module for EasyDeL packages so that
+    ``import easydel`` is fast and only imports sub-packages on demand.
+    Adapted from the HuggingFace ``transformers`` lazy module pattern.
+
+    Attributes:
+        _modules: Set of known sub-module names.
+        _class_to_module: Mapping from exported class name to its sub-module.
+        _import_structure: Flattened mapping of module -> list of exported names.
+        _objects: Extra objects injected at construction time.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        module_file: str,
+        import_structure: IMPORT_STRUCTURE_T,
+        module_spec: importlib.machinery.ModuleSpec | None = None,
+        extra_objects: dict[str, object] | None = None,
+    ):
+        """Initialize a lazy module skeleton.
+
+        Two ``import_structure`` shapes are accepted:
+
+        * Mapping of ``frozenset(backend_name, ...)`` to ``{module: {symbol, ...}}``
+          (the new HF style with backend-gated symbols).
+        * Mapping of ``module: [symbol, ...]`` (the legacy flat shape).
+
+        Args:
+            name: The fully-qualified module name being installed (e.g.
+                ``"easydel"``).
+            module_file: The ``__file__`` of the underlying ``__init__.py``.
+            import_structure: Description of which symbols come from which
+                sub-module, optionally gated on backend frozensets.
+            module_spec: Optional ``ModuleSpec`` to attach (preserves package
+                semantics).
+            extra_objects: Mapping of symbol name to a concrete value that
+                should be returned directly without importing a sub-module.
+        """
+        super().__init__(name)
+
+        self._backend_import_structure = import_structure
+        self._object_missing_backend: dict[str, tuple[str, ...]] = {}
+        if any(isinstance(key, frozenset) for key in import_structure.keys()):
+            self._modules = set[str]()
+            self._class_to_module = dict[str, str]()
+            self.__all__ = []
+
+            _import_structure = dict[str, list[str]]()
+
+            for _backends, module in import_structure.items():
+                self._modules = self._modules.union(set(module.keys()))
+                missing_backends = tuple(sorted(backend for backend in _backends if not is_package_available(backend)))
+
+                for key, values in module.items():
+                    for value in values:
+                        self._class_to_module[value] = key
+                        if missing_backends:
+                            self._object_missing_backend[value] = missing_backends
+                    _import_structure.setdefault(key, []).extend(values)
+
+                self.__all__.extend(list(module.keys()) + list(chain(*module.values())))
+
+            self.__file__ = module_file
+            self.__spec__ = module_spec
+            self.__path__ = [os.path.dirname(module_file)]
+            self._objects = {} if extra_objects is None else extra_objects
+            self._name = name
+            self._import_structure = _import_structure
+
+        # This can be removed once every exportable object has a `export()` export.
+        else:
+            self._modules = set(import_structure.keys())
+            self._class_to_module = {}
+            for key, values in import_structure.items():
+                for value in values:
+                    self._class_to_module[value] = key
+            self.__all__ = list[BACKENDS_T](import_structure.keys()) + list[Any](chain(*import_structure.values()))
+            self.__file__ = module_file
+            self.__spec__ = module_spec
+            self.__path__ = [os.path.dirname(module_file)]
+            self._objects = {} if extra_objects is None else extra_objects
+            self._name = name
+            self._import_structure = import_structure
+
+    def __dir__(self):
+        """Return ``dir()`` augmented with all lazy-export names.
+
+        Returns:
+            The default ``ModuleType.__dir__`` result extended with every name
+            declared in ``__all__`` so IDE auto-completion sees lazy exports.
+        """
+        result = super().__dir__()
+        for attr in self.__all__:
+            if attr not in result:
+                result.append(attr)
+        return result
+
+    def __getattr__(self, name: str) -> tp.Any:
+        """Resolve a lazy attribute by importing its backing sub-module.
+
+        Args:
+            name: Attribute being accessed on the lazy module.
+
+        Returns:
+            The resolved object, which is also cached on ``self`` so further
+            accesses don't reimport.
+
+        Raises:
+            AttributeError: If ``name`` is not registered as a sub-module,
+                a class export, an extra object, or a missing-backend stub.
+        """
+        if name in self._objects:
+            return self._objects[name]
+        if name in self._object_missing_backend:
+            missing_backends = self._object_missing_backend[name]
+
+            class Placeholder(metaclass=DummyObject):
+                """Stub class returned when required backends are missing.
+
+                Tagged with ``_backends`` so callers can introspect which
+                optional dependencies they would need to install before this
+                symbol becomes usable.
+                """
+
+                _backends = missing_backends
+
+            Placeholder.__name__ = name
+            Placeholder.__module__ = self.__name__
+
+            value = Placeholder
+        elif name in self._class_to_module.keys():
+            module = self._get_module(self._class_to_module[name])
+            value = getattr(module, name)
+        elif name in self._modules:
+            value = self._get_module(name)
+        else:
+            raise AttributeError(f"module {self.__name__} has no attribute {name}")
+
+        setattr(self, name, value)
+        return value
+
+    def _get_module(self, module_name: str):
+        """Import and return a child sub-module by relative name.
+
+        Args:
+            module_name: The sub-module name relative to this package.
+
+        Returns:
+            The imported module.
+
+        Raises:
+            RuntimeError: If the import raises any exception (with the
+                original error chained as ``__cause__`` for full traceback).
+        """
+        try:
+            return importlib.import_module("." + module_name, self.__name__)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to import {self.__name__}.{module_name} because of the following error (look up to see its"
+                f" traceback):\n{e}"
+            ) from e
+
+    def __reduce__(self):
+        """Support ``pickle`` round-trips by rebuilding the lazy module.
+
+        Returns:
+            A ``(class, args)`` tuple suitable for ``pickle`` to call.
+        """
+        return (
+            self.__class__,
+            (self._name, self.__file__, self._backend_import_structure, self.__spec__, self._objects),
+        )
+
+
+def is_package_available(package_name: str) -> bool:
+    """Check if a package can be imported in the current environment.
+
+    Distribution names containing dashes are normalised to underscores
+    (``"my-pkg"`` -> ``"my_pkg"``) before the lookup so PyPI-style names work
+    too.
+
+    Args:
+        package_name: Importable name of the package (e.g. ``"numpy"``).
+
+    Returns:
+        ``True`` if a module spec exists for ``package_name``, ``False`` if
+        not.
+    """
+    return importlib.util.find_spec(package_name.replace("-", "_")) is not None

@@ -1,0 +1,418 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Sequence-level Knowledge Distillation (SeqKD) trainer.
+
+The teacher generates text completions from prompts and the student trains
+on them with standard cross-entropy loss.  No teacher logits are required,
+so this works with API-based teachers via ``teacher_fn``.
+"""
+
+from __future__ import annotations
+
+import typing as tp
+from copy import deepcopy
+
+import numpy as np
+from eformer.loggings import get_logger
+from jax import numpy as jnp
+
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.base_state import EasyDeLState
+from easydel.infra.utils import ProcessingClassType
+from easydel.utils import Registry
+from easydel.utils.helpers import capture_time
+
+from .._shared import drop_optimizer_state
+from ..metrics import _host_mean_float
+from ..prompt_transforms import GRPOPreprocessTransform
+from ..trainer import Trainer
+from .seq_kd_config import SeqKDConfig
+
+if tp.TYPE_CHECKING:
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
+
+    from easydel.data.core.protocols import ShardedDataSource
+
+logger = get_logger(__name__)
+
+
+@Registry.register("trainer", "seq_kd")
+class SeqKDTrainer(Trainer):
+    """Sequence-level Knowledge Distillation trainer.
+
+    The teacher generates text completions from prompts and the student is
+    trained on those completions using standard cross-entropy loss.  This is
+    a black-box distillation method: no teacher logits or hidden states are
+    required.
+
+    Two teacher modes are supported:
+        1. **Local teacher model** (``teacher_model``): An EasyDeL model that
+           generates completions via ``rollout``.
+        2. **External teacher function** (``teacher_fn``): A callable
+           ``(prompts: list[str]) -> list[str]`` for API-based teachers.
+           When ``num_generations_per_prompt > 1``, prompts are repeated in
+           prompt-major order and the callable must return one completion per
+           repeated prompt.
+
+    Training loop:
+        1. Sample prompts from the dataset
+        2. Teacher generates completions (local model or API)
+        3. Build training batch with teacher completions as labels
+        4. Student trains with standard CE loss (same as SFT)
+
+    Attributes:
+        arguments (SeqKDConfig): Resolved SeqKD configuration carried
+            from initialisation.
+        teacher_state (EasyDeLState | None): In-process teacher state
+            used when generation runs locally; ``None`` for the
+            external-callable mode.
+        teacher_fn (Callable[[list[str]], list[str]] | None): External
+            teacher callable mapping a list of prompt strings to a list
+            of completion strings; ``None`` when ``teacher_state`` is
+            used instead.
+        processing_class (ProcessingClassType): Tokenizer / processor
+            used for prompt encoding and (for the callable teacher
+            mode) decoding/re-encoding of completions.
+        padding_value (int): Pad token id used by the collators; falls
+            back to ``0`` when the tokenizer exposes no pad token.
+
+    Example:
+        >>> config = SeqKDConfig(
+        ...     max_prompt_length=512,
+        ...     max_completion_length=256,
+        ...     learning_rate=2e-5,
+        ... )
+        >>> trainer = SeqKDTrainer(
+        ...     arguments=config,
+        ...     student_model=student,
+        ...     teacher_model=teacher,
+        ...     train_dataset=dataset,
+        ...     processing_class=tokenizer,
+        ... )
+        >>> trainer.train()
+    """
+
+    supports_sequence_packing: tp.ClassVar[bool] = False
+
+    teacher_state: EasyDeLState | None
+    teacher_fn: tp.Callable[[list[str]], list[str]] | None
+    arguments: SeqKDConfig
+
+    def __init__(
+        self,
+        arguments: SeqKDConfig,
+        processing_class: ProcessingClassType,
+        student_model: EasyDeLBaseModule | EasyDeLState | None = None,
+        teacher_model: EasyDeLBaseModule | EasyDeLState | None = None,
+        teacher_fn: tp.Callable[[list[str]], list[str]] | None = None,
+        train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
+        eval_dataset: Dataset | IterableDataset | ShardedDataSource | dict[str, Dataset] | None = None,
+    ):
+        """Initialize the SeqKD trainer.
+
+        Exactly one of ``teacher_model`` or ``teacher_fn`` must be
+        provided.
+
+        Args:
+            arguments (SeqKDConfig): SeqKD configuration. Must be a
+                :class:`SeqKDConfig`.
+            processing_class (ProcessingClassType): Tokenizer / processor.
+                If ``pad_token`` is unset and ``eos_token`` is available,
+                pad is set to eos in place.
+            student_model (EasyDeLBaseModule | EasyDeLState | None):
+                Student model (the one being trained).
+            teacher_model (EasyDeLBaseModule | EasyDeLState | None):
+                Optional in-process teacher model used via
+                ``rollout``. Mutually exclusive with
+                ``teacher_fn``.
+            teacher_fn (tp.Callable[[list[str]], list[str]] | None):
+                Optional API-style teacher callable mapping a list of
+                prompts to a list of completions. Mutually exclusive
+                with ``teacher_model``.
+            train_dataset (Dataset | IterableDataset | ShardedDataSource | None):
+                Training dataset of prompts.
+            eval_dataset (Dataset | IterableDataset | ShardedDataSource |
+                dict[str, Dataset] | None): Optional evaluation
+                dataset(s).
+
+        Raises:
+            TypeError: If ``arguments`` is not a :class:`SeqKDConfig`.
+            ValueError: If neither ``teacher_model`` nor ``teacher_fn``
+                is supplied.
+        """
+        tokenizer = processing_class
+        if hasattr(processing_class, "tokenizer"):
+            tokenizer = processing_class.tokenizer
+        if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
+            tokenizer.pad_token = tokenizer.eos_token
+
+        if not isinstance(arguments, SeqKDConfig):
+            raise TypeError("passed argument must be a `SeqKDConfig`.")
+        if teacher_model is None and teacher_fn is None:
+            raise ValueError("Either `teacher_model` or `teacher_fn` must be provided.")
+
+        self.arguments = arguments
+
+        if not isinstance(student_model, EasyDeLState):
+            student_model = student_model.to_state(trainable_selector=arguments.trainable_selector)
+
+        if teacher_model is not None and not isinstance(teacher_model, EasyDeLState):
+            teacher_model = teacher_model.to_state(trainable_selector=arguments.trainable_selector)
+
+        self.teacher_state = drop_optimizer_state(teacher_model)
+        self.teacher_fn = teacher_fn
+        self.processing_class = processing_class
+
+        pad_token_id = getattr(processing_class, "pad_token_id", None)
+        if pad_token_id is None and hasattr(processing_class, "tokenizer"):
+            pad_token_id = getattr(processing_class.tokenizer, "pad_token_id", None)
+        self.padding_value = 0 if pad_token_id is None else int(pad_token_id)
+
+        super().__init__(
+            arguments=arguments,
+            dataset_train=train_dataset,
+            dataset_eval=eval_dataset,
+            model_state=student_model,
+            data_collator=None,
+            processing_class=processing_class,
+        )
+
+    def _get_preprocess_transform(self) -> GRPOPreprocessTransform | None:
+        """Build the lazy prompt-only preprocessing transform for SeqKD.
+
+        SeqKD trains the student on completions sampled from a teacher;
+        the dataset only needs to provide prompts. This hook returns the
+        same GRPO-style transform used by other prompt-only trainers,
+        which renders the chat template (with optional tool schemas in
+        ``arguments.tools``) and tokenises to
+        ``arguments.max_prompt_length``. The transform runs lazily
+        inside the data loader.
+
+        Returns:
+            A :class:`GRPOPreprocessTransform` configured against the
+            tokenizer / prompt budget / chat template flags, or ``None``
+            when :meth:`_is_pretokenized` reports the source already
+            emits ``input_ids``.
+        """
+        if self._is_pretokenized():
+            return None
+        preprocess_tokenizer = deepcopy(self.processing_class)
+        return GRPOPreprocessTransform(
+            tokenizer=preprocess_tokenizer,
+            max_prompt_length=self.arguments.max_prompt_length,
+            skip_apply_chat_template=self.arguments.skip_apply_chat_template,
+            tools=getattr(self.arguments, "tools", None),
+        )
+
+    def create_grain_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
+    ) -> tp.Callable:
+        """Construct the Grain collator that left-pads prompt-only SeqKD batches.
+
+        SeqKD batches prompts only; teacher completions are produced
+        inside :meth:`_preprocess_batch_input`. The collator left-pads
+        tokenised prompts to ``arguments.max_prompt_length`` using the
+        resolved ``self.padding_value`` so that teacher generation
+        always receives a contiguous, right-aligned prefix.
+
+        Args:
+            max_sequence_length: Accepted for compatibility with
+                :class:`Trainer`; ignored.
+            truncation_mode: Accepted for compatibility with
+                :class:`Trainer`; ignored -- the GRPO collator left-pads
+                rather than truncating.
+
+        Returns:
+            A freshly built :class:`GRPODataCollatorGrain`.
+        """
+        from ..utils import GRPODataCollatorGrain
+
+        return GRPODataCollatorGrain(
+            max_prompt_length=self.arguments.max_prompt_length,
+            pad_token_id=self.padding_value,
+        )
+
+    def create_tfds_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
+    ) -> tp.Callable:
+        """Construct the TFDS collator that left-pads prompt-only SeqKD batches.
+
+        TFDS analogue of :meth:`create_grain_collect_function`. The
+        collator pads tokenised prompts to
+        ``arguments.max_prompt_length`` with ``self.padding_value`` and
+        produces no completion tensors -- those are filled in by the
+        teacher generation step.
+
+        Args:
+            max_sequence_length: Accepted for compatibility with
+                :class:`Trainer`; ignored.
+            truncation_mode: Accepted for compatibility with
+                :class:`Trainer`; ignored.
+
+        Returns:
+            A freshly built :class:`GRPODataCollatorTFDS`.
+        """
+        from ..utils import GRPODataCollatorTFDS
+
+        return GRPODataCollatorTFDS(
+            max_prompt_length=self.arguments.max_prompt_length,
+            pad_token_id=self.padding_value,
+        )
+
+    def _preprocess_batch_input(
+        self,
+        state: EasyDeLState,
+        batch: dict[str, tp.Any],
+        is_train: bool,
+    ) -> tuple[dict[str, tp.Any], dict[str, float | int | str]]:
+        """Generate completions from teacher and prepare a CE training batch.
+
+        If ``teacher_fn`` is set, prompts are decoded to text, optionally
+        repeated per prompt when ``num_generations_per_prompt > 1``, passed to
+        the callable, and the returned completions are re-tokenized.  Otherwise
+        ``rollout`` is called on the local teacher model.
+
+        Args:
+            state (EasyDeLState): Current student state (unused for
+                generation; passed only for logging hooks).
+            batch (dict[str, tp.Any]): Raw input batch with prompt
+                ``input_ids`` and ``attention_mask``.
+            is_train (bool): Whether preprocessing runs for training
+                (currently behavior-equivalent for eval).
+
+        Returns:
+            tuple[dict[str, tp.Any], dict[str, float | int | str]]: A
+            pair of (training_batch, auxiliary_metrics). The training
+            batch contains ``input_ids``, ``attention_mask`` and
+            ``labels`` (with prompt and pad positions masked to
+            ``-100``).
+
+        Raises:
+            ValueError: If ``teacher_fn`` returns a list whose length
+                does not match the expected number of repeated prompts.
+        """
+        batch = self._apply_user_data_collator(batch)
+        batch = self._purify_batch(batch)
+
+        generation_time: float = 0.0
+        with capture_time() as preprocessing_time_fn:
+            prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
+            generated_completions_text: list[str] | None = None
+
+            if self.teacher_fn is not None:
+                with capture_time() as generation_time_fn:
+                    host_prompt_ids = np.asarray(prompt_ids)
+                    prompt_texts = self.processing_class.batch_decode(
+                        host_prompt_ids,
+                        skip_special_tokens=True,
+                    )
+                    generation_factor = int(
+                        getattr(self.arguments, "generation_num_return_sequences", None)
+                        or getattr(self.arguments, "num_generations_per_prompt", 1)
+                        or 1
+                    )
+                    generation_factor = max(generation_factor, 1)
+                    expanded_prompt_texts = [
+                        prompt_text for prompt_text in prompt_texts for _ in range(generation_factor)
+                    ]
+                    completion_texts = list(self.teacher_fn(expanded_prompt_texts))
+                    if len(completion_texts) != len(expanded_prompt_texts):
+                        raise ValueError(
+                            "`teacher_fn` must return exactly one completion per prompt. "
+                            f"Expected {len(expanded_prompt_texts)} completions for "
+                            f"{len(prompt_texts)} prompts with generation_factor={generation_factor}, "
+                            f"but got {len(completion_texts)}."
+                        )
+                    encoded = self.processing_class(
+                        completion_texts,
+                        padding="max_length",
+                        max_length=self.arguments.max_completion_length,
+                        truncation=True,
+                        return_tensors="np",
+                        add_special_tokens=False,
+                    )
+                    generated_completions_text = completion_texts
+                    completion_ids = jnp.array(encoded["input_ids"])
+                    completion_mask = jnp.array(encoded["attention_mask"])
+                generation_time = generation_time_fn()
+            else:
+                with capture_time() as generation_time_fn:
+                    results = self.rollout(
+                        input_ids=prompt_ids,
+                        attention_mask=prompt_mask,
+                        state=self.teacher_state,
+                        apply_chat_template=False,
+                        shard_inputs=False,
+                        all_gather=False,
+                    )
+                    prompt_ids = results.prompt_ids
+                    prompt_mask = results.prompt_mask
+                    completion_ids = results.completion_ids
+                    generated_completions_text = self._coerce_generation_texts(results.text)
+                generation_time = generation_time_fn()
+
+                completion_mask = self._make_attn_mask(completion_ids)
+
+            # Handle generation factor (num_generations_per_prompt > 1)
+            generation_factor = completion_ids.shape[0] // max(prompt_mask.shape[0], 1)
+            generation_factor = max(generation_factor, 1)
+            expanded_prompt_ids = prompt_ids.repeat(generation_factor, 0) if generation_factor > 1 else prompt_ids
+            expanded_prompt_mask = prompt_mask.repeat(generation_factor, 0) if generation_factor > 1 else prompt_mask
+
+            input_ids_full = jnp.concatenate([expanded_prompt_ids, completion_ids], axis=1)
+            attention_mask_full = jnp.concatenate([expanded_prompt_mask, completion_mask], axis=1)
+
+            # Build labels: same as input_ids, but mask prompt tokens with -100
+            # ForCausalLMLoss shifts internally, so labels[i] = input_ids[i] is correct.
+            prompt_len = expanded_prompt_ids.shape[1]
+            labels = np.array(input_ids_full)
+            labels[:, :prompt_len] = -100
+            labels[np.array(attention_mask_full) == 0] = -100
+
+            # Gather to replicated sharding
+            input_ids_full = self._all_gather(input_ids_full)
+            attention_mask_full = self._all_gather(attention_mask_full)
+            labels = self._all_gather(jnp.asarray(labels))
+
+        preprocessing_time = preprocessing_time_fn()
+
+        metrics_dict: dict[str, float | int | str] = {
+            "completion_length": _host_mean_float(jnp.sum(completion_mask, -1)),
+            "generation_time": generation_time,
+            "preprocessing_time": preprocessing_time,
+        }
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=expanded_prompt_ids,
+            prompt_mask=expanded_prompt_mask,
+            completions=generated_completions_text,
+            completion_ids=completion_ids,
+            completion_mask=completion_mask,
+            generation_time=generation_time,
+            source="teacher",
+        )
+
+        return (
+            {
+                "input_ids": input_ids_full,
+                "attention_mask": attention_mask_full,
+                "labels": labels,
+            },
+            metrics_dict,
+        )

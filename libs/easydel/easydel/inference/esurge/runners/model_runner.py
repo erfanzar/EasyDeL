@@ -1,0 +1,4999 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""eSurge Model Runner - High-performance inference execution engine.
+
+This module implements the core execution logic for the eSurge inference engine,
+providing efficient model execution with advanced features like paged attention,
+dynamic batching, and compilation caching.
+
+Key Components:
+    ExecutionManager: Manages compiled execution functions for different batch/token configurations
+    eSurgeRunner: Main runner class that orchestrates model execution
+
+Architecture:
+    The module uses a two-stage compilation strategy:
+    1. Pre-compilation of functions for different token/batch size combinations
+    2. Runtime selection of appropriate compiled function based on input shape
+
+Performance Features:
+    - Paged attention for efficient KV cache management
+    - Vectorized operations for batch processing
+    - Pre-allocated buffers to minimize memory allocation
+    - Compilation caching to avoid recompilation
+    - Progress logging for long compilation processes
+
+Example:
+    >>> from easydel.infra import EasyDeLBaseModule
+    >>> from easydel.inference.esurge.runners import eSurgeRunner
+    >>>
+    >>> # Initialize model
+    >>> model = EasyDeLBaseModule.from_pretrained("model-name")
+    >>>
+    >>> # Create runner
+    >>> runner = eSurgeRunner(
+    ...     model=model,
+    ...     max_model_len=2048,
+    ...     max_num_seqs=8,
+    ...     hbm_utilization=0.9
+    ... )
+    >>>
+    >>> # Compile for different configurations
+    >>> runner.compile()
+    >>>
+    >>> # Execute model
+    >>> output = runner.execute_model(scheduler_output)
+"""
+
+from __future__ import annotations
+
+import time
+import typing
+from collections import deque
+from concurrent.futures import Future
+from functools import partial
+from math import gcd
+
+import jax
+import numpy as np
+import spectrax as spx
+from eformer.loggings import get_logger
+from ejkernel.modules.operations import set_gdn_kernel_tile_policy
+from jax import numpy as jnp
+from jax.experimental import multihost_utils
+
+from easydel.inference.esurge.config import (
+    KernelTilePolicy,
+    normalize_draft_schedule,
+    normalize_token_bucket_minimum,
+    resolve_num_draft_tokens,
+    token_bucket_floor,
+)
+from easydel.inference.speculative import DrafterProtocol, accept_or_reject, resample_rejected
+from easydel.infra.sharding import replicated_named_sharding
+from easydel.infra.side_inputs import SideInputWindow
+from easydel.layers.quantization import TurboQuantConfig
+from easydel.utils import flags
+
+from ..core.dp_sharding import dp_shard_page_bounds, pages_per_dp_shard
+from ..core.interface import create_kv_cache_specs_from_config, estimate_runtime_page_budget
+from ..metrics import get_metrics_collector
+from ..multimodal.cache import VisionEncoderCache
+from ..multimodal.side_inputs import build_side_input_provider, model_has_side_inputs
+from ..outputs import LogprobsLists, ModelRunnerOutput
+from ..scheduler import SchedulerOutput
+from ..utils import model_uses_mrope
+from .async_types import AsyncPreResults, AsyncWindowResult, DeviceInputTokenHandoff
+from .execution_types import CacheGroupInputs
+from .host_sync import host_payload_broadcast_needed
+from .perf import RunnerPerfSample, RunnerPerfTracker
+from .pipeline_execution_manager import PipelineExecutionManager
+from .pipeline_execution_manager import RunnerExecutionManager as ExecutionManager
+from .pipeline_plan import build_pipeline_inference_plan, cap_metadata_pages
+from .sequence_buffer import SequenceBuffer
+from .slot_pool import RecurrentSlotPool
+from .spec.interface import NullSpeculation, SpeculativeStrategy
+from .spec.sampling import score_sampled_tokens, summarize_logprobs
+from .spec.strategy import DrafterSpeculation, snapshot_recurrent_state, window_hidden_row
+from .state_sync import SequenceStateSync
+from .states import CachedRequestState
+from .vlm_prefill import VlmPrefillHelper
+from .window_planner import WindowPlanner
+
+if typing.TYPE_CHECKING:
+    from easydel.infra import EasyDeLBaseModule
+    from easydel.infra.etils import MpMdSchedulers
+
+logger = get_logger("eSurge")
+MLA_RAGGED_ATTN_MECHANISM = "multi_latent_ragged_page_attention_v2"
+
+
+class _BatchedVerifyRow(typing.NamedTuple):
+    """Precomputed batched greedy verify result for one spec request.
+
+    Populated by the per-step batched emission pre-pass (see
+    ``_execute_model_impl``): the LM-head projection and greedy argmax for the
+    whole running batch's verify rows run ONCE, and each request's slice is read
+    back here so the per-request emission loop consumes host integers instead of
+    issuing its own device->host argmax sync.
+
+    Attributes:
+        verify_meta: The request's :class:`_SpecVerifyMetadata`.
+        offset: Start row of this request inside the batched gather/argmax.
+        count: Number of verify rows for this request (``num_drafts + 1``).
+        argmaxes: Host greedy argmax token ids for this request's ``count`` rows.
+        gathered_hidden: The shared batched ``[pad_rows, H]`` gathered hidden
+            device array; ``gathered_hidden[offset + accepted]`` is the seed
+            hidden for drafting, bit-identical to the per-request gather.
+        batched_logits: The shared batched ``[pad_rows, vocab]`` logits device
+            array; sliced only when verify tracing is enabled.
+    """
+
+    verify_meta: typing.Any
+    offset: int
+    count: int
+    argmaxes: list[int]
+    gathered_hidden: jax.Array
+    batched_logits: jax.Array
+
+
+def derive_spec_token_buckets(
+    *,
+    seq_buckets: typing.Sequence[int],
+    num_draft_tokens: int,
+    draft_schedule: list[tuple[int, int, int]] | None,
+    min_token_pad: int,
+    max_bucket: int,
+) -> set[int]:
+    """Exact spec-window token buckets for the runner's compile grid.
+
+    Speculative steady-state verify windows schedule EXACTLY
+    ``n_active * (1 + k)`` tokens; without exact buckets those windows pad to
+    the next power-of-two token bucket (~60% utilization). This returns the
+    extra token buckets to add:
+
+    - Static K (``draft_schedule is None``): one ``reqs * (K + 1)`` bucket per
+      request bucket — the pre-schedule behavior, unchanged.
+    - Dynamic schedule: for each request bucket, only the ``k`` values the
+      schedule can actually resolve within that bucket's live-concurrency
+      range ``(prev_bucket, bucket]`` contribute a ``reqs * (k + 1)`` bucket
+      (``k == 0`` ranges contribute nothing — plain decode buckets already
+      exist). This is strictly FEWER buckets than the static grid whenever
+      the schedule throttles speculation off at high concurrency.
+
+    Args:
+        seq_buckets: Sorted request-count buckets (``max_num_seq_buckets``).
+        num_draft_tokens: Static draft-token count (compiled maximum and the
+            schedule's gap fallback).
+        draft_schedule: Normalized dynamic schedule or ``None`` for static.
+        min_token_pad: Smallest allowed token bucket.
+        max_bucket: Largest allowed token bucket.
+
+    Returns:
+        The set of exact spec token-bucket sizes within
+        ``[min_token_pad, max_bucket]``.
+    """
+    buckets: set[int] = set()
+    static_k = max(0, int(num_draft_tokens))
+    if static_k <= 0:
+        return buckets
+    prev_bucket = 0
+    for reqs in sorted(int(b) for b in seq_buckets):
+        if draft_schedule is None:
+            k_candidates = {static_k}
+        else:
+            # Probe every concurrency at which the resolved k can change within
+            # this bucket's live range (prev_bucket, reqs]: the range edges plus
+            # each schedule boundary (a range start, or the first concurrency
+            # after a range end) that falls inside it.
+            probes = {prev_bucket + 1, reqs}
+            for start, end, _k in draft_schedule:
+                for boundary in (start, end, end + 1):
+                    if prev_bucket < boundary <= reqs:
+                        probes.add(boundary)
+            k_candidates = {
+                resolve_num_draft_tokens(draft_schedule, batch_size=probe, num_draft_tokens=static_k) for probe in probes
+            }
+        for k in k_candidates:
+            if k <= 0:
+                continue
+            spec_bucket = reqs * (k + 1)
+            if int(min_token_pad) <= spec_bucket <= int(max_bucket):
+                buckets.add(spec_bucket)
+        prev_bucket = reqs
+    return buckets
+
+
+def _materialize_logprobs(
+    req_ids: list[str],
+    sampled_token_ids: list[list[int]],
+    payloads: dict[str, tuple[typing.Any, typing.Any, typing.Any]],
+    requested: set[str],
+) -> LogprobsLists | None:
+    """Flatten per-request device summaries in emitted-position order.
+
+    Unrequested emitted positions retain empty rows so scheduler offsets remain
+    correct for mixed batches. Partial prefill contributes no output positions.
+    """
+    if not requested:
+        return None
+    ids_out, scores_out, ranks_out = [], [], []
+    for req_id, emitted in zip(req_ids, sampled_token_ids, strict=True):
+        if req_id not in requested:
+            ids_out.extend([] for _ in emitted)
+            scores_out.extend([] for _ in emitted)
+            ranks_out.extend(0 for _ in emitted)
+            continue
+        if not emitted:
+            continue
+        if req_id not in payloads:
+            raise RuntimeError(f"Missing requested sampling probabilities for {req_id!r}.")
+        ids, scores, ranks = (np.asarray(array) for array in payloads[req_id])
+        if ids.shape[0] != len(emitted):
+            raise RuntimeError(f"Sampling probability positions do not match emitted tokens for {req_id!r}.")
+        for token, token_ids, values, rank in zip(emitted, ids, scores, ranks, strict=True):
+            if int(token_ids[0]) != int(token):
+                raise RuntimeError(f"Sampling probability token does not match output for {req_id!r}.")
+            # Sampled-first summaries may repeat the sampled token in top-k.
+            unique = dict(zip(token_ids.astype(int).tolist(), values.astype(float).tolist(), strict=True))
+            ids_out.append(list(unique))
+            scores_out.append(list(unique.values()))
+            ranks_out.append(int(rank))
+    return LogprobsLists(ids_out, scores_out, ranks_out)
+
+
+class _AsyncExecutionHandle:
+    """Deferred host-materialized model output for overlap execution.
+
+    Returned by :meth:`eSurgeRunner.execute_model` when overlap execution is
+    enabled. Wraps a partially-materialized :class:`ModelRunnerOutput` plus
+    one :class:`AsyncWindowResult` per runner window. Calling
+    :meth:`get_output` finishes the host copies and returns the fully
+    populated :class:`ModelRunnerOutput`.
+    """
+
+    def __init__(
+        self,
+        model_runner_output: ModelRunnerOutput,
+        windows: list[AsyncWindowResult],
+        finalize: typing.Callable[[list[list[int]]], None] | None = None,
+        resolve_logprobs: typing.Callable[[list[list[int]]], LogprobsLists | None] | None = None,
+    ) -> None:
+        """Initialize the deferred handle.
+
+        Args:
+            model_runner_output (ModelRunnerOutput): Output skeleton with all
+                host-resolvable fields filled in (sampled tokens are filled
+                later from ``windows``).
+            windows (list[AsyncWindowResult]): Per-window sampled-token tensors
+                whose host copies are already in flight.
+            finalize: Optional callback invoked exactly once with the resolved
+                ``sampled_token_ids`` once the host data is ready.
+            resolve_logprobs: Optional deferred position-major probability
+                materializer, independent of sampler metrics.
+        """
+        self._model_runner_output = model_runner_output
+        self._windows = windows
+        self._finalize = finalize
+        self._resolve_logprobs = resolve_logprobs
+        self._resolved_output: ModelRunnerOutput | None = None
+
+    def get_output(self) -> ModelRunnerOutput:
+        """Block on host copies and return the finalized output.
+
+        Returns:
+            ModelRunnerOutput: Output with ``sampled_token_ids`` and
+            ``token_logprobs`` populated. Subsequent calls return the cached
+            result without redoing host transfer.
+        """
+        if self._resolved_output is not None:
+            return self._resolved_output
+
+        sampled_token_ids: list[list[int]] = []
+        token_logprobs: dict[str, float] = {}
+
+        for window in self._windows:
+            tokens_cpu = np.asarray(window.sampled_token_ids)
+            logprobs_cpu = np.asarray(window.token_logprobs) if window.token_logprobs is not None else None
+            for row_pos, req_id, is_valid in zip(
+                window.row_positions,
+                window.req_ids,
+                window.valid_mask,
+                strict=False,
+            ):
+                if not is_valid:
+                    sampled_token_ids.append([])
+                    continue
+
+                sampled_token_ids.append([int(tokens_cpu[row_pos])])
+                if logprobs_cpu is not None and row_pos < logprobs_cpu.shape[0]:
+                    try:
+                        token_logprobs[req_id] = float(logprobs_cpu[row_pos])
+                    except Exception:
+                        pass
+
+        if self._finalize is not None:
+            self._finalize(sampled_token_ids)
+            self._finalize = None
+
+        output = self._model_runner_output
+        output.sampled_token_ids = sampled_token_ids
+        output.token_logprobs = token_logprobs or None
+        if self._resolve_logprobs is not None:
+            output.logprobs = self._resolve_logprobs(sampled_token_ids)
+            self._resolve_logprobs = None
+        self._resolved_output = output
+        return output
+
+
+class eSurgeRunner:
+    """High-performance model runner for efficient batched inference.
+
+    The eSurgeRunner orchestrates model execution with advanced features:
+    - Paged attention for memory-efficient KV cache management
+    - Dynamic batching with request scheduling
+    - Pre-allocated buffers for zero-copy operations
+    - Vectorized token processing
+    - Compilation caching for different batch/sequence configurations
+
+    The runner maintains an internal state of active requests and manages
+    their lifecycle from prompt processing through token generation.
+
+    Architecture:
+        Request Flow:
+        1. Scheduler provides requests to execute
+        2. Runner updates internal state (add/remove requests)
+        3. Prepares inputs with proper padding and batching
+        4. Executes model using pre-compiled functions
+        5. Processes sampled tokens and updates buffers
+        6. Returns results to scheduler
+
+    Memory Management:
+        - Pre-allocated buffers for common operations
+        - Paged KV cache with configurable page size
+        - Efficient slot mapping for attention
+        - Buffer reuse across batches
+
+    Attributes:
+        model: The EasyDeL model to run
+        metadata: Paged attention metadata
+        max_num_seqs: Maximum concurrent sequences
+        max_model_len: Maximum sequence length
+        executor_manager: Manages compiled functions
+        sequence_buffer: Manages active sequences
+        requests: Active request states
+
+    Example:
+        >>> runner = eSurgeRunner(
+        ...     model=model,
+        ...     max_model_len=2048,
+        ...     max_num_seqs=8,
+        ...     hbm_utilization=0.9,
+        ...     page_size=128
+        ... )
+        >>>
+        >>> # Compile for all configurations
+        >>> runner.compile()
+        >>>
+        >>> # Execute requests from scheduler
+        >>> output = runner.execute_model(scheduler_output)
+        >>>
+        >>> # Process results
+        >>> for req_id, tokens in zip(output.req_ids, output.sampled_token_ids):
+        ...     print(f"Request {req_id}: {tokens}")
+    """
+
+    def __init__(
+        self,
+        model: EasyDeLBaseModule,
+        hbm_utilization: float = 0.5,
+        page_size: int = 128,
+        max_cache_tokens: int | None = None,
+        cache_capacity_margin: float = 0.92,
+        kernel_tile_policy: KernelTilePolicy = "auto",
+        max_model_len: int = 2**13,
+        max_num_batched_tokens: int | None = None,
+        compile_vision_encoder: bool = True,
+        vision_patch_buckets: list[int] | None = None,
+        min_input_pad: int = 256,
+        min_token_pad: int | None = None,
+        max_num_seqs: int = 16,
+        max_num_seq_buckets: list[int] | None = None,
+        async_scheduling: bool = True,
+        use_aot_forward: bool = True,
+        verbose: bool = False,
+        enable_overlap_execution: bool = True,
+        enable_sampler_metrics: bool = False,
+        enable_window_aware_runtime_cap: bool = False,
+        mpmd_scheduler: MpMdSchedulers | None = None,
+        pp_microbatch_count: int | str | None = "auto",
+        pp_microbatch_size: int | str | None = "auto",
+        drafter: DrafterProtocol | None = None,
+        spec_debug_max_traces: int = 0,
+        spec_adaptive_conf_threshold: float = 0.0,
+        vision_cache: VisionEncoderCache | None = None,
+        host_payloads_replicated: bool = False,
+        recurrent_prefix_snapshots: int = 16,
+    ):
+        """Initialize the model runner.
+
+        Args:
+            model: EasyDeL model instance.
+            hbm_utilization: Target cache-memory utilization ratio.
+            page_size: KV page size used by cache metadata.
+            max_model_len: Maximum sequence length.
+            max_num_batched_tokens: Maximum scheduler token budget used for
+                window-aware runtime-cap estimation.
+            compile_vision_encoder: Whether to precompile and use a bucketed
+                JIT helper for VLM vision features.
+            vision_patch_buckets: Optional raw patch-count buckets used by the
+                VLM vision precompile helper.
+            min_input_pad: Minimum request-count bucket.
+            min_token_pad: Optional minimum token bucket size.
+            max_num_seqs: Maximum concurrent sequences.
+            max_num_seq_buckets: Optional explicit request-count buckets.
+            async_scheduling: Whether scheduler async token sampling is enabled.
+            use_aot_forward: Whether to use AOT compilation.
+            verbose: Enable verbose execution logs.
+            enable_overlap_execution: Enable overlap execution path.
+            enable_sampler_metrics: Enable sampler-side metrics.
+            enable_window_aware_runtime_cap: Whether to derive the runtime
+                request cap from the model's live KV-window page demand.
+                When False, the runner falls back to the cache metadata's
+                heuristic request cap instead.
+            pp_microbatch_count: Expert PP decode wavefront policy. ``"auto"``
+                keeps the built-in split, ``None`` or ``0`` disables the
+                wavefront path, and a positive integer pins max microbatches.
+            pp_microbatch_size: Expert PP decode wavefront policy. ``"auto"``
+                keeps the built-in split, ``None`` or ``0`` disables the
+                wavefront path, and a positive integer pins rows per
+                microbatch. Mutually exclusive with a positive count.
+            drafter: Optional speculative-decoding drafter implementing
+                :class:`~easydel.inference.speculative.DrafterProtocol`
+                (e.g. ``Qwen3_5MTPDrafter`` or ``Gemma4AssistantDrafter``).
+                When set, the runner drives the runner-native
+                draft/verify/commit path, filling ``request.spec_token_ids``
+                from real drafts. ``None`` keeps the standard
+                single-token-per-forward decode.
+            spec_debug_max_traces: Maximum speculative verify traces to retain;
+                zero disables trace capture.
+            spec_adaptive_conf_threshold: Top-1 confidence threshold in [0, 1]
+                for early-exit drafting; zero keeps fixed-length drafting.
+            vision_cache: Optional shared multimodal manager cache for encoder
+                outputs. Passing the manager's cache shares its capacity,
+                clearing and statistics; None disables cross-request reuse.
+            host_payloads_replicated: This runner's coordinator guarantees identical
+                host payloads on all processes. Defaults to False independently of
+                legacy process-global policy; update between steps if coordination
+                starts after runner construction.
+            recurrent_prefix_snapshots: Recurrent-state snapshot slots that let linear-attention/SSM models reuse
+                prefix-cache hits. ``0`` turns prefix caching off for such models.
+        """
+        self.host_payloads_replicated = host_payloads_replicated
+        self.model = model.esurge_compatible_model
+        # Compressed-window models (DeepSeek-V4) keep ALL decode state in
+        # per-request slots (CompressedWindowCache rows). Requests must keep a
+        # stable physical slot for their lifetime (SequenceBuffer rows can be
+        # condensed/moved), so the recurrent slot pool is used even without
+        # SPMD DP and the slot ids are threaded to the model each step.
+        self._slot_indexed_state = getattr(self.model, "esurge_cache_family", None) == "compressed_window"
+        # Models declaring ``esurge_side_input_specs`` get per-token side inputs every step (see
+        # ``multimodal/side_inputs.py``); the model's provider is built lazily on first use.
+        self._side_input_tokenizer_state: typing.Any = None
+        self._side_input_provider: typing.Any | None = None
+        if (
+            self._slot_indexed_state
+            and drafter is not None
+            and not bool(getattr(drafter, "supports_compressed_window_cache", False))
+        ):
+            raise ValueError(
+                "Speculative decoding is not supported for compressed-window cache models: "
+                "per-slot ring/compressor state advances on every consumed token and cannot "
+                "roll back rejected draft tokens (only drafters that set `supports_compressed_window_cache`, "
+                "i.e. DSpark, snapshot the cache and replay the accepted prefix)."
+            )
+        self.drafter = drafter
+        if self.drafter is not None and hasattr(self.drafter, "set_max_length"):
+            self.drafter.set_max_length(int(max_model_len))
+        self.num_draft_tokens = int(getattr(drafter, "num_draft_tokens", 1) if drafter is not None else 0)
+        # Dynamic speculative-token scheduling: the drafter may carry a
+        # ``num_draft_tokens_per_batch_size`` schedule (attached by the engine
+        # bootstrap from the drafter config, or set directly on the object).
+        # ``num_draft_tokens`` stays the compiled maximum; the strategy
+        # re-resolves the live per-step budget from this schedule.
+        raw_draft_schedule = getattr(drafter, "num_draft_tokens_per_batch_size", None) if drafter is not None else None
+        if raw_draft_schedule is not None and flags.get_bool(flags.EASYDEL_DISABLE_DYNAMIC_SPEC):
+            logger.info(
+                "EASYDEL_DISABLE_DYNAMIC_SPEC is set: ignoring the drafter's "
+                "num_draft_tokens_per_batch_size schedule (static num_draft_tokens=%d).",
+                self.num_draft_tokens,
+            )
+            raw_draft_schedule = None
+        self.draft_schedule = (
+            normalize_draft_schedule(raw_draft_schedule, max_num_draft_tokens=self.num_draft_tokens)
+            if raw_draft_schedule is not None
+            else None
+        )
+        if self.draft_schedule is not None:
+            logger.info("Dynamic speculative-token schedule active: %s", self.draft_schedule)
+        self.spec: SpeculativeStrategy = (
+            DrafterSpeculation(
+                runner=self,
+                drafter=self.drafter,
+                num_draft_tokens=self.num_draft_tokens,
+                draft_schedule=self.draft_schedule,
+                debug_max_traces=spec_debug_max_traces,
+                adaptive_conf_threshold=spec_adaptive_conf_threshold,
+            )
+            if self.drafter is not None
+            else NullSpeculation()
+        )
+        self._spec_suffix_time_acc = 0.0
+        self._spec_replay_time_acc = 0.0
+        logger.debug(f"Initializing eSurgeRunner with {max_model_len=}, {max_num_seqs=}")
+        logger.debug(f"Configuration: {hbm_utilization=}, {page_size=}")
+        self.pipeline_plan = build_pipeline_inference_plan(
+            model=self.model,
+            max_cache_tokens=max_cache_tokens,
+            cache_capacity_margin=cache_capacity_margin,
+            kernel_tile_policy=kernel_tile_policy,
+        )
+        set_gdn_kernel_tile_policy(self.pipeline_plan.kernel_tile_policy)
+
+        backend = jax.default_backend()
+        attn_mechanism = getattr(self.model.config.get_text_config(), "attn_mechanism", None)
+        if backend == "gpu" and attn_mechanism in ("ragged_page_attention_v2", "ragged_page_attention_v3"):
+            logger.warning(
+                "GPU backend detected: `unified_attention` is preferred for eSurge inference; "
+                f"got attn_mechanism={attn_mechanism!r}."
+            )
+        elif backend != "gpu" and attn_mechanism == "paged_flash_attention":
+            logger.warning(
+                "Paged flash attention is CUDA-only; falling back to non-CUDA backends may fail. "
+                f"got backend={backend!r}."
+            )
+        elif backend == "tpu" and attn_mechanism == "unified_attention":
+            logger.warning(
+                "TPU backend detected: `ragged_page_attention_v3` is preferred for eSurge inference; "
+                f"got attn_mechanism={attn_mechanism!r}."
+            )
+        elif backend == "tpu" and attn_mechanism == "ragged_page_attention_v2":
+            logger.warning(
+                "TPU backend detected: `ragged_page_attention_v3` is preferred for eSurge inference; "
+                f"got attn_mechanism={attn_mechanism!r}."
+            )
+
+        if getattr(self.model.config.get_text_config(), "attn_mechanism", None) in (
+            "unified_attention",
+            "paged_flash_attention",
+        ):
+            self.metadata = self.model.create_unified_attention_cache_config(
+                hbm_utilization=hbm_utilization,
+                page_size=page_size,
+                max_length=max_model_len,
+                # Born-capped here too, so the HBM-derived page count is never
+                # sized to the full pool before the global token cap applies.
+                max_cache_tokens=max_cache_tokens,
+            )
+        else:
+            self.metadata = self.model.create_ragged_page_cache_config(
+                hbm_utilization=hbm_utilization,
+                page_size=page_size,
+                max_length=max_model_len,
+                # Born-capped: honor the global token cap at creation time so the
+                # page pool is never sized to the full HBM-derived count first.
+                # cap_metadata_pages below applies the capacity margin for every
+                # engine (SPMD and PP) and is a no-op for the cap itself once
+                # this has already capped.
+                max_cache_tokens=max_cache_tokens,
+            )
+        cap_metadata_pages(self.metadata, self.pipeline_plan)
+        self.max_num_batched_tokens = (
+            int(max_model_len)
+            if max_num_batched_tokens is None
+            # Per-step token budget is a SUM across batched sequences, so it may
+            # legitimately exceed a single sequence's max_model_len (continuous
+            # batching of multiple prefills). Don't clamp it down to max_model_len.
+            else max(1, int(max_num_batched_tokens))
+        )
+        self.enable_window_aware_runtime_cap = bool(enable_window_aware_runtime_cap)
+        self.max_model_len = max_model_len
+        self.kv_cache_groups = self._build_kv_cache_groups()
+        self.window_aware_runtime_estimate = self._apply_window_aware_runtime_cap(self.max_num_batched_tokens)
+        self.max_num_seq_buckets = self._init_seq_buckets(max_num_seq_buckets, max_num_seqs, min_input_pad)
+        self.max_num_seqs = max_num_seqs
+        self.max_num_reqs = self.max_num_seq_buckets[-1]
+        if self._uses_spmd_dp():
+            self._validate_spmd_dp_support(attn_mechanism=attn_mechanism)
+        self.async_scheduling = bool(async_scheduling)
+        self.min_input_pad = max(min_input_pad, self.max_num_seq_buckets[0])
+        self.page_size = int(self.metadata.page_size)
+        self.max_pages_per_req = int(self.metadata.max_num_pages_per_req)
+
+        if min_token_pad is None:
+            # Request-count padding and token-count padding are independent.
+            # A non-power-of-two request floor (for example CC=6) must not be
+            # forwarded to WindowPlanner's power-of-two token ladder.
+            min_token_pad_i = token_bucket_floor(max_num_seqs)
+        else:
+            min_token_pad_i = int(min_token_pad)
+        token_floor = token_bucket_floor(max_num_seqs)
+        min_token_pad_i = normalize_token_bucket_minimum(max(min_token_pad_i, token_floor), self.max_model_len)
+        self.num_tokens_paddings = self._get_token_paddings(
+            min_token_size=min_token_pad_i,
+            # Compile token buckets up to the per-step batched-token budget, not
+            # just one sequence's length, so a multi-prefill step (sum of tokens
+            # > max_token_size) still has a bucket and doesn't overflow the
+            # scheduler's static budget.
+            max_token_size=max(int(self.max_model_len), int(self.max_num_batched_tokens)),
+            padding_gap=0,
+        )
+        if self.drafter is not None and int(self.num_draft_tokens) > 0:
+            # Speculative steady-state verify windows schedule EXACTLY
+            # n_active * (1 + k) tokens. With power-of-two buckets those windows
+            # pad 64->40, 128->80, 256->160 (~60% utilization), and most of the
+            # verify forward's cost scales with the token bucket. Add an exact
+            # spec bucket per request bucket so verify windows run tight. With a
+            # dynamic schedule only the k values reachable at each request
+            # bucket's concurrency contribute (k=0 ranges add nothing).
+            spec_buckets = derive_spec_token_buckets(
+                seq_buckets=self.max_num_seq_buckets,
+                num_draft_tokens=self.num_draft_tokens,
+                draft_schedule=self.draft_schedule,
+                min_token_pad=min_token_pad_i,
+                max_bucket=max(int(self.max_model_len), int(self.max_num_batched_tokens)),
+            )
+            self.num_tokens_paddings = sorted(set(self.num_tokens_paddings) | spec_buckets)
+        if self._uses_spmd_dp():
+            dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+            self.num_tokens_paddings = [int(bucket) for bucket in self.num_tokens_paddings if int(bucket) % dp_size == 0]
+            if not self.num_tokens_paddings:
+                raise ValueError(
+                    f"Rank-major SPMD DP requires at least one token bucket divisible by DP size {dp_size}."
+                )
+        self.max_num_tokens = self.num_tokens_paddings[-1]
+        self.window_planner = WindowPlanner(
+            num_tokens_paddings=self.num_tokens_paddings,
+            max_num_seq_buckets=self.max_num_seq_buckets,
+        )
+        self.vlm = VlmPrefillHelper(
+            model_getter=lambda: self.model,
+            metadata=self.metadata,
+            compile_vision_encoder=compile_vision_encoder,
+            vision_patch_buckets=vision_patch_buckets,
+            max_num_batched_tokens=self.max_num_batched_tokens,
+            max_num_tokens=self.max_num_tokens,
+            vision_cache=vision_cache,
+        )
+        spec_full_hidden_max_tokens = 0
+        if drafter is not None:
+            spec_window_tokens = max(1, int(self.num_draft_tokens) + 1)
+            if bool(getattr(drafter, "supports_prefix_draft", False)):
+                spec_window_tokens = max(spec_window_tokens, int(self.max_num_batched_tokens))
+            spec_full_hidden_max_tokens = int(
+                self.window_planner.get_token_bucket(spec_window_tokens, active_buckets=self.num_tokens_paddings)
+            )
+        text_config = self.model.config.get_text_config()
+        layer_types = getattr(text_config, "layer_types", ()) or ()
+        recurrent_layer_types = {"linear_attention", "kda_linear_attention", "parallel_hybrid", "hybrid"}
+        has_recurrent_layers = any(str(layer_type).lower() in recurrent_layer_types for layer_type in layer_types)
+        self._has_recurrent_layers = bool(has_recurrent_layers)
+        # Speculative candidate rows: generic recurrent (GDN) views and KDA views (Kimi-Linear, GLM-5-Next; GLM labels
+        # them ``linear_attention`` at model level, ``kda_linear_attention`` at cache level) both keep the decode-exact
+        # state after every verify prefix in extra prefix-major pool rows, so an accepted prefix is committed by a row
+        # copy instead of snapshot + replay (``kda_packed_rows_forward`` writes and commits the KDA rows).
+        spec_active = drafter is not None and int(self.num_draft_tokens) > 0
+        self.spec_decode_recurrent_candidates = bool(spec_active and has_recurrent_layers)
+        # Greedy recurrent verify: how to advance the live recurrent (GDN) state
+        # after a verify window.
+        #   fast path (default): reuse the fused verify forward's argmax + the
+        #     deferred recurrent candidate-commit. Coherent output, ~0.95x on a
+        #     27B GDN hybrid. NOT bit-identical to plain greedy (a chunked verify
+        #     cannot match a per-token decode on a linear-attention model) and
+        #     cross-process non-deterministic at the low bits.
+        #   exact replay (EASYDEL_SPEC_RECURRENT_REPLAY=1): advance the live state
+        #     via a sequential-GDN replay of the accepted prefix. Bit-identical to
+        #     plain greedy, but the extra per-window replay forward costs ~2.5x
+        #     (measured 0.39x vs 0.95x on Qwen3.6-27B, tp=4, K=2) — so it is opt-in.
+        # Default fast so speculative decoding serves its purpose (a speedup);
+        # set the env to 1 when bit-exact greedy is required over throughput.
+        self.spec_decode_recurrent_replay = flags.get_bool(flags.EASYDEL_SPEC_RECURRENT_REPLAY)
+
+        self.cache_group_configs, self.layer_to_cache_group = self._build_execution_cache_group_layout()
+        logger.debug("Creating ExecutionManager and initializing pages cache")
+        manager_cls = PipelineExecutionManager if self.pipeline_plan.is_enabled else ExecutionManager
+        self.executor_manager = manager_cls(
+            model=self.model,
+            use_aot_forward=use_aot_forward,
+            min_input_pad=self.min_input_pad,
+            max_model_len=max_model_len,
+            max_num_reqs=self.max_num_reqs,
+            max_num_tokens=self.max_num_tokens,
+            metadata=self.metadata,
+            cache_group_configs=self.cache_group_configs,
+            layer_to_cache_group=self.layer_to_cache_group,
+            host_payloads_replicated=self.host_payloads_replicated,
+            verbose=verbose,
+            mpmd_scheduler=mpmd_scheduler,
+            pipeline_plan=self.pipeline_plan,
+            pp_microbatch_count=pp_microbatch_count,
+            pp_microbatch_size=pp_microbatch_size,
+            full_hidden_state_max_tokens=spec_full_hidden_max_tokens,
+            speculative_recurrent_state_tokens=(
+                int(self.num_draft_tokens) + 1 if self.spec_decode_recurrent_candidates else 0
+            ),
+            # Drafters that roll back a per-slot (compressed-window) cache: keep verify-width projection traces so a
+            # partially accepted window commits without a replay forward.
+            speculative_trace_tokens=(
+                int(self.num_draft_tokens) + 1
+                if drafter is not None and bool(getattr(drafter, "rolls_back_cache", False))
+                else 0
+            ),
+        )
+        if drafter is not None and bool(getattr(drafter, "needs_main_hidden", False)):
+            # DSpark: the fused model step must also return the backbone's ``main_hidden`` rows.
+            if self.pipeline_plan.is_enabled:
+                raise ValueError("DSpark speculative decoding does not support MPMD/PP execution.")
+            self.executor_manager.set_main_hidden_enabled(True)
+        self.log_it = logger.info if verbose else logger.debug
+        self._setup_variables()
+        # Snapshots cover row-indexed recurrent pools (plain and PP) and rank-major DP slot pools; compressed-window
+        # and speculative-candidate layouts keep prefix caching off instead.
+        snapshots_supported = self._has_recurrent_layers and not self._slot_indexed_state and drafter is None
+        self.recurrent_prefix_snapshot_slots = int(recurrent_prefix_snapshots) if snapshots_supported else 0
+        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+        # Each DP rank scheduler owns its own contiguous block of snapshot slots.
+        self.executor_manager.recurrent_snapshot_slots = self.recurrent_prefix_snapshot_slots * dp_size
+        self.enable_overlap_execution = enable_overlap_execution
+        self.enable_sampler_metrics = enable_sampler_metrics
+
+        # Perf logging state (kept lightweight; no allocations in the hot path).
+        self.perf = RunnerPerfTracker(history_maxlen=max(32768, int(max_model_len) * 4), alpha=0.2)
+
+        self._pre_async_results: AsyncPreResults | None = None
+        self._executor: typing.Any = None  # ThreadPoolExecutor, typed as Any to avoid circular import
+        self._handoff_positions_cache: dict[int, jax.Array] = {}
+        self._handoff_scalar_cache: dict[int, jax.Array] = {}
+        logger.debug("eSurgeRunner initialization complete")
+        self._log_startup_summary()
+
+    @property
+    def host_payloads_replicated(self) -> bool:
+        """Return this runner's explicit, instance-local coordination guarantee."""
+        return getattr(self, "_host_payloads_replicated", False)
+
+    @host_payloads_replicated.setter
+    def host_payloads_replicated(self, enabled: bool) -> None:
+        """Update coordination between steps, including existing child preparers.
+
+        Set this on the scheduler thread before stepping after a coordinator
+        starts or stops. Other runners and the legacy global policy are untouched.
+        """
+        self._host_payloads_replicated = bool(enabled)
+        manager = getattr(self, "executor_manager", None)
+        if manager is not None:
+            manager.host_payloads_replicated = self._host_payloads_replicated
+
+    def _validate_spmd_dp_support(self, *, attn_mechanism: str | None) -> None:
+        """Fail early for features not wired into rank-major DP execution yet."""
+        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+        if jax.default_backend() != "tpu":
+            raise ValueError("Rank-major SPMD DP is currently TPU-only.")
+        if dp_size <= 1:
+            raise ValueError("Rank-major SPMD DP requires a data-parallel cache axis with size > 1.")
+        if self.pipeline_plan.is_enabled:
+            raise ValueError("Rank-major SPMD DP does not support MPMD/PP execution yet.")
+        if self.drafter is not None:
+            raise ValueError("Rank-major SPMD DP does not support speculative decoding yet.")
+        # KDA layers advance per-row recurrent state through the packed-row driver, which has no
+        # per-rank scatter for rank-major ([dp, rows + 1]) metadata. The kernel refuses it at trace
+        # time; reject here so the failure is a clear config error at startup instead.
+        text_config = self.model.config.get_text_config()
+        get_layer_types = getattr(text_config, "get_layer_types", None)
+        try:
+            cache_layer_types = tuple(get_layer_types()) if callable(get_layer_types) else ()
+        except TypeError:
+            cache_layer_types = ()
+        cache_layer_types += tuple(getattr(text_config, "layer_types", ()) or ())
+        if any(str(layer_type).lower() == "kda_linear_attention" for layer_type in cache_layer_types):
+            raise ValueError(
+                "Rank-major SPMD DP does not support KDA linear-attention models yet "
+                "(glm5_next / kimi_linear); serve them with data_parallel_size=1."
+            )
+        if attn_mechanism not in ("ragged_page_attention_v3", MLA_RAGGED_ATTN_MECHANISM):
+            raise ValueError(
+                "Rank-major SPMD DP currently supports "
+                f"ragged TPU attention only, got attn_mechanism={attn_mechanism!r}."
+            )
+        if int(self.max_num_reqs) % dp_size != 0:
+            raise ValueError(
+                "Rank-major SPMD DP requires max_num_reqs divisible by DP size: "
+                f"max_num_reqs={self.max_num_reqs}, dp_size={dp_size}."
+            )
+        runtime_rows = min(int(self.metadata.get_max_num_seqs()), int(self.max_num_reqs))
+        if runtime_rows != int(self.max_num_reqs):
+            raise ValueError(
+                "Rank-major SPMD DP currently requires the cache runtime request cap "
+                f"to cover all request rows: runtime_rows={runtime_rows}, max_num_reqs={self.max_num_reqs}."
+            )
+
+    def _uses_spmd_dp(self) -> bool:
+        """Return whether the runner is using rank-major data-parallel execution."""
+        return int(getattr(self.metadata, "data_parallel_size", 1) or 1) > 1
+
+    def _plain_recurrent_row_sync_enabled(self) -> bool:
+        """Whether device recurrent rows must track SequenceBuffer row moves.
+
+        True only on the plain-recurrent path: the model has recurrent/SSM
+        state AND requests are not pinned to a stable pooled slot. Rank-major
+        SPMD DP and slot-indexed compressed-window families
+        (``slot_pool.is_enabled()``) already thread ``recurrent_state_indices``
+        to the kernel, so their device state is keyed by a stable slot and must
+        not be permuted here.
+        """
+        return bool(self._has_recurrent_layers) and not self.slot_pool.is_enabled()
+
+    def _sync_recurrent_rows(self, prev_row_owner: list[str | None] | None) -> None:
+        """Move device recurrent-state rows to follow SequenceBuffer row moves.
+
+        On the plain-recurrent path the conv/GDR/SSM cache is indexed by the
+        physical ``SequenceBuffer`` row a request occupies in the packed batch.
+        ``_update_states`` (condense) and ``reorder_decode_first`` can relocate a
+        surviving request to a different row; without moving its device state in
+        lockstep the request would read a freed/zeroed neighbour's state and emit
+        garbage. This computes the row permutation from the pre-mutation layout
+        ``prev_row_owner`` (which the device recurrent rows currently reflect) to
+        the current layout and applies it via
+        :meth:`ExecutionManager.permute_recurrent_slots`.
+
+        Args:
+            prev_row_owner: Per-row request ids captured immediately before
+                ``_update_states`` this step, or ``None`` when the plain-recurrent
+                row sync is disabled (non-recurrent or slot-pooled models).
+        """
+        if prev_row_owner is None:
+            return
+        n = int(self.max_num_reqs)
+        new_ids = self.sequence_buffer.req_ids
+        prev_index: dict[str, int] = {}
+        for f, rid in enumerate(prev_row_owner):
+            if rid is not None and f < n:
+                prev_index[str(rid)] = f
+        perm = np.full((n,), -1, dtype=np.int32)
+        moved = False
+        for t in range(n):
+            rid = new_ids[t] if t < len(new_ids) else None
+            if rid is None:
+                continue
+            f = prev_index.get(str(rid))
+            if f is None:
+                # Newly admitted this step: its row is (re)populated by prefill;
+                # leaving perm[t] == -1 zeroes any stale occupant first.
+                continue
+            perm[t] = f
+            if f != t:
+                moved = True
+        if not moved:
+            return
+        self.executor_manager.permute_recurrent_slots(perm)
+
+    def _snapshot_rows(self, by_req: dict[str, int]) -> tuple[list[int], list[int]]:
+        """Map ``request id -> snapshot slot`` to aligned (state row, slot) lists for live requests."""
+        rows: list[int] = []
+        slots: list[int] = []
+        for req_id, slot in by_req.items():
+            if self.slot_pool.is_enabled():
+                if self.sequence_buffer.req_id_to_index.get(req_id) is None:
+                    continue
+                row = self.slot_pool.slot_by_req.get(str(req_id))
+                if row is None:
+                    row = self.slot_pool.assign_slot(str(req_id), self.slot_pool.dp_rank_by_req.get(str(req_id)))
+            else:
+                row = self.sequence_buffer.req_id_to_index.get(req_id)
+            if row is not None:
+                rows.append(int(row))
+                slots.append(int(slot))
+        return rows, slots
+
+    def _apply_recurrent_snapshot_restores(self, scheduler_output: SchedulerOutput) -> None:
+        """Load the recurrent state of prefix-cache hits before their first forward."""
+        restores = getattr(scheduler_output, "recurrent_snapshot_restores", None)
+        if not restores:
+            return
+        if not self.recurrent_prefix_snapshot_slots:
+            raise RuntimeError("Scheduler issued recurrent snapshot restores but this runner has no snapshot store.")
+        rows, slots = self._snapshot_rows(restores)
+        self.executor_manager.restore_recurrent_snapshots(rows, slots)
+
+    def _apply_recurrent_snapshot_saves(self, scheduler_output: SchedulerOutput) -> None:
+        """Store the recurrent state of rows whose prefill chunk ended on their snapshot boundary."""
+        saves = getattr(scheduler_output, "recurrent_snapshot_saves", None)
+        if not saves or not self.recurrent_prefix_snapshot_slots:
+            return
+        rows, slots = self._snapshot_rows(saves)
+        self.executor_manager.save_recurrent_snapshots(rows, slots)
+
+    def _recurrent_rows_per_dp_rank(self) -> int:
+        """Return the number of recurrent-state rows owned by each DP rank.
+
+        Delegates to :meth:`RecurrentSlotPool.rows_per_dp_rank`.
+        """
+        return self.slot_pool.rows_per_dp_rank()
+
+    def _assign_recurrent_slot(self, req_id: str, dp_rank: int | None) -> int | None:
+        """Assign or return the stable physical recurrent-state slot for a request.
+
+        Delegates to :meth:`RecurrentSlotPool.assign_slot`.
+        """
+        return self.slot_pool.assign_slot(req_id, dp_rank)
+
+    @property
+    def _recurrent_slot_by_req(self) -> dict[str, int]:
+        """Live request-id to physical-slot map (see :class:`RecurrentSlotPool`)."""
+        return self.slot_pool.slot_by_req
+
+    @property
+    def _request_dp_rank_by_req(self) -> dict[str, int]:
+        """Live request-id to DP-rank map (see :class:`RecurrentSlotPool`)."""
+        return self.slot_pool.dp_rank_by_req
+
+    def _build_kv_cache_groups(self):
+        """Build cache-group specs for runtime-cap and scheduler estimation.
+
+        Inspects the model's text config to determine KV head count and head
+        dimension, then delegates to ``create_kv_cache_specs_from_config`` to
+        produce one ``CacheGroupSpec`` per distinct attention type. MLA models
+        return an empty list because their cache layout is handled separately.
+
+        Returns:
+            List of ``CacheGroupSpec`` objects, one per attention type group.
+            Empty for MLA-based models.
+        """
+
+        text_config = self.model.config.get_text_config()
+        attn_mechanism = str(getattr(text_config, "attn_mechanism", "") or "").lower()
+        if "multi_latent" in attn_mechanism:
+            return []
+
+        metadata = self.metadata
+        num_kv_heads = getattr(text_config, "num_kv_heads", None)
+        if isinstance(num_kv_heads, (list, tuple)):
+            num_kv_heads = int(num_kv_heads[0]) if len(num_kv_heads) > 0 else None
+        if num_kv_heads is None:
+            num_kv_heads = getattr(text_config, "num_key_value_heads", None)
+        if num_kv_heads is None:
+            num_kv_heads = getattr(text_config, "num_attention_heads", None)
+        if num_kv_heads is None or int(num_kv_heads) <= 0:
+            num_kv_heads = getattr(metadata, "num_kv_heads", 1)
+
+        head_size = getattr(text_config, "head_dim", None)
+        if head_size is None or int(head_size) <= 0:
+            hidden_size = getattr(text_config, "hidden_size", None)
+            num_attention_heads = getattr(text_config, "num_attention_heads", None)
+            if hidden_size and num_attention_heads:
+                head_size = int(hidden_size) // int(num_attention_heads)
+        if head_size is None or int(head_size) <= 0:
+            head_size = getattr(metadata, "k_headdim", None) or getattr(metadata, "head_dim", None) or 1
+
+        return create_kv_cache_specs_from_config(
+            config=text_config,
+            page_size=int(metadata.page_size),
+            num_kv_heads=int(num_kv_heads),
+            head_size=int(head_size),
+            dtype=metadata.kvdtype,
+            use_mla=False,
+        )
+
+    def _build_execution_cache_group_layout(self) -> tuple[tuple[typing.Any, ...], tuple[int, ...]]:
+        """Resolve static per-pool configurations and model-layer dispatch before compilation.
+
+        Cache creation already resolves physical per-layer geometry (including KV
+        head replication) into the representative config's mixed-layout map. Reuse
+        those configurations rather than reconstructing logical model geometry.
+        A single FULL pool retains the legacy execution PyTree.
+        """
+        from ..core.interface import FullAttentionSpec
+
+        groups = self.kv_cache_groups
+        if not groups or (len(groups) == 1 and isinstance(groups[0].kv_cache_spec, FullAttentionSpec)):
+            return (), ()
+        layer_groups: dict[int, int] = {}
+        configs = []
+        per_layer = getattr(self.metadata, "_mixed_layer_configs", None) or {}
+        for group_index, group in enumerate(groups):
+            if not group.layer_names:
+                raise ValueError("Independent KV pools require explicit model-layer ownership")
+            layer_indices = [int(name.rsplit(".", 1)[-1]) for name in group.layer_names]
+            for layer_index in layer_indices:
+                if layer_index < 0 or layer_index in layer_groups:
+                    raise ValueError("Each model layer must belong to exactly one KV pool")
+                layer_groups[layer_index] = group_index
+            config = per_layer.get(layer_indices[0], self.metadata)
+            # Physical geometry may differ, but all groups share one batch layout.
+            for name in (
+                "window_aware_max_num_seqs",
+                "window_aware_pages_per_request",
+                "window_aware_max_num_batched_tokens",
+            ):
+                if hasattr(config, name) and hasattr(self.metadata, name):
+                    setattr(config, name, getattr(self.metadata, name))
+            configs.append(config)
+        layer_count = int(getattr(self.model.config.get_text_config(), "num_hidden_layers", len(layer_groups)))
+        if set(layer_groups) != set(range(layer_count)):
+            raise ValueError("KV pool ownership must cover every model layer")
+        return tuple(configs), tuple(layer_groups[index] for index in range(layer_count))
+
+    def cache_group_inputs_for_execute(
+        self,
+        *,
+        window_row_indices_cpu: np.ndarray,
+        num_computed_tokens_cpu: np.ndarray,
+    ) -> tuple[CacheGroupInputs, ...]:
+        """Build complete pool inputs for normal or speculative execution windows.
+
+        Each independently versioned table is gathered in the exact model-window
+        order. Evicted leading pages of sliding/chunk pools are trimmed and their
+        cache-local progress is rebased; model token positions remain absolute.
+        Window identities include the trim offset, invalidating cached table
+        staging when a replay starts at a different local prefix.
+
+        Args:
+            window_row_indices_cpu: Global sequence rows in compact window order.
+            num_computed_tokens_cpu: Absolute per-row progress for this exact call,
+                including speculative replay/suffix calls.
+
+        Returns:
+            All independent pool inputs in static cache-group order, or an empty
+            tuple for the legacy single-FULL/MLA execution path.
+        """
+        if not getattr(self, "cache_group_configs", ()):
+            return ()
+        from ..core.interface import FullAttentionSpec
+
+        computed = np.asarray(num_computed_tokens_cpu, dtype=np.int32)
+        rows = np.asarray(window_row_indices_cpu[: len(computed)], dtype=np.int32)
+        if len(rows) != len(computed):
+            raise ValueError("Cache group rows and computed progress must align")
+        payloads = []
+        for index, group in enumerate(self.kv_cache_groups):
+            table = self.sequence_buffer.page_table[index]
+            pages = np.asarray(table.get_cpu_tensor()[rows])
+            local_computed = None
+            offsets = np.zeros(len(rows), dtype=np.int32)
+            if not isinstance(group.kv_cache_spec, FullAttentionSpec) and pages.shape[1]:
+                page_size = int(group.kv_cache_spec.page_size)
+                # Never trim uncomputed tokens, including a null-only inactive row.
+                first_live = np.argmax(pages != 0, axis=1)
+                offsets = np.minimum(first_live, np.maximum(computed, 0) // page_size)
+                chunk_size = getattr(group.kv_cache_spec, "attention_chunk_size", None)
+                if chunk_size is not None:
+                    # A chunk mask uses cache-local positions too. Only subtract a
+                    # multiple of both page size and chunk size so floor(pos/chunk)
+                    # still identifies exactly the same absolute chunk boundaries.
+                    pages_per_chunk_lattice = int(chunk_size) // gcd(int(chunk_size), page_size)
+                    offsets = (offsets // pages_per_chunk_lattice) * pages_per_chunk_lattice
+                if np.any(offsets):
+                    rebased = np.zeros_like(pages)
+                    for row, offset in enumerate(offsets):
+                        count = pages.shape[1] - int(offset)
+                        rebased[row, :count] = pages[row, int(offset) :]
+                    pages = rebased
+                local_computed = computed - offsets * page_size
+            identity = tuple(
+                int(row) * (pages.shape[1] + 1) + int(offset) for row, offset in zip(rows, offsets, strict=True)
+            )
+            payloads.append(
+                CacheGroupInputs(
+                    page_table_cpu=pages,
+                    page_table_version=getattr(table, "cpu_version", None),
+                    window_identity=identity,
+                    num_computed_tokens_cpu=local_computed,
+                )
+            )
+        return tuple(payloads)
+
+    def _get_full_attention_page_table_index(self) -> int:
+        """Return the page table group index for the full-attention cache group.
+
+        This selects the legacy carrier table for common token/sampler packing.
+        Mixed-attention execution additionally supplies every independent pool
+        through :meth:`cache_group_inputs_for_execute`; layer-local cache reads
+        and writes select those complete group payloads instead of this table.
+
+        Returns:
+            0 if no cache groups are defined (single-group model), otherwise
+            the index of the first FullAttentionSpec group.
+        """
+        from ..core.interface import FullAttentionSpec
+
+        for i, group in enumerate(self.kv_cache_groups):
+            if isinstance(group.kv_cache_spec, FullAttentionSpec):
+                return i
+        return 0
+
+    def _clear_window_aware_runtime_cap_metadata(self) -> None:
+        """Reset the cache-metadata fields that the window-aware estimate writes.
+
+        Sentinel-clears the three derived attributes
+        (``window_aware_max_num_seqs``, ``window_aware_pages_per_request``,
+        ``window_aware_max_num_batched_tokens``) on ``self.metadata`` to
+        ``-1`` so downstream consumers (the scheduler's heuristic
+        request-cap path) treat them as absent. Always called before
+        writing fresh values in :meth:`_apply_window_aware_runtime_cap`,
+        and used as the no-op path when window-aware estimation is
+        disabled.
+        """
+        for attr_name in (
+            "window_aware_max_num_seqs",
+            "window_aware_pages_per_request",
+            "window_aware_max_num_batched_tokens",
+        ):
+            if hasattr(self.metadata, attr_name):
+                setattr(self.metadata, attr_name, -1)
+
+    def _apply_window_aware_runtime_cap(self, max_num_batched_tokens: int):
+        """Attach a hybrid full/sliding runtime-cap estimate to cache metadata.
+
+        Calls ``estimate_runtime_page_budget`` using the runner's page pool and
+        cache groups, then writes the resulting concurrency limits back onto
+        ``self.metadata`` so the scheduler can use them.
+
+        Args:
+            max_num_batched_tokens: Maximum number of tokens batched in one
+                decode step; used to size each request's page demand.
+
+        Returns:
+            The ``RuntimePageBudgetEstimate`` if estimation succeeds, or
+            ``None`` if no cache groups are available or an error occurs.
+        """
+        self._clear_window_aware_runtime_cap_metadata()
+
+        if not self.enable_window_aware_runtime_cap:
+            logger.debug("Window-aware runtime-cap estimation disabled; using heuristic request caps.")
+            return None
+
+        if not self.kv_cache_groups:
+            return None
+
+        try:
+            estimate = estimate_runtime_page_budget(
+                num_pages=int(getattr(self.metadata, "num_pages", 0) or 0),
+                kv_cache_groups=list(self.kv_cache_groups),
+                max_model_len=int(self.max_model_len),
+                max_num_batched_tokens=int(max_num_batched_tokens),
+                data_parallel_size=int(getattr(self.metadata, "data_parallel_size", 1) or 1),
+            )
+        except Exception as exc:
+            logger.debug("Window-aware runtime-cap estimation skipped: %s", exc, exc_info=True)
+            return None
+
+        self.metadata.window_aware_max_num_seqs = int(estimate.max_num_seqs)
+        self.metadata.window_aware_pages_per_request = int(estimate.pages_per_request)
+        self.metadata.window_aware_max_num_batched_tokens = int(max_num_batched_tokens)
+        return estimate
+
+    def _log_startup_summary(self) -> None:
+        """Log a consolidated startup summary to the logger.
+
+        Inspects the model configuration to gather architecture details
+        (layer types, attention mechanism), cache configuration (page count,
+        sequence capacity), and recurrent operation names, then emits a
+        single multi-line INFO log with all key runtime parameters.
+        """
+        try:
+            text_config = self.model.config.get_text_config()
+            model_type = getattr(text_config, "model_type", "unknown")
+            attn_mechanism = getattr(text_config, "attn_mechanism", "unknown")
+            num_layers = getattr(text_config, "num_hidden_layers", 0)
+            layer_types = getattr(text_config, "layer_types", None)
+            cache_info = None
+            try:
+                cache_info = self.model.get_operations_cache_info()
+            except Exception:
+                pass
+
+            rec_ops: set[str] = set()
+            if cache_info is not None and len(cache_info.layers) > 0:
+                for layer in cache_info.layers:
+                    if layer.is_recurrent_layer:
+                        rec_ops.add(layer.operation_name)
+                cache_type = cache_info.get_recommended_cache_type()
+            else:
+                cache_type = "paged"
+
+            if layer_types is not None:
+                from collections import Counter
+
+                type_counts = Counter(layer_types)
+                n_attn = sum(v for k, v in type_counts.items() if "full" in k or "sliding" in k)
+                n_linear = sum(v for k, v in type_counts.items() if "linear" in k)
+                n_parallel = type_counts.get("parallel_hybrid", 0)
+                n_other = num_layers - n_attn - n_linear - n_parallel
+
+                parts = []
+                if n_parallel:
+                    parts.append(f"{n_parallel} parallel attn+ssm")
+                if n_linear:
+                    parts.append(f"{n_linear} linear")
+                if n_attn:
+                    parts.append(f"{n_attn} full-attention")
+                if n_other:
+                    parts.append(f"{n_other} other")
+
+                has_recurrent = n_linear > 0 or n_parallel > 0
+                has_attention = n_attn > 0 or n_parallel > 0
+
+                if n_parallel and not n_attn and not n_linear:
+                    arch_desc = f"parallel_hybrid ({' + '.join(parts)} / {num_layers} layers)"
+                elif has_recurrent and has_attention:
+                    arch_desc = f"hybrid ({' + '.join(parts)} / {num_layers} layers)"
+                elif has_recurrent and not has_attention:
+                    arch_desc = f"recurrent ({' + '.join(parts)} / {num_layers} layers)"
+                else:
+                    arch_desc = f"attention ({num_layers} layers)"
+            elif num_layers > 0:
+                arch_desc = f"attention ({num_layers} layers)"
+            else:
+                arch_desc = "unknown"
+
+            algos = [f"attention={attn_mechanism}"]
+            if rec_ops:
+                algos.append(f"linear={', '.join(sorted(rec_ops))}")
+            algo_str = " | ".join(algos)
+
+            cache_parts = [f"type={cache_type}"]
+            if hasattr(self.metadata, "num_pages") and hasattr(self.metadata, "page_size"):
+                n_pages = int(self.metadata.num_pages)
+                p_size = int(self.metadata.page_size)
+                seq_cap = int((n_pages * p_size) / 1000)
+                cache_parts.append(f"pages={n_pages:,} ({p_size} tok/page)")
+                cache_parts.append(f"sequence_capacity={seq_cap:,}K")
+            if self.pipeline_plan.is_enabled:
+                cache_parts.append(f"pp_stages={self.pipeline_plan.mpmd_dim}")
+                cache_parts.append(f"pp_cache_layers/stage={self.pipeline_plan.max_stage_cache_layers}")
+            window_pages_per_req = int(getattr(self.metadata, "window_aware_pages_per_request", -1) or -1)
+            if window_pages_per_req > 0:
+                cache_parts.append(f"pages/request={window_pages_per_req}")
+            if hasattr(self.metadata, "get_max_num_seqs"):
+                try:
+                    max_len_cap = min(int(self.metadata.get_max_num_seqs()), int(self.max_num_reqs))
+                    cache_parts.append(f"max_len_concurrency={max_len_cap:,} reqs")
+                except Exception:
+                    logger.debug("Could not compute runtime concurrency summary", exc_info=True)
+
+            lines = [
+                f"Model : {model_type}",
+                f"Architecture : {arch_desc}",
+                f"Algorithms : {algo_str}",
+                f"Cache : {' | '.join(cache_parts)}",
+            ]
+            logger.info("\n".join(lines))
+        except Exception as e:
+            logger.debug(f"Could not generate startup summary: {e}")
+
+    # Perf-tracker passthroughs
+    # The perf state lives on ``self.perf`` (:class:`RunnerPerfTracker`). The
+    # historical ``_perf_*`` attribute names are kept as thin properties because
+    # both the execute path and external readers (
+    # serving benchmarks) reference them directly.
+
+    @property
+    def _perf_iteration(self) -> int:
+        """Monotonically increasing step counter (see :class:`RunnerPerfTracker`)."""
+        return self.perf.iteration
+
+    @_perf_iteration.setter
+    def _perf_iteration(self, value: int) -> None:
+        self.perf.iteration = value
+
+    @property
+    def _perf_tps_ema(self) -> float | None:
+        """EMA of aggregate tokens/second (see :class:`RunnerPerfTracker`)."""
+        return self.perf.tps_ema
+
+    @_perf_tps_ema.setter
+    def _perf_tps_ema(self, value: float | None) -> None:
+        self.perf.tps_ema = value
+
+    @property
+    def _perf_alpha(self) -> float:
+        """EMA smoothing factor (see :class:`RunnerPerfTracker`)."""
+        return self.perf.alpha
+
+    @_perf_alpha.setter
+    def _perf_alpha(self, value: float) -> None:
+        self.perf.alpha = value
+
+    @property
+    def _perf_last_agg_tps(self) -> float | None:
+        """Aggregate tokens/second of the most recent step."""
+        return self.perf.last_agg_tps
+
+    @_perf_last_agg_tps.setter
+    def _perf_last_agg_tps(self, value: float | None) -> None:
+        self.perf.last_agg_tps = value
+
+    @property
+    def _perf_last_req_tps(self) -> float | None:
+        """Per-request tokens/second of the most recent step."""
+        return self.perf.last_req_tps
+
+    @_perf_last_req_tps.setter
+    def _perf_last_req_tps(self, value: float | None) -> None:
+        self.perf.last_req_tps = value
+
+    @property
+    def _perf_last_total_time(self) -> float | None:
+        """Wall-clock seconds of the most recent step."""
+        return self.perf.last_total_time
+
+    @_perf_last_total_time.setter
+    def _perf_last_total_time(self, value: float | None) -> None:
+        self.perf.last_total_time = value
+
+    @property
+    def _perf_last_total_tokens(self) -> int | None:
+        """Tokens fed to the model on the most recent step."""
+        return self.perf.last_total_tokens
+
+    @_perf_last_total_tokens.setter
+    def _perf_last_total_tokens(self, value: int | None) -> None:
+        self.perf.last_total_tokens = value
+
+    @property
+    def _perf_history(self) -> deque[RunnerPerfSample]:
+        """Bounded deque of :class:`RunnerPerfSample` step snapshots."""
+        return self.perf.history
+
+    @property
+    def _perf_phase_history(self) -> deque[dict[str, typing.Any]]:
+        """Bounded deque of per-step phase-timing dicts (read by external benchmark harnesses)."""
+        return self.perf.phase_history
+
+    # Speculative-decoding passthroughs
+    # The draft/verify/commit machinery lives on ``self.spec`` (NullSpeculation or
+    # DrafterSpeculation). The historical runner attribute names are kept as thin
+    # delegating properties so the engine, benchmarks, and external tests are
+    # untouched.
+
+    @property
+    def spec_decode_num_drafts_generated(self) -> int:
+        """Total draft tokens proposed (delegates to ``self.spec``)."""
+        return int(self.spec.num_drafts_generated)
+
+    @spec_decode_num_drafts_generated.setter
+    def spec_decode_num_drafts_generated(self, value: int) -> None:
+        self.spec.num_drafts_generated = int(value)
+
+    @property
+    def spec_decode_num_drafts_accepted(self) -> int:
+        """Total draft tokens accepted by verification (delegates to ``self.spec``)."""
+        return int(self.spec.num_drafts_accepted)
+
+    @spec_decode_num_drafts_accepted.setter
+    def spec_decode_num_drafts_accepted(self, value: int) -> None:
+        self.spec.num_drafts_accepted = int(value)
+
+    @property
+    def spec_decode_num_verify_steps(self) -> int:
+        """Total speculative verify windows processed (delegates to ``self.spec``)."""
+        return int(self.spec.num_verify_steps)
+
+    @spec_decode_num_verify_steps.setter
+    def spec_decode_num_verify_steps(self, value: int) -> None:
+        self.spec.num_verify_steps = int(value)
+
+    @property
+    def spec_decode_reject_backoff_steps(self) -> int:
+        """Drafter-call backoff after a full rejection (delegates to ``self.spec``)."""
+        return int(self.spec.reject_backoff_steps)
+
+    @spec_decode_reject_backoff_steps.setter
+    def spec_decode_reject_backoff_steps(self, value: int) -> None:
+        self.spec.reject_backoff_steps = int(value)
+
+    @property
+    def spec_decode_debug_traces(self) -> list[dict[str, typing.Any]]:
+        """Collected speculative verify traces (delegates to ``self.spec``)."""
+        return self.spec.debug_traces
+
+    @property
+    def spec_decode_debug_max_traces(self) -> int:
+        """Speculative verify-trace budget (delegates to ``self.spec``)."""
+        return int(self.spec.debug_max_traces)
+
+    @spec_decode_debug_max_traces.setter
+    def spec_decode_debug_max_traces(self, value: int) -> None:
+        self.spec.debug_max_traces = int(value)
+
+    @property
+    def mesh(self):
+        """The model's JAX/Spectrax sharding mesh.
+
+        Surfaced as a property so the runner code can keep referring to
+        ``self.mesh`` even as the underlying model reference is swapped
+        during a hot weight update.
+
+        Returns:
+            The :class:`MeshLike` mesh the model was built on; may be a
+            standard JAX mesh or an MPMD ``MpMdMesh`` when pipeline
+            parallelism is active.
+        """
+        return self.model.mesh
+
+    @property
+    def _empty_sharding(self):
+        """Cheap fully-replicated ``NamedSharding`` for scalar-shaped placement.
+
+        Used by the runner whenever a tensor needs to live on the mesh
+        but has no axis to shard along (perf scalars, host-prepared scratch
+        buffers, etc.). Building the sharding fresh per call keeps it cheap
+        and side-effect-free.
+
+        Returns:
+            ``NamedSharding(self.mesh, PartitionSpec())`` — replicated on
+            every device in the mesh.
+        """
+        return replicated_named_sharding(self.mesh)
+
+    @staticmethod
+    def _get_token_paddings(min_token_size: int, max_token_size: int, padding_gap: int) -> list[int]:
+        """Generate padding sizes for efficient compilation.
+
+        Delegates to :meth:`WindowPlanner.get_token_paddings`.
+        """
+        return WindowPlanner.get_token_paddings(min_token_size, max_token_size, padding_gap)
+
+    def _init_seq_buckets(
+        self,
+        user_buckets: list[int] | None,
+        max_num_seqs: int,
+        min_input_pad: int,
+    ) -> list[int]:
+        """Initialize sequence count buckets for compilation.
+
+        Delegates to :meth:`WindowPlanner.init_seq_buckets`.
+        """
+        return WindowPlanner.init_seq_buckets(user_buckets, max_num_seqs, min_input_pad)
+
+    def _get_current_bucket(self, num_reqs: int) -> int:
+        """Select the smallest bucket that can accommodate num_reqs.
+
+        Delegates to :meth:`WindowPlanner.get_current_bucket`, passing the
+        runtime-clamped bucket list when it has been set up.
+        """
+        return self.window_planner.get_current_bucket(num_reqs, getattr(self, "active_num_seq_buckets", None))
+
+    @staticmethod
+    def _clamp_request_buckets_to_runtime_cap(buckets: list[int], runtime_cap: int) -> list[int]:
+        """Clamp request-count buckets to the runtime execution cap.
+
+        Delegates to :meth:`WindowPlanner.clamp_request_buckets_to_runtime_cap`.
+        """
+        return WindowPlanner.clamp_request_buckets_to_runtime_cap(buckets, runtime_cap)
+
+    def _setup_variables(self):
+        """Initialize internal variables and preallocate reusable buffers.
+
+        Computes the runtime request cap from paged-attention metadata,
+        clamps sequence buckets accordingly, creates the ``SequenceBuffer``
+        for tracking active sequences, and allocates fixed JAX arrays
+        (``input_ids_buf``, ``position_ids_buf``, ``arange``, etc.) that
+        are reused across iterations to avoid repeated allocation.
+        """
+        self.num_reqs_max_model_len = min(self.metadata.get_max_num_seqs(), self.max_num_reqs)
+        self.num_reqs_most_model_len = self.num_reqs_max_model_len
+        self._allow_sparse_window_packing = (
+            int(getattr(self.metadata, "data_parallel_size", 1) or 1) <= 1 and not self.async_scheduling
+        )
+        self.active_num_seq_buckets = self._clamp_request_buckets_to_runtime_cap(
+            self.max_num_seq_buckets,
+            self.num_reqs_max_model_len,
+        )
+        self.requests: dict[str, CachedRequestState] = {}
+        logger.debug(f"Token padding sizes: {len(self.num_tokens_paddings)} levels, max={self.max_num_tokens}")
+        logger.debug(
+            "Active request buckets clamped to runtime cap: %s (configured=%s, runtime_cap=%s)",
+            self.active_num_seq_buckets,
+            self.max_num_seq_buckets,
+            self.num_reqs_max_model_len,
+        )
+        logger.debug("Sparse zero-token row packing enabled: %s", self._allow_sparse_window_packing)
+
+        logger.debug(
+            f"Creating sequence buffer for max_num_reqs={self.max_num_reqs}, max_model_len={self.max_model_len}"
+        )
+        num_cache_groups = max(1, len(self.kv_cache_groups))
+        self.sequence_buffer = SequenceBuffer(
+            max_num_reqs=self.max_num_reqs,
+            max_model_len=self.max_model_len,
+            max_num_batched_tokens=self.max_num_tokens,
+            vocab_size=self.model.config.get_text_config().vocab_size,
+            page_sizes=[self.metadata.page_size] * num_cache_groups,
+            sharding=self._empty_sharding,
+        )
+        # Keep the live dictionary: admission, compaction and row swaps mutate
+        # it in place. Rebind after reset_state replaces the sequence buffer.
+        self.executor_manager.sampler_runtime.request_seeds = self.sequence_buffer.generator_seeds
+        self.slot_pool = RecurrentSlotPool(
+            metadata=self.metadata,
+            max_num_reqs=self.max_num_reqs,
+            slot_indexed_state=self._slot_indexed_state,
+        )
+
+        self.arange = jnp.arange(self.max_num_tokens, dtype=jnp.int32)
+        self.arange_np = jnp.arange(self.max_num_reqs, dtype=jnp.int32)
+
+        self.input_ids_buf = jnp.zeros((self.max_num_tokens,), dtype=jnp.int32, device=self._empty_sharding)
+        self.position_ids_buf = jnp.zeros((self.max_num_tokens,), dtype=jnp.int32, device=self._empty_sharding)
+        self.num_tokens_paddings_arr = jnp.array(self.num_tokens_paddings, dtype=jnp.int32, device=self._empty_sharding)
+        self.scheduled_full_buf = jnp.zeros((self.max_num_reqs,), dtype=jnp.int32, device=self._empty_sharding)
+        self.req_num_tokens_full_buf = jnp.zeros((self.max_num_reqs,), dtype=jnp.int32, device=self._empty_sharding)
+        self.active_mask_full_buf = jnp.zeros((self.max_num_reqs,), dtype=bool, device=self._empty_sharding)
+
+        # Host-side scratch buffers (avoid per-step NumPy allocations in hot path).
+        self._scheduled_full_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
+        self._active_mask_full_cpu = np.zeros((self.max_num_reqs,), dtype=bool)
+        self._req_num_tokens_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
+        self._window_temperature_cpu = np.zeros_like(self.sequence_buffer.temperature)
+        self._window_top_p_cpu = np.zeros_like(self.sequence_buffer.top_p)
+        self._window_top_k_cpu = np.zeros_like(self.sequence_buffer.top_k)
+        self._window_min_p_cpu = np.zeros_like(self.sequence_buffer.min_p)
+        self._window_frequency_penalties_cpu = np.zeros_like(self.sequence_buffer.frequency_penalties)
+        self._window_presence_penalties_cpu = np.zeros_like(self.sequence_buffer.presence_penalties)
+        self._window_repetition_penalties_cpu = np.ones_like(self.sequence_buffer.repetition_penalties)
+        self._window_row_indices_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
+        self._window_recurrent_slot_indices_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
+        self._spec_recurrent_commit_cpu = np.zeros((2, self.max_num_reqs), dtype=np.int32)
+        self._pending_spec_recurrent_commit_by_req: dict[str, int] = {}
+        self.executor_manager.invalidate_sampler_penalty_state(
+            self.sequence_buffer.token_ids,
+            self.sequence_buffer.num_tokens,
+        )
+
+        # VLM host-side scratch buffers keyed by `num_tokens_static` (avoid repeated
+        # large allocations while keeping the step-function input pytree stable).
+        self.vlm.reset_cpu_buffers()
+        self.state_sync = SequenceStateSync(
+            sequence_buffer=self.sequence_buffer,
+            requests=self.requests,
+            slot_pool=self.slot_pool,
+            metadata=self.metadata,
+            executor_manager=self.executor_manager,
+            max_model_len=self.max_model_len,
+            spec_decode_recurrent_candidates=self.spec_decode_recurrent_candidates,
+            spec_recurrent_commit_cpu=self._spec_recurrent_commit_cpu,
+            pending_spec_recurrent_commit_by_req=self._pending_spec_recurrent_commit_by_req,
+        )
+
+    def _get_vlm_cpu_buffers(
+        self,
+        *,
+        num_tokens_static: int,
+        uses_mrope_model: bool,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, list[np.ndarray] | None]:
+        """Get or create cached CPU buffers for VLM prefill data.
+
+        Delegates to :meth:`VlmPrefillHelper.get_cpu_buffers`.
+        """
+        return self.vlm.get_cpu_buffers(
+            num_tokens_static=num_tokens_static,
+            uses_mrope_model=uses_mrope_model,
+        )
+
+    def _get_window_state_views(
+        self,
+        *,
+        start_index: int,
+        row_count: int,
+        page_table_cpu: np.ndarray,
+        page_table_version: int | None,
+        row_indices: np.ndarray | None = None,
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        int | None,
+    ]:
+        """Return CPU-side state views aligned to the active scheduler window.
+
+        Slices row-backed request state for the current scheduling window and
+        copies per-request sampling scalars into fixed-size scratch buffers so
+        downstream batch-preparation code still receives arrays sized for
+        ``max_num_reqs``. For nonzero windows the page-table version is salted
+        with ``start_index`` to avoid cache collisions between different row
+        slices that share the same underlying page-table allocation. Packed
+        non-contiguous row selections disable page-table cache reuse to avoid
+        stale cache hits on mismatched row layouts.
+        """
+        row_count = max(0, int(row_count))
+        start_index = max(0, int(start_index))
+        end_index = start_index + row_count
+        if row_indices is not None:
+            row_indices = np.asarray(row_indices, dtype=np.int32)
+            token_ids_window_cpu = self.sequence_buffer.token_ids[row_indices]
+            num_computed_tokens_window_cpu = self.sequence_buffer.num_computed_tokens[row_indices]
+            page_table_window_cpu = page_table_cpu[row_indices]
+            start_index = int(row_indices[0]) if row_indices.size else 0
+            packed_rows = True
+        else:
+            token_ids_window_cpu = self.sequence_buffer.token_ids[start_index:end_index]
+            num_computed_tokens_window_cpu = self.sequence_buffer.num_computed_tokens[start_index:end_index]
+            page_table_window_cpu = page_table_cpu[start_index:end_index]
+            packed_rows = False
+
+        temperature_window_cpu = self._window_temperature_cpu
+        top_p_window_cpu = self._window_top_p_cpu
+        top_k_window_cpu = self._window_top_k_cpu
+        min_p_window_cpu = self._window_min_p_cpu
+        frequency_penalties_window_cpu = self._window_frequency_penalties_cpu
+        presence_penalties_window_cpu = self._window_presence_penalties_cpu
+        repetition_penalties_window_cpu = self._window_repetition_penalties_cpu
+
+        temperature_window_cpu.fill(0)
+        top_p_window_cpu.fill(1.0)
+        top_k_window_cpu.fill(0)
+        min_p_window_cpu.fill(0)
+        frequency_penalties_window_cpu.fill(0.0)
+        presence_penalties_window_cpu.fill(0.0)
+        repetition_penalties_window_cpu.fill(1.0)
+
+        if row_count > 0:
+            if row_indices is not None:
+                temperature_window_cpu[:row_count] = self.sequence_buffer.temperature[row_indices]
+                top_p_window_cpu[:row_count] = self.sequence_buffer.top_p[row_indices]
+                top_k_window_cpu[:row_count] = self.sequence_buffer.top_k[row_indices]
+                min_p_window_cpu[:row_count] = self.sequence_buffer.min_p[row_indices]
+                frequency_penalties_window_cpu[:row_count] = self.sequence_buffer.frequency_penalties[row_indices]
+                presence_penalties_window_cpu[:row_count] = self.sequence_buffer.presence_penalties[row_indices]
+                repetition_penalties_window_cpu[:row_count] = self.sequence_buffer.repetition_penalties[row_indices]
+            else:
+                temperature_window_cpu[:row_count] = self.sequence_buffer.temperature[start_index:end_index]
+                top_p_window_cpu[:row_count] = self.sequence_buffer.top_p[start_index:end_index]
+                top_k_window_cpu[:row_count] = self.sequence_buffer.top_k[start_index:end_index]
+                min_p_window_cpu[:row_count] = self.sequence_buffer.min_p[start_index:end_index]
+                frequency_penalties_window_cpu[:row_count] = self.sequence_buffer.frequency_penalties[
+                    start_index:end_index
+                ]
+                presence_penalties_window_cpu[:row_count] = self.sequence_buffer.presence_penalties[
+                    start_index:end_index
+                ]
+                repetition_penalties_window_cpu[:row_count] = self.sequence_buffer.repetition_penalties[
+                    start_index:end_index
+                ]
+
+        # The batch-preparer page-table cache key must distinguish different
+        # row windows that share the same underlying page-table version.
+        if page_table_version is None:
+            page_table_window_version = None
+        elif packed_rows:
+            page_table_window_version = None
+        elif start_index == 0:
+            page_table_window_version = int(page_table_version)
+        else:
+            page_table_window_version = int(page_table_version) * (int(self.max_num_reqs) + 1) + start_index
+
+        return (
+            token_ids_window_cpu,
+            num_computed_tokens_window_cpu,
+            temperature_window_cpu,
+            top_p_window_cpu,
+            top_k_window_cpu,
+            min_p_window_cpu,
+            page_table_window_cpu,
+            frequency_penalties_window_cpu,
+            presence_penalties_window_cpu,
+            repetition_penalties_window_cpu,
+            page_table_window_version,
+        )
+
+    def _collect_schedulable_window_rows(
+        self,
+        *,
+        start_index: int,
+        stop_index: int,
+        scheduled_tokens_by_req: dict[str, int],
+        allow_sparse_packing: bool,
+    ) -> tuple[np.ndarray, list[str | None], list[int], int, bool]:
+        """Collect runnable rows for a window, compacting interior zero-token gaps.
+
+        Delegates to :meth:`WindowPlanner.collect_schedulable_window_rows` with
+        the live sequence-buffer row ids.
+        """
+        return WindowPlanner.collect_schedulable_window_rows(
+            req_ids=self.sequence_buffer.req_ids,
+            start_index=start_index,
+            stop_index=stop_index,
+            scheduled_tokens_by_req=scheduled_tokens_by_req,
+            allow_sparse_packing=allow_sparse_packing,
+        )
+
+    def _precompile_draft_schedule_variants(self) -> None:
+        """Warm the batched drafter's per-``k`` compiles for every schedule ``k``.
+
+        ``Qwen3_5MTPDrafter.draft_batched`` compile-keys on the draft count
+        ``k`` (the recurrence is unrolled), so a dynamic schedule with several
+        distinct ``k`` values would otherwise hit one cold JIT per value the
+        first time serving crosses each concurrency band. Warm each distinct
+        ``k`` (schedule values plus the static gap-fallback) here with an
+        all-idle (``collected_mask`` all-``False``) call: every pool row's
+        write index is restored by the batched program, so the warmup leaves
+        the drafter cache coherent while materializing the executable.
+
+        No-op for drafters without ``draft_batched`` (their per-request
+        ``draft`` path is not keyed on ``k``). Failures are logged and
+        skipped — the runtime path can still JIT lazily.
+        """
+        if self.drafter is None or int(self.num_draft_tokens) <= 0:
+            return
+        if not bool(getattr(self.drafter, "supports_batched_draft", False)):
+            return
+        if not callable(getattr(self.drafter, "draft_batched", None)):
+            return
+        k_values = {int(self.num_draft_tokens)}
+        if self.draft_schedule is not None:
+            k_values |= {int(k) for (_start, _end, k) in self.draft_schedule if int(k) > 0}
+        n = max(1, int(self.max_num_reqs))
+        ensure = getattr(self.drafter, "ensure_batch_size", None)
+        if callable(ensure):
+            ensure(n)
+        hidden_size = int(self.model.config.get_text_config().hidden_size)
+        hidden_dtype = getattr(self.model, "dtype", None) or jnp.float32
+        for k in sorted(k_values):
+            try:
+                _ = self.drafter.draft_batched(
+                    seed_tokens=jnp.zeros((n,), dtype=jnp.int32),
+                    seed_hidden=jnp.zeros((n, 1, hidden_size), dtype=hidden_dtype),
+                    seed_positions=jnp.zeros((n,), dtype=jnp.int32),
+                    committed_lens=jnp.zeros((n,), dtype=jnp.int32),
+                    collected_mask=jnp.zeros((n,), dtype=bool),
+                    num_draft_tokens=int(k),
+                )
+                logger.debug(f"Batched drafter precompiled for k={k} (pool={n})")
+            except Exception as e:
+                logger.debug(f"Batched drafter precompile skip (k={k}): {e}")
+
+    def _precompile_draft_in_verify_variants(self) -> None:
+        """Warm the fused draft-in-verify program for every (request bucket, k).
+
+        The fused program (``Qwen3_5MTPDrafter.verify_draft_batched``) compile-
+        keys on the gathered verify-stripe shape — ``padded_num_reqs * (k + 1)``
+        rows — and on the draft count ``k`` (unrolled recurrence), so its
+        executable count is exactly one per (request bucket, schedule-``k``)
+        pair. Warm each pair here with an all-idle (``collected_mask``
+        all-``False``) call: every pool row's write index is restored by the
+        program, so the warmup leaves the drafter cache coherent while
+        materializing the executable.
+
+        No-op when the strategy cannot use the fused path (no capable drafter,
+        or ``EASYDEL_DISABLE_DRAFT_IN_VERIFY`` / ``EASYDEL_DISABLE_BATCHED_DRAFT``
+        set at compile time). Failures are logged and skipped — the runtime
+        path can still JIT lazily.
+        """
+        if self.drafter is None or int(self.num_draft_tokens) <= 0:
+            return
+        can_fused = getattr(self.spec, "can_draft_in_verify", None)
+        if not callable(can_fused) or not can_fused():
+            return
+        k_values = {int(self.num_draft_tokens)}
+        if self.draft_schedule is not None:
+            k_values |= {int(k) for (_start, _end, k) in self.draft_schedule if int(k) > 0}
+        n = max(1, int(self.max_num_reqs))
+        ensure = getattr(self.drafter, "ensure_batch_size", None)
+        if callable(ensure):
+            ensure(n)
+        hidden_size = int(self.model.config.get_text_config().hidden_size)
+        hidden_dtype = getattr(self.model, "dtype", None) or jnp.float32
+        project_fn = self.spec.draft_in_verify_project_fn()
+        for pnr in sorted({int(b) for b in self.active_num_seq_buckets}):
+            for k in sorted(k_values):
+                rows = int(pnr) * (int(k) + 1)
+                try:
+                    _ = self.drafter.verify_draft_batched(
+                        gathered_hidden=jnp.zeros((rows, hidden_size), dtype=hidden_dtype),
+                        row_offsets=np.zeros((n,), dtype=np.int32),
+                        draft_tokens=np.zeros((n, int(k)), dtype=np.int32),
+                        draft_counts=np.zeros((n,), dtype=np.int32),
+                        seed_pos_base=np.zeros((n,), dtype=np.int32),
+                        committed_base=np.zeros((n,), dtype=np.int32),
+                        fresh_mask=np.zeros((n,), dtype=bool),
+                        collected_mask=np.zeros((n,), dtype=bool),
+                        num_draft_tokens=int(k),
+                        project_fn=project_fn,
+                    )
+                    logger.debug(f"Draft-in-verify precompiled for (reqs={pnr}, k={k}, pool={n})")
+                except Exception as e:
+                    logger.debug(f"Draft-in-verify precompile skip (reqs={pnr}, k={k}): {e}")
+
+    def compile(self, *, max_num_batched_tokens: int | None = None) -> None:
+        """Compile the model for token/request bucket sizes.
+
+        Drives the execution manager's bucketed compile over the current
+        ``num_tokens_paddings`` and active sequence buckets so the hot path
+        has zero JIT cost.
+
+        Args:
+            max_num_batched_tokens: Optional per-step token budget. When set,
+                compilation is capped to the smallest token bucket that is at
+                least ``max_num_batched_tokens``; otherwise every bucket up to
+                ``max_num_tokens`` is compiled.
+
+        Raises:
+            ValueError: If ``max_num_batched_tokens`` is provided but not
+                positive.
+
+        Notes:
+            - ``max_model_len`` controls the *sequence length* (context window).
+            - ``max_num_batched_tokens`` controls the *per-step* token budget
+              that the scheduler will emit in a single forward pass.
+
+            When ``max_num_batched_tokens`` is provided, compilation is capped
+            to the smallest token bucket >= that value (dramatically reducing
+            startup time for long-context models).
+        """
+        logger.info("Starting eSurgeRunner compilation")
+        num_tokens_paddings = list(self.num_tokens_paddings)
+        if max_num_batched_tokens is not None:
+            target = int(max_num_batched_tokens)
+            if target <= 0:
+                raise ValueError(f"max_num_batched_tokens must be positive, got {max_num_batched_tokens}")
+
+            # Pick the smallest bucket >= target (keeps runtime bucket selection valid).
+            cap = next((b for b in num_tokens_paddings if b >= target), num_tokens_paddings[-1])
+            num_tokens_paddings = [b for b in num_tokens_paddings if b <= cap]
+
+        logger.debug(
+            f"Compiling for {len(num_tokens_paddings)} token padding sizes: {num_tokens_paddings[:5]}..."
+            if len(num_tokens_paddings) > 5
+            else f"Compiling for token padding sizes: {num_tokens_paddings}"
+        )
+
+        self.executor_manager.compile(
+            num_tokens_paddings=num_tokens_paddings,
+            num_reqs_max_model_len=self.num_reqs_max_model_len,
+            max_pages_per_req=self.max_pages_per_req,
+            max_num_reqs=self.max_num_reqs,
+            metadata=self.metadata,
+            num_reqs_paddings=self.active_num_seq_buckets,
+            prune_infeasible_pairs=self._allow_sparse_window_packing,
+        )
+
+        self._precompile_vlm_vision_helpers(max_num_batched_tokens=num_tokens_paddings[-1])
+
+        self._precompile_draft_schedule_variants()
+        self._precompile_draft_in_verify_variants()
+        self._precompile_whole_block_drafter()
+
+    def _precompile_whole_block_drafter(self) -> None:
+        """Warm a whole-block drafter's (DSpark) programs through its optional ``precompile`` hook.
+
+        Without it the draft programs JIT lazily at every new padded row count, inside serving steps. Failures are
+        logged and skipped; the runtime path still compiles lazily.
+        """
+        if self.drafter is None or int(self.num_draft_tokens) <= 0:
+            return
+        precompile = getattr(self.drafter, "precompile", None)
+        if not bool(getattr(self.drafter, "whole_block_draft", False)) or not callable(precompile):
+            return
+        try:
+            precompile(
+                max_num_reqs=max(1, int(self.max_num_reqs)),
+                max_tokens=int(self.max_num_tokens),
+                hidden_dtype=getattr(self.model, "dtype", None),
+            )
+            logger.debug("Whole-block drafter precompiled")
+        except Exception as e:
+            logger.debug(f"Whole-block drafter precompile skip: {e}")
+
+    def update_model_weights(
+        self,
+        model: EasyDeLBaseModule | None = None,
+        *,
+        graphdef=None,
+        graphstate=None,
+        graphother=None,
+        reset_state: bool = True,
+    ) -> None:
+        """Update the runner's model weights/graphs and optionally reset state.
+
+        Args:
+            model: Optional EasyDeL model instance providing new weights. If
+                omitted, graph components must be supplied explicitly.
+            graphdef: Optional graphdef override.
+            graphstate: Optional graphstate override.
+            graphother: Optional graphother override.
+            reset_state: When True (default) reinitializes internal buffers and
+                cached requests to ensure the new weights are applied cleanly.
+
+        Raises:
+            RuntimeError: If active requests exist while reset_state is True.
+        """
+        if reset_state and self.requests:
+            raise RuntimeError("Cannot update model weights while requests are active")
+
+        if model is None:
+            if graphdef is None:
+                raise ValueError("graphdef must not be None when model is None")
+            if graphstate is None:
+                raise ValueError("graphstate must not be None when model is None")
+            if graphother is None:
+                raise ValueError("graphother must not be None when model is None")
+            model = spx.bind(graphdef, graphstate.overlay(graphother))
+
+        model = model.esurge_compatible_model
+        graphdef = model.graphdef
+        self.model = model
+        # Weight refreshes may reuse the same model object; identity alone is
+        # insufficient to invalidate cached encoder outputs in that case.
+        vlm = getattr(self, "vlm", None)
+        if vlm is not None:
+            vlm.reset_vision_cache()
+        self._vlm_image_features_jit = None
+        self._vlm_video_features_jit = None
+        self._vlm_vision_jit_disabled = False
+
+        self.executor_manager.update_graphs(
+            model=model,
+            graphdef=graphdef,
+            graphstate=graphstate,
+            graphother=graphother,
+        )
+
+        if reset_state:
+            self._setup_variables()
+
+    def release_model_state(self, *, clear_compiled_cache: bool = False) -> None:
+        """Drop model/graph references held by the runner to free memory.
+
+        This keeps the runner object reusable, but it requires a later
+        `update_model_weights(...)` call before executing new generation steps.
+
+        Args:
+            clear_compiled_cache: Whether to clear compiled model/sampler caches.
+
+        Raises:
+            RuntimeError: If active requests exist.
+        """
+        if self.requests:
+            raise RuntimeError("Cannot release model state while requests are active")
+
+        self.reset_state()
+
+        self.executor_manager.release_model_state(clear_compiled_cache=clear_compiled_cache)
+
+        self.model = None
+        self._vlm_image_features_jit = None
+        self._vlm_video_features_jit = None
+        self._vlm_vision_jit_disabled = False
+
+    def destroy_kv_cache(self) -> None:
+        """Drop the executor-manager's KV-pages reference to free HBM.
+
+        Called from :meth:`eSurge.pause` when ``destroy_pages_on_pause``
+        is enabled. Does not zero the underlying device buffers — Python
+        garbage collection of the cache object releases the HBM as soon
+        as no other reference remains. Counterpart of
+        :meth:`initialize_kv_cache`, which reallocates a fresh cache on
+        resume.
+        """
+        logger.info("Destroying eSurgeRunner ragged KV cache pages")
+        self.executor_manager.kv_pages = None
+        self.executor_manager.drop_recurrent_snapshots()
+
+    def initialize_kv_cache(self) -> None:
+        """Allocate the operations cache when the executor manager has none.
+
+        Idempotent: when ``executor_manager.kv_pages`` is already set,
+        returns immediately so resuming an already-running engine doesn't
+        leak a second allocation. Otherwise builds the right
+        ``Quantizer`` (TurboQuant gets a no-config quantizer; everything
+        else gets the model's standard kv-quant config) and delegates to
+        the public allocation API
+        :meth:`RunnerExecutionManager.initialize_kv_cache`, which
+        will shrink the page pool on PP HBM-OOM. Called by both
+        :meth:`eSurge.initiate` (fresh start) and :meth:`eSurge.resume`
+        (after a pause that destroyed pages).
+        """
+
+        if self.executor_manager.kv_pages is not None:
+            logger.debug("KV cache already initialized; skipping reallocation")
+            return
+
+        logger.info("Reinitializing eSurgeRunner ragged KV cache pages")
+        text_config = self.model.config.get_text_config()
+        kv_quant_cfg = text_config.kv_cache_quantization_config
+        # TurboQuant handles compression internally; skip standard quantizer
+        _is_turboquant = isinstance(kv_quant_cfg, TurboQuantConfig)
+        if _is_turboquant:
+            quantizer = self.model._quant_class(quantization_config=None)
+        else:
+            quantizer = self.model._quant_class(quantization_config=kv_quant_cfg)
+
+        self.executor_manager.initialize_kv_cache(
+            quantizer=quantizer,
+            masking_details=getattr(text_config, "get_mask_details", lambda: None)(),
+        )
+        return
+
+    # VLM prefill passthroughs
+    # The VLM prefill machinery lives on ``self.vlm`` (:class:`VlmPrefillHelper`).
+    # The historical runner method/attribute names are kept as thin delegators
+    # and properties so _execute_model_impl, compile(), weight-update paths, and
+    # external tests are untouched.
+
+    @property
+    def compile_vision_encoder(self) -> bool:
+        """Whether the bucketed vision JIT path is enabled (see :class:`VlmPrefillHelper`)."""
+        return self.vlm.compile_vision_encoder
+
+    @property
+    def vision_patch_buckets(self) -> list[int] | None:
+        """Raw patch-count buckets for vision precompile (see :class:`VlmPrefillHelper`)."""
+        return self.vlm.vision_patch_buckets
+
+    @property
+    def _vlm_image_features_jit(self) -> typing.Callable | None:
+        """Cached image-features JIT closure (see :class:`VlmPrefillHelper`)."""
+        return self.vlm.image_features_jit
+
+    @_vlm_image_features_jit.setter
+    def _vlm_image_features_jit(self, value: typing.Callable | None) -> None:
+        self.vlm.image_features_jit = value
+
+    @property
+    def _vlm_video_features_jit(self) -> typing.Callable | None:
+        """Cached video-features JIT closure (see :class:`VlmPrefillHelper`)."""
+        return self.vlm.video_features_jit
+
+    @_vlm_video_features_jit.setter
+    def _vlm_video_features_jit(self, value: typing.Callable | None) -> None:
+        self.vlm.video_features_jit = value
+
+    @property
+    def _vlm_vision_jit_disabled(self) -> bool:
+        """Sticky vision-JIT fallback flag (see :class:`VlmPrefillHelper`)."""
+        return self.vlm.vision_jit_disabled
+
+    @_vlm_vision_jit_disabled.setter
+    def _vlm_vision_jit_disabled(self, value: bool) -> None:
+        self.vlm.vision_jit_disabled = value
+
+    @property
+    def _vlm_cpu_buffers(self):
+        """Host-side VLM scratch buffers keyed by bucket (see :class:`VlmPrefillHelper`)."""
+        return self.vlm.cpu_buffers
+
+    @staticmethod
+    def _static_grid_thw(grid: np.ndarray | jax.Array | tuple | list | None) -> tuple[tuple[int, int, int], ...] | None:
+        """Convert a processor grid into a hashable static JIT argument.
+
+        Delegates to :meth:`VlmPrefillHelper.static_grid_thw`.
+        """
+        return VlmPrefillHelper.static_grid_thw(grid)
+
+    @staticmethod
+    def _max_grid_size(grid: tuple[tuple[int, int, int], ...] | None) -> int | None:
+        """Return the static max spatial grid size used by Qwen-style vision towers.
+
+        Delegates to :meth:`VlmPrefillHelper.max_grid_size`.
+        """
+        return VlmPrefillHelper.max_grid_size(grid)
+
+    @staticmethod
+    def _block_tree_until_ready(value: typing.Any) -> None:
+        """Block until every device-array leaf in ``value`` is ready.
+
+        Delegates to :meth:`VlmPrefillHelper.block_tree_until_ready`.
+        """
+        VlmPrefillHelper.block_tree_until_ready(value)
+
+    def _vlm_uses_deepstack_visuals(self) -> bool:
+        """Delegates to :meth:`VlmPrefillHelper.uses_deepstack_visuals`."""
+        return self.vlm.uses_deepstack_visuals()
+
+    def _vision_patch_input_dim(self) -> int | None:
+        """Delegates to :meth:`VlmPrefillHelper.vision_patch_input_dim`."""
+        return self.vlm.vision_patch_input_dim()
+
+    def _vision_spatial_merge_size(self) -> int:
+        """Delegates to :meth:`VlmPrefillHelper.vision_spatial_merge_size`."""
+        return self.vlm.vision_spatial_merge_size()
+
+    def _vision_dtype(self) -> jnp.dtype:
+        """Delegates to :meth:`VlmPrefillHelper.vision_dtype`."""
+        return self.vlm.vision_dtype()
+
+    def _vision_grid_for_patch_bucket(self, raw_patches: int) -> tuple[int, tuple[int, int, int]]:
+        """Delegates to :meth:`VlmPrefillHelper.vision_grid_for_patch_bucket`."""
+        return self.vlm.vision_grid_for_patch_bucket(raw_patches)
+
+    def _vision_patch_buckets_for_compile(self, *, max_num_batched_tokens: int | None) -> list[int]:
+        """Delegates to :meth:`VlmPrefillHelper.vision_patch_buckets_for_compile`."""
+        return self.vlm.vision_patch_buckets_for_compile(max_num_batched_tokens=max_num_batched_tokens)
+
+    def _get_vlm_image_features_jit(self) -> typing.Callable:
+        """Delegates to :meth:`VlmPrefillHelper.get_image_features_jit`."""
+        return self.vlm.get_image_features_jit()
+
+    def _get_vlm_video_features_jit(self) -> typing.Callable:
+        """Delegates to :meth:`VlmPrefillHelper.get_video_features_jit`."""
+        return self.vlm.get_video_features_jit()
+
+    def _precompile_vlm_vision_helpers(self, *, max_num_batched_tokens: int | None) -> None:
+        """Delegates to :meth:`VlmPrefillHelper.precompile_vision_helpers`."""
+        self.vlm.precompile_vision_helpers(max_num_batched_tokens=max_num_batched_tokens)
+
+    def set_side_input_tokenizer_state(self, state: typing.Any) -> None:
+        """Set the tokenizer-derived state the model's side-input provider needs (``esurge_prepare_tokenizer``).
+
+        Args:
+            state: Model-defined state (opaque to eSurge).
+        """
+        self._side_input_tokenizer_state = state
+        self._side_input_provider = None
+
+    def _get_side_input_provider(self) -> typing.Any:
+        """Return (building on first use) the served model's side-input provider."""
+        if self._side_input_provider is None:
+            self._side_input_provider = build_side_input_provider(self.model, self._side_input_tokenizer_state)
+        return self._side_input_provider
+
+    def _build_model_side_inputs(
+        self,
+        *,
+        req_ids_window: list[str | None],
+        scheduled_list: list[int],
+        window_row_indices: np.ndarray,
+        num_tokens_static: int,
+    ) -> dict[str, np.ndarray]:
+        """Build the per-token side inputs of models that declare them (aligned with the flat token stream).
+
+        Rows follow the batch preparer's packing: scheduled tokens back to back within each DP rank's token slice,
+        with padding at each spec's fill value. The model's provider rebuilds everything from each request's token history, so
+        chunked prefill, decode, preemption resume and slot reuse need no per-request provider state.
+
+        Args:
+            req_ids_window: Request ids of the window rows.
+            scheduled_list: Tokens scheduled per window row.
+            window_row_indices: Sequence-buffer row of each window row.
+            num_tokens_static: Token bucket of this step.
+
+        Returns:
+            ``{name: [num_tokens_static, *per_token_shape]}`` per declared side input.
+        """
+        windows: list[tuple[int, SideInputWindow]] = []
+        for pos, rid in enumerate(req_ids_window):
+            n = int(scheduled_list[pos])
+            if n <= 0:
+                continue
+            row = int(window_row_indices[pos])
+            start = int(self.sequence_buffer.num_computed_tokens[row])
+            req_state = self.requests.get(rid) if rid is not None else None
+            types = None if req_state is None else req_state.token_types
+            known = int(self.sequence_buffer.num_tokens_no_spec[row])
+            windows.append((row, SideInputWindow(self.sequence_buffer.token_ids[row], types, start, start + n, known)))
+        return self._pack_side_input_windows(windows, num_tokens_static=int(num_tokens_static))
+
+    def _pack_side_input_windows(
+        self, windows: list[tuple[int, SideInputWindow]], *, num_tokens_static: int
+    ) -> dict[str, np.ndarray]:
+        """Build side inputs in the same rank-major layout as model token IDs.
+
+        Args:
+            windows: Global sequence-row index and scheduled side-input window pairs.
+            num_tokens_static: Total token bucket, including every rank's padding.
+
+        Returns:
+            Side-input arrays with per-rank padding supplied by the model provider.
+
+        Raises:
+            ValueError: If the rank layout is invalid or any rank exceeds its token budget.
+        """
+        provider = self._get_side_input_provider()
+        if not self._uses_spmd_dp():
+            return provider.build([window for _, window in windows], int(num_tokens_static))
+        dp_size = int(self.metadata.data_parallel_size)
+        rows_per_rank, extra_rows = divmod(int(self.num_reqs_max_model_len), dp_size)
+        tokens_per_rank, extra_tokens = divmod(int(num_tokens_static), dp_size)
+        if extra_rows or extra_tokens or rows_per_rank <= 0:
+            raise ValueError("Rank-major side inputs require rows and token buckets divisible by DP size.")
+        rank_windows: list[list[SideInputWindow]] = [[] for _ in range(dp_size)]
+        for row, window in windows:
+            rank = int(row) // rows_per_rank
+            if not 0 <= rank < dp_size:
+                raise ValueError(f"Side-input row {row} is outside the rank-major request layout.")
+            rank_windows[rank].append(window)
+        payloads = []
+        for rank, local_windows in enumerate(rank_windows):
+            used = sum(int(window.end) - int(window.start) for window in local_windows)
+            if used > tokens_per_rank:
+                raise ValueError(f"DP rank {rank} side inputs exceed its token budget: {used} > {tokens_per_rank}.")
+            payloads.append(provider.build(local_windows, tokens_per_rank))
+        return {name: np.concatenate([payload[name] for payload in payloads], axis=0) for name in payloads[0]}
+
+    def queue_speculative_recurrent_commit(self, req_id: str, prefix_len: int) -> None:
+        """Queue a verified prefix for the next model step's recurrent commit.
+
+        Args:
+            req_id: Request whose recurrent candidate state should be committed.
+            prefix_len: Positive number of accepted input tokens, including real tokens.
+
+        Raises:
+            ValueError: If the prefix length is not positive.
+        """
+        if int(prefix_len) <= 0:
+            raise ValueError("A speculative recurrent commit requires a positive prefix length.")
+        self._pending_spec_recurrent_commit_by_req[str(req_id)] = int(prefix_len)
+
+    def record_speculative_execution_time(self, *, replay: float = 0.0, suffix: float = 0.0) -> None:
+        """Accumulate strategy execution time for this step's performance sample.
+
+        Args:
+            replay: Seconds spent restoring and replaying an accepted prefix.
+            suffix: Seconds spent executing the suffix sampling path.
+        """
+        self._spec_replay_time_acc += float(replay)
+        self._spec_suffix_time_acc += float(suffix)
+
+    @property
+    def scheduled_token_counts_cpu(self) -> np.ndarray:
+        """Current window's host scheduled-token counts (borrowed, not copied)."""
+        return self._scheduled_full_cpu
+
+    @property
+    def active_request_mask_cpu(self) -> np.ndarray:
+        """Current window's host active-row mask (borrowed, not copied)."""
+        return self._active_mask_full_cpu
+
+    def side_inputs_for_execute(
+        self,
+        *,
+        token_ids_cpu: np.ndarray,
+        num_computed_tokens_cpu: np.ndarray,
+        scheduled_full_cpu: np.ndarray,
+        window_row_indices_cpu: np.ndarray,
+        num_tokens_static: int,
+    ) -> dict[str, np.ndarray] | None:
+        """Build model side inputs aligned with a speculative executor call.
+
+        Args:
+            token_ids_cpu: Window token-id rows passed to the executor.
+            num_computed_tokens_cpu: Window compute progress.
+            scheduled_full_cpu: Scheduled token counts per window position.
+            window_row_indices_cpu: Sequence-buffer row per window position.
+            num_tokens_static: Padded token count for the call.
+
+        Returns:
+            Model side inputs, or None for models without side inputs.
+        """
+        return self._side_inputs_for_execute(
+            token_ids_cpu=token_ids_cpu,
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
+            scheduled_full_cpu=scheduled_full_cpu,
+            window_row_indices_cpu=window_row_indices_cpu,
+            num_tokens_static=num_tokens_static,
+        )
+
+    def _side_inputs_for_execute(
+        self,
+        *,
+        token_ids_cpu: np.ndarray,
+        num_computed_tokens_cpu: np.ndarray,
+        scheduled_full_cpu: np.ndarray,
+        window_row_indices_cpu: np.ndarray,
+        num_tokens_static: int,
+    ) -> dict[str, np.ndarray] | None:
+        """Side inputs of one extra executor call (speculative replay / suffix re-sample), or ``None``.
+
+        Built from exactly the arrays the call hands the executor: window position ``pos`` schedules
+        ``scheduled_full_cpu[pos]`` tokens of ``token_ids_cpu[pos]`` starting at ``num_computed_tokens_cpu[pos]``, packed
+        back to back within its DP rank's padded slice (the batch preparer's packing). The executor and side inputs read the
+        same token ids even when the window arrays are a pre-verify copy of the sequence buffer.
+
+        Args:
+            token_ids_cpu: Window token-id rows passed to the executor.
+            num_computed_tokens_cpu: Window compute progress passed to the executor.
+            scheduled_full_cpu: Tokens scheduled per window position.
+            window_row_indices_cpu: Sequence-buffer row of each window position.
+            num_tokens_static: Token bucket of the call.
+
+        Returns:
+            ``{name: [num_tokens_static, ...]}`` per declared side input; ``None`` for models without side inputs.
+        """
+        if not model_has_side_inputs(self.model):
+            return None
+        req_ids = self.sequence_buffer.req_ids
+        windows: list[tuple[int, SideInputWindow]] = []
+        for pos in range(min(len(token_ids_cpu), len(scheduled_full_cpu))):
+            n = int(scheduled_full_cpu[pos])
+            if n <= 0:
+                continue
+            row = int(window_row_indices_cpu[pos])
+            rid = req_ids[row] if 0 <= row < len(req_ids) else None
+            req_state = self.requests.get(rid) if rid is not None else None
+            types = None if req_state is None else req_state.token_types
+            start = int(num_computed_tokens_cpu[pos])
+            known = int(self.sequence_buffer.num_tokens_no_spec[row]) if 0 <= row < len(req_ids) else -1
+            windows.append((row, SideInputWindow(token_ids_cpu[pos], types, start, start + n, known)))
+        return self._pack_side_input_windows(windows, num_tokens_static=int(num_tokens_static))
+
+    def _precompute_vlm_prefill(self, req_state: CachedRequestState) -> None:
+        """Precompute prompt embeddings (+ optional mRoPE indices) for VLM requests.
+
+        Delegates to :meth:`VlmPrefillHelper.precompute_prefill`.
+        """
+        self.vlm.precompute_prefill(req_state)
+
+    def _update_states(self, scheduler_output: SchedulerOutput) -> bool:
+        """Update internal states based on scheduler output.
+
+        Delegates to :meth:`SequenceStateSync.update_states`.
+
+        Args:
+            scheduler_output: Contains request scheduling decisions (finished,
+                new, cached requests and per-request token counts).
+
+        Returns:
+            True if state changed (requests added/removed), indicating
+            potential buffer reorganization. False if no changes occurred.
+        """
+        return self.state_sync.update_states(scheduler_output)
+
+    def _modify_prev_results(self, pre_results: AsyncPreResults | None = None) -> None:
+        """Apply previous iteration's tokens to sequence buffer.
+
+        Delegates to :meth:`SequenceStateSync.modify_prev_results`, defaulting
+        to the runner's pending async payload when ``pre_results`` is omitted.
+        """
+        if pre_results is None:
+            pre_results = self._pre_async_results
+        self.state_sync.modify_prev_results(pre_results)
+
+    def _finalize_async_scheduler_runner_state(
+        self,
+        sampled_token_ids: list[list[int]],
+        *,
+        request_seq_lens: list[tuple[int, int, CachedRequestState, int]],
+        expected_pre_results: AsyncPreResults | None = None,
+    ) -> None:
+        """Repair runner-side placeholders after async scheduler output drains.
+
+        Delegates the token repair to
+        :meth:`SequenceStateSync.finalize_async_runner_state`, then clears the
+        runner's pending async payload. ``expected_pre_results`` lets the drain
+        path clear only the payload it finalized: in the PP device-handoff
+        path, step ``N+1`` may have already installed its own async payload by
+        the time step ``N`` drains; clearing by identity avoids deleting that
+        newer payload.
+        """
+        SequenceStateSync.finalize_async_runner_state(
+            sampled_token_ids,
+            request_seq_lens=request_seq_lens,
+            sequence_buffer=self.sequence_buffer,
+            requests=self.requests,
+            max_model_len=self.max_model_len,
+        )
+        if expected_pre_results is None or self._pre_async_results is expected_pre_results:
+            self._pre_async_results = None
+
+    def _model_uses_vlm_inputs(self) -> bool:
+        """Return whether the loaded model has multimodal prefill side inputs."""
+        cfg = getattr(self.model, "config", None)
+        task_type = getattr(self.model, "_task_type", None)
+        return task_type == "image-text-to-text" or (
+            cfg is not None
+            and (getattr(cfg, "image_token_id", None) is not None or getattr(cfg, "video_token_id", None) is not None)
+            and callable(getattr(self.model, "get_image_features", None))
+        )
+
+    def _has_default_sampling_penalties(self) -> bool:
+        """Return whether device-token handoff can ignore penalty state updates.
+
+        Async placeholder handoff patches only the next input token. Frequency,
+        presence, and repetition penalties are computed from CPU-side token
+        history during metadata preparation, so requests with non-default
+        penalties must keep the older repair-before-dispatch path until those
+        penalty buffers are also made device-resident.
+        """
+        return (
+            not bool(np.any(self.sequence_buffer.frequency_penalties != 0.0))
+            and not bool(np.any(self.sequence_buffer.presence_penalties != 0.0))
+            and not bool(np.any(self.sequence_buffer.repetition_penalties != 1.0))
+        )
+
+    def can_dispatch_next_before_async_drain(self, scheduler_output: SchedulerOutput) -> bool:
+        """Return whether the next async decode step may launch before drain.
+
+        The async scheduler advances decode with optimistic output placeholders.
+        If this returns ``True``, the lifecycle loop can schedule and dispatch
+        step ``N+1`` before host-materializing step ``N``. The runner then
+        replaces the placeholder input in ``N+1`` from step ``N``'s device
+        sampled-token array via :class:`DeviceInputTokenHandoff`.
+
+        This is deliberately a capability gate, not a pipeline-parallelism
+        check. It applies to both SPMD/TP and PP executions, but only when all
+        correctness-sensitive features that currently depend on CPU token
+        history are disabled.
+        """
+        if not self.async_scheduling or not scheduler_output.async_scheduling:
+            return False
+        if int(scheduler_output.total_num_scheduled_tokens or 0) <= 0:
+            return False
+        if any(int(n) != 1 for n in scheduler_output.num_scheduled_tokens.values()):
+            return False
+        if bool(getattr(scheduler_output, "pending_structured_output_tokens", False)):
+            return False
+        if self._model_uses_vlm_inputs():
+            return False
+        if model_has_side_inputs(self.model):
+            # Side inputs are computed from host token history, which still holds async placeholders.
+            return False
+        return self._has_default_sampling_penalties()
+
+    def _can_delay_async_result_repair(
+        self,
+        *,
+        scheduler_output: SchedulerOutput,
+        return_async_output: bool,
+        is_vlm_model: bool,
+        frequency_penalties_cpu: np.ndarray,
+        presence_penalties_cpu: np.ndarray,
+        repetition_penalties_cpu: np.ndarray,
+    ) -> bool:
+        """Return whether previous async tokens may be repaired after dispatch.
+
+        The delayed path is a launch-path optimization: it lets the next decode
+        step consume previous sampled tokens from device arrays, then repairs
+        CPU sequence state after that step has been queued. It is only
+        profitable when the caller is already using the deferred-output path;
+        the synchronous async-scheduler loop has already materialized the token
+        for ``scheduler.update_from_output()``, so adding a scatter there just
+        adds work. Keep the gate conservative so correctness-sensitive features
+        continue using the old host-repair-before-dispatch path.
+        """
+        if not return_async_output:
+            return False
+        if not scheduler_output.async_scheduling:
+            return False
+        if int(scheduler_output.total_num_scheduled_tokens or 0) <= 0:
+            return False
+        if any(int(n) != 1 for n in scheduler_output.num_scheduled_tokens.values()):
+            return False
+        if bool(getattr(scheduler_output, "pending_structured_output_tokens", False)):
+            return False
+        if is_vlm_model or model_has_side_inputs(self.model):
+            return False
+        if bool(np.any(frequency_penalties_cpu != 0.0)):
+            return False
+        if bool(np.any(presence_penalties_cpu != 0.0)):
+            return False
+        if bool(np.any(repetition_penalties_cpu != 1.0)):
+            return False
+        return True
+
+    def _build_device_token_handoff(
+        self,
+        *,
+        pre_results: AsyncPreResults,
+        req_ids_window: list[str | None],
+        scheduled_list: list[int],
+        window_row_indices: np.ndarray,
+        num_tokens_static: int,
+    ) -> DeviceInputTokenHandoff | None:
+        """Build a device-side patch for decode placeholders in one window.
+
+        The current batch preparer reads token ids from the CPU
+        ``sequence_buffer``. When async scheduling inserted a placeholder at the
+        previous step, that CPU slot still contains ``0`` until
+        :meth:`_modify_prev_results` materializes the sampled token. For pure
+        decode rows whose next input is exactly that placeholder position, this
+        helper gathers the previous device sampled-token scalar and records the
+        flattened input offset that must be patched.
+
+        Returning ``None`` means the caller must use the old path and repair CPU
+        state before building/launching the next step.
+        """
+        sampled_by_req: dict[str, tuple[int, jax.Array, int]] = {}
+        for window_idx, window in enumerate(pre_results.windows):
+            for row_pos, req_id, is_valid in zip(window.row_positions, window.req_ids, window.valid_mask, strict=False):
+                if is_valid:
+                    sampled_by_req[str(req_id)] = (window_idx, window.sampled_token_ids, int(row_pos))
+
+        use_spmd_dp = self._uses_spmd_dp()
+        if use_spmd_dp:
+            dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+            if int(num_tokens_static) % dp_size != 0:
+                return None
+            if int(self.num_reqs_max_model_len) % dp_size != 0:
+                return None
+            tokens_per_rank = int(num_tokens_static) // dp_size
+            rows_per_rank = int(self.num_reqs_max_model_len) // dp_size
+            rank_used_tokens = [0] * dp_size
+        else:
+            dp_size = 1
+            tokens_per_rank = int(num_tokens_static)
+            rows_per_rank = int(self.num_reqs_max_model_len)
+            rank_used_tokens = [0]
+
+        patch_positions: list[int] = []
+        patch_token_sources: list[tuple[jax.Array, int]] = []
+        patch_sources: list[tuple[int, int]] = []
+        flat_offset = 0
+        for local_row, rid in enumerate(req_ids_window):
+            scheduled = int(scheduled_list[local_row])
+            if scheduled <= 0:
+                continue
+            global_row = int(window_row_indices[local_row])
+            if use_spmd_dp:
+                rank = min(max(global_row, 0) // rows_per_rank, dp_size - 1)
+                packed_row_offset = rank * tokens_per_rank + int(rank_used_tokens[rank])
+                if packed_row_offset + scheduled > (rank + 1) * tokens_per_rank:
+                    return None
+            else:
+                rank = 0
+                packed_row_offset = flat_offset
+            if rid is None:
+                if use_spmd_dp:
+                    rank_used_tokens[rank] += scheduled
+                flat_offset += scheduled
+                continue
+
+            start_tok = int(self.sequence_buffer.num_computed_tokens[global_row])
+            placeholder_pos = int(self.sequence_buffer.num_tokens_no_spec[global_row]) - 1
+            touches_placeholder = start_tok <= placeholder_pos < start_tok + scheduled
+            if not touches_placeholder:
+                if use_spmd_dp:
+                    rank_used_tokens[rank] += scheduled
+                flat_offset += scheduled
+                continue
+            if scheduled != 1 or start_tok != placeholder_pos:
+                return None
+            sampled = sampled_by_req.get(str(rid))
+            if sampled is None:
+                return None
+
+            sampled_window_idx, sampled_tokens, sampled_row_pos = sampled
+            patch_positions.append(packed_row_offset + (placeholder_pos - start_tok))
+            patch_token_sources.append((sampled_tokens, sampled_row_pos))
+            patch_sources.append((sampled_window_idx, sampled_row_pos))
+            if use_spmd_dp:
+                rank_used_tokens[rank] += scheduled
+            flat_offset += scheduled
+
+        if not patch_token_sources:
+            return None
+
+        max_handoff = int(getattr(self.executor_manager, "max_num_reqs", len(patch_positions)) or len(patch_positions))
+        if len(patch_positions) > max_handoff:
+            return None
+
+        count = self._get_handoff_scalar(len(patch_positions))
+        offset = self._get_handoff_scalar(0)
+        fast_dense_handoff = (
+            patch_positions == list(range(len(patch_positions)))
+            and patch_sources == [(patch_sources[0][0], idx) for idx in range(len(patch_sources))]
+            and int(pre_results.windows[patch_sources[0][0]].sampled_token_ids.shape[0]) >= max_handoff
+        )
+        if fast_dense_handoff:
+            input_positions = self._get_handoff_positions(max_handoff)
+            token_ids = pre_results.windows[patch_sources[0][0]].sampled_token_ids
+        else:
+            input_positions_np = np.asarray(patch_positions, dtype=np.int32)
+            if input_positions_np.shape[0] < max_handoff:
+                input_positions_np = np.pad(input_positions_np, (0, max_handoff - int(input_positions_np.shape[0])))
+            input_positions = jax.device_put(input_positions_np, self.executor_manager._empty_sharding)
+            token_ids = jnp.stack(
+                [
+                    jnp.asarray(sampled_tokens[row_pos], dtype=jnp.int32)
+                    for sampled_tokens, row_pos in patch_token_sources
+                ]
+            )
+            if token_ids.shape[0] < max_handoff:
+                token_ids = jnp.pad(token_ids, ((0, max_handoff - int(token_ids.shape[0])),))
+            token_ids = jax.device_put(token_ids, self.executor_manager._empty_sharding)
+        return DeviceInputTokenHandoff(input_positions=input_positions, token_ids=token_ids, count=count, offset=offset)
+
+    def _get_handoff_positions(self, size: int) -> jax.Array:
+        """Return cached ``[0, size)`` device positions for dense token handoff."""
+        cached = self._handoff_positions_cache.get(size)
+        if cached is not None:
+            return cached
+        positions = np.arange(size, dtype=np.int32)
+        cached = jax.device_put(positions, self.executor_manager._empty_sharding)
+        self._handoff_positions_cache[size] = cached
+        return cached
+
+    def _get_handoff_scalar(self, value: int) -> jax.Array:
+        """Return a cached int32 device scalar used by token handoff metadata."""
+        cached = self._handoff_scalar_cache.get(value)
+        if cached is not None:
+            return cached
+        cached = jax.device_put(np.asarray(value, dtype=np.int32), self.executor_manager._empty_sharding)
+        self._handoff_scalar_cache[value] = cached
+        return cached
+
+    def _update_placeholder(
+        self,
+        discard_sampled_tokens_req_indices: list[int],
+        request_seq_lens: list[tuple[int, int, CachedRequestState, int]],
+    ) -> dict[str, int]:
+        """Set placeholders for tokens not yet generated.
+
+        When async scheduling is enabled, this method is called after the
+        forward pass to set placeholder tokens (0) for requests that will
+        generate tokens. The actual tokens will be filled in during the
+        next iteration via _modify_prev_results().
+
+        Args:
+            discard_sampled_tokens_req_indices: Indices of requests whose
+                tokens should be discarded (e.g., partial prefill).
+            request_seq_lens: List of (out_idx, seq_row_idx, req_state,
+                seq_len) tuples for requests that generated tokens.
+
+        Returns:
+            Mapping from request ID to index for placeholder replacement.
+
+        Note:
+            This method updates num_tokens_no_spec and num_tokens in the
+            sequence buffer, and appends placeholder (0) to output_token_ids.
+        """
+        placeholder_req_id_to_index: dict[str, int] = {}
+        discard_set = set(discard_sampled_tokens_req_indices)
+
+        for out_idx, seq_row_idx, req_state, placeholder_idx in request_seq_lens:
+            if out_idx in discard_set:
+                continue
+
+            # Honor the placeholder position recorded at schedule time
+            # (``num_computed_tokens + scheduled``). Re-reading
+            # ``num_tokens_no_spec`` here would re-introduce the stale-counter
+            # drift after a synchronously finalized step.
+            start_idx = int(placeholder_idx)
+            end_idx = start_idx + 1  # Assume 1 token (no spec decode yet)
+
+            if end_idx > self.max_model_len:
+                raise ValueError(
+                    f"Sampled token IDs exceed the max model length. "
+                    f"Total number of tokens: {end_idx} > max_model_len: {self.max_model_len}"
+                )
+
+            self.sequence_buffer.num_tokens_no_spec[seq_row_idx] = end_idx
+            self.sequence_buffer.num_tokens[seq_row_idx] = end_idx
+
+            # Add placeholder (0) to output
+            req_state.output_token_ids.extend([0])
+            placeholder_req_id_to_index[req_state.req_id] = seq_row_idx
+
+        return placeholder_req_id_to_index
+
+    def _reorder_decode_first(self, scheduler_output: SchedulerOutput) -> None:
+        """Reorder active requests so decode requests are placed first.
+
+        Delegates to :meth:`SequenceStateSync.reorder_decode_first`.
+        """
+        self.state_sync.reorder_decode_first(scheduler_output)
+
+    def _reorder_decode_first_per_shard(
+        self,
+        scheduler_output: SchedulerOutput,
+        dp_size: int,
+    ) -> None:
+        """Reorder decode requests first within each DP shard's row range.
+
+        Delegates to :meth:`SequenceStateSync.reorder_decode_first_per_shard`.
+        """
+        self.state_sync.reorder_decode_first_per_shard(scheduler_output, dp_size)
+
+    def token_offsets_for_window(
+        self, *, scheduled_list, window_row_indices, num_tokens_static: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return request token offsets and rank bases in the model's flat layout.
+
+        The same rank-local padding used for input IDs must also separate vision
+        embeddings, mRoPE positions, masks and DeepStack rows. Compact request
+        order need not be rank order.
+        """
+        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+        rows_per_rank, extra_rows = divmod(int(self.num_reqs_max_model_len), dp_size)
+        tokens_per_rank, extra_tokens = divmod(int(num_tokens_static), dp_size)
+        if extra_rows or extra_tokens or rows_per_rank <= 0:
+            raise ValueError("Rank-major token offsets require divisible row and token buckets.")
+        cursors = [rank * tokens_per_rank for rank in range(dp_size)]
+        offsets = np.zeros((len(scheduled_list),), dtype=np.int32)
+        rank_bases = np.zeros_like(offsets)
+        for index, (row, count) in enumerate(zip(window_row_indices, scheduled_list, strict=True)):
+            rank = int(row) // rows_per_rank if dp_size > 1 else 0
+            if not 0 <= rank < dp_size or int(count) < 0 or int(row) < 0:
+                raise ValueError("Invalid request row or scheduled count in token window.")
+            offsets[index] = cursors[rank]
+            rank_bases[index] = rank * tokens_per_rank
+            cursors[rank] += int(count)
+            if cursors[rank] > (rank + 1) * tokens_per_rank:
+                raise ValueError("Scheduled tokens exceed their rank-local token bucket.")
+        return offsets, rank_bases
+
+    def _score_output_row(
+        self, *, logits, sampled_tokens, history, seq_len: int, sampling_params
+    ) -> tuple[typing.Any, typing.Any, typing.Any]:
+        """Enqueue compact behavior-policy scores without host token readback."""
+        params = sampling_params
+        arrays = score_sampled_tokens(
+            logits,
+            sampled_tokens,
+            np.asarray(history, dtype=np.int32)[None, :],
+            np.asarray([seq_len], dtype=np.int32),
+            np.asarray([params.temperature], dtype=np.float32),
+            np.asarray([params.top_p], dtype=np.float32),
+            np.asarray([params.top_k], dtype=np.int32),
+            np.asarray([params.min_p], dtype=np.float32),
+            np.asarray([params.frequency_penalty], dtype=np.float32),
+            np.asarray([params.presence_penalty], dtype=np.float32),
+            np.asarray([params.repetition_penalty], dtype=np.float32),
+            num_logprobs=max(0, int(params.logprobs or 0)),
+        )
+        return tuple(jax.copy_to_host_async(array) for array in arrays)
+
+    def _execute_model_impl(
+        self,
+        scheduler_output: SchedulerOutput,
+        *,
+        return_async_output: bool = False,
+    ) -> ModelRunnerOutput | _AsyncExecutionHandle:
+        """Execute the model on scheduled requests.
+
+        Main entry point for model execution. Processes all scheduled requests
+        in batches, handling state updates, input preparation, model execution,
+        and token processing.
+
+        The method handles:
+        1. State synchronization with scheduler
+        2. Batch-wise processing of requests
+        3. Token generation and sampling
+        4. Buffer updates and metrics logging
+
+        Args:
+            scheduler_output: Output from the scheduler containing:
+                - Requests to process
+                - Tokens to generate per request
+                - Finished/new/cached request information
+
+        Returns:
+            ModelRunnerOutput or _AsyncExecutionHandle. The async handle is used
+            by overlap execution to defer the host block while preserving
+            same-thread TPU dispatch.
+
+            ModelRunnerOutput contains:
+                - req_ids: List of processed request IDs
+                - sampled_token_ids: Generated tokens per request
+                - logprobs: Log probabilities (if requested)
+                - Timing and debugging information
+
+        Note:
+            The method processes requests in batches when they exceed
+            the maximum model length, ensuring all requests are handled
+            efficiently without exceeding memory constraints.
+        """
+        execution_start_time = time.time()
+
+        updating_states_start = time.time()
+        layout_version_before = self.sequence_buffer.layout_version
+        prev_recurrent_row_owner = (
+            list(self.sequence_buffer.req_ids) if self._plain_recurrent_row_sync_enabled() else None
+        )
+        self._update_states(scheduler_output)
+        self.spec.on_states_applied(scheduler_output)
+        updating_states_time = time.time() - updating_states_start
+
+        # Apply previous async results if available. For safe PP decode windows,
+        # this repair is delayed until after the next device dispatch is queued:
+        # the next input token is patched from the previous device token directly.
+        prev_async_start = time.time()
+        pending_pre_async_results = self._pre_async_results
+        self._pre_async_results = None
+        pre_async_repair_pending = pending_pre_async_results is not None
+        prev_async_time = time.time() - prev_async_start
+
+        # Align ordering with TPU runner: decode requests first.
+        dp_size = int(getattr(self.metadata, "data_parallel_size", 1) or 1)
+        if self.sequence_buffer.num_reqs > 1:
+            if dp_size <= 1:
+                self._reorder_decode_first(scheduler_output)
+            else:
+                self._reorder_decode_first_per_shard(scheduler_output, dp_size)
+
+        if self.sequence_buffer.layout_version != layout_version_before:
+            self.executor_manager.invalidate_sampler_penalty_state(
+                self.sequence_buffer.token_ids,
+                self.sequence_buffer.num_tokens,
+            )
+            # Keep the plain-recurrent conv/GDR/SSM device state (indexed by
+            # physical buffer row) in lockstep with condense/reorder row moves.
+            self._sync_recurrent_rows(prev_recurrent_row_owner)
+        if self.drafter is not None:
+            # Rows are final for this step: rewrite the sampler's device token counts of penalised speculative
+            # requests that now take the plain sampler path (their counts drift during verify steps).
+            self.spec.sync_penalty_counts(scheduler_output)
+        self._apply_recurrent_snapshot_restores(scheduler_output)
+
+        if not scheduler_output.total_num_scheduled_tokens:
+            if pending_pre_async_results is not None and pre_async_repair_pending:
+                prev_async_start = time.time()
+                self._modify_prev_results(pending_pre_async_results)
+                pre_async_repair_pending = False
+                prev_async_time += time.time() - prev_async_start
+            return ModelRunnerOutput(
+                req_ids=[],
+                req_id_to_index={},
+                req_id_to_row_index={},
+                sampled_token_ids=[],
+                spec_token_ids=None,
+                logprobs=None,
+                prompt_logprobs_dict={},
+                finished_sending=None,
+                finished_recving=None,
+                num_nans_in_logits=None,
+            )
+
+        can_defer_async_output = (
+            self.drafter is None
+            and bool(scheduler_output.async_scheduling)
+            and self.can_dispatch_next_before_async_drain(scheduler_output)
+        )
+        needs_async_output = return_async_output or can_defer_async_output
+        if self.drafter is not None and return_async_output:
+            raise NotImplementedError("eSurge runner-native speculative decoding is synchronous-only for now.")
+        if self.drafter is not None:
+            # Dynamic speculative-token scheduling: resolve the step's draft
+            # budget ONCE from the live concurrency (requests scheduled this
+            # step — drafts produced now are verified next step at ~the same
+            # concurrency). Verification of ALREADY-scheduled drafts is
+            # unaffected; only how many new drafts this step proposes changes.
+            self.spec.resolve_step_draft_budget(len(scheduler_output.num_scheduled_tokens))
+        start_index = 0
+        total_step_time = 0.0
+        total_post_proc_time = 0.0
+
+        req_ids_all: list[str] = []
+        sampled_token_ids_all: list[list[int]] = []
+        spec_token_ids_all: list[list[int]] | None = [] if self.drafter is not None else None
+        accepted_spec_tokens_by_req: dict[str, int] | None = {} if self.drafter is not None else None
+        hidden_states_by_req: dict[str, typing.Any] | None = {} if self.drafter is not None else None
+        token_logprobs: dict[str, float] = {}
+        logprob_payloads: dict[str, tuple[typing.Any, typing.Any, typing.Any]] = {}
+        requested_logprobs = {rid for rid, state in self.requests.items() if state.sampling_params.logprobs is not None}
+        async_windows: list[AsyncWindowResult] = []
+        sync_finalize_entries: list[tuple[CachedRequestState | None, int | None, int | None]] = []
+
+        # Window-level perf aggregation (a single scheduler step can span multiple windows).
+        num_windows = 0
+        total_exec_time = 0.0
+        total_sample_time = 0.0
+        total_prep_time = 0.0
+        total_prep_host_time = 0.0
+        total_prep_put_time = 0.0
+        total_prep_extra_put_time = 0.0
+        total_prep_batch_metadata_time = 0.0
+        total_prep_handoff_time = 0.0
+        total_prep_sampler_window_time = 0.0
+        total_prep_ensure_variants_time = 0.0
+        total_prep_pack_inputs_time = 0.0
+        total_execute_overhead_time = 0.0
+        total_model_enqueue_time = 0.0
+        total_sampler_enqueue_time = 0.0
+        total_greedy_argmax_time = 0.0
+        total_greedy_argmax_fastpath = 0
+        total_logits_wait_time = 0.0
+        total_exec_enqueue_time = 0.0
+        total_exec_wait_time = 0.0
+        total_sampler_wait_time = 0.0
+        total_pp_stage_dispatch_time = 0.0
+        total_pp_queue_wait_time = 0.0
+        total_pp_stage_launches = 0
+        total_pp_stage_compute_time = 0.0
+        total_pp_stage_max_time = 0.0
+        total_pp_prepare_time = 0.0
+        total_pp_submit_time = 0.0
+        total_pp_assemble_time = 0.0
+        total_pp_backbone_time = 0.0
+        total_pp_combine_time = 0.0
+        total_pp_lm_head_time = 0.0
+        total_pp_sampler_enqueue_time = 0.0
+        total_pp_microbatch_scratch_time = 0.0
+        total_pp_microbatch_metadata_time = 0.0
+        total_pp_microbatch_handoff_time = 0.0
+        total_pp_sampler_window_time = 0.0
+        total_pp_ensure_variants_time = 0.0
+        pp_stage_times_by_index: dict[int, float] = {}
+        pp_stage_submit_times_by_index: dict[int, float] = {}
+        pp_stage_assemble_times_by_index: dict[int, float] = {}
+        pp_stage_execute_times_by_index: dict[int, float] = {}
+        total_runner_host_time = 0.0
+        total_async_copy_enqueue_time = 0.0
+        total_token_materialize_time = 0.0
+        total_spec_project_time = 0.0
+        total_spec_argmax_sync_time = 0.0
+        total_spec_meta_time = 0.0
+        total_spec_emit_write_time = 0.0
+        total_spec_draft_time = 0.0
+        self._spec_suffix_time_acc = 0.0
+        self._spec_replay_time_acc = 0.0
+        total_spec_commit_time = 0.0
+        # Greedy inline-MTP requests collected during the window loop(s) for ONE
+        # post-loop batched draft pass, instead of ``N`` per-request drafts. Each
+        # entry: (req_id, req_idx, seed_token, seed_position, seed_hidden, req_state,
+        # known_len, spec_idx). See ``DrafterSpeculation.draft_next_batched``.
+        pending_batched_drafts: list[tuple] = []
+        # Early-dispatched batched drafts, one (handle, writeback-map) per
+        # window; read back after the emission loop (see the pre-pass block).
+        early_draft_batches: list[tuple[dict, dict]] = []
+        # Fused draft-in-verify results, one (host drafts-by-rid, writeback-map)
+        # per window; the drafts are already host lists (the fused program's
+        # single readback returned them with the argmaxes), so the post-loop
+        # writeback needs no strategy readback call.
+        fused_draft_batches: list[tuple[dict[str, list[int]], dict]] = []
+        # Engage the batched pool draft when >= 2 spec-active requests are verified this
+        # step, or for a single request when no replay rollback follows the verify (see
+        # ``_single_ok`` below). The pooled pass runs all k draft forwards as one jitted
+        # program; the per-request path issues k separate dispatches. When a replay
+        # rollback (DSpark ``rolls_back_cache`` or exact recurrent replay) follows, the
+        # pooled pass would be reordered relative to that replay, so a single request
+        # keeps the in-loop per-request path there. (For >= 2 the pooled forward's
+        # batched matmul differs from N separate matmuls by ~1 ULP, the same near-tie
+        # sensitivity any batched-decode inference engine has.)
+        step_batch_candidate_count = 0
+        if self.drafter is not None and scheduler_output.scheduled_spec_decode_tokens:
+            for _spec_rid, _spec_toks in scheduler_output.scheduled_spec_decode_tokens.items():
+                if (
+                    _spec_toks
+                    and all(int(_t) >= 0 for _t in _spec_toks)
+                    and self.spec.can_batch_draft(self.requests.get(_spec_rid))
+                ):
+                    step_batch_candidate_count += 1
+        # A single request also takes the pooled path when no replay rollback follows the verify (candidate-row
+        # commits are deferred into the next forward, so the draft pass is not reordered against a replay): its k
+        # forwards then run as ONE jitted program instead of k separate per-token draft dispatches.
+        _single_ok = not bool(getattr(self.spec, "rolls_back_cache", False)) and not self.spec_decode_recurrent_replay
+        step_allows_batch = step_batch_candidate_count >= (1 if _single_ok else 2)
+        token_buckets_used: set[int] = set()
+        req_buckets_used: set[int] = set()
+        request_seq_lens: list[tuple[int, int, CachedRequestState, int]] = []
+        discard_sampled_tokens_req_indices: list[int] = []
+
+        is_vlm_model = self._model_uses_vlm_inputs()
+        uses_mrope_model = is_vlm_model and model_uses_mrope(self.model)
+
+        while start_index < self.sequence_buffer.num_slots:
+            host_start = time.time()
+            num_reqs_total = self.sequence_buffer.num_slots
+            window_stop_index = min(num_reqs_total, start_index + self.num_reqs_max_model_len)
+            (
+                window_row_indices,
+                req_ids_window,
+                scheduled_list,
+                next_start_index,
+                packed_window_rows,
+            ) = self._collect_schedulable_window_rows(
+                start_index=start_index,
+                stop_index=window_stop_index,
+                scheduled_tokens_by_req=scheduler_output.num_scheduled_tokens,
+                allow_sparse_packing=self._allow_sparse_window_packing and not scheduler_output.async_scheduling,
+            )
+            num_reqs = len(scheduled_list)
+            if num_reqs == 0:
+                start_index = next_start_index
+                continue
+
+            original_scheduled_list = [int(n) for n in scheduled_list]
+            model_scheduled_list = list(original_scheduled_list)
+            total_scheduled = sum(model_scheduled_list)
+            token_bucket_target = total_scheduled
+            if self._uses_spmd_dp():
+                dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+                rows_per_rank = int(self.num_reqs_max_model_len) // dp_size
+                rank_scheduled_tokens = [0] * dp_size
+                for row_pos, scheduled_tokens in enumerate(model_scheduled_list):
+                    global_row = int(window_row_indices[row_pos])
+                    rank = min(max(global_row, 0) // rows_per_rank, dp_size - 1)
+                    rank_scheduled_tokens[rank] += int(scheduled_tokens)
+                peak_rank_scheduled = max(rank_scheduled_tokens) if rank_scheduled_tokens else 0
+                token_bucket_target = peak_rank_scheduled * dp_size
+            num_tokens_static = int(
+                self.window_planner.get_token_bucket(token_bucket_target, active_buckets=self.num_tokens_paddings)
+            )
+
+            # Select optimal bucket for current batch size
+            # This determines which compiled function to use
+            current_bucket = self._get_current_bucket(num_reqs)
+            padded_num_reqs = current_bucket  # Use bucket size for compilation lookup
+
+            scheduled_full_cpu = self._scheduled_full_cpu
+            active_mask_full_cpu = self._active_mask_full_cpu
+            req_num_tokens_np = self._req_num_tokens_cpu
+            window_row_indices_cpu = self._window_row_indices_cpu
+            recurrent_slot_indices_cpu = self._window_recurrent_slot_indices_cpu
+            if num_reqs > 0:
+                scheduled_full_cpu = self._scheduled_full_cpu
+                scheduled_full_cpu.fill(0)
+                scheduled_full_cpu[: len(model_scheduled_list)] = model_scheduled_list
+
+                # Packed view of the per-request target lengths for the current window.
+                # Avoid per-step dict lookups; SequenceBuffer keeps this aligned with its ordering.
+                req_num_tokens_np.fill(0)
+                req_num_tokens_np[:num_reqs] = self.sequence_buffer.num_tokens[window_row_indices]
+
+                active_mask_full_cpu = self._active_mask_full_cpu
+                active_mask_full_cpu.fill(False)
+                for i, rid in enumerate(req_ids_window):
+                    if rid is not None:
+                        active_mask_full_cpu[i] = True
+
+                window_row_indices_cpu.fill(0)
+                window_row_indices_cpu[:num_reqs] = window_row_indices
+
+                recurrent_slot_indices_cpu.fill(0)
+                for row_pos, rid in enumerate(req_ids_window):
+                    if rid is None:
+                        continue
+                    slot = self._recurrent_slot_by_req.get(str(rid))
+                    if slot is None:
+                        if self._uses_spmd_dp():
+                            rank = self._request_dp_rank_by_req.get(str(rid))
+                            if rank is None:
+                                rows_per_rank = self._recurrent_rows_per_dp_rank()
+                                rank = min(max(int(window_row_indices[row_pos]), 0) // rows_per_rank, dp_size - 1)
+                            slot = self._assign_recurrent_slot(str(rid), int(rank))
+                        elif self._slot_indexed_state:
+                            slot = self._assign_recurrent_slot(str(rid), None)
+                        else:
+                            slot = int(window_row_indices[row_pos])
+                    recurrent_slot_indices_cpu[row_pos] = int(slot)
+
+                if host_payload_broadcast_needed(self.host_payloads_replicated):
+                    req_num_tokens_np = multihost_utils.broadcast_one_to_all(req_num_tokens_np)
+
+            mrope_position_ids_cpu: np.ndarray | None = None
+            prefill_embeds_cpu: np.ndarray | None = None
+            prefill_embeds_mask_cpu: np.ndarray | None = None
+            visual_pos_masks_cpu = None
+            deepstack_visual_embeds_cpu = None
+            if is_vlm_model:
+                # Precompute per-request VLM prompt embeddings outside the compiled step.
+                for rid in req_ids_window:
+                    if rid is None:
+                        continue
+                    req_state = self.requests.get(rid)
+                    if req_state is None:
+                        continue
+                    if req_state.has_vision and not req_state.vision_processed:
+                        self._precompute_vlm_prefill(req_state)
+
+                (
+                    prefill_embeds_cpu,
+                    prefill_embeds_mask_cpu,
+                    mrope_position_ids_cpu,
+                    visual_pos_masks_cpu,
+                    deepstack_visual_embeds_cpu,
+                ) = self._get_vlm_cpu_buffers(
+                    num_tokens_static=num_tokens_static,
+                    uses_mrope_model=uses_mrope_model,
+                )
+                token_offsets, _ = self.token_offsets_for_window(
+                    scheduled_list=model_scheduled_list,
+                    window_row_indices=window_row_indices,
+                    num_tokens_static=num_tokens_static,
+                )
+                # Embeddings/masks are token-aligned and rank-padded, but the
+                # model's DeepStack contract is a globally compact residual
+                # table indexed by the flattened mask's cumulative visual count.
+                # Visit requests in packed token order, not scheduler order, so
+                # empty ranks and reordered windows cannot insert residual gaps.
+                visual_off = 0
+                for req_idx in np.argsort(token_offsets, kind="stable"):
+                    rid = req_ids_window[req_idx]
+                    off = int(token_offsets[req_idx])
+                    n = int(model_scheduled_list[req_idx])
+                    if n <= 0:
+                        continue
+
+                    req_state = self.requests.get(rid)
+                    global_row_index = int(window_row_indices[req_idx])
+                    start_tok = int(self.sequence_buffer.num_computed_tokens[global_row_index])
+                    end_tok = start_tok + n
+
+                    if uses_mrope_model and mrope_position_ids_cpu is not None:
+                        # mRoPE position ids: use precomputed prompt indices when available, otherwise
+                        # fall back to a constant delta-adjusted 1D position broadcast.
+                        if (
+                            req_state is not None
+                            and req_state.prefill_position_ids is not None
+                            and start_tok < req_state.num_prompt_tokens
+                        ):
+                            prompt_end = min(end_tok, req_state.num_prompt_tokens)
+                            prompt_n = int(prompt_end - start_tok)
+                            if prompt_n > 0:
+                                mrope_position_ids_cpu[:, off : off + prompt_n] = req_state.prefill_position_ids[
+                                    :, start_tok:prompt_end
+                                ]
+
+                            if prompt_n < n:
+                                delta = 0
+                                if req_state.prefill_rope_deltas is not None:
+                                    delta = int(np.asarray(req_state.prefill_rope_deltas).reshape(-1)[0])
+                                idxs = np.arange(start_tok + prompt_n, end_tok, dtype=np.int32) + np.int32(delta)
+                                mrope_position_ids_cpu[:, off + prompt_n : off + n] = np.broadcast_to(
+                                    idxs[None, :], (3, idxs.shape[0])
+                                )
+                        else:
+                            delta = 0
+                            if req_state is not None and req_state.prefill_rope_deltas is not None:
+                                delta = int(np.asarray(req_state.prefill_rope_deltas).reshape(-1)[0])
+                            idxs = np.arange(start_tok, end_tok, dtype=np.int32) + np.int32(delta)
+                            mrope_position_ids_cpu[:, off : off + n] = np.broadcast_to(idxs[None, :], (3, n))
+
+                    # Embedding overrides: use precomputed prompt embeddings when available.
+                    if (
+                        prefill_embeds_cpu is not None
+                        and prefill_embeds_mask_cpu is not None
+                        and req_state is not None
+                        and req_state.prefill_inputs_embeds is not None
+                        and start_tok < req_state.num_prompt_tokens
+                    ):
+                        prompt_end = min(end_tok, req_state.num_prompt_tokens)
+                        prompt_n = int(prompt_end - start_tok)
+                        if prompt_n > 0:
+                            prefill_embeds_cpu[off : off + prompt_n] = req_state.prefill_inputs_embeds[
+                                start_tok:prompt_end
+                            ]
+                            prefill_embeds_mask_cpu[off : off + prompt_n] = True
+
+                            if visual_pos_masks_cpu is not None and req_state.prefill_visual_pos_masks is not None:
+                                mask_slice = req_state.prefill_visual_pos_masks[start_tok:prompt_end]
+                                visual_pos_masks_cpu[off : off + prompt_n] = mask_slice
+
+                                num_before = int(req_state.prefill_visual_pos_masks[:start_tok].sum())
+                                num_in = int(mask_slice.sum())
+                                if (
+                                    uses_mrope_model
+                                    and num_in
+                                    and deepstack_visual_embeds_cpu is not None
+                                    and req_state.prefill_deepstack_visual_embeds is not None
+                                ):
+                                    ds_list = req_state.prefill_deepstack_visual_embeds
+                                    for layer_idx, buf in enumerate(deepstack_visual_embeds_cpu):
+                                        if layer_idx >= len(ds_list):
+                                            break
+                                        buf[visual_off : visual_off + num_in] = ds_list[layer_idx][
+                                            num_before : num_before + num_in
+                                        ]
+                                    visual_off += num_in
+
+            _pt_group_idx = self._get_full_attention_page_table_index()
+            page_table_cpu = self.sequence_buffer.page_table[_pt_group_idx].get_cpu_tensor()
+            page_table_version = getattr(self.sequence_buffer.page_table[_pt_group_idx], "cpu_version", None)
+
+            # Preflight check: surface req_id + row details for DP-local page mismatches.
+            if dp_size > 1:
+                total_pages = int(getattr(self.metadata, "num_pages", 0) or 0)
+                page_size = max(1, int(getattr(self.metadata, "page_size", 1)))
+                pages_per_shard_opt = pages_per_dp_shard(total_pages, dp_size)
+                if pages_per_shard_opt is not None and self.num_reqs_max_model_len % dp_size == 0:
+                    rows_per_shard = self.num_reqs_max_model_len // dp_size
+                    pages_per_shard = int(pages_per_shard_opt)
+                    for local_req_idx in range(num_reqs):
+                        req_id_dbg = req_ids_window[local_req_idx]
+                        if req_id_dbg is None or int(model_scheduled_list[local_req_idx]) <= 0:
+                            continue
+                        global_row_index = int(window_row_indices[local_req_idx])
+                        seq_len = int(self.sequence_buffer.num_computed_tokens[global_row_index]) + int(
+                            model_scheduled_list[local_req_idx]
+                        )
+                        if seq_len <= 0:
+                            continue
+                        page_cnt = min((seq_len + page_size - 1) // page_size, int(page_table_cpu.shape[1]))
+                        row = np.asarray(page_table_cpu[global_row_index, :page_cnt], dtype=np.int32)
+                        row = row[row != 0]
+                        if row.size == 0:
+                            continue
+                        global_req_idx = global_row_index
+                        req_shard = min(global_req_idx // rows_per_shard, dp_size - 1)
+                        page_lo, page_hi = dp_shard_page_bounds(req_shard, pages_per_shard)
+                        invalid = row[(row < page_lo) | (row >= page_hi)]
+                        if invalid.size:
+                            logger.error(
+                                "Pre-execute DP-local mismatch: row=%s req_id=%s req_shard=%s range=[%s, %s) "
+                                "sample_bad_page=%s pages_preview=%s scheduled=%s computed=%s",
+                                local_req_idx,
+                                req_id_dbg,
+                                req_shard,
+                                page_lo,
+                                page_hi,
+                                int(invalid[0]),
+                                row[:8].tolist(),
+                                int(model_scheduled_list[local_req_idx]),
+                                int(self.sequence_buffer.num_computed_tokens[global_row_index]),
+                            )
+                            break
+
+            device_token_handoff: DeviceInputTokenHandoff | None = None
+            if pending_pre_async_results is not None and pre_async_repair_pending:
+                can_delay_repair = self._can_delay_async_result_repair(
+                    scheduler_output=scheduler_output,
+                    return_async_output=return_async_output,
+                    is_vlm_model=is_vlm_model,
+                    frequency_penalties_cpu=self.sequence_buffer.frequency_penalties,
+                    presence_penalties_cpu=self.sequence_buffer.presence_penalties,
+                    repetition_penalties_cpu=self.sequence_buffer.repetition_penalties,
+                )
+                if can_delay_repair:
+                    device_token_handoff = self._build_device_token_handoff(
+                        pre_results=pending_pre_async_results,
+                        req_ids_window=req_ids_window,
+                        scheduled_list=model_scheduled_list,
+                        window_row_indices=window_row_indices,
+                        num_tokens_static=num_tokens_static,
+                    )
+                if device_token_handoff is None:
+                    prev_async_start = time.time()
+                    self._modify_prev_results(pending_pre_async_results)
+                    pre_async_repair_pending = False
+                    pending_pre_async_results = None
+                    prev_async_time += time.time() - prev_async_start
+
+            (
+                token_ids_window_cpu,
+                num_computed_tokens_window_cpu,
+                temperature_window_cpu,
+                top_p_window_cpu,
+                top_k_window_cpu,
+                min_p_window_cpu,
+                page_table_window_cpu,
+                frequency_penalties_window_cpu,
+                presence_penalties_window_cpu,
+                repetition_penalties_window_cpu,
+                page_table_window_version,
+            ) = self._get_window_state_views(
+                start_index=start_index,
+                row_count=num_reqs,
+                page_table_cpu=page_table_cpu,
+                page_table_version=page_table_version,
+                row_indices=window_row_indices if packed_window_rows else None,
+            )
+            # Built after the async repair above so host token history is final; ``None`` for models that do not
+            # declare ``esurge_side_input_specs``.
+            model_side_inputs_cpu = None
+            if model_has_side_inputs(self.model):
+                model_side_inputs_cpu = self._build_model_side_inputs(
+                    req_ids_window=req_ids_window,
+                    scheduled_list=model_scheduled_list,
+                    window_row_indices=window_row_indices,
+                    num_tokens_static=num_tokens_static,
+                )
+
+            total_runner_host_time += time.time() - host_start
+            spec_decode_active_window = self.drafter is not None and bool(scheduler_output.scheduled_spec_decode_tokens)
+            spec_window_needs_snapshot = bool(
+                spec_decode_active_window
+                # ``or`` is commutative here; put the O(1) flag first so the
+                # O(num_layers) ``cache_replay_required()`` view scan is skipped
+                # every step whenever recurrent candidate rows are in use.
+                and (self.spec_decode_recurrent_candidates or self.spec.cache_replay_required())
+            )
+            if (
+                spec_window_needs_snapshot
+                and self.spec_decode_recurrent_candidates
+                and not self.spec_decode_recurrent_replay
+                # Only caches that actually carry candidate rows can commit without the snapshot. KDA layers
+                # (Kimi-Linear / GLM-5-Next) enable recurrent candidates by layer type but own no candidate rows,
+                # so their rejected drafts are rolled back by snapshot + replay and the snapshot must be kept.
+                and self.spec.recurrent_candidate_count() > 0
+            ):
+                # Steady-state candidate fast path: the pre-step recurrent
+                # snapshot exists only to feed the replay fallbacks
+                # (``replay_prefix_sample`` / ``commit_cache_replay``). Those
+                # can only trigger when (a) full hidden rows do NOT cover the
+                # window, or (b) a spec request schedules more than one real
+                # token (the in-model spec lane is skipped, so the candidate
+                # commit cannot cover the accepted prefix). In the steady
+                # decode state — every spec request schedules exactly
+                # 1 real + k draft tokens and the window bucket returns full
+                # hidden — the commit always succeeds and the snapshot is a
+                # dead full-pool copy of every recurrent layer, every step.
+                # Skip it; any window violating the conditions keeps it.
+                _full_hidden_ok = int(num_tokens_static) <= int(
+                    getattr(self.executor_manager, "full_hidden_state_max_tokens", 0) or 0
+                )
+                _snapshot_needed = not _full_hidden_ok
+                if not _snapshot_needed:
+                    for _row_pos, _rid in enumerate(req_ids_window):
+                        if _rid is None:
+                            continue
+                        _specs = scheduler_output.scheduled_spec_decode_tokens.get(_rid, [])
+                        if not _specs or any(int(_t) < 0 for _t in _specs):
+                            continue
+                        _real = int(model_scheduled_list[_row_pos]) - len(_specs)
+                        if _real != 1:
+                            _snapshot_needed = True
+                            break
+                spec_window_needs_snapshot = _snapshot_needed
+            pre_step_kv_pages = (
+                snapshot_recurrent_state(self.executor_manager.kv_pages) if spec_window_needs_snapshot else None
+            )
+            window_token_offsets = np.zeros((len(model_scheduled_list),), dtype=np.int32)
+            if self.drafter is not None and model_scheduled_list:
+                running_off = 0
+                for _i, _n in enumerate(model_scheduled_list):
+                    window_token_offsets[_i] = running_off
+                    running_off += int(_n)
+            spec_recurrent_commit_cpu = None
+            applied_pending_commit_req_ids: list[str] = []
+            if self.spec_decode_recurrent_candidates:
+                spec_recurrent_commit_cpu = self._spec_recurrent_commit_cpu
+                spec_recurrent_commit_cpu.fill(0)
+                for _row_pos, _rid in enumerate(req_ids_window):
+                    if _rid is None:
+                        continue
+                    _prefix = self._pending_spec_recurrent_commit_by_req.get(str(_rid))
+                    if _prefix is None or int(_prefix) <= 0:
+                        continue
+                    spec_recurrent_commit_cpu[0, int(_row_pos)] = 1
+                    spec_recurrent_commit_cpu[1, int(_row_pos)] = int(_prefix)
+                    applied_pending_commit_req_ids.append(str(_rid))
+            step_start = time.time()
+            (
+                out_tokens_win,
+                _valid_mask_win,
+                self.input_ids_buf,
+                self.position_ids_buf,
+                _hidden_states,
+                _logits,
+                window_metrics,
+            ) = self.executor_manager.execute(
+                num_tokens=num_tokens_static,
+                scheduled_full_cpu=scheduled_full_cpu,
+                req_num_tokens_full_cpu=req_num_tokens_np,
+                active_mask_full_cpu=active_mask_full_cpu,
+                window_row_indices_cpu=window_row_indices_cpu,
+                recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
+                input_ids_buf=self.input_ids_buf,
+                position_ids_buf=self.position_ids_buf,
+                padded_num_reqs=padded_num_reqs,
+                token_ids_cpu=token_ids_window_cpu,
+                num_computed_tokens_cpu=num_computed_tokens_window_cpu,
+                temperature_cpu=temperature_window_cpu,
+                top_p_cpu=top_p_window_cpu,
+                top_k_cpu=top_k_window_cpu,
+                min_p_cpu=min_p_window_cpu,
+                frequency_penalties_cpu=frequency_penalties_window_cpu,
+                presence_penalties_cpu=presence_penalties_window_cpu,
+                repetition_penalties_cpu=repetition_penalties_window_cpu,
+                page_table_cpu=page_table_window_cpu,
+                page_table_version=page_table_window_version,
+                cache_group_inputs=self.cache_group_inputs_for_execute(
+                    window_row_indices_cpu=window_row_indices_cpu,
+                    num_computed_tokens_cpu=num_computed_tokens_window_cpu,
+                ),
+                spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
+                mrope_position_ids_cpu=mrope_position_ids_cpu,
+                prefill_embeds_cpu=prefill_embeds_cpu,
+                prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
+                visual_pos_masks_cpu=visual_pos_masks_cpu,
+                deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
+                device_token_handoff=device_token_handoff,
+                wait_for_outputs=not needs_async_output,
+                model_side_inputs_cpu=model_side_inputs_cpu,
+            )
+            if self.spec_decode_recurrent_candidates:
+                self._spec_recurrent_commit_cpu.fill(0)
+                for _rid in applied_pending_commit_req_ids:
+                    self._pending_spec_recurrent_commit_by_req.pop(str(_rid), None)
+            if device_token_handoff is not None and pending_pre_async_results is not None and pre_async_repair_pending:
+                # The previous async handle will repair CPU placeholders when
+                # the lifecycle loop drains it. Doing that repair here would
+                # immediately wait on the previous sampled token and erase the
+                # point of the device-side PP token handoff.
+                pre_async_repair_pending = False
+                pending_pre_async_results = None
+
+            # account for device time (blocking already happened inside execute())
+            total_step_time += time.time() - step_start
+            num_windows += 1
+            total_exec_time += float(window_metrics.get("exec_time", 0.0))
+            total_sample_time += float(window_metrics.get("sample_time", 0.0))
+            total_prep_time += float(window_metrics.get("prep_time", 0.0))
+            total_prep_host_time += float(window_metrics.get("prep_host_time", 0.0))
+            total_prep_put_time += float(window_metrics.get("prep_put_time", 0.0))
+            total_prep_extra_put_time += float(window_metrics.get("prep_extra_put_time", 0.0))
+            total_prep_batch_metadata_time += float(window_metrics.get("prep_batch_metadata_time", 0.0))
+            total_prep_handoff_time += float(window_metrics.get("prep_handoff_time", 0.0))
+            total_prep_sampler_window_time += float(window_metrics.get("prep_sampler_window_time", 0.0))
+            total_prep_ensure_variants_time += float(window_metrics.get("prep_ensure_variants_time", 0.0))
+            total_prep_pack_inputs_time += float(window_metrics.get("prep_pack_inputs_time", 0.0))
+            total_execute_overhead_time += float(window_metrics.get("execute_overhead_time", 0.0))
+            total_model_enqueue_time += float(window_metrics.get("model_enqueue_time", 0.0))
+            total_sampler_enqueue_time += float(window_metrics.get("sampler_enqueue_time", 0.0))
+            total_greedy_argmax_time += float(window_metrics.get("greedy_argmax_time", 0.0))
+            total_greedy_argmax_fastpath += int(window_metrics.get("greedy_argmax_fastpath", 0))
+            total_logits_wait_time += float(window_metrics.get("logits_wait_time", 0.0))
+            total_exec_enqueue_time += float(window_metrics.get("exec_enqueue_time", 0.0))
+            total_exec_wait_time += float(window_metrics.get("exec_wait_time", 0.0))
+            total_sampler_wait_time += float(window_metrics.get("sampler_wait_time", 0.0))
+            total_pp_stage_dispatch_time += float(window_metrics.get("pp_stage_dispatch_time", 0.0))
+            total_pp_queue_wait_time += float(window_metrics.get("pp_queue_wait_time", 0.0))
+            total_pp_stage_launches += int(window_metrics.get("pp_stage_launches", 0))
+            total_pp_stage_compute_time += float(window_metrics.get("pp_stage_compute_time", 0.0))
+            total_pp_stage_max_time = max(
+                total_pp_stage_max_time,
+                float(window_metrics.get("pp_stage_max_time", 0.0)),
+            )
+            total_pp_prepare_time += float(window_metrics.get("pp_prepare_time", 0.0))
+            total_pp_submit_time += float(window_metrics.get("pp_submit_time", 0.0))
+            total_pp_assemble_time += float(window_metrics.get("pp_assemble_time", 0.0))
+            total_pp_backbone_time += float(window_metrics.get("pp_backbone_time", 0.0))
+            total_pp_combine_time += float(window_metrics.get("pp_combine_time", 0.0))
+            total_pp_lm_head_time += float(window_metrics.get("pp_lm_head_time", 0.0))
+            total_pp_sampler_enqueue_time += float(window_metrics.get("pp_sampler_enqueue_time", 0.0))
+            total_pp_microbatch_scratch_time += float(window_metrics.get("pp_microbatch_scratch_time", 0.0))
+            total_pp_microbatch_metadata_time += float(window_metrics.get("pp_microbatch_metadata_time", 0.0))
+            total_pp_microbatch_handoff_time += float(window_metrics.get("pp_microbatch_handoff_time", 0.0))
+            total_pp_sampler_window_time += float(window_metrics.get("pp_sampler_window_time", 0.0))
+            total_pp_ensure_variants_time += float(window_metrics.get("pp_ensure_variants_time", 0.0))
+            for stage_idx in range(8):
+                key = f"pp_stage_{stage_idx}_time"
+                if key in window_metrics:
+                    pp_stage_times_by_index[stage_idx] = pp_stage_times_by_index.get(stage_idx, 0.0) + float(
+                        window_metrics[key]
+                    )
+                submit_key = f"pp_stage_{stage_idx}_submit_time"
+                if submit_key in window_metrics:
+                    pp_stage_submit_times_by_index[stage_idx] = pp_stage_submit_times_by_index.get(
+                        stage_idx, 0.0
+                    ) + float(window_metrics[submit_key])
+                assemble_key = f"pp_stage_{stage_idx}_assemble_time"
+                if assemble_key in window_metrics:
+                    pp_stage_assemble_times_by_index[stage_idx] = pp_stage_assemble_times_by_index.get(
+                        stage_idx, 0.0
+                    ) + float(window_metrics[assemble_key])
+                execute_key = f"pp_stage_{stage_idx}_execute_time"
+                if execute_key in window_metrics:
+                    pp_stage_execute_times_by_index[stage_idx] = pp_stage_execute_times_by_index.get(
+                        stage_idx, 0.0
+                    ) + float(window_metrics[execute_key])
+            token_buckets_used.add(int(window_metrics.get("token_bucket", num_tokens_static)))
+            req_buckets_used.add(int(window_metrics.get("padded_num_reqs", padded_num_reqs)))
+
+            up_wtime = time.time()
+            window_entries: list[tuple[int, str, CachedRequestState | None, int | None, int | None, bool]] = []
+            for i, rid in enumerate(req_ids_window):
+                if rid is None:
+                    continue
+
+                out_idx = len(req_ids_all)
+                req_ids_all.append(rid)
+
+                req_state = self.requests.get(rid)
+                req_idx = self.sequence_buffer.req_id_to_index.get(rid) if req_state is not None else None
+                seq_len: int | None = None
+                is_valid = False
+
+                if req_state is not None:
+                    seq_len = req_state.num_computed_tokens + scheduler_output.num_scheduled_tokens.get(rid, 0)
+                    global_row_index = int(window_row_indices[i])
+                    target_len = int(self.sequence_buffer.num_tokens[global_row_index])
+                    is_valid = int(scheduled_list[i]) > 0 and seq_len >= target_len
+
+                window_entries.append((i, rid, req_state, req_idx, seq_len, is_valid))
+
+                if scheduler_output.async_scheduling:
+                    if is_valid:
+                        if req_state is None or req_idx is None or seq_len is None:
+                            raise RuntimeError(f"Missing runner state for async request {rid!r}")
+                        # The token sampled by this step lands right after the tokens
+                        # computed in this step: ``num_computed_tokens + scheduled``
+                        # (== ``seq_len``). ``num_tokens_no_spec`` is only maintained
+                        # by the async placeholder path itself, so it goes stale one
+                        # slot behind whenever the previous step for this request was
+                        # finalized synchronously (e.g. the prefill step). Using the
+                        # stale counter made the next async finalize overwrite the
+                        # previous token and left the real append slot as a 0
+                        # placeholder that was then fed back into the model.
+                        placeholder_idx = int(seq_len)
+                        request_seq_lens.append((out_idx, req_idx, req_state, placeholder_idx))
+                    else:
+                        discard_sampled_tokens_req_indices.append(out_idx)
+                elif return_async_output:
+                    sync_finalize_entries.append((req_state, req_idx, seq_len))
+
+            window_metric_scores = None
+            for row_pos, rid, req_state, _req_idx, seq_len, is_valid in window_entries:
+                if not is_valid or req_state is None:
+                    continue
+                if rid not in requested_logprobs and not self.enable_sampler_metrics:
+                    continue
+                payload = self._score_output_row(
+                    logits=_logits[row_pos : row_pos + 1],
+                    sampled_tokens=out_tokens_win[row_pos : row_pos + 1],
+                    history=token_ids_window_cpu[row_pos],
+                    seq_len=int(seq_len),
+                    sampling_params=req_state.sampling_params,
+                )
+                logprob_payloads[rid] = payload
+                if self.enable_sampler_metrics:
+                    if window_metric_scores is None:
+                        window_metric_scores = jnp.zeros((padded_num_reqs,), dtype=jnp.float32)
+                    window_metric_scores = window_metric_scores.at[row_pos].set(payload[1][0, 0])
+
+            if needs_async_output:
+                copy_enqueue_start = time.time()
+                row_positions = [row_pos for row_pos, *_rest in window_entries]
+                async_windows.append(
+                    AsyncWindowResult(
+                        req_ids=[rid for _, rid, *_rest in window_entries],
+                        row_positions=row_positions,
+                        sampled_token_ids=jax.copy_to_host_async(out_tokens_win[:padded_num_reqs]),
+                        valid_mask=[is_valid for *_, is_valid in window_entries],
+                        token_logprobs=(
+                            jax.copy_to_host_async(window_metric_scores) if window_metric_scores is not None else None
+                        ),
+                    )
+                )
+                total_async_copy_enqueue_time += time.time() - copy_enqueue_start
+                total_post_proc_time += time.time() - up_wtime
+                start_index = next_start_index
+                continue
+
+            token_materialize_start = time.time()
+            tokens_np = np.asarray(out_tokens_win)
+            hidden_states_for_spec = _hidden_states
+            hidden_np_len = (
+                int(getattr(hidden_states_for_spec, "shape", (0,))[0]) if hidden_states_for_spec is not None else 0
+            )
+            if self.drafter is not None and bool(getattr(self.drafter, "whole_block_draft", False)):
+                # DSpark: hand this step's hidden rows to the drafter (rings are fed from committed positions only).
+                self.spec.observe_window_hidden(
+                    hidden_states_for_spec,
+                    req_ids_window=req_ids_window,
+                    scheduled_list=scheduled_list,
+                    token_offsets=window_token_offsets,
+                    start_positions=num_computed_tokens_window_cpu,
+                    scheduled_spec=scheduler_output.scheduled_spec_decode_tokens,
+                )
+            logits_np = np.asarray(window_metric_scores) if window_metric_scores is not None else None
+            total_token_materialize_time += time.time() - token_materialize_start
+
+            spec_commit_scheduled_list = [int(n) for n in scheduled_list]
+            spec_window_needs_commit = False
+            spec_window_requires_replay = False
+            rng_after_verify = self.executor_manager.rng_key if spec_decode_active_window else None
+
+            _replay_prefix_sample = partial(
+                self.spec.replay_prefix_sample,
+                pre_step_kv_pages=pre_step_kv_pages,
+                num_computed_tokens_window_cpu=num_computed_tokens_window_cpu,
+                num_tokens_static=num_tokens_static,
+                window_row_indices_cpu=window_row_indices_cpu,
+                recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
+                padded_num_reqs=padded_num_reqs,
+                token_ids_window_cpu=token_ids_window_cpu,
+                temperature_window_cpu=temperature_window_cpu,
+                top_p_window_cpu=top_p_window_cpu,
+                top_k_window_cpu=top_k_window_cpu,
+                min_p_window_cpu=min_p_window_cpu,
+                frequency_penalties_window_cpu=frequency_penalties_window_cpu,
+                presence_penalties_window_cpu=presence_penalties_window_cpu,
+                repetition_penalties_window_cpu=repetition_penalties_window_cpu,
+                page_table_window_cpu=page_table_window_cpu,
+                page_table_window_version=page_table_window_version,
+                mrope_position_ids_cpu=mrope_position_ids_cpu,
+                prefill_embeds_cpu=prefill_embeds_cpu,
+                prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
+                visual_pos_masks_cpu=visual_pos_masks_cpu,
+                deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
+                window_token_offsets=window_token_offsets,
+                total_scheduled=total_scheduled,
+                rng_after_verify=rng_after_verify,
+            )
+
+            _replay_prefix_sequential = partial(
+                self.spec.replay_prefix_sequential,
+                pre_step_kv_pages=pre_step_kv_pages,
+                num_computed_tokens_window_cpu=num_computed_tokens_window_cpu,
+                window_row_indices_cpu=window_row_indices_cpu,
+                recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
+                padded_num_reqs=padded_num_reqs,
+                token_ids_window_cpu=token_ids_window_cpu,
+                temperature_window_cpu=temperature_window_cpu,
+                top_p_window_cpu=top_p_window_cpu,
+                top_k_window_cpu=top_k_window_cpu,
+                min_p_window_cpu=min_p_window_cpu,
+                frequency_penalties_window_cpu=frequency_penalties_window_cpu,
+                presence_penalties_window_cpu=presence_penalties_window_cpu,
+                repetition_penalties_window_cpu=repetition_penalties_window_cpu,
+                page_table_window_cpu=page_table_window_cpu,
+                page_table_window_version=page_table_window_version,
+                mrope_position_ids_cpu=mrope_position_ids_cpu,
+                prefill_embeds_cpu=prefill_embeds_cpu,
+                prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
+                visual_pos_masks_cpu=visual_pos_masks_cpu,
+                deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
+                rng_after_verify=rng_after_verify,
+            )
+
+            # Project + argmax the verify rows of EVERY greedy spec request in
+            # this window together: ONE LM-head matmul over the pooled
+            # ``[sum(k+1), H]`` hidden rows and ONE device->host argmax transfer,
+            # instead of N per-request projections and N blocking int() syncs.
+            # Each request's slice is stashed in ``batched_verify_by_row`` and
+            # consumed by the emission loop below, which then does only host
+            # bookkeeping. Gated exactly like the batched drafter: only greedy,
+            # spec-eligible, full-hidden-available rows, and only when >= 2 are
+            # verified together (a single request stays bit-identical to the
+            # per-request path). ``EASYDEL_DISABLE_BATCHED_EMIT=1`` forces the
+            # legacy per-request project/argmax (A/B + isolated parity proof).
+            batched_verify_by_row: dict[int, _BatchedVerifyRow] = {}
+            verify_meta_by_row: dict[int, typing.Any] = {}
+            # Populated either by the fused draft-in-verify pre-pass (drafts
+            # already on host) or by the legacy early batched-draft dispatch
+            # below (drafts still on device); consumed by the emission loop and
+            # the post-loop writeback in both cases.
+            early_draft_handle: dict | None = None
+            early_draft_by_rid: dict[str, tuple[int, int]] = {}
+            batched_emit_enabled = (
+                spec_decode_active_window
+                and self.drafter is not None
+                and hidden_states_for_spec is not None
+                # Exact recurrent replay re-derives the corrected token and seed
+                # hidden in the per-request path. Batched argmax consumption
+                # would bypass that replay and its live recurrent-state update.
+                and not (self.spec_decode_recurrent_candidates and self.spec_decode_recurrent_replay)
+                and not flags.get_bool(flags.EASYDEL_DISABLE_BATCHED_EMIT)
+            )
+            if batched_emit_enabled:
+                _flat_indices: list[int] = []
+                _pending_bv: list[tuple[int, int, int, typing.Any]] = []
+                for _rp, _rid, _rs, _ridx, _sl, _iv in window_entries:
+                    if not _iv or _rs is None or _ridx is None:
+                        continue
+                    _sched_n = int(scheduled_list[_rp])
+                    _spec_toks = scheduler_output.scheduled_spec_decode_tokens.get(_rid, [])
+                    if not (
+                        bool(_spec_toks) and all(int(_t) >= 0 for _t in _spec_toks) and self.spec.is_spec_request(_rs)
+                    ):
+                        continue
+                    _real_count = _sched_n - len(_spec_toks)
+                    if _real_count <= 0:
+                        continue
+                    if not self.spec.is_greedy_request(_rs):
+                        continue
+                    _meta_start = time.time()
+                    _meta = self.spec.build_verify_metadata(
+                        request_id=_rid,
+                        row_pos=int(_rp),
+                        req_idx=int(_ridx),
+                        start_pos=int(num_computed_tokens_window_cpu[_rp]),
+                        real_count=int(_real_count),
+                        scheduled_draft_tokens=[int(_t) for _t in _spec_toks],
+                        token_ids_window_cpu=token_ids_window_cpu,
+                        token_offset=int(window_token_offsets[int(_rp)]),
+                    )
+                    total_spec_meta_time += time.time() - _meta_start
+                    if hidden_np_len < int(_meta.bonus_local_index) + 1:
+                        continue
+                    _idxs = [*_meta.target_local_indices, int(_meta.bonus_local_index)]
+                    _pending_bv.append((int(_rp), len(_flat_indices), len(_idxs), _meta))
+                    _flat_indices.extend(int(_x) for _x in _idxs)
+                # Kept at >= 2: a lone request routed through the fused draft-in-verify program changed greedy
+                # output vs plain on the real GLM-5.3 checkpoint (in-program LM-head argmax != runner lm_head
+                # executable on near-ties) with no throughput gain over the pooled post-loop draft.
+                if len(_pending_bv) >= 2:
+                    _total_rows = len(_flat_indices)
+                    # Pad to a stable ``padded_num_reqs * (k+1)`` bucket so the
+                    # on-demand LM-head executable count stays bounded (<= one
+                    # per request bucket) instead of one per distinct row total.
+                    # With a dynamic schedule, size k to the LARGEST verify
+                    # window actually collected this step (a schedule k, so the
+                    # executable count stays <= one per (request bucket,
+                    # schedule-k) pair) instead of always the static maximum.
+                    _pad_window_k = int(self.num_draft_tokens)
+                    if self.draft_schedule is not None:
+                        _pad_window_k = max(
+                            (int(_cnt) - 1 for (_rp2, _off2, _cnt, _meta2) in _pending_bv),
+                            default=_pad_window_k,
+                        )
+                    _pad_target = max(_total_rows, int(padded_num_reqs) * (_pad_window_k + 1))
+                    if _total_rows < _pad_target:
+                        _flat_indices.extend([_flat_indices[0]] * (_pad_target - _total_rows))
+                    _idx_arr = np.asarray(_flat_indices, dtype=np.int32)
+                    _project_start = time.time()
+                    _gathered_hidden = hidden_states_for_spec[_idx_arr]
+                    total_spec_project_time += time.time() - _project_start
+                    # Fold the greedy argmax, the acceptance compare, and the K
+                    # recursive MTP draft forwards into ONE compiled program:
+                    # the separate drafter dispatch (and the host round-trip
+                    # between the argmax readback and that dispatch)
+                    # disappears — the step's only host sync returns argmaxes
+                    # AND next-window drafts together. Gated to the exact cases
+                    # whose host semantics the in-program acceptance reproduces:
+                    # greedy batched rows (>= 2), no recurrent replay (it
+                    # re-derives the corrected token after this point), no
+                    # reject-backoff, no debug traces (they need the full verify
+                    # logits), and a steady-state window (the verify width
+                    # k_pad equals this step's live draft budget — dynamic-K
+                    # transition steps fall back to the two-dispatch flow).
+                    # ``EASYDEL_DISABLE_DRAFT_IN_VERIFY=1`` forces the fallback.
+                    fused_verify_results: dict | None = None
+                    if (
+                        step_allows_batch
+                        and spec_token_ids_all is not None
+                        and not self.spec_decode_recurrent_replay
+                        and int(getattr(self.spec, "reject_backoff_steps", 0) or 0) <= 0
+                        and self.spec_decode_debug_max_traces <= 0
+                        and int(_pad_window_k) == int(getattr(self.spec, "live_num_draft_tokens", 0))
+                        and self.spec.can_draft_in_verify()
+                        and all(
+                            self.spec.can_batch_draft(self.requests.get(str(_meta2.request_id)))
+                            for (_rp2, _off2, _cnt2, _meta2) in _pending_bv
+                        )
+                        # The fused program has no history counts, so penalised windows take the two-dispatch flow.
+                        and not any(
+                            self.spec.uses_history_penalties(self.requests.get(str(_meta2.request_id)))
+                            for (_rp2, _off2, _cnt2, _meta2) in _pending_bv
+                        )
+                    ):
+                        draft_timer_start = time.time()
+                        _fused_handle = self.spec.begin_draft_in_verify(
+                            [(_meta2, int(_off2), int(_cnt2)) for (_rp2, _off2, _cnt2, _meta2) in _pending_bv],
+                            gathered_hidden=_gathered_hidden,
+                            k_pad=int(_pad_window_k),
+                        )
+                        total_spec_draft_time += time.time() - draft_timer_start
+                        if _fused_handle is not None:
+                            _argmax_start = time.time()
+                            fused_verify_results = self.spec.finish_draft_in_verify(_fused_handle)
+                            total_spec_argmax_sync_time += time.time() - _argmax_start
+                    if fused_verify_results is not None:
+                        _fused_drafts_by_rid: dict[str, list[int]] = {}
+                        for _rp, _off, _cnt, _meta in _pending_bv:
+                            _rid2 = str(_meta.request_id)
+                            _res = fused_verify_results[_rid2]
+                            verify_meta_by_row[_rp] = _meta
+                            batched_verify_by_row[_rp] = _BatchedVerifyRow(
+                                verify_meta=_meta,
+                                offset=int(_off),
+                                count=int(_cnt),
+                                argmaxes=[int(_x) for _x in _res["argmaxes"]],
+                                gathered_hidden=_gathered_hidden,
+                                batched_logits=None,
+                            )
+                            # Mark the request as already drafted so the emission
+                            # loop reserves its output slot; the drafts (already
+                            # on host) are written back after the loop through
+                            # the shared early-draft writeback.
+                            early_draft_by_rid[_rid2] = (int(_meta.req_idx), int(_res["known_len"]))
+                            _fused_drafts_by_rid[_rid2] = list(_res["drafts"])
+                        fused_draft_batches.append((_fused_drafts_by_rid, early_draft_by_rid))
+                    else:
+                        _project_start = time.time()
+                        _batched_logits = self.spec.project_hidden_rows(_gathered_hidden)
+                        total_spec_project_time += time.time() - _project_start
+                        _argmax_start = time.time()
+                        # Penalised requests get the sampler's history-penalty transform on their verify rows
+                        # (on device, only the argmaxes come back); ``None`` keeps the plain argmax.
+                        _penalized_argmax = self.spec.penalized_verify_argmaxes(
+                            _batched_logits,
+                            [(_meta2, int(_off2), int(_cnt2)) for (_rp2, _off2, _cnt2, _meta2) in _pending_bv],
+                        )
+                        if _penalized_argmax is not None:
+                            _batched_argmax = np.asarray(_penalized_argmax).astype(np.int64)
+                        else:
+                            _batched_argmax = np.asarray(jnp.argmax(_batched_logits, axis=-1)).astype(np.int64)
+                        total_spec_argmax_sync_time += time.time() - _argmax_start
+                        for _rp, _off, _cnt, _meta in _pending_bv:
+                            verify_meta_by_row[_rp] = _meta
+                            batched_verify_by_row[_rp] = _BatchedVerifyRow(
+                                verify_meta=_meta,
+                                offset=int(_off),
+                                count=int(_cnt),
+                                argmaxes=[int(_x) for _x in _batched_argmax[_off : _off + _cnt].tolist()],
+                                gathered_hidden=_gathered_hidden,
+                                batched_logits=_batched_logits,
+                            )
+            # Every input the batched drafter needs (per-request accepted count,
+            # corrected token, seed position, seed hidden row) is derivable from
+            # the pre-pass argmaxes, so ENQUEUE the drafter's device work here —
+            # before the host emission loop — and read it back after the loop
+            # (finish_batched_draft). The drafter's device time then overlaps
+            # the emission python instead of serializing after it, and the seed
+            # hidden rows are fetched with ONE fused gather instead of one
+            # eager device slice per request. Gated exactly like the emission
+            # loop's batched-draft queueing (greedy, batched-capable requests,
+            # >= 2 verified together), plus: no recurrent replay (which would
+            # re-derive the corrected token after this point) and no
+            # reject-backoff (its state is only updated later in the loop).
+            # Skipped when the fused draft-in-verify pre-pass already produced
+            # this window's drafts (``early_draft_by_rid`` pre-populated).
+            if (
+                not early_draft_by_rid
+                and batched_verify_by_row
+                and step_allows_batch
+                and spec_token_ids_all is not None
+                and not self.spec_decode_recurrent_replay
+                and int(getattr(self.spec, "reject_backoff_steps", 0) or 0) <= 0
+            ):
+                draft_timer_start = time.time()
+                _early_seeds: list[tuple[str, int, int, int, int]] = []
+                for _rp, _off, _cnt, _meta in _pending_bv:
+                    _bv2 = batched_verify_by_row.get(int(_rp))
+                    if _bv2 is None:
+                        continue
+                    _rid2 = str(_meta.request_id)
+                    _rs2 = self.requests.get(_rid2)
+                    if not self.spec.can_batch_draft(_rs2):
+                        continue
+                    _acc = 0
+                    for _draft_idx, _draft_tok in enumerate(_meta.buffer_draft_tokens):
+                        if int(_bv2.argmaxes[_draft_idx]) != int(_draft_tok):
+                            break
+                        _acc += 1
+                    _corrected = int(_bv2.argmaxes[_acc])
+                    _known_len = int(_meta.start_pos) + int(_meta.real_count) + _acc + 1
+                    _seed_pos = max(0, _known_len - 2)
+                    _early_seeds.append((_rid2, int(_meta.req_idx), _corrected, _seed_pos, int(_off) + _acc))
+                    early_draft_by_rid[_rid2] = (int(_meta.req_idx), _known_len)
+                if len(_early_seeds) >= 2:
+                    early_draft_handle = self.spec.begin_batched_draft(
+                        _early_seeds,
+                        seed_hidden_matrix=_gathered_hidden,
+                    )
+                    early_draft_batches.append((early_draft_handle, early_draft_by_rid))
+                else:
+                    early_draft_by_rid.clear()
+                total_spec_draft_time += time.time() - draft_timer_start
+
+            # Whole-block drafters (DSpark): collect this window's verify-path drafts and draft them in one batched call
+            # after the emission loop (before the commit replay), instead of one draft pass + host sync per request.
+            whole_block_batch_ok = self.drafter is not None and self.spec.can_batch_whole_block_draft()
+            pending_whole_block_drafts: list[tuple[str, int, int, int, CachedRequestState, int, int]] = []
+            for row_pos, rid, req_state, req_idx, seq_len, is_valid in window_entries:
+                if not is_valid:
+                    sampled_token_ids_all.append([])
+                    if spec_token_ids_all is not None:
+                        spec_token_ids_all.append([])
+                    continue
+
+                scheduled_n = int(scheduled_list[row_pos])
+                scheduled_spec_tokens = [int(t) for t in scheduler_output.scheduled_spec_decode_tokens.get(rid, [])]
+                has_scheduled_specs = (
+                    self.drafter is not None
+                    and bool(scheduled_spec_tokens)
+                    and all(int(t) >= 0 for t in scheduled_spec_tokens)
+                    and self.spec.is_spec_request(req_state)
+                )
+
+                if has_scheduled_specs:
+                    if req_state is None or req_idx is None:
+                        sampled_token_ids_all.append([])
+                        if spec_token_ids_all is not None:
+                            spec_token_ids_all.append([])
+                        continue
+                    real_count = scheduled_n - len(scheduled_spec_tokens)
+                    if real_count <= 0:
+                        sampled_token_ids_all.append([])
+                        if spec_token_ids_all is not None:
+                            spec_token_ids_all.append([])
+                        continue
+
+                    verify_meta = verify_meta_by_row.get(int(row_pos))
+                    if verify_meta is None:
+                        _meta_start = time.time()
+                        verify_meta = self.spec.build_verify_metadata(
+                            request_id=rid,
+                            row_pos=int(row_pos),
+                            req_idx=int(req_idx),
+                            start_pos=int(num_computed_tokens_window_cpu[row_pos]),
+                            real_count=int(real_count),
+                            scheduled_draft_tokens=scheduled_spec_tokens,
+                            token_ids_window_cpu=token_ids_window_cpu,
+                            token_offset=int(window_token_offsets[int(row_pos)]),
+                        )
+                        total_spec_meta_time += time.time() - _meta_start
+                    draft_tokens_for_verify = verify_meta.buffer_draft_tokens
+                    accepted = 0
+                    projected_target_tokens: list[int] = []
+                    hidden_rows: jax.Array | None = None
+                    greedy_spec = self.spec.is_greedy_request(req_state)
+                    want_output_scores = rid in requested_logprobs or self.enable_sampler_metrics
+                    output_score_rows: list[jax.Array] = []
+                    recurrent_state_advanced_by_suffix = False
+                    required_hidden_len = int(verify_meta.bonus_local_index) + 1
+                    can_project_full_hidden = hidden_np_len >= required_hidden_len
+                    _bv = batched_verify_by_row.get(int(row_pos)) if can_project_full_hidden else None
+                    if _bv is not None:
+                        # Batched greedy fast path: this request's verify-row LM-head
+                        # projection and greedy argmax were computed once in the
+                        # per-step pre-pass over the whole running batch. Consume the
+                        # host argmaxes and the shared gathered hidden; no per-request
+                        # project / argmax / device->host sync happens here.
+                        for draft_idx, draft_token in enumerate(draft_tokens_for_verify):
+                            if int(_bv.argmaxes[draft_idx]) != int(draft_token):
+                                break
+                            accepted += 1
+                        corrected_token = int(_bv.argmaxes[accepted])
+                        if str(rid) in early_draft_by_rid:
+                            # This request's next drafts were already dispatched by
+                            # the early batched-draft pre-pass, which also fetched
+                            # its seed hidden row in the fused gather — skip the
+                            # per-request device slice on the hot loop.
+                            seed_hidden = None
+                        else:
+                            seed_hidden = _bv.gathered_hidden[_bv.offset + accepted]
+                        if self.spec_decode_debug_max_traces > 0:
+                            self.spec.record_verify_trace(
+                                meta=verify_meta,
+                                logits_rows=_bv.batched_logits[_bv.offset : _bv.offset + _bv.count],
+                                accepted=accepted,
+                                corrected_token=corrected_token,
+                                greedy=True,
+                                source="full-hidden-batched",
+                            )
+                    elif can_project_full_hidden:
+                        spec_hidden_indices = np.asarray(
+                            [*verify_meta.target_local_indices, verify_meta.bonus_local_index],
+                            dtype=np.int32,
+                        )
+                        hidden_rows = hidden_states_for_spec[spec_hidden_indices]
+                        project_timer_start = time.time()
+                        logits_rows = self.spec.project_hidden_rows(hidden_rows)
+                        total_spec_project_time += time.time() - project_timer_start
+                        if greedy_spec:
+                            _argmax_start = time.time()
+                            # A lone (or otherwise unpooled) penalised request is penalised here too.
+                            _penalized_argmax = self.spec.penalized_verify_argmaxes(
+                                logits_rows,
+                                [(verify_meta, 0, int(logits_rows.shape[0]))],
+                            )
+                            if _penalized_argmax is not None:
+                                projected_target_tokens = np.asarray(_penalized_argmax).astype(np.int64).tolist()
+                            else:
+                                projected_target_tokens = (
+                                    np.asarray(jnp.argmax(logits_rows, axis=-1)).astype(np.int64).tolist()
+                                )
+                            total_spec_argmax_sync_time += time.time() - _argmax_start
+                            for draft_idx, draft_token in enumerate(draft_tokens_for_verify):
+                                if int(projected_target_tokens[draft_idx]) != int(draft_token):
+                                    break
+                                accepted += 1
+                            corrected_token = int(projected_target_tokens[accepted])
+                            if self.spec_decode_recurrent_candidates and self.spec_decode_recurrent_replay:
+                                # Exact greedy path (default; required for
+                                # correctness): advance the live recurrent state via
+                                # a sequential-GDN replay and re-derive the corrected
+                                # token + seed hidden from it. The "fast" path
+                                # (EASYDEL_SPEC_RECURRENT_REPLAY=0) instead reused the
+                                # fused verify forward's argmax + the deferred
+                                # recurrent candidate-commit; that commit is NOT exact
+                                # for greedy, so the live GDN state diverged from
+                                # plain greedy decode -> greedy spec output diverged
+                                # from the target's greedy stream at the first verify
+                                # window and was cross-process non-deterministic
+                                # (stale/uninitialized candidate rows). See
+                                # tests/inference/esurge/test_spec_decode.py::
+                                # test_esurge_runner_spec_decode.
+                                corrected_token, replay_hidden = _replay_prefix_sequential(
+                                    int(row_pos),
+                                    prefix_len=int(real_count + accepted),
+                                )
+                                _penalized_token = self.spec.penalized_replay_token(
+                                    meta=verify_meta,
+                                    req_state=req_state,
+                                    hidden_row=replay_hidden,
+                                    draft_prefix=int(accepted),
+                                )
+                                if _penalized_token is not None:
+                                    corrected_token = _penalized_token
+                                hidden_rows = hidden_rows.at[accepted].set(replay_hidden)
+                                recurrent_state_advanced_by_suffix = True
+                        else:
+                            if want_output_scores:
+                                output_score_rows = list(self.spec.filtered_log_probs(logits_rows, req_state))
+                            draft_fulls = self.spec.draft_full_log_probs_by_req.pop(str(rid), None)
+                            if draft_fulls is None or int(draft_fulls.shape[0]) < len(draft_tokens_for_verify):
+                                target_fulls = self.spec.filtered_log_probs(logits_rows, req_state)
+                                corrected_token = self.spec.sample_distribution(target_fulls[:1], req_state)
+                            else:
+                                accepted, corrected_token = self.spec.verify_sampled_window(
+                                    target_logits=logits_rows,
+                                    draft_log_probs=draft_fulls[: len(draft_tokens_for_verify)],
+                                    draft_tokens=draft_tokens_for_verify,
+                                    req_state=req_state,
+                                )
+                        # Whole-block drafters (DSpark) draft after this loop from the rows handed over by
+                        # ``observe_window_hidden`` and never read ``seed_hidden``; skip the per-request device slice.
+                        seed_hidden = (
+                            None if (whole_block_batch_ok and spec_token_ids_all is not None) else hidden_rows[accepted]
+                        )
+                        self.spec.record_verify_trace(
+                            meta=verify_meta,
+                            logits_rows=logits_rows,
+                            accepted=accepted,
+                            corrected_token=corrected_token,
+                            greedy=greedy_spec,
+                            source="full-hidden",
+                        )
+                    else:
+                        corrected_token = int(tokens_np[row_pos])
+                        seed_hidden = window_hidden_row(
+                            hidden_states_for_spec,
+                            row_pos=int(row_pos),
+                            token_offset=int(window_token_offsets[int(row_pos)]),
+                            token_index=max(0, scheduled_n - 1),
+                            total_window_tokens=int(total_scheduled),
+                            padded_reqs=int(padded_num_reqs),
+                        )
+                        trace_logits_rows: list[jax.Array] = []
+                        want_trace_logits = (
+                            self.spec_decode_debug_max_traces > 0
+                            and len(self.spec_decode_debug_traces) < self.spec_decode_debug_max_traces
+                        )
+                        if greedy_spec:
+                            for draft_idx, draft_token in enumerate(draft_tokens_for_verify):
+                                target_token, target_hidden = _replay_prefix_sample(row_pos, real_count + draft_idx)
+                                _penalized_token = self.spec.penalized_replay_token(
+                                    meta=verify_meta,
+                                    req_state=req_state,
+                                    hidden_row=target_hidden,
+                                    draft_prefix=int(draft_idx),
+                                )
+                                if _penalized_token is not None:
+                                    target_token = _penalized_token
+                                corrected_token = int(target_token)
+                                seed_hidden = target_hidden
+                                if want_trace_logits:
+                                    trace_logits_rows.append(self.spec.project_hidden_rows(target_hidden[None, :])[0])
+                                if int(target_token) != int(draft_token):
+                                    break
+                                accepted += 1
+                            if accepted == len(draft_tokens_for_verify):
+                                corrected_token, seed_hidden = _replay_prefix_sample(row_pos, real_count + accepted)
+                                _penalized_token = self.spec.penalized_replay_token(
+                                    meta=verify_meta,
+                                    req_state=req_state,
+                                    hidden_row=seed_hidden,
+                                    draft_prefix=int(accepted),
+                                )
+                                if _penalized_token is not None:
+                                    corrected_token = _penalized_token
+                        else:
+                            draft_fulls = self.spec.draft_full_log_probs_by_req.pop(str(rid), None)
+                            if draft_fulls is not None and int(draft_fulls.shape[0]) >= len(draft_tokens_for_verify):
+                                for draft_idx, draft_token in enumerate(draft_tokens_for_verify):
+                                    _target_token, target_hidden = _replay_prefix_sample(
+                                        row_pos,
+                                        real_count + draft_idx,
+                                    )
+                                    target_full = self.spec.filtered_log_probs(
+                                        self.spec.project_hidden_rows(target_hidden[None, :]),
+                                        req_state,
+                                    )
+                                    if want_trace_logits:
+                                        trace_logits_rows.append(target_full[0])
+                                    if want_output_scores:
+                                        output_score_rows.append(target_full[0])
+                                    tok = jnp.asarray([int(draft_token)], dtype=jnp.int32)
+                                    draft_full = draft_fulls[draft_idx : draft_idx + 1]
+                                    d_lp = jnp.take_along_axis(draft_full, tok[:, None], axis=-1).squeeze(-1)
+                                    t_lp = jnp.take_along_axis(target_full, tok[:, None], axis=-1).squeeze(-1)
+                                    accept_i = accept_or_reject(d_lp, t_lp, self.spec.rng_split(1)[0])
+                                    seed_hidden = target_hidden
+                                    if int(np.asarray(accept_i).reshape(-1)[0]) == 1:
+                                        accepted += 1
+                                        continue
+                                    corrected_token = int(
+                                        np.asarray(
+                                            resample_rejected(target_full, draft_full, self.spec.rng_split(1)[0])
+                                        ).reshape(-1)[0]
+                                    )
+                                    break
+                                else:
+                                    _target_token, seed_hidden = _replay_prefix_sample(row_pos, real_count + accepted)
+                                    bonus_full = self.spec.filtered_log_probs(
+                                        self.spec.project_hidden_rows(seed_hidden[None, :]),
+                                        req_state,
+                                    )
+                                    corrected_token = self.spec.sample_distribution(bonus_full, req_state)
+                                    if want_output_scores:
+                                        output_score_rows.append(bonus_full[0])
+                            else:
+                                # SP1: the drafter distributions are missing/short, so
+                                # every draft must be rejected (accepted stays 0).
+                                # Resample the target at the FIRST draft position, whose
+                                # context is the real tokens only — mirroring the
+                                # full-hidden branch (target_fulls[:1]). The pre-set
+                                # fallback `corrected_token = tokens_np[row_pos]` is the
+                                # bonus-position sample taken with the drafts as context
+                                # and must not be emitted.
+                                _target_token, target_hidden = _replay_prefix_sample(row_pos, real_count)
+                                target_full = self.spec.filtered_log_probs(
+                                    self.spec.project_hidden_rows(target_hidden[None, :]),
+                                    req_state,
+                                )
+                                corrected_token = self.spec.sample_distribution(target_full, req_state)
+                                seed_hidden = target_hidden
+                                if want_output_scores:
+                                    output_score_rows.append(target_full[0])
+                                if want_trace_logits:
+                                    trace_logits_rows.append(target_full[0])
+
+                        self.spec.record_verify_trace(
+                            meta=verify_meta,
+                            logits_rows=jnp.stack(trace_logits_rows, axis=0) if trace_logits_rows else None,
+                            accepted=accepted,
+                            corrected_token=corrected_token,
+                            greedy=greedy_spec,
+                            source="replay",
+                        )
+
+                    _emit_write_start = time.time()
+                    emitted = [int(t) for t in draft_tokens_for_verify[:accepted]] + [int(corrected_token)]
+                    if want_output_scores:
+                        emitted_array = jnp.asarray(emitted, dtype=jnp.int32)
+                        if greedy_spec:
+                            output_log_probs = jnp.where(
+                                jnp.arange(_logits.shape[-1])[None, :] == emitted_array[:, None], 0.0, -jnp.inf
+                            )
+                        else:
+                            # Rejection sampling emits the target policy marginal,
+                            # not the proposal or the conditional rejection residual.
+                            output_log_probs = jnp.stack(output_score_rows[: len(emitted)])
+                        logprob_payloads[rid] = tuple(
+                            jax.copy_to_host_async(array)
+                            for array in summarize_logprobs(
+                                output_log_probs,
+                                emitted_array,
+                                num_logprobs=max(0, int(req_state.sampling_params.logprobs or 0)),
+                            )
+                        )
+                        if self.enable_sampler_metrics:
+                            token_logprobs[rid] = float(np.asarray(logprob_payloads[rid][1])[-1, 0])
+                    sampled_token_ids_all.append(emitted)
+                    req_state.output_token_ids.extend(emitted)
+
+                    emit_start = int(num_computed_tokens_window_cpu[row_pos]) + real_count
+                    emit_end = emit_start + len(emitted)
+                    if emit_end <= self.max_model_len:
+                        self.sequence_buffer.token_ids[req_idx, emit_start:emit_end] = np.asarray(
+                            emitted,
+                            dtype=np.int32,
+                        )
+                    known_len = int(num_computed_tokens_window_cpu[row_pos]) + real_count + len(emitted)
+                    self.sequence_buffer.num_tokens_no_spec[req_idx] = min(known_len, self.max_model_len)
+                    self.sequence_buffer.num_tokens[req_idx] = min(known_len, self.max_model_len)
+                    total_spec_emit_write_time += time.time() - _emit_write_start
+
+                    self.spec.record_acceptance(
+                        rid,
+                        accepted=int(accepted),
+                        num_drafts=len(draft_tokens_for_verify),
+                    )
+                    if str(rid) in early_draft_by_rid:
+                        # Drafts already dispatched by the early batched-draft
+                        # pre-pass; reserve the output slot and write back after
+                        # the loop (finish_batched_draft).
+                        spec_idx = len(spec_token_ids_all)
+                        spec_token_ids_all.append([])
+                        early_draft_by_rid[str(rid)] = (int(req_idx), int(known_len), spec_idx)
+                    elif whole_block_batch_ok and spec_token_ids_all is not None:
+                        # Reserve the output slot; drafted with the window's other requests after the loop.
+                        spec_idx = len(spec_token_ids_all)
+                        spec_token_ids_all.append([])
+                        pending_whole_block_drafts.append(
+                            (
+                                str(rid),
+                                int(req_idx),
+                                int(emitted[-1]),
+                                max(0, int(known_len) - 2),
+                                req_state,
+                                int(known_len),
+                                spec_idx,
+                            )
+                        )
+                    elif self.spec.can_batch_draft(req_state) and step_allows_batch and spec_token_ids_all is not None:
+                        # Defer to the post-loop batched draft (see callsite above).
+                        spec_idx = len(spec_token_ids_all)
+                        spec_token_ids_all.append([])
+                        pending_batched_drafts.append(
+                            (
+                                rid,
+                                int(req_idx),
+                                int(emitted[-1]),
+                                max(0, int(known_len) - 2),
+                                seed_hidden,
+                                req_state,
+                                int(known_len),
+                                spec_idx,
+                            )
+                        )
+                    else:
+                        draft_timer_start = time.time()
+                        next_drafts = self.spec.draft_next(
+                            req_id=rid,
+                            seed_token=int(emitted[-1]),
+                            seed_position=max(0, int(known_len) - 2),
+                            seed_hidden=seed_hidden,
+                            req_state=req_state,
+                            # Stable KV-pool slot (see the sequential-greedy call above).
+                            row_pos=int(req_idx),
+                        )
+                        total_spec_draft_time += time.time() - draft_timer_start
+                        if next_drafts:
+                            draft_start = known_len
+                            draft_end = min(draft_start + len(next_drafts), self.max_model_len)
+                            self.sequence_buffer.token_ids[req_idx, draft_start:draft_end] = np.asarray(
+                                next_drafts[: draft_end - draft_start],
+                                dtype=np.int32,
+                            )
+                            self.sequence_buffer.num_tokens[req_idx] = draft_end
+                        if spec_token_ids_all is not None:
+                            spec_token_ids_all.append(next_drafts)
+                    if accepted_spec_tokens_by_req is not None:
+                        accepted_spec_tokens_by_req[rid] = int(accepted)
+                    if hidden_states_by_req is not None and seed_hidden is not None:
+                        hidden_states_by_req[rid] = seed_hidden
+                    self.spec_decode_num_drafts_accepted += int(accepted)
+                    self.spec_decode_num_verify_steps += 1
+                    spec_commit_scheduled_list[row_pos] = int(real_count + accepted)
+                    spec_window_needs_commit = True
+                    committed_candidate = True
+                    if self.spec.rolls_back_cache and not self.spec_decode_recurrent_candidates:
+                        # DSpark on a per-slot compressed-window cache: nothing commits implicitly, so a rejected
+                        # draft must restore the pre-verify snapshot and replay the accepted prefix.
+                        committed_candidate = False
+                    if (
+                        self.spec_decode_recurrent_candidates
+                        and int(real_count) > 0
+                        and not recurrent_state_advanced_by_suffix
+                    ):
+                        commit_timer_start = time.time()
+                        committed_candidate = self.spec.queue_or_commit_recurrent_candidate_state(
+                            req_id=str(rid),
+                            row_pos=int(row_pos),
+                            prefix_len=int(real_count + accepted),
+                            defer=not bool(getattr(self.drafter, "requires_target_kv_cache", False)),
+                        )
+                        total_spec_commit_time += time.time() - commit_timer_start
+                    if not committed_candidate:
+                        if self.spec.recurrent_candidate_count() > 0:
+                            spec_window_requires_replay = True
+                        elif accepted < len(draft_tokens_for_verify) and self.spec.cache_replay_required():
+                            spec_window_requires_replay = True
+                    tid = int(emitted[-1])
+                else:
+                    tid = int(tokens_np[row_pos])
+                    if req_state is not None and seq_len is not None:
+                        if req_idx is not None and 0 <= seq_len < self.max_model_len:
+                            self.sequence_buffer.token_ids[req_idx, seq_len] = tid
+                        sampled_token_ids_all.append([tid])
+                        req_state.output_token_ids.append(tid)
+                    else:
+                        sampled_token_ids_all.append([tid])
+
+                    if spec_token_ids_all is not None:
+                        next_drafts = []
+                        if (
+                            self.drafter is not None
+                            and req_state is not None
+                            and req_idx is not None
+                            and seq_len is not None
+                            and self.spec.is_spec_request(req_state)
+                        ):
+                            seed_hidden = window_hidden_row(
+                                hidden_states_for_spec,
+                                row_pos=int(row_pos),
+                                token_offset=int(window_token_offsets[int(row_pos)]),
+                                token_index=max(0, scheduled_n - 1),
+                                total_window_tokens=int(total_scheduled),
+                                padded_reqs=int(padded_num_reqs),
+                            )
+                            known_len = int(seq_len) + 1
+                            prefix_input_ids = None
+                            prefix_hidden_states = None
+                            prefix_position_ids = None
+                            token_offset_i = int(window_token_offsets[int(row_pos)])
+                            if (
+                                scheduled_n > 1
+                                and bool(getattr(self.drafter, "supports_prefix_draft", False))
+                                and hidden_np_len >= token_offset_i + int(scheduled_n)
+                            ):
+                                prefix_start = int(num_computed_tokens_window_cpu[int(row_pos)])
+                                row_tokens = np.asarray(token_ids_window_cpu[int(row_pos)])
+                                shifted = row_tokens[prefix_start + 1 : prefix_start + int(scheduled_n)]
+                                if int(shifted.shape[0]) == int(scheduled_n) - 1:
+                                    prefix_input_ids = jnp.asarray(
+                                        np.concatenate(
+                                            [shifted.astype(np.int32), np.asarray([tid], dtype=np.int32)],
+                                            axis=0,
+                                        )[None, :],
+                                        dtype=jnp.int32,
+                                    )
+                                    prefix_hidden_states = hidden_states_for_spec[
+                                        token_offset_i : token_offset_i + int(scheduled_n)
+                                    ][None, :, :]
+                                    prefix_position_ids = jnp.arange(
+                                        prefix_start,
+                                        prefix_start + int(scheduled_n),
+                                        dtype=jnp.int32,
+                                    )[None, :]
+                            if whole_block_batch_ok:
+                                # Whole-block drafters ignore the prefix inputs: draft with the window's other
+                                # requests after the loop; the flush fills the slot reserved by the append below
+                                # (``next_drafts`` stays ``[]`` here) and writes the drafts into the buffer.
+                                pending_whole_block_drafts.append(
+                                    (
+                                        str(rid),
+                                        int(req_idx),
+                                        int(tid),
+                                        max(0, int(known_len) - 2),
+                                        req_state,
+                                        int(known_len),
+                                        len(spec_token_ids_all),
+                                    )
+                                )
+                            else:
+                                draft_timer_start = time.time()
+                                next_drafts = self.spec.draft_next(
+                                    req_id=rid,
+                                    seed_token=tid,
+                                    seed_position=max(0, int(known_len) - 2),
+                                    seed_hidden=seed_hidden,
+                                    req_state=req_state,
+                                    prefix_input_ids=prefix_input_ids,
+                                    prefix_hidden_states=prefix_hidden_states,
+                                    prefix_position_ids=prefix_position_ids,
+                                    # Stable KV-pool slot (see the sequential-greedy call above).
+                                    row_pos=int(req_idx),
+                                )
+                                total_spec_draft_time += time.time() - draft_timer_start
+                            self.sequence_buffer.num_tokens_no_spec[req_idx] = min(known_len, self.max_model_len)
+                            self.sequence_buffer.num_tokens[req_idx] = min(known_len, self.max_model_len)
+                            if next_drafts:
+                                draft_start = known_len
+                                draft_end = min(draft_start + len(next_drafts), self.max_model_len)
+                                self.sequence_buffer.token_ids[req_idx, draft_start:draft_end] = np.asarray(
+                                    next_drafts[: draft_end - draft_start],
+                                    dtype=np.int32,
+                                )
+                                self.sequence_buffer.num_tokens[req_idx] = draft_end
+                            if hidden_states_by_req is not None:
+                                hidden_states_by_req[rid] = seed_hidden
+                            if accepted_spec_tokens_by_req is not None:
+                                accepted_spec_tokens_by_req.setdefault(rid, 0)
+                        spec_token_ids_all.append(next_drafts)
+
+                if (
+                    self.enable_sampler_metrics
+                    and rid not in token_logprobs
+                    and logits_np is not None
+                    and row_pos < logits_np.shape[0]
+                ):
+                    token_logprobs[rid] = float(logits_np[row_pos])
+
+            if pending_whole_block_drafts and spec_token_ids_all is not None:
+                draft_timer_start = time.time()
+                whole_block_drafts = self.spec.draft_whole_block_batched(
+                    [
+                        (rid_, tok_, pos_, rs_, idx_)
+                        for (rid_, idx_, tok_, pos_, rs_, _kl, _si) in pending_whole_block_drafts
+                    ]
+                )
+                for rid_, idx_, _tok, _pos, _rs, known_len_, spec_idx_ in pending_whole_block_drafts:
+                    next_drafts = whole_block_drafts.get(rid_, [])
+                    if next_drafts:
+                        draft_end = min(known_len_ + len(next_drafts), self.max_model_len)
+                        self.sequence_buffer.token_ids[idx_, known_len_:draft_end] = np.asarray(
+                            next_drafts[: draft_end - known_len_], dtype=np.int32
+                        )
+                        self.sequence_buffer.num_tokens[idx_] = draft_end
+                    spec_token_ids_all[spec_idx_] = next_drafts
+                total_spec_draft_time += time.time() - draft_timer_start
+
+            if spec_window_needs_commit and spec_window_requires_replay and pre_step_kv_pages is not None:
+                commit_timer_start = time.time()
+                self.spec.commit_cache_replay(
+                    pre_step_kv_pages=pre_step_kv_pages,
+                    commit_scheduled_list=spec_commit_scheduled_list,
+                    window_row_indices=window_row_indices_cpu,
+                    recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
+                    num_tokens_static_original=num_tokens_static,
+                    padded_num_reqs=padded_num_reqs,
+                    token_ids_window_cpu=token_ids_window_cpu,
+                    num_computed_tokens_window_cpu=num_computed_tokens_window_cpu,
+                    temperature_window_cpu=temperature_window_cpu,
+                    top_p_window_cpu=top_p_window_cpu,
+                    top_k_window_cpu=top_k_window_cpu,
+                    min_p_window_cpu=min_p_window_cpu,
+                    frequency_penalties_window_cpu=frequency_penalties_window_cpu,
+                    presence_penalties_window_cpu=presence_penalties_window_cpu,
+                    repetition_penalties_window_cpu=repetition_penalties_window_cpu,
+                    page_table_window_cpu=page_table_window_cpu,
+                    page_table_window_version=page_table_window_version,
+                    mrope_position_ids_cpu=mrope_position_ids_cpu,
+                    prefill_embeds_cpu=prefill_embeds_cpu,
+                    prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
+                    visual_pos_masks_cpu=visual_pos_masks_cpu,
+                    deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
+                )
+                if rng_after_verify is not None:
+                    self.executor_manager.rng_key = rng_after_verify
+                total_spec_commit_time += time.time() - commit_timer_start
+
+            total_post_proc_time += time.time() - up_wtime
+
+            start_index = next_start_index
+
+        self._apply_recurrent_snapshot_saves(scheduler_output)
+
+        # Draft every collected greedy inline-MTP request in ONE batched pass over
+        # the pooled MTP cache (``k`` batched forwards for the whole running batch,
+        # not ``N * k`` batch-1 forwards). Only reached when ``step_allows_batch`` (>= 2
+        # collected requests, or 1 when no replay rollback follows the verify); otherwise
+        # requests draft in-loop through the exact per-request path above. Runs after the
+        # window loop so all per-request fallback drafts (prefix / first window) have
+        # already advanced their pool rows; the batched pass leaves those rows
+        # untouched. The drafts are scattered back into each request's reserved output
+        # slot and sequence buffer exactly as the per-request path would have written
+        # them.
+        # Read back the early-dispatched batched drafts (their device work
+        # overlapped the emission loop above) and write them into the sequence
+        # buffer / output slots exactly as the legacy post-loop path would.
+        if (early_draft_batches or fused_draft_batches) and spec_token_ids_all is not None:
+            draft_timer_start = time.time()
+            resolved_batches = [
+                # Two-dispatch handles need the strategy readback; fused batches
+                # already carry host drafts (their single sync happened in the
+                # pre-pass together with the argmaxes).
+                *((self.spec.finish_batched_draft(_handle), _by_rid) for _handle, _by_rid in early_draft_batches),
+                *fused_draft_batches,
+            ]
+            for early_drafts, _by_rid in resolved_batches:
+                for _rid3, _entry in _by_rid.items():
+                    if len(_entry) != 3:
+                        continue
+                    _req_idx3, _known_len3, _spec_idx3 = _entry
+                    next_drafts = early_drafts.get(_rid3, [])
+                    if next_drafts:
+                        draft_start = int(_known_len3)
+                        draft_end = min(draft_start + len(next_drafts), self.max_model_len)
+                        self.sequence_buffer.token_ids[_req_idx3, draft_start:draft_end] = np.asarray(
+                            next_drafts[: draft_end - draft_start],
+                            dtype=np.int32,
+                        )
+                        self.sequence_buffer.num_tokens[_req_idx3] = draft_end
+                    spec_token_ids_all[_spec_idx3] = next_drafts
+            total_spec_draft_time += time.time() - draft_timer_start
+
+        if pending_batched_drafts and spec_token_ids_all is not None:
+            draft_timer_start = time.time()
+            batched_drafts = self.spec.draft_next_batched(
+                [
+                    (rid, req_idx, seed_token, seed_position, seed_hidden)
+                    for (rid, req_idx, seed_token, seed_position, seed_hidden, _rs, _known_len, _spec_idx) in (
+                        pending_batched_drafts
+                    )
+                ]
+            )
+            for (
+                rid,
+                req_idx,
+                _seed_token,
+                _seed_position,
+                _seed_hidden,
+                _req_state,
+                known_len,
+                spec_idx,
+            ) in pending_batched_drafts:
+                next_drafts = batched_drafts.get(rid, [])
+                if next_drafts:
+                    draft_start = known_len
+                    draft_end = min(draft_start + len(next_drafts), self.max_model_len)
+                    self.sequence_buffer.token_ids[req_idx, draft_start:draft_end] = np.asarray(
+                        next_drafts[: draft_end - draft_start],
+                        dtype=np.int32,
+                    )
+                    self.sequence_buffer.num_tokens[req_idx] = draft_end
+                spec_token_ids_all[spec_idx] = next_drafts
+            total_spec_draft_time += time.time() - draft_timer_start
+
+        req_id_to_row_index = {
+            rid: int(req_idx)
+            for rid in req_ids_all
+            if (req_idx := self.sequence_buffer.req_id_to_index.get(rid)) is not None
+        }
+        req_id_to_out_index = {rid: i for i, rid in enumerate(req_ids_all)}
+
+        final_output: ModelRunnerOutput | _AsyncExecutionHandle
+        if needs_async_output:
+            if scheduler_output.async_scheduling:
+                self._update_placeholder(
+                    discard_sampled_tokens_req_indices,
+                    request_seq_lens,
+                )
+                async_request_seq_lens = list(request_seq_lens)
+                async_pre_results = AsyncPreResults(
+                    windows=async_windows,
+                    request_seq_lens=async_request_seq_lens,
+                )
+                self._pre_async_results = async_pre_results
+            else:
+                async_request_seq_lens = []
+                async_pre_results = None
+
+            def _finalize_sync_runner_state(sampled_token_ids: list[list[int]]) -> None:
+                """Apply sampled tokens to host buffers for the synchronous overlap path.
+
+                Mirrors what the async finalizer does, but for the case where the
+                runner produced sampled tokens synchronously (no
+                :class:`AsyncPreResults` to consume on the next step). Walks
+                ``sync_finalize_entries`` in lockstep with the per-request
+                sampled-id lists and writes the last sampled token id into both
+                the device-side ``sequence_buffer.token_ids`` row and the host
+                ``output_token_ids`` queue of the corresponding
+                :class:`CachedRequestState`.
+                """
+                for sampled_ids, entry in zip(sampled_token_ids, sync_finalize_entries, strict=False):
+                    req_state, req_idx, seq_len = entry
+                    if not sampled_ids or req_state is None or seq_len is None:
+                        continue
+                    tid = int(sampled_ids[-1])
+                    if req_idx is not None and 0 <= seq_len < self.max_model_len:
+                        self.sequence_buffer.token_ids[req_idx, seq_len] = tid
+                    req_state.output_token_ids.append(tid)
+
+            async_output = _AsyncExecutionHandle(
+                model_runner_output=ModelRunnerOutput(
+                    req_ids=req_ids_all,
+                    req_id_to_index=req_id_to_out_index,
+                    req_id_to_row_index=req_id_to_row_index,
+                    sampled_token_ids=[],
+                    spec_token_ids=spec_token_ids_all,
+                    logprobs=None,
+                    prompt_logprobs_dict={rid: None for rid in req_ids_all},
+                    finished_sending=None,
+                    finished_recving=None,
+                    token_logprobs=None,
+                    num_accepted_spec_tokens=accepted_spec_tokens_by_req,
+                    hidden_states=hidden_states_by_req,
+                ),
+                windows=async_windows,
+                resolve_logprobs=partial(
+                    _materialize_logprobs,
+                    req_ids_all,
+                    payloads=logprob_payloads,
+                    requested=requested_logprobs,
+                ),
+                finalize=(
+                    partial(
+                        self._finalize_async_scheduler_runner_state,
+                        request_seq_lens=async_request_seq_lens,
+                        expected_pre_results=async_pre_results,
+                    )
+                    if scheduler_output.async_scheduling
+                    else _finalize_sync_runner_state
+                ),
+            )
+            if return_async_output:
+                final_output = async_output
+            else:
+                token_materialize_start = time.time()
+                resolved_output = async_output.get_output()
+                total_token_materialize_time += time.time() - token_materialize_start
+                final_output = resolved_output
+                token_logprobs = resolved_output.token_logprobs or token_logprobs
+        else:
+            final_output = ModelRunnerOutput(
+                req_ids=req_ids_all,
+                req_id_to_index=req_id_to_out_index,
+                req_id_to_row_index=req_id_to_row_index,
+                sampled_token_ids=sampled_token_ids_all,
+                spec_token_ids=spec_token_ids_all,
+                logprobs=_materialize_logprobs(req_ids_all, sampled_token_ids_all, logprob_payloads, requested_logprobs),
+                prompt_logprobs_dict={rid: None for rid in req_ids_all},
+                finished_sending=None,
+                finished_recving=None,
+                token_logprobs=token_logprobs or None,
+                num_accepted_spec_tokens=accepted_spec_tokens_by_req,
+                hidden_states=hidden_states_by_req,
+            )
+
+        metrics_start = time.time()
+        metrics_collector = get_metrics_collector()
+        if metrics_collector:
+            metrics_collector.record_runner_metrics(
+                execution_time=time.time() - execution_start_time,
+                batch_size=len(req_ids_all),
+                num_tokens=scheduler_output.total_num_scheduled_tokens,
+            )
+        metrics_time = time.time() - metrics_start
+
+        total_time = time.time() - execution_start_time
+        self._perf_iteration += 1
+
+        total_tokens = int(scheduler_output.total_num_scheduled_tokens)
+        agg_tps = total_tokens / total_time if total_time > 0 else 0.0
+        num_scheduled_reqs = sum(1 for n in scheduler_output.num_scheduled_tokens.values() if int(n) > 0)
+        req_tps = agg_tps / num_scheduled_reqs if num_scheduled_reqs > 0 else 0.0
+        self._perf_last_agg_tps = agg_tps
+        self._perf_last_req_tps = req_tps
+        self._perf_last_total_time = total_time
+        self._perf_last_total_tokens = total_tokens
+        if self._perf_tps_ema is None:
+            self._perf_tps_ema = agg_tps
+        else:
+            self._perf_tps_ema = self._perf_alpha * agg_tps + (1.0 - self._perf_alpha) * self._perf_tps_ema
+
+        def _fmt_bucket(values: set[int]) -> str:
+            """Format a set of compile-bucket sizes as a compact log string.
+
+            Returns ``"?"`` for empty sets, the lone value as-is for singletons,
+            and ``"min-max"`` for multi-value sets, used purely for human-readable
+            performance log lines so wide windows do not spam every distinct
+            bucket count.
+            """
+            if not values:
+                return "?"
+            if len(values) == 1:
+                return str(next(iter(values)))
+            vals = sorted(values)
+            return f"{vals[0]}-{vals[-1]}"
+
+        num_new = len(scheduler_output.scheduled_new_reqs)
+        num_cached = scheduler_output.scheduled_cached_reqs.num_reqs
+        num_finished = len(scheduler_output.finished_req_ids)
+        self._perf_history.append(
+            RunnerPerfSample(
+                iteration=self._perf_iteration,
+                total_tokens=total_tokens,
+                num_scheduled_reqs=num_scheduled_reqs,
+                num_new=num_new,
+                num_cached=num_cached,
+                num_finished=num_finished,
+                total_time=total_time,
+                agg_tps=agg_tps,
+                req_tps=req_tps,
+                ema_tps=float(self._perf_tps_ema),
+            )
+        )
+
+        step_gap_time = total_step_time - (total_prep_time + total_exec_time + total_sample_time)
+        step_gap_time = max(0.0, step_gap_time)
+
+        misc_time = total_time - (
+            updating_states_time
+            + prev_async_time
+            + total_runner_host_time
+            + total_async_copy_enqueue_time
+            + total_token_materialize_time
+            + total_post_proc_time
+            + total_prep_time
+            + total_exec_time
+            + total_sample_time
+            + total_execute_overhead_time
+            + step_gap_time
+            + metrics_time
+        )
+        misc_time = max(0.0, misc_time)
+
+        self._perf_phase_history.append(
+            {
+                "iteration": self._perf_iteration,
+                "total_tokens": total_tokens,
+                "num_scheduled_reqs": num_scheduled_reqs,
+                "num_new": num_new,
+                "num_cached": num_cached,
+                "num_finished": num_finished,
+                "num_windows": num_windows,
+                "token_buckets": sorted(int(v) for v in token_buckets_used),
+                "req_buckets": sorted(int(v) for v in req_buckets_used),
+                "agg_tps": agg_tps,
+                "req_tps": req_tps,
+                "ema_tps": float(self._perf_tps_ema),
+                "total_time": total_time,
+                "runner_time": total_runner_host_time,
+                "copy_enqueue_time": total_async_copy_enqueue_time,
+                "token_materialize_time": total_token_materialize_time,
+                "prep_time": total_prep_time,
+                "prep_host_time": total_prep_host_time,
+                "prep_put_time": total_prep_put_time,
+                "prep_extra_put_time": total_prep_extra_put_time,
+                "prep_batch_metadata_time": total_prep_batch_metadata_time,
+                "prep_handoff_time": total_prep_handoff_time,
+                "prep_sampler_window_time": total_prep_sampler_window_time,
+                "prep_ensure_variants_time": total_prep_ensure_variants_time,
+                "prep_pack_inputs_time": total_prep_pack_inputs_time,
+                "forward_time": total_exec_time,
+                "model_enqueue_time": total_model_enqueue_time,
+                "sampler_enqueue_time": total_sampler_enqueue_time,
+                "greedy_argmax_time": total_greedy_argmax_time,
+                "greedy_argmax_fastpath": total_greedy_argmax_fastpath,
+                "logits_wait_time": total_logits_wait_time,
+                "exec_enqueue_time": total_exec_enqueue_time,
+                "exec_wait_time": total_exec_wait_time,
+                "sample_time": total_sample_time,
+                "sampler_wait_time": total_sampler_wait_time,
+                "execute_overhead_time": total_execute_overhead_time,
+                "metrics_time": metrics_time,
+                "prev_async_time": prev_async_time,
+                "step_time": total_step_time,
+                "step_gap_time": step_gap_time,
+                "sync_time": updating_states_time,
+                "post_time": total_post_proc_time,
+                "spec_project_time": total_spec_project_time,
+                "spec_argmax_sync_time": total_spec_argmax_sync_time,
+                "spec_meta_time": total_spec_meta_time,
+                "spec_emit_write_time": total_spec_emit_write_time,
+                "spec_draft_time": total_spec_draft_time,
+                "spec_suffix_time": self._spec_suffix_time_acc,
+                "spec_replay_time": self._spec_replay_time_acc,
+                "spec_commit_time": total_spec_commit_time,
+                "misc_time": misc_time,
+                "pp_stage_dispatch_time": total_pp_stage_dispatch_time,
+                "pp_queue_wait_time": total_pp_queue_wait_time,
+                "pp_stage_launches": total_pp_stage_launches,
+                "pp_stage_compute_time": total_pp_stage_compute_time,
+                "pp_stage_max_time": total_pp_stage_max_time,
+                "pp_prepare_time": total_pp_prepare_time,
+                "pp_submit_time": total_pp_submit_time,
+                "pp_assemble_time": total_pp_assemble_time,
+                "pp_backbone_time": total_pp_backbone_time,
+                "pp_combine_time": total_pp_combine_time,
+                "pp_lm_head_time": total_pp_lm_head_time,
+                "pp_sampler_enqueue_time": total_pp_sampler_enqueue_time,
+                "pp_microbatch_scratch_time": total_pp_microbatch_scratch_time,
+                "pp_microbatch_metadata_time": total_pp_microbatch_metadata_time,
+                "pp_microbatch_handoff_time": total_pp_microbatch_handoff_time,
+                "pp_sampler_window_time": total_pp_sampler_window_time,
+                "pp_ensure_variants_time": total_pp_ensure_variants_time,
+            }
+        )
+
+        prep_detail = ""
+        if (total_prep_host_time + total_prep_put_time + total_prep_extra_put_time) > 0:
+            prep_detail = (
+                f"(host={total_prep_host_time * 1e3:.2f}ms put={total_prep_put_time * 1e3:.2f}ms "
+                f"extra={total_prep_extra_put_time * 1e3:.2f}ms) "
+            )
+        if (
+            total_prep_batch_metadata_time
+            + total_prep_handoff_time
+            + total_prep_sampler_window_time
+            + total_prep_ensure_variants_time
+            + total_prep_pack_inputs_time
+        ) > 0:
+            prep_detail += (
+                f"(batch={total_prep_batch_metadata_time * 1e3:.2f}ms "
+                f"handoff={total_prep_handoff_time * 1e3:.2f}ms "
+                f"samplerwin={total_prep_sampler_window_time * 1e3:.2f}ms "
+                f"ensure={total_prep_ensure_variants_time * 1e3:.2f}ms "
+                f"pack={total_prep_pack_inputs_time * 1e3:.2f}ms) "
+            )
+
+        queue_detail = (
+            f"q(run={int(getattr(scheduler_output, 'num_running_reqs', 0))},"
+            f"wait={int(getattr(scheduler_output, 'num_waiting_reqs', 0))},"
+            f"freep={getattr(scheduler_output, 'free_pages', '?')},"
+            f"budget={getattr(scheduler_output, 'token_budget_remaining', '?')}/"
+            f"{getattr(scheduler_output, 'token_budget_initial', '?')}) "
+        )
+        pp_detail = (
+            f"pp(stage={total_pp_stage_launches},dispatch={total_pp_stage_dispatch_time * 1e3:.2f}ms,"
+            f"queue={total_pp_queue_wait_time * 1e3:.2f}ms)"
+        )
+        if (
+            total_pp_prepare_time
+            + total_pp_submit_time
+            + total_pp_assemble_time
+            + total_pp_backbone_time
+            + total_pp_combine_time
+            + total_pp_lm_head_time
+            + total_pp_sampler_enqueue_time
+        ) > 0:
+            pp_detail += (
+                f" ppd(prep={total_pp_prepare_time * 1e3:.1f}ms,submit={total_pp_submit_time * 1e3:.1f}ms,"
+                f"asm={total_pp_assemble_time * 1e3:.1f}ms,bb={total_pp_backbone_time * 1e3:.1f}ms,"
+                f"comb={total_pp_combine_time * 1e3:.1f}ms,lm={total_pp_lm_head_time * 1e3:.1f}ms,"
+                f"sampq={total_pp_sampler_enqueue_time * 1e3:.1f}ms)"
+            )
+        if pp_stage_submit_times_by_index:
+            submit_detail = ",".join(
+                f"s{stage_idx}={stage_time * 1e3:.1f}ms"
+                for stage_idx, stage_time in sorted(pp_stage_submit_times_by_index.items())
+            )
+            pp_detail += f" pp_submit({submit_detail})"
+        if pp_stage_assemble_times_by_index or pp_stage_execute_times_by_index:
+            assemble_detail = ",".join(
+                f"s{stage_idx}={stage_time * 1e3:.1f}ms"
+                for stage_idx, stage_time in sorted(pp_stage_assemble_times_by_index.items())
+            )
+            execute_detail = ",".join(
+                f"s{stage_idx}={stage_time * 1e3:.1f}ms"
+                for stage_idx, stage_time in sorted(pp_stage_execute_times_by_index.items())
+            )
+            pp_detail += f" pp_split(asm=[{assemble_detail}],jit=[{execute_detail}])"
+        if (
+            total_pp_microbatch_scratch_time
+            + total_pp_microbatch_metadata_time
+            + total_pp_microbatch_handoff_time
+            + total_pp_sampler_window_time
+            + total_pp_ensure_variants_time
+        ) > 0:
+            pp_detail += (
+                f" ppmb(scratch={total_pp_microbatch_scratch_time * 1e3:.1f}ms,"
+                f"meta={total_pp_microbatch_metadata_time * 1e3:.1f}ms,"
+                f"handoff={total_pp_microbatch_handoff_time * 1e3:.1f}ms,"
+                f"samplerwin={total_pp_sampler_window_time * 1e3:.1f}ms,"
+                f"ensure={total_pp_ensure_variants_time * 1e3:.1f}ms)"
+            )
+        if total_pp_stage_compute_time > 0:
+            stage_detail = ",".join(
+                f"s{stage_idx}={stage_time * 1e3:.1f}ms"
+                for stage_idx, stage_time in sorted(pp_stage_times_by_index.items())
+            )
+            pp_detail = (
+                f"pp(stage={total_pp_stage_launches},compute={total_pp_stage_compute_time * 1e3:.2f}ms,"
+                f"max={total_pp_stage_max_time * 1e3:.2f}ms" + (f",{stage_detail}" if stage_detail else "") + ")"
+            )
+
+        self.log_it(
+            f"[perf] it={self._perf_iteration:06d} "
+            f"win={num_windows} "
+            f"reqs={len(req_ids_all)}(new={num_new},cached={num_cached},fin={num_finished},pad={_fmt_bucket(req_buckets_used)}) "
+            f"tok={total_tokens}/b{_fmt_bucket(token_buckets_used)} "
+            f"{queue_detail}"
+            f"agg_tps={agg_tps:,.0f} req_tps={req_tps:,.1f} ema={self._perf_tps_ema:,.0f} "
+            f"{pp_detail} "
+            f"runner={total_runner_host_time * 1e3:.2f}ms "
+            f"copyq={total_async_copy_enqueue_time * 1e3:.2f}ms "
+            f"token_wait={total_token_materialize_time * 1e3:.2f}ms "
+            f"prep={total_prep_time * 1e3:.2f}ms {prep_detail}"
+            f"fwd={total_exec_time * 1e3:.2f}ms samp={total_sample_time * 1e3:.2f}ms "
+            f"ovh={total_execute_overhead_time * 1e3:.2f}ms metrics={metrics_time * 1e3:.2f}ms "
+            f"async={prev_async_time * 1e3:.2f}ms "
+            f"step={total_step_time * 1e3:.2f}ms gap={step_gap_time * 1e3:.2f}ms "
+            f"sync={updating_states_time * 1e3:.2f}ms post={total_post_proc_time * 1e3:.2f}ms misc={misc_time * 1e3:.2f}ms "
+            f"total={total_time * 1e3:.2f}ms"
+        )
+
+        return final_output
+
+    def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
+        """Execute the model synchronously on scheduled requests.
+
+        Main public entry point for model execution. Delegates to the internal
+        implementation which handles state synchronization, batch processing,
+        and token generation.
+
+        Args:
+            scheduler_output: Output from the scheduler containing requests to
+                process, tokens to generate per request, and lifecycle information.
+
+        Returns:
+            ModelRunnerOutput containing request IDs, sampled tokens, and optional
+            log probabilities and timing information.
+
+        Note:
+            This is the synchronous version. For async execution that allows
+            overlapping with scheduling, use execute_model_async() instead.
+        """
+        return typing.cast(ModelRunnerOutput, self._execute_model_impl(scheduler_output))
+
+    def execute_model_async(self, scheduler_output: SchedulerOutput) -> _AsyncExecutionHandle:
+        """Dispatch model work and defer the host-side token materialization.
+
+        TPU/JAX dispatch is already asynchronous on the calling thread. This
+        method exploits that by keeping execution on the scheduler thread,
+        returning an async handle once the device work and host copies have been
+        queued, and letting the lifecycle loop do scheduler prefetch work before
+        calling wait_for_execution().
+
+        Args:
+            scheduler_output: Scheduler decision for the current step.
+
+        Returns:
+            An :class:`_AsyncExecutionHandle` whose ``get_output()`` blocks on
+            the device-to-host copies and finalizes the
+            :class:`ModelRunnerOutput`.
+        """
+        return typing.cast(_AsyncExecutionHandle, self._execute_model_impl(scheduler_output, return_async_output=True))
+
+    def initialize_async_executor(self) -> None:
+        """Retire any legacy background executor and confirm same-thread overlap.
+
+        Historical context: an earlier version of the overlap path moved
+        compiled-step dispatch to a :class:`ThreadPoolExecutor` so the
+        scheduler thread could prepare the next batch while the current
+        one was in flight. TPU/JAX dispatch turned out to be unreliable
+        across threads (different XLA-runtime contexts), so the design
+        was changed to keep dispatch on the scheduler thread and use
+        host-async copies (:meth:`execute_model_async`) for the overlap.
+        This method is retained for API compatibility: if a stale
+        executor is still attached (older callers), it is shut down
+        cleanly; otherwise it is a no-op that just records the chosen
+        overlap strategy.
+        """
+        if self._executor is not None:
+            logger.debug("Shutting down legacy async executor")
+            self._executor.shutdown(wait=True)
+            self._executor = None
+        logger.debug("Using same-thread async execution handles for overlap")
+
+    def reset_state(self) -> None:
+        """Forget every in-flight request and drop pending async results.
+
+        Wipes the runner's three state containers:
+
+        * ``self.requests`` — the dict of :class:`CachedRequestState` that
+          tracks per-request prompt tokens, vision data, and sample state.
+        * ``self.sequence_buffer`` — the per-row scheduler view (token ids,
+          positions, sampling params) backing the model step.
+        * ``self._pre_async_results`` — any deferred sampled-token payload
+          from the previous overlap window.
+
+        Required precondition (callers should enforce): no requests are
+        currently in flight, otherwise their device-side rows will become
+        unreachable. The method itself does not check, so the engine
+        :meth:`update_model_weights` / :meth:`pause` paths gate the call
+        on ``num_running_requests + num_pending_requests == 0``.
+        """
+        self.requests.clear()
+        self.sequence_buffer.clear()
+        self._pre_async_results = None
+        self.spec.on_reset()
+
+    def wait_for_execution(self, future: Future | _AsyncExecutionHandle) -> ModelRunnerOutput:
+        """Wait for an async execution to complete and return the result.
+
+        Args:
+            future: The async handle returned by execute_model_async()
+
+        Returns:
+            ModelRunnerOutput: The completed model execution output
+
+        Note:
+            This call blocks until sampled tokens have been copied to the host
+            and any deferred runner-side state updates have been applied.
+        """
+        if isinstance(future, _AsyncExecutionHandle):
+            return future.get_output()
+        return future.result()
+
+    def shutdown(self) -> None:
+        """Tear down legacy thread executor and forward to executor manager.
+
+        Engine-teardown path: drains any leftover background executor
+        retained for backward compat, then defers to
+        :meth:`ExecutionManager.shutdown` so resident PP-stage worker
+        threads inside :class:`ModelStepExecutor` are joined. Safe to
+        invoke when the runner has already been shut down.
+        """
+        if self._executor is not None:
+            logger.debug("Shutting down async executor")
+            self._executor.shutdown(wait=True)
+            self._executor = None
+        if getattr(self, "executor_manager", None) is not None:
+            self.executor_manager.shutdown()

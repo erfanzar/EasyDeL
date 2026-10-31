@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    name: CPU checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      JAX_PLATFORMS: cpu
+      XLA_FLAGS: --xla_force_host_platform_device_count=4
+      UV_SYSTEM_PYTHON: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev --extra test
+
+      - name: Ruff
+        run: uv run ruff check spectrax
+
+      - name: Basedpyright
+        run: uv run basedpyright spectrax
+
+      - name: Compile
+        run: uv run python -m compileall -q spectrax
+
+      - name: Tests
+        run: uv run pytest tests -q

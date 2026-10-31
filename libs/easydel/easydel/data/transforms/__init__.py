@@ -1,0 +1,176 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Transform DSL for data manipulation.
+
+This module provides a comprehensive transform system for data pipelines:
+- Chainable transforms with >> operator
+- Map and filter operations
+- Field manipulation (rename, select, drop, extract, combine)
+- Chat template application for conversational data
+"""
+
+from .base import ChainedTransform, ExpandTransform, Transform
+from .chat_template import (
+    DEFAULT_ROLE_MAPPING,
+    ChatTemplateTransform,
+    ConvertInputOutputToChatML,
+    ConvertToChatML,
+    MaybeApplyChatTemplate,
+)
+from .collators import collate_bucket_static, collate_embeds_pack, collate_packed_embeds
+from .field_ops import (
+    AddField,
+    CombineFields,
+    DropFields,
+    ExtractField,
+    RenameFields,
+    SelectFields,
+)
+from .filter_ops import FilterByField, FilterNonEmpty, FilterTransform
+from .map_ops import MapField, MapTransform
+from .mixture import (
+    MixedShardedSource,
+    MixedShardState,
+    MixStage,
+    WeightScheduler,
+    block_mixture_interleave,
+)
+from .pack import (
+    FirstFitPacker,
+    GreedyPacker,
+    PackedSequence,
+    PackedShardedSource,
+    PackingStats,
+    PackStage,
+    PoolPacker,
+    pack_constant_length,
+    pack_pre_tokenized,
+    report_packing_stats,
+)
+from .packer import EmbedsWindowPacker
+from .source import LimitedShardedSource, ShuffledShardedSource, TransformedShardedSource
+from .tokenize import (
+    TokenizedShardedSource,
+    TokenizerManager,
+    TokenizeStage,
+    batched_tokenize_iterator,
+    compute_tokenizer_hash,
+    tokenize_dataset_config,
+)
+
+# Trainer-specific transforms are now in easydel.trainers.transforms
+# Use lazy imports for backwards compatibility to avoid circular imports
+_TRAINER_TRANSFORMS = {
+    "BCOPreprocessTransform",
+    "CPOPreprocessTransform",
+    "DPOPreprocessTransform",
+    "GRPOPreprocessTransform",
+    "KTOPreprocessTransform",
+    "ORPOPreprocessTransform",
+    "RewardPreprocessTransform",
+    "SFTPreprocessTransform",
+}
+
+
+def __getattr__(name: str):
+    """Module-level ``__getattr__`` that forwards trainer-transform names to :mod:`easydel.trainers`.
+
+    The trainer preprocessing transforms (SFT, DPO, KTO, …) used
+    to live in :mod:`easydel.data.transforms` and many user
+    scripts still import them from here. This hook intercepts
+    matching attribute lookups and delegates to
+    :mod:`easydel.trainers.prompt_transforms` to avoid the
+    circular dependency that an eager re-export would introduce.
+
+    Args:
+        name: Attribute name being looked up on the module.
+
+    Returns:
+        Any: The matching trainer transform class.
+
+    Raises:
+        AttributeError: When ``name`` is neither in
+            :data:`_TRAINER_TRANSFORMS` nor a top-level export
+            of this module.
+    """
+    if name in _TRAINER_TRANSFORMS:
+        from easydel.trainers import prompt_transforms as prompt_transforms
+
+        return getattr(prompt_transforms, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+# These are provided via __getattr__ for backwards compatibility:
+# BCOPreprocessTransform, CPOPreprocessTransform, DPOPreprocessTransform,
+# GRPOPreprocessTransform, KTOPreprocessTransform, ORPOPreprocessTransform,
+# RewardPreprocessTransform, SFTPreprocessTransform
+
+__all__ = [
+    "DEFAULT_ROLE_MAPPING",
+    "AddField",
+    "BCOPreprocessTransform",
+    "CPOPreprocessTransform",
+    "ChainedTransform",
+    "ChatTemplateTransform",
+    "CombineFields",
+    "ConvertInputOutputToChatML",
+    "ConvertToChatML",
+    "DPOPreprocessTransform",
+    "DropFields",
+    "EmbedsWindowPacker",
+    "ExpandTransform",
+    "ExtractField",
+    "FilterByField",
+    "FilterNonEmpty",
+    "FilterTransform",
+    "FirstFitPacker",
+    "GRPOPreprocessTransform",
+    "GreedyPacker",
+    "KTOPreprocessTransform",
+    "LimitedShardedSource",
+    "MapField",
+    "MapTransform",
+    "MaybeApplyChatTemplate",
+    "MixStage",
+    "MixedShardState",
+    "MixedShardedSource",
+    "ORPOPreprocessTransform",
+    "PackStage",
+    "PackedSequence",
+    "PackedShardedSource",
+    "PackingStats",
+    "PoolPacker",
+    "RenameFields",
+    "RewardPreprocessTransform",
+    "SFTPreprocessTransform",
+    "SelectFields",
+    "ShuffledShardedSource",
+    "TokenizeStage",
+    "TokenizedShardedSource",
+    "TokenizerManager",
+    "Transform",
+    "TransformedShardedSource",
+    "WeightScheduler",
+    "batched_tokenize_iterator",
+    "block_mixture_interleave",
+    "collate_bucket_static",
+    "collate_embeds_pack",
+    "collate_packed_embeds",
+    "compute_tokenizer_hash",
+    "pack_constant_length",
+    "pack_pre_tokenized",
+    "report_packing_stats",
+    "tokenize_dataset_config",
+]

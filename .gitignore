@@ -11,6 +11,7 @@ execute_command.sh
 *.txt
 env.ipynb
 env.py
+.basedpyright
 exp.py
 vxp.py
 nohup.out
@@ -22,9 +23,12 @@ autoscale/cluster.yaml
 autoscale/easydel-*.yaml
 !autoscale/easydel-cluster-template.yaml
 memory_log_dir/
+.ray_adc/
 wandb
 .ruff_cache/*
 launch_test.py
+# no leaks on internal stuff hehehe
+.xerxes/projects
 .gradio
 *.easy
 tmp-files
@@ -164,3 +168,7 @@ dmypy.json
 # Pyre type checker
 .pyre/
 *.bin
+.basedpyright/
+debug/*
+model-files/*
+autoresearch-results.tsv

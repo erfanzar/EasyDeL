@@ -1,0 +1,2337 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Whisper speech-to-text model implementation for EasyDeL.
+
+This module implements OpenAI's Whisper encoder-decoder transformer
+for automatic speech recognition. The encoder consumes log-Mel
+spectrogram features through two strided 1-D convolutions followed by
+sinusoidal position embeddings, then a stack of self-attention
+transformer blocks. The decoder is a causal transformer with both
+self-attention and encoder-cross-attention.
+
+Components:
+- :class:`WhisperEncoder` and :class:`WhisperDecoder` for the
+  audio-encoder and text-decoder trunks.
+- :class:`WhisperModel` glues them together for raw encoder/decoder
+  exposure.
+- :class:`WhisperForConditionalGeneration` adds the LM head and is the
+  task entrypoint for transcription.
+- :class:`WhisperForAudioClassification` reuses the encoder for audio
+  classification tasks.
+"""
+
+import copy
+import math
+import typing as tp
+from functools import partial
+
+__all__ = (
+    "WhisperForAudioClassification",
+    "WhisperForConditionalGeneration",
+    "WhisperTimeStampLogitsProcessor",
+)
+
+import jax
+import jax.numpy as jnp
+import spectrax as spx
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+from jax import lax
+from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
+
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
+from easydel.inference.logits_process import (
+    ForceTokensLogitsProcessor,
+    LogitsProcessorList,
+    WhisperTimeStampLogitsProcessor,
+)
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.loss_utils import LossConfig, LossMetrics
+from easydel.infra.modeling_outputs import (
+    BaseModelOutput,
+    BaseModelOutputWithPastAndCrossAttentions,
+    Seq2SeqLMOutput,
+    Seq2SeqModelOutput,
+    SequenceClassifierOutput,
+)
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseConditionalGenerationModule
+
+from .whisper_configuration import WhisperConfig as WhisperConfig
+
+remat = spx.remat
+
+
+class _WhisperConv1d(nn.Conv1d):
+    """Keep stem parameters in storage dtype and cast only convolution operands.
+
+    SpectraX convolutions treat ``dtype`` as a storage alias. Whisper's public
+    ``dtype`` instead specifies computation, independently of ``param_dtype``.
+    Inheriting the convolution retains the existing ``conv{1,2}.weight/bias``
+    checkpoint paths without mutating their values during a forward pass.
+    """
+
+    def __init__(self, *args, dtype, **kwargs):
+        super().__init__(*args, dtype=dtype, **kwargs)
+        self.compute_dtype = dtype
+
+    def forward(self, x, **kwargs):
+        """Apply the stem convolution in Whisper's activation dtype."""
+        return spx.functional.conv(
+            jnp.asarray(x, dtype=self.compute_dtype),
+            self.weight.value.astype(self.compute_dtype),
+            self.bias.value.astype(self.compute_dtype) if self.use_bias else None,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+            precision=self.precision,
+        )
+
+
+def shift_tokens_right(
+    input_ids: Int[Array, "batch seq_len"],
+    pad_token_id: int,
+    decoder_start_token_id: int,
+):
+    """Shift input ids one token to the right for decoder teacher forcing.
+
+    This function prepares decoder inputs by shifting the target sequence one position
+    to the right and prepending the decoder start token. This is a standard technique
+    for sequence-to-sequence models during training, where the decoder predicts the
+    next token given the previous tokens.
+
+    Args:
+        input_ids (Int[Array, "batch seq_len"]): Target token IDs to be shifted.
+            Shape: (batch_size, sequence_length). Tokens with value -100 are treated
+            as labels to be ignored and are replaced with pad_token_id.
+        pad_token_id (int): The ID of the padding token to use for filling positions
+            and replacing -100 values.
+        decoder_start_token_id (int): The ID of the token to insert at the start of
+            each sequence (typically <|startoftranscript|> for Whisper).
+
+    Returns:
+        Int[Array, "batch seq_len"]: Shifted input IDs where:
+            - Position 0 contains decoder_start_token_id
+            - Position i contains the original token from position i-1
+            - -100 values are replaced with pad_token_id
+
+    Example:
+        >>> # Original: [tok1, tok2, tok3, -100]
+        >>> # Shifted:  [start_tok, tok1, tok2, tok3]
+    """
+    batch_size, seq_length = input_ids.shape
+    shifted_input_ids = jnp.full(
+        (batch_size, seq_length),
+        pad_token_id,
+        dtype=input_ids.dtype,
+    )
+    shifted_input_ids = shifted_input_ids.at[:, 1:].set(input_ids[:, :-1])
+    shifted_input_ids = shifted_input_ids.at[:, 0].set(decoder_start_token_id)
+    shifted_input_ids = jnp.where(input_ids == -100, pad_token_id, shifted_input_ids)
+    return shifted_input_ids
+
+
+def sinusoidal_embedding_init(key, shape, dtype=jnp.float_) -> jax.Array:
+    """Initializes sinusoidal positional embeddings.
+
+    Args:
+        key: JAX PRNG key (unused, but part of standard initializer signature).
+        shape (tuple): Shape of the embedding matrix (length, channels).
+        dtype: Data type of the embeddings (default: jnp.float_).
+
+    Returns:
+        jax.Array: Sinusoidal positional embedding matrix.
+
+    Raises:
+        ValueError: If the number of channels is not even.
+    """
+    length, channels = shape
+    if channels % 2 != 0:
+        raise ValueError(
+            f"Number of channels has to be divisible by 2 for sinusoidal positional embeddings, got {channels} channels."
+        )
+    log_timescale_increment = math.log(10000) / (channels // 2 - 1)
+    inv_timescales = jnp.exp(-log_timescale_increment * jnp.arange(channels // 2))
+    scaled_time = jnp.arange(length).reshape(-1, 1) * inv_timescales.reshape(1, -1)
+    return jnp.concatenate([jnp.sin(scaled_time), jnp.cos(scaled_time)], axis=1).astype(dtype)
+
+
+class WhisperAttention(AttentionModule):
+    """Whisper Attention mechanism.
+
+    This module implements the standard multi-head attention mechanism used
+    in both the encoder and decoder of the Whisper model.
+
+    Attributes:
+        config (WhisperConfig): Configuration object for the model.
+        embed_dim (int): Dimensionality of the embedding layer.
+        num_heads (int): Number of attention heads.
+        dropout (float): Dropout probability.
+        causal (bool): Whether this attention is causal (used in decoder self-attention).
+        bias (bool): Whether to include bias in linear projections.
+        head_dim (int): Dimensionality of each attention head.
+        q_proj (ParallelLinear): Linear layer for query projection.
+        k_proj (ParallelLinear): Linear layer for key projection.
+        v_proj (ParallelLinear): Linear layer for value projection.
+        out_proj (ParallelLinear): Linear layer for output projection.
+        attention_performer (FlexibleAttentionModule): Module for performing attention computation.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+        rngs (spx.Rngs): Random number generators.
+    """
+
+    def __init__(
+        self,
+        config: WhisperConfig,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        causal: bool = False,
+        bias: bool = True,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: str | lax.Precision | None = None,
+        *,
+        rngs: spx.Rngs,
+    ) -> None:
+        """Initializes the WhisperAttention module.
+
+        Args:
+            config (WhisperConfig): The configuration object for the model.
+            embed_dim (int): Dimensionality of the input and output features.
+            num_heads (int): Number of attention heads.
+            dropout (float): Dropout probability for attention weights (default: 0.0).
+            causal (bool): Whether to apply causal masking (default: False).
+            bias (bool): Whether to include bias terms in the projection layers (default: True).
+            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+            precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
+            rngs (spx.Rngs): Random number generators.
+
+        Raises:
+            ValueError: If `embed_dim` is not divisible by `num_heads`.
+        """
+        super().__init__(config=config)
+        self.rngs = rngs
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.causal = causal
+        self.bias = bias
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.head_dim = self.embed_dim // self.num_heads
+        if self.head_dim * self.num_heads != self.embed_dim:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+
+        linear = partial(
+            ColumnParallelLinear,
+            self.embed_dim,
+            self.embed_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+        )
+
+        self.q_proj = linear(use_bias=self.bias, rngs=rngs)
+        self.k_proj = linear(use_bias=False, rngs=rngs)
+        self.v_proj = linear(use_bias=self.bias, rngs=rngs)
+        self.out_proj = linear(use_bias=self.bias, rngs=rngs)
+
+        # Only causal (decoder) attention needs KV cache.
+        # Encoder attention (causal=False) processes full sequences at once.
+        self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
+            base_config=config,
+            softmax_scale=self.head_dim**-0.5,
+            dropout_prob=config.attention_dropout,
+            requires_cache=causal,  # Only decoder self-attention needs cache
+        )
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None = None,
+        key_value_states: jnp.ndarray | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+    ) -> tuple[tp.Any, tp.Any, tp.Any]:
+        """Forward pass of the attention module.
+
+        Args:
+            hidden_states (jnp.ndarray): Input hidden states (batch, seq_len, embed_dim).
+            mask_info (MaskInfo | None): Mask information for attention.
+            key_value_states (tp.Optional[jnp.ndarray]): Optional key/value states for cross-attention
+                (batch, kv_seq_len, embed_dim). If None, self-attention is performed.
+            mode: Runtime mode (train/decode/prefill).
+            cache_view (tp.Optional[TransformerCacheView]): Cache view for key/value states, used in causal attention.
+            cache_metadata (tp.Optional[TransformerMetadata]): Metadata for paged attention.
+
+        Returns:
+            tuple[jnp.ndarray, jnp.ndarray, cache_view]: A tuple containing:
+                - attn_output (jnp.ndarray): Attention output (batch, seq_len, embed_dim).
+                - attn_weights (jnp.ndarray): Attention weights (batch, num_heads, seq_len, kv_seq_len).
+                - cache_view: Updated cache view.
+        """
+        is_cross_attention = key_value_states is not None
+        query_states = checkpoint_name(self.q_proj(hidden_states), "attn_query")
+
+        if is_cross_attention:
+            key_states = checkpoint_name(self.k_proj(key_value_states), "attn_key")
+            value_states = checkpoint_name(self.v_proj(key_value_states), "attn_value")
+        else:
+            key_states = checkpoint_name(self.k_proj(hidden_states), "attn_key")
+            value_states = checkpoint_name(self.v_proj(hidden_states), "attn_value")
+
+        query_states = self._split_heads(query_states)
+        key_states = self._split_heads(key_states)
+        value_states = self._split_heads(value_states)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
+
+        init_attention_bias = lambda: None  # noqa
+
+        if self.causal:
+            # For causal (decoder) attention, use concatenate to handle KV cache
+            (
+                key_states,
+                value_states,
+                mask_info,
+                init_attention_bias,
+                cache_view,
+                cache_metadata,
+            ) = self.concatenate(
+                query=query_states,
+                key=key_states,
+                cache_view=cache_view,
+                value=value_states,
+                mask_info=mask_info,
+            )
+
+        attentions = self.attention_performer.forward(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            mode=mode,
+            bias=None,
+            cache_metadata=cache_metadata,
+            cache_view=cache_view,
+            init_bias=init_attention_bias,
+            mask_info=mask_info,
+            causal=self.causal,
+        )
+
+        attn_output = checkpoint_name(
+            self.out_proj(self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))), "attn_output"
+        )
+        attn_output = self.shard_attention_prod(attn_output)
+
+        return attn_output, attentions.attention_weights, cache_view
+
+    def _split_heads(self, hidden_state) -> jnp.ndarray:
+        """Reshape ``(batch, seq_len, embed_dim)`` to per-head layout.
+
+        Args:
+            hidden_state: Tensor with trailing dim ``embed_dim``.
+
+        Returns:
+            Tensor reshaped to
+            ``(batch, seq_len, num_heads, head_dim)`` so subsequent
+            attention ops can broadcast across heads.
+        """
+        return hidden_state.reshape((*hidden_state.shape[:2], self.num_heads, self.head_dim))
+
+    def _merge_heads(self, hidden_state) -> jnp.ndarray:
+        """Inverse of :meth:`_split_heads`.
+
+        Args:
+            hidden_state: Tensor of shape
+                ``(batch, seq_len, num_heads, head_dim)``.
+
+        Returns:
+            Tensor of shape ``(batch, seq_len, embed_dim)`` ready for
+            the output projection.
+        """
+        return hidden_state.reshape((*hidden_state.shape[:2], self.embed_dim))
+
+
+class WhisperEncoderLayer(spx.Module):
+    """A single layer for the Whisper encoder.
+
+    This layer consists of a self-attention mechanism followed by a feed-forward
+    network (FFN), with residual connections and layer normalization.
+
+    Attributes:
+        config (WhisperConfig): Configuration object for the model.
+        embed_dim (int): Dimensionality of the input and output features.
+        self_attn (WhisperAttention): Self-attention module.
+        self_attn_layer_norm (LayerNorm): Layer normalization before self-attention.
+        fc1 (ParallelLinear): First linear layer of the FFN.
+        fc2 (ParallelLinear): Second linear layer of the FFN.
+        final_layer_norm (LayerNorm): Layer normalization after the FFN.
+        activation_fn (callable): Activation function for the FFN.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+        rngs (spx.Rngs): Random number generators.
+    """
+
+    def __init__(
+        self,
+        config: WhisperConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: str | lax.Precision | None = None,
+        *,
+        rngs: spx.Rngs,
+    ) -> None:
+        """Initializes the WhisperEncoderLayer module.
+
+        Args:
+            config (WhisperConfig): The configuration object for the model.
+            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+            precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
+            rngs (spx.Rngs): Random number generators.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.embed_dim = self.config.d_model
+
+        self.self_attn = WhisperAttention(
+            config=config,
+            embed_dim=self.embed_dim,
+            num_heads=config.encoder_attention_heads,
+            dropout=config.attention_dropout,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.self_attn_layer_norm = LayerNorm(
+            self.embed_dim,
+            param_dtype=self.param_dtype,
+            dtype=self.dtype,
+            epsilon=1e-05,
+            rngs=rngs,
+        )
+        self.dropout_layer = nn.Dropout(rate=self.config.dropout, rngs=rngs)
+        self.activation_fn = ACT2FN[self.config.activation_function]
+        self.activation_dropout_layer = nn.Dropout(
+            rate=self.config.activation_dropout,
+            rngs=rngs,
+        )
+        self.fc1 = ColumnParallelLinear(
+            self.embed_dim,
+            self.config.encoder_ffn_dim,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+            dtype=self.dtype,
+            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            rngs=rngs,
+        )
+        self.fc2 = ColumnParallelLinear(
+            self.config.encoder_ffn_dim,
+            self.embed_dim,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+            dtype=self.dtype,
+            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            rngs=rngs,
+        )
+        self.final_layer_norm = LayerNorm(
+            self.embed_dim,
+            param_dtype=self.param_dtype,
+            dtype=self.dtype,
+            epsilon=1e-05,
+            rngs=rngs,
+        )
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None = None,
+        output_attentions: bool = True,
+    ) -> tuple[jnp.ndarray, ...]:
+        """Forward pass of the encoder layer.
+
+        Args:
+            hidden_states (jnp.ndarray): Input hidden states (batch, seq_len, embed_dim).
+            mask_info (MaskInfo | None): Mask information for attention.
+            output_attentions (bool): Whether to return attention weights (default: True).
+
+        Returns:
+            tp.Tuple[jnp.ndarray, ...]: A tuple containing:
+                - hidden_states (jnp.ndarray): Output hidden states (batch, seq_len, embed_dim).
+                - attn_weights (jnp.ndarray, optional): Attention weights if `output_attentions` is True.
+        """
+        residual = hidden_states
+        hidden_states = self.self_attn_layer_norm(hidden_states)
+        hidden_states, attn_weights, _ = self.self_attn(
+            hidden_states=hidden_states,
+            mask_info=mask_info,
+            mode=common_types.MODE_TRAIN,
+            cache_view=None,
+            key_value_states=None,
+        )
+        hidden_states = self.dropout_layer(hidden_states)
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
+
+        residual = hidden_states
+        hidden_states = self.final_layer_norm(hidden_states)
+        if self.config.use_scan_mlp:
+            hidden_states = blockwise_ffn(
+                lambda _h: checkpoint_name(
+                    self.fc2(self.activation_dropout_layer(self.activation_fn(checkpoint_name(self.fc1(_h), "mlp_up")))),
+                    "mlp_down",
+                ),
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            hidden_states = checkpoint_name(self.fc1(hidden_states), "mlp_up")
+            hidden_states = self.activation_fn(hidden_states)
+            hidden_states = self.activation_dropout_layer(hidden_states)
+            hidden_states = checkpoint_name(self.fc2(hidden_states), "mlp_down")
+        hidden_states = self.dropout_layer(hidden_states)
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
+        hidden_states = checkpoint_name(hidden_states, "layer_output")
+
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (attn_weights,)
+
+        return outputs
+
+
+class WhisperDecoderLayer(spx.Module):
+    """A single layer for the Whisper decoder.
+
+    This layer consists of self-attention, cross-attention (attending to encoder outputs),
+    and a feed-forward network (FFN), each followed by residual connections and layer normalization.
+
+    Attributes:
+        config (WhisperConfig): Configuration object for the model.
+        embed_dim (int): Dimensionality of the input and output features.
+        self_attn (WhisperAttention): Self-attention module (causal).
+        encoder_attn (WhisperAttention): Cross-attention module (attends to encoder outputs).
+        self_attn_layer_norm (LayerNorm): Layer normalization before self-attention.
+        encoder_attn_layer_norm (LayerNorm): Layer normalization before cross-attention.
+        fc1 (ParallelLinear): First linear layer of the FFN.
+        fc2 (ParallelLinear): Second linear layer of the FFN.
+        final_layer_norm (LayerNorm): Layer normalization after the FFN.
+        activation_fn (callable): Activation function for the FFN.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+        rngs (spx.Rngs): Random number generators.
+    """
+
+    def __init__(
+        self,
+        config: WhisperConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: str | lax.Precision | None = None,
+        *,
+        rngs: spx.Rngs,
+    ) -> None:
+        """Initializes the WhisperDecoderLayer module.
+
+        Args:
+            config (WhisperConfig): The configuration object for the model.
+            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+            precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
+            rngs (spx.Rngs): Random number generators.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.embed_dim = self.config.d_model
+        self.self_attn = WhisperAttention(
+            config=self.config,
+            embed_dim=self.embed_dim,
+            num_heads=self.config.decoder_attention_heads,
+            dropout=self.config.attention_dropout,
+            causal=True,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.dropout_layer = nn.Dropout(
+            rate=self.config.dropout,
+            rngs=rngs,
+        )
+        self.activation_fn = ACT2FN[self.config.activation_function]
+        self.activation_dropout_layer = nn.Dropout(
+            rate=self.config.activation_dropout,
+            rngs=rngs,
+        )
+
+        self.self_attn_layer_norm = LayerNorm(
+            self.embed_dim,
+            param_dtype=self.param_dtype,
+            dtype=self.dtype,
+            epsilon=1e-05,
+            rngs=rngs,
+        )
+        self.encoder_attn = WhisperAttention(
+            config=self.config,
+            embed_dim=self.embed_dim,
+            num_heads=self.config.decoder_attention_heads,
+            dropout=self.config.attention_dropout,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.encoder_attn_layer_norm = LayerNorm(
+            self.embed_dim,
+            param_dtype=self.param_dtype,
+            dtype=self.dtype,
+            epsilon=1e-05,
+            rngs=rngs,
+        )
+        linear = partial(
+            ColumnParallelLinear,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+            dtype=self.dtype,
+            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+        )
+        self.fc1 = linear(
+            self.embed_dim,
+            self.config.decoder_ffn_dim,
+            rngs=rngs,
+        )
+        self.fc2 = linear(
+            self.config.decoder_ffn_dim,
+            self.embed_dim,
+            rngs=rngs,
+        )
+        self.final_layer_norm = LayerNorm(
+            self.embed_dim,
+            param_dtype=self.param_dtype,
+            dtype=self.dtype,
+            epsilon=1e-05,
+            rngs=rngs,
+        )
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None = None,
+        encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        encoder_mask_info: MaskInfo | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = True,
+    ) -> tuple[jnp.ndarray, ...]:
+        """Forward pass of the decoder layer.
+
+        Args:
+            hidden_states (jnp.ndarray): Input hidden states (batch, seq_len, embed_dim).
+            mask_info (MaskInfo | None): Mask information for self-attention.
+            encoder_hidden_states (tp.Optional[jnp.ndarray]): Hidden states from the encoder
+                (batch, encoder_seq_len, embed_dim).
+            encoder_mask_info (MaskInfo | None): Mask information for cross-attention.
+            mode: Runtime mode (train/decode/prefill).
+            cache_view (tp.Optional[TransformerCacheView]): Cache view for key/value states.
+            cache_metadata (tp.Optional[TransformerMetadata]): Metadata for paged attention.
+            output_attentions (bool): Whether to return attention weights (default: True).
+
+        Returns:
+            tp.Tuple[jnp.ndarray, ...]: A tuple containing:
+                - hidden_states (jnp.ndarray): Output hidden states (batch, seq_len, embed_dim).
+                - self_attn_weights (jnp.ndarray, optional): Self-attention weights if `output_attentions` is True.
+                - cross_attn_weights (jnp.ndarray, optional): Cross-attention weights if `output_attentions` is True.
+                - cache_view: Updated cache view.
+        """
+        residual = hidden_states
+        hidden_states = self.self_attn_layer_norm(hidden_states)
+
+        hidden_states, self_attn_weights, cache_view = self.self_attn(
+            hidden_states=hidden_states,
+            mask_info=mask_info,
+            mode=mode,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
+        )
+        hidden_states = self.dropout_layer(hidden_states)
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
+
+        cross_attn_weights = None
+        if encoder_hidden_states is not None:
+            residual = hidden_states
+
+            hidden_states = self.encoder_attn_layer_norm(hidden_states)
+            hidden_states, cross_attn_weights, _ = self.encoder_attn(
+                hidden_states=hidden_states,
+                mask_info=encoder_mask_info,
+                key_value_states=encoder_hidden_states,
+            )
+            hidden_states = self.dropout_layer(hidden_states)
+            hidden_states = checkpoint_name(residual + hidden_states, "residual")
+
+        residual = hidden_states
+        hidden_states = self.final_layer_norm(hidden_states)
+        if self.config.use_scan_mlp:
+            hidden_states = blockwise_ffn(
+                lambda _h: checkpoint_name(
+                    self.fc2(self.activation_dropout_layer(self.activation_fn(checkpoint_name(self.fc1(_h), "mlp_up")))),
+                    "mlp_down",
+                ),
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            hidden_states = checkpoint_name(self.fc1(hidden_states), "mlp_up")
+            hidden_states = self.activation_fn(hidden_states)
+            hidden_states = self.activation_dropout_layer(hidden_states)
+            hidden_states = checkpoint_name(self.fc2(hidden_states), "mlp_down")
+        hidden_states = self.dropout_layer(hidden_states)
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
+        hidden_states = checkpoint_name(hidden_states, "layer_output")
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (self_attn_weights, cross_attn_weights)
+        outputs += (cache_view,)
+        return outputs  # pyright: ignore[reportReturnType]
+
+
+class WhisperEncoder(EasyDeLBaseModule):
+    """The Whisper Encoder transformer stack.
+
+    This module processes the input audio features (log-Mel spectrogram) through
+    convolutional layers followed by a stack of `WhisperEncoderLayer` modules.
+
+    Attributes:
+        config (WhisperConfig): Configuration object for the model.
+        conv1 (nn.Conv): First convolutional layer.
+        conv2 (nn.Conv): Second convolutional layer.
+        embed_positions (Embed): Positional embedding layer.
+        layers (nn.ModuleList[WhisperEncoderLayer]): List of encoder layers.
+        layer_norm (LayerNorm): Final layer normalization.
+        embed_dim (int): Dimensionality of the model.
+        num_mel_bins (int): Number of Mel frequency bins in the input features.
+        padding_idx (int): Index of the padding token.
+        max_source_positions (int): Maximum sequence length for the encoder.
+        scale_embedding (float | None): Scaling factor for embeddings.
+        embed_scale (float | None): Alias for scale_embedding.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        rngs (spx.Rngs): Random number generators.
+    """
+
+    def __init__(
+        self,
+        config: WhisperConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: str | lax.Precision | None = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initializes the WhisperEncoder module.
+
+        Args:
+            config (WhisperConfig): The configuration object for the model.
+            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+            precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
+            rngs (spx.Rngs): Random number generators.
+        """
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        # HF uses symmetric ``padding=1`` on both convs. ``"SAME"`` would pad the
+        # stride-2 conv2 as (0, 1) for L=3000, shifting every frame by half a step.
+        self.conv1 = _WhisperConv1d(
+            self.config.num_mel_bins,
+            self.config.d_model,
+            kernel_size=3,
+            padding=((1, 1),),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+            precision=precision,
+        )
+        self.conv2 = _WhisperConv1d(
+            self.config.d_model,
+            self.config.d_model,
+            kernel_size=3,
+            stride=2,
+            padding=((1, 1),),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+            precision=precision,
+        )
+
+        self.dropout_layer = nn.Dropout(
+            rate=self.config.dropout,
+            rngs=rngs,
+        )
+
+        block = auto_remat(
+            WhisperEncoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.layers = nn.ModuleList([])
+        for _ in range(self.config.encoder_layers):
+            with self.assign_layer_stage(_, total_layers=self.config.encoder_layers):
+                self.layers.append(
+                    block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
+                )
+
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.embed_positions = Embed(
+                self.config.max_source_positions,
+                self.config.d_model,
+                dtype=self.dtype,
+                embedding_init=sinusoidal_embedding_init,
+                param_dtype=self.param_dtype,
+                rngs=rngs,
+            )
+
+        final_layer_idx = max(0, self.config.encoder_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=self.config.encoder_layers):
+            self.layer_norm = LayerNorm(
+                self.config.d_model,
+                param_dtype=self.param_dtype,
+                dtype=self.dtype,
+                epsilon=1e-05,
+                rngs=rngs,
+            )
+        self.layerdrop = self.config.encoder_layerdrop
+
+    def forward(
+        self,
+        input_features: jnp.ndarray,
+        mask_info: MaskInfo | None = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ) -> tuple[tp.Any | None, ...] | BaseModelOutput:
+        """Forward pass of the Whisper encoder.
+
+        Args:
+            input_features (jnp.ndarray): Input audio features (log-Mel spectrogram)
+                of shape (batch_size, num_mel_bins, sequence_length).
+            mask_info (MaskInfo | None): Mask information for attention.
+            output_attentions (bool): Whether to return attention weights (default: False).
+            output_hidden_states (bool): Whether to return hidden states for all layers (default: False).
+
+        Returns:
+            BaseModelOutput | tuple: The encoder output. returns a `BaseModelOutput`
+                containing `last_hidden_state`, `hidden_states` (optional), and `attentions` (optional).
+        """
+        all_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+        if input_features.shape[1:] != (
+            self.config.num_mel_bins,
+            self.config.max_source_positions * 2,
+        ):
+            raise ValueError(
+                "input_features.shape[1:], must be equal to (self.config.num_mel_bins,"
+                f" self.config.max_source_positions * 2) (got {input_features.shape[1:]}, but should be"
+                f" ({self.config.num_mel_bins}, {self.config.max_source_positions * 2}))"
+            )
+
+        input_features = input_features.transpose(0, 2, 1)
+        hidden_states = jax.nn.gelu(self.conv1(input_features), approximate=False)
+        hidden_states = jax.nn.gelu(self.conv2(hidden_states), approximate=False)
+
+        embed_positions = self.embed_positions(jnp.arange(self.config.max_source_positions))
+        embed_positions = jax.lax.stop_gradient(embed_positions)
+        hidden_states = checkpoint_name(hidden_states + embed_positions, "embeddings")
+
+        hidden_states = self.dropout_layer(hidden_states)
+
+        # Keep layer-local RNG updates outside the stacked readonly scan
+        # when stochastic LayerDrop is active.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            extra=bool(self.training and self.layerdrop > 0),
+        )
+
+        def _layer_loop(encoder_layer, carry):
+            """Apply a single Whisper encoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``encoder_layer`` on the
+            current hidden states, optionally accumulates per-layer
+            hidden states / self-attention weights, and returns the
+            updated carry tuple.
+            """
+            hidden_states, all_hidden_states, all_attentions, idx = carry
+            if output_hidden_states:
+                assert all_hidden_states is not None
+                all_hidden_states = (*all_hidden_states, hidden_states)
+            residual = hidden_states
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = encoder_layer(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    output_attentions=output_attentions,
+                )
+            if self.training and self.layerdrop > 0:
+                drop_layer = jax.random.bernoulli(self.rngs.key("dropout"), self.layerdrop)
+                # Dynamic None entries cannot be represented in a compiled output;
+                # dropped layers expose zero attention weights instead.
+                layer_outputs = (
+                    jnp.where(drop_layer, residual, layer_outputs[0]),
+                    *(
+                        None if value is None else jnp.where(drop_layer, jnp.zeros_like(value), value)
+                        for value in layer_outputs[1:]
+                    ),
+                )
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs[0], idx, layers=self.layers)
+            if output_attentions:
+                assert all_attentions is not None
+                all_attentions = (*all_attentions, layer_outputs[1])
+
+            return hidden_states, all_hidden_states, all_attentions, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, 0),
+            trace=trace_layers,
+            **self._layer_scan_kwargs("audio"),
+        )
+        hidden_states = checkpoint_name(self.layer_norm(hidden_states), "model_output")
+        # HF parity: num_layers + 1 states (layer inputs, then the post-norm
+        # output in place of the last layer's pre-norm output).
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        return BaseModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+        )
+
+
+class WhisperDecoder(EasyDeLBaseModule):
+    """The Whisper Decoder transformer stack.
+
+    This module processes the target token IDs, incorporates positional embeddings,
+    and attends to both the input sequence (self-attention) and the encoder outputs
+    (cross-attention) through a stack of `WhisperDecoderLayer` modules.
+
+    Attributes:
+        config (WhisperConfig): Configuration object for the model.
+        embed_tokens (Embed): Embedding layer for target tokens.
+        embed_positions (Embed): Positional embedding layer.
+        layers (nn.ModuleList[WhisperDecoderLayer]): List of decoder layers.
+        layer_norm (LayerNorm): Final layer normalization (applied to pre-final outputs).
+        dropout (nn.Dropout): Dropout layer.
+        padding_idx (int): Index of the padding token.
+        max_target_positions (int): Maximum sequence length for the decoder.
+        embed_scale (float | None): Scaling factor for embeddings.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        rngs (spx.Rngs): Random number generators.
+    """
+
+    def __init__(
+        self,
+        config: WhisperConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: str | lax.Precision | None = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initializes the WhisperDecoder module.
+
+        Args:
+            config (WhisperConfig): The configuration object for the model.
+            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+            precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
+            rngs (spx.Rngs): Random number generators.
+        """
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                self.config.vocab_size,
+                self.config.d_model,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.embed_positions = Embed(
+                self.config.max_target_positions,
+                self.config.d_model,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+
+        remat_layer_block = auto_remat(
+            WhisperDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.layers = nn.ModuleList([])
+        for _ in range(self.config.decoder_layers):
+            with self.assign_layer_stage(_, total_layers=self.config.decoder_layers):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
+                )
+
+        self.layerdrop = self.config.decoder_layerdrop
+        self.dropout_layer = nn.Dropout(
+            rate=self.config.dropout,
+            rngs=rngs,
+        )
+
+        final_layer_idx = max(0, self.config.decoder_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=self.config.decoder_layers):
+            self.layer_norm = LayerNorm(
+                self.config.d_model,
+                param_dtype=self.param_dtype,
+                dtype=self.dtype,
+                epsilon=1e-05,
+                rngs=rngs,
+            )
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"],
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        encoder_mask_info: MaskInfo | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ) -> tuple[tp.Any, ...] | BaseModelOutputWithPastAndCrossAttentions:
+        """Forward pass of the Whisper decoder.
+
+        Args:
+            input_ids (jnp.ndarray): Input token IDs (batch, target_sequence_length).
+            mask_info (MaskInfo | None): Mask information for self-attention.
+            position_ids (jnp.ndarray): Position IDs (batch, target_sequence_length).
+            encoder_hidden_states (tp.Optional[jnp.ndarray]): Hidden states from the encoder
+                (batch, encoder_sequence_length, embed_dim).
+            encoder_mask_info (MaskInfo | None): Mask information for cross-attention.
+            mode: Runtime mode (train/decode/prefill).
+            past_key_values (tp.Optional[TransformerCache]): Cached key/value states for fast decoding.
+            cache_metadata (tp.Optional[TransformerMetadata]): Metadata for paged attention.
+            output_attentions (bool): Whether to return attention weights (default: False).
+            output_hidden_states (bool): Whether to return hidden states for all layers (default: False).
+
+        Returns:
+            BaseModelOutputWithPastAndCrossAttentions: The decoder output.
+                returns a `BaseModelOutputWithPastAndCrossAttentions` containing `last_hidden_state`,
+                `past_key_values` (if `use_cache` is True), `hidden_states` (optional), `attentions` (optional),
+                and `cross_attentions` (optional).
+        """
+        if mask_info is None:
+            attention_mask = jnp.ones((input_ids.shape[0], input_ids.shape[1]), dtype=jnp.bool_)
+            mask_info = MaskInfo.from_attention_mask(attention_mask)
+
+        if encoder_hidden_states is not None and encoder_mask_info is None:
+            cross_attention_mask = jnp.ones(
+                (input_ids.shape[0], input_ids.shape[1], encoder_hidden_states.shape[1]),
+                dtype=jnp.bool_,
+            )
+            encoder_mask_info = MaskInfo.from_attention_mask(cross_attention_mask)
+
+        inputs_embeds = checkpoint_name(self.embed_tokens(input_ids), "embeddings")
+        if position_ids is None:
+            position_ids = (
+                jnp.arange(inputs_embeds.shape[1])
+                .reshape(1, -1)
+                .repeat(
+                    inputs_embeds.shape[0],
+                    0,
+                )
+            )
+
+        position_ids = position_ids.astype("i4")
+        position_embeds = self.embed_positions(position_ids)
+
+        hidden_states = checkpoint_name(inputs_embeds + position_embeds, "embeddings")
+        hidden_states = self.dropout_layer(hidden_states)
+
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        all_cross_attentions = () if (output_attentions and encoder_hidden_states is not None) else None
+        if mode is None:
+            mode = (
+                common_types.MODE_DECODE
+                if input_ids.shape[1] == 1 and past_key_values is not None
+                else common_types.MODE_TRAIN
+            )
+        if past_key_values is None:
+            past_key_values = TransformerCache.init_empty(len(self.layers))
+
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        # Keep layer-local RNG updates outside the stacked readonly scan
+        # when stochastic LayerDrop is active.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache or bool(self.training and self.layerdrop > 0),
+        )
+        cache_views = views if trace_layers else None
+
+        def _layer_loop(decoder_layer, carry):
+            """Apply a single Whisper decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; carries ``(hidden_states,
+            cache_views, all_hidden_states, all_self_attns,
+            all_cross_attentions, layer_index)``, optionally accumulating
+            per-layer hidden states, self-attention weights and
+            cross-attention weights.
+            """
+            hidden_states, cv, all_hidden_states, all_self_attns, all_cross_attentions, idx = carry
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+            residual = hidden_states
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = decoder_layer(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_mask_info=encoder_mask_info,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                )
+            if self.training and self.layerdrop > 0:
+                drop_layer = jax.random.bernoulli(self.rngs.key("dropout"), self.layerdrop)
+                layer_outputs = (
+                    jnp.where(drop_layer, residual, layer_outputs[0]),
+                    *(
+                        None if value is None else jnp.where(drop_layer, jnp.zeros_like(value), value)
+                        for value in layer_outputs[1:-1]
+                    ),
+                    layer_outputs[-1],
+                )
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs[-1],
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs[0], idx, layers=self.layers)
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
+                if encoder_hidden_states is not None:
+                    all_cross_attentions += (layer_outputs[2],)
+
+            return hidden_states, cv, all_hidden_states, all_self_attns, all_cross_attentions, idx + 1
+
+        hidden_states, _, all_hidden_states, all_self_attns, all_cross_attentions, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, cache_views, all_hidden_states, all_self_attns, all_cross_attentions, 0),
+            trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
+        )
+        hidden_states = checkpoint_name(self.layer_norm(hidden_states), "model_output")
+        # HF parity: num_layers + 1 states (layer inputs, then the post-norm
+        # output in place of the last layer's pre-norm output).
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        return BaseModelOutputWithPastAndCrossAttentions(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+            cross_attentions=all_cross_attentions,
+            past_key_values=past_key_values,
+        )
+
+
+@register_module(TaskType.BASE_MODULE, config=WhisperConfig, model_type="whisper")
+class WhisperModel(EasyDeLBaseModule):
+    """The base Whisper Model transformer implementing the encoder-decoder architecture.
+
+    Attributes:
+        config (WhisperConfig): Configuration object for the model.
+        encoder (WhisperEncoder): The encoder stack.
+        decoder (WhisperDecoder): The decoder stack.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        rngs (spx.Rngs): Random number generators.
+    """
+
+    def __init__(
+        self,
+        config: WhisperConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: str | lax.Precision | None = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initializes the WhisperModel module.
+
+        Args:
+            config (WhisperConfig): The configuration object for the model.
+            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+            precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
+            rngs (spx.Rngs): Random number generators.
+        """
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.encoder = WhisperEncoder(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.decoder = WhisperDecoder(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+    def forward(
+        self,
+        input_features: jnp.ndarray,
+        decoder_input_ids: Int[Array, "batch seq_len"],
+        decoder_mask_info: MaskInfo | None = None,
+        decoder_position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = False,
+        output_hidden_states: bool | None = False,
+    ):
+        """Forward pass of the complete Whisper model (encoder + decoder).
+
+        Args:
+            input_features (jnp.ndarray): Input audio features (batch, num_mel_bins, seq_len).
+            decoder_input_ids (jnp.ndarray): Decoder input token IDs (batch, target_seq_len).
+            decoder_mask_info (MaskInfo | None): Mask information for decoder self-attention.
+            decoder_position_ids (tp.Optional[jnp.ndarray]): Position IDs for decoder inputs.
+            mode: Runtime mode (train/decode/prefill).
+            past_key_values (tp.Optional[TransformerCache]): Cached key/value states for fast decoding.
+            cache_metadata (tp.Optional[TransformerMetadata]): Metadata for paged attention.
+            output_attentions (bool): Whether to return attention weights (default: False).
+            output_hidden_states (bool): Whether to return hidden states for all layers (default: False).
+
+        Returns:
+            Seq2SeqModelOutput: The model output. returns a `Seq2SeqModelOutput`.
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        batch_size, sequence_length = decoder_input_ids.shape
+
+        if decoder_position_ids is None:
+            if past_key_values is not None:
+                raise ValueError("Make sure to provide `decoder_position_ids` when passing `past_key_values`.")
+
+            decoder_position_ids = jnp.broadcast_to(
+                jnp.arange(sequence_length)[None, :],
+                (batch_size, sequence_length),
+            )
+        decoder_position_ids = decoder_position_ids.astype("i4")
+        encoder_outputs = self.encoder(
+            input_features=input_features,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
+
+        decoder_outputs = self.decoder(
+            input_ids=decoder_input_ids,
+            mask_info=decoder_mask_info,
+            position_ids=decoder_position_ids,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            encoder_hidden_states=encoder_outputs[0],
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
+
+        return Seq2SeqModelOutput(
+            last_hidden_state=decoder_outputs.last_hidden_state,
+            decoder_hidden_states=decoder_outputs.hidden_states,
+            decoder_attentions=decoder_outputs.attentions,
+            past_key_values=decoder_outputs.past_key_values,
+            cross_attentions=decoder_outputs.cross_attentions,
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            encoder_hidden_states=encoder_outputs.hidden_states,
+            encoder_attentions=encoder_outputs.attentions,
+        )
+
+    def decode(
+        self,
+        encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        decoder_input_ids: Int[Array, "batch seq_len"],
+        decoder_mask_info: MaskInfo | None = None,
+        decoder_position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = False,
+        output_hidden_states: bool | None = False,
+        encoder_mask_info: MaskInfo | None = None,
+    ):
+        """Performs decoding using the decoder module.
+
+        Args:
+            encoder_hidden_states (jnp.ndarray): Hidden states from the encoder.
+            decoder_input_ids (jnp.ndarray): Decoder input token IDs.
+            decoder_mask_info (MaskInfo | None): Mask information for decoder self-attention.
+            decoder_position_ids (tp.Optional[jnp.ndarray]): Position IDs for decoder inputs.
+            mode: Runtime mode (train/decode/prefill).
+            past_key_values (tp.Optional[TransformerCache]): Cached key/value states.
+            cache_metadata (tp.Optional[TransformerMetadata]): Metadata for paged attention.
+            output_attentions (bool): Whether to return attention weights.
+            output_hidden_states (bool): Whether to return hidden states for all layers.
+            encoder_mask_info (MaskInfo | None): Optional cross-attention mask over encoder keys.
+
+        Returns:
+            BaseModelOutputWithPastAndCrossAttentions | tuple: Decoder output.
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        batch_size, sequence_length = decoder_input_ids.shape
+
+        if decoder_position_ids is None:
+            if past_key_values is not None:
+                raise ValueError("Make sure to provide `decoder_position_ids` when passing `past_key_values`.")
+
+            decoder_position_ids = jnp.broadcast_to(
+                jnp.arange(sequence_length)[None, :],
+                (batch_size, sequence_length),
+            )
+
+        decoder_outputs = self.decoder(
+            input_ids=decoder_input_ids,
+            mask_info=decoder_mask_info,
+            position_ids=decoder_position_ids,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_mask_info=encoder_mask_info,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
+
+        return Seq2SeqModelOutput(
+            last_hidden_state=decoder_outputs.last_hidden_state,
+            decoder_hidden_states=decoder_outputs.hidden_states,
+            decoder_attentions=decoder_outputs.attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
+            past_key_values=decoder_outputs.past_key_values,
+        )
+
+    def encode(
+        self,
+        input_features: jnp.ndarray,
+        output_attentions: bool | None = False,
+        output_hidden_states: bool | None = False,
+    ):
+        """Performs encoding using the encoder module.
+
+        Args:
+            input_features (jnp.ndarray): Input audio features.
+            output_attentions (bool): Whether to return attention weights.
+            output_hidden_states (bool): Whether to return hidden states for all layers.
+
+        Returns:
+            BaseModelOutput | tuple: Encoder output.
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        encoder_outputs = self.encoder(
+            input_features=input_features,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
+
+        return Seq2SeqModelOutput(
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            encoder_hidden_states=encoder_outputs.hidden_states,
+            encoder_attentions=encoder_outputs.attentions,
+        )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        """
+        return self.encoder
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.decoder
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the decoder.
+        """
+        return self.decoder.embed_tokens
+
+
+@register_module(TaskType.SPEECH_SEQUENCE_TO_SEQUENCE, config=WhisperConfig, model_type="whisper")
+class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperModel, WhisperConfig]):  # type: ignore
+    """Whisper encoder-decoder with projection head for speech-to-text generation.
+
+    This model extends the base Whisper architecture with a language modeling head for
+    generating text transcriptions and translations from audio. It supports multilingual
+    speech recognition, translation to English, and timestamp prediction.
+
+    The model consists of:
+        - WhisperModel: The base encoder-decoder transformer
+        - proj_out: Linear projection layer mapping decoder hidden states to vocabulary logits
+
+    Attributes:
+        model (WhisperModel): The base encoder-decoder model.
+        proj_out (RowParallelLinear): Output projection to vocabulary space.
+        config (WhisperConfig): Model configuration.
+        loss_type (str): Loss type identifier for training ("ForCausalLM").
+    """
+
+    loss_type = "ForCausalLM"
+
+    _task_type = TaskType.SPEECH_SEQUENCE_TO_SEQUENCE
+    _model_type = "whisper"
+    _config_class = WhisperConfig
+
+    def __init__(
+        self,
+        config: WhisperConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: str | lax.Precision | None = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initializes WhisperForConditionalGeneration.
+
+        Args:
+            config (WhisperConfig): Model configuration object specifying architecture
+                parameters such as vocab_size, num_mel_bins, layer counts, hidden dimensions,
+                and attention head counts.
+            dtype (jnp.dtype): Data type for activations and computations during forward pass.
+                Default: jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for model parameters (weights and biases).
+                Default: jnp.bfloat16.
+            precision (str | lax.Precision, optional): JAX precision setting for matrix
+                multiplications. Options include 'default', 'high', 'highest', or None.
+                Default: None.
+            rngs (spx.Rngs): Random number generator state for dropout and parameter
+                initialization.
+        """
+        super().__init__(
+            config=config,
+            base_model_class=WhisperModel,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            lm_head_name="proj_out",
+            lm_head_class=RowParallelLinear,
+            lm_head_bias=False,
+            lm_head_kernel_init=jax.nn.initializers.normal(config.init_std),
+            create_lm_head=True,
+        )
+
+    def forward(
+        self,
+        input_features,
+        decoder_input_ids,
+        decoder_mask_info: MaskInfo | None = None,
+        decoder_position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ):
+        """Forward pass of WhisperForConditionalGeneration.
+
+        Processes audio features through the encoder and generates text through the decoder
+        with an optional language modeling head for next-token prediction.
+
+        Args:
+            input_features (jnp.ndarray): Log-Mel spectrogram features from audio input.
+                Shape: (batch_size, num_mel_bins, sequence_length) where num_mel_bins is
+                typically 80 and sequence_length is max_source_positions * 2 (usually 3000).
+            decoder_input_ids (jnp.ndarray): Input token IDs for the decoder.
+                Shape: (batch_size, target_sequence_length). For training, these are typically
+                the shifted target sequences. For generation, starts with decoder_start_token_id.
+            decoder_mask_info (MaskInfo, optional): Mask information for decoder self-attention,
+                encoding causal attention patterns and padding. If None, creates default causal mask.
+            decoder_position_ids (Int[Array, "batch seq_len"], optional): Position indices for
+                decoder inputs. Shape: (batch_size, target_sequence_length). If None, uses
+                sequential positions [0, 1, 2, ...].
+            mode (RUNTIME_MODE_TYPES, optional): Execution mode controlling attention computation.
+                Options: MODE_TRAIN (full attention), MODE_DECODE (single-token generation),
+                MODE_PREFILL (initial KV cache population). Auto-detected if None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache, optional):
+                Cached key/value states from previous decoder layers for fast autoregressive
+                generation. Contains cached states for all decoder layers.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata, optional):
+                Metadata for managing paged attention caches, including sequence lengths and
+                valid token positions.
+            apply_lm_head (bool): Whether to apply the language modeling head to produce logits.
+                Set to False if you only need hidden states. Default: True.
+            output_attentions (bool): Whether to return attention weights from all layers.
+                Default: False.
+            output_hidden_states (bool): Whether to return hidden states from all layers
+                (encoder and decoder). Default: False.
+
+        Returns:
+            Seq2SeqLMOutput: Model output containing:
+                - logits (jnp.ndarray, optional): Next-token prediction logits if apply_lm_head=True.
+                  Shape: (batch_size, target_sequence_length, vocab_size).
+                - decoder_hidden_states (tuple[jnp.ndarray], optional): Hidden states from each
+                  decoder layer if output_hidden_states=True.
+                - decoder_attentions (tuple[jnp.ndarray], optional): Self-attention weights from
+                  each decoder layer if output_attentions=True.
+                - cross_attentions (tuple[jnp.ndarray], optional): Cross-attention weights from
+                  each decoder layer if output_attentions=True.
+                - encoder_last_hidden_state (jnp.ndarray): Final encoder hidden states.
+                  Shape: (batch_size, encoder_sequence_length, d_model).
+                - encoder_hidden_states (tuple[jnp.ndarray], optional): Hidden states from each
+                  encoder layer if output_hidden_states=True.
+                - encoder_attentions (tuple[jnp.ndarray], optional): Attention weights from each
+                  encoder layer if output_attentions=True.
+                - past_key_values (TransformerCache | RaggedPagesCache | HybridCache, optional):
+                  Updated cache with new key/value states.
+        """
+        outputs = self.model(
+            input_features=input_features,
+            decoder_input_ids=decoder_input_ids,
+            decoder_mask_info=decoder_mask_info,
+            decoder_position_ids=decoder_position_ids,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+        )
+
+        hidden_states = outputs[0]
+
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = self.compute_lm_logits(hidden_states)
+
+        return Seq2SeqLMOutput(
+            logits=lm_logits,
+            decoder_hidden_states=outputs.decoder_hidden_states,
+            decoder_attentions=outputs.decoder_attentions,
+            cross_attentions=outputs.cross_attentions,
+            encoder_last_hidden_state=outputs.encoder_last_hidden_state,
+            encoder_hidden_states=outputs.encoder_hidden_states,
+            encoder_attentions=outputs.encoder_attentions,
+            past_key_values=outputs.past_key_values,
+        )
+
+    def decode(
+        self,
+        decoder_input_ids,
+        encoder_outputs,
+        encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        decoder_mask_info: MaskInfo | None = None,
+        decoder_position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ):
+        """Runs the decoder with pre-computed encoder outputs.
+
+        This method performs only the decoding step, using encoder hidden states that were
+        computed separately. This is useful for autoregressive generation where the encoder
+        outputs can be computed once and reused for each decoding step.
+
+        Args:
+            decoder_input_ids (jnp.ndarray): Input token IDs for the decoder.
+                Shape: (batch_size, target_sequence_length).
+            encoder_outputs (BaseModelOutput | tuple): Pre-computed encoder outputs containing
+                at least the last hidden state. The first element should be encoder hidden states
+                with shape (batch_size, encoder_sequence_length, d_model).
+            encoder_attention_mask (Bool[Array, "batch seq_len"], optional): Mask for encoder
+                hidden states indicating valid positions. Shape: (batch_size, encoder_seq_len).
+            decoder_mask_info (MaskInfo, optional): Mask information for decoder self-attention.
+                If None, creates default causal mask.
+            decoder_position_ids (Int[Array, "batch seq_len"], optional): Position indices for
+                decoder inputs. Auto-generated as sequential positions if None.
+            mode (RUNTIME_MODE_TYPES, optional): Execution mode (train/decode/prefill).
+                Auto-detected based on sequence length and cache state if None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache, optional):
+                Cached key/value states for fast autoregressive generation.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata, optional):
+                Metadata for paged attention cache management.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to config.output_attentions.
+            output_hidden_states (bool, optional): Whether to return hidden states from all layers.
+                Defaults to config.output_hidden_states.
+
+        Returns:
+            Seq2SeqLMOutput: Decoder output containing:
+                - logits (jnp.ndarray): Next-token prediction logits.
+                  Shape: (batch_size, target_sequence_length, vocab_size).
+                - decoder_hidden_states (tuple, optional): Hidden states from each decoder layer.
+                - decoder_attentions (tuple, optional): Self-attention weights from each layer.
+                - cross_attentions (tuple, optional): Cross-attention weights from each layer.
+                - past_key_values: Updated cache with new key/value states.
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        encoder_hidden_states = encoder_outputs[0]
+        encoder_mask_info = None
+        if encoder_attention_mask is not None:
+            expected_shape = encoder_hidden_states.shape[:2]
+            if encoder_attention_mask.shape != expected_shape:
+                raise ValueError(
+                    f"encoder_attention_mask must have shape {expected_shape}, got {encoder_attention_mask.shape}."
+                )
+            # Cross-attention has distinct query and key lengths. A 3-D mask
+            # broadcasts the encoder padding mask over decoder queries.
+            cross_attention_mask = jnp.broadcast_to(
+                encoder_attention_mask[:, None, :],
+                (decoder_input_ids.shape[0], decoder_input_ids.shape[1], encoder_hidden_states.shape[1]),
+            )
+            encoder_mask_info = MaskInfo.from_attention_mask(cross_attention_mask)
+
+        outputs = self.model.decode(
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_mask_info=encoder_mask_info,
+            decoder_mask_info=decoder_mask_info,
+            decoder_input_ids=decoder_input_ids,
+            decoder_position_ids=decoder_position_ids,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+        )
+        hidden_states = outputs[0]
+
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        lm_logits = self.proj_out(
+            hidden_states,
+            (
+                self.model.decoder.embed_tokens.weight.value.T.astype(self.param_dtype)
+                if self.config.tie_word_embeddings
+                else None
+            ),
+        )
+
+        return Seq2SeqLMOutput(
+            logits=lm_logits,
+            decoder_hidden_states=outputs.decoder_hidden_states,
+            decoder_attentions=outputs.decoder_attentions,
+            cross_attentions=outputs.cross_attentions,
+            encoder_last_hidden_state=outputs.encoder_last_hidden_state,
+            encoder_hidden_states=outputs.encoder_hidden_states,
+            encoder_attentions=outputs.encoder_attentions,
+            past_key_values=outputs.past_key_values,
+        )
+
+    def encode(
+        self,
+        input_features: jnp.ndarray,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        **kwargs,
+    ):
+        """Runs the encoder to produce audio representations.
+
+        This method encodes log-Mel spectrogram features into contextualized representations
+        that can be used by the decoder for transcription or translation. The encoder output
+        can be cached and reused for multiple decoding steps during generation.
+
+        Args:
+            input_features (jnp.ndarray): Log-Mel spectrogram features from audio input.
+                Shape: (batch_size, num_mel_bins, sequence_length) where num_mel_bins is
+                typically 80 and sequence_length is max_source_positions * 2 (usually 3000).
+            attention_mask (Bool[Array, "batch seq_len"], optional): Mask indicating valid
+                audio positions. Currently unused as Whisper processes fixed-length spectrograms.
+            output_attentions (bool, optional): Whether to return attention weights from all
+                encoder layers. Defaults to config.output_attentions.
+            output_hidden_states (bool, optional): Whether to return hidden states from all
+                encoder layers. Defaults to config.output_hidden_states.
+            **kwargs: Additional keyword arguments (unused, for API compatibility).
+
+        Returns:
+            Seq2SeqModelOutput: Encoder output containing:
+                - encoder_last_hidden_state (jnp.ndarray): Final encoder hidden states.
+                  Shape: (batch_size, encoder_sequence_length, d_model).
+                - encoder_hidden_states (tuple, optional): Hidden states from each encoder layer
+                  if output_hidden_states=True.
+                - encoder_attentions (tuple, optional): Attention weights from each encoder layer
+                  if output_attentions=True.
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        return self.model.encode(
+            input_features=jnp.array(input_features, dtype="f4"),
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
+
+    def generate(
+        self,
+        input_features,
+        generation_config=None,
+        logits_processor=None,
+        return_timestamps=None,
+        task=None,
+        language=None,
+        is_multilingual=None,
+        **kwargs,
+    ):
+        """Generates text transcriptions or translations from audio features.
+
+        This method performs autoregressive text generation from audio input, supporting
+        multilingual transcription, English translation, and timestamp prediction. It handles
+        Whisper-specific generation features including forced decoder tokens for language
+        and task conditioning.
+
+        Args:
+            input_features (jnp.ndarray): Log-Mel spectrogram features from audio input.
+                Shape: (batch_size, num_mel_bins, sequence_length).
+            generation_config (GenerationConfig, optional): Configuration object controlling
+                generation parameters (max_length, temperature, top_k, etc.). If None, uses
+                the model's default generation_config.
+            logits_processor (LogitsProcessorList, optional): Custom logits processors for
+                modifying the probability distribution during generation.
+            return_timestamps (bool, optional): Whether to predict timestamps along with text.
+                When True, uses WhisperTimeStampLogitsProcessor for timestamp token generation.
+            task (str, optional): Task to perform - either "transcribe" (speech-to-text in
+                original language) or "translate" (speech-to-English translation).
+            language (str, optional): Language code for transcription (e.g., "en", "fr", "de").
+                Used to condition the model for a specific language.
+            is_multilingual (bool, optional): Whether to use multilingual tokens. When True,
+                prepends language and task tokens to guide generation.
+            **kwargs: Additional keyword arguments passed to the base generate method,
+                including decoder_input_ids, max_length, num_beams, etc.
+
+        Returns:
+            jnp.ndarray: Generated token IDs. Shape: (batch_size, generated_sequence_length).
+                The output includes special tokens like language tags, task tokens, and
+                optionally timestamp tokens depending on the configuration.
+
+        Note:
+            - For multilingual models, language and task tokens are automatically prepended
+            - Timestamp tokens are interleaved with text tokens when return_timestamps=True
+            - The no_timestamps_token is forced when return_timestamps=False to suppress
+              timestamp generation
+        """
+        generation_config = copy.deepcopy(self.generation_config if generation_config is None else generation_config)
+
+        if return_timestamps is not None:
+            generation_config.return_timestamps = return_timestamps
+
+        if task is not None:
+            generation_config.task = task
+
+        if is_multilingual is not None:
+            generation_config.is_multilingual = is_multilingual
+
+        if language is not None:
+            generation_config.language = language
+
+        if "decoder_input_ids" in kwargs:
+            decoder_input_length = kwargs["decoder_input_ids"].shape[-1]
+        else:
+            decoder_input_length = 1
+
+        configured_ids = kwargs.pop("forced_decoder_ids", getattr(generation_config, "forced_decoder_ids", None))
+        forced_decoder_ids = list(configured_ids) if configured_ids is not None else []
+
+        if getattr(generation_config, "is_multilingual", False):
+            if not forced_decoder_ids:
+                configured_language = getattr(generation_config, "language", None)
+                language_id = generation_config.lang_to_id[configured_language] if configured_language else None
+                configured_task = getattr(generation_config, "task", None) or "transcribe"
+                forced_decoder_ids = [(1, language_id), (2, generation_config.task_to_id[configured_task])]
+            elif language is not None or task is not None:
+                # Explicit call options override their prefix positions, not the
+                # caller's remaining forced tokens. Config-only defaults do not
+                # replace an explicitly configured forced-token sequence.
+                forced_tokens = dict(forced_decoder_ids)
+                if language is not None:
+                    forced_tokens[1] = generation_config.lang_to_id[language]
+                if task is not None:
+                    forced_tokens[2] = generation_config.task_to_id[task]
+                forced_decoder_ids = sorted(forced_tokens.items())
+
+        if (
+            hasattr(generation_config, "return_timestamps") and generation_config.return_timestamps
+        ) or return_timestamps:
+            logits_processor = LogitsProcessorList(logits_processor or [])
+            logits_processor.append(
+                WhisperTimeStampLogitsProcessor(generation_config, self.config, decoder_input_length)
+            )
+        else:
+            no_timestamps_token_id = getattr(generation_config, "no_timestamps_token_id", None)
+            if no_timestamps_token_id is not None and all(
+                token != no_timestamps_token_id for _, token in forced_decoder_ids
+            ):
+                idx = max((position for position, _ in forced_decoder_ids), default=0) + 1
+                forced_decoder_ids.append((idx, no_timestamps_token_id))
+
+        generation_config.forced_decoder_ids = forced_decoder_ids or None
+
+        return super().generate(
+            input_features,
+            generation_config,
+            logits_processor=logits_processor,
+            **kwargs,
+        )
+
+    def _force_generate(
+        self,
+        input_features: jax.Array,
+        forced_decoder_ids: jax.Array,
+        return_timestamps: bool = False,
+        generation_config: tp.Optional["transformers.GenerationConfig"] = None,  # type:ignore
+        **kwargs,
+    ):
+        """Generates text with explicitly forced decoder token IDs.
+
+        This internal method provides fine-grained control over generation by forcing
+        specific tokens at specific positions in the output sequence. It's useful for
+        scenarios where you want to guarantee certain tokens appear in the output,
+        such as language tags or task identifiers.
+
+        Args:
+            input_features (jax.Array): Log-Mel spectrogram features from audio input.
+                Shape: (batch_size, num_mel_bins, sequence_length).
+            forced_decoder_ids (jax.Array): Array of (position, token_id) pairs specifying
+                which tokens to force at which positions. Shape: (num_forced, 2).
+                For example, [(1, lang_id), (2, task_id)] forces language token at position 1
+                and task token at position 2.
+            return_timestamps (bool): Whether to predict timestamps along with text.
+                When True, applies WhisperTimeStampLogitsProcessor for timestamp generation.
+                Default: False.
+            generation_config (GenerationConfig, optional): Configuration for generation
+                parameters. If None, uses the model's default generation_config.
+                Note: forced_decoder_ids in generation_config is overridden and set to None.
+            **kwargs: Additional keyword arguments passed to the base generate method.
+
+        Returns:
+            jnp.ndarray: Generated token IDs including forced tokens.
+                Shape: (batch_size, generated_sequence_length).
+        """
+        generation_config = copy.deepcopy(self.generation_config if generation_config is None else generation_config)
+        generation_config.forced_decoder_ids = None
+        logits_processor = LogitsProcessorList(kwargs.pop("logits_processor", None) or [])
+        if not isinstance(forced_decoder_ids, dict):
+            forced_decoder_ids = {
+                int(position): None if token is None else int(token) for position, token in forced_decoder_ids
+            }
+        logits_processor.append(ForceTokensLogitsProcessor(forced_decoder_ids))
+        if return_timestamps:
+            logits_processor.append(WhisperTimeStampLogitsProcessor(generation_config, self.config, 1))
+        return super().generate(
+            input_features,
+            generation_config,
+            logits_processor=logits_processor,
+            **kwargs,
+        )
+
+    def prepare_inputs_for_generation(
+        self,
+        decoder_input_ids,
+        max_length: int,
+        pad_token_id: int,
+        starts: int | None = None,
+        shardings=None,
+        attention_mask: jax.Array | None = None,
+        decoder_attention_mask: jax.Array | None = None,
+        encoder_outputs=None,
+        **kwargs,
+    ):
+        """Prepares model inputs for the first generation step.
+
+        This method initializes the KV cache and prepares all necessary inputs for
+        the autoregressive generation loop. It sets up attention masks, position IDs,
+        and the initial cache state.
+
+        Args:
+            decoder_input_ids (jnp.ndarray): Initial decoder token IDs to start generation.
+                Shape: (batch_size, initial_sequence_length). Typically contains the
+                decoder_start_token_id and any prompt tokens.
+            max_length (int): Maximum sequence length for generation. Used to pre-allocate
+                the KV cache and attention mask.
+            pad_token_id (int): Token ID used for padding. Used to compute prefill length
+                and pad the attention mask.
+            starts (int, optional): Starting position indices for each sequence in the batch.
+                If None, computed automatically from decoder_input_ids.
+            shardings: Sharding specifications for distributed computation.
+            attention_mask (jax.Array, optional): Encoder attention mask.
+                Shape: (batch_size, encoder_sequence_length).
+            decoder_attention_mask (jax.Array, optional): Decoder attention mask for the
+                initial input sequence. Shape: (batch_size, initial_sequence_length).
+            encoder_outputs (tuple, optional): Pre-computed encoder outputs to use for
+                cross-attention during decoding.
+            **kwargs: Additional keyword arguments for API compatibility.
+
+        Returns:
+            dict: Prepared inputs dictionary containing:
+                - past_key_values: Initialized KV cache for all decoder layers.
+                - encoder_outputs: Pre-computed encoder hidden states.
+                - encoder_attention_mask: Mask for encoder outputs.
+                - decoder_mask_info: MaskInfo for decoder self-attention.
+                - decoder_position_ids: Position indices for decoder inputs.
+        """
+        batch_size, seq_length = decoder_input_ids.shape
+
+        if starts is None:
+            starts = self.compute_prefill_length(decoder_input_ids, pad_token_id)
+        past_key_values = self.init_cache(
+            batch_size,
+            max_length,
+            starts,
+            shardings,
+            pad_token_id,
+        )
+        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="b1")
+        if decoder_attention_mask is not None:
+            position_ids = decoder_attention_mask.cumsum(-1) - 1
+            extended_attention_mask = lax.dynamic_update_slice(extended_attention_mask, decoder_attention_mask, (0, 0))
+        else:
+            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
+
+        decoder_mask_info = MaskInfo.from_attention_mask(extended_attention_mask)
+
+        return self.prepare_inputs_for_call(
+            **{
+                "past_key_values": past_key_values,
+                "encoder_outputs": encoder_outputs,
+                "encoder_attention_mask": attention_mask,
+                "decoder_mask_info": decoder_mask_info,
+                "decoder_position_ids": position_ids,
+            }
+        )
+
+    def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        """Updates model inputs for the next autoregressive generation step.
+
+        This method updates the model kwargs after each generation step, preparing
+        them for the next forward pass. It updates the KV cache with the new key/value
+        states and increments position IDs.
+
+        Args:
+            model_outputs (Seq2SeqLMOutput): Outputs from the previous generation step,
+                containing updated past_key_values with cached key/value states.
+            model_kwargs (dict): Dictionary of model inputs from the current step,
+                including decoder_position_ids and other generation state.
+
+        Returns:
+            dict: Updated model kwargs for the next generation step with:
+                - past_key_values: Updated KV cache from model_outputs.
+                - decoder_position_ids: Incremented position IDs for the next token.
+        """
+        model_kwargs["past_key_values"] = model_outputs.past_key_values
+        model_kwargs["decoder_position_ids"] = model_kwargs["decoder_position_ids"][:, -1:] + 1
+        return model_kwargs
+
+    def compute_loss(
+        self,
+        *,
+        labels: Array | None = None,
+        loss_config: LossConfig | None = None,
+        loss_kwargs: dict | None = None,
+        **batch,
+    ) -> tuple[tp.Any, LossMetrics]:
+        """Computes the cross-entropy loss for speech-to-text training.
+
+        This method handles the loss computation for Whisper training, including
+        automatic preparation of decoder inputs through right-shifting of labels.
+        It uses mean reduction and disables token shifting in the base loss function
+        since shifting is handled here.
+
+        Args:
+            labels (Array, optional): Target token IDs for computing the loss.
+                Shape: (batch_size, sequence_length). Tokens with value -100 are
+                ignored in the loss computation.
+            loss_config (LossConfig, optional): Configuration for loss computation
+                including reduction method and other parameters. If None, creates
+                a default LossConfig with mean reduction.
+            loss_kwargs (dict, optional): Additional keyword arguments passed to
+                the loss computation function.
+            **batch: Additional batch inputs including input_features and optionally
+                decoder_input_ids. If decoder_input_ids is not provided but labels
+                is provided, decoder_input_ids will be created by right-shifting
+                the labels.
+
+        Returns:
+            tuple[Array, LossMetrics]: A tuple containing:
+                - loss (Array): Scalar loss value (mean cross-entropy over valid tokens).
+                - metrics (LossMetrics): Additional loss metrics including per-token
+                  losses and auxiliary information.
+
+        Note:
+            - If decoder_input_ids is not provided, it's automatically created by
+              shifting labels right with decoder_start_token_id prepended.
+            - Tokens with label -100 are replaced with pad_token_id in decoder inputs.
+            - Uses mean reduction by default rather than sum.
+        """
+        if loss_config is None:
+            loss_config = LossConfig()
+        loss_config.reduction = "mean"
+        loss_config.shift_tokens = False
+        if labels is not None:
+            if batch.get("decoder_input_ids", None) is None and batch.get("decoder_inputs_embeds", None) is None:
+                batch["decoder_input_ids"] = shift_tokens_right(
+                    labels,
+                    self.config.pad_token_id,
+                    self.config.decoder_start_token_id,
+                )
+        return super().compute_loss(
+            labels=labels,
+            loss_config=loss_config,
+            loss_kwargs=loss_kwargs,
+            **batch,
+        )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        """
+        return self.model.encoder
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.decoder
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        """
+        return self.proj_out
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the decoder.
+        """
+        return self.model.decoder.embed_tokens
+
+
+@register_module(TaskType.AUDIO_CLASSIFICATION, config=WhisperConfig, model_type="whisper")
+class WhisperForAudioClassification(EasyDeLBaseModule):
+    """Encoder-only Whisper variant with pooling and classifier for audio tagging.
+
+    This model uses the Whisper encoder for audio feature extraction, followed by
+    mean-pooling and a classification head for tasks like audio event detection,
+    music genre classification, or acoustic scene classification.
+
+    Architecture:
+        - WhisperEncoder: Processes log-Mel spectrograms into contextualized representations
+        - Optional weighted layer sum: Combines encoder layer outputs with learned weights
+        - Projector: Linear layer reducing d_model to classifier_proj_size
+        - Mean pooling: Aggregates temporal representations
+        - Classifier: Linear layer mapping to num_labels classes
+
+    Attributes:
+        encoder (WhisperEncoder): The Whisper encoder stack.
+        layer_weights (spx.Parameter, optional): Learned weights for combining encoder layers
+            when use_weighted_layer_sum=True.
+        projector (ColumnParallelLinear): Dimension reduction layer before classification.
+        classifier (ColumnParallelLinear): Final classification layer.
+        config (WhisperConfig): Model configuration.
+    """
+
+    def __init__(
+        self,
+        config: WhisperConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: str | lax.Precision | None = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initializes WhisperForAudioClassification.
+
+        Args:
+            config (WhisperConfig): Model configuration object. Must include num_labels
+                for the classification task and optionally use_weighted_layer_sum and
+                classifier_proj_size.
+            dtype (jnp.dtype): Data type for activations and computations during forward pass.
+                Default: jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for model parameters (weights and biases).
+                Default: jnp.bfloat16.
+            precision (str | lax.Precision, optional): JAX precision setting for matrix
+                multiplications. Options include 'default', 'high', 'highest', or None.
+                Default: None.
+            rngs (spx.Rngs): Random number generator state for dropout and parameter
+                initialization.
+        """
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.encoder = WhisperEncoder(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        config.is_encoder_decoder = False
+        num_layers = config.num_hidden_layers + 1  # transformer layers + input embeddings
+        if config.use_weighted_layer_sum:
+            self.layer_weights = spx.Parameter(jnp.full((num_layers,), 1.0 / num_layers, dtype=param_dtype))
+        self.projector = ColumnParallelLinear(
+            config.d_model,
+            config.classifier_proj_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.classifier = ColumnParallelLinear(
+            config.classifier_proj_size,
+            config.num_labels,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+    def forward(
+        self,
+        input_features,
+        encoder_outputs=None,
+        output_attentions=None,
+        output_hidden_states: bool | None = True,
+    ):
+        """Forward pass of WhisperForAudioClassification.
+
+        Processes audio features through the Whisper encoder, applies optional weighted layer
+        summation, pools the representations, and produces classification logits.
+
+        Args:
+            input_features (jnp.ndarray): Log-Mel spectrogram features from audio input.
+                Shape: (batch_size, num_mel_bins, sequence_length) where num_mel_bins is
+                typically 80 and sequence_length is max_source_positions * 2 (usually 3000).
+            encoder_outputs (BaseModelOutput, optional): Pre-computed encoder outputs to reuse.
+                If provided, skips encoder computation. Must include hidden_states if
+                use_weighted_layer_sum=True. Default: None (compute encoder outputs).
+            output_attentions (bool, optional): Whether to return attention weights from all
+                encoder layers. If None, uses config.output_attentions. Default: None.
+            output_hidden_states (bool): Whether to return hidden states from all encoder layers.
+                Required when use_weighted_layer_sum=True to compute weighted average across
+                layers. Default: True.
+
+        Returns:
+            SequenceClassifierOutput: Classification output containing:
+                - logits (jnp.ndarray): Classification logits over all label classes.
+                  Shape: (batch_size, num_labels).
+                - hidden_states (tuple[jnp.ndarray], optional): Hidden states from each encoder
+                  layer if output_hidden_states=True. Each tensor has shape
+                  (batch_size, sequence_length, d_model).
+                - attentions (tuple[jnp.ndarray], optional): Attention weights from each encoder
+                  layer if output_attentions=True. Each tensor has shape
+                  (batch_size, num_heads, sequence_length, sequence_length).
+
+        Note:
+            This model uses mean pooling over the temporal dimension to aggregate encoder
+            outputs into a fixed-size representation before classification. If
+            use_weighted_layer_sum=True in the config, it computes a learned weighted
+            average across all encoder layer outputs instead of using only the final layer.
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        if self.config.use_weighted_layer_sum:
+            output_hidden_states = True
+
+        if encoder_outputs is None:
+            encoder_outputs = self.encoder(
+                input_features,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+            )
+
+        if self.config.use_weighted_layer_sum:
+            hidden_states = jnp.stack(encoder_outputs.hidden_states, axis=1)
+            norm_weights = jax.nn.softmax(self.layer_weights.value.astype(jnp.float32), axis=-1)
+            norm_weights = norm_weights.astype(hidden_states.dtype)
+            hidden_states = jnp.sum(hidden_states * jnp.reshape(norm_weights, [-1, 1, 1]), axis=1)
+        else:
+            hidden_states = encoder_outputs[0]
+
+        hidden_states = self.projector(hidden_states)
+        pooled_output = jnp.mean(hidden_states, axis=1)
+
+        logits = self.classifier(pooled_output)
+
+        return SequenceClassifierOutput(
+            logits=logits,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+        )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        """
+        return self.encoder
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        This is an encoder-only model for classification.
+        """
+        raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        This model has an audio classification head, not a language model head.
+        """
+        raise NotImplementedError("This model has an audio classification head, not a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        The encoder uses convolutional layers for feature extraction, not a standard token embedding.
+        Returning the first convolutional layer as the "embedding" layer.
+        """
+        return self.encoder.conv1

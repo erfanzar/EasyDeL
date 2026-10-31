@@ -1,0 +1,946 @@
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+"""Compilation utilities for JAX function optimization.
+
+Provides enhanced JIT compilation with persistent caching to disk,
+reducing compilation overhead across script runs.
+
+Functions:
+    ejit: Enhanced JIT with persistent caching
+    save_compiled_fn: Save compiled function to disk
+    load_compiled_fn: Load compiled function from disk
+    load_cached_functions: Load multiple cached functions
+
+Constants:
+    RECOMPILE_FORCE: Force recompilation flag (``EASYDEL_RECOMPILE_FORCE``).
+    ECACHE_COMPILES: Enable two-level compilation caching (``EASYDEL_CACHE_COMPILES``).
+    ALLOW_FULL_CACHE: Persist all XLA caches including tiny entries (``ALLOW_FULL_CACHE``).
+    CACHE_DIR: Base cache directory (``EJKERNEL_CACHE_ROOT`` relocates it).
+    COMPILE_FUNC_DIR: Directory for serialized compiled executables
+        (``EJKERNEL_COMPILE_CACHE_DIR``, legacy ``COMPILE_FUNC_DIR``, or
+        ``<CACHE_DIR>/ejit_compiled_functions``). This is the cache that grows
+        to multiple GB; ``EJKERNEL_PERSISTENT_CACHE_DIR`` does not relocate it.
+    COMPILED_CACHE: Module-level in-memory dict of compiled ``Compiled`` objects.
+
+Key Features:
+    - Persistent disk caching of compiled functions
+    - Automatic cache invalidation on source, hardware, or argument-signature changes
+    - Hardware-specific cache keys (device list included in signature)
+    - Two-level caching (in-memory dict + disk pickle)
+    - Graceful fallback to standard ``jax.jit`` on any error
+
+Example:
+    >>> from ejkernel.callib import ejit
+    >>>
+    >>> @ejit
+    ... def optimized_fn(x, y):
+    ...     return x @ y + x.T @ y.T
+    >>>
+    >>> result = optimized_fn(a, b)
+    >>> result = optimized_fn(a, b)  # served from cache on second call
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import enum
+import functools
+import hashlib
+import importlib.metadata
+import inspect
+import logging
+import os
+import pickle
+import platform
+import re
+import typing as tp
+import warnings
+from pathlib import Path
+
+import jax
+import numpy as np
+from jax.experimental.serialize_executable import deserialize_and_load, serialize
+
+from ._utils import check_bool_flag, get_cache_dir
+
+if tp.TYPE_CHECKING:
+    from jax._src.stages import Compiled, Lowered
+
+logger = logging.getLogger(__name__)
+
+P = tp.ParamSpec("P")
+R = tp.TypeVar("R")
+
+# These two flags use the EASYDEL_ prefix by intentional cross-package
+# agreement: ejkernel's compile cache is driven by the same env vars EasyDeL
+# users already set (easydel.utils.compiling_utils re-exports these values), so
+# a single EASYDEL_CACHE_COMPILES / EASYDEL_RECOMPILE_FORCE controls caching in
+# both packages. They are deliberately NOT renamed to an EJKERNEL_ prefix.
+RECOMPILE_FORCE = check_bool_flag("EASYDEL_RECOMPILE_FORCE", False)
+ECACHE_COMPILES = check_bool_flag("EASYDEL_CACHE_COMPILES", False)
+ALLOW_FULL_CACHE = check_bool_flag("ALLOW_FULL_CACHE", False)
+
+CACHE_DIR = get_cache_dir()
+
+# This is the cache that actually grows: serialized XLA executables, routinely
+# several GB. ``EJKERNEL_COMPILE_CACHE_DIR`` is the documented name; the older
+# unprefixed ``COMPILE_FUNC_DIR`` keeps working for existing setups. Note that
+# neither ``EJKERNEL_PERSISTENT_CACHE_DIR`` (autotuned kernel configs) nor
+# ``JAX_COMPILATION_CACHE_DIR`` relocates it -- pointing those at another
+# volume to escape a full root filesystem does nothing for this directory,
+# which is the one worth moving.
+COMPILE_FUNC_DIR = Path(
+    os.getenv("EJKERNEL_COMPILE_CACHE_DIR") or os.getenv("COMPILE_FUNC_DIR") or (CACHE_DIR / "ejit_compiled_functions")
+).expanduser()
+
+
+def _env_fingerprint() -> str:
+    """Import-safe fingerprint of the compilation environment.
+
+    Serialized/AOT executables are only valid for the exact toolchain and
+    machine class that produced them: a blob compiled against a different
+    jax/jaxlib/libtpu, or on a CPU with target features this host lacks
+    (e.g. ``+prefer-no-gather``), deserializes into garbage that aborts the
+    process with SIGILL-class native crashes — long after any Python
+    ``except`` block. Namespacing the on-disk cache by this fingerprint makes
+    foreign entries invisible instead of fatal.
+
+    Deliberately avoids ``jax.devices()`` (must not initialize a backend at
+    import time); accelerator identity is already part of every executable's
+    lowering, and toolchain + host-CPU identity is what the flat cache could
+    not see.
+    """
+    parts = [f"jax={jax.__version__}"]
+    for dist in ("jaxlib", "libtpu", "libtpu-nightly", "jax-cuda12-plugin", "jax-cuda13-plugin"):
+        try:
+            parts.append(f"{dist}={importlib.metadata.version(dist)}")
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    parts.append(platform.machine())
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith(("flags", "Features")):
+                    parts.append(hashlib.sha1(line.encode()).hexdigest()[:8])
+                    break
+    except OSError:
+        parts.append("nocpuinfo")
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
+
+
+EFFECTIVE_COMPILE_FUNC_DIR = COMPILE_FUNC_DIR / f"env-{_env_fingerprint()}"
+try:
+    EFFECTIVE_COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:  # read-only filesystem: caching disabled naturally at write time
+    pass
+
+
+def get_effective_compile_dir() -> Path:
+    """The environment-namespaced directory all compile caching reads/writes."""
+    return EFFECTIVE_COMPILE_FUNC_DIR
+
+
+COMPILED_FILE_NAME = "compiled.executable"
+COMPILED_CACHE: dict[str, Compiled] = {}
+
+# Serialized XLA executables are protobuf-framed; entries at/over the 2 GiB
+# protobuf limit fail metadata parsing on read and can abort the reader
+# natively. An executable this large almost always means model weights were
+# captured as jit constants — a bug to fix at the call site, never to cache.
+MAX_CACHE_ENTRY_BYTES = int(os.getenv("EJIT_MAX_CACHE_ENTRY_BYTES", str(1_900_000_000)))
+
+_JAX_PERSISTENT_CACHE_CONFIGURED = False
+
+
+def _configure_jax_persistent_cache() -> None:
+    """Point JAX's persistent compilation cache at the namespaced dir (once).
+
+    An explicit ``JAX_COMPILATION_CACHE_DIR`` wins. Overwriting it silently
+    redirected JAX's cache back under this module's directory, so operators who
+    set that variable to move compile artifacts off a nearly-full root
+    filesystem saw the traffic land in the old place anyway, with no warning
+    and no way to tell from the environment.
+
+    Also sweeps any oversized entry out of the directory so a partially
+    written or weight-capturing giant blob can never poison later readers.
+    """
+    global _JAX_PERSISTENT_CACHE_CONFIGURED
+    if _JAX_PERSISTENT_CACHE_CONFIGURED:
+        return
+    from jax.experimental.compilation_cache import compilation_cache as cc
+
+    jax_cache_dir = os.getenv("JAX_COMPILATION_CACHE_DIR") or str(EFFECTIVE_COMPILE_FUNC_DIR)
+    cc.set_cache_dir(jax_cache_dir)
+    jax.config.update("jax_compilation_cache_dir", jax_cache_dir)
+    if ALLOW_FULL_CACHE:
+        jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+        jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
+    try:
+        for entry in EFFECTIVE_COMPILE_FUNC_DIR.iterdir():
+            if entry.is_file() and entry.stat().st_size > MAX_CACHE_ENTRY_BYTES:
+                warnings.warn(
+                    f"Removing oversized compile-cache entry {entry.name} "
+                    f"({entry.stat().st_size / 1e9:.2f} GB > {MAX_CACHE_ENTRY_BYTES / 1e9:.2f} GB): "
+                    "entries this large fail protobuf parsing on read and can crash the reader. "
+                    "The producing jit likely captures model weights as constants.",
+                    stacklevel=2,
+                )
+                entry.unlink(missing_ok=True)
+    except OSError:
+        pass
+    _JAX_PERSISTENT_CACHE_CONFIGURED = True
+
+
+def _entry_too_large(num_bytes: int, what: str, *, verbose: bool = True) -> bool:
+    """True (with an actionable warning) when a cache entry exceeds the safe size."""
+    if num_bytes <= MAX_CACHE_ENTRY_BYTES:
+        return False
+    if verbose:
+        warnings.warn(
+            f"Skipping compile-cache {what}: {num_bytes / 1e9:.2f} GB exceeds the "
+            f"{MAX_CACHE_ENTRY_BYTES / 1e9:.2f} GB safe limit (protobuf parse ceiling). "
+            "An executable this large usually means model weights were captured as jit "
+            "constants — thread them as inputs (spx.export/spx.bind) instead.",
+            stacklevel=3,
+        )
+    return True
+
+
+def _atomic_pickle_dump(obj: tp.Any, path: Path) -> None:
+    """Write a pickle atomically (tmp + rename) so readers never see partial blobs."""
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    with open(tmp, "wb") as f:
+        pickle.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def _serialize_compiled(fn: Compiled) -> tuple:
+    """Serialize an executable with its ordered, global execution-device IDs.
+
+    JAX's deserializer defaults to *all* backend devices, not the devices used
+    at compilation. Its native executable and restored argument shardings can
+    then disagree even for a single-device jit on a multi-device host.
+    """
+    serialized, in_tree, out_tree = serialize(fn)
+    # Use the same unloaded executable that JAX serializes. Unlike the runtime
+    # executable's local_devices(), this includes remote devices and preserves
+    # assignment order; it also works for functions without array arguments.
+    unloaded = fn._executable._unloaded_executable
+    devices = tuple(unloaded.device_list)
+    if not devices:
+        raise ValueError("Cannot serialize compiled function without an execution-device assignment")
+    metadata = {
+        "version": 1,
+        "environment": _env_fingerprint(),
+        "platform": devices[0].platform,
+        "devices": tuple((d.id, d.process_index, d.device_kind) for d in devices),
+    }
+    return serialized, in_tree, out_tree, metadata
+
+
+def _deserialize_compiled(payload: tuple) -> Compiled:
+    """Validate cache metadata before loading on the original ordered devices.
+
+    The first three fields retain JAX's serialized bytes and pytree metadata.
+    Legacy three-field entries lack an unambiguous execution assignment and
+    must be recompiled (or explicitly saved again), never loaded speculatively.
+    """
+    if len(payload) == 3:
+        raise ValueError("Legacy ejit cache lacks execution-device metadata; recompile and save it again")
+    if len(payload) != 4:
+        raise ValueError("Invalid ejit compiled-cache payload")
+    serialized, in_tree, out_tree, metadata = payload
+    if not isinstance(metadata, dict) or metadata.get("version") != 1:
+        raise ValueError("Unsupported ejit compiled-cache metadata version; recompile and save it again")
+    if metadata.get("environment") != _env_fingerprint():
+        raise ValueError("Incompatible ejit compilation environment; recompile and save it again")
+    device_ids = metadata.get("devices")
+    if not device_ids or not metadata.get("platform"):
+        raise ValueError("Invalid ejit execution-device metadata")
+    available = {(d.id, d.process_index, d.device_kind): d for d in jax.devices(metadata["platform"])}
+    if len(set(device_ids)) != len(device_ids) or any(key not in available for key in device_ids):
+        raise ValueError("Cached ejit execution devices are unavailable; recompile and save it again")
+    devices = tuple(available[key] for key in device_ids)
+    return deserialize_and_load(serialized, in_tree, out_tree, backend=devices[0].client, execution_devices=devices)
+
+
+def _get_hardware_signature() -> str:
+    """Create signature for current JAX hardware environment.
+
+    Returns:
+        String representation of available JAX devices.
+    """
+    return str(jax.devices())
+
+
+def _get_leaf_signature(leaf: tp.Any) -> tp.Hashable:
+    """Generate hashable signature for PyTree leaf.
+
+    Args:
+        leaf: Leaf node from PyTree.
+
+    Returns:
+        Hashable signature including shape, dtype, and sharding.
+
+    Note:
+        Static ``jax.jit`` arguments are baked into the compiled executable.
+        Their values (including enum, dtype, and configuration fields) must
+        participate in the persistent key. Objects without a stable textual
+        representation cannot safely share an on-disk executable.
+    """
+    if isinstance(leaf, jax.Array | np.ndarray):
+        if hasattr(leaf, "sharding"):
+            return (leaf.shape, str(jax.dtypes.canonicalize_dtype(leaf.dtype)), repr(leaf.sharding))
+        return (leaf.shape, str(jax.dtypes.canonicalize_dtype(leaf.dtype)))
+    if isinstance(leaf, enum.Enum):
+        return (type(leaf), leaf.name)
+    if isinstance(leaf, bool | int | float | complex | str | bytes | type(None)):
+        return (type(leaf), leaf)
+    if isinstance(leaf, np.generic):
+        return (type(leaf), leaf.item())
+    if isinstance(leaf, np.dtype):
+        return (type(leaf), leaf.name)
+    if isinstance(leaf, type):
+        try:
+            leaf_dtype = np.dtype(leaf)
+        except TypeError:
+            leaf_dtype = None
+        # ``np.dtype`` maps every non-scalar class to ``object``; only accept real dtype-like classes
+        # so distinct user classes fall through to their (address-free) qualified-name repr.
+        if leaf_dtype is not None and (leaf_dtype != np.dtype(object) or leaf in (object, np.object_)):
+            return (type(leaf), leaf_dtype.name)
+    if dataclasses.is_dataclass(leaf) and not isinstance(leaf, type):
+        return (
+            type(leaf),
+            tuple((field.name, _get_leaf_signature(getattr(leaf, field.name))) for field in dataclasses.fields(leaf)),
+        )
+    if isinstance(leaf, tuple) and hasattr(leaf, "_fields"):
+        return (
+            type(leaf),
+            tuple((name, _get_leaf_signature(value)) for name, value in zip(leaf._fields, leaf, strict=True)),
+        )
+    if isinstance(leaf, set | frozenset):
+        return (type(leaf), tuple(sorted((_get_leaf_signature(value) for value in leaf), key=repr)))
+    representation = repr(leaf)
+    if re.search(r"0x[0-9a-fA-F]+", representation):
+        raise ValueError(f"No process-stable ejit cache signature for {type(leaf).__name__}")
+    return (type(leaf), representation)
+
+
+def _get_args_signature(
+    args: tuple,
+    kwargs: dict,
+    static_argnums: tp.Collection[int] = (),
+    static_argnames: tp.Collection[str] = (),
+) -> str:
+    """Create a process-stable signature for JIT arguments.
+
+    Args:
+        args: Positional arguments.
+        kwargs: Keyword arguments.
+        static_argnums: Positional indices baked into the executable.
+        static_argnames: Keyword names baked into the executable.
+
+    Returns:
+        String signature of argument trees and dynamic avals or static values.
+
+    Raises:
+        ValueError: If a dynamic leaf cannot be traced or a static leaf has no stable key.
+    """
+    static_indices = {index if index >= 0 else len(args) + index for index in static_argnums}
+    static_names = set(static_argnames)
+    _, arg_tree = jax.tree_util.tree_flatten((args, kwargs))
+    leaf_signatures = []
+    for index, arg in enumerate(args):
+        leaves = jax.tree_util.tree_leaves(arg)
+        if index in static_indices:
+            leaf_signatures.extend(_get_leaf_signature(leaf) for leaf in leaves)
+        else:
+            leaf_signatures.extend(_get_dynamic_leaf_signature(leaf) for leaf in leaves)
+    for name, arg in sorted(kwargs.items()):
+        leaves = jax.tree_util.tree_leaves(arg)
+        if name in static_names:
+            leaf_signatures.extend(_get_leaf_signature(leaf) for leaf in leaves)
+        else:
+            leaf_signatures.extend(_get_dynamic_leaf_signature(leaf) for leaf in leaves)
+    return str((arg_tree, tuple(leaf_signatures)))
+
+
+def _get_dynamic_leaf_signature(leaf: tp.Any) -> tp.Hashable:
+    """Key traceable dynamic leaves by abstract type, never their runtime value."""
+    if isinstance(leaf, jax.Array | np.ndarray):
+        return _get_leaf_signature(leaf)
+    if type(leaf) in (bool, int, float, complex):
+        return (type(leaf), True)
+    if isinstance(leaf, np.generic) and leaf.dtype.kind in "biufc":
+        return (type(leaf), False)
+    raise ValueError(f"No traceable dynamic ejit cache signature for {type(leaf).__name__}")
+
+
+class _UnstableClosureError(ValueError):
+    """Raised when a function's closure has no process-stable persistent-cache fingerprint."""
+
+
+def _get_closure_signature(func: tp.Callable) -> tuple:
+    """Fingerprint the values a function captured from its enclosing scopes.
+
+    Closure cell values are baked into the compiled executable, but ``inspect.getsource`` does not
+    see them, so two functions with identical source built by a factory with different captures
+    would otherwise share one persistent cache entry.
+
+    Args:
+        func: The function being wrapped by ``ejit``.
+
+    Returns:
+        A hashable tuple of ``(name, treedef, leaf signatures)`` per free variable, empty when the
+        function has no closure.
+
+    Raises:
+        _UnstableClosureError: If a captured value is unbound, unhashable, an array (its contents
+            would be baked in but are not keyed), or has no process-stable representation.
+    """
+    cells = getattr(func, "__closure__", None)
+    if not cells:
+        return ()
+    names = getattr(getattr(func, "__code__", None), "co_freevars", ())
+    signature = []
+    for name, cell in zip(names, cells, strict=False):
+        try:
+            value = cell.cell_contents
+        except ValueError as e:
+            raise _UnstableClosureError(f"closure variable '{name}' is unbound") from e
+        try:
+            hash(value)
+        except TypeError as e:
+            raise _UnstableClosureError(f"closure variable '{name}' is unhashable") from e
+        leaves, treedef = jax.tree_util.tree_flatten(value)
+        if any(isinstance(leaf, jax.Array | np.ndarray) for leaf in leaves):
+            raise _UnstableClosureError(f"closure variable '{name}' captures array values")
+        try:
+            leaf_signatures = tuple(_get_leaf_signature(leaf) for leaf in leaves)
+        except ValueError as e:
+            raise _UnstableClosureError(f"closure variable '{name}': {e}") from e
+        signature.append((name, str(treedef), leaf_signatures))
+    return tuple(signature)
+
+
+def _is_named_module_function(value) -> bool:
+    """True for a plain module-level function (no closure, importable qualified name)."""
+    if not inspect.isfunction(value) and not inspect.isbuiltin(value):
+        return False
+    qualname = getattr(value, "__qualname__", "") or ""
+    module = getattr(value, "__module__", None)
+    if not module or not qualname or "<locals>" in qualname or "<lambda>" in qualname:
+        return False
+    return not getattr(value, "__closure__", None)
+
+
+def _get_defaults_signature(func) -> tuple:
+    """Key positional and keyword-only default values under the closure stability policy.
+
+    A factory that captures a value through a default parameter (``def f(x, k=scale)``) has no
+    closure cells, and omitted defaults are absent from the call-argument signature, so without
+    this two such functions shared one persistent cache entry (r12 S06-1).
+
+    Raises:
+        _UnstableClosureError: If a default is unhashable, an array, or has no stable representation.
+    """
+    entries = [(f"__defaults__[{i}]", v) for i, v in enumerate(getattr(func, "__defaults__", None) or ())]
+    entries += [(f"__kwdefaults__[{k}]", v) for k, v in sorted((getattr(func, "__kwdefaults__", None) or {}).items())]
+    signature = []
+    for name, value in entries:
+        if _is_named_module_function(value):
+            # e.g. ``policy=jax.checkpoint_policies.nothing_saveable``: its repr carries an address,
+            # but a module-level function is identified stably by its import path.
+            signature.append((name, "callable", f"{value.__module__}.{value.__qualname__}"))
+            continue
+        try:
+            hash(value)
+        except TypeError as e:
+            raise _UnstableClosureError(f"default '{name}' is unhashable") from e
+        leaves, treedef = jax.tree_util.tree_flatten(value)
+        if any(isinstance(leaf, jax.Array | np.ndarray) for leaf in leaves):
+            raise _UnstableClosureError(f"default '{name}' captures array values")
+        try:
+            leaf_signatures = tuple(_get_leaf_signature(leaf) for leaf in leaves)
+        except ValueError as e:
+            raise _UnstableClosureError(f"default '{name}': {e}") from e
+        signature.append((name, str(treedef), leaf_signatures))
+    return tuple(signature)
+
+
+def ejit(
+    func: tp.Callable[P, R] | None = None,
+    *,
+    static_argnums: int | tp.Sequence[int] | None = None,
+    static_argnames: str | tp.Iterable[str] | None = None,
+    donate_argnums: int | tp.Sequence[int] | None = None,
+    in_shardings: tp.Any = None,
+    out_shardings: tp.Any = None,
+    donate_argnames: str | tp.Iterable[str] | None = None,
+    keep_unused: bool = False,
+    backend: str | None = None,
+    inline: bool = False,
+    compiler_options: dict[str, tp.Any] | None = None,
+):
+    """Enhanced JIT compilation with persistent caching.
+
+    Drop-in replacement for ``jax.jit`` that caches compiled functions
+    to disk for reuse across script runs, significantly reducing
+    compilation overhead. Can be used as a bare decorator or called
+    with keyword arguments.
+
+    Features:
+        - Two-level caching (in-memory dict + persistent disk cache)
+        - Automatic cache invalidation on source, hardware, or signature changes
+        - Graceful fallback to standard ``jax.jit`` on errors
+        - Support for all ``jax.jit`` parameters
+
+    Args:
+        func: Function to JIT-compile and cache. When ``None``, returns a
+            partial decorator so that ``@ejit(...)`` syntax works.
+        static_argnums: Indices of arguments to treat as compile-time constants.
+        static_argnames: Names of arguments to treat as compile-time constants.
+        donate_argnums: Indices of arguments whose buffers may be donated to outputs.
+        in_shardings: Input sharding specifications for distributed execution.
+        out_shardings: Output sharding specifications for distributed execution.
+        donate_argnames: Names of arguments whose buffers may be donated.
+        keep_unused: Whether to keep unused arguments in the compiled function.
+        backend: JAX backend to use (e.g., ``'cpu'``, ``'gpu'``, ``'tpu'``).
+        inline: Whether to inline the function into the caller.
+        compiler_options: Dictionary of additional XLA compiler options.
+
+    Returns:
+        JIT-compiled function with persistent caching when ``EASYDEL_CACHE_COMPILES``
+        is set, otherwise a standard ``jax.jit``-compiled function with XLA cache
+        directory configured.
+
+    Note:
+        Caching behavior is controlled by two environment variables:
+
+        - ``EASYDEL_CACHE_COMPILES``: Enable the custom two-level cache (default: off).
+        - ``EASYDEL_RECOMPILE_FORCE``: Force recompilation ignoring cache (default: off).
+        - ``ALLOW_FULL_CACHE``: Enable full XLA persistent caching (default: off).
+
+    Example:
+        >>> @ejit
+        ... def fast_matmul(a, b):
+        ...     return a @ b
+        >>>
+        >>> result = fast_matmul(x, y)
+        >>>
+        >>> @ejit(static_argnums=(2,))
+        ... def scaled_matmul(a, b, scale):
+        ...     return a @ b * scale
+    """
+    if func is None:
+        return functools.partial(
+            ejit,
+            static_argnums=static_argnums,
+            static_argnames=static_argnames,
+            donate_argnums=donate_argnums,
+            in_shardings=in_shardings,
+            out_shardings=out_shardings,
+            backend=backend,
+            compiler_options=compiler_options,
+            donate_argnames=donate_argnames,
+            inline=inline,
+            keep_unused=keep_unused,
+        )
+
+    if not ECACHE_COMPILES:
+        _configure_jax_persistent_cache()
+
+        jitted_function = jax.jit(
+            func,
+            static_argnums=static_argnums,
+            static_argnames=static_argnames,
+            donate_argnums=donate_argnums,
+            in_shardings=in_shardings,
+            out_shardings=out_shardings,
+            backend=backend,
+            compiler_options=compiler_options,
+            donate_argnames=donate_argnames,
+            inline=inline,
+            keep_unused=keep_unused,
+        )
+        return jitted_function
+    jitted_function = jax.jit(
+        func,
+        static_argnums=static_argnums,
+        static_argnames=static_argnames,
+        donate_argnums=donate_argnums,
+        in_shardings=in_shardings,
+        out_shardings=out_shardings,
+        backend=backend,
+        compiler_options=compiler_options,
+        donate_argnames=donate_argnames,
+        inline=inline,
+        keep_unused=keep_unused,
+    )
+    jit_options_sig = str(
+        (
+            static_argnums,
+            static_argnames,
+            donate_argnums,
+            donate_argnames,
+            in_shardings,
+            out_shardings,
+            backend,
+            keep_unused,
+            inline,
+            tuple(sorted((str(k), repr(v)) for k, v in compiler_options.items())) if compiler_options else None,
+        )
+    )
+    # Diagnostics must not assume ``__name__``: functools.partial objects and callable instances lack it,
+    # and reading it turned the intended fallback to plain jit into an AttributeError (r14 S06-1).
+    _func_label = getattr(func, "__name__", None) or type(func).__qualname__
+    static_key_part: str | None = None
+    static_key_disabled = False
+
+    def _resolve_static_key_part() -> str | None:
+        """Lazily resolve cache key components to avoid import-time backend init."""
+        nonlocal static_key_part, static_key_disabled
+        if static_key_disabled:
+            return None
+        if static_key_part is not None:
+            return static_key_part
+        try:
+            # Default argument values are baked in exactly like closure cells, and omitted defaults
+            # never appear in the call-argument signature (r12 S06-1).
+            if inspect.ismethod(func):
+                # A bound method bakes receiver state (``self.scale``) into its program, but the
+                # receiver is neither source, closure, default nor a call argument: two instances would
+                # share one executable (r13 S06-1). It has no stable fingerprint, so skip the cache.
+                raise _UnstableClosureError("bound method receiver state cannot be keyed")
+            closure_sig = str(_get_closure_signature(func)) + str(_get_defaults_signature(func))
+        except _UnstableClosureError as e:
+            static_key_disabled = True
+            logger.debug("ejit persistent cache skipped for '%s': %s", getattr(func, "__name__", func), e)
+            return None
+        try:
+            func_source = inspect.getsource(func)
+            hardware_sig = _get_hardware_signature()
+            static_key_part = "".join([func_source, closure_sig, hardware_sig, jit_options_sig])
+            return static_key_part
+        except Exception as e:
+            static_key_disabled = True
+            warnings.warn(
+                f"Could not create static cache key for ejit function '{_func_label}'. "
+                f"Falling back to regular jit. Error: {e}",
+                stacklevel=2,
+            )
+            return None
+
+    static_arg_indices = (
+        set(static_argnums)
+        if isinstance(static_argnums, list | tuple)
+        else {static_argnums}
+        if static_argnums is not None
+        else set()
+    )
+    static_arg_names_set = (
+        set(static_argnames)
+        if isinstance(static_argnames, list | tuple)
+        else {static_argnames}
+        if static_argnames is not None
+        else set()
+    )
+    # JAX infers the other form when only one of static_argnums/static_argnames
+    # is supplied (``jax._src.api_util.infer_argnums_and_argnames``): only
+    # POSITIONAL_OR_KEYWORD parameters, and never from negative indices.
+    if (static_argnums is None) != (static_argnames is None):
+        try:
+            keyword_positions = [
+                (index, name)
+                for index, (name, parameter) in enumerate(inspect.signature(func).parameters.items())
+                if parameter.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+            ]
+            if static_argnames is None:
+                static_arg_names_set.update(name for index, name in keyword_positions if index in static_arg_indices)
+            else:
+                static_arg_indices.update(index for index, name in keyword_positions if name in static_arg_names_set)
+        except (TypeError, ValueError):
+            # Without a signature JAX cannot infer the complementary form either.
+            pass
+
+    def get_compiled_and_cache(static_key: str, args_sig: str, args, kwargs) -> Compiled | None:
+        """Retrieve or compile a function with the given argument signature.
+
+        Implements the three-level lookup and compilation "slow path":
+
+        1. Check in-memory ``COMPILED_CACHE`` dict (L1 / fastest).
+        2. Check on-disk pickle under ``COMPILE_FUNC_DIR`` (L2).
+        3. Compile via ``jitted_function.lower(...).compile()`` and persist (L3).
+
+        Serialization failures on disk writes are silently swallowed so that a
+        read-only filesystem never prevents execution.
+
+        Args:
+            static_key: Stable string incorporating function source, hardware
+                signature, and JIT options — used as the non-argument portion
+                of the cache key.
+            args_sig: String signature of the dynamic arguments (shapes, dtypes,
+                shardings). Combined with ``static_key`` to form the MD5 hash.
+            args: Positional arguments forwarded to ``jitted_function.lower``.
+            kwargs: Keyword arguments forwarded to ``jitted_function.lower``.
+
+        Returns:
+            The compiled ``Compiled`` object if successful, ``None`` if
+            compilation itself failed (caller falls back to ``jitted_function``).
+        """
+        compilation_key = hashlib.md5((static_key + args_sig).encode("utf-8")).hexdigest()
+
+        if compilation_key in COMPILED_CACHE and not RECOMPILE_FORCE:
+            return COMPILED_CACHE[compilation_key]
+
+        func_dir = EFFECTIVE_COMPILE_FUNC_DIR / compilation_key
+        filepath = func_dir / COMPILED_FILE_NAME
+        if filepath.exists() and not RECOMPILE_FORCE:
+            try:
+                if not _entry_too_large(filepath.stat().st_size, f"load of '{filepath}'"):
+                    with open(filepath, "rb") as f:
+                        compiled_func = _deserialize_compiled(pickle.load(f))
+                    COMPILED_CACHE[compilation_key] = compiled_func
+                    return compiled_func
+            except Exception as e:
+                warnings.warn(f"Could not load ejit cache from '{filepath}'. Recompiling. Error: {e}", stacklevel=2)
+
+        try:
+            lowered_func = jitted_function.lower(*args, **kwargs)
+            compiled_func = lowered_func.compile()
+
+            try:
+                payload = _serialize_compiled(compiled_func)
+                if not _entry_too_large(len(payload[0]), f"save for '{_func_label}'"):
+                    func_dir.mkdir(parents=True, exist_ok=True)
+                    _atomic_pickle_dump(payload, filepath)
+            except Exception:
+                pass
+
+            COMPILED_CACHE[compilation_key] = compiled_func
+            return compiled_func
+        except Exception as e:
+            warnings.warn(f"ejit compilation failed for '{_func_label}'. Error: {e}", stacklevel=2)
+            return None
+
+    @functools.wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        """Execute the cached compiled function or fall back to jitted version.
+
+        Attempts to resolve a cached compiled executable for the given
+        argument signature. If caching or compilation fails at any stage,
+        transparently falls back to the standard ``jax.jit`` path.
+
+        Args:
+            *args: Positional arguments forwarded to the original function.
+            **kwargs: Keyword arguments forwarded to the original function.
+
+        Returns:
+            The result of calling the compiled (or jitted) function.
+        """
+        try:
+            local_static_key_part = _resolve_static_key_part()
+            if local_static_key_part is None:
+                return jitted_function(*args, **kwargs)
+            args_sig = _get_args_signature(args, kwargs, static_arg_indices, static_arg_names_set)
+            compiled_func = get_compiled_and_cache(local_static_key_part, args_sig, args, kwargs)
+
+        except Exception as e:
+            warnings.warn(
+                f"ejit signature generation failed for '{_func_label}'. Falling back. Error: {e}", stacklevel=2
+            )
+            return jitted_function(*args, **kwargs)
+        if compiled_func is None:
+            return jitted_function(*args, **kwargs)
+        static_positions = {index if index >= 0 else len(args) + index for index in static_arg_indices}
+        dynamic_args = tuple(arg for i, arg in enumerate(args) if i not in static_positions)
+        dynamic_kwargs = {k: v for k, v in kwargs.items() if k not in static_arg_names_set}
+        return compiled_func(*dynamic_args, **dynamic_kwargs)
+
+    return wrapper
+
+
+def load_cached_functions(verbose: bool = True) -> None:
+    """Pre-load all cached compiled functions from disk into memory.
+
+    Scans the cache directory and loads all valid compiled functions into
+    the in-memory cache for faster subsequent lookups.
+
+    Args:
+        verbose: If True, print status messages and warnings about loading.
+
+    Note:
+        This is useful at startup to warm up the cache before running
+        performance-critical code paths.
+    """
+    if not EFFECTIVE_COMPILE_FUNC_DIR.exists():
+        return
+
+    loaded_count = 0
+    for cache_key_dir in EFFECTIVE_COMPILE_FUNC_DIR.iterdir():
+        if not cache_key_dir.is_dir():
+            continue
+
+        cache_key = cache_key_dir.name
+        filepath = cache_key_dir / COMPILED_FILE_NAME
+
+        if filepath.exists():
+            try:
+                if _entry_too_large(filepath.stat().st_size, f"pre-load of '{filepath}'", verbose=verbose):
+                    continue
+                with open(filepath, "rb") as f:
+                    compiled_func = _deserialize_compiled(pickle.load(f))
+                COMPILED_CACHE[cache_key] = compiled_func
+                loaded_count += 1
+            except Exception as e:
+                if verbose:
+                    warnings.warn(f"Could not pre-load ejit cache for key {cache_key}. Error: {e}", stacklevel=2)
+
+    if verbose and loaded_count > 0:
+        print(f"Pre-loaded {loaded_count} functions into ejit's persistent memory cache.")
+
+
+def save_compiled_fn(path: str | os.PathLike, fn: Compiled, prefix: str | None = None):
+    """Save a compiled JAX function to disk for later reuse.
+
+    Serializes a compiled function along with its input/output tree structures,
+    compilation environment, and ordered global device assignment, allowing it
+    to be loaded and executed in compatible future Python sessions.
+
+    Args:
+        path: Directory path where the compiled function will be saved.
+              Will be created if it doesn't exist.
+        fn: Compiled JAX function (output of lowered.compile()).
+        prefix: Optional prefix for the filename. Useful for organizing
+               multiple compiled functions in the same directory.
+
+    Files Created:
+        - {prefix}-compiled.executable: Serialized function and metadata
+
+    Example:
+        >>>
+        >>> jitted = jax.jit(my_function)
+        >>> lowered = jitted.lower(sample_input)
+        >>> compiled = lowered.compile()
+        >>>
+        >>>
+        >>> from pathlib import Path
+        >>> cache_dir = Path("./my_cache")
+        >>> save_compiled_fn(cache_dir, compiled, prefix="model_v1")
+        >>>
+        >>>
+
+    Raises:
+        Warning: If serialization fails (logged, not raised).
+
+    Notes:
+        - Compiled functions are hardware-specific
+        - Large models may produce large cache files
+        - Uses pickle for serialization (standard security caveats apply)
+    """
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    prefix = prefix or ""
+    filename = path / (prefix + "-" + COMPILED_FILE_NAME if prefix else COMPILED_FILE_NAME)
+    payload = _serialize_compiled(fn)
+    if _entry_too_large(len(payload[0]), f"save to '{filename}'"):
+        return
+    try:
+        _atomic_pickle_dump(payload, filename)
+    except Exception as e:
+        warnings.warn(f"Could not save compiled function to {filename}: {e}", stacklevel=2)
+
+
+def load_compiled_fn(path: str | os.PathLike, prefix: str | None = None):
+    """Load a previously saved compiled function from disk.
+
+    Reconstructs a ``Compiled`` JAX object from the pickle produced by
+    :func:`save_compiled_fn`, using ``jax.experimental.serialize_executable``.
+
+    Args:
+        path: Directory path where the compiled function was saved.
+        prefix: Optional prefix that was used when saving. When provided, the
+            filename is ``{prefix}-compiled.executable``; otherwise just
+            ``compiled.executable``.
+
+    Returns:
+        The deserialized ``Compiled`` JAX function, ready to call directly
+        (bypassing re-compilation).
+
+    Raises:
+        FileNotFoundError: If the compiled function file doesn't exist at
+            the resolved path.
+        pickle.UnpicklingError: If the file is corrupt or incompatible.
+        ValueError: If the entry is oversized, lacks execution-device metadata,
+            or its environment/device assignment is incompatible. Legacy
+            three-field entries must be recompiled and saved again.
+
+    Note:
+        Compiled functions are hardware- and XLA-version-specific. The saved
+        environment and ordered device assignment are validated before native
+        deserialization; device IDs are not remapped to arbitrary substitutes.
+        Only load trusted files: pickle and native executables can execute code.
+    """
+    path = Path(path)
+    prefix = prefix or ""
+    filename = path / (prefix + "-" + COMPILED_FILE_NAME if prefix else COMPILED_FILE_NAME)
+    if _entry_too_large(filename.stat().st_size, f"load of '{filename}'"):
+        raise ValueError(
+            f"Refusing to deserialize '{filename}': {filename.stat().st_size / 1e9:.2f} GB exceeds the "
+            "safe protobuf parse ceiling (readers can crash natively on such entries)."
+        )
+    with open(filename, "rb") as f:
+        return _deserialize_compiled(pickle.load(f))
+
+
+def get_hash_of_lowering(lowered_func: Lowered) -> str:
+    """Generate a SHA-256 hash of a lowered JAX function.
+
+    Creates a deterministic hash based on the text representation of the
+    lowered function, useful for cache key generation.
+
+    Args:
+        lowered_func: JAX lowered function object.
+
+    Returns:
+        Hexadecimal string of the SHA-256 hash.
+    """
+    text_representation = lowered_func.as_text()
+    hash_object = hashlib.sha256(text_representation.encode("utf-8"))
+    hash_digest = hash_object.hexdigest()
+    return hash_digest
+
+
+if __name__ == "__main__":
+    jnp = jax.numpy
+
+    @ejit
+    def my_function(x, y):
+        """Example function demonstrating ejit usage."""
+        return x * y + x
+
+    a = jnp.array([1, 2, 3], dtype=jnp.float32)
+    b = jnp.array([4, 5, 6], dtype=jnp.float32)
+
+    result1 = my_function(a, b)
+    result2 = my_function(a, b)
+
+    c = jnp.array([1, 2, 3], dtype=jnp.float32)
+    d = jnp.array([1, 1, 1], dtype=jnp.float32)
+    result3 = my_function(c, d)
+    print(result1, result2, result3)

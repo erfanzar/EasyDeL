@@ -1,0 +1,950 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unified delegating parser that orchestrates reasoning and tool extraction.
+
+Wraps a ReasoningParser and a ToolParser behind a single interface with an
+explicit phase state machine, eliminating the ad-hoc orchestration and
+expensive retokenization previously done in OutputPipeline._run_output_parsers().
+
+Design inspired by a delegating parser pattern.
+"""
+
+from __future__ import annotations
+
+import enum
+import json
+import logging
+from dataclasses import dataclass
+
+from ..openai_api_modules import ChatCompletionRequest, ChatMessage, DeltaFunctionCall, DeltaToolCall, ToolCall
+from ..reasoning.abstract_reasoning import ReasoningParser
+from ..stream_protocol import compute_stream_delta_text
+from ..tools.abstract_tool import ToolParser
+
+logger = logging.getLogger("easydel.inference.parsing")
+
+
+class ParsePhase(enum.IntEnum):
+    """Explicit phase of the combined reasoning + tool parsing pipeline.
+
+    The ``DelegatingParser`` maintains a single phase variable that
+    governs how incoming token deltas are routed:
+
+    - ``REASONING``: the model is inside a reasoning section (e.g.
+      ``<think>…</think>``).  All deltas are forwarded to the reasoning
+      parser; visible content is suppressed.
+    - ``CONTENT``: normal text generation.  Deltas are forwarded to the
+      tool parser for protocol detection and, if no tool protocol is
+      active, surfaced as visible content.
+    - ``TOOL_CALL``: a tool-call protocol has been detected and is
+      actively being parsed. Only parser-certified ordinary content is
+      surfaced, preventing raw markup from leaking to the client.
+    - ``BUFFERING``: the parser suspects a tool-call start marker may
+      be forming but cannot confirm yet. Ambiguous text is withheld from
+      the client until it resolves (either entering
+      ``TOOL_CALL`` or falling back to ``CONTENT``).
+    """
+
+    REASONING = 0
+    CONTENT = 1
+    TOOL_CALL = 2
+    BUFFERING = 3
+
+
+@dataclass
+class ParseResult:
+    """Structured output returned by ``DelegatingParser.process_delta`` / ``process_final``.
+
+    Each field captures one dimension of the parse state:
+
+    - ``delta_reasoning`` / ``delta_content``: the incremental text chunks
+      the client should append to its reasoning and content buffers
+      respectively.  ``None`` means "no change this step".
+    - ``accumulated_reasoning`` / ``accumulated_content``: the full text
+      seen so far after reasoning extraction and tool-markup stripping.
+    - ``tool_calls``: populated only on final processing when batch
+      extraction finds completed tool calls.
+    - ``delta_tool_calls``: incremental tool-call deltas for streaming.
+    - ``phase``: the parser phase *after* this step (useful for callers
+      that need to know whether buffering is active).
+
+    ``to_dict()`` flattens the result into the dict format consumed by
+    ``OutputPipeline._process_engine_outputs``.
+    """
+
+    delta_reasoning: str | None = None
+    delta_content: str | None = None
+    accumulated_reasoning: str = ""
+    accumulated_content: str = ""
+    tool_calls: list | None = None
+    delta_tool_calls: list | None = None
+    phase: ParsePhase = ParsePhase.CONTENT
+
+    def to_dict(self) -> dict:
+        """Flatten into the dict format consumed by ``OutputPipeline._run_output_parsers``."""
+        return {
+            "delta_reasoning": self.delta_reasoning,
+            "delta_content": self.delta_content,
+            "accumulated_reasoning": self.accumulated_reasoning,
+            "accumulated_content": self.accumulated_content,
+            "tool_calls": self.tool_calls,
+            "delta_tool_calls": self.delta_tool_calls,
+        }
+
+
+@dataclass
+class TrackedToolCallState:
+    """Per-tool-call accumulator that tracks what has already been streamed.
+
+    During streaming, tool-call deltas arrive incrementally (first the
+    function name, then argument chunks).  This state records what the
+    client has already received so that ``_build_missing_final_tool_deltas``
+    can synthesize a catch-up delta at finalization time for any data
+    that the streaming parser missed or that arrived only in the batch
+    extraction.
+    """
+
+    index: int
+    tool_call_id: str | None = None
+    tool_type: str | None = None
+    function_name: str = ""
+    function_arguments: str = ""
+
+
+class DelegatingParser:
+    """Orchestrates reasoning and tool parsers with an explicit phase state machine.
+
+    Instead of tangling reasoning extraction, tool parsing, buffering detection,
+    and retokenization in one method, this class maintains an explicit ``phase``
+    and delegates to the appropriate parser at each step.
+
+    Key design: when reasoning ends, the tool parser's previous-text view is
+    **reset** (not retokenized). The tool parser only ever sees content-portion
+    text, starting from a clean slate after the reasoning boundary.
+    """
+
+    def __init__(
+        self,
+        reasoning_parser: ReasoningParser | None = None,
+        tool_parser: ToolParser | None = None,
+        tool_request: ChatCompletionRequest | None = None,
+    ):
+        """Initialize the orchestrator with optional reasoning/tool parsers.
+
+        Args:
+            reasoning_parser: Parser used to detect and extract a reasoning
+                section from the model output. ``None`` disables reasoning
+                extraction and starts the state machine in
+                :attr:`ParsePhase.CONTENT`.
+            tool_parser: Parser used to detect tool calls in the visible
+                content. ``None`` disables tool-call extraction.
+            tool_request: Original chat-completion request used to look up
+                ``tools``/``tool_choice`` and decide whether tool calls are
+                actually permitted.
+        """
+        self.reasoning_parser = reasoning_parser
+        self.tool_parser = tool_parser
+        self.tool_request = tool_request
+
+        self.phase: ParsePhase = ParsePhase.REASONING if reasoning_parser is not None else ParsePhase.CONTENT
+
+        self._accumulated_reasoning: str = ""
+        self._accumulated_content: str = ""
+        self._raw_content_text: str = ""
+
+        self._tool_previous_text: str = ""
+        self._tool_previous_token_ids: list[int] = []
+        # Once True, _tool_machinery_needed never bypasses again (see LATCH note there).
+        self._tool_machinery_latched: bool = False
+
+        # Parser-owned tool-start markers used to prescreen text before the
+        # expensive streaming tool machinery runs (which re-tokenizes the full
+        # accumulated text every delta — O(n^2) per request). Prefer the
+        # machinery-specific hints so parsers that accept markerless bare-JSON
+        # payloads (llama3_json, xlam, ...) can include "{" / "[" without
+        # polluting is_buffering_protocol. Empty hints (e.g. custom parsers
+        # without marker attributes) fail OPEN: the machinery always runs,
+        # preserving the historical contract.
+        hints_fn = getattr(tool_parser, "get_tool_machinery_hints", None)
+        if not callable(hints_fn):
+            hints_fn = getattr(tool_parser, "get_streaming_buffer_hints", None)
+        try:
+            self._tool_marker_hints: tuple[str, ...] = tuple(hints_fn()) if callable(hints_fn) else ()
+        except Exception:
+            self._tool_marker_hints = ()
+        self._streamed_tool_call_state: dict[int, TrackedToolCallState] = {}
+
+    def streamed_tool_call_id(self, index: int) -> str | None:
+        """Return the tool-call ID already announced for a streaming index.
+
+        Args:
+            index: Zero-based tool-call index from the streaming deltas.
+
+        Returns:
+            The tracked ID, or ``None`` if no ID has been emitted for this
+            index. Final catch-up deltas are included in the tracked state.
+        """
+        state = self._streamed_tool_call_state.get(index)
+        return state.tool_call_id if state is not None else None
+
+    @staticmethod
+    def _compute_visible_content_delta(
+        current_text: str,
+        previous_text: str,
+        fallback_delta: str = "",
+    ) -> str:
+        """Compute a canonical visible-text delta from accumulated snapshots.
+
+        Thin wrapper around :func:`compute_stream_delta_text` exposed as a
+        method so subclasses can override the strategy.
+
+        Args:
+            current_text: Current cumulative visible content.
+            previous_text: Visible content prior to this delta.
+            fallback_delta: Engine-supplied delta used when prefix matching
+                fails.
+
+        Returns:
+            The newly visible text since ``previous_text``.
+        """
+        return compute_stream_delta_text(current_text, previous_text, fallback_delta)
+
+    def _merge_streamed_tool_call_state(self, delta_tool_calls: list | None) -> None:
+        """Accumulate streamed tool-call metadata for final delta synthesis.
+
+        Args:
+            delta_tool_calls: Iterable of :class:`DeltaToolCall` instances or
+                raw dicts emitted during streaming. Invalid entries are
+                silently skipped.
+        """
+
+        if not delta_tool_calls:
+            return
+
+        for raw_call in delta_tool_calls:
+            tool_call: DeltaToolCall
+            if isinstance(raw_call, DeltaToolCall):
+                tool_call = raw_call
+            else:
+                try:
+                    tool_call = DeltaToolCall.model_validate(raw_call)
+                except Exception:
+                    continue
+
+            state = self._streamed_tool_call_state.setdefault(
+                int(tool_call.index),
+                TrackedToolCallState(index=int(tool_call.index)),
+            )
+            if tool_call.id:
+                state.tool_call_id = tool_call.id
+            if tool_call.type:
+                state.tool_type = tool_call.type
+            if tool_call.function is not None:
+                if tool_call.function.name:
+                    state.function_name = tool_call.function.name
+                if tool_call.function.arguments:
+                    state.function_arguments += tool_call.function.arguments
+
+    def _build_missing_final_tool_deltas(self, tool_calls: list | None) -> list[DeltaToolCall] | None:
+        """Build final delta_tool_calls for any tool data not streamed earlier.
+
+        Compares the tracked streaming state against the batch-extracted
+        tool calls and synthesizes a delta covering any missing function
+        names or arguments. This guarantees clients receive the full call
+        even when the streaming parser missed a portion.
+
+        Args:
+            tool_calls: Final batch-extracted tool calls.
+
+        Returns:
+            A list of synthesized :class:`DeltaToolCall` objects, or ``None``
+            when no catch-up deltas are required.
+        """
+
+        if not tool_calls:
+            return None
+
+        synthesized: list[DeltaToolCall] = []
+        for index, raw_tool_call in enumerate(tool_calls):
+            tool_call: ToolCall
+            if isinstance(raw_tool_call, ToolCall):
+                tool_call = raw_tool_call
+            else:
+                try:
+                    tool_call = ToolCall.model_validate(raw_tool_call)
+                except Exception:
+                    continue
+
+            state = self._streamed_tool_call_state.get(index)
+            function_name = tool_call.function.name
+            function_arguments = tool_call.function.arguments or ""
+
+            missing_name = function_name if state is None or not state.function_name else None
+            if state is None:
+                missing_arguments = function_arguments
+            elif function_arguments == state.function_arguments:
+                missing_arguments = ""
+            elif function_arguments.startswith(state.function_arguments):
+                missing_arguments = function_arguments[len(state.function_arguments) :]
+            elif self._arguments_payload_is_equivalent(function_arguments, state.function_arguments):
+                # The streamed deltas already carried the same payload in a
+                # different serialization (e.g. compact vs. default JSON
+                # separators). Re-sending the final text would make the
+                # concatenated argument stream invalid JSON.
+                missing_arguments = ""
+            else:
+                missing_arguments = function_arguments
+
+            if not missing_name and not missing_arguments:
+                continue
+
+            synthesized.append(
+                DeltaToolCall(
+                    index=index,
+                    id=tool_call.id if state is None else None,
+                    type=tool_call.type if state is None else None,
+                    function=DeltaFunctionCall(
+                        name=missing_name,
+                        arguments=missing_arguments or None,
+                    ),
+                )
+            )
+
+        return synthesized or None
+
+    @staticmethod
+    def _arguments_payload_is_equivalent(first: str, second: str) -> bool:
+        """Compare two JSON argument strings by decoded value.
+
+        Args:
+            first: First argument JSON string (final, batch-extracted).
+            second: Second argument JSON string (accumulated stream).
+
+        Returns:
+            ``True`` when both decode to equal payloads. Strings that fail
+            to decode are never considered equivalent, so callers still
+            fall back to text-level catch-up for malformed streams.
+        """
+        try:
+            return json.loads(first) == json.loads(second)
+        except Exception:
+            return False
+
+    def _canonicalize_reasoning_content(
+        self,
+        *,
+        accumulated_text: str,
+        fallback_content: str,
+    ) -> tuple[str, str | None]:
+        """Return the canonical visible content after reasoning extraction.
+
+        Args:
+            accumulated_text: Full accumulated text from the engine.
+            fallback_content: Visible content to fall back to when the
+                reasoning parser cannot infer the visible portion.
+
+        Returns:
+            Tuple ``(visible_content, reasoning_text)`` where ``reasoning_text``
+            may be ``None`` when no reasoning section was detected.
+        """
+
+        if self.reasoning_parser is None:
+            return fallback_content, None
+
+        reasoning, content = self.reasoning_parser.extract_reasoning(accumulated_text)
+        if content is None:
+            return fallback_content, reasoning
+        return content, reasoning
+
+    def _tool_machinery_needed(self, content_text: str) -> bool:
+        """Decide whether the streaming tool machinery must run for this text.
+
+        Returns True when the parser exposes no start-marker hints (fail
+        open), when any full hint substring is present in the cumulative
+        visible text, or when the tail of the text is a proper prefix of a
+        hint (a marker split across streaming deltas). Otherwise the caller
+        takes the cheap pass-through path — the dominant case for outputs
+        that never emit tool syntax.
+
+        Args:
+            content_text: Cumulative visible content (post reasoning split).
+
+        Returns:
+            Whether to run the tool parser for this step.
+        """
+        # LATCH: once the machinery has engaged for this request it must stay
+        # engaged. Stateful parsers may buffer/withhold text during a false
+        # marker-prefix engagement; if the gate flipped off afterwards, the
+        # bypass path would advance the accumulated-content view past the
+        # withheld text and drop it from the client stream permanently (and
+        # ParsePhase could stick in BUFFERING).
+        if self._tool_machinery_latched:
+            return True
+        hints = self._tool_marker_hints
+        if not hints:
+            return True
+        if not content_text:
+            return False
+        for hint in hints:
+            if hint in content_text:
+                self._tool_machinery_latched = True
+                return True
+        tail = content_text[-32:]
+        for hint in hints:
+            limit = min(len(hint) - 1, len(tail))
+            for k in range(1, limit + 1):
+                if tail.endswith(hint[:k]):
+                    self._tool_machinery_latched = True
+                    return True
+        return False
+
+    def process_delta(
+        self,
+        accumulated_text: str,
+        delta_text: str,
+        token_ids: list[int],
+        prev_text: str,
+        prev_token_ids: list[int],
+    ) -> ParseResult:
+        """Process a streaming delta through reasoning then tool parsing.
+
+        Args:
+            accumulated_text: Full decoded text so far.
+            delta_text: New text in this chunk.
+            token_ids: All token IDs decoded so far.
+            prev_text: Accumulated text as of previous call.
+            prev_token_ids: Token IDs as of previous call.
+
+        Returns:
+            ParseResult with deltas and accumulated state.
+        """
+        result = ParseResult(
+            accumulated_reasoning=self._accumulated_reasoning,
+            accumulated_content=self._accumulated_content,
+            phase=self.phase,
+        )
+
+        content_text = accumulated_text
+        content_delta = delta_text
+
+        if self.reasoning_parser is not None:
+            content_text, content_delta = self._process_reasoning_delta(
+                result=result,
+                accumulated_text=accumulated_text,
+                delta_text=delta_text,
+                token_ids=token_ids,
+                prev_text=prev_text,
+                prev_token_ids=prev_token_ids,
+            )
+
+        if (
+            self.tool_parser is not None
+            and not self._tools_explicitly_disabled()
+            and self.phase != ParsePhase.REASONING
+            and self._tool_machinery_needed(content_text)
+        ):
+            self._process_tool_delta(
+                result=result,
+                content_text=content_text,
+                content_delta=content_delta,
+                token_ids=token_ids,
+            )
+        else:
+            result.accumulated_content = (
+                content_text if self.phase != ParsePhase.REASONING else self._accumulated_content
+            )
+            if self.phase != ParsePhase.REASONING and content_delta:
+                result.delta_content = content_delta
+            if self.phase != ParsePhase.REASONING:
+                # Keep the tool parser's previous-text view current while the
+                # machinery gate passes text through, so the first engaged
+                # call sees a consistent (previous, current, delta) triple
+                # instead of previous_text="" against the full content.
+                self._tool_previous_text = content_text
+
+        self._accumulated_reasoning = result.accumulated_reasoning
+        self._raw_content_text = content_text
+        self._accumulated_content = result.accumulated_content
+        result.phase = self.phase
+        return result
+
+    def process_final(
+        self,
+        accumulated_text: str,
+        token_ids: list[int],
+    ) -> ParseResult:
+        """Process the final (finished) output through both parsers in batch mode.
+
+        Args:
+            accumulated_text: Complete decoded text.
+            token_ids: All token IDs.
+
+        Returns:
+            ParseResult with final accumulated state.
+        """
+        result = ParseResult(
+            accumulated_reasoning=self._accumulated_reasoning,
+            accumulated_content=self._accumulated_content,
+            phase=self.phase,
+        )
+
+        content_for_tools = accumulated_text
+
+        if self.reasoning_parser is not None:
+            try:
+                extract_final = getattr(
+                    self.reasoning_parser, "extract_reasoning_final", self.reasoning_parser.extract_reasoning
+                )
+                reasoning, content = extract_final(accumulated_text)
+                result.accumulated_reasoning = reasoning or ""
+                if content is None:
+                    content_for_tools = "" if reasoning is not None else accumulated_text
+                else:
+                    content_for_tools = content
+                result.accumulated_content = content_for_tools
+
+                old_reasoning = self._accumulated_reasoning
+                if reasoning and len(reasoning) > len(old_reasoning):
+                    result.delta_reasoning = reasoning[len(old_reasoning) :]
+
+                old_content = self._raw_content_text
+                if content_for_tools:
+                    result.delta_content = self._compute_visible_content_delta(
+                        content_for_tools,
+                        old_content,
+                    )
+                elif reasoning is not None:
+                    result.delta_content = ""
+            except Exception:
+                logger.warning("Reasoning extraction failed in final processing", exc_info=True)
+                result.accumulated_content = accumulated_text
+                content_for_tools = accumulated_text
+        else:
+            result.accumulated_content = accumulated_text
+
+        # No machinery gate here: finalization is a single O(n) batch call
+        # (the gate exists to bound the O(n^2) *streaming* retokenization),
+        # and gating it on marker hints drops markerless bare-JSON tool
+        # calls (e.g. llama3_json's `{"name": ...}`) as plain content.
+        if self.tool_parser is not None and content_for_tools and not self._tools_explicitly_disabled():
+            self._process_tool_final(result, content_for_tools)
+        else:
+            result.delta_content = self._compute_visible_content_delta(
+                result.accumulated_content, self._accumulated_content
+            )
+
+        self._accumulated_reasoning = result.accumulated_reasoning
+        self._raw_content_text = content_for_tools
+        self._accumulated_content = result.accumulated_content
+        self.phase = ParsePhase.CONTENT
+        result.phase = self.phase
+        return result
+
+    def _process_reasoning_delta(
+        self,
+        result: ParseResult,
+        accumulated_text: str,
+        delta_text: str,
+        token_ids: list[int],
+        prev_text: str,
+        prev_token_ids: list[int],
+    ) -> tuple[str, str]:
+        """Run reasoning parser on streaming delta. Returns (content_text, content_delta).
+
+        Handles both REASONING phase and non-REASONING phase (where the model
+        may start reasoning mid-stream). Transitions phase to CONTENT when the
+        end token is detected.
+
+        Args:
+            result: Mutable :class:`ParseResult` updated in place with the
+                reasoning/content deltas and accumulated state.
+            accumulated_text: Full decoded text seen so far.
+            delta_text: Newly added text in this engine snapshot.
+            token_ids: All token IDs decoded so far.
+            prev_text: Decoded text up to the previous snapshot.
+            prev_token_ids: Token IDs up to the previous snapshot.
+
+        Returns:
+            Tuple ``(content_text, content_delta)`` describing the visible
+            content after reasoning has been peeled off.
+        """
+        content_text = self._raw_content_text
+        content_delta = ""
+
+        try:
+            delta_ids = token_ids[len(prev_token_ids) :] if prev_token_ids else token_ids
+
+            if getattr(self.reasoning_parser, "streaming_all_phases", False):
+                # Text delimiters can start in visible content too. Batch extraction
+                # here would bypass prefix buffering after the first content delta.
+                delta_msg = self.reasoning_parser.extract_reasoning_streaming(
+                    previous_text=prev_text,
+                    current_text=accumulated_text,
+                    delta_text=delta_text,
+                    previous_token_ids=prev_token_ids,
+                    current_token_ids=token_ids,
+                    delta_token_ids=delta_ids,
+                )
+                # A withheld marker or reasoning-only update emits no visible
+                # text, rather than an unspecified (None) content delta.
+                result.delta_content = ""
+                if delta_msg is not None:
+                    if delta_msg.reasoning_content:
+                        result.delta_reasoning = delta_msg.reasoning_content
+                        result.accumulated_reasoning += delta_msg.reasoning_content
+                        # Once content has been exposed, keep advancing the tool
+                        # parser's independent content-only view, even when a
+                        # subsequent update contains only reasoning.
+                        if self.phase == ParsePhase.CONTENT and not content_text:
+                            self.phase = ParsePhase.REASONING
+                    if delta_msg.content:
+                        content_delta = delta_msg.content
+                        content_text += content_delta
+                        result.delta_content = content_delta
+                        result.accumulated_content = content_text
+                        if self.phase == ParsePhase.REASONING:
+                            self.phase = ParsePhase.CONTENT
+                return content_text, content_delta
+
+            if self.phase == ParsePhase.REASONING:
+                delta_msg = self.reasoning_parser.extract_reasoning_streaming(
+                    previous_text=prev_text,
+                    current_text=accumulated_text,
+                    delta_text=delta_text,
+                    previous_token_ids=prev_token_ids,
+                    current_token_ids=token_ids,
+                    delta_token_ids=delta_ids,
+                )
+
+                if delta_msg is not None:
+                    if delta_msg.reasoning_content is not None:
+                        result.delta_reasoning = delta_msg.reasoning_content
+                        result.accumulated_reasoning = self._accumulated_reasoning + delta_msg.reasoning_content
+
+                    if delta_msg.content is not None:
+                        self.phase = ParsePhase.CONTENT
+                        canonical_content, canonical_reasoning = self._canonicalize_reasoning_content(
+                            accumulated_text=accumulated_text,
+                            fallback_content=self._raw_content_text + delta_msg.content,
+                        )
+                        content_text = canonical_content
+                        content_delta = self._compute_visible_content_delta(
+                            content_text,
+                            self._raw_content_text,
+                            delta_msg.content,
+                        )
+                        result.delta_content = content_delta
+                        result.accumulated_content = content_text
+                        if canonical_reasoning is not None:
+                            result.accumulated_reasoning = canonical_reasoning
+
+                        self._tool_previous_text = ""
+                        self._tool_previous_token_ids = []
+                    elif delta_msg.reasoning_content is not None:
+                        result.delta_content = ""
+                        result.accumulated_content = self._raw_content_text
+
+                if self.phase == ParsePhase.REASONING and delta_msg is None:
+                    reasoning, content = self.reasoning_parser.extract_reasoning(accumulated_text)
+                    if content is not None and content != accumulated_text:
+                        self.phase = ParsePhase.CONTENT
+                        old_content = self._raw_content_text
+                        candidate_delta = self._compute_visible_content_delta(content, old_content, delta_text)
+                        if content.startswith(old_content) or candidate_delta:
+                            content_text = content
+                            content_delta = candidate_delta
+                        else:
+                            content_text = old_content
+                            content_delta = ""
+                        result.accumulated_content = content_text
+                        result.delta_content = content_delta
+                        result.accumulated_reasoning = reasoning or self._accumulated_reasoning
+                        self._tool_previous_text = ""
+                        self._tool_previous_token_ids = []
+                    elif delta_msg is None:
+                        result.delta_content = ""
+                        result.accumulated_content = self._raw_content_text
+            else:
+                reasoning, content = self.reasoning_parser.extract_reasoning(accumulated_text)
+
+                if reasoning is not None and reasoning != self._accumulated_reasoning:
+                    old_reasoning = self._accumulated_reasoning
+                    result.accumulated_reasoning = reasoning
+                    if len(reasoning) > len(old_reasoning):
+                        result.delta_reasoning = reasoning[len(old_reasoning) :]
+
+                if content is not None:
+                    old_content = self._raw_content_text
+                    candidate_delta = self._compute_visible_content_delta(content, old_content, delta_text)
+                    if content.startswith(old_content) or candidate_delta:
+                        content_text = content
+                        content_delta = candidate_delta
+                    else:
+                        content_text = old_content
+                        content_delta = ""
+                else:
+                    content_text = self._raw_content_text
+                    content_delta = ""
+
+        except Exception:
+            logger.warning(
+                "Reasoning streaming extraction failed; treating delta as content",
+                exc_info=True,
+            )
+            self.phase = ParsePhase.CONTENT
+            content_text = accumulated_text
+            content_delta = delta_text
+            result.accumulated_content = content_text
+
+        return content_text, content_delta
+
+    def _get_tool_request(self) -> ChatCompletionRequest:
+        """Return the tool request, creating a dummy one if needed.
+
+        Returns:
+            The original :class:`ChatCompletionRequest` if available, else
+            a minimal dummy request that satisfies tool-parser interfaces.
+        """
+        if self.tool_request is not None:
+            return self.tool_request
+        return ChatCompletionRequest(
+            model="dummy",
+            messages=[ChatMessage(role="user", content="")],
+        )
+
+    def _tools_explicitly_disabled(self) -> bool:
+        """Distinguish an explicit opt-out from legacy callers without tool metadata."""
+        choice = getattr(self.tool_request, "tool_choice", None)
+        return isinstance(choice, str) and choice.strip().lower() == "none"
+
+    def _is_tools_enabled(self) -> bool:
+        """Check whether tool calling is actually enabled for this request.
+
+        Returns:
+            ``True`` when the request declares tools and ``tool_choice`` is
+            not ``"none"``; ``False`` otherwise.
+        """
+        if self.tool_request is None:
+            return False
+        tools = getattr(self.tool_request, "tools", None)
+        if not tools:
+            return False
+        tool_choice = getattr(self.tool_request, "tool_choice", None)
+        if isinstance(tool_choice, str) and tool_choice.strip().lower() == "none":
+            return False
+        return True
+
+    def _process_tool_delta(
+        self,
+        result: ParseResult,
+        content_text: str,
+        content_delta: str,
+        token_ids: list[int],
+    ) -> None:
+        """Run tool parser on a streaming content delta. Mutates *result* in place.
+
+        Args:
+            result: Mutable :class:`ParseResult` updated in place with content
+                and tool-call deltas.
+            content_text: Cumulative visible content (post reasoning).
+            content_delta: Newly produced visible text since the last call.
+            token_ids: All token IDs decoded so far.
+        """
+        tool_request = self._get_tool_request()
+        tools_enabled = self._is_tools_enabled()
+        previous_visible_content = self._accumulated_content
+
+        try:
+            tool_current_token_ids = self._tokenize_for_tool_view(content_text)
+            tool_delta_token_ids = self._tokenize_for_tool_view(content_delta) if content_delta else []
+            if self._tool_previous_text and not self._tool_previous_token_ids:
+                # The machinery gate keeps previous_text synced while
+                # bypassing but (deliberately) skips per-delta retokenization;
+                # reconstruct the previous ids ONCE at engagement so parsers
+                # that inspect previous_token_ids (e.g. ernie45's
+                # all-newlines check) see a consistent triple.
+                self._tool_previous_token_ids = self._tokenize_for_tool_view(self._tool_previous_text)
+
+            delta_msg = self.tool_parser.extract_tool_calls_streaming(
+                previous_text=self._tool_previous_text,
+                current_text=content_text,
+                delta_text=content_delta or "",
+                previous_token_ids=self._tool_previous_token_ids,
+                current_token_ids=tool_current_token_ids,
+                delta_token_ids=tool_delta_token_ids,
+                request=tool_request,
+            )
+
+            buffering = bool(
+                hasattr(self.tool_parser, "is_buffering_protocol")
+                and self.tool_parser.is_buffering_protocol(
+                    current_text=content_text,
+                    delta_text=content_delta or "",
+                )
+            )
+
+            tool_calls = getattr(delta_msg, "tool_calls", None)
+            if tool_calls:
+                result.delta_tool_calls = tool_calls
+                self._merge_streamed_tool_call_state(result.delta_tool_calls)
+                if tools_enabled:
+                    self.phase = ParsePhase.TOOL_CALL
+
+            # Preserve extracted ordinary prefixes alongside tool calls or a
+            # buffered suffix. A raw pass-through delta is not disambiguated,
+            # however: legacy parsers return it while a marker is still forming.
+            visible_content = getattr(delta_msg, "content", None)
+            if buffering and not tool_calls and not self._streamed_tool_call_state and visible_content == content_delta:
+                visible_content = None
+            if visible_content is not None:
+                visible_delta = visible_content if isinstance(visible_content, str) else str(visible_content)
+                result.accumulated_content = f"{previous_visible_content}{visible_delta}"
+                result.delta_content = visible_delta
+                if not tool_calls:
+                    if buffering and tools_enabled:
+                        if self.phase != ParsePhase.TOOL_CALL:
+                            self.phase = ParsePhase.BUFFERING
+                    elif not buffering:
+                        self.phase = ParsePhase.CONTENT
+            elif tool_calls or buffering or self.phase in (ParsePhase.BUFFERING, ParsePhase.TOOL_CALL):
+                if buffering and tools_enabled and self.phase != ParsePhase.TOOL_CALL:
+                    self.phase = ParsePhase.BUFFERING
+                result.accumulated_content = previous_visible_content
+                result.delta_content = ""
+            else:
+                result.accumulated_content = content_text
+                result.delta_content = content_delta
+
+            self._tool_previous_text = content_text
+            self._tool_previous_token_ids = tool_current_token_ids
+
+        except Exception:
+            logger.warning(
+                "Tool streaming extraction failed; passing content through",
+                exc_info=True,
+            )
+            result.accumulated_content = content_text
+            result.delta_content = content_delta
+
+    def _process_tool_final(self, result: ParseResult, content_for_tools: str) -> None:
+        """Run tool parser batch extraction on the final content. Mutates *result*.
+
+        Args:
+            result: Mutable :class:`ParseResult` updated with batch-extracted
+                tool calls and any catch-up deltas.
+            content_for_tools: Final visible content fed to the tool parser.
+        """
+        tool_request = self._get_tool_request()
+        tools_enabled = self._is_tools_enabled()
+        original_visible_content = self._accumulated_content
+        previous_visible_content = original_visible_content
+        # The terminal engine update is not necessarily passed through process_delta.
+        # Let stateful parsers classify that unseen suffix before their batch fallback.
+        if content_for_tools != self._tool_previous_text:
+            unseen = self._compute_visible_content_delta(content_for_tools, self._tool_previous_text)
+            self._process_tool_delta(result, content_for_tools, unseen, [])
+            previous_visible_content = result.accumulated_content
+        flush = getattr(self.tool_parser, "flush_streaming_content", None)
+        if callable(flush):
+            previous_visible_content += flush() or ""
+        protocol_recognized = (
+            self.phase == ParsePhase.TOOL_CALL
+            or bool(self._streamed_tool_call_state)
+            or any(marker in content_for_tools for marker in self._tool_marker_hints)
+        )
+        if protocol_recognized:
+            # Final batch extraction can fail or return raw-input fallback text.
+            # Neither may undo the boundary already established by streaming,
+            # even if subsequent safe content moved the phase back to CONTENT.
+            result.accumulated_content = previous_visible_content
+            result.delta_content = ""
+
+        try:
+            extracted = self.tool_parser.extract_tool_calls(content_for_tools, tool_request)
+            if extracted.tools_called and extracted.tool_calls:
+                result.tool_calls = extracted.tool_calls
+                # Batch parsers can generate new IDs. Keep the final public
+                # result aligned with IDs already announced to clients.
+                for index, call in enumerate(result.tool_calls):
+                    streamed_id = self.streamed_tool_call_id(index)
+                    if streamed_id:
+                        call.id = streamed_id
+                missing_deltas = self._build_missing_final_tool_deltas(extracted.tool_calls)
+                self._merge_streamed_tool_call_state(missing_deltas)
+                result.delta_tool_calls = (list(result.delta_tool_calls or []) + list(missing_deltas or [])) or None
+                self.phase = ParsePhase.TOOL_CALL
+                # Successful batch extraction certifies its content, but some
+                # parsers return only the preamble rather than all ordinary
+                # text. Accept extensions without retracting streamed suffixes.
+                visible = extracted.content
+                if visible is not None and visible.startswith(previous_visible_content):
+                    result.accumulated_content = visible
+                    result.delta_content = visible[len(previous_visible_content) :]
+                else:
+                    result.accumulated_content = previous_visible_content
+                    result.delta_content = ""
+            elif protocol_recognized:
+                result.accumulated_content = previous_visible_content
+                result.delta_content = ""
+            elif tools_enabled:
+                visible = extracted.content if extracted.content is not None else content_for_tools
+                result.accumulated_content = visible
+                result.delta_content = self._compute_visible_content_delta(
+                    visible,
+                    previous_visible_content,
+                )
+        except Exception:
+            logger.warning(
+                "Tool batch extraction failed; passing content through",
+                exc_info=True,
+            )
+        result.delta_content = self._compute_visible_content_delta(result.accumulated_content, original_visible_content)
+
+    def _tokenize_for_tool_view(self, text: str) -> list[int]:
+        """Tokenize text for the tool parser's independent view.
+
+        Tool parsers maintain their own token-id view starting after the
+        reasoning boundary. This helper encodes ``text`` with the parser's
+        tokenizer (when available) and gracefully handles tokenizers whose
+        ``encode`` method does not accept ``add_special_tokens``.
+
+        Args:
+            text: Visible content to tokenize.
+
+        Returns:
+            List of integer token IDs, or an empty list when no tokenizer
+            is available or encoding fails.
+        """
+        if not text:
+            return []
+
+        tokenizer = getattr(self.tool_parser, "model_tokenizer", None)
+        if tokenizer is None or not hasattr(tokenizer, "encode"):
+            return []
+
+        try:
+            ids = tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            try:
+                ids = tokenizer.encode(text)
+            except Exception:
+                return []
+        except Exception:
+            return []
+
+        try:
+            return [int(tid) for tid in ids]
+        except Exception:
+            return []

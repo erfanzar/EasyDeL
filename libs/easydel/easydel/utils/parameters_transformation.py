@@ -1,0 +1,2163 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+"""Parameter format conversion between PyTorch/HuggingFace and EasyDeL.
+
+This module is the bridge that lets EasyDeL load HuggingFace checkpoints
+into JAX/Spectrax modules and vice versa. It groups three responsibilities:
+
+* :class:`DtypeHandler` -- string-to-``jnp.dtype`` mapping and float tensor
+  re-cast helpers used throughout the converters.
+* :class:`TensorConverter` -- low-level torch-tensor / JAX-array conversion
+  (with optional zero-copy DLPack transfer).
+* :class:`StateDictConverter` and :class:`ModelConverter` -- the high-level
+  HuggingFace -> EasyDeL and EasyDeL -> HuggingFace converters, including
+  MoE expert consolidation and key renaming logic.
+
+Most public entry points are exposed via the top-level ``easydel.utils``
+package as :class:`ModelConverter`, :class:`StateDictConverter`, and
+:class:`TensorConverter`.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import functools
+import gc
+import inspect
+import re
+import typing as tp
+import warnings
+from collections.abc import Mapping
+
+import jax
+import ml_dtypes
+import numpy as np
+from eformer.loggings import get_logger
+from jax import numpy as jnp
+from tqdm.autonotebook import tqdm
+
+from easydel.utils.helpers import check_bool_flag
+
+from . import flags
+from .traversals import unflatten_dict
+
+if tp.TYPE_CHECKING:
+    from transformers import PreTrainedModel
+
+    from easydel.infra.base_config import EasyDeLBaseConfig
+    from easydel.infra.base_module import EasyDeLBaseModule
+
+
+logger = get_logger(__name__)
+
+
+def fp32_param_pattern_matches(path: str | tp.Sequence[tp.Any], patterns: tp.Sequence[str] | None) -> bool:
+    """Whether a parameter path matches any fp32-pinned pattern.
+
+    A pattern is a dotted run of path segments (``"router.weight"``, ``"A_log"``); it matches when those
+    segments appear contiguously in ``path``. Matching is on whole segments only, so ``"router"`` does not
+    match ``"routers"`` and the same rule applies to HF keys, EasyDeL key tuples and native checkpoint keys.
+
+    Args:
+        path: Dotted or ``/``-separated key string, or a key tuple.
+        patterns: Dotted segment patterns declared by the model (``fp32_param_patterns``).
+
+    Returns:
+        ``True`` when at least one pattern matches.
+    """
+    if not patterns:
+        return False
+    if isinstance(path, str):
+        segments = tuple(segment for segment in re.split(r"[./\\]", path) if segment)
+    else:
+        segments = tuple(str(part) for part in path)
+    for pattern in patterns:
+        wanted = tuple(segment for segment in str(pattern).split(".") if segment)
+        width = len(wanted)
+        if width and any(segments[i : i + width] == wanted for i in range(len(segments) - width + 1)):
+            return True
+    return False
+
+
+def fp32_pinned_dtype(path: str | tp.Sequence[tp.Any], default: tp.Any, patterns: tp.Sequence[str] | None) -> tp.Any:
+    """Return ``jnp.float32`` for a pinned ``path``, otherwise ``default``."""
+    return jnp.float32 if fp32_param_pattern_matches(path, patterns) else default
+
+
+class ExpertMergeSpec(tp.NamedTuple):
+    """How per-expert checkpoint tensors merge into one stacked expert tensor.
+
+    ``parts`` are the per-expert leaf names in concatenation order (``("w1",
+    "w3")`` or ``("gate_proj", "up_proj")``); each is stacked on a new leading
+    expert axis, then the parts are concatenated along ``concat_dim`` of the
+    stacked tensor to form ``experts.<target>``.
+    """
+
+    parts: tuple[str, ...]
+    target: str
+    concat_dim: int
+
+
+# transformers>=5's own MoE convention, used when it has no mapping for a model.
+DEFAULT_EXPERT_MERGE_SPECS = (
+    ExpertMergeSpec(("gate_proj", "up_proj"), "gate_up_proj", 1),
+    ExpertMergeSpec(("down_proj",), "down_proj", 0),
+)
+_PER_EXPERT_KEY = re.compile(r"^(.*\.experts)\.(\d+)\.([^.]+)\.weight$")
+
+
+@functools.cache
+def hf_expert_layout(model_type: str | None) -> tuple[tuple[tp.Any, ...], tuple[ExpertMergeSpec, ...]]:
+    """The per-expert merges (and key renames) transformers applies when loading ``model_type``.
+
+    Read from ``transformers.conversion_mapping.get_checkpoint_conversion_mapping``:
+    every ``WeightConverter`` built only from ``MergeModulelist``/``Concatenate``
+    over ``experts.*.<leaf>.weight`` sources becomes an :class:`ExpertMergeSpec`,
+    and every ``WeightRenaming`` is kept so a checkpoint key can be moved into
+    the namespace transformers (and EasyDeL's rules) use in memory.
+
+    Returns:
+        ``(renamings, specs)``; ``specs`` falls back to
+        :data:`DEFAULT_EXPERT_MERGE_SPECS` when transformers has none.
+    """
+    renamings: list[tp.Any] = []
+    specs: list[ExpertMergeSpec] = []
+    try:
+        from transformers.conversion_mapping import get_checkpoint_conversion_mapping
+        from transformers.core_model_loading import Concatenate, MergeModulelist, WeightConverter, WeightRenaming
+
+        mapping = get_checkpoint_conversion_mapping(model_type) if model_type else None
+    except Exception:  # older transformers, or an unknown model type
+        mapping = None
+    for transform in mapping or ():
+        if isinstance(transform, WeightRenaming):
+            renamings.append(transform)
+            continue
+        if not isinstance(transform, WeightConverter):
+            continue
+        ops = list(transform.operations or ())
+        if not ops or not isinstance(ops[0], MergeModulelist):
+            continue
+        if not all(isinstance(op, (MergeModulelist, Concatenate)) for op in ops):
+            continue
+        sources = transform.source_patterns
+        targets = transform.target_patterns
+        sources = [sources] if isinstance(sources, str) else list(sources)
+        targets = [targets] if isinstance(targets, str) else list(targets)
+        parts = [re.fullmatch(r".*experts\.\*\.([^.]+)\.weight", src) for src in sources]
+        target = re.fullmatch(r".*experts\.([^.]+)", targets[0]) if len(targets) == 1 else None
+        if target is None or not all(parts):
+            continue
+        concat_dim = next((op.dim for op in ops if isinstance(op, Concatenate)), 0)
+        specs.append(ExpertMergeSpec(tuple(m.group(1) for m in parts), target.group(1), int(concat_dim)))
+    return tuple(renamings), tuple(specs) or DEFAULT_EXPERT_MERGE_SPECS
+
+
+def canonical_expert_leaf(spec: ExpertMergeSpec, part: int) -> str | None:
+    """Name transformers' own convention gives ``spec``'s ``part`` (``w1`` -> ``gate_proj``, ``w2`` -> ``down_proj``).
+
+    Lets a checkpoint's per-expert names reach runtimes that keep one leaf per
+    part (``experts.gate_proj``/``up_proj``/``down_proj``) instead of the merged tensor.
+    """
+    for default in DEFAULT_EXPERT_MERGE_SPECS:
+        if default.target == spec.target and len(default.parts) == len(spec.parts):
+            return default.parts[part]
+    return None
+
+
+class HFCheckpointKeyMapper:
+    """Map checkpoint keys to transformers' in-memory names exactly as a transformers load does.
+
+    Built from the model skeleton on the ``meta`` device: transformers' full
+    conversion mapping for that model (per-submodule scoped renames and
+    merges, see ``get_model_conversion_mapping``) plus its base-model-prefix
+    fix-up against the real parameter names. Key-by-key loaders use it so they
+    see what the full loader gets from the torch model.
+    """
+
+    def __init__(self, renamings, converters, base_model_prefix, meta_state_dict):
+        self.renamings = renamings
+        self.converters = converters
+        self.base_model_prefix = base_model_prefix
+        self.meta_state_dict = meta_state_dict
+        self._specs: dict[int, ExpertMergeSpec | None] = {}
+
+    @classmethod
+    def for_config(cls, hf_config: tp.Any, trust_remote_code: bool = False) -> HFCheckpointKeyMapper | None:
+        """Build the mapper for ``hf_config``; ``None`` when transformers cannot build its skeleton."""
+        try:
+            import torch
+            import transformers
+            from transformers.conversion_mapping import get_model_conversion_mapping
+            from transformers.core_model_loading import WeightConverter, WeightRenaming
+        except Exception:
+            return None
+        auto_map = getattr(hf_config, "auto_map", None) or {}
+        for name in (
+            "AutoModelForCausalLM",
+            "AutoModelForImageTextToText",
+            "AutoModelForVision2Seq",
+            "AutoModelForSeq2SeqLM",
+            "AutoModel",
+        ):
+            auto_class = getattr(transformers, name, None)
+            if auto_class is None:
+                continue
+            try:
+                if name not in auto_map and type(hf_config) not in auto_class._model_mapping:
+                    continue
+                with torch.device("meta"):
+                    model = auto_class.from_config(hf_config, trust_remote_code=trust_remote_code)
+                transforms = get_model_conversion_mapping(model)
+            except Exception:
+                continue
+            return cls(
+                [t for t in transforms if isinstance(t, WeightRenaming)],
+                [t for t in transforms if isinstance(t, WeightConverter)],
+                getattr(model, "base_model_prefix", None),
+                dict.fromkeys(model.state_dict()),
+            )
+        return None
+
+    def rename(self, key: str) -> str:
+        """Checkpoint key -> in-memory name, applying renames only (per-expert keys keep their index)."""
+        from transformers.core_model_loading import rename_source_key
+
+        return rename_source_key(key, self.renamings, [], self.base_model_prefix, self.meta_state_dict)[0]
+
+    def expert_merge(self, key: str) -> tuple[str, int, ExpertMergeSpec, int] | None:
+        """Like :func:`resolve_expert_merge`, from this model's own converters."""
+        from transformers.core_model_loading import Concatenate, MergeModulelist, rename_source_key
+
+        merged, pattern = rename_source_key(
+            key, self.renamings, self.converters, self.base_model_prefix, self.meta_state_dict
+        )
+        if pattern is None:
+            return None
+        converter = next(c for c in self.converters if pattern in c.source_patterns)
+        if id(converter) not in self._specs:
+            ops = list(converter.operations or ())
+            parts = [re.fullmatch(r".*experts\.\*\.([^.]+)\.weight", src) for src in converter.source_patterns]
+            target = re.fullmatch(r".*experts\.([^.]+)", converter.target_patterns[0])
+            ok = (
+                ops
+                and isinstance(ops[0], MergeModulelist)
+                and all(isinstance(o, (MergeModulelist, Concatenate)) for o in ops)
+            )
+            self._specs[id(converter)] = (
+                ExpertMergeSpec(
+                    tuple(m.group(1) for m in parts),
+                    target.group(1),
+                    int(next((o.dim for o in ops if isinstance(o, Concatenate)), 0)),
+                )
+                if ok and target is not None and all(parts)
+                else None
+            )
+        spec = self._specs[id(converter)]
+        match = _PER_EXPERT_KEY.match(self.rename(key))
+        if spec is None or match is None or match.group(3) not in spec.parts:
+            return None
+        return merged, int(match.group(2)), spec, spec.parts.index(match.group(3))
+
+
+def hf_rename_key(key: str, model_type: str | None, mapper: HFCheckpointKeyMapper | None = None) -> str:
+    """Apply transformers' load-time ``WeightRenaming`` rules for ``model_type`` to one checkpoint key.
+
+    transformers>=5 saves some models under legacy on-disk names (e.g. VLMs'
+    ``language_model.model.*``) and renames them on load; key-by-key loaders
+    use this to see the same names the in-memory model (and so the full
+    loader) has.
+    """
+    if mapper is not None:
+        return mapper.rename(key)
+    renamings, _ = hf_expert_layout(model_type)
+    for renaming in renamings:
+        key, _ = renaming.rename_source_key(key)
+    return key
+
+
+def resolve_expert_merge(
+    key: str,
+    model_type: str | None,
+    *,
+    apply_renamings: bool = True,
+    mapper: HFCheckpointKeyMapper | None = None,
+) -> tuple[str, int, ExpertMergeSpec, int] | None:
+    """Place one per-expert checkpoint key inside transformers' stacked expert layout.
+
+    Args:
+        key: Checkpoint key such as ``model.layers.3.block_sparse_moe.experts.5.w1.weight``.
+        model_type: The model's ``model_type`` (selects transformers' mapping).
+        apply_renamings: ``False`` when ``key`` already went through :func:`hf_rename_key`
+            (renamings are not guaranteed idempotent).
+
+    Returns:
+        ``(merged_key, expert_index, spec, part_index)`` where ``merged_key`` is
+        the in-memory transformers name (``model.layers.3.mlp.experts.gate_up_proj``),
+        or ``None`` when ``key`` is not a per-expert tensor any merge covers.
+    """
+    if mapper is not None and apply_renamings:
+        return mapper.expert_merge(key)
+    _, specs = hf_expert_layout(model_type)
+    if apply_renamings:
+        key = hf_rename_key(key, model_type)
+    match = _PER_EXPERT_KEY.match(key)
+    if match is None:
+        return None
+    for spec in specs:
+        if match.group(3) in spec.parts:
+            return f"{match.group(1)}.{spec.target}", int(match.group(2)), spec, spec.parts.index(match.group(3))
+    return None
+
+
+EASYDEL_PREFERRED_HOST_COPY_INDEX = flags.get_int(flags.EASYDEL_PREFERRED_HOST_COPY_INDEX)
+_preferred_host_copy_raw = str(flags.get_str(flags.EASYDEL_PREFERRED_HOST_COPY)).lower()
+EASYDEL_PREFERRED_HOST_COPY: str | None = None if _preferred_host_copy_raw == "none" else _preferred_host_copy_raw
+
+
+class DtypeHandler:
+    """Static helpers for parsing dtype aliases and re-casting float tensors.
+
+    EasyDeL's checkpoint and conversion code receives dtypes from CLI flags
+    and YAML configs as short strings (``"bf16"``, ``"fp16"``, ``"fp8_e4m3fn"``,
+    …); :meth:`get_dtype` is the single canonical place that maps those
+    aliases to ``jnp.dtype`` objects, including the various 8-bit FP variants.
+    :meth:`float_tensor_to_dtype` is the matching tensor-side helper used by
+    :class:`StateDictConverter`/:class:`ModelConverter` to coerce *only*
+    floating-point arrays while leaving integer/bool tensors (e.g. masks,
+    indices) at their native precision.
+
+    The class deliberately exposes only ``@staticmethod`` callables so it
+    can be used as a namespace without instantiation.
+    """
+
+    @staticmethod
+    def get_dtype(dtype: str | jnp.dtype) -> jnp.dtype:
+        """Convert string dtype representation to JAX dtype.
+
+        Args:
+            dtype: Either a ``jnp.dtype`` (returned unchanged) or a short
+                alias string such as ``"bf16"``, ``"fp16"``, ``"fp8_e4m3fn"``.
+
+        Returns:
+            The corresponding ``jnp.dtype``.
+
+        Raises:
+            KeyError: If ``dtype`` is a string not in the supported alias map.
+        """
+        if isinstance(dtype, str):
+            dtype_map: dict[str, jnp.dtype] = {
+                "bf16": jnp.bfloat16,
+                "bfloat16": jnp.bfloat16,
+                "fp16": jnp.float16,
+                "float16": jnp.float16,
+                "fp32": jnp.float32,
+                "float32": jnp.float32,
+                "fp64": jnp.float64,
+                "float64": jnp.float64,
+                "fp8": jnp.float8_e5m2,
+                "nvfp8": jnp.float8_e4m3,
+                "mxfp8": jnp.float8_e5m2,
+                "mxfp4": jnp.float4_e2m1fn,
+                "fp8_e4m3fn": jnp.float8_e4m3fn,
+                "fp8_e4m3fnuz": jnp.float8_e4m3fnuz,
+                "fp8_e4m3b11fnuz": jnp.float8_e4m3b11fnuz,
+                "fp8_e5m2": jnp.float8_e5m2,
+                "fp8_e5m2fnuz": jnp.float8_e5m2fnuz,
+                "float8_e4m3fn": jnp.float8_e4m3fn,
+                "float8_e4m3fnuz": jnp.float8_e4m3fnuz,
+                "float8_e4m3b11fnuz": jnp.float8_e4m3b11fnuz,
+                "float8_e5m2": jnp.float8_e5m2,
+                "float8_e5m2fnuz": jnp.float8_e5m2fnuz,
+            }
+            return dtype_map[dtype]
+        return dtype
+
+    @staticmethod
+    def float_tensor_to_dtype(tensor: tp.Any, dtype: str | jnp.dtype | None) -> tp.Any:
+        """Convert a float-valued tensor to the specified dtype, if applicable.
+
+        Integer/boolean tensors and ``None``/``""`` dtypes pass through.
+
+        Args:
+            tensor: Any object exposing a ``dtype`` attribute and an
+                ``astype`` method (JAX/NumPy/PyTorch arrays all qualify).
+            dtype: Target dtype as a string or ``jnp.dtype``; ``None`` or
+                ``""`` skip the conversion.
+
+        Returns:
+            ``tensor`` cast to ``dtype`` when its current dtype is a known
+            float type; otherwise ``tensor`` unchanged.
+        """
+        if dtype is None or dtype == "":
+            return tensor
+
+        dtype = DtypeHandler.get_dtype(dtype)
+        source_dtype = getattr(tensor, "dtype", None)
+        if source_dtype is None:
+            return tensor
+        if str(source_dtype).startswith("torch."):
+            if tensor.is_floating_point():
+                torch = TensorConverter.get_torch()
+                return tensor.to(dtype=getattr(torch, str(jnp.dtype(dtype))))
+            return tensor
+        if jnp.issubdtype(source_dtype, jnp.floating):
+            return tensor.astype(dtype)
+        return tensor
+
+
+_NUMPY_REPRESENTABLE = frozenset(
+    jnp.dtype(d)
+    for d in (
+        "float16",
+        "float32",
+        "float64",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "bool",
+        "complex64",
+        "complex128",
+    )
+)
+
+
+class TensorConverter:
+    """Low-level tensor adapters between PyTorch tensors and JAX arrays.
+
+    Used by the higher-level :class:`StateDictConverter` to move parameter
+    leaves between frameworks while preserving dtype semantics. Two
+    transfer paths are supported:
+
+    * **NumPy bridge** — slower but format-stable. ``bfloat16`` PyTorch
+      tensors are upcast to ``float`` before going through NumPy because
+      NumPy lacks native ``bfloat16`` storage.
+    * **DLPack** — zero-copy capsule transfer used when both runtimes are
+      on a compatible backend (CPU or CUDA). Gated by ``EASY_SAFE_TRANSFER``;
+      callers can force the safe NumPy path on platforms with broken DLPack
+      capsules.
+
+    All callables are ``@staticmethod`` so the class is used as a
+    namespace; ``get_torch`` is ``lru_cache``-d to avoid paying repeated
+    import-time cost on hot conversion loops.
+    """
+
+    @staticmethod
+    def convert_pytorch_to_jnp(tensor: tp.Any, dtype: jnp.dtype) -> jnp.ndarray:
+        """Convert a PyTorch tensor to a JAX array of the requested dtype.
+
+        ``bfloat16`` PyTorch tensors are upcast to ``float`` before going
+        through NumPy because NumPy doesn't natively support ``bfloat16``.
+
+        Args:
+            tensor: A PyTorch tensor to convert.
+            dtype: Target ``jnp.dtype`` for the resulting array.
+
+        Returns:
+            A JAX array with the same data and the requested dtype.
+        """
+        dtype_name = str(tensor.dtype)
+        # NumPy has no bfloat16 and no float8 variants, so torch's `.numpy()`
+        # rejects them outright ("Got unsupported ScalarType Float8_e8m0fnu").
+        # Upcast to float32 first; the value is preserved exactly, since every
+        # one of these formats is a strict subset of float32. Checkpoints that
+        # store block scales in float8 (DeepSeek-V4's `ue8m0`) reach this path.
+        if "bfloat16" in dtype_name or "float8" in dtype_name.lower():
+            tensor = tensor.float()
+        npv = tensor.cpu().detach().numpy()
+        return jnp.array(npv, dtype=dtype)
+
+    @staticmethod
+    def to_jax_preserving_dtype(tensor: tp.Any) -> jnp.ndarray:
+        """Convert a tensor to a JAX array **without** changing its dtype.
+
+        The counterpart to :meth:`convert_pytorch_to_jnp`, which casts to the
+        model's parameter dtype. Quantized checkpoint leaves must not be cast:
+        a packed ``uint32`` kernel or a ``uint8`` block scale reinterpreted as
+        ``bfloat16`` is silently destroyed. Accepts values that are already
+        JAX/NumPy arrays so it can sit on paths where an earlier stage
+        converted.
+
+        Args:
+            tensor: A PyTorch tensor, NumPy array, or JAX array.
+
+        Returns:
+            A JAX array holding the same values and dtype.
+        """
+        if hasattr(tensor, "detach"):
+            return TensorConverter.pytorch_to_jax(tensor)
+        return jnp.asarray(tensor)
+
+    @staticmethod
+    @functools.lru_cache
+    def get_torch():
+        """Import and return the ``torch`` module, cached across calls.
+
+        Returns:
+            The imported ``torch`` module.
+        """
+        import torch
+
+        return torch
+
+    @staticmethod
+    def jax_to_pytorch(x: jax.Array) -> tp.Any:
+        """Convert a JAX array to a PyTorch tensor.
+
+        When ``EASY_SAFE_TRANSFER`` is enabled (the default) the data is
+        moved through NumPy, which is slower but avoids DLPack edge cases.
+        Otherwise a zero-copy DLPack transfer is used for CPU arrays, or
+        GPU arrays when CUDA is available and host transfer is not forced.
+
+        Args:
+            x: JAX array to transfer.
+
+        Returns:
+            A PyTorch tensor view of the array.
+        """
+        if check_bool_flag("EASY_SAFE_TRANSFER", True):
+            torch = TensorConverter.get_torch()
+            x = jax.device_get(x)
+            x = np.asarray(x)
+            if not x.flags.c_contiguous:
+                x = np.ascontiguousarray(x)
+            if x.dtype == ml_dtypes.bfloat16:
+                # ``torch.from_numpy`` cannot ingest ``ml_dtypes.bfloat16`` arrays (NumPy has
+                # no native bfloat16), so the NumPy bridge raised TypeError for bf16 models.
+                # Reinterpret the bits as uint16 and view back as torch bfloat16 --
+                # bit-exact, no upcast, no extra copy.
+                return torch.from_numpy(x.view(np.uint16)).view(torch.bfloat16)
+            return torch.from_numpy(x)
+        else:
+            from torch import cuda
+            from torch.utils import dlpack as dlpack_pt
+
+            devices = x.devices()
+            platform = next(iter(devices)).platform
+            force_cpu = check_bool_flag("EASYDEL_FORCE_TORCH_USE_CPU", False)
+            compatible_platform = platform == "cpu" or (platform == "gpu" and cuda.is_available() and not force_cpu)
+            # DLPack represents one device buffer, not a distributed array.
+            # Gather fully addressable multi-device arrays through the staging
+            # path below before handing torch a single-device buffer.
+            if len(devices) == 1 and compatible_platform:
+                # Let torch negotiate the stream through the array's __dlpack__
+                # protocol (the capsule-based jax.dlpack.to_dlpack is unavailable).
+                return dlpack_pt.from_dlpack(x)
+            host_platform = "cpu" if force_cpu or not cuda.is_available() else EASYDEL_PREFERRED_HOST_COPY
+            host_array = jax.device_put(
+                jax.device_get(x),
+                jax.devices(host_platform)[EASYDEL_PREFERRED_HOST_COPY_INDEX],
+            )
+            return dlpack_pt.from_dlpack(host_array)
+
+    @staticmethod
+    def pytorch_to_jax(x: tp.Any) -> jnp.ndarray:
+        """Convert a PyTorch tensor to a JAX array via NumPy.
+
+        NumPy has no float8 types, so ``.numpy()`` raises on them ("Got
+        unsupported ScalarType Float8_e8m0fnu"). Those are carried across as
+        raw bytes and bitcast back on the JAX side, which keeps this method's
+        dtype-preserving contract: upcasting a block scale to float32 here
+        would both change the leaf's dtype and quadruple its footprint.
+
+        Args:
+            x: A PyTorch tensor.
+
+        Returns:
+            A JAX array with the same dtype and shape.
+        """
+        dtype_name = str(x.dtype).removeprefix("torch.")
+        target = getattr(jnp, dtype_name, None)
+        if target is not None and jnp.dtype(target) not in _NUMPY_REPRESENTABLE:
+            import torch
+
+            # Carry the bits across in an integer of the same width; both
+            # sides agree on the layout, so the reinterpretation is exact.
+            carrier = {1: torch.uint8, 2: torch.int16, 4: torch.int32}.get(jnp.dtype(target).itemsize)
+            if carrier is not None:
+                raw = x.detach().cpu().view(carrier).numpy()
+                return jnp.asarray(raw).view(target)
+        return jnp.asarray(x.detach().cpu().numpy())
+
+
+class StateDictConverter:
+    """Convert flat PyTorch ``state_dict``s to nested EasyDeL parameter trees.
+
+    PyTorch ships parameters as a flat ``{'layer.0.attn.q_proj.weight': Tensor}``
+    mapping where each entry follows PyTorch's ``[out, in]`` weight layout.
+    EasyDeL's Spectrax modules expect a nested ``{tuple_path: jnp.ndarray}``
+    pytree with JAX-friendly axis order (``[in, out]`` for dense layers, with
+    higher-rank tensors transposed analogously). This class is the bridge.
+
+    The high-traffic entry point is the private helper
+    :meth:`_base_huggingface_to_easydel`; trainer/loader code reaches it
+    through :class:`ModelConverter`, which adds MoE expert consolidation and
+    config-driven hooks. Static methods on this class implement the
+    individual stages: keyword filtering (:meth:`match_keywords`), per-tensor
+    rewriting (:meth:`process_tensor` — applies the axis transposition,
+    detects embeddings/layernorms, and applies optional ``reform_param``
+    splits), and the orchestration loop that progress-bars over a state dict
+    and runs each tensor through user-provided shard/callback hooks.
+
+    Notes:
+        * The class is deliberately stateless; configuration flows through
+          the per-call ``config`` dict so concurrent conversions don't
+          interact.
+        * Tied LM-head weights are intentionally not dropped during
+          conversion to keep tree-key parity with EasyDeL graphs that still
+          materialise ``lm_head.kernel``.
+    """
+
+    @staticmethod
+    def validate_reform_param_schema(reform_param: Mapping[str, Mapping[str, tp.Any]] | None) -> None:
+        """Validate the structural contract used by ``reform_param`` rules.
+
+        Checks rule shape and callable presence, not tensor shapes. Rules
+        that merge multiple checkpoint tensors into one EasyDeL tensor must be
+        bidirectional so export cannot accidentally write runtime-only layouts.
+
+        Args:
+            reform_param: Mapping of target-key pattern to rule mapping. May
+                be ``None`` or empty (treated as no-op).
+
+        Raises:
+            TypeError: If a rule entry, its ``sources`` list, or one of its
+                callables has the wrong type.
+            ValueError: If a fusion rule is missing one of ``sources``,
+                ``fuser`` or ``inverse_fuser``; or if a split rule omits
+                ``inverse_spliter``.
+        """
+        if not reform_param:
+            return
+        for key, rule in reform_param.items():
+            if not isinstance(rule, Mapping):
+                raise TypeError(f"reform_param[{key!r}] must be a mapping, got {type(rule).__name__}")
+
+            has_sources = "sources" in rule
+            has_fuser = "fuser" in rule
+            has_inverse_fuser = "inverse_fuser" in rule
+            if has_sources or has_fuser or has_inverse_fuser:
+                if not has_sources or not has_fuser or not has_inverse_fuser:
+                    raise ValueError(
+                        f"reform_param[{key!r}] fusion rules must define 'sources', 'fuser', and 'inverse_fuser'"
+                    )
+                sources = rule["sources"]
+                if not isinstance(sources, tuple | list) or not all(isinstance(source, str) for source in sources):
+                    raise TypeError(f"reform_param[{key!r}]['sources'] must be a sequence of strings")
+                if not callable(rule["fuser"]):
+                    raise TypeError(f"reform_param[{key!r}]['fuser'] must be callable")
+                if not callable(rule["inverse_fuser"]):
+                    raise TypeError(f"reform_param[{key!r}]['inverse_fuser'] must be callable")
+
+            if "splits" in rule:
+                splits = rule["splits"]
+                if not isinstance(splits, tuple | list):
+                    raise TypeError(f"reform_param[{key!r}]['splits'] must be a sequence")
+                if "inverse_spliter" not in rule:
+                    raise ValueError(f"reform_param[{key!r}] split rules must define 'inverse_spliter'")
+                if not callable(rule["inverse_spliter"]):
+                    raise TypeError(f"reform_param[{key!r}]['inverse_spliter'] must be callable")
+                for split in splits:
+                    if not isinstance(split, Mapping):
+                        raise TypeError(f"reform_param[{key!r}] split entries must be mappings")
+                    if not isinstance(split.get("name"), str):
+                        raise TypeError(f"reform_param[{key!r}] split entries must define string 'name'")
+                    if not callable(split.get("spliter")):
+                        raise TypeError(f"reform_param[{key!r}] split entries must define callable 'spliter'")
+
+    @staticmethod
+    def match_keywords(string: str, required: list[str], forbidden: list[str]) -> bool:
+        """Check if a string contains all required keywords and none of the forbidden ones.
+
+        Args:
+            string: The text to inspect.
+            required: Substrings that must all be present in ``string``.
+            forbidden: Substrings that must not appear in ``string``.
+
+        Returns:
+            ``True`` when every required keyword is present and no forbidden
+            keyword appears.
+        """
+        return all(t in string for t in required) and not any(n in string for n in forbidden)
+
+    @staticmethod
+    def normalize_flattened_wrapper_key(key: str, flattened_wrappers: Mapping[str, str] | None) -> str:
+        """Re-insert a wrapper-module prefix that newer transformers flattened away.
+
+        transformers >= 5.13 removed the inner wrapper module from standalone
+        tower classes (e.g. ``CLIPVisionModel.state_dict()`` keys went from
+        ``vision_model.embeddings...`` to ``embeddings...``); the rename is
+        published per class via ``transformers`` checkpoint-conversion
+        mappings (``get_checkpoint_conversion_mapping("CLIPVisionModel")``).
+        EasyDeL module trees keep the wrapper submodule, so keys arriving in
+        the new (flattened) layout must have the wrapper name re-inserted,
+        while old-layout keys (real hub checkpoints) pass through unchanged.
+
+        Args:
+            key: Dot-separated HF state-dict key.
+            flattened_wrappers: Mapping of module subtree path (``""`` for the
+                root module) to the wrapper submodule name the EasyDeL tree
+                keeps but new transformers layouts drop.
+
+        Returns:
+            The key with the wrapper prefix inserted when missing; the
+            original key otherwise (idempotent for already-prefixed keys).
+        """
+        if not flattened_wrappers:
+            return key
+        for subtree in sorted(flattened_wrappers, key=len, reverse=True):
+            wrapper = flattened_wrappers[subtree]
+            prefix = f"{subtree}." if subtree else ""
+            if prefix and not key.startswith(prefix):
+                continue
+            remainder = key[len(prefix) :]
+            if not remainder:
+                continue
+            if remainder == wrapper or remainder.startswith(f"{wrapper}."):
+                return key
+            return f"{prefix}{wrapper}.{remainder}"
+        return key
+
+    @staticmethod
+    def apply_checkpoint_key_normalizer(
+        state_dict: Mapping[str, tp.Any],
+        normalizer: tp.Callable[[str], str | None] | None,
+    ) -> Mapping[str, tp.Any]:
+        """Rewrite checkpoint keys through a model-declared normalizer.
+
+        Runs FIRST, before every other rule, because it exists for vendor
+        layouts whose names share nothing with transformers naming -- the
+        later passes (flattened wrappers, MoE consolidation, ``reform_param``)
+        all pattern-match on EasyDeL-style names and would silently no-op on a
+        raw vendor key.
+
+        A normalizer returning ``None`` marks a tensor the runtime does not own
+        (e.g. DeepSeek-V4's ``mtp.*`` multi-token-prediction stack); those keys
+        are dropped here so the loader's unused-key reporting stays truthful
+        rather than listing them as unexpected.
+
+        Args:
+            state_dict: Raw checkpoint mapping.
+            normalizer: Per-key rewrite, or ``None`` to pass through unchanged.
+
+        Returns:
+            The state dict with keys rewritten, or the original object when no
+            normalizer is declared.
+
+        Raises:
+            ValueError: If two distinct source keys normalize to the same
+                target, which would silently drop one tensor.
+        """
+        if normalizer is None:
+            return state_dict
+        out: dict[str, tp.Any] = {}
+        origin: dict[str, str] = {}
+        for key, value in state_dict.items():
+            mapped = normalizer(key)
+            if mapped is None:
+                continue
+            if mapped in out:
+                raise ValueError(
+                    f"checkpoint key normalizer mapped both {origin[mapped]!r} and {key!r} to {mapped!r}; "
+                    "one tensor would be silently dropped."
+                )
+            origin[mapped] = key
+            out[mapped] = value
+        return out
+
+    @staticmethod
+    def normalize_flattened_wrapper_keys(
+        state_dict: dict[str, tp.Any],
+        flattened_wrappers: Mapping[str, str] | None,
+    ) -> dict[str, tp.Any]:
+        """Apply :meth:`normalize_flattened_wrapper_key` to a whole state dict.
+
+        Args:
+            state_dict: HuggingFace-style state dict (key -> tensor).
+            flattened_wrappers: Subtree-path to wrapper-name mapping; ``None``
+                or empty returns ``state_dict`` unchanged.
+
+        Returns:
+            The same dict when no rule applies, otherwise a new dict with
+            renamed keys (tensor values are shared, not copied).
+        """
+        if not flattened_wrappers:
+            return state_dict
+        renamed = {
+            key: StateDictConverter.normalize_flattened_wrapper_key(key, flattened_wrappers) for key in state_dict
+        }
+        if all(key == new_key for key, new_key in renamed.items()):
+            return state_dict
+        return {renamed[key]: value for key, value in state_dict.items()}
+
+    @staticmethod
+    def collect_reform_param_fusion_groups(
+        keys: tp.Iterable[str],
+        reform_param: dict | None,
+    ) -> tuple[dict[str, tuple[str, ...]], dict[str, dict[str, tp.Any]]]:
+        """Find multi-source ``reform_param`` fusion groups present in *keys*.
+
+        Existing ``reform_param`` entries split one incoming HF tensor into one
+        or more EasyDeL leaves via ``splits``. Fusion entries are the inverse
+        load-time shape: they provide ``sources`` and a ``fuser`` callable to
+        materialize a target tensor before the normal per-tensor conversion
+        path runs.
+
+        Args:
+            keys: Iterable of state-dict keys present in the incoming
+                checkpoint.
+            reform_param: Mapping of target-key pattern to rule mapping;
+                ``None`` returns empty results.
+
+        Returns:
+            A pair ``(groups, rules_by_fused_key)`` where ``groups`` maps each
+            fused target key to the tuple of source keys it consumes, and
+            ``rules_by_fused_key`` maps the same target keys to their full
+            rule mapping (for ``fuser`` lookup downstream).
+        """
+        if not reform_param:
+            return {}, {}
+        StateDictConverter.validate_reform_param_schema(reform_param)
+
+        key_set = set(keys)
+        groups: dict[str, tuple[str, ...]] = {}
+        rules_by_fused_key: dict[str, dict[str, tp.Any]] = {}
+        sorted_items = sorted(reform_param.items(), key=lambda x: len(x[0]), reverse=True)
+
+        for key_check, value in sorted_items:
+            if "sources" not in value or "fuser" not in value:
+                continue
+            target_key = key_check[:-1] if key_check.endswith("$") else key_check
+            source_keys = tuple(value["sources"])
+            if not source_keys:
+                continue
+            skip_substrings = tuple(value.get("skip_substrings", ()))
+            if any(any(skip in source_key for skip in skip_substrings) for source_key in source_keys):
+                continue
+            if all(source_key in key_set for source_key in source_keys):
+                groups[target_key] = source_keys
+                rules_by_fused_key[target_key] = value
+
+        return groups, rules_by_fused_key
+
+    @staticmethod
+    def merge_hf_expert_tensors(
+        state_dict: dict[str, tp.Any],
+        reform_param: dict | None,
+        model_type: str | None = None,
+    ) -> None:
+        """Build transformers>=5 merged expert tensors from per-expert keys where rules source them.
+
+        The inverse of :meth:`unfuse_hf_expert_tensors`: a state dict with
+        per-expert tensors (remote-code models, or checkpoints read key by key)
+        meets a rule whose single source is the in-memory merged tensor
+        (``experts.gate_up_proj``). Parts are stacked over experts and
+        concatenated as transformers does (see :func:`resolve_expert_merge`).
+        Mutates *state_dict* in place.
+        """
+        import torch
+
+        wanted = {
+            rule["sources"][0]
+            for rule in (reform_param or {}).values()
+            if "fuser" in rule and len(rule.get("sources", ())) == 1 and ".experts." in rule["sources"][0]
+        }
+        wanted -= set(state_dict)
+        if not wanted:
+            return
+        groups: dict[str, tuple[ExpertMergeSpec, list[dict[int, str]]]] = {}
+        for key in list(state_dict):
+            # Full-mode keys are transformers' in-memory names: already renamed.
+            merge = resolve_expert_merge(key, model_type, apply_renamings=False)
+            if merge is None or merge[0] not in wanted or len(merge[2].parts) < 2:
+                continue
+            merged_key, expert, spec, part = merge
+            groups.setdefault(merged_key, (spec, [{} for _ in spec.parts]))[1][part][expert] = key
+        for merged_key, (spec, parts) in groups.items():
+            experts = sorted(parts[0])
+            if any(sorted(part) != experts for part in parts):
+                continue  # incomplete group: leave the keys for the strict materialization check
+            stacked = [torch.stack([state_dict.pop(part[e]) for e in experts]) for part in parts]
+            state_dict[merged_key] = torch.cat(stacked, dim=spec.concat_dim)
+
+    @staticmethod
+    def unfuse_hf_expert_tensors(
+        state_dict: dict[str, tp.Any],
+        reform_param: dict | None,
+        model_type: str | None = None,
+    ) -> None:
+        """Restore per-expert keys from transformers>=5 fused experts where rules expect them.
+
+        transformers>=5 builds MoE experts pre-merged (see :func:`hf_expert_layout`:
+        e.g. ``experts.gate_up_proj`` = ``cat(gate, up)`` over stacked experts,
+        ``experts.down_proj`` stacked), while rules written for the per-expert
+        checkpoint layout (DeepSeek) fuse stacked halves named by their
+        ``sources``. Splitting the merged tensors back to
+        ``experts.<i>.<leaf>.weight`` sends them through the same stacking path
+        as an on-disk checkpoint. Mutates *state_dict* in place.
+        """
+        _, specs = hf_expert_layout(model_type)
+        for rule in (reform_param or {}).values():
+            sources = tuple(rule.get("sources", ()))
+            if "fuser" not in rule or len(sources) < 2:
+                continue
+            leaves = [re.fullmatch(r"(.*\.experts\.)([^.]+)\.weight", source) for source in sources]
+            if not all(leaves) or len({m.group(1) for m in leaves}) != 1:
+                continue
+            base, names = leaves[0].group(1), tuple(m.group(2) for m in leaves)
+            spec = next((spec for spec in specs if spec.parts == names), None)
+            fused = state_dict.get(f"{base}{spec.target}") if spec is not None else None
+            if fused is None or getattr(fused, "ndim", 0) != 3 or any(source in state_dict for source in sources):
+                continue
+            pieces = state_dict.pop(f"{base}{spec.target}").chunk(len(names), dim=spec.concat_dim)
+            for name, piece in zip(names, pieces, strict=True):
+                for index in range(piece.shape[0]):
+                    state_dict[f"{base}{index}.{name}.weight"] = piece[index]
+            # The experts' other merged tensors (down) follow the same per-expert layout.
+            for other in specs:
+                merged = state_dict.get(f"{base}{other.target}")
+                if len(other.parts) != 1 or merged is None or getattr(merged, "ndim", 0) != 3:
+                    continue
+                state_dict.pop(f"{base}{other.target}")
+                for index in range(merged.shape[0]):
+                    state_dict[f"{base}{index}.{other.parts[0]}.weight"] = merged[index]
+
+    @staticmethod
+    def fuse_reform_param_tensors(rule: dict[str, tp.Any], tensors: list[tp.Any]) -> tp.Any:
+        """Apply a ``reform_param`` multi-source fusion rule.
+
+        Detects whether the rule's ``fuser`` callable wants the ``torch``
+        module as its first positional argument and dispatches accordingly.
+
+        Args:
+            rule: Rule mapping containing a ``"fuser"`` callable.
+            tensors: Per-source tensors in the order declared by
+                ``rule["sources"]``.
+
+        Returns:
+            The fused tensor returned by the ``fuser`` callable.
+        """
+        fuser = rule["fuser"]
+        torch = TensorConverter.get_torch()
+        accepted = [
+            p
+            for p in inspect.signature(fuser).parameters.values()
+            if p.kind in {p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.VAR_POSITIONAL}
+        ]
+        if accepted and accepted[0].name in {"torch", "pt"}:
+            return fuser(torch, *tensors)
+        return fuser(*tensors)
+
+    @staticmethod
+    def inverse_fuse_reform_param_tensor(rule: dict[str, tp.Any], tensor: tp.Any) -> tp.Any:
+        """Apply a ``reform_param`` inverse fusion rule.
+
+        Used during EasyDeL -> HuggingFace export to recover the original
+        per-source tensors from a fused EasyDeL leaf. Dispatches with or
+        without a leading ``torch`` argument based on the callable signature.
+
+        Args:
+            rule: Rule mapping containing an ``"inverse_fuser"`` callable.
+            tensor: The fused EasyDeL tensor to split back into its sources.
+
+        Returns:
+            Either a tuple/list of per-source tensors or a mapping of source
+            name to tensor, as produced by the configured ``inverse_fuser``.
+        """
+        inverse_fuser = rule["inverse_fuser"]
+        torch = TensorConverter.get_torch()
+        accepted = [
+            p
+            for p in inspect.signature(inverse_fuser).parameters.values()
+            if p.kind in {p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.VAR_POSITIONAL}
+        ]
+        if accepted and accepted[0].name in {"torch", "pt"}:
+            return inverse_fuser(torch, tensor)
+        return inverse_fuser(tensor)
+
+    @staticmethod
+    def apply_reform_param_fusions(
+        state_dict: dict[str, tp.Any] | None,
+        reform_param: dict | None,
+    ) -> dict[str, int]:
+        """Materialize all present ``reform_param`` fusion groups in-place.
+
+        For each fusion group whose source keys are all present in
+        ``state_dict``, computes the fused tensor via
+        :meth:`fuse_reform_param_tensors`, writes it under the target key, and
+        drops the original source entries.
+
+        Args:
+            state_dict: HuggingFace-style state dict to mutate. ``None`` is a
+                no-op.
+            reform_param: Mapping of rules (see :meth:`validate_reform_param_schema`).
+
+        Returns:
+            Mapping of human-readable fusion label to the number of fused
+            tensors materialized for that label.
+        """
+        if state_dict is None:
+            return {}
+
+        groups, rules_by_fused_key = StateDictConverter.collect_reform_param_fusion_groups(
+            state_dict.keys(),
+            reform_param,
+        )
+        if not groups:
+            return {}
+
+        fused_counts: dict[str, int] = {}
+        source_keys_to_drop: set[str] = set()
+        for fused_key, source_keys in groups.items():
+            if fused_key in state_dict:
+                continue
+            rule = rules_by_fused_key[fused_key]
+            tensors = [state_dict[source_key] for source_key in source_keys]
+            state_dict[fused_key] = StateDictConverter.fuse_reform_param_tensors(rule, tensors)
+            source_keys_to_drop.update(source_keys)
+            label = str(rule.get("log_label", fused_key))
+            fused_counts[label] = fused_counts.get(label, 0) + 1
+
+        for source_key in source_keys_to_drop:
+            state_dict.pop(source_key, None)
+
+        return fused_counts
+
+    @staticmethod
+    def _reform_key_to_tuple(key: str) -> tuple[tp.Any, ...]:
+        """Convert a dotted reform-param key into a native checkpoint tuple path."""
+        if key.endswith("$"):
+            key = key[:-1]
+        parts: list[tp.Any] = []
+        for part in key.split("."):
+            if not part:
+                continue
+            parts.append(int(part) if part.isdigit() else part)
+        return tuple(parts)
+
+    @staticmethod
+    def _call_native_reform_fuser(rule: dict[str, tp.Any], tensors: list[tp.Any]) -> tp.Any:
+        """Apply a native EasyDeL checkpoint fusion rule."""
+        native_fuser = rule["native_fuser"]
+        return native_fuser(*tensors)
+
+    @staticmethod
+    def apply_native_reform_param_fusions(
+        state_dict: dict[tuple, tp.Any] | None,
+        reform_param: dict | None,
+        *,
+        collection_prefixes: tuple[tuple[tp.Any, ...], ...] = (("parameters",), ()),
+    ) -> dict[str, int]:
+        """Materialize fusion rules against EasyDeL-native tuple-key state.
+
+        The regular ``reform_param`` fusion path handles HuggingFace-style flat
+        keys and torch ``[out, in]`` tensors. Native TensorStore checkpoints
+        already carry EasyDeL tuple paths and JAX-friendly ``[in, out]``
+        leaves, so rules that want to support native split-to-merged loading
+        can provide a ``native_fuser`` callable.
+
+        Args:
+            state_dict: Flat native checkpoint tree keyed by tuples.
+            reform_param: Collected model reform rules.
+            collection_prefixes: Collection prefixes to try before the dotted
+                reform path. ``("parameters",)`` matches normal trainable
+                leaves; ``()`` keeps legacy collection-less checkpoints usable.
+
+        Returns:
+            Mapping of log label to the number of native groups fused.
+        """
+        if not state_dict or not reform_param:
+            return {}
+        StateDictConverter.validate_reform_param_schema(reform_param)
+
+        fused_counts: dict[str, int] = {}
+        sorted_items = sorted(reform_param.items(), key=lambda x: len(x[0]), reverse=True)
+
+        for key_check, rule in sorted_items:
+            if "native_fuser" not in rule or "sources" not in rule:
+                continue
+            target_path = StateDictConverter._reform_key_to_tuple(key_check)
+            source_paths = tuple(StateDictConverter._reform_key_to_tuple(source) for source in rule["sources"])
+            if not source_paths:
+                continue
+
+            for prefix in collection_prefixes:
+                target_key = (*prefix, *target_path)
+                source_keys = tuple((*prefix, *source_path) for source_path in source_paths)
+                if target_key in state_dict:
+                    break
+                if not all(source_key in state_dict for source_key in source_keys):
+                    continue
+
+                tensors = [state_dict[source_key] for source_key in source_keys]
+                state_dict[target_key] = StateDictConverter._call_native_reform_fuser(rule, tensors)
+                for source_key in source_keys:
+                    state_dict.pop(source_key, None)
+
+                label = str(rule.get("log_label", target_key))
+                fused_counts[label] = fused_counts.get(label, 0) + 1
+                break
+
+        return fused_counts
+
+    @staticmethod
+    def process_tensor(key: str, tensor: tp.Any, config: dict[str, tp.Any]) -> list[tuple[tuple, jnp.ndarray]] | None:
+        """Process a single PyTorch tensor into EasyDeL format.
+
+        Applies key renaming (e.g., ``.weight`` -> ``.kernel``), axis
+        transposition for dense layers, embedding/layernorm detection,
+        and optional ``reform_param`` splitting rules.
+
+        Args:
+            key: Dot-separated PyTorch parameter name.
+            tensor: PyTorch tensor to convert.
+            config: Conversion configuration containing ``embedding_layer_names``,
+                ``layernorm_names``, ``dtype``, ``reform_param``, etc.
+
+        Returns:
+            List of ``(key_tuple, jax_array)`` pairs, or ``None`` if the
+            parameter should be skipped.
+        """
+        new_key = key
+
+        reform_param = config.get("reform_param", None)
+        if reform_param:
+            sorted_items = sorted(reform_param.items(), key=lambda x: len(x[0]), reverse=True)
+            for key_check, value in sorted_items:
+                if value.get("already_converted", False):
+                    anchor_to_end = key_check.endswith("$")
+                    match_target = key_check[:-1] if anchor_to_end else key_check
+                    match_index = key.find(match_target)
+                    if match_index != -1:
+                        after_match = key[match_index + len(match_target) :]
+                        if anchor_to_end and after_match:
+                            continue
+                        if not after_match or after_match.startswith("."):
+                            before_match = key[:match_index]
+                            if not before_match or before_match.endswith("."):
+                                config = config.copy()
+                                config["_reform_processed"] = True
+                                break
+                if "splits" not in value:
+                    continue
+                anchor_to_end = key_check.endswith("$")
+                match_target = key_check[:-1] if anchor_to_end else key_check
+
+                match_index = key.find(match_target)
+                if match_index != -1:
+                    after_match = key[match_index + len(match_target) :]
+                    if anchor_to_end and after_match:
+                        continue
+                    if not after_match or after_match.startswith("."):
+                        before_match = key[:match_index]
+                        if not before_match or before_match.endswith("."):
+                            splits = value["splits"]
+                            results = []
+
+                            new_config = config.copy()
+                            new_config["reform_param"] = {}
+                            new_config["_reform_processed"] = True
+                            # Quantized checkpoint rules produce packed integer codes and
+                            # 8-bit scales; casting those to the model's param dtype would
+                            # destroy them, so such rules opt out of the dtype cast.
+                            if value.get("preserve_dtype", False):
+                                new_config["_preserve_dtype"] = True
+
+                            for split in splits:
+                                split_name = split["name"]
+                                spliter = split["spliter"]
+                                new_key_split = f"{before_match}{split_name}{after_match}"
+                                tensor_split = spliter(tensor)
+                                sub_results = StateDictConverter.process_tensor(
+                                    new_key_split,
+                                    tensor_split,
+                                    new_config,
+                                )
+                                if sub_results:
+                                    results.extend(sub_results)
+                            return results
+
+        if "weight" in key and not config.get("_reform_processed", False):
+            is_embedding = any(layer_name in key for layer_name in config.get("embedding_layer_names", []))
+            is_layernorm = any(layer_name in key for layer_name in config.get("layernorm_names", []))
+            is_moe_expert = key in config.get("consolidated_moe_keys", set())
+            ndim = len(tensor.shape)
+            if not is_embedding and not is_layernorm and not is_moe_expert:
+                if ndim == 2:
+                    tensor = tensor.permute(1, 0)
+                elif ndim == 3:
+                    tensor = tensor.permute(2, 1, 0)
+                elif ndim == 4:
+                    tensor = tensor.permute(2, 3, 1, 0)
+                elif ndim == 5:
+                    tensor = tensor.permute(2, 3, 4, 1, 0)
+                elif ndim == 6:
+                    tensor = tensor.permute(4, 5, 3, 2, 1, 0)
+            elif is_moe_expert:
+                if ndim == 3:
+                    tensor = tensor.permute(0, 2, 1)
+            # Everything now uses .weight; no key renaming needed
+
+        key_tuple = tuple(int(n) if n.isdigit() else n for n in new_key.split("."))
+
+        # Keep explicit LM-head leaves even for tied models. Missing tied heads
+        # are materialized against the target graph by the bridge after conversion.
+        if config.get("_preserve_dtype", False):
+            array = TensorConverter.to_jax_preserving_dtype(tensor)
+        else:
+            target_dtype = fp32_pinned_dtype(key_tuple, config["dtype"], config.get("fp32_param_patterns"))
+            array = TensorConverter.convert_pytorch_to_jnp(tensor, target_dtype)
+        return [(key_tuple, array)]
+
+    @staticmethod
+    def _base_huggingface_to_easydel(
+        state_dict: dict[str, tp.Any],
+        *,
+        device: jax.Device | None = None,  # type:ignore
+        embedding_layer_names: list[str] | None = None,
+        layernorm_names: list[str] | None = None,
+        moe_block_names: list[str] | None = None,
+        moe_names: list[str] | None = None,
+        shard_fns: Mapping[tuple, tp.Callable] | None = None,
+        dtype: jnp.dtype = jnp.float16,
+        verbose: bool = True,
+        callback: tp.Callable[[jax.Array, tuple], jax.Array] | None = None,
+        remove_state_dict: bool = False,
+        lm_head_name: str | None = None,
+        uses_tie_word_embedding: bool = False,
+        consolidated_moe_keys: set[str] | None = None,
+        reform_param: dict | None = None,
+        fp32_param_patterns: tp.Sequence[str] | None = None,
+        **kwargs,
+    ) -> dict[str, tp.Any]:
+        """Base conversion from a PyTorch state dict to EasyDeL nested dict format.
+
+        Iterates over all keys in ``state_dict``, applies per-tensor
+        processing (key renaming, axis transposition, dtype casting),
+        optional shard functions, and a user callback.
+
+        Args:
+            state_dict: PyTorch model ``state_dict()``.
+            device: Target JAX device for parameter placement.
+            embedding_layer_names: Parameter name substrings identifying embeddings.
+            layernorm_names: Parameter name substrings identifying layer norms.
+            moe_block_names: Names of MoE block modules.
+            moe_names: Names of individual MoE expert sub-modules.
+            shard_fns: Optional mapping of key tuples to sharding functions.
+            dtype: Target JAX dtype for converted parameters.
+            verbose: Whether to display a progress bar.
+            callback: Optional function called on each converted array.
+            remove_state_dict: Whether to delete the input dict after conversion.
+            lm_head_name: Name of the language model head parameter.
+            uses_tie_word_embedding: Whether embeddings are tied with lm_head.
+            consolidated_moe_keys: Set of keys that were consolidated from
+                per-expert weights.
+            reform_param: Optional parameter splitting/merging rules.
+            fp32_param_patterns: Dotted segment patterns of leaves kept in float32 regardless of
+                ``dtype`` (see :func:`fp32_param_pattern_matches`).
+
+        Returns:
+            Nested EasyDeL parameter dictionary.
+        """
+        try:
+            import torch
+
+            _clear = torch.cuda.empty_cache if torch.cuda.is_available() else gc.collect
+        except ModuleNotFoundError:
+            _clear = gc.collect
+
+        config = {
+            "embedding_layer_names": set(embedding_layer_names or []),
+            "layernorm_names": set(layernorm_names or []),
+            "dtype": dtype,
+            "consolidated_moe_keys": consolidated_moe_keys or set(),
+            "reform_param": reform_param,
+            "fp32_param_patterns": tuple(fp32_param_patterns or ()),
+        }
+
+        with jax.default_device(device) if device is not None and shard_fns is None else contextlib.nullcontext():
+            parameters_dict = {}
+            with tqdm(total=len(state_dict), disable=not verbose, desc="Converting Model") as pbar:
+                keys = sorted(state_dict.keys())
+                for key in keys:
+                    tensor = state_dict.get(key)
+                    try:
+                        # Note: memory_stats() returns None on CPU devices
+                        def get_memory_bytes(device_idx):
+                            """Return current bytes-in-use for a local JAX device.
+
+                            Args:
+                                device_idx: Index into ``jax.local_devices()``.
+
+                            Returns:
+                                ``stats["bytes_in_use"]`` when available,
+                                otherwise ``0`` (e.g. on CPU devices that
+                                don't expose ``memory_stats()``).
+                            """
+                            stats = jax.local_devices()[device_idx].memory_stats()
+                            return stats["bytes_in_use"] if stats is not None else 0
+
+                        bytesi = {i: get_memory_bytes(i) for i in range(jax.local_device_count())}
+                        results = StateDictConverter.process_tensor(key, tensor, config)
+                        if results is not None:
+                            for key_tuple, jax_array in results:
+                                if shard_fns and key_tuple in shard_fns:
+                                    jax_array = shard_fns[key_tuple](jax_array)
+                                if callback is not None:
+                                    jax_array = callback(jax_array, key_tuple)
+                                bytesn = {i: get_memory_bytes(i) for i in range(jax.local_device_count())}
+                                change = {i: bytesn[i] - bytesi[i] for i in range(jax.local_device_count())}
+                                divider = 1024**3
+                                change_gb = {i: round(change[i] / divider, 4) for i in change}
+                                usage_gb = {i: round(bytesn[i] / divider, 4) for i in bytesn}
+                                strm = f"Sharding {'.'.join([str(i) for i in key_tuple])} change_gb: {change_gb} current_gb: {usage_gb}"
+                                logger.debug(strm)
+                                parameters_dict[key_tuple] = jax_array
+                    except Exception as e:
+                        e.add_note(f"While converting checkpoint parameter {key!r} to EasyDeL.")
+                        raise
+                    pbar.update(1)
+
+            if remove_state_dict:
+                del state_dict
+                _clear()
+
+            return unflatten_dict(parameters_dict)
+
+    @staticmethod
+    def apply_moe_transformations(
+        state_dict: dict[str, tp.Any],
+        moe_block_names: list[str] | None = None,
+        moe_names: list[str] | None = None,
+        moe_block_path: list[str] | None = None,
+        moe_path: list[str] | None = None,
+        tensor_transform: tp.Callable | None = None,
+        reform_param: dict | None = None,
+        debug: bool = False,
+    ) -> tuple[dict[str, tp.Any], set[str]]:
+        """
+        Transform MoE weights from HuggingFace format (separate experts) to EasyDel format (stacked experts).
+        Converts from:
+            model.layers.3.block_sparse_moe.experts.0.w3.weight -> shape (128, 256)
+            model.layers.3.block_sparse_moe.experts.1.w3.weight -> shape (128, 256)
+            ...
+        To:
+            model.layers.3.block_sparse_moe.experts.w3.weight -> shape (num_experts, 128, 256)
+
+        Args:
+            state_dict: HuggingFace ``state_dict``-style mapping. Mutated in
+                place (entries are popped) for memory efficiency.
+            moe_block_names: Tail names of MoE block modules (e.g.
+                ``"block_sparse_moe"``).
+            moe_names: Tail names of expert sub-modules (e.g.
+                ``["w1", "w2", "w3"]``).
+            moe_block_path: Full dotted paths to each MoE block in the model
+                graph.
+            moe_path: Full dotted paths to expert modules. Used to derive the
+                expert container name (e.g. ``"experts"``).
+            tensor_transform: Optional callable applied to each stacked tensor
+                before it is written into the output dict.
+            reform_param: Optional split-rule mapping reused from the rest of
+                the converter; keys mentioning the experts container provide
+                fallback names when the strict rule does not match.
+
+        Returns:
+            ``(new_state_dict, consolidated_keys)`` where ``new_state_dict``
+            contains stacked expert tensors (and any non-expert leaves passed
+            through unchanged) and ``consolidated_keys`` lists the new stacked
+            keys for downstream MoE-aware logic.
+
+        Raises:
+            ValueError: If the required ``moe_path`` / ``moe_names`` /
+                ``moe_block_path`` arguments are ``None``.
+        """
+        if not all([moe_block_names, moe_names, moe_block_path]):
+            return state_dict, set()
+
+        import torch
+
+        if moe_path is None:
+            raise ValueError("moe_path cannot be None")
+        if moe_names is None:
+            raise ValueError("moe_names cannot be None")
+        if moe_block_path is None:
+            raise ValueError("moe_block_path cannot be None")
+
+        expected_expert_name = moe_path[0].split(".")[-2]
+        expert_prefix = f".{expected_expert_name}."
+
+        moe_names_set = set(moe_names)
+        moe_stacked_paths = {
+            f"{block_path}.{expected_expert_name}.{moe_name}" for block_path in moe_block_path for moe_name in moe_names
+        }
+        reform_param = reform_param or {}
+        reform_fusion_source_paths = {
+            (source[:-7] if source.endswith(".weight") else source)
+            for value in reform_param.values()
+            if "sources" in value
+            for source in value["sources"]
+            if f".{expected_expert_name}." in source
+        }
+        stackable_moe_paths = moe_stacked_paths | reform_fusion_source_paths
+        if debug:
+            logger.info("MoE converter stackable paths: %s", sorted(stackable_moe_paths))
+            if reform_fusion_source_paths:
+                logger.info("MoE converter reform source paths: %s", sorted(reform_fusion_source_paths))
+        fallback_reform_keys = {
+            key[:-1] if key.endswith("$") else key
+            for key, value in reform_param.items()
+            if "splits" in value and f".{expected_expert_name}." in key
+        }
+        sibling_expert_parents = {path.rsplit(".", 1)[0] for path in moe_path if f".{expected_expert_name}." in path}
+
+        new_state_dict = {}
+        moe_groups = {path: {} for path in stackable_moe_paths}
+        consolidated_moe_keys = set()
+
+        for key in tqdm(list(state_dict.keys()), desc="Applying MoE Transformations"):
+            is_moe_expert = False
+            value = state_dict.pop(key)
+            if expert_prefix not in key:
+                new_state_dict[key] = value
+                continue
+
+            for block_path in moe_block_path:
+                block_expert_prefix = block_path + expert_prefix
+                if key.startswith(block_expert_prefix):
+                    remainder = key[len(block_expert_prefix) :]
+
+                    dot_idx = remainder.find(".")
+                    if dot_idx <= 0:
+                        continue
+
+                    expert_part = remainder[:dot_idx]
+                    if not expert_part.isdigit():
+                        continue
+
+                    expert_idx = int(expert_part)
+                    moe_name_part = remainder[dot_idx + 1 :]
+                    moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
+
+                    target_path = f"{block_path}.{expected_expert_name}.{moe_name}"
+                    if moe_name in moe_names_set or target_path in stackable_moe_paths:
+                        moe_groups[target_path][expert_idx] = value
+                        is_moe_expert = True
+                        break
+
+            if not is_moe_expert:
+                match = re.match(rf"^(.*\.{expected_expert_name})\.(\d+)\.([^.]+)\.weight$", key)
+                if match:
+                    expert_parent, expert_idx_str, moe_name = match.groups()
+                    target_path = f"{expert_parent}.{moe_name}"
+                    if expert_parent in sibling_expert_parents and (
+                        moe_name in moe_names_set
+                        or target_path in fallback_reform_keys
+                        or target_path in stackable_moe_paths
+                    ):
+                        moe_groups.setdefault(target_path, {})[int(expert_idx_str)] = value
+                        is_moe_expert = True
+
+            if not is_moe_expert:
+                if debug and expert_prefix in key:
+                    logger.info("MoE converter left expert key unclaimed: %s", key)
+                new_state_dict[key] = value
+        for target_path, expert_dict in moe_groups.items():
+            if not expert_dict:
+                continue
+
+            expert_indices = sorted(expert_dict.keys())
+            num_experts = len(expert_indices)
+            first_tensor = expert_dict[expert_indices[0]]
+            new_key = f"{target_path}.weight"
+
+            try:
+                if isinstance(first_tensor, torch.Tensor):
+                    if first_tensor.device.type != "meta":
+                        meta_sample = torch.empty_like(first_tensor, device="meta")
+                    else:
+                        meta_sample = first_tensor
+                    stacked_shape = (num_experts, *meta_sample.shape)
+                    stacked_tensor = torch.empty(
+                        stacked_shape,
+                        dtype=first_tensor.dtype,
+                        device=first_tensor.device,
+                    )
+
+                    for i, idx in enumerate(expert_indices):
+                        stacked_tensor[i] = expert_dict[idx]
+
+                else:
+                    import numpy as np
+
+                    expert_tensors = [expert_dict[idx] for idx in expert_indices]
+                    stacked_tensor = np.stack(expert_tensors, axis=0)
+
+                if tensor_transform is not None:
+                    stacked_tensor = tensor_transform(stacked_tensor)
+
+                new_state_dict[new_key] = stacked_tensor
+                consolidated_moe_keys.add(new_key)
+            except Exception as e:
+                logger.error(f"Failed to stack MoE tensors for {target_path}: {e}")
+                for idx, tensor in expert_dict.items():
+                    fallback_key = (
+                        f"{target_path.replace(f'.{expected_expert_name}.', f'.{expected_expert_name}.{idx}.')}.weight"
+                    )
+                    new_state_dict[fallback_key] = tensor
+
+        return new_state_dict, consolidated_moe_keys
+
+    @staticmethod
+    def huggingface_to_easydel(
+        state_dict: dict[str, tp.Any],
+        *,
+        device: jax.Device | None = None,  # type:ignore
+        embedding_layer_names: list[str] | None = None,
+        layernorm_names: list[str] | None = None,
+        moe_block_names: list[str] | None = None,
+        moe_names: list[str] | None = None,
+        moe_block_path: list[str] | None = None,
+        moe_path: list[str] | None = None,
+        shard_fns: Mapping[tuple, tp.Callable] | None = None,
+        dtype: jnp.dtype = jnp.float16,
+        verbose: bool = True,
+        callback: tp.Callable[[jax.Array, tuple], jax.Array] | None = None,
+        remove_state_dict: bool = False,
+        lm_head_name: str | None = None,
+        uses_tie_word_embedding: bool = False,
+        reform_param: dict | None = None,
+        hf_flattened_wrappers: Mapping[str, str] | None = None,
+        checkpoint_key_normalizer: tp.Callable[[str], str | None] | None = None,
+        **kwargs,
+    ) -> dict[str, tp.Any]:
+        """Convert a PyTorch state dict to EasyDeL format with MoE support.
+
+        If MoE parameters are present, first stacks per-expert weights into
+        consolidated tensors, then delegates to ``_base_huggingface_to_easydel``
+        for the standard conversion pipeline.
+
+        Args:
+            state_dict: PyTorch model ``state_dict()``.
+            device: Target JAX device.
+            embedding_layer_names: Substrings identifying embedding layers.
+            layernorm_names: Substrings identifying layer norm layers.
+            moe_block_names: Names of MoE block modules.
+            moe_names: Names of individual expert sub-modules.
+            moe_block_path: Full dot-paths to MoE blocks in the model.
+            moe_path: Full dot-paths to expert modules.
+            shard_fns: Optional sharding functions per key tuple.
+            dtype: Target JAX dtype.
+            verbose: Whether to show progress.
+            callback: Optional per-array callback.
+            remove_state_dict: Whether to delete input dict after conversion.
+            lm_head_name: Language model head parameter name.
+            uses_tie_word_embedding: Whether embeddings are tied.
+            reform_param: Optional splitting/merging rules.
+            hf_flattened_wrappers: Optional mapping of module subtree path to
+                the wrapper submodule name dropped from live HF state dicts by
+                transformers >= 5.13 (see
+                :meth:`normalize_flattened_wrapper_key`). Keys in either the
+                old (wrapper-prefixed) or new (flattened) layout are accepted.
+
+        Returns:
+            Nested EasyDeL parameter dictionary.
+        """
+        state_dict = StateDictConverter.apply_checkpoint_key_normalizer(state_dict, checkpoint_key_normalizer)
+        state_dict = StateDictConverter.normalize_flattened_wrapper_keys(state_dict, hf_flattened_wrappers)
+        hf_model_type = kwargs.pop("hf_model_type", None)
+        StateDictConverter.merge_hf_expert_tensors(state_dict, reform_param, hf_model_type)
+        StateDictConverter.unfuse_hf_expert_tensors(state_dict, reform_param, hf_model_type)
+        consolidated_moe_keys = set()
+        debug = bool(kwargs.pop("debug", False))
+        if moe_block_names is not None and moe_names is not None:
+            state_dict, consolidated_moe_keys = StateDictConverter.apply_moe_transformations(
+                state_dict=state_dict,
+                moe_names=moe_names,
+                moe_path=moe_path,
+                moe_block_names=moe_block_names,
+                moe_block_path=moe_block_path,
+                reform_param=reform_param,
+                debug=debug,
+            )
+
+        fused_counts = StateDictConverter.apply_reform_param_fusions(state_dict, reform_param)
+        for label, count in sorted(fused_counts.items()):
+            logger.info("Fused %d reform_param %s into runtime merged weights.", count, label)
+
+        return StateDictConverter._base_huggingface_to_easydel(
+            state_dict,
+            device=device,
+            embedding_layer_names=embedding_layer_names,
+            layernorm_names=layernorm_names,
+            moe_names=moe_names,
+            moe_path=moe_path,
+            moe_block_names=moe_block_names,
+            moe_block_path=moe_block_path,
+            shard_fns=shard_fns,
+            dtype=dtype,
+            verbose=verbose,
+            callback=callback,
+            remove_state_dict=remove_state_dict,
+            lm_head_name=lm_head_name,
+            uses_tie_word_embedding=uses_tie_word_embedding,
+            consolidated_moe_keys=consolidated_moe_keys,
+            reform_param=reform_param,
+            **kwargs,
+        )
+
+    @staticmethod
+    def apply_moe_transformations_reverse(
+        state_dict: dict[str, tp.Any],
+        moe_block_names: list[str] | None = None,
+        moe_names: list[str] | None = None,
+        moe_block_path: list[str] | None = None,
+        moe_path: list[str] | None = None,
+        tensor_transform: tp.Callable | None = None,
+    ) -> dict[str, tp.Any]:
+        """
+        Transform MoE weights from EasyDel format (stacked experts) to HuggingFace format (separate experts).
+
+        Converts from:
+            model.layers.3.block_sparse_moe.experts.w3.weight -> shape (num_experts, 128, 256)
+        To:
+            model.layers.3.block_sparse_moe.experts.0.w3.weight -> shape (128, 256)
+            model.layers.3.block_sparse_moe.experts.1.w3.weight -> shape (128, 256)
+            ...
+
+        Args:
+            state_dict: PyTorch-style state dict containing stacked-MoE tensors.
+            moe_block_names: Tail names of MoE block modules.
+            moe_names: Tail names of expert sub-modules.
+            moe_block_path: Full dotted paths to each MoE block.
+            moe_path: Full dotted paths to expert modules; used to detect the
+                expert-container name.
+            tensor_transform: Optional callable applied to each per-expert
+                tensor before it is written to the output dict.
+
+        Returns:
+            A new dict with each stacked tensor split into one ``...{i}.{name}.weight``
+            entry per expert.
+
+        Raises:
+            ValueError: If ``moe_names`` or ``moe_block_path`` is ``None``.
+        """
+        if not all([moe_block_names, moe_names, moe_block_path]):
+            return state_dict
+
+        if moe_names is None:
+            raise ValueError("moe_names cannot be None")
+        if moe_block_path is None:
+            raise ValueError("moe_block_path cannot be None")
+
+        new_state_dict = {}
+        expected_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
+        sibling_expert_parents = {
+            path.rsplit(".", 1)[0] for path in moe_path or [] if f".{expected_expert_name}." in path
+        }
+
+        for key, value in state_dict.items():
+            is_stacked_moe = False
+            for block_path in moe_block_path:
+                if key.startswith(block_path):
+                    remainder = key[len(block_path) + 1 :]
+                    parts = remainder.split(".")
+                    if (
+                        len(parts) == 3
+                        and parts[0] == expected_expert_name
+                        and parts[1] in moe_names
+                        and parts[2] == "weight"
+                    ):
+                        is_stacked_moe = True
+                        moe_name = parts[1]
+                        if hasattr(value, "shape") and len(value.shape) >= 3:
+                            num_experts = value.shape[0]
+
+                            for expert_idx in range(num_experts):
+                                expert_tensor = value[expert_idx]
+                                if tensor_transform is not None:
+                                    expert_tensor = tensor_transform(expert_tensor)
+                                new_key = f"{block_path}.{expected_expert_name}.{expert_idx}.{moe_name}.weight"
+                                new_state_dict[new_key] = expert_tensor
+
+                            break
+
+            if not is_stacked_moe:
+                match = re.match(rf"^(.*\.{expected_expert_name})\.([^.]+)\.weight$", key)
+                if match:
+                    expert_parent, moe_name = match.groups()
+                    if expert_parent in sibling_expert_parents and hasattr(value, "shape") and len(value.shape) >= 3:
+                        num_experts = value.shape[0]
+                        for expert_idx in range(num_experts):
+                            expert_tensor = value[expert_idx]
+                            if tensor_transform is not None:
+                                expert_tensor = tensor_transform(expert_tensor)
+                            new_key = f"{expert_parent}.{expert_idx}.{moe_name}.weight"
+                            new_state_dict[new_key] = expert_tensor
+                        is_stacked_moe = True
+
+            if not is_stacked_moe:
+                new_state_dict[key] = value
+        return new_state_dict
+
+    @staticmethod
+    def reconcile_to_target_shapes(state_dict: dict, target_shapes: dict) -> dict:
+        """Fix 2-D weight orientation against the HF target's real shapes (data-driven).
+
+        The generic EasyDeL->torch export transposes every dense 2-D weight assuming the
+        JAX ``[in, out]`` convention. Some layers do not follow it (e.g. GPT-2 ``Conv1D``
+        already stores ``[out, in]``), and tied heads can be exported in a flipped layout.
+        Rather than special-casing each model, this consults the HF model's own parameter
+        shapes: for any key whose tensor shape does not match the target but whose
+        transpose does, transpose it. Square or already-correct tensors are left untouched.
+
+        Args:
+            state_dict: Converted torch state dict (keys already in HF naming).
+            target_shapes: ``{key: shape}`` from the instantiated HF model's ``state_dict``.
+
+        Returns:
+            The same dict with mis-oriented 2-D weights transposed in place.
+        """
+        for key, tensor in list(state_dict.items()):
+            tgt = target_shapes.get(key)
+            if tgt is None or not hasattr(tensor, "shape"):
+                continue
+            cur = tuple(tensor.shape)
+            tgt = tuple(tgt)
+            if cur == tgt:
+                continue
+            # Only the unambiguous 2-D transpose case is safe to auto-correct here: a
+            # weight stored as the exact reverse of the target with two DISTINCT dims.
+            # (Higher-rank / repeated-dim permutations are ambiguous — which axis maps to
+            # which can't be inferred from shape alone — so they are left to the model's
+            # own reform_param rules rather than guessed.)
+            if tensor.ndim == 2 and cur == tgt[::-1] and cur[0] != cur[1]:
+                state_dict[key] = tensor.transpose(0, 1).contiguous()
+        return state_dict
+
+    @staticmethod
+    def easydel_to_torch(
+        module: EasyDeLBaseModule, dtype: jnp.dtype | None = jnp.float16, **kwargs
+    ) -> dict[str, tp.Any]:
+        """Convert an EasyDeL module's parameters to a PyTorch state dict.
+
+        Flattens the module's parameter tree, transposes weight axes back
+        to PyTorch conventions, preserves model-declared parameter names, and
+        un-stacks MoE expert weights if present. Legacy checkpoint leaf names
+        are normalized when loading against the target graph, not by rewriting
+        substrings in current model paths.
+
+        Args:
+            module: EasyDeL module whose parameters will be exported.
+            dtype: Target dtype for the exported tensors.
+
+        Returns:
+            Dictionary mapping PyTorch-style parameter names to tensors.
+        """
+        if dtype is None:
+            dtype = module.param_dtype
+
+        # ``module.parameters`` is a spectrax ``State`` (post-migration). Its ``flatten()``
+        # yields ``{"<collection>/<dotted.path>": array}``; strip the leading collection
+        # ("parameters/") to get the ``{dotted.path: array}`` the converter expects.
+        flat_state = module.parameters.flatten()
+        model_parameters = {key.split("/", 1)[-1]: value for key, value in flat_state.items()}
+
+        from easydel.layers import BaseMoeModule, Embed, ParallelMoELinear
+        from easydel.utils import traversals
+
+        md = ParallelMoELinear
+        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(module, md)]
+        md = BaseMoeModule
+        moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(module, md)]
+
+        # SpectraX uses ".weight" for dense, embedding, and normalization leaves.
+        # Discover layout-preserving module types rather than inferring from rank:
+        # normalization parameters can be multidimensional, including square matrices.
+        from easydel.layers.norms import BatchNorm, LayerNorm, RMSNorm, RMSNormGated
+
+        embedding_paths = {".".join(map(str, pa)) for pa, _ in traversals.iter_module_search(module, Embed)}
+        # Automatically discovered paths identify the module owning a parameter,
+        # not substrings: `norm` must not exempt `norm_projection.weight`, and a
+        # root normalization module (path "") must not exempt its dense children.
+        layernorm_paths = {
+            ".".join(map(str, pa))
+            for norm_type in (BatchNorm, LayerNorm, RMSNorm, RMSNormGated)
+            for pa, _ in traversals.iter_module_search(module, norm_type)
+        }
+        # Explicit declarations retain their public, substring-based semantics.
+        layernorm_names = list(kwargs.get("layernorm_names") or [])
+
+        moe_names = list(set([names.split(".")[-1] for names in moe_path])) if moe_path else None
+        moe_block_names = list(set([names.split(".")[-1] for names in moe_block_path])) if moe_block_path else None
+
+        stacked_moe_keys = set()
+        if moe_block_names and moe_names and moe_block_path:
+            for block_path in moe_block_path:
+                for moe_name in moe_names:
+                    # spectrax leaves are ".weight" (was ".kernel"); match that so stacked
+                    # expert tensors get the expert-specific permute (0, 2, 1), not the dense one.
+                    potential_key = f"{block_path}.experts.{moe_name}.weight"
+                    if potential_key in model_parameters:
+                        stacked_moe_keys.add(potential_key)
+
+        # Mirror of the load path's ``_reform_processed`` skip: a splits rule's
+        # spliter receives the raw HF tensor and produces the complete EasyDeL
+        # layout (the generic transpose is skipped for its children), so on
+        # export its ``inverse_spliter`` must receive the raw EasyDeL tensor
+        # and own the complete inverse. Applying the generic permute first
+        # double-transforms (e.g. conv1d weights exported in runtime layout).
+        inverse_split_names: list[tuple[str, bool]] = []
+        # Mirror of the load path's ``_preserve_dtype``: leaves owned by a rule
+        # with ``preserve_dtype`` (exact integer tables such as DeepSeek-V4's
+        # ``tid2eid``, quantized codes) must not be cast to the export dtype.
+        preserve_dtype_names: list[tuple[str, bool]] = []
+        for rule_key, rule in (kwargs.get("reform_param", None) or {}).items():
+            if "splits" not in rule:
+                continue
+            anchored = rule_key.endswith("$")
+            if rule.get("inverse_spliter") is not None:
+                for split in rule["splits"]:
+                    inverse_split_names.append((split["name"], anchored))
+            if rule.get("preserve_dtype", False):
+                for split in rule["splits"]:
+                    preserve_dtype_names.append((split["name"], anchored))
+
+        def _matches_split_names(key: str, names: list[tuple[str, bool]]) -> bool:
+            for split_name, anchored in names:
+                match_index = key.find(split_name)
+                if match_index == -1:
+                    continue
+                after_match = key[match_index + len(split_name) :]
+                if anchored and after_match:
+                    continue
+                if after_match and not after_match.startswith("."):
+                    continue
+                before_match = key[:match_index]
+                if before_match and not before_match.endswith("."):
+                    continue
+                return True
+            return False
+
+        torch_state_dict = {}
+        with tqdm(model_parameters.items(), desc=f"Converting {module.__class__.__name__} to torch") as pbar:
+            for key, tensor in pbar:
+                if tensor is None:
+                    continue
+                if hasattr(tensor, "materialize"):
+                    tensor = tensor.materialize()
+                if hasattr(tensor, "value") and hasattr(tensor.value, "materialize"):
+                    tensor = tensor.value.materialize()
+                if tensor.dtype != DtypeHandler.get_dtype(dtype) and not _matches_split_names(key, preserve_dtype_names):
+                    tensor = tensor.astype(DtypeHandler.get_dtype(dtype))
+                tensor = TensorConverter.jax_to_pytorch(jax.block_until_ready(tensor))
+                is_stacked_moe = key in stacked_moe_keys
+                owner_path = key.rpartition(".")[0]
+                is_embedding = owner_path in embedding_paths
+                is_layernorm = owner_path in layernorm_paths or any(norm in key for norm in layernorm_names)
+
+                # Transpose weight parameters only, symmetric with process_tensor on import.
+                # Raw parameters (tokens, positions, multidimensional biases) retain HF layout.
+                # Preserve embedding and normalization layouts at every rank, matching import.
+                # Dense tensors consumed by a splits rule's inverse_spliter are left in raw
+                # EasyDeL layout — the rule owns the complete inverse transform. Stacked MoE
+                # weights are NOT exempt: apply_moe_transformations_reverse un-stacks them
+                # (deleting the stacked key) before the splits-inverse pass runs, so their
+                # inverse_spliter never fires and the stacked permute must still apply.
+                if "weight" in key and not is_embedding and not is_layernorm:
+                    if is_stacked_moe:
+                        if tensor.ndim == 3:
+                            tensor = tensor.permute(0, 2, 1)
+                    elif not _matches_split_names(key, inverse_split_names):
+                        if tensor.ndim == 2:
+                            tensor = tensor.permute(1, 0)
+                        elif tensor.ndim == 3:
+                            tensor = tensor.permute(2, 1, 0)
+                        elif tensor.ndim == 4:
+                            tensor = tensor.permute(3, 2, 0, 1)
+                        elif tensor.ndim == 5:
+                            tensor = tensor.permute(4, 3, 0, 1, 2)
+                        elif tensor.ndim == 6:
+                            tensor = tensor.permute(5, 4, 3, 2, 0, 1)
+
+                torch_state_dict[key] = tensor
+
+        if moe_block_names and moe_names and moe_block_path and moe_path:
+            torch_state_dict = StateDictConverter.apply_moe_transformations_reverse(
+                state_dict=torch_state_dict,
+                moe_names=moe_names,
+                moe_path=moe_path,
+                moe_block_names=moe_block_names,
+                moe_block_path=moe_block_path,
+            )
+
+        reform_param = kwargs.get("reform_param", None)
+        if reform_param:
+            StateDictConverter.validate_reform_param_schema(reform_param)
+            for key_check, value_check in reform_param.items():
+                if "splits" not in value_check:
+                    continue
+                inverse_spliter = value_check.get("inverse_spliter", None)
+                if inverse_spliter:
+                    anchor_to_end = key_check.endswith("$")
+                    match_target = key_check[:-1] if anchor_to_end else key_check
+                    candidates = {}  # (prefix, suffix) -> {split_name: tensor}
+
+                    splits = value_check["splits"]
+                    split_names = [s["name"] for s in splits]
+
+                    keys_to_remove = []
+
+                    for key in torch_state_dict.keys():
+                        for split_name in split_names:
+                            match_index = key.find(split_name)
+                            if match_index != -1:
+                                after_match = key[match_index + len(split_name) :]
+                                if anchor_to_end and after_match:
+                                    continue
+                                if not after_match or after_match.startswith("."):
+                                    before_match = key[:match_index]
+                                    if not before_match or before_match.endswith("."):
+                                        original_key_candidate = f"{before_match}{match_target}{after_match}"
+                                        if original_key_candidate.replace(match_target, split_name) == key:
+                                            prefix = before_match
+                                            suffix = after_match
+
+                                            group_key = (prefix, suffix)
+                                            if group_key not in candidates:
+                                                candidates[group_key] = {}
+
+                                            candidates[group_key][split_name] = key
+
+                    for (prefix, suffix), found_splits in candidates.items():
+                        if len(found_splits) == len(split_names):
+                            tensors_to_merge = []
+                            for split in splits:
+                                split_name = split["name"]
+                                key = found_splits[split_name]
+                                tensors_to_merge.append(torch_state_dict[key])
+                                keys_to_remove.append(key)
+
+                            torch_module = TensorConverter.get_torch()
+
+                            positional_params = [
+                                p
+                                for p in inspect.signature(inverse_spliter).parameters.values()
+                                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.VAR_POSITIONAL)
+                            ]
+                            wants_torch = bool(positional_params) and positional_params[0].name == "torch"
+                            if wants_torch:
+                                merged_tensor = inverse_spliter(torch_module, *tensors_to_merge)
+                            else:
+                                merged_tensor = inverse_spliter(*tensors_to_merge)
+                            original_key = f"{prefix}{match_target}{suffix}"
+                            torch_state_dict[original_key] = merged_tensor
+                            if original_key in keys_to_remove:
+                                keys_to_remove.remove(original_key)
+
+                    for key in keys_to_remove:
+                        del torch_state_dict[key]
+
+            for key_check, value_check in reform_param.items():
+                if "sources" not in value_check or "inverse_fuser" not in value_check:
+                    continue
+                anchor_to_end = key_check.endswith("$")
+                match_target = key_check[:-1] if anchor_to_end else key_check
+                source_names = tuple(value_check["sources"])
+                if not source_names:
+                    continue
+
+                additions: dict[str, tp.Any] = {}
+                keys_to_remove: set[str] = set()
+                for key, tensor in list(torch_state_dict.items()):
+                    match_index = key.find(match_target)
+                    if match_index == -1:
+                        continue
+                    after_match = key[match_index + len(match_target) :]
+                    if anchor_to_end and after_match:
+                        continue
+                    if after_match and not after_match.startswith("."):
+                        continue
+                    before_match = key[:match_index]
+                    if before_match and not before_match.endswith("."):
+                        continue
+
+                    outputs = StateDictConverter.inverse_fuse_reform_param_tensor(value_check, tensor)
+                    if isinstance(outputs, Mapping):
+                        source_tensors = {str(name): value for name, value in outputs.items()}
+                    else:
+                        if not isinstance(outputs, tuple | list):
+                            outputs = (outputs,)
+                        if len(outputs) != len(source_names):
+                            raise ValueError(
+                                f"inverse_fuser for {match_target} returned {len(outputs)} tensors, "
+                                f"expected {len(source_names)}."
+                            )
+                        source_tensors = dict(zip(source_names, outputs, strict=True))
+
+                    for source_name, source_tensor in source_tensors.items():
+                        additions[f"{before_match}{source_name}{after_match}"] = source_tensor
+                    keys_to_remove.add(key)
+
+                for key in keys_to_remove:
+                    torch_state_dict.pop(key, None)
+                torch_state_dict.update(additions)
+
+        return torch_state_dict
+
+
+def _fit_hf_config_dict(config_class: type, config_dict: dict, torch_module: tp.Any, nested: bool = False) -> None:
+    """Fit an EasyDeL config dict to a transformers>=5 config class, recursing into sub-configs.
+
+    Those configs are strict dataclasses: ``1`` in a ``float | None`` field is rejected, and some
+    sub-configs (e.g. DBRX's ``ffn_config``) reject keys they do not declare, which an EasyDeL
+    sub-config always carries (its runtime settings); such sub-configs keep only their fields.
+    """
+    try:
+        hints = tp.get_type_hints(config_class, localns={"torch": torch_module})
+    except Exception:
+        return
+    for key, value in config_dict.items():
+        if key not in hints:
+            continue
+        allowed = set(tp.get_args(hints[key])) or {hints[key]}
+        if type(value) is int and int not in allowed:
+            if float in allowed:
+                config_dict[key] = float(value)
+            elif bool in allowed:
+                config_dict[key] = bool(value)
+        elif isinstance(value, dict):
+            for sub in allowed:
+                if isinstance(sub, type) and hasattr(sub, "from_dict") and sub is not dict:
+                    _fit_hf_config_dict(sub, value, torch_module, nested=True)
+                    break
+    if nested:
+        try:
+            config_class.from_dict(dict(config_dict))
+        except (TypeError, ValueError) as err:
+            if "unknown" not in str(err).lower():
+                raise
+            for key in [k for k in config_dict if k not in hints]:
+                config_dict.pop(key)
+
+
+class ModelConverter:
+    """High-level orchestrator for two-way EasyDeL ↔ HuggingFace model conversion.
+
+    Where :class:`StateDictConverter` operates on raw parameter mappings,
+    :class:`ModelConverter` brings model classes and configs into the
+    picture: it instantiates a fresh ``transformers`` ``PreTrainedModel``
+    from the equivalent EasyDeL config, feeds it the converted state dict,
+    and validates parameter shape parity along the way. Used by the public
+    ``module.to_torch()`` / ``module.from_pretrained(... save_torch=True)``
+    paths.
+
+    The class exposes only ``@staticmethod`` callables — there is no
+    instance state. Memory-conscious conversions can be run under
+    ``torch.device("meta")`` (the default) so the HuggingFace skeleton is
+    materialised lazily.
+    """
+
+    @staticmethod
+    def easydel_to_huggingface(
+        module: EasyDeLBaseModule,
+        config: EasyDeLBaseConfig,
+        base_huggingface_module: PreTrainedModel,
+        base_huggingface_module_kwarguments: dict | None = None,
+        dtype: jnp.dtype = jnp.float16,
+        use_meta_torch: bool = True,
+        reform_param: dict | None = None,
+        **kw,
+    ) -> tp.Any:
+        """Convert an EasyDeL module to a HuggingFace ``PreTrainedModel``.
+
+        Creates a HuggingFace model instance, converts the EasyDeL
+        parameters to a PyTorch state dict via ``easydel_to_torch``,
+        and loads the weights into the HuggingFace model.
+
+        Args:
+            module: Source EasyDeL module.
+            config: EasyDeL configuration to derive the HuggingFace config.
+            base_huggingface_module: HuggingFace model class to instantiate.
+            base_huggingface_module_kwarguments: Extra kwargs for the HF
+                model constructor.
+            dtype: Target dtype for the conversion.
+            use_meta_torch: Whether to use ``torch.device("meta")`` for
+                memory-efficient model construction.
+            reform_param: Optional parameter splitting/merging rules.
+
+        Returns:
+            Instantiated HuggingFace model with loaded weights.
+        """
+
+        import torch
+
+        if base_huggingface_module_kwarguments is None:
+            base_huggingface_module_kwarguments = {}
+
+        state_dict = StateDictConverter.easydel_to_torch(module=module, dtype=dtype, reform_param=reform_param)
+        config_class = base_huggingface_module.config_class
+        config_dict = config.to_dict()
+        # Configs that alias ``tie_word_embeddings`` through ``attribute_map`` (MPT: ``use_lm_head``) serialize only
+        # the aliased name, so the HF config would fall back to its own default and could flip the head's tying.
+        if "tie_word_embeddings" not in config_dict and hasattr(config, "tie_word_embeddings"):
+            config_dict["tie_word_embeddings"] = bool(config.tie_word_embeddings)
+        # Values HF derives through read-only properties (e.g. Falcon's ``head_dim``) cannot be passed back in.
+        for key in list(config_dict):
+            attr = inspect.getattr_static(config_class, key, None)
+            if isinstance(attr, property) and attr.fset is None:
+                config_dict.pop(key)
+        _fit_hf_config_dict(config_class, config_dict, torch)
+        base_config = config_class.from_dict(config_dict)
+        with torch.device("meta") if use_meta_torch else contextlib.nullcontext():
+            model: torch.nn.Module = base_huggingface_module(config=base_config, **base_huggingface_module_kwarguments)
+            target_shapes = {k: tuple(v.shape) for k, v in model.state_dict().items() if hasattr(v, "shape")}
+            # Reconcile each converted tensor against the HF target's actual shape, driven
+            # by data (not model-specific rules): when a 2-D weight's orientation is the
+            # transpose of what HF expects, flip it. This self-corrects layers whose JAX vs
+            # torch storage convention matches (e.g. GPT-2 Conv1D, already [out, in]) where
+            # the generic export transpose would otherwise mis-orient them, and any tied
+            # head whose export layout differs — no per-model casing required.
+            state_dict = StateDictConverter.reconcile_to_target_shapes(state_dict, target_shapes)
+            if len(target_shapes) != len(state_dict):
+                warnings.warn(
+                    f"converted state_dict has {len(state_dict)} keys, HF model expects {len(target_shapes)}.",
+                    stacklevel=1,
+                )
+            shape_conflicts = [
+                f"{key}: have {tuple(state_dict[key].shape)}, expected {shape}"
+                for key, shape in target_shapes.items()
+                if key in state_dict and tuple(state_dict[key].shape) != shape
+            ]
+            if shape_conflicts:
+                # ``load_state_dict(assign=True)`` is keys-only strict: wrong-shaped
+                # tensors would be assigned silently and ship a broken HF artifact.
+                raise RuntimeError(
+                    "EasyDeL -> HF export produced wrong-shaped tensors (layout transform bug, "
+                    "not a data problem):\n  " + "\n  ".join(shape_conflicts)
+                )
+            model.load_state_dict(state_dict, assign=True, strict=True)
+            # ``assign=True`` swaps in a fresh tensor per key, which unties parameters torch had tied at
+            # construction (e.g. ``lm_head.weight`` -> ``wte.weight``). Re-tie them; ``tie_weights`` only touches
+            # keys the HF config declares tied, so untied models are left alone.
+            if hasattr(model, "tie_weights"):
+                model.tie_weights()
+
+        return model

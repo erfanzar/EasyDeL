@@ -1,0 +1,281 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""JAX device memory monitoring helpers.
+
+This module exposes :class:`SMPMemoryMonitor` -- a single-process monitor with
+a background polling thread that records per-device HBM snapshots into an
+in-memory history buffer.
+
+Pandas is used opportunistically in :meth:`SMPMemoryMonitor.get_summary`;
+when it isn't installed the module gracefully falls back to plain Python
+lists.
+"""
+
+import logging
+import threading
+import time
+import typing as tp
+from datetime import datetime
+
+import jax
+
+logger = logging.getLogger(__name__)
+
+try:
+    import pandas as pd  # pyright: ignore[reportMissingTypeStubs]
+
+    _pandas_available = True
+except ImportError:
+    pd = None
+    _pandas_available = False
+
+
+class SMPMemoryMonitor:
+    """Simple memory monitor for JAX devices.
+
+    Tracks memory usage across all local JAX devices, maintains a history
+    of measurements, and provides reporting utilities. Can run in the
+    background to log periodic snapshots.
+
+    Attributes:
+        check_interval: Seconds between automatic checks.
+        quiet: If True, suppresses printed output during monitoring.
+        running: Whether background monitoring is active.
+        history: List of memory analysis dictionaries.
+    """
+
+    def __init__(self, check_interval: int = 60, quiet: bool = False):
+        """Configure the monitor without starting any background thread.
+
+        Args:
+            check_interval: Number of seconds the background thread sleeps
+                between successive sweeps over ``jax.local_devices()``. Has
+                no effect until :meth:`start_monitoring` is called.
+            quiet: When ``True`` the background loop calls
+                :meth:`check_all_devices` (silent), recording history and
+                logging only WARNING-level events. When ``False`` (default)
+                each cycle additionally prints the formatted status block
+                produced by :meth:`print_current_status`.
+        """
+        self.check_interval = check_interval
+        self.quiet = quiet
+        self.running = False
+        self.history = []
+        self._monitor_thread = None
+
+    def analyze_device(self, device_stats: dict, dev) -> dict:
+        """Analyze memory stats for a single device.
+
+        Args:
+            device_stats: Raw stats dict returned by ``device.memory_stats()``.
+                Must contain ``bytes_limit``, ``bytes_in_use``,
+                ``peak_bytes_in_use`` and ``num_allocs``.
+            dev: The JAX ``Device`` the stats belong to (used only for its
+                ``str()`` representation).
+
+        Returns:
+            A dict containing rounded GB usage, percent-utilization fields,
+            allocation count, and a ``"OK"``/``"WARNING"`` status string.
+        """
+        bytes_limit = device_stats["bytes_limit"]
+        current_usage = device_stats["bytes_in_use"]
+        peak_usage = device_stats["peak_bytes_in_use"]
+
+        analysis = {
+            "timestamp": datetime.now(),
+            "device_id": str(dev),
+            "memory_used_gb": round(current_usage / 1e9, 2),
+            "memory_limit_gb": round(bytes_limit / 1e9, 2),
+            "utilization_pct": round((current_usage / bytes_limit) * 100, 2),
+            "peak_usage_gb": round(peak_usage / 1e9, 2),
+            "peak_utilization_pct": round((peak_usage / bytes_limit) * 100, 2),
+            "num_allocations": device_stats["num_allocs"],
+            "status": "OK" if current_usage / bytes_limit < 0.75 else "WARNING",
+        }
+
+        return analysis
+
+    def start_monitoring(self):
+        """Spawn a daemon thread that records memory snapshots periodically.
+
+        Sets :attr:`running` to ``True`` and starts a daemon thread running
+        :meth:`_monitor_loop`. The method returns immediately; call
+        :meth:`stop_monitoring` to cleanly halt the loop. Calling this
+        method while monitoring is already running starts an additional
+        thread (avoid).
+        """
+        self.running = True
+        self._monitor_thread = threading.Thread(target=self._monitor_loop)
+        self._monitor_thread.daemon = True
+        self._monitor_thread.start()
+        print(f"Started monitoring memory every {self.check_interval} seconds")
+
+    def stop_monitoring(self):
+        """Signal the monitor thread to exit and wait for it to join.
+
+        Flips :attr:`running` to ``False`` so the next iteration of
+        :meth:`_monitor_loop` exits, then blocks on the thread until it
+        finishes. Safe to call when monitoring was never started.
+        """
+        self.running = False
+        if self._monitor_thread:
+            self._monitor_thread.join()
+        print("Stopped memory monitoring")
+
+    def _monitor_loop(self):
+        """Background thread body that polls all devices on a fixed cadence.
+
+        Runs until :attr:`running` is set to ``False``. Each iteration calls
+        :meth:`check_all_devices` (silent) or :meth:`print_current_status`
+        (verbose) depending on :attr:`quiet`, then sleeps for
+        :attr:`check_interval` seconds.
+        """
+        while self.running:
+            if self.quiet:
+                self.check_all_devices()
+            else:
+                self.print_current_status()
+            time.sleep(self.check_interval)
+
+    def check_all_devices(self) -> list[dict]:
+        """Snapshot every local JAX device and append the analyses to ``history``.
+
+        Iterates over ``jax.local_devices()``, calls ``device.memory_stats()``
+        on each, runs :meth:`analyze_device` on the result, appends the dict
+        to :attr:`history` (truncated to the most recent 1000 entries), and
+        prints a one-line WARNING for any device whose status is
+        ``"WARNING"``. Devices that raise are logged but skipped so a single
+        bad device does not abort the sweep.
+
+        Returns:
+            list[dict]: The freshly produced analyses, in the same order as
+            ``jax.local_devices()``. Failed devices are omitted.
+        """
+        results = []
+        for device in jax.local_devices():
+            try:
+                stats = device.memory_stats()
+                analysis = self.analyze_device(stats, device)
+                self.history.append(analysis)
+                results.append(analysis)
+
+                if len(self.history) > 1000:
+                    self.history = self.history[-1000:]
+
+                if analysis["status"] == "WARNING":
+                    print(f"WARNING: High memory usage on {analysis['device_id']}: {analysis['utilization_pct']}%")
+
+            except Exception as e:
+                print(f"Error checking device {device}: {e}")
+
+        return results
+
+    def get_summary(self, format: str = "auto") -> list[dict] | tp.Any:  # noqa
+        """Return the recorded history sorted newest-first.
+
+        Args:
+            format: Output container selector. ``"pandas"`` forces a pandas
+                ``DataFrame`` (raises :class:`ImportError` when pandas is
+                not installed); ``"list"`` forces a plain list of dicts;
+                ``"auto"`` (default) returns a ``DataFrame`` when pandas is
+                available and falls back to the list form otherwise.
+
+        Returns:
+            list[dict] | pandas.DataFrame: Either a list of analysis dicts
+            (matching :meth:`analyze_device` output) or a DataFrame of the
+            same data, ordered by ``timestamp`` descending. An empty list
+            (or empty DataFrame) is returned when no entries have been
+            recorded yet.
+
+        Raises:
+            ImportError: If ``format == "pandas"`` and pandas is not
+                installed in the environment.
+        """
+        if not self.history:
+            return [] if format == "list" else pd.DataFrame() if _pandas_available else []
+
+        if format == "pandas" and not _pandas_available:
+            raise ImportError("Pandas is not available. Install pandas or use format='list'")
+
+        if format == "pandas" or (format == "auto" and _pandas_available):
+            return pd.DataFrame(self.history).sort_values("timestamp", ascending=False)
+
+        return sorted(self.history, key=lambda x: x["timestamp"], reverse=True)
+
+    def print_current_status(self):
+        """Run a fresh sweep and pretty-print one block per device to stdout.
+
+        Calls :meth:`check_all_devices` and then prints a multi-line block
+        per result containing device id, status, used/limit GB, utilization
+        percent, peak usage, and active allocation count. Used by the
+        non-quiet variant of :meth:`_monitor_loop` and intended for ad-hoc
+        debugging — it is not parsing-stable.
+        """
+        results = self.check_all_devices()
+        print("\nCurrent Memory Status:")
+        print("-" * 50)
+
+        for r in results:
+            print(f"\nDevice: {r['device_id']}")
+            print(f"Status: {r['status']}")
+            print(f"Memory Used: {r['memory_used_gb']} GB / {r['memory_limit_gb']} GB")
+            print(f"Utilization: {r['utilization_pct']}%")
+            print(f"Peak Usage: {r['peak_usage_gb']} GB ({r['peak_utilization_pct']}%)")
+            print(f"Active Allocations: {r['num_allocations']}")
+
+    def get_device_history(self, device_id: str | None = None) -> list[dict]:
+        """Return the recorded history, optionally filtered to one device.
+
+        Args:
+            device_id: When supplied, only entries whose ``device_id`` field
+                equals this string (set by :meth:`analyze_device` to
+                ``str(device)``) are returned. ``None`` (default) returns
+                the full history.
+
+        Returns:
+            list[dict]: A list of analysis dicts in insertion order
+            (oldest first); the list is the underlying buffer when no
+            filter is given, so callers should not mutate it.
+        """
+        if device_id:
+            return [entry for entry in self.history if entry["device_id"] == device_id]
+        return self.history
+
+    def print_history_summary(self, n_entries: int = 5):
+        """Print the ``n_entries`` most recent history entries newest-first.
+
+        Args:
+            n_entries: Maximum number of recent entries to print. ``5`` by
+                default; pass a larger value to inspect a longer window.
+                When ``self.history`` is shorter than ``n_entries`` only the
+                available entries are printed.
+        """
+        if not self.history:
+            print("No history available")
+            return
+
+        print("\nRecent Memory Usage History:")
+        print("-" * 50)
+
+        sorted_history = sorted(self.history, key=lambda x: x["timestamp"], reverse=True)
+        for entry in sorted_history[:n_entries]:
+            print(f"\nTimestamp: {entry['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"Device: {entry['device_id']}")
+            print(f"Memory Used: {entry['memory_used_gb']} GB ({entry['utilization_pct']}%)")
+            print(f"Status: {entry['status']}")
+
+
+if __name__ == "__main__":
+    print(SMPMemoryMonitor().check_all_devices())

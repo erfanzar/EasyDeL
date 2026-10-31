@@ -1,0 +1,4214 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Base module implementation for EasyDeL models.
+
+This module provides the core foundation for all EasyDeL neural network models,
+implementing essential functionality for model initialization, parameter management,
+sharding, quantization, and integration with the broader EasyDeL ecosystem.
+
+The EasyDeLBaseModule class serves as the base class that all EasyDeL models inherit from,
+providing:
+- Parameter management and state handling
+- Model sharding and gathering for distributed training
+- Quantization and LoRA support
+- Loss computation framework
+- Integration with HuggingFace models
+- Generation capabilities through mixins
+
+Key Classes:
+    EasyDeLBaseModule: The base class for all EasyDeL models, providing common
+        functionality for parameter handling, sharding, and model operations.
+    ParameterTransformRule: Data class defining rules for transforming parameter
+        names and tensors, particularly useful for MoE models.
+
+Example:
+    >>> from easydel.infra import EasyDeLBaseModule, EasyDeLBaseConfig
+    >>> import spectrax as spx
+    >>> from spectrax import nn
+    >>>
+    >>> class MyModel(EasyDeLBaseModule):
+    ...     def __init__(self, config, dtype, param_dtype, precision, rngs):
+    ...         super().__init__(config, dtype, param_dtype, precision, rngs)
+    ...         # Initialize model layers
+    ...         self.layer = nn.Linear(config.hidden_size, config.hidden_size)
+    ...
+    ...     def forward(self, inputs):
+    ...         return self.layer(inputs)
+    >>>
+    >>> # Create and use the model
+    >>> config = EasyDeLBaseConfig(hidden_size=768)
+    >>> model = MyModel(
+    ...     config=config,
+    ...     dtype=jnp.float32,
+    ...     param_dtype=jnp.float32,
+    ...     precision='highest',
+    ...     rngs=spx.Rngs(0)
+    ... )
+
+The module integrates with JAX's sharding system for distributed training,
+supports various quantization methods, and provides utilities for converting
+between EasyDeL and HuggingFace model formats.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import inspect
+import re
+import typing as tp
+import warnings
+from collections.abc import Callable, Mapping
+from contextvars import ContextVar
+from copy import deepcopy
+from dataclasses import dataclass
+from functools import cached_property, partial, wraps
+from re import Pattern
+from typing import Self, Unpack
+
+import jax
+import jax.tree_util
+import numpy as np
+import spectrax as spx
+from eformer.loggings import get_logger
+from jax import lax
+from jax import numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec
+from jaxtyping import Array, Float, Int
+from spectrax import nn
+
+from easydel.infra.sharding import is_mpmd_mesh, moe_expert_param_layout_scope, replicated_named_sharding
+from easydel.infra.utils import ArrayParam, materialize_meta_leaves
+from easydel.layers.norms import LayerNorm
+from easydel.utils import traversals
+from easydel.utils.traversals import flatten_dict, is_flatten
+
+from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
+from .etils import EasyDeLGradientCheckPointers
+from .loss_utils import (
+    LOSS_MAPPING,
+    ForCausalLMLoss,
+    ForSequenceClassificationLoss,
+    LossConfig,
+    LossMetrics,
+    resolve_loss_strategy,
+)
+from .mixins import BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin, EasyShardingMixin, OperationCacheMixin
+from .modeling_outputs import EmbeddingInfo
+from .sequence_packing import fold_sequence_packing_segments
+
+if tp.TYPE_CHECKING:
+    from easydel.infra.base_state import EasyDeLState
+    from easydel.layers import Embed, ParallelLinear, QuantizationConfig
+
+
+# Type alias for partition rule specifications.
+#
+# Can be a mapping from parameter name patterns (as strings or tuples) to
+# partition specification functions, or None for default partitioning.
+PartitionLike = Mapping[str, tp.Callable] | Mapping[tuple, tp.Callable] | tuple[tuple[str, tp.Any], ...] | None
+
+
+logger = get_logger(__name__)
+
+
+# Alias for EasyDeLBaseConfig for backward compatibility.
+BaseConf = EasyDeLBaseConfig
+
+
+def _is_jnp_scalar_dtype(value: tp.Any) -> bool:
+    """Return whether *value* is a JAX scalar-type dtype such as ``jnp.float32``.
+
+    JAX scalar types (``jnp.float32``, ``jnp.bfloat16``...) are instances of a private metaclass whose module
+    path has moved between JAX releases, so they are recognised structurally: they are classes exposing a
+    ``dtype`` attribute holding a real :class:`numpy.dtype`. Plain NumPy scalar types (``np.float32``) and
+    ``np.dtype`` instances are not matched.
+
+    Args:
+        value: Object to inspect.
+
+    Returns:
+        bool: ``True`` for JAX scalar-type dtypes.
+    """
+    return isinstance(value, type) and isinstance(getattr(value, "dtype", None), jnp.dtype)
+
+
+def _looks_like_config(value: tp.Any) -> bool:
+    """Return whether *value* duck-types as an EasyDeL config.
+
+    Accepts either an :class:`EasyDeLBaseConfig` subclass instance or any
+    object exposing both ``runtime_sharding_resolver`` and ``mesh`` attributes.
+
+    Args:
+        value: Object to inspect.
+
+    Returns:
+        bool: ``True`` if the value can be used as an EasyDeL config.
+    """
+    return isinstance(value, EasyDeLBaseConfig) or (
+        value is not None and hasattr(value, "runtime_sharding_resolver") and hasattr(value, "mesh")
+    )
+
+
+def _resolve_init_config(
+    init: tp.Callable, instance: tp.Any, args: tuple[tp.Any, ...], kwargs: dict[str, tp.Any]
+) -> tp.Any:
+    """Locate the ``config`` argument inside an ``__init__`` call.
+
+    Inspects positional and keyword arguments to find the first value that
+    looks like an EasyDeL config so the surrounding decorator can install
+    parameter-init sharding context before the inner ``__init__`` runs.
+
+    Args:
+        init: The wrapped ``__init__`` method (used for signature binding).
+        instance: The module instance being initialized.
+        args: Positional arguments passed to ``__init__``.
+        kwargs: Keyword arguments passed to ``__init__``.
+
+    Returns:
+        Any | None: The resolved config object, or ``None`` if no config-like
+        argument is found.
+    """
+    if _looks_like_config(kwargs.get("config")):
+        return kwargs["config"]
+
+    try:
+        bound = inspect.signature(init).bind_partial(instance, *args, **kwargs)
+    except Exception:
+        bound = None
+    if bound is not None:
+        config = bound.arguments.get("config")
+        if _looks_like_config(config):
+            return config
+
+    for value in args:
+        if _looks_like_config(value):
+            return value
+    return None
+
+
+def _is_reusable_context(value: tp.Any) -> bool:
+    """Return whether *value* implements the context-manager protocol.
+
+    Args:
+        value: Candidate context manager.
+
+    Returns:
+        bool: ``True`` if ``value`` defines both ``__enter__`` and
+        ``__exit__``.
+    """
+    return hasattr(value, "__enter__") and hasattr(value, "__exit__")
+
+
+def _pin_fp32_parameters(module: tp.Any) -> None:
+    """Cast floating leaves matching ``type(module).fp32_param_patterns`` to float32 in place.
+
+    Runs after construction (eager, ``lazy_init`` and ``sequential_init`` alike), so every load path
+    starts from a float32 template for pinned leaves. Shardings of concrete arrays are preserved.
+
+    Args:
+        module: A freshly constructed :class:`EasyDeLBaseModule`.
+    """
+    from easydel.utils.parameters_transformation import fp32_param_pattern_matches
+
+    patterns = tuple(type(module).fp32_param_patterns)
+    for path, var in spx.iter_variables(module):
+        if not fp32_param_pattern_matches(path, patterns):
+            continue
+        value = var.value
+        dtype = getattr(value, "dtype", None)
+        if dtype is None or not jnp.issubdtype(dtype, jnp.floating) or dtype == jnp.float32:
+            continue
+        if isinstance(value, jax.ShapeDtypeStruct):
+            var.value = jax.ShapeDtypeStruct(value.shape, jnp.float32, sharding=value.sharding)
+        else:
+            var.value = value.astype(jnp.float32)
+
+
+_parameter_init_device: ContextVar[jax.Device | None] = ContextVar("parameter_init_device", default=None)
+
+
+@contextlib.contextmanager
+def _parameter_init_device_scope(device: jax.Device | None):
+    """Temporarily override allocation and nested constructor placement, not model metadata."""
+    if device is None:
+        yield
+        return
+    token = _parameter_init_device.set(device)
+    try:
+        with jax.default_device(device):
+            yield
+    finally:
+        _parameter_init_device.reset(token)
+
+
+@contextlib.contextmanager
+def _parameter_init_sharding_context(config: tp.Any):
+    """Install mesh, axis rules, and variable placement during parameter init.
+
+    Yields a context in which fresh ``jax.Array`` parameters created by an
+    EasyDeL module's ``__init__`` are placed on the proper mesh according to
+    the config's :class:`RuntimeShardingResolver`. An active sequential-init
+    device scope overrides physical placement without changing logical layout
+    or pipeline-stage metadata. If *config* doesn't look like an EasyDeL
+    config, this is a pass-through.
+
+    Args:
+        config: An EasyDeL config (or duck-typed equivalent) supplying the
+            mesh, runtime sharding resolver, and logical axis rules.
+
+    Yields:
+        None: Inside the ``with`` block, parameter creation respects the
+        config's sharding metadata.
+    """
+    if not _looks_like_config(config):
+        yield
+        return
+
+    mesh = config.mesh
+    resolver = config.runtime_sharding_resolver
+    init_device = _parameter_init_device.get()
+
+    if hasattr(resolver, "with_mesh"):
+        resolver = resolver.with_mesh(mesh)
+
+    def place(value: tp.Any, metadata: dict[str, tp.Any], explicit_sharding: bool) -> tp.Any | None:
+        """Place a freshly-created parameter on its target named sharding.
+
+        Args:
+            value: The candidate parameter (typically a ``jax.Array``).
+            metadata: Variable metadata describing the parameter (sharding,
+                tensor layout, etc.).
+            explicit_sharding: Whether the caller is asking for explicit
+                sharding even when the array already has a NamedSharding.
+
+        Returns:
+            Any | None: A device-placed array (when sharding can be applied),
+            the input value unchanged when already correctly sharded, or
+            ``None`` to signal that no placement should be performed.
+        """
+        if not isinstance(value, jax.Array):
+            return None
+        if init_device is not None:
+            return jax.device_put(value, init_device)
+        if not metadata:
+            return None
+
+        has_layout_metadata = any(key in metadata for key in ("sharding", "tensor_layout"))
+        existing = getattr(value, "sharding", None)
+        if isinstance(existing, NamedSharding) and not explicit_sharding and not has_layout_metadata:
+            return None
+
+        shape = tuple(int(dim) for dim in value.shape)
+        try:
+            named = resolver.named_sharding_for_metadata(metadata, shape=shape, mesh=mesh)
+        except (TypeError, ValueError):
+            return None
+        if named is None:
+            return None
+        if existing is not None and existing == named:
+            return value
+        return jax.device_put(value, named)
+
+    with contextlib.ExitStack() as stack:
+        if init_device is not None:
+            # Keep logical axes usable during construction, without activating the
+            # training devices (or mutating its mesh / pipeline-stage metadata).
+            axis_names = tuple(mesh.axis_names)
+            devices = np.asarray([init_device], dtype=object).reshape((1,) * len(axis_names))
+            stack.enter_context(spx.use_mesh(jax.sharding.Mesh(devices, axis_names)))
+        elif _is_reusable_context(mesh):
+            stack.enter_context(mesh)
+        if hasattr(resolver, "logical_axis_rules"):
+            stack.enter_context(resolver.logical_axis_rules())
+        # The explicit knob is authoritative. Under ep-bound fsdp the expert
+        # weight specs still resolve to P('ep', ...) — at ep=1 that is fully
+        # REPLICATED per device (54.8GB for a 30B MoE), which the previous
+        # `and not fsdp_is_ep_bound` mask made impossible to override: models
+        # too large to hold replicated experts could not train at all. Opting
+        # in trades the zero-comm whole-weight layout for sharded-at-rest +
+        # gather-at-use.
+        stack.enter_context(
+            moe_expert_param_layout_scope(
+                fsdp_shard_expert_weights=bool(getattr(config, "moe_fsdp_shard_expert_weights", False))
+            )
+        )
+        stack.enter_context(spx.variable_init_placement(place))
+        yield
+
+
+@dataclass
+class ParameterTransformRule:
+    """Rule for transforming parameter names and tensors during model conversion.
+
+    This dataclass defines transformation rules that can be applied to parameter
+    names and their associated tensor values during model conversion or loading.
+    It is particularly useful for handling Mixture of Experts (MoE) models where
+    parameter naming conventions may differ between frameworks.
+
+    Attributes:
+        pattern: Regular expression pattern or string to match parameter names.
+            Can be a compiled Pattern object or a string that will be used for
+            matching against parameter paths during conversion.
+        replacement: String to replace matched patterns in parameter names.
+            Supports regex replacement syntax (e.g., r'\\1' for capture groups).
+        tensor_transform: Optional callable to transform the tensor values.
+            Should take a tensor and return a transformed tensor of potentially
+            different shape or dtype. If None, no transformation is applied
+            to the tensor values, only the name is changed.
+        consolidate_experts: Whether to consolidate multiple expert parameters
+            into a single tensor. When True, parameters matching the pattern
+            from multiple experts will be stacked into a single array with
+            an additional expert dimension. Defaults to False.
+
+    Example:
+        >>> # Rule to rename and transpose expert weights
+        >>> rule = ParameterTransformRule(
+        ...     pattern=r"expert_(\\d+)\\.weight",
+        ...     replacement=r"experts.\\1.weight",
+        ...     tensor_transform=lambda x: x.transpose(),
+        ...     consolidate_experts=True
+        ... )
+        >>>
+        >>> # Simple renaming rule without tensor transformation
+        >>> simple_rule = ParameterTransformRule(
+        ...     pattern="old_layer_name",
+        ...     replacement="new_layer_name"
+        ... )
+
+    Note:
+        When consolidate_experts is True, the pattern should capture the expert
+        index so that parameters can be properly grouped and stacked.
+    """
+
+    pattern: str | Pattern
+    replacement: str
+    tensor_transform: Callable | None = None
+    consolidate_experts: bool = False
+
+
+class EasyDeLLayerStackMixin:
+    """Shared utilities for modules built around a stack of identical sub-layers.
+
+    Mixed into :class:`EasyDeLBaseModule` (and selectively into model trunks
+    such as transformer blocks) to centralize three concerns that recur across
+    architectures:
+
+    1. **Per-layer KV-cache view plumbing** — :meth:`_layer_cache_view_at` and
+       :meth:`_layer_cache_view_update` read/write the per-layer slice of a
+       paged-attention cache using a single mutable cache-views handle, so
+       caller code does not need to special-case ``cache``-vs-``cache_views``
+       call paths during trace and execution.
+    2. **Pipeline-parallel stage assignment** — methods prefixed
+       ``_pipeline_stage_*`` and ``_layer_stage_*`` resolve a logical layer
+       index to its physical PP owner under SpecTrax's virtual / interleaved
+       schedules and emit ``spx.assign_stage`` / ``spx.sxstage_region``
+       contexts so that newly-created variables and activations land on the
+       correct stage. This keeps creation-time sharding aligned with the
+       pipeline schedule and avoids cross-rank parameter movement at runtime.
+    3. **Scan-vs-trace dispatch and stage-boundary marking** —
+       :meth:`_layer_scan_trace` decides whether a stack must use the Python
+       trace path (cache views, hidden-state output, virtual stages, etc.)
+       and :meth:`_mark_layer_stage_boundary` emits ``spx.sxstage_iter``
+       between layers that span a PP boundary.
+
+    All methods read configuration off ``self.config`` (a
+    :class:`EasyDeLBaseConfig` or subclass) and rely on
+    ``config.mesh``, ``config.pipeline_*`` settings, and
+    ``config.runtime_sharding_resolver`` being available. The mixin holds no
+    state of its own.
+    """
+
+    config: tp.Any
+
+    def _layer_cache_view_at(
+        self: Self,
+        cache_views: tp.Any,
+        layer_idx: tp.Any,
+        *,
+        enabled: bool,
+        cache: tp.Any = None,
+    ) -> tp.Any:
+        """Read a mutable per-layer cache view for trace/cache execution.
+
+        Args:
+            cache_views: Mutable per-layer cache views handle (None when
+                cache plumbing is not in use).
+            layer_idx: Index into the cache view container.
+            enabled: When ``False`` cache plumbing is bypassed and ``None``
+                is returned without indexing.
+            cache: Optional flat cache to prefer over ``cache_views`` (used
+                during trace paths).
+
+        Returns:
+            Any | None: The cache view for ``layer_idx`` or ``None`` when
+            disabled / unavailable.
+        """
+        if not enabled:
+            return None
+        if cache is not None:
+            return cache[layer_idx]
+        if cache_views is None:
+            return None
+        return cache_views[layer_idx]
+
+    def _layer_cache_view_update(
+        self: Self,
+        cache_views: tp.Any,
+        layer_idx: tp.Any,
+        new_view: tp.Any,
+        *,
+        enabled: bool,
+        cache: tp.Any = None,
+    ) -> tp.Any:
+        """Update mutable per-layer cache views only on cache/trace paths.
+
+        Args:
+            cache_views: Existing mutable per-layer cache views container.
+            layer_idx: Index of the layer being updated.
+            new_view: Replacement cache view (skipped when ``None``).
+            enabled: When ``False`` the update is a no-op.
+            cache: Optional flat cache to update instead of ``cache_views``.
+
+        Returns:
+            Any: The (possibly mutated) ``cache_views`` handle, returned for
+            functional-style chaining inside layer loops.
+        """
+        if not enabled or new_view is None:
+            return cache_views
+        if cache is not None:
+            cache[layer_idx] = new_view
+        elif cache_views is not None:
+            cache_views[layer_idx] = new_view
+        return cache_views
+
+    def _pipeline_stage_count(self: Self) -> int:
+        """Return the logical pipeline width (physical PP * virtual stages).
+
+        Returns:
+            int: Total logical pipeline width derived from
+            ``config.mesh.shape['pp']`` (or 1 when no PP axis exists) multiplied by
+            ``config.pipeline_virtual_stages``.
+        """
+        return self._pipeline_physical_stage_count() * int(getattr(self.config, "pipeline_virtual_stages", 1) or 1)
+
+    def _pipeline_physical_stage_count(self: Self) -> int:
+        """Return the number of physical pipeline ranks.
+
+        Returns:
+            int: ``config.mesh.shape['pp']`` cast to ``int``; 1 when the
+            active mesh has no pipeline axis.
+        """
+        mesh_shape = getattr(getattr(self.config, "mesh", None), "shape", None)
+        try:
+            return int(mesh_shape["pp"])
+        except (KeyError, TypeError, AttributeError):
+            return 1
+
+    def _pipeline_stage_regions_enabled(self: Self) -> bool:
+        """Return whether this module should emit SpectraX stage-region markers.
+
+        Returns:
+            bool: ``True`` only when ``config.pipeline_stage_regions`` is
+            enabled *and* the resolved logical pipeline width is greater
+            than one.
+        """
+        if not bool(getattr(self.config, "pipeline_stage_regions", False)):
+            return False
+        try:
+            return self._pipeline_stage_count() > 1
+        except Exception:
+            return False
+
+    def _pipeline_stage_region_name(self: Self) -> str:
+        """Return a stable human-readable region name for this module call.
+
+        Returns:
+            str: ``_model_type`` if set; otherwise ``base_model_prefix``;
+            otherwise the class name.
+        """
+        model_type = getattr(self, "_model_type", None) or getattr(self.config, "model_type", None)
+        if model_type:
+            return str(model_type)
+        prefix = getattr(self, "base_model_prefix", None)
+        if prefix:
+            return str(prefix)
+        return type(self).__name__
+
+    def _pipeline_stage_region(self: Self):
+        """Build the SpectraX region wrapper used by EasyDeL module calls.
+
+        Returns:
+            Any: A :func:`spx.sxstage_region` wrapper named per
+            :meth:`_pipeline_stage_region_name`, ready to wrap a callable.
+        """
+        return spx.sxstage_region(self._pipeline_stage_region_name())
+
+    def _pipeline_effective_layer_total(self: Self, total_layers: int) -> int:
+        """Return the logical PP denominator used for layer assignment.
+
+        ``pipeline_terminal_stage_layer_reserve`` reserves virtual layer slots
+        at the end of the stack for terminal work that is not represented by a
+        decoder block (final norm, LM head, and loss). The reserve is clamped
+        so the final real transformer layer still maps to the terminal stage.
+        """
+        total = max(1, int(total_layers))
+        logical_pp = self._pipeline_stage_count()
+        if logical_pp <= 1 or total <= 1:
+            return total
+        reserve = max(0, int(getattr(self.config, "pipeline_terminal_stage_layer_reserve", 0) or 0))
+        if reserve <= 0:
+            return total
+        max_effective_total = ((total - 1) * logical_pp) // max(1, logical_pp - 1)
+        return min(total + reserve, max(total, max_effective_total))
+
+    def _pipeline_layer_position(self: Self, layer_idx: int, total_layers: int) -> tuple[int, int]:
+        """Map a stack-local layer index into the model-wide PP layer order.
+
+        Args:
+            layer_idx: Index of the layer within this module's stack.
+            total_layers: Default total layer count for the model.
+
+        Returns:
+            tuple[int, int]: ``(global_layer_index, logical_total_layers)``,
+            using ``pipeline_layer_offset`` / ``pipeline_layer_total`` when
+            set on the config, then applying any terminal-stage reserve.
+        """
+        offset = int(getattr(self.config, "pipeline_layer_offset", 0) or 0)
+        total = int(getattr(self.config, "pipeline_layer_total", total_layers) or total_layers)
+        return offset + int(layer_idx), self._pipeline_effective_layer_total(total)
+
+    def _pipeline_logical_stage(self: Self, layer_idx: int, total_layers: int) -> int:
+        """Resolve a stack-local layer index to a model-wide logical PP stage.
+
+        Args:
+            layer_idx: Index of the layer within this module's stack.
+            total_layers: Default total layer count for the model.
+
+        Returns:
+            int: Logical pipeline stage index in ``[0, _pipeline_stage_count)``.
+        """
+        logical_pp = self._pipeline_stage_count()
+        global_idx, global_total = self._pipeline_layer_position(layer_idx, total_layers)
+        return min(logical_pp - 1, (global_idx * logical_pp) // global_total)
+
+    def _layer_physical_stage_assignment(self: Self, layer_idx: int, total_layers: int) -> tuple[int, int]:
+        """Resolve a layer position to the physical PP owner used for sharding.
+
+        Logical virtual stages are ordered as ``virt * pp + rank`` by the
+        default SpectraX virtual schedules. Parameter metadata stores the
+        physical owner so creation-time sharding matches the schedule instead
+        of requiring runtime cross-rank parameter moves.
+
+        Args:
+            layer_idx: Index of the layer within this module's stack.
+            total_layers: Default total layer count for the model.
+
+        Returns:
+            tuple[int, int]: ``(physical_rank, physical_pp)``, with the rank
+            picked according to the configured ``pipeline_stage_layout``
+            (``"contiguous"``, ``"loop"``, or the default interleaved layout).
+        """
+        physical_pp = self._pipeline_physical_stage_count()
+        if physical_pp <= 1:
+            return 0, 1
+        logical_stage = self._pipeline_logical_stage(layer_idx, total_layers)
+        layout = self.config.pipeline_stage_layout
+        if layout == "contiguous":
+            virtual_stages = max(1, int(self.config.pipeline_virtual_stages))
+            return min(physical_pp - 1, logical_stage // virtual_stages), physical_pp
+        if layout == "loop":
+            offset = logical_stage % physical_pp
+            virtual_stage = logical_stage // physical_pp
+            physical_stage = offset if virtual_stage % 2 == 0 else physical_pp - 1 - offset
+            return physical_stage, physical_pp
+        return logical_stage % physical_pp, physical_pp
+
+    @contextlib.contextmanager
+    def assign_layer_stage(self: Self, layer_idx: int, *, total_layers: int):
+        """Assign subsequently-created variables to a logical layer slot.
+
+        ``spx.assign_stage`` stores a logical ``(current, total)`` hint on
+        variables. SpectraX resolves that hint to the active physical MPMD rank
+        later via ``resolve_stage_rank``. Keeping the logical layer slot here is
+        important for stacks with per-layer state/cache metadata: collapsing
+        multiple layers to the same physical rank at construction time loses
+        layer identity even though the final physical owner is the same.
+        """
+        current, total = self._pipeline_layer_position(layer_idx, total_layers)
+        current = min(max(0, int(current)), max(1, int(total)) - 1)
+        with spx.assign_stage(total=total, current=current):
+            yield
+
+    @contextlib.contextmanager
+    def _layer_stage_context(
+        self: Self,
+        layer_idx: tp.Any,
+        *,
+        layers: tp.Sized | None = None,
+        total_layers: int | None = None,
+    ):
+        """Enter the physical PP owner context for executing a concrete layer.
+
+        Args:
+            layer_idx: Concrete (non-traced) layer index. Passing a tracer
+                falls back to a no-op yield.
+            layers: Optional sized container used to derive ``total_layers``
+                when omitted.
+            total_layers: Optional explicit total layer count.
+
+        Yields:
+            None: Inside the ``with`` block, SpectraX assigns the resolved
+            physical PP rank for the layer; if pipeline parallelism is not
+            in use the block runs unchanged.
+        """
+        try:
+            idx = int(layer_idx)
+        except (TypeError, ValueError, jax.errors.ConcretizationTypeError):
+            yield
+            return
+        if total_layers is None:
+            total_layers = len(layers if layers is not None else self.layers)  # type: ignore[attr-defined]
+        if self._pipeline_stage_count() <= 1:
+            yield
+            return
+        current, total = self._layer_physical_stage_assignment(idx, total_layers)
+        with spx.assign_stage(total=total, current=current):
+            yield
+
+    def _layer_scan_trace(
+        self: Self,
+        trace: bool,
+        *,
+        output_hidden_states: bool = False,
+        output_attentions: bool = False,
+        cache: tp.Any = None,
+        cache_views: tp.Iterable[tp.Any] | None = None,
+        extra: bool = False,
+    ) -> bool:
+        """Resolve whether a repeated-layer stack must use the Python trace path.
+
+        ``jax.lax.scan`` cannot honour any of the EasyDeL features that need
+        per-iteration Python control (hidden-state aggregation, paged-cache
+        views, pipeline parallelism). This helper centralises that decision
+        so each stack just reads a single bool to choose between scan and
+        explicit Python iteration.
+
+        Args:
+            trace: Caller's explicit "trace this stack" override.
+            output_hidden_states: When ``True`` forces Python iteration so
+                per-layer hidden states can be collected.
+            output_attentions: When ``True`` forces Python iteration so
+                per-layer attention probabilities can be collected.
+            cache: Reserved for symmetry with caller signatures; ignored.
+            cache_views: Iterable of per-layer cache views. Any non-``None``
+                entry forces Python iteration.
+            extra: Arbitrary caller-supplied flag that should always force
+                Python iteration.
+
+        Returns:
+            bool: ``True`` when the stack must run in Python (no scan).
+        """
+        del cache
+        has_cache_views = cache_views is not None and any(view is not None for view in cache_views)
+        return (
+            trace
+            or output_hidden_states
+            or output_attentions
+            or has_cache_views
+            or extra
+            or not self.config.scan_layers
+            or self._pipeline_stage_count() > 1
+        )
+
+    def _layer_scan_kwargs(self: Self, scope: str | None = None) -> dict[str, tp.Any]:
+        """Return the ``ModuleList.scan`` lowering options configured for one scan scope.
+
+        Args:
+            scope: ``"text"``, ``"vision"`` or ``"audio"``. ``None`` infers it from this module's
+                config class name, so towers built from a vision/audio sub-config pick up that scope.
+
+        Returns:
+            Keyword arguments to spread into ``layers.scan(...)``. With ``layer_scan_options=None`` the
+            training text scans of an fsdp-sharded model get ``prefetch_axes=("fsdp",)``; an explicit
+            mapping (``{}`` included) replaces that default.
+        """
+        from easydel.utils.inference_mode import is_inference_mode
+
+        from .layer_scan import auto_layer_scan_kwargs, infer_layer_scan_scope, resolve_layer_scan_kwargs
+
+        config = self.config
+        if scope is None:
+            scope = infer_layer_scan_scope(config)
+        options = getattr(config, "layer_scan_options", None)
+        if options is None:
+            return auto_layer_scan_kwargs(getattr(config, "mesh", None), scope, inference=is_inference_mode())
+        return resolve_layer_scan_kwargs(options, scope)
+
+    def _mark_layer_stage_boundary(
+        self: Self,
+        hidden_states: tp.Any,
+        layer_idx: tp.Any,
+        *,
+        layers: tp.Sized | None = None,
+    ) -> tp.Any:
+        """Mark dynamic pipeline stage boundaries for repeated layer stacks.
+
+        When the next layer lives on a different pipeline stage, emits an
+        :func:`spx.sxstage_iter` marker on ``hidden_states`` so SpectraX
+        inserts the appropriate cross-stage transfer.
+
+        Args:
+            hidden_states: Activation tensor returned by the current layer.
+            layer_idx: Index of the current layer.
+            layers: Optional sized container used to derive the total layer
+                count when ``layer_idx`` is a concrete int.
+
+        Returns:
+            Any: ``hidden_states`` either unchanged (no boundary crossing or
+            traced index) or wrapped with the stage-transfer marker.
+        """
+        try:
+            idx = int(layer_idx)
+        except (TypeError, ValueError):
+            return hidden_states
+        total = len(layers if layers is not None else self.layers)  # type: ignore[attr-defined]
+        pp = self._pipeline_stage_count()
+        global_idx, global_total = self._pipeline_layer_position(idx, total)
+        if pp <= 1 or global_idx + 1 >= global_total:
+            return hidden_states
+        current = self._pipeline_logical_stage(idx, total)
+        nxt = self._pipeline_logical_stage(idx + 1, total)
+        if current != nxt:
+            edge_sharding = self._layer_stage_boundary_sharding(hidden_states)
+            return spx.sxstage_iter(hidden_states, stage=current, sharding=edge_sharding)
+        return hidden_states
+
+    def _decoder_scan_step(
+        self: Self,
+        block: tp.Callable[..., tp.Any],
+        carry: tuple[tp.Any, tp.Any, tp.Any, tp.Any, tp.Any],
+        *,
+        output_hidden_states: bool,
+        output_attentions: bool,
+        trace_layers: bool,
+        cache: tp.Any = None,
+        **block_kwargs: tp.Any,
+    ) -> tuple[tp.Any, tp.Any, tp.Any, tp.Any, tp.Any]:
+        """One step of the standard decoder-stack scan body.
+
+        Carry layout: ``(hidden_states, cache_views, all_hidden_states, all_attentions, layer_index)``. Appends the
+        pre-block hidden state, runs ``block`` inside the layer's PP stage context with its cache view, marks the
+        stage boundary, writes back the cache view and appends the attention weights, in that order.
+
+        Args:
+            block: Decoder layer; called with ``hidden_states``, ``cache_view``, ``output_attentions`` and
+                ``block_kwargs`` (mask info, positions, mode, cache metadata, frequencies, ...).
+            carry: Scan carry described above.
+            output_hidden_states: Collect pre-block hidden states.
+            output_attentions: Collect attention weights (also forwarded to ``block``).
+            trace_layers: Whether cache-view plumbing is active (the Python trace path).
+            cache: Flat cache preferred over the carried views.
+            **block_kwargs: Remaining keyword arguments for ``block``.
+
+        Returns:
+            The updated carry.
+        """
+        hs, cv, ah, aa, idx = carry
+        if output_hidden_states:
+            ah = (*ah, hs)
+        with self._layer_stage_context(idx, layers=self.layers):  # type: ignore[attr-defined]
+            layer_outputs = block(
+                hidden_states=hs,
+                cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=cache),
+                output_attentions=output_attentions,
+                **block_kwargs,
+            )
+        hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)  # type: ignore[attr-defined]
+        cv = self._layer_cache_view_update(cv, idx, layer_outputs.cache_view, enabled=trace_layers, cache=cache)
+        if output_attentions:
+            aa = (*aa, layer_outputs.attention_weight)
+        return hs, cv, ah, aa, idx + 1
+
+    def _layer_stage_boundary_sharding(self: Self, hidden_states: tp.Any) -> PartitionSpec | None:
+        """Resolve the activation sharding contract for PP stage edges.
+
+        Picks the right ``HiddenStateSharding`` axes for prefill vs decode
+        by inspecting the sequence length, then maps them onto a
+        :class:`PartitionSpec` through the runtime sharding resolver.
+
+        Args:
+            hidden_states: Activation tensor about to cross a PP stage
+                boundary.
+
+        Returns:
+            PartitionSpec | None: The resolved sharding spec, or ``None``
+            when the activation has no shape attribute or resolution fails.
+        """
+        if not hasattr(hidden_states, "shape"):
+            return None
+        try:
+            shape = tuple(hidden_states.shape)
+            mode = spx.common_types.MODE_DECODE if len(shape) > 1 and int(shape[1]) == 1 else spx.common_types.MODE_TRAIN
+            return self.config.runtime_sharding_resolver.with_mesh(self.config.mesh).resolve(
+                axes=spx.common_types.HiddenStateSharding.axes,
+                mode=mode,
+            )
+        except Exception:
+            return None
+
+
+class EasyDeLBaseModule(
+    EasyDeLLayerStackMixin,
+    spx.Module,
+    EasyBridgeMixin,
+    EasyGenerationMixin,
+    EasyShardingMixin,
+    OperationCacheMixin,
+    BaseModuleProtocol,
+):
+    """Base class for all EasyDeL neural network modules.
+
+    EasyDeLBaseModule provides the foundational functionality for all EasyDeL models,
+    including parameter management, distributed training support, quantization,
+    LoRA adaptation, and integration with HuggingFace models. It inherits from
+    spx.Module and multiple mixins that provide additional capabilities.
+
+    This class should be subclassed to create specific model architectures. Subclasses
+    must implement the forward method and may override various hooks for customization.
+
+    Attributes:
+        config_class: The configuration class associated with this model type.
+            Should be a subclass of EasyDeLBaseConfig.
+        base_model_prefix: String prefix used when loading/saving weights,
+            typically matches the HuggingFace model prefix.
+        config: The model configuration instance containing architecture parameters.
+        _model_task: String identifier for the model's task (e.g., 'causal-language-model').
+            Set automatically based on the model class.
+        _model_type: String identifier for the model type (e.g., 'llama', 'mistral').
+            Set automatically based on the configuration.
+        _parameter_transform_rules: Class-level list of ParameterTransformRule instances
+            for handling parameter name/value transformations during conversion.
+        _hf_flattened_wrapper: Name of the inner wrapper submodule this module
+            keeps but transformers >= 5.13 flattened out of the matching HF
+            class's state dict (e.g. ``"vision_model"`` on CLIP/SigLIP vision
+            towers). Consumed by ``_get_hf_flattened_wrappers`` so HF -> EasyDeL
+            conversion accepts both the old (wrapper-prefixed) and new
+            (flattened) key layouts. ``None`` for modules whose HF layout is
+            unchanged.
+
+    Example:
+        >>> class MyCustomModel(EasyDeLBaseModule):
+        ...     config_class = MyCustomConfig
+        ...     base_model_prefix = "model"
+        ...
+        ...     def __init__(self, config, dtype, param_dtype, precision, rngs):
+        ...         super().__init__(config, dtype, param_dtype, precision, rngs)
+        ...         self.embed = nn.Embed(config.vocab_size, config.hidden_size)
+        ...         self.layers = nn.ModuleList([
+        ...             TransformerBlock(config, dtype, param_dtype, precision, rngs)
+        ...             for _ in range(config.num_hidden_layers)
+        ...         ])
+        ...
+        ...     def forward(self, input_ids, attention_mask=None):
+        ...         hidden_states = self.embed(input_ids)
+        ...         for layer in self.layers:
+        ...             hidden_states = layer(hidden_states, attention_mask)
+        ...         return hidden_states
+
+    Note:
+        - Always call super().__init__() in subclass constructors to properly
+          initialize base functionality.
+        - The mesh and partition rules from config are used for distributed training.
+        - Use lazy_init() for memory-efficient model initialization.
+    """
+
+    config_class: type[BaseConf] | None
+    base_model_prefix: str
+    config: BaseConf | None
+    _model_task: str | None
+    _model_type: str | None
+    _parameter_transform_rules: tp.ClassVar[list[ParameterTransformRule]] = []
+    _hf_flattened_wrapper: tp.ClassVar[str | None] = None
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ()
+
+    def __init_subclass__(cls, **kwargs: tp.Any) -> None:
+        """Wrap subclass ``__init__`` to install parameter-init sharding context.
+
+        Each :class:`EasyDeLBaseModule` subclass automatically gets its
+        ``__init__`` wrapped so that parameter creation runs inside
+        :func:`_parameter_init_sharding_context`, ensuring fresh ``jax.Array``
+        weights are placed on the configured mesh. The wrapper is idempotent
+        (skipped if already applied).
+
+        Args:
+            **kwargs: Forwarded to ``super().__init_subclass__``.
+
+        Returns:
+            None.
+        """
+        super().__init_subclass__(**kwargs)
+        original_init = cls.__dict__.get("__init__")
+        if original_init is None or getattr(original_init, "_easydel_init_sharding_wrapped", False):
+            return
+
+        @wraps(original_init)
+        def init_with_parameter_sharding(self, *args, **kwargs):
+            """Run the original ``__init__`` inside the parameter sharding context.
+
+            Args:
+                *args: Positional ``__init__`` arguments.
+                **kwargs: Keyword ``__init__`` arguments.
+
+            Returns:
+                None.
+            """
+            config = _resolve_init_config(original_init, self, args, kwargs)
+            with _parameter_init_sharding_context(config):
+                original_init(self, *args, **kwargs)
+            owner = next(klass for klass in type(self).__mro__ if "__init__" in klass.__dict__)
+            if owner is cls and type(self).fp32_param_patterns:
+                _pin_fp32_parameters(self)
+
+        init_with_parameter_sharding._easydel_init_sharding_wrapped = True
+        with contextlib.suppress(Exception):
+            init_with_parameter_sharding.__signature__ = inspect.signature(original_init)
+        cls.__init__ = init_with_parameter_sharding
+
+    def __init__(
+        self,
+        config: BaseConf,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: lax.PrecisionLike,
+        rngs: spx.Rngs,
+    ):
+        """Initialize the EasyDeLBaseModule.
+
+        Sets up the base module with configuration and data types. This method
+        initializes core attributes and triggers the computation of various
+        cached properties. Subclasses should call this in their __init__ method
+        before initializing their own layers.
+
+        Args:
+            config: Model configuration object containing architecture parameters
+                such as hidden_size, num_layers, etc. Must be an instance of
+                EasyDeLBaseConfig or a subclass.
+            dtype: Data type for computations during forward pass. Common choices
+                include jnp.float32, jnp.bfloat16, or jnp.float16.
+            param_dtype: Data type for storing model parameters. May differ from
+                dtype for mixed-precision training (e.g., bfloat16 params with
+                float32 computation).
+            precision: JAX precision setting for matrix operations. Can be 'highest',
+                'high', 'default', or a jax.lax.Precision enum value.
+            rngs: SpecTrax random number generator container for parameter initialization
+                and stochastic operations like dropout.
+
+        Example:
+            >>> config = LlamaConfig(hidden_size=1024, num_hidden_layers=4)
+            >>> model = LlamaModel(
+            ...     config=config,
+            ...     dtype=jnp.bfloat16,
+            ...     param_dtype=jnp.bfloat16,
+            ...     precision='high',
+            ...     rngs=spx.Rngs(42)
+            ... )
+
+        Note:
+            This method should be called by all subclasses to properly
+            initialize the base functionality. Failing to call super().__init__()
+            will result in missing core attributes.
+        """
+        super().__init__()
+        self.config: BaseConf = config
+        self.dtype: jnp.dtype = dtype
+        self.param_dtype: jnp.dtype = param_dtype
+        self.precision: lax.PrecisionLike = precision
+        self.rngs: spx.Rngs = rngs
+
+        _ = self.graphtree_shape
+        _ = self.graphstate_shape
+        _ = self.parameters_shape
+        _ = self.mesh
+        self.register_context(mesh=self.mesh)
+        _ = self.model_task
+        _ = self.model_type
+
+    def __call__(self, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
+        """Call the module, optionally annotated as a SpectraX stage region.
+
+        Args:
+            *args: Positional arguments forwarded to the underlying
+                ``spx.Module.__call__``.
+            **kwargs: Keyword arguments forwarded to the underlying
+                ``spx.Module.__call__``.
+
+        Returns:
+            Any: Whatever the module's forward path returns, optionally
+            wrapped in an :func:`spx.sxstage_region` when pipeline-region
+            annotation is enabled.
+        """
+        if "segment_ids" in kwargs:
+            from easydel.infra.sequence_packing import fold_sequence_packing_segments
+
+            kwargs = fold_sequence_packing_segments(kwargs)
+        if self._pipeline_stage_regions_enabled():
+            return self._pipeline_stage_region()(super().__call__)(*args, **kwargs)
+        return super().__call__(*args, **kwargs)
+
+    def drafter(
+        self,
+        method: str = "auto",
+        *,
+        num_draft_tokens: int = 4,
+        assistant_model: tp.Any | None = None,
+        target_embed_module: tp.Any | None = None,
+        layer_mapping: list[int] | None = None,
+        target_config: tp.Any | None = None,
+        drafter_model: tp.Any | None = None,
+        **kwargs: tp.Any,
+    ) -> tp.Any:
+        """Build a speculative-decoding drafter owned by this model.
+
+        The drafter family is resolved through
+        :class:`easydel.infra.spec_decode.DrafterRegistry`, so any drafter
+        registered with ``@register_drafter(...)`` is reachable by name here
+        (and, declaratively, through ``eSurgeDrafterConfig``). The built-in
+        families are ``"mtp"``, ``"gemma4_assistant"``, ``"eagle3"``,
+        ``"dspark"``, and ``"dflash"`` (plus their aliases).
+
+        Examples:
+            >>> drafter = model.drafter(method="mtp", num_draft_tokens=4)
+            >>> drafter = model.drafter(
+            ...     method="gemma4_assistant",
+            ...     assistant_model=assistant,
+            ...     num_draft_tokens=4,
+            ... )
+            >>> drafter = model.drafter(method="eagle3", drafter_model=eagle3)
+
+        Args:
+            method: Drafter family (any registered name/alias). ``"auto"`` picks
+                ``"mtp"`` when this model exposes an inline MTP head, otherwise
+                ``"gemma4_assistant"`` when an ``assistant_model`` is supplied.
+            num_draft_tokens: Speculative tokens proposed per verify window.
+            assistant_model: Standalone assistant model for assistant-based
+                drafting.
+            target_embed_module: Optional target token embedding module for
+                assistant drafting. If omitted, it is resolved from ``self``.
+            layer_mapping: Optional assistant-layer to target-layer mapping.
+            target_config: Optional target config. Defaults to ``self.config``.
+            drafter_model: Optional standalone model-native drafter instance
+                (an ``EasyDeLBaseModule`` + ``SpecDecodeBase``) for families such
+                as EAGLE3 / DSpark / DFlash.
+            **kwargs: Extra drafter-specific constructor arguments.
+
+        Returns:
+            A drafter implementing :class:`easydel.inference.speculative.DrafterProtocol`.
+
+        Raises:
+            ValueError: If ``method`` matches no registered drafter, or ``"auto"``
+                cannot infer a family for this model.
+        """
+        from easydel.infra.spec_decode import DrafterRegistry
+
+        method_key = re.sub(r"[^a-z0-9]+", "_", str(method or "auto").strip().lower()).strip("_")
+
+        if method_key == "auto":
+            if bool(getattr(self, "has_mtp", lambda: False)()):
+                method_key = "mtp"
+            elif assistant_model is not None:
+                method_key = "gemma4_assistant"
+            else:
+                raise ValueError(
+                    f"{type(self).__name__} cannot infer a drafter. Pass an explicit method= "
+                    f"(one of {DrafterRegistry.names()})."
+                )
+
+        builder = DrafterRegistry.resolve(method_key)
+        return builder(
+            self,
+            num_draft_tokens=num_draft_tokens,
+            assistant_model=assistant_model,
+            target_embed_module=target_embed_module,
+            layer_mapping=layer_mapping,
+            target_config=target_config,
+            drafter_model=drafter_model,
+            **kwargs,
+        )
+
+    def _resolve_drafter_target_embedding(self) -> tp.Any:
+        """Resolve this model's token embedding module for assistant drafters.
+
+        Walks several conventional accessors (``get_embedding``,
+        ``get_input_embeddings``, ``get_language_model``, ``base_model``,
+        ``model``) to find a usable token embedding module for an assistant
+        drafter.
+
+        Returns:
+            Any: The discovered embedding module.
+
+        Raises:
+            ValueError: When no embedding module can be located.
+        """
+        for getter_name in ("get_embedding", "get_input_embeddings"):
+            getter = getattr(self, getter_name, None)
+            if callable(getter):
+                with contextlib.suppress(NotImplementedError):
+                    embedding = getter()
+                    if embedding is not None:
+                        return embedding
+        get_language_model = getattr(self, "get_language_model", None)
+        if callable(get_language_model):
+            language_model = get_language_model()
+            getter = getattr(language_model, "get_embedding", None)
+            if callable(getter):
+                embedding = getter()
+                if embedding is not None:
+                    return embedding
+        base_model = getattr(self, "base_model", None) or getattr(self, "model", None)
+        if base_model is not None:
+            getter = getattr(base_model, "get_embedding", None)
+            if callable(getter):
+                embedding = getter()
+                if embedding is not None:
+                    return embedding
+        raise ValueError(f"Could not resolve target token embedding module for {type(self).__name__}.")
+
+    @property
+    def trainable_selector(self: Self) -> spx.SelectorSugar:
+        """Return the canonical default trainable selector for this module.
+
+        Subclasses (e.g. LoRA-only training) override this property to
+        return a narrower selector.
+
+        Returns:
+            spx.SelectorSugar: The string ``"parameters"`` by default,
+            usable with ``spx.split``/``spx.as_selector``.
+        """
+        return "parameters"
+
+    def resolve_trainable_selector(
+        self: Self,
+        trainable_selector: spx.SelectorSugar | None = None,
+    ) -> spx.SelectorSugar:
+        """Resolve ``trainable_selector`` against the module default.
+
+        Args:
+            trainable_selector: Optional explicit selector. When ``None``
+                the module's :attr:`trainable_selector` is returned.
+
+        Returns:
+            spx.SelectorSugar: The resolved selector.
+        """
+        return self.trainable_selector if trainable_selector is None else trainable_selector
+
+    def _partition_trainable_state(
+        self: Self,
+        state: spx.State,
+        *,
+        trainable_selector: spx.SelectorSugar | None = None,
+    ) -> tuple[spx.State, spx.State]:
+        """Partition ``state`` into selected trainables and the remaining state.
+
+        Args:
+            state: A SpectraX state container produced by :func:`spx.export`.
+            trainable_selector: Optional override for the trainable
+                selector; defaults to the module's
+                :attr:`trainable_selector`.
+
+        Returns:
+            tuple[spx.State, spx.State]: ``(graphstate, graphother)`` — the
+            selected trainable subtree and its complement.
+        """
+        selector = spx.as_selector(self.resolve_trainable_selector(trainable_selector))
+        return selector.partition_state(self, state)
+
+    def parameter_values(
+        self: Self,
+        *,
+        selector: spx.SelectorSugar | None = None,
+        extract_fn: tp.Callable | None = None,
+        remove_none: bool = True,
+    ) -> dict[str, tp.Any]:
+        """Return a flat ``path -> array`` mapping for the selected trainables.
+
+        Args:
+            selector: Optional override for the trainable selector.
+            extract_fn: Optional callable applied to each leaf, useful for
+                unwrapping :class:`spx.Parameter` boxes or materialising
+                quantized weights.
+            remove_none: When ``True`` (default), drop entries whose value
+                is ``None`` after extraction.
+
+        Returns:
+            dict[str, Any]: Flat mapping from dotted parameter path to the
+            (extracted) leaf value.
+        """
+        flat_values: dict[str, tp.Any] = {}
+        for _collection, path, value in self.split_parameters(selector).items():
+            leaf = extract_fn(value) if extract_fn is not None else value
+            leaf = leaf.value if hasattr(leaf, "value") else leaf
+            if remove_none and leaf is None:
+                continue
+            flat_values[path] = leaf
+        return flat_values
+
+    def abstract_parameter_leaves(
+        self: Self,
+        *,
+        selector: spx.SelectorSugar | None = None,
+    ) -> tuple[tuple[str, str, tuple[tp.Any, ...], tp.Any], ...]:
+        """Return selected trainable leaves still represented as ``ShapeDtypeStruct``.
+
+        Useful to detect checkpoints that have not finished materialising
+        on the live model.
+
+        Args:
+            selector: Optional override for the trainable selector.
+
+        Returns:
+            tuple: Tuple of ``(collection, path, shape, dtype)`` tuples,
+            one per abstract leaf still present in the selected state.
+        """
+        missing: list[tuple[str, str, tuple[tp.Any, ...], tp.Any]] = []
+        for collection, path, value in self.split_parameters(selector).items():
+            leaf = value.value if hasattr(value, "value") else value
+            if isinstance(leaf, jax.ShapeDtypeStruct):
+                missing.append((collection, path, tuple(leaf.shape), leaf.dtype))
+        return tuple(missing)
+
+    def assert_parameters_materialized(
+        self: Self,
+        *,
+        selector: spx.SelectorSugar | None = None,
+        context: str = "parameter materialization",
+    ) -> Self:
+        """Fail if a real-weight path still contains lazy ``ShapeDtypeStruct`` leaves.
+
+        Args:
+            selector: Optional override for the trainable selector.
+            context: Human-readable phase name used in the error message.
+
+        Returns:
+            Self: The module itself when every selected leaf is concrete,
+            enabling chained calls.
+
+        Raises:
+            ValueError: If any selected leaf is still a
+                :class:`jax.ShapeDtypeStruct` placeholder.
+        """
+        missing = self.abstract_parameter_leaves(selector=selector)
+        if not missing:
+            return self
+
+        preview_items = [
+            f"{collection}/{path} shape={shape} dtype={dtype}" for collection, path, shape, dtype in missing[:8]
+        ]
+        preview = "; ".join(preview_items)
+        if len(missing) > len(preview_items):
+            preview = f"{preview}; ... +{len(missing) - len(preview_items)} more"
+        raise ValueError(
+            f"{context} left {len(missing)} abstract trainable parameter leaf/leaves. "
+            "This means checkpoint conversion/loading did not materialize required weights. "
+            f"First missing leaves: {preview}"
+        )
+
+    def split_module(
+        self: Self,
+        *,
+        trainable_selector: spx.SelectorSugar | None = None,
+    ) -> tuple[spx.GraphDef, spx.State, spx.State]:
+        """Split the module into graph definition, selected trainables, and remainder.
+
+        Args:
+            trainable_selector: Optional override for the trainable
+                selector; defaults to the module's
+                :attr:`trainable_selector`.
+
+        Returns:
+            tuple[spx.GraphDef, spx.State, spx.State]: A triple of
+            ``(graphdef, graphstate, graphother)`` suitable for
+            :meth:`merge_module` and :class:`EasyDeLState` construction.
+            ``graphother`` has its meta-leaves materialised so the result
+            can be passed through JAX transformations without further
+            preprocessing.
+        """
+        gdef, state = spx.export(self)
+        graphstate, graphother = self._partition_trainable_state(state, trainable_selector=trainable_selector)
+        graphother = materialize_meta_leaves(graphother, seed=42)
+        return gdef, graphstate, graphother
+
+    @staticmethod
+    def _reconcile_missing_rng_state(graphdef: spx.GraphDef, full_state: spx.State) -> spx.State:
+        """Add RNG leaves that ``graphdef`` requires but ``full_state`` is missing.
+
+        :meth:`sequential_init` reassigns every submodule's ``rngs``
+        (``module.rngs = rng.fork(1)[0]``), so a model built that way exports a
+        ``rng`` collection whose stream paths differ from those of a
+        freshly-constructed module: it grows per-submodule streams
+        (``model.layers.0.mlp.dropout.rngs.default``, ...) and loses the shared
+        top-level ``rngs.parameters`` stream. When such a model's state is
+        rebound against a *freshly-built* graph definition — the
+        attention-retargeted graphdef used by
+        :attr:`~EasyGenerationMixin.esurge_compatible_model`, or the graphdef
+        from :meth:`update_module`/:meth:`new_graphdef` — the graphdef references
+        canonical RNG paths (``rngs.parameters``) the state no longer carries and
+        :func:`spx.bind` raises ``KeyError`` while walking the missing path.
+
+        Only the regenerable ``rng`` collection is reconciled. A missing
+        parameter or buffer is a genuine structural error and is deliberately
+        left for :func:`spx.bind` to surface rather than being silently
+        zero-filled. When nothing is missing (the common same-structure
+        round-trip) the input state is returned unchanged.
+
+        Args:
+            graphdef: Target graph definition being bound against.
+            full_state: The merged ``graphstate.overlay(graphother)`` state.
+
+        Returns:
+            spx.State: ``full_state`` when it already covers every RNG leaf the
+            graphdef needs, otherwise a new state with the missing RNG streams
+            materialized (existing leaves are preserved and win on overlap).
+        """
+        missing_sentinel = object()
+        canonical = dict(graphdef.var_canonical)
+        missing_paths: list[str] = []
+        seen_refs: set[int] = set()
+        for node_idx, ref in graphdef.var_refs:
+            if ref in seen_refs:
+                continue
+            seen_refs.add(ref)
+            node = graphdef.nodes[node_idx]
+            if getattr(node, "collection", None) != "rng":
+                continue
+            path = canonical.get(ref)
+            if path is None:
+                continue
+            if full_state.get("rng", path, missing_sentinel) is missing_sentinel:
+                missing_paths.append(path)
+
+        if not missing_paths:
+            return full_state
+
+        ref_shape: tuple[int, ...] = (4,)
+        ref_dtype: tp.Any = jnp.uint32
+        for collection, _path, leaf in full_state.items():
+            if collection != "rng":
+                continue
+            value = leaf.value if hasattr(leaf, "value") else leaf
+            shape = getattr(value, "shape", None)
+            dtype = getattr(value, "dtype", None)
+            if shape is not None and dtype is not None:
+                ref_shape, ref_dtype = tuple(shape), dtype
+                break
+
+        filler: dict[str, dict[str, tp.Any]] = {"rng": {}}
+        for path in missing_paths:
+            filler["rng"][path] = jax.ShapeDtypeStruct(ref_shape, ref_dtype)
+        filler_state = materialize_meta_leaves(spx.State(filler), seed=42)
+        # ``full_state`` overlaid on top wins on overlap, so already-present RNG
+        # streams keep their real values and only the missing ones are added.
+        return filler_state.overlay(full_state)
+
+    def merge_module(
+        self: Self,
+        graphdef: spx.GraphDef,
+        graphstate: spx.State,
+        graphother: spx.State,
+    ) -> Self:
+        """Merge graph components back into a complete module.
+
+        Reconstructs a complete module instance from its decomposed components.
+        This is the inverse operation of split_module().
+
+        Args:
+            graphdef: The module's graph definition containing the structural
+                information (layer types, connections) without parameter values.
+            graphstate: The module's parameter state containing the trainable
+                parameters (weights and biases).
+            graphother: The module's non-parameter state containing other
+                variables like batch statistics or cached values.
+
+        Returns:
+            EasyDeLBaseModule: The reconstructed module instance with all
+                components merged back together.
+
+        Example:
+            >>> graphdef, params, others = model.split_module()
+            >>> # Apply some transformation to parameters
+            >>> new_params = jax.tree_map(lambda x: x.astype(jnp.float16), params)
+            >>> # Merge back into a complete model
+            >>> new_model = model.merge_module(graphdef, new_params, others)
+        """
+        full_state = graphstate.overlay(graphother)
+        full_state = self._reconcile_missing_rng_state(graphdef, full_state)
+        bound = spx.bind(graphdef, full_state)
+        object.__setattr__(bound, "_spx_opaque", dict(self._spx_opaque))
+        for opaque_name in self._spx_attr_order:
+            if opaque_name not in bound._spx_attr_order:
+                bound._spx_attr_order.append(opaque_name)
+        # Preserve training mode across bind/reconstruct
+        bound.train(self.training)
+        return tp.cast(Self, bound)
+
+    def materialize_meta_state(self: Self, *, seed: int = 0) -> Self:
+        """Concretize any leftover abstract (``ShapeDtypeStruct``) state leaves.
+
+        ``lazy_init`` builds the whole module under ``jax.eval_shape``, so
+        non-parameter state created by the constructor — most importantly the
+        ``spx.Rngs`` PRNG-key leaves — comes back abstract. Checkpoint loading
+        (``merge_model_and_tree``) fills only the *parameter* tree, so those
+        ``rng``-collection leaves remain ``ShapeDtypeStruct``. They slip past
+        :meth:`assert_parameters_materialized` (which only inspects the trainable
+        ``parameters`` collection) and then crash ``spx.export``-based
+        serialization in :meth:`save_pretrained` with
+        ``'ShapeDtypeStruct' object has no attribute 'addressable_shards'``.
+
+        This must be called only AFTER parameters are concrete: ``rng`` leaves
+        become real keys, while any other abstract leaf would be zero-filled by
+        :func:`materialize_meta_leaves`. Already-materialized leaves (the loaded
+        weights) are left untouched, and when nothing is abstract the same module
+        is returned without an unnecessary re-bind.
+
+        Args:
+            seed: Seed used to derive concrete PRNG keys for abstract ``rng``
+                leaves.
+
+        Returns:
+            Self: A module whose state contains no abstract leaves.
+        """
+        graphdef, state = spx.export(self)
+        materialized = materialize_meta_leaves(state, seed=seed)
+        if materialized is state:
+            return self
+        bound = spx.bind(graphdef, materialized)
+        object.__setattr__(bound, "_spx_opaque", dict(self._spx_opaque))
+        for opaque_name in self._spx_attr_order:
+            if opaque_name not in bound._spx_attr_order:
+                bound._spx_attr_order.append(opaque_name)
+        bound.train(self.training)
+        return tp.cast(Self, bound)
+
+    @property
+    def graphdef(self: Self) -> spx.GraphDef:
+        """Get the graph definition (structure without parameters) of the module.
+
+        Uses spx.export to separate the graph definition from the state.
+        The graph definition contains the module's structural information
+        including layer types, shapes, and connections, but no parameter values.
+
+        Returns:
+            spx.GraphDef: The graph definition of the module, which can be used
+                to reconstruct the module structure or for functional transformations.
+
+        Example:
+            >>> model = LlamaModel(config, dtype, param_dtype, precision, rngs)
+            >>> gdef = model.graphdef
+            >>> # The graphdef can be used with different parameter states
+            >>> new_model = spx.bind(gdef, new_params.overlay(new_others))
+        """
+        return self.split_module()[0]
+
+    @property
+    def graphstate(self: Self) -> spx.State:
+        """Return the default selected trainable state for the module.
+
+        Returns:
+            spx.State: The graphstate component of :meth:`split_module`.
+        """
+        return self.split_module()[1]
+
+    @property
+    def graphother(self: Self) -> spx.State:
+        """Return the complement of :attr:`graphstate` in the exported module state.
+
+        Returns:
+            spx.State: All non-trainable variables (buffers, RNG state,
+            etc.) carried by the module.
+        """
+        return self.split_module()[-1]
+
+    @property
+    def parameters(self: Self) -> spx.State:
+        """Return the default trainable state for this module.
+
+        By default this is the ``"parameters"`` collection only. Models that
+        want LoRA-only or combined training should pass an explicit
+        ``trainable_selector`` to :meth:`split_parameters`,
+        :meth:`split_module`, or :meth:`to_state`.
+        """
+        return self.split_parameters("parameters")
+
+    @property
+    def parameters_shape(self: Self) -> spx.State:
+        """Compute shape metadata for :attr:`parameters` via :func:`jax.eval_shape`.
+
+        Returns:
+            spx.State: A pytree of :class:`jax.ShapeDtypeStruct` leaves
+            mirroring the structure of :attr:`parameters`.
+        """
+        return jax.eval_shape(lambda: self.parameters)
+
+    @property
+    def graphstate_shape(self: Self) -> spx.State:
+        """Compute shape metadata for :attr:`graphstate` via :func:`jax.eval_shape`.
+
+        Returns:
+            spx.State: A pytree of :class:`jax.ShapeDtypeStruct` leaves
+            mirroring the structure of :attr:`graphstate`.
+        """
+        return jax.eval_shape(lambda: self.graphstate)
+
+    @property
+    def graphother_shape(self: Self) -> spx.State:
+        """Compute shape metadata for :attr:`graphother` via :func:`jax.eval_shape`.
+
+        Returns:
+            spx.State: A pytree of :class:`jax.ShapeDtypeStruct` leaves
+            mirroring the structure of :attr:`graphother`.
+        """
+        return jax.eval_shape(lambda: self.graphother)
+
+    @property
+    def graphtree_shape(self: Self) -> dict:
+        """Compute the shapes of all state variables (including non-parameters).
+
+        Uses jax.eval_shape on the entire module state (both parameters and
+        other variables) and extracts shape information. This provides a
+        complete view of all arrays in the model.
+
+        Returns:
+            dict: A nested dictionary mirroring the module's complete state
+                structure, where each leaf contains shape and dtype information
+                for all variables, not just trainable parameters.
+
+        Example:
+            >>> model = LlamaModel(config, dtype, param_dtype, precision, rngs)
+            >>> all_shapes = model.graphtree_shape
+            >>> # Includes both parameters and other state like batch stats
+        """
+        _, state = spx.export(self)
+        graphtree = jax.eval_shape(lambda: state)
+        return graphtree.raw()
+
+    @property
+    def model_task(self: Self) -> str | None:
+        """Get the task identifier for this model instance.
+
+        Returns the specific task this model is designed for, such as
+        'causal-language-model', 'sequence-classification', etc. This is
+        used for selecting appropriate loss functions and training procedures.
+
+        Returns:
+            str | None: The model task identifier string, or None if not set.
+                Common values include 'ForCausalLM', 'ForSequenceClassification',
+                'ForTokenClassification', etc.
+
+        Example:
+            >>> model = LlamaForCausalLM(config, dtype, param_dtype, precision, rngs)
+            >>> print(model.model_task)
+            'ForCausalLM'
+        """
+        return self._model_task
+
+    @property
+    def model_type(self: Self) -> str | None:
+        """Get the model type identifier for this model instance.
+
+        Returns the specific architecture type of this model, such as
+        'llama', 'mistral', 'qwen2', etc. This is typically derived from
+        the configuration and used for model identification.
+
+        Returns:
+            str | None: The model type identifier string, or None if not set.
+
+        Example:
+            >>> model = LlamaModel(config, dtype, param_dtype, precision, rngs)
+            >>> print(model.model_type)
+            'llama'
+        """
+        return self._model_type
+
+    @cached_property
+    def causal_mask(self: Self) -> tp.Any:
+        """Get or compute the basic causal attention mask from configuration.
+
+        Retrieves the causal attention mask from the configuration, computing
+        and caching it on first access. The mask prevents attention to future
+        positions in autoregressive models.
+
+        Returns:
+            jnp.ndarray: The causal attention mask with shape typically
+                (1, 1, max_position_embeddings, max_position_embeddings).
+                Values are 0 for positions that can be attended to and
+                large negative values for positions that should be masked.
+
+        Note:
+            This is a cached property - the mask is computed once and stored
+            for subsequent accesses.
+        """
+        return self.config.get_basic_causal_mask()
+
+    @cached_property
+    def frequencies(self: Self) -> tp.Any:
+        """Get or compute the frequency components for rotary embeddings.
+
+        Retrieves the frequency components used in Rotary Position Embeddings
+        (RoPE) from the configuration, computing and caching on first access.
+
+        Returns:
+            jnp.ndarray: The frequency components for RoPE with shape
+                (max_position_embeddings, head_dim // 2) or similar depending
+                on the RoPE implementation.
+
+        Note:
+            This is a cached property - frequencies are computed once and
+            stored for subsequent accesses.
+        """
+        return self.config.get_basic_frequencies()
+
+    @cached_property
+    def inv_frequencies(self: Self) -> tp.Any:
+        """Get or compute the inverse frequency components for rotary embeddings.
+
+        Retrieves the inverse frequency components used in Rotary Position
+        Embeddings (RoPE) from the configuration, computing and caching on
+        first access.
+
+        Returns:
+            jnp.ndarray: The inverse frequency components for RoPE.
+
+        Note:
+            This is a cached property - inverse frequencies are computed once
+            and stored for subsequent accesses.
+        """
+        return self.config.get_basic_inv_frequencies()
+
+    @cached_property
+    def static_arguments(self: Self) -> tuple:
+        """Get static arguments needed by the module's forward method.
+
+        Retrieves static arguments that don't change during execution and can
+        be pre-computed. These are typically used for JIT compilation optimization.
+
+        Returns:
+            tuple: A tuple of static arguments. The default implementation
+                returns an empty tuple; subclasses should override this if
+                they have static arguments.
+
+        Note:
+            This is a cached property - arguments are computed once and stored.
+        """
+        return self.get_static_arguments()
+
+    @cached_property
+    def lossfn_type(self: Self):
+        """Determine the loss function type for this model.
+
+        Determines the appropriate loss function type based on (in order of
+        priority):
+        1. config.loss_type attribute if set
+        2. self.loss_type attribute if set
+        3. Class name pattern matching against known loss types
+        4. Defaults to 'ForCausalLM' if not determined
+
+        Returns:
+            str: String identifier for the loss function type (e.g., 'ForCausalLM',
+                'ForSequenceClassification', 'ForTokenClassification').
+
+        Note:
+            If an unrecognized loss_type is set in config, a warning is issued
+            and 'ForCausalLM' is used as fallback.
+        """
+        if getattr(self.config, "loss_type", None) is not None:
+            loss_type = self.config.loss_type
+        elif getattr(self, "loss_type", None) is not None:
+            loss_type = self.loss_type
+        else:
+            loss_type = self.__class__.__name__
+            if loss_type not in LOSS_MAPPING:
+                loss_groups = f"({'|'.join(LOSS_MAPPING)})"
+                loss_type = re.findall(loss_groups, self.__class__.__name__)
+                if len(loss_type) > 0:
+                    loss_type = loss_type[0]
+                else:
+                    loss_type = None
+        if loss_type is None or (loss_type not in LOSS_MAPPING and getattr(self.config, "loss_type", None) is not None):
+            warnings.warn(
+                f"`loss_type={loss_type}` was set in the config but it is unrecognised. "
+                f"Using the default loss: `ForCausalLMLoss`.",
+                stacklevel=1,
+            )
+            loss_type = "ForCausalLM"
+        return loss_type
+
+    @cached_property
+    def loss_function(self: Self):
+        """Get the appropriate loss function based on configuration or model type.
+
+        Determines and returns the loss function class based on the lossfn_type.
+        The function is looked up in the LOSS_MAPPING registry.
+
+        Returns:
+            Callable: The selected loss function class (e.g., ForCausalLMLoss,
+                ForSequenceClassificationLoss) that can be called to compute
+                the loss given model outputs and labels.
+
+        Example:
+            >>> model = LlamaForCausalLM(config, dtype, param_dtype, precision, rngs)
+            >>> loss_fn = model.loss_function
+            >>> print(loss_fn.__name__)
+            'ForCausalLMLoss'
+        """
+
+        return LOSS_MAPPING[self.lossfn_type]
+
+    @cached_property
+    def loss_strategy(self: Self):
+        """Return the planning-aware strategy wrapper for :attr:`loss_function`.
+
+        Returns:
+            Any: Whatever :func:`resolve_loss_strategy` produces — typically
+            a strategy object responsible for choosing the right execution
+            path (chunked LM head, normal materialised path, etc.) for the
+            resolved loss type.
+        """
+
+        return resolve_loss_strategy(self.loss_function)
+
+    @property
+    def module_dtype(self: Self) -> jnp.dtype:
+        """Determine the data type of the module's parameters.
+
+        Inspects the flattened parameter state to find the dtype of the first
+        parameter encountered. This reflects the actual storage dtype of
+        the model's parameters.
+
+        Returns:
+            jnp.dtype: The data type of the module's parameters (e.g.,
+                jnp.float32, jnp.bfloat16, jnp.float16).
+
+        Example:
+            >>> model = LlamaModel(config, dtype, param_dtype, precision, rngs)
+            >>> print(model.module_dtype)
+            bfloat16
+        """
+        leaves = jax.tree_util.tree_leaves(self.split_parameters())
+        return leaves[0].dtype
+
+    def compute_complex_rotary(self, position_ids: jax.Array) -> jnp.ndarray:
+        """Compute complex-valued rotary position embeddings.
+
+        Computes the complex exponential of frequencies for rotary embeddings
+        given position indices. This is used in models that use complex-valued
+        RoPE implementation.
+
+        Args:
+            position_ids: Position indices to compute embeddings for, with
+                shape (batch_size, sequence_length).
+
+        Returns:
+            jnp.ndarray: Complex exponential of frequencies with shape
+                (batch_size, sequence_length, head_dim // 2). The result
+                contains complex numbers that can be used to rotate query
+                and key vectors.
+
+        Example:
+            >>> position_ids = jnp.arange(128)[None, :]  # (1, 128)
+            >>> freqs_cis = model.compute_complex_rotary(position_ids)
+            >>> print(freqs_cis.shape)
+            (1, 128, 64)  # Assuming head_dim=128
+        """
+        frequencies = jnp.transpose(
+            self.inv_frequencies[None, :, None] @ position_ids[:, None, :].astype("f4"),
+            (0, 2, 1),
+        )
+        return jnp.exp(1j * frequencies)
+
+    def to_dtype(self: Self, dtype: jnp.dtype) -> Self:
+        """Convert the module's parameters to the specified data type.
+
+        Iterates through the module's parameters (excluding quantization-related
+        ones like quant_*) and casts them to the target dtype. Also updates the
+        param_dtype attribute of the module and all its submodules.
+
+        Args:
+            dtype: The target data type for the parameters (e.g., jnp.float32,
+                jnp.bfloat16, jnp.float16).
+
+        Returns:
+            Self: The module instance with parameters converted to the specified
+                dtype. Note that this returns a new module instance.
+
+        Example:
+            >>> model = LlamaModel(config, jnp.float32, jnp.float32, precision, rngs)
+            >>> model = model.to_dtype(jnp.bfloat16)
+            >>> print(model.module_dtype)
+            bfloat16
+
+        Note:
+            Quantization-related parameters (those starting with 'quant_') are
+            not converted to preserve their specific formats.
+        """
+        from easydel.utils.traversals import iter_module_search
+
+        gdef, params, others = self.split_module()
+
+        def _map_leaf(leaf):
+            """Cast a single leaf to the target dtype if non-None.
+
+            Args:
+                leaf: A pytree leaf, typically a ``jax.Array`` or ``None``.
+
+            Returns:
+                The leaf cast to ``dtype``, or ``None`` if the input was
+                ``None``.
+            """
+            if leaf is not None:
+                leaf = leaf.astype(dtype)
+            return leaf
+
+        params = jax.tree_util.tree_map(_map_leaf, params)
+        self = self.merge_module(gdef, params, others)
+
+        for _path, module in iter_module_search(self):
+            if hasattr(module, "param_dtype"):
+                module.param_dtype = dtype
+        return self
+
+    def half(self: Self, change_runtime_dtype: bool = True) -> Self:
+        """Convert the module's parameters to half-precision (float16).
+
+        Convenience method to convert all parameters to float16. Optionally
+        also changes the runtime computation dtype to float16.
+
+        Args:
+            change_runtime_dtype: If True, also sets self.dtype to jnp.float16
+                for runtime computations. Defaults to True.
+
+        Returns:
+            Self: The module instance with parameters (and potentially runtime
+                dtype) set to float16.
+
+        Example:
+            >>> model = LlamaModel(config, jnp.float32, jnp.float32, precision, rngs)
+            >>> model = model.half()
+            >>> print(model.module_dtype)
+            float16
+
+        Note:
+            For better numerical stability on TPUs, consider using bfloat16
+            instead of float16.
+        """
+        if change_runtime_dtype:
+            self = self._reformat_runtime_dtype(jnp.float16)
+        return self._reformat_dtype(jnp.float16)
+
+    def float(self: Self, change_runtime_dtype: bool = True) -> Self:
+        """Convert the module's parameters to single-precision (float32).
+
+        Convenience method to convert all parameters to float32. Optionally
+        also changes the runtime computation dtype to float32.
+
+        Args:
+            change_runtime_dtype: If True, also sets self.dtype to jnp.float32
+                for runtime computations. Defaults to True.
+
+        Returns:
+            Self: The module instance with parameters (and potentially runtime
+                dtype) set to float32.
+
+        Example:
+            >>> model = model.float()  # Convert to float32
+            >>> print(model.module_dtype)
+            float32
+        """
+        if change_runtime_dtype:
+            self = self._reformat_runtime_dtype(jnp.float32)
+        return self._reformat_dtype(jnp.float32)
+
+    def _reformat_runtime_dtype(self: Self, dtype) -> Self:
+        """Change the runtime computation dtype of the module and submodules.
+
+        Internal helper method that updates the dtype attribute (used for
+        computations during forward pass) of this module and all its submodules.
+
+        Args:
+            dtype: The target runtime data type (e.g., jnp.float32, jnp.bfloat16).
+
+        Returns:
+            Self: The module instance with updated runtime dtype.
+
+        Note:
+            This is an internal method. Use half(), float(), or to_dtype()
+            for the public API.
+        """
+        from easydel.utils.traversals import iter_module_search
+
+        for _path, module in iter_module_search(self):
+            if hasattr(module, "dtype"):
+                if _is_jnp_scalar_dtype(module.dtype):  # dont change numpy based dtypes
+                    module.dtype = dtype
+        self.dtype = dtype
+        return self
+
+    def _reformat_dtype(self: Self, dtype) -> Self:
+        """Change the data type of the module's parameters.
+
+        Internal helper method that casts all floating-point parameters to
+        the target dtype. Non-floating-point parameters are left unchanged.
+
+        Args:
+            dtype: The target parameter data type (e.g., jnp.float32, jnp.bfloat16).
+
+        Returns:
+            Self: The module instance with updated parameter dtype.
+
+        Note:
+            This is an internal method. Use half(), float(), or to_dtype()
+            for the public API.
+        """
+        from easydel.utils.traversals import iter_module_search
+
+        gdef, params, others = self.split_module()
+
+        def _map(array):
+            """Cast a floating-point array to ``dtype``; leave others as-is.
+
+            Args:
+                array: A ``jax.Array`` leaf.
+
+            Returns:
+                The array cast to ``dtype`` if it has a floating-point dtype,
+                otherwise the input unchanged.
+            """
+            if jnp.issubdtype(array.dtype, jnp.floating):
+                array = array.astype(dtype)
+            return array
+
+        params = jax.tree_util.tree_map(_map, params)
+        others = jax.tree_util.tree_map(_map, others)
+        self = self.merge_module(gdef, params, others)
+
+        for _path, module in iter_module_search(self):
+            if hasattr(module, "param_dtype"):
+                if isinstance(module.param_dtype, jnp.dtype) or _is_jnp_scalar_dtype(module.param_dtype):
+                    module.param_dtype = dtype
+
+        self.param_dtype = dtype
+        return self
+
+    def quantize(
+        self: Self,
+        quantization_config: QuantizationConfig | None = None,
+        apply_quantization: bool = True,
+        verbose: bool | None = None,
+        raise_error: bool = True,
+    ) -> Self:
+        """Apply quantization to the module's linear layers.
+
+        Quantizes the model using the specified configuration by replacing
+        Linear layers with their quantized equivalents (module-level).
+
+        Args:
+            quantization_config: Configuration specifying quantization dtype,
+                group_size, and pattern. If None, uses default INT8 quantization.
+            apply_quantization: If True, replaces Linear layers with quantized
+                equivalents (e.g., Linear8bit, LinearNF4). Defaults to True.
+            verbose: If True, logs information during quantization. Defaults
+                to True only on process index 0.
+            raise_error: If True, raises error when apply_quantization is False.
+                Defaults to True.
+
+        Returns:
+            Self: The quantized model instance.
+
+        Raises:
+            ValueError: If apply_quantization is False and raise_error is True.
+
+        Example:
+            >>> from easydel.layers.quantization import QuantizationConfig, QuantizationType
+            >>> # INT8 quantization
+            >>> config = QuantizationConfig(dtype=QuantizationType.INT8)
+            >>> model = model.quantize(quantization_config=config)
+            >>>
+            >>> # NF4 quantization with custom block size
+            >>> config = QuantizationConfig(dtype=QuantizationType.NF4, group_size=64)
+            >>> model = model.quantize(quantization_config=config)
+
+        Note:
+            Module-level quantization (apply_quantization=True) typically provides
+            better performance as it can fuse dequantization with computation.
+        """
+        from easydel.layers import EasyQuantizer, QuantizationConfig, QuantizationType
+
+        if quantization_config is None:
+            quantization_config = QuantizationConfig(dtype=QuantizationType.INT8)
+
+        quantizer = EasyQuantizer(quantization_config=quantization_config)
+
+        if verbose is None:
+            verbose = jax.process_index() == 0
+        if apply_quantization:
+            self = quantizer.apply_quantization(self, verbose=verbose)
+        elif raise_error:
+            raise ValueError(
+                "`apply_quantization` can't be False when quantization is requested; pass `raise_error=False` to skip."
+            )
+        return self
+
+    def to_state(
+        self,
+        state_class: type[EasyDeLState] | None = None,
+        *,
+        trainable_selector: spx.SelectorSugar | None = None,
+    ) -> EasyDeLState:
+        """Convert the module instance into an EasyDeLState object.
+
+        Creates an EasyDeLState that encapsulates the model's parameters and
+        configuration for saving, loading, and training operations. The state
+        includes the model graph definition and parameters.
+
+        Args:
+            state_class: Optional custom state class to use. Must be a subclass
+                of EasyDeLState. If None, uses the default EasyDeLState class.
+            trainable_selector: Selector describing which collections belong in
+                the state's ``graphstate``. Defaults to
+                :attr:`trainable_selector`.
+
+        Returns:
+            EasyDeLState: An EasyDeLState object representing the current model
+                state, with step initialized to 0 and no optimizer state.
+
+        Example:
+            >>> model = LlamaModel(config, dtype, param_dtype, precision, rngs)
+            >>> state = model.to_state()
+            >>> # State can be saved and loaded
+            >>> state.save_state("checkpoint/")
+            >>>
+            >>> # Can also use custom state class
+            >>> state = model.to_state(state_class=MyCustomState)
+        """
+        if state_class is None:
+            from easydel.infra.base_state import EasyDeLState
+
+            state_class = EasyDeLState
+        gstruct, gstate, gother = self.split_module(trainable_selector=trainable_selector)
+        return state_class.create(
+            step=0,
+            graphdef=gstruct,
+            graphstate=gstate,
+            graphother=gother,
+        )
+
+    def to_torch(self, **kwargs):
+        """Convert the EasyDeL module to its HuggingFace PyTorch equivalent.
+
+        Creates a HuggingFace PyTorch model and transfers the parameters from
+        this JAX model to PyTorch format. Requires the corresponding PyTorch
+        model class to be available and registered.
+
+        Args:
+            **kwargs: Additional keyword arguments passed to the parameter
+                transformation function (e.g., device specification).
+
+        Returns:
+            torch.spx.Module: The equivalent HuggingFace PyTorch model with
+                weights loaded from this JAX model.
+
+        Example:
+            >>> model = LlamaModel.from_pretrained("meta-llama/Llama-2-7b")
+            >>> torch_model = model.to_torch()
+            >>> # torch_model is now a HuggingFace LlamaModel in PyTorch
+
+        Note:
+            Requires PyTorch and the corresponding HuggingFace model to be
+            installed. The conversion handles parameter name mapping and
+            tensor transposition automatically.
+        """
+        from easydel.layers.layouts import strip_fused_tp_config
+        from easydel.layers.layouts._runtime import tensor_parallel_size
+        from easydel.utils.parameters_transformation import ModelConverter
+
+        # Fused params are interleaved for config.fused_param_tp; the export
+        # de-interleaves with the mesh-resolved tp. A mismatch (e.g. a tp=4
+        # state handed to a no-mesh CPU process, which resolves tp=1) would
+        # silently scramble every fused projection in the HF artifact.
+        mesh_tp = tensor_parallel_size(self.config)
+        recorded_tp = getattr(self.config, "fused_param_tp", None)
+        if recorded_tp is not None and int(recorded_tp) != mesh_tp:
+            raise RuntimeError(
+                f"to_torch: fused params carry the tp={int(recorded_tp)} interleave "
+                f"(config.fused_param_tp) but the resolved mesh tp is {mesh_tp}; exporting now would "
+                "scramble fused projections in the HF artifact. Re-load the checkpoint with "
+                "from_pretrained under the current mesh (which re-interleaves), or export under a "
+                "mesh whose tensor-parallel size matches."
+            )
+        config_for_export = deepcopy(self.config)
+        strip_fused_tp_config(config_for_export)
+
+        # Build the torch model on a real device by default so non-persistent buffers
+        # (e.g. rope ``inv_freq``) are computed and the returned model is immediately
+        # usable for ``forward``. Creating under ``torch.device("meta")`` leaves those
+        # buffers un-materialized. Callers converting very large models can opt back in
+        # via ``use_meta_torch=True`` (and materialize buffers themselves).
+        kwargs.setdefault("use_meta_torch", False)
+        return ModelConverter.easydel_to_huggingface(
+            module=self,
+            base_huggingface_module=self.get_torch_loader()._model_mapping[type(self.config)],
+            config=config_for_export,
+            dtype=self.param_dtype,
+            reform_param=self._get_reform_param(),
+            **kwargs,
+        )
+
+    def prepare_inputs_for_call(self, **kwargs):
+        """Prepare keyword arguments before passing to the module.
+
+        Hook method that can modify or add arguments before they are passed
+        to the module. The base implementation returns
+        kwargs unchanged; subclasses can override for custom preprocessing.
+
+        Args:
+            **kwargs: The keyword arguments intended for the module call.
+
+        Returns:
+            dict: The prepared keyword arguments, potentially modified.
+
+        Example:
+            >>> # In a subclass:
+            >>> def prepare_inputs_for_call(self, **kwargs):
+            ...     # Add default values
+            ...     kwargs.setdefault('use_cache', True)
+            ...     return kwargs
+        """
+        return kwargs
+
+    def get_static_arguments(self: Self) -> tuple:
+        """Get static arguments required by the module's forward method.
+
+        Returns a tuple of static arguments that don't change across calls
+        and can be potentially cached or handled differently by JIT compilation.
+        Subclasses should override this if they have static arguments.
+
+        Returns:
+            tuple: A tuple containing static arguments. The default
+                implementation returns an empty tuple.
+
+        Example:
+            >>> # In a subclass with static config:
+            >>> def get_static_arguments(self):
+            ...     return (self.config.use_flash_attention,)
+        """
+        return ()
+
+    def get_encoder(self: Self) -> spx.Module | EasyDeLBaseModule:
+        """Return the encoder component of the model.
+
+        Should be overridden by encoder-decoder models to return their
+        encoder component. Useful for tasks that only need the encoder,
+        such as feature extraction or embedding generation.
+
+        Returns:
+            spx.Module | EasyDeLBaseModule: The encoder module.
+
+        Raises:
+            NotImplementedError: If the model does not implement an encoder.
+                Decoder-only models should not override this method.
+
+        Example:
+            >>> # For encoder-decoder models like T5:
+            >>> encoder = model.get_encoder()
+            >>> encoder_outputs = encoder(input_ids)
+        """
+        raise NotImplementedError()
+
+    def get_decoder(self: Self) -> spx.Module | EasyDeLBaseModule:
+        """Return the decoder component of the model.
+
+        Should be overridden by encoder-decoder models to return their
+        decoder component. Useful for tasks that need access to the
+        decoder separately from the encoder.
+
+        Returns:
+            spx.Module | EasyDeLBaseModule: The decoder module.
+
+        Raises:
+            NotImplementedError: If the model does not implement a decoder.
+                Encoder-only models should not override this method.
+
+        Example:
+            >>> # For encoder-decoder models:
+            >>> decoder = model.get_decoder()
+            >>> outputs = decoder(input_ids, encoder_hidden_states=enc_out)
+        """
+        raise NotImplementedError()
+
+    def get_lm_head(self: Self) -> ParallelLinear:
+        """Return the language model head of the model.
+
+        Should be overridden by language models to return their output
+        projection layer that maps hidden states to vocabulary logits.
+
+        Returns:
+            ParallelLinear: The language model head layer.
+
+        Raises:
+            NotImplementedError: If the model does not have a language
+                model head. Base models without LM heads should not
+                override this method.
+
+        Example:
+            >>> lm_head = model.get_lm_head()
+            >>> logits = lm_head(hidden_states)  # Shape: (batch, seq, vocab)
+        """
+        raise NotImplementedError()
+
+    def get_embedding(self: Self) -> spx.Module | Embed:
+        """Return the input embedding layer of the model.
+
+        Should be overridden by models to return their token embedding
+        layer. Useful for weight tying or accessing embeddings directly.
+
+        Returns:
+            spx.Module | Embed: The embedding layer that converts token IDs
+                to dense vectors.
+
+        Raises:
+            NotImplementedError: If the model does not have an embedding
+                layer accessible through this method.
+
+        Example:
+            >>> embedding = model.get_embedding()
+            >>> embeds = embedding(input_ids)  # Shape: (batch, seq, hidden)
+        """
+        raise NotImplementedError()
+
+    def compute_embedding(self: Self, input_ids: Int[Array, "..."] | None, *args, **kwargs) -> Float[Array, "..."]:
+        """Compute input embeddings from token IDs.
+
+        By default, calls the embedding layer returned by get_embedding().
+        Vision-language models can override this hook to incorporate
+        multimodal embeddings or other model-specific preprocessing.
+
+        Args:
+            input_ids: Token IDs to embed, typically with shape
+                (batch_size, sequence_length).
+            *args: Additional positional arguments for subclass implementations.
+            **kwargs: Additional keyword arguments for subclass implementations.
+
+        Returns:
+            Float[Array, "..."]: The embedded representations, typically with
+                shape (batch_size, sequence_length, hidden_size).
+
+        Raises:
+            ValueError: If input_ids is None.
+
+        Example:
+            >>> embeds = model.compute_embedding(input_ids)
+            >>> print(embeds.shape)
+            (2, 128, 4096)  # (batch, seq_len, hidden_size)
+        """
+        if input_ids is None:
+            raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
+        return tp.cast(Array, self.get_embedding()(jnp.asarray(input_ids, dtype="i4")))
+
+    def compute_embedding_with_info(
+        self: Self, input_ids: Int[Array, "..."], *args, **kwargs
+    ) -> tuple[Float[Array, "..."], EmbeddingInfo | None]:
+        """Compute input embeddings and optional auxiliary information.
+
+        The default implementation returns (compute_embedding(...), None).
+        Multimodal models can override this to return extra tensors needed
+        to reproduce the full forward pass when providing inputs_embeds
+        directly (e.g., DeepStack visual features, mRoPE indices).
+
+        Args:
+            input_ids: Token IDs to embed.
+            *args: Additional positional arguments for subclass implementations.
+            **kwargs: Additional keyword arguments for subclass implementations.
+
+        Returns:
+            tuple: A tuple of (embeddings, info) where:
+                - embeddings: The embedded token representations
+                - info: Optional EmbeddingInfo containing auxiliary data,
+                    or None for text-only models
+
+        Example:
+            >>> embeds, info = model.compute_embedding_with_info(input_ids, images=images)
+            >>> # For VLMs, info may contain visual features and position info
+        """
+        return self.compute_embedding(input_ids, *args, **kwargs), None
+
+    @classmethod
+    def sequential_init(cls: type[Self], *, init_device: jax.Device | None = None, **kwargs) -> Self:
+        """Initialize model parameters sequentially with proper sharding.
+
+        Performs lazy initialization followed by sequential parameter
+        initialization with appropriate sharding for distributed training.
+        This is particularly useful for large models that need memory-efficient
+        initialization where creating all parameters at once would exceed
+        available memory.
+
+        The method:
+        1. Creates a lazy (shape-only) version of the model
+        2. Iterates through all modules and initializes their parameters one by one
+        3. Applies proper sharding based on partition rules to each parameter
+
+        Args:
+            init_device: Optional allocation device for offloaded initialization.
+                Initializer RNGs and all parameter placement use this device while
+                the config's training mesh and variable stage/layout metadata stay
+                unchanged for subsequent sharding. Not passed to the constructor.
+                Defaults to normal training-mesh initialization.
+            **kwargs: Arguments passed to lazy_init, including:
+                - config: Model configuration
+                - dtype: Computation dtype
+                - param_dtype: Parameter dtype
+                - precision: JAX precision setting
+                - rngs: Random number generators (defaults to Rngs(44) if not provided)
+
+        Returns:
+            Self: Fully initialized model with properly sharded parameters.
+
+        Example:
+            >>> config = LlamaConfig(hidden_size=4096, num_hidden_layers=32)
+            >>> # This won't OOM even for very large models
+            >>> model = LlamaModel.sequential_init(
+            ...     config=config,
+            ...     dtype=jnp.bfloat16,
+            ...     param_dtype=jnp.bfloat16,
+            ...     precision='high',
+            ...     rngs=spx.Rngs(0)
+            ... )
+
+        Note:
+            This method is slower than regular initialization but allows
+            initializing models that would otherwise not fit in memory.
+        """
+        with _parameter_init_device_scope(init_device), _parameter_init_sharding_context(kwargs.get("config")):
+            return cls._sequential_init(**kwargs)
+
+    @classmethod
+    def _sequential_init(cls: type[Self], **kwargs) -> Self:
+        """Materialize parameters within the caller's initialization placement scope."""
+        from easydel.utils.traversals import iter_module_search
+
+        init_device = _parameter_init_device.get()
+        rng = kwargs.get("rngs")
+        if rng is None:
+            rng = spx.Rngs(44)
+        elif init_device is not None:
+            rng = jax.tree.map(lambda value: jax.device_put(value, init_device), rng)
+        kwargs["rngs"] = rng
+        lazy_model = cls.lazy_init(**kwargs)
+        # # @erfanzar NOTE: variable-aware sharding via the runtime resolver.
+        # The resolver's ``named_sharding_for_variable`` reads each Variable's
+        # metadata (including the per-stage assignment recorded by
+        # ``spx.assign_stage`` during ``lazy_init``), so PP placements are
+        # preserved.  Hand-rolling ``NamedSharding(lazy_model.mesh, spec)``
+        # against a regex-derived PartitionSpec would collapse stages back to
+        # the full mesh.
+        resolver = lazy_model.runtime_sharding_resolver
+        full_mesh = lazy_model.mesh
+        fallback_spec = PartitionSpec()
+
+        def _sharding_for(var, shape):
+            """Resolve physical placement, retaining metadata for later training sharding.
+
+            Args:
+                var: A SpectraX variable carrying sharding metadata, or
+                    ``None`` to indicate an absent parameter.
+                shape: Concrete tensor shape, or ``None`` for replicated.
+
+            Returns:
+                jax.Device | jax.sharding.NamedSharding: Explicit offload device,
+                or resolved named sharding (variable metadata if available,
+                otherwise a replicated or shape-corrected fallback).
+            """
+            if init_device is not None:
+                return init_device
+            if var is not None and hasattr(var, "metadata"):
+                ns = resolver.named_sharding_for_variable(var, shape=shape, mesh=full_mesh)
+                if ns is not None:
+                    return ns
+            if shape is None:
+                return replicated_named_sharding(full_mesh)
+            return spx.get_corrected_named_sharding(shape, fallback_spec, raise_mesh_error=False)
+
+        for path, module in iter_module_search(lazy_model, (spx.Module, ArrayParam)):
+            if not path:
+                continue
+
+            # ``weight``/``bias`` are matched by name, but the name is not
+            # reserved: some layers store a plain flag there (``OPTAttention.bias``
+            # is a bool). Require the parameter protocol -- a ``.value`` -- before
+            # treating the attribute as one, otherwise the shape probe below
+            # raises ``AttributeError`` on an unrelated attribute.
+            def _as_param(owner, name):
+                candidate = getattr(owner, name, None)
+                return candidate if candidate is not None and hasattr(candidate, "value") else None
+
+            weight_var = _as_param(module, "weight")
+            bias_var = _as_param(module, "bias")
+            shardings = {
+                "weight": _sharding_for(
+                    weight_var,
+                    tuple(weight_var.value.shape) if weight_var is not None else None,
+                ),
+                "bias": _sharding_for(
+                    bias_var,
+                    tuple(bias_var.value.shape) if bias_var is not None else None,
+                ),
+                "raw": _sharding_for(None, None),
+            }
+
+            def _init_array_param(param: ArrayParam, key: jax.Array) -> jax.Array:
+                """Initialize an ArrayParam using its stored init metadata."""
+                direct_initializers = {"zeros", "ones"}
+                if param.init_method in direct_initializers:
+                    init_fn = getattr(jax.nn.initializers, param.init_method)
+                else:
+                    init_fn = getattr(
+                        jax.nn.initializers,
+                        param.init_method,
+                        jax.nn.initializers.normal,
+                    )(**(param.init_kwargs or {}))
+                return init_fn(key, param.value.shape, param.value.dtype)
+
+            if hasattr(module, "weight") and hasattr(module, "kernel_init"):
+                arr = module.kernel_init(
+                    key=rng.param,
+                    shape=module.weight.value.shape,
+                    dtype=module.weight.value.dtype,
+                )
+                arr = jax.device_put(arr, shardings["weight"])
+                if isinstance(module.weight, spx.Parameter):
+                    module.weight.value = arr
+                else:
+                    module.weight = arr
+            # Fallback for ArrayParam weights without kernel_init.
+            elif hasattr(module, "weight") and isinstance(module.weight, ArrayParam):
+                if isinstance(module.weight.value, jax.ShapeDtypeStruct):
+                    arr = _init_array_param(module.weight, rng.param)
+                    arr = jax.device_put(arr, shardings["weight"])
+                    module.weight.value = arr
+
+            if hasattr(module, "bias") and hasattr(module, "bias_init") and module.bias is not None:
+                arr = module.bias_init(
+                    key=rng.param,
+                    shape=module.bias.value.shape,
+                    dtype=module.bias.value.dtype,
+                )
+                arr = jax.device_put(arr, shardings["bias"])
+                module.bias.value = arr
+            # Handle modules (e.g., nn.LayerNorm) that don't store init fns.
+            if hasattr(module, "bias") and module.bias is not None:
+                bias = module.bias
+                if isinstance(bias, spx.Parameter) and isinstance(bias.value, jax.ShapeDtypeStruct):
+                    arr = jax.nn.initializers.zeros(rng.param, bias.value.shape, bias.value.dtype)
+                    arr = jax.device_put(arr, shardings["bias"])
+                    bias.value = arr
+                elif isinstance(bias, ArrayParam) and isinstance(bias.value, jax.ShapeDtypeStruct):
+                    arr = _init_array_param(bias, rng.param)
+                    arr = jax.device_put(arr, shardings["bias"])
+                    bias.value = arr
+
+            if hasattr(module, "weight") and hasattr(module, "embedding_init"):
+                arr = module.embedding_init(
+                    key=rng.param,
+                    shape=module.weight.value.shape,
+                    dtype=module.weight.value.dtype,
+                )
+                arr = jax.device_put(arr, shardings["weight"])
+                module.weight.value = arr
+
+            if hasattr(module, "weight") and hasattr(module, "scale_init"):
+                arr = module.scale_init(
+                    key=rng.param,
+                    shape=module.weight.value.shape,
+                    dtype=module.weight.value.dtype,
+                )
+                arr = jax.device_put(arr, shardings["weight"])
+                module.weight.value = arr
+            # Handle modules (e.g., nn.LayerNorm) that don't store init fns.
+            elif hasattr(module, "weight") and module.weight is not None:
+                weight = module.weight
+                if isinstance(weight, spx.Parameter) and isinstance(weight.value, jax.ShapeDtypeStruct):
+                    arr = jax.nn.initializers.ones(rng.param, weight.value.shape, weight.value.dtype)
+                    arr = jax.device_put(arr, shardings["weight"])
+                    weight.value = arr
+                elif isinstance(weight, ArrayParam) and isinstance(weight.value, jax.ShapeDtypeStruct):
+                    arr = _init_array_param(weight, rng.param)
+                    arr = jax.device_put(arr, shardings["weight"])
+                    weight.value = arr
+
+            # General fallback: initialize any ArrayParam attributes that are
+            # still ShapeDtypeStruct (e.g. A_log, D, dt_bias in Mamba layers).
+            for attr_name in dir(module):
+                if attr_name.startswith("_"):
+                    continue
+                try:
+                    attr = getattr(module, attr_name)
+                except Exception:
+                    continue
+                if isinstance(attr, ArrayParam) and isinstance(attr.value, jax.ShapeDtypeStruct):
+                    arr = _init_array_param(attr, rng.param)
+                    attr.value = jax.device_put(arr, _sharding_for(attr, tuple(attr.value.shape)))
+
+            if hasattr(module, "rngs"):
+                module.rngs = rng.fork(1)[0]
+            if hasattr(module, "resure"):
+                _raw_sharding = shardings["raw"]
+                module.resure(rng.param, shard_fn=lambda x, _s=_raw_sharding: jax.device_put(x, _s))
+        parameter_collections = {"parameters", "lora"} if lazy_model.lora_is_enabled else {"parameters"}
+        for path, module in spx.iter_variables(lazy_model):
+            if module.kind not in parameter_collections:
+                continue
+            if path and type(module.value) is jax.ShapeDtypeStruct:
+                if isinstance(module, ArrayParam):
+                    # ArrayParam stores init info in its own attributes.
+                    direct_initializers = {"zeros", "ones"}
+                    if module.init_method in direct_initializers:
+                        init_fn = getattr(jax.nn.initializers, module.init_method)
+                    else:
+                        init_fn = getattr(
+                            jax.nn.initializers,
+                            module.init_method,
+                            jax.nn.initializers.normal,
+                        )(**(module.init_kwargs or {}))
+                    arr = init_fn(rng.param, module.value.shape, module.value.dtype)
+                    module.value = jax.device_put(arr, _sharding_for(module, tuple(module.value.shape)))
+                else:
+                    logger.warning(
+                        f"({type(module).__name__}) found empty array at " + ("/".join([str(s) for s in path]))
+                    )
+
+        return lazy_model
+
+    @classmethod
+    def lazy_init(cls: type[Self], **kwargs) -> Self:
+        """Perform lazy initialization using jax.eval_shape.
+
+        Initializes the module structure and determines parameter shapes
+        without actually allocating memory for the parameters. This is
+        useful for inspecting model structure, preparing sharding specs,
+        or initializing very large models incrementally.
+
+        Args:
+            **kwargs: Keyword arguments passed to the class constructor,
+                including config, dtype, param_dtype, precision, and rngs.
+
+        Returns:
+            Self: A module instance with initialized structure but abstract
+                parameters (jax.ShapeDtypeStruct instead of actual arrays).
+
+        Example:
+            >>> config = LlamaConfig(hidden_size=4096, num_hidden_layers=32)
+            >>> lazy_model = LlamaModel.lazy_init(
+            ...     config=config,
+            ...     dtype=jnp.bfloat16,
+            ...     param_dtype=jnp.bfloat16,
+            ...     precision='high',
+            ...     rngs=spx.Rngs(0)
+            ... )
+            >>> # Inspect shapes without allocating memory
+            >>> print(lazy_model.graphtree_parameters_shape)
+
+        Note:
+            The returned model cannot be used for computation directly.
+            Use sequential_init() or regular __init__ for usable models.
+        """
+        rngs = kwargs.pop("rngs", None)
+
+        def _init(rngs):
+            """Construct the module with bound kwargs and the supplied ``rngs``.
+
+            Args:
+                rngs: SpectraX random-number-generator container.
+
+            Returns:
+                cls: A freshly constructed module instance.
+            """
+            return cls(**kwargs, rngs=rngs)
+
+        return jax.eval_shape(_init, rngs=rngs)
+
+    def merge_lora_parameters(self: Self, pytree: dict) -> Self:
+        """Merge LoRA parameters from a pytree into the base model.
+
+        Combines LoRA low-rank adaptation matrices with the base model's
+        weights. The LoRA update is computed as: W_new = W + A @ B * scaling
+
+        Args:
+            pytree: A dictionary (pytree) containing the LoRA parameters
+                (A and B matrices) structured similarly to the base model's
+                parameters.
+
+        Returns:
+            Self: The module instance with LoRA parameters merged into
+                the base weights.
+
+        Example:
+            >>> # After training LoRA adapters
+            >>> lora_params = load_lora_params("lora_checkpoint/")
+            >>> model = model.merge_lora_parameters(lora_params)
+            >>> # Model now has LoRA weights baked into base weights
+
+        See Also:
+            split_lora_parameters: Inverse operation to extract LoRA params.
+            apply_lora_to_layers: Apply LoRA to specific layers.
+        """
+        from easydel.infra.utils import merge_lora_parameters
+
+        self = merge_lora_parameters(self, pytree)
+        return self
+
+    def split_lora_parameters(self: Self) -> tp.Any:
+        """Split merged LoRA parameters back out from the base model.
+
+        Extracts LoRA adaptation matrices that were previously merged using
+        merge_lora_parameters() or a similar process. Restores the base model
+        weights to their original pre-merge state.
+
+        Returns:
+            dict: A pytree containing the extracted LoRA parameters
+                (A and B matrices) that can be saved or reapplied later.
+
+        Example:
+            >>> # Extract LoRA params for saving
+            >>> lora_params = model.split_lora_parameters()
+            >>> save_lora_params(lora_params, "lora_checkpoint/")
+            >>> # Base model weights are restored
+
+        See Also:
+            merge_lora_parameters: Inverse operation to merge LoRA params.
+        """
+        from easydel.infra.utils import split_lora_parameters
+
+        pytree = split_lora_parameters(self)
+        return pytree
+
+    @property
+    def lora_is_enabled(self: Self):
+        """Check if LoRA (Low-Rank Adaptation) is enabled for this module.
+
+        Iterates through the module's graph to detect any LoRAParam instances,
+        indicating that LoRA adaptation has been applied.
+
+        Returns:
+            bool: True if any LoRA parameters are found in the module,
+                False otherwise.
+
+        Example:
+            >>> model = LlamaModel(config, dtype, param_dtype, precision, rngs)
+            >>> print(model.lora_is_enabled)
+            False
+            >>> model = model.apply_lora_to_layers(lora_rank=8)
+            >>> print(model.lora_is_enabled)
+            True
+        """
+        for _, tensor in spx.iter_variables(self):
+            if isinstance(tensor, nn.LoraParameter):
+                return True
+        return False
+
+    @property
+    def is_quantized(self) -> bool:
+        """Check if the model contains any quantized layers or parameters.
+
+        Iterates through the model graph to detect quantized components,
+        including 8-bit linear layers, NF4 linear layers, and quantized
+        arrays (Array8B, ArrayNF4, Array1B).
+
+        Returns:
+            bool: True if the model contains any quantized components,
+                False otherwise.
+
+        Example:
+            >>> model = LlamaModel(config, dtype, param_dtype, precision, rngs)
+            >>> print(model.is_quantized)
+            False
+            >>> model = model.quantize()
+            >>> print(model.is_quantized)
+            True
+        """
+        from eformer.ops.quantization import Array1B, Array8B, ArrayNF4
+
+        from easydel.layers import (
+            ColumnParallelLinearQuantized,
+            ParallelLinearQuantized,
+            RowParallelLinearQuantized,
+        )
+
+        # Check 1: any child module is a quantized layer type.
+        # This works for lazy models where variables hold ShapeDtypeStruct.
+        for _, module in spx.iter_modules(self):
+            if isinstance(
+                module,
+                (
+                    RowParallelLinearQuantized,
+                    ColumnParallelLinearQuantized,
+                    ParallelLinearQuantized,
+                ),
+            ):
+                return True
+
+        # Check 2: any variable value is a quantized array type.
+        # This works for fully-materialized models.
+        for _, var in spx.iter_variables(self):
+            val = getattr(var, "value", getattr(var, "raw_value", var))
+            if isinstance(val, (Array8B, ArrayNF4, Array1B)):
+                return True
+            if getattr(val, "dtype", None) in [
+                jnp.float8_e4m3,
+                jnp.float8_e5m2,
+                jnp.float4_e2m1fn,
+            ]:
+                return True
+        return False
+
+    def wire_distributed_matmul(self: Self) -> Self:
+        """Install collective-matmul engines on all ParallelLinear children.
+
+        Reads ``config.collective_matmul_impl`` and sets each child layer's
+        ``distributed_matmul`` injectable accordingly (``"none"`` clears it,
+        restoring the plain-einsum/GSPMD path).  Call after construction or
+        after changing the config field; wiring before compilation ensures a
+        single jit cache entry.
+
+        Returns:
+            The module itself (wiring mutates layer attributes in place).
+        """
+        from easydel.layers.linears import ColumnParallelLinear, RowParallelLinear
+        from easydel.layers.linears._distributed_matmul import make_distributed_matmul
+
+        impl = self.config.collective_matmul_impl
+        for _, module in spx.iter_modules(self):
+            if isinstance(module, (RowParallelLinear, ColumnParallelLinear)):
+                module.distributed_matmul = make_distributed_matmul(
+                    module._direction,
+                    impl,
+                    precision=module.precision,
+                    config=self.config,
+                    weight_layout=module.sharding_layout,
+                )
+        return self
+
+    def apply_lora_to_layers(
+        self: Self,
+        lora_rank: int,
+        lora_pattern: str | None = None,
+        verbose: bool = False,
+        rngs: spx.Rngs | None = None,
+    ) -> Self:
+        """Apply Low-Rank Adaptation (LoRA) to specified linear layers.
+
+        Replaces matching Linear layers with LoRA-enabled equivalents that
+        have low-rank A and B matrices for efficient fine-tuning.
+
+        Args:
+            lora_rank: The rank of the LoRA decomposition. Lower ranks use
+                less memory but have less capacity. Common values: 4, 8, 16, 32.
+            lora_pattern: Regular expression to match the names of Linear
+                layers to apply LoRA to. If None, applies to common attention
+                and MLP layers. Defaults to None.
+            verbose: If True, prints information about which layers are being
+                modified. Defaults to False.
+            rngs: JAX random number generators for initializing LoRA matrices.
+                If None, uses default RNGs. Defaults to None.
+
+        Returns:
+            Self: The module instance with LoRA layers applied.
+
+        Example:
+            >>> # Apply LoRA to attention layers only
+            >>> model = model.apply_lora_to_layers(
+            ...     lora_rank=8,
+            ...     lora_pattern=r".*attention.*(q_proj|v_proj).*",
+            ...     verbose=True
+            ... )
+            >>>
+            >>> # Apply LoRA to all linear layers
+            >>> model = model.apply_lora_to_layers(lora_rank=16)
+
+        See Also:
+            unwrap_lora_to_layers: Remove LoRA and restore original layers.
+            merge_lora_parameters: Merge LoRA weights into base weights.
+        """
+        from easydel.infra.utils import apply_lora_to_layers
+
+        self = apply_lora_to_layers(
+            self,
+            lora_pattern=lora_pattern,
+            lora_rank=lora_rank,
+            rngs=rngs,
+            verbose=verbose,
+        )
+        return self
+
+    def unwrap_lora_to_layers(self: Self, verbose: bool = False) -> Self:
+        """Revert LoRA layers to their original linear layers.
+
+        Replaces LoraLinear layers with their original spectrax.nn.Linear
+        counterparts, discarding the LoRA A and B matrices. The base
+        weights are preserved.
+
+        Args:
+            verbose: If True, prints information about which layers are being
+                reverted. Defaults to False.
+
+        Returns:
+            Self: The module instance with LoRA layers removed and original
+                Linear layers restored.
+
+        Example:
+            >>> model = model.apply_lora_to_layers(lora_rank=8)
+            >>> # ... training ...
+            >>> model = model.unwrap_lora_to_layers(verbose=True)
+            >>> # Model now has regular Linear layers
+
+        See Also:
+            apply_lora_to_layers: Apply LoRA to layers.
+        """
+        from easydel.infra.utils import unwrap_lora_to_layers
+
+        self = unwrap_lora_to_layers(self, verbose=verbose)
+        return self
+
+    def _get_reform_param(self) -> dict[str, tp.Any]:
+        """Collect reform_param configurations from submodules.
+
+        Traverses the module tree to collect reform_param configurations
+        used for parameter transformation during model conversion.
+
+        Returns:
+            dict[str, Any]: A dictionary mapping fully qualified parameter
+                paths to their reform configuration dictionaries.
+
+        Note:
+            This is an internal method used during model conversion.
+        """
+        from easydel.utils import traversals
+        from easydel.utils.parameters_transformation import StateDictConverter
+
+        reform_param = {}
+        for path, module in traversals.iter_module_search(self, spx.Module):
+            module_reform_param = getattr(module, "reform_param", None)
+            if module_reform_param:
+                if not isinstance(module_reform_param, Mapping):
+                    path_str = ".".join(map(str, path)) or module.__class__.__name__
+                    raise TypeError(
+                        f"{path_str}.reform_param must be a mapping of reform rules, "
+                        f"got {type(module_reform_param).__name__}"
+                    )
+                path_str = ".".join(map(str, path))
+                for key, value in module_reform_param.items():
+                    full_key = f"{path_str}.{key}" if path_str else key
+                    new_value = value.copy()
+                    if "splits" in value:
+                        new_splits = []
+                        for split in value["splits"]:
+                            new_split = split.copy()
+                            split_name = split["name"]
+                            new_split["name"] = f"{path_str}.{split_name}" if path_str else split_name
+                            new_splits.append(new_split)
+                        new_value["splits"] = new_splits
+                    if "sources" in value:
+                        new_value["sources"] = tuple(
+                            f"{path_str}.{source}" if path_str else source for source in value["sources"]
+                        )
+
+                    reform_param[full_key] = new_value
+        StateDictConverter.validate_reform_param_schema(reform_param)
+        return reform_param
+
+    def _get_checkpoint_key_normalizer(self) -> tp.Callable[[str], str | None] | None:
+        """Return the model's declared checkpoint-key rules, if any.
+
+        Most families publish weights in transformers naming, so the loader's own rules are enough. Families that
+        publish a vendor layout (DeepSeek-V4 ``layers.N.attn.wq_a``, GLM-5-Next's composite VLM, Kimi-Linear's
+        ``block_sparse_moe``) declare ``checkpoint_key_rules``: a :class:`~easydel.utils.checkpoint_keys.KeyRuleSet`
+        mapping one raw key to its EasyDeL parameter name, or ``None`` when the runtime does not own the tensor.
+
+        Declared on the class rather than resolved by ``model_type`` so the loader stays free of per-family branches.
+
+        Returns:
+            The declared rule set (callable on one key), or ``None`` to leave key naming alone.
+        """
+        return getattr(type(self), "checkpoint_key_rules", None)
+
+    def _get_hf_flattened_wrappers(self) -> dict[str, str]:
+        """Collect ``_hf_flattened_wrapper`` declarations from the module tree.
+
+        transformers >= 5.13 flattened the inner wrapper module out of
+        standalone tower classes (CLIP/SigLIP vision and text models), so
+        live HF state dicts emit keys without the wrapper prefix while real
+        hub checkpoints keep the old prefixed layout. EasyDeL module trees
+        mirror the old layout; modules that wrap such an HF class declare the
+        dropped wrapper name via the ``_hf_flattened_wrapper`` class
+        attribute. This walks the tree so declarations compose automatically
+        when a tower is embedded in a larger model (e.g. a CLIP tower at
+        ``model.vision_tower`` inside LLaVA).
+
+        Returns:
+            dict[str, str]: Mapping of dotted subtree path (``""`` for the
+                root module) to the wrapper submodule name to re-insert into
+                flattened HF keys during conversion.
+        """
+        from easydel.utils import traversals
+
+        flattened_wrappers: dict[str, str] = {}
+        for path, module in traversals.iter_module_search(self, spx.Module):
+            wrapper = getattr(module, "_hf_flattened_wrapper", None)
+            if wrapper:
+                flattened_wrappers[".".join(map(str, path))] = str(wrapper)
+        return flattened_wrappers
+
+    @property
+    def fused_params(self) -> dict[str, tuple[int, ...]]:
+        """Dynamic registry of fused (TP-interleaved) parameters.
+
+        The fused analogue of :meth:`_get_reform_param`: maps each fused
+        module's dotted path (owning ``<path>.weight`` and, when present,
+        ``<path>.bias``) to the logical segment sizes packed on its last
+        axis — e.g. ``(q, k, v)`` for ``qkv_proj`` or ``(gate, up)`` for
+        ``gate_up_proj``. Discovered dynamically from the live module tree;
+        models may override to extend or correct the mapping. Consumed by
+        the checkpoint layout machinery (save/load re-interleaving) in
+        :mod:`easydel.layers.layouts`.
+        """
+        from easydel.layers.layouts import fused_layout_param_specs
+
+        return dict(fused_layout_param_specs(self))
+
+    def _build_transform_fn(self, shard_fns=None):
+        """Build a HuggingFace-to-EasyDeL transformation function.
+
+        Args:
+            shard_fns: Optional sharding functions. If None, no sharding is applied.
+
+        Returns:
+            Callable: A partial function (StateDictConverter.huggingface_to_easydel).
+        """
+        from easydel.layers import BaseMoeModule, Embed, ParallelMoELinear
+        from easydel.utils import traversals
+        from easydel.utils.parameters_transformation import StateDictConverter
+
+        embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.Embed)]
+        embedding_path.extend([".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, Embed)])
+        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, LayerNorm)]
+        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, ParallelMoELinear)]
+        moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]
+
+        kwargs = dict(
+            embedding_layer_names=embedding_path,
+            layernorm_names=layernorm_path,
+            moe_names=list(set([names.split(".")[-1] for names in moe_path])),
+            moe_block_names=list(set([names.split(".")[-1] for names in moe_block_path])),
+            moe_block_path=moe_block_path,
+            moe_path=moe_path,
+            dtype=self.param_dtype,
+            reform_param=self._get_reform_param(),
+            hf_flattened_wrappers=self._get_hf_flattened_wrappers(),
+            checkpoint_key_normalizer=self._get_checkpoint_key_normalizer(),
+            hf_model_type=getattr(self.config, "model_type", None),
+            fp32_param_patterns=tuple(self.fp32_param_patterns),
+        )
+        if shard_fns is not None:
+            kwargs["shard_fns"] = shard_fns
+        return partial(StateDictConverter.huggingface_to_easydel, **kwargs)
+
+    @property
+    def transform_fn(self):
+        """Create a transformation function for HuggingFace to EasyDeL conversion.
+
+        Identifies special layers (embeddings, LayerNorm, MoE) and returns a
+        configured transformation function with sharding rules applied.
+
+        Returns:
+            Callable: A partial function (StateDictConverter.huggingface_to_easydel)
+                configured with layer information, dtype, and sharding functions.
+
+        Example:
+            >>> transform_fn = model.transform_fn
+            >>> easydel_params = transform_fn(hf_state_dict)
+        """
+        return self._build_transform_fn(shard_fns=self._shard_fns)
+
+    @property
+    def _generate_compatible_graphdef(self: Self):
+        """Create a graph definition compatible with generation tasks.
+
+        Generation often requires specific configurations (like disabling
+        gradient checkpointing). This method creates a temporary generation-
+        compatible configuration, performs lazy initialization, and extracts
+        the resulting graph definition.
+
+        Returns:
+            spx.GraphDef: A graph definition suitable for use during generation,
+                with gradient checkpointing disabled.
+        """
+
+        adjusted_config = deepcopy(self.config)
+        adjusted_config.gradient_checkpointing = EasyDeLGradientCheckPointers.NONE
+        dummy = type(self).lazy_init(
+            config=adjusted_config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+            rngs=self.rngs,
+        )
+        gdef, _ = spx.export(dummy)
+        return gdef
+
+    @property
+    def _generate_compatible_graphother(self: Self):
+        """Create non-parameter state compatible with generation tasks.
+
+        Similar to _generate_compatible_graphdef, creates a temporary
+        generation-compatible configuration, lazy-initializes, and extracts
+        the non-parameter state variables with concrete values.
+
+        Returns:
+            spx.State: A graph state containing non-parameter variables
+                suitable for generation, with meta-placeholders replaced by
+                concrete values.
+        """
+
+        adjusted_config = deepcopy(self.config)
+        adjusted_config.gradient_checkpointing = EasyDeLGradientCheckPointers.NONE
+        dummy = type(self).lazy_init(
+            config=adjusted_config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+            rngs=self.rngs,
+        )
+        _, state = spx.export(dummy)
+        _graphstate, gother = self._partition_trainable_state(state)
+        gother = traversals.recreate_meta_values(gother)
+        return gother
+
+    def merge_parameters(
+        self: Self,
+        tree: spx.State,
+        *,
+        selector: spx.SelectorSugar | None = None,
+    ) -> Self:
+        """Merge a selected trainable state tree back into the module.
+
+        Args:
+            tree: New trainable state tree (typically produced by
+                :meth:`split_parameters`) to install on this module.
+            selector: Optional override for the trainable selector; defaults
+                to :attr:`trainable_selector`.
+
+        Returns:
+            Self: A new module instance with ``tree`` in place of the
+            previous trainable state and the existing non-trainable state
+            preserved.
+        """
+        gdef, _graphstate, gother = self.split_module(trainable_selector=selector)
+        self = self.merge_module(gdef, tree, gother)
+        return self
+
+    def split_parameters(self, selector: spx.SelectorSugar | None = None) -> spx.State:
+        """Return the selected trainable state as an :class:`spx.State`.
+
+        Args:
+            selector: Optional override for the trainable selector; defaults
+                to :attr:`trainable_selector`.
+
+        Returns:
+            spx.State: Just the trainable subtree (``graphstate``) of the
+            full module state.
+        """
+        _, state = spx.export(self)
+        graphstate, _graphother = self._partition_trainable_state(state, trainable_selector=selector)
+        return graphstate
+
+    def merge_parameter_values(
+        self: Self,
+        parameter_values: dict,
+        *,
+        selector: spx.SelectorSugar | None = None,
+    ) -> Self:
+        """Merge a flat or nested ``path -> value`` mapping into the selected state.
+
+        Args:
+            parameter_values: Mapping of parameter paths (flat tuples or
+                nested dicts) to replacement values. Collection-qualified paths
+                are accepted, as are unambiguous collection-free paths and the
+                dotted names returned by :meth:`parameter_values`.
+            selector: Optional override for the trainable selector.
+
+        Returns:
+            Self: A new module instance with the matching trainable leaves
+            replaced by ``parameter_values``.
+
+        Raises:
+            KeyError: If ``parameter_values`` contains a key not present in
+                the current selected state.
+        """
+        # Exported State leaves are raw values, not boxed Variables. Detach the
+        # structure so replacements (or a later invalid key) cannot mutate self.
+        current_state = self.split_parameters(selector).copy()
+        current_values = flatten_dict(current_state.raw())
+        path_aliases: dict[tuple, list[tuple]] = {}
+        for key in current_values:
+            # Also accept legacy collection-free paths and the dotted names
+            # returned by parameter_values(). Never guess across collections.
+            for alias in {key[1:], (".".join(str(part) for part in key[1:]),)}:
+                path_aliases.setdefault(alias, []).append(key)
+        if not is_flatten(parameter_values):
+            parameter_values = flatten_dict(parameter_values)
+        for key, value in parameter_values.items():
+            if key not in current_values:
+                matches = path_aliases.get(key, ())
+                if len(matches) != 1:
+                    reason = "ambiguous across collections" if matches else "not found"
+                    raise KeyError(f"Parameter key {key} {reason} in the current model state.")
+                key = matches[0]
+            current_state.set(key[0], key[1:], value)
+        return self.merge_parameters(current_state, selector=selector)
+
+    def flops_per_token(
+        self,
+        sequence_length: int | None = None,
+        include_loss: bool = True,
+        include_backward: bool = False,
+    ) -> float:
+        """Calculate the FLOPs (Floating Point Operations) per token.
+
+        Estimates the computational cost of processing one token through
+        the model, useful for performance benchmarking and cost estimation.
+
+        Args:
+            sequence_length: Sequence length to use for the calculation.
+                If None, uses granted_mask_max_position_embedding from config.
+            include_loss: Whether to include loss computation in the count.
+                Defaults to True.
+            include_backward: Whether to include backward pass FLOPs.
+                If True, multiplies forward FLOPs by 3 (typical ratio).
+                Defaults to False.
+
+        Returns:
+            float: The estimated FLOPs per token. Returns 1 if calculation fails.
+
+        Example:
+            >>> flops = model.flops_per_token(sequence_length=2048)
+            >>> print(f"FLOPs per token: {flops:.2e}")
+            FLOPs per token: 1.23e+12
+            >>>
+            >>> # Include backward pass for training cost
+            >>> train_flops = model.flops_per_token(include_backward=True)
+
+        Note:
+            This is an estimate based on standard transformer operations.
+            Actual FLOPs may vary depending on implementation details.
+        """
+        from .utils import ActivationType, FlopCalcConfig, flops_per_token
+
+        def _config_value(source, *names, default=0):
+            for name in names:
+                value = getattr(source, name, None)
+                if value is not None:
+                    return value
+            return default
+
+        def _as_int(value, default=0):
+            if value is None:
+                return default
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _activation_value(source, default=ActivationType.SILU):
+            value = _config_value(source, "hidden_act", "activation_function", "activation", default=default)
+            try:
+                return ActivationType(value)
+            except (TypeError, ValueError):
+                return value
+
+        def _count_moe_layers(source, num_layers, num_experts):
+            if num_experts <= 1 or num_layers <= 0:
+                return 0
+
+            explicit_num_moe_layers = _config_value(source, "num_moe_layers", "moe_num_layers", default=None)
+            if explicit_num_moe_layers is not None:
+                return max(0, min(_as_int(explicit_num_moe_layers), num_layers))
+
+            # Dedicated per-layer MoE schedule. ``mlp_layer_types`` carries the
+            # MoE (dense/sparse/moe) schedule for families such as hy_v3,
+            # minimax_m3_vl and deepseek_v4. It is intentionally distinct from
+            # ``layer_types``, which those same configs use for the *attention*
+            # schedule (full/sliding/linear/sparse-attention). Reading
+            # ``layer_types`` here undercounts MoE layers (e.g. minimax_m3_vl
+            # reports attention markers only) so it must not be the primary
+            # source.
+            mlp_layer_types = getattr(source, "mlp_layer_types", None)
+            if mlp_layer_types is not None:
+                mlp_layer_types = list(mlp_layer_types)[:num_layers]
+                return sum(
+                    1
+                    for layer_type in mlp_layer_types
+                    if "moe" in str(layer_type).lower() or "sparse" in str(layer_type).lower()
+                )
+
+            # Qwen-style schedule: every layer is MoE except those listed in
+            # ``mlp_only_layers``, gated by ``decoder_sparse_step``
+            # (``(layer_idx + 1) % decoder_sparse_step == 0``).
+            mlp_only_layers = getattr(source, "mlp_only_layers", None)
+            if isinstance(mlp_only_layers, (list, tuple, set)):
+                sparse_step = max(1, _as_int(_config_value(source, "decoder_sparse_step", default=1), 1))
+                dense_only = {layer_idx for layer_idx in mlp_only_layers if 0 <= layer_idx < num_layers}
+                return sum(
+                    1
+                    for layer_idx in range(num_layers)
+                    if layer_idx not in dense_only and (layer_idx + 1) % sparse_step == 0
+                )
+
+            # Legacy fallback: an explicit ``moe`` marker inside the
+            # attention/layer schedule. Only ``moe`` is matched here (never
+            # ``sparse``) because ``sparse`` in ``layer_types`` denotes
+            # sparse-*attention* layers, not MoE FFN layers.
+            layer_types = getattr(source, "layer_types", None)
+            if layer_types is not None:
+                moe_marked = sum(1 for layer_type in list(layer_types)[:num_layers] if "moe" in str(layer_type).lower())
+                if moe_marked:
+                    return moe_marked
+
+            # DeepSeek / Mistral-style schedule (and the default when no
+            # schedule is declared): the first ``first_k_dense_replace`` layers
+            # are dense and the rest follow a ``moe_layer_freq`` cadence. With
+            # the defaults (``0`` dense, freq ``1``) every layer is MoE.
+            first_dense_layer_count = _as_int(
+                _config_value(source, "first_k_dense_replace", "first_k_dense_layers", default=0)
+            )
+            moe_layer_freq = max(
+                1, _as_int(_config_value(source, "moe_layer_freq", "decoder_sparse_step", default=1), 1)
+            )
+            return sum(1 for layer_idx in range(first_dense_layer_count, num_layers) if layer_idx % moe_layer_freq == 0)
+
+        try:
+            config = self.config
+            text_config = getattr(config, "text_config", config)
+            vision_config = getattr(config, "vision_config", config)
+            if sequence_length is None:
+                sequence_length = _config_value(
+                    text_config,
+                    "granted_mask_max_position_embedding",
+                    "max_position_embeddings",
+                    "n_positions",
+                    "seq_length",
+                    default=2048,
+                )
+
+            num_heads = _config_value(text_config, "num_attention_heads", "n_head", "num_heads")
+            num_heads = _as_int(num_heads)
+            hidden_dim = _config_value(text_config, "hidden_size", "n_embd", "d_model")
+            hidden_dim = _as_int(hidden_dim)
+            intermediate_dim = _as_int(
+                _config_value(text_config, "intermediate_size", "ffn_dim", "n_inner", default=hidden_dim * 4)
+            )
+            num_layers = _as_int(_config_value(text_config, "num_hidden_layers", "n_layer", "num_layers", "depth"))
+            num_experts = _as_int(
+                _config_value(
+                    text_config, "num_local_experts", "num_experts", "n_routed_experts", "n_experts", default=1
+                ),
+                1,
+            )
+            num_shared_experts = _as_int(_config_value(text_config, "num_shared_experts", "n_shared_experts", default=0))
+            num_experts_per_tok = _as_int(
+                _config_value(
+                    text_config, "num_experts_per_tok", "num_experts_per_token", "moe_top_k", "top_k", default=1
+                ),
+                1,
+            )
+            moe_intermediate_dim = _config_value(
+                text_config,
+                "moe_intermediate_size",
+                "moe_ffn_dim",
+                "expert_intermediate_size",
+                default=None,
+            )
+            if moe_intermediate_dim is not None:
+                moe_intermediate_dim = _as_int(moe_intermediate_dim)
+            shared_expert_intermediate_dim = _as_int(
+                _config_value(
+                    text_config,
+                    "shared_expert_intermediate_size",
+                    "moe_shared_expert_intermediate_size",
+                    "shared_intermediate_size",
+                    default=0,
+                )
+            )
+            # Families such as deepseek_v3, hy_v3 and mistral4 build their shared
+            # expert(s) at the routed-expert width (``moe_intermediate_size``)
+            # and expose no explicit shared-expert-width field. Without this
+            # fallback ``flop_moe_mlp`` sizes the shared expert at
+            # ``intermediate_dim`` (the much larger dense FFN width) and
+            # overcounts the shared-expert contribution.
+            if shared_expert_intermediate_dim <= 0 and num_shared_experts > 0 and moe_intermediate_dim:
+                shared_expert_intermediate_dim = moe_intermediate_dim
+            layer_types = getattr(text_config, "layer_types", None)
+            fconf = FlopCalcConfig(
+                hidden_dim=hidden_dim,
+                intermediate_dim=intermediate_dim,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                activation_type=_activation_value(text_config),
+                head_dim=_as_int(
+                    _config_value(text_config, "head_dim", default=hidden_dim // num_heads if num_heads else 0)
+                ),
+                kv_heads=_as_int(
+                    _config_value(text_config, "num_key_value_heads", "num_kv_heads", default=num_heads), num_heads
+                ),
+                seq_len=sequence_length,
+                task=self._model_task,
+                vocab_size=_as_int(
+                    _config_value(text_config, "vocab_size", default=_config_value(config, "vocab_size", default=0))
+                ),
+                include_loss=include_loss,
+                num_labels=_as_int(_config_value(text_config, "num_labels", default=0)),
+                num_experts=num_experts,
+                num_shared_experts=num_shared_experts,
+                num_experts_per_tok=num_experts_per_tok,
+                moe_intermediate_dim=moe_intermediate_dim,
+                shared_expert_intermediate_dim=shared_expert_intermediate_dim,
+                num_moe_layers=_count_moe_layers(text_config, num_layers, num_experts),
+                layer_types=layer_types,
+                sliding_window=_config_value(text_config, "sliding_window", "window_size", default=None),
+                glu=getattr(text_config, "glu_mlp", True),
+                vision_hidden_dim=_as_int(_config_value(vision_config, "hidden_size", "d_model", default=0)),
+                vision_intermediate_dim=_as_int(
+                    _config_value(vision_config, "intermediate_size", "mlp_dim", "ffn_dim", default=0)
+                ),
+                vision_num_heads=_as_int(_config_value(vision_config, "num_attention_heads", "num_heads", default=0)),
+                vision_num_layers=_as_int(
+                    _config_value(vision_config, "num_hidden_layers", "num_layers", "depth", default=0)
+                ),
+                vision_seq_len=_config_value(
+                    vision_config,
+                    "max_position_embeddings",
+                    "num_position_embeddings",
+                    "seq_length",
+                    default=0,
+                ),
+                vision_head_dim=_config_value(vision_config, "head_dim", default=None),
+                vision_activation_type=_activation_value(vision_config, ActivationType.GELU),
+            )
+
+            flops = flops_per_token(fconf)
+            if include_backward:
+                flops *= 3
+        except Exception as exc:
+            logger.warning_once(f"Calculating Flops Failed! {type(exc).__name__}: {exc}")
+            flops = 1
+        return flops
+
+    def _flop(self, *args, **kwargs) -> float | None:
+        """Estimate FLOPs for a single forward pass using JAX's make_jaxpr.
+
+        Uses JAX's computation graph analysis to estimate the floating point
+        operations required for one forward pass with the given arguments.
+
+        Args:
+            *args: Positional arguments to pass to the module.
+            **kwargs: Keyword arguments to pass to the module.
+
+        Returns:
+            float | None: The estimated FLOP count, or None if calculation fails.
+
+        Note:
+            This provides a more accurate estimate than flops_per_token() but
+            requires actually tracing the computation graph.
+        """
+        from .utils import count_flop_jaxpr
+
+        return count_flop_jaxpr(jax.make_jaxpr(self.forward)(*args, **kwargs))
+
+    @property
+    def pure_transform_fn(self: Self):
+        """Get a pure transformation function without sharding.
+
+        Similar to transform_fn, but does not include sharding functions.
+        Returns a partial function configured only with layer names and dtype.
+
+        Returns:
+            Callable: A partial function (StateDictConverter.huggingface_to_easydel)
+                for converting PyTorch state dicts without applying sharding.
+
+        Example:
+            >>> transform_fn = model.pure_transform_fn
+            >>> # Convert without sharding
+            >>> easydel_params = transform_fn(hf_state_dict, shard_fns=None)
+        """
+        return self._build_transform_fn(shard_fns=None)
+
+    @property
+    def _default_loss_config(self: Self) -> LossConfig | None:
+        """Get the default LossConfig for this module.
+
+        Subclasses can override this property to return a default LossConfig
+        instance specific to the model's task.
+
+        Returns:
+            LossConfig | None: The default loss configuration, or None.
+        """
+        return None
+
+    def compute_loss(
+        self,
+        *,
+        labels: Array | None = None,
+        loss_config: LossConfig | None = None,
+        loss_kwargs: dict | None = None,
+        **batch,
+    ) -> tuple[tp.Any, LossMetrics]:
+        """Compute the loss for the model given inputs and labels.
+
+        Performs a forward pass using the provided batch arguments, then
+        calculates the loss using the determined loss function. Handles
+        label inference for causal LM and default configurations for
+        sequence classification.
+
+        Args:
+            labels: The target labels. For Causal LM, if None, uses input_ids
+                from the batch. Defaults to None.
+            loss_config: Specific configuration for loss calculation. For
+                sequence classification, defaults to using num_labels from
+                config. Defaults to None.
+            loss_kwargs: Additional keyword arguments to pass directly to
+                the loss function. Defaults to None.
+            **batch: Keyword arguments representing the input batch
+                (e.g., input_ids, attention_mask, pixel_values).
+
+        Returns:
+            tuple: A tuple containing:
+                - outputs: The model's output (dataclass with logits, hidden_states, etc.)
+                - LossMetrics: Object containing the calculated loss and metrics.
+
+        Raises:
+            AssertionError: If labels are required but not provided or inferred.
+            AssertionError: If sequence classification loss is used without
+                num_labels in config.
+
+        Example:
+            >>> outputs, loss_metrics = model.compute_loss(
+            ...     input_ids=input_ids,
+            ...     attention_mask=attention_mask,
+            ...     labels=labels
+            ... )
+            >>> print(f"Loss: {loss_metrics.loss}")
+        """
+        if labels is None and self.loss_function.__name__ == ForCausalLMLoss.__name__:
+            labels = batch.get("input_ids", None)
+
+        if self.loss_function.__name__ == ForSequenceClassificationLoss.__name__:
+            if loss_config is None:
+                if not hasattr(self.config, "num_labels"):
+                    raise ValueError(
+                        "in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach"
+                        " `num_labels` to model `config`"
+                    )
+                loss_config = LossConfig(num_labels=self.config.num_labels)
+
+        if labels is None:
+            raise ValueError("`labels` can not be `None` for computing loss.")
+        loss_kwargs = loss_kwargs or {}
+        batch = fold_sequence_packing_segments(batch)
+        forward_batch = batch
+
+        try:
+            call_signature = inspect.signature(self.forward)
+        except (TypeError, ValueError):
+            call_signature = None
+
+        if call_signature is not None:
+            call_parameters = call_signature.parameters
+            if not any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in call_parameters.values()):
+                accepted_keys = set(call_parameters.keys())
+                forward_batch = {key: value for key, value in batch.items() if key in accepted_keys}
+
+        # Most task heads accept either token IDs or input embeddings, not both simultaneously.
+        if forward_batch.get("input_ids", None) is not None and forward_batch.get("inputs_embeds", None) is not None:
+            forward_batch = dict(forward_batch)
+            forward_batch.pop("inputs_embeds", None)
+
+        forward_plan = self.loss_strategy.plan_forward(
+            module=self,
+            labels=labels,
+            loss_config=loss_config,
+            batch=batch,
+            loss_kwargs=loss_kwargs,
+        )
+        if forward_plan.forward_kwargs:
+            forward_batch = dict(forward_batch)
+            forward_batch.update(forward_plan.forward_kwargs)
+
+        outputs = self(**forward_batch)
+
+        if bool(getattr(loss_config, "mtp_only", False)):
+            mtp_loss = getattr(outputs, "mtp_loss", None)
+            if mtp_loss is None:
+                raise ValueError("loss_config.mtp_only=True requires the model output to expose `mtp_loss`.")
+            aux_loss = getattr(outputs, "aux_loss", None)
+            other_metrics = {"mtp_loss": mtp_loss}
+            if aux_loss is not None:
+                other_metrics["aux_loss"] = aux_loss
+            loss_output = LossMetrics(
+                loss=mtp_loss,
+                z_loss=jnp.zeros_like(mtp_loss),
+                other_metrics=other_metrics,
+            )
+            outputs = outputs.replace(loss=loss_output.loss)
+            return outputs, loss_output
+
+        config_mesh = getattr(self.config, "_hidden_mesh", None) or getattr(self.config, "mesh", None)
+        config_mesh_shape = getattr(config_mesh, "shape", {})
+        axis_names = tuple(getattr(self.config, "sharding_axis_names", ()))
+        axis_dims = tuple(getattr(self.config, "sharding_axis_dims", ()))
+        config_has_pp = False
+        if "pp" in axis_names:
+            pp_index = axis_names.index("pp")
+            config_has_pp = pp_index < len(axis_dims) and int(axis_dims[pp_index]) > 1
+        loss_paxis = (
+            None
+            if is_mpmd_mesh(config_mesh)
+            or int(config_mesh_shape.get("pp", 1)) > 1
+            or config_has_pp
+            or getattr(self.mesh, "is_mpmd", False)
+            else self.config.partition_axis
+        )
+
+        loss_output: LossMetrics = self.loss_strategy.compute(
+            module=self,
+            outputs=outputs,
+            labels=labels,
+            loss_config=loss_config,
+            batch=batch,
+            loss_kwargs=loss_kwargs,
+            paxis=loss_paxis,
+            forward_plan=forward_plan,
+        )
+        if hasattr(outputs, "aux_loss"):
+            if outputs.aux_loss is not None:
+                other_metrics = dict(loss_output.other_metrics or {})
+                other_metrics.setdefault("aux_loss", outputs.aux_loss)
+                mtp_loss = getattr(outputs, "mtp_loss", None)
+                if mtp_loss is not None:
+                    other_metrics.setdefault("mtp_loss", mtp_loss)
+                indexer_aux_loss = getattr(outputs, "indexer_aux_loss", None)
+                if indexer_aux_loss is not None:
+                    other_metrics.setdefault("indexer_aux_loss", indexer_aux_loss)
+                loss_output = loss_output.replace(other_metrics=other_metrics)
+                loss_output.loss = loss_output.loss + outputs.aux_loss
+        outputs = outputs.replace(loss=loss_output.loss)
+        return outputs, loss_output
+
+    def _tie_embeddings_enabled(self) -> bool:
+        """Resolve constructor and config requests to share input/output weights.
+
+        The first present config key among ``tie_word_embeddings``,
+        ``use_lm_head`` and ``share_input_output_layers`` retains precedence.
+        A task wrapper's optional constructor feature can also enable tying.
+
+        Returns:
+            Whether the LM head should use the transposed embedding matrix.
+        """
+        config_tie = next(
+            (
+                getattr(self.config, key)
+                for key in ("tie_word_embeddings", "use_lm_head", "share_input_output_layers")
+                if hasattr(self.config, key)
+            ),
+            False,
+        )
+        feature = getattr(self, "_tie_embeddings_feature", None)
+        return bool(config_tie) or bool(getattr(feature, "tie", False))
+
+    def apply_lm_head(self, hidden_states: Array) -> Array:
+        """Apply the language model head to transform hidden states to logits.
+
+        Computes output logits over the vocabulary from the final hidden states.
+        Handles weight tying if configured (shares weights between embedding
+        and output projection).
+
+        Args:
+            hidden_states: Input hidden states from the transformer model
+                with shape (..., hidden_size).
+
+        Returns:
+            Array: Output logits over the vocabulary with shape (..., vocab_size).
+
+        Example:
+            >>> # Get hidden states from model
+            >>> hidden_states = model.model(input_ids).last_hidden_state
+            >>> # Apply LM head to get logits
+            >>> logits = model.apply_lm_head(hidden_states)
+            >>> print(logits.shape)
+            (2, 128, 32000)  # (batch, seq, vocab)
+        """
+        head = self.get_lm_head()
+        w = self._tied_lm_head_weight(head)
+        return tp.cast(Array, head(hidden_states, w=w))
+
+    def _lm_head_kernel_spec(self: Self, head: tp.Any, shape: tuple[int, ...]) -> PartitionSpec | None:
+        """Resolve the LM head's intended kernel :class:`PartitionSpec`.
+
+        Resolution order: the head's ``weight`` variable sharding metadata (present even
+        when the tied kernel is unused), then an explicit ``sharding_layout``, then the
+        layout implied by its ``_direction`` marker. Every path goes through the config's
+        ``RuntimeShardingResolver``, so axes that do not divide ``shape`` are dropped.
+
+        Args:
+            head: The LM head module whose kernel layout the tied weight must match.
+            shape: Kernel-oriented shape ``(in_features, out_features)``.
+
+        Returns:
+            PartitionSpec | None: The head kernel's partition spec, or ``None`` when no
+            layout can be resolved (the failure reason is logged once).
+        """
+        head_name = type(head).__name__
+        try:
+            resolver = self.config.runtime_sharding_resolver.with_mesh(self.config.mesh)
+        except Exception as exc:
+            logger.warn_once(f"tied LM-head: no sharding resolver/mesh available for {head_name}: {exc!r}")
+            return None
+        metadata = getattr(getattr(head, "weight", None), "metadata", None)
+        if metadata:
+            try:
+                spec = resolver.resolve_metadata(metadata, shape=shape)
+            except Exception as exc:
+                logger.warn_once(f"tied LM-head: resolving {head_name}.weight metadata failed: {exc!r}")
+                spec = None
+            if spec is not None:
+                return spec
+        layout = getattr(head, "sharding_layout", None)
+        if layout is None:
+            direction = getattr(head, "_direction", None)
+            if direction == "column":
+                layout = spx.common_types.ColumnWise
+            elif direction == "row":
+                layout = spx.common_types.RowWise
+        if layout is None:
+            return None
+        try:
+            return resolver.resolve_layout(layout, shape=shape)
+        except Exception as exc:
+            logger.warn_once(f"tied LM-head: resolving {head_name} layout {layout!r} failed: {exc!r}")
+            return None
+
+    def _tied_lm_head_weight(self: Self, head: tp.Any) -> Array | None:
+        """Return the tied-embedding LM-head weight resharded to the head kernel's layout.
+
+        The embedding is stored over ``(vocab, hidden)`` with the hidden dimension on the
+        tensor axis, so its transpose arrives over ``(hidden, vocab)`` with the
+        *contracting* dimension tensor-sharded. Left unconstrained, GSPMD can lower the
+        projection as partial full-vocab matmuls plus a tensor-axis all-reduce and
+        materialize replicated ``[batch, seq, vocab]`` logits on every device.
+        Constraining the transposed weight to the head kernel's own (column-parallel)
+        layout makes the tied path produce the same vocab-sharded logits as an untied
+        kernel.
+
+        Args:
+            head: The LM head module whose kernel layout the tied weight must match.
+
+        Returns:
+            Array | None: The transposed (and, when a layout resolves, sharding-constrained)
+            embedding matrix, or ``None`` when weight tying is disabled.
+        """
+        if not self._tie_embeddings_enabled():
+            return None
+        w = tp.cast(Array, self.get_embedding().weight.value.T)
+        if getattr(w, "shape", None) is None:
+            return w
+        spec = self._lm_head_kernel_spec(head, tuple(w.shape))
+        if spec is None:
+            logger.warn_once(
+                f"tied LM-head weight could not be resharded: no partition spec resolved for "
+                f"{type(head).__name__} at shape {tuple(w.shape)}; the transposed embedding keeps its "
+                "row-parallel layout and GSPMD may materialize replicated full-vocab logits."
+            )
+            return w
+        return tp.cast(
+            Array,
+            spx.with_sharding_constraint(
+                w,
+                spec,
+                mesh=self.config.mesh,
+                metadata=getattr(getattr(head, "weight", None), "metadata", None),
+            ),
+        )
+
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None) -> "Callable[[Array], Array]":
+        """Return a trace-safe callable that projects hidden states to logits.
+
+        The returned function can safely be called from inside any JAX
+        traced region — ``jax.lax.scan``, ``jax.lax.fori_loop``,
+        ``jax.checkpoint``, and their compositions — without triggering
+        ``ValueError``.
+
+        **Why this is needed:**  When gradient checkpointing is enabled the
+        LM-head linear layer is wrapped with ``nn.remat``.  SpecTrax's remat
+        uses a split/merge protocol that *mutates* Variables
+        (``update_from_state``) — which fails when the call site is inside
+        a different JAX trace level (e.g. ``lax.scan`` body under
+        ``jax.grad``).  This method bypasses the ``nn.remat`` wrapper by
+        calling the head's ``native_forward`` directly (reads-only on SpecTrax
+        Variables — no mutation, no trace-context check).
+
+        The default implementation resolves tied-embedding weights and
+        calls ``native_forward`` on the LM head.  Model subclasses that
+        add post-processing (e.g. logit soft-capping or scaling) should
+        override this method so the returned function reproduces the same
+        semantics.
+
+        Trainers should call this method **once** before entering a
+        traced loop and use the returned function inside the loop body.
+
+        Returns:
+            A callable ``fn(hidden_states) -> logits`` that preserves
+            all model-specific projection semantics.
+        """
+        # Kept for signature compatibility; the tied-weight reshard is stage-aware through the
+        # head weight's own metadata.
+        del vocab_shard_stage
+        head = self.get_lm_head()
+        w = self._tied_lm_head_weight(head)
+
+        _native_forward = getattr(head, "native_forward", None)
+
+        if _native_forward is None:
+
+            def _native_forward(hidden_states: "Array", *, w: "Array | None" = None) -> "Array":
+                """Fallback LM-head forward used when the head exposes no ``native_forward``.
+
+                Args:
+                    hidden_states: Hidden states ``[..., hidden]`` to project.
+                    w: Optional override weight matrix for tied embeddings.
+
+                Returns:
+                    Array: Projected logits over the vocabulary.
+                """
+                if w is None:
+                    return tp.cast(Array, head(hidden_states))
+                return tp.cast(Array, head(hidden_states, w=w))
+
+        def _project(hidden_states: "Array") -> "Array":
+            """Trace-safe LM-head projection bound to the resolved tied weight.
+
+            Args:
+                hidden_states: Hidden states to project to vocabulary logits.
+
+            Returns:
+                Array: Logits over the vocabulary.
+            """
+            return tp.cast(Array, _native_forward(hidden_states, w=w))
+
+        return _project
+
+    @staticmethod
+    def _recursive_config_children(config: EasyDeLBaseConfig) -> tuple[EasyDeLBaseConfig, ...]:
+        """Collect nested config objects without evaluating dynamic properties.
+
+        We intentionally avoid ``dir(config)`` + ``getattr(config, ...)`` here,
+        because that can evaluate computed properties (for example mesh accessors)
+        and trigger side effects during graph-def rebuild.
+
+        Args:
+            config: Parent :class:`EasyDeLBaseConfig` instance to scan.
+
+        Returns:
+            tuple[EasyDeLBaseConfig, ...]: De-duplicated nested config
+            instances discovered via ``sub_configs`` or direct ``__dict__``
+            attributes.
+        """
+        config_dict = getattr(config, "__dict__", None)
+        if not isinstance(config_dict, dict):
+            return ()
+
+        out: list[EasyDeLBaseConfig] = []
+        seen_ids: set[int] = set()
+
+        sub_configs = config_dict.get("sub_configs")
+        if isinstance(sub_configs, dict):
+            for attr_name in sub_configs.keys():
+                sub_cfg = config_dict.get(attr_name, None)
+                if isinstance(sub_cfg, EasyDeLBaseConfig):
+                    sub_cfg_id = id(sub_cfg)
+                    if sub_cfg_id not in seen_ids:
+                        out.append(sub_cfg)
+                        seen_ids.add(sub_cfg_id)
+
+        for value in config_dict.values():
+            if isinstance(value, EasyDeLBaseConfig):
+                value_id = id(value)
+                if value_id not in seen_ids:
+                    out.append(value)
+                    seen_ids.add(value_id)
+
+        return tuple(out)
+
+    @staticmethod
+    def _apply_recursive_config_updates(config: EasyDeLBaseConfig, updates: Mapping[str, tp.Any]) -> None:
+        """Apply overrides to nested configs discovered from concrete attributes.
+
+        For each child returned by :meth:`_recursive_config_children`,
+        applies every override that the child either already holds on its
+        instance ``__dict__`` or declares on its class. Read-only attributes
+        are skipped silently.
+
+        Args:
+            config: Parent config whose nested configs should receive
+                updates.
+            updates: Mapping of attribute names to replacement values.
+        """
+        visited = {id(config)}
+        pending = list(EasyDeLBaseModule._recursive_config_children(config))
+        while pending:
+            sub_cfg = pending.pop()
+            if id(sub_cfg) in visited:
+                continue
+            visited.add(id(sub_cfg))
+            sub_cfg_dict = getattr(sub_cfg, "__dict__", None)
+            for key, value in updates.items():
+                if (isinstance(sub_cfg_dict, dict) and key in sub_cfg_dict) or hasattr(type(sub_cfg), key):
+                    try:
+                        setattr(sub_cfg, key, value)
+                    except AttributeError:
+                        # Skip read-only attributes/properties while applying broad overrides.
+                        continue
+            pending.extend(EasyDeLBaseModule._recursive_config_children(sub_cfg))
+
+    @staticmethod
+    def _normalize_rebuild_quantization_config(config: EasyDeLBaseConfig):
+        """Coerce a config's ``quantization_config`` dict into a typed object.
+
+        If the config already carries an instantiated
+        :class:`QuantizationConfig` (or ``None``), the value is returned
+        as-is. Plain dicts are upgraded in-place on the config so subsequent
+        rebuild paths see the typed form.
+
+        Args:
+            config: The (mutable) EasyDeL config being rebuilt.
+
+        Returns:
+            QuantizationConfig | None: The normalized quantization config, or
+            ``None`` if the config has no quantization configured.
+        """
+        quantization_config = getattr(config, "quantization_config", None)
+        if quantization_config is None:
+            return None
+
+        from easydel.layers import QuantizationConfig
+
+        if isinstance(quantization_config, dict):
+            # Lenient on purpose: checkpoints converted from Hugging Face can
+            # inherit a descriptor block (quant_method/activation_scheme/...);
+            # coercion drops those instead of raising on every rebuild.
+            quantization_config = QuantizationConfig.coerce(quantization_config, strict=False)
+            config.quantization_config = quantization_config
+        return quantization_config
+
+    def _lazy_init_rebuilt_module(self, config: EasyDeLBaseConfig):
+        """Lazy-init a sibling module from *config*, re-applying quantization if needed.
+
+        Used by :meth:`update_module` and :meth:`new_graphdef` to materialize a
+        new graph definition that mirrors the current module's dtype/precision/
+        rng configuration.
+
+        Args:
+            config: Target config used to construct the new lazy module.
+
+        Returns:
+            EasyDeLBaseModule: A lazy module instance, optionally wrapped by
+            :class:`EasyQuantizer` when this module is already quantized.
+        """
+        module = self.lazy_init(
+            config=config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+            rngs=self.rngs,
+        )
+
+        quantization_config = self._normalize_rebuild_quantization_config(config)
+        if quantization_config is None or not self.is_quantized:
+            return module
+
+        from easydel.layers import EasyQuantizer
+
+        return EasyQuantizer(quantization_config=quantization_config).apply_quantization(module, verbose=False)
+
+    def update_module(
+        self,
+        recursive_update: bool = False,
+        **kwargs: Unpack[EasyDeLBaseConfigDict],
+    ):
+        """Update the module configuration and reinitialize structure.
+
+        Creates a new lazy module with updated configuration while preserving
+        the current parameter state. Useful for changing model behavior
+        without reinitializing weights.
+
+        Args:
+            recursive_update: If True, recursively apply the same updates to
+                any nested config objects that are subclasses of EasyDeLBaseConfig.
+                Defaults to False.
+            **kwargs: Configuration overrides typed by ``EasyDeLBaseConfigDict``
+                (consumed via ``Unpack[EasyDeLBaseConfigDict]``). Recognized
+                keys are:
+
+                sharding_axis_dims (Sequence[int]): Parallelism sizes for
+                    ``(pp, dp, fsdp, ep, tp, sp)``.
+                sharding_dcn_axis_dims (Sequence[int] | None): Optional DCN
+                    mesh sizes for multi-host/multi-slice setups.
+                sharding_axis_names (Sequence[str]): Logical mesh axis names.
+                attn_mechanism (str): Forward-pass attention implementation.
+                decode_attn_mechanism (str): Decode-time attention
+                    implementation.
+                mla_attn_mechanism (str): Attention mechanism override for MLA
+                    layers.
+                mla_attn_dtype (jnp.dtype | str | None): MLA-specific
+                    attention activation dtype.
+                mla_attn_softmax_dtype (jnp.dtype | str | None): MLA-specific
+                    softmax compute dtype.
+                blocksize_k (int): Key block size for attention kernels.
+                blocksize_q (int): Query block size for attention kernels.
+                blocksize_b (int): Batch/block size for attention kernels.
+                moe_tiling_size_batch (int): MoE batch tiling.
+                moe_tiling_size_seqlen (int): MoE sequence-length tiling.
+                moe_tiling_size_dim (int): MoE hidden-dim tiling.
+                partition_axis (PartitionAxis): Logical-to-mesh axis mapping.
+                axis_policy (AxisPolicy): Canonical semantic-axis policy.
+                use_sharded_kv_caching (bool): Shard the KV cache instead of
+                    replicating.
+                use_sharding_constraint (bool): Insert explicit sharding
+                    constraints during model build.
+                backend (EasyDeLBackends | str | None): Explicit JAX backend.
+                platform (EasyDeLPlatforms | str | None): Kernel platform hint.
+                easy_method (Literal["train","serve","convert"]): Workflow
+                    context.
+                bits (int | None): Optional weight quantization bit width.
+                scan_ring_attention (bool): Scan ring-attention impls.
+                scan_attention_layers (bool): Apply scan to attention blocks.
+                scan_layers (bool): Apply scan over repeated model layers.
+                pipeline_stage_regions (bool): Enable pipeline stage region
+                    annotations.
+                pipeline_virtual_stages (int): Number of virtual pipeline
+                    stages.
+                pipeline_stage_layout (Literal["contiguous","interleaved",
+                    "loop"]): Pipeline-stage layout strategy.
+                use_scan_mlp (bool): Apply scan to MLP blocks.
+                scan_mlp_chunk_size (int): Chunk size when scanning MLPs.
+                sequence_axis_name (str): Sequence/attention axis name.
+                gradient_checkpointing (EasyDeLGradientCheckPointers | str):
+                    Gradient checkpointing policy.
+                gradient_checkpointing_targets (list[str] | None): Selective
+                    checkpointing target names.
+                kv_cache_quantization_config (QuantizationConfig | None): KV
+                    cache quantization config.
+                kv_cache_sharding_sequence_axis_name (str | tuple[str,...]):
+                    Axis (or axes) used when sharding the KV cache.
+                use_qmm_best_config (bool): Request ejkernel tuned block
+                    configs for quantized matmuls.
+                qmm_platform_override (str | None): Quantized-matmul platform
+                    override.
+                qmm_tpu_path_override (str | None): Quantized-matmul TPU
+                    fused-path override.
+                flash_attention_backward_pass_impl (Literal["triton","xla"]):
+                    Backward kernel for flash attention.
+                attn_dtype (jnp.dtype): Attention activation dtype.
+                kvdtype (jnp.dtype): KV cache dtype.
+                attn_softmax_dtype (jnp.dtype): Softmax compute dtype.
+                fcm_max_ratio (float): Max ratio for forgetful causal masks.
+                fcm_min_ratio (float): Min ratio for forgetful causal masks.
+                use_expert_tensor_mode (bool): Treat experts as a tensor-
+                    parallel axis.
+                moe_method (str): Mixture-of-experts implementation.
+                moe_force_xla_gmm (bool): Force XLA GMM kernels for MoE.
+                use_ring_of_experts (bool): Use ring expert dispatch.
+                fsdp_is_ep_bound (bool): Fold FSDP axis into expert axis.
+                sp_is_ep_bound (bool): Fold sequence-parallel axis into
+                    expert axis.
+                quantization_config (QuantizationConfig | None): Linear-layer
+                    quantization config.
+                operation_configs (dict[str, BaseOperationConfig] | None):
+                    Per-operation kernel configs.
+                mask_max_position_embeddings (int): Max positions for
+                    attention mask precompute.
+                freq_max_position_embeddings (int): Max positions for RoPE
+                    frequency precompute.
+                precompute_masks (bool): Precompute and cache causal masks.
+                lmhead_chunksize (int | None): Optional token chunk size for
+                    chunked LM-head projection.
+
+        Returns:
+            Self: Updated module with new configuration and same parameter values.
+
+        Example:
+            >>> # Change attention mechanism
+            >>> model = model.update_module(attn_mechanism='flash')
+            >>>
+            >>> # Disable gradient checkpointing
+            >>> model = model.update_module(
+            ...     gradient_checkpointing=EasyDeLGradientCheckPointers.NONE
+            ... )
+
+        Note:
+            This modifies the config in place. Use new_graphdef() if you need
+            to preserve the original config.
+        """
+        config = self.config
+        for k, v in kwargs.items():
+            setattr(config, k, v)
+        if recursive_update:
+            self._apply_recursive_config_updates(config, kwargs)
+        module = self._lazy_init_rebuilt_module(config)
+        self = self.merge_module(module.graphdef, self.graphstate, self.graphother)
+        return self
+
+    def new_graphdef(
+        self,
+        recursive_update: bool = False,
+        **kwargs: Unpack[EasyDeLBaseConfigDict],
+    ):
+        """Create a new module with updated configuration.
+
+        Creates a new lazy module with updated configuration while preserving
+        the current parameter state. Unlike update_module(), this does not
+        modify the original config.
+
+        Args:
+            recursive_update: If True, recursively apply the same updates to
+                any nested config objects that are subclasses of EasyDeLBaseConfig.
+                Defaults to False.
+            **kwargs: Configuration overrides typed by ``EasyDeLBaseConfigDict``
+                (consumed via ``Unpack[EasyDeLBaseConfigDict]``). Applied to a
+                deep-copied configuration; see :meth:`update_module` for the
+                full list of recognized keys, which include
+                ``sharding_axis_dims``, ``sharding_dcn_axis_dims``,
+                ``sharding_axis_names``, ``attn_mechanism``,
+                ``decode_attn_mechanism``, ``mla_attn_mechanism``,
+                ``mla_attn_dtype``, ``mla_attn_softmax_dtype``,
+                ``blocksize_k``, ``blocksize_q``, ``blocksize_b``,
+                ``moe_tiling_size_batch``, ``moe_tiling_size_seqlen``,
+                ``moe_tiling_size_dim``, ``partition_axis``, ``axis_policy``,
+                ``use_sharded_kv_caching``, ``use_sharding_constraint``,
+                ``backend``, ``platform``, ``easy_method``, ``bits``,
+                ``scan_ring_attention``, ``scan_attention_layers``,
+                ``scan_layers``, ``pipeline_stage_regions``,
+                ``pipeline_virtual_stages``, ``pipeline_stage_layout``,
+                ``use_scan_mlp``, ``scan_mlp_chunk_size``,
+                ``sequence_axis_name``, ``gradient_checkpointing``,
+                ``gradient_checkpointing_targets``,
+                ``kv_cache_quantization_config``,
+                ``kv_cache_sharding_sequence_axis_name``,
+                ``use_qmm_best_config``, ``qmm_platform_override``,
+                ``qmm_tpu_path_override``,
+                ``flash_attention_backward_pass_impl``, ``attn_dtype``,
+                ``kvdtype``, ``attn_softmax_dtype``, ``fcm_max_ratio``,
+                ``fcm_min_ratio``, ``use_expert_tensor_mode``, ``moe_method``,
+                ``moe_force_xla_gmm``, ``use_ring_of_experts``,
+                ``fsdp_is_ep_bound``, ``sp_is_ep_bound``,
+                ``quantization_config``, ``operation_configs``,
+                ``mask_max_position_embeddings``,
+                ``freq_max_position_embeddings``, ``precompute_masks``, and
+                ``lmhead_chunksize``.
+
+        Returns:
+            spx.GraphDef: A new graph definition with updated configuration
+                that can be merged with existing parameters.
+
+        Example:
+            >>> # Get a new graphdef with different settings
+            >>> new_gdef = model.new_graphdef(attn_mechanism='flash')
+            >>> # Merge with existing parameters
+            >>> new_model = spx.bind(new_gdef, model.graphstate.overlay(model.graphother))
+        """
+        config = deepcopy(self.config)
+        for k, v in kwargs.items():
+            setattr(config, k, v)
+        if recursive_update:
+            self._apply_recursive_config_updates(config, kwargs)
+        module = self._lazy_init_rebuilt_module(config)
+        return module.graphdef
+
+    def __hash__(self):
+        """Compute a hash of the module for caching and comparison.
+
+        Returns:
+            int: Hash value based on the module's state and configuration.
+
+        Note:
+            This delegates to static_hash(None).
+        """
+        return self.static_hash(None)
+
+    def static_hash(self, pop_things: list[str] | None = None):
+        """Compute a deterministic hash of the module's state and configuration.
+
+        Creates a hash based on the module's parameters (graphstate),
+        non-parameter state (graphother), and configuration dictionary.
+        Useful for caching compiled functions or identifying state changes.
+
+        Args:
+            pop_things: Optional list of configuration keys to exclude from
+                the hash. Useful when certain config fields (e.g., 'attn_mechanism')
+                shouldn't affect the cache key.
+
+        Returns:
+            int: A signed integer hash value computed from the model's state
+                and configuration using MD5.
+
+        Example:
+            >>> # Hash without excluding any config keys
+            >>> hash1 = model.static_hash()
+            >>>
+            >>> # Hash excluding attention mechanism
+            >>> hash2 = model.static_hash(["attn_mechanism"])
+            >>>
+            >>> # Hashes may be equal if only attn_mechanism differs
+            >>> print(hash1 == hash2)
+
+        Note:
+            The hash is deterministic - identical states produce identical hashes.
+        """
+        from ejkernel.callib import get_args_signature  # pyright: ignore[reportMissingTypeStubs]
+
+        dict_config = self.config.to_dict()
+        if pop_things:
+            for pops in pop_things:
+                dict_config.pop(pops)
+        # Config values (strings, dtypes, tuples) are static: hash them by value, not as traceable leaves.
+        tree_hash = get_args_signature(
+            (self.graphstate, self.graphother),
+            dict_config,
+            static_argnames=tuple(dict_config),
+        )
+        bytes_in = hashlib.md5((tree_hash).encode("utf-8")).digest()
+        return int.from_bytes(bytes_in, byteorder="big", signed=True)
+
+
+__all__ = (
+    "EasyDeLBaseConfig",
+    "EasyDeLBaseConfigDict",
+    "EasyDeLBaseModule",
+    "ParameterTransformRule",
+)

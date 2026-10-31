@@ -1,0 +1,958 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import functools
+import types
+
+import easydel.infra.loss_utils as loss_utils_module
+import jax
+import jax.numpy as jnp
+from easydel.infra.loss_utils import (
+    ForCausalLMLoss,
+    ForSequenceClassificationLoss,
+    LossConfig,
+    LossForwardPlan,
+    LossMetrics,
+    _resolve_module_vocab_size,
+    causal_lm_loss_chunked_lm_head,
+    cross_entropy_blockwise_logits,
+    fixed_cross_entropy,
+    resolve_causal_lm_chunk_token_size,
+    resolve_loss_strategy,
+)
+from easydel.modules._base._base_task_module import BaseTaskModule
+
+
+class _DummyCausalLMModule:
+    class _Config:
+        vocab_size = 32000
+        partition_axis = None
+        lmhead_chunksize = None
+
+    config = _Config()
+
+    @staticmethod
+    def compute_lm_logits(hidden_states):
+        return hidden_states
+
+    def __call__(self, input_ids=None, apply_lm_head=True):
+        del input_ids, apply_lm_head
+        return None
+
+
+class _UnsupportedChunkedCausalLMModule:
+    class _Config:
+        vocab_size = 32000
+        partition_axis = None
+        lmhead_chunksize = None
+
+    config = _Config()
+
+    @staticmethod
+    def compute_lm_logits(hidden_states):
+        return hidden_states
+
+    def __call__(self, input_ids=None):
+        return input_ids
+
+
+class _ConfiguredChunkedCausalLMModule:
+    class _Config:
+        vocab_size = 32000
+        partition_axis = None
+        lmhead_chunksize = 3
+
+    config = _Config()
+
+    @staticmethod
+    def compute_lm_logits(hidden_states):
+        return hidden_states
+
+    def __call__(self, input_ids=None, apply_lm_head=True):
+        del input_ids, apply_lm_head
+        return None
+
+
+class _TextConfigOnlyConfig:
+    partition_axis = None
+    lmhead_chunksize = 3
+
+    def __init__(self):
+        self.text_config = types.SimpleNamespace(vocab_size=12345)
+
+    def get_text_config(self, decoder: bool = True):
+        del decoder
+        return self.text_config
+
+
+class _TextConfigOnlyChunkedCausalLMModule:
+    def __init__(self):
+        self.config = _TextConfigOnlyConfig()
+        self.vocab_size = 12345
+
+    @staticmethod
+    def compute_lm_logits(hidden_states):
+        return hidden_states
+
+    def __call__(self, input_ids=None, apply_lm_head=True):
+        del input_ids, apply_lm_head
+        return None
+
+
+def test_all_ignored_causal_lm_batch_has_finite_zero_loss_and_gradient():
+    labels = jnp.full((2, 4), -100, dtype=jnp.int32)
+    logits = jnp.arange(2 * 4 * 8, dtype=jnp.float32).reshape(2, 4, 8) / 10
+    config = LossConfig(z_loss=0.001)
+
+    def dense_loss(values):
+        return ForCausalLMLoss(values, labels, config=config).loss
+
+    metrics = ForCausalLMLoss(logits, labels, config=config)
+    assert float(metrics.loss) == 0.0
+    assert float(metrics.z_loss) == 0.0
+    assert float(metrics.weight_sum) == 0.0
+    assert jnp.all(jnp.isfinite(jax.grad(dense_loss)(logits)))
+    assert jnp.all(jax.grad(dense_loss)(logits) == 0)
+
+    hidden = logits[:, :, :4]
+
+    def chunked_loss(values):
+        return causal_lm_loss_chunked_lm_head(
+            values,
+            labels,
+            lambda x: jnp.concatenate((x, x), axis=-1),
+            vocab_size=8,
+            config=config,
+            token_chunk_size=2,
+        ).loss
+
+    chunked = causal_lm_loss_chunked_lm_head(
+        hidden,
+        labels,
+        lambda x: jnp.concatenate((x, x), axis=-1),
+        vocab_size=8,
+        config=config,
+        token_chunk_size=2,
+    )
+    assert float(chunked.loss) == 0.0
+    assert float(chunked.z_loss) == 0.0
+    assert float(chunked.weight_sum) == 0.0
+    assert jnp.all(jnp.isfinite(jax.grad(chunked_loss)(hidden)))
+    assert jnp.all(jax.grad(chunked_loss)(hidden) == 0)
+
+
+def test_all_ignored_batch_is_finite_for_every_normalization_branch():
+    """An all-ignored batch must give a finite zero loss and gradient in every loss branch."""
+    labels = jnp.full((2, 4), -100, dtype=jnp.int32)
+    logits = jnp.arange(2 * 4 * 8, dtype=jnp.float32).reshape(2, 4, 8) / 10
+    configs = {
+        "no_weight": LossConfig(loss_normalizing_factor="NO_WEIGHT_NUM_REAL_TARGET_TOKENS", z_loss=0.001),
+        "num_total": LossConfig(loss_normalizing_factor="NUM_TOTAL_TARGET_TOKENS"),
+        "average_per_sequence": LossConfig(loss_normalizing_factor="AVERAGE_PER_SEQUENCE"),
+        "divide_weight_sum": LossConfig(divide_weight_sum=True),
+        "reduction_mean": LossConfig(reduction="mean"),
+        "reduction_sum": LossConfig(reduction="sum"),
+    }
+    for name, config in configs.items():
+
+        def dense_loss(values, config=config):
+            return ForCausalLMLoss(values, labels, config=config).loss
+
+        loss = dense_loss(logits)
+        grads = jax.grad(dense_loss)(logits)
+        assert jnp.isfinite(loss) and float(loss) == 0.0, (name, loss)
+        assert jnp.all(jnp.isfinite(grads)) and jnp.all(grads == 0), name
+
+    # Callers may pass a batch-level item count that is zero when every target is ignored.
+    config = LossConfig()
+    hidden = logits[:, :, :4]
+
+    def dense_items_loss(values):
+        return ForCausalLMLoss(values, labels, config=config, num_items_in_batch=jnp.asarray(0.0)).loss
+
+    def chunked_items_loss(values):
+        return causal_lm_loss_chunked_lm_head(
+            values,
+            labels,
+            lambda x: jnp.concatenate((x, x), axis=-1),
+            vocab_size=8,
+            config=config,
+            token_chunk_size=2,
+            num_items_in_batch=jnp.asarray(0.0),
+        ).loss
+
+    for loss_fn, arg in ((dense_items_loss, logits), (chunked_items_loss, hidden)):
+        assert float(loss_fn(arg)) == 0.0
+        assert jnp.all(jnp.isfinite(jax.grad(loss_fn)(arg)))
+
+
+def test_cross_entropy_blockwise_logits_respects_bf16_compute_dtype():
+    logits = jnp.arange(2 * 3 * 8, dtype=jnp.bfloat16).reshape(2, 3, 8) / 10
+    targets = jnp.array([[1, 2, 3], [4, 5, 6]], dtype=jnp.int32)
+
+    def loss_fn(x):
+        return cross_entropy_blockwise_logits(
+            x,
+            targets,
+            block_size=4,
+            dtype=jnp.bfloat16,
+        )[0]
+
+    total_loss, total_z_loss, weight_sum, accuracy = cross_entropy_blockwise_logits(
+        logits,
+        targets,
+        block_size=4,
+        dtype=jnp.bfloat16,
+    )
+    gradients = jax.grad(loss_fn)(logits)
+
+    # The [N, V] math runs in bf16 (bf16 gradient), but token-reduced metrics are fp32
+    # accumulators regardless of the compute dtype (a bf16 running sum saturates).
+    assert total_loss.dtype == jnp.float32
+    assert total_z_loss.dtype == jnp.float32
+    assert weight_sum.dtype == jnp.float32
+    assert accuracy.dtype == jnp.float32
+    assert gradients.dtype == jnp.bfloat16
+
+
+def test_cross_entropy_blockwise_logits_keeps_block_loop_checkpointed():
+    logits = jnp.arange(2 * 3 * 8, dtype=jnp.bfloat16).reshape(2, 3, 8) / 10
+    targets = jnp.array([[1, 2, 3], [4, 5, 6]], dtype=jnp.int32)
+
+    def loss_fn(x):
+        return cross_entropy_blockwise_logits(
+            x,
+            targets,
+            block_size=4,
+            dtype=jnp.bfloat16,
+        )[0]
+
+    grad_jaxpr = str(jax.make_jaxpr(jax.grad(loss_fn))(logits))
+
+    assert "remat2[" in grad_jaxpr or "checkpoint[" in grad_jaxpr
+
+
+def test_causal_lm_loss_chunked_lm_head_matches_full_logits():
+    hidden_states = jnp.arange(2 * 5 * 4, dtype=jnp.float32).reshape(2, 5, 4) / 17
+    kernel = jnp.arange(4 * 8, dtype=jnp.float32).reshape(4, 8) / 19
+    labels = jnp.array([[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]], dtype=jnp.int32)
+    attention_mask = jnp.array([[1, 1, 1, 1, 0], [1, 1, 1, 1, 1]], dtype=jnp.int32)
+    config = LossConfig(chunk_block_size=4)
+
+    def lm_head_fn(x):
+        return jnp.einsum("bth,hv->btv", x, kernel)
+
+    expected = fixed_cross_entropy(
+        source=lm_head_fn(hidden_states[:, :-1, :]),
+        target=labels[:, 1:],
+        attention_mask=attention_mask[:, 1:],
+        config=config,
+    )
+    actual = causal_lm_loss_chunked_lm_head(
+        hidden_states=hidden_states,
+        labels=labels,
+        lm_head_fn=lm_head_fn,
+        vocab_size=kernel.shape[1],
+        attention_mask=attention_mask,
+        config=config,
+        token_chunk_size=2,
+    )
+
+    assert jnp.allclose(actual.loss, expected.loss, atol=1e-5)
+    assert jnp.allclose(actual.z_loss, expected.z_loss, atol=1e-5)
+    assert jnp.allclose(actual.weight_sum, expected.weight_sum, atol=1e-5)
+    assert jnp.allclose(actual.accuracy, expected.accuracy, atol=1e-5)
+
+
+def test_causal_lm_loss_chunked_lm_head_keeps_projection_checkpointed():
+    hidden_states = jnp.arange(2 * 5 * 4, dtype=jnp.float32).reshape(2, 5, 4) / 17
+    kernel = jnp.arange(4 * 8, dtype=jnp.float32).reshape(4, 8) / 19
+    labels = jnp.array([[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]], dtype=jnp.int32)
+    config = LossConfig(chunk_block_size=4)
+
+    def loss_fn(x):
+        return causal_lm_loss_chunked_lm_head(
+            hidden_states=x,
+            labels=labels,
+            lm_head_fn=lambda h: jnp.einsum("bth,hv->btv", h, kernel),
+            vocab_size=kernel.shape[1],
+            config=config,
+            token_chunk_size=2,
+        ).loss
+
+    grad_jaxpr = str(jax.make_jaxpr(jax.grad(loss_fn))(hidden_states))
+
+    assert "remat2[" in grad_jaxpr or "checkpoint[" in grad_jaxpr
+
+
+def test_causal_lm_loss_chunked_lm_head_checkpoint_false_removes_remat_keeps_value():
+    hidden_states = jnp.arange(2 * 5 * 4, dtype=jnp.float32).reshape(2, 5, 4) / 17
+    kernel = jnp.arange(4 * 8, dtype=jnp.float32).reshape(4, 8) / 19
+    labels = jnp.array([[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]], dtype=jnp.int32)
+    config = LossConfig(chunk_block_size=4)
+
+    def lm_head_fn(h):
+        return jnp.einsum("bth,hv->btv", h, kernel)
+
+    def loss_fn(x, ckpt):
+        return causal_lm_loss_chunked_lm_head(
+            hidden_states=x,
+            labels=labels,
+            lm_head_fn=lm_head_fn,
+            vocab_size=kernel.shape[1],
+            config=config,
+            token_chunk_size=2,
+            checkpoint=ckpt,
+        ).loss
+
+    jaxpr_off = str(jax.make_jaxpr(jax.grad(lambda x: loss_fn(x, False)))(hidden_states))
+    assert "remat2[" not in jaxpr_off and "checkpoint[" not in jaxpr_off
+
+    # value/grad must be unchanged by the memory/compute tradeoff
+    assert jnp.allclose(loss_fn(hidden_states, True), loss_fn(hidden_states, False), atol=1e-6)
+    g_on = jax.grad(lambda x: loss_fn(x, True))(hidden_states)
+    g_off = jax.grad(lambda x: loss_fn(x, False))(hidden_states)
+    assert jnp.allclose(g_on, g_off, atol=1e-6)
+
+
+def test_causal_lm_loss_chunked_lm_head_supports_fp32_compute_dtype_with_bf16_hidden_states():
+    hidden_states = (jnp.arange(2 * 5 * 4, dtype=jnp.float32).reshape(2, 5, 4) / 17).astype(jnp.bfloat16)
+    kernel = jnp.arange(4 * 8, dtype=jnp.float32).reshape(4, 8) / 19
+    labels = jnp.array([[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]], dtype=jnp.int32)
+    config = LossConfig(chunk_block_size=4, compute_dtype="fp32")
+
+    metrics = causal_lm_loss_chunked_lm_head(
+        hidden_states=hidden_states,
+        labels=labels,
+        lm_head_fn=lambda h: jnp.einsum("bth,hv->btv", h.astype(jnp.float32), kernel),
+        vocab_size=kernel.shape[1],
+        config=config,
+        token_chunk_size=2,
+    )
+
+    assert metrics.loss.dtype == jnp.float32
+    assert metrics.z_loss.dtype == jnp.float32
+    assert metrics.weight_sum.dtype == jnp.float32
+    assert metrics.accuracy.dtype == jnp.float32
+
+
+def test_causal_lm_loss_chunked_lm_head_bf16_large_t_normalizes_in_fp32():
+    """bf16 hidden states (compute_dtype=None -> bf16 CE math) at T=65536 shifted tokens.
+
+    The token-count normalizer and the FLCE accumulators must be fp32: with bf16 carries the
+    running weight sum saturates at 32768 and the reported loss drifts by several percent.
+    Reference: plain fp32 log-softmax CE over the same bf16 logits.
+    """
+    batch, seq_len, hidden_dim, vocab = 1, 65537, 8, 16
+    keys = jax.random.split(jax.random.PRNGKey(3), 3)
+    hidden_states = (jax.random.normal(keys[0], (batch, seq_len, hidden_dim)) * 0.5).astype(jnp.bfloat16)
+    kernel = (jax.random.normal(keys[1], (hidden_dim, vocab)) * 0.5).astype(jnp.bfloat16)
+    labels = jax.random.randint(keys[2], (batch, seq_len), 0, vocab).at[:, ::7].set(-100)
+
+    def lm_head_fn(x):
+        return jnp.matmul(x, kernel)
+
+    metrics = causal_lm_loss_chunked_lm_head(
+        hidden_states=hidden_states,
+        labels=labels,
+        lm_head_fn=lm_head_fn,
+        vocab_size=vocab,
+        config=LossConfig(),
+        token_chunk_size=256,
+    )
+
+    targets = labels[:, 1:].reshape(-1)
+    valid = targets != -100
+    logits = lm_head_fn(hidden_states[:, :-1]).reshape(-1, vocab).astype(jnp.float32)
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    nll = -jnp.take_along_axis(log_probs, jnp.where(valid, targets, 0)[:, None], axis=-1)[:, 0]
+    num_valid = jnp.sum(valid.astype(jnp.float32))
+    expected = jnp.sum(jnp.where(valid, nll, 0.0)) / num_valid
+
+    assert float(metrics.weight_sum) == float(num_valid)
+    assert jnp.allclose(metrics.loss, expected, rtol=1e-3)
+
+
+def test_causal_lm_loss_chunked_lm_head_preserves_decoder_loss_weights():
+    hidden_states = jnp.arange(2 * 5 * 4, dtype=jnp.float32).reshape(2, 5, 4) / 17
+    kernel = jnp.arange(4 * 8, dtype=jnp.float32).reshape(4, 8) / 19
+    labels = jnp.array([[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]], dtype=jnp.int32)
+    decoder_loss_weights = jnp.array(
+        [
+            [0.0, 0.0, 1.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0, 0.0, 0.0],
+        ],
+        dtype=jnp.float32,
+    )
+    config = LossConfig(chunk_block_size=4)
+
+    def lm_head_fn(x):
+        return jnp.einsum("bth,hv->btv", x, kernel)
+
+    shifted_weights = decoder_loss_weights[:, 1:]
+    expected = fixed_cross_entropy(
+        source=lm_head_fn(hidden_states[:, :-1, :]),
+        target=labels[:, 1:],
+        config=config,
+        batch={
+            "decoder_target_tokens": labels[:, 1:],
+            "decoder_loss_weights": shifted_weights,
+        },
+    )
+    actual = causal_lm_loss_chunked_lm_head(
+        hidden_states=hidden_states,
+        labels=labels,
+        lm_head_fn=lm_head_fn,
+        vocab_size=kernel.shape[1],
+        config=config,
+        token_chunk_size=2,
+        batch={"decoder_loss_weights": decoder_loss_weights},
+    )
+
+    assert jnp.allclose(actual.loss, expected.loss, atol=1e-5)
+    assert jnp.allclose(actual.z_loss, expected.z_loss, atol=1e-5)
+    assert jnp.allclose(actual.weight_sum, expected.weight_sum, atol=1e-5)
+    assert jnp.allclose(actual.accuracy, expected.accuracy, atol=1e-5)
+
+
+def test_causal_lm_loss_chunked_lm_head_ignores_inner_ce_chunk_config():
+    # The LM-head-chunked loss delegates the per-chunk math to ejkernel's fused
+    # linear cross-entropy and does NOT apply a second (inner) vocab/block CE
+    # chunking pass. Setting chunk_vocab_size / chunk_block_size / chunk_token_size
+    # must therefore leave the result identical to the dense reference.
+    hidden_states = jnp.arange(2 * 5 * 4, dtype=jnp.float32).reshape(2, 5, 4) / 17
+    kernel = jnp.arange(4 * 8, dtype=jnp.float32).reshape(4, 8) / 19
+    labels = jnp.array([[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]], dtype=jnp.int32)
+
+    def lm_head_fn(x):
+        return jnp.einsum("bth,hv->btv", x, kernel)
+
+    expected = fixed_cross_entropy(
+        source=lm_head_fn(hidden_states[:, :-1, :]),
+        target=labels[:, 1:],
+        config=LossConfig(),
+    )
+    actual = causal_lm_loss_chunked_lm_head(
+        hidden_states=hidden_states,
+        labels=labels,
+        lm_head_fn=lm_head_fn,
+        vocab_size=kernel.shape[1],
+        config=LossConfig(chunk_vocab_size=3, chunk_block_size=4, chunk_token_size=2),
+        token_chunk_size=2,
+    )
+
+    assert jnp.allclose(actual.loss, expected.loss, atol=1e-5)
+    assert jnp.allclose(actual.z_loss, expected.z_loss, atol=1e-5)
+    assert jnp.allclose(actual.weight_sum, expected.weight_sum, atol=1e-5)
+    assert jnp.allclose(actual.accuracy, expected.accuracy, atol=1e-5)
+
+
+def test_causal_lm_loss_strategy_disables_lm_head_for_large_blockwise_loss():
+    strategy = resolve_loss_strategy(ForCausalLMLoss)
+    labels = jnp.ones((2, 8193), dtype=jnp.int32)
+    plan = strategy.plan_forward(
+        module=_DummyCausalLMModule(),
+        labels=labels,
+        loss_config=LossConfig(chunk_block_size=4096),
+        batch={},
+        loss_kwargs={},
+    )
+
+    assert plan.forward_kwargs == {"apply_lm_head": False}
+
+
+def test_causal_lm_loss_strategy_auto_disables_lm_head_for_large_logits_without_chunk_config():
+    strategy = resolve_loss_strategy(ForCausalLMLoss)
+    labels = jnp.ones((4, 4096), dtype=jnp.int32)
+    plan = strategy.plan_forward(
+        module=_DummyCausalLMModule(),
+        labels=labels,
+        loss_config=LossConfig(chunk_block_size=None, chunk_vocab_size=None, chunk_token_size=None),
+        batch={},
+        loss_kwargs={},
+    )
+
+    assert plan.forward_kwargs == {"apply_lm_head": False}
+
+
+def test_causal_lm_loss_strategy_honors_explicit_token_chunk_size_loss_kwarg():
+    strategy = resolve_loss_strategy(ForCausalLMLoss)
+    labels = jnp.ones((2, 8), dtype=jnp.int32)
+    plan = strategy.plan_forward(
+        module=_DummyCausalLMModule(),
+        labels=labels,
+        loss_config=LossConfig(chunk_block_size=None, chunk_vocab_size=None, chunk_token_size=None),
+        batch={},
+        loss_kwargs={"token_chunk_size": 2},
+    )
+
+    assert plan.forward_kwargs == {"apply_lm_head": False}
+
+
+def test_causal_lm_loss_strategy_uses_module_config_lmhead_chunksize(monkeypatch):
+    strategy = resolve_loss_strategy(ForCausalLMLoss)
+    labels = jnp.ones((2, 8), dtype=jnp.int32)
+    hidden_states = jnp.arange(2 * 8 * 4, dtype=jnp.float32).reshape(2, 8, 4) / 17
+    captured: dict[str, int | None] = {}
+
+    def fake_chunked_loss(*, token_chunk_size=None, **kwargs):
+        del kwargs
+        captured["token_chunk_size"] = token_chunk_size
+        one = jnp.array(1.0, dtype=jnp.float32)
+        return LossMetrics(loss=one, z_loss=one, weight_sum=one, accuracy=one)
+
+    monkeypatch.setattr(loss_utils_module, "causal_lm_loss_chunked_lm_head", fake_chunked_loss)
+
+    module = _ConfiguredChunkedCausalLMModule()
+    plan = strategy.plan_forward(
+        module=module,
+        labels=labels,
+        loss_config=LossConfig(chunk_block_size=None, chunk_vocab_size=None, chunk_token_size=None),
+        batch={},
+        loss_kwargs={},
+    )
+    assert plan.forward_kwargs == {"apply_lm_head": False}
+
+    strategy.compute(
+        module=module,
+        outputs=types.SimpleNamespace(last_hidden_state=hidden_states),
+        labels=labels,
+        loss_config=LossConfig(chunk_block_size=None, chunk_vocab_size=None, chunk_token_size=None),
+        batch={},
+        loss_kwargs={},
+        paxis=None,
+        forward_plan=plan,
+    )
+
+    assert captured["token_chunk_size"] == 3
+
+
+def test_causal_lm_loss_strategy_uses_module_compute_lm_logits_postprocessing():
+    kernel = jnp.arange(4 * 8, dtype=jnp.float32).reshape(4, 8) / 19
+
+    class _Module:
+        class _Config:
+            vocab_size = 8
+            partition_axis = None
+            lmhead_chunksize = None
+
+        config = _Config()
+
+        @staticmethod
+        def compute_lm_logits(hidden_states):
+            logits = jnp.einsum("bth,hv->btv", hidden_states, kernel)
+            return logits * 0.5
+
+    hidden_states = jnp.arange(2 * 5 * 4, dtype=jnp.float32).reshape(2, 5, 4) / 17
+    labels = jnp.array([[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]], dtype=jnp.int32)
+    strategy = resolve_loss_strategy(ForCausalLMLoss)
+    expected = fixed_cross_entropy(
+        source=_Module.compute_lm_logits(hidden_states[:, :-1, :]),
+        target=labels[:, 1:],
+        config=LossConfig(chunk_block_size=4),
+    )
+
+    actual = strategy.compute(
+        module=_Module(),
+        outputs=types.SimpleNamespace(last_hidden_state=hidden_states),
+        labels=labels,
+        loss_config=LossConfig(chunk_block_size=4),
+        batch={},
+        loss_kwargs={"token_chunk_size": 2},
+        paxis=None,
+        forward_plan=LossForwardPlan(forward_kwargs={"apply_lm_head": False}),
+    )
+
+    assert jnp.allclose(actual.loss, expected.loss, atol=1e-5)
+    assert jnp.allclose(actual.z_loss, expected.z_loss, atol=1e-5)
+    assert jnp.allclose(actual.weight_sum, expected.weight_sum, atol=1e-5)
+    assert jnp.allclose(actual.accuracy, expected.accuracy, atol=1e-5)
+
+
+def test_base_task_module_compute_lm_logits_chunks_tokens_from_config():
+    kernel = jnp.arange(4 * 8, dtype=jnp.float32).reshape(4, 8) / 19
+    hidden_states = jnp.arange(2 * 5 * 4, dtype=jnp.float32).reshape(2, 5, 4) / 17
+
+    class _Module:
+        class _Config:
+            lmhead_chunksize = 2
+
+        config = _Config()
+        _resolve_lmhead_chunksize = BaseTaskModule._resolve_lmhead_chunksize
+        compute_lm_logits = BaseTaskModule.compute_lm_logits
+
+        @staticmethod
+        def apply_lm_head(chunk_hidden_states):
+            return jnp.einsum("bth,hv->btv", chunk_hidden_states, kernel)
+
+        @staticmethod
+        def apply_logit_cap(logits):
+            return logits
+
+        @staticmethod
+        def _constrain_lm_logits(logits):
+            # passthrough: the real method applies logical-axis sharding via
+            # config.runtime_sharding_resolver, which this lightweight mock omits.
+            return logits
+
+    module = _Module()
+    actual = module.compute_lm_logits(hidden_states)
+    expected = module.apply_lm_head(hidden_states)
+
+    assert jnp.allclose(actual, expected, atol=1e-5)
+
+
+def test_causal_lm_loss_chunked_lm_head_avoids_scan_chunk_stacking():
+    kernel = jnp.arange(4 * 8, dtype=jnp.float32).reshape(4, 8) / 19
+    hidden_states = jnp.arange(2 * 5 * 4, dtype=jnp.float32).reshape(2, 5, 4) / 17
+    labels = jnp.array([[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]], dtype=jnp.int32)
+
+    def _lm_head_fn(chunk_hidden_states):
+        return jnp.einsum("bth,hv->btv", chunk_hidden_states, kernel)
+
+    actual = causal_lm_loss_chunked_lm_head(
+        hidden_states=hidden_states,
+        labels=labels,
+        lm_head_fn=_lm_head_fn,
+        vocab_size=8,
+        config=LossConfig(chunk_block_size=4),
+        token_chunk_size=2,
+    )
+    expected = fixed_cross_entropy(
+        source=_lm_head_fn(hidden_states[:, :-1, :]),
+        target=labels[:, 1:],
+        config=LossConfig(chunk_block_size=4),
+    )
+
+    assert jnp.allclose(actual.loss, expected.loss, atol=1e-5)
+    assert jnp.allclose(actual.z_loss, expected.z_loss, atol=1e-5)
+    assert jnp.allclose(actual.weight_sum, expected.weight_sum, atol=1e-5)
+    assert jnp.allclose(actual.accuracy, expected.accuracy, atol=1e-5)
+
+
+def test_causal_lm_loss_strategy_uses_module_prepare_lm_head_inputs():
+    class _Module:
+        class _Config:
+            vocab_size = 8
+            partition_axis = None
+            lmhead_chunksize = None
+
+        config = _Config()
+
+        @staticmethod
+        def prepare_lm_head_inputs(hidden_states):
+            return hidden_states * 0.5
+
+        @staticmethod
+        def compute_lm_logits(hidden_states):
+            return hidden_states
+
+    hidden_states = jnp.arange(2 * 5 * 8, dtype=jnp.float32).reshape(2, 5, 8) / 17
+    labels = jnp.array([[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]], dtype=jnp.int32)
+    strategy = resolve_loss_strategy(ForCausalLMLoss)
+
+    expected = fixed_cross_entropy(
+        source=_Module.prepare_lm_head_inputs(hidden_states[:, :-1, :]),
+        target=labels[:, 1:],
+        config=LossConfig(chunk_block_size=4),
+    )
+    actual = strategy.compute(
+        module=_Module(),
+        outputs=types.SimpleNamespace(last_hidden_state=hidden_states),
+        labels=labels,
+        loss_config=LossConfig(chunk_block_size=4),
+        batch={},
+        loss_kwargs={"token_chunk_size": 2},
+        paxis=None,
+        forward_plan=LossForwardPlan(forward_kwargs={"apply_lm_head": False}),
+    )
+
+    assert jnp.allclose(actual.loss, expected.loss, atol=1e-5)
+    assert jnp.allclose(actual.z_loss, expected.z_loss, atol=1e-5)
+    assert jnp.allclose(actual.weight_sum, expected.weight_sum, atol=1e-5)
+    assert jnp.allclose(actual.accuracy, expected.accuracy, atol=1e-5)
+
+
+def test_causal_lm_loss_strategy_forwards_num_items_in_batch_from_batch():
+    kernel = jnp.arange(4 * 8, dtype=jnp.float32).reshape(4, 8) / 19
+
+    class _Module:
+        class _Config:
+            vocab_size = 8
+            partition_axis = None
+            lmhead_chunksize = None
+
+        config = _Config()
+
+        @staticmethod
+        def compute_lm_logits(hidden_states):
+            return jnp.einsum("bth,hv->btv", hidden_states, kernel)
+
+    hidden_states = jnp.arange(2 * 5 * 4, dtype=jnp.float32).reshape(2, 5, 4) / 17
+    labels = jnp.array([[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]], dtype=jnp.int32)
+    batch = {"num_items_in_batch": 3}
+    strategy = resolve_loss_strategy(ForCausalLMLoss)
+
+    expected = causal_lm_loss_chunked_lm_head(
+        hidden_states=hidden_states,
+        labels=labels,
+        lm_head_fn=_Module.compute_lm_logits,
+        vocab_size=8,
+        config=LossConfig(chunk_block_size=4),
+        token_chunk_size=2,
+        num_items_in_batch=3,
+    )
+    actual = strategy.compute(
+        module=_Module(),
+        outputs=types.SimpleNamespace(last_hidden_state=hidden_states),
+        labels=labels,
+        loss_config=LossConfig(chunk_block_size=4),
+        batch=batch,
+        loss_kwargs={"token_chunk_size": 2},
+        paxis=None,
+        forward_plan=LossForwardPlan(forward_kwargs={"apply_lm_head": False}),
+    )
+
+    assert jnp.allclose(actual.loss, expected.loss, atol=1e-5)
+    assert jnp.allclose(actual.z_loss, expected.z_loss, atol=1e-5)
+    assert jnp.allclose(actual.weight_sum, expected.weight_sum, atol=1e-5)
+    assert jnp.allclose(actual.accuracy, expected.accuracy, atol=1e-5)
+
+
+def test_legacy_loss_strategy_keeps_default_forward_plan():
+    strategy = resolve_loss_strategy(ForSequenceClassificationLoss)
+    plan = strategy.plan_forward(
+        module=object(),
+        labels=jnp.array([0, 1], dtype=jnp.int32),
+        loss_config=LossConfig(num_labels=2),
+        batch={},
+        loss_kwargs={},
+    )
+
+    assert plan.forward_kwargs == {}
+
+
+def test_causal_lm_loss_strategy_skips_modules_without_apply_lm_head_forward_flag():
+    strategy = resolve_loss_strategy(ForCausalLMLoss)
+    labels = jnp.ones((2, 8193), dtype=jnp.int32)
+    plan = strategy.plan_forward(
+        module=_UnsupportedChunkedCausalLMModule(),
+        labels=labels,
+        loss_config=LossConfig(chunk_block_size=4096),
+        batch={},
+        loss_kwargs={},
+    )
+
+    assert plan.forward_kwargs == {}
+
+
+def test_resolve_module_vocab_size_falls_back_to_text_config():
+    module = _TextConfigOnlyChunkedCausalLMModule()
+
+    assert _resolve_module_vocab_size(module) == 12345
+
+
+def test_causal_lm_loss_strategy_supports_text_config_only_vocab_size():
+    strategy = resolve_loss_strategy(ForCausalLMLoss)
+    labels = jnp.ones((2, 8193), dtype=jnp.int32)
+    plan = strategy.plan_forward(
+        module=_TextConfigOnlyChunkedCausalLMModule(),
+        labels=labels,
+        loss_config=LossConfig(chunk_block_size=4096),
+        batch={},
+        loss_kwargs={},
+    )
+
+    assert plan.forward_kwargs == {"apply_lm_head": False}
+
+
+def test_resolve_loss_strategy_unwraps_wrapped_causal_lm_loss():
+    @functools.wraps(ForCausalLMLoss)
+    def wrapped_loss(*args, **kwargs):
+        return ForCausalLMLoss(*args, **kwargs)
+
+    strategy = resolve_loss_strategy(wrapped_loss)
+
+    assert type(strategy).__name__ == "CausalLMLossStrategy"
+
+
+def _make_label_smoothing_case():
+    logits = jnp.array(
+        [
+            [
+                [0.1, 0.4, -0.7, 0.6, 0.3, -0.2, 0.5],
+                [0.2, -0.1, 0.8, 0.7, -0.5, 0.6, 0.1],
+                [0.9, 0.1, -0.4, 0.3, 0.5, -0.6, 0.7],
+                [-0.3, 0.2, 0.4, -0.1, 0.8, 0.5, -0.2],
+            ],
+            [
+                [0.6, -0.2, 0.3, 0.9, -0.4, 0.1, 0.7],
+                [0.5, 0.8, -0.3, 0.2, 0.4, -0.6, 0.1],
+                [-0.2, 0.7, 0.6, -0.5, 0.3, 0.9, 0.4],
+                [0.4, -0.7, 0.2, 0.5, 0.6, 0.3, -0.1],
+            ],
+        ],
+        dtype=jnp.float32,
+    )
+    targets = jnp.array(
+        [
+            [1, 3, 4, -100],
+            [0, 2, 5, 4],
+        ],
+        dtype=jnp.int32,
+    )
+    weights = jnp.array(
+        [
+            [1.0, 0.5, 1.0, 0.0],
+            [0.3, 1.0, 0.8, 0.2],
+        ],
+        dtype=jnp.float32,
+    )
+    batch = {
+        "decoder_target_tokens": targets,
+        "decoder_loss_weights": weights,
+    }
+    dense_config = LossConfig(label_smoothing=0.1, z_loss=1e-4, chunk_block_size=None)
+    return logits, targets, batch, dense_config
+
+
+def _assert_metrics_close(actual, expected):
+    assert jnp.allclose(actual.loss, expected.loss, atol=1e-5)
+    assert jnp.allclose(actual.z_loss, expected.z_loss, atol=1e-5)
+    assert jnp.allclose(actual.weight_sum, expected.weight_sum, atol=1e-5)
+    assert jnp.allclose(actual.accuracy, expected.accuracy, atol=1e-5)
+
+
+def test_fixed_cross_entropy_unreduced_accuracy_is_weighted_fraction():
+    """reduction='none' keeps per-token loss but accuracy is the scalar weighted fraction (r12 S10-1)."""
+    logits = jnp.asarray([[[4.0, 0.0], [4.0, 0.0], [4.0, 0.0], [0.0, 4.0]]], dtype=jnp.float32)
+    targets = jnp.asarray([[0, 0, -100, 0]], dtype=jnp.int32)  # 2 of 3 valid tokens correct
+    metrics = fixed_cross_entropy(source=logits, target=targets, config=LossConfig(reduction="none"))
+    assert jnp.shape(metrics.loss) == targets.shape
+    assert jnp.ndim(metrics.accuracy) == 0
+    assert jnp.allclose(metrics.accuracy, 2.0 / 3.0, atol=1e-6), metrics.accuracy
+
+
+def test_fixed_cross_entropy_constant_or_none_factor_without_batch():
+    """Omitted ``batch`` with a numeric / None normalizing factor must not crash on None weights (r13 S10-1)."""
+    logits = jnp.asarray([[[4.0, 0.0], [0.0, 4.0], [4.0, 0.0]]], dtype=jnp.float32)
+    targets = jnp.asarray([[0, 1, -100]], dtype=jnp.int32)  # two valid tokens, one ignored
+    per_token = jnp.log1p(jnp.exp(-4.0))  # CE of each valid token
+    summed = 2.0 * per_token
+    for factor, expected in ((2.0, summed / 2.0), (None, summed)):
+        metrics = fixed_cross_entropy(source=logits, target=targets, config=LossConfig(loss_normalizing_factor=factor))
+        assert jnp.allclose(metrics.loss, expected, rtol=1e-5, atol=1e-6), (factor, metrics.loss, expected)
+        assert jnp.allclose(metrics.accuracy, 1.0, atol=1e-6), metrics.accuracy
+
+
+def test_fixed_cross_entropy_default_blockwise_matches_dense_label_smoothing():
+    logits, targets, batch, dense_config = _make_label_smoothing_case()
+
+    expected = fixed_cross_entropy(
+        source=logits,
+        target=targets,
+        config=dense_config,
+        batch=batch,
+    )
+    actual = fixed_cross_entropy(
+        source=logits,
+        target=targets,
+        config=LossConfig(label_smoothing=0.1, z_loss=1e-4),
+        batch=batch,
+    )
+
+    _assert_metrics_close(actual, expected)
+
+
+def test_fixed_cross_entropy_chunk_vocab_matches_dense_label_smoothing():
+    logits, targets, batch, dense_config = _make_label_smoothing_case()
+
+    expected = fixed_cross_entropy(
+        source=logits,
+        target=targets,
+        config=dense_config,
+        batch=batch,
+    )
+    actual = fixed_cross_entropy(
+        source=logits,
+        target=targets,
+        config=LossConfig(label_smoothing=0.1, z_loss=1e-4, chunk_block_size=None, chunk_vocab_size=3),
+        batch=batch,
+    )
+
+    _assert_metrics_close(actual, expected)
+
+
+def test_fixed_cross_entropy_chunk_tokens_matches_dense_label_smoothing():
+    logits, targets, batch, dense_config = _make_label_smoothing_case()
+
+    expected = fixed_cross_entropy(
+        source=logits,
+        target=targets,
+        config=dense_config,
+        batch=batch,
+    )
+    actual = fixed_cross_entropy(
+        source=logits,
+        target=targets,
+        config=LossConfig(label_smoothing=0.1, z_loss=1e-4, chunk_block_size=None, chunk_token_size=3),
+        batch=batch,
+    )
+
+    _assert_metrics_close(actual, expected)
+
+
+def test_resolve_causal_lm_chunk_token_size_respects_budget():
+    hidden_states = jax.ShapeDtypeStruct((128, 2048, 4096), jnp.bfloat16)
+
+    chunk = resolve_causal_lm_chunk_token_size(hidden_states, vocab_size=256_000)
+    fp32_chunk = resolve_causal_lm_chunk_token_size(
+        hidden_states,
+        vocab_size=256_000,
+        config=LossConfig(compute_dtype="fp32"),
+    )
+
+    assert chunk == 256
+    assert fp32_chunk == 128
+
+
+def test_chunked_lm_head_loss_threads_cross_entropy_platform(monkeypatch):
+    seen = []
+
+    def fake_fused_ce(**kwargs):
+        seen.append(kwargs.get("platform"))
+        return types.SimpleNamespace(
+            loss=jnp.array(6.0, dtype=jnp.float32),
+            z_loss=jnp.array(0.0, dtype=jnp.float32),
+            weight_sum=jnp.array(3.0, dtype=jnp.float32),
+            accuracy=jnp.array(1.0, dtype=jnp.float32),
+        )
+
+    monkeypatch.setattr(loss_utils_module, "_fused_ce", fake_fused_ce)
+    hidden = jnp.ones((1, 4, 8), dtype=jnp.float32)
+    labels = jnp.array([[1, 2, 3, 4]], dtype=jnp.int32)
+
+    def lm_head_fn(x):
+        return jnp.zeros((*x.shape[:-1], 16), dtype=x.dtype)
+
+    metrics = causal_lm_loss_chunked_lm_head(
+        hidden,
+        labels,
+        lm_head_fn,
+        vocab_size=16,
+        config=LossConfig(chunk_token_size=2, cross_entropy_platform="pallas"),
+    )
+
+    assert seen == ["pallas"]
+    assert jnp.allclose(metrics.loss, jnp.array(2.0, dtype=jnp.float32))
