@@ -318,7 +318,10 @@ class MixedShardedSource(ShardedDataSource[dict]):
                 names must equal the source names exactly.
             reshuffle_on_restart: Visit a restarted constituent's shards in
                 a fresh deterministic per-epoch permutation. Only meaningful
-                with ``stop_strategy="restart"``. An unseeded mixer draws its
+                with ``stop_strategy="restart"``. Off by default: trainer resume
+                restores the mixture from an emitted-row count only, so turning it
+                on for a run that was checkpointed without it would replay a
+                different order past the first wrap. An unseeded mixer draws its
                 seed once at construction and records it in
                 :class:`MixedShardState`, so resume stays exact.
             attach_dataset_ids: Stamp :data:`DATASET_ID_FIELD` (the
@@ -857,7 +860,7 @@ class MixedShardedSource(ShardedDataSource[dict]):
         Canonical-order epochs go through :meth:`_chain_shards` so subclasses overriding it keep
         working; permuted epochs open the shards in :meth:`_epoch_shard_order`.
         """
-        if not self._reshuffle_on_restart or epoch <= 0:
+        if not self._reshuffle_on_restart or epoch <= 0 or len(source.shard_names) < 2:
             return self._chain_shards(source)
         return self._chain_ordered(source, self._epoch_shard_order(source, name=name, epoch=epoch))
 

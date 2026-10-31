@@ -485,6 +485,75 @@ class ShuffledShardedSource(ShardedDataSource[dict]):
                 yield out
             emitted += 1
 
+    def _known_total_rows(self, shard_names: Sequence[str]) -> int | None:
+        """Return the exact number of rows the underlying stream delivers, when cheaply known.
+
+        The total is the sum of shard ``num_rows`` metadata and is only trusted when the wrapped source
+        guarantees that iteration delivers exactly the metadata row counts.
+
+        Args:
+            shard_names: Underlying shard names in visitation order.
+
+        Returns:
+            The total row count, or ``None`` when any shard lacks metadata or the source is lossy.
+        """
+        if not self._source.delivers_all_metadata_rows:
+            return None
+        total = 0
+        for shard_name in shard_names:
+            try:
+                info = self._source.get_shard_info(shard_name)
+            except Exception:
+                return None
+            if info is None or info.num_rows is None:
+                return None
+            total += int(info.num_rows)
+        return total
+
+    def _drain_phase_resume_rows(
+        self,
+        rng: random.Random,
+        shard_names: Sequence[str],
+        total_rows: int,
+        row: int,
+    ) -> list[dict] | None:
+        """Rebuild the rows still to be emitted when resuming inside the reservoir drain phase.
+
+        Mirrors the forward path RNG sequence: ``max(total_rows - buffer_size, 0)`` eviction draws, one
+        ``rng.shuffle`` of the final reservoir, then a drain. ``rng`` must already have consumed the shard-order
+        shuffle.
+
+        Args:
+            rng: RNG positioned right after the shard-order shuffle.
+            shard_names: Underlying shard names in visitation order.
+            total_rows: Exact number of rows the underlying stream delivers.
+            row: Number of emitted rows to skip; must exceed ``total_rows - buffer_size``.
+
+        Returns:
+            The remaining emitted rows, or ``None`` when the state cannot be reconstructed exactly (the stream
+            holds rows beyond ``total_rows`` or a row lookup failed) and the caller must replay sequentially.
+        """
+        buffer_size = self._buffer_size
+        steady = max(total_rows - buffer_size, 0)
+        slot_positions = list(range(min(total_rows, buffer_size)))
+        for emitted in range(steady):
+            slot_positions[rng.randrange(buffer_size)] = buffer_size + emitted
+        rng.shuffle(slot_positions)
+        wanted = slot_positions[row - steady :]
+
+        tail = self._underlying_stream_at_row(shard_names, total_rows)
+        try:
+            if next(tail, None) is not None:
+                return None
+            if not wanted:
+                return []
+            rows_by_position = self._underlying_rows_at_positions(shard_names, wanted)
+            return [rows_by_position[position] for position in wanted]
+        except (KeyError, StopIteration, IndexError):
+            return None
+        finally:
+            tail.close()
+
     def _shuffled_iter_at_row(self, row: int) -> Iterator[dict]:
         """Resume reservoir shuffle at an emitted-row offset without replaying all rows."""
         row = max(int(row), 0)
@@ -494,6 +563,20 @@ class ShuffledShardedSource(ShardedDataSource[dict]):
 
         rng = random.Random(self._seed)
         shard_names = self._ordered_shard_names(rng)
+        total_rows = self._known_total_rows(shard_names)
+        if total_rows is not None and row > max(total_rows - self._buffer_size, 0):
+            remaining = self._drain_phase_resume_rows(rng, shard_names, total_rows, row)
+            if remaining is None:
+                logger.warning(
+                    "Could not reconstruct shuffled drain-phase resume state at row %d; "
+                    "falling back to sequential skip.",
+                    row,
+                )
+                yield from self._shuffled_iter(skip=row)
+                return
+            yield from remaining
+            return
+
         slot_positions = list(range(self._buffer_size))
         for emitted in range(row):
             idx = rng.randrange(self._buffer_size)

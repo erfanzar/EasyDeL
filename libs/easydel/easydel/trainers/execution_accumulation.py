@@ -37,6 +37,7 @@ import jax
 import spectrax as spx
 from eformer.loggings import get_logger
 
+from .batch_placement import place_batch, release_batch_slot, replicated_batch_slot_spec
 from .training_utils import (
     _infer_batch_size,
     fold_microbatch_metrics,
@@ -73,6 +74,8 @@ class ExecutionAccumulation:
         empty_sharding: tp.Any,
         static_argnums: tp.Sequence[int],
         jit_options: dict[str, tp.Any] | None = None,
+        batch_spec: tp.Any = None,
+        mesh: tp.Any = None,
     ) -> None:
         if int(num_steps) < 2:
             raise ValueError(f"execution-mode gradient accumulation needs >= 2 microbatches, got {num_steps}.")
@@ -81,6 +84,9 @@ class ExecutionAccumulation:
             raise ValueError("`in_shardings` must cover at least (state, batch).")
         self.num_steps = int(num_steps)
         self.step_fn = step_fn
+        self._batch_spec = batch_spec
+        self._mesh = mesh
+        in_shardings = release_batch_slot(tuple(in_shardings), batch_spec)
         acc_pos = 2 + n_extra
         shifted_statics = tuple(int(i) + 1 for i in static_argnums)
         jit_options = dict(jit_options or {})
@@ -133,7 +139,10 @@ class ExecutionAccumulation:
         if batch_size % self.num_steps:
             raise ValueError(f"batch of {batch_size} rows is not divisible by {self.num_steps} microbatches.")
         size = batch_size // self.num_steps
-        return [slice_host_minibatch(batch, batch_size, k * size, size) for k in range(self.num_steps)]
+        parts = [slice_host_minibatch(batch, batch_size, k * size, size) for k in range(self.num_steps)]
+        if self._batch_spec is None:
+            return parts
+        return [place_batch(part, self._batch_spec, self._mesh) for part in parts]
 
     def run(self, state, batch, extra_args: tuple[tp.Any, ...], static_args: tuple[tp.Any, ...]):
         """One optimizer step: ``num_steps`` grad executions, then the apply execution.
@@ -176,6 +185,7 @@ def build_execution_accumulation(
     if getattr(trainer, "_has_buckets", False):
         raise ValueError("gradient_accumulation_mode='execution' is not supported together with training buckets.")
     logger.info("gradient accumulation by separate executions: %d microbatches per optimizer step", steps)
+    mesh = getattr(getattr(trainer, "model", None), "mesh", None)
     return ExecutionAccumulation(
         step_fn=step_fn,
         num_steps=steps,
@@ -184,4 +194,6 @@ def build_execution_accumulation(
         empty_sharding=empty_sharding,
         static_argnums=static_argnums,
         jit_options=jit_options,
+        batch_spec=replicated_batch_slot_spec(arguments, mesh, tuple(in_shardings)),
+        mesh=mesh,
     )

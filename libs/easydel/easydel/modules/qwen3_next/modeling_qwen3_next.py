@@ -2955,11 +2955,13 @@ class Qwen3NextLinearAttention(spx.Module):
         """
         kernel = self.conv1d.weight.value  # [kernel_size, 1, conv_dim] (HIO, depthwise)
         k_size = kernel.shape[0]
-        w = kernel[:, 0, :].astype(jnp.float32)  # [K, conv_dim]
-        x = conv_input.astype(jnp.float32)  # [B, S, C]
+        acc_dtype = jnp.promote_types(jnp.promote_types(conv_input.dtype, kernel.dtype), jnp.float32)
+        w = kernel[:, 0, :].astype(acc_dtype)  # [K, conv_dim]
+        # Shift in the input dtype and widen per tap: avoids K-1 full-size fp32 copies of the stream.
+        x = conv_input  # [B, S, C]
         b, s, _ = x.shape
         seg = seg_ids[:, :s]
-        acc = jnp.zeros_like(x)
+        acc = jnp.zeros(x.shape, acc_dtype)
         # tap j (0..K-1) reads position t - (K-1-j); j=K-1 is the current token.
         for j in range(k_size):
             shift = k_size - 1 - j
@@ -2975,7 +2977,8 @@ class Qwen3NextLinearAttention(spx.Module):
                     [jnp.full((b, shift), -2, seg.dtype), seg[:, :-shift]], axis=1
                 )  # segment id of the source token for this tap
                 same_seg = src_seg == seg
-            acc = acc + jnp.where(same_seg[..., None], shifted_x * w[j][None, None, :], 0.0)
+            tap = shifted_x.astype(acc_dtype) * w[j][None, None, :]
+            acc = acc + jnp.where(same_seg[..., None], tap, 0.0)
         return acc.astype(conv_input.dtype)
 
     def fix_query_key_value_ordering(

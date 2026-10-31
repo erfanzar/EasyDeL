@@ -7,21 +7,42 @@
 
 Provides :class:`Checkpointer` which wraps :class:`AsyncCheckpointManager` with
 discovery, temporary-checkpoint cleanup, and trainer-loop integration.
+
+Commit protocol (version 1)
+---------------------------
+A checkpoint directory is written in three stages:
+
+1. *prepare*: process 0 removes any stale ``commit_success.json`` and writes a
+   ``metadata.json`` carrying ``commit_protocol``. From this point the
+   directory is identifiable as an in-progress (uncommitted) save.
+2. *write*: every process writes its array shards (and optional per-process
+   ``data_state.p{i}.json``).
+3. *commit*: after a global barrier, process 0 rewrites ``metadata.json`` and
+   writes ``commit_success.json`` **last**.
+
+Discovery only returns directories that are committed, or legacy directories
+(``metadata.json`` without ``commit_protocol``) written before the protocol
+existed. A marker file is used instead of a directory rename so the protocol
+also holds on object stores where rename is not atomic. Deletion removes the
+marker first, so a crash mid-delete leaves an invisible directory that later
+retention passes clean up.
 """
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import json
 import queue
 import threading
-import time
 import typing as tp
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental import multihost_utils as mh
 from jax.sharding import Mesh, NamedSharding
 
@@ -35,6 +56,38 @@ from .async_manager import AsyncCheckpointManager
 logger: LazyLogger = get_logger("Checkpointer")
 
 MetadataDict: tp.TypeAlias = dict[str, object]
+
+COMMIT_PROTOCOL_VERSION = 1
+"""Version stamped into ``metadata.json`` under ``commit_protocol``."""
+
+COMMIT_MARKER = "commit_success.json"
+"""File written last by process 0; its presence makes a checkpoint visible."""
+
+METADATA_FILE = "metadata.json"
+
+_DATA_STATE_TEMPLATE = "data_state.p{process}.json"
+_BYTES_TAG = "__spx_bytes__"
+
+
+@dataclass(frozen=True)
+class CheckpointInfo:
+    """Discovery record for one checkpoint directory.
+
+    Attributes:
+        path: Full checkpoint directory path.
+        step: Step recorded in ``metadata.json`` (``-1`` if absent).
+        timestamp: Timestamp recorded in ``metadata.json``.
+        is_temporary: Whether the checkpoint was saved as temporary.
+        committed: Whether the checkpoint is visible (committed or legacy).
+        legacy: ``True`` for directories written before the commit protocol.
+    """
+
+    path: str
+    step: int
+    timestamp: dt.datetime
+    is_temporary: bool
+    committed: bool
+    legacy: bool
 
 
 @dataclass(frozen=True)
@@ -72,6 +125,8 @@ class Checkpointer:
         *,
         manager: AsyncCheckpointManager | None = None,
         delete_old_temp_checkpoints: bool = True,
+        max_to_keep: int | None = None,
+        cleanup_uncommitted: bool = True,
         ocdbt: bool = False,
         ocdbt_options: OcdbtSaveOptions | None = None,
     ) -> None:
@@ -88,6 +143,12 @@ class Checkpointer:
                 created if ``None``.
             delete_old_temp_checkpoints: Whether to queue deletion of prior
                 temporary checkpoints found at startup.
+            max_to_keep: Keep at most this many committed *permanent*
+                checkpoints written under the commit protocol; older ones are
+                deleted after each successful commit. ``None`` keeps all.
+                Legacy checkpoints are never deleted by retention.
+            cleanup_uncommitted: After each commit, delete uncommitted
+                protocol directories with a lower step (crashed saves).
             ocdbt: Default layout for saves: ``True`` writes one coalesced OCDBT
                 store per prefix instead of one zarr store per array.
             ocdbt_options: Default OCDBT write tuning (data-file size, TensorStore
@@ -102,6 +163,12 @@ class Checkpointer:
         self.step_policies = list(step_policies)
         self._last_save_time = dt.datetime.now()
         self._last_save_step = 0
+        if max_to_keep is not None and int(max_to_keep) < 1:
+            raise ValueError(f"max_to_keep must be >= 1 or None; got {max_to_keep!r}")
+        self.max_to_keep = None if max_to_keep is None else int(max_to_keep)
+        self.cleanup_uncommitted = bool(cleanup_uncommitted)
+        self._queued_removals: set[str] = set()
+        self._queued_removals_lock = threading.Lock()
 
         for i in range(1, len(step_policies)):
             prev_until = step_policies[i - 1].until
@@ -149,6 +216,7 @@ class Checkpointer:
         true_callbacks: list[tp.Callable[[str, Mesh, dict], None]] | None = None,
         extras: dict | None = None,
         prefix: str = "checkpoint",
+        data_state: Mapping[str, object] | None = None,
     ) -> None:
         """Process a training step and save checkpoint if policies dictate.
 
@@ -167,6 +235,12 @@ class Checkpointer:
             extras: Optional extra metadata written to the checkpoint.
             prefix: Prefix used when saving via ``save_pytree``. Ignored when
                 ``pytree is None``.
+            data_state: Optional per-process JSON-serializable data-loader
+                state (``bytes`` values are allowed). Written into the same
+                commit as the model so resume restores a consistent position.
+
+        The checkpoint is committed exactly once, after the pytree and every
+        ``true_callbacks`` entry have written their data.
         """
         if step == 0 and not force:
             self._last_save_time = dt.datetime.now()
@@ -200,55 +274,33 @@ class Checkpointer:
         else:
             logger.info(f"Saving temporary checkpoint at step {step}.")
 
-        last_tmp = self._last_temporary_checkpoint
         destination = f"run-{step}"
         full_path = _fs.joinpath(self.base_path, destination)
+        temporary = not save_permanent
+        merged_extras = dict(extras or {})
 
-        self._last_temporary_checkpoint = full_path if not save_permanent else None
+        if pytree is None and true_callbacks is None and data_state is None:
+            # Nothing to write; still advance the timers so the interval policy
+            # does not fire again on the very next step.
+            self._last_save_time = dt.datetime.now()
+            self._last_save_step = int(step)
+            return
 
-        def callback() -> None:
-            """Write metadata and clean up previous temporary checkpoint."""
-            try:
-                _write_checkpoint_metadata(
-                    full_path,
-                    step=step,
-                    is_temporary=not save_permanent,
-                )
-            except Exception as e:
-                logger.warning(f"Failed to write metadata.json: {e}")
-            if last_tmp is not None and jax.process_index() == 0:
-                try:
-                    meta = read_checkpoint_metadata(last_tmp)
-                    if meta.get("is_temporary", False):
-                        logger.info(f"Deleting old temporary checkpoint {last_tmp}")
-                        self._queue_checkpoint_removal(last_tmp)
-                    else:
-                        logger.info(
-                            f"Not deleting old temporary checkpoint {last_tmp} because it is no longer temporary."
-                        )
-                except FileNotFoundError:
-                    logger.warning(f"Could not load metadata for last temporary checkpoint {last_tmp}.")
-
+        self._prepare_destination(full_path, step=int(step), temporary=temporary)
         if pytree is not None:
-            self.save_pytree(
-                tree=pytree,
-                prefix=prefix,
-                step=step,
-                destination=destination,
+            self._write_trees(
+                full_path,
+                {prefix: pytree},
+                step=int(step),
                 mesh=mesh,
-                extras=extras,
-                temporary=not save_permanent,
+                dtype=None,
+                extras=merged_extras,
             )
-            callback()
-
         if true_callbacks is not None:
+            callback_meta = {"step": step, "is_temporary": temporary, **merged_extras}
             for save_callback in true_callbacks:
-                save_callback(
-                    full_path,
-                    mesh,
-                    {"step": step, "is_temporary": not save_permanent, **(extras or {})},
-                )
-            callback()
+                save_callback(full_path, mesh, dict(callback_meta))
+        self._finalize(full_path, step=int(step), temporary=temporary, data_state=data_state)
 
     def save_pytree(
         self,
@@ -262,6 +314,7 @@ class Checkpointer:
         extras: dict | None = None,
         temporary: bool = False,
         write_index: bool = True,
+        commit: bool = True,
         ocdbt: bool | None = None,
         ocdbt_options: OcdbtSaveOptions | None = None,
     ) -> str:
@@ -279,6 +332,9 @@ class Checkpointer:
             extras: Optional extra metadata.
             temporary: If ``True``, mark as temporary in metadata.
             write_index: Whether to write the TensorStore index file.
+            commit: When ``step`` is given, commit the checkpoint after the
+                write (default). Pass ``False`` to write several prefixes and
+                call :func:`commit_checkpoint` yourself, or use :meth:`save`.
             ocdbt: Write the OCDBT layout; ``None`` uses the checkpointer default.
             ocdbt_options: OCDBT write tuning; ``None`` uses the checkpointer default.
 
@@ -296,10 +352,12 @@ class Checkpointer:
             dest = destination or f"run-{int(step)}"
             path = _fs.joinpath(self.base_path, str(dest))
 
-        if _should_write_shared(path):
+        if step is not None:
+            self._prepare_destination(path, step=int(step), temporary=temporary)
+        elif _should_write_shared(path):
             _fs.mkdir(path, exist_ok=True)
 
-        merged_extras = extras or {}
+        merged_extras = dict(extras or {})
         if step is not None:
             merged_extras["step"] = int(step)
 
@@ -315,8 +373,8 @@ class Checkpointer:
             ocdbt_options=ocdbt_options if ocdbt_options is not None else self.ocdbt_options,
         )
 
-        if step is not None:
-            _write_checkpoint_metadata(path, step=int(step), is_temporary=temporary)
+        if step is not None and commit:
+            self._finalize(path, step=int(step), temporary=temporary, data_state=None)
 
         return path
 
@@ -457,6 +515,161 @@ class Checkpointer:
 
         return pytree, extras
 
+    def save(
+        self,
+        step: int,
+        trees: Mapping[str, PyTree],
+        *,
+        mesh: Mesh | None = None,
+        data_state: Mapping[str, object] | None = None,
+        extras: dict | None = None,
+        temporary: bool = False,
+        dtype: jnp.dtype | None = None,
+        destination: str | None = None,
+    ) -> str:
+        """Save several prefixed pytrees (and data state) as ONE committed checkpoint.
+
+        Example::
+
+            ckpt.save(step, {"model": state, "opt": opt_state}, data_state=loader.state())
+
+        Args:
+            step: Training step; also names the directory ``run-{step}``.
+            trees: Mapping ``prefix -> pytree``.
+            mesh: Optional compatibility argument (ignored on save).
+            data_state: Optional per-process data-loader state.
+            extras: Optional extra metadata stored with each prefix.
+            temporary: Mark the checkpoint as temporary.
+            dtype: Optional floating cast applied on save.
+            destination: Optional subdirectory name instead of ``run-{step}``.
+
+        Returns:
+            The committed checkpoint directory.
+
+        Raises:
+            ValueError: If there is nothing to save or a prefix is invalid.
+        """
+        if not trees and data_state is None:
+            raise ValueError("Checkpointer.save requires at least one tree or a data_state")
+        for prefix in trees:
+            if not prefix or not isinstance(prefix, str):
+                raise ValueError(f"Tree prefixes must be non-empty strings; got {prefix!r}")
+        path = _fs.joinpath(self.base_path, str(destination or f"run-{int(step)}"))
+        self._prepare_destination(path, step=int(step), temporary=temporary)
+        self._write_trees(path, trees, step=int(step), mesh=mesh, dtype=dtype, extras=dict(extras or {}))
+        self._finalize(path, step=int(step), temporary=temporary, data_state=data_state)
+        return path
+
+    def latest_checkpoint(self) -> CheckpointInfo | None:
+        """Return the newest committed checkpoint under ``base_path``, if any."""
+        infos = list_checkpoints(self.base_path)
+        return infos[-1] if infos else None
+
+    def load_data_state(self, path: str | None = None) -> dict | None:
+        """Read this process's data state from ``path`` (default: latest committed).
+
+        Args:
+            path: Checkpoint directory. ``None`` uses :meth:`latest_checkpoint`.
+
+        Returns:
+            The decoded data-state dict, or ``None`` when absent.
+        """
+        if path is None:
+            info = self.latest_checkpoint()
+            if info is None:
+                return None
+            path = info.path
+        return read_data_state(path)
+
+    def _prepare_destination(self, path: str, *, step: int, temporary: bool) -> None:
+        """Invalidate any previous commit of ``path`` and mark it in progress."""
+        if jax.process_index() == 0:
+            marker = _fs.joinpath(path, COMMIT_MARKER)
+            if _fs.exists(marker):
+                logger.warning(f"Overwriting committed checkpoint {path}; it is invisible until the new commit.")
+                _fs.rm(marker)
+            _write_checkpoint_metadata(path, step=step, is_temporary=temporary)
+        if _should_write_shared(path):
+            _fs.mkdir(path, exist_ok=True)
+        _barrier(f"spectrax_ckpt_prepare_{int(step)}")
+
+    def _write_trees(
+        self,
+        path: str,
+        trees: Mapping[str, PyTree],
+        *,
+        step: int,
+        mesh: Mesh | None,
+        dtype: jnp.dtype | None,
+        extras: dict,
+    ) -> None:
+        """Write every prefixed tree into ``path`` without committing."""
+        for prefix, tree in trees.items():
+            self._manager.save_pytree(
+                pytree=tree,
+                path=path,
+                prefix=prefix,
+                mesh=mesh,
+                dtype=dtype,
+                extras={**extras, "step": int(step)},
+                write_index=True,
+                ocdbt=self.ocdbt,
+                ocdbt_options=self.ocdbt_options,
+            )
+
+    def _finalize(
+        self,
+        path: str,
+        *,
+        step: int,
+        temporary: bool,
+        data_state: Mapping[str, object] | None,
+    ) -> None:
+        """Write data state, commit, advance save timers, and apply retention."""
+        if data_state is not None:
+            write_data_state(path, data_state)
+        commit_checkpoint(path, step=step, is_temporary=temporary)
+        self._last_save_time = dt.datetime.now()
+        self._last_save_step = int(step)
+
+        last_tmp = self._last_temporary_checkpoint
+        self._last_temporary_checkpoint = path if temporary else None
+        if jax.process_index() != 0:
+            return
+        if last_tmp is not None and last_tmp != path:
+            try:
+                meta = read_checkpoint_metadata(last_tmp)
+                if meta.get("is_temporary", False):
+                    logger.info(f"Deleting old temporary checkpoint {last_tmp}")
+                    self._queue_checkpoint_removal(last_tmp)
+                else:
+                    logger.info(f"Not deleting old temporary checkpoint {last_tmp} because it is no longer temporary.")
+            except FileNotFoundError:
+                logger.warning(f"Could not load metadata for last temporary checkpoint {last_tmp}.")
+        self._apply_retention(current_step=int(step), current_path=path)
+
+    def _apply_retention(self, *, current_step: int, current_path: str) -> None:
+        """Queue deletion of crashed saves and permanent checkpoints beyond ``max_to_keep``."""
+        if jax.process_index() != 0:
+            return
+        if not self.cleanup_uncommitted and self.max_to_keep is None:
+            return
+        infos = list_checkpoints(self.base_path, include_uncommitted=True)
+        doomed: list[str] = []
+        if self.cleanup_uncommitted:
+            doomed.extend(i.path for i in infos if not i.committed and not i.legacy and i.step < current_step)
+        if self.max_to_keep is not None:
+            permanent = sorted(
+                (i for i in infos if i.committed and not i.legacy and not i.is_temporary),
+                key=lambda i: (i.step, i.timestamp),
+            )
+            if len(permanent) > self.max_to_keep:
+                doomed.extend(i.path for i in permanent[: len(permanent) - self.max_to_keep])
+        for path in dict.fromkeys(doomed):
+            if path in (current_path, self.base_path):
+                continue
+            self._queue_checkpoint_removal(path)
+
     def wait_until_finished(self) -> None:
         """Block until all checkpoint operations complete.
 
@@ -465,11 +678,10 @@ class Checkpointer:
         """
         self._manager.global_manager.wait_until_finished()
         if jax.process_index() == 0:
-            while (
-                getattr(self, "_checkpoint_being_removed", None) is not None
-                or not self._checkpoint_cleanup_worker_queue.empty()
-            ):
-                time.sleep(0.2)
+            # ``join`` waits for ``task_done`` on every queued path, closing the
+            # window where the worker has dequeued a path but not yet marked it
+            # as being removed (the previous empty()/flag poll could return early).
+            self._checkpoint_cleanup_worker_queue.join()
 
     def _queue_checkpoint_removal(self, checkpoint_dir: str) -> None:
         """Add *checkpoint_dir* to the background deletion queue.
@@ -478,6 +690,10 @@ class Checkpointer:
             checkpoint_dir: Full path to the checkpoint directory to delete.
         """
         if jax.process_index() == 0:
+            with self._queued_removals_lock:
+                if checkpoint_dir in self._queued_removals:
+                    return
+                self._queued_removals.add(checkpoint_dir)
             logger.info(f"Queueing deletion of checkpoint {checkpoint_dir}")
             self._checkpoint_cleanup_worker_queue.put(checkpoint_dir)
 
@@ -497,7 +713,10 @@ class Checkpointer:
             except Exception:
                 logger.exception(f"Failed to delete checkpoint {checkpoint}")
             finally:
+                with self._queued_removals_lock:
+                    self._queued_removals.discard(checkpoint)
                 self._checkpoint_being_removed = None
+                self._checkpoint_cleanup_worker_queue.task_done()
 
     def _get_save_interval_for_step(self, step: int) -> int | None:
         """Determine the checkpoint save interval that applies at *step*.
@@ -537,10 +756,122 @@ def _write_checkpoint_metadata(
         "step": int(step),
         "timestamp": dt.datetime.now().isoformat(),
         "is_temporary": bool(is_temporary),
+        "commit_protocol": COMMIT_PROTOCOL_VERSION,
     }
     if jax.process_index() == 0:
         _fs.mkdir(checkpoint_path, exist_ok=True)
-        _fs.write_text(_fs.joinpath(checkpoint_path, "metadata.json"), json.dumps(meta))
+        _fs.write_text(_fs.joinpath(checkpoint_path, METADATA_FILE), json.dumps(meta))
+
+
+def _barrier(name: str) -> None:
+    """Synchronize all JAX processes; a no-op in single-process runs."""
+    if jax.process_count() > 1:
+        mh.sync_global_devices(name)
+
+
+def commit_checkpoint(path: str, *, step: int, is_temporary: bool = False) -> None:
+    """Make ``path`` visible to discovery once every process has finished writing.
+
+    Waits for in-flight array writes on all processes, then process 0 rewrites
+    ``metadata.json`` (fresh timestamp) and writes ``commit_success.json``
+    last. A second barrier makes the commit visible to every process before
+    any of them proceeds.
+
+    Args:
+        path: Checkpoint directory.
+        step: Step recorded in the metadata.
+        is_temporary: Whether the checkpoint is temporary.
+    """
+    _barrier(f"spectrax_ckpt_written_{int(step)}")
+    if jax.process_index() == 0:
+        _write_checkpoint_metadata(path, step=int(step), is_temporary=is_temporary)
+        marker = {
+            "step": int(step),
+            "timestamp": dt.datetime.now().isoformat(),
+            "commit_protocol": COMMIT_PROTOCOL_VERSION,
+            "process_count": int(jax.process_count()),
+        }
+        _fs.write_text(_fs.joinpath(path, COMMIT_MARKER), json.dumps(marker))
+    _barrier(f"spectrax_ckpt_committed_{int(step)}")
+
+
+def is_checkpoint_committed(path: str) -> bool:
+    """Return whether ``path`` is visible: committed, or a legacy checkpoint.
+
+    Args:
+        path: Checkpoint directory.
+
+    Returns:
+        ``False`` for missing metadata or an uncommitted protocol directory.
+    """
+    try:
+        meta = read_checkpoint_metadata(path)
+    except Exception:
+        return False
+    if "commit_protocol" not in meta:
+        return True
+    return _fs.exists(_fs.joinpath(path, COMMIT_MARKER))
+
+
+def _encode_data_state(value: object) -> object:
+    """Convert a data-state value into JSON-safe form (bytes are base64-tagged)."""
+    if isinstance(value, bytes | bytearray):
+        return {_BYTES_TAG: base64.b64encode(bytes(value)).decode("ascii")}
+    if isinstance(value, Mapping):
+        out = {}
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise TypeError(f"data_state keys must be strings; got {k!r}")
+            out[k] = _encode_data_state(v)
+        return out
+    if isinstance(value, list | tuple):
+        return [_encode_data_state(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray | jax.Array):
+        return np.asarray(value).tolist()
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    raise TypeError(f"Unsupported data_state value of type {type(value).__name__}")
+
+
+def _decode_data_state(value: object) -> object:
+    """Inverse of :func:`_encode_data_state`."""
+    if isinstance(value, dict):
+        if set(value) == {_BYTES_TAG}:
+            return base64.b64decode(value[_BYTES_TAG])
+        return {k: _decode_data_state(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_decode_data_state(v) for v in value]
+    return value
+
+
+def write_data_state(path: str, state: Mapping[str, object]) -> None:
+    """Write this process's data-loader state into checkpoint ``path``.
+
+    Every process writes its own ``data_state.p{process}.json`` so per-host
+    loader positions round-trip. Call before :func:`commit_checkpoint`.
+
+    Args:
+        path: Checkpoint directory.
+        state: JSON-serializable mapping; ``bytes`` and numpy values are allowed.
+    """
+    if not isinstance(state, Mapping):
+        raise TypeError(f"data_state must be a mapping; got {type(state).__name__}")
+    payload = json.dumps(_encode_data_state(state))
+    if not _fs.is_remote_path(path):
+        _fs.mkdir(path, exist_ok=True)
+    name = _DATA_STATE_TEMPLATE.format(process=int(jax.process_index()))
+    _fs.write_text(_fs.joinpath(path, name), payload)
+
+
+def read_data_state(path: str) -> dict | None:
+    """Read this process's data-loader state from ``path``; ``None`` if absent."""
+    name = _DATA_STATE_TEMPLATE.format(process=int(jax.process_index()))
+    file_path = _fs.joinpath(path, name)
+    if not _fs.exists(file_path):
+        return None
+    return tp.cast(dict, _decode_data_state(json.loads(_fs.read_text(file_path))))
 
 
 def read_checkpoint_metadata(checkpoint_path: str) -> MetadataDict:
@@ -557,7 +888,38 @@ def read_checkpoint_metadata(checkpoint_path: str) -> MetadataDict:
     return json.loads(text)
 
 
+# Backward-compatible alias
 _read_checkpoint_metadata = read_checkpoint_metadata
+
+
+def _checkpoint_info(path: str) -> CheckpointInfo | None:
+    """Build a :class:`CheckpointInfo` for ``path``; ``None`` without metadata."""
+    if not _fs.exists(_fs.joinpath(path, METADATA_FILE)):
+        return None
+    try:
+        meta = read_checkpoint_metadata(path)
+    except Exception as e:
+        logger.debug(f"Could not read metadata for {path}: {e}")
+        return None
+    try:
+        # Legacy metadata uses local, naive datetimes; EasyDeL state metadata includes a UTC offset.
+        ts = dt.datetime.fromisoformat(str(meta.get("timestamp", "1970-01-01T00:00:00"))).astimezone(dt.UTC)
+    except (ValueError, OverflowError):
+        ts = dt.datetime.min.replace(tzinfo=dt.UTC)
+    legacy = "commit_protocol" not in meta
+    committed = legacy or _fs.exists(_fs.joinpath(path, COMMIT_MARKER))
+    try:
+        step = int(meta.get("step", -1))
+    except (TypeError, ValueError):
+        step = -1
+    return CheckpointInfo(
+        path=path,
+        step=step,
+        timestamp=ts,
+        is_temporary=bool(meta.get("is_temporary", False)),
+        committed=committed,
+        legacy=legacy,
+    )
 
 
 def _reattach_scheme(scheme: str, path: str) -> str:
@@ -583,68 +945,67 @@ def _reattach_scheme(scheme: str, path: str) -> str:
     return scheme + path
 
 
-def find_latest_checkpoint(base_path: str) -> str | None:
-    """Find the most recent checkpoint under *base_path*.
+def list_checkpoints(base_path: str, *, include_uncommitted: bool = False) -> list[CheckpointInfo]:
+    """List checkpoints under ``base_path`` (and ``base_path`` itself), oldest first.
 
-    Checkpoints are identified by the presence of ``metadata.json``.
-    Sorting is based on ``timestamp`` (primary) and ``step`` (secondary).
+    Ordering is ``(timestamp, step)``; the commit rewrites the timestamp, so
+    order reflects commit time.
 
     Args:
         base_path: Root directory to search.
+        include_uncommitted: Also return in-progress / crashed protocol saves.
 
     Returns:
-        Full path to the latest checkpoint directory, or ``None`` if no
-        valid checkpoints are found.
+        A list of :class:`CheckpointInfo`, oldest to newest.
     """
     if not _fs.is_dir(base_path):
-        return None
-
-    # ``_fs.iterdir()`` returns paths with the URI scheme stripped
-    # ("gs://bucket/run" -> "bucket/run"). Every subsequent path operation --
-    # including the metadata.json existence probe below -- then resolves against
-    # the LOCAL filesystem and is unconditionally False for remote object
-    # storage, so discovery silently returns None and resumption never happens.
-    # Re-attach the scheme taken from ``base_path`` before touching the results.
-    _scheme = base_path.split("://", 1)[0] + "://" if "://" in base_path else ""
-
-    candidates = [q for q in (_reattach_scheme(_scheme, p) for p in _fs.iterdir(base_path)) if _fs.is_dir(q)]
+        return []
+    # ``_fs.iterdir()`` strips the URI scheme ("gs://bucket/run" -> "bucket/run"),
+    # so re-attach it before probing children; otherwise every probe resolves
+    # against the local filesystem and remote discovery finds nothing.
+    scheme = base_path.split("://", 1)[0] + "://" if "://" in base_path else ""
+    candidates = [q for q in (_reattach_scheme(scheme, p) for p in _fs.iterdir(base_path)) if _fs.is_dir(q)]
     candidates.append(base_path)
+    infos = [info for info in (_checkpoint_info(p) for p in candidates) if info is not None]
+    if not include_uncommitted:
+        infos = [info for info in infos if info.committed]
+    infos.sort(key=lambda i: (i.timestamp, i.step))
+    return infos
 
-    ckpts = [p for p in candidates if _fs.exists(_fs.joinpath(p, "metadata.json"))]
-    if not ckpts:
-        logger.debug(f"No checkpoints found under {base_path}")
+
+def find_latest_checkpoint(base_path: str, *, include_uncommitted: bool = False) -> str | None:
+    """Find the most recent *committed* checkpoint under *base_path*.
+
+    Protocol checkpoints are visible only once ``commit_success.json`` exists;
+    legacy checkpoints (``metadata.json`` without ``commit_protocol``) are
+    always visible. Sorting is by ``timestamp`` then ``step``.
+
+    Args:
+        base_path: Root directory to search.
+        include_uncommitted: Also consider uncommitted (crashed) saves.
+
+    Returns:
+        Full path to the latest checkpoint directory, or ``None``.
+    """
+    infos = list_checkpoints(base_path, include_uncommitted=include_uncommitted)
+    if not infos:
+        logger.debug(f"No committed checkpoints found under {base_path}")
         return None
-
-    def sort_key(path: str):
-        """Return a sort key for a checkpoint path based on timestamp and step.
-
-        Args:
-            path: Checkpoint directory path.
-
-        Returns:
-            A tuple of ``(timestamp, step)`` for sorting.
-        """
-        try:
-            meta = read_checkpoint_metadata(path)
-            ts = dt.datetime.fromisoformat(meta.get("timestamp", "1970-01-01T00:00:00"))
-            # Legacy metadata uses local, naive datetimes; EasyDeL state
-            # metadata includes a UTC offset. Compare both on the same timeline.
-            ts = ts.astimezone(dt.UTC)
-            step = int(meta.get("step", -1))
-            return (ts, step)
-        except Exception as e:
-            logger.debug(f"Could not read metadata for {path}: {e}")
-            return (dt.datetime.min.replace(tzinfo=dt.UTC), -1)
-
-    return max(ckpts, key=sort_key)
+    return infos[-1].path
 
 
 def _rm_checkpoint(path: str) -> None:
-    """Remove a checkpoint directory recursively.
+    """Remove a checkpoint directory, deleting its commit marker first.
+
+    Removing the marker first means a crash mid-delete leaves an invisible
+    (uncommitted) directory rather than a visible, partially deleted one.
 
     Args:
         path: Directory to delete.
     """
+    marker = _fs.joinpath(path, COMMIT_MARKER)
+    if _fs.exists(marker):
+        _fs.rm(marker)
     if _fs.exists(path):
         _fs.rm(path, recursive=True)
 

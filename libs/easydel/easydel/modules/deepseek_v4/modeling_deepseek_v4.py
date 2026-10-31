@@ -1705,7 +1705,7 @@ class DeepseekV4TopKRouter(spx.Module):
         if self.uses_score_correction:
             self.e_score_correction_bias = ArrayParam.bound(
                 shape=(self.num_experts,),
-                dtype=param_dtype,
+                dtype=jnp.float32,
                 init_method="zeros",
                 key=rngs.param,
             )
@@ -2163,6 +2163,8 @@ class DeepseekV4Model(EasyDeLBaseModule):
     """
 
     esurge_cache_family: tp.ClassVar[str] = "compressed_window"
+
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 
     def __init__(
         self,
@@ -2710,6 +2712,8 @@ class DeepseekV4ForCausalLM(BaseCausalLMModule[DeepseekV4Model, DeepseekV4Config
     esurge_cache_family: tp.ClassVar[str] = "compressed_window"
     # DeepSeek publishes V4 only in its own inference naming (see DEEPSEEK_V4_KEY_RULES).
     checkpoint_key_rules: tp.ClassVar[KeyRuleSet] = DEEPSEEK_V4_KEY_RULES
+
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 
     def __init__(
         self,

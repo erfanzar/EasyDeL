@@ -161,7 +161,9 @@ def _packed_depthwise_causal_conv(
     """Depthwise causal convolution that never crosses packed documents."""
     batch, seq_len, channels = hidden_states.shape
     positions = jnp.arange(seq_len, dtype=jnp.int32)
-    out = jnp.zeros((batch, seq_len, channels), jnp.float32)
+    # Callers receive the accumulator dtype (fp32 for bf16/fp16 streams); never narrower.
+    acc_dtype = jnp.promote_types(jnp.promote_types(hidden_states.dtype, kernel.dtype), jnp.float32)
+    out = jnp.zeros((batch, seq_len, channels), acc_dtype)
     width = kernel.shape[0]
     for kernel_idx in range(width):
         lag = dilation * (width - 1 - kernel_idx)
@@ -170,7 +172,7 @@ def _packed_depthwise_causal_conv(
         shifted = jnp.take_along_axis(hidden_states, jnp.broadcast_to(gather, hidden_states.shape), axis=1)
         source_segments = jnp.take_along_axis(segment_ids, jnp.broadcast_to(gather[..., 0], segment_ids.shape), axis=1)
         valid = (source[None, :] >= 0) & (segment_ids >= 0) & (source_segments == segment_ids)
-        out = out + jnp.where(valid[..., None], shifted.astype(jnp.float32), 0.0) * kernel[kernel_idx, 0]
+        out = out + jnp.where(valid[..., None], shifted.astype(acc_dtype), 0.0) * kernel[kernel_idx, 0].astype(acc_dtype)
     return out
 
 

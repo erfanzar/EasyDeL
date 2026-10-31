@@ -36,6 +36,7 @@ Components:
   wraps it with the LM head.
 """
 
+import typing as tp
 from functools import partial
 
 import jax
@@ -689,6 +690,8 @@ class HyV3Model(EasyDeLBaseModule):
         precision: Precision setting for JAX operations.
     """
 
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
+
     def __init__(
         self,
         config: HyV3Config,
@@ -967,6 +970,8 @@ class HyV3ForCausalLM(BaseCausalLMModule[HyV3Model, HyV3Config]):  # type: ignor
     _task_type = TaskType.CAUSAL_LM
     _model_type = "hy_v3"
     _config_class = HyV3Config
+
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 
     def __init__(
         self,

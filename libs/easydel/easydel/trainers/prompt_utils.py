@@ -166,6 +166,14 @@ def normalize_message_payload(
 
             if "role" in item:
                 normalized = dict(item)
+                tool_calls = normalized.get("tool_calls")
+                if isinstance(tool_calls, str):
+                    decoded = _maybe_json_load(tool_calls)
+                    if isinstance(decoded, list):
+                        normalized["tool_calls"] = tool_calls = decoded
+                # Mirrors data/transforms/chat_template.py: None content is kept only alongside tool_calls.
+                if normalized.get("content") is None and not tool_calls:
+                    normalized["content"] = ""
                 normalized.setdefault("content", "")
                 return [normalized]
 

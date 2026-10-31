@@ -1107,6 +1107,7 @@ class Glm5NextTextModel(_Glm5NextIndexerCacheMixin, EasyDeLBaseModule):
         rngs: PRNG key container.
     """
 
+    fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
     # Accepts native checkpoints that nest the forget gate under ``self_attn.forget_gate``.
     _upgrade_legacy_native_state = staticmethod(unnest_legacy_kda_forget_gate)
 
@@ -1413,6 +1414,8 @@ class Glm5NextForCausalLM(_Glm5NextIndexerCacheMixin, BaseCausalLMModule[Glm5Nex
     _model_type = "glm5_next_text"
     _config_class = Glm5NextTextConfig
     _upgrade_legacy_native_state = staticmethod(unnest_legacy_kda_forget_gate)
+
+    fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 
     def __init__(
         self,

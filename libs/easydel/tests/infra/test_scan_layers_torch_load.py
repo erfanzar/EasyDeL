@@ -49,6 +49,9 @@ def test_scanned_load_matches_unscanned_logits(hf_checkpoint):
     assert isinstance(scanned.model.layers, spx.nn.StackedModuleList)
     assert len(scanned.model.layers) == 3
     assert not scanned.abstract_parameter_leaves()
+    mesh_devices = set(scanned.mesh.devices.flat)
+    for path, leaf in jax.tree_util.tree_flatten_with_path(scanned.split_module()[1])[0]:
+        assert set(leaf.sharding.device_set) == mesh_devices, f"{jax.tree_util.keystr(path)} is off the mesh"
 
     ids = jnp.asarray(np.random.default_rng(0).integers(0, VOCAB, (2, SEQ)), jnp.int32)
     with plain.mesh:

@@ -420,7 +420,8 @@ class MixStageConfig:
         reshuffle_on_restart (bool): Visit a restarted constituent's shards
             in a fresh deterministic per-epoch permutation instead of
             replaying the identical order. Only meaningful with
-            ``stop_strategy="restart"``.
+            ``stop_strategy="restart"``. Enable it only for a fresh run: a
+            run checkpointed without it resumes onto a different order.
         attach_dataset_ids (bool): Stamp the integer dataset-attribution
             column (``easydel.data.DATASET_ID_FIELD``) on every mixed row so
             trainers can split metrics or losses per source.

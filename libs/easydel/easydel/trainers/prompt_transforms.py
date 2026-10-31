@@ -21,6 +21,7 @@ and provides trainer-specific utilities.
 from __future__ import annotations
 
 import json
+import re
 import typing as tp
 import warnings
 from collections.abc import Iterator
@@ -42,6 +43,7 @@ from .prompt_utils import (
 )
 
 _DEFAULT_SFT_PADDING = object()
+_GENERATION_TAG_RE = re.compile(r"\{%-?\s*generation\s*-?%\}")
 _TOKENIZED_FIELDS = {
     "input_ids",
     "attention_mask",
@@ -1152,7 +1154,7 @@ class SFTPreprocessTransform(Transform):
         self._packing_mode = packing_mode
         chat_template = getattr(tokenizer, "chat_template", None)
         self._return_assistant_tokens_mask = bool(
-            mask_prompt and isinstance(chat_template, str) and "{% generation %}" in chat_template
+            mask_prompt and isinstance(chat_template, str) and _GENERATION_TAG_RE.search(chat_template) is not None
         )
 
     def __call__(self, example: Example) -> Example:

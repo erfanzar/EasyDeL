@@ -400,6 +400,42 @@ def _stacked_layer_paths(model: tp.Any) -> tuple[tuple, ...]:
     return tuple(str_to_path(path) for path, _ in spx.iter_modules(model, select=nn.StackedModuleList) if path)
 
 
+def _torch_pretrained_model_class() -> type:
+    from transformers import PreTrainedModel
+
+    return PreTrainedModel
+
+
+@contextlib.contextmanager
+def _torch_fp32_pinned_load(patterns: tuple[str, ...]):
+    """Keep checkpoint keys matching ``patterns`` in float32 during a half-precision torch load.
+
+    Extends transformers' per-key ``dtype_plan`` (the ``_keep_in_fp32_modules_strict`` mechanism) for the
+    duration of one ``from_pretrained`` call, so only the pinned leaves are materialized in float32.
+    Patterns match whole dotted segments, like ``fp32_param_pattern_matches``.
+    """
+    if not patterns:
+        yield
+        return
+    import torch
+
+    model_class = _torch_pretrained_model_class()
+    original = model_class._get_dtype_plan
+    extra = {rf"(?:^|\.){re.escape(pattern)}(?:\.|$)": torch.float32 for pattern in patterns}
+
+    def _get_dtype_plan(self, dtype):
+        plan = original(self, dtype)
+        if dtype in (torch.float16, torch.bfloat16):
+            plan = {**plan, **extra}
+        return plan
+
+    model_class._get_dtype_plan = _get_dtype_plan
+    try:
+        yield
+    finally:
+        model_class._get_dtype_plan = original
+
+
 def _restack_layer_containers(model: tp.Any, paths: tuple[tuple, ...]) -> tp.Any:
     """Replace the ``ModuleList`` at each path with its stacked equivalent.
 
@@ -2925,8 +2961,8 @@ class EasyBridgeMixin(PushToHubMixin):
                 torch_loader=cls.get_torch_loader(),
                 clear_fn=_clear,
                 kwargs=kwargs,
-                # fp32-pinned leaves must reach the converter un-rounded; it casts the rest itself.
-                param_dtype=jnp.float32 if getattr(module, "fp32_param_patterns", ()) else param_dtype,
+                param_dtype=param_dtype,
+                fp32_param_patterns=tuple(getattr(module, "fp32_param_patterns", ()) or ()),
             )
         else:
             ckpt_info = cls._resolve_streaming_checkpoint(
@@ -3061,7 +3097,8 @@ class EasyBridgeMixin(PushToHubMixin):
         # remaining meta leaves now so the model is fully materialized and safe to serialize.
         model = model.materialize_meta_state()
         if stacked_layer_paths:
-            model = _restack_layer_containers(model, stacked_layer_paths)
+            # Eager stacking drops the per-layer mesh placement; re-place the stacked leaves on the mesh.
+            model = _restack_layer_containers(model, stacked_layer_paths).shard_model()
         logger.debug("model and parameters pytree merged.")
 
         model = model.quantize(
@@ -4150,6 +4187,7 @@ class EasyBridgeMixin(PushToHubMixin):
         clear_fn: tp.Callable[[], None],
         kwargs: dict[str, tp.Any],
         param_dtype: jnp.dtype | None = None,
+        fp32_param_patterns: tuple[str, ...] = (),
     ) -> tuple[tp.Any, tp.Any, dict[str, tp.Any]]:
         """Load full PyTorch checkpoint into memory (for torch_load_mode='full').
 
@@ -4165,6 +4203,8 @@ class EasyBridgeMixin(PushToHubMixin):
             param_dtype (jnp.dtype | None): Target parameter dtype. Without an explicit
                 ``torch_dtype`` the torch model loads in this dtype (or the checkpoint's own
                 dtype when torch has no match), so weights are rounded once, to the target.
+            fp32_param_patterns: The model's fp32-pinned segment patterns. Matching keys load
+                in float32 while the rest load in ``param_dtype``.
 
         Returns:
             tuple[Any, Any, dict[str, Any]]: A tuple of (ed_config, generation_config, state_dict)
@@ -4174,16 +4214,22 @@ class EasyBridgeMixin(PushToHubMixin):
         import torch
 
         logger.debug(f"Downloading hf_model weights from {pretrained_model_name_or_path}")
+        pin_supported = hasattr(_torch_pretrained_model_class(), "_get_dtype_plan")
+        if fp32_param_patterns and not pin_supported:
+            # No per-key dtype hook: load everything in fp32 so pinned leaves reach the converter un-rounded.
+            param_dtype = jnp.float32
         if "torch_dtype" not in kwargs:
             target = jnp.dtype(param_dtype).name if param_dtype is not None else None
             kwargs["torch_dtype"] = getattr(torch, target, "auto") if target else "auto"
         torch_dtype = kwargs.pop("torch_dtype")
+        pinned = fp32_param_patterns if pin_supported else ()
         try:
-            hf_model = torch_loader.from_pretrained(
-                pretrained_model_name_or_path,
-                dtype=torch_dtype,
-                **kwargs,
-            )
+            with _torch_fp32_pinned_load(pinned):
+                hf_model = torch_loader.from_pretrained(
+                    pretrained_model_name_or_path,
+                    dtype=torch_dtype,
+                    **kwargs,
+                )
         except ValueError as err:
             # Remote-code repos register only the Auto classes in their
             # ``auto_map`` (Kimi-VL maps AutoModelForCausalLM, not
@@ -4193,11 +4239,12 @@ class EasyBridgeMixin(PushToHubMixin):
             fallback = cls._auto_map_torch_loader(pretrained_model_name_or_path, hub_kwargs, kwargs)
             if fallback is None:
                 raise
-            hf_model = fallback.from_pretrained(
-                pretrained_model_name_or_path,
-                dtype=torch_dtype,
-                **kwargs,
-            )
+            with _torch_fp32_pinned_load(pinned):
+                hf_model = fallback.from_pretrained(
+                    pretrained_model_name_or_path,
+                    dtype=torch_dtype,
+                    **kwargs,
+                )
         generation_config = getattr(hf_model, "generation_config", None)
         ed_config = config_class.from_pretrained(pretrained_model_name_or_path, **hub_kwargs)
         state_dict = hf_model.state_dict()

@@ -1296,6 +1296,8 @@ class DeepseekV41Model(EngramModelMixin, EasyDeLBaseModule):
 
     esurge_cache_family: tp.ClassVar[str] = "compressed_window"
 
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
+
     def __init__(
         self,
         config: DeepseekV41Config,
@@ -1817,6 +1819,8 @@ class DeepseekV41ForCausalLM(EngramModelMixin, BaseCausalLMModule[DeepseekV41Mod
     esurge_cache_family: tp.ClassVar[str] = "compressed_window"
     # Engram table management, eSurge side inputs and the trainer host-batch hook come from ``EngramModelMixin``.
 
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
+
     @property
     def esurge_requires_tokens_to_end(self) -> bool:
         """eSurge hook: request the ``tokens_to_end`` side input that drives the CED prefill skip."""
@@ -2159,6 +2163,8 @@ class DeepseekV41ForConditionalGeneration(  # type: ignore
     _config_class = DeepseekV41Config
     _auto_register = False  # registered explicitly above
     checkpoint_key_rules: tp.ClassVar[KeyRuleSet] = DEEPSEEK_V41_VL_KEY_RULES
+
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 
     @property
     def esurge_requires_tokens_to_end(self) -> bool:

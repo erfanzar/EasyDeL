@@ -93,11 +93,28 @@ def test_all_exhausted_sees_every_row_once_then_terminates():
     assert sorted(r["i"] for r in rows if r["src"] == "big") == list(range(30))
 
 
-def test_restart_default_replays_identical_shard_order():
-    mix = _mix({"a": _source("a", 4, 3), "pad": _source("pad", 1, 10_000)}, block_size=8)
+def test_restart_without_reshuffle_replays_identical_shard_order():
+    mix = _mix({"a": _source("a", 4, 3), "pad": _source("pad", 1, 10_000)}, block_size=8, reshuffle_on_restart=False)
     epochs = _epochs_of(list(islice(mix.open_shard("mixed_shard_0"), 200)), "a", 12)
     assert len(epochs) >= 3
     assert epochs[1] == epochs[0] == epochs[2] == [0] * 3 + [1] * 3 + [2] * 3 + [3] * 3
+
+
+def test_restart_default_keeps_shard_order_so_old_checkpoints_resume_exactly():
+    sources = {"a": _source("a", 12, 3), "pad": _source("pad", 1, 10_000)}
+    default = list(islice(_mix(sources, block_size=8, seed=7).open_shard("mixed_shard_0"), 400))
+    fixed = list(
+        islice(_mix(sources, block_size=8, seed=7, reshuffle_on_restart=False).open_shard("mixed_shard_0"), 400)
+    )
+    assert default == fixed
+    epochs = _epochs_of(default, "a", 36)
+    assert len(epochs) >= 2 and epochs[1] == epochs[0]
+    assert MixStageConfig().reshuffle_on_restart is False
+
+    row = next(i for i, r in enumerate(default) if r["__source__"] == "a" and i > 2 * 36 + 18)
+    state = _mix(sources, block_size=8, seed=7, reshuffle_on_restart=False).resume_state(row)
+    resumed = list(islice(_mix(sources, block_size=8, seed=7).open_shard_from_state(state), 400 - row))
+    assert resumed == default[row:]
 
 
 def _reshuffled(seed=7, **kw):

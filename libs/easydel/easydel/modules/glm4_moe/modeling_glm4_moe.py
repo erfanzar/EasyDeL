@@ -33,6 +33,7 @@ Exports:
     - :class:`Glm4MoeForSequenceClassification`: Pooled classifier head.
 """
 
+import typing as tp
 from functools import partial
 
 import jax
@@ -738,6 +739,8 @@ class Glm4MoeModel(EasyDeLBaseModule):
         precision: Precision setting for JAX operations.
     """
 
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
+
     def __init__(
         self,
         config: Glm4MoeConfig,
@@ -1029,6 +1032,8 @@ class Glm4MoeForCausalLM(BaseCausalLMModule[Glm4MoeModel, Glm4MoeConfig]):  # ty
     _model_type = "glm4_moe"
     _config_class = Glm4MoeConfig
 
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
+
     def __init__(
         self,
         config: Glm4MoeConfig,
@@ -1077,6 +1082,8 @@ class Glm4MoeForSequenceClassification(BaseSequenceClassificationModule[Glm4MoeM
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "glm4_moe"
     _config_class = Glm4MoeConfig
+
+    fp32_param_patterns: tp.ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 
     def __init__(
         self,

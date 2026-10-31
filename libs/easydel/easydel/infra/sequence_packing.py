@@ -236,7 +236,6 @@ def segmented_depthwise_causal_conv1d(
 
     # The rolling window stores tokens in the state dtype before the compute-dtype reduction.
     x_state = inputs.astype(state_dtype)
-    x = x_state.astype(compute_dtype)
     taps = kernel.astype(compute_dtype)
     zero = jnp.zeros((), dtype=compute_dtype)
     # Products round in the compute dtype (as the window product does); the tap sum accumulates in at
@@ -244,7 +243,9 @@ def segmented_depthwise_causal_conv1d(
     accum_dtype = jnp.promote_types(compute_dtype, jnp.float32)
     conv = None
     for j in range(kernel_size - 1, -1, -1):
-        tap = jnp.where(keep[j][..., None], _shift_tokens(x, j, 0), zero) * taps[:, kernel_size - 1 - j]
+        # Shift in the stream dtype and widen per tap to avoid a full compute-dtype copy of the stream.
+        shifted = _shift_tokens(x_state, j, 0).astype(compute_dtype)
+        tap = jnp.where(keep[j][..., None], shifted, zero) * taps[:, kernel_size - 1 - j]
         tap = tap.astype(accum_dtype)
         conv = tap if conv is None else conv + tap
 

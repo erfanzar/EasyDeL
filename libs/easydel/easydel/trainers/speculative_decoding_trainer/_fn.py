@@ -199,13 +199,16 @@ def _call_module_or_method(
     Returns:
         The raw output of the model call.
     """
-    method = module.__call__ if method_name in (None, "", "__call__", "forward") else getattr(module, method_name)
+    uses_call = method_name in (None, "", "__call__", "forward")
+    method = module.__call__ if uses_call else getattr(module, method_name)
+    # EasyDeLBaseModule.__call__ takes **kwargs, so filter against forward's real signature.
+    signature_source = getattr(module, "forward", method) if uses_call else method
     call_kwargs = _strip_forward_only_keys(batch)
     if output_hidden_states:
         call_kwargs["output_hidden_states"] = True
     if extra_kwargs:
         call_kwargs.update(extra_kwargs)
-    call_kwargs = filter_kwargs_for_callable(method, call_kwargs)
+    call_kwargs = filter_kwargs_for_callable(signature_source, call_kwargs)
     call_kwargs = sanitize_model_call_kwargs(call_kwargs)
     return method(**call_kwargs)
 
