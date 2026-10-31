@@ -467,7 +467,15 @@ class Mistral4MoE(BaseMoeModule):
         # grouped selection, which consumes full per-expert probabilities.
         self.moe_hooks = self.moe_hooks.replace(
             normalize_gate_logits=lambda x: jax.nn.softmax(x.astype(jnp.float32), axis=-1),
-            select_hook=self._select_experts,
+            select_hook=functools.partial(
+                moe_group_topk_select,
+                n_routed_experts=config.n_routed_experts,
+                score_fn="none",
+                n_group=config.n_group,
+                topk_group=config.topk_group,
+                norm_topk_prob=config.norm_topk_prob,
+                routed_scaling_factor=config.routed_scaling_factor,
+            ),
         )
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -479,40 +487,6 @@ class Mistral4MoE(BaseMoeModule):
                 intermediate_size=intermediate_size,
                 rngs=rngs,
             )
-
-    def _select_experts(self, gate_logits: Array, pre_bias_logits: Array | None, k: int) -> tuple[Array, Array]:
-        """Select eligible experts, preserving zero-weight slots beyond group capacity.
-
-        Args:
-            gate_logits: Full per-expert softmax scores, shaped ``[tokens, experts]``.
-            pre_bias_logits: Optional hook input, passed through to the shared selector.
-            k: Number of output routing slots per token.
-
-        Returns:
-            Weights and indices shaped ``[tokens, k]``. Slots beyond the retained
-            groups' capacity have zero weight and cannot activate excluded experts.
-        """
-        config = self.config
-        capacity = config.n_routed_experts
-        if config.n_group > 1:
-            capacity = (config.n_routed_experts // config.n_group) * min(config.topk_group, config.n_group)
-        eligible_k = min(k, capacity)
-        weights, indices = moe_group_topk_select(
-            gate_logits,
-            pre_bias_logits,
-            eligible_k,
-            n_routed_experts=config.n_routed_experts,
-            score_fn="none",
-            n_group=config.n_group,
-            topk_group=config.topk_group,
-            norm_topk_prob=config.norm_topk_prob,
-            routed_scaling_factor=config.routed_scaling_factor,
-        )
-        if eligible_k < k:
-            padding = ((0, 0), (0, k - eligible_k))
-            weights = jnp.pad(weights, padding)
-            indices = jnp.pad(indices, padding)
-        return weights, indices
 
     def forward(self, hidden_states: Array):
         """Process tokens through MoE experts with routing.

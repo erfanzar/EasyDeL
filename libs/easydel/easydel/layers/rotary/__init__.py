@@ -92,6 +92,7 @@ from ._modules import (
 )
 from ._rotary import get_frequencies, get_inv_frequencies, get_rope, partial_rope_frequencies
 from ._utils import (
+    apply_mla_rope,
     apply_rope_interleaved,
     apply_rope_interleaved_partial,
     apply_rope_split_half,
@@ -114,6 +115,7 @@ __all__ = (
     "RotaryEmbedding",
     "YaRNScalingRotaryEmbedding",
     "apply_basic_rope",
+    "apply_mla_rope",
     "apply_phi3_rope",
     "apply_rope_interleaved",
     "apply_rope_interleaved_partial",

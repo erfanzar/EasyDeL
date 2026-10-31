@@ -95,6 +95,29 @@ def test_fused_matches_scan_values_and_grads(packed, continue_initial_state):
         assert _rel(a, c) < 1e-3
 
 
+@pytest.mark.parametrize("packed", [False, True], ids=["plain", "packed"])
+def test_fused_with_gate_bound_matches_scan(packed):
+    """``decay_lower_bound`` (factored MXU pairwise decay in the fused kernel) matches the scan's values and grads."""
+    q, k, v, b, g, s0 = _inputs(2, 2, L, seed=20 + int(packed))
+    assert float(g.min()) >= -5.0
+    seg = _segments(PACKED, L) if packed else None
+    w = jax.random.normal(jax.random.PRNGKey(19), (2, 2, L, V))
+
+    def run(fn, **extra):
+        def loss(q, k, v, b, g, s0):
+            o, s = fn(q, k, v, b, g, initial_state=s0, chunk_size=64, segment_ids=seg, **extra)
+            return jnp.sum(o * w) + jnp.sum(s), (o, s)
+
+        return jax.jit(jax.value_and_grad(loss, argnums=range(6), has_aux=True))(q, k, v, b, g, s0)
+
+    (_, (o_f, s_f)), g_f = run(_chunk_kda_per_channel_fused, decay_lower_bound=-5.0)
+    (_, (o_s, s_s)), g_s = run(_chunk_kda_per_channel_fwd)
+    assert _rel(o_f, o_s) < 1e-4 and _rel(s_f, s_s) < 1e-4
+    for a, c in zip(g_f, g_s, strict=True):
+        assert np.isfinite(np.asarray(a)).all()
+        assert _rel(a, c) < 1e-3
+
+
 @pytest.mark.skipif(jax.default_backend() != "tpu" or jax.device_count() < 4, reason="needs 4 TPU devices")
 def test_fused_four_device_shard_map_matches_scan():
     q, k, v, b, g, s0 = _inputs(2, 4, L, seed=7)
@@ -141,6 +164,12 @@ def test_op_seam_selects_fused_impl():
     scan = op(**args)
     assert _rel(fused.attention_outputs, scan.attention_outputs) < 1e-4
     assert _rel(fused.recurrent_state, scan.recurrent_state) < 1e-4
+    bounded = op(**args, chunk_impl="kda_chunk", decay_lower_bound=-5.0)
+    assert _rel(bounded.attention_outputs, scan.attention_outputs) < 1e-4
+    assert _rel(bounded.recurrent_state, scan.recurrent_state) < 1e-4
+    assert not np.array_equal(np.asarray(bounded.attention_outputs), np.asarray(fused.attention_outputs))
+    with pytest.raises(ValueError, match="decay_lower_bound"):
+        op(**args, chunk_impl="kda_chunk", decay_lower_bound=1.0)
     with pytest.raises(ValueError, match="chunk_impl"):
         op(**args, chunk_impl="twophase")
     with pytest.raises(ValueError, match="chunk_precision"):

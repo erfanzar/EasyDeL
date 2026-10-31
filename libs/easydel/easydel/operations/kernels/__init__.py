@@ -113,6 +113,7 @@ from .blocksparse_attention import BlockSparseAttn
 from .compressed_window_attention import CompressedWindowAttn
 from .compressed_window_decode import CompressedWindowDecodeAttn
 from .decode_attention import AutoRegressiveDecodeAttn
+from .dsa_gather_attention import DsaGatherAttn
 from .dsa_pool_sparse_attention import DsaPoolSparseAttn
 from .flash_attention import FlashAttn
 from .fused_mlp import FusedMlpOp
@@ -145,6 +146,7 @@ __all__ = (
     "BlockSparseAttn",
     "CompressedWindowAttn",
     "CompressedWindowDecodeAttn",
+    "DsaGatherAttn",
     "DsaPoolSparseAttn",
     "FlashAttn",
     "FusedMlpOp",

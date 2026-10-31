@@ -26,11 +26,14 @@ gathered from the unbiased scores, which is what makes the routing
 auxiliary-loss-free: expert load moves without perturbing the combine.
 """
 
+import functools
+
 import jax
 import numpy as np
 import pytest
-from easydel.layers.moe import moe_group_topk_select
+from easydel.layers.moe import moe_group_topk_select, normalize_topk_weights
 from jax import numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 EXPERTS = 16
 TOKENS = 12
@@ -206,10 +209,6 @@ def test_already_correct_families_still_thread_the_live_bias(family):
     assert "e_score_correction_bias=self" in source
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-q"]))
-
-
 def test_excluded_negative_score_group_cannot_win():
     """Masking must work even when every valid routing score is negative."""
     logits = jnp.asarray([[-1.0, -2.0, -3.0, -4.0]], dtype=jnp.float32)
@@ -225,6 +224,116 @@ def test_excluded_negative_score_group_cannot_win():
         norm_topk_prob=False,
     )
     assert np.asarray(indices).tolist() == [[0]]
+
+
+@pytest.mark.parametrize("norm_topk_prob", [False, True])
+def test_slots_past_the_kept_groups_carry_zero_weight(norm_topk_prob):
+    """``k`` above the kept groups' capacity yields zero-weight slots, never an excluded expert's score."""
+    logits = _logits(17)
+    k = 10  # 2 of 4 groups of 4 kept: capacity 8
+    config = dict(GROUPED, norm_topk_prob=norm_topk_prob)
+    weights, indices = moe_group_topk_select(logits, None, k, **config)
+
+    scores = np.asarray(jax.nn.sigmoid(logits))
+    group_mass = np.sort(scores.reshape(TOKENS, 4, EXPERTS // 4), axis=-1)[..., -2:].sum(axis=-1)
+    winning = np.argsort(-group_mass, axis=-1, kind="stable")[:, :2]
+    eligible = np.zeros((TOKENS, 4), dtype=bool)
+    np.put_along_axis(eligible, winning, True, axis=-1)
+    eligible = np.repeat(eligible, EXPERTS // 4, axis=-1)
+    expected_indices = np.argsort(-np.where(eligible, scores, -np.inf), axis=-1, kind="stable")[:, :k]
+    expected = np.take_along_axis(np.where(eligible, scores, 0), expected_indices, axis=-1)
+    if norm_topk_prob:
+        expected = expected / (expected.sum(axis=-1, keepdims=True) + 1e-20)
+    expected = expected * GROUPED["routed_scaling_factor"]
+
+    np.testing.assert_array_equal(np.asarray(indices), expected_indices)
+    np.testing.assert_allclose(np.asarray(weights), expected, rtol=1e-5, atol=1e-7)
+    assert np.all(np.asarray(weights)[:, 8:] == 0)
+
+
+def test_normalization_gradient_stays_finite_for_tiny_selected_mass():
+    """Differentiating the plain quotient squares a ~1e-20 denominator, which float32 cannot hold."""
+    weights = np.full((2, 3), 3e-21, dtype=np.float32)
+    cotangent = np.asarray([[1.0, -2.0, 0.5], [0.25, 3.0, -1.0]], dtype=np.float32)
+
+    gradient = jax.jit(jax.grad(lambda w: jnp.sum(normalize_topk_weights(w) * cotangent)))(jnp.asarray(weights))
+
+    w = weights.astype(np.float64)
+    denominator = w.sum(axis=-1, keepdims=True) + 1e-20
+    normalized = w / denominator
+    expected = (cotangent - (cotangent * normalized).sum(axis=-1, keepdims=True)) / denominator
+    assert np.isfinite(np.asarray(gradient)).all()
+    np.testing.assert_allclose(np.asarray(gradient, np.float64), expected, rtol=1e-5)
+
+
+def test_all_zero_row_normalizes_to_zero_with_a_bare_sum():
+    """``norm_eps=0.0`` must not turn an all-zero selection into ``0 / 0``."""
+    cotangent = jnp.asarray([[1.0, -2.0, 0.5]])
+    zeros = jnp.zeros((1, 3))
+    np.testing.assert_array_equal(np.asarray(normalize_topk_weights(zeros, 0.0)), np.zeros((1, 3)))
+    gradient = jax.grad(lambda w: jnp.sum(normalize_topk_weights(w, 0.0) * cotangent))(zeros)
+    np.testing.assert_array_equal(np.asarray(gradient), np.asarray(cotangent))
+
+
+def test_per_token_bias_steers_each_token_separately():
+    """A ``(tokens, experts)`` bias selects per token; the weights stay the unbiased scores."""
+    logits = _logits(19)
+    bias = np.random.default_rng(20).standard_normal((TOKENS, EXPERTS)).astype(np.float32) * 2
+    flat = dict(GROUPED, n_group=1, topk_group=1)
+    weights, indices = moe_group_topk_select(logits, None, 4, e_score_correction_bias=jnp.asarray(bias), **flat)
+
+    scores = np.asarray(jax.nn.sigmoid(logits))
+    expected_indices = np.argsort(-(scores + bias), axis=-1, kind="stable")[:, :4]
+    expected = np.take_along_axis(scores, expected_indices, axis=-1)
+    expected = expected / (expected.sum(axis=-1, keepdims=True) + 1e-20) * GROUPED["routed_scaling_factor"]
+    np.testing.assert_array_equal(np.asarray(indices), expected_indices)
+    np.testing.assert_allclose(np.asarray(weights), expected, rtol=1e-5, atol=1e-7)
+
+
+def test_topk_lookup_matches_the_gather_and_its_scatter_gradient():
+    """The one-hot select-and-sum lookup equals ``take_along_axis`` exactly; its gradient is the scatter-add."""
+    from easydel.layers.moe._routing import _take_topk
+
+    rng = np.random.default_rng(5)
+    tokens, experts, k = 512, 288, 8
+    scores = jax.nn.sigmoid(jnp.asarray(rng.standard_normal((tokens, experts)), jnp.float32))
+    indices = jax.lax.top_k(scores + jnp.asarray(rng.standard_normal(experts), jnp.float32), k)[1]
+    ct = jnp.asarray(rng.standard_normal((tokens, k)), jnp.float32)
+
+    got = jax.jit(_take_topk)(scores, indices)
+    want = jax.jit(lambda s, i: jnp.take_along_axis(s, i, axis=-1))(scores, indices)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+    grad = jax.jit(jax.grad(lambda s: jnp.sum(_take_topk(s, indices) * ct)))(scores)
+    ref = np.zeros((tokens, experts), np.float64)
+    np.add.at(ref, (np.arange(tokens)[:, None], np.asarray(indices)), np.asarray(ct, np.float64))
+    np.testing.assert_allclose(np.asarray(grad, np.float64), ref, rtol=0, atol=1e-6)
+
+
+def test_flat_selector_lowers_without_a_gather():
+    """With one group, selection is top-k + the select-and-sum lookup: no gather (or its scatter transpose)."""
+    flat = dict(GROUPED, n_group=1, topk_group=1)
+    logits = jnp.asarray(np.random.default_rng(6).standard_normal((64, 288)), jnp.float32)
+
+    def loss(lg):
+        weights, _ = moe_group_topk_select(
+            lg, None, 8, e_score_correction_bias=jnp.zeros((288,), jnp.float32), **{**flat, "n_routed_experts": 288}
+        )
+        return jnp.sum(weights)
+
+    names = set()
+
+    def walk(jaxpr):
+        for eqn in jaxpr.eqns:
+            names.add(eqn.primitive.name)
+            for param in eqn.params.values():
+                for sub in param if isinstance(param, (tuple, list)) else (param,):
+                    sub = getattr(sub, "jaxpr", sub)
+                    if hasattr(sub, "eqns"):
+                        walk(sub)
+
+    walk(jax.make_jaxpr(jax.value_and_grad(loss))(logits).jaxpr)
+    assert not {"gather", "scatter-add", "scatter_add"} & names, sorted(names)
 
 
 @pytest.mark.parametrize("family", ["glm4_moe", "glm4_moe_lite", "glm_moe_dsa"])
@@ -255,3 +364,80 @@ def test_family_select_hook_observes_changed_live_bias(family):
     unbiased = jnp.take_along_axis(jax.nn.sigmoid(logits), selected, axis=-1)
     expected = unbiased / jnp.sum(unbiased, axis=-1, keepdims=True) * 2.5
     np.testing.assert_allclose(weights, expected, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("sharded", [False, True])
+@pytest.mark.parametrize(("n_group", "topk_group", "k"), [(4, 2, 4), (2, 1, 4), (4, 1, 1), (1, 1, 1), (1, 1, 4)])
+def test_grouped_selection_matches_stable_host_reference_on_token_sharded_inputs(
+    n_group, topk_group, k, sharded, compiled
+):
+    """Group ranking and expert picks match a stable host reference, also with tokens sharded over devices.
+
+    One kept group and ``k == 1`` are the cases where index selection on token-sharded operands goes wrong.
+    """
+    devices = jax.devices()
+    tokens = 4 * len(devices)
+    rng = np.random.default_rng(21)
+    logits = rng.standard_normal((tokens, EXPERTS)).astype(np.float32)
+    bias = rng.standard_normal(EXPERTS).astype(np.float32)
+    inputs = jnp.asarray(logits)
+    if sharded:
+        mesh = Mesh(np.asarray(devices), ("tokens",))
+        inputs = jax.device_put(inputs, NamedSharding(mesh, PartitionSpec("tokens", None)))
+    config = dict(GROUPED, n_group=n_group, topk_group=topk_group)
+    select = functools.partial(
+        moe_group_topk_select, pre_bias_logits=None, k=k, e_score_correction_bias=jnp.asarray(bias), **config
+    )
+    weights, indices = (jax.jit(select) if compiled else select)(inputs)
+
+    scores = np.asarray(jax.nn.sigmoid(jnp.asarray(logits)))
+    choices = scores + bias
+    group_size = EXPERTS // n_group
+    group_mass = np.sort(choices.reshape(tokens, n_group, group_size), axis=-1)[..., -2:].sum(axis=-1)
+    winning = np.argsort(-group_mass, axis=-1, kind="stable")[:, :topk_group]
+    eligible = np.zeros((tokens, n_group), dtype=bool)
+    np.put_along_axis(eligible, winning, True, axis=-1)
+    eligible = np.repeat(eligible, group_size, axis=-1)
+    expected_indices = np.argsort(-np.where(eligible, choices, -np.inf), axis=-1, kind="stable")[:, :k]
+    expected_weights = np.take_along_axis(np.where(eligible, scores, 0), expected_indices, axis=-1)
+    expected_weights = expected_weights / (expected_weights.sum(axis=-1, keepdims=True) + 1e-20) * 2.5
+
+    np.testing.assert_array_equal(np.asarray(indices), expected_indices)
+    np.testing.assert_allclose(np.asarray(weights), expected_weights, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("k", [1, 2, 3, 4, 8])
+def test_flat_selection_on_wide_token_sharded_rows_matches_stable_host_reference(k, compiled):
+    """288 experts with tokens sharded over devices: small ``k`` on wide rows is where index selection goes wrong."""
+    devices = jax.devices()
+    tokens, experts = 16 * len(devices), 288
+    rng = np.random.default_rng(23)
+    logits = rng.standard_normal((tokens, experts)).astype(np.float32)
+    bias = rng.standard_normal(experts).astype(np.float32)
+    mesh = Mesh(np.asarray(devices), ("tokens",))
+    inputs = jax.device_put(jnp.asarray(logits), NamedSharding(mesh, PartitionSpec("tokens", None)))
+    select = functools.partial(
+        moe_group_topk_select,
+        pre_bias_logits=None,
+        k=k,
+        n_routed_experts=experts,
+        score_fn="sigmoid",
+        e_score_correction_bias=jnp.asarray(bias),
+        norm_topk_prob=True,
+        routed_scaling_factor=2.5,
+    )
+    weights, indices = (jax.jit(select) if compiled else select)(inputs)
+
+    scores = np.asarray(jax.nn.sigmoid(jnp.asarray(logits)))
+    expected_indices = np.argsort(-(scores + bias), axis=-1, kind="stable")[:, :k]
+    expected_weights = np.take_along_axis(scores, expected_indices, axis=-1)
+    expected_weights = expected_weights / (expected_weights.sum(axis=-1, keepdims=True) + 1e-20) * 2.5
+
+    np.testing.assert_array_equal(np.asarray(indices), expected_indices)
+    np.testing.assert_allclose(np.asarray(weights), expected_weights, rtol=1e-5, atol=1e-6)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))

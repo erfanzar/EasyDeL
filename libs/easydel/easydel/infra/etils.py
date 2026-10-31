@@ -371,6 +371,16 @@ AVAILABLE_OPTIMIZERS = tp.Literal[
 # dense_moe: Dense computation across all experts
 AVAILABLE_MOE_METHODS = tp.Literal["fused_moe", "standard_moe", "dense_moe"]
 
+# ``EasyDeLBaseConfig.kda_chunk_impl`` values: the XLA chunk ``"scan"`` or the fused ejkernel ``"kda_chunk"`` kernel.
+KDA_CHUNK_IMPLS = ("scan", "kda_chunk")
+# ``EasyDeLBaseConfig.kda_chunk_precision`` values (non-inverse dots of the ``"kda_chunk"`` kernel).
+KDA_CHUNK_PRECISIONS = ("highest", "default")
+
+# ``EasyDeLBaseConfig.index_scoring_kernel`` values (indexer multi-query scoring).
+INDEX_SCORING_KERNELS = ("xla", "pallas")
+# ``EasyDeLBaseConfig.dsa_pool_kernel`` values (attention kernel of the DSA pool-training path).
+DSA_POOL_KERNELS = ("bitmap", "gather")
+
 # Type alias for valid attention mechanism implementations.
 # Provides various optimized attention implementations for different use cases.
 AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[

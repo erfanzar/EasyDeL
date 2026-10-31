@@ -423,7 +423,7 @@ LutFn = Callable[[int, int, int], tuple[int, int, int] | None]
 
 @functools.partial(
     jax.jit,
-    static_argnames=["preferred_element_type", "tiling", "transpose_rhs", "interpret"],
+    static_argnames=["preferred_element_type", "tiling", "transpose_rhs", "interpret", "vmem_limit_bytes"],
 )
 def grouped_matmul(
     lhs: jnp.ndarray,
@@ -435,6 +435,7 @@ def grouped_matmul(
     existing_out: jnp.ndarray | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,
+    vmem_limit_bytes: int | None = None,
 ) -> jnp.ndarray:
     """Grouped Matrix Multiplication: Compute separate matrix products for each group.
 
@@ -472,6 +473,8 @@ def grouped_matmul(
             during multiplication. Useful for certain memory layouts.
         interpret: Run kernel in interpret mode for debugging. Slower but provides
             better error messages and doesn't require compilation.
+        vmem_limit_bytes: Scoped-VMEM limit for the kernel. ``None`` (default) keeps Mosaic's default limit;
+            large tiles (e.g. the whole contraction in one tile) need a higher one.
 
     Returns:
         Output matrix of shape [m, n] containing the concatenated results of all
@@ -689,7 +692,9 @@ def grouped_matmul(
             scratch_shapes=[pltpu.VMEM((tm, tn), jnp.float32)],
         ),
         input_output_aliases=input_output_aliases,
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "arbitrary", "arbitrary")),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "arbitrary", "arbitrary"), vmem_limit_bytes=vmem_limit_bytes
+        ),
         interpret=interpret,
         cost_estimate=cost_estimate,
     )
@@ -722,6 +727,7 @@ def grouped_matmul(
         "tiling",
         "num_actual_groups",
         "interpret",
+        "vmem_limit_bytes",
     ],
 )
 def transposed_grouped_matmul(
@@ -734,6 +740,7 @@ def transposed_grouped_matmul(
     num_actual_groups: int | None = None,
     existing_out: jnp.ndarray | None = None,
     interpret: bool = False,
+    vmem_limit_bytes: int | None = None,
 ) -> jnp.ndarray:
     """Transposed Grouped Matrix Multiplication: Compute grouped products with transposed access pattern.
 
@@ -776,6 +783,8 @@ def transposed_grouped_matmul(
             Enables incremental computation and gradient accumulation.
         interpret: Run kernel in interpret mode for debugging. Slower but provides
             better error messages and avoids compilation.
+        vmem_limit_bytes: Scoped-VMEM limit for the kernel. ``None`` (default) keeps Mosaic's default limit;
+            large tiles, which also double-buffer the aliased ``existing_out`` block, need a higher one.
 
     Returns:
         3D output tensor of shape [num_actual_groups, k, n] where each slice
@@ -981,7 +990,9 @@ def transposed_grouped_matmul(
             scratch_shapes=[pltpu.VMEM((tk, tn), jnp.float32)],
         ),
         input_output_aliases=input_output_aliases,
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "arbitrary", "arbitrary")),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "arbitrary", "arbitrary"), vmem_limit_bytes=vmem_limit_bytes
+        ),
         interpret=interpret,
         cost_estimate=cost_estimate,
     )

@@ -56,6 +56,7 @@ from .blocksparse_attention import blocksparse_attention as blocksparse_attentio
 from .compressed_window_attention import compressed_window_attention
 from .compressed_window_decode import compressed_window_decode
 from .deepseek_attn import deepseek_attn
+from .dsa_gather_attention import dsa_gather_attention
 from .dsa_sparse_attention import dsa_sparse_attention
 from .flash_attention import flash_attention
 from .flash_mla import flash_mla
@@ -74,6 +75,8 @@ from .kda_chunk import kda_chunk
 from .kda_chunk_local import kda_chunk_local
 from .mhc_coefficients import mhc_coefficients
 from .mhc_fused import mhc_collapse, mhc_expand
+from .moe_local_ffn import moe_local_ffn
+from .moe_row_gather import moe_row_gather, moe_row_gather_sum
 from .multi_latent_ragged_page_attention import multi_latent_ragged_page_attention
 from .multi_latent_ragged_page_attention_v2 import multi_latent_ragged_page_attention_v2
 from .page_attention import page_attention
@@ -102,6 +105,7 @@ __all__ = (
     "compressed_window_attention",
     "compressed_window_decode",
     "deepseek_attn",
+    "dsa_gather_attention",
     "dsa_sparse_attention",
     "flash_attention",
     "flash_mla",
@@ -121,6 +125,9 @@ __all__ = (
     "mhc_coefficients",
     "mhc_collapse",
     "mhc_expand",
+    "moe_local_ffn",
+    "moe_row_gather",
+    "moe_row_gather_sum",
     "multi_latent_ragged_page_attention",
     "multi_latent_ragged_page_attention_v2",
     "page_attention",

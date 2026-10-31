@@ -133,13 +133,6 @@ def _easydel_leaf_to_hf(key: str, array: jax.Array) -> dict[str, np.ndarray]:
         if key.endswith(ed_name):
             return {key[: -len(ed_name)] + hf_name: arr}
 
-    # Forget gate: nested under self_attn.forget_gate; HF keeps it flat.
-    if ".forget_gate." in key:
-        key = key.replace(".forget_gate.", ".")
-        if arr.ndim == 2:
-            arr = arr.T
-        return {key: arr}
-
     # Depthwise conv kernels: flax (d, 1, C) -> torch (C, 1, d).
     if key.endswith("_conv1d.weight"):
         return {key: arr.transpose(2, 1, 0)}

@@ -29,8 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
-from easydel.modules.glm5_next import modeling_glm5_next
-from easydel.modules.glm_moe_dsa import modeling_glm_moe_dsa
+from easydel.layers.attention import _dsa as dsa_attention
 from ejkernel.types import MaskInfo
 from spectrax import common_types
 
@@ -116,10 +115,7 @@ def _glm_moe_dsa(sparse: bool):
     return config, model, model.model.layers[0].self_attn
 
 
-MODELS = {
-    "glm5_next": (_glm5_next, modeling_glm5_next),
-    "glm_moe_dsa": (_glm_moe_dsa, modeling_glm_moe_dsa),
-}
+MODELS = {"glm5_next": _glm5_next, "glm_moe_dsa": _glm_moe_dsa}
 
 
 def _forward(layer, model, h, attention_mask):
@@ -142,15 +138,15 @@ def _rel(a, b):
 @pytest.mark.parametrize("name", sorted(MODELS))
 @pytest.mark.parametrize("padded", [False, True])
 def test_sparse_training_matches_dense_topk_mask(name, padded, monkeypatch):
-    build, module = MODELS[name]
+    build = MODELS[name]
     calls = {"n": 0}
-    real = module.sparse_selected_training_attention
+    real = dsa_attention.sparse_selected_training_attention
 
     def counting(**kw):
         calls["n"] += 1
         return real(**kw)
 
-    monkeypatch.setattr(module, "sparse_selected_training_attention", counting)
+    monkeypatch.setattr(dsa_attention, "sparse_selected_training_attention", counting)
 
     _ref_config, ref_model, ref_layer = build(sparse=False)
     config, model, layer = build(sparse=True)
@@ -186,13 +182,13 @@ def test_auto_default_takes_sparse_path_at_threshold_and_matches_dense(monkeypat
     from easydel.operations.kernels.dsa_sparse_attention import AUTO_SPARSE_MIN_SEQ
 
     calls = {"n": 0}
-    real = modeling_glm5_next.sparse_selected_training_attention
+    real = dsa_attention.sparse_selected_training_attention
 
     def counting(**kw):
         calls["n"] += 1
         return real(**kw)
 
-    monkeypatch.setattr(modeling_glm5_next, "sparse_selected_training_attention", counting)
+    monkeypatch.setattr(dsa_attention, "sparse_selected_training_attention", counting)
     _c, ref_model, ref_layer = _glm5_next(sparse=False)
     config, model, layer = _glm5_next(sparse=None)
     h = jnp.asarray(np.random.default_rng(0).standard_normal((1, AUTO_SPARSE_MIN_SEQ, HID)), jnp.float32)
@@ -207,8 +203,7 @@ def test_auto_default_takes_sparse_path_at_threshold_and_matches_dense(monkeypat
 @pytest.mark.parametrize("name", sorted(MODELS))
 def test_selection_is_sparse_at_this_context(name):
     """Negative control: full attention differs from the top-k result past index_topk."""
-    build, _ = MODELS[name]
-    _, model, layer = build(sparse=True)
+    _, model, layer = MODELS[name](sparse=True)
     h = jnp.asarray(np.random.default_rng(0).standard_normal((1, SEQ, HID)), jnp.float32)
     with jax.default_matmul_precision("highest"), model.config.mesh:
         sparse_out = np.asarray(_forward(layer, model, h, None))

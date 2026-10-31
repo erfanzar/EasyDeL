@@ -50,14 +50,17 @@ from ._paged import (
 )
 from ._paged_block_topk import paged_block_topk
 from ._primitives import (
+    CompactLayout,
+    compact_valid_layout,
     indices_to_bool_mask,
     is_vacuous_selection,
+    permute_tokens,
     ste_score_proxy,
     topk_select,
     topk_selection_mask,
     visible_causal_mask,
 )
-from ._selection import BaseIndexer, IndexerSelection, SelectionSpec
+from ._selection import BaseIndexer, IndexerSelection, ScoreRowSplit, SelectionSpec
 from ._shared_key import (
     IndexerScoreInputs,
     SharedKeyIndexer,
@@ -65,9 +68,10 @@ from ._shared_key import (
     select_candidate_blocks,
     selection_bias,
     shared_key_scores,
+    warn_unsupported_scoring_kernel,
 )
 from ._token import TokenIndexer, TokenIndexerConfig
-from ._training import AUTO_SPARSE_MIN_SEQ, use_sparse_training_attention
+from ._training import AUTO_SPARSE_MIN_SEQ, pool_bitmap_tail_error, use_sparse_training_attention
 
 __all__ = (
     "AUTO_SPARSE_MIN_SEQ",
@@ -75,6 +79,7 @@ __all__ = (
     "BlockMaxIndexer",
     "BlockMaxIndexerConfig",
     "BlockTopKIndexer",
+    "CompactLayout",
     "CompressedIndexer",
     "CompressedIndexerAdapter",
     "CompressedIndexerConfig",
@@ -85,6 +90,7 @@ __all__ = (
     "IndexerOutput",
     "IndexerScoreInputs",
     "IndexerSelection",
+    "ScoreRowSplit",
     "SelectionSpec",
     "SharedKeyIndexer",
     "SharedKeyIndexerConfig",
@@ -96,6 +102,7 @@ __all__ = (
     "bounded_block_max_topk",
     "bounded_candidate_entry_topk",
     "bounded_entry_topk",
+    "compact_valid_layout",
     "indexer_distillation_loss",
     "indices_to_bool_mask",
     "is_vacuous_selection",
@@ -103,6 +110,8 @@ __all__ = (
     "paged_pool_select",
     "paged_token_layout",
     "paged_token_select",
+    "permute_tokens",
+    "pool_bitmap_tail_error",
     "running_entry_topk",
     "select_candidate_blocks",
     "selection_bias",
@@ -114,6 +123,7 @@ __all__ = (
     "topk_selection_mask",
     "use_sparse_training_attention",
     "visible_causal_mask",
+    "warn_unsupported_scoring_kernel",
 )
 
 

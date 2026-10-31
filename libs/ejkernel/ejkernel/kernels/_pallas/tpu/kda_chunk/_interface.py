@@ -41,8 +41,7 @@ from ...._xla.kda_chunk._xla_impl import (
     META_ROW_RUN,
     batched_chunk_step,
     kda_chunk_xla,
-    per_chunk_cumsum,
-    per_chunk_reverse_cumsum,
+    pairwise_sub_block,
     prepare_inputs,
     resolve_precision,
     validate_options,
@@ -78,8 +77,8 @@ def _from_chunks(x: Array) -> Array:
     return y.reshape(B, H, C * cs, *y.shape[4:])
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(7, 8, 9, 10, 11, 12))
-def _core(q, k, v, beta, g, state0, meta, chunk_size, block_h, precision, backward, bwd_reduce, use_states):
+@functools.partial(jax.custom_vjp, nondiff_argnums=(7, 8, 9, 10, 11, 12, 13))
+def _core(q, k, v, beta, g, state0, meta, chunk_size, block_h, precision, backward, bwd_reduce, use_states, sub):
     """Fused forward on the prepared fp32 inputs. Returns ``(out, final_state, chunk_states_in)``."""
     del backward, bwd_reduce, use_states
     b4 = beta[..., None]
@@ -88,32 +87,33 @@ def _core(q, k, v, beta, g, state0, meta, chunk_size, block_h, precision, backwa
         k,
         k * b4,
         v * b4,
-        per_chunk_cumsum(g, chunk_size),
+        g,
         state0,
         meta,
         chunk_size=chunk_size,
         block_h=block_h,
         precision=precision,
+        sub=sub,
     )
 
 
-def _core_fwd(q, k, v, beta, g, state0, meta, chunk_size, block_h, precision, backward, bwd_reduce, use_states):
-    outs = _core(q, k, v, beta, g, state0, meta, chunk_size, block_h, precision, backward, bwd_reduce, use_states)
+def _core_fwd(q, k, v, beta, g, state0, meta, chunk_size, block_h, precision, backward, bwd_reduce, use_states, sub):
+    outs = _core(q, k, v, beta, g, state0, meta, chunk_size, block_h, precision, backward, bwd_reduce, use_states, sub)
     return outs, (q, k, v, beta, g, meta, outs[2])
 
 
-def _core_bwd(chunk_size, block_h, precision, backward, bwd_reduce, use_states, res, cts):
+def _core_bwd(chunk_size, block_h, precision, backward, bwd_reduce, use_states, sub, res, cts):
     q, k, v, beta, g, meta, states_in = res
     d_out, d_final, d_states = cts
     d_meta = None if meta is None else jnp.zeros_like(meta)
     b4 = beta[..., None]
     if backward == "pallas":
-        dq, dk_direct, dkb, dvb, dgc, d_state0 = kda_chunk_pallas_bwd(
+        dq, dk_direct, dkb, dvb, dg, d_state0 = kda_chunk_pallas_bwd(
             q,
             k,
             k * b4,
             v * b4,
-            per_chunk_cumsum(g, chunk_size),
+            g,
             states_in,
             d_out,
             d_final,
@@ -123,11 +123,11 @@ def _core_bwd(chunk_size, block_h, precision, backward, bwd_reduce, use_states, 
             block_h=block_h,
             precision=precision,
             reduce_mode=bwd_reduce,
+            sub=sub,
         )
         dk = dk_direct + dkb * b4
         dv = dvb * b4
         dbeta = jnp.sum(dkb * k + dvb * v, axis=-1)
-        dg = per_chunk_reverse_cumsum(dgc, chunk_size)
         return dq, dk, dv, dbeta, dg, d_state0, d_meta
 
     prec = resolve_precision(precision)
@@ -148,7 +148,7 @@ def _core_bwd(chunk_size, block_h, precision, backward, bwd_reduce, use_states, 
         run = x.get("run")
 
         def f(state, q_c, k_c, v_c, b_c, g_c):
-            return batched_chunk_step(state, q_c, k_c, v_c, b_c, g_c, run, prec, inverse="masked")
+            return batched_chunk_step(state, q_c, k_c, v_c, b_c, g_c, run, prec, inverse="masked", sub=sub)
 
         _, vjp = jax.vjp(f, x["state_in"], x["q"], x["k"], x["v"], x["beta"], x["g"])
         d_state, dq, dk, dv, dbeta, dg = vjp((ct_state, x["d_out"]))
@@ -180,6 +180,8 @@ def kda_chunk(
     block_h: int = 1,
     backward: str = "pallas",
     bwd_reduce: str = "vpu",
+    decay_lower_bound: float | None = None,
+    pairwise: str = "auto",
 ) -> tuple[Array, ...]:
     """Fused chunked KDA with per-channel decay on TPU (same contract as the XLA entry).
 
@@ -198,12 +200,17 @@ def kda_chunk(
         precision: ``"highest"`` or ``"default"`` for the non-inverse dots (the chunk inverse is always HIGHEST).
         block_h: Heads per grid step.
         backward: ``"pallas"`` (fused reverse-sweep kernel) or ``"xla"`` (reversed-scan recompute).
-        bwd_reduce: ``"vpu"`` or ``"mxu"`` evaluation of the backward's weighted reductions.
+        bwd_reduce: ``"vpu"`` or ``"mxu"`` evaluation of the backward's weighted reductions (dense form only).
+        decay_lower_bound: Promise that every log-decay ``decay >= decay_lower_bound`` (a safe-gate bound such as
+            GLM-5's ``-5``). With ``pairwise="auto"`` it switches the pairwise decay to the factored MXU form
+            (``pairwise_sub_block``): no ``[cs, cs, K]`` tensor, and the chunk inverse and backward reductions at
+            ``companion_precision``. ``None`` keeps the dense form.
+        pairwise: ``"auto"`` (factored whenever the bound allows it) or ``"dense"``.
 
     Returns:
         ``(out [B, H, L, V] fp32, final_state [B, H, K, V] fp32)`` (+ ``chunk_states``).
     """
-    validate_options(chunk_size, precision, backward, bwd_reduce)
+    validate_options(chunk_size, precision, backward, bwd_reduce, pairwise, decay_lower_bound)
     _, H, L, K = query.shape
     V = value.shape[-1]
     if jax.default_backend() != "tpu" or not is_tileable(K, V, H, chunk_size, block_h):
@@ -222,15 +229,18 @@ def kda_chunk(
             continue_initial_state=continue_initial_state,
             return_chunk_states=return_chunk_states,
             precision=precision,
+            decay_lower_bound=decay_lower_bound,
+            pairwise=pairwise,
         )
     cs = int(chunk_size)
+    sub = pairwise_sub_block(decay_lower_bound, cs) if pairwise == "auto" else 0
     p = prepare_inputs(
         query, key, value, beta, decay, initial_state, segment_ids, cs, use_qk_l2norm, continue_initial_state
     )
     meta = None if p.local_run is None else pack_segment_meta(p.local_run)
     out, final, states_in = _core(
         p.q, p.k, p.v, p.beta, p.g, p.state, meta, cs, int(block_h), precision, backward, bwd_reduce,
-        bool(return_chunk_states),
+        bool(return_chunk_states), sub,
     )  # fmt: skip
     out = out[:, :, :L, :]
     if return_chunk_states:

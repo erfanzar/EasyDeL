@@ -32,6 +32,7 @@ from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._xla.dsa_sparse_attention._tables import TAIL_ROWS, pack_pool_bits
 from ejkernel.ops import AutotunePolicy, ConfigCache, ConfigSelectorChain, Executor, Invocation, Kernel, Tuner
 from ejkernel.ops.config.persistent import PersistentCache
 
@@ -39,6 +40,12 @@ from ..base import detect_platform
 from .configs import DsaSparseAttentionConfig
 
 _PlatformName = Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"]
+
+DSA_SPARSE_MAX_TAIL_KEYS = TAIL_ROWS
+"""Most always-selected tail keys per query the ``dsa_sparse_attention`` kernels accept (``tails [B, S, T]`` with
+``T <= DSA_SPARSE_MAX_TAIL_KEYS``). A pool indexer that always selects its incomplete pool emits ``kpool - 1``."""
+
+__all__ = ("DSA_SPARSE_MAX_TAIL_KEYS", "DsaSparseAttention", "dsa_sparse_attention", "pack_pool_bits")
 
 
 def _cfg_kwargs(cfg: DsaSparseAttentionConfig) -> dict:
@@ -83,7 +90,7 @@ class DsaSparseAttention(Kernel[DsaSparseAttentionConfig, Array]):
         self,
         query: Float[Array, "batch num_heads seq head_dim"],
         latent: Float[Array, "batch seq head_dim"],
-        pool_mask: Bool[Array, "batch seq num_pools"],
+        pool_mask: Bool[Array, "batch seq num_pools"] | Int[Array, "batch seq num_words"],
         tails: Int[Array, "batch seq num_tails"] | None = None,
         ste_pool: Float[Array, "batch seq num_pools"] | None = None,
         *,
@@ -99,7 +106,7 @@ class DsaSparseAttention(Kernel[DsaSparseAttentionConfig, Array]):
         Args:
             query: ``[B, H, S, D]`` queries.
             latent: ``[B, S, D]`` shared ``K == V`` latent.
-            pool_mask: ``[B, S, P]`` bool selected pools.
+            pool_mask: ``[B, S, P]`` bool selected pools, or ``[B, S, W]`` int32 packed words.
             tails: ``[B, S, T]`` int32 tail keys (``-1`` = none) or ``None``.
             ste_pool: ``[B, S, P]`` fp32 pooled straight-through term or ``None``.
             kpool: Keys per pool.
@@ -144,7 +151,7 @@ class DsaSparseAttention(Kernel[DsaSparseAttentionConfig, Array]):
         self,
         query: Float[Array, "batch num_heads seq head_dim"],
         latent: Float[Array, "batch seq head_dim"],
-        pool_mask: Bool[Array, "batch seq num_pools"],
+        pool_mask: Bool[Array, "batch seq num_pools"] | Int[Array, "batch seq num_words"],
         tails: Int[Array, "batch seq num_tails"] | None = None,
         ste_pool: Float[Array, "batch seq num_pools"] | None = None,
         *,
@@ -217,7 +224,7 @@ _dsa_sparse_attention_executor: Executor[DsaSparseAttentionConfig, Array] = Exec
 def dsa_sparse_attention(
     query: Float[Array, "batch num_heads seq head_dim"],
     latent: Float[Array, "batch seq head_dim"],
-    pool_mask: Bool[Array, "batch seq num_pools"],
+    pool_mask: Bool[Array, "batch seq num_pools"] | Int[Array, "batch seq num_words"],
     tails: Int[Array, "batch seq num_tails"] | None = None,
     ste_pool: Float[Array, "batch seq num_pools"] | None = None,
     /,
@@ -242,7 +249,8 @@ def dsa_sparse_attention(
     Args:
         query: ``[B, H, S, D]`` queries.
         latent: ``[B, S, D]`` shared ``K == V`` latent.
-        pool_mask: ``[B, S, P]`` bool selected pools (causal by the indexer's construction).
+        pool_mask: ``[B, S, P]`` bool selected pools (causal by the indexer's construction), or the same selection
+            as ``[B, S, W]`` int32 packed words (bit ``p % 32`` of word ``p // 32`` = pool ``p``; 32x fewer elements).
         tails: ``[B, S, T]`` int32 always-selected tail keys (``-1`` = none, ``T <= 8``) or ``None``.
         ste_pool: ``[B, S, P]`` fp32 pooled straight-through term (value 0) or ``None``.
         kpool: Keys per pool.

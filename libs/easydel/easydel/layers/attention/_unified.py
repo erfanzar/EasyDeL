@@ -133,7 +133,7 @@ from ..linears import (
     RowParallelLinear,
 )
 from ..norms._norms import RMSNorm
-from ..rotary import apply_rope_interleaved, yarn_get_mscale
+from ..rotary import apply_mla_rope, yarn_get_mscale
 from ._flexible import AttentionModule, FlexibleAttentionModule
 
 if TYPE_CHECKING:
@@ -542,7 +542,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
                 self.projection_mapping["mla_q_a_layernorm"],
                 RMSNorm(
                     config.q_lora_rank,
-                    eps=config.rms_norm_eps,
+                    eps=self._mla_norm_eps(config),
                     rngs=rngs,
                     dtype=dtype,
                     param_dtype=param_dtype,
@@ -582,7 +582,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             self.projection_mapping["mla_kv_a_layernorm"],
             RMSNorm(
                 config.kv_lora_rank,
-                eps=config.rms_norm_eps,
+                eps=self._mla_norm_eps(config),
                 rngs=rngs,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -617,7 +617,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             ),
         )
 
-        self.rotary = self._create_rotary(config, dtype)
         self.attention_performer = self._create_attention_performer(config, rngs)
 
     @property
@@ -923,9 +922,10 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
           with that explicit mechanism, enabling mixed MLA / non-MLA
           stacks (e.g. dense layers run flash attention while MLA layers
           run a paged kernel).
-        * When ``mla_attn_dtype`` / ``mla_attn_softmax_dtype`` are set,
-          a shallow-copied config is used so the MLA performer sees
-          different dtypes without mutating the shared config.
+        * MLA performers are always built from a shallow copy of the config.
+          ``mla_attn_dtype`` / ``mla_attn_softmax_dtype`` (when set) are
+          applied to the copy, and the performer's own dtype resolution
+          (``attn_mechanism="auto"``) stays off the shared config.
 
         Override to customize attention dropout or softmax scale (e.g.
         muP / DeepSeek mscale).
@@ -946,24 +946,32 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
                 mla_mech_val = getattr(mla_mech, "value", mla_mech)
                 if str(mla_mech_val).lower() != "auto":
                     attn_mechanism = mla_mech
+            # The performer resolves dtypes on its config in place; a copy keeps that, and the MLA overrides below,
+            # out of the model-wide config. ``None`` overrides follow ``attn_dtype`` / ``attn_softmax_dtype``.
+            performer_config = copy.copy(config)
             mla_attn_dtype = getattr(config, "mla_attn_dtype", None)
             mla_attn_softmax_dtype = getattr(config, "mla_attn_softmax_dtype", None)
-            if mla_attn_dtype is not None or mla_attn_softmax_dtype is not None:
-                performer_config = copy.copy(config)
-                if mla_attn_dtype is not None:
-                    performer_config.attn_dtype = mla_attn_dtype
-                if mla_attn_softmax_dtype is not None:
-                    performer_config.attn_softmax_dtype = mla_attn_softmax_dtype
-        softmax_scale = self.head_dim**-0.5
-        if self.attention_type == "mla":
-            softmax_scale = self._mla_softmax_scale(config)
+            if mla_attn_dtype is not None:
+                performer_config.attn_dtype = mla_attn_dtype
+            if mla_attn_softmax_dtype is not None:
+                performer_config.attn_softmax_dtype = mla_attn_softmax_dtype
+        # MLA sets ``head_dim`` to the value width (0 is legal for NoPE models), so only MLA's own scale applies there.
+        softmax_scale = self._mla_softmax_scale(config) if self.attention_type == "mla" else self.head_dim**-0.5
         return FlexibleAttentionModule(
             rngs=rngs,
             base_config=performer_config,
             softmax_scale=float(softmax_scale),
-            dropout_prob=getattr(config, "attention_dropout", 0.0),
+            dropout_prob=float(getattr(config, "attention_dropout", 0.0) or 0.0),
             attn_mechanism=attn_mechanism,
         )
+
+    def _mla_norm_eps(self, config: Cfg) -> float:
+        """Epsilon of the MLA ``q_a_layernorm`` / ``kv_a_layernorm`` built by :meth:`_build_mla_projections`.
+
+        Defaults to ``config.rms_norm_eps``; families whose reference builds these norms with another epsilon
+        override it.
+        """
+        return config.rms_norm_eps
 
     def _mla_softmax_scale(self, config: Cfg) -> float:
         """MLA score scale: the full ``qk_nope + qk_rope`` query width, with YaRN ``mscale**2``.
@@ -1549,27 +1557,11 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             k_nope = None
             value_states = None
 
-        # Apply RoPE directly to MLA format [batch, heads, seq, rope_dim]
+        # RoPE on the positional components, in the MLA [batch, heads, seq, rope_dim] layout.
         if frequencies is not None:
-            freq_array = frequencies.value if hasattr(frequencies, "value") else frequencies
-            # Gather frequencies for all positions: position_ids is [batch, seq], freq_array is [max_seq, rope_dim*2]
-            # Result: [batch, seq, rope_dim*2]
-            freqs = freq_array[position_ids]
-            # Split into cos/sin: each [batch, seq, rope_dim]
-            cos, sin = jnp.split(freqs, 2, -1)
-            # Expand for heads dimension: [batch, 1, seq, rope_dim]
-            cos = cos[:, None, :, :].astype(q_pe.dtype)
-            sin = sin[:, None, :, :].astype(q_pe.dtype)
-            # DeepSeek checkpoints pair channels (2i, 2i+1); configs without
-            # ``rope_interleave`` keep the split-half (NeoX) pairing.
-            if getattr(self.config, "rope_interleave", False):
-                q_pe = apply_rope_interleaved(q_pe, cos, sin)
-                k_pe = apply_rope_interleaved(k_pe, cos, sin)
-            else:
-                q1, q2 = jnp.split(q_pe, 2, axis=-1)
-                k1, k2 = jnp.split(k_pe, 2, axis=-1)
-                q_pe = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
-                k_pe = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
+            q_pe, k_pe = apply_mla_rope(
+                q_pe, k_pe, frequencies, position_ids, interleave=bool(getattr(self.config, "rope_interleave", False))
+            )
 
         q_nope, q_pe = self._postprocess_mla_queries(q_nope, q_pe, position_ids)
 

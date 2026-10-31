@@ -104,8 +104,9 @@ def moe_expert_param_layout_scope(*, fsdp_shard_expert_weights: bool) -> Iterato
     ``__init__``) enters this scope with the config-derived
     ``moe_fsdp_shard_expert_weights`` knob so that ``ParallelMoELinear``
     layers built anywhere under a model constructor can extend the expert
-    (leading) dimension of their weight layout with the FSDP axis without
-    every model family having to thread the flag explicitly.
+    (leading) dimension of their weight layout with the FSDP axis (in expert
+    tensor mode: the second, feature dimension) without every model family
+    having to thread the flag explicitly.
 
     Args:
         fsdp_shard_expert_weights: Whether MoE expert weights constructed

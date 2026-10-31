@@ -23,6 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from ejkernel.kernels import Backend, Platform, kernel_registry
+from ejkernel.kernels._xla.kda_chunk._xla_impl import DECAY_FACTOR_MAX_LOG, pairwise_sub_block
 
 XLA = kernel_registry.get("kda_chunk", platform=Platform.XLA, backend=Backend.ANY)
 
@@ -175,9 +176,67 @@ def test_bf16_inputs():
 
 
 @pytest.mark.parametrize(
+    ("bound", "chunk_size", "sub"),
+    [(None, 64, 0), (-5.0, 64, 16), (-5.0, 16, 16), (-5.0, 48, 16), (-0.5, 64, 64), (0.0, 64, 64), (-11.0, 64, 8),
+     (-20.0, 64, 0)],
+)  # fmt: skip
+def test_pairwise_sub_block_keeps_every_factor_finite(bound, chunk_size, sub):
+    got = pairwise_sub_block(bound, chunk_size)
+    assert got == sub
+    if got:
+        assert chunk_size % got == 0 and (got - 1) * -bound <= DECAY_FACTOR_MAX_LOG < 88.0
+
+
+@pytest.mark.parametrize("chunk_size", [16, 64])
+@pytest.mark.parametrize("strong", [False, True], ids=["weak_decay", "strong_decay"])
+def test_factored_pairwise_matches_oracle(strong, chunk_size):
+    q, k, v, beta, g, s0 = make_inputs(11, L=150, strong=strong)
+    assert float(g.min()) >= -5.0
+    seg = packed_ids(2, 150, boundaries=(37, 64, 65, 130), pad_rows=((1, 140, None),))
+    for s in (None, seg):
+        out, fin, st = run_xla(
+            q, k, v, beta, g, s0, s, chunk_size=chunk_size, return_chunk_states=True, decay_lower_bound=-5.0
+        )
+        o_ref, f_ref, st_ref = recurrent_oracle(q, k, v, beta, g, s0, s, chunk_size=chunk_size)
+        assert rel(out, o_ref) < 2e-5 and rel(fin, f_ref) < 2e-5 and rel(st, st_ref) < 2e-5
+
+
+def test_factored_pairwise_gradients_match_oracle():
+    q, k, v, beta, g, s0 = make_inputs(12, L=128, strong=True)
+    seg = packed_ids(2, 128, boundaries=(37, 64, 65), pad_rows=((1, 110, None),))
+    rng = np.random.RandomState(13)
+    w_out = jnp.asarray(rng.randn(2, 2, 128, 128).astype(np.float32))
+    w_fin = jnp.asarray(rng.randn(2, 2, 128, 128).astype(np.float32))
+
+    def loss(fn, *a):
+        out, fin = fn(*a)[:2]
+        return jnp.sum(out * w_out) + jnp.sum(fin * w_fin)
+
+    for s in (None, seg):
+        f_k = lambda q, k, v, b, g, s0, s=s: XLA(q, k, v, b, g, s0, s, chunk_size=32, decay_lower_bound=-5.0)  # noqa: E731
+        f_r = lambda q, k, v, b, g, s0, s=s: recurrent_oracle(q, k, v, b, g, s0, s)  # noqa: E731
+        g_k = jax.jit(jax.grad(functools.partial(loss, f_k), argnums=range(6)))(q, k, v, beta, g, s0)
+        g_r = jax.jit(jax.grad(functools.partial(loss, f_r), argnums=range(6)))(q, k, v, beta, g, s0)
+        for a, b, name in zip(g_k, g_r, ("dq", "dk", "dv", "dbeta", "dg", "ds0"), strict=True):
+            assert np.isfinite(np.asarray(a)).all(), name
+            assert rel(a, b) < 1e-4, (name, rel(a, b))
+
+
+def test_dense_pairwise_opts_out_of_the_bound():
+    q, k, v, beta, g, s0 = make_inputs(14, L=96, strong=True)
+    plain = run_xla(q, k, v, beta, g, s0, chunk_size=32)
+    dense = run_xla(q, k, v, beta, g, s0, chunk_size=32, decay_lower_bound=-5.0, pairwise="dense")
+    factored = run_xla(q, k, v, beta, g, s0, chunk_size=32, decay_lower_bound=-5.0)
+    for a, b in zip(dense, plain, strict=True):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    assert not np.array_equal(np.asarray(factored[0]), np.asarray(plain[0]))
+
+
+@pytest.mark.parametrize(
     "kw",
-    [dict(precision="bf16"), dict(backward="cuda"), dict(bwd_reduce="tensor"), dict(chunk_size=0), dict(block_h=0)],
-)
+    [dict(precision="bf16"), dict(backward="cuda"), dict(bwd_reduce="tensor"), dict(chunk_size=0), dict(block_h=0),
+     dict(decay_lower_bound=1.0), dict(decay_lower_bound=float("nan")), dict(pairwise="mxu")],
+)  # fmt: skip
 def test_invalid_arguments_raise(kw):
     q, k, v, beta, g, _ = make_inputs(6, B=1, H=1, L=16, K=16, V=16)
     with pytest.raises(ValueError):

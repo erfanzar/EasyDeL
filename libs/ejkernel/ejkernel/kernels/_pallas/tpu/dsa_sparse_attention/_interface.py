@@ -39,9 +39,12 @@ import jax
 import jax.numpy as jnp
 import jaxtyping
 from beartype import beartype
+from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
 from ejkernel.kernels._xla.dsa_sparse_attention._tables import (
+    WORD,
+    as_pool_bits,
     build_q_tables,
     build_tables,
     validate_blocks,
@@ -52,6 +55,11 @@ from ...._registry import Backend, Platform, kernel_registry
 from ._pallas_impl_bwd import dsa_sparse_attention_pallas_bwd
 from ._pallas_impl_bwd_fused import dsa_sparse_attention_pallas_bwd_fused
 from ._pallas_impl_fwd import STAT_ROWS, dsa_sparse_attention_pallas_fwd
+
+#: ``checkpoint_name`` of the forward residuals the backward reads: the output and the (m, log l) statistics.
+RESIDUAL_NAME = "dsa_sparse_attention_residuals"
+#: ``checkpoint_name`` of the block tables (packed bits, tails, counts, kv lists) the kernels stream.
+TABLES_NAME = "dsa_sparse_attention_tables"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -72,14 +80,11 @@ class _Static:
     pool_sum: str
     stale_tau: float | None
     fused_groups: int | None
+    with_pool: bool = True
+    num_pools: int = 0
 
 
-def _tables(pool_mask, tails, st: _Static):
-    return build_tables(pool_mask, tails, kpool=st.kpool, block_q=st.block_q, block_kv=st.block_kv, mode=st.mode)
-
-
-def _forward(query, latent, pool_mask, tails, st: _Static):
-    bits_t, tails_t, count, kv_list = _tables(pool_mask, tails, st)
+def _forward(query, latent, bits_t, tails_t, count, kv_list, st: _Static):
     return dsa_sparse_attention_pallas_fwd(
         query,
         latent,
@@ -99,18 +104,26 @@ def _forward(query, latent, pool_mask, tails, st: _Static):
     )
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(5,))
-def _core(query, latent, pool_mask, tails, ste_pool, st: _Static):
-    out, _, _ = _forward(query, latent, pool_mask, tails, st)
+@functools.partial(jax.custom_vjp, nondiff_argnums=(7,))
+def _core(query, latent, bits_t, tails_t, count, kv_list, ste_pool, st: _Static):
+    out, _, _ = _forward(query, latent, bits_t, tails_t, count, kv_list, st)
     _ = ste_pool  # value is identically 0 in the forward; only its cotangent matters
     return out
 
 
-def _core_fwd(query, latent, pool_mask, tails, ste_pool, st: _Static):
-    out, m, logl = _forward(query, latent, pool_mask, tails, st)
+def _core_fwd(query, latent, bits_t, tails_t, count, kv_list, ste_pool, st: _Static):
+    out, m, logl = _forward(query, latent, bits_t, tails_t, count, kv_list, st)
     _ = ste_pool
-    # Only row 0 of the 8-row statistics carries information: save [B, H, S] and re-broadcast in the backward.
-    return out, (query, latent, pool_mask, tails, out, m[:, :, 0, :], logl[:, :, 0, :])
+    # The residuals are the kernels' own tables (packed words, not a [B, S, P] mask), so the backward neither keeps
+    # a per-pool tensor alive nor rebuilds the tables. Only row 0 of the 8-row statistics carries information:
+    # save [B, H, S] and re-broadcast in the backward.
+    # Remat names (identity at runtime): a checkpoint policy that saves or offloads RESIDUAL_NAME / TABLES_NAME lets
+    # the backward skip re-running this forward kernel and, for the tables, the selection that produced them.
+    res_out, res_m, res_l = checkpoint_name((out, m[:, :, 0, :], logl[:, :, 0, :]), RESIDUAL_NAME)
+    tables = checkpoint_name((bits_t, tails_t, count, kv_list), TABLES_NAME)
+    # The primal output is the NAMED value too: downstream ops' backward (e.g. the W_v projection) needs it, and an
+    # unnamed copy would force the remat to re-run this kernel even when the policy keeps the residual.
+    return res_out, (query, latent, *tables, res_out, res_m, res_l)
 
 
 def _stat_rows(x):
@@ -118,9 +131,7 @@ def _stat_rows(x):
 
 
 def _core_bwd(st: _Static, res, grad):
-    query, latent, pool_mask, tails, out, m, logl = res
-    num_pools = pool_mask.shape[-1]
-    bits_t, tails_t, count, kv_list = _tables(pool_mask, tails, st)
+    query, latent, bits_t, tails_t, count, kv_list, out, m, logl = res
     delta = _stat_rows(jnp.sum(grad.astype(jnp.float32) * out.astype(jnp.float32), axis=-1))
     m, logl = _stat_rows(m), _stat_rows(logl)
     common = dict(
@@ -136,7 +147,7 @@ def _core_bwd(st: _Static, res, grad):
     if st.backward == "fused":
         dq, d_latent, d_pool_t = dsa_sparse_attention_pallas_bwd_fused(
             query, latent, bits_t, tails_t, count, kv_list, m, logl, delta, grad, fused_groups=st.fused_groups,
-            **common,
+            with_pool=st.with_pool, **common,
         )  # fmt: skip
     else:
         q_count, q_list = build_q_tables(count, kv_list)
@@ -144,8 +155,11 @@ def _core_bwd(st: _Static, res, grad):
             query, latent, bits_t, tails_t, count, kv_list, q_count, q_list, m, logl, delta, grad, lean=st.bwd_lean,
             **common,
         )  # fmt: skip
-    d_ste_pool = jnp.transpose(d_pool_t[:, :num_pools, :], (0, 2, 1))
-    return dq, d_latent, None, None, d_ste_pool
+    if not st.with_pool:
+        # No straight-through operand (ste_pool=None): no pool cotangent is returned.
+        return dq, d_latent, None, None, None, None, None
+    d_ste_pool = jnp.transpose(d_pool_t[:, : st.num_pools, :], (0, 2, 1))
+    return dq, d_latent, None, None, None, None, d_ste_pool
 
 
 _core.defvjp(_core_fwd, _core_bwd)
@@ -178,8 +192,10 @@ def dsa_sparse_attention_pallas(
 ) -> Array:
     """Unregistered entry point of the Pallas path (see :func:`dsa_sparse_attention` for the arguments).
 
-    Pads the sequence to the block grid (padded queries select nothing: output 0, finite statistics; padded keys
-    are never selected) and the pool axis to ``S_pad / kpool``, runs the ``custom_vjp`` core and slices the output.
+    Packs a bool selection into words once, pads the sequence to the block grid (padded queries select nothing:
+    output 0, finite statistics; padded keys are never selected) and the word / pool axes to ``S_pad / kpool`` pools,
+    builds the block tables outside the ``custom_vjp`` core (its residuals are then the tables, never a ``[B, S, P]``
+    mask), runs the core and slices the output.
     """
     mode = validate_options(
         mode=mode, backward=backward, pool_sum=pool_sum, stale_tau=stale_tau, fused_groups=fused_groups
@@ -191,21 +207,31 @@ def dsa_sparse_attention_pallas(
     if tails is None:
         tails = jnp.full((*pool_mask.shape[:2], 1), -1, jnp.int32)
     tails = tails.astype(jnp.int32)
-    pool_mask = pool_mask.astype(jnp.bool_)
-    if ste_pool is None:
-        ste_pool = jnp.zeros(pool_mask.shape, jnp.float32)
+    bits = as_pool_bits(pool_mask)  # [B, S, W] int32: the only form of the selection the kernels read
+    # ste_pool=None means "no indexer gradient": skip the [B, S, P] fp32 operand and the [B, P, S] fp32 pool
+    # cotangent of the backward entirely (both are O(S^2 / kpool) and dominate memory at long context).
+    with_pool = ste_pool is not None
     seq = query.shape[2]
     step = _lcm(block_q, block_kv)
     seq_pad = -(-seq // step) * step
-    num_pools = pool_mask.shape[-1]
-    pools_pad = max(num_pools, seq_pad // kpool)
-    if seq_pad != seq or pools_pad != num_pools:
-        dq, dk, dp = seq_pad - seq, seq_pad - latent.shape[1], pools_pad - num_pools
+    dq, dk = seq_pad - seq, seq_pad - latent.shape[1]
+    if dq or dk:
         query = jnp.pad(query, ((0, 0), (0, 0), (0, dq), (0, 0)))
         latent = jnp.pad(latent, ((0, 0), (0, dk), (0, 0)))
-        pool_mask = jnp.pad(pool_mask, ((0, 0), (0, dq), (0, dp)))
-        ste_pool = jnp.pad(ste_pool, ((0, 0), (0, dq), (0, dp)))
         tails = jnp.pad(tails, ((0, 0), (0, dq), (0, 0)), constant_values=-1)
+    words_pad = max(bits.shape[-1], seq_pad // (WORD * kpool))  # exact: block_kv % (32 * kpool) == 0
+    if dq or words_pad != bits.shape[-1]:
+        bits = jnp.pad(bits, ((0, 0), (0, dq), (0, words_pad - bits.shape[-1])))
+    num_pools = 0
+    if with_pool:
+        ste_pool = ste_pool.astype(jnp.float32)
+        pools_pad = max(ste_pool.shape[-1], seq_pad // kpool)
+        if dq or pools_pad != ste_pool.shape[-1]:
+            ste_pool = jnp.pad(ste_pool, ((0, 0), (0, dq), (0, pools_pad - ste_pool.shape[-1])))
+        num_pools = pools_pad
+    bits_t, tails_t, count, kv_list = build_tables(
+        bits, tails, kpool=kpool, block_q=block_q, block_kv=block_kv, mode=mode
+    )
     st = _Static(
         kpool=kpool,
         block_q=block_q,
@@ -221,8 +247,10 @@ def dsa_sparse_attention_pallas(
         pool_sum=pool_sum,
         stale_tau=None if stale_tau is None else float(stale_tau),
         fused_groups=fused_groups,
+        with_pool=with_pool,
+        num_pools=num_pools,
     )
-    out = _core(query, latent, pool_mask, tails, ste_pool.astype(jnp.float32), st)
+    out = _core(query, latent, bits_t, tails_t, count, kv_list, ste_pool if with_pool else None, st)
     return out[:, :, :seq, :]
 
 
@@ -231,7 +259,7 @@ def dsa_sparse_attention_pallas(
 def dsa_sparse_attention(
     query: Float[Array, "batch num_heads seq head_dim"],
     latent: Float[Array, "batch seq head_dim"],
-    pool_mask: Bool[Array, "batch seq num_pools"],
+    pool_mask: Bool[Array, "batch seq num_pools"] | Int[Array, "batch seq num_words"],
     tails: Int[Array, "batch seq num_tails"] | None = None,
     ste_pool: Float[Array, "batch seq num_pools"] | None = None,
     *,
@@ -258,7 +286,9 @@ def dsa_sparse_attention(
         query: ``[B, H, S, D]`` queries (absorbed-MLA queries for GLM-5-style DSA).
         latent: ``[B, S, D]`` shared ``K == V`` latent.
         pool_mask: ``[B, S, P]`` bool selected pools (causal and same-document by the indexer's construction; pool
-            ``p`` = keys ``p*kpool .. p*kpool + kpool - 1``).
+            ``p`` = keys ``p*kpool .. p*kpool + kpool - 1``), or the same selection as ``[B, S, W]`` int32 packed
+            words (bit ``p % 32`` of word ``p // 32`` = pool ``p``). Packed words are what the kernels read; passing
+            them keeps every ``[B, S, P]`` tensor out of the graph.
         tails: ``[B, S, T]`` int32 tail keys (``-1`` = none), ``T <= 8``, or ``None``.
         ste_pool: ``[B, S, P]`` fp32 pooled straight-through term (value 0); ``None`` = no indexer gradient.
         kpool: Keys per pool.

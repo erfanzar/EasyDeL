@@ -32,7 +32,14 @@ import jax.numpy as jnp
 from jax import lax
 from jaxtyping import Array
 
-from ._tables import build_tables, expand_open_mask, expand_pool_values, parse_sparse_mode, visited_open_mask
+from ._tables import (
+    build_tables,
+    expand_open_mask,
+    expand_pool_values,
+    parse_sparse_mode,
+    unpack_pool_bits,
+    visited_open_mask,
+)
 
 _MASK_MIN = float(jnp.finfo(jnp.float32).min)
 _SINK = -1e30
@@ -56,7 +63,7 @@ def dsa_sparse_attention_xla(
     Args:
         query: ``[B, H, S, D]`` queries.
         latent: ``[B, S, D]`` shared ``K == V`` latent.
-        pool_mask: ``[B, S, P]`` bool selected pools.
+        pool_mask: ``[B, S, P]`` bool selected pools, or ``[B, S, W]`` int32 packed words.
         tails: ``[B, S, T]`` int32 tail keys (``-1`` = none) or ``None``.
         ste_pool: ``[B, S, P]`` pooled straight-through term or ``None``.
         kpool: Keys per pool.
@@ -72,6 +79,9 @@ def dsa_sparse_attention_xla(
     kv_len = latent.shape[1]
     scale = head_dim**-0.5 if softmax_scale is None else float(softmax_scale)
     kind, _ = parse_sparse_mode(mode)
+    if pool_mask.dtype != jnp.bool_:
+        # Packed words: this reference is dense by design, so expanding to the per-pool mask costs nothing extra.
+        pool_mask = unpack_pool_bits(pool_mask, min(32 * pool_mask.shape[-1], -(-kv_len // kpool)))
     open_ = expand_open_mask(pool_mask, tails, kpool=kpool, seq_len=kv_len)
     if kind == "budget":
         _, _, count, kv_list = build_tables(pool_mask, tails, kpool=kpool, block_q=block_q, block_kv=block_kv, mode=mode)

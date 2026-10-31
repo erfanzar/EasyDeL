@@ -930,12 +930,103 @@ def arrayrecord_manifest_instructions(
     return instructions, total_bytes / total_rows
 
 
-def _host_shard(arguments: tp.Any) -> tuple[int, int]:
+def batch_shard_process_groups(
+    devices: np.ndarray,
+    axis_names: tp.Sequence[str],
+    batch_axes: tp.Sequence[str],
+) -> tuple[tuple[int, ...], ...]:
+    """Processes that must load identical lane rows: one sorted tuple per group, groups ordered by lowest process.
+
+    The trainer hands each host's collated batch to the step as a replicated host value, and every device keeps the
+    rows of its batch shard (the mesh coordinates on ``batch_axes``) from its OWN host's copy. Hosts that hold devices
+    of the same batch shard -- a tensor-parallel group spanning hosts, sequence or pipeline axes crossing hosts --
+    must therefore read the same rows, or the replicas of that shard silently disagree. Devices that differ only on
+    non-batch axes share rows. When every host holds batch shards of its own (each group is one process), the groups
+    are the processes in order, i.e. the per-process sharding.
+
+    Args:
+        devices: Mesh device array; every entry exposes ``process_index``.
+        axis_names: Mesh axis names, aligned with ``devices.shape``.
+        batch_axes: Mesh axes the batch dimension is sharded over (names absent from the mesh are ignored).
+
+    Returns:
+        Tuple of process-index tuples.
+    """
+    names = list(axis_names)
+    batch_dims = [names.index(a) for a in batch_axes if a in names]
+    parent: dict[int, int] = {}
+
+    def find(p: int) -> int:
+        while parent[p] != p:
+            parent[p] = parent[parent[p]]
+            p = parent[p]
+        return p
+
+    owner: dict[tuple[int, ...], int] = {}
+    for pos in np.ndindex(devices.shape):
+        proc = int(devices[pos].process_index)
+        parent.setdefault(proc, proc)
+        key = tuple(pos[d] for d in batch_dims)
+        if key in owner:
+            a, b = find(owner[key]), find(proc)
+            if a != b:
+                parent[max(a, b)] = min(a, b)
+        else:
+            owner[key] = proc
+    groups: dict[int, list[int]] = {}
+    for proc in parent:
+        groups.setdefault(find(proc), []).append(proc)
+    return tuple(sorted(tuple(sorted(g)) for g in groups.values()))
+
+
+def _trainer_process_groups(trainer: tp.Any) -> tuple[tuple[int, ...], ...] | None:
+    """:func:`batch_shard_process_groups` for the trainer's mesh and ``step_partition_spec``; ``None`` without a mesh."""
+    try:
+        mesh = getattr(trainer, "mesh", None)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    jmesh = getattr(mesh, "jax_mesh", mesh)
+    devices = getattr(jmesh, "devices", None)
+    axis_names = getattr(jmesh, "axis_names", None)
+    if devices is None or axis_names is None:
+        return None
+    spec = tuple(getattr(trainer.arguments, "step_partition_spec", None) or ())
+    entry = spec[0] if spec else None
+    batch_axes = () if entry is None else tuple(entry) if isinstance(entry, (tuple, list)) else (entry,)
+    return batch_shard_process_groups(np.asarray(devices), tuple(axis_names), batch_axes)
+
+
+def _host_shard(trainer: tp.Any) -> tuple[int, int]:
+    """This host's ``(shard_index, shard_count)`` for the lanes.
+
+    Explicit ``grain_shard_index`` / ``grain_shard_count`` win. Otherwise hosts are grouped by the batch shards their
+    devices hold (:func:`batch_shard_process_groups`, over the trainer mesh and the batch entry of
+    ``step_partition_spec``): every host of a group reads the same rows. Without a mesh, one shard per process.
+    """
     import jax
 
-    index = arguments.grain_shard_index if arguments.grain_shard_index is not None else jax.process_index()
-    count = arguments.grain_shard_count if arguments.grain_shard_count is not None else jax.process_count()
-    return int(index), max(int(count), 1)
+    arguments = trainer.arguments
+    if arguments.grain_shard_index is not None or arguments.grain_shard_count is not None:
+        index = arguments.grain_shard_index if arguments.grain_shard_index is not None else jax.process_index()
+        count = arguments.grain_shard_count if arguments.grain_shard_count is not None else jax.process_count()
+        return int(index), max(int(count), 1)
+    me = jax.process_index()
+    groups = _trainer_process_groups(trainer)
+    if groups is None and jax.process_count() > 1:
+        logger.warn_once(
+            "data lanes: the trainer has no mesh, so each host reads its own rows (shard = process index). This is "
+            "only correct when every batch shard lives on one host; set grain_shard_index / grain_shard_count "
+            "explicitly otherwise."
+        )
+    for i, group in enumerate(groups or ()):
+        if me in group:
+            if len(groups) < jax.process_count():
+                logger.info_once(
+                    f"data lanes: {jax.process_count()} hosts form {len(groups)} batch-shard groups on this mesh; "
+                    "hosts of one group read identical rows."
+                )
+            return i, len(groups)
+    return int(me), max(int(jax.process_count()), 1)
 
 
 def _require_user_collator(trainer: tp.Any, field_name: str) -> None:
@@ -1049,7 +1140,7 @@ def configure_parquetra_lane(trainer: tp.Any) -> tuple[tp.Any, int]:
     ao = resolve_lane_assistant_only(datasets, arguments.parquetra_assistant_only, "parquetra_assistant_only")
     names = sorted(datasets)
     trainer._dataset_id_names = dict(enumerate(names))
-    shard_index, shard_count = _host_shard(arguments)
+    shard_index, shard_count = _host_shard(trainer)
     sources = {
         name: ParquetRandomAccessSource(
             datasets[name],
@@ -1160,7 +1251,7 @@ def configure_arrayrecord_lane(trainer: tp.Any) -> tuple[tp.Any, int]:
     trainer._dataset_id_names = dict(enumerate(names))
     rate = read_rate_bytes_per_second(arguments.arrayrecord_read_rate_limit_mb_per_sec)
     burst = float(arguments.arrayrecord_read_rate_burst_seconds)
-    shard_index, shard_count = _host_shard(arguments)
+    shard_index, shard_count = _host_shard(trainer)
     batch_size = int(trainer.training_batch_size)
     seed = int(arguments.shuffle_seed_train)
     per_source, rows = [], {}

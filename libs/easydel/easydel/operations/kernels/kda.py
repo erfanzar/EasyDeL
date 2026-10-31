@@ -46,7 +46,6 @@ References:
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from ejkernel.kernels import Backend, Platform, kernel_registry  # pyright: ignore[reportMissingTypeStubs]
@@ -58,10 +57,11 @@ from jaxtyping import Array, Float
 from spectrax import sanitize_partition_spec_for_mesh_and_shape, with_sharding_constraint
 
 from easydel.caching import KDACacheView
+from easydel.infra.etils import KDA_CHUNK_IMPLS, KDA_CHUNK_PRECISIONS
 from easydel.infra.sequence_packing import normalize_packed_segment_ids
 
 from .._attention_outputs import AttentionOutput
-from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry, run_mosaic_kernel
+from .._operation_impl import OperationImpl, OperationRegistry, run_mosaic_kernel
 from ..requirements import (
     CacheType,
     ExecutionMode,
@@ -98,7 +98,11 @@ def l2norm(x, axis=-1, eps=1e-6):
     return x * inv_norm
 
 
-def fused_kda_gate(gate: Float[Array, "..."], A_log: Float[Array, "num_heads"], dt_bias: Float[Array, "num_heads"]):
+def fused_kda_gate(
+    gate: Float[Array, "..."],
+    A_log: Float[Array, "num_heads"],  # noqa: F821
+    dt_bias: Float[Array, "num_heads"],  # noqa: F821
+):
     """Materialise the per-token KDA log-decay from raw f_b / A_log / dt_bias.
 
     Implements the fused expression
@@ -579,24 +583,24 @@ def _single_step_kda_core(
 
 def fused_kda_gate_per_channel(
     gate: Float[Array, "batch seq qkv_dim"],
-    A_log: Float[Array, "num_heads"],
+    A_log: Float[Array, "num_heads"],  # noqa: F821
     dt_bias: Float[Array, "qkv_dim"],  # noqa: F821
-    lower_bound: float | None = -5.0,
+    *,
+    lower_bound: float | None,
 ) -> Float[Array, "batch seq num_heads head_dim"]:
-    """Materialise the GLM-5-Next per-channel KDA log-decay.
+    """Materialise the per-channel KDA log-decay (GLM-5-Next safe gate or Kimi Linear softplus gate).
 
-    GLM-5-Next (``Glm5NextTextForgetGate``) computes the forget gate as a
-    two-layer MLP ``f_b(f_a(x))`` whose ``qkv_dim`` output is viewed as
-    ``(num_heads, head_dim)`` — the decay varies per *channel*, unlike the
-    per-head Kimi gate handled by :func:`fused_kda_gate`. With the safe-gate
-    lower bound configured (GLM-5.3-Flash ships ``-5.0``) the log-decay is
+    The forget gate is a two-layer MLP ``f_b(f_a(x))`` whose ``qkv_dim`` output
+    is viewed as ``(num_heads, head_dim)``, so the decay varies per *channel*.
+    ``lower_bound`` is required because the two forms are different models:
+    with a safe-gate lower bound the log-decay is
 
         ``g = lower_bound * sigmoid(exp(A_log_head) * (gate + dt_bias))``
 
     so ``g`` lies in ``[lower_bound, 0)`` and ``exp(g)`` contracts the
-    recurrent state. Without the bound it falls back to the softplus form
-    ``-exp(A_log_head) * softplus(gate + dt_bias)`` (values above 20 pass
-    through unscaled to avoid overflow), matching the HF reference.
+    recurrent state. With ``lower_bound=None`` it is Kimi Linear's softplus
+    form ``-exp(A_log_head) * softplus(gate + dt_bias)``, matching the HF
+    reference.
 
     Args:
         gate: Raw ``f_b_proj`` output before head reshaping,
@@ -605,8 +609,8 @@ def fused_kda_gate_per_channel(
             across each head's channels.
         dt_bias: Per-channel time-discretisation bias,
             ``(num_heads * head_dim,)``.
-        lower_bound: Safe lower bound for the sigmoid gate, or ``None`` to
-            use the softplus formulation.
+        lower_bound: Safe lower bound of the sigmoid gate (GLM-5-Next), or
+            ``None`` for the unbounded softplus gate (Kimi Linear).
 
     Returns:
         Float[Array, "batch seq num_heads head_dim"]: Float32 per-channel
@@ -874,9 +878,6 @@ def _chunk_kda_per_channel_fwd(
     )
 
 
-KDA_CHUNK_IMPLS = ("scan", "kda_chunk")
-
-
 def _chunk_kda_per_channel_fused(
     query: Float[Array, "batch num_heads seq_len head_dim"],
     key: Float[Array, "batch num_heads seq_len head_dim"],
@@ -892,6 +893,7 @@ def _chunk_kda_per_channel_fused(
     continue_initial_state: bool = False,
     precision: str = "highest",
     cfg: KdaChunkConfig | None = None,
+    decay_lower_bound: float | None = None,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
@@ -916,8 +918,11 @@ def _chunk_kda_per_channel_fused(
         kernel_mesh: Optional mesh for the kernel's ``shard_map``.
         kernel_lead_specs: Optional ``(batch_axes, head_axes)`` of the inputs.
         continue_initial_state: Cached-continuation segment semantics.
-        precision: ``"highest"`` or ``"default"`` for the non-inverse dots (the chunk inverse stays HIGHEST).
-        cfg: Optional ejkernel :class:`KdaChunkConfig` (``block_h``, ``backward``, ``bwd_reduce``).
+        precision: ``"highest"`` or ``"default"`` for the non-inverse dots.
+        cfg: Optional ejkernel :class:`KdaChunkConfig` (``block_h``, ``backward``, ``bwd_reduce``, ``pairwise``).
+        decay_lower_bound: Promise that every log-decay ``decay >= decay_lower_bound`` (a safe-gate bound). It lets
+            the kernel factor the pairwise decay into MXU matmuls instead of a ``[cs, cs, K]`` VPU tensor
+            (``cfg.pairwise="dense"`` opts out); ``None`` keeps the dense form.
 
     Returns:
         tuple: ``(outputs, final_state)`` float32.
@@ -940,6 +945,7 @@ def _chunk_kda_per_channel_fused(
             use_qk_l2norm=use_qk_l2norm,
             continue_initial_state=continue_initial_state,
             precision=precision,
+            decay_lower_bound=decay_lower_bound,
             platform=platform,
             cfg=cfg,
         )
@@ -1760,6 +1766,7 @@ class KernelDeltaAttnOp(OperationImpl):
         continue_initial_state: bool = False,
         chunk_impl: str = "scan",
         chunk_precision: str = "highest",
+        decay_lower_bound: float | None = None,
         **kwargs,
     ) -> KDAOutput:
         """Forward pass for KDA attention.
@@ -1793,6 +1800,11 @@ class KernelDeltaAttnOp(OperationImpl):
                 ``"kda_chunk"`` entry of ``OperationMetadata.operation_configs``).
             chunk_precision: Precision of the non-inverse dots on the ``"kda_chunk"``
                 path: ``"highest"`` (default) or ``"default"`` (bf16 MXU passes).
+            decay_lower_bound: Promise that every per-channel log-decay is
+                ``>= decay_lower_bound`` (a safe-gate bound). On the ``"kda_chunk"`` path it
+                lets the kernel factor the pairwise decay into MXU matmuls (see ejkernel
+                ``KdaChunkConfig.pairwise``); ``None`` keeps the dense form. Other paths
+                ignore it (they are exact for any decay).
             **kwargs: Additional ignored arguments
 
         Returns:
@@ -1800,8 +1812,8 @@ class KernelDeltaAttnOp(OperationImpl):
         """
         if chunk_impl not in KDA_CHUNK_IMPLS:
             raise ValueError(f"chunk_impl must be one of {KDA_CHUNK_IMPLS}, got {chunk_impl!r}")
-        if chunk_precision not in ("highest", "default"):
-            raise ValueError(f"chunk_precision must be 'highest' or 'default', got {chunk_precision!r}")
+        if chunk_precision not in KDA_CHUNK_PRECISIONS:
+            raise ValueError(f"chunk_precision must be one of {KDA_CHUNK_PRECISIONS}, got {chunk_precision!r}")
         per_channel = per_channel_decay or (decay is not None and decay.ndim == 4)
         if per_channel and decay is None:
             # The per-channel kernels have no zero-decay fallback (zero decay
@@ -1905,6 +1917,7 @@ class KernelDeltaAttnOp(OperationImpl):
                         chunk_fwd = _chunk_kda_per_channel_fused
                         extra["precision"] = chunk_precision
                         extra["cfg"] = self.metadata.get_operation_config("kda_chunk")
+                        extra["decay_lower_bound"] = decay_lower_bound
                     if shardings is not None and mesh is not None:
 
                         def _eff(axes):
@@ -1998,6 +2011,7 @@ class KernelDeltaAttnOp(OperationImpl):
         continue_initial_state: bool = False,
         chunk_impl: str = "scan",
         chunk_precision: str = "highest",
+        decay_lower_bound: float | None = None,
         **kwargs,
     ) -> KDAOutput:
         """Execute the KDA operation.
@@ -2025,6 +2039,7 @@ class KernelDeltaAttnOp(OperationImpl):
                 the packed-training reset behavior.
             chunk_impl: ``"scan"`` (default) or ``"kda_chunk"``; see :meth:`forward_native`.
             chunk_precision: ``"highest"`` (default) or ``"default"``; see :meth:`forward_native`.
+            decay_lower_bound: Promised log-decay lower bound or ``None``; see :meth:`forward_native`.
             **kwargs: Additional arguments
 
         Returns:
@@ -2046,96 +2061,6 @@ class KernelDeltaAttnOp(OperationImpl):
             continue_initial_state=continue_initial_state,
             chunk_impl=chunk_impl,
             chunk_precision=chunk_precision,
+            decay_lower_bound=decay_lower_bound,
             **kwargs,
         )
-
-
-if __name__ == "__main__":
-    from jax import random as jr
-
-    from easydel.infra import EasyDeLBaseConfig
-
-    print("Testing KernelDeltaAttnOp...")
-
-    batch, seq_len, num_heads, head_dim, d_state = 2, 128, 8, 64, 64
-
-    key = jr.PRNGKey(0)
-    k1, k2, k3, k4, k5 = jr.split(key, 5)
-
-    query = jr.normal(k1, (batch, seq_len, num_heads, head_dim), dtype=jnp.float32) * 0.1
-    key_tensor = jr.normal(k2, (batch, seq_len, num_heads, head_dim), dtype=jnp.float32) * 0.1
-    value = jr.normal(k3, (batch, seq_len, num_heads, d_state), dtype=jnp.float32) * 0.1
-    beta = jax.nn.sigmoid(jr.normal(k4, (batch, seq_len, num_heads), dtype=jnp.float32))
-    decay = jr.normal(k5, (batch, seq_len, num_heads), dtype=jnp.float32) * 0.01
-
-    metadata = OperationMetadata(
-        runtime_dtype=jnp.float32,
-        runtime_softmax_dtype=jnp.float32,
-        base_config=EasyDeLBaseConfig(),
-    )
-
-    kda_op = KernelDeltaAttnOp(metadata)
-
-    print("Testing training mode (chunked)...")
-    output = kda_op(
-        query=query,
-        key=key_tensor,
-        value=value,
-        beta=beta,
-        decay=decay,
-        chunk_size=32,
-    )
-    print(f"  Output shape: {output.attention_outputs.shape}")
-    print(f"  Recurrent state shape: {output.recurrent_state.shape}")
-    print(f"  Output range: [{output.attention_outputs.min():.4f}, {output.attention_outputs.max():.4f}]")
-
-    print("Testing inference mode (recurrent)...")
-    query_single = query[:, :1, :, :]
-    key_single = key_tensor[:, :1, :, :]
-    value_single = value[:, :1, :, :]
-    beta_single = beta[:, :1, :]
-    decay_single = decay[:, :1, :]
-
-    output_infer = kda_op(
-        query=query_single,
-        key=key_single,
-        value=value_single,
-        beta=beta_single,
-        decay=decay_single,
-        recurrent_state=output.recurrent_state,
-    )
-    print(f"  Output shape: {output_infer.attention_outputs.shape}")
-    print(f"  Recurrent state shape: {output_infer.recurrent_state.shape}")
-
-    print("Testing chunked vs recurrent consistency...")
-
-    out_recurrent, state_recurrent = _recurrent_kda_fwd(
-        query.transpose(0, 2, 1, 3)[:, :, :32, :],
-        key_tensor.transpose(0, 2, 1, 3)[:, :, :32, :],
-        value.transpose(0, 2, 1, 3)[:, :, :32, :],
-        beta.transpose(0, 2, 1)[:, :, :32],
-        decay.transpose(0, 2, 1)[:, :, :32],
-        use_qk_l2norm=True,
-    )
-
-    out_chunk, state_chunk = _chunk_kda_fwd(
-        query.transpose(0, 2, 1, 3)[:, :, :32, :],
-        key_tensor.transpose(0, 2, 1, 3)[:, :, :32, :],
-        value.transpose(0, 2, 1, 3)[:, :, :32, :],
-        beta.transpose(0, 2, 1)[:, :, :32],
-        decay.transpose(0, 2, 1)[:, :, :32],
-        chunk_size=16,
-        use_qk_l2norm=True,
-    )
-
-    import numpy as np
-
-    max_diff = np.abs(np.array(out_chunk) - np.array(out_recurrent)).max()
-    print(f"  Max diff between chunked and recurrent: {max_diff:.2e}")
-
-    if max_diff < 1e-4:
-        print("  Consistency check: PASS")
-    else:
-        print("  Consistency check: FAIL")
-
-    print("All tests passed!")

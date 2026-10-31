@@ -79,11 +79,11 @@ References:
 from functools import partial
 
 import jax
-from ejkernel.kernels._xla.ragged_page_attention_v3._sinks import reduce_sinks_to_heads
 from ejkernel.loggings import get_logger
 from ejkernel.modules import (  # pyright: ignore[reportMissingTypeStubs]
     ragged_page_attention_v2,
     ragged_page_attention_v3,
+    reduce_sinks_to_heads,
 )
 from ejkernel.modules.operations.configs import RaggedPageAttentionv3Config
 from ejkernel.quantization.turboquant import (

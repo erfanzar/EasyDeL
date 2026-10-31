@@ -85,34 +85,10 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import UnifiedAttention
+from easydel.layers.moe import moe_group_topk_select
 from easydel.modules._base import BaseCausalLMModule
 
 from .deepseek_configuration import DeepseekV3Config
-
-
-@jax.custom_jvp
-def _normalize_topk_weights(weights: Array) -> Array:
-    """Normalize selected sigmoid mass without squaring tiny denominators in AD."""
-    mass = jnp.sum(weights, axis=-1, keepdims=True)
-    denominator = jnp.where(mass == 0, 1.0, mass + 1e-20)
-    return weights / denominator
-
-
-@_normalize_topk_weights.defjvp
-def _normalize_topk_weights_jvp(primals, tangents):
-    """Use the quotient's normalized output rather than a reciprocal squared.
-
-    The ordinary division VJP forms ``denominator**-2``, overflowing float32
-    even for valid positive sigmoid mass near 1e-20. This equivalent linear
-    rule keeps both forward- and reverse-mode derivatives finite there while
-    retaining the exact forward formula and the constant-denominator zero case.
-    """
-    (weights,), (weights_dot,) = primals, tangents
-    mass = jnp.sum(weights, axis=-1, keepdims=True)
-    denominator = jnp.where(mass == 0, 1.0, mass + 1e-20)
-    normalized = _normalize_topk_weights(weights)
-    mass_dot = jnp.where(mass == 0, 0.0, jnp.sum(weights_dot, axis=-1, keepdims=True))
-    return normalized, (weights_dot - normalized * mass_dot) / denominator
 
 
 class DeepseekV3MLP(spx.Module):
@@ -233,6 +209,9 @@ class MoEGate(spx.Module):
     The selection function ``noaux_tc`` keeps the routing differentiable in
     the value path while load balance is handled purely through the
     correction bias — hence the name "no auxiliary loss" balancing.
+
+    The gate returns the raw router logits; :meth:`DeepseekV3MoE._select_hook`
+    applies steps 1-3.
     """
 
     def __init__(
@@ -290,39 +269,29 @@ class MoEGate(spx.Module):
             )
 
     def forward(self, hidden_states):
-        """Compute the full-expert ``noaux_tc`` choice scores for ``moe_call`` to route on.
+        """Compute the fp32 router logits that ``moe_call`` routes on.
 
-        Returns the ``[batch * seq_len, n_routed_experts]`` ``scores_for_choice`` (sigmoid scores + learnable
-        correction bias). Expert SELECTION (grouped top-k), re-normalization and ``routed_scaling_factor``
-        now happen in :meth:`DeepseekV3MoE._select_experts_static` (wired as ``moe_hooks.select_hook``),
-        which returns both the weights AND the expert indices.
-
-        The previous implementation collapsed this to the top-k weight *values* and discarded the expert
-        indices; ``moe_call`` then ran its own ``top_k`` on that ``[*, top_k]`` array, selecting positions
-        ``0..top_k-1`` instead of the real experts -- silently mis-routing every token. Returning the full
-        per-expert scores (mirroring DeepSeek-V2 / GLM4-MoE) lets the dispatcher pick the correct experts.
+        Sigmoid scoring, the ``e_score_correction_bias`` selection bias, the grouped top-k, renormalization and
+        ``routed_scaling_factor`` are applied by :meth:`DeepseekV3MoE._select_hook`.
 
         Args:
             hidden_states (Array): Input tensor of shape [batch * seq_len, hidden_dim].
 
         Returns:
-            Array: Per-expert choice scores ``[batch * seq_len, n_routed_experts]``.
+            Array: Router logits ``[batch * seq_len, n_routed_experts]``.
+
+        Raises:
+            NotImplementedError: If ``scoring_func`` is not ``"sigmoid"`` or ``topk_method`` is not ``"noaux_tc"``.
         """
-        logits = jnp.dot(
+        if self.scoring_func != "sigmoid":
+            raise NotImplementedError(f"insupportable scoring function for MoE gating: {self.scoring_func}")
+        if self.topk_method != "noaux_tc":
+            raise NotImplementedError(f"insupportable TopK function for MoE gating: {self.topk_method}")
+        return jnp.dot(
             hidden_states.astype(jnp.float32),
             self.weight.value.astype(jnp.float32),
             precision=self.precision,
         )
-
-        if self.scoring_func == "sigmoid":
-            scores = jax.nn.sigmoid(logits)
-        else:
-            raise NotImplementedError(f"insupportable scoring function for MoE gating: {self.scoring_func}")
-
-        if self.topk_method != "noaux_tc":
-            raise NotImplementedError(f"insupportable TopK function for MoE gating: {self.topk_method}")
-
-        return scores + self.e_score_correction_bias
 
 
 class DeepseekV3MLPMoE(spx.Module):
@@ -456,9 +425,10 @@ class DeepseekV3MoE(BaseMoeModule):
 
     Composes the routing and expert paths into one block:
 
-    * **Router** (:class:`MoEGate`) emits ``num_experts_per_tok`` expert ids
-      per token and matching gating weights, using DeepSeek-V3's
-      sigmoid-scored ``noaux_tc`` group-top-k strategy.
+    * **Router** (:class:`MoEGate`) emits per-expert logits; the
+      ``select_hook`` (:meth:`_select_hook`) applies DeepSeek-V3's
+      sigmoid-scored ``noaux_tc`` grouped top-k and returns the expert ids
+      and combine weights.
     * **Routed experts** (:class:`DeepseekV3MLPMoE`) run the SwiGLU FFN per
       expert, scattered through ``BaseMoeModule.moe_call`` with
       ``MoeLoadBalancingStrategy.NO_AUX_LOSS``.
@@ -523,21 +493,8 @@ class DeepseekV3MoE(BaseMoeModule):
             precision=precision,
             rngs=rngs,
         )
-        # Route on the gate's full per-expert scores: identity-normalize (the gate already emits scores) and
-        # run DeepSeek-V3 noaux_tc grouped top-k in the select_hook, which returns weights AND expert indices
-        # (mirrors DeepSeek-V2 / GLM4-MoE). Without this, moe_call's default top_k ran over the gate's
-        # already-collapsed [*, top_k] output and mis-routed every token to experts 0..top_k-1.
-        self.moe_hooks = self.moe_hooks.replace(
-            normalize_gate_logits=lambda x: x,
-            select_hook=functools.partial(
-                self._select_experts_static,
-                n_group=config.n_group,
-                topk_group=config.topk_group,
-                n_routed_experts=config.n_routed_experts,
-                norm_topk_prob=config.norm_topk_prob,
-                routed_scaling_factor=config.routed_scaling_factor,
-            ),
-        )
+        # The select hook scores the raw logits itself; ``forward`` binds it to the live correction bias.
+        self.moe_hooks = self.moe_hooks.replace(normalize_gate_logits=lambda x: x)
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = DeepseekV3MLP(
@@ -550,56 +507,33 @@ class DeepseekV3MoE(BaseMoeModule):
             )
 
     @staticmethod
-    def _select_experts_static(
-        gate_logits: Array,
-        pre_bias_logits: Array | None,
-        k: int,
-        *,
-        n_group: int,
-        topk_group: int,
-        n_routed_experts: int,
-        norm_topk_prob: bool,
-        routed_scaling_factor: float,
-        e_score_correction_bias: Array | None = None,
-    ) -> tuple[Array, Array]:
-        """DeepSeek-V3 ``noaux_tc`` grouped top-k over the gate's full-expert choice scores.
+    def _select_hook(config: DeepseekV3Config, e_score_correction_bias: Array | None) -> functools.partial:
+        """DeepSeek-V3 ``noaux_tc`` routing as a :func:`moe_group_topk_select` ``select_hook``.
 
-        ``gate_logits`` is ``[tokens, n_routed_experts]`` ``scores_for_choice`` (sigmoid + correction bias).
-        Restricts selection to the ``topk_group`` groups with the largest top-2 mass, picks ``k`` experts
-        within them, renormalizes when ``norm_topk_prob and k > 1``, then scales by ``routed_scaling_factor``
-        -- returning BOTH the weights and the expert indices. Numerically identical to the routing the gate
-        used to perform internally (which discarded the indices). Mirrors DeepSeek-V2's select_hook.
+        Scores the router logits with a sigmoid, adds ``e_score_correction_bias`` for selection only, keeps the
+        ``topk_group`` groups with the largest top-2 mass, and picks the top-k experts inside them. The weights are
+        the unbiased sigmoid scores (zero for slots past the kept groups' capacity), renormalized when
+        ``norm_topk_prob`` is set and more than one expert is kept, then scaled by ``routed_scaling_factor``.
+
+        Args:
+            config: Model configuration.
+            e_score_correction_bias: The gate's live selection bias ``[n_routed_experts]``, or ``None``.
+
+        Returns:
+            functools.partial: A ``select_hook`` taking ``(router_logits, pre_bias_logits, k)``.
         """
-        scores_for_choice = gate_logits.astype(jnp.float32)
-        token_count = scores_for_choice.shape[0]
-        group_scores = scores_for_choice.reshape(token_count, n_group, n_routed_experts // n_group)
-        group_scores = jnp.sum(jax.lax.top_k(group_scores, k=2)[0], axis=-1)
-        # Keep group scores and indices paired, including in eager execution
-        # on token-sharded TPU inputs, where narrow top_k index lowering can
-        # choose group zero for every token. Stable sorting preserves top_k's
-        # lower-index tie break without changing noaux_tc's top-two group mass.
-        group_indices = jnp.broadcast_to(jnp.arange(n_group, dtype=jnp.int32), group_scores.shape)
-        _, ranked_groups = jax.lax.sort_key_val(-group_scores, group_indices, dimension=-1, is_stable=True)
-        selected_groups = ranked_groups[:, :topk_group]
-        # Build local membership directly, without a scatter addressed by global
-        # token indices; each token shard owns its complete expert dimension.
-        expert_groups = jnp.arange(n_routed_experts) // (n_routed_experts // n_group)
-        score_mask = jnp.any(selected_groups[:, :, None] == expert_groups[None, None, :], axis=1)
-        masked_scores = jnp.where(score_mask, scores_for_choice, -jnp.inf)
-        _, topk_idx = jax.lax.top_k(masked_scores, k=k)
-        # Exclusion sentinels are selection-only. If k exceeds the eligible
-        # capacity, preserve finite zero-weight padding instead of combining
-        # -inf values or the excluded experts' nonzero sigmoid probabilities.
-        combine_scores = scores_for_choice
-        if e_score_correction_bias is not None:
-            # The bias steers selection only; combine weights are the raw sigmoid scores.
-            combine_scores = combine_scores - e_score_correction_bias.astype(jnp.float32)
-        combine_scores = jnp.where(score_mask, combine_scores, 0.0)
-        topk_weight = jnp.take_along_axis(combine_scores, topk_idx, axis=-1)
-        if k > 1 and norm_topk_prob:
-            topk_weight = _normalize_topk_weights(topk_weight)
-        topk_weight = topk_weight * routed_scaling_factor
-        return topk_weight, topk_idx
+        return functools.partial(
+            moe_group_topk_select,
+            n_routed_experts=config.n_routed_experts,
+            score_fn="sigmoid",
+            e_score_correction_bias=e_score_correction_bias,
+            n_group=config.n_group,
+            topk_group=config.topk_group,
+            group_topk_k=2,
+            group_score="topk_sum",
+            norm_topk_prob=bool(config.norm_topk_prob) and config.num_experts_per_tok > 1,
+            routed_scaling_factor=config.routed_scaling_factor,
+        )
 
     def forward(self, hidden_states: Array):
         """Process tokens through MoE experts with routing.
@@ -612,12 +546,7 @@ class DeepseekV3MoE(BaseMoeModule):
                 - Expert output tensor of shape (batch_size, sequence_length, hidden_dim)
                 - Router logits for auxiliary loss computation
         """
-        # Bind the live correction bias per call (a value captured in __init__
-        # would freeze the initial one).
-        select_hook = functools.partial(
-            self.moe_hooks.select_hook,
-            e_score_correction_bias=self.gate.e_score_correction_bias.value,
-        )
+        select_hook = self._select_hook(self.config, self.gate.e_score_correction_bias.value)
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -1381,22 +1310,14 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         token_count = jnp.maximum(mask.sum(axis=-1, keepdims=True), 1.0)
         losses = []
         moe_layers = [layer.mlp for layer in self.model.layers if isinstance(layer.mlp, DeepseekV3MoE)]
-        for choice_scores, moe in zip(outputs.router_logits, moe_layers, strict=True):
-            choice_scores = choice_scores.reshape(-1, num_experts).astype(jnp.float32)
-            # The gate returns sigmoid scores PLUS selection-only bias, not logits.
-            # Applying softmax would change both the objective and its gradients.
-            scores = choice_scores - moe.gate.e_score_correction_bias.value.astype(jnp.float32)
+        for logits, moe in zip(outputs.router_logits, moe_layers, strict=True):
+            logits = logits.reshape(-1, num_experts).astype(jnp.float32)
+            # Probabilities are the normalized unbiased sigmoid scores, not a softmax; the counts follow the
+            # biased grouped selection the MoE layer dispatched with.
+            scores = jax.nn.sigmoid(logits)
             probabilities = scores / jnp.maximum(scores.sum(axis=-1, keepdims=True), 1e-20)
-            _, selected = moe._select_experts_static(
-                choice_scores,
-                None,
-                top_k,
-                n_group=self.config.n_group,
-                topk_group=self.config.topk_group,
-                n_routed_experts=num_experts,
-                norm_topk_prob=False,
-                routed_scaling_factor=1.0,
-            )
+            select = DeepseekV3MoE._select_hook(self.config, moe.gate.e_score_correction_bias.value)
+            _, selected = select(logits, None, top_k)
             counts = jax.nn.one_hot(selected, num_experts, dtype=jnp.float32).sum(axis=-2)
             counts = counts.reshape(*mask.shape, num_experts)
             probabilities = probabilities.reshape(*mask.shape, num_experts)

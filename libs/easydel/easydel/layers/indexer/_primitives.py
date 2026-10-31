@@ -23,15 +23,19 @@ the vacuous-selection guard every family re-implements slightly differently.
 from __future__ import annotations
 
 import math
+import typing as tp
 
 import jax
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
 __all__ = (
+    "CompactLayout",
+    "compact_valid_layout",
     "indices_to_bool_mask",
     "is_vacuous_selection",
     "mask_to_indices",
+    "permute_tokens",
     "ste_score_proxy",
     "topk_select",
     "topk_selection_mask",
@@ -215,3 +219,99 @@ def is_vacuous_selection(index_topk: int, n_slots: int) -> bool:
         selectable and the whole indexer can be skipped.
     """
     return index_topk >= n_slots
+
+
+class CompactLayout(tp.NamedTuple):
+    """Valid-first token order of every row (see :func:`compact_valid_layout`).
+
+    Attributes:
+        order: ``[batch, seq]`` int32; ``order[b, j]`` is the physical index of compact slot ``j`` (valid tokens
+            first, then padding, each in position order).
+        inverse: ``[batch, seq]`` int32 inverse permutation (``inverse[b, order[b, j]] == j``).
+        rank: ``[batch, seq]`` int32 compact position of every valid token (valid tokens before it), ``-1`` for
+            padding.
+        identity: Scalar bool, ``True`` when every row is already valid-first (no padding or right padding only).
+    """
+
+    order: Array
+    inverse: Array
+    rank: Array
+    identity: Array
+
+    def gather(self, x: Array) -> Array:
+        """``x[b, order[b, j]]`` along the sequence axis of ``x [batch, seq, ...]`` (see :func:`permute_tokens`).
+
+        Skips the permutation at run time (``lax.cond``) when the layout is the identity, the common case of
+        unpadded or right-padded training batches.
+        """
+        return jax.lax.cond(
+            self.identity,
+            lambda rows: rows,
+            lambda rows: permute_tokens(rows, self.order, self.inverse),
+            x,
+        )
+
+
+def compact_valid_layout(valid: Bool[Array, "batch seq"]) -> CompactLayout:
+    """Valid-first token order of every row.
+
+    Strategies that group consecutive *valid* tokens (learned pools and their incomplete tail) define their key grid
+    over the compacted row: valid tokens in position order, padding after them. A kernel that reads contiguous key
+    ranges needs the keys in that order (:meth:`CompactLayout.gather`), while each query keeps its own slot and uses
+    its compact rank as its causal position. For rows whose valid tokens form a prefix the layout is the identity.
+
+    Args:
+        valid: Token validity ``[batch, seq]``.
+
+    Returns:
+        The :class:`CompactLayout` of every row.
+    """
+    seq_len = valid.shape[1]
+    is_valid = valid.astype(jnp.int32)
+    is_pad = 1 - is_valid
+    valid_through = jnp.cumsum(is_valid, axis=1)
+    pad_through = jnp.cumsum(is_pad, axis=1)
+    before_valid = valid_through - is_valid
+    before_pad = pad_through - is_pad
+    num_valid = valid_through[:, -1:]
+    inverse = jnp.where(is_valid > 0, before_valid, num_valid + before_pad).astype(jnp.int32)
+    # Compact slot j holds the (j)-th valid token (j < num_valid) or the (j - num_valid)-th padding token: the first
+    # index whose running count exceeds it. A binary search per slot instead of an argsort of ``inverse``.
+    slots = jnp.arange(seq_len, dtype=jnp.int32)
+    # ``method="scan"``: log2(seq) vectorised steps, never the [seq, seq] comparison of ``"compare_all"``.
+    first_valid = jax.vmap(lambda c: jnp.searchsorted(c, slots, side="right", method="scan"))(valid_through)
+    first_pad = jax.vmap(lambda c, n: jnp.searchsorted(c, slots - n, side="right", method="scan"))(
+        pad_through, num_valid[:, 0]
+    )
+    order = jnp.clip(jnp.where(slots[None, :] < num_valid, first_valid, first_pad), 0, seq_len - 1).astype(jnp.int32)
+    rank = jnp.where(is_valid > 0, before_valid, -1).astype(jnp.int32)
+    identity = jnp.all(order == slots[None, :])
+    return CompactLayout(order=order, inverse=inverse, rank=rank, identity=identity)
+
+
+def permute_tokens(x: Array, order: Int[Array, "batch seq"], inverse: Int[Array, "batch seq"]) -> Array:
+    """``out[b, j] = x[b, order[b, j]]`` along the sequence axis, with gather-only derivatives.
+
+    Posed as the linear solve ``out[:, inverse] = x`` (as the MoE token sort): the forward is one gather with
+    ``order`` and, a permutation being orthogonal, reverse mode is one gather with ``inverse`` instead of the
+    scatter-add JAX derives for a gather. Forward mode, batching and higher derivatives follow from
+    :func:`jax.lax.custom_linear_solve`.
+
+    Args:
+        x: ``[batch, seq, ...]`` rows.
+        order: Permutation of ``range(seq)`` per row (e.g. from :func:`compact_valid_layout`).
+        inverse: Its inverse permutation.
+
+    Returns:
+        ``x`` with every row's sequence axis permuted by ``order``.
+    """
+
+    def take(rows: Array, index: Array) -> Array:
+        return jnp.take_along_axis(rows, index.reshape(index.shape + (1,) * (rows.ndim - 2)), axis=1)
+
+    return jax.lax.custom_linear_solve(
+        lambda permuted: take(permuted, inverse),
+        x,
+        solve=lambda _, rows: take(rows, order),
+        transpose_solve=lambda _, rows: take(rows, inverse),
+    )

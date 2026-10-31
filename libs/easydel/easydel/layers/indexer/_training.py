@@ -28,7 +28,33 @@ import jax
 # forward+backward timings favor sparse starting at 8k tokens.
 AUTO_SPARSE_MIN_SEQ = 8192
 
-__all__ = ("AUTO_SPARSE_MIN_SEQ", "use_sparse_training_attention")
+__all__ = ("AUTO_SPARSE_MIN_SEQ", "pool_bitmap_tail_error", "use_sparse_training_attention")
+
+
+def pool_bitmap_tail_error(kpool: int, select_tail: bool) -> str | None:
+    """Why the ``dsa_pool_kernel="bitmap"`` kernel cannot take a pooled indexer's tail keys (``None`` when it can).
+
+    A pooled indexer that always selects each query's own incomplete pool adds up to ``kpool - 1`` tail keys per
+    query; the bitmap kernel carries at most ``ejkernel.modules.DSA_SPARSE_MAX_TAIL_KEYS`` of them. The ``"gather"``
+    kernel has no such limit.
+
+    Args:
+        kpool: Tokens per pool.
+        select_tail: Whether the incomplete pool is always selected.
+
+    Returns:
+        The error message, or ``None``.
+    """
+    from ejkernel.modules import DSA_SPARSE_MAX_TAIL_KEYS  # pyright: ignore[reportMissingTypeStubs]
+
+    tails = kpool - 1 if select_tail else 0
+    if tails <= DSA_SPARSE_MAX_TAIL_KEYS:
+        return None
+    return (
+        f"dsa_pool_kernel='bitmap' takes at most {DSA_SPARSE_MAX_TAIL_KEYS} always-selected tail keys per query, "
+        f"but pools of {kpool} tokens with the incomplete pool always selected give {tails}. Use "
+        f"dsa_pool_kernel='gather' or a pool size <= {DSA_SPARSE_MAX_TAIL_KEYS + 1}."
+    )
 
 
 def use_sparse_training_attention(

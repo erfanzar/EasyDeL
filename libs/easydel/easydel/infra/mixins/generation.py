@@ -1700,6 +1700,7 @@ class EasyGenerationMixin:
             ValueError: If num_heads cannot be inferred from the model configuration.
         """
         from easydel.caching import KDACacheConfig
+        from easydel.layers.linear_attention import kda_layer_spec  # lazy: layers import this mixin's package
 
         text_config = self.config.get_text_config()
 
@@ -1707,36 +1708,16 @@ class EasyGenerationMixin:
         if partition_axis is None:
             partition_axis = PartitionAxis()
 
-        num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
-
-        linear_config = getattr(text_config, "linear_attn_config", None) or {}
-
-        num_heads = int(linear_config.get("num_heads", getattr(text_config, "num_attention_heads", 0) or 0))
-        head_dim = int(linear_config.get("head_dim", 128))
-        head_k_dim = int(linear_config.get("head_k_dim", head_dim))
-        head_v_dim = int(linear_config.get("head_v_dim", head_dim))
-        d_conv = int(
-            linear_config.get("d_conv", linear_config.get("short_conv_kernel_size", getattr(text_config, "d_conv", 4)))
-        )
-
-        if num_heads <= 0:
-            raise ValueError(
-                "Could not infer `num_heads` for KDACacheConfig; "
-                "expected `linear_attn_config['num_heads']` or `num_attention_heads`."
-            )
-
-        key_dim = num_heads * head_k_dim
-        value_dim = num_heads * head_v_dim
-        recurrent_shape = (num_heads, head_k_dim, head_v_dim)
-
+        # The same shape reader the KDA layer uses, so a layer and its cache cannot disagree.
+        spec = kda_layer_spec(text_config)
         return KDACacheConfig.create(
-            num_hidden_layers=num_hidden_layers,
+            num_hidden_layers=getattr(text_config, "num_hidden_layers", 1),
             partition_axis=partition_axis,
             batch_size=batch_size,
-            key_dim=key_dim,
-            value_dim=value_dim,
-            d_conv=d_conv,
-            recurrent_state_shape=recurrent_shape,
+            key_dim=spec.key_dim,
+            value_dim=spec.value_dim,
+            d_conv=spec.d_conv,
+            recurrent_state_shape=(spec.num_heads, spec.head_k_dim, spec.head_v_dim),
         )
 
     def _create_standard_ragged_page_cache_config(
