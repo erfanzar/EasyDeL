@@ -30,6 +30,7 @@ per-token tensor could not follow.
 """
 
 import easydel as ed
+import jax
 import numpy as np
 import pytest
 import spectrax as spx
@@ -294,3 +295,80 @@ def test_deepseek_nonempty_cached_multitoken_prefill_is_rejected():
     used = [SimpleNamespace(cache_position=jnp.array([0, 3], jnp.int32))]
     with pytest.raises(ValueError, match="requires an empty cache"):
         _reject_nonempty_cached_prefill(used)
+
+
+@pytest.mark.parametrize("norm_topk_prob", [False, True])
+@pytest.mark.parametrize("layer_type", ["hash_moe", "moe"])
+def test_routed_weights_follow_norm_topk_prob(layer_type, norm_topk_prob):
+    """Hash and learned layers weight their experts by unbiased ``sqrtsoftplus`` scores, normalized only with the flag.
+
+    The learned layer carries a selection bias that changes which experts win, and must not reach the weights.
+    """
+    config = ed.DeepseekV4Config(
+        vocab_size=VOCAB,
+        hidden_size=HIDDEN,
+        moe_intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        n_routed_experts=EXPERTS,
+        num_experts_per_tok=TOP_K,
+        n_shared_experts=1,
+        mlp_layer_types=[layer_type],
+        max_position_embeddings=128,
+        norm_topk_prob=norm_topk_prob,
+    )
+    config.sharding_axis_dims = (1, 1, 1, 1, 1, 1)
+    config.moe_force_xla_gmm = True
+    config.use_expert_tensor_mode = False
+    config.attach_custom_arguments()
+    with config.mesh:
+        block = DeepseekV4SparseMoeBlock(
+            config=config,
+            layer_idx=0,
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+            precision=jax.lax.Precision.HIGHEST,
+            rngs=spx.Rngs(0),
+        )
+    # Every token sees the same router logits; these are exact in bfloat16.
+    logits = np.asarray([0.5, -1.0, 2.0, 1.5, -0.5, 0.25, 3.0, -2.0], dtype=np.float32)
+    block.gate.weight.value = jnp.asarray(np.broadcast_to(logits, (HIDDEN, EXPERTS)).copy())
+    table = np.stack([np.arange(VOCAB) % EXPERTS, (np.arange(VOCAB) + 3) % EXPERTS], axis=-1).astype(np.float32)
+    bias = np.zeros(EXPERTS, dtype=np.float32)
+    if layer_type == "hash_moe":
+        block.gate.tid2eid.value = jnp.asarray(table)
+    else:
+        # Unbiased winners are experts 6 and 2; the bias makes them 7 and 6.
+        bias = np.asarray([0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 3.0], dtype=np.float32)
+        block.gate.e_score_correction_bias.value = jnp.asarray(bias)
+    # Hidden 1/HIDDEN with unit gate/up weights gives gate = up = 1 for every expert, so expert e emits
+    # moe_intermediate_size * silu(1) * coefficient[e] on every channel; the shared expert is zeroed.
+    coefficients = np.arange(1, EXPERTS + 1, dtype=np.float32)
+    experts = block.experts
+    experts.gate_proj.weight.value = jnp.ones_like(experts.gate_proj.weight.value)
+    experts.up_proj.weight.value = jnp.ones_like(experts.up_proj.weight.value)
+    experts.down_proj.weight.value = jnp.asarray(
+        np.broadcast_to(coefficients[:, None, None], experts.down_proj.weight.value.shape).copy()
+    )
+    block.shared_experts.down_proj.weight.value = jnp.zeros_like(block.shared_experts.down_proj.weight.value)
+
+    ids = np.asarray([[1, 2, 3, 4]], dtype=np.int32)
+    hidden = jnp.full((1, 4, HIDDEN), 1.0 / HIDDEN, jnp.float32)
+    with config.mesh, jax.default_matmul_precision("highest"):
+        out, _ = block(hidden, input_ids=jnp.asarray(ids))
+
+    scores = np.sqrt(np.log1p(np.exp(logits.astype(np.float64))))
+    if layer_type == "hash_moe":
+        selected = table[ids[0]].astype(np.int64)
+    else:
+        selected = np.broadcast_to(np.argsort(-(scores + bias), kind="stable")[:TOP_K], (4, TOP_K))
+    weights = scores[selected]
+    if norm_topk_prob:
+        weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+    weights = weights * config.routed_scaling_factor
+    silu_one = 1.0 / (1.0 + np.exp(-1.0))
+    per_token = (weights * config.moe_intermediate_size * silu_one * coefficients[selected]).sum(axis=-1)
+    np.testing.assert_allclose(
+        np.asarray(out[0], np.float64), np.broadcast_to(per_token[:, None], (4, HIDDEN)), rtol=1e-4, atol=1e-4
+    )

@@ -527,9 +527,12 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
         mla_attn_mechanism: MLA-specific attention override; ``"auto"`` lets
             EasyDeL pick the best MLA kernel for the current platform.
         mla_attn_dtype: Activation dtype for MLA attention. ``None`` falls back
-            to ``attn_dtype``.
+            to ``attn_dtype``. A saved value equal to the saved ``attn_dtype``
+            loads as ``None`` (see :meth:`_unpin_saved_mla_dtypes`), so pin a
+            different dtype, or pass it again when loading, to keep it fixed.
         mla_attn_softmax_dtype: Softmax accumulator dtype for MLA attention.
-            ``None`` falls back to ``attn_softmax_dtype``.
+            ``None`` falls back to ``attn_softmax_dtype``; loads like
+            ``mla_attn_dtype``.
         blocksize_k: Key-axis block size used by tiled attention kernels.
         blocksize_q: Query-axis block size used by tiled attention kernels.
         blocksize_b: Batch/block tile size used by some attention backends.
@@ -3455,6 +3458,18 @@ class EasyDeLBaseConfig(PretrainedConfig):
         config_dict = self._encode_special_floats(config_dict)
         config_dict = self._normalize_json_value(config_dict)
         return json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
+
+    @classmethod
+    def from_json_file(cls, json_file: str | os.PathLike | ePathLike):
+        """Instantiate a configuration from a JSON file, applying the same load rules as :meth:`from_dict`.
+
+        Args:
+            json_file: Path to the JSON configuration file.
+
+        Returns:
+            The instantiated configuration.
+        """
+        return cls.from_dict(cls._dict_from_json_file(json_file))
 
     @classmethod
     def _dict_from_json_file(cls, json_file: str | os.PathLike | ePathLike):

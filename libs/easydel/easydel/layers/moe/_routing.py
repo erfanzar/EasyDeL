@@ -132,23 +132,37 @@ def _take_topk(scores: Array, indices: Array) -> Array:
     return jnp.sum(jnp.where(hit, scores[..., None, :], jnp.zeros((), scores.dtype)), axis=-1)
 
 
+# Picks made one ``argmax`` at a time (see :func:`_topk_indices`); a larger ``k`` uses ``lax.top_k``.
+_ARGMAX_TOPK_MAX_K = 8
+
+
 def _topk_indices(scores: Array, k: int) -> Int[Array, "tokens k"]:
-    """Indices of the ``k`` largest scores per row, the lower index first on ties.
+    """Indices of the ``k`` largest scores per row, in descending order and the lower index first on ties.
 
     On TPU, ``jax.lax.top_k`` over an operand sharded along the token axis outside ``shard_map`` (an auxiliary loss,
-    the unfused MoE path, a direct call) returns wrong indices with correct values at ``k == 1``, and at some small
-    ``k`` on wide rows. ``argmax`` does not, so ``k == 1`` uses it.
+    the unfused MoE path, a direct call) returns wrong indices with correct values at ``k == 1`` and at small ``k``
+    on wide rows. ``argmax`` does not, so up to :data:`_ARGMAX_TOPK_MAX_K` entries are picked one ``argmax`` at a
+    time, each pick removed before the next. ``-inf`` scores are first raised to the lowest finite value, so they rank
+    after every finite score and before removed entries: slots past a row's finite entries take the excluded experts
+    in index order, as ``top_k`` does.
 
     Args:
-        scores: ``(tokens, experts)`` selection scores.
+        scores: ``(tokens, experts)`` floating-point selection scores.
         k: Entries kept per row.
 
     Returns:
         ``(tokens, k)`` int32 indices.
     """
-    if k == 1:
-        return jnp.argmax(scores, axis=-1, keepdims=True).astype(jnp.int32)
-    return jax.lax.top_k(scores, k=k)[1]
+    if k > _ARGMAX_TOPK_MAX_K:
+        return jax.lax.top_k(scores, k=k)[1]
+    ids = jnp.arange(scores.shape[-1], dtype=jnp.int32)
+    key = jnp.maximum(scores, jnp.finfo(scores.dtype).min)
+    picks = []
+    for _ in range(k):
+        pick = jnp.argmax(key, axis=-1, keepdims=True).astype(jnp.int32)
+        picks.append(pick)
+        key = jnp.where(ids == pick, -jnp.inf, key)
+    return jnp.concatenate(picks, axis=-1)
 
 
 def _score(gate_logits: Array, score_fn: ScoreFn) -> Array:

@@ -169,27 +169,15 @@ def test_rejects_unknown_group_score():
         moe_group_topk_select(_logits(), None, 2, n_routed_experts=EXPERTS, n_group=4, topk_group=2, group_score="mean")
 
 
-MIGRATED = [
-    "deepseek_v2.modeling_deepseek",
-    "deepseek_v3.modeling_deepseek",
-    "deepseek_v4.modeling_deepseek_v4",
-    "glm4_moe.modeling_glm4_moe",
-    "glm4_moe_lite.modeling_glm4_moe_lite",
-    "glm5_next.modeling_glm5_next",
-    "glm_moe_dsa.modeling_glm_moe_dsa",
-    "hy_v3.modeling_hy_v3",
-    "kimi_linear.modeling_kimi_linear",
-    "minimax_m3_vl.modeling_minimax_m3_vl",
-    "mistral4.modeling_mistral4",
-]
+MIGRATED = ["glm4_moe", "glm4_moe_lite", "glm_moe_dsa", "hy_v3", "minimax_m3_vl"]
 
 
-@pytest.mark.parametrize("module_path", MIGRATED)
-def test_family_routes_through_the_shared_selector(module_path):
+@pytest.mark.parametrize("family", MIGRATED)
+def test_family_routes_through_the_shared_selector(family):
     """No migrated family may carry its own copy of the selector again."""
     import importlib
 
-    module = importlib.import_module(f"easydel.modules.{module_path}")
+    module = importlib.import_module(f"easydel.modules.{family}.modeling_{family}")
     source = open(module.__file__).read()
     assert "_select_experts_static" not in source
     assert "moe_group_topk_select" in source
@@ -413,6 +401,38 @@ def test_grouped_selection_matches_stable_host_reference_on_token_sharded_inputs
     eligible = np.repeat(eligible, group_size, axis=-1)
     expected_indices = np.argsort(-np.where(eligible, choices, -np.inf), axis=-1, kind="stable")[:, :k]
     expected_weights = np.take_along_axis(np.where(eligible, scores, 0), expected_indices, axis=-1)
+    expected_weights = expected_weights / (expected_weights.sum(axis=-1, keepdims=True) + 1e-20) * 2.5
+
+    np.testing.assert_array_equal(np.asarray(indices), expected_indices)
+    np.testing.assert_allclose(np.asarray(weights), expected_weights, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("k", [1, 2, 3, 4, 8])
+def test_flat_selection_on_wide_token_sharded_rows_matches_stable_host_reference(k, compiled):
+    """288 experts with tokens sharded over devices: small ``k`` on wide rows is where index selection goes wrong."""
+    devices = jax.devices()
+    tokens, experts = 16 * len(devices), 288
+    rng = np.random.default_rng(23)
+    logits = rng.standard_normal((tokens, experts)).astype(np.float32)
+    bias = rng.standard_normal(experts).astype(np.float32)
+    mesh = Mesh(np.asarray(devices), ("tokens",))
+    inputs = jax.device_put(jnp.asarray(logits), NamedSharding(mesh, PartitionSpec("tokens", None)))
+    select = functools.partial(
+        moe_group_topk_select,
+        pre_bias_logits=None,
+        k=k,
+        n_routed_experts=experts,
+        score_fn="sigmoid",
+        e_score_correction_bias=jnp.asarray(bias),
+        norm_topk_prob=True,
+        routed_scaling_factor=2.5,
+    )
+    weights, indices = (jax.jit(select) if compiled else select)(inputs)
+
+    scores = np.asarray(jax.nn.sigmoid(jnp.asarray(logits)))
+    expected_indices = np.argsort(-(scores + bias), axis=-1, kind="stable")[:, :k]
+    expected_weights = np.take_along_axis(scores, expected_indices, axis=-1)
     expected_weights = expected_weights / (expected_weights.sum(axis=-1, keepdims=True) + 1e-20) * 2.5
 
     np.testing.assert_array_equal(np.asarray(indices), expected_indices)

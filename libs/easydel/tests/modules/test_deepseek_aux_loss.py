@@ -122,7 +122,7 @@ def _v2_reference_loss(layer_logits, config, mask):
 def _v2_routing_diagnostics(records, config):
     """Serialize actual selector intermediates only when the independent assertion fails."""
     diagnostics = []
-    for logits, probabilities, topk_calls, weights, selected in records:
+    for logits, probabilities, group_calls, weights, selected in records:
         host_logits = np.asarray(logits)
         host_probabilities = np.exp(host_logits - host_logits.max(axis=-1, keepdims=True))
         host_probabilities /= host_probabilities.sum(axis=-1, keepdims=True)
@@ -136,18 +136,16 @@ def _v2_routing_diagnostics(records, config):
             "selected_weights": np.asarray(weights).tolist(),
             "assignment_counts": np.eye(config.n_routed_experts)[np.asarray(selected)].sum(axis=-2).tolist(),
         }
-        if config.topk_method == "group_limited_greedy":
-            group_scores, (_, selected_groups) = topk_calls[0]
-            masked_scores, _ = topk_calls[1]
-            host_groups = host_probabilities.reshape(-1, config.n_group, config.n_routed_experts // config.n_group).max(
-                axis=-1
-            )
+        if config.topk_method == "group_limited_greedy" and group_calls:
+            group_scores, selected_groups = group_calls[0]
+            group_size = config.n_routed_experts // config.n_group
+            host_groups = host_probabilities.reshape(-1, config.n_group, group_size).max(axis=-1)
+            kept = np.eye(config.n_group, dtype=bool)[np.asarray(selected_groups)].any(axis=-2)
             diagnostic.update(
                 group_scores=np.asarray(group_scores).tolist(),
                 selected_groups=np.asarray(selected_groups).tolist(),
                 numpy_selected_groups=np.argsort(host_groups, axis=-1)[:, -config.topk_group :].tolist(),
-                eligibility=np.isfinite(np.asarray(masked_scores)).tolist(),
-                masked_scores=np.asarray(masked_scores).tolist(),
+                eligibility=np.repeat(kept, group_size, axis=-1).tolist(),
             )
         diagnostics.append(diagnostic)
     return json.dumps(diagnostics)
@@ -169,27 +167,28 @@ def test_v2_router_logits_forward_uses_aux_loss_alpha(masked, seq_aux, topk_meth
             # concrete calls (including the auxiliary objective); never leak tracers.
             if isinstance(logits, jax.core.Tracer):
                 return selector(logits, *args, **kwargs)
-            probabilities, topk_calls = [], []
-            softmax, top_k = jax.nn.softmax, jax.lax.top_k
+            probabilities, group_calls = [], []
+            softmax, sort_key_val = jax.nn.softmax, jax.lax.sort_key_val
 
             def record_softmax(*inputs, **options):
                 scores = softmax(*inputs, **options)
                 probabilities.append(scores)
                 return scores
 
-            def record_top_k(operand, *inputs, **options):
-                result = top_k(operand, *inputs, **options)
-                topk_calls.append((operand, result))
+            def record_group_sort(keys, values, *inputs, **options):
+                # Groups are ranked by a stable sort of the negated group scores.
+                result = sort_key_val(keys, values, *inputs, **options)
+                group_calls.append((-keys, result[1][:, : config.topk_group]))
                 return result
 
             # These wrappers return the original operation results unchanged and
-            # are restored even on failure. They observe the real group mask and
+            # are restored even on failure. They observe the real group ranking and
             # selection, rather than trying to reconstruct a device discrepancy.
             with monkeypatch.context() as observation:
                 observation.setattr(jax.nn, "softmax", record_softmax)
-                observation.setattr(jax.lax, "top_k", record_top_k)
+                observation.setattr(jax.lax, "sort_key_val", record_group_sort)
                 weights, selected = selector(logits, *args, **kwargs)
-            records.append((logits, probabilities[0], topk_calls, weights, selected))
+            records.append((logits, probabilities[0], group_calls, weights, selected))
             return weights, selected
 
         return record_selection
