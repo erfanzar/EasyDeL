@@ -30,10 +30,15 @@ from ejkernel.kernels._pallas.tpu.sparse_multi_latent_ragged_page_attention impo
 from ejkernel.kernels._pallas.tpu.sparse_multi_latent_ragged_page_attention._pallas_impl_fwd import (
     sparse_mla_ragged_paged_attention_pallas,
     supports,
+    write_token_rows,
 )
 from ejkernel.kernels._registry import kernel_registry
 from ejkernel.kernels._xla.sparse_multi_latent_ragged_page_attention import (
     sparse_multi_latent_ragged_page_attention as xla_sparse_mla,
+)
+from ejkernel.kernels._xla.sparse_multi_latent_ragged_page_attention._xla_impl_fwd import (
+    token_layout,
+    write_tokens_to_cache,
 )
 
 from ..._xla.test_sparse_multi_latent_ragged_page_attention import (
@@ -58,13 +63,15 @@ def _copies(inputs):
     return [jnp.array(x) for x in inputs]
 
 
-def _pallas(inputs, *, chunk_size, group=None, translate_pages=None):
+def _pallas(inputs, *, chunk_size, group=None, translate_pages=None, write_rows=None):
     """Run the Pallas kernel on fresh copies of ``inputs``.
 
-    ``translate_pages=None`` calls the registered entry point (the production dispatch); ``True`` / ``False`` call the
-    backend with the chunk page translation forced into the kernel / into XLA.
+    With ``translate_pages`` and ``write_rows`` both ``None`` this calls the registered entry point (the production
+    dispatch). Otherwise it calls the backend with the chunk page translation forced into the kernel / into XLA
+    (``translate_pages`` ``True`` / ``False``) or the cache write forced to whole packed word rows / single tokens
+    (``write_rows`` ``True`` / ``False``).
     """
-    if translate_pages is None:
+    if translate_pages is None and write_rows is None:
         return pallas_sparse_mla(*_copies(inputs), chunk_size=chunk_size, num_chunks_per_block=group)
     return sparse_mla_ragged_paged_attention_pallas(
         *_copies(inputs),
@@ -72,6 +79,7 @@ def _pallas(inputs, *, chunk_size, group=None, translate_pages=None):
         sm_scale=(NOPE + PE) ** -0.5,
         num_chunks_per_block=group,
         translate_pages=translate_pages,
+        write_rows=write_rows,
     )
 
 
@@ -89,7 +97,11 @@ def _check_against_reference_and_xla(case, out, cache, *, chunk_size, dtype):
     np.testing.assert_array_equal(got_cache, want_cache)
 
 
-@pytest.mark.parametrize("translate_pages", [None, False], ids=["kernel_pages", "xla_pages"])
+@pytest.mark.parametrize(
+    "translate_pages,write_rows",
+    [(None, None), (False, None), (None, True)],
+    ids=["kernel_pages", "xla_pages", "word_rows"],
+)
 @pytest.mark.parametrize(
     "dtype,chunk_size,width,group",
     [
@@ -107,10 +119,12 @@ def _check_against_reference_and_xla(case, out, cache, *, chunk_size, dtype):
         (jnp.bfloat16, 1, 64, None),  # sub-word chunks carry starts: 131 metadata ints -> 256-long SMEM block
     ],
 )
-def test_pallas_matches_reference_and_xla(dtype, chunk_size, width, group, translate_pages):
+def test_pallas_matches_reference_and_xla(dtype, chunk_size, width, group, translate_pages, write_rows):
     case = _build(0, kv_lens=KV_LENS, q_lens=Q_LENS, chunk_size=chunk_size, width=width, dtype=dtype)
     assert supports(tuple(case["inputs"][4].shape), chunk_size)
-    out, cache = _pallas(case["inputs"], chunk_size=chunk_size, group=group, translate_pages=translate_pages)
+    out, cache = _pallas(
+        case["inputs"], chunk_size=chunk_size, group=group, translate_pages=translate_pages, write_rows=write_rows
+    )
     _check_against_reference_and_xla(case, out, cache, chunk_size=chunk_size, dtype=dtype)
 
 
@@ -182,7 +196,8 @@ PAGE_SIZES = (64, 96, 128, 256, 512)
     ],
 )
 def test_pallas_page_sizes_match_reference(page, dtype, chunk_size, group):
-    """Ragged batches spanning several pages, at every page size; page translation in the kernel and in XLA agree.
+    """Ragged batches spanning several pages, at every page size; page translation in the kernel and in XLA agree, and
+    so does the cache write as whole packed word rows (the registered entry's default write differs by bucket size).
 
     Rows: a decode token whose context ends mid-chunk on a partly filled third page, a prefill chunk crossing a page
     boundary, and a fresh prefill ending just past the first page (mid-group). Tokens cycle through three selections:
@@ -224,6 +239,49 @@ def test_pallas_page_sizes_match_reference(page, dtype, chunk_size, group):
     xla_pages = _pallas(case["inputs"], chunk_size=chunk_size, group=group, translate_pages=False)
     np.testing.assert_array_equal(np.asarray(xla_pages[0]), np.asarray(out))
     np.testing.assert_array_equal(np.asarray(xla_pages[1]), np.asarray(cache))
+    word_rows = _pallas(case["inputs"], chunk_size=chunk_size, group=group, write_rows=True)
+    np.testing.assert_array_equal(np.asarray(word_rows[0]), np.asarray(out))
+    np.testing.assert_array_equal(np.asarray(word_rows[1]), np.asarray(cache))
+
+
+@pytest.mark.parametrize("page", [16, 128])
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32, jnp.int8], ids=["bf16", "f32", "int8"])
+def test_word_row_cache_write_equals_per_token_scatter(dtype, page):
+    """The Pallas path writes the step's tokens as whole packed word rows; the cache must be bitwise the XLA
+    reference's per-token scatter (1, 2 and 4 tokens per word).
+
+    Sequences: a fresh prefill ending mid-word, a prefill starting on an odd position and crossing a page, a decode
+    token in a word's last lane, an empty live sequence, a prefill starting and ending mid-word, and an unused slot;
+    plus tokens before ``query_start_loc[0]`` (another shard's) and padding after the last live sequence, which must
+    not be written. The old cache content must survive in every lane the step does not own.
+    """
+    rng = np.random.default_rng(page)
+    pack = 32 // (jnp.dtype(dtype).itemsize * 8)
+    kv_lens = [7, 2 * page + 5, page + 4, 40, 9, 0]
+    q_lens = [7, page + 2, 1, 0, 6, 0]
+    lead, pad = 3, 4
+    max_seqs = len(kv_lens)
+    pages_per_seq = -(-max(kv_lens) // page) + 1
+    num_pages = max_seqs * pages_per_seq + 2
+    qsl = jnp.asarray(np.concatenate([[0], np.cumsum(q_lens)]) + lead, jnp.int32)
+    total = int(qsl[-1]) + pad
+    block_tables = jnp.asarray(rng.permutation(num_pages)[: max_seqs * pages_per_seq], jnp.int32)
+    cache = jnp.asarray(20 * rng.standard_normal((num_pages, page // pack, pack, CACHE_DIM)), jnp.float32)
+    cache = cache.astype(dtype)
+    keys_values = jnp.asarray(20 * rng.standard_normal((total, NOPE)), jnp.float32)
+    keys_pe = jnp.asarray(20 * rng.standard_normal((total, PE)), jnp.float32)
+    kv_lens_arr = jnp.asarray(kv_lens, jnp.int32)
+    seq, pos, valid = token_layout(kv_lens_arr, qsl, jnp.asarray([0, 0, max_seqs - 1], jnp.int32), total)
+    want = jax.jit(write_tokens_to_cache, static_argnames=("pages_per_seq",))(
+        cache, keys_values, keys_pe, block_tables, seq, pos, valid, pages_per_seq=pages_per_seq
+    )
+    got = jax.jit(write_token_rows, static_argnames=("pages_per_seq",))(
+        cache, keys_values, keys_pe, kv_lens_arr, block_tables, qsl, seq, pos, valid, pages_per_seq=pages_per_seq
+    )
+    assert int(jnp.sum(valid)) == sum(q_lens)
+    want, got, before = (np.asarray(x).view(np.uint8) for x in (want, got, cache))
+    np.testing.assert_array_equal(got, want)
+    assert np.any(want != before)
 
 
 def test_pallas_sliding_window_and_soft_cap():

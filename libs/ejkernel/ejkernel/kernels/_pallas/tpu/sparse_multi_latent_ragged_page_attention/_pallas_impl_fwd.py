@@ -16,8 +16,9 @@
 
 Two stages:
 
-1. XLA: write the step's latent tokens into the donated cache (the same scatter as the XLA
-   reference, in the native packed layout) and turn each token's selection into compact
+1. XLA: write the step's latent tokens into the donated cache (bitwise the XLA reference's result;
+   buckets above ``_PER_TOKEN_WRITE_MAX_TOKENS`` tokens scatter whole packed word rows, which keeps the
+   cache in its native layout, see :func:`write_token_rows`) and turn each token's selection into compact
    metadata: the number of attendable chunks, the token position, the first token of its last
    attendable chunk and, for every attendable chunk (compacted to the front, ascending), its first
    packed word. Chunks that are entirely causal-, length- or window-masked are dropped here, so the
@@ -72,6 +73,13 @@ _WORD_COL = 3  # metadata row: [n_valid, pos, last_start, words[0:Wp], (starts[0
 # token -> sequence map; beyond these sizes the translation runs in XLA instead (TPU SMEM is ~1 MiB).
 _MAX_BLOCK_TABLE_ROW_BYTES = 64 * 1024
 _MAX_PREFETCH_BYTES = 256 * 1024
+# Cache write: buckets of up to this many tokens keep the XLA reference's per-token scatter; larger buckets write
+# whole packed word rows (:func:`write_token_rows`). Both give identical caches. Measured on v5p at the serving cache
+# bf16[2826, 64, 2, 640] (page 128): XLA updates the cache in place with the per-token scatter up to 512 tokens (there
+# the row write, which first gathers the rows' current content, is 0.02-0.035 ms per call slower), but at 1024 and 2048
+# tokens it lowers that scatter through a relayout of the whole cache to a flat [P * page_size, D] array and back
+# (~1.2 ms per call).
+_PER_TOKEN_WRITE_MAX_TOKENS = 512
 
 
 def supports(kv_cache_shape: tuple[int, ...], chunk_size: int) -> bool:
@@ -198,6 +206,91 @@ def build_metadata(
     m = int(meta.shape[1])
     meta = jnp.pad(meta, ((0, 0), (0, _smem_len(m) - m)))
     return meta, seq, valid, pos, padded_width
+
+
+def write_token_rows(
+    kv_cache: jax.Array,
+    keys_values: jax.Array,
+    keys_pe: jax.Array,
+    kv_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    seq: jax.Array,
+    pos: jax.Array,
+    token_valid: jax.Array,
+    *,
+    pages_per_seq: int,
+) -> jax.Array:
+    """Scatter the step's latent tokens into the paged cache as whole packed word rows.
+
+    Same result as the XLA reference's ``write_tokens_to_cache``, bit for bit, but every update is one
+    whole ``[pack, D]`` word row of the ``[P * page_size/pack, pack, D]`` view of the cache. That view
+    only merges the two leading, untiled dims of the native layout, so it is free, and a scatter with one
+    index dim and a full minor window updates the donated buffer in place. The reference scatters single
+    tokens with three index dims (page, word, lane); for large token counts XLA lowers that through a
+    flat ``[P * page_size, D]`` operand, a relayout of the whole cache (and back) on every call.
+
+    A row's lanes take this step's tokens of the same sequence where those positions are new and the
+    cache's current content elsewhere (history before the step, untouched slots after it), gathered
+    before the scatter. Only a row's first new token writes it, so every row is written once. Like the
+    paged cache itself, this assumes that a page receiving new tokens belongs to one sequence (two
+    sequences writing different lanes of one word would race here, not in the per-token scatter).
+
+    Args:
+        kv_cache: ``[P, page_size/pack, pack, L_pad + R_pad]`` paged cache.
+        keys_values: ``[T, L]`` new latent tokens.
+        keys_pe: ``[T, R]`` new rope keys.
+        kv_lens: ``[S]`` context lengths including the current step.
+        block_tables: ``[S * pages_per_seq]`` flat page table.
+        query_start_loc: ``[S + 1]`` cumulative query counts.
+        seq: ``[T]`` sequence of each token (from ``token_layout``).
+        pos: ``[T]`` absolute position of each token.
+        token_valid: ``[T]`` tokens that belong to a live sequence of this shard.
+        pages_per_seq: Page-table row length.
+
+    Returns:
+        The updated cache in its native layout; invalid tokens are dropped.
+    """
+    num_pages, words_per_page, kv_packing, cache_dim = kv_cache.shape
+    page_size = words_per_page * kv_packing
+    num_rows = num_pages * words_per_page
+    total_tokens = int(keys_values.shape[0])
+    nope_actual = int(keys_values.shape[-1])
+    pe_actual = int(keys_pe.shape[-1])
+    nope_dim = align_to(nope_actual, 128)
+    pe_dim = align_to(pe_actual, 128)
+    update = jnp.concatenate(
+        [
+            jnp.pad(keys_values, ((0, 0), (0, nope_dim - nope_actual))),
+            jnp.pad(keys_pe, ((0, 0), (0, pe_dim - pe_actual))),
+        ],
+        axis=-1,
+    ).astype(kv_cache.dtype)
+    logical_page = jnp.clip(pos // page_size, 0, pages_per_seq - 1)
+    physical_page = block_tables[seq * pages_per_seq + logical_page]
+    row = physical_page * words_per_page + (pos % page_size) // kv_packing
+    lane = pos % kv_packing
+    kv_len = kv_lens[seq]
+    first_new = kv_len - (query_start_loc[seq + 1] - query_start_loc[seq])
+    writer = token_valid & ((lane == 0) | (pos == first_new))
+    target = jnp.where(writer, row, num_rows)  # out of range -> dropped
+    flat = kv_cache.reshape(num_rows, kv_packing, cache_dim)
+    if kv_packing == 1:
+        rows = update[:, None, :]
+    else:
+        # Indexed like the reference's scatter (negative rows count from the end); only written rows use it.
+        current = flat.at[row].get(mode="clip")
+        tok = jnp.arange(total_tokens, dtype=jnp.int32)
+        lanes = []
+        for j in range(kv_packing):
+            q = pos - lane + j  # position held by lane j of the token's row
+            src = tok + (j - lane)  # the step's token holding that position, when the position is new
+            new = (q >= first_new) & (q < kv_len) & (src >= 0) & (src < total_tokens)
+            src = jnp.clip(src, 0, total_tokens - 1)
+            new = new & token_valid[src]
+            lanes.append(jnp.where(new[:, None], update[src], current[:, j]))
+        rows = jnp.stack(lanes, axis=1)
+    return flat.at[target].set(rows, mode="drop").reshape(kv_cache.shape)
 
 
 def _broadcast_lanes(src: jax.Array, shape: tuple[int, int]) -> jax.Array:
@@ -411,6 +504,7 @@ def _sparse_mla_kernel(
         "num_chunks_per_block",
         "vmem_limit_bytes",
         "translate_pages",
+        "write_rows",
     ),
     donate_argnames=("kv_cache",),
 )
@@ -437,6 +531,7 @@ def sparse_mla_ragged_paged_attention_pallas(
     num_chunks_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
     translate_pages: bool | None = None,
+    write_rows: bool | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Write new tokens into the cache, then run the sparse Pallas attention kernel.
 
@@ -446,6 +541,10 @@ def sparse_mla_ragged_paged_attention_pallas(
     Args:
         translate_pages: Translate chunk pages inside the kernel (``True``) or in XLA (``False``);
             ``None`` picks the kernel whenever its SMEM budget allows. Both give identical results.
+        write_rows: Write the step's tokens into the cache as whole packed word rows (``True``,
+            :func:`write_token_rows`) or one token at a time with the XLA reference's scatter
+            (``False``); ``None`` writes rows for buckets of more than ``_PER_TOKEN_WRITE_MAX_TOKENS``
+            tokens. Both give identical caches.
 
     Returns:
         ``(outputs [T, H, L], updated_kv_cache)``.
@@ -485,9 +584,25 @@ def sparse_mla_ragged_paged_attention_pallas(
         sliding_window=sliding_window,
         translate_pages=translate_pages,
     )
-    kv_cache = write_tokens_to_cache(
-        kv_cache, keys_values, keys_pe, block_tables, seq, pos, valid, pages_per_seq=pages_per_seq
-    )
+    if write_rows is None:
+        write_rows = int(total_tokens) > _PER_TOKEN_WRITE_MAX_TOKENS
+    if write_rows:
+        kv_cache = write_token_rows(
+            kv_cache,
+            keys_values,
+            keys_pe,
+            kv_lens,
+            block_tables,
+            query_start_loc,
+            seq,
+            pos,
+            valid,
+            pages_per_seq=pages_per_seq,
+        )
+    else:
+        kv_cache = write_tokens_to_cache(
+            kv_cache, keys_values, keys_pe, block_tables, seq, pos, valid, pages_per_seq=pages_per_seq
+        )
 
     q_nope = jnp.pad(queries_nope, ((0, 0), (0, 0), (0, nope_dim - nope_actual)))
     q_pe = jnp.pad(queries_pe, ((0, 0), (0, 0), (0, pe_dim - pe_actual))).astype(q_nope.dtype)
@@ -572,4 +687,4 @@ def sparse_mla_ragged_paged_attention_pallas(
     return out[:, :, :nope_actual], kv_cache
 
 
-__all__ = ("build_metadata", "sparse_mla_ragged_paged_attention_pallas", "supports")
+__all__ = ("build_metadata", "sparse_mla_ragged_paged_attention_pallas", "supports", "write_token_rows")
