@@ -28,6 +28,7 @@ ejkernel.modules.operations package
    ragged_decode_attention
    ragged_gated_delta_rule
    ragged_kda
+   ragged_kda_decode
    ragged_page_attention_v2
    ragged_page_attention_v2_turboquant
    ragged_page_attention_v3

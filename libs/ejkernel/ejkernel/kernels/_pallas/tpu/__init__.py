@@ -86,6 +86,7 @@ from .quantized_matmul import quantized_matmul
 from .ragged_decode_attention import ragged_decode_attention
 from .ragged_gated_delta_rule import ragged_gated_delta_rule as ragged_gated_delta_rule
 from .ragged_gated_delta_rule_v2 import ragged_gated_delta_rule_v2
+from .ragged_kda_decode import ragged_kda_decode
 from .ragged_page_attention_v2 import ragged_page_attention_v2
 from .ragged_page_attention_v3 import ragged_page_attention_v3
 from .reduce_scatter import reduce_scatter
@@ -137,6 +138,7 @@ __all__ = (
     "ragged_decode_attention",
     "ragged_gated_delta_rule",
     "ragged_gated_delta_rule_v2",
+    "ragged_kda_decode",
     "ragged_page_attention_v2",
     "ragged_page_attention_v3",
     "reduce_scatter",

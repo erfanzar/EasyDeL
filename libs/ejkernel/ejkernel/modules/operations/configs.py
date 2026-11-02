@@ -1042,6 +1042,23 @@ class RaggedKDAConfig(BaseOperationConfig):
 
 
 @dataclass
+class RaggedKDADecodeConfig(BaseOperationConfig):
+    """Configuration for the per-row KDA decode step over a state pool (``ragged_kda_decode``).
+
+    Args:
+        block_rows: Rows per grid step of the Pallas TPU kernel (``0``: automatic; must divide the row count).
+        block_h: Heads per inner step of the Pallas TPU kernel (``0``: automatic; must divide the local head count).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    block_rows: int = 0
+    block_h: int = 0
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class RowPermuteConfig(BaseOperationConfig):
     """Configuration for the run-table row permutation (``row_permute``).
 

@@ -1098,6 +1098,22 @@ def _cfgs_ragged_kda():
     return _limit_configs(configs)
 
 
+def _cfgs_ragged_kda_decode():
+    """Generate serving-shaped configs for the per-row KDA decode step.
+
+    The geometry is a GLM-5-Next KDA layer at tensor parallel 4 (16 heads, 128-wide keys and values): 128
+    single-token rows over a 128-slot bf16 recurrent-state pool, once in the identity slot layout (row ``r`` owns
+    slot ``r``; the TPU kernel updates those slots in place) and once with explicit, shuffled slots (gather and
+    scatter around the kernel).
+    """
+    geometry = {"num_rows": 128, "num_heads": 16, "head_dim": 128, "num_slots": 128}
+    configs = [
+        {"identity_slots": True, **geometry},
+        {"identity_slots": False, **geometry},
+    ]
+    return _limit_configs(configs)
+
+
 def _rand_inputs(config: dict[str, Any], *shapes: tuple[int, ...], dtype: jnp.dtype | None = None):
     """Generate a list of random normal tensors with the given shapes.
 
@@ -2422,6 +2438,53 @@ def _gen_ragged_kda_inputs(config: dict[str, Any]):
     )
 
 
+def _gen_ragged_kda_decode_inputs(config: dict[str, Any]):
+    """Generate one decode token per row for the per-row KDA decode step.
+
+    Every row carries one token and continues from its slot's state (``valid`` and ``has_initial_state`` all
+    set), over a bf16 recurrent-state pool as in eSurge serving. ``state_indices`` holds distinct, shuffled slots;
+    with ``identity_slots`` the wrapper passes ``None`` instead (row ``r`` owns slot ``r``). Log-decays follow the
+    safe-gate form ``-5 * sigmoid(z)``, so they lie in ``[-5, 0)``.
+
+    Args:
+        config: Benchmark config. Reads ``num_rows``, ``num_heads``, ``head_dim`` (key and value width),
+            ``num_slots`` (at least ``num_rows``), ``identity_slots`` and ``seed``.
+
+    Returns:
+        ``(query, key, value, beta, decay, recurrent_state, state_indices, valid, has_initial_state,
+        identity_slots)``; the last one is a static option.
+    """
+    num_rows = config.get("num_rows", 128)
+    num_heads = config.get("num_heads", 16)
+    head_dim = config.get("head_dim", 128)
+    num_slots = config.get("num_slots", 128)
+    dtype = _default_dtype()
+    keys = jax.random.split(jax.random.PRNGKey(config.get("seed", 0)), 7)
+    token_shape = (num_rows, num_heads, head_dim)
+    query = jax.random.normal(keys[0], token_shape, dtype=dtype)
+    key_tensor = jax.random.normal(keys[1], token_shape, dtype=dtype)
+    value = jax.random.normal(keys[2], token_shape, dtype=dtype)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[3], (num_rows, num_heads), dtype=jnp.float32))
+    decay = -5.0 * jax.nn.sigmoid(jax.random.normal(keys[4], token_shape, dtype=jnp.float32))
+    state_shape = (num_slots, num_heads, head_dim, head_dim)
+    recurrent_state = (jax.random.normal(keys[5], state_shape, dtype=jnp.float32) * 0.05).astype(jnp.bfloat16)
+    state_indices = jax.random.permutation(keys[6], num_slots)[:num_rows].astype(jnp.int32)
+    valid = jnp.ones((num_rows,), dtype=jnp.bool_)
+    has_initial_state = jnp.ones((num_rows,), dtype=jnp.bool_)
+    return (
+        query,
+        key_tensor,
+        value,
+        beta,
+        decay,
+        recurrent_state,
+        state_indices,
+        valid,
+        has_initial_state,
+        bool(config.get("identity_slots", True)),
+    )
+
+
 def _build_algorithms(
     spec: OpBenchmarkSpec,
     *,
@@ -3723,6 +3786,60 @@ def _ragged_kda_wrapper(op_fn: Callable[..., Any], platform: str):
     return _fn
 
 
+def _ragged_kda_decode_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap the per-row KDA decode step with the static slot layout and platform."""
+
+    def _fn(
+        query,
+        key,
+        value,
+        beta,
+        decay,
+        recurrent_state,
+        state_indices,
+        valid,
+        has_initial_state,
+        identity_slots,
+    ):
+        """Run one KDA decode step for every row.
+
+        As in :func:`_ragged_kda_wrapper`, one element of the new pool is added to the output so that the pool
+        update stays reachable from the result ``Benchmark`` synchronizes on. The pool is not donated here, so XLA
+        copies it before the in-place TPU kernel and the timed program can cost more than the donated update the
+        server runs.
+
+        Args:
+            query: Post-conv queries ``[num_rows, num_heads, head_dim]``.
+            key: Post-conv keys, shaped like ``query``.
+            value: Post-conv values ``[num_rows, num_heads, v_dim]``.
+            beta: Write strengths ``[num_rows, num_heads]``.
+            decay: Per-channel log-decay, shaped like ``query``.
+            recurrent_state: State pool ``[num_slots, num_heads, head_dim, v_dim]``.
+            state_indices: Pool slot of every row ``[num_rows]`` (unused with ``identity_slots``).
+            valid: Rows that advance ``[num_rows]``.
+            has_initial_state: Per-row flags; ``False`` rows start from a zero state.
+            identity_slots: Static; pass ``state_indices=None`` (row ``r`` owns slot ``r``).
+
+        Returns:
+            The fp32 output ``[num_rows, num_heads, v_dim]`` plus one element of the updated pool.
+        """
+        out, new_state = op_fn(
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            recurrent_state,
+            None if identity_slots else state_indices,
+            valid,
+            has_initial_state,
+            platform=platform,
+        )
+        return out + new_state[0, 0, 0, 0].astype(out.dtype)
+
+    return _fn
+
+
 SPECS: dict[str, OpBenchmarkSpec] = {
     "all_gather": OpBenchmarkSpec(
         op_name="all_gather",
@@ -4383,5 +4500,14 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         configs=_cfgs_ragged_kda(),
         wrapper_factory=_ragged_kda_wrapper,
         static_kwargs=["chunk_size", "decay_lower_bound"],
+    ),
+    "ragged_kda_decode": OpBenchmarkSpec(
+        op_name="ragged_kda_decode",
+        algorithm="ragged_kda_decode",
+        op_fn=ops.ragged_kda_decode,
+        input_generator=_gen_ragged_kda_decode_inputs,
+        configs=_cfgs_ragged_kda_decode(),
+        wrapper_factory=_ragged_kda_decode_wrapper,
+        static_kwargs=["identity_slots"],
     ),
 }

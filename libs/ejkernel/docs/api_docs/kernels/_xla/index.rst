@@ -28,6 +28,7 @@ ejkernel.kernels._xla package
    ragged_decode_attention/index
    ragged_gated_delta_rule/index
    ragged_kda/index
+   ragged_kda_decode/index
    ragged_page_attention_v2/index
    ragged_page_attention_v2_turboquant/index
    ragged_page_attention_v3/index

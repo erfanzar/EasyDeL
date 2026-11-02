@@ -229,6 +229,7 @@ from .configs import (
     RaggedGatherConfig,
     RaggedGatherReduceConfig,
     RaggedKDAConfig,
+    RaggedKDADecodeConfig,
     RaggedPageAttentionv2Config,
     RaggedPageAttentionv2TurboQuantConfig,
     RaggedPageAttentionv3Config,
@@ -331,6 +332,7 @@ from .ragged_gated_delta_rule_v2 import (
 from .ragged_gather import RaggedGather, ragged_gather
 from .ragged_gather_reduce import RaggedGatherReduce, ragged_gather_reduce
 from .ragged_kda import RaggedKDA, ragged_kda, ragged_kda_head_sharded
+from .ragged_kda_decode import RaggedKDADecode, ragged_kda_decode, ragged_kda_decode_head_sharded
 from .ragged_page_attention_v2 import RaggedPageAttentionv2, ragged_page_attention_v2
 from .ragged_page_attention_v2_turboquant import (
     RaggedPageAttentionv2TurboQuant,
@@ -472,6 +474,8 @@ __all__ = (
     "RaggedGatherReduceConfig",
     "RaggedKDA",
     "RaggedKDAConfig",
+    "RaggedKDADecode",
+    "RaggedKDADecodeConfig",
     "RaggedPageAttentionv2",
     "RaggedPageAttentionv2Config",
     "RaggedPageAttentionv2TurboQuant",
@@ -569,6 +573,8 @@ __all__ = (
     "ragged_gather",
     "ragged_gather_reduce",
     "ragged_kda",
+    "ragged_kda_decode",
+    "ragged_kda_decode_head_sharded",
     "ragged_kda_head_sharded",
     "ragged_page_attention_v2",
     "ragged_page_attention_v2_turboquant",
