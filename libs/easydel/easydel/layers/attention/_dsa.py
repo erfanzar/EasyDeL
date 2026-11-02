@@ -777,6 +777,10 @@ class DeepSeekSparseAttention(UnifiedAttention):
         if selection is not None and ragged:
             mla_kwargs["sparse_selected"] = selection.indices.reshape(bsz * q_len, -1)
             mla_kwargs["sparse_chunk_size"] = self.indexer.selection_chunk_size
+            if getattr(self.config, "dsa_serving_ep_split", False):
+                # Serving only: the ragged-pages MLA op splits the sparse attention's query tokens over the
+                # expert-parallel axis (the key is absent when the flag is off, so that trace is unchanged).
+                mla_kwargs["sparse_ep_split"] = True
         elif selection is not None:
             kv_len = key_states.shape[1]
             topk_mask = selection.to_mask(kv_len)

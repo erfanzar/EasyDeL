@@ -41,6 +41,7 @@ entry point and config dataclass.
 from functools import partial
 
 import jax
+from eformer.loggings import get_logger
 from ejkernel.modules import (
     multi_latent_ragged_page_attention,  # pyright: ignore[reportMissingTypeStubs]
     multi_latent_ragged_page_attention_v2,  # pyright: ignore[reportMissingTypeStubs]
@@ -72,6 +73,8 @@ from ._paged_common import ENABLE_DP_LOCAL_PAGE_PATH, dp_page_axis, request_dist
 
 # Backward-compatible alias for callers importing the former adapter helper.
 _dp_page_axis = dp_page_axis
+
+logger = get_logger(__name__)
 
 
 def _mla_kernel_call(dense_fn, ignore: dict, total_tokens: int, common_call_kwargs: dict):
@@ -116,6 +119,142 @@ def _mla_kernel_call(dense_fn, ignore: dict, total_tokens: int, common_call_kwar
         return sparse_multi_latent_ragged_page_attention(*args, selected, chunk_size=chunk_size, **sparse_kwargs)
 
     return selected, sparse_kernel
+
+
+def _ep_split_sparse_attention(
+    kernel,
+    *,
+    mesh,
+    axis_names: tuple[str, ...],
+    specs: tuple[Ps, Ps, Ps, Ps, Ps],
+    queries_nope: jax.Array,
+    queries_pe: jax.Array,
+    keys_values: jax.Array,
+    keys_pe: jax.Array,
+    kv_pages: jax.Array,
+    context_lens: jax.Array,
+    pages_tables: jax.Array,
+    query_start_loc: jax.Array,
+    distribution: jax.Array,
+    selected: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Sparse MLA attention with its query tokens split over the ``axis_names`` mesh axes.
+
+    Every shard receives all of the step's latent tokens and the full ragged metadata, so its replica of the paged
+    cache gets exactly the writes of the unsplit call. It attends only for its contiguous slice of query tokens: the
+    other rows enter the kernel with zero queries and an all ``-1`` selection, which the kernel skips (no attendable
+    chunk), and only the slice's rows are returned. ``T`` is padded to a multiple of the shard count with tokens past
+    ``query_start_loc[num_seqs]``, which the kernel neither writes nor attends.
+
+    Args:
+        kernel: Sparse kernel from :func:`_mla_kernel_call`.
+        mesh: Device mesh.
+        axis_names: Mesh axes the query tokens are split over (the expert-parallel axis).
+        specs: Unsplit partition specs of ``(queries_nope, queries_pe, keys_values, keys_pe, kv_pages)``; the
+            queries' token entry is replaced by ``axis_names``, the others are used as given (token-replicated).
+        queries_nope: ``[T, H, L]`` absorbed queries.
+        queries_pe: ``[T, H, R]`` rope queries.
+        keys_values: ``[T, L]`` new latent tokens.
+        keys_pe: ``[T, R]`` new rope keys.
+        kv_pages: Paged MLA cache (replicated over ``axis_names``).
+        context_lens: ``[S]`` context lengths.
+        pages_tables: ``[S, pages_per_seq]`` page table.
+        query_start_loc: ``[S + 1]`` cumulative query counts.
+        distribution: ``[3]`` request distribution.
+        selected: ``[T, W]`` selected chunk ids.
+
+    Returns:
+        ``(outputs [T, H, L] sharded over axis_names on the token axis, updated kv_pages)``.
+    """
+    num_shards = mesh_axis_size(mesh, axis_names)
+    total = int(queries_nope.shape[0])
+    padded = -(-total // num_shards) * num_shards
+    if padded != total:
+
+        def _pad(x, value=0):
+            return jnp.pad(x, [(0, padded - total)] + [(0, 0)] * (x.ndim - 1), constant_values=value)
+
+        queries_nope, queries_pe, keys_values, keys_pe = (
+            _pad(x) for x in (queries_nope, queries_pe, keys_values, keys_pe)
+        )
+        selected = _pad(selected, -1)
+
+    token_entry = axis_names[0] if len(axis_names) == 1 else tuple(axis_names)
+
+    def _split(spec, ndim: int) -> Ps:
+        entries = tuple(spec) + (None,) * (ndim - len(tuple(spec)))
+        return Ps(token_entry, *entries[1:])
+
+    q_nope_spec, q_pe_spec, keys_values_spec, keys_pe_spec, pages_spec = specs
+    q_nope_split = _split(q_nope_spec, queries_nope.ndim)
+    q_pe_split = _split(q_pe_spec, queries_pe.ndim)
+
+    @partial(
+        jax.shard_map,
+        mesh=mesh,
+        in_specs=(
+            q_nope_split,
+            q_pe_split,
+            keys_values_spec,
+            keys_pe_spec,
+            pages_spec,
+            Ps(),
+            Ps(),
+            Ps(),
+            Ps(),
+            Ps(token_entry, None),
+        ),
+        out_specs=(q_nope_split, pages_spec),
+        check_vma=False,
+    )
+    def _mapped_split(
+        local_queries_nope,
+        local_queries_pe,
+        all_keys_values,
+        all_keys_pe,
+        local_kv_pages,
+        full_context_lens,
+        full_pages_tables,
+        full_query_start_loc,
+        full_distribution,
+        local_selected,
+    ):
+        rows = local_queries_nope.shape[0]
+        start = axis_index(axis_names) * jnp.int32(rows)
+
+        def _widen(x, fill):
+            full = jnp.full((padded, *x.shape[1:]), fill, x.dtype)
+            return jax.lax.dynamic_update_slice_in_dim(full, x, start, axis=0)
+
+        output, local_kv_pages = kernel(
+            _widen(local_queries_nope, 0),
+            _widen(local_queries_pe, 0),
+            all_keys_values,
+            all_keys_pe,
+            local_kv_pages,
+            full_context_lens,
+            full_pages_tables.reshape(-1),
+            full_query_start_loc,
+            full_distribution,
+            selected=_widen(local_selected, -1),
+        )
+        return jax.lax.dynamic_slice_in_dim(output, start, rows, axis=0), local_kv_pages
+
+    output, kv_pages = _mapped_split(
+        queries_nope,
+        queries_pe,
+        keys_values,
+        keys_pe,
+        kv_pages,
+        context_lens,
+        pages_tables,
+        query_start_loc,
+        distribution,
+        selected,
+    )
+    if padded != total:
+        output = output[:total]
+    return output, kv_pages
 
 
 def _reshape_query_tensor(x, name: str):
@@ -303,6 +442,59 @@ class MultiLatentRaggedPageAttn(OperationImpl):
     def get_impl_name(cls) -> str | tuple[str]:
         """Return the registered operation name for this implementation."""
         return "multi_latent_ragged_page_attention_v1"
+
+    def _sparse_ep_split_axes(
+        self,
+        ignore: dict,
+        sparse_selected: jax.Array | None,
+        *,
+        dp_local: bool,
+        page_axis,
+        query_specs: tuple[Ps, ...],
+    ) -> tuple[str, ...]:
+        """Mesh axes to split the sparse kernel's query tokens over, or ``()`` to keep the unsplit call.
+
+        The DSA layer passes ``sparse_ep_split=True`` (``config.dsa_serving_ep_split``) with its top-k selection. The
+        expert-parallel axis only replicates attention and the MLA pages are replicated over it, so each of its shards
+        can attend for a slice of the query tokens (see :func:`_ep_split_sparse_attention`). The split needs an
+        expert-parallel axis of more than one device, the globally replicated page path (not the data-parallel local
+        one, pages not sharded over data parallelism) and a query sharding that does not already use that axis;
+        otherwise the call stays unsplit and a one-time warning names the reason.
+
+        Args:
+            ignore: Extra forward kwargs; ``sparse_ep_split`` requests the split.
+            sparse_selected: The DSA selection, ``None`` for dense MLA calls (never split).
+            dp_local: Whether the data-parallel local page path runs this call.
+            page_axis: Logical KV-page axis of the cache view (``EMPTY`` when replicated).
+            query_specs: Resolved partition specs of the two query tensors.
+
+        Returns:
+            The expert-parallel mesh axis names to split over, or ``()``.
+        """
+        if not ignore.get("sparse_ep_split") or sparse_selected is None:
+            return ()
+        mesh = self.metadata.mesh
+        names = normalize_axis_names(getattr(self.metadata.partition_axis, "expert_parallel_axis", None))
+        names = tuple(name for name in names if mesh_axis_size(mesh, name) > 1)
+        if not names:
+            return ()  # nothing to split over (ep = 1): the unsplit call is the split call
+        reasons = []
+        if dp_local:
+            reasons.append("the data-parallel local page path runs this call")
+        elif page_axis != ct.EMPTY:
+            reasons.append("the KV pages are sharded over the data-parallel axis")
+        used = {axis for spec in query_specs for entry in spec for axis in normalize_axis_names(entry)}
+        overlap = sorted(used.intersection(names))
+        if overlap:
+            reasons.append(f"the query sharding already uses {overlap}")
+        if reasons:
+            logger.warning_once(
+                "dsa_serving_ep_split is inactive for this sparse MLA call because %s; every expert-parallel shard "
+                "attends for all query tokens.",
+                "; ".join(reasons),
+            )
+            return ()
+        return names
 
     def forward_core(
         self,
@@ -515,6 +707,13 @@ class MultiLatentRaggedPageAttn(OperationImpl):
         if sparse_selected is not None:
             extra_specs = (resolve(axes=[q_token_axis, ct.EMPTY], mode=ct.MODE_PREFILL, shape=sparse_selected.shape),)
             extra_args = (sparse_selected,)
+        ep_split_axes = self._sparse_ep_split_axes(
+            ignore,
+            sparse_selected,
+            dp_local=can_use_dp_local,
+            page_axis=page_axis,
+            query_specs=(qaxes_nope, qaxes_pe),
+        )
 
         if can_use_dp_local:
             rows_per_shard = int(cache_metadata.context_lens.shape[0]) // page_axis_size
@@ -633,6 +832,23 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                 cache_metadata.query_start_loc,
                 request_distribution,
                 *extra_args,
+            )
+        elif ep_split_axes:
+            output, kv_pages = _ep_split_sparse_attention(
+                _kernel,
+                mesh=self.metadata.mesh,
+                axis_names=ep_split_axes,
+                specs=(qaxes_nope, qaxes_pe, kv_values_axes, keys_pe_axes, kv_pages_spec_replicated),
+                queries_nope=queries_nope,
+                queries_pe=queries_pe,
+                keys_values=keys_values,
+                keys_pe=keys_pe,
+                kv_pages=kv_pages,
+                context_lens=cache_metadata.context_lens,
+                pages_tables=cache_metadata.pages_tables,
+                query_start_loc=cache_metadata.query_start_loc,
+                distribution=request_distribution,
+                selected=sparse_selected,
             )
         else:
 

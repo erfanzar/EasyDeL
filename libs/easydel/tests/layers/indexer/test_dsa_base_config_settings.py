@@ -68,6 +68,7 @@ def _primitive_counts(fn, *args):
         ("dsa_pool_query_chunk", 0, 512),
         ("dsa_pool_query_chunk", 1.5, 1024),
         ("dsa_sparse_training", "yes", True),
+        ("dsa_serving_ep_split", "yes", True),
     ],
 )
 def test_dsa_settings_are_validated_by_both_config_entry_points(field, bad, good):
@@ -89,13 +90,15 @@ def test_dsa_settings_have_backward_compatible_defaults_and_survive_serializatio
         default.dsa_pool_training,
         default.dsa_pool_query_chunk,
         default.dsa_pool_kernel,
-    ) == ("xla", None, False, 2048, "bitmap")
+        default.dsa_serving_ep_split,
+    ) == ("xla", None, False, 2048, "bitmap", False)
     settings = dict(
         index_scoring_kernel="pallas",
         dsa_sparse_training=False,
         dsa_pool_training=True,
         dsa_pool_query_chunk=512,
         dsa_pool_kernel="gather",
+        dsa_serving_ep_split=True,
     )
     config = ed.LlamaConfig(hidden_size=64, num_attention_heads=4, **settings)
     restored = ed.LlamaConfig.from_dict(config.to_dict())

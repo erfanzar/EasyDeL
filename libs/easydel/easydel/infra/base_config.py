@@ -712,6 +712,14 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             ``dsa_gather_attention``; each query DMA-gathers exactly its selected pools, the query sequence split
             over tensor parallelism). Model families add their own constraints (GLM-5-Next: ``"gather"`` needs an
             even ``index_kpool``). Default ``"bitmap"``.
+        dsa_serving_ep_split: Serving only (ragged-pages MLA cache): split the sparse MLA attention of DSA layers
+            (GLM-5-Next, GLM-MoE-DSA) over the expert-parallel mesh axis. That axis only replicates attention and
+            the MLA pages, so without the split every expert-parallel shard attends for all of a step's query
+            tokens; with it each shard attends for ``1 / ep`` of them (the step's token count is padded to a
+            multiple of ``ep``), every shard still writes all tokens into its cache replica, and the attention
+            output comes back token-sharded over ``ep``. Results are unchanged. Inactive (one warning) with
+            data-parallel KV pages; no effect with ``ep == 1``, on dense MLA calls and in training. Default
+            ``False``.
         layer_scan_options: Lowering options for lowered repeated-layer scans
             (``block_scan``, ``barrier``, ``prefetch_axes``, ``prefetch_exclude``,
             ``prefetch_defer_dw``, ``unroll``); top-level keys apply to every scan,
@@ -803,6 +811,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     dsa_pool_training: NotRequired[bool]
     dsa_pool_query_chunk: NotRequired[int]
     dsa_pool_kernel: NotRequired[str]
+    dsa_serving_ep_split: NotRequired[bool]
     layer_scan_options: NotRequired[dict[str, tp.Any] | None]
     quantization_config: NotRequired[QuantizationConfig | None]
     operation_configs: NotRequired[dict[str, BaseOperationConfig] | None]
@@ -912,6 +921,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         dsa_pool_query_chunk: Queries per ``dsa_pool_training`` selection chunk (default ``2048``).
         dsa_pool_kernel: ``dsa_pool_training`` attention kernel, ``"bitmap"`` or ``"gather"`` (default
             ``"bitmap"``).
+        dsa_serving_ep_split: Split DSA serving attention over the expert-parallel axis (default ``False``).
         layer_scan_options: Per-scope ``ModuleList.scan`` lowering options (default ``None``).
         **kwargs: Forwarded to `PretrainedConfig`.
 
@@ -1464,6 +1474,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         dsa_pool_training: bool = False,
         dsa_pool_query_chunk: int = 2048,
         dsa_pool_kernel: str = "bitmap",
+        dsa_serving_ep_split: bool = False,
         layer_scan_options: dict[str, tp.Any] | None = None,
         operation_configs: dict[str, BaseOperationConfig] | None = None,
         **kwargs,
@@ -1629,6 +1640,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
         )
         self.dsa_pool_kernel = _one_of(
             "dsa_pool_kernel", getattr(self, "dsa_pool_kernel", dsa_pool_kernel), DSA_POOL_KERNELS
+        )
+        # ``None`` reads as off; anything but a boolean is rejected.
+        self.dsa_serving_ep_split = bool(
+            _optional_bool("dsa_serving_ep_split", getattr(self, "dsa_serving_ep_split", dsa_serving_ep_split))
         )
         self.layer_scan_options = getattr(self, "layer_scan_options", layer_scan_options)
         normalize_layer_scan_options(self.layer_scan_options)
@@ -2289,6 +2304,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "dsa_pool_training",
             "dsa_pool_query_chunk",
             "dsa_pool_kernel",
+            "dsa_serving_ep_split",
             "layer_scan_options",
             "use_fused_mlp",
             "collective_matmul_impl",
@@ -2469,6 +2485,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         dsa_pool_training: bool = NOT_GIVEN,
         dsa_pool_query_chunk: int = NOT_GIVEN,
         dsa_pool_kernel: str = NOT_GIVEN,
+        dsa_serving_ep_split: bool = NOT_GIVEN,
         layer_scan_options: dict[str, tp.Any] | None = NOT_GIVEN,
         **kwargs,
     ):
@@ -2562,6 +2579,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             dsa_pool_query_chunk: Queries per ``dsa_pool_training`` selection chunk (default ``2048``).
             dsa_pool_kernel: ``dsa_pool_training`` attention kernel, ``"bitmap"`` or ``"gather"`` (default
                 ``"bitmap"``).
+            dsa_serving_ep_split: Split DSA serving attention over the expert-parallel axis (default ``False``).
             layer_scan_options: Per-scope ``ModuleList.scan`` lowering options (default ``None``).
             **kwargs: Extra attributes to attach to this config and any defined ``sub_configs``.
         """
@@ -2669,6 +2687,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.dsa_pool_query_chunk = _positive_int("dsa_pool_query_chunk", self.dsa_pool_query_chunk)
         set_attrs_smartly(self, "dsa_pool_kernel", "bitmap", dsa_pool_kernel)
         self.dsa_pool_kernel = _one_of("dsa_pool_kernel", self.dsa_pool_kernel, DSA_POOL_KERNELS)
+        set_attrs_smartly(self, "dsa_serving_ep_split", False, dsa_serving_ep_split)
+        self.dsa_serving_ep_split = bool(_optional_bool("dsa_serving_ep_split", self.dsa_serving_ep_split))
         set_attrs_smartly(self, "layer_scan_options", None, layer_scan_options)
         normalize_layer_scan_options(self.layer_scan_options)
         self._maybe_extend_batch_axis_for_ep()
