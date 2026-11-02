@@ -336,8 +336,9 @@ def _is_kv_attention_layer_type(layer_type: tp.Any) -> bool:
 
     Returns:
         bool: ``True`` for ``"full"``, ``"sliding"``, ``"attention"``,
-        ``"hybrid"``, ``"parallel_hybrid"``, and ``"qwen_sparse_attention"``
-        family labels.
+        ``"hybrid"``, ``"parallel_hybrid"``, ``"qwen_sparse_attention"``,
+        ``"indexed_attention"`` and ``"deepseek_sparse_attention"`` family
+        labels.
     """
     layer_type_norm = str(layer_type).lower()
     return (
@@ -348,6 +349,7 @@ def _is_kv_attention_layer_type(layer_type: tp.Any) -> bool:
         or layer_type_norm == "parallel_hybrid"
         or layer_type_norm == "qwen_sparse_attention"
         or layer_type_norm == "indexed_attention"  # transformers>=5.18 name for indexer (DSA/QSA) layers
+        or layer_type_norm == "deepseek_sparse_attention"  # GLM-5-Next MLA+DSA layers; its KDA layers own no pages
     )
 
 

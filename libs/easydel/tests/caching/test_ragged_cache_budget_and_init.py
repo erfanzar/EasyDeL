@@ -16,7 +16,7 @@
 
 import threading
 import time
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import easydel.caching.mla_ragged_page.cache as mla_cache_mod
 import easydel.caching.ragged_page.cache as ragged_cache_mod
@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 from easydel.caching import MLARaggedPagesCache, RaggedPagesCache, TransformerCache, TurboQuantRaggedPagesCache
+from easydel.infra.mixins.generation import EasyGenerationMixin
 from easydel.infra.sharding import coerce_runtime_sharding_resolver
 from spectrax import PartitionAxis
 
@@ -302,3 +303,45 @@ def test_cache_configs_size_from_the_budget_of_their_own_mesh(monkeypatch, modul
     mesh = _FakeMesh({"tp": 1})
     build(mesh)
     assert meshes and all(seen is mesh for seen in meshes)
+
+
+# One page of one MLA layer at kv_lora_rank 512 plus a zero-padded 128-wide rope (bf16), and of one layer's pooled
+# DSA indexer: a 128-wide key and gate per token plus one 128-wide key per 4-token pool (bf16).
+_LATENT_PAGE_BYTES = 128 * (512 + 128) * 2
+_INDEXER_PAGE_BYTES = 128 * (128 + 128) * 2 + (128 // 4) * 128 * 2
+
+
+def _glm5_next_like(layer_types, indexer_types):
+    text_config = SimpleNamespace(
+        attn_mechanism="multi_latent_ragged_page_attention_v2",
+        kvdtype="bfloat16",
+        mesh=_FakeMesh({"tp": 1}),
+        runtime_sharding_resolver=_resolver(),
+        num_hidden_layers=len(layer_types),
+        num_attention_heads=4,
+        kv_lora_rank=512,
+        qk_rope_head_dim=0,
+        mla_cache_rope_width=128,
+        index_head_dim=128,
+        index_kpool=4,
+        layer_types=list(layer_types),
+        indexer_types=list(indexer_types),
+    )
+    model = SimpleNamespace(config=SimpleNamespace(get_text_config=lambda: text_config))
+    model._create_mla_ragged_page_cache_config = MethodType(
+        EasyGenerationMixin._create_mla_ragged_page_cache_config, model
+    )
+    return model
+
+
+@pytest.mark.parametrize("indexer_types, indexer_owners", [(["full"] * 8, 2), (["full"] * 7 + ["shared"], 1)])
+def test_glm5_next_page_budget_charges_only_the_sparse_attention_layers(monkeypatch, indexer_types, indexer_owners):
+    # GLM-5-Next interleaves three KDA layers with one DSA layer; only the DSA layers own MLA and indexer
+    # pages. Charging every layer shrank eSurge's page pool about 4x at GLM-5.3 size (45 charged, 11 used).
+    budget = 64 << 20
+    monkeypatch.setattr(mla_cache_mod, "per_device_hbm_budget_bytes", lambda *_a, **_k: budget)
+    model = _glm5_next_like((["linear_attention"] * 3 + ["deepseek_sparse_attention"]) * 2, indexer_types)
+    config = EasyGenerationMixin.create_ragged_page_cache_config(model, 1024, page_size=128, hbm_utilization=0.9)
+    assert config.num_hidden_layers == 2
+    assert config.indexer_num_layers == indexer_owners
+    assert config.num_pages == budget // (2 * _LATENT_PAGE_BYTES + indexer_owners * _INDEXER_PAGE_BYTES)
