@@ -386,6 +386,34 @@ TP = common_types.TP
 SP = common_types.SP
 
 
+_DEFERRED_WINDOW_ALIGN = 1024
+"""Row granularity of the deferred-dispatch windows: few distinct window shapes, each a multiple of every row tile."""
+
+
+def _deferred_window_rows(total_rows: int, ep_size: int, override: int | None) -> int:
+    """Static rows per window of the inference-mode ``moe_defer_tp_reduce`` dispatch (``_local_row_windows``).
+
+    ``override`` (``moe_local_ffn_window_rows``) wins, capped at ``total_rows``. Otherwise ``5/4`` of one expert
+    shard's expected local rows ``total_rows / ep_size``, rounded up to 1024 rows and capped at ``total_rows``:
+    balanced routing then runs a single window, and so does a shard holding up to a quarter more than its share.
+
+    Args:
+        total_rows: ``tokens * top_k`` (static).
+        ep_size: Expert-axis size.
+        override: Explicit window rows, or ``None``.
+
+    Returns:
+        Rows per window, in ``[1, total_rows]``.
+    """
+    if override is not None:
+        return max(1, min(int(override), total_rows))
+    if ep_size <= 1:
+        return total_rows
+    rows = -(-5 * total_rows // (4 * ep_size))
+    rows = -(-rows // _DEFERRED_WINDOW_ALIGN) * _DEFERRED_WINDOW_ALIGN
+    return min(rows, total_rows)
+
+
 class BaseMoeModule(spx.Module, ABC):
     """Abstract base class shared by every Mixture-of-Experts module in EasyDeL.
 
@@ -1871,11 +1899,6 @@ class BaseMoeModule(spx.Module, ABC):
                         "reduces the combined [tokens, H] output over the expert axis."
                     )
         local_ffn_window_rows = getattr(self.config, "moe_local_ffn_window_rows", None)
-        if local_ffn_window_rows is not None and not use_local_expert_ffn:
-            logger.warn_once(
-                "moe_local_ffn_window_rows is set but not used: it only sizes the row windows of the active "
-                "moe_local_expert_ffn path."
-            )
         # Under the decode-replicated serving scope the residual stream is replicated over tp, so the local path
         # sums its partials in full instead of reduce-scattering them.
         local_out_replicated = use_local_expert_ffn and inference_mode_forces_decode()
@@ -1955,6 +1978,11 @@ class BaseMoeModule(spx.Module, ABC):
                     logger.warn_once(f"moe_defer_tp_reduce is set but inactive here: {', '.join(defer_blockers)}.")
                 else:
                     defer_tp_reduce = True
+        if local_ffn_window_rows is not None and not (use_local_expert_ffn or replicated_deferred_dispatch):
+            logger.warn_once(
+                "moe_local_ffn_window_rows is set but not used: it only sizes the row windows of the active "
+                "moe_local_expert_ffn path and of the inference-mode moe_defer_tp_reduce dispatch."
+            )
 
         expert_params_bytes = 0
         for _param in (wi_kernel, wu_kernel, gate_up_kernel, wd_kernel, wi_bias, wu_bias, gate_up_bias, wd_bias):
@@ -2329,6 +2357,90 @@ class BaseMoeModule(spx.Module, ABC):
                 combined = combined[:tokens]
             return combined.reshape(local_batch, local_seq, -1)
 
+        def _local_row_windows(
+            x2d: jax.Array,
+            order: jax.Array,
+            sort_keys: jax.Array,
+            group_sizes: jax.Array,
+            is_local: jax.Array,
+            combine_weights: jax.Array,
+            expert_ffn: Callable[..., jax.Array],
+            *,
+            window_rows: int,
+            experts_per_shard: int,
+        ) -> jax.Array:
+            """Expert FFN and top-k combine over this shard's local pairs only, in static row windows.
+
+            Inference-only helper of ``_replicated_deferred_dispatch``, whose stable sort lists the ``n_local`` local
+            pairs first, grouped by local expert. Window ``w`` covers sorted rows ``[w * R, (w + 1) * R)``: it
+            gathers those ``R`` token rows, runs the expert FFN with window-local group sizes (rows past the window's
+            local count form the FFN's masked dispatch tail) and adds every pair sitting in the window, weighted,
+            into an fp32 ``[tokens, H]`` sum; a pair outside the window or not local is selected away (never
+            multiplied, as the FFN's tail rows are not guaranteed finite on TPU).
+            Window 0 always runs and later windows run only while ``w * R < n_local`` (a ``while_loop``), so the
+            dispatch is dropless under any routing skew while balanced routing runs one window of ``R`` rows
+            instead of the full ``tokens * k`` buffer.
+
+            Args:
+                x2d: Token rows ``[tokens, H]``.
+                order: Stable argsort of ``sort_keys`` (local pairs first), ``[tokens * k]`` int32.
+                sort_keys: Per-pair local expert id; ``experts_per_shard`` for non-local pairs.
+                group_sizes: Local pairs per local expert, ``[experts_per_shard]`` int32.
+                is_local: Per-pair locality, ``[tokens * k]``.
+                combine_weights: fp32 combine weights ``[tokens, k]``.
+                expert_ffn: The ``_expert_ffn`` closure; called with ``tp_reduce=False``.
+                window_rows: Static rows per window ``R``.
+                experts_per_shard: Local experts on this shard.
+
+            Returns:
+                fp32 ``[tokens, H]``: this shard's weighted expert rows summed per token, not yet reduced over TP
+                or the expert axis.
+            """
+            tokens = x2d.shape[0]
+            top_k = self.num_experts_per_tok
+            total_rows = tokens * top_k
+            n_windows = -(-total_rows // window_rows)
+            pad = n_windows * window_rows - total_rows
+            # Pair p sits at sorted row positions[p]; local pairs fill sorted rows [0, n_local).
+            positions = jnp.argsort(order).astype(jnp.int32)
+            sorted_ids = jnp.minimum(sort_keys[order], experts_per_shard - 1).astype(jnp.int32)
+            if pad:
+                # Padding rows follow every local row of the last window: masked FFN tail, never combined.
+                order = jnp.concatenate([order, jnp.zeros((pad,), order.dtype)])
+                sorted_ids = jnp.concatenate([sorted_ids, jnp.full((pad,), experts_per_shard - 1, jnp.int32)])
+            ends = jnp.cumsum(group_sizes).astype(jnp.int32)
+            starts = ends - group_sizes.astype(jnp.int32)
+            n_local = ends[-1]
+            x_src = x2d.astype(self.dtype)
+
+            def _window(w) -> jax.Array:
+                start = w * window_rows
+                rows = jax.lax.dynamic_slice_in_dim(order, start, window_rows)
+                ids = jax.lax.dynamic_slice_in_dim(sorted_ids, start, window_rows)
+                sizes = jnp.clip(jnp.minimum(ends, start + window_rows) - jnp.maximum(starts, start), 0, window_rows)
+                inter = expert_ffn(x_src[rows // top_k], sizes.astype(jnp.int32), ids, tp_reduce=False)
+                rel = positions - start
+                live = (is_local & (rel >= 0) & (rel < window_rows)).reshape(tokens, top_k)
+                # Slots outside the window read row 0, and window rows past its local count are the FFN's unwritten
+                # tail (not guaranteed finite on TPU): select, never multiply.
+                picked = inter[jnp.where(live, rel.reshape(tokens, top_k), 0)].astype(jnp.float32)
+                picked = jnp.where(live[:, :, None], picked, 0.0)
+                return jnp.sum(picked * combine_weights[:, :, None], axis=1)
+
+            partial = _window(0)
+            if n_windows > 1:
+
+                def _more(carry):
+                    w, _ = carry
+                    return (w < n_windows) & (w * window_rows < n_local)
+
+                def _next(carry):
+                    w, acc = carry
+                    return w + 1, acc + _window(w)
+
+                _, partial = jax.lax.while_loop(_more, _next, (jnp.asarray(1, jnp.int32), partial))
+            return partial
+
         def _replicated_deferred_dispatch(
             x: jax.Array,
             gate_logits: jax.Array,
@@ -2344,7 +2456,11 @@ class BaseMoeModule(spx.Module, ABC):
             and the ``[tokens, H]`` partial is reduced once: ``psum_scatter`` over TP then ``psum`` over the expert
             axis, or a single ``psum`` over both under the decode-replicated boundary (which then needs no output
             all-gather). Against the default dispatch this drops the ``local_permute`` sort and gather, the
-            placement gather, and the TP reduction of the top-k-expanded ``[tokens * k, H]`` rows. Forward only.
+            placement gather, and the TP reduction of the top-k-expanded ``[tokens * k, H]`` rows. When the static
+            row window (``_deferred_window_rows``: ``5/4`` of one shard's expected ``tokens * k / ep`` local rows
+            rounded up to 1024, or ``moe_local_ffn_window_rows``) is shorter than ``tokens * k``, the gather, FFN
+            and combine cover only the local prefix of the sorted pairs, window by window (``_local_row_windows``;
+            balanced routing runs one window), instead of all ``tokens * k`` rows. Forward only.
 
             Args:
                 x: Local hidden states ``[b, s, H]`` (replicated over the expert and TP axes).
@@ -2384,17 +2500,34 @@ class BaseMoeModule(spx.Module, ABC):
             sort_keys = jnp.where(is_local, local_ids, experts_per_shard)
             order = jnp.argsort(sort_keys).astype(jnp.int32)
             group_sizes = jnp.bincount(sort_keys, length=experts_per_shard + 1)[:experts_per_shard].astype(jnp.int32)
-            x_rows = x2d[order // top_k].astype(self.dtype)
-            # Local expert id per sorted row (bias gathers only); the non-local tail is clamped and masked by the FFN.
-            sorted_ids = jnp.minimum(sort_keys[order], experts_per_shard - 1)
-            inter = expert_ffn(x_rows, group_sizes, sorted_ids, tp_reduce=False)
-            # Pair p sits at row ``positions[p]`` of the expert-sorted buffer. Non-local pairs point past every
-            # local row, where the grouped-matmul output is not guaranteed finite on TPU: select, never multiply.
-            positions = jnp.argsort(order).astype(jnp.int32)
-            picked = inter[positions].astype(jnp.float32)
-            picked = jnp.where(is_local[:, None], picked, 0.0).reshape(tokens, top_k, -1)
-            combine_weights = weights if output_weights_hook is None else output_weights_hook(weights)
-            partial = jnp.sum(picked * combine_weights.astype(jnp.float32)[:, :, None], axis=1)
+            total_rows = tokens * top_k
+            window_rows = _deferred_window_rows(total_rows, ep_size, local_ffn_window_rows)
+            if window_rows >= total_rows:
+                x_rows = x2d[order // top_k].astype(self.dtype)
+                # Local expert id per sorted row (bias gathers only); the non-local tail is clamped and masked by the
+                # FFN.
+                sorted_ids = jnp.minimum(sort_keys[order], experts_per_shard - 1)
+                inter = expert_ffn(x_rows, group_sizes, sorted_ids, tp_reduce=False)
+                # Pair p sits at row ``positions[p]`` of the expert-sorted buffer. Non-local pairs point past every
+                # local row, where the grouped-matmul output is not guaranteed finite on TPU: select, never multiply.
+                positions = jnp.argsort(order).astype(jnp.int32)
+                picked = inter[positions].astype(jnp.float32)
+                picked = jnp.where(is_local[:, None], picked, 0.0).reshape(tokens, top_k, -1)
+                combine_weights = weights if output_weights_hook is None else output_weights_hook(weights)
+                partial = jnp.sum(picked * combine_weights.astype(jnp.float32)[:, :, None], axis=1)
+            else:
+                combine_weights = weights if output_weights_hook is None else output_weights_hook(weights)
+                partial = _local_row_windows(
+                    x2d,
+                    order,
+                    sort_keys,
+                    group_sizes,
+                    is_local,
+                    combine_weights.astype(jnp.float32),
+                    expert_ffn,
+                    window_rows=min(window_rows, total_rows),
+                    experts_per_shard=experts_per_shard,
+                )
             ep_axes = tuple(expert_axis_name) if isinstance(expert_axis_name, tuple) else (expert_axis_name,)
             if decode_replicated_out:
                 # Decode: one small fp32 all-reduce over both axes replaces the default dispatch's TP

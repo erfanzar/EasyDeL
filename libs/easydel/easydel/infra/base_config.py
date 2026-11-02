@@ -632,8 +632,9 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             summation order changes while the reduction moves ``1 / top_k`` of the bytes. Under inference mode
             only, it also switches the single-pass dispatch with tokens replicated over the expert axis
             (``moe_chunk_size`` unset, no ring / expert-tensor mode / ep-carries-batch, no down-projection bias) to
-            one sort and one gather per layer and a single reduction of the combined ``[tokens, H]`` partial over
-            (ep, tp). Warns once when set but inapplicable. Default ``False``.
+            one sort per layer, an expert FFN and combine over this shard's local (token, expert) rows only (in
+            static row windows, see ``moe_local_ffn_window_rows``) and a single reduction of the combined
+            ``[tokens, H]`` partial over (ep, tp). Warns once when set but inapplicable. Default ``False``.
         moe_row_gather_kernel: In the fused-MoE path, run the token dispatch gather and the expert-output
             unsort + top-k combine through the ejkernel Pallas TPU row-gather kernels (``moe_row_gather`` /
             ``moe_row_gather_sum``) instead of XLA gathers. Forward dispatch is bit-identical; the combine
@@ -650,7 +651,10 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             this path. Warns once and keeps the regular dispatch where it cannot run (expert tensor mode off,
             quantized kernels, biases, ungated experts, ring of experts, ...). Default ``False``.
         moe_local_ffn_window_rows: Rows per ``moe_local_expert_ffn`` row window; ``None`` picks ``9/8`` of a
-            chunk's expected local rows (rounded up to the kernel's 1024-row step on TPU).
+            chunk's expected local rows (rounded up to the kernel's 1024-row step on TPU). Also sizes the local-row
+            windows of the inference-mode ``moe_defer_tp_reduce`` dispatch; there ``None`` picks ``5/4`` of one
+            expert shard's expected ``tokens * top_k / ep`` local rows rounded up to 1024, and no windows when that
+            covers all ``tokens * top_k`` rows. Later windows run only while local rows remain (dropless).
         moe_fsdp_shard_expert_weights: Shard the expert (leading) dimension
             of MoE expert weights over the FSDP axis at rest and all-gather
             them over FSDP inside the fused-MoE ``shard_map`` right before
@@ -903,7 +907,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_row_gather_kernel: Fused-MoE dispatch/combine row gathers via the Pallas TPU kernels (default ``False``).
         moe_local_expert_ffn: In expert-tensor mode, run each device's experts through the ejkernel
             ``moe_local_ffn`` op (dropless dynamic row windows, custom VJP; default ``False``).
-        moe_local_ffn_window_rows: Rows per ``moe_local_expert_ffn`` window (``None``: automatic).
+        moe_local_ffn_window_rows: Rows per ``moe_local_expert_ffn`` window and per local-row window of the
+            inference-mode ``moe_defer_tp_reduce`` dispatch (``None``: automatic).
         moe_fsdp_shard_expert_weights: Shard MoE expert weights over FSDP at rest and gather at use.
         moe_ep_carries_batch: Shard the token batch over the expert axis and dispatch tokens to their
             expert-owning shard (MaxText-style "ep carries batch"; default ``False``).
@@ -2562,7 +2567,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 row-gather kernels (default ``False``).
             moe_local_expert_ffn: In expert-tensor mode, run each device's experts through the ejkernel
                 ``moe_local_ffn`` op (default ``False``).
-            moe_local_ffn_window_rows: Rows per ``moe_local_expert_ffn`` window (default ``None`` = automatic).
+            moe_local_ffn_window_rows: Rows per ``moe_local_expert_ffn`` window and per local-row window of the
+                inference-mode ``moe_defer_tp_reduce`` dispatch (default ``None`` = automatic).
             moe_fsdp_shard_expert_weights: Shard MoE expert weights over FSDP at rest and gather at use
                 (default ``False``).
             moe_ep_carries_batch: Shard the token batch over the expert axis and dispatch tokens to

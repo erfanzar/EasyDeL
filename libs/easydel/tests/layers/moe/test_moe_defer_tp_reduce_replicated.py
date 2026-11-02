@@ -27,7 +27,11 @@ combined ``[tokens, H]`` partial once. On four TPU devices these tests pin:
   fallback lowers the identical program, as the outside-inference-mode case pins), it never reduce-scatters the
   top-k-expanded ``[tokens * k, H]`` rows, it reduce-scatters ``[tokens, H]`` rows in the TP-scattered layout and it
   drops the boundary all-gather in the decode layout,
-* outside inference mode (training) the knob leaves the lowered program and the outputs identical.
+* with row windows (``moe_local_ffn_window_rows`` forced, or enough routed rows that the automatic window is shorter
+  than ``tokens * k``) the dispatch computes only each shard's local rows, window by window, and stays dropless:
+  several windows per shard, a padded last window and routing that sends every route to one expert shard all match
+  the one-buffer deferred dispatch, the default dispatch and the float64 reference,
+* outside inference mode (training) the knobs leave the lowered program and the outputs identical.
 """
 
 from __future__ import annotations
@@ -49,6 +53,12 @@ LAYOUTS = pytest.mark.parametrize("decode", [False, True], ids=["prefill_layout"
 # TP reduce-scatter where the default rounds every expert row after its reduction, so the outputs differ by about one
 # bfloat16 rounding (2**-8 relative); allow three.
 BF16_REL_TOL = 3 * 2**-8
+# Row windows. At TOKENS * TOPK = 128 rows the automatic window covers every row (no windows), so the window tests
+# force one: 48 rows gives 3 windows over the 128 sorted rows (the last one padded); an ep1 / ep2 / ep4 shard holds
+# 128 / about 64 / about 32 local rows and runs 3 / about 2 / about 1 of them. SKEW_TOKENS * TOPK = 4096 rows makes the
+# automatic window 2048 (ep4) / 3072 (ep2) rows: a shard that receives every route needs a second window.
+FORCED_WINDOW_ROWS = 48
+SKEW_TOKENS = 1024
 _REDUCE_SCATTER = re.compile(r"stablehlo\.reduce_scatter.*?\}\)\s*:\s*\(tensor<((?:\d+x)+)(\w+)>\)", re.S)
 
 
@@ -95,12 +105,12 @@ def _build(dims, *, quantize: bool = False, dtype=jnp.float32):
     return block
 
 
-def _x(dtype=jnp.float32):
-    return jax.random.normal(jax.random.PRNGKey(0), (1, TOKENS, HIDDEN), dtype=jnp.float32).astype(dtype)
+def _x(dtype=jnp.float32, tokens: int = TOKENS):
+    return jax.random.normal(jax.random.PRNGKey(0), (1, tokens, HIDDEN), dtype=jnp.float32).astype(dtype)
 
 
-def _forward(block, x, *, defer: bool, inference: bool = True, decode: bool = False):
-    """Jitted block output (float64) and the lowered StableHLO text, with the knob set at trace time."""
+def _forward(block, x, *, defer: bool, inference: bool = True, decode: bool = False, window_rows=None):
+    """Jitted block output (float64) and the lowered StableHLO text, with the knobs set at trace time."""
     from easydel.infra.sharding import decode_mode_specs
     from easydel.utils.inference_mode import set_inference_mode
 
@@ -109,6 +119,7 @@ def _forward(block, x, *, defer: bool, inference: bool = True, decode: bool = Fa
     def fwd(st, h):
         module = spx.bind(graphdef, st)
         module.config.moe_defer_tp_reduce = defer
+        module.config.moe_local_ffn_window_rows = window_rows
         return module(h)[0]
 
     with contextlib.ExitStack() as stack:
@@ -153,13 +164,15 @@ def _reduce_scatter_operands(text: str) -> set[tuple[int, str]]:
     return {(int(dims.split("x")[0]), dtype) for dims, dtype in _REDUCE_SCATTER.findall(text)}
 
 
-def _assert_deferred_lowering(text_default: str, text_deferred: str, *, mesh: str, decode: bool) -> None:
+def _assert_deferred_lowering(
+    text_default: str, text_deferred: str, *, mesh: str, decode: bool, tokens: int = TOKENS
+) -> None:
     """Fail unless the deferred dispatch ran: a gate fallback (warn once) lowers the default program unchanged."""
     tp = MESHES[mesh][4]
     assert text_deferred != text_default, "moe_defer_tp_reduce fell back to the default dispatch"
     deferred_rows = {rows for rows, _ in _reduce_scatter_operands(text_deferred)}
     default_rows = {rows for rows, _ in _reduce_scatter_operands(text_default)}
-    assert TOKENS * TOPK not in deferred_rows, f"deferred dispatch reduce-scatters expanded rows: {deferred_rows}"
+    assert tokens * TOPK not in deferred_rows, f"deferred dispatch reduce-scatters expanded rows: {deferred_rows}"
     if decode:
         # One all-reduce over (ep, tp) replaces the TP reduce-scatter and the decode boundary all-gather.
         assert not deferred_rows, f"decode-layout deferred dispatch still reduce-scatters: {deferred_rows}"
@@ -167,8 +180,8 @@ def _assert_deferred_lowering(text_default: str, text_deferred: str, *, mesh: st
         if tp > 1:
             assert "stablehlo.all_gather" in text_default, "the default decode dispatch has no boundary all-gather"
     elif tp > 1:
-        assert deferred_rows == {TOKENS}, f"deferred dispatch should reduce-scatter [tokens, H] rows: {deferred_rows}"
-        assert TOKENS * TOPK in default_rows, f"default dispatch should reduce-scatter [tokens*k, H]: {default_rows}"
+        assert deferred_rows == {tokens}, f"deferred dispatch should reduce-scatter [tokens, H] rows: {deferred_rows}"
+        assert tokens * TOPK in default_rows, f"default dispatch should reduce-scatter [tokens*k, H]: {default_rows}"
 
 
 @LAYOUTS
@@ -238,7 +251,75 @@ def test_knob_is_inert_outside_inference_mode():
     x = _x()
     out_default, text_default = _forward(block, x, defer=False, inference=False)
     out_knob, text_knob = _forward(block, x, defer=True, inference=False)
+    out_window, text_window = _forward(block, x, defer=True, inference=False, window_rows=FORCED_WINDOW_ROWS)
     # A gate fallback lowers exactly the default program, which is what makes the lowering inequality asserted by
-    # every equivalence test above proof that the deferred dispatch ran.
+    # every equivalence test above proof that the deferred dispatch ran. The row-window size cannot reach training.
     assert text_knob == text_default
+    assert text_window == text_default
     np.testing.assert_array_equal(out_knob, out_default)
+    np.testing.assert_array_equal(out_window, out_default)
+
+
+def _while_loops(text: str) -> int:
+    return text.count("stablehlo.while")
+
+
+@LAYOUTS
+@pytest.mark.parametrize("mesh", sorted(MESHES))
+def test_windowed_dispatch_matches_one_buffer_and_reference(mesh, decode):
+    """Forced row windows (several per shard, the last one padded) give the one-buffer deferred result."""
+    _skip_without_four_devices()
+    block = _build(MESHES[mesh])
+    x = _x()
+    reference = _reference(block, x)
+    _, text_default = _forward(block, x, defer=False, decode=decode)
+    out_full, text_full = _forward(block, x, defer=True, decode=decode)
+    out_window, text_window = _forward(block, x, defer=True, decode=decode, window_rows=FORCED_WINDOW_ROWS)
+    _assert_deferred_lowering(text_default, text_window, mesh=mesh, decode=decode)
+    assert text_window != text_full, "the forced row window left the one-buffer deferred program unchanged"
+    assert _while_loops(text_window) > _while_loops(text_full), "no window loop in the windowed program"
+    assert np.isfinite(out_window).all()
+    assert _rel(out_window, reference) < 1e-4, _rel(out_window, reference)
+    # Only the fp32 summation order across windows differs from the one-buffer combine.
+    assert _rel(out_window, out_full) < 1e-5, _rel(out_window, out_full)
+
+
+@pytest.mark.parametrize("mesh", ["ep2tp2", "ep4tp1"])
+def test_windowed_dispatch_is_dropless_under_skewed_routing(mesh):
+    """Every route lands on expert shard 0, twice its automatic window: the second window must run."""
+    _skip_without_four_devices()
+    ep = MESHES[mesh][3]
+    block = _build(MESHES[mesh])
+    bias = np.zeros((EXPERTS,), np.float32)
+    # Sigmoid scores lie in (0, 1), so a +10 selection bias makes shard 0's experts win every top-k slot; the combine
+    # weights come from the unbiased scores (and the float64 reference applies the bias the same way).
+    bias[: EXPERTS // ep] = 10.0
+    block.gate.e_score_correction_bias.value = jnp.asarray(bias, jnp.float32)
+    x = _x(tokens=SKEW_TOKENS)
+    reference = _reference(block, x)
+    out_default, text_default = _forward(block, x, defer=False)
+    out_full, text_full = _forward(block, x, defer=True, window_rows=SKEW_TOKENS * TOPK)
+    out_window, text_window = _forward(block, x, defer=True)
+    _assert_deferred_lowering(text_default, text_window, mesh=mesh, decode=False, tokens=SKEW_TOKENS)
+    assert _while_loops(text_window) > _while_loops(text_full), "the automatic window did not split the rows"
+    assert np.isfinite(out_window).all() and float(np.max(np.abs(out_default))) > 0
+    assert _rel(out_default, reference) < 1e-4, _rel(out_default, reference)
+    assert _rel(out_window, reference) < 1e-4, _rel(out_window, reference)
+    assert _rel(out_window, out_full) < 1e-5, _rel(out_window, out_full)
+    assert _rel(out_window, out_default) < 1e-5, _rel(out_window, out_default)
+
+
+@LAYOUTS
+@pytest.mark.parametrize("mesh", ["ep2tp2", "ep4tp1"])
+def test_windowed_dispatch_bf16_w8a8(mesh, decode):
+    """Served precision (bfloat16 activations, W8A8 experts) with forced row windows."""
+    _skip_without_four_devices()
+    block = _build(MESHES[mesh], quantize=True, dtype=jnp.bfloat16)
+    x = _x(jnp.bfloat16)
+    out_default, text_default = _forward(block, x, defer=False, decode=decode)
+    out_full, _ = _forward(block, x, defer=True, decode=decode)
+    out_window, text_window = _forward(block, x, defer=True, decode=decode, window_rows=FORCED_WINDOW_ROWS)
+    _assert_deferred_lowering(text_default, text_window, mesh=mesh, decode=decode)
+    assert np.isfinite(out_window).all() and float(np.max(np.abs(out_default))) > 0
+    assert _rel(out_window, out_default) < BF16_REL_TOL, _rel(out_window, out_default)
+    assert _rel(out_window, out_full) < BF16_REL_TOL, _rel(out_window, out_full)
