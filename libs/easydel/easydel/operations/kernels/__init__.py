@@ -134,6 +134,7 @@ from .kda import KDAOutput, KernelDeltaAttnOp, fused_kda_gate, fused_kda_gate_pe
 from .multi_latent_ragged_page_attention import MultiLatentRaggedPageAttn
 from .paged_flash_attention import PagedFlashAttn
 from .ragged_kda import RaggedKDAOp, kda_ragged_rows_forward
+from .ragged_kda_decode import RaggedKDADecodeOp, kda_decode_rows_forward, kda_rows_forward
 from .ragged_page_attention import RaggedPageAttnV2, RaggedPageAttnV3
 from .ring_attention import RingAttn
 from .scaled_dot_product_attention import ScaledDotProductAttn
@@ -170,6 +171,7 @@ __all__ = (
     "PagedFlashAttn",
     "RaggedCausalConv1D",
     "RaggedGatedDeltaRule",
+    "RaggedKDADecodeOp",
     "RaggedKDAOp",
     "RaggedPageAttnV2",
     "RaggedPageAttnV3",
@@ -186,8 +188,10 @@ __all__ = (
     "gated_pool_compress_op",
     "indexer_distill_kl_op",
     "indexer_scores_op",
+    "kda_decode_rows_forward",
     "kda_packed_rows_forward",
     "kda_ragged_rows_forward",
+    "kda_rows_forward",
     "packed_ssm1_fwd",
     "packed_ssm2_fwd",
     "ragged_causal_conv1d",

@@ -51,6 +51,7 @@ from easydel.operations.kernels import (
     fused_kda_gate_per_channel,
     kda_packed_rows_forward,
     kda_ragged_rows_forward,
+    kda_rows_forward,
 )
 
 from ._conv_state import apply_conv_with_state
@@ -557,7 +558,9 @@ class KernelDeltaAttention(spx.Module):
         # ``kda_chunk_precision`` is documented for ``kda_chunk_impl="kda_chunk"``; other impls keep exact chunk dots.
         chunk_precision = self.config.kda_chunk_precision if self.config.kda_chunk_impl == "kda_chunk" else "highest"
         if spec_recurrent_commit is None:
-            out_packed, new_cache_view = kda_ragged_rows_forward(
+            # Decode-only steps (every row <= 1 token) take the fused decode path, other steps the flat driver.
+            out_packed, new_cache_view = kda_rows_forward(
+                flat_forward=kda_ragged_rows_forward,
                 query=query,
                 key=key,
                 value=value,
