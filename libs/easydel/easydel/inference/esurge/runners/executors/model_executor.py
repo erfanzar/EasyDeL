@@ -236,6 +236,7 @@ class ModelStepExecutor:
         enable_spec_recurrent_commit: bool = False,
         input_sharding: jax.sharding.Sharding | None = None,
         slot_indexed_state: bool = False,
+        ship_recurrent_slot_indices: bool = False,
         cache_group_configs: tuple[RaggedPagesCacheConfig | UnifiedAttentionCacheConfig, ...] = (),
         layer_to_cache_group: tuple[int, ...] = (),
     ) -> None:
@@ -266,6 +267,8 @@ class ModelStepExecutor:
                 the compiled steps thread ``recurrent_state_indices`` from the
                 batch metadata into the model's cache metadata even without
                 SPMD DP, so the model can address per-request slot state.
+            ship_recurrent_slot_indices: Plain recurrent path: thread the per-row recurrent pool slots the same way,
+                because a row window can start past slot 0 (several windows per step, sparse row packing).
             cache_group_configs: Independent pool configurations in runtime group
                 order, fixed before compilation. Empty preserves single-pool inputs.
             layer_to_cache_group: Static model-layer to pool-index ownership mapping.
@@ -293,6 +296,7 @@ class ModelStepExecutor:
         self.pipeline_plan = pipeline_plan
         self.enable_spec_recurrent_commit = bool(enable_spec_recurrent_commit)
         self._slot_indexed_state = bool(slot_indexed_state)
+        self._ship_recurrent_slot_indices = bool(ship_recurrent_slot_indices)
         # DSpark speculative decoding: the fused SPMD model step returns ``concat([last_hidden, main_hidden])`` rows.
         # Set by the runner before the first trace; read inside the traced step.
         self.main_hidden_enabled = False
@@ -492,6 +496,15 @@ class ModelStepExecutor:
             return hidden_states.squeeze(0)
         return hidden_states.reshape((-1, hidden_states.shape[-1]))
 
+    @property
+    def _plain_recurrent_slots(self) -> bool:
+        """Whether non-DP steps thread the per-row recurrent slots into ``cache_metadata.recurrent_state_indices``.
+
+        True for slot-indexed (compressed-window) families and for plain recurrent pools whose row windows can start
+        past slot 0. Read through ``getattr`` so executors assembled without ``__init__`` (tests) keep working.
+        """
+        return bool(getattr(self, "_slot_indexed_state", False) or getattr(self, "_ship_recurrent_slot_indices", False))
+
     def _build_cache_metadata(self, metadata: BatchMetadata, num_reqs_max_model_len: int) -> RaggedPagesMetadata:
         """Build the per-step :class:`RaggedPagesMetadata` from packed batch metadata.
 
@@ -524,7 +537,7 @@ class ModelStepExecutor:
             num_kv_update_slices=metadata.num_kv_update_slices,
             spec_recurrent_commit=metadata.spec_recurrent_commit,
             recurrent_state_indices=(
-                metadata.rank_recurrent_state_indices if (use_spmd_dp or self._slot_indexed_state) else None
+                metadata.rank_recurrent_state_indices if (use_spmd_dp or self._plain_recurrent_slots) else None
             ),
             version=self._metadata_version,
             cache_groups=metadata.cache_groups,
@@ -788,7 +801,7 @@ class ModelStepExecutor:
             dp_query_start_loc=self._empty_sharding if use_spmd_dp else None,
             dp_request_distribution=self._empty_sharding if use_spmd_dp else None,
             dp_context_lens=self._empty_sharding if use_spmd_dp else None,
-            dp_recurrent_state_indices=self._empty_sharding if (use_spmd_dp or self._slot_indexed_state) else None,
+            dp_recurrent_state_indices=self._empty_sharding if (use_spmd_dp or self._plain_recurrent_slots) else None,
             input_token_handoff_positions=self._empty_sharding,
             input_token_handoff_ids=self._empty_sharding,
             input_token_handoff_count=self._empty_sharding,
@@ -812,7 +825,7 @@ class ModelStepExecutor:
                     num_kv_update_slices=self._empty_sharding if config.version == "v2" else None,
                     spec_recurrent_commit=self._empty_sharding if self.enable_spec_recurrent_commit else None,
                     recurrent_state_indices=(
-                        self._empty_sharding if (use_spmd_dp or self._slot_indexed_state) else None
+                        self._empty_sharding if (use_spmd_dp or self._plain_recurrent_slots) else None
                     ),
                     version=config.version,
                     num_slices_per_kv_cache_update_page=config.num_slices_per_kv_cache_update_page,

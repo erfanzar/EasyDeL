@@ -109,7 +109,7 @@ from .spec.strategy import DrafterSpeculation, snapshot_recurrent_state, window_
 from .state_sync import SequenceStateSync
 from .states import CachedRequestState
 from .vlm_prefill import VlmPrefillHelper
-from .window_planner import WindowPlanner
+from .window_planner import WindowPlanner, resolve_plain_recurrent_slot_shipping
 
 if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
@@ -709,6 +709,30 @@ class eSurgeRunner:
         # Default fast so speculative decoding serves its purpose (a speedup);
         # set the env to 1 when bit-exact greedy is required over throughput.
         self.spec_decode_recurrent_replay = flags.get_bool(flags.EASYDEL_SPEC_RECURRENT_REPLAY)
+        # Plain recurrent path (no SPMD DP, no compressed-window slot pool): a request's recurrent state lives in the
+        # pool slot of its SequenceBuffer row, but a forward numbers the rows of its window from 0. When a row can sit
+        # past its window-local index (several row windows per step, sparse packing of zero-token rows) the runner's
+        # per-row slots must reach the model as ``cache_metadata.recurrent_state_indices``. Decided once here, so
+        # single-window serving keeps the identity layout and no per-step slot payload.
+        self._ship_plain_recurrent_slot_indices = resolve_plain_recurrent_slot_shipping(
+            family=str(getattr(text_config, "model_type", None) or type(self.model).__name__),
+            has_recurrent_layers=self._has_recurrent_layers,
+            pooled_slots=self._slot_indexed_state or self._uses_spmd_dp(),
+            rows_per_forward=min(int(self.metadata.get_max_num_seqs()), int(self.max_num_reqs)),
+            max_num_reqs=int(self.max_num_reqs),
+            sparse_row_packing=(
+                int(getattr(self.metadata, "data_parallel_size", 1) or 1) <= 1 and not self.async_scheduling
+            ),
+            speculative_candidate_rows=self.spec_decode_recurrent_candidates,
+            model_honours_slots=bool(getattr(self.model, "esurge_plain_recurrent_slots", False)),
+        )
+        # Plain-path recurrent rows that receive no slots must sit at their window-local index, so sparse packing of
+        # zero-token rows (which moves rows) is turned off for them in ``_setup_variables``.
+        self._recurrent_rows_pinned_to_window = bool(
+            self._has_recurrent_layers
+            and not (self._slot_indexed_state or self._uses_spmd_dp())
+            and not self._ship_plain_recurrent_slot_indices
+        )
 
         self.cache_group_configs, self.layer_to_cache_group = self._build_execution_cache_group_layout()
         logger.debug("Creating ExecutionManager and initializing pages cache")
@@ -740,6 +764,7 @@ class eSurgeRunner:
                 if drafter is not None and bool(getattr(drafter, "rolls_back_cache", False))
                 else 0
             ),
+            ship_recurrent_slot_indices=self._ship_plain_recurrent_slot_indices,
         )
         if drafter is not None and bool(getattr(drafter, "needs_main_hidden", False)):
             # DSpark: the fused model step must also return the backbone's ``main_hidden`` rows.
@@ -1494,8 +1519,12 @@ class eSurgeRunner:
         """
         self.num_reqs_max_model_len = min(self.metadata.get_max_num_seqs(), self.max_num_reqs)
         self.num_reqs_most_model_len = self.num_reqs_max_model_len
+        # Packing zero-token rows out of a window moves rows past their window-local index: plain-path recurrent pools
+        # then need their rows' slots (shipped when the model follows them), otherwise windows stay unpacked.
         self._allow_sparse_window_packing = (
-            int(getattr(self.metadata, "data_parallel_size", 1) or 1) <= 1 and not self.async_scheduling
+            int(getattr(self.metadata, "data_parallel_size", 1) or 1) <= 1
+            and not self.async_scheduling
+            and not getattr(self, "_recurrent_rows_pinned_to_window", False)
         )
         self.active_num_seq_buckets = self._clamp_request_buckets_to_runtime_cap(
             self.max_num_seq_buckets,

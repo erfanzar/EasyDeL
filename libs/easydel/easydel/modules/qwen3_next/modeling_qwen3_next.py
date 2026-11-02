@@ -3299,6 +3299,18 @@ class Qwen3NextLinearAttention(spx.Module):
                 query_start_loc = jnp.asarray(packed_query_start_loc, dtype=jnp.int32)
                 num_seqs_arr = jnp.asarray(packed_num_seqs, dtype=jnp.int32).reshape(-1)
                 num_requests = num_seqs_arr[0]
+                # eSurge names every row's pool slot (``recurrent_state_indices``) when a row window can start past
+                # slot 0 (several row windows per step, sparse row packing): run the rows on their gathered slots and
+                # scatter the new states back below. The speculative candidate layout keeps row r on slot r.
+                num_rows = int(query_start_loc.shape[0]) - 1
+                pool_states = None
+                if packed_recurrent_state_indices is not None and packed_spec_recurrent_commit is None:
+                    pool_states = (conv_states, recurrent_states)
+                    num_pool_slots = int(conv_states.shape[0])
+                    row_slots = jnp.asarray(packed_recurrent_state_indices, dtype=jnp.int32).reshape(-1)[:num_rows]
+                    read_slots = jnp.clip(row_slots, 0, num_pool_slots - 1)
+                    conv_states = conv_states[read_slots]
+                    recurrent_states = recurrent_states[read_slots]
 
                 conv_states, recurrent_states, token_outputs = _apply_qwen3_next_packed_updates(
                     conv_states=conv_states,
@@ -3329,6 +3341,23 @@ class Qwen3NextLinearAttention(spx.Module):
                     force_recurrent_scan_prefill=bool(self.config.force_recurrent_scan_prefill),
                     recurrent_scan_prefill_max_seq_len=int(self.config.recurrent_scan_prefill_max_seq_len),
                 )
+                if pool_states is not None:
+                    # Rows without tokens (eSurge points padding rows at slot 0) and out-of-range slots write nothing.
+                    row_lens = query_start_loc[1:] - query_start_loc[:-1]
+                    live = (
+                        (jnp.arange(num_rows, dtype=jnp.int32) < num_requests)
+                        & (row_lens > 0)
+                        & (row_slots >= 0)
+                        & (row_slots < num_pool_slots)
+                    )
+                    write_slots = jnp.where(live, row_slots, num_pool_slots)
+                    pool_conv, pool_recurrent = pool_states
+                    conv_states = pool_conv.at[write_slots].set(
+                        conv_states[:num_rows].astype(pool_conv.dtype), mode="drop"
+                    )
+                    recurrent_states = pool_recurrent.at[write_slots].set(
+                        recurrent_states[:num_rows].astype(pool_recurrent.dtype), mode="drop"
+                    )
                 output = token_outputs[None, ...]
 
             new_cache_view = cache_view.replace(
@@ -3973,6 +4002,8 @@ class Qwen3NextForCausalLM(BaseCausalLMModule[Qwen3NextModel, Qwen3NextConfig]):
     _task_type = TaskType.CAUSAL_LM
     _model_type = "qwen3_next"
     _config_class = Qwen3NextConfig
+    # eSurge: the GDN layers follow cache_metadata.recurrent_state_indices on the plain packed path.
+    esurge_plain_recurrent_slots: typing.ClassVar[bool] = True
 
     def __init__(
         self,

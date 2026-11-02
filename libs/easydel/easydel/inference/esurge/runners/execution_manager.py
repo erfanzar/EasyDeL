@@ -527,6 +527,7 @@ class ExecutionManager:
         layer_to_cache_group: tuple[int, ...] = (),
         host_payloads_replicated: bool = False,
         request_seeds: tp.Mapping[int, int] | None = None,
+        ship_recurrent_slot_indices: bool = False,
     ):
         """Initialize the executor manager.
 
@@ -569,6 +570,9 @@ class ExecutionManager:
                 if the coordinator is initialized after the manager.
             request_seeds: Live mapping of global sequence-buffer rows to request seeds. Retained without copying
                 so row moves and removals are visible to the sampler.
+            ship_recurrent_slot_indices: Plain recurrent path (no SPMD DP, no compressed-window pool): ship every
+                row's recurrent pool slot as ``cache_metadata.recurrent_state_indices`` with each step, because a
+                row window can start past slot 0 (several windows per step, sparse row packing).
         """
         if metadata is None:
             raise ValueError("ExecutionManager requires a paged cache config `metadata`.")
@@ -593,6 +597,8 @@ class ExecutionManager:
         # Slot-indexed state families (compressed-window caches) receive the
         # per-row physical state-slot ids in the batch metadata every step.
         self._slot_indexed_state = getattr(model, "esurge_cache_family", None) == "compressed_window"
+        # Plain recurrent families whose row windows can start past slot 0 also receive the per-row slots.
+        self._ship_recurrent_slot_indices = bool(ship_recurrent_slot_indices)
         self.min_input_pad = min_input_pad
         self.max_model_len = max_model_len
         self.max_num_reqs = max_num_reqs
@@ -670,6 +676,7 @@ class ExecutionManager:
             enable_spec_recurrent_commit=self.enable_spec_recurrent_commit_metadata,
             input_sharding=self._input_sharding,
             slot_indexed_state=self._slot_indexed_state,
+            ship_recurrent_slot_indices=self._ship_recurrent_slot_indices,
             cache_group_configs=self.cache_group_configs,
             layer_to_cache_group=self.layer_to_cache_group,
             host_payloads_replicated=self.host_payloads_replicated,
@@ -691,6 +698,7 @@ class ExecutionManager:
             enable_spec_recurrent_commit=self.enable_spec_recurrent_commit_metadata,
             input_sharding=self._input_sharding,
             slot_indexed_state=self._slot_indexed_state,
+            ship_recurrent_slot_indices=self._ship_recurrent_slot_indices,
             cache_group_configs=self.cache_group_configs,
             layer_to_cache_group=self.layer_to_cache_group,
         )
@@ -1482,6 +1490,7 @@ class ExecutionManager:
         microbatch_unsupported = (
             bool(model_side_inputs_cpu)
             or self._slot_indexed_state
+            or getattr(self, "_ship_recurrent_slot_indices", False)
             or self._batch_preparer._uses_spmd_dp()
             or spec_recurrent_commit_cpu is not None
         )

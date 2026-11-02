@@ -210,6 +210,7 @@ class BatchMetadataPreparer:
         enable_spec_recurrent_commit: bool = False,
         input_sharding: jax.sharding.Sharding | None = None,
         slot_indexed_state: bool = False,
+        ship_recurrent_slot_indices: bool = False,
         cache_group_configs: tuple[RaggedPagesCacheConfig | UnifiedAttentionCacheConfig, ...] = (),
         layer_to_cache_group: tuple[int, ...] = (),
         host_payloads_replicated: bool = False,
@@ -239,6 +240,10 @@ class BatchMetadataPreparer:
                 ``dp_recurrent_state_indices`` (shape ``[1, rows]``) even
                 without SPMD DP, so the model can address per-request slot
                 state that survives SequenceBuffer row moves.
+            ship_recurrent_slot_indices: Plain recurrent path: ship the per-row recurrent pool slots the same way
+                (``dp_recurrent_state_indices`` ``[1, rows]``), because a row window can start past slot 0
+                (several windows per step, sparse row packing). The model reads them as
+                ``cache_metadata.recurrent_state_indices``.
             cache_group_configs: Independent pool configurations in runtime order.
                 Empty preserves the single-table preparation API.
             layer_to_cache_group: Static model-layer to pool-index ownership mapping.
@@ -276,6 +281,9 @@ class BatchMetadataPreparer:
         self.min_input_pad = int(min_input_pad)
         self._enable_spec_recurrent_commit = bool(enable_spec_recurrent_commit)
         self._slot_indexed_state = bool(slot_indexed_state)
+        self._ship_recurrent_slot_indices = bool(ship_recurrent_slot_indices)
+        # Non-DP steps carry the per-row physical state slots as ``dp_recurrent_state_indices`` [1, rows].
+        self._plain_recurrent_slots = self._slot_indexed_state or self._ship_recurrent_slot_indices
 
         self._metadata_version = metadata.version
         self._use_slot_mapping = self._metadata_version == "v2"
@@ -982,9 +990,10 @@ class BatchMetadataPreparer:
                 input_ids[off : off + n] = token_ids_cpu[req_idx, start:end]
                 logits_indices[req_idx] = off + n - 1
                 off += n
-            if self._slot_indexed_state:
+            if self._plain_recurrent_slots:
                 # Per-row physical state-slot ids for slot-indexed cache
-                # families (aligned with query_start_loc rows).
+                # families and for plain recurrent windows that can start
+                # past slot 0 (aligned with query_start_loc rows).
                 rows_cap = int(dp_recurrent_state_indices.shape[1])
                 fill_rows = min(num_requests, rows_cap)
                 if recurrent_slot_indices_cpu is None:
@@ -1166,7 +1175,7 @@ class BatchMetadataPreparer:
                 dp_context_lens,
                 dp_recurrent_state_indices,
             )
-        elif self._slot_indexed_state:
+        elif self._plain_recurrent_slots:
             common_payload = (*common_payload, dp_recurrent_state_indices)
         if self._enable_spec_recurrent_commit:
             common_payload = (*common_payload, spec_recurrent_commit_payload)
@@ -1230,7 +1239,7 @@ class BatchMetadataPreparer:
         if (
             not self._use_request_distribution
             or self._uses_spmd_dp()
-            or self._slot_indexed_state
+            or self._plain_recurrent_slots
             or has_vlm_inputs
             or spec_recurrent_commit_cpu is not None
             or page_table_version is None
@@ -1443,6 +1452,7 @@ class BatchMetadataPreparer:
                     enable_spec_recurrent_commit=self._enable_spec_recurrent_commit,
                     input_sharding=self._input_sharding,
                     slot_indexed_state=self._slot_indexed_state,
+                    ship_recurrent_slot_indices=self._ship_recurrent_slot_indices,
                     host_payloads_replicated=self.host_payloads_replicated,
                 )
                 self._cache_group_preparers[index] = (identity, child)
@@ -1468,7 +1478,7 @@ class BatchMetadataPreparer:
                     num_kv_update_slices=prepared.num_kv_update_slices,
                     spec_recurrent_commit=prepared.spec_recurrent_commit,
                     recurrent_state_indices=(
-                        prepared.rank_recurrent_state_indices if (use_dp or self._slot_indexed_state) else None
+                        prepared.rank_recurrent_state_indices if (use_dp or self._plain_recurrent_slots) else None
                     ),
                     version=config.version,
                     page_size=config.page_size,
@@ -1698,7 +1708,7 @@ class BatchMetadataPreparer:
             payload_idx += 1
             dp_recurrent_state_indices_dev = device_payload[payload_idx]
             payload_idx += 1
-        elif self._slot_indexed_state:
+        elif self._plain_recurrent_slots:
             dp_recurrent_state_indices_dev = device_payload[payload_idx]
             payload_idx += 1
         spec_recurrent_commit_dev = None
@@ -1840,7 +1850,7 @@ class BatchMetadataPreparer:
         if (
             self._use_request_distribution
             and not self._uses_spmd_dp()
-            and not self._slot_indexed_state
+            and not self._plain_recurrent_slots
             and spec_recurrent_commit_cpu is None
             # Must mirror the try-gate's has_vlm_inputs set exactly: any VLM
             # input missing here could prime a metadata template embedding
@@ -2043,6 +2053,7 @@ class BatchMetadataPreparer:
                     enable_spec_recurrent_commit=self._enable_spec_recurrent_commit,
                     input_sharding=self._input_sharding,
                     slot_indexed_state=self._slot_indexed_state,
+                    ship_recurrent_slot_indices=self._ship_recurrent_slot_indices,
                     host_payloads_replicated=self.host_payloads_replicated,
                     cache_group_configs=self.cache_group_configs,
                     layer_to_cache_group=self.layer_to_cache_group,
@@ -2226,7 +2237,7 @@ class BatchMetadataPreparer:
             payload_idx += 1
             dp_recurrent_state_indices_dev = self._pending_transfer[payload_idx]
             payload_idx += 1
-        elif self._slot_indexed_state:
+        elif self._plain_recurrent_slots:
             dp_recurrent_state_indices_dev = self._pending_transfer[payload_idx]
             payload_idx += 1
         spec_recurrent_commit_dev = None
