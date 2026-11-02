@@ -77,7 +77,7 @@ from jax import numpy as jnp
 
 from easydel.caching import RaggedPagesCacheConfig, RaggedPagesMetadata, UnifiedAttentionCacheConfig
 from easydel.caching._metadatabuilder import AttentionMetadataBuilder
-from easydel.inference.esurge.runners.host_sync import host_payload_broadcast_needed
+from easydel.inference.esurge.runners.host_sync import host_payload_broadcast_needed, put_host_payload
 from easydel.utils import flags
 
 from ...core.dp_sharding import dp_shard_page_bounds, pages_per_dp_shard
@@ -547,7 +547,11 @@ class BatchMetadataPreparer:
             )
 
         if put_values:
-            put_results = jax.device_put(tuple(put_values), tuple(put_shardings))
+            put_results = put_host_payload(
+                tuple(put_values),
+                tuple(put_shardings),
+                host_payloads_replicated=getattr(self, "host_payloads_replicated", None),
+            )
             for idx, value in zip(put_indices, put_results, strict=True):
                 outputs[idx] = value
                 cache_entry = pending_cache_keys.get(idx)
@@ -1302,9 +1306,10 @@ class BatchMetadataPreparer:
         host_took = time.time() - host_start
 
         put_start = time.time()
-        qsl_dev, ids_dev, pos_dev = jax.device_put(
+        qsl_dev, ids_dev, pos_dev = put_host_payload(
             (packed_qsl, input_ids, positions),
             (self._empty_sharding, self._empty_sharding, self._empty_sharding),
+            host_payloads_replicated=getattr(self, "host_payloads_replicated", None),
         )
         put_took = time.time() - put_start
 

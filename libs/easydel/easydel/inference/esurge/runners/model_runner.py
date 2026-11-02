@@ -96,7 +96,7 @@ from ..scheduler import SchedulerOutput
 from ..utils import model_uses_mrope
 from .async_types import AsyncPreResults, AsyncWindowResult, DeviceInputTokenHandoff
 from .execution_types import CacheGroupInputs
-from .host_sync import host_payload_broadcast_needed
+from .host_sync import host_payload_broadcast_needed, put_host_payload
 from .perf import RunnerPerfSample, RunnerPerfTracker
 from .pipeline_execution_manager import PipelineExecutionManager
 from .pipeline_execution_manager import RunnerExecutionManager as ExecutionManager
@@ -2599,7 +2599,11 @@ class eSurgeRunner:
             input_positions_np = np.asarray(patch_positions, dtype=np.int32)
             if input_positions_np.shape[0] < max_handoff:
                 input_positions_np = np.pad(input_positions_np, (0, max_handoff - int(input_positions_np.shape[0])))
-            input_positions = jax.device_put(input_positions_np, self.executor_manager._empty_sharding)
+            input_positions = put_host_payload(
+                input_positions_np,
+                self.executor_manager._empty_sharding,
+                host_payloads_replicated=getattr(self, "host_payloads_replicated", None),
+            )
             token_ids = jnp.stack(
                 [
                     jnp.asarray(sampled_tokens[row_pos], dtype=jnp.int32)

@@ -111,6 +111,7 @@ from .executors.sampler_executor import (
     _greedy_argmax_tokens,
     _padded_cpu_window,
 )
+from .host_sync import put_host_payload
 from .pipeline_plan import PipelineInferencePlan, metadata_num_pages, set_metadata_num_pages
 from .sequence_buffer import SequenceBuffer
 
@@ -730,8 +731,8 @@ class ExecutionManager:
 
     @property
     def host_payloads_replicated(self) -> bool:
-        """Whether this manager's coordinator guarantees identical host payloads."""
-        return self._host_payloads_replicated
+        """Whether this manager's coordinator guarantees identical host payloads (``False`` until set)."""
+        return getattr(self, "_host_payloads_replicated", False)
 
     @host_payloads_replicated.setter
     def host_payloads_replicated(self, enabled: bool) -> None:
@@ -1640,13 +1641,13 @@ class ExecutionManager:
             sample_took = 0.0
             execute_total_took = time.time() - start_prep
             execute_overhead_took = max(0.0, float(execute_total_took - (prep_took + exec_took + sample_took)))
-            out_tokens_full = jax.device_put(
-                numpy.full((int(padded_num_reqs),), -1, dtype=numpy.int32),
+            out_tokens_full, valid_mask_full = put_host_payload(
+                (
+                    numpy.full((int(padded_num_reqs),), -1, dtype=numpy.int32),
+                    numpy.zeros((int(padded_num_reqs),), dtype=numpy.bool_),
+                ),
                 self._empty_sharding,
-            )
-            valid_mask_full = jax.device_put(
-                numpy.zeros((int(padded_num_reqs),), dtype=numpy.bool_),
-                self._empty_sharding,
+                host_payloads_replicated=self.host_payloads_replicated,
             )
             metrics = {
                 "exec_time": exec_took,
@@ -1976,7 +1977,9 @@ class ExecutionManager:
         cached = self._greedy_mask_cache
         if cached is not None and cached[0] == key:
             return cached[1]
-        device_mask = jax.device_put(valid_mask_cpu, self._empty_sharding)
+        device_mask = put_host_payload(
+            valid_mask_cpu, self._empty_sharding, host_payloads_replicated=self.host_payloads_replicated
+        )
         self._greedy_mask_cache = (key, device_mask)
         return device_mask
 
@@ -1987,7 +1990,11 @@ class ExecutionManager:
         """
         cached = self._greedy_total_tokens_cache.get(total_tokens)
         if cached is None:
-            cached = jax.device_put(jnp.asarray(total_tokens, dtype=jnp.int32), self._empty_sharding)
+            cached = put_host_payload(
+                numpy.asarray(total_tokens, dtype=numpy.int32),
+                self._empty_sharding,
+                host_payloads_replicated=self.host_payloads_replicated,
+            )
             self._greedy_total_tokens_cache[total_tokens] = cached
         return cached
 
