@@ -870,11 +870,17 @@ class eSurgeDistributedConfig(TypedDict, total=False):
             and the leader being ready is a startup race rather than a fault.
             A dead leader is caught by the heartbeat once the plane is up, so
             waiting longer here costs nothing but a slower report of a genuine
-            failure.
+            failure. A worker without ``distributed_leader_addr`` first waits up
+            to this long for the leader to publish its address, then up to this
+            long again for the leader's HelloOk.
         distributed_leader_addr: Explicit leader host/IP for the
-            ``coordination="zmq"`` plane. ``None`` falls back to the JAX
-            distributed coordinator's host (correct for standard pod
-            launches), then DNS discovery via ``distributed_service_name``.
+            ``coordination="zmq"`` plane. ``None`` uses the address the leader
+            (``jax.process_index() == 0``) publishes in the ``jax.distributed``
+            key-value store, then the JAX distributed coordinator's host, then
+            DNS discovery via ``distributed_service_name``. The coordinator's
+            host alone is not enough: TPU slices number processes by chip
+            position, so process 0 can run on a different host than the
+            coordinator.
         distributed_ready_timeout_s: How long the ``coordination="zmq"``
             leader waits at startup for every worker to hello + ready.
             Compilation happens before ready, so this defaults generously
