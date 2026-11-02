@@ -27,6 +27,7 @@ ejkernel.modules.operations package
    quantized_matmul
    ragged_decode_attention
    ragged_gated_delta_rule
+   ragged_kda
    ragged_page_attention_v2
    ragged_page_attention_v2_turboquant
    ragged_page_attention_v3

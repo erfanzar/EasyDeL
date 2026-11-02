@@ -1082,6 +1082,22 @@ def _cfgs_ragged_gdr_v2():
     return _limit_configs(configs)
 
 
+def _cfgs_ragged_kda():
+    """Generate serving-shaped configs for ragged per-channel-decay KDA.
+
+    The geometry is a GLM-5-Next KDA layer (16 heads, 128-wide keys and values) over a 128-slot recurrent-state
+    pool: 128 single-token decode rows, one 2048-token prefill row, and 120 decode rows batched with a 1928-token
+    prefill row (2048 tokens in both configs that carry a prefill row).
+    """
+    geometry = {"num_heads": 16, "head_dim": 128, "num_slots": 128}
+    configs = [
+        {"decode_rows": 128, "prefill_tokens": 0, **geometry},
+        {"decode_rows": 0, "prefill_tokens": 2048, **geometry},
+        {"decode_rows": 120, "prefill_tokens": 1928, **geometry},
+    ]
+    return _limit_configs(configs)
+
+
 def _rand_inputs(config: dict[str, Any], *shapes: tuple[int, ...], dtype: jnp.dtype | None = None):
     """Generate a list of random normal tensors with the given shapes.
 
@@ -2351,6 +2367,61 @@ def _gen_ragged_gdr_v2_inputs(config: dict[str, Any]):
     )
 
 
+def _gen_ragged_kda_inputs(config: dict[str, Any]):
+    """Generate a serving-shaped ragged batch for per-channel-decay KDA.
+
+    The flat token stream holds ``decode_rows`` single-token rows followed by one ``prefill_tokens``-long row; either
+    part may be absent. Rows own distinct, shuffled slots of a ``num_slots``-slot fp32 state pool, so the explicit
+    ``state_indices`` gather/scatter path is measured. Decode rows continue from their slot's state, while the
+    prefill row is a fresh request (``has_initial_state=False``). Log-decays follow the safe-gate form
+    ``decay_lower_bound * sigmoid(z)``, so they lie in ``[decay_lower_bound, 0)``.
+
+    Args:
+        config: Benchmark config. Reads ``decode_rows``, ``prefill_tokens``, ``num_heads``, ``head_dim`` (key and
+            value width), ``num_slots``, ``chunk_size``, ``decay_lower_bound`` (a float) and ``seed``.
+
+    Returns:
+        ``(query, key, value, beta, decay, recurrent_state, query_start_loc, state_indices, has_initial_state,
+        chunk_size, decay_lower_bound)``; the last two are static options.
+    """
+    decode_rows = config.get("decode_rows", 128)
+    prefill_tokens = config.get("prefill_tokens", 0)
+    num_heads = config.get("num_heads", 16)
+    head_dim = config.get("head_dim", 128)
+    num_slots = config.get("num_slots", 128)
+    chunk_size = config.get("chunk_size", 64)
+    decay_lower_bound = config.get("decay_lower_bound", -5.0)
+    row_lens = [1] * decode_rows + ([prefill_tokens] if prefill_tokens else [])
+    num_rows = len(row_lens)
+    total_tokens = sum(row_lens)
+    dtype = _default_dtype()
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    keys = jax.random.split(key, 7)
+    token_shape = (total_tokens, num_heads, head_dim)
+    query = jax.random.normal(keys[0], token_shape, dtype=dtype)
+    key_tensor = jax.random.normal(keys[1], token_shape, dtype=dtype)
+    value = jax.random.normal(keys[2], token_shape, dtype=dtype)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[3], (total_tokens, num_heads), dtype=jnp.float32))
+    decay = decay_lower_bound * jax.nn.sigmoid(jax.random.normal(keys[4], token_shape, dtype=jnp.float32))
+    recurrent_state = jax.random.normal(keys[5], (num_slots, num_heads, head_dim, head_dim), dtype=jnp.float32) * 0.05
+    query_start_loc = jnp.asarray(np.concatenate([[0], np.cumsum(row_lens)]), dtype=jnp.int32)
+    state_indices = jax.random.permutation(keys[6], num_slots)[:num_rows].astype(jnp.int32)
+    has_initial_state = jnp.asarray([True] * decode_rows + [False] * (num_rows - decode_rows))
+    return (
+        query,
+        key_tensor,
+        value,
+        beta,
+        decay,
+        recurrent_state,
+        query_start_loc,
+        state_indices,
+        has_initial_state,
+        chunk_size,
+        decay_lower_bound,
+    )
+
+
 def _build_algorithms(
     spec: OpBenchmarkSpec,
     *,
@@ -3593,6 +3664,65 @@ def _ragged_gdr_v2_wrapper(op_fn: Callable[..., Any], platform: str):
     return _fn
 
 
+def _ragged_kda_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap ragged per-channel-decay KDA with static chunking, decay bound and platform."""
+
+    def _fn(
+        query,
+        key,
+        value,
+        beta,
+        decay,
+        recurrent_state,
+        query_start_loc,
+        state_indices,
+        has_initial_state,
+        chunk_size,
+        decay_lower_bound,
+    ):
+        """Run ragged KDA over a packed decode/prefill batch.
+
+        The op returns ``(out, new_recurrent_state)``, but ``Benchmark`` synchronizes on a single array. Returning
+        only ``out`` would leave the pool update unread, so a compiler could drop it from the timed program. One
+        element of the new pool is therefore added to the output, which keeps the pool update reachable from the
+        result. The pool is not donated here, so XLA may copy it first and the timed program can cost more than the
+        in-place update the server performs.
+
+        Args:
+            query: Post-conv queries ``[total_tokens, num_heads, head_dim]``.
+            key: Post-conv keys, shaped like ``query``.
+            value: Post-conv values ``[total_tokens, num_heads, v_dim]``.
+            beta: Write strengths ``[total_tokens, num_heads]``.
+            decay: Per-channel log-decay, shaped like ``query``.
+            recurrent_state: State pool ``[num_slots, num_heads, head_dim, v_dim]``.
+            query_start_loc: Cumulative row offsets ``[num_rows + 1]``.
+            state_indices: Pool slot of every row ``[num_rows]``.
+            has_initial_state: Per-row flags; ``False`` rows start from a zero state.
+            chunk_size: Static chunk length of the multi-token path.
+            decay_lower_bound: Static promised lower bound of every log-decay.
+
+        Returns:
+            The fp32 output ``[total_tokens, num_heads, v_dim]`` plus one element of the updated pool.
+        """
+        out, new_state = op_fn(
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            recurrent_state,
+            query_start_loc,
+            state_indices,
+            has_initial_state,
+            chunk_size=chunk_size,
+            decay_lower_bound=decay_lower_bound,
+            platform=platform,
+        )
+        return out + new_state[0, 0, 0, 0].astype(out.dtype)
+
+    return _fn
+
+
 SPECS: dict[str, OpBenchmarkSpec] = {
     "all_gather": OpBenchmarkSpec(
         op_name="all_gather",
@@ -4244,5 +4374,14 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         configs=_cfgs_ragged_gdr_v2(),
         wrapper_factory=_ragged_gdr_v2_wrapper,
         static_kwargs=["n_kq", "n_v", "d_k", "d_v", "chunk_size"],
+    ),
+    "ragged_kda": OpBenchmarkSpec(
+        op_name="ragged_kda",
+        algorithm="ragged_kda",
+        op_fn=ops.ragged_kda,
+        input_generator=_gen_ragged_kda_inputs,
+        configs=_cfgs_ragged_kda(),
+        wrapper_factory=_ragged_kda_wrapper,
+        static_kwargs=["chunk_size", "decay_lower_bound"],
     ),
 }

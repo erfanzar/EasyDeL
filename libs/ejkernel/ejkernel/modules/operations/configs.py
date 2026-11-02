@@ -1022,6 +1022,26 @@ class KdaChunkConfig(BaseOperationConfig):
 
 
 @dataclass
+class RaggedKDAConfig(BaseOperationConfig):
+    """Configuration for ragged (flat-token) per-channel-decay KDA over a state pool (``ragged_kda``).
+
+    Args:
+        inverse: Chunk inverse of the multi-token path: ``"auto"`` (block-recursive ``"masked"`` inverse for
+            power-of-two chunks of at least 8 tokens, else ``"solve"``), ``"masked"`` (matmul-only) or ``"solve"``
+            (exact batched triangular solve).
+        pairwise: ``"auto"`` (factored MXU pairwise decay whenever the call passes a ``decay_lower_bound`` that
+            allows it) or ``"dense"`` (always the ``[cs, cs, K]`` form).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    inverse: str = "auto"
+    pairwise: str = "auto"
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class RowPermuteConfig(BaseOperationConfig):
     """Configuration for the run-table row permutation (``row_permute``).
 
