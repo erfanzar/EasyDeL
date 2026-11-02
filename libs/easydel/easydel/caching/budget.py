@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 import typing as tp
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -100,3 +102,113 @@ def compute_paged_cache_budget(
         page_bytes=page_bytes,
         num_hidden_layers=max(len(group) for group in groups),
     )
+
+
+_AGREEMENT_LOCK = threading.Lock()
+# (id(client), group) -> [client, {process_index: next round}]; holding the client keeps its id from being reused.
+_AGREEMENT_ROUNDS: dict[tuple[int, str], list[tp.Any]] = {}
+
+
+def mesh_process_indices(mesh: tp.Any) -> tuple[int, ...] | None:
+    """Return the sorted JAX process indices that own devices of ``mesh``.
+
+    Args:
+        mesh: A ``jax.sharding.Mesh``, or a wrapper exposing one as ``jax_mesh`` or ``mesh``.
+
+    Returns:
+        The process indices, or ``None`` when no device array can be found on ``mesh``.
+    """
+    import numpy as np
+
+    for candidate in (mesh, getattr(mesh, "jax_mesh", None), getattr(mesh, "mesh", None)):
+        devices = getattr(candidate, "devices", None)
+        if devices is None or callable(devices):
+            continue
+        try:
+            flat = np.asarray(devices, dtype=object).reshape(-1)
+            return tuple(sorted({int(device.process_index) for device in flat}))
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return None
+
+
+def min_across_processes(
+    value: int,
+    *,
+    what: str = "value",
+    participants: tp.Iterable[int] | None = None,
+    timeout_s: float = 1800.0,
+) -> int:
+    """Return the minimum of ``value`` over the participating JAX processes.
+
+    Multi-controller runs size shared buffers such as paged KV pools from each host's own free HBM. After a real
+    checkpoint load the hosts' free memory (and its largest free block) differs slightly, so independently derived
+    page counts diverge, each host compiles a differently shaped step program, and the first collective step hangs
+    or halts the TPU. Agreeing on the minimum keeps the cache geometry identical on every host.
+
+    The values travel through the ``jax.distributed`` key-value store, so no device program runs. Every
+    participant must call this the same number of times in the same order, which holds for SPMD setup code: the
+    n-th call of each participant forms one round.
+
+    Args:
+        value: This process's value.
+        what: Description used in the log line.
+        participants: Process indices that share the buffer (for example :func:`mesh_process_indices` of its
+            mesh); ``None`` means every process. A process outside the set, or a set of one, keeps ``value``.
+        timeout_s: Seconds to wait for the other participants' values.
+
+    Returns:
+        The minimum over the participants (``value`` itself on a single process).
+
+    Raises:
+        RuntimeError: When a participant does not publish its value within ``timeout_s`` (chained to the key-value
+            store's error): the processes did not call this the same number of times in the same order.
+    """
+    import jax
+
+    count = int(jax.process_count())
+    if count <= 1:
+        return int(value)
+    index = int(jax.process_index())
+    peers = tuple(range(count)) if participants is None else tuple(sorted({int(p) for p in participants}))
+    if len(peers) <= 1 or index not in peers:
+        return int(value)
+    from eformer.loggings import get_logger
+
+    logger = get_logger(__name__)
+    try:
+        from jax._src.distributed import global_state
+    except ImportError:  # private JAX module: without it no process can reach the key-value store
+        global_state = None
+    client = getattr(global_state, "client", None)
+    if client is None:
+        logger.warning(
+            "%s: no jax.distributed client, so processes %s cannot agree; keeping this process's %d",
+            what,
+            list(peers),
+            int(value),
+        )
+        return int(value)
+    group = "all" if peers == tuple(range(count)) else "-".join(str(peer) for peer in peers)
+    with _AGREEMENT_LOCK:
+        rounds = _AGREEMENT_ROUNDS.setdefault((id(client), group), [client, {}])[1]
+        round_id = rounds.get(index, 0)
+        rounds[index] = round_id + 1
+    prefix = f"easydel/min_across_processes/{group}/{round_id}"
+    client.key_value_set(f"{prefix}/{index}", str(int(value)), allow_overwrite=True)
+    deadline = time.monotonic() + float(timeout_s)
+    values = []
+    for peer in peers:
+        try:
+            raw = client.blocking_key_value_get(f"{prefix}/{peer}", max(1, int((deadline - time.monotonic()) * 1000)))
+        except Exception as exc:
+            raise RuntimeError(
+                f"{what}: process {index} waited {float(timeout_s):.0f}s for process {peer} in agreement round "
+                f"{round_id} of processes {list(peers)}. Every process that shares the mesh must build its cache "
+                "configuration the same number of times and in the same order; one that skipped or repeated a "
+                "build leaves the others waiting."
+            ) from exc
+        values.append(int(raw))
+    agreed = min(values)
+    logger.info("%s per process %s -> using %d", what, dict(zip(peers, values, strict=True)), agreed)
+    return agreed

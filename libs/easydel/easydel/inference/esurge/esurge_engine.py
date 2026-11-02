@@ -898,6 +898,9 @@ class eSurge:
                 "max_model_len": self.runtime_config.max_model_len,
                 "max_num_seqs": self.runtime_config.max_num_seqs,
                 "page_size": self.cache_config.page_size,
+                # The page count derives from free HBM. Hosts that disagree compile differently shaped step
+                # programs, which hang or halt the first collective instead of failing; fail the handshake.
+                "num_pages": int(getattr(getattr(self.runner, "metadata", None), "num_pages", 0) or 0),
                 "decoding_engine": self.decoding_engine,
                 "data_parallelism_axis": self.data_parallelism_axis,
                 "max_num_batched_tokens": (

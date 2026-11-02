@@ -955,7 +955,7 @@ def _create_mixed_turboquant_ragged_page_cache_configs(
     budget = compute_paged_cache_budget(
         {idx: _page_bytes(*geometry) for idx, geometry in geometries.items()},
         available_bytes=(
-            per_device_hbm_budget_bytes(hbm_utilization, mode="free") * kv_head_size * data_parallel_size
+            per_device_hbm_budget_bytes(hbm_utilization, mode="free", mesh=mesh) * kv_head_size * data_parallel_size
             if num_pages_override is None
             else None
         ),

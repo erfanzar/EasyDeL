@@ -76,7 +76,7 @@ from easydel.infra.sharding import (
 from easydel.utils.helpers import check_bool_flag
 
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, OperationsMetadata, unwrap_metadata
-from ..budget import compute_paged_cache_budget
+from ..budget import compute_paged_cache_budget, mesh_process_indices, min_across_processes
 from .utils import kv_cache_update, kv_cache_update_jax
 
 if tp.TYPE_CHECKING:
@@ -517,7 +517,12 @@ def get_page_size_bytes(
     return page_size * num_combined_kv_heads * padded_head_size * kv_cache_dtype_bits // 8
 
 
-def per_device_hbm_budget_bytes(util: float = 0.9, mode: str = "free", safety_margin: int = 256 << 20) -> int:
+def per_device_hbm_budget_bytes(
+    util: float = 0.9,
+    mode: str = "free",
+    safety_margin: int = 256 << 20,
+    mesh: tp.Any = None,
+) -> int:
     """Calculate available HBM budget per device for cache allocation.
 
     Queries device memory statistics and computes usable memory based
@@ -529,10 +534,16 @@ def per_device_hbm_budget_bytes(util: float = 0.9, mode: str = "free", safety_ma
             - "free": Use fraction of currently free memory
             - "total": Use fraction of total memory minus current usage
         safety_margin: Reserved bytes to keep free. Default: 256MB.
+        mesh: Mesh the cache is sharded over. The processes owning its devices agree on one budget (every process
+            when its devices cannot be read); a mesh of this process's own devices needs no agreement. ``None``
+            keeps this process's own budget without any agreement, so a caller that runs on only some processes
+            never waits for the others.
 
     Returns:
-        int: Available bytes for cache allocation per device.
-            Returns 4GB as fallback if device stats unavailable.
+        int: Available bytes for cache allocation per device: the minimum over this process's devices and, when
+            ``mesh`` spans several processes, over those processes, so all of them size identical cache pools
+            (see :func:`easydel.caching.budget.min_across_processes`). Returns 4GB as fallback if device stats
+            unavailable.
     """
     budgets = []
     for d in jax.local_devices():
@@ -559,7 +570,12 @@ def per_device_hbm_budget_bytes(util: float = 0.9, mode: str = "free", safety_ma
             usable = max(0, int(int(limit) * float(util)) - int(used) - safety_margin)
         budgets.append(usable)
 
-    return min(budgets) if budgets else 4 * (1024**3)
+    local_budget = min(budgets) if budgets else 4 * (1024**3)
+    if mesh is None:
+        return local_budget
+    return min_across_processes(
+        local_budget, what="per-device HBM cache budget", participants=mesh_process_indices(mesh)
+    )
 
 
 @auto_pytree
@@ -655,7 +671,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         physical_kv_head_axis = runtime_sharding_resolver.paxis.kv_head_axis
         physical_kv_head_size = mesh_axis_size(mesh, physical_kv_head_axis)
         kv_head_size = physical_kv_head_size if kv_head_shards is None else max(1, int(kv_head_shards))
-        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
+        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free", mesh=mesh)
         page_axis_size = mesh_axis_size(
             mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver, mode=MODE_PREFILL)
         )

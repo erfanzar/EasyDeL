@@ -119,7 +119,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
         Returns:
             Total allocatable bytes across all devices on the page axis.
         """
-        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
+        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free", mesh=mesh)
         page_axis_size = mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
         available_alloc = budget * page_axis_size
         logger.info(f"{page_axis_size=} {budget=} {available_alloc=} {hbm_utilization=}")

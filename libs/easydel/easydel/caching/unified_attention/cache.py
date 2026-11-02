@@ -192,7 +192,7 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
         """
         kv_head_axis = runtime_sharding_resolver.paxis.kv_head_axis
         kv_head_size = mesh_axis_size(mesh, kv_head_axis)
-        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
+        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free", mesh=mesh)
         page_axis_size = mesh_axis_size(
             mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver, mode=MODE_PREFILL)
         )
