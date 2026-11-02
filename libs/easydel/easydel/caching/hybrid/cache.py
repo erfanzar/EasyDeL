@@ -495,9 +495,11 @@ class HybridCacheView(BaseCacheView):
             key_dim = metadata.num_attention_heads * metadata.head_dim
             value_dim = metadata.d_state  # In KDA, value has different dimension
 
+            # Conv windows split by feature over the head axis, like the recurrent state's heads (the conv is
+            # depthwise; the eSurge ragged conv reads and writes the windows feature-sharded).
             conv_sharding = PartitionSpec(
                 metadata.partition_axis.batch_axis,
-                None,
+                metadata.partition_axis.head_axis,
                 None,
             )
             q_conv_state = with_sharding_constraint(

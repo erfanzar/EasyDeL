@@ -201,7 +201,10 @@ class KDACacheView(BaseCacheView):
             KDACacheView: Initialized cache view.
         """
         paxis = config.partition_axis
-        conv_specs = PartitionSpec(paxis.batch_axis, None, None)
+        # Split the conv windows by feature over the head axis, like the recurrent state's heads. The conv is depthwise
+        # and q / k / v come from column-parallel projections, so the eSurge ragged conv reads and writes the windows
+        # feature-sharded; a replicated pool made XLA all-gather all three windows back on every step.
+        conv_specs = PartitionSpec(paxis.batch_axis, paxis.head_axis, None)
 
         q_conv_state = with_sharding_constraint(
             arr=jnp.zeros(shape=(config.batch_size, config.key_dim, config.d_conv), dtype=dtype),
