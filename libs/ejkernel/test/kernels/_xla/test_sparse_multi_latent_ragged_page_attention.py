@@ -37,28 +37,29 @@ CACHE_DIM = 256  # align(NOPE, 128) + align(PE, 128)
 PAD_TOKENS = 3
 
 
-def _build(seed, kv_lens, q_lens, *, chunk_size, width, dtype=jnp.float32):
+def _build(seed, kv_lens, q_lens, *, chunk_size, width, dtype=jnp.float32, page=PAGE, pages_per_seq=PAGES_PER_SEQ):
+    """Ragged batch over a randomly permuted table of ``page``-token pages, ``pages_per_seq`` per sequence."""
     rng = np.random.default_rng(seed)
     num_live = len(kv_lens)
     kv_lens_all = [*kv_lens, 0]  # one extra empty slot: max_num_seqs > live seqs
     q_lens_all = [*q_lens, 0]
     max_seqs = len(kv_lens_all)
     pack = 32 // (jnp.dtype(dtype).itemsize * 8)
-    num_pages = max_seqs * PAGES_PER_SEQ + 2
-    block_tables = rng.permutation(num_pages)[: max_seqs * PAGES_PER_SEQ].astype(np.int32)
+    num_pages = max_seqs * pages_per_seq + 2
+    block_tables = rng.permutation(num_pages)[: max_seqs * pages_per_seq].astype(np.int32)
 
     def rnd(*shape):
         return np.asarray(jnp.asarray(rng.standard_normal(shape), dtype).astype(jnp.float32), np.float64)
 
-    cache = rnd(num_pages, PAGE // pack, pack, CACHE_DIM)
-    flat = cache.reshape(num_pages * PAGE, CACHE_DIM)
+    cache = rnd(num_pages, page // pack, pack, CACHE_DIM)
+    flat = cache.reshape(num_pages * page, CACHE_DIM)
     hist_nope = [rnd(kl, NOPE) for kl in kv_lens]
     hist_pe = [rnd(kl, PE) for kl in kv_lens]
     for s, (kl, ql) in enumerate(zip(kv_lens, q_lens, strict=True)):
         for j in range(kl - ql):  # already-cached history
-            phys = block_tables[s * PAGES_PER_SEQ + j // PAGE]
-            flat[phys * PAGE + j % PAGE, :NOPE] = hist_nope[s][j]
-            flat[phys * PAGE + j % PAGE, 128 : 128 + PE] = hist_pe[s][j]
+            phys = block_tables[s * pages_per_seq + j // page]
+            flat[phys * page + j % page, :NOPE] = hist_nope[s][j]
+            flat[phys * page + j % page, 128 : 128 + PE] = hist_pe[s][j]
     cache = flat.reshape(cache.shape)
 
     total = sum(q_lens) + PAD_TOKENS
@@ -75,7 +76,7 @@ def _build(seed, kv_lens, q_lens, *, chunk_size, width, dtype=jnp.float32):
         k_nope[t] = hist_nope[s][p]
         k_pe[t] = hist_pe[s][p]
 
-    num_chunks = PAGES_PER_SEQ * PAGE // chunk_size
+    num_chunks = pages_per_seq * page // chunk_size
     selected = np.full((total, width), -1, np.int32)
     for t in range(total):
         n = rng.integers(0, width + 1)
@@ -104,6 +105,8 @@ def _build(seed, kv_lens, q_lens, *, chunk_size, width, dtype=jnp.float32):
         "block_tables": block_tables,
         "selected": selected,
         "kv_lens": kv_lens,
+        "page": page,
+        "pages_per_seq": pages_per_seq,
     }
 
 
@@ -128,10 +131,11 @@ def _reference(case, *, chunk_size, scale, sliding_window=None, soft_cap=None):
 
 
 def _expected_cache(case):
+    page, pages_per_seq = case["page"], case["pages_per_seq"]
     flat = case["cache_np"].reshape(-1, CACHE_DIM).copy()
     k_nope, k_pe = (np.asarray(x, np.float64) for x in case["inputs"][2:4])
     for t, (s, p) in enumerate(zip(case["seq_of"], case["pos_of"], strict=True)):
-        row = case["block_tables"][s * PAGES_PER_SEQ + p // PAGE] * PAGE + p % PAGE
+        row = case["block_tables"][s * pages_per_seq + p // page] * page + p % page
         flat[row] = 0.0
         flat[row, :NOPE] = k_nope[t]
         flat[row, 128 : 128 + PE] = k_pe[t]

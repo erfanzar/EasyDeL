@@ -103,6 +103,26 @@ def test_default_kpool16_layout_eight_pools_per_page(k):
     np.testing.assert_array_equal(got, xla)
 
 
+@pytest.mark.parametrize("ppp", [16, 64, 128], ids=["page64", "page256", "page512"])
+def test_pools_per_page_of_other_page_sizes(ppp):
+    """``index_kpool=4`` pools per page at page sizes 64 / 256 / 512 (the 128-token default gives 32)."""
+    npool = [75, 1250, 7000, 0, 4, 896, 511, 512, 513]
+    k = 512
+    scale = D**-0.5
+    args, ref = _case(5, npool, ppp=ppp)
+    got = _run("pallas", args, k, scale)
+    xla = _run("xla", args, k, scale)
+    for t, n in enumerate(npool):
+        ids = got[t][got[t] >= 0]
+        assert len(ids) == min(k, n) and np.all(np.diff(ids) > 0) and np.all(ids < max(n, 1))
+        assert np.all(got[t][len(ids) :] == -1)
+        if n > k:
+            s = _scores(ref, t, scale, ppp)
+            kth = np.sort(s)[::-1][k - 1]
+            assert s[ids].min() >= kth - 1e-5 * max(abs(kth), 1.0), t
+    np.testing.assert_array_equal(got, xla)
+
+
 def test_ties_select_lowest_ids():
     npool = [300, 64]
     args, _ = _case(1, npool, tie=True)

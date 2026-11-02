@@ -27,7 +27,10 @@ import pytest
 from ejkernel.kernels._pallas.tpu.sparse_multi_latent_ragged_page_attention import (
     sparse_multi_latent_ragged_page_attention as pallas_sparse_mla,
 )
-from ejkernel.kernels._pallas.tpu.sparse_multi_latent_ragged_page_attention._pallas_impl_fwd import supports
+from ejkernel.kernels._pallas.tpu.sparse_multi_latent_ragged_page_attention._pallas_impl_fwd import (
+    sparse_mla_ragged_paged_attention_pallas,
+    supports,
+)
 from ejkernel.kernels._registry import kernel_registry
 from ejkernel.kernels._xla.sparse_multi_latent_ragged_page_attention import (
     sparse_multi_latent_ragged_page_attention as xla_sparse_mla,
@@ -38,6 +41,8 @@ from ..._xla.test_sparse_multi_latent_ragged_page_attention import (
     HEADS,
     NOPE,
     PAD_TOKENS,
+    PAGE,
+    PAGES_PER_SEQ,
     PE,
     _build,
     _expected_cache,
@@ -53,31 +58,27 @@ def _copies(inputs):
     return [jnp.array(x) for x in inputs]
 
 
-@pytest.mark.parametrize(
-    "dtype,chunk_size,width,group",
-    [
-        (jnp.float32, 4, 6, None),
-        (jnp.float32, 4, 6, 1),  # one chunk per step: exercises the double-buffered group loop
-        (jnp.float32, 1, 20, None),
-        (jnp.float32, 1, 64, None),  # wide row: 130 metadata ints -> 256-long SMEM block, fori chunk loop
-        (jnp.float32, 16, 2, None),
-        (jnp.bfloat16, 4, 6, None),
-        (jnp.bfloat16, 4, 6, 2),
-        (jnp.bfloat16, 16, 2, None),
-        # bf16 packs 2 tokens per word: chunk 1 fetches the containing word and masks the other lane.
-        (jnp.bfloat16, 1, 20, None),
-        (jnp.bfloat16, 1, 20, 1),
-        (jnp.bfloat16, 1, 64, None),
-    ],
-)
-def test_pallas_matches_reference_and_xla(dtype, chunk_size, width, group):
-    case = _build(0, kv_lens=KV_LENS, q_lens=Q_LENS, chunk_size=chunk_size, width=width, dtype=dtype)
-    assert supports(tuple(case["inputs"][4].shape), chunk_size)
-    scale = (NOPE + PE) ** -0.5
-    out, cache = pallas_sparse_mla(*_copies(case["inputs"]), chunk_size=chunk_size, num_chunks_per_block=group)
+def _pallas(inputs, *, chunk_size, group=None, translate_pages=None):
+    """Run the Pallas kernel on fresh copies of ``inputs``.
+
+    ``translate_pages=None`` calls the registered entry point (the production dispatch); ``True`` / ``False`` call the
+    backend with the chunk page translation forced into the kernel / into XLA.
+    """
+    if translate_pages is None:
+        return pallas_sparse_mla(*_copies(inputs), chunk_size=chunk_size, num_chunks_per_block=group)
+    return sparse_mla_ragged_paged_attention_pallas(
+        *_copies(inputs),
+        chunk_size=chunk_size,
+        sm_scale=(NOPE + PE) ** -0.5,
+        num_chunks_per_block=group,
+        translate_pages=translate_pages,
+    )
+
+
+def _check_against_reference_and_xla(case, out, cache, *, chunk_size, dtype):
     with jax.default_matmul_precision("highest"):
         xla_out, xla_cache = xla_sparse_mla(*_copies(case["inputs"]), chunk_size=chunk_size)
-    expected = _reference(case, chunk_size=chunk_size, scale=scale)
+    expected = _reference(case, chunk_size=chunk_size, scale=(NOPE + PE) ** -0.5)
     got = np.asarray(out, np.float64)
     np.testing.assert_allclose(got, expected, atol=2e-3, rtol=2e-3)
     np.testing.assert_allclose(got, np.asarray(xla_out, np.float64), atol=2e-3, rtol=2e-3)
@@ -86,6 +87,143 @@ def test_pallas_matches_reference_and_xla(dtype, chunk_size, width, group):
     got_cache = np.asarray(jnp.asarray(cache, jnp.float32), np.float64).reshape(-1, CACHE_DIM)
     want_cache = np.asarray(jnp.asarray(_expected_cache(case), dtype).astype(jnp.float32))
     np.testing.assert_array_equal(got_cache, want_cache)
+
+
+@pytest.mark.parametrize("translate_pages", [None, False], ids=["kernel_pages", "xla_pages"])
+@pytest.mark.parametrize(
+    "dtype,chunk_size,width,group",
+    [
+        (jnp.float32, 4, 6, None),
+        (jnp.float32, 4, 6, 1),  # one chunk per step: exercises the double-buffered group loop
+        (jnp.float32, 1, 20, None),
+        (jnp.float32, 1, 64, None),  # wide row: one 64-chunk group
+        (jnp.float32, 16, 2, None),
+        (jnp.bfloat16, 4, 6, None),
+        (jnp.bfloat16, 4, 6, 2),
+        (jnp.bfloat16, 16, 2, None),
+        # bf16 packs 2 tokens per word: chunk 1 fetches the containing word and masks the other lane.
+        (jnp.bfloat16, 1, 20, None),
+        (jnp.bfloat16, 1, 20, 1),
+        (jnp.bfloat16, 1, 64, None),  # sub-word chunks carry starts: 131 metadata ints -> 256-long SMEM block
+    ],
+)
+def test_pallas_matches_reference_and_xla(dtype, chunk_size, width, group, translate_pages):
+    case = _build(0, kv_lens=KV_LENS, q_lens=Q_LENS, chunk_size=chunk_size, width=width, dtype=dtype)
+    assert supports(tuple(case["inputs"][4].shape), chunk_size)
+    out, cache = _pallas(case["inputs"], chunk_size=chunk_size, group=group, translate_pages=translate_pages)
+    _check_against_reference_and_xla(case, out, cache, chunk_size=chunk_size, dtype=dtype)
+
+
+@pytest.mark.parametrize("translate_pages", [None, False], ids=["kernel_pages", "xla_pages"])
+@pytest.mark.parametrize(
+    "dtype,chunk_size,group",
+    [
+        # f32 pages are 16 words: chunks of 4 tokens in groups of 4 / 8 / 16 words tile them.
+        (jnp.float32, 4, 1),
+        (jnp.float32, 4, 2),
+        (jnp.float32, 4, 4),
+        # bf16 pages are 8 words: 4-token chunks (2 words) in groups of 4 / 8 words; one 16-token chunk is a page.
+        (jnp.bfloat16, 4, 2),
+        (jnp.bfloat16, 4, 4),
+        (jnp.bfloat16, 16, 1),
+    ],
+)
+def test_pallas_prefix_selections_match_reference(dtype, chunk_size, group, translate_pages):
+    """Rows selecting every visible chunk (what the indexer returns while the context fits its top-k).
+
+    The kernel fetches such a row one page-tiling group per copy instead of one chunk per copy; every third row keeps a
+    random sparse selection so both kinds of rows share one call. Prefix rows also select the chunk after their own,
+    which causality drops; with several chunks per group their last group's copy reaches past their last attendable
+    chunk, and those keys must stay masked.
+    """
+    width = PAGES_PER_SEQ * PAGE // chunk_size
+    case = _build(11, kv_lens=KV_LENS, q_lens=Q_LENS, chunk_size=chunk_size, width=width, dtype=dtype)
+    rng = np.random.default_rng(1)
+    selected = case["selected"].copy()
+    for t, p in enumerate(case["pos_of"]):
+        if t % 3 == 2:
+            continue
+        n = min(p // chunk_size + 2, width)
+        selected[t] = -1
+        selected[t, :n] = rng.permutation(n)
+    case["selected"] = selected
+    inputs = list(case["inputs"])
+    inputs[9] = jnp.asarray(selected)
+    case["inputs"] = tuple(inputs)
+    out, cache = _pallas(case["inputs"], chunk_size=chunk_size, group=group, translate_pages=translate_pages)
+    _check_against_reference_and_xla(case, out, cache, chunk_size=chunk_size, dtype=dtype)
+
+
+def test_pallas_page_translation_in_kernel_equals_xla_translation():
+    """Translating chunk pages inside the kernel or in XLA must give bitwise identical outputs and caches."""
+    case = _build(13, kv_lens=KV_LENS, q_lens=Q_LENS, chunk_size=4, width=10, dtype=jnp.bfloat16)
+    in_kernel = _pallas(case["inputs"], chunk_size=4, translate_pages=True)
+    in_xla = _pallas(case["inputs"], chunk_size=4, translate_pages=False)
+    np.testing.assert_array_equal(np.asarray(in_kernel[0]), np.asarray(in_xla[0]))
+    np.testing.assert_array_equal(np.asarray(in_kernel[1]), np.asarray(in_xla[1]))
+
+
+# Page sizes the kernel must address: shorter than a default 32-chunk group (64), not a power of two (96), the serving
+# default (128), and pages holding two and four default groups (256, 512).
+PAGE_SIZES = (64, 96, 128, 256, 512)
+
+
+@pytest.mark.parametrize("page", PAGE_SIZES)
+@pytest.mark.parametrize(
+    "dtype,chunk_size,group",
+    [
+        (jnp.bfloat16, 4, None),  # default 32-chunk group = 64 words: whole-group copies where groups tile the page
+        (jnp.bfloat16, 4, 2),  # 4-word groups: whole-group copies at every page size
+        (jnp.bfloat16, 4, 8),
+        (jnp.float32, 4, None),
+        (jnp.float32, 4, 4),
+        (jnp.bfloat16, 1, None),  # sub-word chunks: masked per key from the chunk starts, never whole-group copies
+        (jnp.bfloat16, 16, None),
+    ],
+)
+def test_pallas_page_sizes_match_reference(page, dtype, chunk_size, group):
+    """Ragged batches spanning several pages, at every page size; page translation in the kernel and in XLA agree.
+
+    Rows: a decode token whose context ends mid-chunk on a partly filled third page, a prefill chunk crossing a page
+    boundary, and a fresh prefill ending just past the first page (mid-group). Tokens cycle through three selections:
+    every visible chunk plus the next one (a prefix: one copy per group where groups tile pages), the same prefix
+    without one visible chunk (per-chunk copies), and a random sparse set in random order.
+    """
+    kv_lens = [2 * page + page // 2 + 3, page + 37, page + 5]
+    q_lens = [1, 40, page + 5]
+    pages_per_seq = -(-max(kv_lens) // page) + 1
+    width = (max(kv_lens) - 1) // chunk_size + 2
+    case = _build(
+        17,
+        kv_lens=kv_lens,
+        q_lens=q_lens,
+        chunk_size=chunk_size,
+        width=width,
+        dtype=dtype,
+        page=page,
+        pages_per_seq=pages_per_seq,
+    )
+    assert supports(tuple(case["inputs"][4].shape), chunk_size)
+    rng = np.random.default_rng(page)
+    num_chunks = pages_per_seq * page // chunk_size
+    selected = case["selected"].copy()
+    for t, p in enumerate(case["pos_of"]):
+        n = p // chunk_size + 2
+        if t % 3 == 0:
+            ids = np.arange(n)
+        elif t % 3 == 1 and n > 2:
+            ids = np.delete(np.arange(n), n // 2)
+        else:
+            ids = rng.choice(num_chunks, size=width // 2, replace=False)
+        selected[t] = -1
+        selected[t, : ids.size] = rng.permutation(ids)
+    case["selected"] = selected
+    case["inputs"] = (*case["inputs"][:9], jnp.asarray(selected))
+    out, cache = _pallas(case["inputs"], chunk_size=chunk_size, group=group)
+    _check_against_reference_and_xla(case, out, cache, chunk_size=chunk_size, dtype=dtype)
+    xla_pages = _pallas(case["inputs"], chunk_size=chunk_size, group=group, translate_pages=False)
+    np.testing.assert_array_equal(np.asarray(xla_pages[0]), np.asarray(out))
+    np.testing.assert_array_equal(np.asarray(xla_pages[1]), np.asarray(cache))
 
 
 def test_pallas_sliding_window_and_soft_cap():
