@@ -629,8 +629,11 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
         moe_defer_tp_reduce: In the chunked fused-MoE dispatch (``moe_chunk_size`` set, tp > 1, ep == 1, no ring,
             no down-projection bias), apply the tensor-parallel ``psum_scatter`` to the combined ``[chunk, H]``
             output instead of the top-k-expanded ``[chunk * top_k, H]`` rows. The combine is linear, so only the
-            summation order changes while the reduction moves ``1 / top_k`` of the bytes. Warns once when set but
-            inapplicable. Default ``False``.
+            summation order changes while the reduction moves ``1 / top_k`` of the bytes. Under inference mode
+            only, it also switches the single-pass dispatch with tokens replicated over the expert axis
+            (``moe_chunk_size`` unset, no ring / expert-tensor mode / ep-carries-batch, no down-projection bias) to
+            one sort and one gather per layer and a single reduction of the combined ``[tokens, H]`` partial over
+            (ep, tp). Warns once when set but inapplicable. Default ``False``.
         moe_row_gather_kernel: In the fused-MoE path, run the token dispatch gather and the expert-output
             unsort + top-k combine through the ejkernel Pallas TPU row-gather kernels (``moe_row_gather`` /
             ``moe_row_gather_sum``) instead of XLA gathers. Forward dispatch is bit-identical; the combine
@@ -886,7 +889,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         fsdp_is_ep_bound: Fold the FSDP axis into the expert axis when building expert meshes.
         sp_is_ep_bound: Fold the sequence-parallel axis into the expert axis when building expert meshes.
         moe_chunk_size: Optional token chunk size for chunk-scanned fused-MoE dispatch (``None`` disables).
-        moe_defer_tp_reduce: Reduce the chunked MoE output over TP after the top-k combine (default ``False``).
+        moe_defer_tp_reduce: Reduce the MoE output over TP after the top-k combine: the chunked dispatch, and the
+            single-pass replicated-expert dispatch under inference mode (default ``False``).
         moe_row_gather_kernel: Fused-MoE dispatch/combine row gathers via the Pallas TPU kernels (default ``False``).
         moe_local_expert_ffn: In expert-tensor mode, run each device's experts through the ejkernel
             ``moe_local_ffn`` op (dropless dynamic row windows, custom VJP; default ``False``).
@@ -2535,8 +2539,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
             fsdp_is_ep_bound: Fold FSDP into the expert axis when building expert meshes.
             sp_is_ep_bound: Fold sequence-parallel into the expert axis when building expert meshes.
             moe_chunk_size: Token chunk size for chunk-scanned fused-MoE dispatch (default ``None`` = disabled).
-            moe_defer_tp_reduce: Reduce the chunked MoE output over TP after the top-k combine
-                (default ``False``).
+            moe_defer_tp_reduce: Reduce the MoE output over TP after the top-k combine (chunked dispatch;
+                single-pass replicated-expert dispatch under inference mode; default ``False``).
             moe_row_gather_kernel: Run the fused-MoE dispatch/combine row gathers through the Pallas TPU
                 row-gather kernels (default ``False``).
             moe_local_expert_ffn: In expert-tensor mode, run each device's experts through the ejkernel

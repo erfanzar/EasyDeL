@@ -1901,26 +1901,60 @@ class BaseMoeModule(spx.Module, ABC):
                 )
                 ep_carries_batch = False
 
-        # Deferred tp reduce (moe_defer_tp_reduce): only the chunked non-ring ep=1 dispatch applies it; anywhere else
-        # it warns once (the local expert FFN path warns above).
+        # Deferred tp reduce (moe_defer_tp_reduce): the chunked non-ring ep=1 dispatch applies it inside its scan, and
+        # under inference mode the single-pass non-ring dispatch switches to ``_replicated_deferred_dispatch``;
+        # anywhere else it warns once (the local expert FFN path warns above).
         defer_tp_reduce = False
+        replicated_deferred_dispatch = False
         if bool(getattr(self.config, "moe_defer_tp_reduce", False)) and not use_local_expert_ffn:
-            defer_blockers = [
-                why
-                for why, bad in (
-                    ("moe_chunk_size is None (only the chunked dispatch defers the reduce)", moe_chunk_size is None),
-                    ("the ep-carries-batch dispatch is active", ep_carries_batch),
-                    ("tp_size == 1", tp_size <= 1),
-                    ("ep_size > 1", ep_size > 1),
-                    ("use_ring_of_experts", bool(self.config.use_ring_of_experts)),
-                    ("a down-projection bias", wd_bias is not None),
-                )
-                if bad
-            ]
-            if defer_blockers:
-                logger.warn_once(f"moe_defer_tp_reduce is set but inactive here: {', '.join(defer_blockers)}.")
+            if moe_chunk_size is None:
+                replicated_blockers = [
+                    why
+                    for why, bad in (
+                        (
+                            "not in inference mode (the single-pass deferred dispatch is forward-only)",
+                            not is_inference_mode(),
+                        ),
+                        ("the ep-carries-batch dispatch is active", ep_carries_batch),
+                        ("use_ring_of_experts", bool(self.config.use_ring_of_experts)),
+                        ("use_expert_tensor_mode", bool(self.config.use_expert_tensor_mode)),
+                        ("a down-projection bias", wd_bias is not None),
+                        ("a scale_replicated_inputs hook", scale_replicated_inputs is not None),
+                        ("ep_size == tp_size == 1", ep_size <= 1 and tp_size <= 1),
+                        (
+                            f"n_routed_experts={self.n_routed_experts} not divisible by ep_size={ep_size}",
+                            self.n_routed_experts % ep_size != 0,
+                        ),
+                    )
+                    if bad
+                ]
+                if replicated_blockers:
+                    logger.warn_once(f"moe_defer_tp_reduce is set but inactive here: {', '.join(replicated_blockers)}.")
+                else:
+                    replicated_deferred_dispatch = True
+                    if row_gather_kernel:
+                        # As on the local expert FFN path: this dispatch runs its own XLA gathers, so the Pallas
+                        # row-gather kernels do not apply; warn instead of dropping the knob silently.
+                        logger.warn_once(
+                            "moe_row_gather_kernel set but not used: the inference-mode moe_defer_tp_reduce dispatch "
+                            "runs its own XLA row gathers and reduces the combined [tokens, H] output once."
+                        )
             else:
-                defer_tp_reduce = True
+                defer_blockers = [
+                    why
+                    for why, bad in (
+                        ("the ep-carries-batch dispatch is active", ep_carries_batch),
+                        ("tp_size == 1", tp_size <= 1),
+                        ("ep_size > 1", ep_size > 1),
+                        ("use_ring_of_experts", bool(self.config.use_ring_of_experts)),
+                        ("a down-projection bias", wd_bias is not None),
+                    )
+                    if bad
+                ]
+                if defer_blockers:
+                    logger.warn_once(f"moe_defer_tp_reduce is set but inactive here: {', '.join(defer_blockers)}.")
+                else:
+                    defer_tp_reduce = True
 
         expert_params_bytes = 0
         for _param in (wi_kernel, wu_kernel, gate_up_kernel, wd_kernel, wi_bias, wu_bias, gate_up_bias, wd_bias):
@@ -2294,6 +2328,89 @@ class BaseMoeModule(spx.Module, ABC):
             if padded_tokens != tokens:
                 combined = combined[:tokens]
             return combined.reshape(local_batch, local_seq, -1)
+
+        def _replicated_deferred_dispatch(
+            x: jax.Array,
+            gate_logits: jax.Array,
+            expert_ffn: Callable[..., jax.Array],
+            expert_shard_id: jax.Array,
+        ) -> jax.Array:
+            """Inference-only single-pass dispatch with the TP reduction after the top-k combine.
+
+            ``moe_defer_tp_reduce`` under inference mode for the non-ring, non-chunked dispatch, where tokens are
+            replicated over the expert axis. One stable sort puts this shard's ``(token, expert)`` pairs first,
+            grouped by local expert (the default dispatch's row order); one gather builds the expert rows; the FFN
+            runs without its per-row TP ``psum_scatter``; one gather-combine sums each token's local rows in fp32;
+            and the ``[tokens, H]`` partial is reduced once: ``psum_scatter`` over TP then ``psum`` over the expert
+            axis, or a single ``psum`` over both under the decode-replicated boundary (which then needs no output
+            all-gather). Against the default dispatch this drops the ``local_permute`` sort and gather, the
+            placement gather, and the TP reduction of the top-k-expanded ``[tokens * k, H]`` rows. Forward only.
+
+            Args:
+                x: Local hidden states ``[b, s, H]`` (replicated over the expert and TP axes).
+                gate_logits: Normalized gate scores ``[b * s, E]`` aligned with ``x``.
+                expert_ffn: The ``_expert_ffn`` closure; called with ``tp_reduce=False``.
+                expert_shard_id: This shard's index along the expert axis.
+
+            Returns:
+                ``[b, s, H]`` summed over the expert and TP axes when ``decode_replicated_out``, otherwise
+                ``[b, s, H // tp_size]`` (TP-scattered, summed over the expert axis), in ``self.dtype``.
+            """
+            local_batch, local_seq, _hd = x.shape
+            tokens = local_batch * local_seq
+            top_k = self.num_experts_per_tok
+            experts_per_shard = self.n_routed_experts // ep_size
+            x2d = x.reshape(tokens, HD)
+            weights, experts = get_experts_location(
+                gate_logits=gate_logits,
+                pre_bias_logits=None,
+                select_hook=select_hook,
+                refine_weights_hook=refine_weights_hook,
+                num_experts_per_tok=top_k,
+            )
+            if refine_inputs_hook is not None:
+                x2d = refine_inputs_hook(x2d, weights, x.shape)
+            flat_experts = jnp.ravel(experts).astype(jnp.int32)
+            maybe_record_group_sizes(
+                jnp.bincount(flat_experts, length=self.n_routed_experts),
+                num_experts=self.n_routed_experts,
+                layer_idx=layer_idx,
+                replica_id=expert_shard_id * tp_size + jax.lax.axis_index(tensor_axis_name),
+            )
+            local_ids = flat_experts - expert_shard_id * experts_per_shard
+            is_local = (local_ids >= 0) & (local_ids < experts_per_shard)
+            # Non-local pairs take key ``experts_per_shard`` and sort past every local group; the stable sort keeps
+            # pair order inside each group.
+            sort_keys = jnp.where(is_local, local_ids, experts_per_shard)
+            order = jnp.argsort(sort_keys).astype(jnp.int32)
+            group_sizes = jnp.bincount(sort_keys, length=experts_per_shard + 1)[:experts_per_shard].astype(jnp.int32)
+            x_rows = x2d[order // top_k].astype(self.dtype)
+            # Local expert id per sorted row (bias gathers only); the non-local tail is clamped and masked by the FFN.
+            sorted_ids = jnp.minimum(sort_keys[order], experts_per_shard - 1)
+            inter = expert_ffn(x_rows, group_sizes, sorted_ids, tp_reduce=False)
+            # Pair p sits at row ``positions[p]`` of the expert-sorted buffer. Non-local pairs point past every
+            # local row, where the grouped-matmul output is not guaranteed finite on TPU: select, never multiply.
+            positions = jnp.argsort(order).astype(jnp.int32)
+            picked = inter[positions].astype(jnp.float32)
+            picked = jnp.where(is_local[:, None], picked, 0.0).reshape(tokens, top_k, -1)
+            combine_weights = weights if output_weights_hook is None else output_weights_hook(weights)
+            partial = jnp.sum(picked * combine_weights.astype(jnp.float32)[:, :, None], axis=1)
+            ep_axes = tuple(expert_axis_name) if isinstance(expert_axis_name, tuple) else (expert_axis_name,)
+            if decode_replicated_out:
+                # Decode: one small fp32 all-reduce over both axes replaces the default dispatch's TP
+                # reduce-scatter, expert-axis psum and output all-gather.
+                partial = jax.lax.psum(partial, (*ep_axes, tensor_axis_name))
+            else:
+                if tp_size > 1:
+                    # The TP reduction moves the combined [tokens, H] partial in the activation dtype, as the
+                    # default dispatch does for its top-k-expanded rows; the expert-axis psum stays fp32 like
+                    # ``replicated_expert_psum_unpermute``.
+                    partial = jax.lax.psum_scatter(
+                        partial.astype(self.dtype), tensor_axis_name, scatter_dimension=1, tiled=True
+                    ).astype(jnp.float32)
+                if ep_size > 1:
+                    partial = jax.lax.psum(partial, ep_axes)
+            return partial.astype(self.dtype).reshape(local_batch, local_seq, -1)
 
         def _local_expert_dispatch(
             x: jax.Array,
@@ -2979,6 +3096,9 @@ class BaseMoeModule(spx.Module, ABC):
                 # after the dispatch all-to-all.
                 return _dispatch_ep_batch(x, gate_logits)
 
+            if replicated_deferred_dispatch:
+                return _replicated_deferred_dispatch(x, gate_logits, _expert_ffn, expert_shard_id)
+
             if moe_chunk_size is not None:
                 partial_output = _chunked_dispatch(
                     x,
@@ -3181,10 +3301,11 @@ class BaseMoeModule(spx.Module, ABC):
             In decode-replicated mode the body's tp-sharded ``[B, S, H/tp]``
             result is all-gathered back to full hidden so the block's output
             matches the replicated decode residual stream declared by
-            ``output_ps``.
+            ``output_ps``. The replicated deferred dispatch already returns
+            the full hidden width there (one psum over the expert and TP axes).
             """
             out = _sparse_call_body(*call_args)
-            if decode_replicated_out:
+            if decode_replicated_out and not replicated_deferred_dispatch:
                 out = jax.lax.all_gather(out, tensor_axis_name, axis=2, tiled=True)
             return out
 
