@@ -53,6 +53,7 @@ from easydel.operations.kernels import (
     kda_ragged_rows_forward,
     kda_rows_forward,
 )
+from easydel.operations.kernels.ragged_kda_rank_major import kda_ragged_rows_rank_major_forward
 
 from ._conv_state import apply_conv_with_state
 from ._masking import apply_mask_to_padding_states
@@ -368,6 +369,11 @@ class KernelDeltaAttention(spx.Module):
         query, key, value, beta, decay, gate_low_rank = self._input_projections(hidden_states)
 
         query_start_loc = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
+        if cache_view is not None and query_start_loc is not None and getattr(query_start_loc, "ndim", 1) == 2:
+            # eSurge rank-major SPMD data parallelism (data_parallel_size > 1): [dp, T / dp, D] with per-rank rows.
+            return self._forward_rank_major_rows(
+                hidden_states, query, key, value, beta, decay, cache_view, query_start_loc, gate_low_rank, cache_metadata
+            )
         if cache_view is not None and query_start_loc is not None:
             if batch_size != 1:
                 raise ValueError(
@@ -463,6 +469,72 @@ class KernelDeltaAttention(spx.Module):
                 new_v_conv_state=kda_output.v_conv_state,
                 new_recurrent_state=kda_output.recurrent_state,
             )
+        return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)
+
+    def _forward_rank_major_rows(
+        self,
+        hidden_states: Float[Array, "dp tokens_per_rank hidden_dim"],
+        query: Float[Array, "dp tokens_per_rank key_dim"],
+        key: Float[Array, "dp tokens_per_rank key_dim"],
+        value: Float[Array, "dp tokens_per_rank value_dim"],
+        beta: Float[Array, "dp tokens_per_rank num_heads"],
+        decay: Float[Array, "dp tokens_per_rank num_heads head_k_dim"],
+        cache_view: KDACacheView,
+        query_start_loc: Array,
+        gate_low_rank: Float[Array, "dp tokens_per_rank gate_low_rank_dim"],
+        cache_metadata: KDAMetadata | None,
+    ) -> AttentionLayerOutput:
+        """Advance per-request KDA state over an eSurge rank-major SPMD DP batch ``[dp, T / dp, D]``.
+
+        eSurge serves with ``data_parallel_size > 1`` by giving every DP rank its own token block, rows
+        (``query_start_loc`` ``[dp, rows + 1]``) and block of pool slots (rank-local
+        ``cache_metadata.recurrent_state_indices`` ``[dp, rows]``). The conv and the delta rule run in
+        :func:`~easydel.operations.kernels.kda_ragged_rows_rank_major_forward` (the flat driver per rank under one
+        ``shard_map``); this method adds the output gate, norm and projection, as :meth:`_forward_packed_rows` does for
+        a single rank. Only eSurge rank-major steps reach it; training and single-rank serving never do.
+
+        Args:
+            hidden_states: Rank-major layer input ``[dp, T / dp, D]``.
+            query: Q projection ``[dp, T / dp, key_dim]``.
+            key: K projection ``[dp, T / dp, key_dim]``.
+            value: V projection ``[dp, T / dp, value_dim]``.
+            beta: Write strength ``[dp, T / dp, heads]`` (sigmoid applied).
+            decay: Per-channel log-decay ``[dp, T / dp, heads, head_k_dim]``.
+            cache_view: Per-layer KDA cache view (pool slot axis split into ``dp`` rank blocks).
+            query_start_loc: Rank-local cumulative row offsets ``[dp, rows + 1]``.
+            gate_low_rank: ``g_a_proj(hidden_states)`` from :meth:`_input_projections`.
+            cache_metadata: KDA metadata (context lengths, rank-local recurrent slots).
+
+        Returns:
+            :class:`AttentionLayerOutput` with the rank-major output and the updated cache view.
+
+        Raises:
+            ValueError: For a speculative step (``spec_recurrent_commit`` set), which rank-major DP does not serve.
+        """
+        if getattr(cache_metadata, "spec_recurrent_commit", None) is not None:
+            raise ValueError("Rank-major SPMD DP does not serve speculative KDA steps (spec_recurrent_commit is set).")
+        dp_size, tokens_per_rank = int(hidden_states.shape[0]), int(hidden_states.shape[1])
+        out, new_cache_view = kda_ragged_rows_rank_major_forward(
+            query=query,
+            key=key,
+            value=value,
+            beta=beta,
+            decay=decay,
+            conv_kernels=tuple(getattr(self, f"{n}_conv1d").weight.value.squeeze(1).T for n in ("q", "k", "v")),
+            cache_view=cache_view,
+            query_start_loc=query_start_loc,
+            context_lens=getattr(cache_metadata, "context_lens", None),
+            metadata=self.kda_op.get_impl_metadata(),
+            conv_dtype=jnp.bfloat16 if self.dtype in lowfloats else self.dtype,
+            chunk_size=self.chunk_size,
+            decay_lower_bound=self.gate_lower_bound,
+            precision=self.config.kda_chunk_precision if self.config.kda_chunk_impl == "kda_chunk" else "highest",
+            state_indices=getattr(cache_metadata, "recurrent_state_indices", None),
+            flat_forward=kda_ragged_rows_forward,
+        )
+        output_gate = self.g_b_proj(gate_low_rank).reshape(dp_size, tokens_per_rank, self.num_heads, self.head_v_dim)
+        output = self.o_norm(out.astype(hidden_states.dtype), output_gate)
+        output = checkpoint_name(self.o_proj(output.reshape(dp_size, tokens_per_rank, -1)), name="attn_output")
         return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)
 
     def _input_projections(

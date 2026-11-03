@@ -21,6 +21,7 @@ easydel.operations.kernels package
    paged_flash_attention
    ragged_kda
    ragged_kda_decode
+   ragged_kda_rank_major
    ragged_page_attention
    ring_attention
    scaled_dot_product_attention

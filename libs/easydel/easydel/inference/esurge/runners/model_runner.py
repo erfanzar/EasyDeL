@@ -825,21 +825,9 @@ class eSurgeRunner:
             raise ValueError("Rank-major SPMD DP does not support MPMD/PP execution yet.")
         if self.drafter is not None:
             raise ValueError("Rank-major SPMD DP does not support speculative decoding yet.")
-        # KDA layers advance per-row recurrent state through the packed-row driver, which has no
-        # per-rank scatter for rank-major ([dp, rows + 1]) metadata. The kernel refuses it at trace
-        # time; reject here so the failure is a clear config error at startup instead.
-        text_config = self.model.config.get_text_config()
-        get_layer_types = getattr(text_config, "get_layer_types", None)
-        try:
-            cache_layer_types = tuple(get_layer_types()) if callable(get_layer_types) else ()
-        except TypeError:
-            cache_layer_types = ()
-        cache_layer_types += tuple(getattr(text_config, "layer_types", ()) or ())
-        if any(str(layer_type).lower() == "kda_linear_attention" for layer_type in cache_layer_types):
-            raise ValueError(
-                "Rank-major SPMD DP does not support KDA linear-attention models yet "
-                "(glm5_next / kimi_linear); serve them with data_parallel_size=1."
-            )
+        # KDA linear-attention layers (glm5_next / kimi_linear) run rank-major steps through
+        # ``kda_ragged_rows_rank_major_forward``: one shard_map over (ATTN_DP, head axis) around the flat
+        # single-rank driver, on each rank's block of pool slots.
         if attn_mechanism not in ("ragged_page_attention_v3", MLA_RAGGED_ATTN_MECHANISM):
             raise ValueError(
                 "Rank-major SPMD DP currently supports "

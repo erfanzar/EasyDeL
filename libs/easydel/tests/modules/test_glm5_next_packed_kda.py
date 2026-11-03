@@ -236,7 +236,7 @@ def test_packed_mixed_continuation_and_fresh_prefill_rows():
 
 
 def test_rank_major_query_start_loc_is_rejected():
-    """Per-channel KDA cannot advance rank-major DP rows; it must fail loudly rather than use rank 0."""
+    """Rank-major query_start_loc over a single-rank batch [1, T, D] fails loudly instead of advancing rank 0 only."""
     import pytest
 
     model, layer = _layer()
