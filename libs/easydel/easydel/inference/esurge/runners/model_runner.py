@@ -635,8 +635,12 @@ class eSurgeRunner:
             # Compile token buckets up to the per-step batched-token budget, not
             # just one sequence's length, so a multi-prefill step (sum of tokens
             # > max_token_size) still has a bucket and doesn't overflow the
-            # scheduler's static budget.
-            max_token_size=max(int(self.max_model_len), int(self.max_num_batched_tokens)),
+            # scheduler's static budget. Under rank-major SPMD DP every rank scheduler gets the whole budget and a
+            # step's bucket is its busiest rank's tokens times the DP size, so the ladder reaches budget x DP size.
+            max_token_size=max(
+                int(self.max_model_len),
+                int(self.max_num_batched_tokens) * max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1)),
+            ),
             padding_gap=0,
         )
         if self.drafter is not None and int(self.num_draft_tokens) > 0:
@@ -1884,6 +1888,9 @@ class eSurgeRunner:
             target = int(max_num_batched_tokens)
             if target <= 0:
                 raise ValueError(f"max_num_batched_tokens must be positive, got {max_num_batched_tokens}")
+            # Rank-major SPMD DP: every rank scheduler gets the whole budget and a step runs the bucket of its busiest
+            # rank's tokens times the DP size (``execute_model``), so steps reach buckets up to budget x DP size.
+            target *= max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
 
             # Pick the smallest bucket >= target (keeps runtime bucket selection valid).
             cap = next((b for b in num_tokens_paddings if b >= target), num_tokens_paddings[-1])
