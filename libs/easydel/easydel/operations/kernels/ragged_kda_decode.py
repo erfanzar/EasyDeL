@@ -143,6 +143,7 @@ class RaggedKDADecodeOp(OperationImpl):
         num_tokens: int | None,
         use_qk_l2norm: bool,
         platform: str | None,
+        head_axis: str | tuple[str, ...] | None = None,
     ) -> tuple[Array, Array]:
         metadata = self.get_impl_metadata()
         tokens = int(query.shape[0]) if num_tokens is None else int(num_tokens)
@@ -157,7 +158,7 @@ class RaggedKDADecodeOp(OperationImpl):
             valid,
             has_initial_state,
             mesh=metadata.mesh,
-            head_axis=self.resolve_head_axis(int(query.shape[1]), tokens),
+            head_axis=self.resolve_head_axis(int(query.shape[1]), tokens) if head_axis is None else head_axis,
             use_qk_l2norm=bool(use_qk_l2norm),
             platform=platform,
             cfg=metadata.get_operation_config("ragged_kda_decode"),
@@ -178,6 +179,7 @@ class RaggedKDADecodeOp(OperationImpl):
         *,
         num_tokens: int | None = None,
         use_qk_l2norm: bool = True,
+        head_axis: str | tuple[str, ...] | None = None,
     ) -> tuple[Float[Array, "num_rows num_heads v_dim"], Float[Array, "num_slots num_heads head_dim v_dim"]]:
         """Run the XLA reference of ``ejkernel.modules.operations.ragged_kda_decode`` (head-sharded).
 
@@ -194,6 +196,8 @@ class RaggedKDADecodeOp(OperationImpl):
             has_initial_state: Optional ``[R]`` flags; ``False`` rows start from a zero state.
             num_tokens: Token count of the step's packed stream (head-axis rule); defaults to ``R``.
             use_qk_l2norm: L2-normalise queries and keys first.
+            head_axis: Mesh axis (or tuple of axes) to split the heads over, or ``None`` for
+                :meth:`resolve_head_axis`.
 
         Returns:
             ``(out [R, H, V] float32, new_recurrent_state [S, H, K, V])``.
@@ -211,6 +215,7 @@ class RaggedKDADecodeOp(OperationImpl):
             num_tokens=num_tokens,
             use_qk_l2norm=use_qk_l2norm,
             platform="xla",
+            head_axis=head_axis,
         )
 
     @jax.named_scope("easydel-ragged-kda-decode")
@@ -243,6 +248,7 @@ def kda_decode_rows_forward(
     metadata: OperationMetadata,
     conv_dtype: jnp.dtype = jnp.bfloat16,
     state_indices: Array | None = None,
+    head_axis: str | tuple[str, ...] | None = None,
 ) -> tuple[Float[Array, "1 seq_len num_heads d_state"], KDACacheView]:
     """Advance KDA state for an eSurge step in which every row has at most one token.
 
@@ -269,6 +275,8 @@ def kda_decode_rows_forward(
         metadata: Operation metadata (mesh, sharding policy, optional ``"ragged_kda_decode"`` config).
         conv_dtype: Dtype of the conv outputs fed to the recurrence.
         state_indices: Pool slot of every row, ``[rows]`` or ``[1, rows]``, or ``None`` for slot ``r``.
+        head_axis: Mesh axis (or tuple of axes) of the heads for the decode operation, or ``None`` for
+            :meth:`RaggedKDADecodeOp.resolve_head_axis` (see :func:`~easydel.operations.kernels.kda_ragged_rows_forward`).
 
     Returns:
         tuple: ``(outputs, new_cache_view)``: outputs ``[1, T, heads, head_v_dim]`` float32 and the cache view with
@@ -360,6 +368,7 @@ def kda_decode_rows_forward(
             advance,
             jnp.logical_not(fresh),
             num_tokens=seq_len,
+            head_axis=head_axis,
         )
         out = jnp.zeros((seq_len, num_heads, head_v), f32)
         out = out.at[jnp.where(advance, tok, seq_len)].set(row_out.astype(f32), mode="drop")
@@ -390,6 +399,7 @@ def kda_rows_forward(
     precision: str = "highest",
     state_indices: Array | None = None,
     flat_forward: Callable[..., tuple[Array, KDACacheView]] = kda_ragged_rows_forward,
+    head_axis: str | tuple[str, ...] | None = None,
 ) -> tuple[Float[Array, "1 seq_len num_heads d_state"], KDACacheView]:
     """eSurge KDA serving driver: :func:`kda_decode_rows_forward` on decode-only steps, else ``flat_forward``.
 
@@ -417,6 +427,8 @@ def kda_rows_forward(
         precision: ``"highest"`` or ``"default"`` for the flat driver's chunk dots.
         state_indices: Pool slot of every row, ``[rows]`` or ``[1, rows]``, or ``None`` for slot ``r``.
         flat_forward: Driver for steps with multi-token rows (same signature as ``kda_ragged_rows_forward``).
+        head_axis: Mesh axis (or tuple of axes) of the heads, passed to both drivers when given (``None``: each
+            operation resolves its own).
 
     Returns:
         tuple: ``(outputs [1, T, heads, head_v_dim] float32, new_cache_view)``.
@@ -434,6 +446,8 @@ def kda_rows_forward(
         conv_dtype=conv_dtype,
         state_indices=state_indices,
     )
+    if head_axis is not None:
+        common["head_axis"] = head_axis
     flat_kwargs = dict(chunk_size=chunk_size, decay_lower_bound=decay_lower_bound, precision=precision)
     leaves = tuple(getattr(cache_view, name) for name in LEAF_NAMES)
     rows = int(query_start_loc.shape[-1]) - 1

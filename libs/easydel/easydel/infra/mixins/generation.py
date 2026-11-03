@@ -1703,6 +1703,7 @@ class EasyGenerationMixin:
         """
         from easydel.caching import KDACacheConfig
         from easydel.layers.linear_attention import kda_layer_spec  # lazy: layers import this mixin's package
+        from easydel.layers.linear_attention._kda import kda_serving_head_axes
 
         text_config = self.config.get_text_config()
 
@@ -1720,6 +1721,8 @@ class EasyGenerationMixin:
             value_dim=spec.value_dim,
             d_conv=spec.d_conv,
             recurrent_state_shape=(spec.num_heads, spec.head_k_dim, spec.head_v_dim),
+            # ``kda_serving_ep_split``: heads over (head axis, ep axis); None keeps the partition axis's head axis.
+            head_shard_axes=kda_serving_head_axes(text_config),
         )
 
     def _create_standard_ragged_page_cache_config(

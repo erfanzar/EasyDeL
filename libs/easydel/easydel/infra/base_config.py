@@ -693,6 +693,14 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             forward + backward on TPU, its XLA implementation elsewhere). Default ``"scan"``.
         kda_chunk_precision: Precision of the non-inverse dots of ``kda_chunk_impl="kda_chunk"``: ``"highest"`` or
             ``"default"`` (bf16 MXU passes). Default ``"highest"``.
+        kda_serving_ep_split: Serving only (eSurge KDA cache views): split the heads of every Kernel Delta Attention
+            layer (GLM-5-Next, Kimi-Linear) over the head (tensor-parallel) axis and the expert-parallel axis together,
+            head axis major. The expert-parallel axis otherwise only replicates KDA, so every expert-parallel group
+            runs the same heads; with the split each device advances ``heads / (tp * ep)`` heads and holds that share
+            of the conv windows and recurrent states, the layer input is gathered over tp once and ``o_proj``'s partial
+            sums are reduced over all ``tp * ep`` devices. Used only when the expert-parallel axis has more than one
+            device and ``tp * ep`` divides the head count; training and non-eSurge caches never split. Default
+            ``False``.
         index_scoring_kernel: Dense multi-query scoring of every learned sparse-attention indexer that has a fused
             path (GLM-5-Next's pooled indexer, DeepSeek-V4's compressed and DeepSeek-V4.1's shared-key indexers):
             ``"xla"`` (per-head logits as XLA ops) or ``"pallas"`` (the fused ``indexer_scores`` operation; Pallas
@@ -810,6 +818,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     gather_shared_projection_input: NotRequired[bool]
     kda_chunk_impl: NotRequired[str]
     kda_chunk_precision: NotRequired[str]
+    kda_serving_ep_split: NotRequired[bool]
     index_scoring_kernel: NotRequired[str]
     dsa_sparse_training: NotRequired[bool | None]
     dsa_pool_training: NotRequired[bool]
@@ -919,6 +928,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         kda_chunk_impl: Chunked KDA implementation, ``"scan"`` or ``"kda_chunk"`` (default ``"scan"``).
         kda_chunk_precision: Non-inverse dot precision of ``"kda_chunk"``, ``"highest"`` or ``"default"``
             (default ``"highest"``).
+        kda_serving_ep_split: Split eSurge KDA heads over the head and expert-parallel axes (default ``False``).
         index_scoring_kernel: Indexer multi-query scoring, ``"xla"`` or ``"pallas"`` (default ``"xla"``).
         dsa_sparse_training: Force (``True``) / forbid (``False``) the sparse DSA training kernel; ``None``
             (default) picks it automatically.
@@ -1474,6 +1484,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         gather_shared_projection_input: bool = False,
         kda_chunk_impl: str = "scan",
         kda_chunk_precision: str = "highest",
+        kda_serving_ep_split: bool = False,
         index_scoring_kernel: str = "xla",
         dsa_sparse_training: bool | None = None,
         dsa_pool_training: bool = False,
@@ -1632,6 +1643,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.kda_chunk_impl = _one_of("kda_chunk_impl", getattr(self, "kda_chunk_impl", kda_chunk_impl), KDA_CHUNK_IMPLS)
         self.kda_chunk_precision = _one_of(
             "kda_chunk_precision", getattr(self, "kda_chunk_precision", kda_chunk_precision), KDA_CHUNK_PRECISIONS
+        )
+        self.kda_serving_ep_split = bool(
+            _optional_bool("kda_serving_ep_split", getattr(self, "kda_serving_ep_split", kda_serving_ep_split))
         )
         self.index_scoring_kernel = _one_of(
             "index_scoring_kernel", getattr(self, "index_scoring_kernel", index_scoring_kernel), INDEX_SCORING_KERNELS
@@ -2304,6 +2318,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "gather_shared_projection_input",
             "kda_chunk_impl",
             "kda_chunk_precision",
+            "kda_serving_ep_split",
             "index_scoring_kernel",
             "dsa_sparse_training",
             "dsa_pool_training",
@@ -2485,6 +2500,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         gather_shared_projection_input: bool = NOT_GIVEN,
         kda_chunk_impl: str = NOT_GIVEN,
         kda_chunk_precision: str = NOT_GIVEN,
+        kda_serving_ep_split: bool = NOT_GIVEN,
         index_scoring_kernel: str = NOT_GIVEN,
         dsa_sparse_training: bool | None = NOT_GIVEN,
         dsa_pool_training: bool = NOT_GIVEN,
@@ -2579,6 +2595,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 once (default ``False``).
             kda_chunk_impl: Chunked KDA implementation, ``"scan"`` or ``"kda_chunk"`` (default ``"scan"``).
             kda_chunk_precision: Non-inverse dot precision of ``"kda_chunk"`` (default ``"highest"``).
+            kda_serving_ep_split: Split eSurge KDA heads over the head and expert-parallel axes (default ``False``).
             index_scoring_kernel: Indexer multi-query scoring, ``"xla"`` or ``"pallas"`` (default ``"xla"``).
             dsa_sparse_training: Force / forbid the sparse DSA training kernel; ``None`` = automatic (default).
             dsa_pool_training: Pool-selection DSA training path for pooled indexers (default ``False``).
@@ -2683,6 +2700,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.kda_chunk_impl = _one_of("kda_chunk_impl", self.kda_chunk_impl, KDA_CHUNK_IMPLS)
         set_attrs_smartly(self, "kda_chunk_precision", "highest", kda_chunk_precision)
         self.kda_chunk_precision = _one_of("kda_chunk_precision", self.kda_chunk_precision, KDA_CHUNK_PRECISIONS)
+        set_attrs_smartly(self, "kda_serving_ep_split", False, kda_serving_ep_split)
+        self.kda_serving_ep_split = bool(_optional_bool("kda_serving_ep_split", self.kda_serving_ep_split))
         set_attrs_smartly(self, "index_scoring_kernel", "xla", index_scoring_kernel)
         self.index_scoring_kernel = _one_of("index_scoring_kernel", self.index_scoring_kernel, INDEX_SCORING_KERNELS)
         set_attrs_smartly(self, "dsa_sparse_training", None, dsa_sparse_training)

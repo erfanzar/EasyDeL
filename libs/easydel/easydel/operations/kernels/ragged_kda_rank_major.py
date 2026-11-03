@@ -78,6 +78,7 @@ def kda_ragged_rows_rank_major_forward(
     precision: str = "highest",
     state_indices: Array | None = None,
     flat_forward: Callable[..., tuple[Array, KDACacheView]] = kda_ragged_rows_forward,
+    head_axis: str | tuple[str, ...] | None = None,
 ) -> tuple[Float[Array, "dp tokens_per_rank num_heads d_state"], KDACacheView]:
     """:func:`~easydel.operations.kernels.kda_rows_forward` for eSurge rank-major SPMD data parallelism.
 
@@ -113,6 +114,8 @@ def kda_ragged_rows_rank_major_forward(
             of rank ``d`` owns its rank's slot ``r``).
         flat_forward: Single-rank driver for rank steps with multi-token rows (same signature as
             :func:`~easydel.operations.kernels.kda_ragged_rows_forward`), run per rank.
+        head_axis: Mesh axis (or tuple of axes) the heads and conv features split over (must not share an axis with
+            the attention data-parallel axis), or ``None`` for :meth:`RaggedKDAOp.resolve_head_axis`.
 
     Returns:
         tuple: ``(outputs, new_cache_view)``: outputs ``[dp, T / dp, heads, head_v_dim]`` float32 (zero at bucket
@@ -168,7 +171,8 @@ def kda_ragged_rows_rank_major_forward(
     op = OperationRegistry.create("ragged_kda", metadata)
     if not isinstance(op, RaggedKDAOp):
         raise TypeError(f"'ragged_kda' resolved to {type(op).__name__}, expected a RaggedKDAOp")
-    head_axis = op.resolve_head_axis(int(beta.shape[-1]), int(query.shape[1]))
+    if head_axis is None:
+        head_axis = op.resolve_head_axis(int(beta.shape[-1]), int(query.shape[1]))
     local_metadata = _meshless_metadata(metadata)
     view_metadata, layer_index = cache_view.metadata, cache_view.layer_index
 

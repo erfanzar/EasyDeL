@@ -21,8 +21,10 @@ forget-gate form and Hugging Face checkpoint layout: ``KimiDeltaAttention`` (Kim
 Shapes come from ``config.linear_attn_config`` through :func:`kda_layer_spec`, the same reader the KDA cache uses, so
 a layer and its cache cannot disagree. The runtime choices are
 :class:`~easydel.infra.base_config.EasyDeLBaseConfig` fields that every KDA model honours: ``kda_chunk_impl`` /
-``kda_chunk_precision`` (the chunked kernel, see :class:`~easydel.operations.kernels.KernelDeltaAttnOp`) and
-``gather_shared_projection_input`` (one tensor-parallel gather for the six input projections).
+``kda_chunk_precision`` (the chunked kernel, see :class:`~easydel.operations.kernels.KernelDeltaAttnOp`),
+``gather_shared_projection_input`` (one tensor-parallel gather for the six input projections) and
+``kda_serving_ep_split`` (eSurge serving: heads split over the head and expert-parallel axes, see
+:func:`kda_serving_head_axes`).
 """
 
 import functools
@@ -35,15 +37,18 @@ import spectrax as spx
 from eformer.loggings import get_logger
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax.ad_checkpoint import checkpoint_name
+from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float
-from spectrax import apply_logical_sharding, common_types, nn
+from spectrax import apply_logical_sharding, common_types, nn, with_sharding_constraint
 
+from easydel.axis import resolve_attention_data_parallel_axis
 from easydel.caching import KDACacheView, KDAMetadata
 from easydel.infra.modeling_outputs import AttentionLayerOutput
 from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info
+from easydel.infra.sharding import mesh_axis_size
 from easydel.infra.utils import ArrayParam
 from easydel.layers.linears import ColumnParallelLinear, RowParallelLinear, gather_shared_input
-from easydel.layers.norms import RMSNormGated, lowfloats
+from easydel.layers.norms import RMSNormGated, lowfloats, promote_dtype
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import (
     KDAOutput,
@@ -129,6 +134,71 @@ def kda_layer_spec(config: tp.Any) -> KDALayerSpec:
         gate_low_rank_dim=int(linear.get("gate_low_rank_dim", linear.get("head_dim", head_v_dim))),
         chunk_size=int(linear.get("chunk_size", 64)),
     )
+
+
+def _axis_names(entry: tp.Any) -> tuple[str, ...]:
+    """Mesh axis names of a partition-spec entry (a name, a tuple of names or ``None``)."""
+    if entry is None:
+        return ()
+    if isinstance(entry, str):
+        return (entry,)
+    return tuple(name for name in entry if isinstance(name, str))
+
+
+def kda_serving_head_axes(config: tp.Any) -> tuple[str, ...] | None:
+    """Mesh axes the eSurge KDA cache splits the heads over under ``config.kda_serving_ep_split``, else ``None``.
+
+    KDA heads normally split over the head axis (tensor parallelism) and are replicated over the expert-parallel axis,
+    so every expert-parallel group runs the same heads. With ``kda_serving_ep_split`` they split over the head axis and
+    the expert-parallel axis together, head axis major: each device's heads are then a subset of the heads it holds
+    without the split, so every column-parallel weight reaches the split layout by a local slice (no weight
+    collective; parameters and checkpoints keep their layout). ``None`` (today's layout) when the flag is off, the
+    expert-parallel axis has a single device or is already part of the head axis, the mesh is MPMD, eSurge's attention
+    data-parallel axis has more than one device (rank-major DP), or the split does not divide the head count.
+
+    Args:
+        config: Model (text) config with ``kda_serving_ep_split``, ``partition_axis``, ``mesh`` and the KDA shapes.
+
+    Returns:
+        ``(*head_axis, expert_parallel_axis)`` as mesh axis names, or ``None``.
+    """
+    if not getattr(config, "kda_serving_ep_split", False):
+        return None
+    paxis = getattr(config, "partition_axis", None)
+    if paxis is None:
+        return None
+    ep_axis = paxis.expert_parallel_axis
+    base = _axis_names(paxis.head_axis)
+    if not base or ep_axis in base:
+        return None
+    mesh = getattr(config, "mesh", None)
+    if mesh is None or getattr(mesh, "is_mpmd", False) or mesh_axis_size(mesh, ep_axis) <= 1:
+        return None
+    if mesh_axis_size(mesh, resolve_attention_data_parallel_axis(paxis)) > 1:
+        # eSurge rank-major SPMD data parallelism keeps today's head layout.
+        return None
+    axes = (*base, ep_axis)
+    num_heads = kda_layer_spec(config).num_heads
+    if num_heads % mesh_axis_size(mesh, axes):
+        logger.warn_once(
+            f"kda_serving_ep_split: {num_heads} KDA heads do not split over {axes} "
+            f"({mesh_axis_size(mesh, axes)} devices); keeping the head axis {base}."
+        )
+        return None
+    return axes
+
+
+class _ServingHeadSplit(tp.NamedTuple):
+    """Head split of one eSurge KDA step (``kda_serving_ep_split``).
+
+    Attributes:
+        axes: Mesh axes of the heads (and of the q / k / v / gate features).
+        lead: Partition-spec entries of the two leading activation dims (``(None, None)`` for a packed ``[1, T, ...]``
+            stream, ``(attention dp axis, None)`` for a rank-major ``[dp, T / dp, ...]`` batch).
+    """
+
+    axes: tuple[str, ...]
+    lead: tuple[tp.Any, ...]
 
 
 def unnest_legacy_kda_forget_gate(state: dict, expected_leaves: dict) -> dict:
@@ -366,15 +436,29 @@ class KernelDeltaAttention(spx.Module):
         batch_size, seq_len, _ = hidden_states.shape
         is_inference = seq_len == 1 and cache_view is not None
 
-        query, key, value, beta, decay, gate_low_rank = self._input_projections(hidden_states)
-
         query_start_loc = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
-        if cache_view is not None and query_start_loc is not None and getattr(query_start_loc, "ndim", 1) == 2:
+        serving = cache_view is not None and query_start_loc is not None
+        rank_major = serving and getattr(query_start_loc, "ndim", 1) == 2
+        # eSurge KDA cache views created under ``kda_serving_ep_split`` split the heads over (head axis, ep axis).
+        split = self._serving_head_split(cache_view, rank_major) if serving else None
+        query, key, value, beta, decay, gate_low_rank = self._input_projections(hidden_states, split=split)
+
+        if rank_major:
             # eSurge rank-major SPMD data parallelism (data_parallel_size > 1): [dp, T / dp, D] with per-rank rows.
             return self._forward_rank_major_rows(
-                hidden_states, query, key, value, beta, decay, cache_view, query_start_loc, gate_low_rank, cache_metadata
+                hidden_states,
+                query,
+                key,
+                value,
+                beta,
+                decay,
+                cache_view,
+                query_start_loc,
+                gate_low_rank,
+                cache_metadata,
+                split=split,
             )
-        if cache_view is not None and query_start_loc is not None:
+        if serving:
             if batch_size != 1:
                 raise ValueError(
                     f"Packed-row KDA serving expects one flattened token stream [1, T, D], got batch_size={batch_size}."
@@ -390,6 +474,7 @@ class KernelDeltaAttention(spx.Module):
                 query_start_loc=query_start_loc,
                 gate_low_rank=gate_low_rank,
                 cache_metadata=cache_metadata,
+                split=split,
             )
 
         conv_output_dtype = jnp.bfloat16 if self.dtype in lowfloats else self.dtype
@@ -483,6 +568,7 @@ class KernelDeltaAttention(spx.Module):
         query_start_loc: Array,
         gate_low_rank: Float[Array, "dp tokens_per_rank gate_low_rank_dim"],
         cache_metadata: KDAMetadata | None,
+        split: _ServingHeadSplit | None = None,
     ) -> AttentionLayerOutput:
         """Advance per-request KDA state over an eSurge rank-major SPMD DP batch ``[dp, T / dp, D]``.
 
@@ -504,6 +590,7 @@ class KernelDeltaAttention(spx.Module):
             query_start_loc: Rank-local cumulative row offsets ``[dp, rows + 1]``.
             gate_low_rank: ``g_a_proj(hidden_states)`` from :meth:`_input_projections`.
             cache_metadata: KDA metadata (context lengths, rank-local recurrent slots).
+            split: Head split of the step (``kda_serving_ep_split`` cache views), or ``None``.
 
         Returns:
             :class:`AttentionLayerOutput` with the rank-major output and the updated cache view.
@@ -513,7 +600,6 @@ class KernelDeltaAttention(spx.Module):
         """
         if getattr(cache_metadata, "spec_recurrent_commit", None) is not None:
             raise ValueError("Rank-major SPMD DP does not serve speculative KDA steps (spec_recurrent_commit is set).")
-        dp_size, tokens_per_rank = int(hidden_states.shape[0]), int(hidden_states.shape[1])
         out, new_cache_view = kda_ragged_rows_rank_major_forward(
             query=query,
             key=key,
@@ -531,14 +617,164 @@ class KernelDeltaAttention(spx.Module):
             precision=self.config.kda_chunk_precision if self.config.kda_chunk_impl == "kda_chunk" else "highest",
             state_indices=getattr(cache_metadata, "recurrent_state_indices", None),
             flat_forward=kda_ragged_rows_forward,
+            head_axis=None if split is None else split.axes,
         )
-        output_gate = self.g_b_proj(gate_low_rank).reshape(dp_size, tokens_per_rank, self.num_heads, self.head_v_dim)
-        output = self.o_norm(out.astype(hidden_states.dtype), output_gate)
-        output = checkpoint_name(self.o_proj(output.reshape(dp_size, tokens_per_rank, -1)), name="attn_output")
+        output = self._gated_output_projection(out, gate_low_rank, hidden_states.dtype, split)
         return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)
 
+    def _serving_head_split(self, cache_view: tp.Any, rank_major: bool) -> _ServingHeadSplit | None:
+        """Head split of an eSurge step, from the cache view's ``head_shard_axes`` (``kda_serving_ep_split``).
+
+        The pools of a KDA cache view created under ``kda_serving_ep_split`` (:func:`kda_serving_head_axes`) split
+        their heads over ``metadata.head_shard_axes``; the step then splits its heads the same way, so the conv windows
+        and recurrent states never move between devices. ``None`` (today's head-axis layout) for any other view, when
+        the axes do not divide the heads on this mesh, or when they share an axis with a rank-major step's
+        data-parallel axis.
+
+        Args:
+            cache_view: The layer's cache view.
+            rank_major: Whether the step is an eSurge rank-major SPMD DP step (``[dp, T / dp, D]``).
+
+        Returns:
+            The :class:`_ServingHeadSplit`, or ``None``.
+        """
+        axes = getattr(getattr(cache_view, "metadata", None), "head_shard_axes", None)
+        if not axes:
+            return None
+        axes = tuple(axes)
+        mesh = self.config.mesh
+        shards = mesh_axis_size(mesh, axes)
+        if shards <= 1 or self.num_heads % shards:
+            return None
+        if not rank_major:
+            return _ServingHeadSplit(axes, (None, None))
+        dp_axis = resolve_attention_data_parallel_axis(self.config.runtime_sharding_resolver)
+        if set(_axis_names(dp_axis)) & set(axes):
+            return None
+        return _ServingHeadSplit(axes, (dp_axis, None))
+
+    def _constrain_heads(self, x: Array, split: _ServingHeadSplit, trailing: int = 0) -> Array:
+        """Constrain ``x`` ``[lead0, lead1, features or heads, *trailing]`` to the split's head axes."""
+        spec = PartitionSpec(*split.lead, split.axes, *((None,) * trailing))
+        return with_sharding_constraint(x, spec, mesh=self.config.mesh)
+
+    def _gated_output_projection(
+        self,
+        out: Array,
+        gate_low_rank: Array,
+        hidden_dtype: jnp.dtype,
+        split: _ServingHeadSplit | None,
+    ) -> Array:
+        """Output gate, gated RMSNorm and ``o_proj`` of a serving step's KDA output ``[B, T, heads, head_v_dim]``.
+
+        With a head split the gate and the normalized heads stay split over the head axes, and ``o_proj``'s partial
+        sums over every device's heads are reduced straight into the residual stream's layout.
+
+        Args:
+            out: Driver output ``[B, T, heads, head_v_dim]``.
+            gate_low_rank: ``g_a_proj(hidden_states)`` ``[B, T, gate_low_rank_dim]``.
+            hidden_dtype: Dtype of the layer input (the driver output is cast to it before the norm).
+            split: Head split of the step, or ``None``.
+
+        Returns:
+            The layer output ``[B, T, hidden_size]``.
+        """
+        lead0, lead1 = int(out.shape[0]), int(out.shape[1])
+        if split is None:
+            gate = self.g_b_proj(gate_low_rank)
+        else:
+            gate = self._constrain_heads(self._split_projection(self.g_b_proj, gate_low_rank, split, dim=1), split)
+        output_gate = gate.reshape(lead0, lead1, self.num_heads, self.head_v_dim)
+        normed = self.o_norm(out.astype(hidden_dtype), output_gate).reshape(lead0, lead1, -1)
+        if split is None:
+            return checkpoint_name(self.o_proj(normed), name="attn_output")
+        projected = self._split_output_projection(self._constrain_heads(normed, split), split)
+        return checkpoint_name(projected, name="attn_output")
+
+    def _split_output_projection(self, normed: Array, split: _ServingHeadSplit) -> Array:
+        """``o_proj`` of a head-split serving step, with an explicit reduction of its partial sums.
+
+        Every device multiplies its own heads' features by its rows of the ``o_proj`` kernel (a local slice of its
+        tensor-parallel shard), and one ``shard_map`` reduces the partial sums: a reduce-scatter over the residual
+        stream's hidden axis (``partition_axis.hidden_state_axis``, one of the head axes), then an all-reduce of that
+        slice over the remaining head axes (the expert-parallel axis). Left to the SPMD partitioner, the same dot
+        gathered its input back over the expert-parallel axis and reduced over tensor parallelism only. Projections that
+        are not a plain bias-free :class:`RowParallelLinear` (quantized, LoRA, a fused distributed matmul, a
+        quantization rule), and residual layouts outside the head axes, keep :meth:`_split_projection`.
+
+        Args:
+            normed: Gated-norm output ``[lead0, lead1, value_dim]``, features split over ``split.axes``.
+            split: Head split of the step.
+
+        Returns:
+            The projection ``[lead0, lead1, hidden_size]`` in the residual stream's layout.
+        """
+        linear = self.o_proj
+        weight = getattr(getattr(linear, "weight", None), "value", None)
+        mesh = self.kda_op.get_impl_metadata().mesh
+        hidden = _axis_names(getattr(self.config.partition_axis, "hidden_state_axis", None))
+        if (
+            type(linear) is not RowParallelLinear
+            or linear.use_bias
+            or getattr(linear, "distributed_matmul", None) is not None
+            or not isinstance(weight, jax.Array)
+            or spx.quantization.rule_for(linear, "dot_general") is not None
+            or mesh is None
+            or not set(hidden) <= set(split.axes)
+            or int(weight.shape[1]) % mesh_axis_size(mesh, hidden)
+        ):
+            return self._split_projection(linear, normed, split, dim=0)
+        rest = tuple(name for name in split.axes if name not in hidden)
+        scale = float(getattr(linear, "output_scale", 1.0))
+
+        def body(x: Array, w: Array) -> Array:
+            x, w = promote_dtype((x, w), dtype=linear.dtype)
+            y = jnp.einsum("...i,io->...o", x, w, precision=linear.precision)
+            if hidden:
+                y = jax.lax.psum_scatter(y, hidden, scatter_dimension=y.ndim - 1, tiled=True)
+            if rest:
+                y = jax.lax.psum(y, rest)
+            return y * scale if scale != 1.0 else y
+
+        hidden_entry = None if not hidden else (hidden[0] if len(hidden) == 1 else hidden)
+        return jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(PartitionSpec(*split.lead, split.axes), PartitionSpec(split.axes, None)),
+            out_specs=PartitionSpec(*split.lead, hidden_entry),
+            check_vma=False,
+        )(normed, weight)
+
+    def _split_projection(self, linear: tp.Any, x: Array, split: _ServingHeadSplit, dim: int) -> Array:
+        """``linear(x)`` with its kernel constrained to the split's head axes on ``dim``.
+
+        ``dim=1``: a column-parallel projection's output features (q / k / v, beta, the gates); ``dim=0``: a
+        row-parallel projection's input features (``o_proj``). The head axes refine the tensor-parallel axis (head axis
+        major), so the constraint is a local slice of each device's tensor-parallel shard and the matmul runs on the
+        device's own heads only; without it XLA may re-gather the activation to the kernel's layout. Layers whose kernel
+        is not a plain array (quantized, LoRA, a fused distributed matmul) keep their own module call.
+
+        Args:
+            linear: A projection of this layer.
+            x: Its input.
+            split: Head split of the step.
+            dim: Kernel axis carrying the per-head features.
+
+        Returns:
+            The projection output.
+        """
+        weight = getattr(getattr(linear, "weight", None), "value", None)
+        if (
+            type(linear) not in (ColumnParallelLinear, RowParallelLinear)
+            or getattr(linear, "distributed_matmul", None) is not None
+            or not isinstance(weight, jax.Array)
+        ):
+            return linear(x)
+        spec = PartitionSpec(None, split.axes) if dim == 1 else PartitionSpec(split.axes, None)
+        return linear(x, w=with_sharding_constraint(weight, spec, mesh=self.config.mesh))
+
     def _input_projections(
-        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"], split: _ServingHeadSplit | None = None
     ) -> tuple[Array, Array, Array, Array, Array, Array]:
         """The six projections of the layer input: ``q/k/v``, beta, the log-decay and the output-gate low rank.
 
@@ -547,27 +783,41 @@ class KernelDeltaAttention(spx.Module):
         (:func:`easydel.layers.linears.gather_shared_input`), so the rematerialized backward does not re-gather it for
         every projection's weight gradient. Each projection still runs its own module call.
 
+        With a serving head split (``split``, ``kda_serving_ep_split`` cache views) the input is gathered the same way
+        and the per-head projections (``q/k/v``, beta, the forget gate and its log-decay) are constrained to the
+        split's head axes: each device computes only its own heads' columns, from a local slice of the column-parallel
+        weights.
+
         Args:
             hidden_states: Layer input ``(batch, seq_len, hidden_size)``.
+            split: Head split of an eSurge serving step, or ``None``.
 
         Returns:
             ``(query, key, value, beta, decay, gate_low_rank)``: the three projections before the convolutions,
             ``sigmoid(b_proj(x))`` ``[B, S, heads]``, the per-channel log-decay ``[B, S, heads, head_k_dim]`` and
             ``g_a_proj(x)`` ``[B, S, gate_low_rank_dim]``.
         """
-        if self.config.gather_shared_projection_input:
+        if self.config.gather_shared_projection_input or split is not None:
             hidden_states = gather_shared_input(hidden_states, self.config)
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        value = self.v_proj(hidden_states)
-        b_logits = self.b_proj(hidden_states)
+
+        def project(linear: tp.Any, x: Array) -> Array:
+            if split is None:
+                return linear(x)
+            return self._constrain_heads(self._split_projection(linear, x, split, dim=1), split)
+
+        query = project(self.q_proj, hidden_states)
+        key = project(self.k_proj, hidden_states)
+        value = project(self.v_proj, hidden_states)
+        b_logits = project(self.b_proj, hidden_states)
         gate_low_rank = self.g_a_proj(hidden_states)
         decay = fused_kda_gate_per_channel(
-            self.f_b_proj(self.f_a_proj(hidden_states)),
+            project(self.f_b_proj, self.f_a_proj(hidden_states)),
             self.A_log.value,
             self.dt_bias.value,
             lower_bound=self.gate_lower_bound,
         )
+        if split is not None:
+            decay = self._constrain_heads(decay, split, trailing=1)
         return query, key, value, jax.nn.sigmoid(b_logits), decay, gate_low_rank
 
     def _forward_packed_rows(
@@ -582,6 +832,7 @@ class KernelDeltaAttention(spx.Module):
         query_start_loc: Array,
         gate_low_rank: Float[Array, "1 seq_len gate_low_rank_dim"],
         cache_metadata: KDAMetadata | None = None,
+        split: _ServingHeadSplit | None = None,
     ) -> AttentionLayerOutput:
         """Advance per-request KDA state over an eSurge packed token stream ``[1, T, D]``.
 
@@ -609,6 +860,9 @@ class KernelDeltaAttention(spx.Module):
             query_start_loc: Cumulative segment offsets ``[rows + 1]``.
             gate_low_rank: ``g_a_proj(hidden_states)`` from :meth:`_input_projections`.
             cache_metadata: Optional KDA metadata (context lengths, speculative commit).
+            split: Head split of the step (``kda_serving_ep_split`` cache views), or ``None``. The flat and decode
+                drivers then run their conv and recurrence on the split's head axes; the row-padded speculative driver
+                leaves the layout to XLA.
 
         Returns:
             :class:`AttentionLayerOutput` with the packed output row and the updated cache view.
@@ -617,7 +871,6 @@ class KernelDeltaAttention(spx.Module):
             ValueError: If a speculative step (``spec_recurrent_commit`` set) also names explicit pool slots
                 (``recurrent_state_indices``), which the row-padded driver cannot follow.
         """
-        seq_len = hidden_states.shape[1]
         conv_kernels = tuple(getattr(self, f"{n}_conv1d").weight.value.squeeze(1).T for n in ("q", "k", "v"))
         conv_dtype = jnp.bfloat16 if self.dtype in lowfloats else self.dtype
         context_lens = getattr(cache_metadata, "context_lens", None)
@@ -649,6 +902,7 @@ class KernelDeltaAttention(spx.Module):
                 decay_lower_bound=self.gate_lower_bound,
                 precision=chunk_precision,
                 state_indices=recurrent_state_indices,
+                head_axis=None if split is None else split.axes,
             )
         else:
             if recurrent_state_indices is not None:
@@ -672,10 +926,14 @@ class KernelDeltaAttention(spx.Module):
                 chunk_size=self.chunk_size,
                 spec_recurrent_commit=spec_recurrent_commit,
             )
-        output_gate = self.g_b_proj(gate_low_rank).reshape(1, seq_len, self.num_heads, self.head_v_dim)
-        output = self.o_norm(out_packed.astype(hidden_states.dtype), output_gate)
-        output = checkpoint_name(self.o_proj(output.reshape(1, seq_len, -1)), name="attn_output")
+        output = self._gated_output_projection(out_packed, gate_low_rank, hidden_states.dtype, split)
         return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)
 
 
-__all__ = ("KDALayerSpec", "KernelDeltaAttention", "kda_layer_spec", "unnest_legacy_kda_forget_gate")
+__all__ = (
+    "KDALayerSpec",
+    "KernelDeltaAttention",
+    "kda_layer_spec",
+    "kda_serving_head_axes",
+    "unnest_legacy_kda_forget_gate",
+)

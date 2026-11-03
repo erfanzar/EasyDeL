@@ -164,6 +164,7 @@ class RaggedKDAOp(OperationImpl):
         use_qk_l2norm: bool = True,
         decay_lower_bound: float | None = None,
         precision: str = "highest",
+        head_axis: str | tuple[str, ...] | None = None,
     ) -> tuple[Float[Array, "num_tokens num_heads v_dim"], Float[Array, "num_slots num_heads head_dim v_dim"]]:
         """Run ragged KDA through ``ejkernel.modules.operations.ragged_kda_head_sharded``.
 
@@ -183,6 +184,8 @@ class RaggedKDAOp(OperationImpl):
             decay_lower_bound: Promise that every log-decay is ``>= decay_lower_bound`` (a safe-gate bound selects
                 the factored pairwise decay), or ``None``.
             precision: ``"highest"`` or ``"default"`` for the non-inverse chunk dots.
+            head_axis: Mesh axis (or tuple of axes) to split the heads over, or ``None`` for
+                :meth:`resolve_head_axis` (eSurge KDA steps with ``kda_serving_ep_split`` pass the cache's head axes).
 
         Returns:
             ``(out [T, H, V] float32, new_recurrent_state [S, H, K, V])``; the pool keeps its dtype.
@@ -201,6 +204,7 @@ class RaggedKDAOp(OperationImpl):
             use_qk_l2norm=use_qk_l2norm,
             decay_lower_bound=decay_lower_bound,
             precision=precision,
+            head_axis=head_axis,
             platform="xla",
         )
 
@@ -236,6 +240,7 @@ class RaggedKDAOp(OperationImpl):
         use_qk_l2norm: bool = True,
         decay_lower_bound: float | None = None,
         precision: str = "highest",
+        head_axis: str | tuple[str, ...] | None = None,
         platform: str | None = None,
     ) -> tuple[Array, Array]:
         """Call ``ejkernel.modules.operations.ragged_kda_head_sharded`` on one platform.
@@ -254,6 +259,7 @@ class RaggedKDAOp(OperationImpl):
             use_qk_l2norm: L2-normalise queries and keys first.
             decay_lower_bound: Promised lower bound of every log-decay, or ``None``.
             precision: Precision of the non-inverse chunk dots.
+            head_axis: Mesh axis (or tuple of axes) of the heads, or ``None`` for :meth:`resolve_head_axis`.
             platform: ``"xla"`` (the reference), or ``None`` for the operation config's platform.
 
         Returns:
@@ -271,7 +277,9 @@ class RaggedKDAOp(OperationImpl):
             state_indices,
             has_initial_state,
             mesh=metadata.mesh,
-            head_axis=self.resolve_head_axis(int(query.shape[1]), int(query.shape[0])),
+            head_axis=(
+                self.resolve_head_axis(int(query.shape[1]), int(query.shape[0])) if head_axis is None else head_axis
+            ),
             chunk_size=int(chunk_size),
             use_qk_l2norm=bool(use_qk_l2norm),
             decay_lower_bound=decay_lower_bound,
@@ -298,6 +306,7 @@ def kda_ragged_rows_forward(
     decay_lower_bound: float | None = None,
     precision: str = "highest",
     state_indices: Array | None = None,
+    head_axis: str | tuple[str, ...] | None = None,
 ) -> tuple[Float[Array, "1 seq_len num_heads d_state"], KDACacheView]:
     """Advance per-request per-channel KDA state over an eSurge packed token stream, on the flat stream.
 
@@ -337,6 +346,10 @@ def kda_ragged_rows_forward(
         state_indices: Pool slot of every row, ``[rows]`` or ``[1, rows]`` (eSurge's
             ``cache_metadata.recurrent_state_indices``), or ``None`` for slot ``r``. Windows and states are then
             gathered and scattered by slot; rows without tokens or with an out-of-range slot write nothing.
+        head_axis: Mesh axis (or tuple of axes) the conv features and heads split over, or ``None`` for the
+            operation's :meth:`RaggedKDAOp.resolve_head_axis`. eSurge KDA cache views created with
+            ``kda_serving_ep_split`` pass their head axes (head axis, expert-parallel axis); the pools must be split
+            the same way.
 
     Returns:
         tuple: ``(outputs, new_cache_view)``: outputs ``[1, T, heads, head_v_dim]`` float32 (zero at bucket padding)
@@ -392,7 +405,8 @@ def kda_ragged_rows_forward(
         # zero length and keep their windows).
         distribution = jnp.full((3,), rows, dtype=jnp.int32)
         mesh = metadata.mesh
-        head_axis = op.resolve_head_axis(num_heads, seq_len)
+        if head_axis is None:
+            head_axis = op.resolve_head_axis(num_heads, seq_len)
         if state_indices is None:
             read_slots = write_slots = None
         else:
@@ -445,6 +459,7 @@ def kda_ragged_rows_forward(
             use_qk_l2norm=True,
             decay_lower_bound=decay_lower_bound,
             precision=precision,
+            head_axis=head_axis,
         )
     new_cache_view = cache_view.update_kda_states(
         new_q_conv_state=q_pool,
