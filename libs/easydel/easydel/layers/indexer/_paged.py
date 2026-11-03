@@ -85,12 +85,16 @@ def _paged_pool_topk_impl(platform: str):
     return kernel_registry.get("paged_pool_topk", platform=platform, backend="any")
 
 
-def _run_pool_topk(kernel_mesh, *args, **kwargs) -> jax.Array:
+def _run_pool_topk(kernel_mesh, *args, constrain_heads=None, **kwargs) -> jax.Array:
     """Dispatch ``paged_pool_topk``: fused Pallas on TPU, XLA loop otherwise.
 
     A Pallas call cannot be SPMD-partitioned, so on a multi-device mesh it runs under a
     replicated ``shard_map`` over ``kernel_mesh`` (valid only while the indexer pages are
     replicated; the cache view returns ``None`` otherwise, which keeps the XLA path).
+
+    ``constrain_heads`` optionally pins the query ``[T, H, D]`` and head weights ``[T, H]`` to
+    their head-sharded projection layout (``MLARaggedPagesCacheView.constrain_indexer_heads``)
+    before the rows are split over the mesh; it is applied on that path only.
     """
     xla = _paged_pool_topk_impl("xla")
     if jax.default_backend() != "tpu":
@@ -114,6 +118,12 @@ def _run_pool_topk(kernel_mesh, *args, **kwargs) -> jax.Array:
         row = PartitionSpec(tuple(mesh.axis_names))
         in_specs = (row, row, rep, rep, row, row)
         out_specs = row
+        if constrain_heads is not None:
+            # The query and head weights leave column-parallel projections sharded over heads. Pinned to that
+            # layout, XLA moves them to the row split with an all-to-all of the activation; unpinned, it
+            # all-gathers the projection weights on every call instead (GLM-5.3-Flash at tp4: the bf16
+            # [32, 128, 1536] indexer query weight in every DSA layer).
+            args = (constrain_heads(args[0]), constrain_heads(args[1]), *args[2:])
     else:
         in_specs = (rep,) * len(args)
         out_specs = rep
@@ -248,6 +258,7 @@ def _pool_select_core(
     rows_c: tp.Callable[[jax.Array], jax.Array],
     pages_c: tp.Callable[[jax.Array], jax.Array],
     kernel_mesh: object | None,
+    heads_c: tp.Callable[[jax.Array], jax.Array] | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Page update + pool selection for one set of 1-D ragged metadata (a whole batch or one DP rank)."""
     num_pages, page_size, packed_dim = token_pages.shape
@@ -294,6 +305,7 @@ def _pool_select_core(
         block_tables,
         seq,
         num_complete,
+        constrain_heads=heads_c,
         k=select_k,
         sm_scale=sm_scale,
         relu=relu,
@@ -329,6 +341,7 @@ def paged_pool_select(
     constrain_pages: tp.Callable[[jax.Array], jax.Array] | None = None,
     kernel_mesh: object | None = None,
     dp_sharding: tuple[tp.Any, tp.Any] | None = None,
+    constrain_heads: tp.Callable[[jax.Array], jax.Array] | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Update the paged indexer state and select pools for every packed token.
 
@@ -356,6 +369,10 @@ def paged_pool_select(
             multi-device mesh keeps the partitioned XLA path.
         dp_sharding: ``(mesh, page_axis_names)`` of the DP-sharded indexer pages
             (``MLARaggedPagesCacheView.indexer_dp_sharding()``); required for rank-major metadata.
+        constrain_heads: Optional sharding constraint pinning the query ``[T, H, D]`` and head
+            weights ``[T, H]`` head-sharded (``MLARaggedPagesCacheView.constrain_indexer_heads``)
+            where the fused top-k splits rows over ``kernel_mesh``, so the activations are
+            resharded instead of the projection weights being gathered. Unused on the rank-major path.
 
     Returns:
         ``(selected [T, index_topk // kpool + 1], token_pages, pool_pages)``: chunk
@@ -422,6 +439,7 @@ def paged_pool_select(
             rows_c=constrain_rows or _identity,
             pages_c=constrain_pages or _identity,
             kernel_mesh=kernel_mesh,
+            heads_c=constrain_heads,
         )
 
     mesh, names, dp = _dp_setup(

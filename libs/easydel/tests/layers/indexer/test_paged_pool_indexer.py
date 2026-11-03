@@ -29,6 +29,7 @@ import numpy as np
 import pytest
 import spectrax as spx
 from easydel.layers.indexer import IndexerConfig, IndexerKind, SparseIndexer, paged_pool_select
+from jax.sharding import NamedSharding, PartitionSpec
 
 HID, H, D = 64, 4, 16
 PAGE = 8
@@ -75,23 +76,37 @@ def _kernel_mesh(num_devices):
     return jax.sharding.Mesh(np.asarray(jax.devices()[:num_devices]), ("x",))
 
 
+def _head_constraint(mesh):
+    """Pin ``[T, heads, ...]`` activations head-sharded over ``mesh`` (what a tensor-parallel projection emits)."""
+
+    def constrain(x):
+        spec = PartitionSpec(None, "x", *([None] * (x.ndim - 2)))
+        return jax.lax.with_sharding_constraint(x, NamedSharding(mesh, spec))
+
+    return constrain
+
+
 @pytest.mark.parametrize(
-    ("kpool", "topk", "pool_chunk", "dim", "mesh_devices"),
+    ("kpool", "topk", "pool_chunk", "dim", "mesh_devices", "head_sharded"),
     [
-        (4, 12, 2, D, None),
-        (4, 8, 128, D, None),
-        (2, 10, 3, D, None),
+        (4, 12, 2, D, None, False),
+        (4, 8, 128, D, None, False),
+        (2, 10, 3, D, None, False),
         # dim 128 is tileable; a 1-device kernel mesh runs the fused Pallas selector directly
         # (no mesh on a multi-chip host would take the XLA fallback instead).
-        (4, 12, 1024, 128, 1),
+        (4, 12, 1024, 128, 1, False),
         # Production tp>1 dispatch: replicated shard_map over a multi-chip kernel mesh.
-        (4, 12, 1024, 128, 4),
-        (4, 8, 2, D, 4),
+        (4, 12, 1024, 128, 4, False),
+        (4, 8, 2, D, 4, False),
+        # Same, with the query and head weights pinned head-sharded before the rows are split over the mesh
+        # (``constrain_heads``, as the serving cache view does for tensor-parallel indexer projections).
+        (4, 12, 1024, 128, 4, True),
     ],
 )
-def test_paged_pool_select_matches_dense_indexer(kpool, topk, pool_chunk, dim, mesh_devices):
+def test_paged_pool_select_matches_dense_indexer(kpool, topk, pool_chunk, dim, mesh_devices, head_sharded):
     D = dim  # shadows the module default for this case
     kernel_mesh = _kernel_mesh(mesh_devices)
+    constrain_heads = _head_constraint(kernel_mesh) if head_sharded else None
     indexer = _indexer(kpool, topk, dim)
     steps = _schedule()
     lengths = [sum(s[i] for s in steps) for i in range(3)]
@@ -114,7 +129,11 @@ def test_paged_pool_select_matches_dense_indexer(kpool, topk, pool_chunk, dim, m
 
         token_pages = jnp.zeros((num_pages, PAGE, 2 * D), jnp.float32)
         pool_pages = jnp.zeros((num_pages, PAGE // kpool, D), jnp.float32)
-        select = jax.jit(lambda *a: paged_pool_select(indexer, *a, pool_chunk=pool_chunk, kernel_mesh=kernel_mesh))
+        select = jax.jit(
+            lambda *a: paged_pool_select(
+                indexer, *a, pool_chunk=pool_chunk, kernel_mesh=kernel_mesh, constrain_heads=constrain_heads
+            )
+        )
         done = [0, 0, 0]
         for step in steps:
             hs, qs, owners = [], [], []
