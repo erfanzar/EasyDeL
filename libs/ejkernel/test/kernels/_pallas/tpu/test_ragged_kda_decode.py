@@ -151,18 +151,29 @@ def test_pallas_decode_matches_float64_and_xla_reference(in_dtype, state_dtype, 
     assert _rel(_f64(new_pool), _f64(ref_pool)) < 1e-5
 
 
-def test_head_sharded_operation_matches_float64_reference():
+@pytest.mark.parametrize(
+    ("heads", "mesh_shape"),
+    [
+        pytest.param(8, (4,), id="2-heads-per-device-tp4"),
+        pytest.param(16, (4,), id="4-heads-per-device-tp4"),
+        pytest.param(16, (2, 2), id="4-heads-per-device-ep2-tp2"),
+    ],
+)
+def test_head_sharded_operation_matches_float64_reference(heads, mesh_shape):
     devices = jax.devices()
     if len(devices) < 4:
         pytest.skip("needs 4 devices")
-    mesh = Mesh(np.asarray(devices[:4]), ("tp",))
-    case = _case(2, jnp.bfloat16, jnp.bfloat16, heads=8)  # 2 heads per device
+    # A 2-D mesh splits the heads over both axes (ep x tp), as serving does with 4 heads per device on 16 chips.
+    axes = ("tp",) if len(mesh_shape) == 1 else ("ep", "tp")
+    mesh = Mesh(np.asarray(devices[:4]).reshape(mesh_shape), axes)
+    head_axis = axes[0] if len(axes) == 1 else axes
+    case = _case(2, jnp.bfloat16, jnp.bfloat16, heads=heads)
     live, init = _flags()
     tokens, pool = _device(case, jnp.bfloat16, jnp.bfloat16)
 
     @jax.jit
     def step(tokens, pool, live, init):
-        return ragged_kda_decode_head_sharded(*tokens, pool, None, live, init, mesh=mesh, head_axis="tp")
+        return ragged_kda_decode_head_sharded(*tokens, pool, None, live, init, mesh=mesh, head_axis=head_axis)
 
     out, new_pool = step(tokens, pool, jnp.asarray(live), jnp.asarray(init))
     _check(out, new_pool, case, np.arange(ROWS, dtype=np.int32), live, init, 2e-2)

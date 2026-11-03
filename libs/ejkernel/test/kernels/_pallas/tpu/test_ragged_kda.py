@@ -149,6 +149,7 @@ def _explicit_slots(num_rows):
         pytest.param(jnp.float32, jnp.float32, 8, True, 0, 1e-4, id="f32-explicit-slots-8-heads"),
         pytest.param(jnp.bfloat16, jnp.bfloat16, 4, False, 0, 2e-2, id="bf16-bf16-pool"),
         pytest.param(jnp.bfloat16, jnp.float32, 4, True, 5, 2e-2, id="bf16-f32-pool-explicit-slots"),
+        pytest.param(jnp.bfloat16, jnp.bfloat16, 16, True, 3, 2e-2, id="bf16-explicit-slots-16-heads"),
     ],
 )
 def test_pallas_chunk_path_matches_float64_and_xla_reference(in_dtype, pool_dtype, heads, explicit, pad, tol):
@@ -187,12 +188,23 @@ def test_registry_entry_without_a_decay_bound_matches_float64_reference():
     _check(out, pool, case, LENS, np.arange(len(LENS), dtype=np.int32), INIT, 1e-4)
 
 
-def test_head_sharded_operation_matches_float64_reference():
+@pytest.mark.parametrize(
+    ("heads", "mesh_shape"),
+    [
+        pytest.param(8, (4,), id="2-heads-per-device-tp4"),
+        pytest.param(16, (4,), id="4-heads-per-device-tp4"),
+        pytest.param(16, (2, 2), id="4-heads-per-device-ep2-tp2"),
+    ],
+)
+def test_head_sharded_operation_matches_float64_reference(heads, mesh_shape):
     devices = jax.devices()
     if len(devices) < 4:
         pytest.skip("needs 4 devices")
-    mesh = Mesh(np.asarray(devices[:4]), ("tp",))
-    case = _case(LENS, 8, SLOTS, seed=5, in_dtype=jnp.bfloat16, pool_dtype=jnp.bfloat16)  # 2 heads per device
+    # A 2-D mesh splits the heads over both axes (ep x tp), as serving does with 4 heads per device on 16 chips.
+    axes = ("tp",) if len(mesh_shape) == 1 else ("ep", "tp")
+    mesh = Mesh(np.asarray(devices[:4]).reshape(mesh_shape), axes)
+    head_axis = axes[0] if len(axes) == 1 else axes
+    case = _case(LENS, heads, SLOTS, seed=5, in_dtype=jnp.bfloat16, pool_dtype=jnp.bfloat16)
     tokens = tuple(jnp.asarray(case[name], jnp.bfloat16) for name in ("q", "k", "v", "beta"))
 
     @jax.jit
@@ -205,7 +217,7 @@ def test_head_sharded_operation_matches_float64_reference():
             None,
             init,
             mesh=mesh,
-            head_axis="tp",
+            head_axis=head_axis,
             chunk_size=CHUNK,
             decay_lower_bound=LOWER,
         )

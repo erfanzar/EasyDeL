@@ -23,6 +23,8 @@ The live chunks of a step are laid out back to back (row by row) in a static num
     num_chunks = max_live_chunks(T, R, cs)           # static bound on the live chunks (see that function)
 
     XLA:     windows of q, k, v, beta, decay -> normalised, masked, head-major [num_chunks, H, cs, D] fp32
+             (beta [T, H] has no lane axis: its windows come from a row gather of cs-token blocks plus static
+             shifts, because XLA lowers a window gather of it to a loop with one iteration per chunk slot)
     kernel:  grid = (H // block_h "parallel", num_chunks "arbitrary")
              state [block_h, K, V] fp32 in a VMEM scratch, carried along the chunk axis
              a row's first chunk seeds it from the row's pool slot (zero for a fresh row), its last chunk stores it
@@ -182,6 +184,43 @@ def _chunk_tables(
     }
 
 
+def _beta_windows(beta: Array, starts: Array, chunk_size: int) -> Array:
+    """``beta[s : s + cs]`` for every window start ``s`` of ``starts`` ``[C]``: ``[C, cs, H]``, without a window gather.
+
+    ``beta`` ``[T, H]`` has no 128-lane axis (in serving it leaves the narrow beta projection token-minor), and a
+    vmapped ``dynamic_slice`` of it lowers to an XLA while loop with one index fusion and one dynamic-update-slice per
+    window (544 iterations per call at 32,768 tokens and 32 rows). Instead ``beta`` is viewed as rows of ``cs``
+    tokens; each window lies in the two consecutive rows starting at row ``s // cs`` (one plain row gather), and
+    ``log2(cs)`` static selects shift that pair left by ``s % cs``. Pure data movement: the result equals the window
+    slices bit for bit (non-finite values included).
+
+    Args:
+        beta: ``[T, H]`` with ``T >= cs``.
+        starts: Window starts ``[C]`` int32 in ``[0, T - cs]``.
+        chunk_size: Window length ``cs`` (a power of two).
+
+    Returns:
+        ``[C, cs, H]`` in ``beta``'s dtype.
+    """
+    cs = int(chunk_size)
+    num_tokens, num_heads = beta.shape
+    num_blocks = -(-num_tokens // cs)
+    if num_blocks * cs != num_tokens:
+        beta = jnp.pad(beta, ((0, num_blocks * cs - num_tokens), (0, 0)))
+    blocks = beta.reshape(num_blocks, cs * num_heads)
+    starts = starts.astype(jnp.int32)
+    first = starts // cs
+    shift = starts - first * cs
+    # A window that ends inside its first row (shift 0 at the last row) never reads the clamped second row.
+    rows = jnp.stack([first, jnp.minimum(first + 1, num_blocks - 1)], axis=1)
+    pair = jnp.take(blocks, rows, axis=0, mode="clip").reshape(starts.shape[0], 2 * cs, num_heads)
+    for bit in range(cs.bit_length() - 1):
+        step = 1 << bit
+        moved = jnp.concatenate([pair[:, step:], pair[:, :step]], axis=1)
+        pair = jnp.where(((shift >> bit) & 1)[:, None, None] == 1, moved, pair)
+    return pair[:, :cs]
+
+
 def _chunk_inputs(
     query: Array,
     key: Array,
@@ -196,6 +235,7 @@ def _chunk_inputs(
     """Head-major chunk windows ``[C, H, cs, D]`` fp32 of ``q * K**-0.5``, ``k``, ``k * beta``, ``v * beta``, ``g``.
 
     Same per-token arithmetic and masking as the XLA reference's chunk loop: lanes outside ``[lo, hi)`` are zero.
+    The beta windows come from :func:`_beta_windows` (equal to window slices bit for bit, without a per-window loop).
     """
     cs = chunk_size
     f32 = jnp.float32
@@ -217,7 +257,7 @@ def _chunk_inputs(
     k = jnp.where(vmask, k, 0.0)
     v = jnp.where(vmask, windows(value).astype(f32), 0.0)
     g = jnp.where(vmask, windows(decay).astype(f32), 0.0)
-    b = jnp.where(valid[:, :, None], windows(beta).astype(f32), 0.0)[..., None]
+    b = jnp.where(valid[:, :, None], _beta_windows(beta, starts, cs).astype(f32), 0.0)[..., None]
     return tuple(jnp.swapaxes(x, 1, 2) for x in (q, k, k * b, v * b, g))
 
 
