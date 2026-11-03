@@ -84,7 +84,10 @@ def sparse_multi_latent_ragged_page_attention(
         q_scale: Optional query dequantisation scale.
         k_scale: Optional key dequantisation scale.
         v_scale: Optional value dequantisation scale.
-        num_queries_per_block: Used only by the XLA fallback.
+        num_queries_per_block: Query tokens per program of the query-block prefill kernel (2 to 16): in buckets of
+            at least 256 tokens whose blocks of that many consecutive tokens each hold one sequence, every block
+            fetches the union of its tokens' selected chunks once. ``None`` or 1 keeps one program per token, as do
+            smaller buckets and steps with a block spanning two sequences. Also the XLA fallback's rows per step.
         num_chunks_per_block: Chunks fetched per kernel step (default ``128 // chunk_size``).
         vmem_limit_bytes: Optional VMEM limit for the Pallas compiler.
 
@@ -135,6 +138,7 @@ def sparse_multi_latent_ragged_page_attention(
         v_scale=v_scale,
         num_chunks_per_block=num_chunks_per_block,
         vmem_limit_bytes=vmem_limit_bytes,
+        query_block=None if num_queries_per_block is None else int(num_queries_per_block),
     )
 
 

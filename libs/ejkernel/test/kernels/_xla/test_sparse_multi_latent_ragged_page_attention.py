@@ -37,8 +37,13 @@ CACHE_DIM = 256  # align(NOPE, 128) + align(PE, 128)
 PAD_TOKENS = 3
 
 
-def _build(seed, kv_lens, q_lens, *, chunk_size, width, dtype=jnp.float32, page=PAGE, pages_per_seq=PAGES_PER_SEQ):
-    """Ragged batch over a randomly permuted table of ``page``-token pages, ``pages_per_seq`` per sequence."""
+def _build(
+    seed, kv_lens, q_lens, *, chunk_size, width, dtype=jnp.float32, page=PAGE, pages_per_seq=PAGES_PER_SEQ, heads=HEADS
+):
+    """Ragged batch over a randomly permuted table of ``page``-token pages, ``pages_per_seq`` per sequence.
+
+    Queries have ``heads`` heads.
+    """
     rng = np.random.default_rng(seed)
     num_live = len(kv_lens)
     kv_lens_all = [*kv_lens, 0]  # one extra empty slot: max_num_seqs > live seqs
@@ -68,8 +73,8 @@ def _build(seed, kv_lens, q_lens, *, chunk_size, width, dtype=jnp.float32, page=
     for s, (kl, ql) in enumerate(zip(kv_lens, q_lens, strict=True)):
         seq_of += [s] * ql
         pos_of += list(range(kl - ql, kl))
-    q_nope = rng.standard_normal((total, HEADS, NOPE)).astype(np.float32)
-    q_pe = rng.standard_normal((total, HEADS, PE)).astype(np.float32)
+    q_nope = rng.standard_normal((total, heads, NOPE)).astype(np.float32)
+    q_pe = rng.standard_normal((total, heads, PE)).astype(np.float32)
     k_nope = rng.standard_normal((total, NOPE)).astype(np.float32)
     k_pe = rng.standard_normal((total, PE)).astype(np.float32)
     for t, (s, p) in enumerate(zip(seq_of, pos_of, strict=True)):

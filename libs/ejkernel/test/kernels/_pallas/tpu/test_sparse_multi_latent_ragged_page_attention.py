@@ -28,6 +28,7 @@ from ejkernel.kernels._pallas.tpu.sparse_multi_latent_ragged_page_attention impo
     sparse_multi_latent_ragged_page_attention as pallas_sparse_mla,
 )
 from ejkernel.kernels._pallas.tpu.sparse_multi_latent_ragged_page_attention._pallas_impl_fwd import (
+    block_path_supported,
     sparse_mla_ragged_paged_attention_pallas,
     supports,
     write_token_rows,
@@ -331,3 +332,102 @@ def test_registered_pallas_tpu_backend():
     impl = kernel_registry.get("sparse_multi_latent_ragged_page_attention", platform="pallas", backend="any")
     assert impl is pallas_sparse_mla
     assert HEADS > 0
+
+
+# The query-block prefill kernel maps the rows of a block's [Q * H, L] query tile to its tokens by a shift and steps
+# through 128 fetched keys at a time: it needs a power-of-two head count that is a multiple of 16, buckets of at least
+# 256 tokens, and 4-token chunks in groups of 32 (selections at least 32 wide).
+QB_HEADS, QB_CHUNK, QB_WIDTH, QB_TOKENS = 16, 4, 48, 16
+
+
+def _prefill_selection(case, *, seed):
+    """Selections shaped like a prefill's: neighbouring tokens share most of their chunks.
+
+    A token that sees fewer chunks than the selection width selects all of them plus the next chunk (as the indexer
+    does while the context fits its top-k; causality drops the next one), so such a block's union is a prefix. Longer
+    contexts rank their visible chunks by one score shared by the whole batch plus per-token noise, and always keep
+    their own chunk.
+    """
+    rng = np.random.default_rng(seed)
+    num_chunks = case["pages_per_seq"] * case["page"] // QB_CHUNK
+    shared = rng.random(num_chunks)
+    selected = np.full_like(case["selected"], -1)
+    for t, p in enumerate(case["pos_of"]):
+        visible = p // QB_CHUNK + 1
+        if visible < QB_WIDTH:
+            ids = np.arange(visible + 1)
+        else:
+            score = shared[:visible] + 0.3 * rng.random(visible)
+            score[visible - 1] = -1.0
+            ids = np.argsort(score)[:QB_WIDTH]
+        selected[t, : ids.size] = rng.permutation(ids)
+    return selected
+
+
+def _query_block_case(seed, *, kv_lens, q_lens, dtype, page, selection):
+    """A 16-head ragged batch; ``selection`` is ``prefill`` (overlapping neighbours) or ``random`` (no overlap)."""
+    pages_per_seq = -(-max(kv_lens) // page) + 1
+    case = _build(
+        seed,
+        kv_lens=kv_lens,
+        q_lens=q_lens,
+        chunk_size=QB_CHUNK,
+        width=QB_WIDTH,
+        dtype=dtype,
+        page=page,
+        pages_per_seq=pages_per_seq,
+        heads=QB_HEADS,
+    )
+    if selection == "prefill":
+        selected = _prefill_selection(case, seed=seed)
+        case["selected"] = selected
+        case["inputs"] = (*case["inputs"][:9], jnp.asarray(selected))
+    return case
+
+
+@pytest.mark.parametrize("selection", ["prefill", "random"])
+@pytest.mark.parametrize(
+    "dtype,page",
+    [(jnp.bfloat16, 16), (jnp.bfloat16, 128), (jnp.float32, 16)],
+    ids=["bf16-p16", "bf16-p128", "f32-p16"],
+)
+def test_pallas_query_block_matches_reference(dtype, page, selection):
+    """``num_queries_per_block=16`` on a prefill bucket: each block of 16 consecutive tokens fetches the union of its
+    tokens' selected chunks once (the query-block kernel), yet every token attends exactly to its own chunks.
+
+    Sequences start on multiples of 16 tokens, so every block holds one sequence and the whole step runs the
+    query-block kernel: a fresh prefill (prefix unions; at page 128 one copy per page-aligned group), a chunk
+    continuing a longer context and a short one, then padding tokens. ``prefill`` selections overlap between
+    neighbours; ``random`` ones do not (wide unions in which most chunks belong to a single token).
+    """
+    case = _query_block_case(
+        29, kv_lens=[208, 900, 40], q_lens=[208, 64, 16], dtype=dtype, page=page, selection=selection
+    )
+    cache = case["inputs"][4]
+    assert block_path_supported(
+        total_tokens=int(case["inputs"][0].shape[0]),
+        chunk_size=QB_CHUNK,
+        kv_packing=int(cache.shape[2]),
+        sliding_window=None,
+        query_block=QB_TOKENS,
+        width=QB_WIDTH,
+        num_heads=QB_HEADS,
+        group=128 // QB_CHUNK,
+        page_size=page,
+        pages_per_seq=case["pages_per_seq"],
+    )
+    out, cache = pallas_sparse_mla(*_copies(case["inputs"]), chunk_size=QB_CHUNK, num_queries_per_block=QB_TOKENS)
+    _check_against_reference_and_xla(case, out, cache, chunk_size=QB_CHUNK, dtype=dtype)
+
+
+def test_pallas_query_block_falls_back_to_per_token_kernel_across_sequences():
+    """A bucket in which some block of 16 tokens holds two sequences runs the per-token kernel for the whole step:
+    outputs and cache are bitwise those of the call without ``num_queries_per_block``."""
+    case = _query_block_case(
+        31, kv_lens=[250, 900, 41], q_lens=[250, 70, 9], dtype=jnp.bfloat16, page=16, selection="prefill"
+    )
+    per_token = pallas_sparse_mla(*_copies(case["inputs"]), chunk_size=QB_CHUNK)
+    blocked = pallas_sparse_mla(*_copies(case["inputs"]), chunk_size=QB_CHUNK, num_queries_per_block=QB_TOKENS)
+    np.testing.assert_array_equal(np.asarray(blocked[0]), np.asarray(per_token[0]))
+    np.testing.assert_array_equal(np.asarray(blocked[1]), np.asarray(per_token[1]))
+    _check_against_reference_and_xla(case, blocked[0], blocked[1], chunk_size=QB_CHUNK, dtype=jnp.bfloat16)
