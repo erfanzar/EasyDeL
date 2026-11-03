@@ -120,6 +120,13 @@ def _mla_kernel_call(dense_fn, ignore: dict, total_tokens: int, common_call_kwar
     sparse_kwargs = {k: v for k, v in common_call_kwargs.items() if k != "cfg"}
     dense_cfg = common_call_kwargs.get("cfg")
     sparse_kwargs["cfg"] = SparseMultiLatentRaggedPageAttentionConfig(
+        # TPU: 16 consecutive query tokens per program of ejkernel's Pallas query-block prefill kernel. Prefill
+        # buckets (>= 256 tokens) whose 16-token blocks each hold one sequence fetch the block's shared selected
+        # chunks once; other steps (decode, batches with a block spanning two sequences) keep the per-token kernel.
+        # Measured on v5p with 16 heads per chip (16 x 16 = 256 MXU rows per program), latent 512 + 128 rope pad,
+        # page 128, 4-token chunks, 513 selected chunks per token. The kernel switches itself off for head counts
+        # that are not power-of-two multiples of 16. Other backends keep the XLA default (8 rows per step).
+        num_queries_per_block=16 if jax.default_backend() == "tpu" else None,
         vmem_limit_bytes=getattr(dense_cfg, "vmem_limit_bytes", None),
         platform="auto",
     )
