@@ -34,6 +34,7 @@ import numpy as np
 import pytest
 import spectrax as spx
 from easydel.caching import MLARaggedPagesCacheConfig, MLARaggedPagesCacheView, RaggedPagesMetadata
+from easydel.operations.kernels import multi_latent_ragged_page_attention as mlrpa
 from spectrax import common_types
 
 HID, HEADS, KPOOL, TOPK, PAGE = 64, 4, 4, 8, 8
@@ -170,13 +171,25 @@ def _run(config, layer, ep_split: bool):
 
 
 @pytest.mark.parametrize(
-    "dims",
-    [(1, 1, 1, 4, 1, 1), (1, 1, 1, 2, 2, 1), (1, 1, 1, 1, 4, 1), (1, 2, 1, 2, 1, 1)],
-    ids=["ep4tp1", "ep2tp2", "ep1tp4", "dp2ep2"],
+    ("dims", "compact_min_window"),
+    [
+        ((1, 1, 1, 4, 1, 1), None),
+        ((1, 1, 1, 2, 2, 1), None),
+        ((1, 1, 1, 1, 4, 1), None),
+        ((1, 2, 1, 2, 1, 1), None),
+        ((1, 1, 1, 4, 1, 1), 1),
+        ((1, 1, 1, 2, 2, 1), 1),
+    ],
+    ids=["ep4tp1", "ep2tp2", "ep1tp4", "dp2ep2", "ep4tp1-compact", "ep2tp2-compact"],
 )
-def test_ep_split_serving_matches_unsplit(dims):
+def test_ep_split_serving_matches_unsplit(dims, compact_min_window, monkeypatch):
     if jax.device_count() < int(np.prod(dims)):
         pytest.skip(f"needs {int(np.prod(dims))} devices")
+    if compact_min_window is not None:
+        # These steps' per-shard windows are shorter than the production threshold, so by default they take the
+        # single-call path (as decode does); lowering it runs every window as its own compact kernel call (the path
+        # of production prefill steps).
+        monkeypatch.setattr(mlrpa, "_EP_SPLIT_COMPACT_MIN_WINDOW", compact_min_window)
     config, layer = _layer(dims)
     off, off_cache, off_counts = _run(config, layer, False)
     on, on_cache, on_counts = _run(config, layer, True)
