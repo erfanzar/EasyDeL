@@ -31,6 +31,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from easydel.inference.esurge.distributed import zmq_coordinator
 from easydel.inference.esurge.distributed.coordinator import (
     LocalCoordinator,
     StepCoordinationError,
@@ -103,7 +104,14 @@ def _wait_until(predicate, timeout: float = DEADLINE_S) -> None:
 class _Plane:
     """One leader + one worker over loopback, torn down deterministically."""
 
-    def __init__(self, *, worker_runner=None, leader_runner=None, verify_digest_interval: int = 1):
+    def __init__(
+        self,
+        *,
+        worker_runner=None,
+        leader_runner=None,
+        verify_digest_interval: int = 1,
+        heartbeat_interval_s: float = 0.2,
+    ):
         from easydel.inference.esurge.distributed import wire
 
         port = _free_port()
@@ -118,7 +126,7 @@ class _Plane:
             config_fingerprint=FINGERPRINT,
             ready_timeout_s=DEADLINE_S,
             step_timeout_s=5.0,
-            heartbeat_interval_s=0.2,
+            heartbeat_interval_s=heartbeat_interval_s,
             heartbeat_timeout_s=DEADLINE_S,
             verify_digest_interval=verify_digest_interval,
             max_inflight_steps=4,
@@ -140,7 +148,7 @@ class _Plane:
             auth_token=AUTH,
             config_fingerprint=FINGERPRINT,
             connect_timeout_s=DEADLINE_S,
-            heartbeat_interval_s=0.2,
+            heartbeat_interval_s=heartbeat_interval_s,
             heartbeat_timeout_s=DEADLINE_S,
         )
         self.stop_event = threading.Event()
@@ -184,6 +192,36 @@ def test_worker_replays_leader_stream_in_order():
 
         # deferred acks + matching outputs keep the plane healthy
         _wait_until(lambda: plane.leader._ledger.min_acked() >= 2)
+        plane.leader.check_health()
+        assert not plane.worker_error
+
+
+def test_leader_sends_queued_commands_without_waiting_out_its_poll(monkeypatch):
+    """A Step or Drain the leader queues reaches the workers at once, not when its IO loop's poll next returns.
+
+    The leader's IO thread owns the ROUTER socket and sends what the engine thread queues only between polls, so
+    without a wakeup a queued command waits for an inbound frame (an ack, a heartbeat) or the poll timeout. Workers
+    start a step only when its command arrives, so on a multi-host slice that delay idles every host's devices in the
+    step's first collective. The poll interval is raised to 3 s and heartbeats to 60 s, so that nothing but the wakeup
+    can end the poll within the bound asserted here.
+    """
+    monkeypatch.setattr(zmq_coordinator, "_POLL_MS", 3000)
+    with _Plane(heartbeat_interval_s=60.0) as plane:
+        time.sleep(0.5)  # handshake frames and first heartbeats are handled; both IO loops now sit in their poll
+        sent = time.monotonic()
+        handle = plane.leader.execute_async(_sched_output("S1"))
+        _wait_until(lambda: plane.worker_runner.calls == ["dispatch:S1"])
+        step_latency = time.monotonic() - sent
+
+        time.sleep(0.5)
+        sent = time.monotonic()
+        assert plane.leader.drain(handle).tag == "S1"
+        _wait_until(lambda: plane.worker_runner.calls == ["dispatch:S1", "drain:S1"])
+        drain_latency = time.monotonic() - sent
+
+        assert step_latency < 1.0, f"the Step reached the worker {step_latency:.2f}s after it was queued"
+        assert drain_latency < 1.0, f"the Drain reached the worker {drain_latency:.2f}s after it was queued"
+        _wait_until(lambda: plane.leader._ledger.min_acked() >= 1)
         plane.leader.check_health()
         assert not plane.worker_error
 
