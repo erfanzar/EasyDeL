@@ -187,6 +187,78 @@ class RaggedKDAOp(OperationImpl):
         Returns:
             ``(out [T, H, V] float32, new_recurrent_state [S, H, K, V])``; the pool keeps its dtype.
         """
+        return self._forward(
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            recurrent_state,
+            query_start_loc,
+            state_indices,
+            has_initial_state,
+            chunk_size=chunk_size,
+            use_qk_l2norm=use_qk_l2norm,
+            decay_lower_bound=decay_lower_bound,
+            precision=precision,
+            platform="xla",
+        )
+
+    @jax.named_scope("easydel-ragged-kda")
+    def forward_tpu(self, *args, **kwargs) -> tuple[Array, Array]:
+        """TPU path: the operation config's platform (default ``"auto"``: the Pallas TPU ``ragged_kda`` kernel).
+
+        The Pallas entry runs the multi-token chunk path in one kernel and falls back to the XLA reference itself for
+        options it does not lower (no usable ``decay_lower_bound``, head sizes that are not multiples of 128).
+
+        Args:
+            *args: Same as :meth:`forward_native`.
+            **kwargs: Same as :meth:`forward_native`.
+
+        Returns:
+            ``(out [T, H, V] float32, new_recurrent_state [S, H, K, V])``.
+        """
+        return self._forward(*args, **kwargs, platform=None)
+
+    def _forward(
+        self,
+        query: Array,
+        key: Array,
+        value: Array,
+        beta: Array,
+        decay: Array,
+        recurrent_state: Array,
+        query_start_loc: Array,
+        state_indices: Array | None,
+        has_initial_state: Array | None = None,
+        *,
+        chunk_size: int = 64,
+        use_qk_l2norm: bool = True,
+        decay_lower_bound: float | None = None,
+        precision: str = "highest",
+        platform: str | None = None,
+    ) -> tuple[Array, Array]:
+        """Call ``ejkernel.modules.operations.ragged_kda_head_sharded`` on one platform.
+
+        Args:
+            query: Post-conv queries ``[T, H, K]``.
+            key: Post-conv keys ``[T, H, K]``.
+            value: Post-conv values ``[T, H, V]``.
+            beta: Write strengths ``[T, H]``.
+            decay: Per-channel log-decay ``[T, H, K]``.
+            recurrent_state: State pool ``[S, H, K, V]``.
+            query_start_loc: Cumulative row offsets ``[R + 1]``.
+            state_indices: Pool slot of every row ``[R]``, or ``None`` (row ``r`` owns slot ``r``).
+            has_initial_state: Optional ``[R]`` flags.
+            chunk_size: Chunk length of the multi-token path.
+            use_qk_l2norm: L2-normalise queries and keys first.
+            decay_lower_bound: Promised lower bound of every log-decay, or ``None``.
+            precision: Precision of the non-inverse chunk dots.
+            platform: ``"xla"`` (the reference), or ``None`` for the operation config's platform.
+
+        Returns:
+            ``(out [T, H, V] float32, new_recurrent_state [S, H, K, V])``.
+        """
         metadata = self.get_impl_metadata()
         return ragged_kda_head_sharded(
             query,
@@ -204,6 +276,7 @@ class RaggedKDAOp(OperationImpl):
             use_qk_l2norm=bool(use_qk_l2norm),
             decay_lower_bound=decay_lower_bound,
             precision=precision,
+            platform=platform,
             cfg=metadata.get_operation_config("ragged_kda"),
         )
 
