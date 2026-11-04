@@ -47,13 +47,15 @@ def row_gather_unsupported_reason(x, indices, scale=None, dot_with=None) -> str 
     return gather_unsupported_reason(tuple(x.shape), x.dtype, rows, has_dot=dot_with is not None)
 
 
-def row_gather_sum_unsupported_reason(y, indices, weights, out_dtype=None) -> str | None:
+def row_gather_sum_unsupported_reason(y, indices, weights, out_dtype=None, *, skip_negative=False) -> str | None:
     """Why ``moe_row_gather_sum`` would use the XLA fallback for these arguments (``None``: the Pallas kernel runs)."""
     if jax.default_backend() != "tpu":
         return f"backend is {jax.default_backend()}, not tpu"
     if len(indices.shape) != 2 or tuple(weights.shape) != tuple(indices.shape):
         return f"indices {tuple(indices.shape)} and weights {tuple(weights.shape)} must both be [tokens, k]"
     tokens, k = indices.shape
+    if skip_negative and 2 * tokens * k >= 2**31:
+        return f"{tokens} x {k} slots overflow the int32 live-slot sort keys"
     return gather_sum_unsupported_reason(tuple(y.shape), y.dtype, tokens, k, out_dtype)
 
 
@@ -86,21 +88,25 @@ def moe_row_gather_sum(
     indices: Int[Array, "tokens k"],
     weights: Float[Array, "tokens k"],
     out_dtype: jax.typing.DTypeLike | None = None,
+    skip_negative: bool = False,
 ) -> Float[Array, "tokens hidden"]:
     """``out[t] = sum_j weights[t, j] * y[indices[t, j]]`` (fp32 accumulation) by row DMA.
 
     Args:
         y: ``[src_rows, hidden]`` source rows.
-        indices: ``[tokens, k]`` row ids (clamped to range).
+        indices: ``[tokens, k]`` row ids (clamped to range; negative = inactive slot under ``skip_negative``).
         weights: ``[tokens, k]`` combine weights.
         out_dtype: Output dtype (default ``y.dtype``).
+        skip_negative: A negative index contributes exactly zero and issues no row copy: the live-slot kernel
+            (:func:`gather_sum_rows`) visits only the non-negative slots of each token block, so rows that only
+            inactive slots point at are never read (they may be non-finite).
 
     Returns:
         ``[tokens, hidden]`` in ``out_dtype``.
     """
-    if row_gather_sum_unsupported_reason(y, indices, weights, out_dtype) is not None:
-        return moe_row_gather_sum_xla(y, indices, weights, out_dtype)
-    return gather_sum_rows(y, indices, weights, out_dtype)
+    if row_gather_sum_unsupported_reason(y, indices, weights, out_dtype, skip_negative=skip_negative) is not None:
+        return moe_row_gather_sum_xla(y, indices, weights, out_dtype, skip_negative)
+    return gather_sum_rows(y, indices, weights, out_dtype, skip_negative=skip_negative)
 
 
 __all__ = (

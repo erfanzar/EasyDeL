@@ -57,16 +57,20 @@ def moe_row_gather_sum_xla(
     indices: Array,
     weights: Array,
     out_dtype: jax.typing.DTypeLike | None = None,
+    skip_negative: bool = False,
 ) -> Array:
     """``out[t] = sum_j weights[t, j] * y[indices[t, j]]``, accumulated in fp32.
 
-    Indices are clamped to ``[0, src_rows)``.
+    Indices are clamped to ``[0, src_rows)``. With ``skip_negative`` a negative index marks an inactive slot: its row
+    is selected away before the multiply, so it contributes exactly zero whatever its weight and whatever the clamped
+    source row holds (a non-finite row that only inactive slots point at never reaches the sum).
 
     Args:
         y: ``[src_rows, ...]`` source rows.
         indices: ``[tokens, k]`` integer row ids.
         weights: ``[tokens, k]`` combine weights.
         out_dtype: Output dtype (default ``y.dtype``).
+        skip_negative: Treat negative indices as inactive slots instead of clamping them to row 0.
 
     Returns:
         ``[tokens, ...]`` in ``out_dtype``.
@@ -74,5 +78,8 @@ def moe_row_gather_sum_xla(
     tokens, k = indices.shape
     rows = jnp.take(y, indices.reshape(-1), axis=0, mode="clip").astype(F32)
     rows = rows.reshape((tokens, k, *y.shape[1:]))
+    if skip_negative:
+        live = (indices >= 0).reshape((tokens, k, *((1,) * (y.ndim - 1))))
+        rows = jnp.where(live, rows, 0.0)
     factor = weights.astype(F32).reshape((tokens, k, *((1,) * (y.ndim - 1))))
     return jnp.sum(rows * factor, axis=1).astype(out_dtype or y.dtype)
