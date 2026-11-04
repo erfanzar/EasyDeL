@@ -130,3 +130,19 @@ def test_flag_is_inert_without_tensor_parallelism():
     out_def, grad_def = _out_and_grad(_build(dims=dims, defer=True), x)
     np.testing.assert_array_equal(out_def, out_ref)
     np.testing.assert_array_equal(grad_def, grad_ref)
+
+
+def test_automatic_setting_keeps_the_chunked_dispatch_off():
+    """``moe_defer_tp_reduce=None`` (automatic) never defers the chunked dispatch, a training path: same as ``False``."""
+    dims = _tp2_dims()
+    x = _x()
+    block_off = _build(dims=dims, defer=False)
+    block_auto = _build(dims=dims, defer=False)
+    block_auto.config.moe_defer_tp_reduce = None
+    out_off, grad_off = _out_and_grad(block_off, x)
+    out_auto, grad_auto = _out_and_grad(block_auto, x)
+    np.testing.assert_array_equal(out_auto, out_off)
+    np.testing.assert_array_equal(grad_auto, grad_off)
+    rows_auto = _reduce_scatter_operand_rows(block_auto, x)
+    assert rows_auto == _reduce_scatter_operand_rows(block_off, x)
+    assert CHUNK * TOPK in rows_auto, f"automatic setting should keep the expanded [chunk*k, H] rows, saw {rows_auto}"

@@ -82,6 +82,7 @@ from ._communication_utils import (
     MoEMethods,
     MoeMetrics,
     MoeRoutingStrategy,
+    _moe_row_gather_sum_entry,
     build_ep_traffic_matrix,
     chunk_group_sizes,
     ep_batch_receive_buffer_rows,
@@ -412,6 +413,56 @@ def _deferred_window_rows(total_rows: int, ep_size: int, override: int | None) -
     rows = -(-5 * total_rows // (4 * ep_size))
     rows = -(-rows // _DEFERRED_WINDOW_ALIGN) * _DEFERRED_WINDOW_ALIGN
     return min(rows, total_rows)
+
+
+_LIVE_COMBINE_MIN_LOCAL_ROWS = 8192
+"""Expected local (token, expert) rows per expert shard, ``tokens * top_k / ep``, from which the inference-mode deferred
+dispatch combines through the Pallas TPU ``moe_row_gather_sum`` entry (its live-slot kernel) instead of the XLA entry.
+
+Measured on TPU v5p per W8A8 GLM-5.3-Flash routed-MoE layer (hidden 4096, 288 experts top-8, bf16 rows), ms per layer
+with the live-slot kernel vs the XLA entry: ep4 x tp1 (72 local experts) at 1,024 / 2,048 / 8,192 / 32,768 tokens,
+i.e. 2,048 / 4,096 / 16,384 / 65,536 local rows: 1.033 vs 0.985, 1.494 vs 1.440, 4.895 vs 6.901, 17.93 vs 26.02;
+ep2 x tp2 (144 local experts) at 2,048 / 8,192 tokens (8,192 / 32,768 local rows): 2.406 vs 2.774, 7.981 vs 9.392.
+Below it the kernel's fixed cost (packing the window rows, sorting the per-block live-slot lists) exceeds the
+``[tokens * k, H]`` XLA gather it replaces.
+"""
+
+
+def resolve_moe_defer_tp_reduce(
+    setting: bool | None,
+    *,
+    path: tp.Literal["replicated", "chunked"],
+    blockers: tp.Sequence[str],
+    ep_size: int,
+) -> bool:
+    """Whether the fused MoE reduces over TP after the top-k combine (``moe_defer_tp_reduce``) on ``path``.
+
+    ``True`` turns the deferral on wherever ``path``'s preconditions hold and warns once, naming ``blockers``, where
+    they do not. ``False`` keeps it off (the escape hatch). ``None`` is automatic: on only for the inference-mode
+    single-pass dispatch with tokens replicated over an expert axis (``path="replicated"`` with ``ep_size > 1``; its
+    ``blockers`` include "not in inference mode"), silently off everywhere else. That covers training, which never
+    runs in inference mode; the chunked dispatch, which training uses, so ``None`` keeps it off exactly as ``False``
+    does; and ``ep_size == 1``, where the deferred dispatch measured neutral (0.98-1.00x per W8A8 GLM-5.3 layer at
+    ep1 x tp4). With an expert axis it measured 1.2-1.6x per W8A8 GLM-5.3-Flash layer (hidden 4096, 288 experts
+    top-8) on TPU v5p at ep4 x tp1 and ep2 x tp2.
+
+    Args:
+        setting: The config value: ``True``, ``False`` or ``None`` (automatic).
+        path: ``"replicated"`` (single-pass dispatch, tokens replicated over the expert axis) or ``"chunked"``.
+        blockers: Unmet preconditions of ``path``; empty when it can run.
+        ep_size: Expert-axis size.
+
+    Returns:
+        Whether ``path`` defers its TP reduction.
+    """
+    if setting is None:
+        return path == "replicated" and ep_size > 1 and not blockers
+    if not bool(setting):
+        return False
+    if blockers:
+        logger.warn_once(f"moe_defer_tp_reduce is set but inactive here: {', '.join(blockers)}.")
+        return False
+    return True
 
 
 class BaseMoeModule(spx.Module, ABC):
@@ -1924,12 +1975,13 @@ class BaseMoeModule(spx.Module, ABC):
                 )
                 ep_carries_batch = False
 
-        # Deferred tp reduce (moe_defer_tp_reduce): the chunked non-ring ep=1 dispatch applies it inside its scan, and
-        # under inference mode the single-pass non-ring dispatch switches to ``_replicated_deferred_dispatch``;
-        # anywhere else it warns once (the local expert FFN path warns above).
+        # Deferred tp reduce (``moe_defer_tp_reduce``), decided by ``resolve_moe_defer_tp_reduce``: under inference
+        # mode the single-pass non-ring dispatch switches to ``_replicated_deferred_dispatch`` (``True``, or automatic
+        # with an expert axis); the chunked non-ring ep=1 dispatch defers inside its scan (``True`` only).
+        defer_setting = getattr(self.config, "moe_defer_tp_reduce", None)
         defer_tp_reduce = False
         replicated_deferred_dispatch = False
-        if bool(getattr(self.config, "moe_defer_tp_reduce", False)) and not use_local_expert_ffn:
+        if not use_local_expert_ffn and (defer_setting is None or bool(defer_setting)):
             if moe_chunk_size is None:
                 replicated_blockers = [
                     why
@@ -1951,17 +2003,16 @@ class BaseMoeModule(spx.Module, ABC):
                     )
                     if bad
                 ]
-                if replicated_blockers:
-                    logger.warn_once(f"moe_defer_tp_reduce is set but inactive here: {', '.join(replicated_blockers)}.")
-                else:
-                    replicated_deferred_dispatch = True
-                    if row_gather_kernel:
-                        # As on the local expert FFN path: this dispatch runs its own XLA gathers, so the Pallas
-                        # row-gather kernels do not apply; warn instead of dropping the knob silently.
-                        logger.warn_once(
-                            "moe_row_gather_kernel set but not used: the inference-mode moe_defer_tp_reduce dispatch "
-                            "runs its own XLA row gathers and reduces the combined [tokens, H] output once."
-                        )
+                replicated_deferred_dispatch = resolve_moe_defer_tp_reduce(
+                    defer_setting, path="replicated", blockers=replicated_blockers, ep_size=ep_size
+                )
+                if replicated_deferred_dispatch and row_gather_kernel:
+                    # This dispatch picks its own row gathers (an XLA dispatch gather and a top-k combine chosen by
+                    # row count), so the knob does not apply; warn instead of dropping it silently.
+                    logger.warn_once(
+                        "moe_row_gather_kernel set but not used: the inference-mode deferred MoE dispatch keeps its "
+                        "XLA dispatch gather and picks its moe_row_gather_sum combine from the step's row count."
+                    )
             else:
                 defer_blockers = [
                     why
@@ -1974,10 +2025,9 @@ class BaseMoeModule(spx.Module, ABC):
                     )
                     if bad
                 ]
-                if defer_blockers:
-                    logger.warn_once(f"moe_defer_tp_reduce is set but inactive here: {', '.join(defer_blockers)}.")
-                else:
-                    defer_tp_reduce = True
+                defer_tp_reduce = resolve_moe_defer_tp_reduce(
+                    defer_setting, path="chunked", blockers=defer_blockers, ep_size=ep_size
+                )
         if local_ffn_window_rows is not None and not (use_local_expert_ffn or replicated_deferred_dispatch):
             logger.warn_once(
                 "moe_local_ffn_window_rows is set but not used: it only sizes the row windows of the active "
@@ -2375,10 +2425,14 @@ class BaseMoeModule(spx.Module, ABC):
             pairs first, grouped by local expert. Window ``w`` covers sorted rows ``[w * R, (w + 1) * R)``: it
             gathers those ``R`` token rows, runs the expert FFN with window-local group sizes (rows past the window's
             local count form the FFN's masked dispatch tail) and adds every pair sitting in the window, weighted,
-            into an fp32 ``[tokens, H]`` sum; a pair outside the window or not local is selected away (never
-            multiplied, as the FFN's tail rows are not guaranteed finite on TPU).
-            Window 0 always runs and later windows run only while ``w * R < n_local`` (a ``while_loop``), so the
-            dispatch is dropless under any routing skew while balanced routing runs one window of ``R`` rows
+            into an fp32 ``[tokens, H]`` sum through the ejkernel ``moe_row_gather_sum`` op with ``skip_negative``:
+            slot ``-1`` marks a pair outside the window or not local and is never read (the FFN's tail rows are not
+            guaranteed finite on TPU). From ``_LIVE_COMBINE_MIN_LOCAL_ROWS`` expected local rows per shard the Pallas
+            TPU entry runs, whose live-slot kernel copies only the live slots' rows where its shapes apply
+            (``row_gather_sum_unsupported_reason``); below that, and off TPU, the XLA entry gathers every slot,
+            selects the live ones and sums. With ``R >= tokens * k`` (decode buckets, ep == 1) one window holds every
+            pair. Window 0 always runs and later windows run only while ``w * R < n_local`` (a ``while_loop``), so
+            the dispatch is dropless under any routing skew while balanced routing runs one window of ``R`` rows
             instead of the full ``tokens * k`` buffer.
 
             Args:
@@ -2412,20 +2466,27 @@ class BaseMoeModule(spx.Module, ABC):
             starts = ends - group_sizes.astype(jnp.int32)
             n_local = ends[-1]
             x_src = x2d.astype(self.dtype)
+            gather_sum = _moe_row_gather_sum_entry(
+                live_slot_kernel=total_rows >= _LIVE_COMBINE_MIN_LOCAL_ROWS * max(ep_size, 1)
+            )
 
             def _window(w) -> jax.Array:
-                start = w * window_rows
-                rows = jax.lax.dynamic_slice_in_dim(order, start, window_rows)
-                ids = jax.lax.dynamic_slice_in_dim(sorted_ids, start, window_rows)
-                sizes = jnp.clip(jnp.minimum(ends, start + window_rows) - jnp.maximum(starts, start), 0, window_rows)
-                inter = expert_ffn(x_src[rows // top_k], sizes.astype(jnp.int32), ids, tp_reduce=False)
-                rel = positions - start
-                live = (is_local & (rel >= 0) & (rel < window_rows)).reshape(tokens, top_k)
-                # Slots outside the window read row 0, and window rows past its local count are the FFN's unwritten
-                # tail (not guaranteed finite on TPU): select, never multiply.
-                picked = inter[jnp.where(live, rel.reshape(tokens, top_k), 0)].astype(jnp.float32)
-                picked = jnp.where(live[:, :, None], picked, 0.0)
-                return jnp.sum(picked * combine_weights[:, :, None], axis=1)
+                if n_windows == 1:
+                    rows, ids, sizes, rel, live = order, sorted_ids, group_sizes.astype(jnp.int32), positions, is_local
+                else:
+                    start = w * window_rows
+                    rows = jax.lax.dynamic_slice_in_dim(order, start, window_rows)
+                    ids = jax.lax.dynamic_slice_in_dim(sorted_ids, start, window_rows)
+                    sizes = jnp.clip(
+                        jnp.minimum(ends, start + window_rows) - jnp.maximum(starts, start), 0, window_rows
+                    ).astype(jnp.int32)
+                    rel = positions - start
+                    live = is_local & (rel >= 0) & (rel < window_rows)
+                inter = expert_ffn(x_src[rows // top_k], sizes, ids, tp_reduce=False)
+                # Window rows past its local count are the FFN's unwritten tail (not guaranteed finite on TPU): dead
+                # slots are -1, which the live-slot combine never reads (its XLA entry selects them away).
+                slots = jnp.where(live, rel, -1).reshape(tokens, top_k)
+                return gather_sum(inter, slots, combine_weights, jnp.float32, skip_negative=True)
 
             partial = _window(0)
             if n_windows > 1:
@@ -2501,33 +2562,18 @@ class BaseMoeModule(spx.Module, ABC):
             order = jnp.argsort(sort_keys).astype(jnp.int32)
             group_sizes = jnp.bincount(sort_keys, length=experts_per_shard + 1)[:experts_per_shard].astype(jnp.int32)
             total_rows = tokens * top_k
-            window_rows = _deferred_window_rows(total_rows, ep_size, local_ffn_window_rows)
-            if window_rows >= total_rows:
-                x_rows = x2d[order // top_k].astype(self.dtype)
-                # Local expert id per sorted row (bias gathers only); the non-local tail is clamped and masked by the
-                # FFN.
-                sorted_ids = jnp.minimum(sort_keys[order], experts_per_shard - 1)
-                inter = expert_ffn(x_rows, group_sizes, sorted_ids, tp_reduce=False)
-                # Pair p sits at row ``positions[p]`` of the expert-sorted buffer. Non-local pairs point past every
-                # local row, where the grouped-matmul output is not guaranteed finite on TPU: select, never multiply.
-                positions = jnp.argsort(order).astype(jnp.int32)
-                picked = inter[positions].astype(jnp.float32)
-                picked = jnp.where(is_local[:, None], picked, 0.0).reshape(tokens, top_k, -1)
-                combine_weights = weights if output_weights_hook is None else output_weights_hook(weights)
-                partial = jnp.sum(picked * combine_weights.astype(jnp.float32)[:, :, None], axis=1)
-            else:
-                combine_weights = weights if output_weights_hook is None else output_weights_hook(weights)
-                partial = _local_row_windows(
-                    x2d,
-                    order,
-                    sort_keys,
-                    group_sizes,
-                    is_local,
-                    combine_weights.astype(jnp.float32),
-                    expert_ffn,
-                    window_rows=min(window_rows, total_rows),
-                    experts_per_shard=experts_per_shard,
-                )
+            combine_weights = weights if output_weights_hook is None else output_weights_hook(weights)
+            partial = _local_row_windows(
+                x2d,
+                order,
+                sort_keys,
+                group_sizes,
+                is_local,
+                combine_weights.astype(jnp.float32),
+                expert_ffn,
+                window_rows=_deferred_window_rows(total_rows, ep_size, local_ffn_window_rows),
+                experts_per_shard=experts_per_shard,
+            )
             ep_axes = tuple(expert_axis_name) if isinstance(expert_axis_name, tuple) else (expert_axis_name,)
             if decode_replicated_out:
                 # Decode: one small fp32 all-reduce over both axes replaces the default dispatch's TP

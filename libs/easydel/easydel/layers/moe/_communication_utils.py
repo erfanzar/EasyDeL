@@ -409,6 +409,24 @@ def _moe_row_gather_kernels():
     )
 
 
+def _moe_row_gather_sum_entry(*, live_slot_kernel: bool):
+    """One ``moe_row_gather_sum`` registry entry: the Pallas TPU one or the XLA one.
+
+    Args:
+        live_slot_kernel: Take the Pallas TPU entry, which runs its DMA kernels (the live-slot kernel under
+            ``skip_negative``) where ``row_gather_sum_unsupported_reason`` allows and the XLA entry elsewhere;
+            ``False`` takes the XLA entry directly.
+
+    Returns:
+        The registered callable ``(y, indices, weights, out_dtype=None, skip_negative=False) -> [tokens, hidden]``.
+    """
+    from ejkernel.kernels import Backend, Platform, kernel_registry  # pyright: ignore[reportMissingTypeStubs]
+
+    if live_slot_kernel:
+        return kernel_registry.get("moe_row_gather_sum", platform=Platform.PALLAS, backend=Backend.TPU)
+    return kernel_registry.get("moe_row_gather_sum", platform=Platform.XLA, backend=Backend.ANY)
+
+
 def _float0_zeros(x: jax.Array) -> np.ndarray:
     return np.zeros(x.shape, dtype=jax.dtypes.float0)
 

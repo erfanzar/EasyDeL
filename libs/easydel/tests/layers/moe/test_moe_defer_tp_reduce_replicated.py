@@ -31,7 +31,12 @@ combined ``[tokens, H]`` partial once. On four TPU devices these tests pin:
   than ``tokens * k``) the dispatch computes only each shard's local rows, window by window, and stays dropless:
   several windows per shard, a padded last window and routing that sends every route to one expert shard all match
   the one-buffer deferred dispatch, the default dispatch and the float64 reference,
-* outside inference mode (training) the knobs leave the lowered program and the outputs identical.
+* outside inference mode (training) the knobs leave the lowered program and the outputs identical,
+* ``moe_defer_tp_reduce=None`` (automatic) lowers the program ``True`` lowers under inference mode with an expert axis
+  (ep > 1) and the program ``False`` lowers at ep == 1 and outside inference mode,
+* from ``_LIVE_COMBINE_MIN_LOCAL_ROWS`` expected local rows per expert shard the top-k combine runs the ejkernel
+  Pallas live-slot kernel (``moe_row_gather_sum`` with ``skip_negative``): at the served precision it matches the
+  XLA combine to the fp32 summation order and the default dispatch within three bfloat16 roundings.
 """
 
 from __future__ import annotations
@@ -59,6 +64,8 @@ BF16_REL_TOL = 3 * 2**-8
 # automatic window 2048 (ep4) / 3072 (ep2) rows: a shard that receives every route needs a second window.
 FORCED_WINDOW_ROWS = 48
 SKEW_TOKENS = 1024
+# ``_forward(defer=FROM_CONFIG)`` leaves ``moe_defer_tp_reduce`` as the config was constructed.
+FROM_CONFIG = object()
 _REDUCE_SCATTER = re.compile(r"stablehlo\.reduce_scatter.*?\}\)\s*:\s*\(tensor<((?:\d+x)+)(\w+)>\)", re.S)
 
 
@@ -67,13 +74,13 @@ def _skip_without_four_devices():
         pytest.skip("needs 4 devices")
 
 
-def _build(dims, *, quantize: bool = False, dtype=jnp.float32):
+def _build(dims, *, quantize: bool = False, dtype=jnp.float32, hidden: int = HIDDEN, config_kwargs=None):
     """GLM-5-Next routed-MoE block (no shared expert) in ``dtype`` on ``dims``; optionally W8A8 experts."""
     import easydel as ed
     from easydel.modules.glm5_next.modeling_glm5_next import Glm5NextTextMoE
 
     config = ed.Glm5NextTextConfig(
-        hidden_size=HIDDEN,
+        hidden_size=hidden,
         num_attention_heads=2,
         num_key_value_heads=2,
         q_lora_rank=16,
@@ -89,6 +96,7 @@ def _build(dims, *, quantize: bool = False, dtype=jnp.float32):
         norm_topk_prob=True,
         routed_scaling_factor=2.5,
         swiglu_limit=10.0,
+        **(config_kwargs or {}),
     )
     config.add_basic_configurations(sharding_axis_dims=dims, sharding_axis_names=AXES, moe_method="fused_moe")
     block = Glm5NextTextMoE(config=config, dtype=dtype, param_dtype=dtype, precision=None, rngs=spx.Rngs(3))
@@ -105,12 +113,15 @@ def _build(dims, *, quantize: bool = False, dtype=jnp.float32):
     return block
 
 
-def _x(dtype=jnp.float32, tokens: int = TOKENS):
-    return jax.random.normal(jax.random.PRNGKey(0), (1, tokens, HIDDEN), dtype=jnp.float32).astype(dtype)
+def _x(dtype=jnp.float32, tokens: int = TOKENS, hidden: int = HIDDEN):
+    return jax.random.normal(jax.random.PRNGKey(0), (1, tokens, hidden), dtype=jnp.float32).astype(dtype)
 
 
-def _forward(block, x, *, defer: bool, inference: bool = True, decode: bool = False, window_rows=None):
-    """Jitted block output (float64) and the lowered StableHLO text, with the knobs set at trace time."""
+def _forward(
+    block, x, *, defer: bool | None, inference: bool = True, decode: bool = False, window_rows=None, compiled=False
+):
+    """Jitted block output (float64) and the lowered StableHLO text (the compiled HLO text with ``compiled``), with
+    the knobs set at trace time; ``defer=None`` is the automatic setting."""
     from easydel.infra.sharding import decode_mode_specs
     from easydel.utils.inference_mode import set_inference_mode
 
@@ -118,7 +129,8 @@ def _forward(block, x, *, defer: bool, inference: bool = True, decode: bool = Fa
 
     def fwd(st, h):
         module = spx.bind(graphdef, st)
-        module.config.moe_defer_tp_reduce = defer
+        if defer is not FROM_CONFIG:
+            module.config.moe_defer_tp_reduce = defer
         module.config.moe_local_ffn_window_rows = window_rows
         return module(h)[0]
 
@@ -129,7 +141,8 @@ def _forward(block, x, *, defer: bool, inference: bool = True, decode: bool = Fa
             stack.enter_context(set_inference_mode())
         stack.enter_context(decode_mode_specs(decode))
         out = jax.jit(fwd)(state, x)
-        text = jax.jit(fwd).lower(state, x).as_text()
+        lowered = jax.jit(fwd).lower(state, x)
+        text = lowered.compile().as_text() if compiled else lowered.as_text()
     return np.asarray(jax.device_get(out), np.float32).astype(np.float64), text
 
 
@@ -252,10 +265,14 @@ def test_knob_is_inert_outside_inference_mode():
     out_default, text_default = _forward(block, x, defer=False, inference=False)
     out_knob, text_knob = _forward(block, x, defer=True, inference=False)
     out_window, text_window = _forward(block, x, defer=True, inference=False, window_rows=FORCED_WINDOW_ROWS)
+    out_auto, text_auto = _forward(block, x, defer=None, inference=False)
     # A gate fallback lowers exactly the default program, which is what makes the lowering inequality asserted by
-    # every equivalence test above proof that the deferred dispatch ran. The row-window size cannot reach training.
+    # every equivalence test above proof that the deferred dispatch ran. The row-window size cannot reach training,
+    # and neither can the automatic setting.
     assert text_knob == text_default
     assert text_window == text_default
+    assert text_auto == text_default
+    np.testing.assert_array_equal(out_auto, out_default)
     np.testing.assert_array_equal(out_knob, out_default)
     np.testing.assert_array_equal(out_window, out_default)
 
@@ -323,3 +340,74 @@ def test_windowed_dispatch_bf16_w8a8(mesh, decode):
     assert np.isfinite(out_window).all() and float(np.max(np.abs(out_default))) > 0
     assert _rel(out_window, out_default) < BF16_REL_TOL, _rel(out_window, out_default)
     assert _rel(out_window, out_full) < BF16_REL_TOL, _rel(out_window, out_full)
+
+
+@pytest.mark.parametrize("mesh", sorted(MESHES))
+def test_automatic_setting_defers_only_with_an_expert_axis(mesh):
+    """``moe_defer_tp_reduce=None`` under inference mode: ``True``'s program with ep > 1, ``False``'s at ep == 1."""
+    _skip_without_four_devices()
+    block = _build(MESHES[mesh])
+    x = _x()
+    expect_deferred = MESHES[mesh][3] > 1
+    out_auto, text_auto = _forward(block, x, defer=None)
+    out_same, text_same = _forward(block, x, defer=expect_deferred)
+    _, text_other = _forward(block, x, defer=not expect_deferred)
+    assert text_auto == text_same
+    assert text_auto != text_other, "True and False lowered the same program: the comparison proves nothing"
+    np.testing.assert_array_equal(out_auto, out_same)
+
+
+# The top-k combine takes the Pallas live-slot kernel from _LIVE_COMBINE_MIN_LOCAL_ROWS expected local rows per expert
+# shard, for bfloat16 expert rows of a hidden size that is a multiple of 2048: ep2 x tp2 with 4096 tokens x top-4 is
+# 8192 local rows per shard, over an automatic window of 10,240 rows whose FFN tail is never written.
+LIVE_HIDDEN, LIVE_TOKENS = 2048, 4096
+
+
+def test_live_slot_combine_matches_xla_combine_and_default(monkeypatch):
+    """Served precision (bfloat16 activations, W8A8 experts) where the combine runs the Pallas live-slot kernel."""
+    _skip_without_four_devices()
+    from easydel.layers.moe import _moe_module
+
+    dims = MESHES["ep2tp2"]
+    assert LIVE_TOKENS * TOPK >= _moe_module._LIVE_COMBINE_MIN_LOCAL_ROWS * dims[3]
+    block = _build(dims, quantize=True, dtype=jnp.bfloat16, hidden=LIVE_HIDDEN)
+    x = _x(jnp.bfloat16, tokens=LIVE_TOKENS, hidden=LIVE_HIDDEN)
+    out_default, text_default = _forward(block, x, defer=False)
+    out_live, text_live = _forward(block, x, defer=True)
+    _, compiled_live = _forward(block, x, defer=True, compiled=True)
+    entry = _moe_module._moe_row_gather_sum_entry
+    monkeypatch.setattr(
+        _moe_module, "_moe_row_gather_sum_entry", lambda *, live_slot_kernel: entry(live_slot_kernel=False)
+    )
+    out_xla, compiled_xla = _forward(block, x, defer=True, compiled=True)
+    _assert_deferred_lowering(text_default, text_live, mesh="ep2tp2", decode=False, tokens=LIVE_TOKENS)
+    # The live-slot combine adds two Mosaic kernels (row pack + gather-sum) to the XLA-combine program.
+    assert compiled_live.count("tpu_custom_call") >= compiled_xla.count("tpu_custom_call") + 2
+    assert np.isfinite(out_live).all() and float(np.max(np.abs(out_default))) > 0
+    # Only the fp32 order of the top-k sum differs from the XLA combine. It can flip the bfloat16 rounding of a few
+    # partials before the TP reduce-scatter (measured rel_l2 1.9e-5 at the served GLM-5.3 shapes on ep2 x tp2), while a
+    # dropped or misplaced slot moves the output by about 1/k.
+    assert _rel(out_live, out_xla) < 1e-3, _rel(out_live, out_xla)
+    assert _rel(out_live, out_default) < BF16_REL_TOL, _rel(out_live, out_default)
+
+
+@pytest.mark.parametrize("passed", ["not_passed", "passed_none"])
+def test_automatic_setting_through_the_config_constructor(passed):
+    """The default ``None``, built through the config constructor (setting not passed, or passed as ``None``): under
+    inference mode at ep > 1 the block lowers ``True``'s program, outside it ``False``'s (training unchanged)."""
+    _skip_without_four_devices()
+    kwargs = {} if passed == "not_passed" else {"moe_defer_tp_reduce": None}
+    block = _build(MESHES["ep2tp2"], config_kwargs=kwargs)
+    assert block.config.moe_defer_tp_reduce is None, block.config.moe_defer_tp_reduce
+    x = _x()
+    # The constructed setting first: the explicit runs below write the knob into the shared config object.
+    out_auto, text_auto = _forward(block, x, defer=FROM_CONFIG)
+    out_auto_train, text_auto_train = _forward(block, x, defer=FROM_CONFIG, inference=False)
+    out_on, text_on = _forward(block, x, defer=True)
+    _, text_off = _forward(block, x, defer=False)
+    out_off_train, text_off_train = _forward(block, x, defer=False, inference=False)
+    assert text_auto == text_on
+    assert text_auto != text_off, "the automatic setting lowered the non-deferred program"
+    np.testing.assert_array_equal(out_auto, out_on)
+    assert text_auto_train == text_off_train
+    np.testing.assert_array_equal(out_auto_train, out_off_train)
