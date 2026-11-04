@@ -420,14 +420,37 @@ def test_pallas_query_block_matches_reference(dtype, page, selection):
     _check_against_reference_and_xla(case, out, cache, chunk_size=QB_CHUNK, dtype=dtype)
 
 
-def test_pallas_query_block_falls_back_to_per_token_kernel_across_sequences():
-    """A bucket in which some block of 16 tokens holds two sequences runs the per-token kernel for the whole step:
-    outputs and cache are bitwise those of the call without ``num_queries_per_block``."""
-    case = _query_block_case(
-        31, kv_lens=[250, 900, 41], q_lens=[250, 70, 9], dtype=jnp.bfloat16, page=16, selection="prefill"
+@pytest.mark.parametrize("selection", ["prefill", "random"])
+@pytest.mark.parametrize(
+    "dtype,page",
+    [(jnp.bfloat16, 16), (jnp.bfloat16, 128), (jnp.float32, 16)],
+    ids=["bf16-p16", "bf16-p128", "f32-p16"],
+)
+def test_pallas_query_block_spans_sequences(dtype, page, selection):
+    """Blocks of 16 tokens that hold several sequences run the query-block kernel too, and stay exact.
+
+    Prompt boundaries off multiples of 16, a sequence without new tokens between two scheduled ones, 30 decode rows
+    (one block holds 16 sequences) and padding tokens: every union entry is a (chunk, sequence) pair read through its
+    sequence's block-table row, and every token still attends exactly to its own chunks.
+    """
+    kv_lens = [250, 900, 300, 41, *(60 + 7 * i for i in range(30))]
+    q_lens = [250, 70, 0, 9, *([1] * 30)]
+    case = _query_block_case(31, kv_lens=kv_lens, q_lens=q_lens, dtype=dtype, page=page, selection=selection)
+    seq_of = np.asarray(case["seq_of"])
+    per_block = [np.unique(seq_of[b : b + QB_TOKENS]).size for b in range(0, seq_of.size, QB_TOKENS)]
+    assert max(per_block) == QB_TOKENS and sum(n > 1 for n in per_block) >= 3
+    cache = case["inputs"][4]
+    assert block_path_supported(
+        total_tokens=int(case["inputs"][0].shape[0]),
+        chunk_size=QB_CHUNK,
+        kv_packing=int(cache.shape[2]),
+        sliding_window=None,
+        query_block=QB_TOKENS,
+        width=QB_WIDTH,
+        num_heads=QB_HEADS,
+        group=128 // QB_CHUNK,
+        page_size=page,
+        pages_per_seq=case["pages_per_seq"],
     )
-    per_token = pallas_sparse_mla(*_copies(case["inputs"]), chunk_size=QB_CHUNK)
-    blocked = pallas_sparse_mla(*_copies(case["inputs"]), chunk_size=QB_CHUNK, num_queries_per_block=QB_TOKENS)
-    np.testing.assert_array_equal(np.asarray(blocked[0]), np.asarray(per_token[0]))
-    np.testing.assert_array_equal(np.asarray(blocked[1]), np.asarray(per_token[1]))
-    _check_against_reference_and_xla(case, blocked[0], blocked[1], chunk_size=QB_CHUNK, dtype=jnp.bfloat16)
+    out, cache = pallas_sparse_mla(*_copies(case["inputs"]), chunk_size=QB_CHUNK, num_queries_per_block=QB_TOKENS)
+    _check_against_reference_and_xla(case, out, cache, chunk_size=QB_CHUNK, dtype=dtype)

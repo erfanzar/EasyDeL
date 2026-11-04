@@ -34,10 +34,12 @@ Two stages:
    groups tile pages; other tokens issue one DMA per chunk.
 
 Prefill buckets can instead run the query-block kernel (``query_block``, :func:`block_path_supported`): one program
-per ``Q`` consecutive query tokens of one sequence fetches the ascending union of their attendable chunks once
-(consecutive prefill queries select heavily overlapping chunks) and masks each of its ``Q * H`` rows to its own
-token's chunks and causal limit through one visibility word per key, so every token still attends exactly to its own
-selection. Its metadata (:func:`build_block_metadata`) comes from sorts and elementwise ops only.
+per ``Q`` consecutive query tokens fetches the union of their attendable chunks once (consecutive prefill queries
+select heavily overlapping chunks) and masks each of its ``Q * H`` rows to its own token's chunks and causal limit
+through one visibility word per key, so every token still attends exactly to its own selection. A block may hold
+tokens of several sequences (prompt boundaries anywhere, decode rows): a union entry is a (chunk, sequence) pair, and
+the program holds the block-table rows of the ``Q`` sequences its tokens can belong to. Its metadata
+(:func:`build_block_metadata`) comes from sorts and elementwise ops only.
 
 Masking: valid chunks are unique (the selection contract of every backend) and sorted ascending
 here, so only a token's last chunk can be partially causal-masked. With word-aligned chunks and no
@@ -312,6 +314,10 @@ def _pow2_shift(n: int) -> int | None:
 _BLOCK_MIN_TOKENS = 256  # smaller buckets (decode, short mixed steps) keep the per-token kernel
 _VIS_SHIFT = 5  # per-key visibility word: (member bits << 5) | first block token that may see the key (0 .. Q)
 _MAX_BLOCK_META_BYTES = 128 * 1024  # one block's metadata row in SMEM (GLM-5 serving: 16 x 513 chunks -> 64 KiB)
+# A block's block-table window in SMEM: one row per sequence its tokens can belong to (GLM-5 serving: 16 rows of 1,024
+# pages of 128 tokens, i.e. 131,072 tokens per sequence -> 64 KiB).
+_MAX_BLOCK_TABLE_WINDOW_BYTES = 64 * 1024
+_INT32_MAX = (1 << 31) - 1  # sort-key sentinel of the query-block metadata
 
 
 def block_path_supported(
@@ -331,8 +337,9 @@ def block_path_supported(
 
     It needs word-aligned chunks without a sliding window (one causal rule per key), ``group`` chunks of exactly 128
     keys per step (one visibility row per step), a power-of-two head count that is a multiple of 16 (rows of a
-    block's ``[Q * H, L]`` query tile map to block tokens by a shift), at least ``_BLOCK_MIN_TOKENS`` tokens, and the
-    block-table row, the block -> sequence map and one block's metadata row within their SMEM budgets.
+    block's ``[Q * H, L]`` query tile map to block tokens by a shift), at least ``_BLOCK_MIN_TOKENS`` tokens, and a
+    block's block-table window (one row per sequence it can meet), the block -> sequence-rank map and one block's
+    metadata row within their SMEM budgets. A block may hold tokens of any number of sequences.
     """
     if query_block is None or not 1 < int(query_block) <= _MAX_QUERY_BLOCK:
         return False
@@ -344,21 +351,66 @@ def block_path_supported(
         return False
     if int(group) * _fetch_span(chunk_size, kv_packing) != 128:
         return False
-    # Union entries are packed as (chunk << Q) | members into uint32 below the all-ones sentinel.
+    q = int(query_block)
+    # Metadata sort keys (chunk * Q + sequence slot) * Q + token stay int32, below the int32-max sentinel.
     max_chunks = int(pages_per_seq) * int(page_size) // int(chunk_size)
-    if max_chunks << int(query_block) >= 1 << 32:
+    if max_chunks * q * q >= _INT32_MAX:
         return False
-    union_width = -(-(int(query_block) * int(width)) // int(group)) * int(group)
+    union_width = -(-(q * int(width)) // int(group)) * int(group)
     if 4 * _smem_len(_BLOCK_HDR + union_width) > _MAX_BLOCK_META_BYTES:
         return False
-    num_blocks = -(-int(total_tokens) // int(query_block))
-    return 4 * _smem_len(pages_per_seq) <= _MAX_BLOCK_TABLE_ROW_BYTES and 4 * num_blocks <= _MAX_PREFETCH_BYTES
+    num_blocks = -(-int(total_tokens) // q)
+    window_bytes = 4 * _window_rows(q) * _smem_len(pages_per_seq)
+    return window_bytes <= _MAX_BLOCK_TABLE_WINDOW_BYTES and 4 * num_blocks <= _MAX_PREFETCH_BYTES
+
+
+def _window_rows(query_block: int) -> int:
+    """Block-table rows per block window: ``query_block`` rounded up to a power of two (a Mosaic 1-D SMEM block)."""
+    return 1 << (int(query_block) - 1).bit_length()
+
+
+def _sequence_ranks(seq: jax.Array) -> jax.Array:
+    """``[T]`` rank of each token's sequence among the sequences of the step's tokens, in token order.
+
+    ``seq`` is non-decreasing (packed rows), so consecutive tokens' ranks differ by 0 or 1 and rows without tokens get
+    no rank: the tokens of a block of ``Q`` consecutive tokens belong to at most ``Q`` consecutive ranks.
+    """
+    change = (seq[1:] != seq[:-1]).astype(jnp.int32)
+    return jnp.concatenate([jnp.zeros((1,), jnp.int32), jnp.cumsum(change, dtype=jnp.int32)])
+
+
+def _block_table_windows(
+    block_tables: jax.Array,
+    seq: jax.Array,
+    rank: jax.Array,
+    *,
+    max_num_seqs: int,
+    pages_per_seq: int,
+    window_pages: int,
+    window_rows: int,
+) -> jax.Array:
+    """Flat ``[S * window_rows * window_pages]`` block-table windows, one per sequence rank.
+
+    Window ``r`` holds the block-table rows (padded to ``window_pages``) of the sequences of ranks
+    ``r .. r + window_rows - 1``; ranks past the last repeat the last one. A block whose first token has rank ``r``
+    reads window ``r``, and its tokens of rank ``r + j`` find their pages in row ``j``.
+    """
+    total_tokens = int(seq.shape[0])
+    ranks = jnp.arange(max_num_seqs, dtype=jnp.int32)
+    first_token = jnp.searchsorted(rank, ranks, side="left")
+    rank_seq = seq[jnp.minimum(first_token, total_tokens - 1)]
+    bt = jnp.asarray(block_tables, jnp.int32).reshape(max_num_seqs, pages_per_seq)
+    if window_pages != pages_per_seq:
+        bt = jnp.pad(bt, ((0, 0), (0, window_pages - pages_per_seq)))
+    rows = jnp.minimum(ranks[:, None] + jnp.arange(window_rows, dtype=jnp.int32)[None, :], max_num_seqs - 1)
+    return bt[rank_seq[rows]].reshape(-1)
 
 
 def build_block_metadata(
     seq: jax.Array,
     pos: jax.Array,
     valid: jax.Array,
+    rank: jax.Array,
     kv_lens: jax.Array,
     selected: jax.Array,
     *,
@@ -368,22 +420,26 @@ def build_block_metadata(
     group: int,
     query_block: int,
     pages_per_seq: int,
+    window_pages: int,
 ) -> tuple[jax.Array, jax.Array, int]:
     """Metadata of the query-block kernel: per block of ``Q`` query tokens, the union of their attendable chunks.
 
-    Block ``b`` holds query tokens ``[b * Q, (b + 1) * Q)``. The attendable chunks of its tokens (as in
-    :func:`build_metadata`) are merged into one ascending list without duplicates, and every union chunk carries a
-    bit mask of the block tokens that selected it, so each token still attends exactly to its own selection. Only
-    sorts and elementwise ops are used (no scatter, no gather): keys ``chunk * Q + token`` are sorted per block, a
-    chunk's bits are summed over its run (at most ``Q`` entries, one per token, because selections are unique per
-    token), and a second sort moves one entry per run to the front. The kernel relies on every live token of a block
-    belonging to the sequence of the block's first token (the caller checks it), so token ``j`` of block ``b`` sits
-    at position ``pos0 + j``.
+    Block ``b`` holds query tokens ``[b * Q, (b + 1) * Q)``, of one or several sequences. A token's slot is the rank of
+    its sequence (:func:`_sequence_ranks`) minus that of the block's first token (``0 .. Q - 1``). The attendable
+    chunks of the block's tokens (as in :func:`build_metadata`) are merged into one ascending list of distinct
+    ``(chunk, slot)`` entries, and every entry carries a bit mask of the block tokens that selected it, so each token
+    still attends exactly to its own selection. Only sorts and elementwise ops are used (no scatter, no gather): keys
+    ``(chunk * Q + slot) * Q + token`` are sorted per block, an entry's bits are summed over its run (at most ``Q``
+    entries, one per token, because selections are unique per token), and a second sort keyed by ``chunk * Q + slot``
+    moves one entry per run to the front with its mask. A slot's tokens are consecutive positions of one sequence, so
+    block token ``j`` of slot ``s`` sits at position ``base[s] + j``; that gives every key the first block token that
+    may see it.
 
     Args:
         seq: ``[T]`` sequence of each token (from ``token_layout``).
         pos: ``[T]`` absolute position of each token.
         valid: ``[T]`` tokens that belong to a live sequence of this shard.
+        rank: ``[T]`` sequence rank of each token (:func:`_sequence_ranks`).
         kv_lens: ``[S]`` context lengths including the current step.
         selected: ``[T, W]`` chunk ids, ``-1``-padded, unique per row.
         chunk_size: Tokens per chunk (a multiple of ``kv_packing``).
@@ -392,13 +448,15 @@ def build_block_metadata(
         group: Chunks per kernel step (``group * chunk_size == 128``); the union is padded to a multiple of it.
         query_block: Query tokens per block ``Q``.
         pages_per_seq: Page-table row length.
+        window_pages: Length of one row of a block's block-table window (:func:`_block_table_windows`).
 
     Returns:
         ``(meta [B, M], vis [B, R, 128], padded_width)``. ``meta`` row ``b`` is ``[n_union, pos0, dense,
         words[0:Up]]``: the union size, the position of the block's first token, whether the union is exactly chunks
-        ``0 .. n_union - 1``, and every union chunk's first packed word within the sequence (padding slots repeat the
-        first chunk). ``vis[b]`` holds one int32 per union key (row ``g`` = the 128 keys of step ``g``):
-        ``(bits << 5) | thr`` with ``bits`` the chunk's member mask and ``thr`` the first block token whose position
+        ``0 .. n_union - 1`` of one sequence, and every entry's first packed word in the block's window
+        (``slot * window_pages * words_per_page`` plus the chunk's word within its sequence; padding slots repeat the
+        first entry). ``vis[b]`` holds one int32 per union key (row ``g`` = the 128 keys of step ``g``):
+        ``(bits << 5) | thr`` with ``bits`` the entry's member mask and ``thr`` the first block token whose position
         reaches the key; padding keys are 0 (visible to nobody).
     """
     total_tokens = int(seq.shape[0])
@@ -409,49 +467,61 @@ def build_block_metadata(
     kv_len = kv_lens[seq]
     start = selected * chunk_size
     ok = (selected >= 0) & valid[:, None] & (start <= pos[:, None]) & (start < kv_len[:, None])
-    big = jnp.iinfo(jnp.int32).max
-    tok_in_block = jnp.arange(total_tokens, dtype=jnp.int32) % q
-    key = jnp.where(ok, selected * q + tok_in_block[:, None], big)
-    pos_p = pos
+    big = _INT32_MAX
+    rank_b = jnp.pad(rank, (0, extra), mode="edge").reshape(num_blocks, q)
+    slot_b = rank_b - rank_b[:, :1]  # 0 .. q - 1: a block's tokens span at most q consecutive ranks
+    pos_b = jnp.pad(pos, (0, extra), mode="edge").reshape(num_blocks, q)
+    tok_b = jnp.broadcast_to(jnp.arange(q, dtype=jnp.int32)[None, :], (num_blocks, q))
+    seg = (slot_b * q + tok_b).reshape(-1)[:total_tokens]
+    key = jnp.where(ok, selected * (q * q) + seg[:, None], big)
     if extra:
         key = jnp.pad(key, ((0, extra), (0, 0)), constant_values=big)
-        pos_p = jnp.pad(pos, (0, extra), mode="edge")
-    key = jnp.sort(key.reshape(num_blocks, q * width), axis=1)
+    # Live keys are unique and sentinels identical: an unstable sort gives the same array without an iota operand.
+    key = lax.sort(key.reshape(num_blocks, q * width), dimension=1, is_stable=False)
     live = key < big
-    chunk = jnp.where(live, key // q, big)
+    run = jnp.where(live, key // q, big)  # chunk * q + slot: one union entry per (chunk, sequence)
     bits = jnp.where(live, jnp.left_shift(jnp.int32(1), key % q), 0)
-    # A chunk's run holds at most one entry per token, so summing the bits of the previous q - 1 entries of the
-    # same chunk gives, at the run's last entry, the mask of every token that selected it.
+    # A run holds at most one entry per token, so summing the bits of the previous q - 1 entries of the same run
+    # gives, at the run's last entry, the mask of every token that selected it.
     members = bits
     for k in range(1, q):
-        prev_chunk = jnp.pad(chunk[:, :-k], ((0, 0), (k, 0)), constant_values=-1)
+        prev_run = jnp.pad(run[:, :-k], ((0, 0), (k, 0)), constant_values=-1)
         prev_bits = jnp.pad(bits[:, :-k], ((0, 0), (k, 0)))
-        members = members + jnp.where(prev_chunk == chunk, prev_bits, 0)
-    next_chunk = jnp.pad(chunk[:, 1:], ((0, 0), (0, 1)), constant_values=big)
-    is_last = live & (chunk != next_chunk)
+        members = members + jnp.where(prev_run == run, prev_bits, 0)
+    next_run = jnp.pad(run[:, 1:], ((0, 0), (0, 1)), constant_values=big)
+    is_last = live & (run != next_run)
     n_union = jnp.sum(is_last, axis=1).astype(jnp.int32)
-    # One entry per union chunk, packed as (chunk << Q) | members (block_path_supported keeps it below the sentinel),
-    # so a single-operand sort moves the union to the front in ascending chunk order.
-    empty = jnp.uint32(0xFFFFFFFF)
-    packed = jnp.where(is_last, jnp.left_shift(chunk.astype(jnp.uint32), q) | members.astype(jnp.uint32), empty)
-    packed = jnp.sort(packed, axis=1)
+    # One entry per run moves to the front in ascending (chunk, slot) order; its member mask rides along.
+    ukey, umem = lax.sort(
+        (jnp.where(is_last, run, big), jnp.where(is_last, members, 0)), dimension=1, is_stable=False, num_keys=1
+    )
     padded_width = -(-(q * width) // group) * group
     if padded_width != q * width:
-        packed = jnp.pad(packed, ((0, 0), (0, padded_width - q * width)), constant_values=empty)
-    ulive = packed != empty
-    ukey = jnp.right_shift(packed, q).astype(jnp.int32)
-    umem = (packed & jnp.uint32((1 << q) - 1)).astype(jnp.int32)
+        ukey = jnp.pad(ukey, ((0, 0), (0, padded_width - q * width)), constant_values=big)
+        umem = jnp.pad(umem, ((0, 0), (0, padded_width - q * width)))
+    ulive = ukey < big
     first = jnp.where(ulive[:, :1], ukey[:, :1], 0)
     safe = jnp.where(ulive, ukey, first)
+    uchunk = safe // q
+    uslot = safe % q
     words_per_page = page_size // kv_packing
-    words = jnp.minimum(safe * (chunk_size // kv_packing), pages_per_seq * words_per_page - 1)
-    pos0 = pos_p.reshape(num_blocks, q)[:, 0]
-    dense = ((n_union > 0) & (jnp.max(safe, axis=1) == n_union - 1)).astype(jnp.int32)
+    words = jnp.minimum(uchunk * (chunk_size // kv_packing), pages_per_seq * words_per_page - 1)
+    words = words + uslot * (int(window_pages) * words_per_page)
+    # Position of block token 0 in each slot's sequence: block token j of slot s sits at slot_base[s] + j.
+    slots = jnp.arange(q, dtype=jnp.int32)
+    base_b = pos_b - tok_b
+    slot_base = jnp.max(jnp.where(slot_b[:, :, None] == slots[None, None, :], base_b[:, :, None], -big), axis=1)
+    ubase = jnp.zeros_like(safe)
+    for s in range(q):
+        ubase = jnp.where(uslot == s, slot_base[:, s : s + 1], ubase)
+    pos0 = pos_b[:, 0]
+    one_sequence = jnp.max(uslot, axis=1) == jnp.min(uslot, axis=1)
+    dense = ((n_union > 0) & (jnp.max(uchunk, axis=1) == n_union - 1) & one_sequence).astype(jnp.int32)
     meta = jnp.concatenate([n_union[:, None], pos0[:, None], dense[:, None], words], axis=1).astype(jnp.int32)
     m = int(meta.shape[1])
     meta = jnp.pad(meta, ((0, 0), (0, _smem_len(m) - m)))
     offs = jnp.arange(chunk_size, dtype=jnp.int32)
-    thr = jnp.clip(safe[:, :, None] * chunk_size + offs[None, None, :] - pos0[:, None, None], 0, q)
+    thr = jnp.clip((uchunk * chunk_size - ubase)[:, :, None] + offs[None, None, :], 0, q)
     vis = jnp.where(ulive[:, :, None], jnp.left_shift(umem[:, :, None], _VIS_SHIFT) | thr, 0).astype(jnp.int32)
     rows = padded_width * chunk_size // 128
     vis = vis.reshape(num_blocks, rows, 128)
@@ -462,7 +532,7 @@ def build_block_metadata(
 
 
 def _sparse_mla_block_kernel(
-    block_seq_ref,
+    block_rank_ref,
     meta_ref,
     bt_ref,
     q_nope_ref,
@@ -483,10 +553,11 @@ def _sparse_mla_block_kernel(
     """One block of ``Q`` query tokens (``Q * H`` rows): online softmax over the union of their chunks.
 
     Each union chunk is fetched once for the whole block; the per-key visibility row of the step masks every row to
-    its own token's selection and causal limit. Refs: ``block_seq`` (scalar prefetch), ``meta``, ``block-table row``,
-    ``q_nope``, ``[q_pe]``, ``vis``, cache (HBM), ``out``, kv ring, DMA semaphores, ``m``, ``l``, ``acc``.
+    its own token's selection and causal limit. Refs: ``block_rank`` (scalar prefetch), ``meta``, block-table
+    window (the rows of the sequences the block's tokens can belong to; a union word selects its row), ``q_nope``,
+    ``[q_pe]``, ``vis``, cache (HBM), ``out``, kv ring, DMA semaphores, ``m``, ``l``, ``acc``.
     """
-    del block_seq_ref
+    del block_rank_ref
     refs = list(refs)
     q_pe_ref = refs.pop(0) if has_pe else None
     vis_ref, cache_hbm_ref, o_ref, kv_buf, sems, m_ref, l_ref, acc_ref = refs
@@ -650,10 +721,13 @@ def _block_attention(
     num_blocks = -(-total_tokens // q)
     extra = num_blocks * q - total_tokens
     max_num_seqs = int(kv_lens.shape[0])
+    bt_block = _smem_len(pages_per_seq)
+    rank = _sequence_ranks(seq)
     meta, vis, _ = build_block_metadata(
         seq,
         pos,
         valid,
+        rank,
         kv_lens,
         selected,
         chunk_size=chunk_size,
@@ -662,26 +736,33 @@ def _block_attention(
         group=group,
         query_block=q,
         pages_per_seq=pages_per_seq,
+        window_pages=bt_block,
     )
-    block_seq = jnp.pad(seq, (0, extra), mode="edge").reshape(num_blocks, q)[:, 0].astype(jnp.int32)
+    block_rank = jnp.pad(rank, (0, extra), mode="edge").reshape(num_blocks, q)[:, 0]
+    windows = _block_table_windows(
+        block_tables,
+        seq,
+        rank,
+        max_num_seqs=max_num_seqs,
+        pages_per_seq=pages_per_seq,
+        window_pages=bt_block,
+        window_rows=_window_rows(q),
+    )
     if extra:
         q_nope = jnp.pad(q_nope, ((0, extra), (0, 0), (0, 0)))
         q_pe = jnp.pad(q_pe, ((0, extra), (0, 0), (0, 0)))
     # Token-major [Tp * H, D] rows: a block's queries are one contiguous [Q * H, D] slab (a free reshape).
     q_nope = q_nope.reshape(num_blocks * q * num_heads, nope_dim)
     q_pe = q_pe.reshape(num_blocks * q * num_heads, int(q_pe.shape[-1]))
-    bt_block = _smem_len(pages_per_seq)
-    bt = jnp.asarray(block_tables, jnp.int32).reshape(max_num_seqs, pages_per_seq)
-    if bt_block != pages_per_seq:
-        bt = jnp.pad(bt, ((0, 0), (0, bt_block - pages_per_seq)))
     meta_cols = int(meta.shape[1])
     vis_rows = int(vis.shape[1])
     in_specs = [
         pl.BlockSpec((meta_cols,), lambda b, *_: (b,), memory_space=pltpu.SMEM),
-        pl.BlockSpec((bt_block,), lambda b, seq_ref: (seq_ref[b],), memory_space=pltpu.SMEM),
+        # The window of the block's first sequence rank; the pipeline refetches it only when that rank changes.
+        pl.BlockSpec((_window_rows(q) * bt_block,), lambda b, rank_ref: (rank_ref[b],), memory_space=pltpu.SMEM),
         pl.BlockSpec((q * num_heads, nope_dim), lambda b, *_: (b, 0)),
     ]
-    operands = [meta.reshape(-1), bt.reshape(-1), q_nope]
+    operands = [meta.reshape(-1), windows, q_nope]
     if has_pe:
         in_specs.append(pl.BlockSpec((q * num_heads, int(q_pe.shape[-1])), lambda b, *_: (b, 0)))
         operands.append(q_pe)
@@ -726,7 +807,7 @@ def _block_attention(
         out_shape=jax.ShapeDtypeStruct((num_blocks * q * num_heads, nope_dim), q_nope.dtype),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",), vmem_limit_bytes=vmem_limit_bytes),
         name=f"SPARSE-MLA-BLK-q{q}-c{chunk_size}-g{group}-p{page_size}",
-    )(block_seq, *operands)
+    )(block_rank, *operands)
     return out.reshape(num_blocks * q, num_heads, nope_dim)[:total_tokens]
 
 
@@ -986,9 +1067,8 @@ def sparse_mla_ragged_paged_attention_pallas(
             tokens. Both give identical caches.
         query_block: Query tokens per program of the query-block kernel (``None`` = the per-token kernel only).
             When :func:`block_path_supported` holds (prefill buckets of at least ``_BLOCK_MIN_TOKENS`` tokens),
-            each block of ``query_block`` consecutive tokens fetches the union of its tokens' chunks once and
-            masks every token to its own selection; a step in which some block holds live tokens of two
-            sequences runs the per-token kernel instead (one ``lax.cond``, decided on device).
+            each block of ``query_block`` consecutive tokens, of one or several sequences, fetches the union of
+            its tokens' chunks once and masks every token to its own selection.
 
     Returns:
         ``(outputs [T, H, L], updated_kv_cache)``.
@@ -1036,7 +1116,6 @@ def sparse_mla_ragged_paged_attention_pallas(
         pages_per_seq=pages_per_seq,
     )
     if use_block:
-        # The per-token metadata is built only inside the fallback branch below.
         seq, pos, valid = token_layout(kv_lens, query_start_loc, distribution, int(total_tokens))
         meta = padded_width = None
     else:
@@ -1087,52 +1166,32 @@ def sparse_mla_ragged_paged_attention_pallas(
     if not use_block:
         out = _token_attention(meta, seq, padded_width, q_nope, q_pe, kv_cache, block_tables, **token_kw)
         return out[:, :, :nope_actual], kv_cache
-
-    def token_branch():
-        meta_t, _, _, _, width_t = build_metadata(
-            kv_lens, block_tables, query_start_loc, distribution, selected, **meta_kw
-        )
-        return _token_attention(meta_t, seq, width_t, q_nope, q_pe, kv_cache, block_tables, **token_kw)
-
-    def block_branch():
-        return _block_attention(
-            q_nope,
-            q_pe,
-            kv_cache,
-            kv_lens,
-            block_tables,
-            selected,
-            seq,
-            pos,
-            valid,
-            has_pe=has_pe,
-            chunk_size=int(chunk_size),
-            kv_packing=int(kv_packing),
-            group=int(group),
-            query_block=int(query_block),
-            page_size=page_size,
-            pages_per_seq=pages_per_seq,
-            sm_scale=float(sm_scale),
-            soft_cap=soft_cap,
-            mask_value=float(mask_value),
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            vmem_limit_bytes=vmem_limit_bytes,
-        )
-
-    out = lax.cond(_blocks_single_sequence(seq, valid, int(query_block)), block_branch, token_branch)
+    out = _block_attention(
+        q_nope,
+        q_pe,
+        kv_cache,
+        kv_lens,
+        block_tables,
+        selected,
+        seq,
+        pos,
+        valid,
+        has_pe=has_pe,
+        chunk_size=int(chunk_size),
+        kv_packing=int(kv_packing),
+        group=int(group),
+        query_block=int(query_block),
+        page_size=page_size,
+        pages_per_seq=pages_per_seq,
+        sm_scale=float(sm_scale),
+        soft_cap=soft_cap,
+        mask_value=float(mask_value),
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
     return out[:, :, :nope_actual], kv_cache
-
-
-def _blocks_single_sequence(seq: jax.Array, valid: jax.Array, query_block: int) -> jax.Array:
-    """Whether the live tokens of every block of ``query_block`` tokens share the sequence of its first token."""
-    total_tokens = int(seq.shape[0])
-    num_blocks = -(-total_tokens // int(query_block))
-    extra = num_blocks * int(query_block) - total_tokens
-    seq_b = jnp.pad(seq, (0, extra), mode="edge").reshape(num_blocks, int(query_block))
-    valid_b = jnp.pad(valid, (0, extra)).reshape(num_blocks, int(query_block))
-    return jnp.all(jnp.where(valid_b, seq_b == seq_b[:, :1], True))
 
 
 def _token_attention(
