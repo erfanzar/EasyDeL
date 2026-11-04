@@ -19,7 +19,8 @@ serving path (paged indexer + sparse MLA op) twice, with the flag off and on: ch
 divide the expert-parallel size, a mixed step (one row decodes while the other prefills), an idle row, padding tokens,
 then decode. Every step's layer output and the final caches must match. On expert-parallel meshes the flag-on program
 must really split (it indexes its expert-parallel shard); with ``ep == 1`` and with data-parallel KV pages it must keep
-the unsplit program.
+the unsplit program. ``None``, the automatic default, must build the flag-on program wherever the flag splits and the
+unsplit program elsewhere.
 """
 
 from __future__ import annotations
@@ -113,8 +114,11 @@ def _attention_output(layer, hidden, *, view, meta):
     return _forward(layer, hidden, view=view, meta=meta).attention_output
 
 
-def _run(config, layer, ep_split: bool):
-    """Run ``STEPS`` from an empty cache; returns per-step outputs, final cache arrays, first-step primitive counts."""
+def _run(config, layer, ep_split: bool | None, trace_only: bool = False):
+    """Run ``STEPS`` from an empty cache; returns per-step outputs, final cache arrays, first-step primitive counts.
+
+    ``trace_only`` returns only the first step's primitive counts, without running a step.
+    """
     layer.config.dsa_serving_ep_split = ep_split
     rng = np.random.default_rng(0)
     lengths = [sum(step[row] for step in STEPS) for row in range(2)]
@@ -163,6 +167,8 @@ def _run(config, layer, ep_split: bool):
                 # Trace on a shallow copy: the op stores its updated pages on the view object it is handed.
                 traced = view.replace(kv_pages=view.kv_pages)
                 counts = _primitive_counts(functools.partial(_attention_output, layer, view=traced, meta=meta), packed)
+                if trace_only:
+                    return counts
             out = _forward(layer, packed, view=view, meta=meta)
             view = out.cache_view
             outputs.append(np.asarray(out.attention_output[0]))
@@ -191,15 +197,22 @@ def test_ep_split_serving_matches_unsplit(dims, compact_min_window, monkeypatch)
         # of production prefill steps).
         monkeypatch.setattr(mlrpa, "_EP_SPLIT_COMPACT_MIN_WINDOW", compact_min_window)
     config, layer = _layer(dims)
+    # ``None``, the automatic rule, must build the split program exactly where ``True`` splits and the unsplit one
+    # elsewhere, so the outputs and caches compared below are its own. Traced first, from the config as built
+    # without the setting (``None`` with the merged base_config.py; one that still coerces the unset setting to
+    # ``False`` gets ``None`` assigned).
+    auto_counts = _run(config, layer, getattr(config, "dsa_serving_ep_split", None) or None, trace_only=True)
     off, off_cache, off_counts = _run(config, layer, False)
     on, on_cache, on_counts = _run(config, layer, True)
     ep, dp = dims[3], dims[1]
     if ep > 1 and dp == 1:
         # Guard against a vacuous comparison: the flag-on program indexes its expert-parallel shard.
         assert on_counts["axis_index"] > off_counts["axis_index"], (on_counts["axis_index"], off_counts["axis_index"])
+        assert auto_counts == on_counts
     else:
         # ep == 1, or KV pages sharded over data parallelism: the flag must leave the program unchanged.
         assert on_counts == off_counts
+        assert auto_counts == off_counts
     diffs = [float(np.max(np.abs(a - b))) for a, b in zip(on, off, strict=True)]
     bitwise = all(np.array_equal(a, b) for a, b in zip(on, off, strict=True))
     print(f"{dims}: per-step max|on - off| = {diffs}, bitwise={bitwise}")

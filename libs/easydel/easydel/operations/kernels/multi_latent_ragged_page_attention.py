@@ -137,6 +137,66 @@ def _mla_kernel_call(dense_fn, ignore: dict, total_tokens: int, common_call_kwar
     return selected, sparse_kernel
 
 
+def resolve_dsa_serving_ep_split(
+    setting: bool | None,
+    *,
+    mesh,
+    partition_axis,
+    sparse: bool,
+    dp_local: bool,
+    page_axis,
+    query_specs: tuple[Ps, ...],
+) -> tuple[str, ...]:
+    """Resolve ``dsa_serving_ep_split`` for one MLA ragged-pages call: the mesh axes its sparse queries split over.
+
+    The expert-parallel axis only replicates attention and the MLA pages are replicated over it, so each of its shards
+    can attend for a slice of the query tokens (:func:`_ep_split_sparse_attention`), with outputs and caches equal to
+    the unsplit call's. The split applies to sparse (DSA top-k) calls, which only the eSurge serving path makes (MLA
+    ragged-pages cache views), on an expert-parallel axis of more than one device, with the globally replicated page
+    path (KV pages not sharded over data parallelism) and a query sharding that does not already use that axis.
+
+    The setting is tri-state: ``None`` (automatic) splits wherever the split applies and keeps the unsplit call
+    elsewhere without a message; ``True`` does the same and warns once where it cannot apply; ``False`` never splits.
+    Training never reaches this function: it runs only for ragged-pages cache views.
+
+    Args:
+        setting: ``config.dsa_serving_ep_split`` (``None``, ``True`` or ``False``).
+        mesh: Device mesh of the call.
+        partition_axis: Partition axis naming the expert-parallel mesh axes.
+        sparse: Whether the call carries a DSA selection (dense MLA calls never split).
+        dp_local: Whether the data-parallel local page path runs this call.
+        page_axis: Logical KV-page axis of the cache view (``EMPTY`` when replicated).
+        query_specs: Resolved partition specs of the two query tensors.
+
+    Returns:
+        The expert-parallel mesh axis names to split over, or ``()`` for the unsplit call.
+    """
+    if (setting is not None and not setting) or not sparse:
+        return ()
+    names = normalize_axis_names(getattr(partition_axis, "expert_parallel_axis", None))
+    names = tuple(name for name in names if mesh_axis_size(mesh, name) > 1)
+    if not names:
+        return ()  # nothing to split over (ep = 1): the unsplit call is the split call
+    reasons = []
+    if dp_local:
+        reasons.append("the data-parallel local page path runs this call")
+    elif page_axis != ct.EMPTY:
+        reasons.append("the KV pages are sharded over the data-parallel axis")
+    used = {axis for spec in query_specs for entry in spec for axis in normalize_axis_names(entry)}
+    overlap = sorted(used.intersection(names))
+    if overlap:
+        reasons.append(f"the query sharding already uses {overlap}")
+    if reasons:
+        if setting:
+            logger.warning_once(
+                "dsa_serving_ep_split is inactive for this sparse MLA call because %s; every expert-parallel shard "
+                "attends for all query tokens.",
+                "; ".join(reasons),
+            )
+        return ()
+    return names
+
+
 def _ep_split_sparse_attention(
     kernel,
     *,
@@ -523,15 +583,11 @@ class MultiLatentRaggedPageAttn(OperationImpl):
     ) -> tuple[str, ...]:
         """Mesh axes to split the sparse kernel's query tokens over, or ``()`` to keep the unsplit call.
 
-        The DSA layer passes ``sparse_ep_split=True`` (``config.dsa_serving_ep_split``) with its top-k selection. The
-        expert-parallel axis only replicates attention and the MLA pages are replicated over it, so each of its shards
-        can attend for a slice of the query tokens (see :func:`_ep_split_sparse_attention`). The split needs an
-        expert-parallel axis of more than one device, the globally replicated page path (not the data-parallel local
-        one, pages not sharded over data parallelism) and a query sharding that does not already use that axis;
-        otherwise the call stays unsplit and a one-time warning names the reason.
+        The DSA layer passes its ``dsa_serving_ep_split`` setting as ``sparse_ep_split`` with its top-k selection (an
+        absent key is ``None``, the automatic rule); :func:`resolve_dsa_serving_ep_split` decides.
 
         Args:
-            ignore: Extra forward kwargs; ``sparse_ep_split`` requests the split.
+            ignore: Extra forward kwargs; ``sparse_ep_split`` carries the setting.
             sparse_selected: The DSA selection, ``None`` for dense MLA calls (never split).
             dp_local: Whether the data-parallel local page path runs this call.
             page_axis: Logical KV-page axis of the cache view (``EMPTY`` when replicated).
@@ -540,30 +596,19 @@ class MultiLatentRaggedPageAttn(OperationImpl):
         Returns:
             The expert-parallel mesh axis names to split over, or ``()``.
         """
-        if not ignore.get("sparse_ep_split") or sparse_selected is None:
+        setting = ignore.get("sparse_ep_split")
+        if sparse_selected is None or (setting is not None and not setting):
+            # Dense MLA calls and an explicit ``False`` keep the unsplit call without reading the metadata.
             return ()
-        mesh = self.metadata.mesh
-        names = normalize_axis_names(getattr(self.metadata.partition_axis, "expert_parallel_axis", None))
-        names = tuple(name for name in names if mesh_axis_size(mesh, name) > 1)
-        if not names:
-            return ()  # nothing to split over (ep = 1): the unsplit call is the split call
-        reasons = []
-        if dp_local:
-            reasons.append("the data-parallel local page path runs this call")
-        elif page_axis != ct.EMPTY:
-            reasons.append("the KV pages are sharded over the data-parallel axis")
-        used = {axis for spec in query_specs for entry in spec for axis in normalize_axis_names(entry)}
-        overlap = sorted(used.intersection(names))
-        if overlap:
-            reasons.append(f"the query sharding already uses {overlap}")
-        if reasons:
-            logger.warning_once(
-                "dsa_serving_ep_split is inactive for this sparse MLA call because %s; every expert-parallel shard "
-                "attends for all query tokens.",
-                "; ".join(reasons),
-            )
-            return ()
-        return names
+        return resolve_dsa_serving_ep_split(
+            setting,
+            mesh=self.metadata.mesh,
+            partition_axis=getattr(self.metadata, "partition_axis", None),
+            sparse=sparse_selected is not None,
+            dp_local=dp_local,
+            page_axis=page_axis,
+            query_specs=query_specs,
+        )
 
     def forward_core(
         self,
