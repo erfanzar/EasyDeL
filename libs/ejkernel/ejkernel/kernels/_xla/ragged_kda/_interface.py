@@ -33,31 +33,51 @@ def ragged_kda(
     query_start_loc: Int[Array, "num_rows_plus_1"],
     state_indices: Int[Array, "num_rows"] | None,
     has_initial_state: Bool[Array, "num_rows"] | None = None,
+    read_offset: Int[Array, "num_rows"] | None = None,
+    commit_lens: Int[Array, "num_rows"] | None = None,
+    q_conv_weight: Float[Array, "key_dim d_conv"] | None = None,
+    k_conv_weight: Float[Array, "key_dim d_conv"] | None = None,
+    v_conv_weight: Float[Array, "value_dim d_conv"] | None = None,
+    q_conv_state: Float[Array, "num_slots key_dim d_conv"] | None = None,
+    k_conv_state: Float[Array, "num_slots key_dim d_conv"] | None = None,
+    v_conv_state: Float[Array, "num_slots value_dim d_conv"] | None = None,
     *,
+    short_row_max: int = 1,
     chunk_size: int = 64,
     use_qk_l2norm: bool = True,
     decay_lower_bound: float | None = None,
     precision: str = "highest",
     inverse: str = "auto",
     pairwise: str = "auto",
-) -> tuple[Float[Array, "num_tokens num_heads v_dim"], Float[Array, "num_slots num_heads head_dim v_dim"]]:
-    """Ragged (flat-token) KDA with per-channel decay over a recurrent-state pool.
+) -> tuple[Array, ...]:
+    """Ragged (flat-token) KDA: fused causal conv, per-channel decay, per-token state capture (XLA reference).
 
-    Request ``r`` owns tokens ``[query_start_loc[r], query_start_loc[r + 1])`` and pool slot ``state_indices[r]``.
-    Single-token rows take one vectorised decode step; rows with two or more tokens run the chunked math on their
-    own live chunks only. See :mod:`._xla_impl` for the algorithm.
+    Row ``r`` owns tokens ``[query_start_loc[r], query_start_loc[r + 1])`` and the slot group starting at its base slot
+    ``g = state_indices[r]``. It reads its conv windows and state from slot ``g + read_offset[r]``; rows of at most
+    ``short_row_max`` tokens write the windows and state after token ``commit_lens[r] - 1 + j`` into slot ``g + j``
+    (``j = 0 .. lens - commit``), longer rows their final windows and state into slot ``g``. See :mod:`._xla_impl`.
 
     Args:
-        query: Post-conv queries ``[T, H, K]``.
-        key: Post-conv keys ``[T, H, K]``.
-        value: Post-conv values ``[T, H, V]``.
+        query: Queries ``[T, H, K]``: raw (pre-conv) with the six conv arrays, post-conv without them.
+        key: Keys ``[T, H, K]``.
+        value: Values ``[T, H, V]``.
         beta: Write strengths ``[T, H]`` (sigmoid already applied).
         decay: Per-channel log-decay ``[T, H, K]`` (``<= 0``), ideally fp32.
-        recurrent_state: State pool ``[S, H, K, V]`` (fp32 recommended; the recurrence always runs in fp32).
+        recurrent_state: State pool ``[S, H, K, V]`` (the recurrence always runs in fp32).
         query_start_loc: Cumulative row offsets ``[R + 1]``; tokens at or past ``query_start_loc[R]`` are padding.
-        state_indices: Pool slot of every row ``[R]``; out-of-range slots mark padding rows. ``None``: row ``r``
-            owns slot ``r`` (identity layout, ``S >= R``; the decode phase updates those slots in place).
-        has_initial_state: Optional ``[R]`` flags; ``False`` rows start from a zero state instead of their slot.
+        state_indices: Base slot of every row ``[R]`` (rows whose slots fall out of range are padding rows), or
+            ``None`` (row ``r``'s base slot is ``r``).
+        has_initial_state: Optional ``[R]`` flags; ``False`` rows start from zero windows and a zero state.
+        read_offset: Optional ``[R]`` read offsets (zero when ``None``).
+        commit_lens: Optional ``[R]`` commit lengths (``lens`` when ``None``).
+        q_conv_weight: Depthwise causal conv taps ``[H * K, d_conv]`` (the last tap is the current token), or
+            ``None`` (post-conv inputs).
+        k_conv_weight: ``[H * K, d_conv]`` or ``None``.
+        v_conv_weight: ``[H * V, d_conv]`` or ``None``.
+        q_conv_state: Conv-window pool ``[S, H * K, d_conv]`` (oldest tap first), or ``None``.
+        k_conv_state: ``[S, H * K, d_conv]`` or ``None``.
+        v_conv_state: ``[S, H * V, d_conv]`` or ``None``.
+        short_row_max: ``W``: rows of at most ``W`` tokens take the short-row path (per-token capture).
         chunk_size: Chunk length of the multi-token path.
         use_qk_l2norm: L2-normalise queries and keys first.
         decay_lower_bound: Promise that every log-decay is ``>= decay_lower_bound`` (e.g. a safe-gate bound); with
@@ -69,12 +89,11 @@ def ragged_kda(
         pairwise: ``"auto"`` or ``"dense"``.
 
     Returns:
-        ``(out [T, H, V] fp32, new_recurrent_state [S, H, K, V])``: zero output at padding tokens; the pool keeps
-        its dtype, and slots of rows without tokens are unchanged.
+        With the conv arrays ``(out [T, H, V] fp32, q_conv_state, k_conv_state, v_conv_state, recurrent_state)``,
+        without them ``(out, recurrent_state)``: zero output at padding tokens; the pools keep their dtypes, and slots
+        no live row writes are unchanged.
     """
-    validate_options(chunk_size, precision, inverse, pairwise, decay_lower_bound)
-    validate_shapes(query, key, value, beta, decay, recurrent_state, query_start_loc, state_indices, has_initial_state)
-    return ragged_kda_xla(
+    arrays = (
         query,
         key,
         value,
@@ -84,6 +103,20 @@ def ragged_kda(
         query_start_loc,
         state_indices,
         has_initial_state,
+        read_offset,
+        commit_lens,
+        q_conv_weight,
+        k_conv_weight,
+        v_conv_weight,
+        q_conv_state,
+        k_conv_state,
+        v_conv_state,
+    )
+    validate_options(chunk_size, precision, inverse, pairwise, decay_lower_bound, short_row_max)
+    validate_shapes(*arrays)
+    return ragged_kda_xla(
+        *arrays,
+        short_row_max=int(short_row_max),
         chunk_size=int(chunk_size),
         use_qk_l2norm=use_qk_l2norm,
         decay_lower_bound=decay_lower_bound,

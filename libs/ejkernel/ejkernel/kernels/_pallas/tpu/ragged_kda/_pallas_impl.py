@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pallas TPU ``ragged_kda``: the multi-token chunk path of ragged KDA in one ``pallas_call``, pool updated in place.
+"""Pallas TPU ``ragged_kda``: chunk rows in one ``pallas_call`` (pool updated in place), short rows token by token.
 
-Single-token rows take the XLA reference's vectorised decode phase unchanged. Every row with two or more tokens is
-cut into ``chunk_size`` chunks aligned to its first token, exactly as in the XLA reference (``_xla.ragged_kda``):
-chunk ``c`` reads the ``chunk_size``-token window of the flat stream that starts at the chunk's first token (clamped
-back near the end of the buffer), and tokens of the window outside the chunk are zeroed, which makes them inert.
-The live chunks of a step are laid out back to back (row by row) in a static number of chunk slots::
+Row planning, the causal conv and the short rows (at most ``short_row_max`` tokens, captured per token into the row's
+slot group) follow the XLA reference (``_xla.ragged_kda``). With the conv arrays every short-row token's recurrence is
+the Pallas decode kernel (``ragged_kda_decode``'s arithmetic: MXU matvecs at ``HIGHEST``, the serving decode step); on
+post-conv inputs it is the reference's decode step (the round-4 ``ragged_kda`` arithmetic, kept for post-conv callers).
+
+Every chunk row (more than ``short_row_max`` tokens) is cut into ``chunk_size`` chunks aligned to its first token,
+exactly as in the XLA reference: chunk ``c`` reads the ``chunk_size``-token window of the flat (post-conv) stream that
+starts at the chunk's first token (clamped back near the end of the buffer), and tokens of the window outside the
+chunk are zeroed, which makes them inert. The live chunks of a step are laid out back to back (row by row) in a static
+number of chunk slots::
 
     num_chunks = max_live_chunks(T, R, cs)           # static bound on the live chunks (see that function)
 
@@ -27,17 +32,18 @@ The live chunks of a step are laid out back to back (row by row) in a static num
              shifts, because XLA lowers a window gather of it to a loop with one iteration per chunk slot)
     kernel:  grid = (H // block_h "parallel", num_chunks "arbitrary")
              state [block_h, K, V] fp32 in a VMEM scratch, carried along the chunk axis
-             a row's first chunk seeds it from the row's pool slot (zero for a fresh row), its last chunk stores it
-             back; the pool block follows the slot table (scalar prefetch), so each live row's slot is DMAed in once
-             and out once, and the pool is an input/output alias (no other slot is read or written)
+             a row's first chunk seeds it from the row's read slot g + a (zero for a fresh row), its last chunk
+             stores it into the base slot g; the pool blocks follow the read / write slot tables (scalar prefetch), so
+             each live row's slots are DMAed in once and out once, and the pool is an input/output alias (no other
+             slot is read or written)
              per chunk: g_cumsum on the MXU and the shared ``chunk_core`` math vmapped over the head block (the
              training ``kda_chunk`` kernel's factored form)
              chunk slots past the live ones revisit the last live chunk's blocks: no DMA, no compute
-    XLA:     chunk outputs gathered back to the flat stream, merged with the decode rows' outputs
+    XLA:     chunk outputs gathered back to the flat stream, merged with the short rows' outputs
 
 The kernel needs the factored pairwise decay (a ``decay_lower_bound`` that allows it), the masked chunk inverse and
 lane-aligned head sizes; :func:`supported` says when, and the registry entry runs the XLA reference otherwise. Rows
-with tokens must own distinct pool slots (as eSurge schedules them).
+with tokens must own disjoint slot groups (as eSurge schedules them).
 """
 
 from __future__ import annotations
@@ -52,10 +58,11 @@ from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array
 
 from ...._xla.kda_chunk._xla_impl import LANES, SUBLANES, chunk_core, l2norm, pairwise_sub_block, resolve_precision
-from ...._xla.ragged_kda._xla_impl import _decode_phase, resolve_inverse
+from ...._xla.ragged_kda._xla_impl import conv_and_short_rows, plan_rows, resolve_inverse, xla_step
 from ..kda_chunk._pallas_impl_fwd import chunk_cumsum
+from ..ragged_kda_decode._pallas_impl import ragged_kda_decode_pallas
 
-_NUM_TABLES = 6  # scalar-prefetch operands: live count, chunk map, slot, first, last, init
+_NUM_TABLES = 7  # scalar-prefetch operands: live count, chunk map, read slot, write slot, first, last, init
 
 
 def supported(head_dim: int, v_dim: int, chunk_size: int, sub: int, inverse: str) -> bool:
@@ -142,15 +149,19 @@ def _vmem_limit_bytes() -> int:
 def _chunk_tables(
     qsl: Array,
     lens: Array,
-    state_indices: Array | None,
-    has_init: Array | None,
+    read_slot: Array,
+    write_slot: Array,
+    has_init: Array,
     *,
     num_tokens: int,
     num_slots: int,
     chunk_size: int,
     num_chunks: int,
 ) -> dict[str, Array]:
-    """Per-chunk-slot tables: row, window start, valid lanes, pool slot and first / last / init flags."""
+    """Per-chunk-slot tables: row, window start, valid lanes, read / write pool slots and first / last / init flags.
+
+    ``lens`` holds the chunk rows' token counts (zero for every other row).
+    """
     i32 = jnp.int32
     cs = chunk_size
     num_rows = lens.shape[0]
@@ -168,15 +179,18 @@ def _chunk_tables(
     win_start = jnp.clip(start, 0, num_tokens - cs)
     lo = jnp.where(live, start - win_start, 0)
     hi = jnp.where(live, jnp.minimum(start + cs, qsl[row + 1]) - win_start, 0)
-    slot = row if state_indices is None else state_indices[row]
-    init = jnp.ones((num_chunks,), i32) if has_init is None else has_init[row].astype(i32)
+    wslot = jnp.clip(write_slot[row], 0, num_slots - 1).astype(i32)
+    rslot = jnp.clip(read_slot[row], 0, num_slots - 1).astype(i32)
+    # Without a live chunk the kernel copies the visited block onto itself: read and write the same slot.
+    rslot = jnp.where(n_live > 0, rslot, wslot)
     return {
         "n_live": n_live.reshape(1),
         "cmap": cmap,
-        "slot": jnp.clip(slot, 0, num_slots - 1).astype(i32),
+        "rslot": rslot,
+        "wslot": wslot,
         "first": (live & (local == 0)).astype(i32),
         "last": (live & (local == n_chunks[row] - 1)).astype(i32),
-        "init": init,
+        "init": has_init[row].astype(i32),
         "win_start": win_start,
         "lo": lo,
         "hi": hi,
@@ -264,7 +278,8 @@ def _chunk_inputs(
 def _chunk_kernel(
     n_live_ref,
     cmap_ref,
-    slot_ref,
+    rslot_ref,
+    wslot_ref,
     first_ref,
     last_ref,
     init_ref,
@@ -284,7 +299,7 @@ def _chunk_kernel(
     precision,
 ):
     """Grid step ``(hb, c)``: advance ``block_h`` heads of chunk slot ``c``'s row through that chunk."""
-    del cmap_ref, slot_ref  # consumed by the index maps
+    del cmap_ref, rslot_ref, wslot_ref  # consumed by the index maps
     c = pl.program_id(1)
     n_live = n_live_ref[0]
     live = c < n_live
@@ -324,7 +339,7 @@ def _chunk_kernel(
 
     @pl.when(n_live == 0)
     def _hold():
-        # No live chunk: the visited pool block is written back unchanged.
+        # No live chunk: the visited pool block (read slot == write slot) is written back unchanged.
         new_pool_ref[...] = pool_ref[...]
 
 
@@ -337,10 +352,10 @@ def _flat_output(
     num_tokens: int,
     chunk_size: int,
 ) -> tuple[Array, Array]:
-    """Gather the chunk outputs ``[C, H, cs, V]`` back to the flat stream.
+    """Gather the chunk outputs ``[C, H, cs, V]`` back to the flat stream (``lens``: the chunk rows' token counts).
 
     Returns:
-        ``(in_multi_token_row [T] bool, out [T, H, V])``; ``out`` is meaningful only where the flag is set.
+        ``(in_chunk_row [T] bool, out [T, H, V])``; ``out`` is meaningful only where the flag is set.
     """
     i32 = jnp.int32
     cs = chunk_size
@@ -356,6 +371,27 @@ def _flat_output(
     return multi, chunk_out[chunk, :, lane, :]
 
 
+def _decode_kernel_step(
+    query: Array,
+    key: Array,
+    value: Array,
+    beta: Array,
+    decay: Array,
+    state: Array,
+    valid: Array,
+    init: Array | None,
+    use_qk_l2norm: bool = True,
+) -> tuple[Array, Array]:
+    """One short-row token for every row through the Pallas decode kernel (the serving decode step's arithmetic).
+
+    ``state`` ``[R, H, K, V]`` (pool dtype) is the rows' carried state, updated in place; rows that are not ``valid``
+    keep it bit for bit and output zeros.
+    """
+    return ragged_kda_decode_pallas(
+        query, key, value, beta, decay, state, None, valid, init, use_qk_l2norm=use_qk_l2norm
+    )
+
+
 def ragged_kda_pallas(
     query: Array,
     key: Array,
@@ -366,7 +402,16 @@ def ragged_kda_pallas(
     query_start_loc: Array,
     state_indices: Array | None,
     has_initial_state: Array | None = None,
+    read_offset: Array | None = None,
+    commit_lens: Array | None = None,
+    q_conv_weight: Array | None = None,
+    k_conv_weight: Array | None = None,
+    v_conv_weight: Array | None = None,
+    q_conv_state: Array | None = None,
+    k_conv_state: Array | None = None,
+    v_conv_state: Array | None = None,
     *,
+    short_row_max: int = 1,
     chunk_size: int = 64,
     use_qk_l2norm: bool = True,
     decay_lower_bound: float | None = None,
@@ -374,32 +419,41 @@ def ragged_kda_pallas(
     inverse: str = "auto",
     pairwise: str = "auto",
     block_h: int = 0,
-) -> tuple[Array, Array]:
-    """Ragged per-channel KDA over a packed token stream and a recurrent-state pool (Pallas TPU chunk path).
+) -> tuple[Array, ...]:
+    """Ragged per-channel KDA with the causal conv fused and per-token state capture (Pallas TPU).
 
     Same contract as the XLA reference ``ragged_kda_xla``; the caller checks :func:`supported` first.
 
     Args:
-        query: Post-conv queries ``[T, H, K]``.
-        key: Post-conv keys ``[T, H, K]``.
-        value: Post-conv values ``[T, H, V]``.
+        query: Queries ``[T, H, K]``: raw (pre-conv) with the six conv arrays, post-conv without them.
+        key: Keys ``[T, H, K]``.
+        value: Values ``[T, H, V]``.
         beta: Write strengths ``[T, H]`` (sigmoid applied).
         decay: Per-channel log-decay ``[T, H, K]`` (``<= 0``).
         recurrent_state: State pool ``[S, H, K, V]``; computed in fp32, returned in its own dtype.
         query_start_loc: Cumulative row offsets ``[R + 1]`` (nondecreasing).
-        state_indices: Pool slot of every row ``[R]`` (out of range: the row is empty), or ``None`` (row ``r`` owns
-            slot ``r``). Rows with tokens must own distinct slots.
-        has_initial_state: Optional ``[R]`` flags; ``False`` rows start from a zero state.
-        chunk_size: Chunk length of the multi-token path.
+        state_indices: Base slot of every row ``[R]``, or ``None`` (``g = r``). Rows must own disjoint slot groups.
+        has_initial_state: Optional ``[R]`` flags; ``False`` rows start from zero windows and a zero state.
+        read_offset: Optional ``[R]`` read offsets (zero when ``None``).
+        commit_lens: Optional ``[R]`` commit lengths (``lens`` when ``None``).
+        q_conv_weight: Depthwise causal conv taps ``[H * K, d_conv]``, or ``None`` (post-conv inputs).
+        k_conv_weight: ``[H * K, d_conv]`` or ``None``.
+        v_conv_weight: ``[H * V, d_conv]`` or ``None``.
+        q_conv_state: Conv-window pool ``[S, H * K, d_conv]``, or ``None``.
+        k_conv_state: ``[S, H * K, d_conv]`` or ``None``.
+        v_conv_state: ``[S, H * V, d_conv]`` or ``None``.
+        short_row_max: ``W``: rows of at most ``W`` tokens take the short-row path (per-token capture).
+        chunk_size: Chunk length of the chunk path.
         use_qk_l2norm: L2-normalise queries and keys.
         decay_lower_bound: Promised lower bound of every log-decay (selects the factored pairwise decay).
         precision: Precision of the non-inverse chunk dots.
         inverse: ``"auto"`` or ``"masked"``.
         pairwise: ``"auto"`` (the factored form must result).
-        block_h: Heads per grid step (``0``: :func:`pick_block_h`).
+        block_h: Heads per grid step of the chunk kernel (``0``: :func:`pick_block_h`).
 
     Returns:
-        ``(out [T, H, V] fp32, new_recurrent_state [S, H, K, V])``.
+        With the conv arrays ``(out [T, H, V] fp32, q_conv_state, k_conv_state, v_conv_state, recurrent_state)``,
+        without them ``(out, recurrent_state)``.
 
     Raises:
         ValueError: If the options do not resolve to the factored form with the masked inverse, or for a bad
@@ -416,42 +470,46 @@ def ragged_kda_pallas(
             f"ragged_kda Pallas TPU kernel: unsupported options (head_dim={head_dim}, v_dim={v_dim}, "
             f"chunk_size={cs}, factored sub-block={sub}, inverse={inverse!r})"
         )
+    fused = q_conv_weight is not None
     qsl = query_start_loc.astype(jnp.int32)
     num_rows = qsl.shape[0] - 1
-    lens = jnp.maximum(qsl[1:] - qsl[:-1], 0)
-    if state_indices is not None:
-        state_indices = state_indices.astype(jnp.int32)
-        lens = jnp.where((state_indices >= 0) & (state_indices < num_slots), lens, 0)
-    has_init = None if has_initial_state is None else jnp.asarray(has_initial_state).astype(jnp.bool_)
+    plan = plan_rows(
+        qsl,
+        state_indices,
+        has_initial_state,
+        read_offset,
+        commit_lens,
+        num_slots=num_slots,
+        short_row_max=int(short_row_max),
+    )
+    out, pools, (query, key, value) = conv_and_short_rows(
+        query,
+        key,
+        value,
+        beta,
+        decay,
+        (q_conv_weight, k_conv_weight, v_conv_weight) if fused else None,
+        (q_conv_state, k_conv_state, v_conv_state, recurrent_state),
+        qsl,
+        plan,
+        short_row_max=int(short_row_max),
+        use_qk_l2norm=use_qk_l2norm,
+        step_fn=_decode_kernel_step if fused else xla_step,
+    )
+    chunk_lens = jnp.where(plan.chunk, plan.lens, 0)
 
     pad = max(cs - num_tokens, 0)  # a chunk window must fit in the buffer (as in the reference)
     if pad:
         query, key, value, decay = (jnp.pad(x, ((0, pad), (0, 0), (0, 0))) for x in (query, key, value, decay))
         beta = jnp.pad(beta, ((0, pad), (0, 0)))
     padded = num_tokens + pad
-    out = jnp.zeros((padded, num_heads, v_dim), jnp.float32)
-    out, pool = _decode_phase(
-        out,
-        recurrent_state,
-        query=query,
-        key=key,
-        value=value,
-        beta=beta,
-        decay=decay,
-        starts=qsl[:-1],
-        lens=lens,
-        state_indices=state_indices,
-        has_init=has_init,
-        num_tokens=num_tokens,
-        use_qk_l2norm=use_qk_l2norm,
-    )
-
     num_chunks = max_live_chunks(num_tokens, num_rows, cs)
     tables = _chunk_tables(
         qsl,
-        lens,
-        state_indices,
-        has_init,
+        chunk_lens,
+        plan.read_slot,
+        plan.base_slot,
+        plan.init,
         num_tokens=padded,
         num_slots=num_slots,
         chunk_size=cs,
@@ -464,28 +522,38 @@ def ragged_kda_pallas(
     def chunk_map(hb, c, n_live, cmap, *_):
         return (cmap[c], hb, 0, 0)
 
-    def slot_map(hb, c, n_live, cmap, slot, *_):
-        return (slot[c], hb, 0, 0)
+    def read_map(hb, c, n_live, cmap, rslot, *_):
+        return (rslot[c], hb, 0, 0)
+
+    def write_map(hb, c, n_live, cmap, rslot, wslot, *_):
+        return (wslot[c], hb, 0, 0)
 
     k_spec = pl.BlockSpec((None, bh, cs, head_dim), chunk_map)
     v_spec = pl.BlockSpec((None, bh, cs, v_dim), chunk_map)
-    pool_spec = pl.BlockSpec((None, bh, head_dim, v_dim), slot_map)
     f32 = jnp.float32
+    pool = pools[3]
     kernel = functools.partial(_chunk_kernel, chunk_size=cs, sub=int(sub), precision=resolve_precision(precision))
     chunk_out, new_pool = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=_NUM_TABLES,
             grid=(num_heads // bh, num_chunks),
-            in_specs=[k_spec, k_spec, k_spec, v_spec, k_spec, pool_spec],
-            out_specs=[v_spec, pool_spec],
+            in_specs=[
+                k_spec,
+                k_spec,
+                k_spec,
+                v_spec,
+                k_spec,
+                pl.BlockSpec((None, bh, head_dim, v_dim), read_map),
+            ],
+            out_specs=[v_spec, pl.BlockSpec((None, bh, head_dim, v_dim), write_map)],
             scratch_shapes=[pltpu.VMEM((bh, head_dim, v_dim), f32), pltpu.VMEM((bh, cs, head_dim), f32)],
         ),
         out_shape=[
             jax.ShapeDtypeStruct((num_chunks, num_heads, cs, v_dim), f32),
             jax.ShapeDtypeStruct(pool.shape, pool.dtype),
         ],
-        # operands: 6 tables, q, k, k_beta, v_beta, g, pool -> the pool (11) is updated in place as output 1.
+        # operands: 7 tables, q, k, k_beta, v_beta, g, pool -> the pool (12) is updated in place as output 1.
         input_output_aliases={_NUM_TABLES + 5: 1},
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "arbitrary"),
@@ -495,7 +563,8 @@ def ragged_kda_pallas(
     )(
         tables["n_live"],
         tables["cmap"],
-        tables["slot"],
+        tables["rslot"],
+        tables["wslot"],
         tables["first"],
         tables["last"],
         tables["init"],
@@ -506,8 +575,11 @@ def ragged_kda_pallas(
         g,
         pool,
     )
-    multi, flat = _flat_output(chunk_out, qsl, lens, tables, num_tokens=num_tokens, chunk_size=cs)
-    return jnp.where(multi[:, None, None], flat, out[:num_tokens]), new_pool
+    multi, flat = _flat_output(chunk_out, qsl, chunk_lens, tables, num_tokens=num_tokens, chunk_size=cs)
+    out = jnp.where(multi[:, None, None], flat, out)
+    if fused:
+        return out, pools[0], pools[1], pools[2], new_pool
+    return out, new_pool
 
 
 __all__ = ("max_live_chunks", "pick_block_h", "ragged_kda_pallas", "supported")
