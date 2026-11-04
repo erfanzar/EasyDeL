@@ -1686,7 +1686,7 @@ class EasyGenerationMixin:
             recurrent_state_shape=(int(conv_dim), int(d_state)),
         )
 
-    def create_kda_cache_config(self, batch_size: int):
+    def create_kda_cache_config(self, batch_size: int, *, serving: bool = False):
         """Create KDACacheConfig from model configuration.
 
         Creates cache configuration for models using Key-Dependent Attention (KDA)
@@ -1694,6 +1694,9 @@ class EasyGenerationMixin:
 
         Args:
             batch_size (int): Batch size for inference.
+            serving (bool): Whether the cache serves eSurge. Only serving caches split their heads over the head
+                and expert-parallel axes (``kda_serving_ep_split``, see
+                :func:`easydel.layers.linear_attention._kda.kda_serving_head_axes`); ``init_cache`` caches never do.
 
         Returns:
             KDACacheConfig: Cache configuration for KDA-style attention layers.
@@ -1721,8 +1724,8 @@ class EasyGenerationMixin:
             value_dim=spec.value_dim,
             d_conv=spec.d_conv,
             recurrent_state_shape=(spec.num_heads, spec.head_k_dim, spec.head_v_dim),
-            # ``kda_serving_ep_split``: heads over (head axis, ep axis); None keeps the partition axis's head axis.
-            head_shard_axes=kda_serving_head_axes(text_config),
+            # Serving caches: heads over (head axis, ep axis) where the mesh allows it; None keeps the head axis.
+            head_shard_axes=kda_serving_head_axes(text_config, serving=serving),
         )
 
     def _create_standard_ragged_page_cache_config(
@@ -2494,7 +2497,11 @@ class EasyGenerationMixin:
                     config = self.create_recurrent_cache_config(batch_size=batch_size)
                     views_config[idx] = config
                 elif view_class is KDACacheView:
-                    config = self.create_kda_cache_config(batch_size=batch_size)
+                    # eSurge passes its paged-cache config; ``init_cache`` passes none, so its KDA heads never split.
+                    config = self.create_kda_cache_config(
+                        batch_size=batch_size,
+                        serving=ragged_config is not None or unified_config is not None,
+                    )
                     views_config[idx] = config
                 elif view_class is MLARaggedPagesCacheView:
                     if shared_mla_ragged_config is None:

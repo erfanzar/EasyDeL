@@ -145,24 +145,31 @@ def _axis_names(entry: tp.Any) -> tuple[str, ...]:
     return tuple(name for name in entry if isinstance(name, str))
 
 
-def kda_serving_head_axes(config: tp.Any) -> tuple[str, ...] | None:
-    """Mesh axes the eSurge KDA cache splits the heads over under ``config.kda_serving_ep_split``, else ``None``.
+def kda_serving_head_axes(config: tp.Any, *, serving: bool = False) -> tuple[str, ...] | None:
+    """Mesh axes an eSurge KDA cache splits the heads over, else ``None`` (the resolver of ``kda_serving_ep_split``).
 
     KDA heads normally split over the head axis (tensor parallelism) and are replicated over the expert-parallel axis,
-    so every expert-parallel group runs the same heads. With ``kda_serving_ep_split`` they split over the head axis and
-    the expert-parallel axis together, head axis major: each device's heads are then a subset of the heads it holds
-    without the split, so every column-parallel weight reaches the split layout by a local slice (no weight
-    collective; parameters and checkpoints keep their layout). ``None`` (today's layout) when the flag is off, the
-    expert-parallel axis has a single device or is already part of the head axis, the mesh is MPMD, eSurge's attention
-    data-parallel axis has more than one device (rank-major DP), or the split does not divide the head count.
+    so every expert-parallel group runs the same heads. The split puts them over the head axis and the expert-parallel
+    axis together, head axis major: each device's heads are then a subset of the heads it holds without the split, so
+    every column-parallel weight reaches the split layout by a local slice (no weight collective; parameters and
+    checkpoints keep their layout).
+
+    ``kda_serving_ep_split`` is tri-state: ``None`` (automatic) and ``True`` split every eSurge cache (``serving``)
+    whose mesh allows it, ``True`` warning once when the heads do not divide; ``False`` never splits. Caches created
+    outside eSurge (``serving=False``: ``init_cache``, training) never split. The mesh allows it when the
+    expert-parallel axis has more than one device and is not part of the head axis, the mesh is not MPMD, eSurge's
+    attention data-parallel axis has a single device (rank-major DP keeps today's layout) and the split divides the
+    head count.
 
     Args:
         config: Model (text) config with ``kda_serving_ep_split``, ``partition_axis``, ``mesh`` and the KDA shapes.
+        serving: Whether the cache is an eSurge serving cache.
 
     Returns:
         ``(*head_axis, expert_parallel_axis)`` as mesh axis names, or ``None``.
     """
-    if not getattr(config, "kda_serving_ep_split", False):
+    setting = getattr(config, "kda_serving_ep_split", None)
+    if not serving or setting is False:
         return None
     paxis = getattr(config, "partition_axis", None)
     if paxis is None:
@@ -180,10 +187,11 @@ def kda_serving_head_axes(config: tp.Any) -> tuple[str, ...] | None:
     axes = (*base, ep_axis)
     num_heads = kda_layer_spec(config).num_heads
     if num_heads % mesh_axis_size(mesh, axes):
-        logger.warn_once(
-            f"kda_serving_ep_split: {num_heads} KDA heads do not split over {axes} "
-            f"({mesh_axis_size(mesh, axes)} devices); keeping the head axis {base}."
-        )
+        if setting is True:
+            logger.warn_once(
+                f"kda_serving_ep_split: {num_heads} KDA heads do not split over {axes} "
+                f"({mesh_axis_size(mesh, axes)} devices); keeping the head axis {base}."
+            )
         return None
     return axes
 
@@ -692,15 +700,25 @@ class KernelDeltaAttention(spx.Module):
         return checkpoint_name(projected, name="attn_output")
 
     def _split_output_projection(self, normed: Array, split: _ServingHeadSplit) -> Array:
-        """``o_proj`` of a head-split serving step, with an explicit reduction of its partial sums.
+        """``o_proj`` of a head-split serving step: heads traded for tokens when the residual is feature-sharded.
 
-        Every device multiplies its own heads' features by its rows of the ``o_proj`` kernel (a local slice of its
-        tensor-parallel shard), and one ``shard_map`` reduces the partial sums: a reduce-scatter over the residual
-        stream's hidden axis (``partition_axis.hidden_state_axis``, one of the head axes), then an all-reduce of that
-        slice over the remaining head axes (the expert-parallel axis). Left to the SPMD partitioner, the same dot
-        gathered its input back over the expert-parallel axis and reduced over tensor parallelism only. Projections that
-        are not a plain bias-free :class:`RowParallelLinear` (quantized, LoRA, a fused distributed matmul, a
-        quantization rule), and residual layouts outside the head axes, keep :meth:`_split_projection`.
+        Every device holds the gated-norm features of its own heads (``split.axes``, head axis major). When the
+        residual stream's hidden axis (``HiddenStateSharding``, resolved mode-aware) is split over the leading head
+        axes ``H`` and exactly one head axis ``R`` remains (prefill and mixed steps of a ``kda_serving_ep_split`` cache:
+        ``H`` = tensor parallelism, ``R`` = expert parallelism), one ``shard_map`` runs: an ``all_to_all`` over ``R``
+        trades tokens for heads, so each device holds its ``H`` group's heads (in the order of its ``H`` shard of the
+        ``o_proj`` rows) for ``1 / |R|`` of the tokens; the dot contracts that shard, a reduce-scatter over ``H`` leaves
+        the residual's hidden slice and an all-gather over ``R`` restores the tokens. Per token these are the dot and
+        the reduce-scatter of the unsplit layer. The path it replaces (the SPMD partitioner, or the row-parallel
+        ``distributed_matmul`` engine, whose ``shard_map`` takes the input split over ``H`` only) all-gathers the heads
+        over ``R`` first and then runs the dot and the reduce-scatter for every token on every device. Calculated per
+        device and layer at ep4 x tp4 (4 heads of 128 per chip, hidden 4096, 32,768 bf16 tokens): 25 + 50 + 50 MB of
+        collectives and a quarter of the dot, against 100 + 201 MB and the whole dot.
+
+        Other steps keep :meth:`_split_projection`: decode buckets (their residual is replicated under
+        ``decode_mode_specs``), token counts that ``|R|`` does not divide and residual layouts outside the head axes;
+        so do projections that are not a plain bias-free :class:`RowParallelLinear` (quantized, LoRA, a quantization
+        rule).
 
         Args:
             normed: Gated-norm output ``[lead0, lead1, value_dim]``, features split over ``split.axes``.
@@ -712,38 +730,82 @@ class KernelDeltaAttention(spx.Module):
         linear = self.o_proj
         weight = getattr(getattr(linear, "weight", None), "value", None)
         mesh = self.kda_op.get_impl_metadata().mesh
-        hidden = _axis_names(getattr(self.config.partition_axis, "hidden_state_axis", None))
         if (
             type(linear) is not RowParallelLinear
             or linear.use_bias
-            or getattr(linear, "distributed_matmul", None) is not None
             or not isinstance(weight, jax.Array)
+            or weight.ndim != 2
             or spx.quantization.rule_for(linear, "dot_general") is not None
             or mesh is None
-            or not set(hidden) <= set(split.axes)
-            or int(weight.shape[1]) % mesh_axis_size(mesh, hidden)
         ):
             return self._split_projection(linear, normed, split, dim=0)
-        rest = tuple(name for name in split.axes if name not in hidden)
+        tokens, hidden_size = int(normed.shape[1]), int(weight.shape[1])
+        resolver = self.config.runtime_sharding_resolver
+
+        def active(entry: tp.Any) -> tuple[str, ...] | None:
+            """Mesh axes of more than one device in a spec entry; ``None`` for an entry that names no layout."""
+            if entry is not None and not isinstance(entry, str | tuple | list):
+                return None
+            return tuple(name for name in _axis_names(entry) if mesh_axis_size(mesh, name) > 1)
+
+        heads = active(split.axes) or ()
+        residual = tuple(
+            resolver.resolve(
+                dynamic_axes=common_types.HiddenStateSharding,
+                shape=(int(normed.shape[0]), tokens, hidden_size),
+            )
+        )
+        try:
+            # The weight's declared layout: its rows must split over the residual's hidden axes only.
+            kernel = tuple(
+                resolver.resolve_layout(
+                    linear.sharding_layout if linear.sharding_layout is not None else common_types.RowWise,
+                    shape=tuple(int(dim) for dim in weight.shape),
+                    mesh=resolver.mesh,
+                )
+            )
+        except Exception:
+            kernel = ()
+        # A resolved spec may omit trailing replicated entries: pad both to their array's rank.
+        residual = residual + (None,) * (normed.ndim - len(residual))
+        kernel = kernel + (None,) * (2 - len(kernel))
+        out_entries = [active(entry) for entry in residual] if len(residual) == normed.ndim else [None]
+        kernel_entries = [active(entry) for entry in kernel] if len(kernel) == 2 else [None]
+        out_axes = out_entries[-1] or ()
+        rest = heads[len(out_axes) :]
+        if (
+            any(entry is None for entry in (*out_entries, *kernel_entries))
+            or not out_axes
+            or heads[: len(out_axes)] != out_axes
+            or len(rest) != 1
+            or any(out_entries[:-1])
+            or kernel_entries[0] != out_axes
+            or kernel_entries[1]
+            or tokens % mesh_axis_size(mesh, rest[0])
+            or hidden_size % mesh_axis_size(mesh, out_axes)
+        ):
+            return self._split_projection(linear, normed, split, dim=0)
+        out_entry = out_axes[0] if len(out_axes) == 1 else out_axes
+        token_axis = rest[0]
         scale = float(getattr(linear, "output_scale", 1.0))
 
         def body(x: Array, w: Array) -> Array:
             x, w = promote_dtype((x, w), dtype=linear.dtype)
+            # [.., T, own heads] -> [.., T / |R|, the H group's heads]: the heads arrive in R order, the order of this
+            # device's H shard of the o_proj rows.
+            x = jax.lax.all_to_all(x, token_axis, split_axis=1, concat_axis=x.ndim - 1, tiled=True)
             y = jnp.einsum("...i,io->...o", x, w, precision=linear.precision)
-            if hidden:
-                y = jax.lax.psum_scatter(y, hidden, scatter_dimension=y.ndim - 1, tiled=True)
-            if rest:
-                y = jax.lax.psum(y, rest)
-            return y * scale if scale != 1.0 else y
+            y = jax.lax.psum_scatter(y, out_entry, scatter_dimension=y.ndim - 1, tiled=True)
+            return jax.lax.all_gather(y, token_axis, axis=1, tiled=True)
 
-        hidden_entry = None if not hidden else (hidden[0] if len(hidden) == 1 else hidden)
-        return jax.shard_map(
+        y = jax.shard_map(
             body,
             mesh=mesh,
-            in_specs=(PartitionSpec(*split.lead, split.axes), PartitionSpec(split.axes, None)),
-            out_specs=PartitionSpec(*split.lead, hidden_entry),
+            in_specs=(PartitionSpec(*split.lead, split.axes), PartitionSpec(out_entry, None)),
+            out_specs=PartitionSpec(*split.lead, out_entry),
             check_vma=False,
         )(normed, weight)
+        return y * scale if scale != 1.0 else y
 
     def _split_projection(self, linear: tp.Any, x: Array, split: _ServingHeadSplit, dim: int) -> Array:
         """``linear(x)`` with its kernel constrained to the split's head axes on ``dim``.

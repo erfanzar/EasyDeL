@@ -94,8 +94,14 @@ def _jax_mesh(model):
     return getattr(model.mesh, "jax_mesh", model.mesh)
 
 
+def _auto(config):
+    """The automatic setting (``None``); this tree's constructor still stores ``False`` for an omitted field."""
+    config.kda_serving_ep_split = None
+    return config
+
+
 def _cache_configs(model):
-    split = model.create_kda_cache_config(batch_size=SLOTS)
+    split = model.create_kda_cache_config(batch_size=SLOTS, serving=True)
     plain = KDACacheConfig.create(
         num_hidden_layers=split.num_hidden_layers,
         partition_axis=split.partition_axis,
@@ -142,20 +148,38 @@ def _compiled_step(model, layer, cfg, pools):
     return jax.jit(step, donate_argnums=(2,), out_shardings=(hidden_sharding, shardings)), state, hidden_sharding
 
 
-def test_split_axes_follow_the_flag_and_the_mesh():
+def test_split_axes_follow_the_setting_the_mesh_and_the_cache_kind():
     _need_four_devices()
-    assert kda_serving_head_axes(_config()) == ("tp", "ep")
-    assert kda_serving_head_axes(_config(split=False)) is None
+    assert kda_serving_head_axes(_config(), serving=True) == ("tp", "ep")
+    # Caches created outside eSurge (``init_cache``) never split, whatever the setting.
+    assert kda_serving_head_axes(_config()) is None
+    # ``False`` is the escape hatch.
+    assert kda_serving_head_axes(_config(split=False), serving=True) is None
+    # ``None`` (the automatic rule) splits every eSurge cache whose mesh allows it.
+    assert kda_serving_head_axes(_auto(_config(split=False)), serving=True) == ("tp", "ep")
+    assert kda_serving_head_axes(_auto(_config(split=False))) is None
     # No expert-parallel devices (ep1 x tp4): nothing to split over.
-    assert kda_serving_head_axes(_config(dims=(1, 1, 1, 1, 4, 1))) is None
+    assert kda_serving_head_axes(_auto(_config(dims=(1, 1, 1, 1, 4, 1))), serving=True) is None
     # 2 heads do not split over 4 devices: today's head-axis layout is kept.
-    assert kda_serving_head_axes(_config(heads=2)) is None
+    assert kda_serving_head_axes(_auto(_config(heads=2)), serving=True) is None
+    assert kda_serving_head_axes(_config(heads=2), serving=True) is None
+
+
+def test_only_esurge_cache_configs_split_under_the_automatic_rule():
+    _need_four_devices()
+    model, _ = _model(_config(split=False))
+    _auto(model.config.get_text_config())
+    # ``init_cache`` builds its views without a paged-cache config: the KDA pools keep the head axis.
+    views = model.init_operations_cache_config(batch_size=SLOTS, max_length=128)
+    assert [cfg.head_shard_axes for cfg in views] == [None]
+    assert model.create_kda_cache_config(batch_size=SLOTS).head_shard_axes is None
+    assert model.create_kda_cache_config(batch_size=SLOTS, serving=True).head_shard_axes == ("tp", "ep")
 
 
 def test_split_cache_pools_shard_heads_over_tp_and_ep():
     _need_four_devices()
     model, _ = _model(_config())
-    cfg = model.create_kda_cache_config(batch_size=SLOTS)
+    cfg = model.create_kda_cache_config(batch_size=SLOTS, serving=True)
     assert cfg.head_shard_axes == ("tp", "ep")
     with model.mesh:
         view = KDACacheView.init(config=cfg, layer_index=0, dtype=jnp.bfloat16)
@@ -165,9 +189,14 @@ def test_split_cache_pools_shard_heads_over_tp_and_ep():
         assert leaf.addressable_shards[0].data.shape[1] * 4 == leaf.shape[1], name
 
 
-def test_split_layer_matches_unsplit_over_prefill_mixed_and_decode_steps():
+@pytest.mark.parametrize("wire", [False, True], ids=["plain-linears", "row-parallel-engines"])
+def test_split_layer_matches_unsplit_over_prefill_mixed_and_decode_steps(wire):
     _need_four_devices()
     model, layer = _model(_config())
+    if wire:
+        # eSurge's loader wires the row-parallel distributed_matmul engines (auto_modeling.py); the split o_proj
+        # must give the same result through them.
+        model.wire_distributed_matmul()
     split_cfg, plain_cfg = _cache_configs(model)
     configs = {"split": split_cfg, "plain": plain_cfg}
     pools = {kind: _random_pools(model, cfg, seed=7) for kind, cfg in configs.items()}
@@ -199,6 +228,41 @@ def test_split_layer_matches_unsplit_over_prefill_mixed_and_decode_steps():
             assert np.linalg.norm(live_split - live_plain) / np.linalg.norm(live_plain) < 1e-2
             np.testing.assert_array_equal(outs["split"][0, tokens:], outs["plain"][0, tokens:])
     assert tuple(pools["split"][3].sharding.spec[1]) == ("tp", "ep")
+
+
+def _has_all_to_all(hlo_text: str) -> bool:
+    return " all-to-all(" in hlo_text or " all-to-all-start(" in hlo_text
+
+
+def test_split_prefill_trades_tokens_for_heads_and_decode_keeps_its_o_proj():
+    """A head-split prefill step reaches ``o_proj`` through one all-to-all over ep (tokens for heads), also with the
+    row-parallel engines eSurge's loader wires; a decode bucket (replicated residual under ``decode_mode_specs``)
+    keeps today's ``o_proj`` and has no all-to-all."""
+    from easydel.infra.sharding import decode_mode_specs
+
+    _need_four_devices()
+    model, layer = _model(_config())
+    model.wire_distributed_matmul()
+    split_cfg, _ = _cache_configs(model)
+    pools = _random_pools(model, split_cfg, seed=7)
+    replicated = NamedSharding(_jax_mesh(model), P())
+    texts = {}
+    with model.mesh:
+        for name, bucket, lens in (("prefill", 128, (50, 37, 0, 0)), ("decode", 4, (1, 1, 1, 0))):
+            fn, state, hidden_sharding = _compiled_step(model, layer, split_cfg, pools)
+            qsl = np.concatenate([[0], np.cumsum(lens)])
+            args = (
+                state,
+                jax.device_put(jnp.zeros((1, bucket, HIDDEN), jnp.bfloat16), hidden_sharding),
+                pools,
+                jax.device_put(jnp.asarray(qsl, jnp.int32), replicated),
+                jax.device_put(jnp.asarray(lens, jnp.int32), replicated),
+                jax.device_put(jnp.asarray((5, 2, 7, 0), jnp.int32), replicated),
+            )
+            with decode_mode_specs(name == "decode"):
+                texts[name] = fn.lower(*args).compile().as_text()
+    assert _has_all_to_all(texts["prefill"])
+    assert not _has_all_to_all(texts["decode"])
 
 
 def test_flag_leaves_the_cacheless_forward_unchanged():
