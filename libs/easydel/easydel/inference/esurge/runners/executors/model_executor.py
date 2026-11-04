@@ -236,7 +236,6 @@ class ModelStepExecutor:
         enable_spec_recurrent_commit: bool = False,
         input_sharding: jax.sharding.Sharding | None = None,
         slot_indexed_state: bool = False,
-        ship_recurrent_slot_indices: bool = False,
         cache_group_configs: tuple[RaggedPagesCacheConfig | UnifiedAttentionCacheConfig, ...] = (),
         layer_to_cache_group: tuple[int, ...] = (),
     ) -> None:
@@ -263,12 +262,10 @@ class ModelStepExecutor:
                 below this token count return all token hidden rows rather than
                 only sampled rows. Speculative verification uses this for tiny
                 draft windows while larger prompt buckets keep compact outputs.
-            slot_indexed_state: If True (compressed-window cache families),
-                the compiled steps thread ``recurrent_state_indices`` from the
-                batch metadata into the model's cache metadata even without
-                SPMD DP, so the model can address per-request slot state.
-            ship_recurrent_slot_indices: Plain recurrent path: thread the per-row recurrent pool slots the same way,
-                because a row window can start past slot 0 (several windows per step, sparse row packing).
+            slot_indexed_state: If True (requests own pooled state slots: compressed-window caches and recurrent
+                layers that declare the eSurge slot contract), the compiled steps thread
+                ``recurrent_state_indices`` from the batch metadata into the model's cache metadata even without
+                SPMD DP.
             cache_group_configs: Independent pool configurations in runtime group
                 order, fixed before compilation. Empty preserves single-pool inputs.
             layer_to_cache_group: Static model-layer to pool-index ownership mapping.
@@ -296,7 +293,6 @@ class ModelStepExecutor:
         self.pipeline_plan = pipeline_plan
         self.enable_spec_recurrent_commit = bool(enable_spec_recurrent_commit)
         self._slot_indexed_state = bool(slot_indexed_state)
-        self._ship_recurrent_slot_indices = bool(ship_recurrent_slot_indices)
         # DSpark speculative decoding: the fused SPMD model step returns ``concat([last_hidden, main_hidden])`` rows.
         # Set by the runner before the first trace; read inside the traced step.
         self.main_hidden_enabled = False
@@ -500,10 +496,10 @@ class ModelStepExecutor:
     def _plain_recurrent_slots(self) -> bool:
         """Whether non-DP steps thread the per-row recurrent slots into ``cache_metadata.recurrent_state_indices``.
 
-        True for slot-indexed (compressed-window) families and for plain recurrent pools whose row windows can start
-        past slot 0. Read through ``getattr`` so executors assembled without ``__init__`` (tests) keep working.
+        True when requests own pooled state slots (compressed-window caches, recurrent layers that declare the slot
+        contract). Read through ``getattr`` so executors assembled without ``__init__`` (tests) keep working.
         """
-        return bool(getattr(self, "_slot_indexed_state", False) or getattr(self, "_ship_recurrent_slot_indices", False))
+        return bool(getattr(self, "_slot_indexed_state", False))
 
     def _build_cache_metadata(self, metadata: BatchMetadata, num_reqs_max_model_len: int) -> RaggedPagesMetadata:
         """Build the per-step :class:`RaggedPagesMetadata` from packed batch metadata.

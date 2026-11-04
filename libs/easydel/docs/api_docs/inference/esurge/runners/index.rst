@@ -16,6 +16,7 @@ easydel.inference.esurge.runners package
    pipeline_plan
    pipeline_runtime
    sequence_buffer
+   slot_contract
    slot_pool
    state_sync
    states

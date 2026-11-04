@@ -527,7 +527,8 @@ class ExecutionManager:
         layer_to_cache_group: tuple[int, ...] = (),
         host_payloads_replicated: bool = False,
         request_seeds: tp.Mapping[int, int] | None = None,
-        ship_recurrent_slot_indices: bool = False,
+        recurrent_slots_pooled: bool = False,
+        recurrent_slot_group_size: int = 1,
     ):
         """Initialize the executor manager.
 
@@ -570,9 +571,11 @@ class ExecutionManager:
                 if the coordinator is initialized after the manager.
             request_seeds: Live mapping of global sequence-buffer rows to request seeds. Retained without copying
                 so row moves and removals are visible to the sampler.
-            ship_recurrent_slot_indices: Plain recurrent path (no SPMD DP, no compressed-window pool): ship every
-                row's recurrent pool slot as ``cache_metadata.recurrent_state_indices`` with each step, because a
-                row window can start past slot 0 (several windows per step, sparse row packing).
+            recurrent_slots_pooled: Requests own stable pooled recurrent-state slots (recurrent layers that declare the
+                eSurge slot contract, where rows can leave their window-local index), shipped with every step as
+                ``cache_metadata.recurrent_state_indices``. Compressed-window caches are always pooled.
+            recurrent_slot_group_size: Recurrent slots per request, ``W`` (``1 + K_max`` for speculative verify,
+                else 1). The recurrent pools hold ``max_num_reqs * W`` slots.
         """
         if metadata is None:
             raise ValueError("ExecutionManager requires a paged cache config `metadata`.")
@@ -594,11 +597,12 @@ class ExecutionManager:
         self.speculative_recurrent_state_tokens = max(0, int(speculative_recurrent_state_tokens))
         self.enable_spec_recurrent_commit_metadata = self.speculative_recurrent_state_tokens > 0
         self.speculative_trace_tokens = max(0, int(speculative_trace_tokens))
-        # Slot-indexed state families (compressed-window caches) receive the
-        # per-row physical state-slot ids in the batch metadata every step.
-        self._slot_indexed_state = getattr(model, "esurge_cache_family", None) == "compressed_window"
-        # Plain recurrent families whose row windows can start past slot 0 also receive the per-row slots.
-        self._ship_recurrent_slot_indices = bool(ship_recurrent_slot_indices)
+        # Requests with pooled state slots (compressed-window caches, recurrent layers that declare the slot contract)
+        # receive the per-row physical state-slot ids in the batch metadata every step.
+        self._slot_indexed_state = bool(recurrent_slots_pooled) or (
+            getattr(model, "esurge_cache_family", None) == "compressed_window"
+        )
+        self.recurrent_slot_group_size = max(1, int(recurrent_slot_group_size))
         self.min_input_pad = min_input_pad
         self.max_model_len = max_model_len
         self.max_num_reqs = max_num_reqs
@@ -676,7 +680,7 @@ class ExecutionManager:
             enable_spec_recurrent_commit=self.enable_spec_recurrent_commit_metadata,
             input_sharding=self._input_sharding,
             slot_indexed_state=self._slot_indexed_state,
-            ship_recurrent_slot_indices=self._ship_recurrent_slot_indices,
+            recurrent_slot_group_size=self.recurrent_slot_group_size,
             cache_group_configs=self.cache_group_configs,
             layer_to_cache_group=self.layer_to_cache_group,
             host_payloads_replicated=self.host_payloads_replicated,
@@ -698,7 +702,6 @@ class ExecutionManager:
             enable_spec_recurrent_commit=self.enable_spec_recurrent_commit_metadata,
             input_sharding=self._input_sharding,
             slot_indexed_state=self._slot_indexed_state,
-            ship_recurrent_slot_indices=self._ship_recurrent_slot_indices,
             cache_group_configs=self.cache_group_configs,
             layer_to_cache_group=self.layer_to_cache_group,
         )
@@ -790,7 +793,8 @@ class ExecutionManager:
 
         def _allocate() -> tp.Any:
             """Single attempt at building the operations cache via the model API."""
-            cache_batch_size = int(self.max_num_reqs)
+            # Every request owns a group of ``recurrent_slot_group_size`` recurrent-state slots.
+            cache_batch_size = int(self.max_num_reqs) * int(getattr(self, "recurrent_slot_group_size", 1) or 1)
             if self.speculative_recurrent_state_tokens > 0:
                 cache_batch_size += cache_batch_size * int(self.speculative_recurrent_state_tokens)
             extra: dict[str, tp.Any] = {}
@@ -1490,7 +1494,6 @@ class ExecutionManager:
         microbatch_unsupported = (
             bool(model_side_inputs_cpu)
             or self._slot_indexed_state
-            or getattr(self, "_ship_recurrent_slot_indices", False)
             or self._batch_preparer._uses_spmd_dp()
             or spec_recurrent_commit_cpu is not None
         )

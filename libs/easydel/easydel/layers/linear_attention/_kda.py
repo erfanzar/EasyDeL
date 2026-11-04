@@ -308,6 +308,10 @@ class KernelDeltaAttention(spx.Module):
     # ``layer_idx`` is init/informational only, so identical KDA layers share one lowered scan body.
     _spx_scan_safe_static_fields: tp.ClassVar[frozenset[str]] = frozenset({"layer_idx"})
 
+    # eSurge (runners/slot_contract.py): row r of every serving step reads and writes pool slot
+    # cache_metadata.recurrent_state_indices[r], so requests keep stable slots across row moves and row windows.
+    esurge_recurrent_slot_contract: tp.ClassVar[str] = "slots"
+
     def __init__(
         self,
         config: tp.Any,

@@ -2679,6 +2679,10 @@ class Qwen3NextLinearAttention(spx.Module):
         layer_idx: Index of this layer.
     """
 
+    # eSurge (runners/slot_contract.py): row r of every serving step reads and writes pool slot
+    # cache_metadata.recurrent_state_indices[r], so requests keep stable slots across row moves and row windows.
+    esurge_recurrent_slot_contract: typing.ClassVar[str] = "slots"
+
     def __init__(
         self,
         config: Qwen3NextConfig,
@@ -4002,8 +4006,6 @@ class Qwen3NextForCausalLM(BaseCausalLMModule[Qwen3NextModel, Qwen3NextConfig]):
     _task_type = TaskType.CAUSAL_LM
     _model_type = "qwen3_next"
     _config_class = Qwen3NextConfig
-    # eSurge: the GDN layers follow cache_metadata.recurrent_state_indices on the plain packed path.
-    esurge_plain_recurrent_slots: typing.ClassVar[bool] = True
 
     def __init__(
         self,

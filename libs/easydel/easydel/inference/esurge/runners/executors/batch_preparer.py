@@ -210,7 +210,7 @@ class BatchMetadataPreparer:
         enable_spec_recurrent_commit: bool = False,
         input_sharding: jax.sharding.Sharding | None = None,
         slot_indexed_state: bool = False,
-        ship_recurrent_slot_indices: bool = False,
+        recurrent_slot_group_size: int = 1,
         cache_group_configs: tuple[RaggedPagesCacheConfig | UnifiedAttentionCacheConfig, ...] = (),
         layer_to_cache_group: tuple[int, ...] = (),
         host_payloads_replicated: bool = False,
@@ -235,15 +235,13 @@ class BatchMetadataPreparer:
             enable_spec_recurrent_commit: If True, the host payload reserves a
                 slot for the speculative recurrent commit metadata. Required
                 when running the recurrent-drafter speculative decoding path.
-            slot_indexed_state: If True (compressed-window cache families),
-                the per-row physical state-slot ids ride the payload as
+            slot_indexed_state: If True (requests own pooled state slots: compressed-window caches and recurrent
+                layers that declare the eSurge slot contract), the per-row physical state-slot ids ride the payload as
                 ``dp_recurrent_state_indices`` (shape ``[1, rows]``) even
                 without SPMD DP, so the model can address per-request slot
                 state that survives SequenceBuffer row moves.
-            ship_recurrent_slot_indices: Plain recurrent path: ship the per-row recurrent pool slots the same way
-                (``dp_recurrent_state_indices`` ``[1, rows]``), because a row window can start past slot 0
-                (several windows per step, sparse row packing). The model reads them as
-                ``cache_metadata.recurrent_state_indices``.
+            recurrent_slot_group_size: Recurrent slots per request, ``W``. Under rank-major DP every request's group
+                lies in its rank's block of ``rows_per_rank * W`` slots and the payload carries rank-local slots.
             cache_group_configs: Independent pool configurations in runtime order.
                 Empty preserves the single-table preparation API.
             layer_to_cache_group: Static model-layer to pool-index ownership mapping.
@@ -281,9 +279,9 @@ class BatchMetadataPreparer:
         self.min_input_pad = int(min_input_pad)
         self._enable_spec_recurrent_commit = bool(enable_spec_recurrent_commit)
         self._slot_indexed_state = bool(slot_indexed_state)
-        self._ship_recurrent_slot_indices = bool(ship_recurrent_slot_indices)
+        self._recurrent_slot_group_size = max(1, int(recurrent_slot_group_size))
         # Non-DP steps carry the per-row physical state slots as ``dp_recurrent_state_indices`` [1, rows].
-        self._plain_recurrent_slots = self._slot_indexed_state or self._ship_recurrent_slot_indices
+        self._plain_recurrent_slots = self._slot_indexed_state
 
         self._metadata_version = metadata.version
         self._use_slot_mapping = self._metadata_version == "v2"
@@ -899,6 +897,8 @@ class BatchMetadataPreparer:
                 )
             tokens_per_rank = int(num_tokens_static) // dp_size
             rows_per_rank = int(self._num_reqs_max_model_len) // dp_size
+            # Each request's group of W recurrent slots lies in its rank's block of rows_per_rank * W slots.
+            slots_per_rank = rows_per_rank * int(getattr(self, "_recurrent_slot_group_size", 1) or 1)
             if window_row_indices_cpu is None:
                 global_rows = np.arange(num_requests, dtype=np.int32)
             else:
@@ -948,14 +948,14 @@ class BatchMetadataPreparer:
                 dp_context_lens[rank, local_row] = start + n
 
                 state_slot = int(recurrent_slots[req_idx])
-                state_rank = min(max(state_slot, 0) // rows_per_rank, dp_size - 1)
+                state_rank = min(max(state_slot, 0) // slots_per_rank, dp_size - 1)
                 if state_rank != rank:
                     raise ValueError(
                         "rank-major SPMD DP recurrent state slot must belong to the "
                         f"same DP rank as the request: req_idx={req_idx} rank={rank} "
                         f"state_slot={state_slot} state_rank={state_rank}."
                     )
-                dp_recurrent_state_indices[rank, local_row] = state_slot - rank * rows_per_rank
+                dp_recurrent_state_indices[rank, local_row] = state_slot - rank * slots_per_rank
                 logits_indices[req_idx] = off + n - 1
                 if n == 1 and int(num_computed_tokens_cpu[req_idx]) > 0:
                     rank_decode_counts[rank] += 1
@@ -1452,7 +1452,7 @@ class BatchMetadataPreparer:
                     enable_spec_recurrent_commit=self._enable_spec_recurrent_commit,
                     input_sharding=self._input_sharding,
                     slot_indexed_state=self._slot_indexed_state,
-                    ship_recurrent_slot_indices=self._ship_recurrent_slot_indices,
+                    recurrent_slot_group_size=self._recurrent_slot_group_size,
                     host_payloads_replicated=self.host_payloads_replicated,
                 )
                 self._cache_group_preparers[index] = (identity, child)
@@ -2053,7 +2053,7 @@ class BatchMetadataPreparer:
                     enable_spec_recurrent_commit=self._enable_spec_recurrent_commit,
                     input_sharding=self._input_sharding,
                     slot_indexed_state=self._slot_indexed_state,
-                    ship_recurrent_slot_indices=self._ship_recurrent_slot_indices,
+                    recurrent_slot_group_size=self._recurrent_slot_group_size,
                     host_payloads_replicated=self.host_payloads_replicated,
                     cache_group_configs=self.cache_group_configs,
                     layer_to_cache_group=self.layer_to_cache_group,

@@ -15,12 +15,12 @@
 """eSurge row windows over plain-path recurrent pools: every request keeps its own state.
 
 eSurge runs a step as several row windows when more requests are resident than one forward takes (``max_num_seqs``
-above the cache's rows per forward, ``metadata.get_max_num_seqs()``). Each window numbers its rows from 0, while a
-request's recurrent state stays in the pool slot of its SequenceBuffer row. The runner therefore ships every row's slot
-as ``cache_metadata.recurrent_state_indices`` whenever a row can sit past its window-local index (several windows, or
-sparse packing of zero-token rows), and ships nothing otherwise, so single-window serving keeps the in-place identity
-layout. Models whose recurrent layers cannot follow the slots, and speculative candidate rows (laid out by the window's
-row count), make the runner refuse a multi-window configuration at init.
+above the cache's rows per forward, ``metadata.get_max_num_seqs()``). Each window numbers its rows from 0. The KDA layer
+declares the eSurge slot contract (``runners/slot_contract.py``), so wherever a row can sit past its window-local index
+(several row windows per step, sparse packing of zero-token rows) every request owns a stable pooled slot, shipped with
+every step as ``cache_metadata.recurrent_state_indices``; single-window serving keeps the in-place identity layout and
+ships nothing. Speculative candidate rows (laid out by the window's row count) keep the identity layout and make the
+runner refuse a multi-window configuration at init.
 
 The two-window cases cap the rows per forward at 2 (``get_max_num_seqs`` patched on the cache config classes; production
 derives it as ``131072 // pages_per_request``) with 4 resident requests on a tiny GLM-5-Next. Computation tests: the
@@ -39,7 +39,7 @@ from easydel.caching.ragged_page.cache import RaggedPagesCacheConfig
 from easydel.caching.unified_attention.cache import UnifiedAttentionCacheConfig
 from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
-from easydel.inference.esurge.runners.window_planner import resolve_plain_recurrent_slot_shipping
+from easydel.inference.esurge.runners.slot_contract import resolve_recurrent_slot_contract
 from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 
@@ -247,33 +247,7 @@ def test_speculative_candidate_rows_refuse_several_row_windows(tiny_model, monke
         _runner(tiny_model, drafter=_InertDrafter())
 
 
-def _decide(**overrides) -> bool:
-    options = dict(
-        family="tiny",
-        has_recurrent_layers=True,
-        pooled_slots=False,
-        rows_per_forward=4,
-        max_num_reqs=4,
-        sparse_row_packing=False,
-        speculative_candidate_rows=False,
-        model_honours_slots=True,
-    )
-    options.update(overrides)
-    return resolve_plain_recurrent_slot_shipping(**options)
-
-
-def test_slot_shipping_follows_the_static_row_layout():
-    """Slots ship exactly when a row can sit past its window-local index, for models that follow them."""
-    assert _decide() is False
-    assert _decide(sparse_row_packing=True) is True
-    assert _decide(rows_per_forward=2) is True
-    # SPMD DP and compressed-window pools already carry their slots; models without recurrent state need none.
-    assert _decide(rows_per_forward=2, pooled_slots=True) is False
-    assert _decide(rows_per_forward=2, has_recurrent_layers=False) is False
-    # One window keeps the identity rows for layouts that cannot follow slots.
-    assert _decide(sparse_row_packing=True, speculative_candidate_rows=True) is False
-    assert _decide(sparse_row_packing=True, model_honours_slots=False) is False
-    with pytest.raises(ValueError, match="speculative decoding"):
-        _decide(rows_per_forward=2, speculative_candidate_rows=True)
-    with pytest.raises(ValueError, match="recurrent_state_indices"):
-        _decide(rows_per_forward=2, model_honours_slots=False)
+def test_kda_layers_declare_the_slot_contract(tiny_model):
+    """Every KDA layer declares the slot contract; one undeclared recurrent layer keeps the identity layout."""
+    assert resolve_recurrent_slot_contract(tiny_model, num_recurrent_layers=3) == "slots"
+    assert resolve_recurrent_slot_contract(tiny_model, num_recurrent_layers=4) == "none"

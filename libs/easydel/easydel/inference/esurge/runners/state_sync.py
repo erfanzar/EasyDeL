@@ -178,7 +178,8 @@ class SequenceStateSync:
         for req_id in sorted(scheduler_output.finished_req_ids):
             slot = self.slot_pool.release_slot(str(req_id), forget_rank=True)
             if slot is not None:
-                removed_recurrent_slots.append(int(slot))
+                # Every slot of the request's group is cleared for the group's next owner.
+                removed_recurrent_slots.extend(self.slot_pool.group_slots(int(slot)))
             self.requests.pop(req_id, None)
             self.pending_spec_recurrent_commit_by_req.pop(str(req_id), None)
 
@@ -201,7 +202,7 @@ class SequenceStateSync:
             self.pending_spec_recurrent_commit_by_req.pop(str(req_id), None)
             slot = self.slot_pool.release_slot(str(req_id), forget_rank=False)
             if slot is not None:
-                removed_recurrent_slots.append(int(slot))
+                removed_recurrent_slots.extend(self.slot_pool.group_slots(int(slot)))
             if req_index is not None:
                 removed_req_indices.append(req_index)
                 removed_req_index_by_id[req_id] = req_index

@@ -102,6 +102,7 @@ from .pipeline_execution_manager import PipelineExecutionManager
 from .pipeline_execution_manager import RunnerExecutionManager as ExecutionManager
 from .pipeline_plan import build_pipeline_inference_plan, cap_metadata_pages
 from .sequence_buffer import SequenceBuffer
+from .slot_contract import resolve_recurrent_slot_contract, uses_pooled_recurrent_slots
 from .slot_pool import RecurrentSlotPool
 from .spec.interface import NullSpeculation, SpeculativeStrategy
 from .spec.sampling import score_sampled_tokens, summarize_logprobs
@@ -109,7 +110,7 @@ from .spec.strategy import DrafterSpeculation, snapshot_recurrent_state, window_
 from .state_sync import SequenceStateSync
 from .states import CachedRequestState
 from .vlm_prefill import VlmPrefillHelper
-from .window_planner import WindowPlanner, resolve_plain_recurrent_slot_shipping
+from .window_planner import WindowPlanner
 
 if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
@@ -713,29 +714,38 @@ class eSurgeRunner:
         # Default fast so speculative decoding serves its purpose (a speedup);
         # set the env to 1 when bit-exact greedy is required over throughput.
         self.spec_decode_recurrent_replay = flags.get_bool(flags.EASYDEL_SPEC_RECURRENT_REPLAY)
-        # Plain recurrent path (no SPMD DP, no compressed-window slot pool): a request's recurrent state lives in the
-        # pool slot of its SequenceBuffer row, but a forward numbers the rows of its window from 0. When a row can sit
-        # past its window-local index (several row windows per step, sparse packing of zero-token rows) the runner's
-        # per-row slots must reach the model as ``cache_metadata.recurrent_state_indices``. Decided once here, so
-        # single-window serving keeps the identity layout and no per-step slot payload.
-        self._ship_plain_recurrent_slot_indices = resolve_plain_recurrent_slot_shipping(
+        num_recurrent_layers = sum(1 for layer_type in layer_types if str(layer_type).lower() in recurrent_layer_types)
+        # Startup check of the recurrent slot contract (``runners/slot_contract.py``): the shared recurrent layer
+        # classes declare whether row ``r`` of a step reads and writes pool slot
+        # ``cache_metadata.recurrent_state_indices[r]``. Read once here; shared code never names a model.
+        self.recurrent_slot_contract = resolve_recurrent_slot_contract(
+            self.model, num_recurrent_layers=num_recurrent_layers
+        )
+        # Recurrent slots per request (W): 1 + K_max once verify steps capture per-token states, 1 otherwise.
+        self.recurrent_slot_group_size = 1
+        # Requests of a declaring model own a stable group of pooled slots (RecurrentSlotPool), shipped with every
+        # step, wherever a row can sit past its window-local index (several row windows per step, sparse packing of
+        # zero-token rows) or W > 1; elsewhere the identity layout stays (slot = row, states updated in place):
+        # explicit slots make today's recurrent drivers gather and scatter the pool rows on every step.
+        self._recurrent_slots_pooled = uses_pooled_recurrent_slots(
             family=str(getattr(text_config, "model_type", None) or type(self.model).__name__),
+            contract=self.recurrent_slot_contract,
             has_recurrent_layers=self._has_recurrent_layers,
-            pooled_slots=self._slot_indexed_state or self._uses_spmd_dp(),
+            slot_indexed_cache=self._slot_indexed_state,
+            rank_major_dp=self._uses_spmd_dp(),
+            speculative_candidate_rows=self.spec_decode_recurrent_candidates,
             rows_per_forward=min(int(self.metadata.get_max_num_seqs()), int(self.max_num_reqs)),
             max_num_reqs=int(self.max_num_reqs),
             sparse_row_packing=(
                 int(getattr(self.metadata, "data_parallel_size", 1) or 1) <= 1 and not self.async_scheduling
             ),
-            speculative_candidate_rows=self.spec_decode_recurrent_candidates,
-            model_honours_slots=bool(getattr(self.model, "esurge_plain_recurrent_slots", False)),
+            group_size=self.recurrent_slot_group_size,
         )
-        # Plain-path recurrent rows that receive no slots must sit at their window-local index, so sparse packing of
-        # zero-token rows (which moves rows) is turned off for them in ``_setup_variables``.
+        # Identity layout (slot = row) for recurrent pools that are neither pooled nor rank-major: rows pinned to their
+        # window-local index (no sparse packing of zero-token rows, see ``_setup_variables``), device rows moved with
+        # SequenceBuffer rows (``_sync_recurrent_rows``).
         self._recurrent_rows_pinned_to_window = bool(
-            self._has_recurrent_layers
-            and not (self._slot_indexed_state or self._uses_spmd_dp())
-            and not self._ship_plain_recurrent_slot_indices
+            self._has_recurrent_layers and not (self._recurrent_slots_pooled or self._uses_spmd_dp())
         )
 
         self.cache_group_configs, self.layer_to_cache_group = self._build_execution_cache_group_layout()
@@ -768,7 +778,8 @@ class eSurgeRunner:
                 if drafter is not None and bool(getattr(drafter, "rolls_back_cache", False))
                 else 0
             ),
-            ship_recurrent_slot_indices=self._ship_plain_recurrent_slot_indices,
+            recurrent_slots_pooled=self._recurrent_slots_pooled,
+            recurrent_slot_group_size=self.recurrent_slot_group_size,
         )
         if drafter is not None and bool(getattr(drafter, "needs_main_hidden", False)):
             # DSpark: the fused model step must also return the backbone's ``main_hidden`` rows.
@@ -854,7 +865,7 @@ class eSurgeRunner:
 
         True only on the plain-recurrent path: the model has recurrent/SSM
         state AND requests are not pinned to a stable pooled slot. Rank-major
-        SPMD DP and slot-indexed compressed-window families
+        SPMD DP, compressed-window families and pooled recurrent slots
         (``slot_pool.is_enabled()``) already thread ``recurrent_state_indices``
         to the kernel, so their device state is keyed by a stable slot and must
         not be permuted here.
@@ -1550,7 +1561,8 @@ class eSurgeRunner:
         self.slot_pool = RecurrentSlotPool(
             metadata=self.metadata,
             max_num_reqs=self.max_num_reqs,
-            slot_indexed_state=self._slot_indexed_state,
+            slot_indexed_state=bool(getattr(self, "_recurrent_slots_pooled", self._slot_indexed_state)),
+            group_size=int(getattr(self, "recurrent_slot_group_size", 1)),
         )
 
         self.arange = jnp.arange(self.max_num_tokens, dtype=jnp.int32)
@@ -3088,7 +3100,7 @@ class eSurgeRunner:
                                 rows_per_rank = self._recurrent_rows_per_dp_rank()
                                 rank = min(max(int(window_row_indices[row_pos]), 0) // rows_per_rank, dp_size - 1)
                             slot = self._assign_recurrent_slot(str(rid), int(rank))
-                        elif self._slot_indexed_state:
+                        elif self.slot_pool.is_enabled():
                             slot = self._assign_recurrent_slot(str(rid), None)
                         else:
                             slot = int(window_row_indices[row_pos])

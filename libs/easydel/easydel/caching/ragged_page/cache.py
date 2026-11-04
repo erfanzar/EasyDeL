@@ -1537,8 +1537,20 @@ class RaggedPagesMetadata:
         request_distribution (Array, optional): v3 distribution bounds.
             Shape: [3] containing [decode_end, prefill_end, total_count]
         recurrent_state_indices (Array, optional): Physical recurrent-state
-            slot ids aligned with request rows. Rank-major DP passes this as
-            [dp, rows_per_dp].
+            slot ids aligned with request rows: the base slot ``g`` of the
+            row's group of ``W`` slots. Rank-major DP passes this as
+            [dp, rows_per_dp] with rank-local slots.
+        recurrent_commit_lens (Array, optional): Per row, the tokens whose
+            state is certain (``c``): the row length for ordinary rows, the
+            real-token count (>= 1) for speculative verify rows. The row
+            writes the state after token ``c - 1 + j`` into slot ``g + j``
+            for ``j = 0 .. lens - c``. ``None`` means ``c = lens`` for every
+            row. Same layout as ``recurrent_state_indices``.
+        recurrent_read_offset (Array, optional): Per row, the drafts
+            accepted in the request's previous verify step (``a``, written
+            on the device); the row reads its initial state from slot
+            ``g + a``. ``None`` means ``a = 0``. Same layout as
+            ``recurrent_state_indices``.
         num_kv_update_slices (Array, optional): v2 update slice count.
             Shape: [1]
         version (str): Metadata format version ("v2" or "v3").
@@ -1572,6 +1584,8 @@ class RaggedPagesMetadata:
     num_kv_update_slices: Int[Array, "1"] | None = None
     spec_recurrent_commit: Int[Array, "2 max_num_reqs"] | None = None
     recurrent_state_indices: Int[Array, "..."] | None = None
+    recurrent_commit_lens: Int[Array, "..."] | None = None
+    recurrent_read_offset: Int[Array, "..."] | None = None
 
     version: str | tp.Literal["v3", "v2"] = field(pytree_node=False, default="v3")
 

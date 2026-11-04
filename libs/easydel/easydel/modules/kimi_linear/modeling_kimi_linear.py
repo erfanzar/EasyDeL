@@ -1682,8 +1682,6 @@ class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig
     _task_type = TaskType.CAUSAL_LM
     _model_type = "kimi_linear"
     _config_class = KimiLinearConfig
-    # eSurge: every KDA layer follows cache_metadata.recurrent_state_indices (flat-stream driver).
-    esurge_plain_recurrent_slots: ClassVar[bool] = True
 
     checkpoint_key_rules: ClassVar[KeyRuleSet] = KIMI_LINEAR_KEY_RULES
 
