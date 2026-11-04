@@ -47,7 +47,12 @@ from easydel.infra.modeling_outputs import AttentionLayerOutput
 from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info
 from easydel.infra.sharding import mesh_axis_size
 from easydel.infra.utils import ArrayParam
-from easydel.layers.linears import ColumnParallelLinear, RowParallelLinear, gather_shared_input
+from easydel.layers.linears import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    gather_shared_input,
+    resolve_gather_shared_projection_input,
+)
 from easydel.layers.norms import RMSNormGated, lowfloats, promote_dtype
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import (
@@ -859,7 +864,7 @@ class KernelDeltaAttention(spx.Module):
             ``sigmoid(b_proj(x))`` ``[B, S, heads]``, the per-channel log-decay ``[B, S, heads, head_k_dim]`` and
             ``g_a_proj(x)`` ``[B, S, gate_low_rank_dim]``.
         """
-        if self.config.gather_shared_projection_input or split is not None:
+        if split is not None or resolve_gather_shared_projection_input(self.config, hidden_states):
             hidden_states = gather_shared_input(hidden_states, self.config)
 
         def project(linear: tp.Any, x: Array) -> Array:
