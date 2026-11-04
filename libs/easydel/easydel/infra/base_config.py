@@ -470,6 +470,16 @@ def _optional_bool(name: str, value: tp.Any) -> bool | None:
     return bool(value)
 
 
+#: Serving settings whose default is ``None`` (decided where each one is read). Their default used to be ``False``,
+#: and configs saved then store ``false`` for every one of them; ``EasyDeLBaseConfig.from_dict`` loads that as ``None``.
+_AUTO_SERVING_SETTINGS: tuple[str, ...] = (
+    "moe_defer_tp_reduce",
+    "gather_shared_projection_input",
+    "kda_serving_ep_split",
+    "dsa_serving_ep_split",
+)
+
+
 @auto_pytree
 class EasyMethod:
     """Constants for EasyDeL operation modes.
@@ -634,7 +644,10 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             (``moe_chunk_size`` unset, no ring / expert-tensor mode / ep-carries-batch, no down-projection bias) to
             one sort per layer, an expert FFN and combine over this shard's local (token, expert) rows only (in
             static row windows, see ``moe_local_ffn_window_rows``) and a single reduction of the combined
-            ``[tokens, H]`` partial over (ep, tp). Warns once when set but inapplicable. Default ``False``.
+            ``[tokens, H]`` partial over (ep, tp). ``True`` applies both wherever their conditions hold and warns
+            once where they do not; ``False`` keeps both off. ``None`` (default) leaves the choice to the MoE layer:
+            the inference-mode dispatch wherever its conditions hold, the chunked dispatch as with ``False`` (so
+            training is unchanged). A saved ``false`` loads as ``None`` (see :meth:`from_dict`).
         moe_row_gather_kernel: In the fused-MoE path, run the token dispatch gather and the expert-output
             unsort + top-k combine through the ejkernel Pallas TPU row-gather kernels (``moe_row_gather`` /
             ``moe_row_gather_sum``) instead of XLA gathers. Forward dispatch is bit-identical; the combine
@@ -686,7 +699,9 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             rematerialized backward does not re-gather it for every projection's weight gradient (see
             :func:`easydel.layers.linears.gather_shared_input`). Projections keep their own module calls (quantized /
             LoRA layers unaffected) and parameters and checkpoints do not change; layers that do not call the helper
-            ignore the flag. Default ``False``.
+            ignore the flag. ``None`` (default) leaves the choice to those layers: gathered in inference mode wherever
+            the input is sharded on its feature axis, not gathered in training (as with ``False``). A saved ``false``
+            loads as ``None`` (see :meth:`from_dict`).
         kda_chunk_impl: Chunked (multi-token) implementation of every Kernel Delta Attention layer
             (:class:`easydel.layers.linear_attention.KernelDeltaAttention`: Kimi-Linear, GLM-5-Next):
             ``"scan"`` (XLA per-channel chunk scan) or ``"kda_chunk"`` (fused ejkernel ``kda_chunk`` kernel; Pallas
@@ -699,8 +714,9 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             runs the same heads; with the split each device advances ``heads / (tp * ep)`` heads and holds that share
             of the conv windows and recurrent states, the layer input is gathered over tp once and ``o_proj``'s partial
             sums are reduced over all ``tp * ep`` devices. Used only when the expert-parallel axis has more than one
-            device and ``tp * ep`` divides the head count; training and non-eSurge caches never split. Default
-            ``False``.
+            device and ``tp * ep`` divides the head count; training and non-eSurge caches never split. ``True``
+            splits where it can and warns once where the heads do not divide; ``None`` (default) splits where it can,
+            silently otherwise; ``False`` never splits. A saved ``false`` loads as ``None`` (see :meth:`from_dict`).
         index_scoring_kernel: Dense multi-query scoring of every learned sparse-attention indexer that has a fused
             path (GLM-5-Next's pooled indexer, DeepSeek-V4's compressed and DeepSeek-V4.1's shared-key indexers):
             ``"xla"`` (per-head logits as XLA ops) or ``"pallas"`` (the fused ``indexer_scores`` operation; Pallas
@@ -729,9 +745,10 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             the MLA pages, so without the split every expert-parallel shard attends for all of a step's query
             tokens; with it each shard attends for ``1 / ep`` of them (the step's token count is padded to a
             multiple of ``ep``), every shard still writes all tokens into its cache replica, and the attention
-            output comes back token-sharded over ``ep``. Results are unchanged. Inactive (one warning) with
-            data-parallel KV pages; no effect with ``ep == 1``, on dense MLA calls and in training. Default
-            ``False``.
+            output comes back token-sharded over ``ep``. Results are unchanged. No effect with ``ep == 1``, on dense
+            MLA calls and in training. ``True`` applies it and warns once where it cannot (data-parallel KV pages);
+            ``None`` (default) applies it wherever it can, silently otherwise; ``False`` never does. A saved
+            ``false`` loads as ``None`` (see :meth:`from_dict`).
         layer_scan_options: Lowering options for lowered repeated-layer scans
             (``block_scan``, ``barrier``, ``prefetch_axes``, ``prefetch_exclude``,
             ``prefetch_defer_dw``, ``unroll``); top-level keys apply to every scan,
@@ -808,23 +825,23 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     fsdp_is_ep_bound: NotRequired[bool]
     sp_is_ep_bound: NotRequired[bool]
     moe_chunk_size: NotRequired[int | None]
-    moe_defer_tp_reduce: NotRequired[bool]
+    moe_defer_tp_reduce: NotRequired[bool | None]
     moe_row_gather_kernel: NotRequired[bool]
     moe_local_expert_ffn: NotRequired[bool]
     moe_local_ffn_window_rows: NotRequired[int | None]
     moe_fsdp_shard_expert_weights: NotRequired[bool]
     moe_ep_carries_batch: NotRequired[bool]
     moe_batch_axes_follow_resolver: NotRequired[bool]
-    gather_shared_projection_input: NotRequired[bool]
+    gather_shared_projection_input: NotRequired[bool | None]
     kda_chunk_impl: NotRequired[str]
     kda_chunk_precision: NotRequired[str]
-    kda_serving_ep_split: NotRequired[bool]
+    kda_serving_ep_split: NotRequired[bool | None]
     index_scoring_kernel: NotRequired[str]
     dsa_sparse_training: NotRequired[bool | None]
     dsa_pool_training: NotRequired[bool]
     dsa_pool_query_chunk: NotRequired[int]
     dsa_pool_kernel: NotRequired[str]
-    dsa_serving_ep_split: NotRequired[bool]
+    dsa_serving_ep_split: NotRequired[bool | None]
     layer_scan_options: NotRequired[dict[str, tp.Any] | None]
     quantization_config: NotRequired[QuantizationConfig | None]
     operation_configs: NotRequired[dict[str, BaseOperationConfig] | None]
@@ -912,7 +929,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         sp_is_ep_bound: Fold the sequence-parallel axis into the expert axis when building expert meshes.
         moe_chunk_size: Optional token chunk size for chunk-scanned fused-MoE dispatch (``None`` disables).
         moe_defer_tp_reduce: Reduce the MoE output over TP after the top-k combine: the chunked dispatch, and the
-            single-pass replicated-expert dispatch under inference mode (default ``False``).
+            single-pass replicated-expert dispatch under inference mode (``None``, the default: the MoE layer
+            decides; ``False``: off).
         moe_row_gather_kernel: Fused-MoE dispatch/combine row gathers via the Pallas TPU kernels (default ``False``).
         moe_local_expert_ffn: In expert-tensor mode, run each device's experts through the ejkernel
             ``moe_local_ffn`` op (dropless dynamic row windows, custom VJP; default ``False``).
@@ -924,11 +942,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_batch_axes_follow_resolver: Order the fused-MoE batch axes like the runtime resolver's
             hidden-state spec (no block-boundary relayout; default ``False``).
         gather_shared_projection_input: All-gather a hidden state shared by several column projections over tp
-            once (one gather and one reduce-scatter instead of one gather per projection; default ``False``).
+            once (one gather and one reduce-scatter instead of one gather per projection; ``None``, the default:
+            the layer decides, in inference mode only; ``False``: off).
         kda_chunk_impl: Chunked KDA implementation, ``"scan"`` or ``"kda_chunk"`` (default ``"scan"``).
         kda_chunk_precision: Non-inverse dot precision of ``"kda_chunk"``, ``"highest"`` or ``"default"``
             (default ``"highest"``).
-        kda_serving_ep_split: Split eSurge KDA heads over the head and expert-parallel axes (default ``False``).
+        kda_serving_ep_split: Split eSurge KDA heads over the head and expert-parallel axes (``None``, the default:
+            wherever they divide; ``False``: never).
         index_scoring_kernel: Indexer multi-query scoring, ``"xla"`` or ``"pallas"`` (default ``"xla"``).
         dsa_sparse_training: Force (``True``) / forbid (``False``) the sparse DSA training kernel; ``None``
             (default) picks it automatically.
@@ -936,7 +956,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         dsa_pool_query_chunk: Queries per ``dsa_pool_training`` selection chunk (default ``2048``).
         dsa_pool_kernel: ``dsa_pool_training`` attention kernel, ``"bitmap"`` or ``"gather"`` (default
             ``"bitmap"``).
-        dsa_serving_ep_split: Split DSA serving attention over the expert-parallel axis (default ``False``).
+        dsa_serving_ep_split: Split DSA serving attention over the expert-parallel axis (``None``, the default:
+            wherever it applies; ``False``: never).
         layer_scan_options: Per-scope ``ModuleList.scan`` lowering options (default ``None``).
         **kwargs: Forwarded to `PretrainedConfig`.
 
@@ -1122,7 +1143,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         ``partial_rotary_factor`` is only lifted for constructors that accept it
         (or when it is already top-level). MLA dtype fields equal to the dense
         dtypes they fall back to are cleared first (see
-        :meth:`_unpin_saved_mla_dtypes`).
+        :meth:`_unpin_saved_mla_dtypes`), and saved ``false`` values of the
+        automatic serving settings load as ``None`` (see
+        :meth:`_unpin_saved_serving_defaults`).
 
         Args:
             config_dict: Serialized configuration mapping.
@@ -1133,7 +1156,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             when ``return_unused_kwargs=True``).
         """
         if isinstance(config_dict, dict):
-            config_dict = cls._unpin_saved_mla_dtypes(config_dict)
+            config_dict = cls._unpin_saved_serving_defaults(cls._unpin_saved_mla_dtypes(config_dict))
         rope_parameters = config_dict.get("rope_parameters") if isinstance(config_dict, dict) else None
         if cls._is_flat_rope_parameters(rope_parameters):
             config_dict = dict(config_dict)
@@ -1474,23 +1497,23 @@ class EasyDeLBaseConfig(PretrainedConfig):
         fsdp_is_ep_bound: bool = FSDP_IS_EP_BOUND,
         sp_is_ep_bound: bool = SP_IS_EP_BOUND,
         moe_chunk_size: int | None = None,
-        moe_defer_tp_reduce: bool = False,
+        moe_defer_tp_reduce: bool | None = None,
         moe_row_gather_kernel: bool = False,
         moe_local_expert_ffn: bool = False,
         moe_local_ffn_window_rows: int | None = None,
         moe_fsdp_shard_expert_weights: bool = False,
         moe_ep_carries_batch: bool = False,
         moe_batch_axes_follow_resolver: bool = False,
-        gather_shared_projection_input: bool = False,
+        gather_shared_projection_input: bool | None = None,
         kda_chunk_impl: str = "scan",
         kda_chunk_precision: str = "highest",
-        kda_serving_ep_split: bool = False,
+        kda_serving_ep_split: bool | None = None,
         index_scoring_kernel: str = "xla",
         dsa_sparse_training: bool | None = None,
         dsa_pool_training: bool = False,
         dsa_pool_query_chunk: int = 2048,
         dsa_pool_kernel: str = "bitmap",
-        dsa_serving_ep_split: bool = False,
+        dsa_serving_ep_split: bool | None = None,
         layer_scan_options: dict[str, tp.Any] | None = None,
         operation_configs: dict[str, BaseOperationConfig] | None = None,
         **kwargs,
@@ -1624,7 +1647,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.fsdp_is_ep_bound = getattr(self, "fsdp_is_ep_bound", fsdp_is_ep_bound)
         self.sp_is_ep_bound = getattr(self, "sp_is_ep_bound", sp_is_ep_bound)
         self.moe_chunk_size = _positive_int_or_none("moe_chunk_size", getattr(self, "moe_chunk_size", moe_chunk_size))
-        self.moe_defer_tp_reduce = bool(getattr(self, "moe_defer_tp_reduce", moe_defer_tp_reduce))
+        self.moe_defer_tp_reduce = _optional_bool(
+            "moe_defer_tp_reduce", getattr(self, "moe_defer_tp_reduce", moe_defer_tp_reduce)
+        )
         self.moe_row_gather_kernel = bool(getattr(self, "moe_row_gather_kernel", moe_row_gather_kernel))
         self.moe_local_expert_ffn = bool(getattr(self, "moe_local_expert_ffn", moe_local_expert_ffn))
         self.moe_local_ffn_window_rows = _positive_int_or_none(
@@ -1637,15 +1662,16 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.moe_batch_axes_follow_resolver = bool(
             getattr(self, "moe_batch_axes_follow_resolver", moe_batch_axes_follow_resolver)
         )
-        self.gather_shared_projection_input = bool(
-            getattr(self, "gather_shared_projection_input", gather_shared_projection_input)
+        self.gather_shared_projection_input = _optional_bool(
+            "gather_shared_projection_input",
+            getattr(self, "gather_shared_projection_input", gather_shared_projection_input),
         )
         self.kda_chunk_impl = _one_of("kda_chunk_impl", getattr(self, "kda_chunk_impl", kda_chunk_impl), KDA_CHUNK_IMPLS)
         self.kda_chunk_precision = _one_of(
             "kda_chunk_precision", getattr(self, "kda_chunk_precision", kda_chunk_precision), KDA_CHUNK_PRECISIONS
         )
-        self.kda_serving_ep_split = bool(
-            _optional_bool("kda_serving_ep_split", getattr(self, "kda_serving_ep_split", kda_serving_ep_split))
+        self.kda_serving_ep_split = _optional_bool(
+            "kda_serving_ep_split", getattr(self, "kda_serving_ep_split", kda_serving_ep_split)
         )
         self.index_scoring_kernel = _one_of(
             "index_scoring_kernel", getattr(self, "index_scoring_kernel", index_scoring_kernel), INDEX_SCORING_KERNELS
@@ -1660,9 +1686,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.dsa_pool_kernel = _one_of(
             "dsa_pool_kernel", getattr(self, "dsa_pool_kernel", dsa_pool_kernel), DSA_POOL_KERNELS
         )
-        # ``None`` reads as off; anything but a boolean is rejected.
-        self.dsa_serving_ep_split = bool(
-            _optional_bool("dsa_serving_ep_split", getattr(self, "dsa_serving_ep_split", dsa_serving_ep_split))
+        self.dsa_serving_ep_split = _optional_bool(
+            "dsa_serving_ep_split", getattr(self, "dsa_serving_ep_split", dsa_serving_ep_split)
         )
         self.layer_scan_options = getattr(self, "layer_scan_options", layer_scan_options)
         normalize_layer_scan_options(self.layer_scan_options)
@@ -2490,23 +2515,23 @@ class EasyDeLBaseConfig(PretrainedConfig):
         fsdp_is_ep_bound: bool = NOT_GIVEN,
         sp_is_ep_bound: bool = NOT_GIVEN,
         moe_chunk_size: int | None = NOT_GIVEN,
-        moe_defer_tp_reduce: bool = NOT_GIVEN,
+        moe_defer_tp_reduce: bool | None = NOT_GIVEN,
         moe_row_gather_kernel: bool = NOT_GIVEN,
         moe_local_expert_ffn: bool = NOT_GIVEN,
         moe_local_ffn_window_rows: int | None = NOT_GIVEN,
         moe_fsdp_shard_expert_weights: bool = NOT_GIVEN,
         moe_ep_carries_batch: bool = NOT_GIVEN,
         moe_batch_axes_follow_resolver: bool = NOT_GIVEN,
-        gather_shared_projection_input: bool = NOT_GIVEN,
+        gather_shared_projection_input: bool | None = NOT_GIVEN,
         kda_chunk_impl: str = NOT_GIVEN,
         kda_chunk_precision: str = NOT_GIVEN,
-        kda_serving_ep_split: bool = NOT_GIVEN,
+        kda_serving_ep_split: bool | None = NOT_GIVEN,
         index_scoring_kernel: str = NOT_GIVEN,
         dsa_sparse_training: bool | None = NOT_GIVEN,
         dsa_pool_training: bool = NOT_GIVEN,
         dsa_pool_query_chunk: int = NOT_GIVEN,
         dsa_pool_kernel: str = NOT_GIVEN,
-        dsa_serving_ep_split: bool = NOT_GIVEN,
+        dsa_serving_ep_split: bool | None = NOT_GIVEN,
         layer_scan_options: dict[str, tp.Any] | None = NOT_GIVEN,
         **kwargs,
     ):
@@ -2578,7 +2603,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
             sp_is_ep_bound: Fold sequence-parallel into the expert axis when building expert meshes.
             moe_chunk_size: Token chunk size for chunk-scanned fused-MoE dispatch (default ``None`` = disabled).
             moe_defer_tp_reduce: Reduce the MoE output over TP after the top-k combine (chunked dispatch;
-                single-pass replicated-expert dispatch under inference mode; default ``False``).
+                single-pass replicated-expert dispatch under inference mode; ``None``, the default: the MoE layer
+                decides; ``False``: off).
             moe_row_gather_kernel: Run the fused-MoE dispatch/combine row gathers through the Pallas TPU
                 row-gather kernels (default ``False``).
             moe_local_expert_ffn: In expert-tensor mode, run each device's experts through the ejkernel
@@ -2592,17 +2618,19 @@ class EasyDeLBaseConfig(PretrainedConfig):
             moe_batch_axes_follow_resolver: Order the fused-MoE batch axes like the runtime resolver's
                 hidden-state spec (default ``False``).
             gather_shared_projection_input: All-gather a hidden state shared by several column projections over tp
-                once (default ``False``).
+                once (``None``, the default: the layer decides, in inference mode only; ``False``: off).
             kda_chunk_impl: Chunked KDA implementation, ``"scan"`` or ``"kda_chunk"`` (default ``"scan"``).
             kda_chunk_precision: Non-inverse dot precision of ``"kda_chunk"`` (default ``"highest"``).
-            kda_serving_ep_split: Split eSurge KDA heads over the head and expert-parallel axes (default ``False``).
+            kda_serving_ep_split: Split eSurge KDA heads over the head and expert-parallel axes (``None``, the
+                default: wherever they divide; ``False``: never).
             index_scoring_kernel: Indexer multi-query scoring, ``"xla"`` or ``"pallas"`` (default ``"xla"``).
             dsa_sparse_training: Force / forbid the sparse DSA training kernel; ``None`` = automatic (default).
             dsa_pool_training: Pool-selection DSA training path for pooled indexers (default ``False``).
             dsa_pool_query_chunk: Queries per ``dsa_pool_training`` selection chunk (default ``2048``).
             dsa_pool_kernel: ``dsa_pool_training`` attention kernel, ``"bitmap"`` or ``"gather"`` (default
                 ``"bitmap"``).
-            dsa_serving_ep_split: Split DSA serving attention over the expert-parallel axis (default ``False``).
+            dsa_serving_ep_split: Split DSA serving attention over the expert-parallel axis (``None``, the
+                default: wherever it applies; ``False``: never).
             layer_scan_options: Per-scope ``ModuleList.scan`` lowering options (default ``None``).
             **kwargs: Extra attributes to attach to this config and any defined ``sub_configs``.
         """
@@ -2685,7 +2713,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "sp_is_ep_bound", SP_IS_EP_BOUND, sp_is_ep_bound)
         set_attrs_smartly(self, "moe_chunk_size", None, moe_chunk_size)
         self.moe_chunk_size = _positive_int_or_none("moe_chunk_size", self.moe_chunk_size)
-        set_attrs_smartly(self, "moe_defer_tp_reduce", False, moe_defer_tp_reduce)
+        set_attrs_smartly(self, "moe_defer_tp_reduce", None, moe_defer_tp_reduce)
+        self.moe_defer_tp_reduce = _optional_bool("moe_defer_tp_reduce", self.moe_defer_tp_reduce)
         set_attrs_smartly(self, "moe_row_gather_kernel", False, moe_row_gather_kernel)
         set_attrs_smartly(self, "moe_local_expert_ffn", False, moe_local_expert_ffn)
         set_attrs_smartly(self, "moe_local_ffn_window_rows", None, moe_local_ffn_window_rows)
@@ -2695,13 +2724,16 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "moe_fsdp_shard_expert_weights", False, moe_fsdp_shard_expert_weights)
         set_attrs_smartly(self, "moe_ep_carries_batch", False, moe_ep_carries_batch)
         set_attrs_smartly(self, "moe_batch_axes_follow_resolver", False, moe_batch_axes_follow_resolver)
-        set_attrs_smartly(self, "gather_shared_projection_input", False, gather_shared_projection_input)
+        set_attrs_smartly(self, "gather_shared_projection_input", None, gather_shared_projection_input)
+        self.gather_shared_projection_input = _optional_bool(
+            "gather_shared_projection_input", self.gather_shared_projection_input
+        )
         set_attrs_smartly(self, "kda_chunk_impl", "scan", kda_chunk_impl)
         self.kda_chunk_impl = _one_of("kda_chunk_impl", self.kda_chunk_impl, KDA_CHUNK_IMPLS)
         set_attrs_smartly(self, "kda_chunk_precision", "highest", kda_chunk_precision)
         self.kda_chunk_precision = _one_of("kda_chunk_precision", self.kda_chunk_precision, KDA_CHUNK_PRECISIONS)
-        set_attrs_smartly(self, "kda_serving_ep_split", False, kda_serving_ep_split)
-        self.kda_serving_ep_split = bool(_optional_bool("kda_serving_ep_split", self.kda_serving_ep_split))
+        set_attrs_smartly(self, "kda_serving_ep_split", None, kda_serving_ep_split)
+        self.kda_serving_ep_split = _optional_bool("kda_serving_ep_split", self.kda_serving_ep_split)
         set_attrs_smartly(self, "index_scoring_kernel", "xla", index_scoring_kernel)
         self.index_scoring_kernel = _one_of("index_scoring_kernel", self.index_scoring_kernel, INDEX_SCORING_KERNELS)
         set_attrs_smartly(self, "dsa_sparse_training", None, dsa_sparse_training)
@@ -2712,8 +2744,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.dsa_pool_query_chunk = _positive_int("dsa_pool_query_chunk", self.dsa_pool_query_chunk)
         set_attrs_smartly(self, "dsa_pool_kernel", "bitmap", dsa_pool_kernel)
         self.dsa_pool_kernel = _one_of("dsa_pool_kernel", self.dsa_pool_kernel, DSA_POOL_KERNELS)
-        set_attrs_smartly(self, "dsa_serving_ep_split", False, dsa_serving_ep_split)
-        self.dsa_serving_ep_split = bool(_optional_bool("dsa_serving_ep_split", self.dsa_serving_ep_split))
+        set_attrs_smartly(self, "dsa_serving_ep_split", None, dsa_serving_ep_split)
+        self.dsa_serving_ep_split = _optional_bool("dsa_serving_ep_split", self.dsa_serving_ep_split)
         set_attrs_smartly(self, "layer_scan_options", None, layer_scan_options)
         normalize_layer_scan_options(self.layer_scan_options)
         self._maybe_extend_batch_axis_for_ep()
@@ -3112,6 +3144,40 @@ class EasyDeLBaseConfig(PretrainedConfig):
             saved = cls._coerce_dtype_spec(config_dict[field_name])
             dense = cls._coerce_dtype_spec(config_dict[fallback])
             if isinstance(saved, np.dtype) and isinstance(dense, np.dtype) and saved == dense:
+                if updated is None:
+                    updated = dict(config_dict)
+                updated[field_name] = None
+        return config_dict if updated is None else updated
+
+    @classmethod
+    def _unpin_saved_serving_defaults(cls, config_dict: dict[str, tp.Any]) -> dict[str, tp.Any]:
+        """Read saved ``false`` values of the automatic serving settings as ``None``.
+
+        ``moe_defer_tp_reduce``, ``gather_shared_projection_input``, ``kda_serving_ep_split`` and
+        ``dsa_serving_ep_split`` default to ``None``: the code that reads each one decides. Their default used to be
+        ``False``, and configs saved then store ``false`` for all four, which would otherwise load as an explicit
+        opt-out. A saved ``false`` therefore loads as ``None``. To turn a setting off, pass ``False`` when loading
+        (``config_kwargs``, or a keyword argument of ``from_pretrained``); that is applied after this step. Nested
+        sub-config mappings (e.g. ``text_config``) are handled too.
+
+        Args:
+            config_dict: Serialized configuration mapping; not modified.
+
+        Returns:
+            The mapping with those ``false`` values set to ``None`` (a copy when anything changed, else
+            ``config_dict`` itself).
+        """
+        updated: dict[str, tp.Any] | None = None
+        for key, value in config_dict.items():
+            if isinstance(value, dict):
+                nested = cls._unpin_saved_serving_defaults(value)
+                if nested is not value:
+                    if updated is None:
+                        updated = dict(config_dict)
+                    updated[key] = nested
+        for field_name in _AUTO_SERVING_SETTINGS:
+            value = config_dict.get(field_name)
+            if isinstance(value, (bool, np.bool_)) and not value:
                 if updated is None:
                     updated = dict(config_dict)
                 updated[field_name] = None

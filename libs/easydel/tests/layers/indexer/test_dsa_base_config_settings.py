@@ -91,7 +91,7 @@ def test_dsa_settings_have_backward_compatible_defaults_and_survive_serializatio
         default.dsa_pool_query_chunk,
         default.dsa_pool_kernel,
         default.dsa_serving_ep_split,
-    ) == ("xla", None, False, 2048, "bitmap", False)
+    ) == ("xla", None, False, 2048, "bitmap", None)
     settings = dict(
         index_scoring_kernel="pallas",
         dsa_sparse_training=False,
