@@ -465,6 +465,145 @@ def resolve_moe_defer_tp_reduce(
     return True
 
 
+SharedExpertKernels = tuple[jax.Array, jax.Array, jax.Array, jax.Array]
+"""``(gate_up_codes [H, 2I], gate_up_scales [1, 2I], down_codes [I, H], down_scales [1, H])``: int8 codes, f32 scales."""
+
+
+def _shared_expert_fold_spec(
+    shared_expert: tp.Any,
+    *,
+    hidden_size: int,
+    tp_size: int,
+) -> tuple[SharedExpertKernels, Callable[[jax.Array, jax.Array], jax.Array]] | None:
+    """Weights and combine for running ``shared_expert`` inside the deferred dispatch, or ``None`` to add it outside.
+
+    The shared expert folds when it is a gated MLP that ``gated_mlp_forward`` (``easydel/layers/mlp.py``) runs on its
+    fused integer route in W8A8: its forward is that helper (a ``GatedMLP``, or a module declaring its combine through
+    ``fused_act_name``), ``use_fused_mlp`` is on and ``FORCE_NATIVE_RUNTIME`` off, the fused ``gate_up_proj`` and
+    ``down_proj`` are bias-free per-channel int8 quantized linears with an explicit 8-bit activation contract (no output
+    scale, no runtime re-pack), and the fused gate/up layout has one interleave segment per TP rank, so each rank's
+    column shard is its own ``[gate | up]`` pair. Anything else returns ``None`` and runs exactly as before.
+
+    Args:
+        shared_expert: The module ``moe_call`` received as ``shared_expert``.
+        hidden_size: Width of the expert input.
+        tp_size: TP size of the expert mesh.
+
+    Returns:
+        ``(kernels, combine)``: the weights (scales as float32) and the ``(gate, up) -> hidden`` combine, or ``None``.
+    """
+    from ejkernel.modules import resolve_mlp_combine  # pyright: ignore[reportMissingTypeStubs]
+
+    from easydel.layers.layouts import tensor_parallel_size
+    from easydel.layers.linears import ParallelLinearQuantized
+    from easydel.layers.mlp import GatedMLP, _act_name, _declared_combine, _mesh_supported
+
+    config = getattr(shared_expert, "config", None)
+    gate_up = getattr(shared_expert, "gate_up_proj", None)
+    down = getattr(shared_expert, "down_proj", None)
+    if config is None or not all(isinstance(proj, ParallelLinearQuantized) for proj in (gate_up, down)):
+        return None
+    if not getattr(config, "use_fused_mlp", True) or check_bool_flag("FORCE_NATIVE_RUNTIME", False):
+        return None
+    if _mesh_supported(config) is None:
+        return None
+    for proj in (gate_up, down):
+        runtime_cfg = getattr(proj, "_runtime_config", None)
+        proj_cfg = getattr(proj, "config", None)
+        if (
+            getattr(proj, "use_bias", False)
+            or getattr(proj, "output_scale", 1.0) != 1.0
+            or (runtime_cfg is not None and runtime_cfg() is not None)
+            or getattr(proj_cfg, "activation_policy", "auto") != "explicit"
+            or getattr(proj_cfg, "activation_bits", None) != 8
+        ):
+            return None
+        try:
+            mode, _group_size, bits, needs_biases = proj._resolve_ejkernel_params()
+        except Exception:
+            return None
+        if mode != "channelwise" or bits != 8 or needs_biases:
+            return None
+    declared = _declared_combine(shared_expert)
+    if declared is None and not isinstance(shared_expert, GatedMLP):
+        # A module without a declared combine may compute something other than ``act(gate) * up`` in its own forward.
+        return None
+    act, act_params = declared if declared is not None else (_act_name(config, shared_expert), ())
+    if act is None:
+        return None
+    gu_codes, gu_scales, dn_codes, dn_scales = (
+        getattr(leaf, "value", leaf)
+        for leaf in (gate_up.quant_kernel, gate_up.quant_scales, down.quant_kernel, down.quant_scales)
+    )
+    if any(leaf is None for leaf in (gu_codes, gu_scales, dn_codes, dn_scales)):
+        return None
+    if gu_codes.dtype != jnp.int8 or dn_codes.dtype != jnp.int8 or gu_codes.ndim != 2 or dn_codes.ndim != 2:
+        return None
+    inter = int(dn_codes.shape[0])
+    if tuple(gu_codes.shape) != (hidden_size, 2 * inter) or int(dn_codes.shape[1]) != hidden_size:
+        return None
+    if int(gu_scales.size) != 2 * inter or int(dn_scales.size) != hidden_size:
+        return None
+    if max(1, int(tensor_parallel_size(config, arr=gu_codes))) != tp_size or inter % tp_size:
+        return None
+    kernels = (
+        gu_codes,
+        gu_scales.reshape(1, -1).astype(jnp.float32),
+        dn_codes,
+        dn_scales.reshape(1, -1).astype(jnp.float32),
+    )
+    return kernels, resolve_mlp_combine(act, tuple(act_params))
+
+
+def _shared_expert_rows(
+    rows: jax.Array,
+    kernels: SharedExpertKernels,
+    combine: Callable[[jax.Array, jax.Array], jax.Array],
+) -> jax.Array:
+    """W8A8 shared expert on ``rows`` with one TP rank's weight shards, inside the fused MoE ``shard_map``.
+
+    Both projections run as one-group int8 ``grouped_matmul_channelwise`` calls, the int8 ragged dot of the routed
+    experts, which reads the stored ``[K, N]`` codes in place (a plain int8 dot re-tiles the weight shard on every call
+    on TPU v5p): per-row int8 activations, exact int32 accumulation, per-channel scales. This rank's gate/up shard
+    splits in halves (one interleave segment per rank), the combine runs in float32 as ``fused_mlp``'s XLA composition
+    does, and the down projection quantizes this rank's slice of each hidden row, as the routed experts' down
+    projection does.
+
+    Args:
+        rows: Token rows ``[r, H]`` (floating).
+        kernels: This rank's ``(gate_up_codes [H, 2I/tp], gate_up_scales [1, 2I/tp], down_codes [I/tp, H],
+            down_scales [1, H])``.
+        combine: The ``(gate, up) -> hidden`` combine.
+
+    Returns:
+        float32 ``[r, H]``: this rank's down-projection partial sums (to be summed over TP).
+    """
+    from ejkernel.modules import grouped_matmul_channelwise  # pyright: ignore[reportMissingTypeStubs]
+
+    gu_codes, gu_scales, dn_codes, dn_scales = kernels
+    sizes = jnp.full((1,), rows.shape[0], dtype=jnp.int32)
+    gate_up = grouped_matmul_channelwise(
+        rows,
+        gu_codes[None],
+        gu_scales[None],
+        sizes,
+        activation_bits=8,
+        preferred_element_type=rows.dtype,
+        platform="xla",
+    )
+    gate, up = jnp.split(gate_up, 2, axis=-1)
+    hidden = combine(gate.astype(jnp.float32), up.astype(jnp.float32)).astype(rows.dtype)
+    return grouped_matmul_channelwise(
+        hidden,
+        dn_codes[None],
+        dn_scales[None],
+        sizes,
+        activation_bits=8,
+        preferred_element_type=jnp.float32,
+        platform="xla",
+    )
+
+
 class BaseMoeModule(spx.Module, ABC):
     """Abstract base class shared by every Mixture-of-Experts module in EasyDeL.
 
@@ -1607,6 +1746,7 @@ class BaseMoeModule(spx.Module, ABC):
         act_fn: Callable[[jax.Array], jax.Array],
         layer_idx: int | None = None,
         gated: bool = True,
+        shared_expert: spx.Module | None = None,
     ):
         """Fused MoE path using grouped matmul and shard_map.
 
@@ -1655,11 +1795,15 @@ class BaseMoeModule(spx.Module, ABC):
             act_fn: Activation used when `ffn_activation` is not provided.
             gated: ``False`` selects ungated experts (``wu_kernel=None``):
                 ``out = wd(act(x @ wi))``. See :meth:`moe_call`.
+            shared_expert: Optional shared expert (see :meth:`moe_call`). It is folded into the inference-mode
+                deferred dispatch when that dispatch runs, the input is already in ``self.dtype`` and
+                ``_shared_expert_fold_spec`` accepts the module; otherwise it is left to the caller.
 
         Returns:
-            Tuple `(output, router_logits)` where:
-            - output: MoE layer output. Shape: [B, S, H].
+            Tuple `(output, router_logits, shared_folded)` where:
+            - output: MoE layer output. Shape: [B, S, H]. Includes the shared expert when ``shared_folded``.
             - router_logits: Pre-softmax router logits for auxiliary losses. Shape: [B*S, E].
+            - shared_folded: Whether ``shared_expert`` ran inside the dispatch (the caller adds it otherwise).
 
         Raises:
             ValueError: If the expert kernels do not match ``gated`` (see
@@ -1690,7 +1834,7 @@ class BaseMoeModule(spx.Module, ABC):
             >>>
             >>> # Call fused MoE
             >>> hidden_states = jnp.ones((2, 512, 768))  # (batch, seq, hidden)
-            >>> output, logits = moe_layer._sparse_moe_call(
+            >>> output, logits, _shared_folded = moe_layer._sparse_moe_call(
             ...     hidden_state=hidden_states,
             ...     gate_layer=gate,
             ...     wi_kernel=wi_kernel,
@@ -1741,6 +1885,8 @@ class BaseMoeModule(spx.Module, ABC):
         wd_kernel, wd_activation_bits, wd_grouped_platform = _unpack_precision(wd_kernel)
         gate_up_kernel, gate_up_activation_bits, gate_up_grouped_platform = _unpack_precision(gate_up_kernel)
 
+        # The folded shared expert reads the dispatch's input, so it folds only when this cast changes nothing.
+        input_in_module_dtype = jnp.dtype(hidden_state.dtype) == jnp.dtype(self.dtype)
         hidden_state = hidden_state.astype(self.dtype)
         gate_hidden_state = hidden_state if gate_hidden_state is None else gate_hidden_state.astype(self.dtype)
         if hooks is not None and hooks.before_gate is not None:
@@ -2033,6 +2179,14 @@ class BaseMoeModule(spx.Module, ABC):
                 "moe_local_ffn_window_rows is set but not used: it only sizes the row windows of the active "
                 "moe_local_expert_ffn path and of the inference-mode moe_defer_tp_reduce dispatch."
             )
+        # The shared expert joins the deferred dispatch's one reduction where ``_shared_expert_fold_spec`` accepts it;
+        # anywhere else ``moe_call`` adds it after the routed experts, as before.
+        shared_fold = (
+            _shared_expert_fold_spec(shared_expert, hidden_size=HD, tp_size=tp_size)
+            if shared_expert is not None and replicated_deferred_dispatch and input_in_module_dtype
+            else None
+        )
+        shared_kernels, shared_combine = shared_fold if shared_fold is not None else (None, None)
 
         expert_params_bytes = 0
         for _param in (wi_kernel, wu_kernel, gate_up_kernel, wd_kernel, wi_bias, wu_bias, gate_up_bias, wd_bias):
@@ -2132,6 +2286,18 @@ class BaseMoeModule(spx.Module, ABC):
             else None
         )
         wdbps = wspec("row", use_expert_tensor, is_bias=True) if wd_bias is not None else None
+        # Folded shared expert: each TP rank receives its own column shard of the fused gate/up codes (one
+        # ``[gate | up]`` interleave segment) and the matching row shard of the down codes, as the weights are stored.
+        shared_ps = (
+            (
+                PartitionSpec(None, tensor_axis_name),
+                PartitionSpec(None, tensor_axis_name),
+                PartitionSpec(tensor_axis_name, None),
+                PartitionSpec(None, None),
+            )
+            if shared_kernels is not None
+            else None
+        )
 
         preferred_element_type = jnp.bfloat16
         if jnp.dtype(self.dtype) == jnp.float32:
@@ -2507,6 +2673,7 @@ class BaseMoeModule(spx.Module, ABC):
             gate_logits: jax.Array,
             expert_ffn: Callable[..., jax.Array],
             expert_shard_id: jax.Array,
+            shared_kernels: SharedExpertKernels | None = None,
         ) -> jax.Array:
             """Inference-only single-pass dispatch with the TP reduction after the top-k combine.
 
@@ -2528,6 +2695,10 @@ class BaseMoeModule(spx.Module, ABC):
                 gate_logits: Normalized gate scores ``[b * s, E]`` aligned with ``x``.
                 expert_ffn: The ``_expert_ffn`` closure; called with ``tp_reduce=False``.
                 expert_shard_id: This shard's index along the expert axis.
+                shared_kernels: This TP rank's shards of the folded W8A8 shared expert (``shared_ps``), or ``None``.
+                    Each expert shard runs it on its ``ceil(tokens / ep)`` rows of ``x`` (``_shared_expert_rows``)
+                    and adds the float32 result into the routed partial before the one reduction, which then sums it
+                    over TP and the expert axis with the routed rows: the shared expert needs no collective of its own.
 
             Returns:
                 ``[b, s, H]`` summed over the expert and TP axes when ``decode_replicated_out``, otherwise
@@ -2545,6 +2716,7 @@ class BaseMoeModule(spx.Module, ABC):
                 refine_weights_hook=refine_weights_hook,
                 num_experts_per_tok=top_k,
             )
+            shared_source = x2d  # the shared expert reads the block input, as it does outside the dispatch
             if refine_inputs_hook is not None:
                 x2d = refine_inputs_hook(x2d, weights, x.shape)
             flat_experts = jnp.ravel(experts).astype(jnp.int32)
@@ -2574,6 +2746,24 @@ class BaseMoeModule(spx.Module, ABC):
                 window_rows=_deferred_window_rows(total_rows, ep_size, local_ffn_window_rows),
                 experts_per_shard=experts_per_shard,
             )
+            if shared_kernels is not None:
+                # Expert shard s runs the shared expert on rows [s * r, (s + 1) * r). The slice start is clamped so it
+                # stays in bounds when tokens % ep != 0; rows it then covers outside its own range are zeroed, so
+                # every token is counted by exactly one expert shard.
+                rows_per_shard = -(-tokens // ep_size)
+                own_start = expert_shard_id * rows_per_shard
+                start = jnp.minimum(own_start, tokens - rows_per_shard)
+                shared_out = _shared_expert_rows(
+                    jax.lax.dynamic_slice_in_dim(shared_source, start, rows_per_shard),
+                    shared_kernels,
+                    shared_combine,
+                )
+                if tokens % ep_size:
+                    row_ids = start + jnp.arange(rows_per_shard)
+                    own = (row_ids >= own_start) & (row_ids < own_start + rows_per_shard)
+                    shared_out = jnp.where(own[:, None], shared_out, jnp.zeros((), shared_out.dtype))
+                current = jax.lax.dynamic_slice_in_dim(partial, start, rows_per_shard)
+                partial = jax.lax.dynamic_update_slice_in_dim(partial, current + shared_out, start, axis=0)
             ep_axes = tuple(expert_axis_name) if isinstance(expert_axis_name, tuple) else (expert_axis_name,)
             if decode_replicated_out:
                 # Decode: one small fp32 all-reduce over both axes replaces the default dispatch's TP
@@ -2692,6 +2882,7 @@ class BaseMoeModule(spx.Module, ABC):
             wu_bias: jax.Array | None,
             gate_up_bias: jax.Array | None,
             wd_bias: jax.Array | None,
+            shared_kernels: SharedExpertKernels | None = None,
         ):
             """Per-shard fused-MoE body executed under :func:`jax.shard_map`.
 
@@ -2710,6 +2901,8 @@ class BaseMoeModule(spx.Module, ABC):
                 wi_bias: Optional gate bias ``[E, H]`` or ``None``.
                 wu_bias: Optional up bias ``[E, H]`` or ``None``.
                 wd_bias: Optional down bias ``[E, M]`` or ``None``.
+                shared_kernels: This TP rank's folded shared-expert shards, or ``None``; only the inference-mode
+                    deferred dispatch receives them.
 
             Returns:
                 Per-shard MoE output sharded according to ``output_ps``;
@@ -3276,7 +3469,7 @@ class BaseMoeModule(spx.Module, ABC):
                 return _dispatch_ep_batch(x, gate_logits)
 
             if replicated_deferred_dispatch:
-                return _replicated_deferred_dispatch(x, gate_logits, _expert_ffn, expert_shard_id)
+                return _replicated_deferred_dispatch(x, gate_logits, _expert_ffn, expert_shard_id, shared_kernels)
 
             if moe_chunk_size is not None:
                 partial_output = _chunked_dispatch(
@@ -3470,7 +3663,7 @@ class BaseMoeModule(spx.Module, ABC):
         @partial(
             shard_map,
             mesh=expert_mesh.jax_mesh,
-            in_specs=(input_ps, glps, wikps, wukps, wgukps, wdkps, wibps, wubps, wgubps, wdbps),
+            in_specs=(input_ps, glps, wikps, wukps, wgukps, wdkps, wibps, wubps, wgubps, wdbps, shared_ps),
             out_specs=output_ps,
             check_vma=False,
         )
@@ -3499,6 +3692,7 @@ class BaseMoeModule(spx.Module, ABC):
             wu_bias,
             gate_up_bias,
             wd_bias,
+            shared_kernels,
         )
 
         # Reshard output back to original 5D mesh for compatibility with rest of model
@@ -3524,7 +3718,7 @@ class BaseMoeModule(spx.Module, ABC):
         if self.config.use_sharding_constraint:
             output = spx.with_sharding_constraint(output, original_output_ps, mesh=self.mesh)
 
-        return output, prein_gate_logits
+        return output, prein_gate_logits, shared_kernels is not None
 
     def moe_call(
         self,
@@ -3548,6 +3742,7 @@ class BaseMoeModule(spx.Module, ABC):
         output_metrics: bool = False,
         layer_idx: int | None = None,
         gated: bool = True,
+        shared_expert: spx.Module | None = None,
     ):
         """Dispatch to the configured MoE execution path with auto-configured hooks.
 
@@ -3623,9 +3818,19 @@ class BaseMoeModule(spx.Module, ABC):
                 ``wd(act(x @ wi) * (x @ wu))``; ``False`` for ungated experts
                 with a single up projection (requires ``wu_kernel=None`` and no
                 fused ``gate_up_kernel``).
+            shared_expert: Optional shared expert, a module every token runs
+                whose output is added to the routed output. Under inference
+                mode the fused engine's deferred dispatch
+                (``moe_defer_tp_reduce``) runs a W8A8 gated-MLP shared expert
+                inside its ``shard_map`` and sums it with the routed rows in
+                its one reduction (``_shared_expert_fold_spec`` lists the
+                conditions). Everywhere else ``shared_expert(hidden_state)``
+                is added after the routed experts, exactly as a caller adding
+                it itself would.
 
         Returns:
             Tuple ``(output, aux)`` where ``output`` has shape ``[B, S, H]``
+            (routed plus shared expert output when ``shared_expert`` is given)
             and ``aux`` is the pre-softmax router logits of shape ``[B*S, E]``
             (or :class:`MoeMetrics` when ``output_metrics`` is requested via
             the standard path).
@@ -3645,13 +3850,14 @@ class BaseMoeModule(spx.Module, ABC):
             raise NotImplementedError(
                 "Quantized (codes, scales) expert kernels are only supported on the FUSED_MOE path."
             )
+        shared_folded = False
         with self._active_auto_expert_mesh(hidden_state):
             match self.module_moe_method:
                 case MoEMethods.STANDARD_MOE:
                     logger.warn_once(
                         "You are using MoEMethods.STANDARD_MOE which is not really recommended please switch to FUSED_MOE"
                     )
-                    return self._moe_call_standard(
+                    output, aux = self._moe_call_standard(
                         gate_layer=gate_layer,
                         expert_layer=expert_layer,
                         hidden_state=hidden_state,
@@ -3664,7 +3870,7 @@ class BaseMoeModule(spx.Module, ABC):
                         hooks=hooks,
                     )
                 case MoEMethods.FUSED_MOE:
-                    return self._sparse_moe_call(
+                    output, aux, shared_folded = self._sparse_moe_call(
                         hidden_state=hidden_state,
                         gate_hidden_state=gate_hidden_state,
                         gate_layer=gate_layer,
@@ -3681,12 +3887,13 @@ class BaseMoeModule(spx.Module, ABC):
                         hooks=hooks,
                         layer_idx=getattr(self, "layer_idx", None) if layer_idx is None else layer_idx,
                         gated=gated,
+                        shared_expert=shared_expert,
                     )
                 case MoEMethods.DENSE_MOE:
                     logger.warn_once(
                         "You are using MoEMethods.DENSE_MOE which is not really recommended please switch to FUSED_MOE"
                     )
-                    return self._moe_call_dense(
+                    output, aux = self._moe_call_dense(
                         hidden_state=hidden_state,
                         gate_hidden_state=gate_hidden_state,
                         gate_layer=gate_layer,
@@ -3705,6 +3912,10 @@ class BaseMoeModule(spx.Module, ABC):
                     )
                 case _:
                     raise NotImplementedError()
+        if shared_expert is not None and not shared_folded:
+            # Outside the expert mesh, on the block input, as a caller adding the shared expert itself does.
+            output = output + shared_expert(hidden_state)
+        return output, aux
 
     def _moe_call_dense(
         self,

@@ -551,7 +551,10 @@ class Glm5NextTextMoE(BaseMoeModule):
         )
 
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
-        """Routes tokens through selected experts and combines outputs.
+        """Routes tokens through selected experts and combines outputs, plus the shared experts.
+
+        The shared experts go to ``moe_call``, which runs them inside the fused dispatch where it can (the
+        inference-mode deferred dispatch with W8A8 shared experts) and adds them after the routed experts otherwise.
 
         Args:
             hidden_states: Input tensor of shape ``(batch, seq_len, hidden_dim)``.
@@ -584,9 +587,8 @@ class Glm5NextTextMoE(BaseMoeModule):
             act_fn=self.experts.act_fn,
             ffn_activation=ffn_activation,
             hooks=hooks,
+            shared_expert=self.shared_experts,
         )
-        if self.shared_experts is not None:
-            out = out + self.shared_experts(hidden_states)
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
