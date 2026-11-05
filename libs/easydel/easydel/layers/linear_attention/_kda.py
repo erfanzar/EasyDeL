@@ -45,7 +45,7 @@ from easydel.axis import resolve_attention_data_parallel_axis
 from easydel.caching import KDACacheView, KDAMetadata
 from easydel.infra.modeling_outputs import AttentionLayerOutput
 from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info
-from easydel.infra.sharding import mesh_axis_size
+from easydel.infra.sharding import inference_mode_forces_decode, mesh_axis_size
 from easydel.infra.utils import ArrayParam
 from easydel.layers.linears import (
     ColumnParallelLinear,
@@ -148,6 +148,13 @@ def _axis_names(entry: tp.Any) -> tuple[str, ...]:
     if isinstance(entry, str):
         return (entry,)
     return tuple(name for name in entry if isinstance(name, str))
+
+
+def _active_mesh_axes(mesh: tp.Any, entry: tp.Any) -> tuple[str, ...] | None:
+    """Mesh axes of more than one device in a partition-spec entry; ``None`` for an entry that names no layout."""
+    if entry is not None and not isinstance(entry, str | tuple | list):
+        return None
+    return tuple(name for name in _axis_names(entry) if mesh_axis_size(mesh, name) > 1)
 
 
 def kda_serving_head_axes(config: tp.Any, *, serving: bool = False) -> tuple[str, ...] | None:
@@ -724,10 +731,11 @@ class KernelDeltaAttention(spx.Module):
         device and layer at ep4 x tp4 (4 heads of 128 per chip, hidden 4096, 32,768 bf16 tokens): 25 + 50 + 50 MB of
         collectives and a quarter of the dot, against 100 + 201 MB and the whole dot.
 
-        Other steps keep :meth:`_split_projection`: decode buckets (their residual is replicated under
-        ``decode_mode_specs``), token counts that ``|R|`` does not divide and residual layouts outside the head axes;
-        so do projections that are not a plain bias-free :class:`RowParallelLinear` (quantized, LoRA, a quantization
-        rule).
+        eSurge's decode buckets (``decode_mode_specs``) whose residual is replicated take
+        :meth:`_replicated_output_projection` instead. Other steps keep :meth:`_split_projection`: token counts that
+        ``|R|`` does not divide and residual layouts outside the head axes; so do projections that are not a plain
+        bias-free :class:`RowParallelLinear` (quantized, LoRA, a quantization rule) or whose declared layout does not
+        resolve.
 
         Args:
             normed: Gated-norm output ``[lead0, lead1, value_dim]``, features split over ``split.axes``.
@@ -750,13 +758,7 @@ class KernelDeltaAttention(spx.Module):
             return self._split_projection(linear, normed, split, dim=0)
         tokens, hidden_size = int(normed.shape[1]), int(weight.shape[1])
         resolver = self.config.runtime_sharding_resolver
-
-        def active(entry: tp.Any) -> tuple[str, ...] | None:
-            """Mesh axes of more than one device in a spec entry; ``None`` for an entry that names no layout."""
-            if entry is not None and not isinstance(entry, str | tuple | list):
-                return None
-            return tuple(name for name in _axis_names(entry) if mesh_axis_size(mesh, name) > 1)
-
+        active = functools.partial(_active_mesh_axes, mesh)
         heads = active(split.axes) or ()
         residual = tuple(
             resolver.resolve(
@@ -774,12 +776,24 @@ class KernelDeltaAttention(spx.Module):
                 )
             )
         except Exception:
-            kernel = ()
+            # No resolvable layout: the shard_maps below cannot name the weight's sharding.
+            return self._split_projection(linear, normed, split, dim=0)
         # A resolved spec may omit trailing replicated entries: pad both to their array's rank.
         residual = residual + (None,) * (normed.ndim - len(residual))
         kernel = kernel + (None,) * (2 - len(kernel))
         out_entries = [active(entry) for entry in residual] if len(residual) == normed.ndim else [None]
         kernel_entries = [active(entry) for entry in kernel] if len(kernel) == 2 else [None]
+        if (
+            inference_mode_forces_decode()
+            and all(entry is not None for entry in (*out_entries, *kernel_entries))
+            and not any(out_entries)
+            and heads
+            and heads[: len(kernel_entries[0])] == kernel_entries[0]
+            and not kernel_entries[1]
+            and int(normed.shape[-1]) % mesh_axis_size(mesh, heads) == 0
+        ):
+            # eSurge decode bucket with a replicated residual: one reduction over every split axis.
+            return self._replicated_output_projection(normed, weight, split, mesh, kernel_entries[0])
         out_axes = out_entries[-1] or ()
         rest = heads[len(out_axes) :]
         if (
@@ -796,15 +810,21 @@ class KernelDeltaAttention(spx.Module):
             return self._split_projection(linear, normed, split, dim=0)
         out_entry = out_axes[0] if len(out_axes) == 1 else out_axes
         token_axis = rest[0]
+        sources = mesh_axis_size(mesh, token_axis)
         scale = float(getattr(linear, "output_scale", 1.0))
 
         def body(x: Array, w: Array) -> Array:
             x, w = promote_dtype((x, w), dtype=linear.dtype)
-            # [.., T, own heads] -> [.., T / |R|, the H group's heads]: the heads arrive in R order, the order of this
-            # device's H shard of the o_proj rows.
-            x = jax.lax.all_to_all(x, token_axis, split_axis=1, concat_axis=x.ndim - 1, tiled=True)
-            y = jnp.einsum("...i,io->...o", x, w, precision=linear.precision)
-            y = jax.lax.psum_scatter(y, out_entry, scatter_dimension=y.ndim - 1, tiled=True)
+            lead0, local_tokens, features = x.shape
+            # [lead0, T, own heads] -> [lead0, |R| sources, T / |R|, the source's heads] for this device's token block.
+            # The sources stay an axis of their own, in R order (the order of this device's H shard of the o_proj
+            # rows), so no relayout moves the received heads into the feature axis: the dot contracts (source,
+            # feature) against the shard viewed as [|R|, features, hidden].
+            x = x.reshape(lead0, sources, local_tokens // sources, features)
+            x = jax.lax.all_to_all(x, token_axis, split_axis=1, concat_axis=1, tiled=True)
+            w = w.reshape(sources, features, w.shape[-1])
+            y = jnp.einsum("bstf,sfo->bto", x, w, precision=linear.precision)
+            y = jax.lax.psum_scatter(y, out_entry, scatter_dimension=2, tiled=True)
             return jax.lax.all_gather(y, token_axis, axis=1, tiled=True)
 
         y = jax.shard_map(
@@ -815,6 +835,133 @@ class KernelDeltaAttention(spx.Module):
             check_vma=False,
         )(normed, weight)
         return y * scale if scale != 1.0 else y
+
+    def _replicated_output_projection(
+        self,
+        normed: Array,
+        weight: Array,
+        split: _ServingHeadSplit,
+        mesh: tp.Any,
+        row_axes: tuple[str, ...],
+    ) -> Array:
+        """``o_proj`` of a head-split eSurge decode bucket (``decode_mode_specs``), whose residual is replicated.
+
+        Every device contracts its own heads' features with its own rows of ``o_proj`` (a local slice of the rows it
+        stores: the split is head axis major, so they lie inside its ``row_axes`` shard) and one ``psum`` over all the
+        split axes adds the partial sums, giving the replicated residual directly. The path it replaces (the SPMD
+        partitioner, or the row-parallel ``distributed_matmul`` engine) all-gathers the heads over the split axes outside
+        ``row_axes`` first, contracts the whole ``row_axes`` shard on every device and then reduces over ``row_axes``:
+        at ep4 x tp4 an all-gather over ep, a dot with 4x the weight reads and an all-reduce over tp, against one dot on
+        a quarter of the rows and one all-reduce over (tp, ep). The partial sums stay in float32 through the reduction
+        and are rounded to the layer dtype once. The path it replaces rounds each of its ``|row_axes|`` partial sums to
+        the layer dtype and reduces them in that dtype; reducing more partials that way would add rounding error, so
+        this path is the more exact of the two.
+
+        Args:
+            normed: Gated-norm output ``[lead0, lead1, value_dim]``, features split over ``split.axes``.
+            weight: ``o_proj`` kernel ``[value_dim, hidden_size]``, rows split over ``row_axes`` only.
+            split: Head split of the step.
+            mesh: The mesh of the split axes.
+            row_axes: Active mesh axes of the kernel rows, a leading part of the split's active axes.
+
+        Returns:
+            The projection ``[lead0, lead1, hidden_size]``, replicated over the split axes.
+        """
+        linear = self.o_proj
+        heads = _active_mesh_axes(mesh, split.axes) or ()
+        rest = heads[len(row_axes) :]
+        own = int(normed.shape[-1]) // mesh_axis_size(mesh, heads)
+        row_entry = (row_axes[0] if len(row_axes) == 1 else row_axes) if row_axes else None
+        reduce_entry = heads[0] if len(heads) == 1 else heads
+        scale = float(getattr(linear, "output_scale", 1.0))
+
+        def body(x: Array, w: Array) -> Array:
+            x, w = promote_dtype((x, w), dtype=linear.dtype)
+            if rest:
+                # Position of this device's heads inside its row shard: the split axes after ``row_axes``, major first.
+                index = 0
+                for name in rest:
+                    index = index * mesh_axis_size(mesh, name) + jax.lax.axis_index(name)
+                w = jax.lax.dynamic_slice_in_dim(w, index * own, own, axis=0)
+            y = jnp.einsum("...i,io->...o", x, w, precision=linear.precision, preferred_element_type=jnp.float32)
+            return jax.lax.psum(y, reduce_entry).astype(x.dtype)
+
+        y = jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(PartitionSpec(*split.lead, split.axes), PartitionSpec(row_entry, None)),
+            out_specs=PartitionSpec(*split.lead, None),
+            check_vma=False,
+        )(normed, weight)
+        return y * scale if scale != 1.0 else y
+
+    def _column_output_axes(self, linear: tp.Any, mesh: tp.Any) -> tuple[str, ...] | None:
+        """Active mesh axes of a plain column-parallel projection's output features, from its declared kernel layout.
+
+        ``None`` when the projection is not a plain :class:`ColumnParallelLinear` with an array kernel, when its
+        layout does not resolve, or when its kernel rows are split too (its output is then not a column split).
+        """
+        weight = getattr(getattr(linear, "weight", None), "value", None)
+        if type(linear) is not ColumnParallelLinear or not isinstance(weight, jax.Array) or weight.ndim != 2:
+            return None
+        resolver = self.config.runtime_sharding_resolver
+        try:
+            kernel = tuple(
+                resolver.resolve_layout(
+                    linear.sharding_layout if linear.sharding_layout is not None else common_types.ColumnWise,
+                    shape=tuple(int(dim) for dim in weight.shape),
+                    mesh=resolver.mesh,
+                )
+            )
+        except Exception:
+            return None
+        kernel = kernel + (None,) * (2 - len(kernel))
+        if len(kernel) != 2:
+            return None
+        rows, cols = _active_mesh_axes(mesh, kernel[0]), _active_mesh_axes(mesh, kernel[1])
+        if rows is None or cols is None or rows:
+            return None
+        return cols
+
+    def _gather_low_rank_pair(self, forget: Array, gate: Array, split: _ServingHeadSplit) -> tuple[Array, Array]:
+        """The two low-rank gate inputs (``f_a_proj`` and ``g_a_proj`` outputs) whole on every device, in one all-gather.
+
+        Both are column-parallel outputs split over the same mesh axes, and ``f_b_proj`` / ``g_b_proj`` read them whole
+        (their rows are replicated). Without this each is all-gathered on its own: two latency-bound collectives per
+        layer on a decode step. The pair is stacked, gathered once and unstacked; the values are unchanged. Inputs
+        that are already whole, or whose layouts differ or do not resolve, are returned as they are.
+
+        Args:
+            forget: ``f_a_proj(x)`` ``[lead0, lead1, gate_low_rank_dim]``.
+            gate: ``g_a_proj(x)``, same shape and dtype.
+            split: Head split of the step.
+
+        Returns:
+            ``(forget, gate)``, replicated over their column axes.
+        """
+        mesh = self.kda_op.get_impl_metadata().mesh
+        if mesh is None or forget.ndim != 3 or forget.shape != gate.shape or forget.dtype != gate.dtype:
+            return forget, gate
+        axes = self._column_output_axes(self.f_a_proj, mesh)
+        if not axes or axes != self._column_output_axes(self.g_a_proj, mesh):
+            return forget, gate
+        if int(forget.shape[-1]) % mesh_axis_size(mesh, axes):
+            return forget, gate
+        entry = axes[0] if len(axes) == 1 else axes
+
+        def body(a: Array, b: Array) -> tuple[Array, Array]:
+            pair = jax.lax.all_gather(jnp.stack((a, b)), entry, axis=3, tiled=True)
+            return pair[0], pair[1]
+
+        split_spec = PartitionSpec(*split.lead, entry)
+        whole_spec = PartitionSpec(*split.lead, None)
+        return jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(split_spec, split_spec),
+            out_specs=(whole_spec, whole_spec),
+            check_vma=False,
+        )(forget, gate)
 
     def _split_projection(self, linear: tp.Any, x: Array, split: _ServingHeadSplit, dim: int) -> Array:
         """``linear(x)`` with its kernel constrained to the split's head axes on ``dim``.
@@ -881,8 +1028,12 @@ class KernelDeltaAttention(spx.Module):
         value = project(self.v_proj, hidden_states)
         b_logits = project(self.b_proj, hidden_states)
         gate_low_rank = self.g_a_proj(hidden_states)
+        forget_low_rank = self.f_a_proj(hidden_states)
+        if split is not None:
+            # f_b / g_b read both low-rank inputs whole: one all-gather for the pair instead of one each.
+            forget_low_rank, gate_low_rank = self._gather_low_rank_pair(forget_low_rank, gate_low_rank, split)
         decay = fused_kda_gate_per_channel(
-            project(self.f_b_proj, self.f_a_proj(hidden_states)),
+            project(self.f_b_proj, forget_low_rank),
             self.A_log.value,
             self.dt_bias.value,
             lower_bound=self.gate_lower_bound,

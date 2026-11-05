@@ -18,9 +18,11 @@ On a 4-device mesh (ep2 x tp2) the split cache view (``head_shard_axes == ("tp",
 and the default view (heads over tp only) start from the same pools. A multi-step eSurge sequence (two fresh prompts,
 a mixed step with a decode row, a continuation and a new prompt, then decode-only steps; explicit pool slots and a
 padding row) must leave bitwise-equal conv windows and recurrent states, and layer outputs that differ only by the
-rounding of o_proj's partial sums.
+rounding of o_proj's partial sums. eSurge's decode buckets (``decode_mode_specs``, replicated residual) are checked the
+same way, and for their collectives: one reduction for o_proj and one all-gather for the two low-rank gate inputs.
 """
 
+import re
 from types import SimpleNamespace
 
 import easydel as ed
@@ -37,6 +39,8 @@ from jax.sharding import PartitionSpec as P
 
 HIDDEN, HEAD_DIM, SLOTS = 256, 128, 8
 EP2_TP2 = (1, 1, 1, 2, 2, 1)
+# Layer input / output layout of prefill and mixed steps (hidden axis over tp); decode buckets keep it replicated.
+HIDDEN_TP = P(None, None, "tp")
 LEAVES = ("q_conv_state", "k_conv_state", "v_conv_state", "recurrent_state")
 # (token bucket, tokens per row, context lens per row, pool slot per row); rows without tokens name slot 0 like eSurge.
 PLAN = (
@@ -126,9 +130,9 @@ def _random_pools(model, cfg, seed):
     return tuple(pools)
 
 
-def _compiled_step(model, layer, cfg, pools):
+def _compiled_step(model, layer, cfg, pools, hidden_spec=HIDDEN_TP):
     graphdef, state = spx.export(layer)
-    hidden_sharding = NamedSharding(_jax_mesh(model), P(None, None, "tp"))
+    hidden_sharding = NamedSharding(_jax_mesh(model), hidden_spec)
 
     def step(state_, hidden, pools_, qsl, ctx, slots):
         view = KDACacheView(
@@ -234,10 +238,10 @@ def _has_all_to_all(hlo_text: str) -> bool:
     return " all-to-all(" in hlo_text or " all-to-all-start(" in hlo_text
 
 
-def test_split_prefill_trades_tokens_for_heads_and_decode_keeps_its_o_proj():
+def test_split_prefill_trades_tokens_for_heads_and_decode_does_not():
     """A head-split prefill step reaches ``o_proj`` through one all-to-all over ep (tokens for heads), also with the
     row-parallel engines eSurge's loader wires; a decode bucket (replicated residual under ``decode_mode_specs``)
-    keeps today's ``o_proj`` and has no all-to-all."""
+    exchanges no tokens (no all-to-all): its ``o_proj`` reduces once instead (the decode test below)."""
     from easydel.infra.sharding import decode_mode_specs
 
     _need_four_devices()
@@ -263,6 +267,53 @@ def test_split_prefill_trades_tokens_for_heads_and_decode_keeps_its_o_proj():
                 texts[name] = fn.lower(*args).compile().as_text()
     assert _has_all_to_all(texts["prefill"])
     assert not _has_all_to_all(texts["decode"])
+
+
+def _collective_counts(hlo_text: str) -> dict[str, int]:
+    """Collective instructions of a compiled program by opcode; an async start counts once, its done never."""
+    found = re.findall(r"\s(all-gather|all-reduce|reduce-scatter|all-to-all|collective-permute)(?:-start)?\(", hlo_text)
+    return {op: found.count(op) for op in sorted(set(found))}
+
+
+def test_split_decode_bucket_reduces_o_proj_once_and_gathers_the_gate_pair_once():
+    """An eSurge decode bucket (``decode_mode_specs``: the residual is replicated) of a head-split layer, with the
+    row-parallel engines eSurge's loader wires. ``o_proj`` contracts every device's own rows and its partial sums are
+    reduced once over (tp, ep); the two low-rank gate inputs share one all-gather. Over three decode steps the pools
+    stay bitwise equal to the unsplit layer's and the outputs agree up to the rounding of o_proj's partial sums."""
+    from easydel.infra.sharding import decode_mode_specs
+
+    _need_four_devices()
+    model, layer = _model(_config())
+    model.wire_distributed_matmul()
+    split_cfg, plain_cfg = _cache_configs(model)
+    configs = {"split": split_cfg, "plain": plain_cfg}
+    pools = {kind: _random_pools(model, cfg, seed=11) for kind, cfg in configs.items()}
+    replicated = NamedSharding(_jax_mesh(model), P())
+    lens, slots = (1, 1, 1, 0), (5, 2, 7, 0)
+    qsl = jax.device_put(jnp.asarray(np.concatenate([[0], np.cumsum(lens)]), jnp.int32), replicated)
+    slot_ids = jax.device_put(jnp.asarray(slots, jnp.int32), replicated)
+    rng = np.random.default_rng(3)
+    compiled, texts = {}, {}
+    with model.mesh, decode_mode_specs(True):
+        for step in range(3):
+            hidden = jax.device_put(jnp.asarray(rng.standard_normal((1, 4, HIDDEN)), jnp.bfloat16), replicated)
+            ctx = jax.device_put(jnp.asarray((40 + step, 9 + step, 25 + step, 0), jnp.int32), replicated)
+            outs = {}
+            for kind, cfg in configs.items():
+                if kind not in compiled:
+                    fn, state, _ = _compiled_step(model, layer, cfg, pools[kind], hidden_spec=P())
+                    program = fn.lower(state, hidden, pools[kind], qsl, ctx, slot_ids).compile()
+                    compiled[kind] = (program, state)
+                    texts[kind] = program.as_text()
+                program, state = compiled[kind]
+                out, pools[kind] = program(state, hidden, pools[kind], qsl, ctx, slot_ids)
+                outs[kind] = np.asarray(out, np.float32)
+            for name, a, b in zip(LEAVES, pools["split"], pools["plain"], strict=True):
+                np.testing.assert_array_equal(np.asarray(a).view(np.uint16), np.asarray(b).view(np.uint16), name)
+            live_split, live_plain = outs["split"][0, :3], outs["plain"][0, :3]
+            assert np.linalg.norm(live_split - live_plain) / np.linalg.norm(live_plain) < 1e-2
+            np.testing.assert_array_equal(outs["split"][0, 3:], outs["plain"][0, 3:])
+    assert _collective_counts(texts["split"]) == {"all-gather": 1, "all-reduce": 1}
 
 
 def test_flag_leaves_the_cacheless_forward_unchanged():
