@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
-from easydel.layers.indexer import IndexerConfig, IndexerKind, SparseIndexer, paged_pool_select
+from easydel.layers.indexer import IndexerConfig, IndexerKind, SparseIndexer, paged_pool_select, paged_token_layout
 from jax.sharding import NamedSharding, PartitionSpec
 
 HID, H, D = 64, 4, 16
@@ -87,23 +87,26 @@ def _head_constraint(mesh):
 
 
 @pytest.mark.parametrize(
-    ("kpool", "topk", "pool_chunk", "dim", "mesh_devices", "head_sharded"),
+    ("kpool", "topk", "pool_chunk", "dim", "mesh_devices", "head_sharded", "aligned"),
     [
-        (4, 12, 2, D, None, False),
-        (4, 8, 128, D, None, False),
-        (2, 10, 3, D, None, False),
+        (4, 12, 2, D, None, False, False),
+        (4, 8, 128, D, None, False, False),
+        (2, 10, 3, D, None, False, False),
         # dim 128 is tileable; a 1-device kernel mesh runs the fused Pallas selector directly
         # (no mesh on a multi-chip host would take the XLA fallback instead).
-        (4, 12, 1024, 128, 1, False),
+        (4, 12, 1024, 128, 1, False, False),
         # Production tp>1 dispatch: replicated shard_map over a multi-chip kernel mesh.
-        (4, 12, 1024, 128, 4, False),
-        (4, 8, 2, D, 4, False),
+        (4, 12, 1024, 128, 4, False, False),
+        (4, 8, 2, D, 4, False, False),
         # Same, with the query and head weights pinned head-sharded before the rows are split over the mesh
         # (``constrain_heads``, as the serving cache view does for tensor-parallel indexer projections).
-        (4, 12, 1024, 128, 4, True),
+        (4, 12, 1024, 128, 4, True, False),
+        # Every step padded to a multiple of the mesh size: the fused top-k splits the rows of every step, and these
+        # small steps update the pages replicated on every device.
+        (4, 12, 1024, 128, 4, False, True),
     ],
 )
-def test_paged_pool_select_matches_dense_indexer(kpool, topk, pool_chunk, dim, mesh_devices, head_sharded):
+def test_paged_pool_select_matches_dense_indexer(kpool, topk, pool_chunk, dim, mesh_devices, head_sharded, aligned):
     D = dim  # shadows the module default for this case
     kernel_mesh = _kernel_mesh(mesh_devices)
     constrain_heads = _head_constraint(kernel_mesh) if head_sharded else None
@@ -142,8 +145,9 @@ def test_paged_pool_select_matches_dense_indexer(kpool, topk, pool_chunk, dim, m
                 qs.append(streams_q[s][done[s] : done[s] + n])
                 owners += [(s, p) for p in range(done[s], done[s] + n)]
                 done[s] += n
-            hs.append(jnp.asarray(rng.standard_normal((PAD_TOKENS, HID)), jnp.float32))
-            qs.append(jnp.asarray(rng.standard_normal((PAD_TOKENS, HID)), jnp.float32))
+            pad = PAD_TOKENS + (-(sum(step) + PAD_TOKENS) % mesh_devices if aligned else 0)
+            hs.append(jnp.asarray(rng.standard_normal((pad, HID)), jnp.float32))
+            qs.append(jnp.asarray(rng.standard_normal((pad, HID)), jnp.float32))
             kv_lens = jnp.asarray([*done, 0], jnp.int32)
             qsl = jnp.asarray(np.concatenate([[0], np.cumsum([*step, 0])]), jnp.int32)
             selected, token_pages, pool_pages = select(
@@ -258,6 +262,62 @@ def test_rank_major_dp_paged_pool_select_matches_dense_indexer(dim):
             assert np.all(selected[pads] == -1), "padding tokens must select nothing"
 
 
+def test_replicated_small_step_page_update_is_bitwise(monkeypatch):
+    """On a multi-device kernel mesh, small steps update the pages replicated on every device; pages and selections
+    equal the row-split update's bit for bit over a multi-step serving schedule."""
+    from easydel.layers.indexer import _paged
+
+    if jax.default_backend() != "tpu":
+        pytest.skip("the fused top-k splits its rows over the kernel mesh only on TPU")
+    kernel_mesh = _kernel_mesh(4)
+    kpool, topk, dim = 4, 12, 128
+    indexer = _indexer(kpool, topk, dim)
+    steps = _schedule()
+    lengths = [sum(s[i] for s in steps) for i in range(3)]
+    max_seqs, pages_per_seq = 4, -(-max(lengths) // PAGE)
+    num_pages = max_seqs * pages_per_seq + 3
+    rng = np.random.default_rng(0)
+    block_tables = jnp.asarray(
+        rng.permutation(num_pages)[: max_seqs * pages_per_seq].reshape(max_seqs, pages_per_seq), jnp.int32
+    )
+    batches, done = [], [0, 0, 0]
+    for step in steps:
+        total = sum(step)
+        pad = PAD_TOKENS + (-(total + PAD_TOKENS) % 4)
+        assert total + pad <= _paged._REPLICATED_POOL_UPDATE_MAX_TOKENS
+        for s in range(3):
+            done[s] += step[s]
+        batches.append(
+            (
+                jnp.asarray(rng.standard_normal((total + pad, HID)), jnp.float32),
+                jnp.asarray(rng.standard_normal((total + pad, HID)), jnp.float32),
+                jnp.asarray([*done, 0], jnp.int32),
+                jnp.asarray(np.concatenate([[0], np.cumsum([*step, 0])]), jnp.int32),
+            )
+        )
+
+    def run(max_tokens):
+        monkeypatch.setattr(_paged, "_REPLICATED_POOL_UPDATE_MAX_TOKENS", max_tokens)
+        select = jax.jit(lambda *a: paged_pool_select(indexer, *a, pool_chunk=1024, kernel_mesh=kernel_mesh))
+        token_pages = jnp.zeros((num_pages, PAGE, 2 * dim), jnp.float32)
+        pool_pages = jnp.zeros((num_pages, PAGE // kpool, dim), jnp.float32)
+        selections = []
+        with jax.default_matmul_precision("highest"):
+            for hidden, resid, kv_lens, qsl in batches:
+                selected, token_pages, pool_pages = select(
+                    hidden, resid, token_pages, pool_pages, block_tables, kv_lens, qsl, jnp.int32(3)
+                )
+                selections.append(np.asarray(selected))
+        return selections, np.asarray(token_pages), np.asarray(pool_pages)
+
+    replicated = run(_paged._REPLICATED_POOL_UPDATE_MAX_TOKENS)
+    row_split = run(0)
+    for step, (a, b) in enumerate(zip(replicated[0], row_split[0], strict=True)):
+        np.testing.assert_array_equal(a, b, err_msg=f"selection of step {step}")
+    np.testing.assert_array_equal(replicated[1], row_split[1], err_msg="token pages")
+    np.testing.assert_array_equal(replicated[2], row_split[2], err_msg="pool pages")
+
+
 def test_paged_pool_select_rejects_unaligned_page_size():
     indexer = _indexer(4, 8)
     with pytest.raises(ValueError, match="multiple of kpool"):
@@ -272,3 +332,62 @@ def test_paged_pool_select_rejects_unaligned_page_size():
             jnp.asarray([0, 2], jnp.int32),
             jnp.int32(1),
         )
+
+
+def _token_layout_reference(kv_lens, query_start_loc, num_seqs, total_tokens):
+    """Row, absolute position and validity of every packed token, from a loop over the live rows' token ranges."""
+    seq = np.zeros(total_tokens, np.int64)
+    pos = np.zeros(total_tokens, np.int64)
+    valid = np.zeros(total_tokens, bool)
+    for row in range(min(max(num_seqs, 0), len(kv_lens))):
+        start, end = query_start_loc[row], query_start_loc[row + 1]
+        for token in range(start, min(end, total_tokens)):
+            position = kv_lens[row] - (end - start) + (token - start)
+            if 0 <= position < kv_lens[row]:
+                seq[token], pos[token], valid[token] = row, position, True
+    return seq, pos, valid
+
+
+def _random_token_layout(seed, rows, live, max_new, pad):
+    """A step of ``live`` rows with 0..max_new new tokens each (about a quarter idle) and ``rows - live`` empty rows."""
+    rng = np.random.default_rng(seed)
+    counts = rng.integers(0, max_new + 1, size=live)
+    counts[rng.random(live) < 0.25] = 0
+    kv_lens = np.concatenate([counts + rng.integers(0, 4096, size=live), np.zeros(rows - live, np.int64)])
+    query_start_loc = np.concatenate([[0], np.cumsum(counts), np.full(rows - live, counts.sum())])
+    return kv_lens.tolist(), query_start_loc.tolist(), live, int(counts.sum()) + pad
+
+
+@pytest.mark.parametrize(
+    ("kv_lens", "query_start_loc", "num_seqs", "total_tokens"),
+    [
+        # Decode: one new token per live row, empty rows after them, padding tokens past the live rows.
+        ([5, 9, 1, 130, 7, 0, 0, 0], [0, 1, 2, 3, 4, 5, 5, 5, 5], 5, 8),
+        # Chunked prefill mixed with decode, with an idle row (no new tokens) between live rows.
+        ([13, 4, 22, 40, 0, 0], [0, 13, 13, 14, 34, 34, 34], 4, 40),
+        # A row past num_seqs that still holds tokens: its tokens are padding.
+        ([3, 8, 4, 0], [0, 3, 5, 9, 9], 2, 10),
+        # A slice whose first row starts past token 0: the leading tokens belong to other shards.
+        ([6, 2, 50, 0, 0], [5, 7, 7, 10, 10, 10], 3, 12),
+        # No live row.
+        ([0, 0, 0], [0, 0, 0, 0], 0, 4),
+        # 128 rows, 100 of them live with up to 40 new tokens each.
+        _random_token_layout(3, rows=128, live=100, max_new=40, pad=7),
+    ],
+    ids=["decode", "mixed_idle_row", "row_past_num_seqs", "sliced_rows", "no_live_row", "random_128_rows"],
+)
+def test_paged_token_layout_matches_row_loop(kv_lens, query_start_loc, num_seqs, total_tokens):
+    """Each live token gets its row and absolute position; every other token is invalid but still names a real row
+    (its gathers stay in bounds and its writes are dropped)."""
+    layout = jax.jit(paged_token_layout, static_argnums=3)
+    seq, pos, valid = (
+        np.asarray(x)
+        for x in layout(
+            jnp.asarray(kv_lens, jnp.int32), jnp.asarray(query_start_loc, jnp.int32), jnp.int32(num_seqs), total_tokens
+        )
+    )
+    ref_seq, ref_pos, ref_valid = _token_layout_reference(kv_lens, query_start_loc, num_seqs, total_tokens)
+    np.testing.assert_array_equal(valid, ref_valid)
+    np.testing.assert_array_equal(seq[valid], ref_seq[valid])
+    np.testing.assert_array_equal(pos[valid], ref_pos[valid])
+    assert seq.min() >= 0 and seq.max() < len(kv_lens)
