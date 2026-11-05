@@ -1,16 +1,17 @@
 # EasyDeL Stack — workspace guide
 
 This repository is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/)
-monorepo containing five packages that are developed together and released
+monorepo containing six packages that are developed together and released
 independently:
 
-| package  | path            | import     | PyPI           | mirror repo         |
-| -------- | --------------- | ---------- | -------------- | ------------------- |
-| EasyDeL  | `libs/easydel`  | `easydel`  | `easydel`      | (this repo)         |
-| Spectrax | `libs/spectrax` | `spectrax` | `spectrax-lib` | `erfanzar/Spectrax` |
-| eJKernel | `libs/ejkernel` | `ejkernel` | `ejkernel`     | `erfanzar/ejkernel` |
-| eFormer  | `libs/eformer`  | `eformer`  | `eformer`      | `erfanzar/eformer`  |
-| eRay     | `libs/eray`     | `eray`     | `eray`         | `erfanzar/eray`     |
+| package   | path             | import      | PyPI           | mirror repo         |
+| --------- | ---------------- | ----------- | -------------- | ------------------- |
+| EasyDeL   | `libs/easydel`   | `easydel`   | `easydel`      | (this repo)         |
+| Spectrax  | `libs/spectrax`  | `spectrax`  | `spectrax-lib` | `erfanzar/Spectrax` |
+| eJKernel  | `libs/ejkernel`  | `ejkernel`  | `ejkernel`     | `erfanzar/ejkernel` |
+| eFormer   | `libs/eformer`   | `eformer`   | `eformer`      | `erfanzar/eformer`  |
+| eRay      | `libs/eray`      | `eray`      | `eray`         | `erfanzar/eray`     |
+| surgecore | `libs/surgecore` | `surgecore` | `surgecore`    | (not mirrored)      |
 
 **This monorepo is the source of truth.** The standalone repositories are
 read-only mirrors kept in sync automatically — do not merge changes there
@@ -127,12 +128,18 @@ During development the packages resolve against each other from `libs/`
 (`{ workspace = true }` sources); published wheels keep the pinned PyPI
 versions declared in `libs/easydel/pyproject.toml`.
 
+`libs/surgecore` is a Rust extension (PyO3, abi3-py311, built by maturin): `uv sync` compiles it from
+source, so it needs a Rust toolchain with `cargo` on PATH (a minimal stable rustup toolchain is enough). Its
+crate checks run in `libs/surgecore`: `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`
+and `cargo test --locked` (the tests link libpython: set `PYO3_PYTHON` to a Python 3.11-3.13 interpreter).
+Workspace CI runs these, a wheel build and the package's CPU tests whenever `libs/surgecore` changes.
+
 ## Layering contract (CI-enforced)
 
 ```md
-spectrax    ejkernel    eformer    eray  <- independent of each other and of easydel
-       \        |        |       /
-                  easydel              <- the only package that may import the others
+spectrax    ejkernel    eformer    eray    surgecore  <- independent of each other and of easydel
+       \        |        |       /        /
+                  easydel                             <- the only package that may import the others
 ```
 
 `uv run lint-imports` checks this locally; Workspace CI runs it on every PR.
@@ -185,6 +192,14 @@ scripts/publish.sh ejkernel          # tag ejkernel-v0.0.82 + push the tag -> CI
 package (PyPI trusted publishing, or the `PYPI_API_TOKEN` secret).
 `publish.sh` pushes the tag only — push the branch yourself with `git push`.
 
+`surgecore` releases with the same two scripts. Because `libs/surgecore` has a `Cargo.toml`, `release.sh`
+also bumps the crate's `[package] version` and its own entry in `libs/surgecore/Cargo.lock` (no cargo needed),
+and it syncs easydel's `surgecore==` pin like the other pins. A `surgecore-v*` tag skips the `uv build` job and
+runs the `surgecore-*` jobs of `publish.yaml` instead: maturin builds manylinux_2_28 wheels for x86_64 and
+aarch64 and a macOS arm64 wheel (abi3, so one wheel per platform covers Python 3.11-3.13) plus an sdist, and one
+step publishes them. easydel pins an exact surgecore version, so that version must be on PyPI before an easydel
+release that requires it is published.
+
 ## Mirror sync
 
 Mirrors update automatically when you `git push`: the pre-push hook
@@ -199,6 +214,9 @@ read/write on the four mirrors). Manual fallback:
 scripts/subtree-sync.sh push            # all mirrors
 scripts/subtree-sync.sh pull ejkernel   # reconcile a diverged mirror
 ```
+
+`libs/surgecore` is not mirrored: `scripts/subtree-sync.sh` and `sync-subtrees.yaml` cover only
+spectrax/ejkernel/eformer/eray, and a surgecore mirror would first need its own repository.
 
 ## Dev tooling
 

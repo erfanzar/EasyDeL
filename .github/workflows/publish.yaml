@@ -5,6 +5,9 @@ name: Publish package
 # package. Uses PyPI trusted publishing (configure each project on PyPI:
 # Publishing -> add GitHub publisher for this repo + this workflow); set the
 # PYPI_API_TOKEN secret instead if you prefer token auth.
+# surgecore (a Rust extension) is the exception: its tags run the surgecore-*
+# jobs below, which build manylinux_2_28 and macOS wheels plus an sdist with
+# maturin and publish them in one step.
 
 on:
   push:
@@ -14,6 +17,7 @@ on:
       - "ejkernel-v*"
       - "eformer-v*"
       - "eray-v*"
+      - "surgecore-v*"
 
 permissions:
   id-token: write # PyPI trusted publishing
@@ -21,6 +25,8 @@ permissions:
 
 jobs:
   publish:
+    # surgecore tags are built and published by the surgecore-* jobs below.
+    if: ${{ !startsWith(github.ref_name, 'surgecore-v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +53,78 @@ jobs:
         run: uv build --package "${{ steps.pkg.outputs.dist }}" --out-dir dist/
 
       - name: Publish to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -n "$UV_PUBLISH_TOKEN" ]; then
+            uv publish dist/*
+          else
+            uv publish --trusted-publishing always dist/*
+          fi
+
+  # surgecore is a Rust extension. `uv build` on the runner would tag its wheel for the runner's glibc, which hosts on
+  # Ubuntu 22.04 (glibc 2.35) cannot install, so maturin builds manylinux_2_28 wheels for x86_64 and aarch64 and a
+  # macOS arm64 wheel instead; abi3-py311 makes one wheel per platform cover Python 3.11 to 3.13.
+  surgecore-wheels:
+    if: ${{ startsWith(github.ref_name, 'surgecore-v') }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64
+          - runner: ubuntu-latest
+            target: aarch64
+          - runner: macos-latest
+            target: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          # Ignored on macOS.
+          manylinux: "2_28"
+          args: --release --locked --out dist --manifest-path libs/surgecore/Cargo.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: surgecore-wheel-${{ matrix.runner }}-${{ matrix.target }}
+          path: dist/*.whl
+
+  surgecore-sdist:
+    if: ${{ startsWith(github.ref_name, 'surgecore-v') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist --manifest-path libs/surgecore/Cargo.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: surgecore-sdist
+          path: dist/*.tar.gz
+
+  surgecore-publish:
+    if: ${{ startsWith(github.ref_name, 'surgecore-v') }}
+    needs: [surgecore-wheels, surgecore-sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: surgecore-*
+          path: dist
+          merge-multiple: true
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Publish surgecore to PyPI
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         run: |

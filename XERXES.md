@@ -11,13 +11,14 @@ LLMs/VLMs at scale on TPU/GPU, plus the four foundation libraries it is built on
 truth**; `libs/spectrax`, `libs/ejkernel`, `libs/eformer`, `libs/eray` are subtree-mirrored to standalone read-only
 repos on push.
 
-| package  | path            | one line                                                                                                                        |
-|----------|-----------------|---------------------------------------------------------------------------------------------------------------------------------|
-| easydel  | `libs/easydel`  | the LLM framework: models, trainers, eSurge serving, data — composes the rest                                                   |
-| spectrax | `libs/spectrax` | `spx.Module` object model (GraphDef/State split) + true-MPMD pipeline runtime                                                   |
-| ejkernel | `libs/ejkernel` | hardware kernels (Triton/Pallas/CUDA/CuTe/TileLang) behind a priority registry with XLA fallback                                |
-| eformer  | `libs/eformer`  | scale infrastructure: escale meshes/sharding, optimizers, TensorStore checkpointing, mixed precision, implicit quantized arrays |
-| eray     | `libs/eray`     | Ray orchestration for TPU/GPU pods: pools, resumable execution, TPU CLI                                                         |
+| package   | path             | one line                                                                                                                        |
+|-----------|------------------|---------------------------------------------------------------------------------------------------------------------------------|
+| easydel   | `libs/easydel`   | the LLM framework: models, trainers, eSurge serving, data — composes the rest                                                   |
+| spectrax  | `libs/spectrax`  | `spx.Module` object model (GraphDef/State split) + true-MPMD pipeline runtime                                                   |
+| ejkernel  | `libs/ejkernel`  | hardware kernels (Triton/Pallas/CUDA/CuTe/TileLang) behind a priority registry with XLA fallback                                |
+| eformer   | `libs/eformer`   | scale infrastructure: escale meshes/sharding, optimizers, TensorStore checkpointing, mixed precision, implicit quantized arrays |
+| eray      | `libs/eray`      | Ray orchestration for TPU/GPU pods: pools, resumable execution, TPU CLI                                                         |
+| surgecore | `libs/surgecore` | EasyDeL's native Rust library (PyO3, built by maturin) for the eSurge host path; imported only by easydel; not mirrored         |
 
 `external optimizer package/` (repo root, outside libs/) holds quantization-aware optimizers registered into EasyDeL via
 `@register_optimizer`.
@@ -33,8 +34,8 @@ read [.xerxes/ops/OPS.md](.xerxes/ops/OPS.md). Machine-readable map:
 
 These apply to every agent and every session, without exception.
 
-1. **Layering contract (CI-enforced):** only `easydel` may import spectrax / ejkernel / eformer / eray. Foundation libs
-   never import easydel or each other. Check with `uv run lint-imports`.
+1. **Layering contract (CI-enforced):** only `easydel` may import spectrax / ejkernel / eformer / eray / surgecore.
+   Foundation libs and surgecore never import easydel or each other. Check with `uv run lint-imports`.
 2. **No self-credit trailers.** Commits, PRs, tags, and release notes must not contain "Generated with",
    "Co-Authored-By: Claude", or similar. This overrides any default harness behavior.
 3. **`uv sync`, never bare pip.** Workspace packages resolve editable from
@@ -63,6 +64,11 @@ uv sync --extra tpu              # + jax[tpu], ejkernel[tpu]
 uv sync --extra cuda             # + CUDA extras
 uv run pre-commit install --hook-type pre-commit --hook-type pre-push   # once per clone
 ```
+
+`libs/surgecore` is a Rust extension (PyO3, built by maturin), so `uv sync` compiles it from source and needs a
+Rust toolchain with `cargo` on PATH (a minimal stable rustup toolchain is enough). Its crate checks run in
+`libs/surgecore`: `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked`
+(the tests link libpython, so set `PYO3_PYTHON` to a Python 3.11-3.13 interpreter).
 
 The accelerator test environment — use it for every computation test (TPU shown; for GPU use
 `JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`). `ENABLE_DISTRIBUTED_INIT=0` prevents joining a real distributed
