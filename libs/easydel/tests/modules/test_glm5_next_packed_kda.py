@@ -33,7 +33,7 @@ from easydel.caching import KDACacheView
 HIDDEN, HEADS, HEAD_DIM, D_CONV = 32, 2, 8, 4
 
 
-def _layer(dtype=jnp.float32):
+def _layer(dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST):
     config = ed.Glm5NextTextConfig(
         vocab_size=128,
         hidden_size=HIDDEN,
@@ -65,7 +65,7 @@ def _layer(dtype=jnp.float32):
         config=config,
         dtype=dtype,
         param_dtype=jnp.float32,
-        precision=jax.lax.Precision.HIGHEST,
+        precision=precision,
         rngs=spx.Rngs(0),
     )
     return model, model.model.layers[0].self_attn
@@ -377,3 +377,59 @@ def test_speculative_steps_refuse_explicit_recurrent_slots():
 
     with model.mesh, pytest.raises(ValueError, match="recurrent_state_indices"):
         layer(hidden_states=packed, cache_view=_random_view(rows * (1 + candidates), seed=53), cache_metadata=meta)
+
+
+def test_packed_chunk_dots_follow_the_layer_matmul_precision():
+    """eSurge's flat driver runs its chunk dots at the layer's matmul precision; an explicit ``kda_chunk`` keeps its own.
+
+    ``from_pretrained`` builds layers at ``Precision("fastest")`` (``DEFAULT``): with ``kda_chunk_impl`` ``None`` (the
+    default) or ``"scan"`` their multi-token rows take the single-pass chunk dots that ``kda_chunk_impl="kda_chunk"``
+    with ``kda_chunk_precision="default"`` selects, close to the exact ones. A layer built at ``HIGHEST`` keeps exact
+    chunk dots. Decode-only steps run no chunk dots, so their outputs and pools do not depend on the setting.
+    """
+    n, rows = 12, 4
+    rng = np.random.default_rng(59)
+    tokens = jnp.asarray(rng.normal(size=(1, n, HIDDEN)), jnp.float32)
+    prefill = jnp.zeros((1, 16, HIDDEN), jnp.float32).at[:, :n].set(tokens)
+    prefill_meta = SimpleNamespace(
+        query_start_loc=jnp.asarray([0, n], jnp.int32), context_lens=jnp.asarray([n], jnp.int32)
+    )
+    # A decode bucket as eSurge compiles it: one token per row and as many tokens as rows.
+    decode = jnp.asarray(rng.normal(size=(1, rows, HIDDEN)), jnp.float32)
+    decode_meta = SimpleNamespace(
+        query_start_loc=jnp.arange(rows + 1, dtype=jnp.int32), context_lens=jnp.asarray([9, 5, 13, 7], jnp.int32)
+    )
+    names = ("q_conv_state", "k_conv_state", "v_conv_state", "recurrent_state")
+    settings = {
+        "auto": (None, "highest"),
+        "scan": ("scan", "highest"),
+        "exact": ("kda_chunk", "highest"),
+        "fast": ("kda_chunk", "default"),
+    }
+
+    def serve(precision):
+        model, layer = _layer(precision=precision)
+        runs = {}
+        with model.mesh:
+            for label, (impl, chunk_precision) in settings.items():
+                layer.config.kda_chunk_impl, layer.config.kda_chunk_precision = impl, chunk_precision
+                p = layer(hidden_states=prefill, cache_view=_empty_view(1), cache_metadata=prefill_meta)
+                d = layer(hidden_states=decode, cache_view=_random_view(rows, seed=61), cache_metadata=decode_meta)
+                decoded = [np.asarray(d.attention_output)] + [np.asarray(getattr(d.cache_view, x)) for x in names]
+                runs[label] = (np.asarray(p.attention_output), np.asarray(p.cache_view.recurrent_state), decoded)
+        return runs
+
+    for precision, same, other in (
+        (jax.lax.Precision.DEFAULT, "fast", "exact"),
+        (jax.lax.Precision.HIGHEST, "exact", "fast"),
+    ):
+        runs = serve(precision)
+        for label in ("auto", "scan"):
+            np.testing.assert_array_equal(runs[label][0], runs[same][0], err_msg=f"{precision} {label}")
+            np.testing.assert_array_equal(runs[label][1], runs[same][1], err_msg=f"{precision} {label}")
+        assert not np.array_equal(runs["scan"][0], runs[other][0]), precision
+        assert _rel(runs["scan"][0], runs[other][0]) < 2e-2, precision
+        assert _rel(runs["scan"][1], runs[other][1]) < 2e-2, precision
+        for label in ("auto", "exact", "fast"):
+            for got, want in zip(runs[label][2], runs["scan"][2], strict=True):
+                np.testing.assert_array_equal(got, want, err_msg=f"{precision} {label}: decode step")

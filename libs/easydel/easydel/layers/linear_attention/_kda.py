@@ -630,6 +630,36 @@ class KernelDeltaAttention(spx.Module):
             chunk_size=self.chunk_size,
         )
 
+    def _serving_chunk_precision(self) -> str:
+        """Precision of the flat serving drivers' non-inverse chunk dots (eSurge packed-row and rank-major steps).
+
+        An explicit ``config.kda_chunk_impl="kda_chunk"`` keeps ``config.kda_chunk_precision`` (the setting it
+        documents). Otherwise (``"scan"``, or ``None``, which :meth:`_chunk_impl` resolves for training) the dots follow
+        the layer's own matmul precision: ``"default"`` (single-pass bf16 MXU dots) when every part of it resolves to
+        ``Precision.DEFAULT``, else ``"highest"``. A ``None`` part resolves through JAX's default-matmul-precision
+        setting, as the layer's other dots do. ``from_pretrained`` builds layers at ``Precision("fastest")``
+        (``DEFAULT``), so served checkpoints take the fast dots, while a layer built at ``HIGHEST`` keeps exact ones.
+        Training and dense-cache forwards run ``kda_op`` with ``config.kda_chunk_precision`` and never read this;
+        decode-only rows have no chunk dots, and the speculative row-padded driver keeps its own exact dots.
+
+        Returns:
+            ``"highest"`` or ``"default"``.
+        """
+        if self.config.kda_chunk_impl == "kda_chunk":
+            return self.config.kda_chunk_precision
+        precision = self.precision
+        for part in precision if isinstance(precision, tuple | list) else (precision,):
+            if part is None:
+                part = jax.config.jax_default_matmul_precision
+            if part is None:
+                continue
+            try:
+                if jax.lax.Precision(part) != jax.lax.Precision.DEFAULT:
+                    return "highest"
+            except (TypeError, ValueError):  # dot algorithms and names that lax.Precision does not know
+                return "highest"
+        return "default"
+
     def _forward_rank_major_rows(
         self,
         hidden_states: Float[Array, "dp tokens_per_rank hidden_dim"],
@@ -688,7 +718,7 @@ class KernelDeltaAttention(spx.Module):
             conv_dtype=jnp.bfloat16 if self.dtype in lowfloats else self.dtype,
             chunk_size=self.chunk_size,
             decay_lower_bound=self.gate_lower_bound,
-            precision=self.config.kda_chunk_precision if self._chunk_impl() == "kda_chunk" else "highest",
+            precision=self._serving_chunk_precision(),
             state_indices=getattr(cache_metadata, "recurrent_state_indices", None),
             flat_forward=kda_ragged_rows_forward,
             head_axis=None if split is None else split.axes,
@@ -1118,8 +1148,8 @@ class KernelDeltaAttention(spx.Module):
         ``rows * (1 + C)`` slots for speculative candidate rows and
         sends the commit metadata exactly then; those steps use the row-padded
         :func:`~easydel.operations.kernels.kda_packed_rows_forward`, which writes the per-prefix states. The flat
-        driver's chunk dots follow ``config.kda_chunk_precision`` only with ``kda_chunk_impl="kda_chunk"`` (the
-        setting it documents) and are ``"highest"`` otherwise. This method adds the output gate, norm and projection.
+        driver's non-inverse chunk dots run at :meth:`_serving_chunk_precision`. This method adds the output gate, norm
+        and projection.
 
         Args:
             hidden_states: Packed layer input ``[1, T, D]``.
@@ -1152,8 +1182,7 @@ class KernelDeltaAttention(spx.Module):
         # Pool slot of every row when eSurge ships them (a row window that does not start at slot 0); None: row r owns
         # slot r. The row-padded (speculative) driver below cannot use them.
         recurrent_state_indices = getattr(cache_metadata, "recurrent_state_indices", None)
-        # ``kda_chunk_precision`` is documented for ``kda_chunk_impl="kda_chunk"``; other impls keep exact chunk dots.
-        chunk_precision = self.config.kda_chunk_precision if self._chunk_impl() == "kda_chunk" else "highest"
+        chunk_precision = self._serving_chunk_precision()
         if spec_recurrent_commit is None:
             # Decode-only steps (every row <= 1 token) take the fused decode path, other steps the flat driver.
             out_packed, new_cache_view = kda_rows_forward(
