@@ -646,8 +646,9 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             static row windows, see ``moe_local_ffn_window_rows``) and a single reduction of the combined
             ``[tokens, H]`` partial over (ep, tp). ``True`` applies both wherever their conditions hold and warns
             once where they do not; ``False`` keeps both off. ``None`` (default) leaves the choice to the MoE layer:
-            the inference-mode dispatch wherever its conditions hold, the chunked dispatch as with ``False`` (so
-            training is unchanged). A saved ``false`` loads as ``None`` (see :meth:`from_dict`).
+            the inference-mode dispatch wherever its conditions hold with an expert axis (ep > 1; at ep == 1 it
+            measured neutral), the chunked dispatch as with ``False`` (so training is unchanged). A saved ``false``
+            loads as ``None`` (see :meth:`from_dict`).
         moe_row_gather_kernel: In the fused-MoE path, run the token dispatch gather and the expert-output
             unsort + top-k combine through the ejkernel Pallas TPU row-gather kernels (``moe_row_gather`` /
             ``moe_row_gather_sum``) instead of XLA gathers. Forward dispatch is bit-identical; the combine
