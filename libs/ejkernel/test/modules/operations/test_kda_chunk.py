@@ -25,6 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from ejkernel.modules.operations import KdaChunk, KdaChunkConfig, kda_chunk
+from ejkernel.modules.operations.kda_chunk import auto_block_h
 from jax.sharding import Mesh, PartitionSpec
 
 _ORACLE_PATH = pathlib.Path(__file__).resolve().parents[2] / "kernels" / "_xla" / "test_kda_chunk.py"
@@ -45,6 +46,31 @@ def test_config_roundtrip():
     cfg = KdaChunkConfig(block_h=2, backward="xla", bwd_reduce="mxu", platform="pallas", backend="tpu")
     assert KdaChunkConfig.from_dict(cfg.to_dict()) == cfg
     assert KdaChunkConfig.from_json(cfg.to_json()) == cfg
+
+
+@pytest.mark.cpu_ok
+def test_auto_block_h_divides_the_heads_and_caps_the_head_block():
+    assert KdaChunkConfig().block_h is None
+    factored = functools.partial(auto_block_h, factored_pairwise=True)
+    assert [factored(heads, 128, 128, 64) for heads in (16, 8, 12, 6, 5, 1)] == [8, 8, 4, 2, 1, 1]
+    assert factored(16, 128, 128, 128) == 4
+    assert factored(16, 256, 128, 64) == 4
+    assert auto_block_h(16, 128, 128, 64, factored_pairwise=False) == 1
+
+
+@pytest.mark.parametrize(("decay_lower_bound", "block_h"), [(-5.0, 2), (None, 1)], ids=["factored", "dense"])
+def test_default_block_h_runs_the_resolved_head_block(decay_lower_bound, block_h):
+    """``block_h=None`` (the default) gives the result of the head block ``auto_block_h`` picks, bit for bit: 2 of 6
+    heads per grid step with the factored pairwise decay (a gate bound), 1 with the dense form."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("Pallas TPU kernel")
+    q, k, v, beta, g, s0 = make_inputs(5, H=6, L=128, strong=True)
+    assert auto_block_h(6, 128, 128, 64, factored_pairwise=decay_lower_bound is not None) == block_h
+    run = functools.partial(kda_chunk, chunk_size=64, platform="pallas", decay_lower_bound=decay_lower_bound)
+    auto = jax.jit(run)(q, k, v, beta, g, s0)
+    fixed = jax.jit(functools.partial(run, cfg=KdaChunkConfig(block_h=block_h)))(q, k, v, beta, g, s0)
+    for a, b in zip(auto, fixed, strict=True):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
 
 @pytest.mark.parametrize("platform", ["xla", "pallas", None])
