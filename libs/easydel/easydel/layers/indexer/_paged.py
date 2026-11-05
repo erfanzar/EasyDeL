@@ -385,9 +385,12 @@ def _pool_select_core(
     # 3) Exact top-k over each token's complete pools through the page table, one fused
     #    pass on TPU (ejkernel ``paged_pool_topk``), the running-top-k loop elsewhere.
     num_complete = jnp.where(valid, (pos + 1) // kpool, 0)
+    # The query goes in its projection dtype: with bf16 queries over bf16 pool pages the TPU kernel scores in one bf16
+    # MXU pass with f32 accumulation (the products are exact), the same keys as an f32 HIGHEST matmul of the upcast
+    # values, and the row split moves half the bytes. The XLA path upcasts to f32 itself.
     best_ids = _run_pool_topk(
         kernel_mesh,
-        query.astype(jnp.float32),
+        query,
         head_weights,
         flat_pools.reshape(pool_pages.shape),
         block_tables,
