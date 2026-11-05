@@ -463,6 +463,18 @@ def should_dequantize_rhs_before_matmul(
     return not matmul_supported
 
 
+def _integer_dot_precision(dtype) -> lax.Precision | None:
+    """``Precision.DEFAULT`` for integer MXU operands, ``None`` (the ambient precision) for floating ones.
+
+    Integer dots accumulate exactly in int32, so a precision means nothing for them, and Mosaic rejects a contract
+    precision on integer operands: on TPU v5p (JAX 0.11.2) an ambient ``jax.default_matmul_precision("highest")``
+    lowered the int8 x int8 dot to ``tpu.matmul`` with ``contract_precision<fp32>`` and the kernel failed to compile
+    ("Bad lhs type"). Pinning the default keeps the integer dots out of the ambient setting (the XLA entries pin
+    their integer dots the same way); without an ambient precision the lowered op is unchanged.
+    """
+    return lax.Precision.DEFAULT if jnp.issubdtype(dtype, jnp.integer) else None
+
+
 def inner_kernel(
     tiled_lhs_ref: jax.Array,
     tiled_rhs_ref: RhsRef,
@@ -542,6 +554,7 @@ def inner_kernel(
             # Already-quantized integer inputs require an integer MXU
             # accumulator, even when the returned/outer accumulator is FP32.
             dot_acc_dtype = jnp.int32 if jnp.issubdtype(lhs_dtype, jnp.integer) else jnp.float32
+            dot_precision = _integer_dot_precision(lhs_dtype)
             # The MXU only accepts specific dtype pairs; on hardware without
             # native support for (lhs, rhs) — e.g. bf16 x f4E2M1FN, or
             # bf16 x f8 on chips with no fp8 units — feeding the pair directly
@@ -583,6 +596,7 @@ def inner_kernel(
                         jnp.matmul(
                             tiled_lhs,
                             tiled_rhs_lhs_dtype[:, start_n:end_n],
+                            precision=dot_precision,
                             preferred_element_type=dot_acc_dtype,
                         ).astype(acc_ref.dtype)
                     )
@@ -599,6 +613,7 @@ def inner_kernel(
                         block_acc = jnp.matmul(
                             tiled_lhs[:, k_start:k_end],
                             tiled_rhs[k_start:k_end, start_n:end_n],
+                            precision=dot_precision,
                             preferred_element_type=dot_acc_dtype,
                         ).astype(acc_ref.dtype)
 
@@ -660,6 +675,7 @@ def inner_kernel(
                     block_acc = jnp.matmul(
                         block_lhs_q,
                         block_rhs,
+                        precision=_integer_dot_precision(lhs_q_dtype),
                         preferred_element_type=preferred_element_type,
                     ).astype(acc_ref.dtype)
                     block_acc *= block_scale.astype(acc_ref.dtype)
