@@ -526,6 +526,58 @@ class Scheduler(SchedulerInterface):
         self._current_seq_bucket = bucket
         return desired_running <= self.max_num_running_reqs and desired_running <= bucket
 
+    def _max_prefill_chunk_tokens(self) -> int:
+        """The most token slots one step adds to a prefilling request: its largest chunk plus the lookahead."""
+        chunk = int(self.max_num_scheduled_tokens)
+        threshold = self.long_prefill_token_threshold
+        if threshold is not None and 0 < threshold < chunk:
+            chunk = int(threshold)
+        return chunk + self.num_lookahead_tokens
+
+    def _outstanding_prompt_pages(self, request: EngineRequest) -> int:
+        """Free pages a running request still draws before it holds its whole prompt (read-only).
+
+        A request counts while it is prefilling, that is while its computed tokens are short of its prompt; for a
+        request resumed after preemption every token it has is prompt again. Pages for tokens it decodes later are
+        not counted.
+
+        Args:
+            request: A running request.
+
+        Returns:
+            The pages it still draws for the rest of its prompt plus the lookahead slots, ``0`` once it decodes.
+        """
+        if request.num_computed_tokens >= max(request.num_prompt_tokens, request.num_tokens - 1):
+            return 0
+        return self.kv_cache_manager.get_num_pages_needed(
+            request,
+            request.num_tokens + self.num_lookahead_tokens,
+            max_chunk_tokens=self._max_prefill_chunk_tokens(),
+        )
+
+    def _whole_prompt_pages_fit(self, request: EngineRequest, new_computed_pages: typing.Any, reserved: int) -> bool:
+        """Whether the pages for a waiting request's whole remaining prompt are free.
+
+        The count is per cache group as :meth:`CacheManager.get_num_pages_needed` makes it: the prompt plus the
+        lookahead slots, net of the prefix-hit pages, and at most the pages a windowed group holds at once. It must
+        fit in the free pages left after ``reserved``, the pages the running requests still draw for their prompts.
+
+        Args:
+            request: The waiting request at the head of the admission loop.
+            new_computed_pages: Its prefix-hit pages (``CachePages``), possibly empty.
+            reserved: Pages the running requests' remaining prompts still draw.
+
+        Returns:
+            ``True`` when the request may start its prefill now.
+        """
+        needed = self.kv_cache_manager.get_num_pages_needed(
+            request,
+            request.num_tokens + self.num_lookahead_tokens,
+            new_computed_pages,
+            max_chunk_tokens=self._max_prefill_chunk_tokens(),
+        )
+        return needed + reserved <= self.kv_cache_manager.page_pool.get_num_free_pages()
+
     def schedule(self) -> SchedulerOutput:
         """Schedule requests for the next forward pass.
 
@@ -840,6 +892,9 @@ class Scheduler(SchedulerInterface):
                 admission_budget = self._token_budget_manager.begin_cycle(self.kv_cache_manager, len(self.running))
                 self._token_budget_manager.consume(max(0, admission_budget - remaining_batch_budget))
                 token_budget = self._token_budget_manager.remaining
+            # Running requests keep priority: the pages their remaining prompts still draw count as taken when a
+            # waiting request is checked (computed on first use, so a step with an empty queue pays nothing).
+            reserved_prompt_pages: int | None = None
             while self.waiting and token_budget > 0:
                 if not self._ensure_capacity(len(self.running) + 1):
                     break
@@ -932,6 +987,15 @@ class Scheduler(SchedulerInterface):
                         continue
                     num_new_tokens = aligned_tokens
                 num_new_tokens = self._clip_to_snapshot_boundary(request, num_computed_tokens, num_new_tokens)
+                if self.running:
+                    # A prefill starts only when the pages for the whole remaining prompt are free; otherwise the
+                    # request would be the next preemption victim and its prefill would be redone. The queue stops
+                    # here, as on an allocation failure (FCFS). With nothing running the head is admitted chunk by
+                    # chunk, so a prompt larger than the free pool cannot block the queue.
+                    if reserved_prompt_pages is None:
+                        reserved_prompt_pages = sum(self._outstanding_prompt_pages(r) for r in self.running)
+                    if not self._whole_prompt_pages_fit(request, new_computed_pages, reserved_prompt_pages):
+                        break
                 new_pages = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -965,6 +1029,8 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 request.status = EngineRequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                if reserved_prompt_pages is not None:
+                    reserved_prompt_pages += self._outstanding_prompt_pages(request)
                 if restore_key is not None:
                     assert self._recurrent_snapshots is not None
                     restore_slot = self._recurrent_snapshots.lookup(restore_key)

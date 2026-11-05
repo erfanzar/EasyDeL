@@ -43,6 +43,25 @@ from .page_pool import PagePool
 from .utils import CachePage, PageHash
 
 
+def _pages_held_at_once(window_tokens: int, max_step_tokens: int, page_size: int) -> int:
+    """Upper bound on the non-null pages a windowed group holds at once while a request advances.
+
+    A step that adds at most ``max_step_tokens`` slots after ``c`` computed tokens holds the pages from the window
+    start (at most ``window_tokens - 1`` tokens before ``c``) to the step's last slot. Over every alignment of ``c``
+    to the page grid that is at most ``cdiv(max_step_tokens + window_tokens + page_size - 2, page_size)`` pages. One
+    page more covers a chunked-local group, which keeps its last published page when a step starts on a chunk boundary.
+
+    Args:
+        window_tokens: The sliding window or the attention chunk size, in tokens.
+        max_step_tokens: The most slots one step adds (the largest prefill chunk plus the lookahead slots).
+        page_size: Tokens per page.
+
+    Returns:
+        The bound, in pages.
+    """
+    return cdiv(max_step_tokens + window_tokens + page_size - 2, page_size) + 1
+
+
 class SingleTypeCacheManager(ABC):
     """Abstract base class for attention-type-specific cache managers.
 
@@ -114,6 +133,65 @@ class SingleTypeCacheManager(ABC):
 
         num_evictable_computed_pages = sum(blk.ref_cnt == 0 and not blk.is_null for blk in new_computed_pages)
         return num_new_pages + num_evictable_computed_pages
+
+    def get_num_pages_needed(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_pages: list[CachePage],
+        max_step_tokens: int | None,
+    ) -> int:
+        """Count the free pages this group still draws before the request holds ``num_tokens`` slots (read-only).
+
+        The whole-request counterpart of :meth:`get_num_pages_to_allocate`: positions the request does not hold
+        yet, plus the prefix-hit pages that sit in the free queue (``ref_cnt == 0``), which attaching them takes from
+        it. Unlike that method it never creates a ``req_to_pages`` entry, so probing a request leaves no trace.
+
+        Args:
+            request_id: The request ID.
+            num_tokens: Token slots the request must hold in the end (lookahead included, capped at
+                ``max_model_len`` by the caller).
+            new_computed_pages: Prefix-hit pages the request would attach in this group (empty when none).
+            max_step_tokens: The most slots one step adds. Full attention ignores it; groups that drop pages behind
+                a window use it to bound the pages they hold at once. ``None`` means the rest arrives in one step.
+
+        Returns:
+            The number of free pages the group draws at most.
+        """
+        held = self.req_to_pages.get(request_id) or ()
+        num_new_pages = max(0, cdiv(num_tokens, self.page_size) - len(new_computed_pages) - len(held))
+        num_evictable_computed_pages = sum(blk.ref_cnt == 0 and not blk.is_null for blk in new_computed_pages)
+        return num_new_pages + num_evictable_computed_pages
+
+    def _windowed_pages_needed(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_pages: list[CachePage],
+        max_step_tokens: int | None,
+        window_tokens: int,
+    ) -> int:
+        """:meth:`get_num_pages_needed` for a group that frees pages behind a window of ``window_tokens``.
+
+        The group never holds more than :func:`_pages_held_at_once` pages, and pages it holds alone go back to the
+        free queue when the window passes them, so it draws at most that bound minus those pages, and never more
+        than the full count.
+        """
+        needed = SingleTypeCacheManager.get_num_pages_needed(
+            self, request_id, num_tokens, new_computed_pages, max_step_tokens
+        )
+        if max_step_tokens is None:
+            return needed
+        # The pages a window dropped form a null prefix of the request's list (remove_skipped_pages), so only the live
+        # tail is walked. Stopping early can only undercount, which keeps the bound conservative.
+        held_alone = 0
+        for page in reversed(self.req_to_pages.get(request_id) or ()):
+            if page.is_null:
+                break
+            if page.ref_cnt == 1:
+                held_alone += 1
+        at_once = _pages_held_at_once(int(window_tokens), int(max_step_tokens), self.page_size)
+        return min(needed, max(0, at_once - held_alone))
 
     def save_new_computed_pages(self, request_id: str, new_computed_pages: list[CachePage]) -> None:
         """Attach new computed pages to the request for this cache group.
@@ -521,6 +599,18 @@ class SlidingWindowManager(SingleTypeCacheManager):
         self.sliding_window = kv_cache_spec.sliding_window
         self._null_page = page_pool.null_page
 
+    def get_num_pages_needed(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_pages: list[CachePage],
+        max_step_tokens: int | None,
+    ) -> int:
+        """Count at most the pages the sliding window holds at once (see the base class for the arguments)."""
+        return self._windowed_pages_needed(
+            request_id, num_tokens, new_computed_pages, max_step_tokens, self.sliding_window
+        )
+
     @classmethod
     def find_longest_cache_hit(
         cls,
@@ -666,6 +756,18 @@ class ChunkedLocalAttentionManager(SingleTypeCacheManager):
         super().__init__(kv_cache_spec, page_pool, **kwargs)
         self.attention_chunk_size = kv_cache_spec.attention_chunk_size
         self._null_page = page_pool.null_page
+
+    def get_num_pages_needed(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_pages: list[CachePage],
+        max_step_tokens: int | None,
+    ) -> int:
+        """Count at most the pages the local chunk holds at once (see the base class for the arguments)."""
+        return self._windowed_pages_needed(
+            request_id, num_tokens, new_computed_pages, max_step_tokens, self.attention_chunk_size
+        )
 
     @classmethod
     def find_longest_cache_hit(

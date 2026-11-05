@@ -436,6 +436,46 @@ class CacheManager:
         # Scheduler.update_from_output publishes fully computed pages instead.
         return CachePages(new_pages)
 
+    def get_num_pages_needed(
+        self,
+        request: EngineRequest,
+        num_tokens: int,
+        new_computed_pages: CachePages | None = None,
+        *,
+        max_chunk_tokens: int | None = None,
+    ) -> int:
+        """Count the free pages ``request`` still draws before it holds ``num_tokens`` token slots (read-only).
+
+        The whole-request counterpart of the free-page check in :meth:`allocate_slots`, summed over every cache
+        group and counted the same way: the pages the request holds and the prefix-hit pages count as present, and
+        a hit page that sits in the free queue (``ref_cnt == 0``) costs one free page. A sliding-window or
+        chunked-local group counts at most the pages it holds at once while the rest arrives in steps of at most
+        ``max_chunk_tokens`` slots, net of the pages it holds alone, which it frees as the window passes. Nothing is
+        allocated, attached or recorded, so probing a waiting request leaves no trace.
+
+        Args:
+            request: The request to count for.
+            num_tokens: Token slots the request must hold in the end, lookahead included; capped at
+                ``max_model_len`` as :meth:`allocate_slots` caps it.
+            new_computed_pages: Prefix-hit pages the request would attach (from :meth:`get_computed_pages`), or
+                ``None`` when there are none.
+            max_chunk_tokens: The most token slots one step adds to the request (its largest prefill chunk plus
+                any lookahead slots). ``None`` means the rest arrives in one step, which counts every page.
+
+        Returns:
+            The number of free pages the request draws at most.
+        """
+        if new_computed_pages is not None:
+            page_lists = new_computed_pages.pages
+        else:
+            page_lists = tuple([] for _ in range(len(self.kv_cache_groups)))
+        return self.coordinator.get_num_pages_needed(
+            request.request_id,
+            min(int(num_tokens), self.max_model_len),
+            page_lists,
+            None if max_chunk_tokens is None else int(max_chunk_tokens),
+        )
+
     def free(self, request: EngineRequest) -> None:
         """Free the pages allocated for the request.
 

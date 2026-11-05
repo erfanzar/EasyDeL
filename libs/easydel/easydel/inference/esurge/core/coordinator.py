@@ -130,6 +130,30 @@ class CacheCoordinator(ABC):
             num_pages_to_allocate += manager.get_num_pages_to_allocate(request_id, num_tokens, new_computed_pages[i])
         return num_pages_to_allocate
 
+    def get_num_pages_needed(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_pages: tuple[list[CachePage], ...],
+        max_step_tokens: int | None,
+    ) -> int:
+        """Sum, over every cache group, the free pages the request still draws (read-only).
+
+        Args:
+            request_id: The request ID.
+            num_tokens: Token slots the request must hold in the end.
+            new_computed_pages: Prefix-hit pages the request would attach, one list per cache group.
+            max_step_tokens: The most slots one step adds; windowed groups use it to bound the pages they hold at
+                once (see :meth:`SingleTypeCacheManager.get_num_pages_needed`).
+
+        Returns:
+            The number of free pages the request draws at most, over all groups.
+        """
+        return sum(
+            manager.get_num_pages_needed(request_id, num_tokens, new_computed_pages[i], max_step_tokens)
+            for i, manager in enumerate(self.single_type_managers)
+        )
+
     def save_new_computed_pages(self, request_id: str, new_computed_pages: tuple[list[CachePage], ...]) -> None:
         """Attach new computed pages to the request across all cache groups.
 
