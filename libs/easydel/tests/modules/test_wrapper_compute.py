@@ -236,7 +236,7 @@ def test_arctic_capacity_is_invariant_under_moe_chunking(chunk_size, top_k):
     block.gate.weight.value = jnp.zeros_like(block.gate.weight.value)
     hidden = jnp.ones((1, 4, 8), dtype=jnp.float32)
     block.train()
-    config.moe_chunk_size = None
+    config.moe_chunk_size = 0
     full, _ = block(hidden)
     config.moe_chunk_size = chunk_size
     chunked, _ = block(hidden)

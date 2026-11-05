@@ -127,7 +127,7 @@ def test_small_config_roundtrip_preserves_schedule():
 def test_moe_schedule_has_no_hash_layers():
     cfg = DeepseekV41Config()
     assert cfg.mlp_layer_types == ["moe"] * 43
-    assert cfg.mlp_bias is False and cfg.hc_use_fused_coefficients is False
+    assert cfg.mlp_bias is False and cfg.hc_use_fused_coefficients is None
     with pytest.raises(ValueError, match="no hash MoE"):
         _small(mlp_layer_types=["hash_moe"] + ["moe"] * 6)
     with pytest.raises(ValueError, match="no hash MoE"):

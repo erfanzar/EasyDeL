@@ -128,6 +128,35 @@ def test_from_json_file_applies_the_from_dict_load_rules(tmp_path):
     assert reloaded.mla_attn_softmax_dtype == jnp.dtype(jnp.bfloat16)
 
 
+def test_from_dict_reads_saved_old_defaults_of_the_automatic_settings_as_none():
+    """Configs saved before these settings defaulted to ``None`` store the old defaults; those load as ``None``."""
+    from easydel.modules.glm5_next.glm5_next_configuration import Glm5NextConfig
+
+    old = {
+        "moe_row_gather_kernel": False,
+        "kda_chunk_impl": "scan",
+        "index_scoring_kernel": "xla",
+        "dsa_pool_kernel": "bitmap",
+        "moe_defer_tp_reduce": False,
+    }
+    reloaded = EasyDeLBaseConfig.from_dict(dict(old))
+    assert {key: getattr(reloaded, key) for key in old} == dict.fromkeys(old)
+    nested = Glm5NextConfig.from_dict(
+        {"model_type": "glm5_next", "text_config": {**old, "hc_use_fused_coefficients": False}}
+    )
+    assert nested.text_config.hc_use_fused_coefficients is None
+    assert {key: getattr(nested.text_config, key) for key in old} == dict.fromkeys(old)
+    chosen = {
+        "moe_row_gather_kernel": True,
+        "kda_chunk_impl": "kda_chunk",
+        "index_scoring_kernel": "pallas",
+        "dsa_pool_kernel": "gather",
+        "moe_chunk_size": 0,
+    }
+    kept = EasyDeLBaseConfig.from_dict(dict(chosen))
+    assert {key: getattr(kept, key) for key in chosen} == chosen
+
+
 def test_to_json_string_normalizes_dtype_inside_to_dict_objects(monkeypatch):
     class ToDictWithDtype:
         def to_dict(self):

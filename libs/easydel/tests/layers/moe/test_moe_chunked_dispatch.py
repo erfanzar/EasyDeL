@@ -16,17 +16,20 @@
 
 The fused MoE dispatch materializes a ``[local_tokens * k, H]`` permuted
 buffer per core; at production shapes (v5p-2048, 131k buckets) that buffer is
-4-17 GB per core with ~3 copies live across fwd+bwd. ``moe_chunk_size`` opts
-into processing the local token stream in fixed-size chunks under
-``jax.lax.scan`` + ``jax.checkpoint``, capping every live dispatch buffer at
-``chunk * k * H`` regardless of batch/sequence size.
+4-17 GB per core with ~3 copies live across fwd+bwd. ``moe_chunk_size``
+(set, or chosen per call on TPU when ``None``) processes the local token
+stream in fixed-size chunks under ``jax.lax.scan`` + ``jax.checkpoint``,
+capping every live dispatch buffer at ``chunk * k * H`` regardless of
+batch/sequence size.
 
 Chunking over tokens is mathematically exact for token-choice top-k routing:
 each token's output depends only on its own k experts, so splitting the
 stream can only change float accumulation order. These tests pin:
 
-* default-off is bit-identical (``moe_chunk_size=None`` equals a config that
-  predates the knob entirely),
+* the default (``moe_chunk_size=None``) is bit-identical to a config that
+  predates the knob entirely,
+* the automatic chunks of the ring dispatch are sized from the tokens one
+  expert shard holds,
 * chunked outputs and input-gradients match the single-pass dispatch on the
   ep=1 all-to-all mesh and the ring fsdp2/ep2/tp2 mesh, including
   non-dividing chunk sizes (tail padding) and chunk > tokens (single padded
@@ -81,8 +84,8 @@ def _build_gptoss_block(
             order.
         ring: Whether to enable ring-of-experts (the ep>1 variant that lowers
             on XLA:CPU).
-        moe_chunk_size: Chunk size for the scanned dispatch (``None``
-            disables chunking).
+        moe_chunk_size: Chunk size for the scanned dispatch (``0``: single
+            pass; ``None``: automatic).
         num_experts: Number of routed experts.
         seed: Parameter init seed.
 
@@ -122,7 +125,7 @@ def _input(hidden_size: int = 32):
 
 
 def test_chunk_none_is_bit_identical_to_knob_absent():
-    """moe_chunk_size=None must equal a config that predates the knob, bitwise.
+    """moe_chunk_size=None (automatic) must equal a config that predates the knob, bitwise.
 
     ``delattr`` simulates configs serialized before ``moe_chunk_size``
     existed: the module reads the knob via ``getattr(..., None)``, so both
@@ -180,6 +183,38 @@ def test_chunked_shard_map_body_sees_chunk_sized_buffers():
     )
 
 
+def test_automatic_ring_chunks_are_sized_from_the_shard_tokens(monkeypatch):
+    """With ``moe_chunk_size=None`` the ring dispatch sizes its chunks from the tokens one expert shard holds.
+
+    Under the ring of experts every expert shard holds the same share of the batch, here all 32 tokens. With the
+    dispatch buffer capped at 24 tokens' rows and chunks aligned to 8 tokens, those 32 tokens run in two chunks of
+    16; counting them once per expert shard (64 tokens) would give chunks of 24.
+    """
+    if jax.default_backend() != "tpu" or jax.device_count() < 4:
+        pytest.skip("the automatic chunk size applies on TPU; needs 4 devices for ep2 x tp2")
+    from easydel.layers.moe import _layout_planner
+    from easydel.layers.moe._communication_utils import MoeFusedHooks
+
+    hidden, top_k = 32, 2
+    monkeypatch.setattr(_layout_planner, "AUTO_CHUNK_BUFFER_BYTES", 24 * top_k * hidden * 4)
+    monkeypatch.setattr(_layout_planner, "AUTO_CHUNK_ALIGN", 8)
+    block = _build_gptoss_block(sharding_axis_dims=(1, 1, 1, 2, 2, 1), ring=True, moe_chunk_size=None)
+    seen: list[tuple[int, ...]] = []
+
+    def spy(inputs_2d, weights, inputs_shape):
+        seen.append(tuple(inputs_2d.shape))
+        return inputs_2d
+
+    block.moe_hooks = MoeFusedHooks(refine_inputs_hook=spy)
+    x = _input(hidden)
+
+    with block.config.mesh:
+        out, _ = block(x)
+
+    assert out.shape == x.shape
+    assert set(seen) == {(16, hidden)}, seen
+
+
 @pytest.mark.parametrize(
     ("candidate_dims", "ring", "chunk"),
     [
@@ -187,7 +222,7 @@ def test_chunked_shard_map_body_sees_chunk_sized_buffers():
         pytest.param(None, False, 4, id="noring-fsdp-tp2-chunk4"),
         pytest.param(None, False, 3, id="noring-fsdp-tp2-chunk3-tailpad"),
         pytest.param(None, False, 999, id="noring-fsdp-tp2-chunk-gt-T"),
-        # ring mesh: post-gather stream is (8/2)*4*2 = 32 tokens per shard.
+        # ring mesh: tokens replicated over the expert axis.
         pytest.param((1, 1, 2, 2, 2, 1), True, 8, id="ring-fsdp2-ep2-tp2-chunk8"),
         pytest.param((1, 1, 2, 2, 2, 1), True, 5, id="ring-fsdp2-ep2-tp2-chunk5-tailpad"),
         pytest.param((1, 1, 2, 2, 2, 1), True, 999, id="ring-fsdp2-ep2-tp2-chunk-gt-T"),
@@ -208,7 +243,7 @@ def test_chunked_matches_unchunked_outputs_and_grads(candidate_dims, ring, chunk
     else:
         candidate_dims = _ep1_mesh_dims()
 
-    single = _build_gptoss_block(sharding_axis_dims=candidate_dims, ring=ring, moe_chunk_size=None)
+    single = _build_gptoss_block(sharding_axis_dims=candidate_dims, ring=ring, moe_chunk_size=0)
     chunked = _build_gptoss_block(sharding_axis_dims=candidate_dims, ring=ring, moe_chunk_size=chunk)
     x = _input()
 
@@ -256,12 +291,12 @@ def test_chunked_nonring_ep2_traces():
     assert tuple(out_struct.shape) == tuple(x.shape)
 
 
-def test_chunk_size_must_be_positive():
-    """A non-positive chunk size must fail loudly at config or dispatch time."""
+def test_negative_chunk_size_is_rejected():
+    """A negative chunk size must fail loudly at config or dispatch time (``0`` is the single pass)."""
     dims = _ep1_mesh_dims()
 
     block = _build_gptoss_block(sharding_axis_dims=dims, ring=False, moe_chunk_size=None)
-    block.config.moe_chunk_size = 0  # bypass config validation on purpose
+    block.config.moe_chunk_size = -1  # bypass config validation on purpose
     x = _input()
 
     with block.config.mesh, pytest.raises(ValueError, match="moe_chunk_size"):

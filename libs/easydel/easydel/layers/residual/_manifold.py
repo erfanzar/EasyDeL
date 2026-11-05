@@ -87,8 +87,13 @@ class ManifoldHyperConnectionConfig:
         """Read the standard ``hc_*`` model-config fields (DeepSeek-V4 / V4.1, GLM-5-Next).
 
         Maps ``hidden_size``, ``hc_mult``, ``hc_eps``, ``rms_norm_eps`` (flattened-stream norm),
-        ``hc_sinkhorn_iters``, ``initializer_range`` and ``hc_use_fused_coefficients``.
+        ``hc_sinkhorn_iters``, ``initializer_range`` and ``hc_use_fused_coefficients``. That last one defaults to
+        ``None`` in the model families, which takes the packed coefficient kernels on TPU and the unfused path
+        elsewhere. On TPU v5p a 12-layer GLM-5.3-Flash forward and backward on 16 sequences of 131072 tokens with
+        4-way tensor parallelism took 10.00 s with them against 10.09 s, at a compiled peak of 63.7 instead of
+        91.3 GB per chip; the gradient norm moved by 0.03%.
         """
+        fused = config.hc_use_fused_coefficients
         return cls(
             hidden_size=config.hidden_size,
             hc_mult=config.hc_mult,
@@ -96,7 +101,7 @@ class ManifoldHyperConnectionConfig:
             norm_eps=config.rms_norm_eps,
             iters=config.hc_sinkhorn_iters,
             initializer=config.initializer_range,
-            use_fused_coefficients=config.hc_use_fused_coefficients,
+            use_fused_coefficients=jax.default_backend() == "tpu" if fused is None else bool(fused),
         )
 
 

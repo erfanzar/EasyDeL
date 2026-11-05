@@ -275,17 +275,29 @@ def compact_valid_layout(valid: Bool[Array, "batch seq"]) -> CompactLayout:
     before_pad = pad_through - is_pad
     num_valid = valid_through[:, -1:]
     inverse = jnp.where(is_valid > 0, before_valid, num_valid + before_pad).astype(jnp.int32)
-    # Compact slot j holds the (j)-th valid token (j < num_valid) or the (j - num_valid)-th padding token: the first
-    # index whose running count exceeds it. A binary search per slot instead of an argsort of ``inverse``.
     slots = jnp.arange(seq_len, dtype=jnp.int32)
-    # ``method="scan"``: log2(seq) vectorised steps, never the [seq, seq] comparison of ``"compare_all"``.
-    first_valid = jax.vmap(lambda c: jnp.searchsorted(c, slots, side="right", method="scan"))(valid_through)
-    first_pad = jax.vmap(lambda c, n: jnp.searchsorted(c, slots - n, side="right", method="scan"))(
-        pad_through, num_valid[:, 0]
-    )
-    order = jnp.clip(jnp.where(slots[None, :] < num_valid, first_valid, first_pad), 0, seq_len - 1).astype(jnp.int32)
+    # A permutation is the identity exactly when its inverse is, so unpadded and right-padded batches are recognised
+    # from ``inverse`` and skip the searches. On TPU v5p the searches took 0.55 s per training step of a 45-layer
+    # GLM-5.3-Flash at 131072 tokens per sequence.
+    identity = jnp.all(inverse == slots[None, :])
+
+    def search(counts):
+        # Compact slot j holds the (j)-th valid token (j < num_valid) or the (j - num_valid)-th padding token: the
+        # first index whose running count exceeds it. A binary search per slot instead of an argsort of ``inverse``.
+        # ``method="scan"``: log2(seq) vectorised steps, never the [seq, seq] comparison of ``"compare_all"``.
+        valid_counts, pad_counts, n_valid = counts
+        first_valid = jax.vmap(lambda c: jnp.searchsorted(c, slots, side="right", method="scan"))(valid_counts)
+        first_pad = jax.vmap(lambda c, n: jnp.searchsorted(c, slots - n, side="right", method="scan"))(
+            pad_counts, n_valid[:, 0]
+        )
+        order = jnp.where(slots[None, :] < n_valid, first_valid, first_pad)
+        return jnp.clip(order, 0, seq_len - 1).astype(jnp.int32)
+
+    def unchanged(counts):
+        return jnp.broadcast_to(slots[None, :], counts[0].shape)
+
+    order = jax.lax.cond(identity, unchanged, search, (valid_through, pad_through, num_valid))
     rank = jnp.where(is_valid > 0, before_valid, -1).astype(jnp.int32)
-    identity = jnp.all(order == slots[None, :])
     return CompactLayout(order=order, inverse=inverse, rank=rank, identity=identity)
 
 
