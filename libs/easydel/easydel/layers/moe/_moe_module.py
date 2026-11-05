@@ -138,13 +138,58 @@ def _default_ffn_activation(
     return ffn_activation
 
 
+_A8_PALLAS_MAX_ROWS = 1024
+"""Dispatch rows up to which inference-mode W8A8 experts run ejkernel's Pallas channelwise entry on any fitting slab.
+
+The entry's whole-slab A8 path (ejkernel ``_a8_slab_tiles``) covers the same calls: int8 codes whose 128-aligned
+``(K, N)`` expert slab fits ``_A8_PALLAS_MAX_SLAB_BYTES``; longer row buffers only on ``_A8_PALLAS_PREFILL_FAMILIES``.
+"""
+_A8_PALLAS_MAX_SLAB_BYTES = 2 * 1024 * 1024
+_A8_PALLAS_PREFILL_FAMILIES = frozenset({(72, 4096, 512), (72, 512, 4096)})
+"""Expert-stacked ``(E, K, N)`` int8 families measured at prefill rows on TPU v5p: the per-chip routed experts
+(gate/up, down) of GLM-5.3-Flash served at ep4 x tp4; the set of ejkernel's ``_A8_PREFILL_SLAB_FAMILIES``."""
+_A8_PALLAS_PREFILL_MAX_ROWS = 81920
+"""Largest measured prefill buffer: the deferred dispatch's window of one 32,768-token step at ep4 (top-8)."""
+
+
 def _channelwise_grouped_platform(rows, codes, activation_bits, *, force_xla=False):
     """Select measured v5p decode and W4A4 prefill matrix families.
 
     Large native INT4 ragged dots on these v5p shapes were much slower than
     exact INT8 arithmetic with packed INT4 HBM storage. Keep A16 decode-only,
     retain forced-XLA, and do not extrapolate past the measured row range.
+
+    Under inference mode, W8A8 calls (A8 activations, int8 codes, bf16 rows) whose 128-aligned ``(K, N)`` slab fits
+    ``_A8_PALLAS_MAX_SLAB_BYTES`` run the Pallas entry on v5p at up to ``_A8_PALLAS_MAX_ROWS`` rows, and on
+    ``_A8_PALLAS_PREFILL_FAMILIES`` up to ``_A8_PALLAS_PREFILL_MAX_ROWS`` rows; the entry reads one whole slab per
+    expert that has rows and applies both scales in the kernel. Measured on TPU v5p at the per-chip expert shapes of
+    GLM-5.3-Flash served at ep4 x tp4 (int8 [72, 4096, 512] gate/up, [72, 512, 4096] down), bit-identical outputs:
+    one W8A8 routed-MoE layer with 32 / 64 / 128 decode tokens (256 / 512 / 1024 dispatch rows) 0.331 / 0.435 /
+    0.513 -> 0.236 / 0.321 / 0.397 ms; the gate + up + down FFN at the ep4 prefill windows of 512 / 2,048 / 32,768
+    tokens (2,048 / 5,120 / 81,920 rows) 0.477 / 0.754 / 6.355 -> 0.317 / 0.532 / 4.564 ms per layer. Training keeps
+    XLA.
     """
+    if activation_bits == 8 and is_inference_mode():
+        m = rows.shape[0]
+        k_dim, n_dim = codes.shape[-2], codes.shape[-1]
+        slab_rows = 0 < m <= _A8_PALLAS_MAX_ROWS or (
+            _A8_PALLAS_MAX_ROWS < m <= _A8_PALLAS_PREFILL_MAX_ROWS
+            and tuple(int(d) for d in codes.shape) in _A8_PALLAS_PREFILL_FAMILIES
+        )
+        if (
+            force_xla
+            or rows.dtype != jnp.bfloat16
+            or codes.dtype != jnp.int8
+            or not slab_rows
+            or k_dim % 128
+            or n_dim % 128
+            or k_dim * n_dim > _A8_PALLAS_MAX_SLAB_BYTES
+            or jax.default_backend() != "tpu"
+        ):
+            return "xla"
+        from jax.experimental.pallas import tpu as pltpu
+
+        return "pallas" if pltpu.get_tpu_info().chip_version.value == "v5p" else "xla"
     measured_rows = 0 < rows.shape[0] <= 128 or (activation_bits == 4 and 1280 <= rows.shape[0] <= 81920)
     if (
         force_xla
