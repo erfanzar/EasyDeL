@@ -123,11 +123,11 @@ def test_pools_per_page_of_other_page_sizes(ppp):
     np.testing.assert_array_equal(got, xla)
 
 
-def _packed_rows(seed, segments, *, num_seqs, shared_table=False, tie=False):
+def _packed_rows(seed, segments, *, num_seqs, shared_table=False, tie=False, heads=H):
     """Packed query rows ``segments = [(seq, first_position, rows), ...]`` (kpool 4); position ``-1`` = padding rows.
 
     ``shared_table`` gives every sequence the same page list, so rows of different sequences read identical pools;
-    ``tie`` makes every score equal.
+    ``tie`` makes every score equal; ``heads`` sets the query heads.
     """
     rng = np.random.default_rng(seed)
     seq_ids, npool = [], []
@@ -144,8 +144,8 @@ def _packed_rows(seed, segments, *, num_seqs, shared_table=False, tie=False):
     bt = np.pad(bt, ((0, 0), (0, PPS - need))).astype(np.int32)
     T = len(seq_ids)
     pools = np.array(jnp.asarray(rng.standard_normal((num_pages, PPP, D)), jnp.bfloat16).astype(jnp.float32))
-    q = rng.standard_normal((T, H, D)).astype(np.float32)
-    w = (rng.standard_normal((T, H)) * H**-0.5).astype(np.float32)
+    q = rng.standard_normal((T, heads, D)).astype(np.float32)
+    w = (rng.standard_normal((T, heads)) * heads**-0.5).astype(np.float32)
     if tie:
         pools[:], q[:], w[:] = 1.0, 1.0, 1.0
     seq_ids = np.asarray(seq_ids, np.int32)
@@ -205,6 +205,38 @@ def test_page_shared_scoring_equals_per_row_scoring():
     per_row = _run("pallas", per_row_args, k, scale)
     np.testing.assert_array_equal(shared, per_row)
     np.testing.assert_array_equal(shared, _run("xla", args, k, scale))
+
+
+@pytest.mark.parametrize("layout", ["rows45", "rows1100"])
+def test_bf16_query_matches_its_f32_upcast(layout):
+    """A bf16 query over bf16 pages scores in one bf16 MXU pass with f32 accumulation (exact products): the ids equal
+    those of the same query upcast to f32 (HIGHEST) and of XLA, in 8-row blocks of mixed rows and in 64-row blocks."""
+    k = 512
+    args, ref = _packed_rows(9, _PACKED_STEPS[layout], num_seqs=15)
+    q16 = args[0].astype(jnp.bfloat16)
+    bf16_args = (q16, *args[1:])
+    f32_args = (q16.astype(jnp.float32), *args[1:])
+    scale = D**-0.5
+    got = _run("pallas", bf16_args, k, scale)
+    np.testing.assert_array_equal(got, _run("pallas", f32_args, k, scale))
+    np.testing.assert_array_equal(got, _run("xla", bf16_args, k, scale))
+    _check_rows(got, (np.asarray(f32_args[0]), *ref[1:]), np.asarray(args[4]), k, scale)
+
+
+@pytest.mark.parametrize("heads", [4, 8])
+def test_bf16_query_with_fewer_heads_than_a_bf16_tile(heads):
+    """A bf16 query whose heads do not fill a bf16 sublane tile (16) scores every row on its own (no page-shared
+    block): its ids equal those of the same query upcast to f32, of XLA, and the float64 reference's top k."""
+    k = 512
+    args, ref = _packed_rows(10, _PACKED_STEPS["rows45"], num_seqs=15, heads=heads)
+    q16 = args[0].astype(jnp.bfloat16)
+    bf16_args = (q16, *args[1:])
+    f32_args = (q16.astype(jnp.float32), *args[1:])
+    scale = D**-0.5
+    got = _run("pallas", bf16_args, k, scale)
+    np.testing.assert_array_equal(got, _run("pallas", f32_args, k, scale))
+    np.testing.assert_array_equal(got, _run("xla", bf16_args, k, scale))
+    _check_rows(got, (np.asarray(f32_args[0]), *ref[1:]), np.asarray(args[4]), k, scale)
 
 
 @pytest.mark.parametrize("one_sequence", [True, False])

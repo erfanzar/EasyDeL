@@ -26,7 +26,8 @@ context, never ``max_model_len``).
 
 Blocks. A program takes a block of consecutive rows, a multiple of 8 so every key tile is
 ``(8, 128)``: 8 rows for small calls (decode), doubled up to ``_MAX_BLOCK_ROWS`` while the grid
-keeps at least ``_MIN_BLOCKS`` programs. Programs alternate between the two halves of the grid
+keeps at least ``_MIN_BLOCKS`` programs and the block's VMEM stays within
+``_BLOCK_VMEM_BUDGET_BYTES`` (long page tables keep 8 rows). Programs alternate between the two halves of the grid
 (even blocks first, then odd ones), which a megacore chip runs on its two TensorCores, so rows
 whose context grows along the batch split evenly between the cores.
 
@@ -34,7 +35,9 @@ Scoring. When every scorable row of a block reads one sequence (prefill: consecu
 one prompt), each 128-pool chunk of that sequence is fetched once and scored for all rows in one
 ``[rows * H, D] x [D, 128]`` matmul. Otherwise (decode rows, a prompt boundary inside the block)
 every row fetches its own pages and runs its own matmul. Both paths apply the same per-row
-operations to each row's ``[H, 128]`` products.
+operations to each row's ``[H, 128]`` products. f32 queries score in f32 at the given precision;
+bf16 queries over bf16 pages score in one bf16 MXU pass with f32 accumulation, whose products
+are exact, as an f32 HIGHEST matmul of the upcast values gives them.
 
 Selection. Scores are written as order-preserving ``int32`` keys into VMEM. The exact k-th key
 ``tau`` is found by MSB-first bisection over the scored chunks; the chunks after them, up to a
@@ -42,7 +45,9 @@ multiple of ``_FILL_CHUNKS``, hold ``INT32_MIN``, which no bisection count inclu
 are compacted in ascending pool order, ``_COMPACT_CHUNKS`` chunks per loop step. When no row
 has to cut its keys equal to ``tau`` (the usual case) compaction keeps every key ``>= tau``;
 otherwise it ranks the ties and keeps the lowest ids, as ``_pallas/tpu/topk`` does. Rows with
-no scorable pool (padding) are settled before the bisection: their output is all ``-1``.
+no scorable pool (padding) are settled before the bisection: their output is all ``-1``. A block
+whose scored chunks hold fewer than ``k`` keys (short rows, such as decode at short context) skips
+the bisection: it would end at ``INT32_MIN`` and keep every scored key.
 """
 
 from __future__ import annotations
@@ -59,18 +64,38 @@ from ..topk._pallas_impl_fwd import _monotone_key, _prefix_sum_lanes
 _LANES = 128
 _INT_MIN = -(2**31)
 _TILE_ROWS = 8
-_MAX_BLOCK_ROWS = 32
+_MAX_BLOCK_ROWS = 64
 _MIN_BLOCKS = 8
 _FILL_CHUNKS = 8
 _COUNT_VREGS = 16
 _COMPACT_CHUNKS = 2
 _VMEM_LIMIT_BYTES = 96 * 1024 * 1024
+# VMEM a block may use for its rows (keys, page buffers, pipelined query / weight / output rows); larger blocks are
+# halved until they fit, down to 8 rows.
+_BLOCK_VMEM_BUDGET_BYTES = 48 * 1024 * 1024
 
 
-def _block_rows(total: int) -> int:
-    """Rows per program: 8, doubled up to ``_MAX_BLOCK_ROWS`` while the grid keeps ``_MIN_BLOCKS`` programs."""
+def _key_width(pages_per_seq: int, pools_per_page: int) -> int:
+    """Key scratch columns: the longest row's pools, rounded up to ``_FILL_CHUNKS`` chunks of 128."""
+    span = _FILL_CHUNKS * _LANES
+    return -(-(pages_per_seq * pools_per_page) // span) * span
+
+
+def _row_vmem_bytes(heads: int, dim: int, q_itemsize: int, page_itemsize: int, key_width: int, k: int) -> int:
+    """VMEM one row of a block needs: its keys, its two page slots and its double-buffered query, weights and ids."""
+    k_pad = -(-k // _LANES) * _LANES
+    return 4 * key_width + 2 * _LANES * dim * page_itemsize + 2 * heads * (dim * q_itemsize + _LANES * 4) + 8 * k_pad
+
+
+def _block_rows(total: int, row_bytes: int = 0) -> int:
+    """Rows per program: 8, doubled up to ``_MAX_BLOCK_ROWS`` while the grid keeps ``_MIN_BLOCKS`` programs and the
+    block's VMEM (``row_bytes`` per row) stays within ``_BLOCK_VMEM_BUDGET_BYTES``."""
     rows = _TILE_ROWS
-    while rows < _MAX_BLOCK_ROWS and -(-int(total) // (2 * rows)) >= _MIN_BLOCKS:
+    while (
+        rows < _MAX_BLOCK_ROWS
+        and -(-int(total) // (2 * rows)) >= _MIN_BLOCKS
+        and 2 * rows * int(row_bytes) <= _BLOCK_VMEM_BUDGET_BYTES
+    ):
         rows *= 2
     return rows
 
@@ -82,7 +107,10 @@ def _num_blocks(total: int, rows: int) -> int:
 
 
 def padded_rows(total: int) -> int:
-    """Rows the kernel runs (and scalar-prefetches) for ``total`` query rows."""
+    """Upper bound on the rows the kernel runs (and scalar-prefetches) for ``total`` query rows.
+
+    Exact unless the VMEM budget shrinks the blocks, which only lowers the padded row count.
+    """
     rows = _block_rows(total)
     return _num_blocks(total, rows) * rows
 
@@ -119,6 +147,7 @@ def _kernel(
     precision,
     can_share: bool,
     compact_chunks: int,
+    low: bool,
 ):
     rows, heads, dim = q_ref.shape
     base = _block_of(pl.program_id(0), num_blocks) * rows
@@ -164,9 +193,24 @@ def _kernel(
         return pl.ds(pl.multiple_of(c * _LANES, _LANES), _LANES)
 
     def products(qq, slot, r):
-        kk = kbuf[slot, r].reshape(group * pools_per_page, dim).astype(jnp.float32)  # [128, D]
+        kk = kbuf[slot, r].reshape(group * pools_per_page, dim)  # [128, D]
+        if low:
+            # bf16 queries over bf16 pages: one MXU pass with f32 accumulation; every product is exact. The precision
+            # is explicit: an ambient higher default (jax.default_matmul_precision) would ask Mosaic for a multi-pass
+            # f32 contraction, which it rejects for bf16 operands.
+            return jax.lax.dot_general(
+                qq,
+                kk,
+                (((1,), (1,)), ((), ())),
+                precision=jax.lax.Precision.DEFAULT,
+                preferred_element_type=jnp.float32,
+            )
         return jax.lax.dot_general(
-            qq, kk, (((1,), (1,)), ((), ())), precision=precision, preferred_element_type=jnp.float32
+            qq.astype(jnp.float32),
+            kk.astype(jnp.float32),
+            (((1,), (1,)), ((), ())),
+            precision=precision,
+            preferred_element_type=jnp.float32,
         )
 
     def head_sum(r, s):
@@ -177,11 +221,11 @@ def _kernel(
         return jnp.sum(s * w_ref[r].astype(jnp.float32), axis=0, keepdims=True)
 
     def sums_shared(slot):
-        s = products(q_ref[...].reshape(rows * heads, dim).astype(jnp.float32), slot, 0)  # [rows * H, 128]
+        s = products(q_ref[...].reshape(rows * heads, dim), slot, 0)  # [rows * H, 128]
         return [head_sum(r, s[r * heads : (r + 1) * heads]) for r in range(rows)]
 
     def sums_rows(slot):
-        return [head_sum(r, products(q_ref[r].astype(jnp.float32), slot, r)) for r in range(rows)]
+        return [head_sum(r, products(q_ref[r], slot, r)) for r in range(rows)]
 
     def score(issue, sums):
         @pl.when(n_steps > 0)
@@ -249,7 +293,10 @@ def _kernel(
         return (bit < 32) & (jnp.min(done) == 0)
 
     empty = npool_lane[:, :1] == 0  # [rows, 1]: output all -1 whatever tau is
-    init = (jnp.int32(0), jnp.zeros((rows, 1), jnp.int32), empty.astype(jnp.int32))
+    # A block whose scored chunks hold fewer than k keys (short rows, such as decode at short context) has fewer than
+    # k keys above INT32_MIN, so no candidate is ever accepted and the bisection would end at tau = INT32_MIN: skip it.
+    settled = empty | (n_steps * _LANES < k)
+    init = (jnp.int32(0), jnp.zeros((rows, 1), jnp.int32), settled.astype(jnp.int32))
     _, biased, _ = jax.lax.while_loop(unfinished, bisect, init)
     tau = biased ^ jnp.int32(_INT_MIN)
     need = k - count(lambda kc: kc > tau)
@@ -348,7 +395,7 @@ def _paged_pool_topk_call(
     num_seqs, pages_per_seq = block_tables.shape
     k_pad = -(-k // _LANES) * _LANES
     max_pools = -(-(pages_per_seq * pools_per_page) // _LANES) * _LANES
-    key_width = -(-max_pools // (_FILL_CHUNKS * _LANES)) * (_FILL_CHUNKS * _LANES)
+    key_width = _key_width(pages_per_seq, pools_per_page)
     num_blocks = _num_blocks(total, block_rows)
     t_pad = num_blocks * block_rows
     pad = t_pad - total
@@ -373,6 +420,7 @@ def _paged_pool_topk_call(
         # One [rows * H, D] query tile per program needs H on whole sublane tiles of the query dtype.
         can_share=heads % (8 * 4 // jnp.dtype(query.dtype).itemsize) == 0,
         compact_chunks=int(compact_chunks),
+        low=jnp.dtype(query.dtype) == jnp.bfloat16 and jnp.dtype(pool_pages.dtype) == jnp.bfloat16,
     )
 
     def rows_map(b, *_):
@@ -428,12 +476,23 @@ def paged_pool_topk_pallas(
         k: Pools kept per row (static).
         sm_scale: Score scale before the activation.
         relu: Apply ``relu`` per head before weighting.
-        precision: Matmul precision for scoring.
+        precision: Matmul precision for f32 scoring. A bf16 query over bf16 pages scores in one
+            bf16 MXU pass with f32 accumulation instead (exact products, as HIGHEST gives for
+            the upcast values).
 
     Returns:
         ``[T, k]`` int32 pool ids in ascending order, ``-1``-padded when a row has fewer
         than ``k`` pools. The set equals ``jax.lax.top_k`` over the row's scores.
     """
+    _, heads, dim = query.shape
+    row_bytes = _row_vmem_bytes(
+        heads,
+        dim,
+        jnp.dtype(query.dtype).itemsize,
+        jnp.dtype(pool_pages.dtype).itemsize,
+        _key_width(int(block_tables.shape[1]), int(pool_pages.shape[1])),
+        int(k),
+    )
     return _paged_pool_topk_call(
         query,
         head_weights,
@@ -445,7 +504,7 @@ def paged_pool_topk_pallas(
         sm_scale=sm_scale,
         relu=relu,
         precision=precision,
-        block_rows=_block_rows(query.shape[0]),
+        block_rows=_block_rows(query.shape[0], row_bytes),
         compact_chunks=_COMPACT_CHUNKS,
     )
 
