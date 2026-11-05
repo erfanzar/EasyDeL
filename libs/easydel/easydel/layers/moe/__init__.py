@@ -199,7 +199,7 @@ from ._expert_stats import (
     shard_active_experts,
     shard_loads,
 )
-from ._layout_planner import MoeLayoutEstimate, estimate_moe_layout, validate_moe_layout
+from ._layout_planner import MoeLayoutEstimate, auto_moe_chunk_size, estimate_moe_layout, validate_moe_layout
 from ._moe_module import BaseMoeModule
 from ._routing import fp32_router_logits, moe_group_topk_select, normalize_topk_weights
 
@@ -214,6 +214,7 @@ __all__ = (
     "MoeMetrics",
     "MoeRoutingStrategy",
     "active_expert_load_recorder",
+    "auto_moe_chunk_size",
     "balancedness",
     "estimate_moe_layout",
     "fp32_router_logits",

@@ -894,6 +894,7 @@ def _chunk_kda_per_channel_fused(
     precision: str = "highest",
     cfg: KdaChunkConfig | None = None,
     decay_lower_bound: float | None = None,
+    fallback_to_scan: bool = False,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
@@ -902,8 +903,10 @@ def _chunk_kda_per_channel_fused(
 
     Same contract as :func:`_chunk_kda_per_channel_fwd` (packed ``segment_ids`` with negative padding,
     ``continue_initial_state``). The Mosaic kernel cannot be SPMD-partitioned, so on TPU it runs directly on one
-    device, under ``shard_map`` over ``kernel_lead_specs = (batch_axes, head_axes)`` on a multi-device mesh, or
-    falls back to the ejkernel XLA implementation when neither is safe (see :func:`run_mosaic_kernel`).
+    device or under ``shard_map`` over ``kernel_lead_specs = (batch_axes, head_axes)`` on a multi-device mesh. Where
+    neither is safe (see :func:`run_mosaic_kernel`) it runs the ejkernel XLA implementation with a warning, as it
+    does without a warning on other backends; with ``fallback_to_scan`` both cases run
+    :func:`_chunk_kda_per_channel_fwd` instead.
 
     Args:
         query: ``(batch, num_heads, seq_len, head_dim)``.
@@ -923,6 +926,8 @@ def _chunk_kda_per_channel_fused(
         decay_lower_bound: Promise that every log-decay ``decay >= decay_lower_bound`` (a safe-gate bound). It lets
             the kernel factor the pairwise decay into MXU matmuls instead of a ``[cs, cs, K]`` VPU tensor
             (``cfg.pairwise="dense"`` opts out); ``None`` keeps the dense form.
+        fallback_to_scan: Run :func:`_chunk_kda_per_channel_fwd` where the Pallas kernel cannot run (set for the
+            automatic ``kda_chunk_impl``).
 
     Returns:
         tuple: ``(outputs, final_state)`` float32.
@@ -950,10 +955,28 @@ def _chunk_kda_per_channel_fused(
             cfg=cfg,
         )
 
+    def scan():
+        return _chunk_kda_per_channel_fwd(
+            query=query,
+            key=key,
+            value=value,
+            beta=beta,
+            decay=decay,
+            chunk_size=chunk_size,
+            initial_state=initial_state,
+            use_qk_l2norm=use_qk_l2norm,
+            segment_ids=segment_ids,
+            kernel_mesh=kernel_mesh,
+            kernel_lead_specs=kernel_lead_specs,
+            continue_initial_state=continue_initial_state,
+        )
+
     if jax.default_backend() != "tpu":
-        return call(*args, platform="xla")
+        return scan() if fallback_to_scan else call(*args, platform="xla")
 
     def fallback(reason):
+        if fallback_to_scan:
+            return scan()
         logger.warning_once(f"kda_chunk: {reason}; using the XLA implementation.")
         return call(*args, platform="xla")
 
@@ -1767,6 +1790,7 @@ class KernelDeltaAttnOp(OperationImpl):
         chunk_impl: str = "scan",
         chunk_precision: str = "highest",
         decay_lower_bound: float | None = None,
+        fallback_to_scan: bool = False,
         **kwargs,
     ) -> KDAOutput:
         """Forward pass for KDA attention.
@@ -1805,6 +1829,9 @@ class KernelDeltaAttnOp(OperationImpl):
                 lets the kernel factor the pairwise decay into MXU matmuls (see ejkernel
                 ``KdaChunkConfig.pairwise``); ``None`` keeps the dense form. Other paths
                 ignore it (they are exact for any decay).
+            fallback_to_scan: On the ``"kda_chunk"`` path, run the ``"scan"`` implementation where the Pallas
+                kernel cannot run (another backend, or a mesh layout it cannot be partitioned over) instead of
+                ejkernel's XLA ``kda_chunk``, and without a warning. Set for the automatic ``kda_chunk_impl``.
             **kwargs: Additional ignored arguments
 
         Returns:
@@ -1918,6 +1945,7 @@ class KernelDeltaAttnOp(OperationImpl):
                         extra["precision"] = chunk_precision
                         extra["cfg"] = self.metadata.get_operation_config("kda_chunk")
                         extra["decay_lower_bound"] = decay_lower_bound
+                        extra["fallback_to_scan"] = fallback_to_scan
                     if shardings is not None and mesh is not None:
 
                         def _eff(axes):
@@ -2012,6 +2040,7 @@ class KernelDeltaAttnOp(OperationImpl):
         chunk_impl: str = "scan",
         chunk_precision: str = "highest",
         decay_lower_bound: float | None = None,
+        fallback_to_scan: bool = False,
         **kwargs,
     ) -> KDAOutput:
         """Execute the KDA operation.
@@ -2040,6 +2069,7 @@ class KernelDeltaAttnOp(OperationImpl):
             chunk_impl: ``"scan"`` (default) or ``"kda_chunk"``; see :meth:`forward_native`.
             chunk_precision: ``"highest"`` (default) or ``"default"``; see :meth:`forward_native`.
             decay_lower_bound: Promised log-decay lower bound or ``None``; see :meth:`forward_native`.
+            fallback_to_scan: See :meth:`forward_native`.
             **kwargs: Additional arguments
 
         Returns:
@@ -2062,5 +2092,6 @@ class KernelDeltaAttnOp(OperationImpl):
             chunk_impl=chunk_impl,
             chunk_precision=chunk_precision,
             decay_lower_bound=decay_lower_bound,
+            fallback_to_scan=fallback_to_scan,
             **kwargs,
         )

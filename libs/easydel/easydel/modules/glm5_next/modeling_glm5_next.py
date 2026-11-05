@@ -99,6 +99,7 @@ from easydel.layers.indexer import (
     IndexerConfig,
     IndexerKind,
     SparseIndexer,
+    resolve_index_scoring_kernel,
 )
 from easydel.layers.linear_attention import KernelDeltaAttention, unnest_legacy_kda_forget_gate
 from easydel.layers.moe import fp32_router_logits, moe_group_topk_select
@@ -784,7 +785,7 @@ class Glm5NextIndexer(SparseIndexer):
                 kpool_size=config.index_kpool,
                 select_tail=config.index_kpool_always_select_tail,
                 initializer_range=config.initializer_range,
-                scoring_kernel=config.index_scoring_kernel,
+                scoring_kernel=resolve_index_scoring_kernel(config.index_scoring_kernel),
             ),
             layer_idx=layer_idx,
             dtype=dtype,

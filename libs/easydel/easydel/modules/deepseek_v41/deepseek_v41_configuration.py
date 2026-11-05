@@ -108,7 +108,7 @@ _TEXT_DEFAULTS: dict[str, tp.Any] = {
     "image_token_id": 129264,
     # Read by the reused DeepSeek-V4 MoE / expert / hyper-connection modules.
     "mlp_bias": False,
-    "hc_use_fused_coefficients": False,
+    "hc_use_fused_coefficients": None,
     "mlp_layer_types": None,
 }
 

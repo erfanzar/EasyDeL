@@ -245,11 +245,19 @@ def test_fused_coefficients_flag_reaches_adapter_and_preserves_math_and_leaves(f
     assert layouts[True] == layouts[False]
 
 
-def test_fused_coefficients_flag_defaults_off():
+@pytest.mark.cpu_ok
+def test_fused_coefficients_default_follows_the_backend():
+    """``hc_use_fused_coefficients=None`` (the default) takes the packed kernels on TPU only; a bool is kept."""
+    from easydel.layers.residual import ManifoldHyperConnectionConfig
     from easydel.modules.deepseek_v4.deepseek_v4_configuration import DeepseekV4Config
 
-    assert Glm5NextTextConfig(hidden_size=5).hc_use_fused_coefficients is False
-    assert DeepseekV4Config(hidden_size=5).hc_use_fused_coefficients is False
+    for config_type in (Glm5NextTextConfig, DeepseekV4Config):
+        assert config_type(hidden_size=5).hc_use_fused_coefficients is None
+        resolved = ManifoldHyperConnectionConfig.from_model_config(config_type(hidden_size=5))
+        assert resolved.use_fused_coefficients is (jax.default_backend() == "tpu")
+        for value in (False, True):
+            config = config_type(hidden_size=5, hc_use_fused_coefficients=value)
+            assert ManifoldHyperConnectionConfig.from_model_config(config).use_fused_coefficients is value
 
 
 @pytest.mark.parametrize("fused", [False, True])

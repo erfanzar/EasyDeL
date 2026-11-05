@@ -98,7 +98,7 @@ from ._communication_utils import (
     unpermute,
 )
 from ._expert_stats import maybe_record_group_sizes
-from ._layout_planner import ep_carries_batch_inactive_reason, validate_moe_layout
+from ._layout_planner import auto_moe_chunk_size, ep_carries_batch_inactive_reason, validate_moe_layout
 
 if typing.TYPE_CHECKING:
     from easydel.infra.base_config import EasyDeLBaseConfig
@@ -483,13 +483,16 @@ def resolve_moe_defer_tp_reduce(
     """Whether the fused MoE reduces over TP after the top-k combine (``moe_defer_tp_reduce``) on ``path``.
 
     ``True`` turns the deferral on wherever ``path``'s preconditions hold and warns once, naming ``blockers``, where
-    they do not. ``False`` keeps it off (the escape hatch). ``None`` is automatic: on only for the inference-mode
-    single-pass dispatch with tokens replicated over an expert axis (``path="replicated"`` with ``ep_size > 1``; its
-    ``blockers`` include "not in inference mode"), silently off everywhere else. That covers training, which never
-    runs in inference mode; the chunked dispatch, which training uses, so ``None`` keeps it off exactly as ``False``
-    does; and ``ep_size == 1``, where the deferred dispatch measured neutral (0.98-1.00x per W8A8 GLM-5.3 layer at
-    ep1 x tp4). With an expert axis it measured 1.2-1.6x per W8A8 GLM-5.3-Flash layer (hidden 4096, 288 experts
-    top-8) on TPU v5p at ep4 x tp1 and ep2 x tp2.
+    they do not. ``False`` keeps it off (the escape hatch). ``None`` is automatic and silent: on TPU the chunked
+    dispatch defers wherever its preconditions hold, and the inference-mode single-pass dispatch with tokens
+    replicated over an expert axis defers when that axis has more than one device (``path="replicated"`` with
+    ``ep_size > 1``; its ``blockers`` include "not in inference mode", so training never takes it).
+
+    Measured on TPU v5p. Chunked dispatch, GLM-5.3-Flash training on 16 sequences of 131072 tokens with 4-way tensor
+    parallelism: the 45-layer grad step took 48.66 s deferred against 50.95 s, and at 12 layers the cross-entropy
+    gradient norm moved by 0.01%, inside the 0.013% between two identical runs. Replicated dispatch, per W8A8
+    GLM-5.3-Flash layer (hidden 4096, 288 experts top-8): 1.2-1.6x at ep4 x tp1 and ep2 x tp2, neutral (0.98-1.00x)
+    at ep1 x tp4.
 
     Args:
         setting: The config value: ``True``, ``False`` or ``None`` (automatic).
@@ -501,7 +504,9 @@ def resolve_moe_defer_tp_reduce(
         Whether ``path`` defers its TP reduction.
     """
     if setting is None:
-        return path == "replicated" and ep_size > 1 and not blockers
+        if path == "chunked":
+            return not blockers and jax.default_backend() == "tpu"
+        return not blockers and ep_size > 1
     if not bool(setting):
         return False
     if blockers:
@@ -2039,13 +2044,12 @@ class BaseMoeModule(spx.Module, ABC):
                 f"dropped from compute."
             )
 
-        moe_chunk_size = getattr(self.config, "moe_chunk_size", None)
-        if moe_chunk_size is not None:
-            moe_chunk_size = int(moe_chunk_size)
-            if moe_chunk_size <= 0:
-                raise ValueError(f"`moe_chunk_size` must be a positive integer, got {moe_chunk_size}.")
-        # Pallas TPU row gathers for the dispatch/combine (permute/unpermute warn once where they cannot apply).
-        row_gather_kernel = bool(getattr(self.config, "moe_row_gather_kernel", False))
+        chunk_setting = getattr(self.config, "moe_chunk_size", None)
+        if chunk_setting is not None and int(chunk_setting) < 0:
+            raise ValueError(f"`moe_chunk_size` must be a non-negative integer, got {chunk_setting}.")
+        # Pallas TPU row gathers for the dispatch/combine: permute / unpermute use them where they apply under ``None``
+        # (the default) and ``True``, and under ``True`` warn once where they do not.
+        row_gather_kernel = getattr(self.config, "moe_row_gather_kernel", None)
 
         # ZeRO-3-style expert weights (moe_fsdp_shard_expert_weights): fsdp-sharded
         # at rest, all-gathered over the fsdp axis inside the shard_map right
@@ -2166,9 +2170,35 @@ class BaseMoeModule(spx.Module, ABC):
                 )
                 ep_carries_batch = False
 
+        # Token chunks of the dispatch (``moe_chunk_size``): ``0`` is a single pass. ``None`` sizes the chunks from this
+        # shard's dispatch buffer (``auto_moe_chunk_size``) on TPU, on the regular dispatch outside inference mode.
+        if chunk_setting is not None:
+            moe_chunk_size = int(chunk_setting) or None
+        elif (
+            use_local_expert_ffn
+            or ep_carries_batch
+            or is_inference_mode()
+            or inference_mode_forces_decode()
+            or jax.default_backend() != "tpu"
+        ):
+            moe_chunk_size = None
+        else:
+            mesh_sizes = dict(expert_mesh.jax_mesh.shape)
+            shard_ways = 1
+            for axis_name in self._moe_batch_axis_names(expert_mesh, dp_axis_name, ep_carries_batch=False):
+                shard_ways *= int(mesh_sizes.get(axis_name, 1))
+            # Under the ring of experts every expert shard holds this same share of the tokens.
+            dispatch_tokens = -(-int(_BS) // shard_ways) * int(_SQLN)
+            moe_chunk_size = auto_moe_chunk_size(
+                dispatch_tokens,
+                num_experts_per_tok=self.num_experts_per_tok,
+                hidden_size=HD,
+                dtype_bytes=jnp.dtype(self.dtype).itemsize,
+            )
+
         # Deferred tp reduce (``moe_defer_tp_reduce``), decided by ``resolve_moe_defer_tp_reduce``: under inference
         # mode the single-pass non-ring dispatch switches to ``_replicated_deferred_dispatch`` (``True``, or automatic
-        # with an expert axis); the chunked non-ring ep=1 dispatch defers inside its scan (``True`` only).
+        # with an expert axis); the chunked non-ring ep=1 dispatch defers inside its scan (``True`` or automatic).
         defer_setting = getattr(self.config, "moe_defer_tp_reduce", None)
         defer_tp_reduce = False
         replicated_deferred_dispatch = False

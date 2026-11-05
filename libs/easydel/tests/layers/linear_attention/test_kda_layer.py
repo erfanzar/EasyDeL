@@ -123,6 +123,20 @@ def _parameter_dtypes(layer):
     return dtypes
 
 
+@pytest.mark.cpu_ok
+def test_automatic_kda_chunk_impl_takes_the_kernel_only_where_its_tpu_path_runs():
+    from easydel.layers.linear_attention import resolve_kda_chunk_impl
+
+    shapes = dict(head_k_dim=128, head_v_dim=128, chunk_size=64)
+    on_tpu = jax.default_backend() == "tpu"
+    assert resolve_kda_chunk_impl(None, decay_lower_bound=-5.0, **shapes) == ("kda_chunk" if on_tpu else "scan")
+    assert resolve_kda_chunk_impl(None, decay_lower_bound=None, **shapes) == "scan"
+    assert resolve_kda_chunk_impl(None, decay_lower_bound=-5.0, **{**shapes, "head_k_dim": 96}) == "scan"
+    assert resolve_kda_chunk_impl(None, decay_lower_bound=-5.0, **{**shapes, "chunk_size": 48}) == "scan"
+    assert resolve_kda_chunk_impl("scan", decay_lower_bound=-5.0, **shapes) == "scan"
+    assert resolve_kda_chunk_impl("kda_chunk", decay_lower_bound=None, **shapes) == "kda_chunk"
+
+
 def test_kda_chunk_impl_reaches_kimi_linear():
     """Kimi-Linear honours the base-config ``kda_chunk_impl``: the lowered program changes and the output matches."""
     h = _hidden(2, 128)
