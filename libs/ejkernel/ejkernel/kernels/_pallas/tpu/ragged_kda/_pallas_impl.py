@@ -58,7 +58,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array
 
 from ...._xla.kda_chunk._xla_impl import LANES, SUBLANES, chunk_core, l2norm, pairwise_sub_block, resolve_precision
-from ...._xla.ragged_kda._xla_impl import conv_and_short_rows, plan_rows, resolve_inverse, xla_step
+from ...._xla.ragged_kda._xla_impl import conv_and_short_rows, plan_rows, resolve_inverse, short_phase, xla_step
 from ..kda_chunk._pallas_impl_fwd import chunk_cumsum
 from ..ragged_kda_decode._pallas_impl import ragged_kda_decode_pallas
 
@@ -482,19 +482,102 @@ def ragged_kda_pallas(
         num_slots=num_slots,
         short_row_max=int(short_row_max),
     )
+    weights = (q_conv_weight, k_conv_weight, v_conv_weight) if fused else None
+    step_fn = _decode_kernel_step if fused else xla_step
+    pools_in = (q_conv_state, k_conv_state, v_conv_state, recurrent_state)
+
+    def all_rows(pools_in):
+        return _all_rows(
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            weights,
+            pools_in,
+            qsl,
+            plan,
+            short_row_max=int(short_row_max),
+            use_qk_l2norm=use_qk_l2norm,
+            step_fn=step_fn,
+            chunk_size=cs,
+            sub=int(sub),
+            precision=precision,
+            block_h=int(block_h),
+        )
+
+    def short_rows_only(pools_in):
+        out = jnp.zeros((num_tokens, num_heads, v_dim), jnp.float32)
+        out, pools = short_phase(
+            out,
+            pools_in,
+            query=query,
+            key=key,
+            value=value,
+            beta=beta,
+            decay=decay,
+            weights=weights,
+            plan=plan,
+            short_row_max=int(short_row_max),
+            use_qk_l2norm=use_qk_l2norm,
+            step_fn=step_fn,
+        )
+        return (out, *pools)
+
+    if int(short_row_max) > 1 and num_tokens <= num_rows * int(short_row_max):
+        # A step whose rows all have at most W tokens (a speculative verify or decode step) fits a bucket of R * W
+        # tokens. Without a chunk row it runs the short rows alone: no flat conv, chunk tables or chunk kernel.
+        out, q_pool, k_pool, v_pool, new_pool = lax.cond(jnp.any(plan.chunk), all_rows, short_rows_only, pools_in)
+    else:
+        out, q_pool, k_pool, v_pool, new_pool = all_rows(pools_in)
+    if fused:
+        return out, q_pool, k_pool, v_pool, new_pool
+    return out, new_pool
+
+
+def _all_rows(
+    query: Array,
+    key: Array,
+    value: Array,
+    beta: Array,
+    decay: Array,
+    weights: tuple[Array, Array, Array] | None,
+    pools_in: tuple[Array | None, Array | None, Array | None, Array],
+    qsl: Array,
+    plan,
+    *,
+    short_row_max: int,
+    use_qk_l2norm: bool,
+    step_fn,
+    chunk_size: int,
+    sub: int,
+    precision: str,
+    block_h: int,
+) -> tuple[Array | None, ...]:
+    """The flat conv, the short rows and the chunk kernel over the chunk rows' live chunks.
+
+    Returns:
+        ``(out [T, H, V] fp32, q_conv_state, k_conv_state, v_conv_state, recurrent_state)``; the conv pools are
+        ``None`` for post-conv inputs.
+    """
+    num_tokens, num_heads, head_dim = query.shape
+    v_dim = value.shape[-1]
+    cs = int(chunk_size)
+    num_slots = pools_in[3].shape[0]
+    num_rows = qsl.shape[0] - 1
     out, pools, (query, key, value) = conv_and_short_rows(
         query,
         key,
         value,
         beta,
         decay,
-        (q_conv_weight, k_conv_weight, v_conv_weight) if fused else None,
-        (q_conv_state, k_conv_state, v_conv_state, recurrent_state),
+        weights,
+        pools_in,
         qsl,
         plan,
         short_row_max=int(short_row_max),
         use_qk_l2norm=use_qk_l2norm,
-        step_fn=_decode_kernel_step if fused else xla_step,
+        step_fn=step_fn,
     )
     chunk_lens = jnp.where(plan.chunk, plan.lens, 0)
 
@@ -577,9 +660,7 @@ def ragged_kda_pallas(
     )
     multi, flat = _flat_output(chunk_out, qsl, chunk_lens, tables, num_tokens=num_tokens, chunk_size=cs)
     out = jnp.where(multi[:, None, None], flat, out)
-    if fused:
-        return out, pools[0], pools[1], pools[2], new_pool
-    return out, new_pool
+    return out, pools[0], pools[1], pools[2], new_pool
 
 
 __all__ = ("max_live_chunks", "pick_block_h", "ragged_kda_pallas", "supported")
