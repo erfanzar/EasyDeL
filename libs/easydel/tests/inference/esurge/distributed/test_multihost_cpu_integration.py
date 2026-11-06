@@ -173,6 +173,9 @@ def _run_world(num_processes: int, tmp: Path, label: str) -> list[int]:
             "XLA_FLAGS": "--xla_force_host_platform_device_count=1",
         }
     )
+    # The ranks run on CPU, but the accelerator test environment these tests run in sets JAX_PLATFORM_NAME=tpu, and a
+    # CPU-only process that inherits it fails at its first backend query (RuntimeError: Unknown backend tpu).
+    env.pop("JAX_PLATFORM_NAME", None)
     procs = []
     log_paths = []
     log_files = []

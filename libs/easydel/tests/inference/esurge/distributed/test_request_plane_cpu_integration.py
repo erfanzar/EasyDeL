@@ -247,6 +247,11 @@ else:
         json.dump(results, f)
     with open(origin_done_path, "w") as f:
         f.write("done")
+    # Every step is a collective over both processes, and the owner can still be stepping the request aborted above:
+    # its AbortReq may arrive after the owner has sent another step. Stopping this rank's replay loop now would leave
+    # that step waiting on the owner forever. Replay until the owner's terminate() broadcasts Shutdown, as the worker
+    # rank of test_multihost_cpu_integration.py does, and terminate then.
+    engine._worker_replay_thread.join(timeout=600.0)
     engine.terminate()
 
 print(f"rank {process_id} done", flush=True)
@@ -273,6 +278,9 @@ def _run_world(tmp: Path) -> tuple[dict, dict]:
             "XLA_FLAGS": "--xla_force_host_platform_device_count=1",
         }
     )
+    # The ranks run on CPU, but the accelerator test environment these tests run in sets JAX_PLATFORM_NAME=tpu, and a
+    # CPU-only process that inherits it fails at its first backend query (RuntimeError: Unknown backend tpu).
+    env.pop("JAX_PLATFORM_NAME", None)
     procs = []
     log_paths = []
     log_files = []
