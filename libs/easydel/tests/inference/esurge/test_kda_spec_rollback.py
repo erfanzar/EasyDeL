@@ -15,7 +15,7 @@
 """Speculative rollback on KDA (Kimi-style linear attention) caches: greedy parity with plain serving.
 
 A tiny fp32 GLM-5-Next hybrid (3 KDA layers + 1 DSA/MLA layer, HIGHEST precision) is served by the real
-``eSurgeRunner`` + ``Scheduler`` with and without an oracle drafter whose proposals are the plain greedy continuation
+``eSurgeRunner`` + engine core with and without an oracle drafter whose proposals are the plain greedy continuation
 with every 3rd window corrupted. Rejected drafts must leave the KDA short-conv windows and recurrent rows exactly as
 plain decoding would. KDA pools keep speculative candidate rows (decode-exact state after every verify prefix,
 written by ``kda_packed_rows_forward``); the accepted prefix's row is committed into the live row at the next step
@@ -34,11 +34,14 @@ import jax
 import jax.numpy as jnp
 import pytest
 import spectrax as spx
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.speculative import DraftStep
+
+try:
+    from ._common import make_core_for_runner, served_request
+except ImportError:  # standalone `python test_x.py`
+    from _common import make_core_for_runner, served_request
 
 VOCAB = 128
 K = 3
@@ -188,7 +191,7 @@ class _Harness:
             drafter=drafter,
         )
         self.runner.compile(max_num_batched_tokens=64)
-        self.scheduler = Scheduler.from_runner(
+        self.scheduler = make_core_for_runner(
             self.runner,
             max_num_batched_tokens=64,
             enable_prefix_caching=False,
@@ -199,7 +202,7 @@ class _Harness:
     def generate_greedy(self, specs: list[dict]) -> list[list[int]]:
         requests = []
         for spec in specs:
-            req = EngineRequest(
+            req = served_request(
                 request_id=spec["id"],
                 prompt_token_ids=list(spec["prompt_token_ids"]),
                 sampling_params=SamplingParams(max_tokens=int(spec["max_tokens"]), temperature=0.0, ignore_eos=True),
@@ -210,7 +213,7 @@ class _Harness:
         for _ in range(STEP_BUDGET):
             scheduler_output = self.scheduler.schedule()
             output = self.runner.execute_model(scheduler_output)
-            self.scheduler.update_from_output(scheduler_output, output)
+            self.scheduler.commit(scheduler_output, output)
             if all(r.is_finished() for r in requests):
                 break
         else:

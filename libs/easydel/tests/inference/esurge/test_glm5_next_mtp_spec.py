@@ -34,14 +34,17 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.speculative import Qwen3_5MTPDrafter
 from easydel.modules.glm5_next import Glm5NextMTPHead, attach_glm5_next_mtp
 from ejkernel.types import MaskInfo
 from spectrax import common_types
+
+try:
+    from ._common import make_core_for_runner, served_request
+except ImportError:  # standalone `python test_x.py`
+    from _common import make_core_for_runner, served_request
 
 VOCAB = 128
 K = 2
@@ -193,7 +196,7 @@ class _Harness:
             drafter=drafter,
         )
         self.runner.compile(max_num_batched_tokens=64)
-        self.scheduler = Scheduler.from_runner(
+        self.scheduler = make_core_for_runner(
             self.runner,
             max_num_batched_tokens=64,
             enable_prefix_caching=False,
@@ -204,7 +207,7 @@ class _Harness:
     def generate(self, specs):
         requests = []
         for spec in specs:
-            req = EngineRequest(
+            req = served_request(
                 request_id=spec["id"],
                 prompt_token_ids=list(spec["prompt_token_ids"]),
                 sampling_params=SamplingParams(max_tokens=int(spec["max_tokens"]), temperature=0.0, ignore_eos=True),
@@ -214,7 +217,7 @@ class _Harness:
             self.scheduler.add_request(req)
         for _ in range(STEP_BUDGET):
             out = self.runner.execute_model(so := self.scheduler.schedule())
-            self.scheduler.update_from_output(so, out)
+            self.scheduler.commit(so, out)
             if all(r.is_finished() for r in requests):
                 break
         else:

@@ -27,10 +27,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..logger import logger
-from ..request import EngineRequest, EngineRequestStatus
 from .interface import CacheGroupSpec, ChunkedLocalAttentionSpec, FullAttentionSpec, SlidingWindowSpec
 
 _KIND = {FullAttentionSpec: 0, SlidingWindowSpec: 1, ChunkedLocalAttentionSpec: 2}
+
+
+EngineRequest = Any
+"""Any object with the request fields the KV core reads (id, tokens, computed count, sampling params, vision data)."""
 
 
 def request_page_hash_extra_keys(request: EngineRequest) -> tuple[Any, ...] | None:
@@ -46,7 +49,7 @@ def request_page_hash_extra_keys(request: EngineRequest) -> tuple[Any, ...] | No
     return None
 
 
-def _extra_key(request: EngineRequest) -> int:
+def page_hash_extra_key(request: EngineRequest) -> int:
     """The request's multimodal identity as a 128-bit int (0 for text), mixed into every page key."""
     keys = request_page_hash_extra_keys(request)
     if keys is None:
@@ -153,7 +156,7 @@ class CacheManager:
     def _slot(self, request: EngineRequest) -> int:
         slot = self._slots.get(request.request_id)
         if slot is None:
-            slot = self._slots[request.request_id] = self._core.open(_extra_key(request))
+            slot = self._slots[request.request_id] = self._core.open(page_hash_extra_key(request))
         return slot
 
     def _tokens_if_unkeyed(self, slot: int | None, request: EngineRequest) -> list[int] | None:
@@ -198,7 +201,7 @@ class CacheManager:
             return 0
         slot = self._slots.get(request.request_id)
         tokens = self._tokens_if_unkeyed(slot, request)
-        return int(self._core.probe(slot, tokens, _extra_key(request), request.num_tokens - 1))
+        return int(self._core.probe(slot, tokens, page_hash_extra_key(request), request.num_tokens - 1))
 
     def allocate_slots(
         self,
@@ -281,7 +284,6 @@ class CacheManager:
 
     def get_num_common_prefix_pages(self, request: EngineRequest, num_scheduled_requests: int) -> list[int]:
         """Per group, the leading pages of ``request`` that at least ``num_scheduled_requests`` requests hold."""
-        assert request.status == EngineRequestStatus.RUNNING
         return list(self._core.common_prefix(self._slots.get(request.request_id), int(num_scheduled_requests)))
 
     def get_page_ids(self, request_id: str) -> tuple[list[int], ...]:

@@ -120,9 +120,10 @@ fallback.
 `OptimizerFactory` optimizers, compiles a sharded train step, streams batches from the `easydel/data/`
 Pipeline (source → tokenize → mix → pack → load), checkpoints async via TensorStore.
 
-**Serving:** eSurge (`easydel/inference/esurge/`) — continuous-batching scheduler + paged KV cache (page pool and prefix
-cache in surgecore's Rust `KvCore`, PageTable) + compiled bucket runners + OpenAI-compatible FastAPI server with
-tool/reasoning parsers, speculative decoding, multimodal, multi-host ZMQ mode.
+**Serving:** eSurge (`easydel/inference/esurge/`) — continuous-batching scheduler in surgecore's Rust `EngineCore`
+(driven by `engine/core_driver.py`) + paged KV cache (page pool and prefix cache in surgecore's `KvCore`, PageTable) +
+compiled bucket runners + OpenAI-compatible FastAPI server with tool/reasoning parsers, speculative decoding,
+multimodal, multi-host ZMQ mode.
 
 **Pipeline parallelism:** `sharding_axis_dims[0] > 1` (the `pp` axis) makes
 `config.mesh` an MPMD `SpxMesh`; layers get stage assignments (`EasyDeLLayerStackMixin.assign_layer_stage`,

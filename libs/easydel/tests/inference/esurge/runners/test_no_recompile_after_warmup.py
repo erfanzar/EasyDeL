@@ -32,11 +32,14 @@ from __future__ import annotations
 import jax
 import pytest
 import spectrax as spx
-from easydel.inference.esurge.request import EngineRequest
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 from jax import numpy as jnp
 from jax._src import test_util as jtu
+
+try:
+    from .._common import make_core_for_runner, served_request
+except ImportError:  # standalone `python test_x.py`
+    from _common import make_core_for_runner, served_request
 
 try:
     from tests.inference.esurge.runtime_pass._tiny_runtime_common import load_test_tokenizer
@@ -117,14 +120,14 @@ def warm_runner():
 def _drive_generation(runner) -> int:
     """One synchronous greedy generation on the calling thread; returns tokens."""
     runner.reset_state()
-    scheduler = Scheduler.from_runner(
+    scheduler = make_core_for_runner(
         runner,
         enable_prefix_caching=False,
         async_scheduling=False,
         num_draft_tokens=0,
     )
     sampling = SamplingParams(max_tokens=OUTPUT_LEN, temperature=0.0, ignore_eos=True)
-    request = EngineRequest(
+    request = served_request(
         request_id="warmup-0",
         prompt_token_ids=list(range(1, PROMPT_LEN + 1)),
         sampling_params=sampling,
@@ -139,7 +142,7 @@ def _drive_generation(runner) -> int:
                 break
             continue
         model_output = runner.execute_model(scheduler_output)
-        scheduler.update_from_output(scheduler_output, model_output)
+        scheduler.commit(scheduler_output, model_output)
         if request.is_finished():
             break
     assert request.is_finished(), "generation did not finish within the step budget"
@@ -174,13 +177,13 @@ def test_second_generation_is_greedy_deterministic(warm_runner):
 
     def _generate_tokens() -> list[int]:
         runner.reset_state()
-        scheduler = Scheduler.from_runner(
+        scheduler = make_core_for_runner(
             runner,
             enable_prefix_caching=False,
             async_scheduling=False,
             num_draft_tokens=0,
         )
-        request = EngineRequest(
+        request = served_request(
             request_id="det-0",
             prompt_token_ids=list(range(1, PROMPT_LEN + 1)),
             sampling_params=SamplingParams(max_tokens=OUTPUT_LEN, temperature=0.0, ignore_eos=True),
@@ -194,7 +197,7 @@ def test_second_generation_is_greedy_deterministic(warm_runner):
                     break
                 continue
             model_output = runner.execute_model(scheduler_output)
-            scheduler.update_from_output(scheduler_output, model_output)
+            scheduler.commit(scheduler_output, model_output)
             if request.is_finished():
                 break
         assert request.is_finished()

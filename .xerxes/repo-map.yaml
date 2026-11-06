@@ -124,7 +124,7 @@ flows:
     - compiled sharded step (compile_trainer_step) -> data/ Pipeline batches -> async TensorStore checkpoints
     - online-RL variants generate rollouts via eSurge inside the loop (esurge_rollout/, async_grpo)
   inference:
-    - request -> eSurge engine (mixins/io) -> scheduler (continuous batching; paged KV and prefix cache in surgecore KvCore)
+    - request -> eSurge engine (mixins/io) -> surgecore EngineCore (continuous batching; paged KV + prefix cache in KvCore)
     - runner compile-bucketed forward (ragged page attention) -> SamplerExecutor -> stream/generate output
     - server/api_server.py exposes OpenAI-compatible endpoints; tools+reasoning parsers post-process
   pipeline_parallelism:

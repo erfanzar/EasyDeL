@@ -32,7 +32,7 @@ Components:
     eSurgeRuntimeConfig: Runtime and scheduler configuration.
     eSurgeCacheRuntimeConfig: KV cache and paging configuration.
     CacheManager: KV cache allocation and prefix caching (binding of surgecore's Rust KvCore)
-    Scheduler: Request scheduling and batching
+    EngineCoreDriver: Request scheduling through surgecore's Rust EngineCore
     eSurgeRunner: Model execution runner
     eSurge: Main engine interface
 
@@ -42,9 +42,9 @@ Classes:
     eSurgeCacheRuntimeConfig: KV cache and paging configuration.
     RequestOutput: Container for generation results and metrics.
     CompletionOutput: Individual completion within a request.
-    EngineRequest: Internal request tracking object.
-    EngineRequestStatus: Enumeration of request lifecycle states.
-    Scheduler: Request scheduler with batching support.
+    AdmissionRecord: What a request was admitted with (EngineRequest is a removed name).
+    EngineRequestStatus: Removed name kept as a raising placeholder.
+    Scheduler: Removed name kept as a raising placeholder (see EngineCoreDriver).
     SchedulerOutput: Output from scheduler decisions.
     eSurgeRunner: Model execution and forward pass runner.
     CacheManager: KV cache allocation and prefix caching.

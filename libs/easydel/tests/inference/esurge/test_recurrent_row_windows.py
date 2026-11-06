@@ -37,11 +37,14 @@ import pytest
 import spectrax as spx
 from easydel.caching.ragged_page.cache import RaggedPagesCacheConfig
 from easydel.caching.unified_attention.cache import UnifiedAttentionCacheConfig
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.runners.slot_contract import resolve_recurrent_slot_contract
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
+
+try:
+    from ._common import make_core_for_runner, served_request
+except ImportError:  # standalone `python test_x.py`
+    from _common import make_core_for_runner, served_request
 
 VOCAB = 128
 MAX_TOKENS = 12
@@ -182,12 +185,12 @@ def _serve_greedy(model) -> tuple[int, dict[str, list[int]]]:
     runner = _runner(model)
     try:
         runner.compile(max_num_batched_tokens=64)
-        scheduler = Scheduler.from_runner(
+        scheduler = make_core_for_runner(
             runner, max_num_batched_tokens=64, enable_prefix_caching=False, async_scheduling=False, num_draft_tokens=0
         )
         requests = []
         for spec in REQUESTS:
-            request = EngineRequest(
+            request = served_request(
                 request_id=spec["id"],
                 prompt_token_ids=list(spec["prompt_token_ids"]),
                 sampling_params=SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0, ignore_eos=True),
@@ -198,7 +201,7 @@ def _serve_greedy(model) -> tuple[int, dict[str, list[int]]]:
         for _ in range(256):
             scheduler_output = scheduler.schedule()
             output = runner.execute_model(scheduler_output)
-            scheduler.update_from_output(scheduler_output, output)
+            scheduler.commit(scheduler_output, output)
             if all(request.is_finished() for request in requests):
                 break
         else:

@@ -21,10 +21,10 @@ import pytest
 import spectrax as spx
 from easydel.inference.esurge.core.interface import CacheGroupsConfig, CacheGroupSpec, FullAttentionSpec
 from easydel.inference.esurge.engine.admission import RequestAdmission
+from easydel.inference.esurge.engine.core_driver import EngineCoreDriver
 from easydel.inference.esurge.engine.output_pipeline import OutputPipeline
 from easydel.inference.esurge.engine.registry import RequestRecord, RequestRegistry
-from easydel.inference.esurge.request import EngineRequest, EngineRequestStatus
-from easydel.inference.esurge.scheduler.scheduler import Scheduler
+from easydel.inference.esurge.request import AdmissionRecord
 from easydel.inference.evaluations.esurge_eval import eSurgeLMEvalAdapter
 from easydel.inference.parsing import DelegatingParser
 from easydel.inference.reasoning.parsers.qwen3_reasoning_parser import Qwen3ReasoningParser
@@ -880,19 +880,20 @@ def test_scheduler_falls_back_to_model_len_when_batch_token_limit_is_none():
         ],
     )
 
-    scheduler = Scheduler(
-        kv_cache_config=kv_cache_config,
+    scheduler = EngineCoreDriver(
+        kv_cache_groups=kv_cache_config.kv_cache_groups,
         max_num_seqs=4,
         max_num_batched_tokens=None,
         max_model_len=128,
         num_pages=16,
-        page_size=8,
         enable_prefix_caching=False,
     )
-
-    assert scheduler.max_num_scheduled_tokens == 128
-    output = scheduler.schedule()
-    assert output.total_num_scheduled_tokens == 0
+    try:
+        assert scheduler.max_num_scheduled_tokens == 128
+        output = scheduler.schedule()
+        assert output.total_num_scheduled_tokens == 0
+    finally:
+        scheduler.shutdown()
 
 
 def test_scheduler_aborts_empty_prompt_request_instead_of_requeueing():
@@ -912,30 +913,32 @@ def test_scheduler_aborts_empty_prompt_request_instead_of_requeueing():
         ],
     )
 
-    scheduler = Scheduler(
-        kv_cache_config=kv_cache_config,
+    scheduler = EngineCoreDriver(
+        kv_cache_groups=kv_cache_config.kv_cache_groups,
         max_num_seqs=4,
         max_num_batched_tokens=64,
         max_model_len=128,
         num_pages=16,
-        page_size=8,
         enable_prefix_caching=False,
     )
-    request = EngineRequest(
-        request_id="req-empty-prompt",
-        prompt_token_ids=[],
-        sampling_params=SamplingParams(max_tokens=8),
-        eos_token_id=1,
-    )
-    scheduler.add_request(request)
+    try:
+        request = AdmissionRecord(
+            request_id="req-empty-prompt",
+            prompt_token_ids=[],
+            sampling_params=SamplingParams(max_tokens=8),
+            eos_token_id=1,
+        )
+        scheduler.add_requests([request])
 
-    output = scheduler.schedule()
+        output = scheduler.schedule()
 
-    assert output.total_num_scheduled_tokens == 0
-    assert "req-empty-prompt" in output.finished_req_ids
-    assert request.status == EngineRequestStatus.FINISHED_ABORTED
-    assert scheduler.get_num_unfinished_requests() == 0
-    assert "req-empty-prompt" not in scheduler.requests
+        assert output.total_num_scheduled_tokens == 0
+        assert "req-empty-prompt" in output.finished_req_ids
+        assert scheduler.num_running == 0 and scheduler.num_waiting == 0
+        assert not scheduler.is_live("req-empty-prompt")
+        assert scheduler.schedule().finished_req_ids == set()
+    finally:
+        scheduler.shutdown()
 
 
 def test_linear_attention_mask_type_is_accepted():

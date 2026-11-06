@@ -43,16 +43,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.runners.spec.strategy import DrafterSpeculation
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.speculative import DraftStep, Qwen3_5MTPDrafter
 
 try:
+    from ._common import make_core_for_runner, served_request
     from ._common import make_tiny_qwen35 as make_tiny_model
 except ImportError:  # standalone `python test_x.py`
+    from _common import make_core_for_runner, served_request
     from _common import make_tiny_qwen35 as make_tiny_model
 
 _VOCAB = 256
@@ -225,14 +225,14 @@ def _run_generation(model, *, drafter, persist_kv: bool, max_new_tokens: int = 8
             drafter=drafter,
         )
         runner.compile(max_num_batched_tokens=16)
-        scheduler = Scheduler.from_runner(
+        scheduler = make_core_for_runner(
             runner,
             max_num_batched_tokens=16,
             enable_prefix_caching=False,
             async_scheduling=False,
             num_draft_tokens=runner.num_draft_tokens,
         )
-        request = EngineRequest(
+        request = served_request(
             request_id="req-persist-0",
             prompt_token_ids=[3, 1, 4, 1, 5, 9],
             sampling_params=SamplingParams(max_tokens=max_new_tokens, temperature=0.0, ignore_eos=True),
@@ -242,7 +242,7 @@ def _run_generation(model, *, drafter, persist_kv: bool, max_new_tokens: int = 8
         for _ in range(64):
             scheduler_output = scheduler.schedule()
             output = runner.execute_model(scheduler_output)
-            scheduler.update_from_output(scheduler_output, output)
+            scheduler.commit(scheduler_output, output)
             if request.is_finished():
                 break
         else:

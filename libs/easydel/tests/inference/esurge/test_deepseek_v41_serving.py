@@ -14,7 +14,7 @@
 
 """eSurge serving parity for DeepSeek-V4.1 on the shared compressed-window cache (computation test).
 
-Drives the real ``eSurgeRunner`` + ``Scheduler`` (same harness as ``test_deepseek_v4_serving.py``) against a tiny
+Drives the real ``eSurgeRunner`` + engine core (same harness as ``test_deepseek_v4_serving.py``) against a tiny
 fp32 DeepSeek-V4.1 with ratio-2 and ratio-1 layers, cross-layer KV sharing (2 KV sources), index sharing and a
 candidate source. Every engine token must equal the argmax of a teacher-forced stateless forward of that request's
 sequence (the stateless forward is itself pinned to DeepSeek's reference by ``modules/spmd/test_deepseek_v41.py``).
@@ -39,11 +39,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 from easydel.modules.deepseek_v41 import DeepseekV41Config
+
+try:
+    from ._common import make_core_for_runner, served_request
+except ImportError:  # standalone `python test_x.py`
+    from _common import make_core_for_runner, served_request
 
 VOCAB = 256
 MAX_NEW_TOKENS = 16
@@ -128,7 +131,7 @@ class _ServingHarness:
             enable_sampler_metrics=False,
         )
         self.runner.compile(max_num_batched_tokens=64)
-        self.scheduler = Scheduler.from_runner(
+        self.scheduler = make_core_for_runner(
             self.runner,
             max_num_batched_tokens=64,
             enable_prefix_caching=True,  # the compressed-window guard must force this off
@@ -140,7 +143,7 @@ class _ServingHarness:
     def generate_greedy(self, request_specs: list[dict]) -> list[list[int]]:
         requests = []
         for spec in request_specs:
-            req = EngineRequest(
+            req = served_request(
                 request_id=f"req-{self._req_counter}",
                 prompt_token_ids=list(spec["prompt_token_ids"]),
                 sampling_params=SamplingParams(
@@ -154,7 +157,7 @@ class _ServingHarness:
         for _ in range(64 * len(requests)):
             scheduler_output = self.scheduler.schedule()
             output = self.runner.execute_model(scheduler_output)
-            self.scheduler.update_from_output(scheduler_output, output)
+            self.scheduler.commit(scheduler_output, output)
             if all(r.is_finished() for r in requests):
                 break
         else:

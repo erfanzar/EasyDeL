@@ -21,8 +21,6 @@ from easydel.inference.esurge.engine.output_pipeline import OutputPipeline
 from easydel.inference.esurge.engine.registry import RequestRecord, RequestRegistry
 from easydel.inference.esurge.engine_types import EngineCoreOutput, EngineCoreOutputs
 from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput
-from easydel.inference.esurge.request import EngineRequest, EngineRequestStatus
-from easydel.inference.esurge.scheduler.utils import check_stop
 from easydel.inference.parsing import DelegatingParser
 from easydel.inference.reasoning.parsers import DeepSeekR1ReasoningParser
 from easydel.inference.sampling_params import SamplingParams
@@ -120,37 +118,6 @@ class _DummyTokenizer:
     def decode(self, token_ids, skip_special_tokens=False):
         reverse = {v: k for k, v in self._vocab.items()}
         return "".join(reverse.get(i, "") for i in token_ids)
-
-
-def test_check_stop_with_custom_stop_token_id():
-    sampling_params = SamplingParams(max_tokens=16, stop_token_ids=[42], ignore_eos=True)
-    request = EngineRequest(
-        request_id="req-stop-token",
-        prompt_token_ids=[1, 2, 3],
-        sampling_params=sampling_params,
-        eos_token_id=0,
-    )
-    request.status = EngineRequestStatus.RUNNING
-    request.append_output_token_ids(42)
-
-    assert check_stop(request, max_model_len=4096) is True
-    assert request.status == EngineRequestStatus.FINISHED_STOPPED
-    assert request.stop_reason == 42
-
-
-def test_check_stop_ignores_eos_when_ignore_eos_true():
-    sampling_params = SamplingParams(max_tokens=16, stop_token_ids=[2], ignore_eos=True)
-    request = EngineRequest(
-        request_id="req-ignore-eos",
-        prompt_token_ids=[1, 2, 3],
-        sampling_params=sampling_params,
-        eos_token_id=2,
-    )
-    request.status = EngineRequestStatus.RUNNING
-    request.append_output_token_ids(2)
-
-    assert check_stop(request, max_model_len=4096) is False
-    assert request.status == EngineRequestStatus.RUNNING
 
 
 def test_stop_string_policy_trims_on_match():

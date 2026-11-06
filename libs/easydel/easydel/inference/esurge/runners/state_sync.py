@@ -453,7 +453,7 @@ class SequenceStateSync:
     ) -> None:
         """Repair runner-side placeholders after async scheduler output drains.
 
-        AsyncScheduler inserts optimistic placeholders before the runner's
+        The engine core inserts optimistic placeholders before the runner's
         sampled token is host-visible. For PP decode we may launch the next
         step from the previous device token directly, so the CPU repair should
         happen when the previous async handle is drained, not inside the next

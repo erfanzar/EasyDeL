@@ -16,7 +16,7 @@
 
 :class:`EngineLoop` owns the background thread that drives inference
 iterations: drain parser-stop signals, ``schedule()``, execute the model via
-the step coordinator, and apply ``update_from_output``. Two loop shapes are
+the step coordinator, and ``commit()`` the runner output to the engine core. Two loop shapes are
 implemented — :meth:`_run_sync` and :meth:`_run_overlap` (async dispatch with
 deferred drain) — selected by ``overlap_execution`` and the runner's async
 capability. All engine coupling is constructor-injected callables; the
@@ -37,10 +37,10 @@ from easydel.utils import flags
 from ..benchmarking import zero_schedule_needs_update
 from ..distributed.coordinator import LocalCoordinator, StepHandle
 from ..logger import logger
-from ..scheduler.dp_scheduler import DPSchedulerClosed
 
 if typing.TYPE_CHECKING:
-    from ..scheduler import Scheduler, SchedulerOutput
+    from ..scheduler.output import SchedulerOutput
+    from .core_driver import EngineCoreDriver
 
 # Default to fail-fast so benchmark runs don't spin for hours on fatal errors.
 # Set `EASYDEL_MAX_SCHEDULER_ERRORS=10` (or higher) to restore retry behavior.
@@ -56,7 +56,7 @@ class EngineLoop:
     :meth:`request_stop` / :meth:`join`.
 
     Args:
-        scheduler: Live :class:`Scheduler` driving request admission.
+        core: The engine's :class:`EngineCoreDriver` (surgecore ``EngineCore`` plus its plan adapter).
         runner: The engine's :class:`eSurgeRunner`.
         coordinator: Step coordinator; ``None`` falls back to a
             :class:`LocalCoordinator` over ``runner`` at loop start.
@@ -85,7 +85,7 @@ class EngineLoop:
     def __init__(
         self,
         *,
-        scheduler: Scheduler,
+        core: EngineCoreDriver,
         runner,
         coordinator,
         scheduler_lock: threading.RLock,
@@ -101,7 +101,7 @@ class EngineLoop:
         info: typing.Callable[..., None],
         on_stopped: typing.Callable[[], None] | None = None,
     ) -> None:
-        self.scheduler = scheduler
+        self.core = core
         self.runner = runner
         self._coordinator = coordinator
         self._scheduler_lock = scheduler_lock
@@ -117,6 +117,7 @@ class EngineLoop:
         self._info = info
         self._on_stopped = on_stopped
 
+        self._closed_error = getattr(core, "closed_error", ())
         self._running = False
         self._thread: threading.Thread | None = None
 
@@ -154,51 +155,26 @@ class EngineLoop:
             self._thread = None
 
     @staticmethod
-    def _can_prefetch_scheduler_output(scheduler: Scheduler, current: SchedulerOutput) -> bool:
+    def _can_prefetch_scheduler_output(core: EngineCoreDriver, current: SchedulerOutput) -> bool:
         """Decide whether ``schedule()`` can run while ``current`` is still in flight.
 
-        The overlap path may compute the next batch ahead of time only when
-        no decision in that batch depends on the sampled token of the
-        current one. Two situations forbid prefetch and force the
-        dispatcher to wait for ``update_from_output()`` first:
-
-        * The async scheduler has already inserted output placeholders
-          (``num_output_placeholders > 0``) — running ``schedule()`` again
-          before those placeholders are filled would either double-budget
-          the request or generate stale page-table updates.
-        * The request has reached prompt-length parity
-          (``num_computed_tokens >= num_tokens``) — its next decision (e.g.
-          whether to terminate on EOS) depends on the as-yet-unobserved
-          sampled token, so re-entering the scheduler would speculatively
-          extend a request that may finish.
-
-        Returns ``False`` defensively whenever exception handling kicks in
-        (e.g. if the scheduler maps are mutated mid-iteration), trading
-        some throughput for correctness.
+        The overlap path may compute the next batch ahead of time only when no decision in that batch depends on the
+        sampled token of the current one: no scheduled request holds an output placeholder, and none has reached the
+        point (``computed >= tokens``) where its next decision, for example an EOS stop, depends on the sampled
+        token. Returns ``False`` defensively when the check itself fails.
 
         Args:
-            scheduler: Live :class:`Scheduler` instance whose
-                ``requests`` map is queried per request id.
-            current: The :class:`SchedulerOutput` representing the
-                in-flight step.
+            core: The engine's :class:`EngineCoreDriver`.
+            current: The :class:`SchedulerOutput` representing the in-flight step.
 
         Returns:
-            ``True`` iff every request in ``current`` is in the safe
-            "pure prefill, no termination decision yet" state, so the
-            next batch can be assembled now.
+            ``True`` iff every request in ``current`` is in the safe "pure prefill, no termination decision yet"
+            state, so the next batch can be assembled now.
         """
         try:
-            for rid in current.num_scheduled_tokens:
-                req = scheduler.requests.get(rid)
-                if req is None:
-                    continue
-                if getattr(req, "num_output_placeholders", 0) > 0:
-                    return False
-                if req.num_computed_tokens >= req.num_tokens:
-                    return False
+            return bool(core.can_prefetch(current))
         except Exception:
             return False
-        return True
 
     @staticmethod
     def _zero_schedule_needs_update(scheduler_output: SchedulerOutput) -> bool:
@@ -229,12 +205,11 @@ class EngineLoop:
         return hasattr(self.runner, "execute_model_async")
 
     def _drain(self, future, scheduler_output: SchedulerOutput) -> None:
-        """Block on an in-flight async step and apply its outputs to the scheduler.
+        """Block on an in-flight async step and commit its outputs to the engine core.
 
         Used by the overlap loop after dispatching a step via
         :meth:`eSurgeRunner.execute_model_async`. Waits for the host
-        copies of sampled tokens to land, runs the scheduler's
-        ``update_from_output`` on the resulting :class:`ModelRunnerOutput`,
+        copies of sampled tokens to land, ``commit()``s the resulting :class:`ModelRunnerOutput`,
         forwards engine-side outputs (sampled tokens, finished requests)
         to the output pipeline for client delivery, and decrements the
         profiler step counter when an active trace is running.
@@ -245,7 +220,7 @@ class EngineLoop:
                 ``_AsyncExecutionHandle`` or ``concurrent.futures.Future``),
                 possibly wrapped in a :class:`StepHandle`.
             scheduler_output: The :class:`SchedulerOutput` that produced
-                ``future``; needed by ``update_from_output`` to map
+                ``future``; needed by ``commit()`` to map
                 sampled tokens back to the right requests.
         """
         wait_start = time.perf_counter()
@@ -261,7 +236,7 @@ class EngineLoop:
         total_tokens = int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0)
         update_start = time.perf_counter()
         with self._scheduler_lock:
-            engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+            engine_outputs = self.core.commit(scheduler_output, model_output)
         update_time = time.perf_counter() - update_start
         process_start = time.perf_counter()
         self._emit_outputs(engine_outputs)
@@ -285,7 +260,7 @@ class EngineLoop:
         Two implementations, selected by :meth:`_overlap_loop_enabled`:
 
         * **Synchronous loop** (:meth:`_run_sync`) — calls ``schedule()``,
-          executes the model, applies ``update_from_output()``, and
+          executes the model, ``commit()``s the output, and
           forwards engine outputs to the parser worker. Errors are
           absorbed up to ``MAX_CONSECUTIVE_SCHEDULER_ERRORS`` retries;
           some invariant violations (per the injected
@@ -348,23 +323,20 @@ class EngineLoop:
                 prof_phase = prof_loop_t0
                 with self._scheduler_lock:
                     self._drain_parser_stops()
-                    scheduler_output = self.scheduler.schedule()
+                    scheduler_output = self.core.schedule()
                 prof_sched = time.perf_counter() - prof_phase
                 _n = len(scheduler_output.num_scheduled_tokens) if scheduler_output else 0
                 _now = time.time()
-                # ``scheduler.running``/``waiting`` are RPC snapshots under
-                # DPScheduler worker processes: each access pickles a rank's
-                # full EngineRequest list back to the coordinator. Python
-                # evaluates logger arguments eagerly, so this diagnostic must
-                # stay behind an explicit level check or every decode step
-                # pays for a log line that is then discarded.
+                # Python evaluates logger arguments eagerly, so this diagnostic
+                # stays behind an explicit level check: every decode step would
+                # otherwise pay for two core counts in a discarded log line.
                 if _diag_debug and (_n > 0 or (_now - _diag_last_log) > 30):
                     logger.debug(
                         "loop iter=%d sched=%d run=%d wait=%d",
                         _diag_iter,
                         _n,
-                        len(self.scheduler.running),
-                        len(self.scheduler.waiting),
+                        self.core.num_running,
+                        self.core.num_waiting,
                     )
                     _diag_last_log = _now
                 self._heartbeat()
@@ -381,7 +353,7 @@ class EngineLoop:
                 prof_execute = time.perf_counter() - prof_phase
                 prof_phase = time.perf_counter()
                 with self._scheduler_lock:
-                    engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+                    engine_outputs = self.core.commit(scheduler_output, model_output)
                 prof_update = time.perf_counter() - prof_phase
                 prof_phase = time.perf_counter()
                 self._emit_outputs(engine_outputs)
@@ -406,10 +378,10 @@ class EngineLoop:
             except KeyboardInterrupt:
                 self._info("Scheduler loop interrupted by user")
                 break
-            except DPSchedulerClosed:
+            except self._closed_error:
                 # Not a fault: teardown began and the DP rank workers are gone.
                 # Retrying cannot succeed and delays shutdown (see _run_overlap).
-                self._info("Scheduler loop stopping: DP scheduler is shut down")
+                self._info("Scheduler loop stopping: the engine core is shut down")
                 break
             except Exception as e:
                 consecutive_errors += 1
@@ -456,7 +428,7 @@ class EngineLoop:
         def _can_dispatch_next_before_drain(current: SchedulerOutput) -> bool:
             """Whether async decode may launch before draining tokens.
 
-            AsyncScheduler tracks one-step-ahead decode with optimistic
+            The engine core tracks one-step-ahead decode with optimistic
             output placeholders. When the runner says the current step
             is eligible, the next step can be queued before
             host-materializing the previous sampled token; the runner
@@ -482,7 +454,7 @@ class EngineLoop:
             """
             if current.async_scheduling:
                 return False
-            return self._can_prefetch_scheduler_output(self.scheduler, current)
+            return self._can_prefetch_scheduler_output(self.core, current)
 
         def _execute_zero_token_schedule(scheduler_output: SchedulerOutput) -> None:
             """Run a zero-token schedule synchronously through the runner.
@@ -491,14 +463,14 @@ class EngineLoop:
             (e.g. parser-driven termination housekeeping). The
             overlap path falls back to a synchronous
             ``execute_model`` for those so the bookkeeping still
-            passes through ``update_from_output`` and the parser
+            passes through ``commit()`` and the parser
             pipeline without disturbing the async pipeline carry.
             """
             if self._runner_verbose and self._zero_schedule_needs_update(scheduler_output):
                 logger.info("[esurge-loop] executing zero-token scheduler output")
             model_output = coordinator.execute_sync(scheduler_output)
             with self._scheduler_lock:
-                engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+                engine_outputs = self.core.commit(scheduler_output, model_output)
             self._emit_outputs(engine_outputs)
             self._handle_profiling_step()
 
@@ -531,7 +503,7 @@ class EngineLoop:
 
             model_output = coordinator.execute_sync(scheduler_output)
             with self._scheduler_lock:
-                engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+                engine_outputs = self.core.commit(scheduler_output, model_output)
             self._emit_outputs(engine_outputs)
             self._handle_profiling_step()
             return None
@@ -545,7 +517,7 @@ class EngineLoop:
                     if _can_dispatch_next_before_drain(prev_sched_out):
                         with self._scheduler_lock:
                             self._drain_parser_stops()
-                            next_sched_out = self.scheduler.schedule()
+                            next_sched_out = self.core.schedule()
                         self._heartbeat()
 
                         if next_sched_out.total_num_scheduled_tokens > 0:
@@ -591,7 +563,7 @@ class EngineLoop:
                     if prefetched_schedule is None and _can_prefetch_next(prev_sched_out):
                         with self._scheduler_lock:
                             self._drain_parser_stops()
-                            prefetched_schedule = self.scheduler.schedule()
+                            prefetched_schedule = self.core.schedule()
 
                     try:
                         self._drain(future, prev_sched_out)
@@ -614,7 +586,7 @@ class EngineLoop:
                 else:
                     with self._scheduler_lock:
                         self._drain_parser_stops()
-                        scheduler_output = self.scheduler.schedule()
+                        scheduler_output = self.core.schedule()
                 if self._runner_verbose and (
                     scheduler_output.total_num_scheduled_tokens > 0 or self._zero_schedule_needs_update(scheduler_output)
                 ):
@@ -622,8 +594,8 @@ class EngineLoop:
                         "[esurge-loop] scheduled tok=%d reqs=%d running=%d waiting=%d async=%s",
                         int(scheduler_output.total_num_scheduled_tokens or 0),
                         len(scheduler_output.num_scheduled_tokens),
-                        len(self.scheduler.running),
-                        len(self.scheduler.waiting),
+                        self.core.num_running,
+                        self.core.num_waiting,
                         bool(scheduler_output.async_scheduling),
                     )
                 self._heartbeat()
@@ -642,13 +614,13 @@ class EngineLoop:
             except KeyboardInterrupt:
                 self._info("Scheduler loop interrupted by user")
                 break
-            except DPSchedulerClosed:
+            except self._closed_error:
                 # Not a fault: the scheduler's rank workers are gone because
                 # teardown began. Retrying cannot succeed, and the retries are
                 # not free -- five of them delayed a rank past jax.distributed's
                 # shutdown barrier and its peer aborted the job.
                 pending_execution = None
-                self._info("Scheduler loop stopping: DP scheduler is shut down")
+                self._info("Scheduler loop stopping: the engine core is shut down")
                 break
             except Exception as e:
                 pending_execution = None

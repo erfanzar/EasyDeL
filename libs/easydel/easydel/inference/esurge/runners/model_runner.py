@@ -2501,7 +2501,7 @@ class eSurgeRunner:
         CPU sequence state after that step has been queued. It is only
         profitable when the caller is already using the deferred-output path;
         the synchronous async-scheduler loop has already materialized the token
-        for ``scheduler.update_from_output()``, so adding a scatter there just
+        for the engine core's ``commit()``, so adding a scatter there just
         adds work. Keep the gate conservative so correctness-sensitive features
         continue using the old host-repair-before-dispatch path.
         """

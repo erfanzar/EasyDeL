@@ -15,10 +15,10 @@ from easydel.inference.esurge.engine_types import EngineCoreOutput, FinishReason
 from easydel.inference.esurge.esurge_engine import eSurge
 from easydel.inference.esurge.metrics import MetricsCollector
 from easydel.inference.esurge.monitoring import PrometheusMetrics
-from easydel.inference.esurge.scheduler.dp_scheduler import DPSchedulerClosed
 from easydel.inference.sampling_params import SamplingParams
 from easydel.modules.auto import AutoEasyDeLModelForCausalLM
 from easydel.modules.auto.auto_modeling import PreTrainedLoading
+from surgecore import CoreClosed
 
 from tests.inference.esurge.test_admission_scheduling_contracts import NoCacheMediaManager, Tokenizer
 from tests.inference.esurge.test_backend_selection import HostModel
@@ -40,14 +40,14 @@ def test_thread_exit_clears_public_alive_and_wakes_waiters(overlap, failure):
     def schedule():
         if failure == "interrupt":
             raise KeyboardInterrupt()
-        raise DPSchedulerClosed("closed")
+        raise CoreClosed("closed")
 
     def info(*args):
         if failure == "setup":
             raise ValueError("setup failed")
 
     loop = EngineLoop(
-        scheduler=SimpleNamespace(schedule=schedule),
+        core=SimpleNamespace(schedule=schedule, closed_error=CoreClosed, num_running=0, num_waiting=0),
         runner=SimpleNamespace(execute_model_async=lambda *args: None),
         coordinator=SimpleNamespace(check_health=lambda: None, supports_overlap=True),
         scheduler_lock=registry.request_lock,
@@ -258,6 +258,28 @@ def test_metrics_cursor_survives_bounded_history_wraparound_without_recounting()
         exporter.close()
 
 
+class _HostCore:
+    """Array-free engine-core boundary: live admission records by id."""
+
+    num_running = 0
+    num_waiting = 0
+
+    def __init__(self):
+        self.requests = {}
+
+    def record_of(self, request_id):
+        return self.requests.get(request_id)
+
+    def is_live(self, request_id):
+        return request_id in self.requests
+
+    def children_of(self, parent_request_id):
+        return [rid for rid, r in self.requests.items() if r.parent_request_id == parent_request_id]
+
+    def finish_requests(self, ids, reason):
+        return [rid for rid in ids if self.requests.pop(rid, None) is not None]
+
+
 class HostEngine(eSurge):
     """Real admission and consumption with an array-free scheduler boundary."""
 
@@ -276,17 +298,13 @@ class HostEngine(eSurge):
         self._failed_detokenizer_resets = set()
         self._detokenizer_cleanup_threshold = 10
         self.tokenizer = Tokenizer()
-        self.scheduler = SimpleNamespace(requests={}, running=[], waiting=[], finish_requests=self.finish_requests)
+        self.core = _HostCore()
         self._admission = admission(self._registry, self.submit_requests)
         self._multimodal_manager = NoCacheMediaManager()
         self.ready = threading.Event()
 
     def submit_requests(self, requests):
-        self.scheduler.requests.update({request.request_id: request for request in requests})
-
-    def finish_requests(self, ids, status):
-        for rid in ids:
-            self.scheduler.requests.pop(rid, None)
+        self.core.requests.update({request.request_id: request for request in requests})
 
     def _tokenize_prompt(self, request_id, prompt):
         return [77, 88]
@@ -355,7 +373,7 @@ def test_public_stream_abandonment_cancels_and_releases_output_lease(monkeypatch
     stream = engine.stream("hello", request_id="request")
     assert not next(stream).finished
     stream.close()
-    assert not engine.scheduler.requests
+    assert not engine.core.requests
     assert not engine._registry.events
     assert not engine._registry.outputs
     assert not engine._registry.output_is_retained("request")
@@ -378,7 +396,7 @@ def test_public_consumer_start_failure_releases_request_and_output(monkeypatch, 
             next(engine.stream("hello", request_id="request"))
         else:
             engine.chat([{"role": "user", "content": [{"type": "image", "image": object()}]}], request_id="request")
-    assert not engine.scheduler.requests
+    assert not engine.core.requests
     assert not engine._registry.events
     assert not engine._registry.outputs
     assert not engine._registry.output_is_retained("request")

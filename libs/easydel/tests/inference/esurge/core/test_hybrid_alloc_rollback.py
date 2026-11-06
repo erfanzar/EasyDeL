@@ -30,13 +30,13 @@ pre-call state.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax.numpy as jnp
 from easydel.inference.esurge.core.interface import CacheGroupSpec, FullAttentionSpec, SlidingWindowSpec
 from easydel.inference.esurge.core.manager import CacheManager
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.sampling_params import SamplingParams
 
 PAGE_SIZE = 16
@@ -77,12 +77,14 @@ def _manager(enable_caching: bool) -> CacheManager:
     )
 
 
-def _req(rid: str, prompt_len: int) -> EngineRequest:
-    return EngineRequest(
+def _req(rid: str, prompt_len: int) -> SimpleNamespace:
+    """The request fields the KV core reads (id, tokens, computed count, sampling params)."""
+    return SimpleNamespace(
         request_id=rid,
-        prompt_token_ids=list(range(prompt_len)),
+        all_token_ids=list(range(prompt_len)),
+        num_tokens=prompt_len,
+        num_computed_tokens=0,
         sampling_params=SamplingParams(max_tokens=8),
-        eos_token_id=1,
     )
 
 
