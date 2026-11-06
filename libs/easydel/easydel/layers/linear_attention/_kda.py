@@ -59,9 +59,9 @@ from easydel.operations.kernels import (
     KDAOutput,
     KernelDeltaAttnOp,
     fused_kda_gate_per_channel,
-    kda_packed_rows_forward,
     kda_ragged_rows_forward,
     kda_rows_forward,
+    kda_verify_rows_forward,
 )
 from easydel.operations.kernels.ragged_kda_rank_major import kda_ragged_rows_rank_major_forward
 
@@ -323,9 +323,8 @@ class KernelDeltaAttention(spx.Module):
     depthwise convolutions of width ``d_conv``; the output goes through a low-rank sigmoid gate
     (``g_a_proj -> g_b_proj``) inside a gated RMSNorm before ``o_proj``. The recurrence runs in
     :class:`~easydel.operations.kernels.KernelDeltaAttnOp` (chunked for multi-token input, one recurrent step on
-    decode); eSurge packed streams go through :func:`~easydel.operations.kernels.kda_ragged_rows_forward` (the
-    row-padded :func:`~easydel.operations.kernels.kda_packed_rows_forward` when the pool holds speculative candidate
-    rows).
+    decode); eSurge packed streams go through :func:`~easydel.operations.kernels.kda_ragged_rows_forward`, and
+    speculative steps (``W`` slots per request) through :func:`~easydel.operations.kernels.kda_verify_rows_forward`.
 
     State carried in :class:`~easydel.caching.KDACacheView`: the three rolling conv windows and ``S``
     ``(num_heads, head_k_dim, head_v_dim)``.
@@ -355,8 +354,9 @@ class KernelDeltaAttention(spx.Module):
     _spx_scan_safe_static_fields: tp.ClassVar[frozenset[str]] = frozenset({"layer_idx"})
 
     # eSurge (runners/slot_contract.py): row r of every serving step reads and writes pool slot
-    # cache_metadata.recurrent_state_indices[r], so requests keep stable slots across row moves and row windows.
-    esurge_recurrent_slot_contract: tp.ClassVar[str] = "slots"
+    # cache_metadata.recurrent_state_indices[r], so requests keep stable slots across row moves and row windows; with a
+    # drafter every request owns W slots, a row reads slot g + recurrent_read_offset[r] and captures per token.
+    esurge_recurrent_slot_contract: tp.ClassVar[str] = "verify"
 
     def __init__(
         self,
@@ -640,7 +640,7 @@ class KernelDeltaAttention(spx.Module):
         setting, as the layer's other dots do. ``from_pretrained`` builds layers at ``Precision("fastest")``
         (``DEFAULT``), so served checkpoints take the fast dots, while a layer built at ``HIGHEST`` keeps exact ones.
         Training and dense-cache forwards run ``kda_op`` with ``config.kda_chunk_precision`` and never read this;
-        decode-only rows have no chunk dots, and the speculative row-padded driver keeps its own exact dots.
+        decode-only rows have no chunk dots.
 
         Returns:
             ``"highest"`` or ``"default"``.
@@ -700,10 +700,10 @@ class KernelDeltaAttention(spx.Module):
             :class:`AttentionLayerOutput` with the rank-major output and the updated cache view.
 
         Raises:
-            ValueError: For a speculative step (``spec_recurrent_commit`` set), which rank-major DP does not serve.
+            ValueError: For a speculative step (``recurrent_read_offset`` set), which rank-major DP does not serve.
         """
-        if getattr(cache_metadata, "spec_recurrent_commit", None) is not None:
-            raise ValueError("Rank-major SPMD DP does not serve speculative KDA steps (spec_recurrent_commit is set).")
+        if getattr(cache_metadata, "recurrent_read_offset", None) is not None:
+            raise ValueError("Rank-major SPMD DP does not serve speculative KDA steps (recurrent_read_offset is set).")
         out, new_cache_view = kda_ragged_rows_rank_major_forward(
             query=query,
             key=key,
@@ -1138,18 +1138,16 @@ class KernelDeltaAttention(spx.Module):
     ) -> AttentionLayerOutput:
         """Advance per-request KDA state over an eSurge packed token stream ``[1, T, D]``.
 
-        Without speculative candidate rows (``cache_metadata.spec_recurrent_commit`` is ``None``) the conv and the
-        delta rule run on the flat stream in :func:`~easydel.operations.kernels.kda_ragged_rows_forward` (ragged
-        conv1d plus the ``"ragged_kda"`` operation), so the work follows the scheduled token count; the pool may hold
-        more slots than the step has rows. Row ``r`` owns pool slot ``cache_metadata.recurrent_state_indices[r]`` when
-        the metadata carries it (eSurge must ship it when a row window does not start at slot 0: multi-window steps,
-        sparse row packing), else slot ``r``; the row-padded driver always uses slot ``r`` and lays candidate rows out by
-        the step's row count, so speculative pools need single-window, unpacked steps. eSurge allocates
-        ``rows * (1 + C)`` slots for speculative candidate rows and
-        sends the commit metadata exactly then; those steps use the row-padded
-        :func:`~easydel.operations.kernels.kda_packed_rows_forward`, which writes the per-prefix states. The flat
-        driver's non-inverse chunk dots run at :meth:`_serving_chunk_precision`. This method adds the output gate, norm
-        and projection.
+        Without a read offset (``cache_metadata.recurrent_read_offset`` is ``None``) the conv and the delta rule run on
+        the flat stream in :func:`~easydel.operations.kernels.kda_rows_forward` (the fused decode path on decode-only
+        steps, else the ragged conv1d plus the ``"ragged_kda"`` operation), so the work follows the scheduled token
+        count. Row ``r`` owns pool slot ``cache_metadata.recurrent_state_indices[r]`` when the metadata carries it,
+        else slot ``r``. With a drafter eSurge gives every request ``W = recurrent_slot_group_size`` slots
+        ``g .. g + W - 1`` and ships ``recurrent_read_offset``: the step then runs
+        :func:`~easydel.operations.kernels.kda_verify_rows_forward`, which reads slot ``g + offset``, writes the state
+        after every token of a row of at most ``W`` tokens into ``g + j`` and the final state of a longer row into
+        ``g``. The non-inverse chunk dots run at :meth:`_serving_chunk_precision`. This method adds the output gate,
+        norm and projection.
 
         Args:
             hidden_states: Packed layer input ``[1, T, D]``.
@@ -1161,29 +1159,32 @@ class KernelDeltaAttention(spx.Module):
             cache_view: Per-layer KDA cache view (per-request rows).
             query_start_loc: Cumulative segment offsets ``[rows + 1]``.
             gate_low_rank: ``g_a_proj(hidden_states)`` from :meth:`_input_projections`.
-            cache_metadata: Optional KDA metadata (context lengths, speculative commit).
-            split: Head split of the step (``kda_serving_ep_split`` cache views), or ``None``. The flat and decode
-                drivers then run their conv and recurrence on the split's head axes; the row-padded speculative driver
-                leaves the layout to XLA.
+            cache_metadata: Optional KDA metadata (context lengths, slots, read offsets).
+            split: Head split of the step (``kda_serving_ep_split`` cache views), or ``None``. The drivers then run
+                their conv and recurrence on the split's head axes.
 
         Returns:
             :class:`AttentionLayerOutput` with the packed output row and the updated cache view.
 
         Raises:
-            ValueError: If a speculative step (``spec_recurrent_commit`` set) also names explicit pool slots
-                (``recurrent_state_indices``), which the row-padded driver cannot follow.
+            ValueError: If a speculative step (``recurrent_read_offset`` set) names no slot groups
+                (``recurrent_state_indices``).
         """
         conv_kernels = tuple(getattr(self, f"{n}_conv1d").weight.value.squeeze(1).T for n in ("q", "k", "v"))
         conv_dtype = jnp.bfloat16 if self.dtype in lowfloats else self.dtype
         context_lens = getattr(cache_metadata, "context_lens", None)
-        # eSurge sends the commit metadata exactly when the pool holds speculative candidate rows; the pool size alone
-        # cannot tell (it keeps max_num_reqs slots, which may exceed twice the step's row cap without any candidates).
-        spec_recurrent_commit = getattr(cache_metadata, "spec_recurrent_commit", None)
         # Pool slot of every row when eSurge ships them (a row window that does not start at slot 0); None: row r owns
-        # slot r. The row-padded (speculative) driver below cannot use them.
+        # slot r.
         recurrent_state_indices = getattr(cache_metadata, "recurrent_state_indices", None)
+        # Speculative serving: every request owns W slots and the row reads slot g + read_offset.
+        read_offset = getattr(cache_metadata, "recurrent_read_offset", None)
+        if getattr(cache_metadata, "spec_recurrent_commit", None) is not None:
+            raise ValueError(
+                "KDA layers serve speculative steps through slot groups (recurrent_read_offset), not candidate rows "
+                "(spec_recurrent_commit)."
+            )
         chunk_precision = self._serving_chunk_precision()
-        if spec_recurrent_commit is None:
+        if read_offset is None:
             # Decode-only steps (every row <= 1 token) take the fused decode path, other steps the flat driver.
             out_packed, new_cache_view = kda_rows_forward(
                 flat_forward=kda_ragged_rows_forward,
@@ -1206,14 +1207,12 @@ class KernelDeltaAttention(spx.Module):
                 head_axis=None if split is None else split.axes,
             )
         else:
-            if recurrent_state_indices is not None:
+            if recurrent_state_indices is None or context_lens is None:
                 raise ValueError(
-                    "A speculative KDA step (cache_metadata.spec_recurrent_commit is set) runs the row-padded driver, "
-                    "which keeps row r in pool slot r and lays the candidate rows out by the step's row count, so it "
-                    "cannot follow cache_metadata.recurrent_state_indices: run speculative steps as one unpacked row "
-                    "window that starts at slot 0, without explicit slots."
+                    "A speculative KDA step (cache_metadata.recurrent_read_offset is set) needs the rows' slot groups "
+                    "(cache_metadata.recurrent_state_indices) and context_lens."
                 )
-            out_packed, new_cache_view = kda_packed_rows_forward(
+            out_packed, new_cache_view = kda_verify_rows_forward(
                 query=query,
                 key=key,
                 value=value,
@@ -1223,9 +1222,16 @@ class KernelDeltaAttention(spx.Module):
                 cache_view=cache_view,
                 query_start_loc=query_start_loc,
                 context_lens=context_lens,
+                metadata=self.kda_op.get_impl_metadata(),
+                state_indices=recurrent_state_indices,
+                read_offset=read_offset,
+                commit_lens=getattr(cache_metadata, "recurrent_commit_lens", None),
+                short_row_max=int(getattr(cache_metadata, "recurrent_slot_group_size", 1)),
                 conv_dtype=conv_dtype,
                 chunk_size=self.chunk_size,
-                spec_recurrent_commit=spec_recurrent_commit,
+                decay_lower_bound=self.gate_lower_bound,
+                precision=chunk_precision,
+                head_axis=None if split is None else split.axes,
             )
         output = self._gated_output_projection(out_packed, gate_low_rank, hidden_states.dtype, split)
         return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)

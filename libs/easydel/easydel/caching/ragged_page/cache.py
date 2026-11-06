@@ -1586,6 +1586,9 @@ class RaggedPagesMetadata:
     recurrent_state_indices: Int[Array, "..."] | None = None
     recurrent_commit_lens: Int[Array, "..."] | None = None
     recurrent_read_offset: Int[Array, "..."] | None = None
+    # Recurrent slots per request (``W``) of a step that ships ``recurrent_read_offset``; rows of at most ``W`` tokens
+    # capture their state after every token into ``g + j``.
+    recurrent_slot_group_size: int = field(pytree_node=False, default=1)
 
     version: str | tp.Literal["v3", "v2"] = field(pytree_node=False, default="v3")
 

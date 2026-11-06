@@ -19,8 +19,7 @@ slots instead when eSurge's row window does not start at slot 0). Both serving d
 independent float64 reference that runs the causal depthwise conv (SiLU) and the per-channel KDA recurrence token by
 token per request: continuation rows (``context_lens > lens``) start from their carried conv window and recurrent
 state, rows that start a request start from zero, rows without tokens and pool slots past the rows keep their state bit
-for bit, and bucket padding (garbage inputs, as in eSurge) gets zero output. The row-padded driver uses the recurrent
-slot of a row that starts a request as is (eSurge zeroes freed slots), so its cases zero those slots. The conv-window
+for bit, and bucket padding (garbage inputs, as in eSurge) gets zero output. The conv-window
 pools may have another dtype than the stream (an fp8 KV-cache dtype, for example); new windows keep the pool's dtype.
 """
 
@@ -35,7 +34,7 @@ from easydel.caching import KDACacheView
 from easydel.caching.kda.cache import KDACacheConfig
 from easydel.infra.sharding import mesh_axis_size
 from easydel.operations import OperationMetadata
-from easydel.operations.kernels import RaggedKDAOp, kda_packed_rows_forward, kda_ragged_rows_forward
+from easydel.operations.kernels import RaggedKDAOp, kda_ragged_rows_forward
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from spectrax import PartitionAxis
 
@@ -180,15 +179,6 @@ def _run_ragged(
     if serving_layout:
         leaves = _serving_layout(leaves, mesh)
     return step(inputs, leaves)
-
-
-def _run_packed(case, layout, dtype, *, chunk_size):
-    @jax.jit
-    def step(inputs, leaves):
-        out, view = kda_packed_rows_forward(**inputs, cache_view=_view(leaves), conv_dtype=dtype, chunk_size=chunk_size)
-        return out, {name: getattr(view, name) for name in LEAVES}
-
-    return step(_driver_inputs(case, layout, dtype), _leaves(case, dtype))
 
 
 def _silu(x):
@@ -390,12 +380,6 @@ def test_ragged_driver_conv_pool_dtype_differs_from_stream(dtype, pool_dtype, co
         conv_dtype=conv_dtype,
     )
     _check(result, case, MIXED, tol=tol, pool_dtype=pool_dtype)
-
-
-@pytest.mark.parametrize("layout", [MIXED, DECODE], ids=["mixed", "decode"])
-def test_row_padded_driver_matches_reference(layout):
-    case = _case(layout, seed=2, dtype=jnp.float32, zero_fresh_recurrent=True)
-    _check(_run_packed(case, layout, jnp.float32, chunk_size=64), case, layout, tol=1e-4)
 
 
 def test_adapter_reaches_ejkernel_only_through_its_public_modules():

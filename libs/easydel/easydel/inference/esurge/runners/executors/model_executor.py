@@ -236,6 +236,7 @@ class ModelStepExecutor:
         enable_spec_recurrent_commit: bool = False,
         input_sharding: jax.sharding.Sharding | None = None,
         slot_indexed_state: bool = False,
+        recurrent_slot_group_size: int = 1,
         cache_group_configs: tuple[RaggedPagesCacheConfig | UnifiedAttentionCacheConfig, ...] = (),
         layer_to_cache_group: tuple[int, ...] = (),
     ) -> None:
@@ -293,6 +294,8 @@ class ModelStepExecutor:
         self.pipeline_plan = pipeline_plan
         self.enable_spec_recurrent_commit = bool(enable_spec_recurrent_commit)
         self._slot_indexed_state = bool(slot_indexed_state)
+        # W > 1: every request owns W recurrent slots (speculative verify contract, see runners/slot_contract.py).
+        self.recurrent_slot_group_size = max(1, int(recurrent_slot_group_size))
         # DSpark speculative decoding: the fused SPMD model step returns ``concat([last_hidden, main_hidden])`` rows.
         # Set by the runner before the first trace; read inside the traced step.
         self.main_hidden_enabled = False
@@ -515,6 +518,21 @@ class ModelStepExecutor:
             The cache metadata consumed by the paged attention layers.
         """
         use_spmd_dp = self._uses_spmd_dp()
+        spec_recurrent_commit = metadata.spec_recurrent_commit
+        group = int(getattr(self, "recurrent_slot_group_size", 1) or 1)
+        read_offset = commit_lens = None
+        if group > 1 and spec_recurrent_commit is not None and not use_spmd_dp:
+            # Slot groups of W slots: the host ships, per row, the tokens covered by slot g after the request's last
+            # step (row 0 of the payload). A row reads slot g + o with o = (context before this step) - base, which is
+            # the drafts its previous verify step accepted; fresh rows read nothing (o = 0). Every short row captures
+            # its state after each token (commit length 1).
+            rows = num_reqs_max_model_len
+            qsl = metadata.query_start_loc[: rows + 1]
+            before = metadata.seq_lens[:rows] - (qsl[1:] - qsl[:-1])
+            base = spec_recurrent_commit[0, :rows]
+            read_offset = jnp.where(before > 0, jnp.clip(before - base, 0, group - 1), 0).astype(jnp.int32)
+            commit_lens = jnp.ones((rows,), jnp.int32)
+            spec_recurrent_commit = None
         return RaggedPagesMetadata(
             pages_tables=metadata.pages_tables,
             context_lens=(
@@ -531,10 +549,13 @@ class ModelStepExecutor:
             request_distribution=metadata.rank_request_distribution,
             slot_mapping=metadata.slot_mapping,
             num_kv_update_slices=metadata.num_kv_update_slices,
-            spec_recurrent_commit=metadata.spec_recurrent_commit,
+            spec_recurrent_commit=spec_recurrent_commit,
             recurrent_state_indices=(
                 metadata.rank_recurrent_state_indices if (use_spmd_dp or self._plain_recurrent_slots) else None
             ),
+            recurrent_read_offset=read_offset,
+            recurrent_commit_lens=commit_lens,
+            recurrent_slot_group_size=group if read_offset is not None else 1,
             version=self._metadata_version,
             cache_groups=metadata.cache_groups,
             layer_to_cache_group=metadata.layer_to_cache_group,

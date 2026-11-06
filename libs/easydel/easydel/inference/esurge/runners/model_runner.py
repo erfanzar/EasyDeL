@@ -694,10 +694,11 @@ class eSurgeRunner:
         recurrent_layer_types = {"linear_attention", "kda_linear_attention", "parallel_hybrid", "hybrid"}
         has_recurrent_layers = any(str(layer_type).lower() in recurrent_layer_types for layer_type in layer_types)
         self._has_recurrent_layers = bool(has_recurrent_layers)
-        # Speculative candidate rows: generic recurrent (GDN) views and KDA views (Kimi-Linear, GLM-5-Next; GLM labels
-        # them ``linear_attention`` at model level, ``kda_linear_attention`` at cache level) both keep the decode-exact
-        # state after every verify prefix in extra prefix-major pool rows, so an accepted prefix is committed by a row
-        # copy instead of snapshot + replay (``kda_packed_rows_forward`` writes and commits the KDA rows).
+        # Speculative candidate rows: recurrent (GDN) views keep the decode-exact state after every verify prefix in
+        # extra prefix-major pool rows, so an accepted prefix is committed by a row copy instead of snapshot + replay.
+        # KDA layers (Kimi-Linear, GLM-5-Next; GLM labels them ``linear_attention`` at model level and
+        # ``kda_linear_attention`` at cache level) declare the "verify" slot contract instead: they capture the state
+        # after every verify token into the request's slot group, and candidate rows are turned off for them below.
         spec_active = drafter is not None and int(self.num_draft_tokens) > 0
         self.spec_decode_recurrent_candidates = bool(spec_active and has_recurrent_layers)
         # Greedy recurrent verify: how to advance the live recurrent (GDN) state
@@ -723,6 +724,13 @@ class eSurgeRunner:
         )
         # Recurrent slots per request (W): 1 + K_max once verify steps capture per-token states, 1 otherwise.
         self.recurrent_slot_group_size = 1
+        if spec_active and self.recurrent_slot_contract == "verify":
+            # Verify-contract layers (KDA) capture the state after every verify token into slot g + j and the next
+            # step reads g + accepted drafts: no candidate rows, no snapshot, no replay.
+            if self._uses_spmd_dp():
+                raise ValueError("Speculative decoding of recurrent verify-contract layers does not support SPMD DP.")
+            self.recurrent_slot_group_size = int(self.num_draft_tokens) + 1
+            self.spec_decode_recurrent_candidates = False
         # Requests of a declaring model own a stable group of pooled slots (RecurrentSlotPool), shipped with every
         # step, wherever a row can sit past its window-local index (several row windows per step, sparse packing of
         # zero-token rows) or W > 1; elsewhere the identity layout stays (slot = row, states updated in place):

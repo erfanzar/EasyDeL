@@ -2545,6 +2545,9 @@ class DrafterSpeculation:
             return True
         if not self.cache_has_recurrent_state():
             return False
+        if int(getattr(self._runner, "recurrent_slot_group_size", 1) or 1) > 1:
+            # Slot groups: the next step reads the accepted prefix's state by index (slot g + accepted drafts).
+            return False
         return self.recurrent_candidate_count() <= 0
 
     def commit_recurrent_candidate_state(self, row_pos: int, prefix_len: int) -> bool:

@@ -21,9 +21,9 @@ mesh, head sharding and operation config from :class:`~easydel.operations.Operat
 
 :func:`kda_ragged_rows_forward` is the eSurge driver built on it. The three causal depthwise convolutions run through
 eJKernel's ragged conv1d on the flat stream (as in Qwen3-Next serving) and the recurrence runs through
-:class:`RaggedKDAOp`, so the work follows the scheduled token count. The row-padded driver
-:func:`~easydel.operations.kernels.kda.kda_packed_rows_forward` copies every request into a bucket-wide row
-(``rows * T`` token slots); it remains the path for pools that carry speculative candidate rows.
+:class:`RaggedKDAOp`, so the work follows the scheduled token count. With a drafter
+attached, every request owns ``W = 1 + K`` slots and :func:`kda_verify_rows_forward` runs the step as one fused
+:class:`RaggedKDAOp` call (conv inside) that reads slot ``g + read_offset`` and captures per-token states.
 """
 
 import jax
@@ -165,7 +165,12 @@ class RaggedKDAOp(OperationImpl):
         decay_lower_bound: float | None = None,
         precision: str = "highest",
         head_axis: str | tuple[str, ...] | None = None,
-    ) -> tuple[Float[Array, "num_tokens num_heads v_dim"], Float[Array, "num_slots num_heads head_dim v_dim"]]:
+        read_offset: Array | None = None,
+        commit_lens: Array | None = None,
+        conv_weights: tuple[Array, Array, Array] | None = None,
+        conv_states: tuple[Array, Array, Array] | None = None,
+        short_row_max: int = 1,
+    ) -> tuple[Array, ...]:
         """Run ragged KDA through ``ejkernel.modules.operations.ragged_kda_head_sharded``.
 
         Args:
@@ -186,9 +191,18 @@ class RaggedKDAOp(OperationImpl):
             precision: ``"highest"`` or ``"default"`` for the non-inverse chunk dots.
             head_axis: Mesh axis (or tuple of axes) to split the heads over, or ``None`` for
                 :meth:`resolve_head_axis` (eSurge KDA steps with ``kda_serving_ep_split`` pass the cache's head axes).
+            read_offset: Optional ``[R]`` offsets: row ``r`` reads its windows and state from slot
+                ``state_indices[r] + read_offset[r]``.
+            commit_lens: Optional ``[R]`` commit lengths: a row of at most ``short_row_max`` tokens writes the state
+                after token ``commit_lens[r] - 1 + j`` into slot ``state_indices[r] + j``.
+            conv_weights: Optional depthwise conv taps ``(q, k, v)``, each ``[dim, d_conv]``: the inputs are then the
+                raw (pre-conv) projections and the op runs the causal conv (SiLU fused) itself.
+            conv_states: The conv-window pools ``(q, k, v)``, each ``[S, dim, d_conv]``, given with ``conv_weights``.
+            short_row_max: ``W``: rows of at most ``W`` tokens take the per-token path and capture per token.
 
         Returns:
-            ``(out [T, H, V] float32, new_recurrent_state [S, H, K, V])``; the pool keeps its dtype.
+            ``(out [T, H, V] float32, new_recurrent_state [S, H, K, V])``; with ``conv_weights``
+            ``(out, q_conv_state, k_conv_state, v_conv_state, new_recurrent_state)``. The pools keep their dtypes.
         """
         return self._forward(
             query,
@@ -205,6 +219,11 @@ class RaggedKDAOp(OperationImpl):
             decay_lower_bound=decay_lower_bound,
             precision=precision,
             head_axis=head_axis,
+            read_offset=read_offset,
+            commit_lens=commit_lens,
+            conv_weights=conv_weights,
+            conv_states=conv_states,
+            short_row_max=short_row_max,
             platform="xla",
         )
 
@@ -241,8 +260,13 @@ class RaggedKDAOp(OperationImpl):
         decay_lower_bound: float | None = None,
         precision: str = "highest",
         head_axis: str | tuple[str, ...] | None = None,
+        read_offset: Array | None = None,
+        commit_lens: Array | None = None,
+        conv_weights: tuple[Array, Array, Array] | None = None,
+        conv_states: tuple[Array, Array, Array] | None = None,
+        short_row_max: int = 1,
         platform: str | None = None,
-    ) -> tuple[Array, Array]:
+    ) -> tuple[Array, ...]:
         """Call ``ejkernel.modules.operations.ragged_kda_head_sharded`` on one platform.
 
         Args:
@@ -260,12 +284,20 @@ class RaggedKDAOp(OperationImpl):
             decay_lower_bound: Promised lower bound of every log-decay, or ``None``.
             precision: Precision of the non-inverse chunk dots.
             head_axis: Mesh axis (or tuple of axes) of the heads, or ``None`` for :meth:`resolve_head_axis`.
+            read_offset: Optional ``[R]`` read offsets (see :meth:`forward_native`).
+            commit_lens: Optional ``[R]`` commit lengths.
+            conv_weights: Optional conv taps ``(q, k, v)`` (pre-conv inputs).
+            conv_states: Conv-window pools ``(q, k, v)``, given with ``conv_weights``.
+            short_row_max: ``W``.
             platform: ``"xla"`` (the reference), or ``None`` for the operation config's platform.
 
         Returns:
             ``(out [T, H, V] float32, new_recurrent_state [S, H, K, V])``.
         """
         metadata = self.get_impl_metadata()
+        if (conv_weights is None) != (conv_states is None):
+            raise ValueError("ragged_kda: conv_weights and conv_states are given together or not at all")
+        conv = () if conv_weights is None else (*conv_weights, *conv_states)
         return ragged_kda_head_sharded(
             query,
             key,
@@ -276,7 +308,11 @@ class RaggedKDAOp(OperationImpl):
             query_start_loc,
             state_indices,
             has_initial_state,
+            read_offset,
+            commit_lens,
+            *conv,
             mesh=metadata.mesh,
+            short_row_max=int(short_row_max),
             head_axis=(
                 self.resolve_head_axis(int(query.shape[1]), int(query.shape[0])) if head_axis is None else head_axis
             ),
@@ -310,8 +346,8 @@ def kda_ragged_rows_forward(
 ) -> tuple[Float[Array, "1 seq_len num_heads d_state"], KDACacheView]:
     """Advance per-request per-channel KDA state over an eSurge packed token stream, on the flat stream.
 
-    Same contract as :func:`~easydel.operations.kernels.kda.kda_packed_rows_forward` for pools without speculative
-    candidate rows (callers route those pools to the row-padded driver). Row ``r`` owns tokens
+    The non-speculative serving step (one slot per request; speculative steps take
+    :func:`kda_verify_rows_forward`). Row ``r`` owns tokens
     ``[query_start_loc[r], query_start_loc[r + 1])`` and pool slot ``state_indices[r]`` (slot ``r`` without
     ``state_indices``: the in-place fast path); tokens at or past ``query_start_loc[-1]`` are bucket padding. eSurge
     must name the slots when a step's row window does not start at slot 0 (multi-window steps, sparse row packing).
@@ -470,4 +506,116 @@ def kda_ragged_rows_forward(
     return out.astype(jnp.float32)[None], new_cache_view
 
 
-__all__ = ("RaggedKDAOp", "kda_ragged_rows_forward")
+def kda_verify_rows_forward(
+    query: Float[Array, "1 seq_len key_dim"],
+    key: Float[Array, "1 seq_len key_dim"],
+    value: Float[Array, "1 seq_len value_dim"],
+    beta: Float[Array, "1 seq_len num_heads"],
+    decay: Float[Array, "1 seq_len num_heads head_dim"],
+    conv_kernels: tuple[Array, Array, Array],
+    cache_view: KDACacheView,
+    query_start_loc: Array,
+    context_lens: Array,
+    *,
+    metadata: OperationMetadata,
+    state_indices: Array,
+    read_offset: Array,
+    commit_lens: Array | None,
+    short_row_max: int,
+    conv_dtype: jnp.dtype = jnp.bfloat16,
+    chunk_size: int = 64,
+    decay_lower_bound: float | None = None,
+    precision: str = "highest",
+    head_axis: str | tuple[str, ...] | None = None,
+) -> tuple[Float[Array, "1 seq_len num_heads d_state"], KDACacheView]:
+    """eSurge KDA step over slot groups of ``W`` slots per request (speculative serving), on the flat stream.
+
+    Every request owns slots ``g .. g + W - 1`` (``g = state_indices[r]``). Row ``r`` reads its conv windows and
+    recurrent state from slot ``g + read_offset[r]``. A row of at most ``short_row_max`` (``W``) tokens advances token
+    by token with the decode arithmetic and writes the windows and state after token ``commit_lens[r] - 1 + j`` into
+    slot ``g + j``; a longer row runs the chunked math and writes its final state into ``g``. The causal conv runs
+    inside :class:`RaggedKDAOp` (one fused call), so a verify row's per-token windows are captured with its states. A
+    row that starts a request (``context_lens <= lens``) starts from zero windows and a zero state.
+
+    Args:
+        query: Packed Q projection (pre-conv) ``[1, T, key_dim]``.
+        key: Packed K projection (pre-conv) ``[1, T, key_dim]``.
+        value: Packed V projection (pre-conv) ``[1, T, value_dim]``.
+        beta: Packed write strength ``[1, T, heads]`` (sigmoid applied).
+        decay: Packed per-channel log-decay ``[1, T, heads, head_dim]``.
+        conv_kernels: Depthwise causal conv kernels for q, k, v, each ``[dim, d_conv]``.
+        cache_view: Per-layer KDA cache view whose pools hold ``W`` slots per request.
+        query_start_loc: Cumulative row offsets ``[rows + 1]``.
+        context_lens: Tokens per row including this step.
+        metadata: Operation metadata for the ``"ragged_kda"`` operation.
+        state_indices: Base slot ``g`` of every row, ``[rows]`` or ``[1, rows]``.
+        read_offset: Read offset of every row (same layout).
+        commit_lens: Commit length of every row (same layout), or ``None`` (``lens``).
+        short_row_max: ``W`` (static).
+        conv_dtype: Dtype of the conv outputs fed to the recurrence.
+        chunk_size: Chunk length of the chunk rows.
+        decay_lower_bound: Promise that every log-decay is ``>= decay_lower_bound``, or ``None``.
+        precision: ``"highest"`` or ``"default"`` for the chunk rows' non-inverse dots.
+        head_axis: Mesh axis (or tuple of axes) of the heads and conv features, or ``None`` for
+            :meth:`RaggedKDAOp.resolve_head_axis`.
+
+    Returns:
+        tuple: ``(outputs [1, T, heads, head_v_dim] float32, new_cache_view)``.
+
+    Raises:
+        ValueError: For rank-major DP metadata (2-D ``query_start_loc``).
+        TypeError: If the registry resolves ``"ragged_kda"`` to something other than a :class:`RaggedKDAOp`.
+    """
+    if query_start_loc.ndim != 1:
+        raise ValueError(
+            f"kda_verify_rows_forward requires 1-D query_start_loc [rows + 1], got shape {tuple(query_start_loc.shape)}"
+        )
+    rows = int(query_start_loc.shape[0]) - 1
+
+    def per_row(x: Array | None) -> Array | None:
+        return None if x is None else jnp.asarray(x, dtype=jnp.int32).reshape(-1)[:rows]
+
+    op = OperationRegistry.create("ragged_kda", metadata)
+    if not isinstance(op, RaggedKDAOp):
+        raise TypeError(f"'ragged_kda' resolved to {type(op).__name__}, expected a RaggedKDAOp")
+    with jax.named_scope("easydel-kda-verify-rows"):
+        qsl = jnp.asarray(query_start_loc, dtype=jnp.int32)
+        seq_len = int(query.shape[1])
+        num_heads = int(beta.shape[-1])
+        head_k = int(query.shape[-1]) // num_heads
+        head_v = int(value.shape[-1]) // num_heads
+        lens = qsl[1:] - qsl[:-1]
+        has_prefix = jnp.asarray(context_lens, dtype=jnp.int32)[:rows] > lens
+        kernels = tuple(w.astype(jnp.float32) if _is_lowfloat(w.dtype) else w for w in conv_kernels)
+        out, q_pool, k_pool, v_pool, recurrent_pool = op(
+            query[0].reshape(seq_len, num_heads, head_k),
+            key[0].reshape(seq_len, num_heads, head_k),
+            value[0].reshape(seq_len, num_heads, head_v),
+            beta[0].astype(jnp.float32) if _is_lowfloat(beta.dtype) else beta[0],
+            decay[0],
+            cache_view.recurrent_state,
+            qsl,
+            per_row(state_indices),
+            has_prefix | (lens <= 0),
+            chunk_size=int(chunk_size),
+            use_qk_l2norm=True,
+            decay_lower_bound=decay_lower_bound,
+            precision=precision,
+            head_axis=op.resolve_head_axis(num_heads, seq_len) if head_axis is None else head_axis,
+            read_offset=per_row(read_offset),
+            commit_lens=per_row(commit_lens),
+            conv_weights=kernels,
+            conv_states=(cache_view.q_conv_state, cache_view.k_conv_state, cache_view.v_conv_state),
+            short_row_max=int(short_row_max),
+        )
+    del conv_dtype  # the fused conv emits the stream dtype (bf16 for 1-byte float streams)
+    new_cache_view = cache_view.update_kda_states(
+        new_q_conv_state=q_pool,
+        new_k_conv_state=k_pool,
+        new_v_conv_state=v_pool,
+        new_recurrent_state=recurrent_pool,
+    )
+    return out.astype(jnp.float32)[None], new_cache_view
+
+
+__all__ = ("RaggedKDAOp", "kda_ragged_rows_forward", "kda_verify_rows_forward")

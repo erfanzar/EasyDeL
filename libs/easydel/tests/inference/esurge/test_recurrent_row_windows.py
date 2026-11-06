@@ -19,8 +19,8 @@ above the cache's rows per forward, ``metadata.get_max_num_seqs()``). Each windo
 declares the eSurge slot contract (``runners/slot_contract.py``), so wherever a row can sit past its window-local index
 (several row windows per step, sparse packing of zero-token rows) every request owns a stable pooled slot, shipped with
 every step as ``cache_metadata.recurrent_state_indices``; single-window serving keeps the in-place identity layout and
-ships nothing. Speculative candidate rows (laid out by the window's row count) keep the identity layout and make the
-runner refuse a multi-window configuration at init.
+ships nothing. With a drafter the KDA layers' verify contract gives every request a pooled group of ``W = 1 + K``
+slots (no candidate rows), so a multi-window speculative configuration is served too.
 
 The two-window cases cap the rows per forward at 2 (``get_max_num_seqs`` patched on the cache config classes; production
 derives it as ``131072 // pages_per_request``) with 4 resident requests on a tiny GLM-5-Next. Computation tests: the
@@ -136,7 +136,7 @@ class _FlatDriverCalls:
 
 
 class _InertDrafter:
-    """A drafter the runner must refuse before it ever drafts (speculative candidate rows + several row windows)."""
+    """A drafter that is never asked to draft (only the runner's init is exercised)."""
 
     num_draft_tokens = 3
     supports_return_full_log_probs = False
@@ -150,7 +150,7 @@ class _InertDrafter:
         del request_id
 
     def draft(self, *args, **kwargs):
-        raise AssertionError("the runner must refuse this configuration at init")
+        raise AssertionError("the runner's init must not draft")
 
 
 def _runner(model, *, async_scheduling: bool = False, drafter=None) -> eSurgeRunner:
@@ -243,14 +243,22 @@ def test_two_row_windows_serve_like_one_window(tiny_model, monkeypatch):
     assert two_windows == one_window
 
 
-def test_speculative_candidate_rows_refuse_several_row_windows(tiny_model, monkeypatch):
-    """Candidate rows are laid out by the window's row count, so a multi-window speculative config fails at init."""
+def test_speculative_kda_slot_groups_serve_several_row_windows(tiny_model, monkeypatch):
+    """With a drafter every request owns a pooled group of 1 + K KDA slots and no candidate rows, in any row window."""
     _cap_rows_per_forward(monkeypatch, 2)
-    with pytest.raises(ValueError, match=r"max_num_seqs=4 exceeds rows per forward=2 .*speculative decoding"):
-        _runner(tiny_model, drafter=_InertDrafter())
+    runner = _runner(tiny_model, drafter=_InertDrafter())
+    try:
+        group = _InertDrafter.num_draft_tokens + 1
+        assert runner.recurrent_slot_group_size == group
+        assert runner._recurrent_slots_pooled
+        assert runner.spec.recurrent_candidate_count() == 0
+        state = runner.executor_manager.kv_pages.views[0].recurrent_state
+        assert int(state.shape[0]) == len(REQUESTS) * group
+    finally:
+        _close(runner)
 
 
 def test_kda_layers_declare_the_slot_contract(tiny_model):
-    """Every KDA layer declares the slot contract; one undeclared recurrent layer keeps the identity layout."""
-    assert resolve_recurrent_slot_contract(tiny_model, num_recurrent_layers=3) == "slots"
+    """Every KDA layer declares the verify contract; one undeclared recurrent layer keeps the identity layout."""
+    assert resolve_recurrent_slot_contract(tiny_model, num_recurrent_layers=3) == "verify"
     assert resolve_recurrent_slot_contract(tiny_model, num_recurrent_layers=4) == "none"

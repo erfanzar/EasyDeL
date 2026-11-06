@@ -267,37 +267,88 @@ def _random_view(rows, seed):
     )
 
 
-def test_packed_routing_follows_the_speculative_commit_metadata():
-    """eSurge sends ``spec_recurrent_commit`` exactly when the pool holds speculative candidate rows.
+def test_verify_step_equals_the_same_tokens_decoded_one_per_step():
+    """A speculative verify step over slot groups equals decoding its tokens one per step from slot ``g + o``.
 
-    Without it the flat-stream driver runs and never touches pool slots past the rows, whatever the pool size (eSurge
-    keeps ``max_num_reqs`` slots, which can exceed twice the step's row cap). With it the row-padded driver runs and
-    writes the candidate rows of a speculative verify row. Both drivers give the same live rows.
+    Every request owns ``W`` slots ``g .. g + W - 1``. The verify step reads slot ``g + recurrent_read_offset`` and
+    writes the windows and state after its ``j``-th token into ``g + j``. Decoding the same tokens one per step from the
+    state of slot ``g + o`` must give the same outputs, and the state after the ``j``-th decode step must be the one
+    captured in ``g + j``; slots past a row's tokens keep their contents.
     """
     model, layer = _layer()
-    rows, candidates = 2, 2
-    pool = rows * (1 + candidates)
+    width = 4
     names = ("q_conv_state", "k_conv_state", "v_conv_state", "recurrent_state")
-    # Host copy of the pool; each call gets its own identical pool, so no call can see another's writes.
-    held = {name: np.asarray(getattr(_random_view(pool, seed=31), name)) for name in names}
-    tokens = jnp.asarray(np.random.default_rng(37).normal(size=(1, 3, HIDDEN)), jnp.float32)
-    packed = jnp.zeros((1, 8, HIDDEN), jnp.float32).at[:, :3].set(tokens)
-    # Row 0: a 2-token verify window continuing its request; row 1: a decode step continuing its request.
-    plain = SimpleNamespace(
-        query_start_loc=jnp.asarray([0, 2, 3], jnp.int32), context_lens=jnp.asarray([9, 5], jnp.int32)
+    base, offset, lens, context = [0, 4], [1, 2], [3, 2], [9, 5]
+    held = {name: np.asarray(getattr(_random_view(2 * width, seed=61), name)) for name in names}
+    tokens = jnp.asarray(np.random.default_rng(67).normal(size=(sum(lens), HIDDEN)), jnp.float32)
+    starts = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
+    verify_meta = SimpleNamespace(
+        query_start_loc=jnp.asarray(starts),
+        context_lens=jnp.asarray(context, jnp.int32),
+        recurrent_state_indices=jnp.asarray([base], jnp.int32),
+        recurrent_read_offset=jnp.asarray(offset, jnp.int32),
+        recurrent_commit_lens=jnp.ones((2,), jnp.int32),
+        recurrent_slot_group_size=width,
     )
-    spec = SimpleNamespace(**vars(plain), spec_recurrent_commit=jnp.zeros((2, rows), jnp.int32))
-
+    packed = jnp.zeros((1, 8, HIDDEN), jnp.float32).at[0, : sum(lens)].set(tokens)
+    read = [g + o for g, o in zip(base, offset, strict=True)]
     with model.mesh:
-        flat = layer(hidden_states=packed, cache_view=_random_view(pool, seed=31), cache_metadata=plain)
-        padded = layer(hidden_states=packed, cache_view=_random_view(pool, seed=31), cache_metadata=spec)
-
+        verify = layer(hidden_states=packed, cache_view=_random_view(2 * width, seed=61), cache_metadata=verify_meta)
+        view = KDACacheView(
+            **{name: jnp.asarray(held[name][read]) for name in names},
+            positions=jnp.zeros((2,), jnp.int32),
+            metadata=None,
+        )
+        for j in range(max(lens)):
+            live = [j < n for n in lens]
+            step = jnp.zeros((1, 2, HIDDEN), jnp.float32)
+            qsl, pos = [0], 0
+            for r in range(2):
+                if live[r]:
+                    step = step.at[0, pos].set(tokens[starts[r] + j])
+                    pos += 1
+                qsl.append(pos)
+            meta = SimpleNamespace(
+                query_start_loc=jnp.asarray(qsl, jnp.int32),
+                context_lens=jnp.asarray([c - n + j + 1 for c, n in zip(context, lens, strict=True)], jnp.int32),
+            )
+            decoded = layer(hidden_states=step, cache_view=view, cache_metadata=meta)
+            view = decoded.cache_view
+            for r in range(2):
+                if not live[r]:
+                    continue
+                np.testing.assert_allclose(
+                    np.asarray(verify.attention_output[0, starts[r] + j]),
+                    np.asarray(decoded.attention_output[0, qsl[r]]),
+                    rtol=1e-5,
+                    atol=1e-6,
+                )
+                for name in names:
+                    np.testing.assert_allclose(
+                        np.asarray(getattr(verify.cache_view, name)[base[r] + j]),
+                        np.asarray(getattr(view, name)[r]),
+                        rtol=1e-5,
+                        atol=1e-6,
+                        err_msg=f"{name} row {r} token {j}",
+                    )
     for name in names:
-        np.testing.assert_array_equal(np.asarray(getattr(flat.cache_view, name)[rows:]), held[name][rows:], err_msg=name)
-    written = np.asarray(padded.cache_view.recurrent_state[rows:])
-    assert not np.array_equal(written, held["recurrent_state"][rows:]), "the speculative step wrote no candidate row"
-    assert _rel(flat.attention_output[0, :3], padded.attention_output[0, :3]) < 1e-2
-    assert _rel(flat.cache_view.recurrent_state[:rows], padded.cache_view.recurrent_state[:rows]) < 1e-2
+        new = np.asarray(getattr(verify.cache_view, name))
+        for r in range(2):
+            untouched = list(range(base[r] + lens[r], base[r] + width))
+            np.testing.assert_array_equal(new[untouched], held[name][untouched], err_msg=name)
+
+
+def test_candidate_row_commit_metadata_is_refused():
+    """KDA layers serve speculative steps through slot groups; candidate-row commit metadata is a contract error."""
+    model, layer = _layer()
+    packed = jnp.zeros((1, 4, HIDDEN), jnp.float32)
+    meta = SimpleNamespace(
+        query_start_loc=jnp.asarray([0, 2, 3], jnp.int32),
+        context_lens=jnp.asarray([9, 5], jnp.int32),
+        spec_recurrent_commit=jnp.zeros((2, 2), jnp.int32),
+    )
+    with model.mesh, pytest.raises(ValueError, match="spec_recurrent_commit"):
+        layer(hidden_states=packed, cache_view=_random_view(2, seed=53), cache_metadata=meta)
 
 
 def test_packed_chunk_precision_applies_only_to_the_kda_chunk_impl():
@@ -356,27 +407,6 @@ def test_packed_rows_follow_recurrent_state_indices():
             new[slots], np.asarray(getattr(want.cache_view, name)), rtol=1e-5, atol=1e-6, err_msg=name
         )
         np.testing.assert_array_equal(new[[0, 2]], held[name][[0, 2]], err_msg=name)
-
-
-def test_speculative_steps_refuse_explicit_recurrent_slots():
-    """A speculative step cannot also name explicit pool slots: the row-padded driver keeps row r in slot r.
-
-    Running it anyway would read and write other requests' states without any error, so the layer refuses the
-    combination before it touches the pool.
-    """
-    model, layer = _layer()
-    rows, candidates = 2, 2
-    tokens = jnp.asarray(np.random.default_rng(53).normal(size=(1, 3, HIDDEN)), jnp.float32)
-    packed = jnp.zeros((1, 8, HIDDEN), jnp.float32).at[:, :3].set(tokens)
-    meta = SimpleNamespace(
-        query_start_loc=jnp.asarray([0, 2, 3], jnp.int32),
-        context_lens=jnp.asarray([9, 5], jnp.int32),
-        spec_recurrent_commit=jnp.zeros((2, rows), jnp.int32),
-        recurrent_state_indices=jnp.asarray([[3, 1]], jnp.int32),
-    )
-
-    with model.mesh, pytest.raises(ValueError, match="recurrent_state_indices"):
-        layer(hidden_states=packed, cache_view=_random_view(rows * (1 + candidates), seed=53), cache_metadata=meta)
 
 
 def test_packed_chunk_dots_follow_the_layer_matmul_precision():

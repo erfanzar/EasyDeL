@@ -595,14 +595,20 @@ class ExecutionManager:
         self.pp_microbatch_count = pp_microbatch_count
         self.pp_microbatch_size = pp_microbatch_size
         self.speculative_recurrent_state_tokens = max(0, int(speculative_recurrent_state_tokens))
-        self.enable_spec_recurrent_commit_metadata = self.speculative_recurrent_state_tokens > 0
+        self.recurrent_slot_group_size = max(1, int(recurrent_slot_group_size))
+        # The [2, max_num_reqs] step payload carries the candidate-row commit (GDN candidate rows) or, with slot groups
+        # of W > 1 slots, the tokens covered by every row's slot g (row 0; see _recurrent_slot_bases).
+        self.enable_spec_recurrent_commit_metadata = (
+            self.speculative_recurrent_state_tokens > 0 or self.recurrent_slot_group_size > 1
+        )
+        self._recurrent_base_cpu = numpy.zeros((2, int(max_num_reqs)), dtype=numpy.int32)
+        self._recurrent_base_by_slot = numpy.zeros((int(max_num_reqs) * self.recurrent_slot_group_size,), numpy.int64)
         self.speculative_trace_tokens = max(0, int(speculative_trace_tokens))
         # Requests with pooled state slots (compressed-window caches, recurrent layers that declare the slot contract)
         # receive the per-row physical state-slot ids in the batch metadata every step.
         self._slot_indexed_state = bool(recurrent_slots_pooled) or (
             getattr(model, "esurge_cache_family", None) == "compressed_window"
         )
-        self.recurrent_slot_group_size = max(1, int(recurrent_slot_group_size))
         self.min_input_pad = min_input_pad
         self.max_model_len = max_model_len
         self.max_num_reqs = max_num_reqs
@@ -702,6 +708,7 @@ class ExecutionManager:
             enable_spec_recurrent_commit=self.enable_spec_recurrent_commit_metadata,
             input_sharding=self._input_sharding,
             slot_indexed_state=self._slot_indexed_state,
+            recurrent_slot_group_size=self.recurrent_slot_group_size,
             cache_group_configs=self.cache_group_configs,
             layer_to_cache_group=self.layer_to_cache_group,
         )
@@ -1486,6 +1493,10 @@ class ExecutionManager:
                 bool(wait_for_outputs),
             )
         microbatch_result = None
+        if int(getattr(self, "recurrent_slot_group_size", 1) or 1) > 1 and recurrent_slot_indices_cpu is not None:
+            spec_recurrent_commit_cpu = self._recurrent_slot_bases(
+                scheduled_full_cpu, num_computed_tokens_cpu, recurrent_slot_indices_cpu
+            )
         # The wavefront path builds per-microbatch metadata without model side inputs, physical recurrent-state slots
         # or speculative recurrent commits; a step that needs any of them must take the full-window path instead.
         # The runner supplies recurrent_slot_indices_cpu for every model, including ordinary attention models.
@@ -2144,6 +2155,41 @@ class ExecutionManager:
         changed = _transform_recurrent_sidecars(new_views, sidecar_clear_indices) or changed
         if changed:
             self.kv_pages = HybridCache(views=new_views)
+
+    def _recurrent_slot_bases(
+        self,
+        scheduled_cpu: numpy.ndarray,
+        num_computed_cpu: numpy.ndarray,
+        slot_indices_cpu: numpy.ndarray,
+    ) -> numpy.ndarray:
+        """Per window row, the tokens slot ``g`` covers before this step; then record what it covers after it.
+
+        With slot groups of ``W`` slots a row of at most ``W`` tokens writes the state after its first token into
+        slot ``g`` (and after token ``j`` into ``g + j``), a longer row its final state. So after a step slot ``g``
+        covers ``computed + 1`` tokens for a short row and ``computed + scheduled`` for a chunk row. The device reads
+        slot ``g + (context before the step - base)`` on the next step, which is the drafts the previous verify step
+        accepted; no acceptance result is needed here.
+
+        Args:
+            scheduled_cpu: Scheduled tokens per window row.
+            num_computed_cpu: Computed tokens per window row before this step.
+            slot_indices_cpu: Base slot ``g`` per window row.
+
+        Returns:
+            The ``[2, max_num_reqs]`` step payload: row 0 holds the bases, row 1 zeros.
+        """
+        width = self.recurrent_slot_group_size
+        out = self._recurrent_base_cpu
+        out.fill(0)
+        by_slot = self._recurrent_base_by_slot
+        n = min(out.shape[1], len(scheduled_cpu), len(num_computed_cpu), len(slot_indices_cpu))
+        sched = numpy.asarray(scheduled_cpu[:n], dtype=numpy.int64)
+        computed = numpy.asarray(num_computed_cpu[:n], dtype=numpy.int64)
+        slots = numpy.asarray(slot_indices_cpu[:n], dtype=numpy.int64)
+        live = (sched > 0) & (slots >= 0) & (slots < by_slot.shape[0])
+        out[0, :n] = numpy.where(live, by_slot[numpy.clip(slots, 0, by_slot.shape[0] - 1)], 0)
+        by_slot[slots[live]] = (computed + numpy.where(sched <= width, 1, sched))[live]
+        return out
 
     def _recurrent_snapshot_store(self, leaves: list[tuple[int, str, typing.Any]]) -> list[jax.Array]:
         """Return (allocating on first use) the snapshot arrays matching ``leaves``."""
