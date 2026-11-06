@@ -507,6 +507,12 @@ class eSurgeRunner:
         self.drafter = drafter
         if self.drafter is not None and hasattr(self.drafter, "set_max_length"):
             self.drafter.set_max_length(int(max_model_len))
+        if self.drafter is not None and callable(getattr(self.drafter, "ensure_batch_size", None)):
+            # Allocate the drafter's cache for the whole request pool before the KV page pool is sized from free
+            # HBM below, so the pool cannot take the drafter's HBM.
+            self.drafter.ensure_batch_size(
+                int(WindowPlanner.init_seq_buckets(max_num_seq_buckets, max_num_seqs, min_input_pad)[-1])
+            )
         self.num_draft_tokens = int(getattr(drafter, "num_draft_tokens", 1) if drafter is not None else 0)
         # Dynamic speculative-token scheduling: the drafter may carry a
         # ``num_draft_tokens_per_batch_size`` schedule (attached by the engine
@@ -1804,8 +1810,9 @@ class eSurgeRunner:
                     seed_tokens=jnp.zeros((n,), dtype=jnp.int32),
                     seed_hidden=jnp.zeros((n, 1, hidden_size), dtype=hidden_dtype),
                     seed_positions=jnp.zeros((n,), dtype=jnp.int32),
-                    committed_lens=jnp.zeros((n,), dtype=jnp.int32),
-                    collected_mask=jnp.zeros((n,), dtype=bool),
+                    # Host arrays: an all-idle host call warms every drafter-cache window width.
+                    committed_lens=np.zeros((n,), dtype=np.int32),
+                    collected_mask=np.zeros((n,), dtype=bool),
                     num_draft_tokens=int(k),
                 )
                 logger.debug(f"Batched drafter precompiled for k={k} (pool={n})")

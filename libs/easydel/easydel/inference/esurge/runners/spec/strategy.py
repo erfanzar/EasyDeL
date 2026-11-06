@@ -510,7 +510,9 @@ class DrafterSpeculation:
     def _release_finished_drafter_rows(self, scheduler_output: SchedulerOutput) -> None:
         """Free the stable drafter rows of requests the scheduler finished."""
         finished = getattr(scheduler_output, "finished_req_ids", None) or ()
-        for rid in finished:
+        # Sorted: a set's order follows each process's string-hash seed, and the free-row order decides which pool
+        # row the next request drafts in, so every process of a multi-host engine must release in the same order.
+        for rid in sorted(str(r) for r in finished):
             self._history_counts.drop(str(rid))
             self._penalty_counts_stale.discard(str(rid))
             row = self._mtp_row_by_req.pop(str(rid), None)
@@ -2189,8 +2191,9 @@ class DrafterSpeculation:
             seed_tokens=jnp.asarray(seed_tokens),
             seed_hidden=hidden_full,
             seed_positions=jnp.asarray(seed_positions),
-            committed_lens=jnp.asarray(committed_lens),
-            collected_mask=jnp.asarray(collected_mask),
+            # Host arrays: the drafter picks its cache window from them without a device read.
+            committed_lens=committed_lens,
+            collected_mask=collected_mask,
             # The drafter compile-keys on k (unrolled recurrence); a schedule
             # contributes one compile per distinct k, warmed by
             # ``eSurgeRunner.compile`` so serving never JITs mid-flight.

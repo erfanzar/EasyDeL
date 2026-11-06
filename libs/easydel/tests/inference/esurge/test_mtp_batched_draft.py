@@ -224,6 +224,41 @@ def test_batched_draft_different_committed_lens_per_row():
         assert got_w2[rid] == ref_w2[rid], f"{rid}: batched {got_w2[rid]} != per-request {ref_w2[rid]}"
 
 
+def test_batched_draft_window_from_host_bounds_only():
+    """The drafter-cache window comes from host arrays only, and never changes the drafts.
+
+    Host ``committed_lens`` run the narrowest window that holds every collected row; a device ``committed_lens``
+    runs the whole capacity, because reading it would block the host. Both draft the same tokens.
+    """
+    model = make_tiny_model(precision=jax.lax.Precision.HIGHEST)
+    n, k, capacity = 4, 3, 1024
+    seed_tokens = jnp.asarray([5, 9, 13, 21], dtype=jnp.int32)
+    seed_hidden = jnp.stack([_seed_hidden(i) for i in range(n)])[:, None, :]
+    seed_positions = jnp.asarray([4, 10, 7, 2], dtype=jnp.int32)
+    mask = np.ones((n,), dtype=bool)
+
+    def run(committed):
+        drafter = Qwen3_5MTPDrafter(model, num_draft_tokens=k, persist_kv=True)
+        drafter.set_max_length(capacity)
+        drafts = drafter.draft_batched(
+            seed_tokens=seed_tokens,
+            seed_hidden=seed_hidden,
+            seed_positions=seed_positions,
+            committed_lens=committed,
+            collected_mask=mask,
+            num_draft_tokens=k,
+        )
+        assert drafter.mtp_cache_capacity() == capacity
+        assert [_row_index(drafter, r) for r in range(n)] == [k] * n
+        (key,) = drafter._jit_batched
+        return np.asarray(drafts), key[-1]
+
+    host, host_width = run(np.zeros((n,), dtype=np.int32))
+    full, full_width = run(jnp.zeros((n,), dtype=jnp.int32))
+    assert (host_width, full_width) == (256, None)
+    np.testing.assert_array_equal(host, full)
+
+
 # --- Full-runner multi-request integration (collect + >=2 gate + scatter) ---
 #
 # A full-runner token-for-token batched-vs-per-request comparison is NOT a valid

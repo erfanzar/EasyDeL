@@ -60,7 +60,7 @@ def _default_fast_recurrent_path(monkeypatch):
     monkeypatch.delenv("EASYDEL_SPEC_RECURRENT_REPLAY", raising=False)
 
 
-def _make_model_with_head():
+def _make_model():
     config = ed.Glm5NextTextConfig(
         vocab_size=VOCAB,
         hidden_size=32,
@@ -95,14 +95,130 @@ def _make_model_with_head():
     kwargs = dict(dtype=jnp.float32, param_dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST)
     with config.mesh:
         model = ed.Glm5NextForCausalLM(config=config, rngs=spx.Rngs(0), **kwargs)
-        head = Glm5NextMTPHead(config, rngs=spx.Rngs(1), max_cache_length=128, **kwargs)
     model.eval()
+    return model
+
+
+def _make_model_with_head():
+    model = _make_model()
+    kwargs = dict(dtype=jnp.float32, param_dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST)
+    with model.config.mesh:
+        head = Glm5NextMTPHead(model.config, rngs=spx.Rngs(1), max_cache_length=128, **kwargs)
     return attach_glm5_next_mtp(model, head)
 
 
 @pytest.fixture(scope="module")
 def model():
     return _make_model_with_head()
+
+
+_HF_OWN = {
+    "pre_fc_norm_embedding.weight": "enorm.weight",
+    "pre_fc_norm_hidden.weight": "hnorm.weight",
+    "fc.weight": "eh_proj.weight",
+    "norm.weight": "shared_head.norm.weight",
+}
+
+
+def _head_to_hf(head, layer: int) -> dict[str, np.ndarray]:
+    """Independent inverse of the nextn checkpoint layout (HF orientation as in the published shards).
+
+    HF stores 2-D linears as ``[out, in]`` (EasyDeL ``[in, out]``), routed experts one tensor per expert, and the
+    shared expert's gate and up projections separately; the indexer's raw ``index_kpool_compress_*`` parameters and
+    1-D tensors keep their layout.
+    """
+    _gd, state = spx.export(head)
+    out: dict[str, np.ndarray] = {}
+    prefix = f"model.language_model.layers.{layer}."
+    for _collection, path, leaf in state.items():
+        path = str(path)
+        arr = np.asarray(jax.device_get(leaf))
+        if path in _HF_OWN:
+            name = prefix + _HF_OWN[path]
+            out[name] = arr.T if arr.ndim == 2 else arr
+            continue
+        rest = path[len("layers.0.") :]
+        if ".experts." in path and "shared" not in path and arr.ndim == 3:
+            base, proj, weight = rest.rsplit(".", 2)
+            for i in range(arr.shape[0]):
+                out[f"{prefix}{base}.{i}.{proj}.{weight}"] = arr[i].T
+        elif rest.endswith("shared_experts.gate_up_proj.weight"):
+            half = arr.shape[1] // 2
+            out[prefix + "mlp.shared_experts.gate_proj.weight"] = arr[:, :half].T
+            out[prefix + "mlp.shared_experts.up_proj.weight"] = arr[:, half:].T
+        elif arr.ndim == 2 and "index_kpool_compress" not in rest:
+            out[prefix + rest] = arr.T
+        else:
+            out[prefix + rest] = arr
+    return out
+
+
+def _write_nextn_checkpoint(directory, tensors: dict, fp8_key: str) -> None:
+    """Two shards + index + config; ``fp8_key`` is stored as block-fp8 with a ``weight_scale_inv`` sibling."""
+    import json
+
+    torch = pytest.importorskip("torch")
+    from safetensors.torch import save_file
+
+    hf = {k: torch.from_numpy(np.ascontiguousarray(v)) for k, v in tensors.items()}
+    hf[fp8_key] = hf[fp8_key].to(torch.float8_e4m3fn)
+    hf[fp8_key + "_scale_inv"] = torch.tensor([[0.5]], dtype=torch.float32)
+    keys = sorted(hf)
+    shards = {"model-00001-of-00002.safetensors": keys[::2], "model-00002-of-00002.safetensors": keys[1::2]}
+    weight_map = {}
+    for name, part in shards.items():
+        save_file({k: hf[k] for k in part}, str(directory / name))
+        weight_map.update(dict.fromkeys(part, name))
+    weight_map["model.language_model.layers.0.input_layernorm.weight"] = "model-00009-of-00009.safetensors"
+    (directory / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    quant = {"quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic", "weight_block_size": [128, 128]}
+    (directory / "config.json").write_text(json.dumps({"quantization_config": quant, "text_config": {}}))
+
+
+def test_drafter_hook_loads_nextn_checkpoint(tmp_path):
+    """``model.drafter(nextn_checkpoint=...)`` loads every nextn tensor (block-fp8 dequantized) and drafts with it."""
+    reference = _make_model_with_head().mtp
+    layer = 4
+    tensors = _head_to_hf(reference, layer)
+    fp8_key = f"model.language_model.layers.{layer}.self_attn.o_proj.weight"
+    # fp8-representable values at scale 0.5: the dequantized weight is exactly code * 0.5.
+    codes = np.round(np.clip(tensors[fp8_key] * 8, -8, 8)) / 4
+    tensors[fp8_key] = codes.astype(np.float32)
+    _write_nextn_checkpoint(tmp_path, tensors, fp8_key)
+
+    target = _make_model()
+    assert not target.has_mtp()
+    drafter = target.drafter(method="mtp", num_draft_tokens=K, nextn_checkpoint=str(tmp_path), nextn_cache_length=96)
+    assert target.has_mtp() and isinstance(drafter, Qwen3_5MTPDrafter)
+    assert target.mtp.cache_spec()["max_length"] == 96
+
+    _gd, want = spx.export(reference)
+    _gd, got = spx.export(target.mtp)
+    got_leaves = {str(p): leaf for _c, p, leaf in got.items()}
+    for _c, path, leaf in want.items():
+        expected = np.asarray(jax.device_get(leaf))
+        if str(path) == "layers.0.self_attn.o_proj.weight":
+            expected = (codes * 0.5).T
+        actual = np.asarray(jax.device_get(got_leaves.pop(str(path))))
+        assert actual.dtype == expected.dtype and actual.shape == expected.shape, path
+        np.testing.assert_array_equal(actual, expected, err_msg=str(path))
+    assert not got_leaves
+
+    drafter.ensure_batch_size(2)
+    assert drafter.mtp_cache_capacity() == 96
+    with pytest.raises(ValueError, match="already attached"):
+        target.drafter(method="mtp", nextn_checkpoint=str(tmp_path))
+
+
+def test_drafter_hook_rejects_incomplete_nextn_checkpoint(tmp_path):
+    reference = _make_model_with_head().mtp
+    tensors = _head_to_hf(reference, 4)
+    fp8_key = "model.language_model.layers.4.self_attn.o_proj.weight"
+    tensors[fp8_key] = np.zeros_like(tensors[fp8_key])
+    tensors.pop("model.language_model.layers.4.hnorm.weight")
+    _write_nextn_checkpoint(tmp_path, tensors, fp8_key)
+    with pytest.raises(ValueError, match="missing"):
+        _make_model().drafter(method="mtp", nextn_checkpoint=str(tmp_path))
 
 
 def _rms(x, w, eps):

@@ -1464,6 +1464,50 @@ class Glm5NextForCausalLM(_Glm5NextIndexerCacheMixin, BaseCausalLMModule[Glm5Nex
         """
         return getattr(self, "mtp", None) is not None
 
+    def drafter(
+        self,
+        method: str = "auto",
+        *,
+        nextn_checkpoint: str | None = None,
+        nextn_cache_length: int | None = None,
+        **kwargs: typing.Any,
+    ) -> typing.Any:
+        """Build a speculative-decoding drafter; optionally load the checkpoint's own nextn layer first.
+
+        GLM-5-Next checkpoints ship their nextn (MTP) layer as ``layers.{num_hidden_layers}.*``. A converted
+        checkpoint may lack it, so ``nextn_checkpoint`` names a Hugging Face checkpoint directory that holds it
+        (any path ``ePath`` reads); the layer is loaded and attached as ``self.mtp`` before the drafter is built
+        (:func:`~easydel.modules.glm5_next.modeling_glm5_next_mtp.load_glm5_next_mtp_checkpoint`).
+
+        Args:
+            method: Drafter family (see :meth:`EasyDeLBaseModule.drafter`).
+            nextn_checkpoint: Hugging Face checkpoint holding the nextn layer, or ``None`` to use an attached head.
+            nextn_cache_length: Slots per request of the drafter-local MTP cache. The cache holds a request's
+                drafted history only (not its prompt); a request whose drafted history reaches it stops drafting.
+            **kwargs: Forwarded to :meth:`EasyDeLBaseModule.drafter`.
+
+        Returns:
+            The drafter.
+
+        Raises:
+            ValueError: If ``nextn_checkpoint`` is given while a head is already attached.
+        """
+        from .modeling_glm5_next_mtp import DEFAULT_MTP_CACHE_LENGTH, load_glm5_next_mtp_checkpoint
+
+        if nextn_checkpoint is not None:
+            if self.has_mtp():
+                raise ValueError("A nextn head is already attached; pass nextn_checkpoint only to load one.")
+            load_glm5_next_mtp_checkpoint(
+                self,
+                str(nextn_checkpoint),
+                param_dtype=self.param_dtype,
+                precision=self.precision,
+                max_cache_length=int(nextn_cache_length or DEFAULT_MTP_CACHE_LENGTH),
+            )
+        elif nextn_cache_length is not None and self.has_mtp():
+            self.mtp.max_cache_length = int(nextn_cache_length)
+        return super().drafter(method, **kwargs)
+
 
 @register_module(TaskType.CAUSAL_LM, config=Glm5NextTextConfig, model_type="glm5_next")
 class Glm5NextCompositeCausalLM(Glm5NextForCausalLM):
