@@ -95,11 +95,14 @@ class FastIncrementalDecoder:
       then stripped from the result. This is required for SentencePiece
       / WordPiece-style tokenizers where the decoding of a token
       depends on its neighbours.
-    * **UTF-8 buffering**: when the decoded delta contains the U+FFFD
-      replacement character (i.e. a split multi-byte sequence) the
-      incoming tokens are kept as ``new_buffered`` and an empty delta
-      is returned; the next call re-decodes them together with the
-      following tokens once a clean boundary is reached.
+    * **UTF-8 buffering**: when the decoded delta ends with the U+FFFD
+      replacement character (a multi-byte character split across
+      tokens) the incoming tokens are kept as ``new_buffered`` and an
+      empty delta is returned; the next call re-decodes them together
+      with the following tokens once a clean boundary is reached. A
+      replacement character followed by more text stands for bytes
+      that no later token can complete, so it is emitted with that
+      text, as the final full decode renders it.
 
     Public API matches the original ``SimpleDecoder.decode`` method
     used by previous versions of the detokenizer worker.
@@ -179,9 +182,10 @@ class FastIncrementalDecoder:
         Decodes ``context_tokens + buffered_tokens + new_tokens`` and
         subtracts the decoded context so tokenizers that need preceding
         context (e.g. WordPiece) still stream correctly. If the resulting
-        delta contains the UTF-8 replacement character (``\\ufffd``) the
-        tokens are kept as ``buffered_tokens`` and an empty delta is
-        returned to avoid emitting corrupt text.
+        delta ends with the UTF-8 replacement character (``\\ufffd``), a
+        multi-byte character may still be incomplete: the tokens are kept
+        as ``buffered_tokens`` and an empty delta is returned. A
+        replacement character inside the delta is final and is emitted.
 
         Args:
             new_tokens: Tokens produced since the last call.
@@ -232,7 +236,10 @@ class FastIncrementalDecoder:
             )
 
         delta = decoded_candidate[len(decoded_context) :]
-        if "�" in delta:
+        # Only a trailing replacement character can be an incomplete multi-byte character that later tokens complete.
+        # One followed by more text stands for invalid bytes that stay invalid: holding it back would hold back every
+        # later delta until the request finishes, whose full decode renders it the same way.
+        if delta.endswith("\ufffd"):
             return "", buffered + fresh, True
 
         return delta, [], False
