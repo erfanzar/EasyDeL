@@ -226,7 +226,7 @@ repos:
         stages: [pre-push]
       - id: subtree-mirror-sync
         name: Push libs/* updates to standalone mirrors
-        description: Pushes spectrax/ejkernel/eformer/eray subtrees to their mirror repos when they changed (SUBTREE_SYNC_SKIP=1 to bypass)
+        description: Pushes spectrax/ejkernel/eformer/eray/surgecore subtrees to their mirror repos when they changed (SUBTREE_SYNC_SKIP=1 to bypass)
         entry: scripts/subtree-sync.sh auto
         language: system
         pass_filenames: false

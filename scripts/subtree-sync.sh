@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sync the libs/* subtrees with their standalone mirror repositories.
 #
-#   scripts/subtree-sync.sh push [lib...]   # monorepo -> mirrors (default: all four)
+#   scripts/subtree-sync.sh push [lib...]   # monorepo -> mirrors (default: all five)
 #   scripts/subtree-sync.sh pull [lib...]   # mirrors -> monorepo (squashed: 2 commits per lib)
 #   scripts/subtree-sync.sh auto [lib...]   # push only the libs whose mirror is out of date
 #                                           # (used by the pre-push git hook; DRY_RUN=1 to
@@ -25,6 +25,7 @@ declare -A REPOS=(
     [ejkernel]="https://github.com/erfanzar/ejkernel"
     [eformer]="https://github.com/erfanzar/eformer"
     [eray]="https://github.com/erfanzar/eray"
+    [surgecore]="https://github.com/erfanzar/esurgecore"
 )
 
 MONO_SYNC_PREFIX="${MONO_SYNC_PREFIX:-easydel(mono-sync): }"
@@ -32,7 +33,7 @@ MONO_SYNC_PREFIX="${MONO_SYNC_PREFIX:-easydel(mono-sync): }"
 cmd="${1:-push}"
 shift || true
 libs=("$@")
-[ ${#libs[@]} -eq 0 ] && libs=(spectrax ejkernel eformer eray)
+[ ${#libs[@]} -eq 0 ] && libs=(spectrax ejkernel eformer eray surgecore)
 
 if [ "$cmd" = "auto" ]; then
     # bypass requested
@@ -105,6 +106,12 @@ build_prefixed_head() {
 push_prefixed() {
     local lib="$1" repo="$2"
     local lsout remote_head remote_ref head
+    # A branch that predates a library (surgecore on an older main) has nothing to mirror: skip it rather than fail
+    # the split, which under `set -e` would block the push that runs this hook.
+    if ! git cat-file -e "HEAD:libs/$lib" 2>/dev/null; then
+        echo ">>> $lib: libs/$lib is not in HEAD, skipping"
+        return 0
+    fi
     if ! lsout=$(git ls-remote "$repo" main 2>/dev/null); then
         echo ">>> $lib: mirror unreachable, skipping (retry: scripts/subtree-sync.sh push $lib)"
         return 0

@@ -8,8 +8,8 @@ this file.
 
 A uv-workspace monorepo containing the EasyDeL stack: a JAX-native framework for training, fine-tuning, and serving
 LLMs/VLMs at scale on TPU/GPU, plus the four foundation libraries it is built on. **This monorepo is the source of
-truth**; `libs/spectrax`, `libs/ejkernel`, `libs/eformer`, `libs/eray` are subtree-mirrored to standalone read-only
-repos on push.
+truth**; `libs/spectrax`, `libs/ejkernel`, `libs/eformer`, `libs/eray` and `libs/surgecore` are subtree-mirrored to
+standalone read-only repos on push.
 
 | package   | path             | one line                                                                                                                        |
 |-----------|------------------|---------------------------------------------------------------------------------------------------------------------------------|
@@ -18,7 +18,7 @@ repos on push.
 | ejkernel  | `libs/ejkernel`  | hardware kernels (Triton/Pallas/CUDA/CuTe/TileLang) behind a priority registry with XLA fallback                                |
 | eformer   | `libs/eformer`   | scale infrastructure: escale meshes/sharding, optimizers, TensorStore checkpointing, mixed precision, implicit quantized arrays |
 | eray      | `libs/eray`      | Ray orchestration for TPU/GPU pods: pools, resumable execution, TPU CLI                                                         |
-| surgecore | `libs/surgecore` | EasyDeL's native Rust library (PyO3, built by maturin) for the eSurge host path; imported only by easydel; not mirrored         |
+| surgecore | `libs/surgecore` | EasyDeL's native Rust library (PyO3, maturin) for eSurge's host path; imported only by easydel; mirror erfanzar/esurgecore      |
 
 `external optimizer package/` (repo root, outside libs/) holds quantization-aware optimizers registered into EasyDeL via
 `@register_optimizer`.
@@ -120,9 +120,9 @@ fallback.
 `OptimizerFactory` optimizers, compiles a sharded train step, streams batches from the `easydel/data/`
 Pipeline (source → tokenize → mix → pack → load), checkpoints async via TensorStore.
 
-**Serving:** eSurge (`easydel/inference/esurge/`) — continuous-batching scheduler + paged KV cache (PagePool/PageTable,
-prefix caching) + compiled bucket runners + OpenAI-compatible FastAPI server with tool/reasoning parsers, speculative
-decoding, multimodal, multi-host ZMQ mode.
+**Serving:** eSurge (`easydel/inference/esurge/`) — continuous-batching scheduler + paged KV cache (page pool and prefix
+cache in surgecore's Rust `KvCore`, PageTable) + compiled bucket runners + OpenAI-compatible FastAPI server with
+tool/reasoning parsers, speculative decoding, multimodal, multi-host ZMQ mode.
 
 **Pipeline parallelism:** `sharding_axis_dims[0] > 1` (the `pp` axis) makes
 `config.mesh` an MPMD `SpxMesh`; layers get stage assignments (`EasyDeLLayerStackMixin.assign_layer_stage`,

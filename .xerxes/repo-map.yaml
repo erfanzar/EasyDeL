@@ -108,7 +108,7 @@ packages:
     imports: numpy only; imported only by easydel (eSurge host path)
     build: uv sync compiles it through maturin, so a Rust toolchain (cargo) is required
     release: surgecore-v* tags -> publish.yaml surgecore-* jobs (manylinux_2_28 x86_64/aarch64 + macOS arm64 wheels, sdist)
-    mirror: none (not subtree-mirrored)
+    mirror: erfanzar/esurgecore (subtree, like the foundation libs)
   external optimizer package:
     path: external optimizer package
     role: quantization-aware optimizers registered into easydel via @register_optimizer
@@ -124,7 +124,7 @@ flows:
     - compiled sharded step (compile_trainer_step) -> data/ Pipeline batches -> async TensorStore checkpoints
     - online-RL variants generate rollouts via eSurge inside the loop (esurge_rollout/, async_grpo)
   inference:
-    - request -> eSurge engine (mixins/io) -> scheduler (continuous batching, prefix-cached PagePool)
+    - request -> eSurge engine (mixins/io) -> scheduler (continuous batching; paged KV and prefix cache in surgecore KvCore)
     - runner compile-bucketed forward (ragged page attention) -> SamplerExecutor -> stream/generate output
     - server/api_server.py exposes OpenAI-compatible endpoints; tools+reasoning parsers post-process
   pipeline_parallelism:

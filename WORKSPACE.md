@@ -4,14 +4,14 @@ This repository is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/
 monorepo containing six packages that are developed together and released
 independently:
 
-| package   | path             | import      | PyPI           | mirror repo         |
-| --------- | ---------------- | ----------- | -------------- | ------------------- |
-| EasyDeL   | `libs/easydel`   | `easydel`   | `easydel`      | (this repo)         |
-| Spectrax  | `libs/spectrax`  | `spectrax`  | `spectrax-lib` | `erfanzar/Spectrax` |
-| eJKernel  | `libs/ejkernel`  | `ejkernel`  | `ejkernel`     | `erfanzar/ejkernel` |
-| eFormer   | `libs/eformer`   | `eformer`   | `eformer`      | `erfanzar/eformer`  |
-| eRay      | `libs/eray`      | `eray`      | `eray`         | `erfanzar/eray`     |
-| surgecore | `libs/surgecore` | `surgecore` | `surgecore`    | (not mirrored)      |
+| package   | path             | import      | PyPI           | mirror repo           |
+| --------- | ---------------- | ----------- | -------------- | --------------------- |
+| EasyDeL   | `libs/easydel`   | `easydel`   | `easydel`      | (this repo)           |
+| Spectrax  | `libs/spectrax`  | `spectrax`  | `spectrax-lib` | `erfanzar/Spectrax`   |
+| eJKernel  | `libs/ejkernel`  | `ejkernel`  | `ejkernel`     | `erfanzar/ejkernel`   |
+| eFormer   | `libs/eformer`   | `eformer`   | `eformer`      | `erfanzar/eformer`    |
+| eRay      | `libs/eray`      | `eray`      | `eray`         | `erfanzar/eray`       |
+| surgecore | `libs/surgecore` | `surgecore` | `surgecore`    | `erfanzar/esurgecore` |
 
 **This monorepo is the source of truth.** The standalone repositories are
 read-only mirrors kept in sync automatically — do not merge changes there
@@ -203,20 +203,18 @@ release that requires it is published.
 ## Mirror sync
 
 Mirrors update automatically when you `git push`: the pre-push hook
-(`scripts/subtree-sync.sh auto`) detects which of spectrax/ejkernel/eformer/eray
-changed and subtree-pushes just those to their standalone repos
-(`SUBTREE_SYNC_SKIP=1 git push` to bypass; mirror outages never block the
-push). `.github/workflows/sync-subtrees.yaml` is the server-side backstop
+(`scripts/subtree-sync.sh auto`) detects which of
+spectrax/ejkernel/eformer/eray/surgecore changed and subtree-pushes just those
+to their standalone repos (`SUBTREE_SYNC_SKIP=1 git push` to bypass; mirror
+outages never block the push, and a library missing from HEAD is skipped).
+`.github/workflows/sync-subtrees.yaml` is the server-side backstop
 (requires the `SUBTREE_SYNC_TOKEN` secret: fine-grained PAT, Contents
-read/write on the four mirrors). Manual fallback:
+read/write on the five mirrors). Manual fallback:
 
 ```bash
 scripts/subtree-sync.sh push            # all mirrors
 scripts/subtree-sync.sh pull ejkernel   # reconcile a diverged mirror
 ```
-
-`libs/surgecore` is not mirrored: `scripts/subtree-sync.sh` and `sync-subtrees.yaml` cover only
-spectrax/ejkernel/eformer/eray, and a surgecore mirror would first need its own repository.
 
 ## Dev tooling
 
