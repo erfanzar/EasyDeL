@@ -15,9 +15,9 @@
 """Pallas TPU ``ragged_kda``: chunk rows in one ``pallas_call`` (pool updated in place), short rows token by token.
 
 Row planning, the causal conv and the short rows (at most ``short_row_max`` tokens, captured per token into the row's
-slot group) follow the XLA reference (``_xla.ragged_kda``). With the conv arrays every short-row token's recurrence is
-the Pallas decode kernel (``ragged_kda_decode``'s arithmetic: MXU matvecs at ``HIGHEST``, the serving decode step); on
-post-conv inputs it is the reference's decode step (the round-4 ``ragged_kda`` arithmetic, kept for post-conv callers).
+slot group) follow the XLA reference (``_xla.ragged_kda``). With the conv arrays every short row runs in one Pallas
+kernel (``ragged_kda_short``: conv fused, state in VMEM, captures written into the pools in place, the serving decode
+step's arithmetic); on post-conv inputs the short rows run the reference's decode step.
 
 Every chunk row (more than ``short_row_max`` tokens) is cut into ``chunk_size`` chunks aligned to its first token,
 exactly as in the XLA reference: chunk ``c`` reads the ``chunk_size``-token window of the flat (post-conv) stream that
@@ -58,9 +58,9 @@ from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array
 
 from ...._xla.kda_chunk._xla_impl import LANES, SUBLANES, chunk_core, l2norm, pairwise_sub_block, resolve_precision
-from ...._xla.ragged_kda._xla_impl import conv_and_short_rows, plan_rows, resolve_inverse, short_phase, xla_step
+from ...._xla.ragged_kda._xla_impl import conv_and_short_rows, plan_rows, resolve_inverse
 from ..kda_chunk._pallas_impl_fwd import chunk_cumsum
-from ..ragged_kda_decode._pallas_impl import ragged_kda_decode_pallas
+from ..ragged_kda_short._interface import ragged_kda_short
 
 _NUM_TABLES = 7  # scalar-prefetch operands: live count, chunk map, read slot, write slot, first, last, init
 
@@ -371,27 +371,6 @@ def _flat_output(
     return multi, chunk_out[chunk, :, lane, :]
 
 
-def _decode_kernel_step(
-    query: Array,
-    key: Array,
-    value: Array,
-    beta: Array,
-    decay: Array,
-    state: Array,
-    valid: Array,
-    init: Array | None,
-    use_qk_l2norm: bool = True,
-) -> tuple[Array, Array]:
-    """One short-row token for every row through the Pallas decode kernel (the serving decode step's arithmetic).
-
-    ``state`` ``[R, H, K, V]`` (pool dtype) is the rows' carried state, updated in place; rows that are not ``valid``
-    keep it bit for bit and output zeros.
-    """
-    return ragged_kda_decode_pallas(
-        query, key, value, beta, decay, state, None, valid, init, use_qk_l2norm=use_qk_l2norm
-    )
-
-
 def ragged_kda_pallas(
     query: Array,
     key: Array,
@@ -483,7 +462,6 @@ def ragged_kda_pallas(
         short_row_max=int(short_row_max),
     )
     weights = (q_conv_weight, k_conv_weight, v_conv_weight) if fused else None
-    step_fn = _decode_kernel_step if fused else xla_step
     pools_in = (q_conv_state, k_conv_state, v_conv_state, recurrent_state)
 
     def all_rows(pools_in):
@@ -499,7 +477,6 @@ def ragged_kda_pallas(
             plan,
             short_row_max=int(short_row_max),
             use_qk_l2norm=use_qk_l2norm,
-            step_fn=step_fn,
             chunk_size=cs,
             sub=int(sub),
             precision=precision,
@@ -508,7 +485,7 @@ def ragged_kda_pallas(
 
     def short_rows_only(pools_in):
         out = jnp.zeros((num_tokens, num_heads, v_dim), jnp.float32)
-        out, pools = short_phase(
+        out, pools = ragged_kda_short(
             out,
             pools_in,
             query=query,
@@ -520,7 +497,6 @@ def ragged_kda_pallas(
             plan=plan,
             short_row_max=int(short_row_max),
             use_qk_l2norm=use_qk_l2norm,
-            step_fn=step_fn,
         )
         return (out, *pools)
 
@@ -548,7 +524,6 @@ def _all_rows(
     *,
     short_row_max: int,
     use_qk_l2norm: bool,
-    step_fn,
     chunk_size: int,
     sub: int,
     precision: str,
@@ -577,7 +552,7 @@ def _all_rows(
         plan,
         short_row_max=int(short_row_max),
         use_qk_l2norm=use_qk_l2norm,
-        step_fn=step_fn,
+        short_fn=ragged_kda_short,
     )
     chunk_lens = jnp.where(plan.chunk, plan.lens, 0)
 

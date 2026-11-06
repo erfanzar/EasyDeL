@@ -1,0 +1,73 @@
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""XLA registry entry (priority 0 fallback and reference) for the short-row phase of ``ragged_kda``."""
+
+from __future__ import annotations
+
+from jaxtyping import Array
+
+from ..._registry import Backend, Platform, kernel_registry
+from ..ragged_kda._xla_impl import RowPlan, short_phase
+
+
+@kernel_registry.register("ragged_kda_short", Platform.XLA, Backend.ANY, priority=0)
+def ragged_kda_short(
+    out: Array,
+    pools: tuple[Array | None, Array | None, Array | None, Array],
+    *,
+    query: Array,
+    key: Array,
+    value: Array,
+    beta: Array,
+    decay: Array,
+    weights: tuple[Array, Array, Array] | None,
+    plan: RowPlan,
+    short_row_max: int,
+    use_qk_l2norm: bool,
+) -> tuple[Array, tuple[Array | None, Array | None, Array | None, Array]]:
+    """Short rows of a ``ragged_kda`` step, token by token (XLA; see ``ragged_kda._xla_impl.short_phase``).
+
+    Args:
+        out: ``[T, H, V]`` fp32 output buffer.
+        pools: ``(q_conv_state, k_conv_state, v_conv_state, recurrent_state)``.
+        query: Queries ``[T, H, K]`` (raw with ``weights``, post-conv without).
+        key: Keys ``[T, H, K]``.
+        value: Values ``[T, H, V]``.
+        beta: ``[T, H]``.
+        decay: ``[T, H, K]``.
+        weights: ``(q, k, v)`` conv taps ``[dim, d_conv]``, or ``None``.
+        plan: The step's row plan.
+        short_row_max: ``W`` (static).
+        use_qk_l2norm: L2-normalise queries and keys.
+
+    Returns:
+        ``(out, pools)`` with the short rows' outputs and captured slots written.
+    """
+    return short_phase(
+        out,
+        pools,
+        query=query,
+        key=key,
+        value=value,
+        beta=beta,
+        decay=decay,
+        weights=weights,
+        plan=plan,
+        short_row_max=short_row_max,
+        use_qk_l2norm=use_qk_l2norm,
+    )
+
+
+__all__ = ("ragged_kda_short",)

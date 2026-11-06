@@ -442,8 +442,9 @@ def decode_step(
     return jnp.sum(s * q[..., None], axis=-2), s
 
 
-# step_fn(query, key, value, beta, decay, state, valid, init, use_qk_l2norm) -> (out fp32, new_state in state.dtype)
-StepFn = tp.Callable[..., tuple[Array, Array]]
+# short_fn(out, pools, *, query, key, value, beta, decay, weights, plan, short_row_max, use_qk_l2norm) -> (out, pools):
+# the whole short-row phase, with :func:`short_phase`'s signature and contract.
+ShortFn = tp.Callable[..., tuple[Array, tuple[Array | None, Array | None, Array | None, Array]]]
 
 
 def xla_step(
@@ -491,7 +492,6 @@ def short_phase(
     plan: RowPlan,
     short_row_max: int,
     use_qk_l2norm: bool,
-    step_fn: StepFn | None = None,
 ) -> tuple[Array, tuple[Array | None, Array | None, Array | None, Array]]:
     """Advance every short row token by token, capturing windows and states into the row's slot group.
 
@@ -508,8 +508,6 @@ def short_phase(
         plan: The step's :class:`RowPlan`.
         short_row_max: ``W`` (static): the loop runs ``W`` token positions.
         use_qk_l2norm: L2-normalise queries and keys.
-        step_fn: Recurrence of one token for every row (:func:`xla_step`'s signature; default :func:`xla_step`).
-            It must return the new state in the pool dtype; ``init`` is passed at the first position only.
 
     Returns:
         ``(out, pools)`` with the short rows' outputs and captured slots written.
@@ -519,7 +517,7 @@ def short_phase(
     v_dim = value.shape[-1]
     num_slots = rec.shape[0]
     num_rows = plan.lens.shape[0]
-    step = step_fn or xla_step
+    step = xla_step
     # Every read of the step happens here, before the first capture is written.
     held_rec = read_rows(rec, plan)
     state = jnp.where(plan.init[:, None, None, None], held_rec, jnp.zeros((), rec.dtype))
@@ -714,7 +712,7 @@ def conv_and_short_rows(
     *,
     short_row_max: int,
     use_qk_l2norm: bool,
-    step_fn: StepFn | None = None,
+    short_fn: ShortFn | None = None,
 ) -> tuple[Array, tuple[Array | None, Array | None, Array | None, Array], tuple[Array, Array, Array]]:
     """Everything but the chunk recurrence: the flat conv, the short rows and the chunk rows' final conv windows.
 
@@ -730,7 +728,7 @@ def conv_and_short_rows(
         plan: The step's :class:`RowPlan`.
         short_row_max: ``W``.
         use_qk_l2norm: L2-normalise queries and keys.
-        step_fn: Per-token recurrence of the short rows (see :func:`short_phase`; default :func:`xla_step`).
+        short_fn: The short-row phase (:func:`short_phase`'s signature and contract; default :func:`short_phase`).
 
     Returns:
         ``(out [T, H, V] fp32 with the short rows' outputs, pools with the short rows' captures and the chunk rows'
@@ -749,10 +747,10 @@ def conv_and_short_rows(
         plan=plan,
         short_row_max=short_row_max,
         use_qk_l2norm=use_qk_l2norm,
-        step_fn=step_fn,
     )
+    short = short_fn or short_phase
     if weights is None:
-        out, pools = short_phase(out, pools, **common)
+        out, pools = short(out, pools, **common)
         return out, pools, (query, key, value)
     q_pool, k_pool, v_pool, rec = pools
     num_slots = rec.shape[0]
@@ -766,7 +764,7 @@ def conv_and_short_rows(
         flat_conv(s, w, read_rows(p, plan), query_start_loc, plan.init)
         for s, w, p in zip(streams, weights, (q_pool, k_pool, v_pool), strict=True)
     ]
-    out, (q_pool, k_pool, v_pool, rec) = short_phase(out, (q_pool, k_pool, v_pool, rec), **common)
+    out, (q_pool, k_pool, v_pool, rec) = short(out, (q_pool, k_pool, v_pool, rec), **common)
     if plan.identity:
         q_pool, k_pool, v_pool = (
             put_rows(p, jnp.where(plan.chunk[:, None, None], c[1], read_rows(p, plan)))
@@ -908,7 +906,7 @@ def ragged_kda_xla(
 __all__ = (
     "CONV_ARRAYS",
     "RowPlan",
-    "StepFn",
+    "ShortFn",
     "chunk_phase",
     "conv_and_short_rows",
     "conv_compute_dtype",
