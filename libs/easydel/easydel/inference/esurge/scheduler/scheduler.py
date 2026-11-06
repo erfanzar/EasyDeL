@@ -1156,7 +1156,7 @@ class Scheduler(SchedulerInterface):
             total_pages = cache_manager.num_pages
             used_pages = total_pages - cache_manager.page_pool.get_num_free_pages()
 
-            num_cached_pages = len(cache_manager.page_pool.cached_page_hash_to_page)
+            num_cached_pages = cache_manager.num_cached_pages
             cache_hit_rate = num_cached_pages / max(total_pages, 1)
 
             metrics_collector.record_cache_metrics(

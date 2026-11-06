@@ -16,11 +16,13 @@
 
 The compiled extension module ``surgecore._native`` is built from this package's Rust crate with maturin. It holds
 the per-step host computation of eSurge's runner: :class:`HostPayloadBuilder` fills a batch preparer's preallocated
-numpy staging arrays with one forward window's step inputs, with the GIL released.
+numpy staging arrays with one forward window's step inputs, with the GIL released. :class:`KvCore` is the KV core of
+one page pool (LRU free list, prefix map, cache-group rules, transactional allocation) and :class:`SnapshotIndex`
+the recurrent-snapshot slot index.
 """
 
 try:
-    from ._native import HostPayloadBuilder, __version__, request_distribution_prefix
+    from ._native import HostPayloadBuilder, KvCore, SnapshotIndex, __version__, request_distribution_prefix
 except ImportError as exc:  # pragma: no cover - depends on the build
     raise ImportError(
         "surgecore._native (EasyDeL's compiled host library) is not built. Build the wheel with "
@@ -28,4 +30,4 @@ except ImportError as exc:  # pragma: no cover - depends on the build
         "surgecore/_native.abi3.so into libs/surgecore/surgecore/ (see libs/surgecore/README.md)."
     ) from exc
 
-__all__ = ("HostPayloadBuilder", "__version__", "request_distribution_prefix")
+__all__ = ("HostPayloadBuilder", "KvCore", "SnapshotIndex", "__version__", "request_distribution_prefix")

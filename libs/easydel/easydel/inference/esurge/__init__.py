@@ -31,7 +31,7 @@ Key Features:
 Components:
     eSurgeRuntimeConfig: Runtime and scheduler configuration.
     eSurgeCacheRuntimeConfig: KV cache and paging configuration.
-    CacheCoordinator: KV cache coordination and management
+    CacheManager: KV cache allocation and prefix caching (binding of surgecore's Rust KvCore)
     Scheduler: Request scheduling and batching
     eSurgeRunner: Model execution runner
     eSurge: Main engine interface
@@ -47,7 +47,7 @@ Classes:
     Scheduler: Request scheduler with batching support.
     SchedulerOutput: Output from scheduler decisions.
     eSurgeRunner: Model execution and forward pass runner.
-    CacheCoordinator: KV cache allocation and management.
+    CacheManager: KV cache allocation and prefix caching.
     MetricsCollector: Centralized metrics collection system.
 
 Example:

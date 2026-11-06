@@ -501,7 +501,6 @@ class TestPrefixPublication:
             no_sample.sampled_token_ids = [[]]
             s.update_from_output(batch, no_sample)
 
-        assert s.kv_cache_manager.page_pool.null_page.page_hash is None
         # Page 0 was nulled out of the window before publication: a request
         # sharing only that page must not report a prefix hit on it.
         assert s.kv_cache_manager.probe_num_computed_tokens(make_req("short", 5)) == 0

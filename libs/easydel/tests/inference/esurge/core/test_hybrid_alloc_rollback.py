@@ -35,7 +35,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax.numpy as jnp
 from easydel.inference.esurge.core.interface import CacheGroupSpec, FullAttentionSpec, SlidingWindowSpec
-from easydel.inference.esurge.core.manager import CacheManager, CachePages
+from easydel.inference.esurge.core.manager import CacheManager
 from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.sampling_params import SamplingParams
 
@@ -107,20 +107,26 @@ def test_hybrid_shard_alloc_failure_leaves_no_leaked_pages():
     # No leak: the group-0 page was returned; free count is fully restored and
     # the victim holds no pages in any group.
     assert pool.get_num_free_pages() == free_before
-    assert all(len(group) == 0 for group in mgr.coordinator.get_pages("victim"))
+    assert all(len(group) == 0 for group in mgr.get_page_ids("victim"))
 
 
 def test_hybrid_shard_alloc_failure_retry_with_prefix_hit_does_not_assert():
     mgr = _manager(enable_caching=True)
     pool = mgr.page_pool
 
-    # Pull one shard-0 page per group to act as the victim's cached prefix
-    # (pages 1 and 2), leaving exactly one free page (page 3) in shard 0.
-    cp_full = pool.get_new_pages(1, dp_shard_hint=0, data_parallel_size=DP)
-    cp_slide = pool.get_new_pages(1, dp_shard_hint=0, data_parallel_size=DP)
-    computed = CachePages((list(cp_full), list(cp_slide)))
+    # A seed request publishes one shard-0 page per group (pages 1 and 2) and finishes, so the victim's
+    # prefix hit is those two pages, leaving exactly one other free page (page 3) in shard 0.
+    seed = _req("seed", 32)
+    assert mgr.allocate_slots(seed, num_new_tokens=PAGE_SIZE, dp_shard_hint=0, data_parallel_size=DP) is not None
+    mgr.cache_pages(seed, PAGE_SIZE)
+    mgr.free(seed)
+    mgr.free_page_hashes(seed)
 
     victim = _req("victim", 32)
+    computed, hit = mgr.get_computed_pages(victim, dp_shard_hint=0, data_parallel_size=DP)
+    assert hit == PAGE_SIZE
+    assert computed.get_page_ids() == ([1], [2])
+    free_before = pool.get_num_free_pages()
 
     def attempt():
         # 1 cached page/group + 1 new page/group needed. Group 0 grabs shard 0's
@@ -139,4 +145,7 @@ def test_hybrid_shard_alloc_failure_retry_with_prefix_hit_does_not_assert():
     # group-0 page attached, so this retry raises AssertionError inside
     # save_new_computed_pages. With the fix it cleanly returns None again.
     assert attempt() is None
-    assert all(len(group) == 0 for group in mgr.coordinator.get_pages("victim"))
+    assert all(len(group) == 0 for group in mgr.get_page_ids("victim"))
+    assert pool.get_num_free_pages() == free_before
+    # The rolled-back hit pages stay published: the same lookup still hits them.
+    assert mgr.get_computed_pages(victim, dp_shard_hint=0, data_parallel_size=DP)[1] == PAGE_SIZE

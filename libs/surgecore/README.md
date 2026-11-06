@@ -1,12 +1,20 @@
 # surgecore
 
 EasyDeL's native host library for the eSurge inference engine: a Rust crate (PyO3 + maturin) whose extension module
-`surgecore._native` runs eSurge's per-step host computation over numpy buffers with the GIL released.
+`surgecore._native` holds eSurge's host-side state and per-step host computation.
 
-Today it holds `HostPayloadBuilder`, which fills a batch preparer's preallocated staging arrays with one forward
-window's step inputs: token and position packing, query start locations and sequence lengths, rank-major DP packing,
-page-table rows, the DP-local page check, the v2 KV slot mapping, the positional request distribution and the packed
-sampling vectors. Only eSurge's runner imports it; `import easydel` and training do not need it.
+It holds:
+- `HostPayloadBuilder`, which fills a batch preparer's preallocated staging arrays with one forward window's step
+  inputs, with the GIL released: token and position packing, query start locations and sequence lengths, rank-major DP
+  packing, page-table rows, the DP-local page check, the v2 KV slot mapping, the positional request distribution and
+  the packed sampling vectors.
+- `KvCore`, eSurge's KV-cache core: the page pool with its LRU free list and null page 0, the chained page keys and the
+  prefix map, the full, sliding-window and chunked-local group rules, transactional allocation with rollback, and
+  publication of pages once their KV is computed. eSurge's `CacheManager` is its binding.
+- `SnapshotIndex`, the slots of recurrent-state snapshots taken at prefix-cache page boundaries, which let
+  linear-attention and SSM models reuse prefix-cache hits.
+
+Only eSurge imports it; `import easydel` and training do not need it.
 
 ## Build
 
@@ -31,6 +39,7 @@ cargo test --locked --no-default-features   # the pure-Rust core alone, no Pytho
 python -m pytest tests                      # parity against the goldens in tests/data plus invariant tests (CPU)
 ```
 
-The pytest files carry `pytest.mark.cpu_ok`: they do no JAX computation. `tests/data/host_payload_goldens.npz` holds
-inputs and outputs captured from eSurge's former Python step-input builder (its header names the source commit); the
-parity test compares the native builder with it bitwise.
+The pytest files carry `pytest.mark.cpu_ok`: they do no JAX computation. The fixtures in `tests/data` hold inputs and
+outputs captured from the Python code each piece replaced, and each header names its source commit:
+`host_payload_goldens.npz` comes from eSurge's former step-input builder, `kv_goldens.npz` from its former KV core.
+The parity tests compare the native code with them bitwise.
