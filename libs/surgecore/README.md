@@ -13,6 +13,12 @@ It holds:
   publication of pages once their KV is computed. eSurge's `CacheManager` is its binding.
 - `SnapshotIndex`, the slots of recurrent-state snapshots taken at prefix-cache page boundaries, which let
   linear-attention and SSM models reuse prefix-cache hits.
+- `EngineCore`, eSurge's host state machine: the request table, every data-parallel rank's queues, token budget, KV
+  core and snapshot index, and the scheduler over them (FCFS or priority, chunked prefill, the long-prefill cap,
+  preemption, whole-prompt admission, image-span alignment, snapshot boundaries, async output placeholders, request
+  buckets) with synchronous speculative drafts (draft trimming, EAGLE lookahead, acceptance rollback) and the stop
+  checks. `schedule()` returns a `Plan`; `commit()` takes the runner's sampled lists, accepted counts and new drafts
+  and returns `Events`. Every call releases the GIL.
 
 Only eSurge imports it; `import easydel` and training do not need it.
 
@@ -41,5 +47,8 @@ python -m pytest tests                      # parity against the goldens in test
 
 The pytest files carry `pytest.mark.cpu_ok`: they do no JAX computation. The fixtures in `tests/data` hold inputs and
 outputs captured from the Python code each piece replaced, and each header names its source commit:
-`host_payload_goldens.npz` comes from eSurge's former step-input builder, `kv_goldens.npz` from its former KV core.
+`host_payload_goldens.npz` comes from eSurge's former step-input builder, `kv_goldens.npz` from its former KV core,
+`engine_goldens.npz` and `engine_goldens_ext.npz` from its former scheduler (the second with speculative drafts,
+runner-output gaps, multimodal page keys, request buckets, the finished set and the structured-output flag).
+`test_engine_behaviour.py` states the former scheduler's behaviour tests against `EngineCore`.
 The parity tests compare the native code with them bitwise.
