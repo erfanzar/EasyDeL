@@ -131,8 +131,10 @@ versions declared in `libs/easydel/pyproject.toml`.
 `libs/surgecore` is a Rust extension (PyO3, abi3-py311, built by maturin): `uv sync` compiles it from
 source, so it needs a Rust toolchain with `cargo` on PATH (a minimal stable rustup toolchain is enough). Its
 crate checks run in `libs/surgecore`: `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`
-and `cargo test --locked` (the tests link libpython: set `PYO3_PYTHON` to a Python 3.11-3.13 interpreter).
-Workspace CI runs these, a wheel build and the package's CPU tests whenever `libs/surgecore` changes.
+and `cargo test --locked` (clippy and the tests link libpython: set `PYO3_PYTHON` to a Python 3.11-3.13
+interpreter); `cargo test --locked --no-default-features` tests the pure-Rust core without Python. Workspace CI
+runs these, a wheel build and the package's CPU tests whenever `libs/surgecore`, the root `pyproject.toml` or
+`uv.lock` changes.
 
 ## Layering contract (CI-enforced)
 

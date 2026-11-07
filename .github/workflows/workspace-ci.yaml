@@ -161,7 +161,8 @@ jobs:
   # run the crate's tests, build its wheel, then run its CPU-only Python tests against the synced workspace.
   surgecore:
     needs: changes
-    if: needs.changes.outputs.surgecore == 'true'
+    # The root pyproject.toml and uv.lock pin the crate's build and Python environment too.
+    if: needs.changes.outputs.surgecore == 'true' || needs.changes.outputs.root == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -195,6 +196,10 @@ jobs:
         env:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
         run: cargo test --locked
+
+      - name: cargo test (pure Rust, no Python)
+        working-directory: libs/surgecore
+        run: cargo test --locked --no-default-features
 
       - name: Build wheel
         run: uv build --package surgecore --wheel
