@@ -108,6 +108,7 @@ from .spec.interface import NullSpeculation, SpeculativeStrategy
 from .spec.sampling import score_sampled_tokens, summarize_logprobs
 from .spec.strategy import (
     DrafterSpeculation,
+    _restore_recurrent_state,
     pool_seed_hidden,
     snapshot_recurrent_state,
     take_hidden_rows,
@@ -673,6 +674,11 @@ class eSurgeRunner:
                 max_bucket=max(int(self.max_model_len), int(self.max_num_batched_tokens)),
             )
             self.num_tokens_paddings = sorted(set(self.num_tokens_paddings) | spec_buckets)
+        # A full decode step pads to its request bucket, so that bucket must be a token bucket as well, or a
+        # max_num_seqs that is not a power of two never runs the decode-layout program.
+        self.num_tokens_paddings = WindowPlanner.add_request_token_buckets(
+            self.num_tokens_paddings, self.max_num_seq_buckets
+        )
         if self._uses_spmd_dp():
             dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
             self.num_tokens_paddings = [int(bucket) for bucket in self.num_tokens_paddings if int(bucket) % dp_size == 0]
@@ -2000,6 +2006,51 @@ class eSurgeRunner:
         self._precompile_draft_in_verify_variants()
         self._precompile_spec_row_gathers()
         self._precompile_whole_block_drafter()
+        self.step_time_table = self._measure_step_times(num_tokens_paddings)
+
+    def _measure_step_times(self, num_tokens_paddings: list[int]) -> dict[int, float] | None:
+        """Milliseconds per compiled token bucket of the model step, for the engine core's verification budget.
+
+        Measured only with a drafter, over the token buckets up to the first one that holds every request verifying
+        every draft. Each bucket runs 1 warm-up and 5 timed steps on compile-shaped inputs, each ended by
+        ``block_until_ready``; its time is the mean of the timed runs without the fastest and the slowest.
+
+        Returns:
+            ``{token_bucket: ms}``, or ``None`` without a drafter or when a bucket cannot be timed.
+        """
+        if self.drafter is None or int(self.num_draft_tokens) <= 0:
+            return None
+        manager = self.executor_manager
+        dp = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+        limit = int(self.max_num_reqs) * (int(self.num_draft_tokens) + 1) * dp
+        req_buckets = sorted({int(b) for b in self.active_num_seq_buckets})
+        table: dict[int, float] = {}
+        # The timed steps run compile-shaped inputs through the live cache. Recurrent rows are restored afterwards
+        # exactly as compile left them; paged KV receives the same dummy writes compile's own warm-up made.
+        saved = snapshot_recurrent_state(manager.kv_pages)
+        try:
+            for num_tokens in sorted({int(t) for t in num_tokens_paddings}):
+                padded = max([b for b in req_buckets if b <= num_tokens], default=req_buckets[0])
+                runs: list[float] = []
+                for _ in range(6):
+                    inputs = manager.get_compile_configurations(
+                        manager.kv_pages, manager.rng_key, num_tokens, self.max_num_reqs, padded, self.metadata
+                    )[3]
+                    start = time.perf_counter()
+                    jax.block_until_ready(manager.execute_model(num_tokens, padded, inputs))
+                    runs.append((time.perf_counter() - start) * 1e3)
+                timed = sorted(runs[1:])[1:-1]
+                table[num_tokens] = sum(timed) / len(timed)
+                if num_tokens >= limit:
+                    break
+        except Exception as exc:  # the budget is an optimisation: serve with every draft verified instead
+            logger.warning("Step-time table not measured (%s); speculative steps verify every draft.", exc)
+            return None
+        finally:
+            manager.kv_pages = _restore_recurrent_state(manager.kv_pages, saved)
+            manager._reset_kv_pages_after_compile_warmup()
+        logger.info("Model-step time per token bucket (ms): %s", {t: round(ms, 3) for t, ms in table.items()})
+        return table
 
     def _precompile_whole_block_drafter(self) -> None:
         """Warm a whole-block drafter's (DSpark) programs through its optional ``precompile`` hook.
@@ -3149,14 +3200,15 @@ class eSurgeRunner:
                     rank_scheduled_tokens[rank] += int(scheduled_tokens)
                 peak_rank_scheduled = max(rank_scheduled_tokens) if rank_scheduled_tokens else 0
                 token_bucket_target = peak_rank_scheduled * dp_size
-            num_tokens_static = int(
-                self.window_planner.get_token_bucket(token_bucket_target, active_buckets=self.num_tokens_paddings)
-            )
-
             # Select optimal bucket for current batch size
             # This determines which compiled function to use
             current_bucket = self._get_current_bucket(num_reqs)
             padded_num_reqs = current_bucket  # Use bucket size for compilation lookup
+            num_tokens_static = int(
+                self.window_planner.get_token_bucket(
+                    token_bucket_target, active_buckets=self.num_tokens_paddings, request_bucket=padded_num_reqs
+                )
+            )
 
             scheduled_full_cpu = self._scheduled_full_cpu
             active_mask_full_cpu = self._active_mask_full_cpu
