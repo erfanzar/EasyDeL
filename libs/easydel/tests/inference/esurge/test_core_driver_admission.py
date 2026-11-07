@@ -248,6 +248,72 @@ def test_every_eos_id_stops_unless_ignore_eos_and_caller_stop_ids_always_stop(ig
         core.shutdown()
 
 
+@pytest.mark.parametrize("requested", [8, None])
+def test_a_prompt_that_fills_the_context_is_truncated_so_one_token_fits(requested):
+    admission = _admission_with_three_eos_ids()
+    prompt = list(range(2, 66))  # 64 tokens = max_model_len
+    params = admission.prepare_sampling_params_for_request(
+        SamplingParams(max_tokens=requested), request_id="full", prompt="p"
+    )
+    (record,) = admission.add_request("full", "p", params, prompt_token_ids=prompt, defer_scheduler_enqueue=True)
+    assert record.prompt_token_ids == prompt[1:]
+    assert record.sampling_params.max_tokens == 1
+    core = _core(dp=1)
+    try:
+        core.add_requests([record])
+        assert core.schedule().num_scheduled_tokens == {"full": 16}
+    finally:
+        core.shutdown()
+
+
+def test_a_prompt_that_fills_the_budget_below_the_model_length_samples_one_token_and_finishes_on_length():
+    admission = _admission_with_three_eos_ids()
+    admission.reserve_tokens = 4
+    prompt = list(range(2, 62))  # 60 tokens = max_model_len - reserve
+    params = admission.prepare_sampling_params_for_request(SamplingParams(max_tokens=8), request_id="r", prompt="p")
+    (record,) = admission.add_request("r", "p", params, prompt_token_ids=prompt, defer_scheduler_enqueue=True)
+    assert record.prompt_token_ids == prompt
+    core = EngineCoreDriver(
+        kv_cache_groups=_groups(),
+        max_num_seqs=4,
+        max_num_batched_tokens=64,
+        max_model_len=64,
+        num_pages=64,
+        data_parallel_size=1,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+    )
+    try:
+        core.add_requests([record])
+        step = core.schedule()
+        assert step.num_scheduled_tokens == {"r": 60}
+        outputs = core.commit(
+            step,
+            ModelRunnerOutput(
+                req_ids=["r"],
+                req_id_to_index={"r": 0},
+                sampled_token_ids=[[7]],
+                spec_token_ids=None,
+                logprobs=None,
+                prompt_logprobs_dict={},
+            ),
+        )
+        (out,) = outputs[0].outputs
+        assert out.new_token_ids == [7]
+        assert out.finish_reason == FinishReason.LENGTH
+        assert not core.is_live("r")
+    finally:
+        core.shutdown()
+
+
+def test_a_full_prompt_without_truncation_raises_a_clear_error():
+    admission = _admission_with_three_eos_ids()
+    admission.context_config = eSurgeContextConfig.coerce_config({"auto_truncate_prompt": False})
+    params = admission.prepare_sampling_params_for_request(SamplingParams(max_tokens=8), request_id="r", prompt="p")
+    with pytest.raises(ValueError, match="prompt_len=64, max_model_len=64"):
+        admission.add_request("r", "p", params, prompt_token_ids=list(range(2, 66)), defer_scheduler_enqueue=True)
+
+
 @pytest.mark.parametrize("name", [Scheduler, EngineRequest])
 def test_removed_names_raise_and_point_to_the_replacement(name):
     with pytest.raises(RuntimeError, match="EngineCore"):

@@ -312,6 +312,8 @@ def _bare_runner(*, data_parallel_size, compiled):
     runner.max_num_reqs = 32
     runner.active_num_seq_buckets = [32]
     runner._allow_sparse_window_packing = False
+    runner.drafter = None
+    runner.num_draft_tokens = 0
     runner._precompile_vlm_vision_helpers = lambda **kwargs: None
     runner._precompile_draft_schedule_variants = lambda: None
     runner._precompile_draft_in_verify_variants = lambda: None
