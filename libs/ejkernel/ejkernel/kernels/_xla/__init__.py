@@ -56,6 +56,7 @@ Available Operations:
         - gated_delta_rule_grouped_decode: Grouped-head single-step GDR decode
         - ragged_gated_delta_rule: Ragged-batch gated delta rule
         - ragged_gated_delta_rule_v2: Packed continuous-batch GDN v2 (mixed prefill+decode)
+        - ragged_kda: Per-channel-decay KDA over a flat packed token stream with a state pool
         - lightning_attn: Lightning attention with exponential decay
         - recurrent: General recurrent state-space attention
         - kernel_delta_attention (kda / kda_decay): Delta-rule linear attention
@@ -143,6 +144,9 @@ from .ragged_gated_delta_rule import ragged_gated_delta_rule as ragged_gated_del
 from .ragged_gated_delta_rule_v2 import ragged_gated_delta_rule_v2
 from .ragged_gather import ragged_gather
 from .ragged_gather_reduce import ragged_gather_reduce
+from .ragged_kda import ragged_kda
+from .ragged_kda_decode import ragged_kda_decode
+from .ragged_kda_short import ragged_kda_short
 from .ragged_page_attention_v2 import ragged_page_attention_v2
 from .ragged_page_attention_v2_turboquant import ragged_page_attention_v2_turboquant
 from .ragged_page_attention_v3 import ragged_page_attention_v3
@@ -220,6 +224,9 @@ __all__ = [
     "ragged_gated_delta_rule_v2",
     "ragged_gather",
     "ragged_gather_reduce",
+    "ragged_kda",
+    "ragged_kda_decode",
+    "ragged_kda_short",
     "ragged_page_attention_v2",
     "ragged_page_attention_v2_turboquant",
     "ragged_page_attention_v3",

@@ -46,16 +46,16 @@ os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 import jax
 import jax.numpy as jnp
 import numpy as np
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.runners.spec.strategy import DrafterSpeculation
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.speculative import Qwen3_5MTPDrafter
 
 try:
+    from ._common import make_core_for_runner, served_request
     from ._common import make_tiny_qwen35 as make_tiny_model
 except ImportError:  # standalone `python test_x.py`
+    from _common import make_core_for_runner, served_request
     from _common import make_tiny_qwen35 as make_tiny_model
 
 _VOCAB = 256
@@ -224,6 +224,138 @@ def test_batched_draft_different_committed_lens_per_row():
         assert got_w2[rid] == ref_w2[rid], f"{rid}: batched {got_w2[rid]} != per-request {ref_w2[rid]}"
 
 
+def test_batched_draft_window_from_host_bounds_only():
+    """The drafter-cache window comes from host arrays only, and never changes the drafts.
+
+    Host ``committed_lens`` run the narrowest window that holds every collected row; a device ``committed_lens``
+    runs the whole capacity, because reading it would block the host. Both draft the same tokens.
+    """
+    model = make_tiny_model(precision=jax.lax.Precision.HIGHEST)
+    n, k, capacity = 4, 3, 1024
+    seed_tokens = jnp.asarray([5, 9, 13, 21], dtype=jnp.int32)
+    seed_hidden = jnp.stack([_seed_hidden(i) for i in range(n)])[:, None, :]
+    seed_positions = jnp.asarray([4, 10, 7, 2], dtype=jnp.int32)
+    mask = np.ones((n,), dtype=bool)
+
+    def run(committed):
+        drafter = Qwen3_5MTPDrafter(model, num_draft_tokens=k, persist_kv=True)
+        drafter.set_max_length(capacity)
+        drafts = drafter.draft_batched(
+            seed_tokens=seed_tokens,
+            seed_hidden=seed_hidden,
+            seed_positions=seed_positions,
+            committed_lens=committed,
+            collected_mask=mask,
+            num_draft_tokens=k,
+        )
+        assert drafter.mtp_cache_capacity() == capacity
+        assert [_row_index(drafter, r) for r in range(n)] == [k] * n
+        (key,) = drafter._jit_batched
+        return np.asarray(drafts), key[-1]
+
+    host, host_width = run(np.zeros((n,), dtype=np.int32))
+    full, full_width = run(jnp.zeros((n,), dtype=jnp.int32))
+    assert (host_width, full_width) == (256, None)
+    np.testing.assert_array_equal(host, full)
+
+
+def test_drafter_programs_return_the_cache_placed_as_allocated():
+    """The batched and fused drafter programs hand the drafter cache back placed exactly as it was allocated.
+
+    Each drafter program is compiled for the placement of the cache it receives: a program that returned the cache
+    placed differently made the next drafter program compile again in serving.
+    """
+    model = make_tiny_model()
+    n, k = 4, 3
+    drafter = Qwen3_5MTPDrafter(model, num_draft_tokens=k, persist_kv=True, cache_length=64)
+    drafter.ensure_batch_size(n)
+
+    def placement():
+        return [leaf.sharding for leaf in jax.tree.leaves(drafter._mtp_cache)]
+
+    allocated = placement()
+    assert allocated and all(isinstance(s, jax.sharding.NamedSharding) for s in allocated), allocated
+    drafter.draft_batched(
+        seed_tokens=np.asarray([5, 9, 13, 21], dtype=np.int32),
+        seed_hidden=jnp.stack([_seed_hidden(i) for i in range(n)])[:, None, :],
+        seed_positions=np.asarray([4, 10, 7, 2], dtype=np.int32),
+        committed_lens=np.zeros((n,), dtype=np.int32),
+        collected_mask=np.ones((n,), dtype=bool),
+        num_draft_tokens=k,
+    )
+    assert placement() == allocated, "the batched draft returned the drafter cache placed differently"
+    drafter.verify_draft_batched(
+        gathered_hidden=jnp.stack([_seed_hidden(i) for i in range(n * (k + 1))]),
+        row_offsets=np.arange(n, dtype=np.int32) * (k + 1),
+        draft_tokens=np.zeros((n, k), dtype=np.int32),
+        draft_counts=np.full((n,), k, dtype=np.int32),
+        seed_pos_base=np.asarray([5, 11, 8, 3], dtype=np.int32),
+        committed_base=np.full((n,), k, dtype=np.int32),
+        fresh_mask=np.zeros((n,), dtype=bool),
+        collected_mask=np.ones((n,), dtype=bool),
+        num_draft_tokens=k,
+    )
+    assert placement() == allocated, "the fused verify+draft returned the drafter cache placed differently"
+
+
+def test_full_drafter_row_restarts_instead_of_starving():
+    """A persisted drafter row that the next window would overflow restarts from that window.
+
+    Such a row used to stop drafting for good (a 1,024-token prompt in a 1,024-slot drafter cache never drafted).
+    The restarted row holds only this window's slots and drafts what a fresh row drafts from the same seed.
+    """
+    model = make_tiny_model(precision=jax.lax.Precision.HIGHEST)
+    n, k, capacity = 2, 3, 8
+
+    def strategy():
+        drafter = Qwen3_5MTPDrafter(model, num_draft_tokens=k, persist_kv=True, cache_length=capacity)
+        return _make_strategy(drafter, n, k), drafter
+
+    spec, drafter = strategy()
+    # Two windows that accept every draft: the row then holds 2 * k of its 8 slots.
+    for window, pos in enumerate((4, 4 + k + 1)):
+        spec.draft_next_batched([("A", 0, 5 + window, pos, _seed_hidden(window))])
+    row = spec._mtp_row_by_req["A"]
+    assert _row_index(drafter, row) == 2 * k
+    seed = ("A", 0, 9, 4 + 2 * (k + 1), _seed_hidden(7))
+    got = spec.draft_next_batched([seed])["A"]
+    assert _row_index(drafter, row) == k, "the full row must restart from this window"
+    fresh, _ = strategy()
+    assert len(got) == k
+    assert got == fresh.draft_next_batched([seed])["A"]
+
+
+def test_per_request_draft_restarts_a_full_row():
+    """The per-request draft restarts a full row too: a request whose prompt does not fit the drafter cache drafts
+    from its next window on, as a fresh row does."""
+    model = make_tiny_model(precision=jax.lax.Precision.HIGHEST)
+    k, capacity, prompt = 2, 8, 10
+
+    def strategy():
+        drafter = Qwen3_5MTPDrafter(model, num_draft_tokens=k, persist_kv=True, cache_length=capacity)
+        return _make_strategy(drafter, 1, k)
+
+    spec = strategy()
+    first = spec.draft_next(
+        req_id="A",
+        row_pos=0,
+        seed_token=7,
+        seed_position=prompt - 1,
+        seed_hidden=_seed_hidden(20),
+        req_state=_REQ_STATE,
+        prefix_input_ids=jnp.arange(1, prompt + 1, dtype=jnp.int32)[None, :],
+        prefix_hidden_states=jnp.stack([_seed_hidden(i) for i in range(prompt)])[None],
+        prefix_position_ids=jnp.arange(prompt, dtype=jnp.int32)[None, :],
+    )
+    assert first == [], "a prefix longer than the drafter cache cannot be drafted"
+    window = dict(
+        req_id="A", row_pos=0, seed_token=8, seed_position=prompt, seed_hidden=_seed_hidden(21), req_state=_REQ_STATE
+    )
+    got = spec.draft_next(**window)
+    assert len(got) == k
+    assert got == strategy().draft_next(**window)
+
+
 # --- Full-runner multi-request integration (collect + >=2 gate + scatter) ---
 #
 # A full-runner token-for-token batched-vs-per-request comparison is NOT a valid
@@ -231,10 +363,10 @@ def test_batched_draft_different_committed_lens_per_row():
 # B separate [1, ...] matmuls by ~1 ULP (measured 1.19e-7 on this model), so on a
 # near-tie greedy argmax the two land on opposite sides — the same floating-point
 # sensitivity any batched-decode engine (vLLM / SGLang) has. Bit-identity IS
-# guaranteed for a SINGLE request: the runner only engages the pooled forward when
-# >= 2 spec-active requests are verified together (``eSurgeRunner`` uses the
-# ``step_allows_batch`` gate), so one request drafts in-loop through the exact
-# per-request path — that bit-identity is asserted by
+# guaranteed for a SINGLE request under exact recurrent replay: the runner then only
+# engages the pooled forward when >= 2 spec-active requests are verified together
+# (``eSurgeRunner`` uses the ``step_allows_batch`` gate), so one request drafts
+# in-loop through the exact per-request path — that bit-identity is asserted by
 # ``test_mtp_persist_kv.test_runner_greedy_output_unchanged_with_persist``. Here we
 # assert the multi-request runner INTEGRATION instead of near-tie-sensitive tokens:
 # the pooled batched draft actually engages for B >= 2 and every request's drafts
@@ -281,18 +413,20 @@ def test_batched_runner_engages_and_scatters_for_multi_request():
     for rid, out in toks.items():
         assert len(out) == 10, f"{rid} did not complete: {out}"
         assert min(out) >= 0 and max(out) < _VOCAB
-    # The pooled batched draft engaged at least once with >= 2 rows (the gate), and
-    # was never called with a single row (single requests draft in-loop).
-    assert seed_counts, "batched pool draft never engaged for a 3-request batch"
-    assert min(seed_counts) >= 2 and max(seed_counts) >= 2
+    # The step that prefilled the three requests drafted their first windows in one pooled call, and their verify
+    # windows drafted together after it; a request left verifying alone drafts in a one-row call.
+    assert 3 in seed_counts, f"the three first windows were not drafted together: {seed_counts}"
+    assert sum(count >= 2 for count in seed_counts) >= 2, f"verify windows did not draft together: {seed_counts}"
 
 
-def _run_runner_generation(model, *, n_seqs, k, disable_batched, prompts, max_new=10):
+def _run_runner_generation(model, *, n_seqs, k, disable_batched, prompts, max_new=10, drafter=None):
     """Drive ``n_seqs`` concurrent requests through a real eSurgeRunner to completion.
 
     ``disable_batched`` toggles the batched pool draft path off (per-request
     fallback) via ``EASYDEL_DISABLE_BATCHED_DRAFT`` so the same runner code can be
-    exercised in both modes. Returns ``{req_id: [emitted token ids]}``.
+    exercised in both modes. ``drafter`` (default: a new persisting
+    ``Qwen3_5MTPDrafter``) is the runner's drafter. Returns
+    ``{req_id: [emitted token ids]}``.
     """
     prev_batch = os.environ.get("EASYDEL_DISABLE_BATCHED_DRAFT")
     prev_persist = os.environ.get("EASYDEL_MTP_PERSIST_KV")
@@ -321,10 +455,10 @@ def _run_runner_generation(model, *, n_seqs, k, disable_batched, prompts, max_ne
             verbose=False,
             enable_overlap_execution=False,
             enable_sampler_metrics=False,
-            drafter=Qwen3_5MTPDrafter(model, num_draft_tokens=k, persist_kv=True),
+            drafter=drafter if drafter is not None else Qwen3_5MTPDrafter(model, num_draft_tokens=k, persist_kv=True),
         )
         runner.compile(max_num_batched_tokens=64)
-        scheduler = Scheduler.from_runner(
+        scheduler = make_core_for_runner(
             runner,
             max_num_batched_tokens=64,
             enable_prefix_caching=False,
@@ -333,7 +467,7 @@ def _run_runner_generation(model, *, n_seqs, k, disable_batched, prompts, max_ne
         )
         reqs = []
         for i in range(n_seqs):
-            r = EngineRequest(
+            r = served_request(
                 request_id=f"r-{i}",
                 prompt_token_ids=list(prompts[i]),
                 sampling_params=SamplingParams(max_tokens=max_new, temperature=0.0, ignore_eos=True),
@@ -344,7 +478,7 @@ def _run_runner_generation(model, *, n_seqs, k, disable_batched, prompts, max_ne
         for _ in range(4000):
             so = scheduler.schedule()
             out = runner.execute_model(so)
-            scheduler.update_from_output(so, out)
+            scheduler.commit(so, out)
             if all(r.is_finished() for r in reqs):
                 break
         else:

@@ -41,14 +41,17 @@ import jax.numpy as jnp
 import pytest
 import spectrax as spx
 from easydel.caching.ragged_page.cache import get_page_size_bytes
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 from easydel.modules.llama.modeling_llama import LlamaForCausalLM
 from ejkernel.kernels._pallas.tpu.ragged_page_attention_v3._pallas_impl_fwd_h64 import (
     get_kv_cache_shape as ejkernel_shape_hd64,
 )
+
+try:
+    from ._common import make_core_for_runner, served_request
+except ImportError:  # standalone `python test_x.py`
+    from _common import make_core_for_runner, served_request
 
 HEAD_DIM = 64
 NUM_KV_HEADS = 8
@@ -117,13 +120,13 @@ def test_esurge_serves_a_head_dim_64_model():
             f"engine allocated {tuple(pages.shape)}, h64 kernel reads {tuple(expected)}"
         )
 
-        scheduler = Scheduler.from_runner(
+        scheduler = make_core_for_runner(
             runner,
             max_num_batched_tokens=64,
             enable_prefix_caching=False,
             async_scheduling=False,
         )
-        request = EngineRequest(
+        request = served_request(
             request_id="head-dim-64",
             prompt_token_ids=[1, 2, 3, 4],
             sampling_params=SamplingParams(max_tokens=MAX_NEW_TOKENS, temperature=0.0, ignore_eos=True),
@@ -133,7 +136,7 @@ def test_esurge_serves_a_head_dim_64_model():
         for _ in range(64):
             scheduler_output = scheduler.schedule()
             output = runner.execute_model(scheduler_output)
-            scheduler.update_from_output(scheduler_output, output)
+            scheduler.commit(scheduler_output, output)
             if request.is_finished():
                 break
         else:

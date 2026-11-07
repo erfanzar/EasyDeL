@@ -79,6 +79,15 @@ class RecordingSpecialTokenTokenizer:
         return "".join(f"<{token}>" for token in token_ids)
 
 
+class Utf8ByteTokenizer:
+    """One token per byte, decoded the way byte-level BPE tokenizers decode: UTF-8 with replacement."""
+
+    def decode(self, token_ids, *, skip_special_tokens=False, clean_up_tokenization_spaces=False):
+        _ = skip_special_tokens
+        _ = clean_up_tokenization_spaces
+        return bytes(token_ids).decode("utf-8", errors="replace")
+
+
 def test_incremental_decoder_buffers_until_utf8_valid():
     tokenizer = DummyByteTokenizer()
     decoder = FastIncrementalDecoder(tokenizer, context_window=0)
@@ -105,6 +114,23 @@ def test_incremental_decoder_buffers_until_utf8_valid():
     assert delta == "A"
     assert buffered == []
     assert has_buffer is False
+
+
+def test_incremental_decoder_streams_past_bytes_that_never_form_a_character():
+    # F0 AB 9E opens a 4-byte character, and the next byte starts a new character instead of completing it.
+    data = b"\xf0\xab\x9e" + "\u1e96 ok".encode()
+    decoder = FastIncrementalDecoder(Utf8ByteTokenizer(), context_window=0)
+    buffered: list[int] = []
+    deltas = []
+    for byte in data:
+        delta, buffered, _ = decoder.decode([byte], "", buffered, skip_special_tokens=True, context_tokens=[])
+        deltas.append(delta)
+
+    # Held while the text ends with an incomplete character, released once U+1E96 completes.
+    assert deltas[:5] == [""] * 5
+    assert deltas[5] == REPLACEMENT_CHAR + "\u1e96"
+    assert "".join(deltas) == data.decode("utf-8", errors="replace")
+    assert buffered == []
 
 
 def test_incremental_decoder_forwards_spaces_between_special_tokens_flag():

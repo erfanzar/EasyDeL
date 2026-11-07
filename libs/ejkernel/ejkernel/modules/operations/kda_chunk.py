@@ -33,6 +33,7 @@ from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._xla.kda_chunk._xla_impl import pairwise_sub_block
 from ejkernel.ops import AutotunePolicy, ConfigCache, ConfigSelectorChain, Executor, Invocation, Kernel, Tuner
 from ejkernel.ops.config.persistent import PersistentCache
 
@@ -40,6 +41,43 @@ from ..base import detect_platform
 from .configs import KdaChunkConfig
 
 _CFG_FIELDS = frozenset(getattr(KdaChunkConfig, "__dataclass_fields__", ()))
+
+AUTO_BLOCK_H_TILE = 8 * 64 * 128
+"""Largest ``block_h * chunk_size * max(k_dim, v_dim)`` that ``block_h=None`` picks: 8 heads of 64-token chunks with
+128-wide keys and values.
+
+Measured on TPU v5p with GLM-5.3-Flash's KDA layers (16 heads per device, 64-token chunks, 128-wide keys and values,
+log-decay bounded by -5, so the factored pairwise form) on 16 sequences of 131072 tokens: a 12-layer forward and
+backward took 10.06 s with 8 heads per grid step and 10.67 s with 1, and a 45-layer training grad step took 54.24 s
+with 8 and 59.13 s with 16.
+"""
+
+
+def auto_block_h(num_heads: int, k_dim: int, v_dim: int, chunk_size: int, *, factored_pairwise: bool) -> int:
+    """Heads per Pallas grid step for ``KdaChunkConfig.block_h=None``.
+
+    With the factored (MXU) pairwise decay, the largest of 8, 4, 2 and 1 that divides ``num_heads`` and keeps a grid
+    step's head block within :data:`AUTO_BLOCK_H_TILE`. With the dense ``[cs, cs, K]`` form, whose temporaries grow
+    with the heads per step, 1 (only the factored form was timed with more).
+
+    Args:
+        num_heads: Heads of the call (inside a ``shard_map``, the local heads).
+        k_dim: Key width.
+        v_dim: Value width.
+        chunk_size: Chunk length.
+        factored_pairwise: Whether the call takes the factored pairwise decay (``pairwise="auto"`` with a
+            ``decay_lower_bound`` that allows it).
+
+    Returns:
+        Heads per grid step.
+    """
+    if not factored_pairwise:
+        return 1
+    tile = int(chunk_size) * max(int(k_dim), int(v_dim))
+    for block_h in (8, 4, 2):
+        if int(num_heads) % block_h == 0 and block_h * tile <= AUTO_BLOCK_H_TILE:
+            return block_h
+    return 1
 
 
 def _normalize_cfg(cfg: KdaChunkConfig | dict | None) -> KdaChunkConfig:
@@ -126,6 +164,12 @@ class KdaChunk(Kernel[KdaChunkConfig, tuple[Array, ...]]):
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
         impl = self.get_impl(cfg)
+        block_h = cfg.block_h
+        if block_h is None:
+            factored = cfg.pairwise == "auto" and pairwise_sub_block(decay_lower_bound, chunk_size) > 0
+            block_h = auto_block_h(
+                query.shape[1], query.shape[-1], value.shape[-1], chunk_size, factored_pairwise=factored
+            )
         return impl(
             query,
             key,
@@ -139,7 +183,7 @@ class KdaChunk(Kernel[KdaChunkConfig, tuple[Array, ...]]):
             continue_initial_state=continue_initial_state,
             return_chunk_states=return_chunk_states,
             precision=precision,
-            block_h=cfg.block_h,
+            block_h=block_h,
             backward=cfg.backward,
             bwd_reduce=cfg.bwd_reduce,
             decay_lower_bound=decay_lower_bound,
@@ -240,9 +284,10 @@ class KdaChunk(Kernel[KdaChunkConfig, tuple[Array, ...]]):
         return shard_map_fn, tuple(arrays[i] for i in present)
 
     def heuristic_cfg(self, inv: Invocation[KdaChunkConfig, tuple[Array, ...]]) -> KdaChunkConfig:
-        """Return the default config: one head per grid step, Pallas backward, VPU reductions, auto pairwise."""
+        """Return the default config: heads per grid step from :func:`auto_block_h`, Pallas backward, VPU
+        reductions, auto pairwise."""
         return KdaChunkConfig(
-            block_h=1,
+            block_h=None,
             backward="pallas",
             bwd_reduce="vpu",
             pairwise="auto",

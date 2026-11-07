@@ -183,43 +183,84 @@ def test_model_overrides_esurge_graphdef_returns_true_when_class_has_attr():
     assert eSurge._model_overrides_esurge_graphdef(obj) is True
 
 
+def _prefetch_core(*, async_scheduling: bool, budget: int):
+    """A one-group engine core (pure host bookkeeping) for the prefetch gate."""
+    import numpy as np
+    from easydel.inference.esurge.core.interface import CacheGroupSpec, FullAttentionSpec
+    from easydel.inference.esurge.engine.core_driver import EngineCoreDriver
+
+    spec = FullAttentionSpec(page_size=4, num_kv_heads=1, head_size=4, dtype=np.float32, use_mla=False)
+    return EngineCoreDriver(
+        kv_cache_groups=[CacheGroupSpec(kv_cache_spec=spec, layer_names=None)],
+        max_num_seqs=2,
+        max_num_batched_tokens=budget,
+        max_model_len=64,
+        num_pages=32,
+        enable_prefix_caching=False,
+        async_scheduling=async_scheduling,
+        chunked_prefill_enabled=True,
+    )
+
+
+def _admit(core, prompt_len: int) -> None:
+    from easydel.inference.esurge.request import AdmissionRecord
+    from easydel.inference.sampling_params import SamplingParams
+
+    core.add_requests(
+        [AdmissionRecord("r1", list(range(1, prompt_len + 1)), SamplingParams(max_tokens=4), eos_token_id=None)]
+    )
+
+
 def test_can_prefetch_scheduler_output_safe_for_pure_prefill():
-    """All requests are mid-prefill (num_computed_tokens < num_tokens) and have no placeholders."""
-    request = SimpleNamespace(num_output_placeholders=0, num_computed_tokens=10, num_tokens=128)
-    scheduler = SimpleNamespace(requests={"r1": request})
-    output = SimpleNamespace(num_scheduled_tokens={"r1": 32})
-    assert EngineLoop._can_prefetch_scheduler_output(scheduler, output) is True
+    """A chunk that leaves the prompt unfinished (computed < tokens, no placeholder) may be followed early."""
+    core = _prefetch_core(async_scheduling=False, budget=8)
+    try:
+        _admit(core, 32)
+        output = core.schedule()
+        assert output.num_scheduled_tokens == {"r1": 8}
+        assert EngineLoop._can_prefetch_scheduler_output(core, output) is True
+    finally:
+        core.shutdown()
 
 
 def test_can_prefetch_scheduler_output_unsafe_when_request_has_placeholders():
-    """Async-scheduler placeholder means the next batch must wait for ``update_from_output``."""
-    request = SimpleNamespace(num_output_placeholders=1, num_computed_tokens=10, num_tokens=128)
-    scheduler = SimpleNamespace(requests={"r1": request})
-    output = SimpleNamespace(num_scheduled_tokens={"r1": 32})
-    assert EngineLoop._can_prefetch_scheduler_output(scheduler, output) is False
+    """An async output placeholder means the next batch must wait for ``commit()``."""
+    core = _prefetch_core(async_scheduling=True, budget=16)
+    try:
+        _admit(core, 4)
+        output = core.schedule()
+        assert output.num_scheduled_tokens == {"r1": 4}
+        assert EngineLoop._can_prefetch_scheduler_output(core, output) is False
+    finally:
+        core.shutdown()
 
 
 def test_can_prefetch_scheduler_output_unsafe_when_at_prompt_length():
-    """Once num_computed_tokens == num_tokens, the request is in decode and may terminate."""
-    request = SimpleNamespace(num_output_placeholders=0, num_computed_tokens=128, num_tokens=128)
-    scheduler = SimpleNamespace(requests={"r1": request})
-    output = SimpleNamespace(num_scheduled_tokens={"r1": 1})
-    assert EngineLoop._can_prefetch_scheduler_output(scheduler, output) is False
+    """Once the whole prompt is computed the request decodes and may terminate on the sampled token."""
+    core = _prefetch_core(async_scheduling=False, budget=16)
+    try:
+        _admit(core, 4)
+        output = core.schedule()
+        assert EngineLoop._can_prefetch_scheduler_output(core, output) is False
+    finally:
+        core.shutdown()
 
 
-def test_can_prefetch_scheduler_output_skips_unknown_request_id():
-    """If a scheduled rid isn't in the scheduler's requests dict, it's skipped silently."""
-    scheduler = SimpleNamespace(requests={})
-    output = SimpleNamespace(num_scheduled_tokens={"r1": 32})
-
-    assert EngineLoop._can_prefetch_scheduler_output(scheduler, output) is True
+def test_can_prefetch_scheduler_output_refuses_a_foreign_output():
+    """An output this core did not return (or already committed) is never prefetched past (conservative)."""
+    core = _prefetch_core(async_scheduling=False, budget=8)
+    try:
+        output = SimpleNamespace(num_scheduled_tokens={"r1": 32})
+        assert EngineLoop._can_prefetch_scheduler_output(core, output) is False
+    finally:
+        core.shutdown()
 
 
 def test_can_prefetch_scheduler_output_handles_internal_exception():
     """Any exception during inspection short-circuits to False (conservative)."""
-    scheduler = SimpleNamespace()
+    core = SimpleNamespace()
     output = SimpleNamespace(num_scheduled_tokens={"r1": 1})
-    assert EngineLoop._can_prefetch_scheduler_output(scheduler, output) is False
+    assert EngineLoop._can_prefetch_scheduler_output(core, output) is False
 
 
 class _LifecycleStub(eSurge):

@@ -89,7 +89,7 @@ from ...core.sampler import (
 from ...core.sampler import sample_tokens as sample_tokens_fn
 from ...core.sampling_metadata import SamplingMetadata
 from ..execution_types import StepFunctionInputs
-from ..host_sync import host_payload_broadcast_needed
+from ..host_sync import device_put_equality_check_redundant, host_payload_broadcast_needed, put_host_payload
 
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
@@ -1179,10 +1179,18 @@ class SamplerRuntime:
         self._sampler_packed_misc_i32_cpu[1] = numpy.int32(sampler_total_tokens)
 
         sampler_host_payload = (sampler_packed_f32, sampler_packed_i32, self._sampler_packed_misc_i32_cpu)
-        if host_payload_broadcast_needed(getattr(self, "host_payloads_replicated", False)):
+        replicated = getattr(self, "host_payloads_replicated", False)
+        if host_payload_broadcast_needed(replicated):
             sampler_host_payload = multihost_utils.broadcast_one_to_all(sampler_host_payload)
         with jax.named_scope("easydel/esurge/sampler/place_metadata"):
-            packed_f32, packed_i32, packed_misc_i32 = _device_put_tree_uniform(sampler_host_payload, sampler_sharding)
+            if device_put_equality_check_redundant(replicated):
+                packed_f32, packed_i32, packed_misc_i32 = put_host_payload(
+                    sampler_host_payload, sampler_sharding, host_payloads_replicated=replicated
+                )
+            else:
+                packed_f32, packed_i32, packed_misc_i32 = _device_put_tree_uniform(
+                    sampler_host_payload, sampler_sharding
+                )
         sampler_prefix = self._sampler_prefix_cpu_by_reqs.get(int(sampler_padded_num_reqs))
         if sampler_prefix is None:
             sampler_prefix = numpy.arange(sampler_padded_num_reqs, dtype=numpy.int32)
@@ -1200,7 +1208,11 @@ class SamplerRuntime:
                 compact_logits = logits[:sampler_padded_num_reqs]
             else:
                 logits_sharding = logits.sharding
-                gather_positions = jax.device_put(gather_positions_cpu[:sampler_padded_num_reqs], sampler_sharding)
+                gather_positions = put_host_payload(
+                    gather_positions_cpu[:sampler_padded_num_reqs],
+                    sampler_sharding,
+                    host_payloads_replicated=replicated,
+                )
                 gather_positions_for_logits = jax.device_put(gather_positions, logits_sharding)
                 compact_logits = logits[gather_positions_for_logits]
             if getattr(compact_logits, "sharding", None) != sampler_sharding:
@@ -1218,7 +1230,11 @@ class SamplerRuntime:
         if prefix_scatter_layout and int(sampler_padded_num_reqs) == int(padded_num_reqs):
             return rng_key, compact_tokens, compact_valid_mask, token_counts_full
         with jax.named_scope("easydel/esurge/sampler/scatter_to_model_rows"):
-            scatter_positions = jax.device_put(scatter_positions_cpu[:sampler_padded_num_reqs], sampler_sharding)
+            scatter_positions = put_host_payload(
+                scatter_positions_cpu[:sampler_padded_num_reqs],
+                sampler_sharding,
+                host_payloads_replicated=replicated,
+            )
             out_tokens_full, valid_mask_full = self._scatter_sampler_outputs(
                 compact_tokens,
                 compact_valid_mask,

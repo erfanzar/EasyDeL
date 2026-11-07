@@ -65,6 +65,7 @@ from easydel.layers.indexer import (
     ScoreRowSplit,
     compact_valid_layout,
     pool_bitmap_tail_error,
+    resolve_dsa_pool_kernel,
     use_sparse_training_attention,
 )
 from easydel.operations.kernels import DsaGatherAttn, DsaPoolSparseAttn
@@ -461,9 +462,15 @@ class DeepSeekSparseAttention(UnifiedAttention):
             ValueError: If the bitmap kernel cannot take the indexer's tail keys
                 (:func:`~easydel.layers.indexer.pool_bitmap_tail_error`).
         """
-        if self.config.dsa_pool_kernel == "gather":
-            return self._forward_dsa_pool_gather(hidden_states, q_resid, query_states, compressed_kv, q_mask)
         kpool = self.indexer.config.kpool_size
+        pool_kernel = resolve_dsa_pool_kernel(
+            self.config.dsa_pool_kernel,
+            kpool,
+            latent_dim=self.kv_lora_rank,
+            latent_dtype=self.attention_performer.metadata.runtime_dtype,
+        )
+        if pool_kernel == "gather":
+            return self._forward_dsa_pool_gather(hidden_states, q_resid, query_states, compressed_kv, q_mask)
         tail_error = pool_bitmap_tail_error(kpool, self.indexer.config.select_tail)
         if tail_error is not None:
             raise ValueError(tail_error)
@@ -777,6 +784,10 @@ class DeepSeekSparseAttention(UnifiedAttention):
         if selection is not None and ragged:
             mla_kwargs["sparse_selected"] = selection.indices.reshape(bsz * q_len, -1)
             mla_kwargs["sparse_chunk_size"] = self.indexer.selection_chunk_size
+            # Serving only (an MLA ragged-pages view): the op resolves ``dsa_serving_ep_split`` (``None`` = automatic,
+            # ``True`` = on, ``False`` = off) against its mesh and cache layout, and where it applies splits the
+            # sparse attention's query tokens over the expert-parallel axis (``resolve_dsa_serving_ep_split``).
+            mla_kwargs["sparse_ep_split"] = getattr(self.config, "dsa_serving_ep_split", None)
         elif selection is not None:
             kv_len = key_states.shape[1]
             topk_mask = selection.to_mask(kv_len)

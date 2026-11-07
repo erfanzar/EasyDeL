@@ -48,6 +48,7 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import spectrax as spx
 from ejkernel.types import MaskInfo
 from jaxtyping import Array, Float, Int
@@ -56,6 +57,7 @@ from spectrax import common_types
 from easydel.caching import TransformerCache, TransformerCacheConfig, TransformerMetadata
 from easydel.infra.spec_decode import SpecDecodeBase, register_drafter
 from easydel.utils.graph_jit import module_jit
+from easydel.utils.inference_mode import set_inference_mode
 
 
 @dataclass(frozen=True)
@@ -211,6 +213,266 @@ def _restore_cache_views(cache: TransformerCache, orig_indexes: list, orig_start
             v2 = v2.replace(starts=jnp.where(mask_st, adv_st, orig_st))
         fixed_views.append(v2)
     return TransformerCache(views=fixed_views)
+
+
+DEFAULT_DRAFT_WINDOW_MIN = 256
+"""Smallest drafter-cache window (slots per row) a batched draft pass runs on (see :func:`_draft_window_widths`)."""
+
+
+def _windowable(view: typing.Any) -> bool:
+    """Whether a batched draft pass may run on the leading slots of ``view`` (a plain, non-sliding dense view)."""
+    return (
+        view is not None
+        and isinstance(view.key, jax.Array)
+        and isinstance(view.value, jax.Array)
+        and getattr(view, "masking_details", None) is None
+    )
+
+
+def _cache_capacity(cache: TransformerCache | None) -> int | None:
+    """Widest per-row slot count over the windowable views of ``cache`` (see :func:`_windowable`).
+
+    Args:
+        cache: A drafter ``TransformerCache``, or ``None``.
+
+    Returns:
+        The capacity in slots, or ``None`` without a cache or any windowable view.
+    """
+    if cache is None:
+        return None
+    widths = [int(view.key.shape[1]) for view in cache.views if _windowable(view)]
+    return max(widths) if widths else None
+
+
+def _draft_window_widths(capacity: int, minimum: int) -> tuple[int, ...]:
+    """Cache widths a batched draft pass may run on: ``minimum * 2**i`` below ``capacity``, then ``capacity``.
+
+    A batched pass reads and writes only the leading ``W`` slots of every drafter-cache view
+    (:func:`_window_cache`), with ``W`` the narrowest width that holds every drafted row's slots. The head's
+    attention and indexer then cost ``rows x W`` instead of ``rows x capacity``. Each width is one compiled program
+    per draft shape; an all-idle call (the runner's precompile) warms every width.
+
+    Args:
+        capacity: Slots per row of the drafter cache.
+        minimum: Smallest width; clamped up to one.
+
+    Returns:
+        Ascending widths; the last one equals ``capacity``.
+    """
+    capacity = int(capacity)
+    width = max(1, int(minimum))
+    widths: list[int] = []
+    while width < capacity:
+        widths.append(width)
+        width *= 2
+    widths.append(capacity)
+    return tuple(widths)
+
+
+def _window_cache(cache: TransformerCache | None, width: int | None) -> TransformerCache | None:
+    """Slice every view of ``cache`` to its leading ``width`` slots (``None`` keeps the whole capacity).
+
+    For a row whose writes this pass end at or before ``width``, the window holds every slot the head can read:
+    attention masks every slot at or past the row's end, the indexer's pools skip slots of segment ``-1`` (every
+    slot past the end), and its selection budget ``min(index_topk // kpool, pools)`` either equals the full view's
+    or covers every pool of the window. Writes past ``width`` (idle rows only) are dropped, as writes past the
+    capacity are.
+
+    Args:
+        cache: The drafter pool cache, or ``None``.
+        width: Leading slots to keep per row, or ``None``.
+
+    Returns:
+        The windowed cache (views no wider than ``width`` are kept as they are).
+    """
+    if cache is None or width is None:
+        return cache
+    width = int(width)
+    views: list[typing.Any] = []
+    for view in cache.views:
+        if not _windowable(view) or int(view.key.shape[1]) <= width:
+            views.append(view)
+            continue
+        views.append(
+            view.replace(
+                key=view.key[:, :width],
+                value=view.value[:, :width],
+                segment_ids=None if view.segment_ids is None else view.segment_ids[:, :width],
+                auxiliary_state=None if view.auxiliary_state is None else view.auxiliary_state[:, :width],
+            )
+        )
+    return TransformerCache(views=views)
+
+
+def _unwindow_cache(full: TransformerCache | None, windowed: TransformerCache | None) -> TransformerCache | None:
+    """Write a :func:`_window_cache` window back into the leading slots of the pool it was sliced from.
+
+    The caller donates ``full``, so the leading-slot update is in place. Write indexes and starts come from
+    ``windowed``; slots past the window keep their contents.
+
+    Args:
+        full: The pool cache the window was sliced from, or ``None``.
+        windowed: The advanced window.
+
+    Returns:
+        The pool cache with its leading slots replaced by the window.
+    """
+    if full is None or windowed is None:
+        return windowed
+
+    def put(dst: jax.Array, src: jax.Array) -> jax.Array:
+        return jax.lax.dynamic_update_slice_in_dim(dst, src.astype(dst.dtype), 0, axis=1)
+
+    views: list[typing.Any] = []
+    for base, win in zip(full.views, windowed.views, strict=True):
+        if base is None or win is None or base.key is None or int(win.key.shape[1]) == int(base.key.shape[1]):
+            views.append(win)
+            continue
+        segment_ids = base.segment_ids
+        if win.segment_ids is not None:
+            if segment_ids is None:
+                # Legacy pools have one implicit continuation segment per row (see ``_scatter_view_row``).
+                width = base.key.shape[1]
+                segment_ids = jnp.where(jnp.arange(width)[None, :] < base.indexes[:, None], 0, -1).astype(
+                    win.segment_ids.dtype
+                )
+            segment_ids = put(segment_ids, win.segment_ids)
+        auxiliary_state = base.auxiliary_state
+        if win.auxiliary_state is not None:
+            if auxiliary_state is None:
+                auxiliary_state = jnp.zeros(
+                    (*base.key.shape[:2], win.auxiliary_state.shape[-1]), dtype=win.auxiliary_state.dtype
+                )
+            auxiliary_state = put(auxiliary_state, win.auxiliary_state)
+        views.append(
+            win.replace(
+                key=put(base.key, win.key),
+                value=put(base.value, win.value),
+                segment_ids=segment_ids,
+                auxiliary_state=auxiliary_state,
+            )
+        )
+    return TransformerCache(views=views)
+
+
+def _host_vector(x: typing.Any, dtype: typing.Any) -> np.ndarray | None:
+    """``x`` as a flat host array, or ``None`` when ``x`` lives on a device.
+
+    A drafter-cache window is chosen from host-known bounds only: reading a device array back would add a host
+    sync between the acceptance program and the draft dispatch, so a device input selects the whole capacity.
+    """
+    if isinstance(x, jax.Array):
+        return None
+    return np.asarray(x, dtype=dtype).reshape(-1)
+
+
+def _device_column(x: typing.Any) -> jax.Array:
+    """``x`` as an ``(N, 1)`` int32 device array.
+
+    A host array is cast and shaped on the host and transferred with ``jax.device_put``: ``jnp.asarray`` of an ndarray
+    without a dtype, and a cast or reshape of a device array, run a device program, and on a multi-host mesh every
+    launch waits for every host. A device array is cast and reshaped.
+    """
+    if isinstance(x, jax.Array):
+        return x.astype(jnp.int32).reshape(-1, 1)
+    return jax.device_put(np.asarray(x, dtype=np.int32).reshape(-1, 1))
+
+
+def _device_vector(x: typing.Any, dtype: typing.Any) -> jax.Array:
+    """``x`` as a flat device array of ``dtype`` (a host array is converted as in :func:`_device_column`)."""
+    if isinstance(x, jax.Array):
+        return x.astype(dtype).reshape(-1)
+    return jax.device_put(np.asarray(x, dtype=dtype).reshape(-1))
+
+
+def _named_sharding(leaf: typing.Any) -> jax.sharding.NamedSharding | None:
+    """The ``NamedSharding`` a device array ``leaf`` is placed on, or ``None``."""
+    sharding = getattr(leaf, "sharding", None) if isinstance(leaf, jax.Array) else None
+    return sharding if isinstance(sharding, jax.sharding.NamedSharding) else None
+
+
+def _place_cache(cache: TransformerCache | None) -> TransformerCache | None:
+    """Commit every array leaf of a drafter cache to a sharding over the cache's mesh.
+
+    A leaf already on a ``NamedSharding`` keeps it; any other array leaf is replicated over the mesh of the first leaf
+    that has one. The drafter programs then hand the cache back placed exactly as it went in
+    (:func:`_cache_out_shardings`), so every program sees the placement it was compiled for.
+
+    Args:
+        cache: A newly allocated drafter cache, or ``None``.
+
+    Returns:
+        The placed cache; ``cache`` itself when no leaf is on a mesh.
+    """
+    if cache is None:
+        return None
+    mesh = next((s.mesh for s in map(_named_sharding, jax.tree.leaves(cache)) if s is not None), None)
+    if mesh is None:
+        return cache
+    replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+    def place(leaf: typing.Any) -> typing.Any:
+        if not isinstance(leaf, jax.Array) or _named_sharding(leaf) is not None or not leaf.is_fully_addressable:
+            return leaf
+        # Each process places its own copy: ``device_put`` of a process-local array onto a sharding that spans
+        # processes would compare the value across hosts.
+        host = np.asarray(jax.device_get(leaf))
+        return jax.make_array_from_callback(host.shape, replicated, lambda index: host[index])
+
+    return jax.tree.map(place, cache)
+
+
+def _cache_out_shardings(cache: TransformerCache | None, num_outputs: int) -> tuple | None:
+    """``out_shardings`` for a drafter program that returns ``num_outputs`` small arrays and then the cache.
+
+    Without them the compiler picks the placement of the returned cache. When that placement is written differently
+    from the cache's input placement (an equivalent layout under another spec counts), the next drafter program,
+    compiled for the input placement, compiles again in serving. Every cache leaf therefore keeps its input
+    placement, and the small outputs (drafts, argmaxes, counts) are replicated over the cache's mesh, so every host
+    reads them locally.
+
+    Args:
+        cache: The drafter cache the program is built for, or ``None``.
+        num_outputs: Arrays the program returns before the cache.
+
+    Returns:
+        The ``out_shardings`` tuple, or ``None`` (the compiler chooses) when there is no cache or an array leaf of it
+        is not on a ``NamedSharding``.
+    """
+    if cache is None:
+        return None
+    leaves = jax.tree.leaves(cache)
+    shardings = [_named_sharding(leaf) for leaf in leaves]
+    if not leaves or any(sharding is None for sharding in shardings):
+        return None
+    replicated = jax.sharding.NamedSharding(shardings[0].mesh, jax.sharding.PartitionSpec())
+    return (*([replicated] * int(num_outputs)), jax.tree.map(_named_sharding, cache))
+
+
+def _select_draft_widths(capacity: int | None, reach: typing.Any) -> tuple[int | None, ...]:
+    """Cache widths one batched draft call runs on (``None`` = the whole capacity).
+
+    Args:
+        capacity: Slots per row of the drafter cache, or ``None`` without a cache.
+        reach: Per drafted row, one past the last slot the pass can read or write (its rollback target plus the
+            drafts written), from host arrays; ``None`` when unknown on the host (whole capacity).
+
+    Returns:
+        ``(width,)``, the narrowest of :func:`_draft_window_widths` that holds every drafted row. With no drafted row
+        (the runner's precompile call) every width, so serving compiles no new program.
+    """
+    if capacity is None or reach is None:
+        return (None,)
+    widths = _draft_window_widths(int(capacity), DEFAULT_DRAFT_WINDOW_MIN)
+    as_arg = tuple(None if width >= int(capacity) else width for width in widths)
+    reach = np.asarray(reach).reshape(-1)
+    if reach.size == 0:
+        return as_arg
+    need = int(reach.max())
+    for width, arg in zip(widths, as_arg, strict=True):
+        if need <= width:
+            return (arg,)
+    return (None,)
 
 
 def _mtp_forward_core(
@@ -674,6 +936,8 @@ class Qwen3_5MTPDrafter:
             self._mtp_cache_batch_size = None
             return
         batch_size = int(batch_size)
+        # Drop the old pool first: the KV page pool was sized around one drafter cache, not two.
+        self._mtp_cache = None
         self._mtp_cache = self._init_mtp_cache(batch_size)
         self._mtp_cache_batch_size = batch_size if self._mtp_cache is not None else None
 
@@ -806,11 +1070,13 @@ class Qwen3_5MTPDrafter:
                 value_dim=int(spec["value_dim"]),
                 auxiliary_dim=spec.get("auxiliary_dim"),
             )
-            return TransformerCache.init_cache(
-                mesh=mesh,
-                config=cache_config,
-                runtime_sharding_resolver=getattr(text_cfg, "runtime_sharding_resolver", None),
-                dtype=getattr(self.model, "dtype", jnp.bfloat16),
+            return _place_cache(
+                TransformerCache.init_cache(
+                    mesh=mesh,
+                    config=cache_config,
+                    runtime_sharding_resolver=getattr(text_cfg, "runtime_sharding_resolver", None),
+                    dtype=getattr(self.model, "dtype", jnp.bfloat16),
+                )
             )
         max_length = self._mtp_cache_max_length
         if max_length is None:
@@ -844,11 +1110,13 @@ class Qwen3_5MTPDrafter:
             value_dim=head_dim,
             auxiliary_dim=auxiliary_dim,
         )
-        return TransformerCache.init_cache(
-            mesh=mesh,
-            config=cache_config,
-            runtime_sharding_resolver=getattr(text_cfg, "runtime_sharding_resolver", None),
-            dtype=getattr(self.model, "dtype", jnp.bfloat16),
+        return _place_cache(
+            TransformerCache.init_cache(
+                mesh=mesh,
+                config=cache_config,
+                runtime_sharding_resolver=getattr(text_cfg, "runtime_sharding_resolver", None),
+                dtype=getattr(self.model, "dtype", jnp.bfloat16),
+            )
         )
 
     def _ensure_mtp_cache(self, batch_size: int) -> TransformerCache | None:
@@ -1376,6 +1644,7 @@ class Qwen3_5MTPDrafter:
         hidden0: jax.Array,
         pos0: jax.Array,
         mtp_cache: TransformerCache | None,
+        width: int | None = None,
     ) -> typing.Callable:
         """Build (or fetch) the jitted fixed-``k`` batched-draft program for a shape.
 
@@ -1412,12 +1681,19 @@ class Qwen3_5MTPDrafter:
             pos0: ``(N, 1)`` seed positions (shape/dtype only).
             mtp_cache: The pool ``TransformerCache`` (shape/dtype signature keys the
                 compile) or ``None`` for the cache-free path.
+            width: Leading slots per row the program reads and writes (one of
+                :func:`_draft_window_widths`; see :func:`_window_cache`), or ``None``
+                for the whole capacity. Keys the compile.
 
         Returns:
             ``fn(state, ids0, hidden0, pos0, cache, committed_lens, collected_mask)
-            -> (drafts[N, k], new_cache)``.
+            -> (drafts[N, k], new_cache)``. The pool cache (argument 7) is donated:
+            the program updates its leading ``width`` slots in place.
         """
         has_cache = mtp_cache is not None
+        capacity = _cache_capacity(mtp_cache)
+        if width is not None and (capacity is None or int(width) >= capacity):
+            width = None
         key = (
             int(k),
             tuple(ids0.shape),
@@ -1427,6 +1703,7 @@ class Qwen3_5MTPDrafter:
             tuple(pos0.shape),
             str(pos0.dtype),
             self._cache_signature(mtp_cache),
+            None if width is None else int(width),
         )
         fn = self._jit_batched.get(key)
         if fn is not None:
@@ -1434,8 +1711,8 @@ class Qwen3_5MTPDrafter:
 
         # Eager warmup on the concrete model (NOT under a trace) materializes any
         # lazily-created state before it is split/traced (see
-        # ``_model_graph_and_state``).
-        _ = self._mtp_forward_compute(self.model, ids0, hidden0, pos0, mtp_cache, None)
+        # ``_model_graph_and_state``), on the window the program traces.
+        _ = self._mtp_forward_compute(self.model, ids0, hidden0, pos0, _window_cache(mtp_cache, width), None)
         graphdefs, _states, _freqs, tie_embeddings = self._batched_bundle_graph_and_states()
         mtp_gd, embed_gd, head_gd = graphdefs
 
@@ -1447,7 +1724,9 @@ class Qwen3_5MTPDrafter:
             orig_starts: list = []
             if has_cache:
                 cache: TransformerCache | None
-                cache, orig_indexes, orig_starts = _rollback_cache_views(cache0, committed_lens, collected_mask)
+                cache, orig_indexes, orig_starts = _rollback_cache_views(
+                    _window_cache(cache0, width), committed_lens, collected_mask
+                )
             else:
                 cache = None
 
@@ -1467,9 +1746,15 @@ class Qwen3_5MTPDrafter:
 
             if has_cache and cache is not None:
                 cache = _restore_cache_views(cache, orig_indexes, orig_starts, collected_mask)
+                cache = _unwindow_cache(cache0, cache)
             return drafts, cache
 
-        fn = jax.jit(_run)
+        # Donate the pool cache (arg 7): its leading slots are updated in place instead of the whole pool being
+        # copied on every call (as ``_get_verify_draft_fn`` does). The cache comes back placed as it went in, so the
+        # drafter program called next runs the placement it was compiled for (``_cache_out_shardings``).
+        out_shardings = _cache_out_shardings(mtp_cache, 1)
+        jit_kwargs = {} if out_shardings is None else {"out_shardings": out_shardings}
+        fn = jax.jit(_run, donate_argnums=(7,), **jit_kwargs)
         self._jit_batched[key] = fn
         return fn
 
@@ -1507,21 +1792,31 @@ class Qwen3_5MTPDrafter:
             ``(N, k)`` device array of drafted token ids. Row ``r`` is valid only
             when ``collected_mask[r]`` is ``True``.
         """
-        ids0 = jnp.asarray(seed_tokens, dtype=jnp.int32).reshape(-1, 1)
-        pos0 = jnp.asarray(seed_positions, dtype=jnp.int32).reshape(-1, 1)
+        ids0 = _device_column(seed_tokens)
+        pos0 = _device_column(seed_positions)
         hidden0 = jnp.asarray(seed_hidden)
         if hidden0.ndim == 2:
             hidden0 = hidden0[:, None, :]
         n = int(ids0.shape[0])
         self.ensure_batch_size(n)
         mtp_cache = self._mtp_cache if self.uses_mtp_cache else None
-        committed = jnp.asarray(committed_lens, dtype=jnp.int32).reshape(-1)
-        mask = jnp.asarray(collected_mask).astype(bool).reshape(-1)
-        fn = self._get_batched_draft_fn(int(num_draft_tokens), ids0, hidden0, pos0, mtp_cache)
-        _gds, (mtp_st, embed_st, head_st), freqs, _tie = self._batched_bundle_graph_and_states()
-        drafts, new_cache = fn(mtp_st, embed_st, head_st, freqs, ids0, hidden0, pos0, mtp_cache, committed, mask)
-        if new_cache is not None:
-            self._mtp_cache = new_cache
+        k = int(num_draft_tokens)
+        # A collected row reads and writes slots below ``committed_lens + k`` only (its write index is rolled back
+        # to at most ``committed_lens``), so the pass runs on the narrowest window holding every collected row.
+        # Host arrays only (see ``_host_vector``): device inputs run on the whole capacity.
+        collected = _host_vector(collected_mask, bool)
+        committed_host = _host_vector(committed_lens, np.int64)
+        reach = None if collected is None or committed_host is None else committed_host[collected] + k
+        committed = _device_vector(committed_lens, np.int32)
+        mask = _device_vector(collected_mask, np.bool_)
+        drafts = None
+        with set_inference_mode():
+            for width in _select_draft_widths(_cache_capacity(mtp_cache), reach):
+                fn = self._get_batched_draft_fn(k, ids0, hidden0, pos0, mtp_cache, width)
+                _gds, (mtp_st, embed_st, head_st), freqs, _tie = self._batched_bundle_graph_and_states()
+                drafts, new_cache = fn(mtp_st, embed_st, head_st, freqs, ids0, hidden0, pos0, mtp_cache, committed, mask)
+                if new_cache is not None:
+                    self._mtp_cache = mtp_cache = new_cache
         return drafts
 
     @staticmethod
@@ -1551,6 +1846,7 @@ class Qwen3_5MTPDrafter:
         gathered_hidden: jax.Array,
         mtp_cache: TransformerCache | None,
         project_fn: typing.Callable | None,
+        width: int | None = None,
     ) -> typing.Callable:
         """Build (or fetch) the fused DRAFT-IN-VERIFY program for a shape.
 
@@ -1599,6 +1895,9 @@ class Qwen3_5MTPDrafter:
                 shared LM head from the drafter bundle (same math as
                 ``apply_lm_head``). Must be a STABLE callable — its ``id`` is
                 part of the compile key.
+            width: Leading slots per row the MTP forwards read and write (one of
+                :func:`_draft_window_widths`; see :func:`_window_cache`), or ``None``
+                for the whole capacity. Keys the compile.
 
         Returns:
             ``fn(mtp_st, embed_st, head_st, freqs, hidden, row_offsets,
@@ -1607,6 +1906,9 @@ class Qwen3_5MTPDrafter:
             accepted[N], seed_positions[N], drafts[N, k_live], new_cache)``.
         """
         has_cache = mtp_cache is not None
+        capacity = _cache_capacity(mtp_cache)
+        if width is not None and (capacity is None or int(width) >= capacity):
+            width = None
         key = (
             int(k_pad),
             int(k_live),
@@ -1614,6 +1916,7 @@ class Qwen3_5MTPDrafter:
             str(gathered_hidden.dtype),
             self._cache_signature(mtp_cache),
             None if project_fn is None else id(project_fn),
+            None if width is None else int(width),
         )
         fn = self._jit_verify_draft.get(key)
         if fn is not None:
@@ -1627,7 +1930,7 @@ class Qwen3_5MTPDrafter:
         warm_ids = jnp.zeros((n, 1), dtype=jnp.int32)
         warm_hidden = jnp.zeros((n, 1, hidden_dim), dtype=gathered_hidden.dtype)
         warm_pos = jnp.zeros((n, 1), dtype=jnp.int32)
-        _ = self._mtp_forward_compute(self.model, warm_ids, warm_hidden, warm_pos, mtp_cache, None)
+        _ = self._mtp_forward_compute(self.model, warm_ids, warm_hidden, warm_pos, _window_cache(mtp_cache, width), None)
         graphdefs, _states, _freqs, tie_embeddings = self._batched_bundle_graph_and_states()
         mtp_gd, embed_gd, head_gd = graphdefs
         k_pad = int(k_pad)
@@ -1685,7 +1988,9 @@ class Qwen3_5MTPDrafter:
             orig_starts: list = []
             if has_cache:
                 cache: TransformerCache | None
-                cache, orig_indexes, orig_starts = _rollback_cache_views(cache0, committed, collected_mask)
+                cache, orig_indexes, orig_starts = _rollback_cache_views(
+                    _window_cache(cache0, width), committed, collected_mask
+                )
             else:
                 cache = None
 
@@ -1707,11 +2012,17 @@ class Qwen3_5MTPDrafter:
 
             if has_cache and cache is not None:
                 cache = _restore_cache_views(cache, orig_indexes, orig_starts, collected_mask)
+                cache = _unwindow_cache(cache0, cache)
             return arg_mat, accepted, seed_positions, drafts, cache
 
         # Donate the MTP pool cache (arg 12): the program aliases the pool
         # buffers input->output instead of copying the whole pool each step.
-        fn = jax.jit(_run, donate_argnums=(12,))
+        # The cache comes back placed as it went in, so the drafter program
+        # called next runs the placement it was compiled for
+        # (``_cache_out_shardings``).
+        out_shardings = _cache_out_shardings(mtp_cache, 4)
+        jit_kwargs = {} if out_shardings is None else {"out_shardings": out_shardings}
+        fn = jax.jit(_run, donate_argnums=(12,), **jit_kwargs)
         self._jit_verify_draft[key] = fn
         return fn
 
@@ -1776,31 +2087,46 @@ class Qwen3_5MTPDrafter:
         self.ensure_batch_size(n)
         mtp_cache = self._mtp_cache if self.uses_mtp_cache else None
         draft_tokens = jnp.asarray(draft_tokens, dtype=jnp.int32).reshape(n, -1)
-        fn = self._get_verify_draft_fn(
-            k_pad=int(draft_tokens.shape[1]),
-            k_live=int(num_draft_tokens),
-            gathered_hidden=gathered_hidden,
-            mtp_cache=mtp_cache,
-            project_fn=project_fn,
-        )
-        _gds, (mtp_st, embed_st, head_st), freqs, _tie = self._batched_bundle_graph_and_states()
-        arg_mat, accepted, seed_positions, drafts, new_cache = fn(
-            mtp_st,
-            embed_st,
-            head_st,
-            freqs,
+        k_live = int(num_draft_tokens)
+        # A collected row's in-program rollback target is at most ``committed_base + draft_counts`` (0 when fresh)
+        # and the pass writes ``k_live`` slots from there, so it runs on the narrowest window holding every collected
+        # row (host arrays: no device read).
+        host = [
+            _host_vector(collected_mask, bool),
+            _host_vector(committed_base, np.int64),
+            _host_vector(draft_counts, np.int64),
+            _host_vector(fresh_mask, bool),
+        ]
+        reach = None
+        if all(h is not None for h in host):
+            collected, base, counts, fresh = host
+            reach = (np.where(fresh, 0, np.maximum(base, 0) + counts) + k_live)[collected]
+        inputs = (
             jnp.asarray(gathered_hidden),
             row_offsets,
             draft_tokens,
             jnp.asarray(draft_counts, dtype=jnp.int32).reshape(-1),
             jnp.asarray(seed_pos_base, dtype=jnp.int32).reshape(-1),
             jnp.asarray(committed_base, dtype=jnp.int32).reshape(-1),
-            jnp.asarray(fresh_mask).astype(bool).reshape(-1),
-            jnp.asarray(collected_mask).astype(bool).reshape(-1),
-            mtp_cache,
+            _device_vector(fresh_mask, np.bool_),
+            _device_vector(collected_mask, np.bool_),
         )
-        if new_cache is not None:
-            self._mtp_cache = new_cache
+        outputs: list = []
+        with set_inference_mode():
+            for width in _select_draft_widths(_cache_capacity(mtp_cache), reach):
+                fn = self._get_verify_draft_fn(
+                    k_pad=int(draft_tokens.shape[1]),
+                    k_live=k_live,
+                    gathered_hidden=gathered_hidden,
+                    mtp_cache=mtp_cache,
+                    project_fn=project_fn,
+                    width=width,
+                )
+                _gds, (mtp_st, embed_st, head_st), freqs, _tie = self._batched_bundle_graph_and_states()
+                *outputs, new_cache = fn(mtp_st, embed_st, head_st, freqs, *inputs, mtp_cache)
+                if new_cache is not None:
+                    self._mtp_cache = mtp_cache = new_cache
+        arg_mat, accepted, seed_positions, drafts = outputs
         return arg_mat, accepted, seed_positions, drafts
 
 

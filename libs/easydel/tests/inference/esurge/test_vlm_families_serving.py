@@ -14,7 +14,7 @@
 """eSurge serving parity tests for the new VLM families (CPU, tiny models).
 
 Covers ``paligemma``, ``internvl``, ``hunyuan_vl``, and ``minimax_m3_vl``
-end to end through the real ``eSurgeRunner`` + ``Scheduler`` (the same
+end to end through the real ``eSurgeRunner`` + engine core (the same
 harness pattern as ``test_spec_decode.py``): continuous-batching prefill and
 decode over the paged KV cache with greedy sampling.
 
@@ -57,10 +57,13 @@ import easydel as ed
 import jax.numpy as jnp
 import numpy as np
 import spectrax as spx
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
+
+try:
+    from ._common import make_core_for_runner, served_request
+except ImportError:  # standalone `python test_x.py`
+    from _common import make_core_for_runner, served_request
 
 VOCAB = 256
 MAX_NEW_TOKENS = 8
@@ -105,7 +108,7 @@ def _build_model(module_name: str, cfg, task=ed.TaskType.IMAGE_TEXT_TO_TEXT, pre
 
 
 class _ServingHarness:
-    """One compiled eSurgeRunner + Scheduler serving several greedy batches."""
+    """One compiled eSurgeRunner + engine core serving several greedy batches."""
 
     def __init__(self, model):
         self.model = model
@@ -127,7 +130,7 @@ class _ServingHarness:
             enable_sampler_metrics=False,
         )
         self.runner.compile(max_num_batched_tokens=64)
-        self.scheduler = Scheduler.from_runner(
+        self.scheduler = make_core_for_runner(
             self.runner,
             max_num_batched_tokens=64,
             enable_prefix_caching=False,
@@ -148,7 +151,7 @@ class _ServingHarness:
         """
         requests = []
         for spec in request_specs:
-            req = EngineRequest(
+            req = served_request(
                 request_id=f"req-{self._req_counter}",
                 prompt_token_ids=list(spec["prompt_token_ids"]),
                 sampling_params=SamplingParams(max_tokens=max_new_tokens, temperature=0.0, ignore_eos=True),
@@ -163,7 +166,7 @@ class _ServingHarness:
         for _ in range(64 * len(requests)):
             scheduler_output = self.scheduler.schedule()
             output = self.runner.execute_model(scheduler_output)
-            self.scheduler.update_from_output(scheduler_output, output)
+            self.scheduler.commit(scheduler_output, output)
             if all(r.is_finished() for r in requests):
                 break
         else:

@@ -40,7 +40,7 @@ from easydel.inference.tools.tool_calling_mixin import build_tool_parser_or_none
 
 from ..logger import logger
 from ..metrics import get_metrics_collector
-from ..request import EngineRequest
+from ..request import AdmissionRecord
 from ..utils import truncate_tokens
 from .chat_templating import normalize_stop_sequences
 from .registry import RequestRecord, RequestRegistry
@@ -116,6 +116,61 @@ def _set_requested_new(sp, n: int):
         sp.max_new_tokens = int(n)
 
 
+def check_image_spans_fit(spans: Sequence[tuple[int, int]], max_tokens: int, request_id: str) -> None:
+    """Reject requests that hold an image span longer than the per-step token budget.
+
+    Args:
+        spans: Half-open ``(start, stop)`` position ranges of the image spans.
+        max_tokens: Per-step token budget (``max_num_batched_tokens``).
+        request_id: Request id used in the error message.
+
+    Raises:
+        ValueError: If a span cannot be scheduled in one step.
+    """
+    for start, stop in spans:
+        if stop - start > int(max_tokens):
+            raise ValueError(
+                f"Request {request_id} holds an image span of {stop - start} tokens (positions {start}..{stop}) "
+                f"which exceeds max_num_batched_tokens={int(max_tokens)}; an image span must be prefilled in one "
+                "step. Raise max_num_batched_tokens or send a smaller image."
+            )
+
+
+def expand_request_images(
+    request: AdmissionRecord,
+    image_expander: Any | None,
+    *,
+    max_num_scheduled_tokens: int,
+    max_model_len: int,
+) -> None:
+    """Expand a request's image placeholders into image spans and attach the preprocessed patches.
+
+    Runs once, on the host that owns scheduling, before the request enters the engine core.
+
+    Args:
+        request: Admission record carrying ``images``; updated in place via ``set_expanded_prompt``.
+        image_expander: Model-provided expander (``esurge_image_expander_builder``) or ``None``.
+        max_num_scheduled_tokens: Per-step token budget an image span must fit in.
+        max_model_len: Maximum context length the expanded prompt must stay below.
+
+    Raises:
+        ValueError: If the served model declares no image support, an image span exceeds the per-step budget, or the
+            expanded prompt does not fit ``max_model_len``.
+    """
+    if image_expander is None:
+        raise ValueError(
+            f"Request {request.request_id} carries images but the served model does not declare image support."
+        )
+    expanded = image_expander.expand(request.prompt_token_ids, request.images)
+    check_image_spans_fit(expanded.spans, max_num_scheduled_tokens, request.request_id)
+    if len(expanded.token_ids) >= max_model_len:
+        raise ValueError(
+            f"Request {request.request_id}: image-expanded prompt has {len(expanded.token_ids)} tokens, "
+            f"which does not fit max_model_len={max_model_len}."
+        )
+    request.set_expanded_prompt(expanded.token_ids, expanded.token_types, expanded.spans, expanded.features)
+
+
 class RequestAdmission:
     """Admission component turning prompts into scheduler-ready requests.
 
@@ -128,7 +183,7 @@ class RequestAdmission:
         registry: Shared :class:`RequestRegistry` holding request records,
             outputs, events, and their locks.
         scheduler_submit: Engine callable that acquires the scheduler lock
-            and enqueues a batch of :class:`EngineRequest` objects.
+            and enqueues a batch of :class:`AdmissionRecord` objects.
         tokenizer_client: Worker-pipeline tokenizer client
             (``tokenize(request_id, prompt) -> list[int]``).
         tokenizer: In-process tokenizer used for segment tokenization,
@@ -160,7 +215,7 @@ class RequestAdmission:
         self,
         *,
         registry: RequestRegistry,
-        scheduler_submit: typing.Callable[[list[EngineRequest]], None],
+        scheduler_submit: typing.Callable[[list[AdmissionRecord]], None],
         tokenizer_client,
         tokenizer,
         context_config,
@@ -460,7 +515,7 @@ class RequestAdmission:
         pixel_values_videos: Any | None = None,
         video_grid_thw: Any | None = None,
         mm_features: list | None = None,
-    ) -> list[EngineRequest] | None:
+    ) -> list[AdmissionRecord] | None:
         """Add a new request to the scheduler queue with intelligent context management.
 
         Tokenizes the prompt, applies context length management policies,
@@ -479,7 +534,7 @@ class RequestAdmission:
                 handed to the request's tool parser so it can disambiguate
                 forced-function calls.
             defer_scheduler_enqueue: When ``True``, return the constructed
-                :class:`EngineRequest` objects to the caller instead of
+                :class:`AdmissionRecord` objects to the caller instead of
                 enqueueing them on the scheduler. Used by :meth:`eSurge.generate`
                 to batch-add all sample children under a single
                 scheduler-lock window.
@@ -494,7 +549,7 @@ class RequestAdmission:
                 across ``n>1`` samples.
 
         Returns:
-            List of :class:`EngineRequest` to enqueue when
+            List of :class:`AdmissionRecord` to enqueue when
             ``defer_scheduler_enqueue=True``; otherwise ``None`` (the
             requests are enqueued internally before returning).
 
@@ -708,7 +763,7 @@ class RequestAdmission:
             if [token for segment in segments for token in segment] == token_ids:
                 prompt_token_segments = segments
 
-        # Handle n > 1 sampling: create multiple EngineRequest objects
+        # Handle n > 1 sampling: create one AdmissionRecord per sample
         n_samples = getattr(sampling_params, "n", 1) or 1
 
         completion_outputs = [CompletionOutput(index=i, text="", token_ids=[]) for i in range(n_samples)]
@@ -743,8 +798,8 @@ class RequestAdmission:
         # Use the first EOS token as the primary one for backwards compatibility
         primary_eos_token_id = eos_token_ids[0] if eos_token_ids else self._primary_eos_token_id
 
-        # Add all EOS tokens to sampling_params.stop_token_ids if not already present
-        if eos_token_ids:
+        # Every EOS id stops the request unless it asked to ignore EOS; stop ids the caller passed always stop.
+        if eos_token_ids and not sampling_params.ignore_eos:
             current_stop_ids = set(sampling_params.stop_token_ids or [])
             all_stop_ids = getattr(sampling_params, "_all_stop_token_ids", None)
             if all_stop_ids is None:
@@ -773,7 +828,7 @@ class RequestAdmission:
                     # This preserves correctness at the cost of extra memory.
                     mm_features_cache_key_only.append(feat)
 
-        scheduler_requests: list[EngineRequest] = []
+        scheduler_requests: list[AdmissionRecord] = []
         for sample_idx in range(n_samples):
             if n_samples == 1:
                 child_request_id = request_id
@@ -822,7 +877,7 @@ class RequestAdmission:
             # hosts agree on preemption/priority ordering.
             _arrival = float(self._request_counter) if jax.process_count() > 1 else None
             scheduler_requests.append(
-                EngineRequest(
+                AdmissionRecord(
                     request_id=child_request_id,
                     prompt_token_ids=token_ids,
                     sampling_params=sampling_params,

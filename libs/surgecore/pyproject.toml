@@ -1,0 +1,55 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "surgecore"
+version = "0.0.1"
+authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
+description = "EasyDeL's native host library for the eSurge inference engine."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "Apache-2.0" }
+classifiers = [
+	"Development Status :: 3 - Alpha",
+	"Intended Audience :: Developers",
+	"License :: OSI Approved :: Apache Software License",
+	"Programming Language :: Python :: 3.11",
+	"Programming Language :: Python :: 3.12",
+	"Programming Language :: Python :: 3.13",
+	"Programming Language :: Rust",
+]
+dependencies = ["numpy"]
+
+[tool.maturin]
+module-name = "surgecore._native"
+features = ["pyo3/extension-module"]
+
+[tool.ruff]
+line-length = 121
+target-version = "py311"
+src = []
+
+[tool.ruff.lint]
+select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
+ignore = [
+	"F722",   # Forward annotations needed for jaxtyping
+	"B008",   # Do not perform function calls in argument defaults
+	"UP015",  # Unnecessary open mode
+	"A005",   # Module-level shadowing
+	"UP037",  # Remove quotes from type annotation - needed for jaxtyping string literals
+	"E501",   # Line too long (handled by formatter)
+	"RUF001", # Ruff's own complexity check - handled by other tools
+	"RUF002", # Ruff's own complexity check - handled by other tools
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401"]
+"**/modeling_*.py" = [
+	"UP037",
+	"F821",
+] # Allow quoted type annotations and forward refs in model files
+
+[tool.pytest.ini_options]
+markers = ["cpu_ok: the test does no array computation, so it may run on a CPU backend"]
+testpaths = ["tests"]

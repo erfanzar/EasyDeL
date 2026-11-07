@@ -23,7 +23,7 @@ advanced (a next step was scheduled and possibly dispatched) must abort the
 loop, never retry: retrying with an unexecuted prefetched batch corrupts
 scheduler/runner state.
 
-These tests run the real :class:`EngineLoop` against a scripted scheduler
+These tests run the real :class:`EngineLoop` against a scripted engine core
 and runner recording call order — no model, no device work. They lock the
 loop-shape invariants established by the EngineLoop extraction refactor.
 """
@@ -86,13 +86,16 @@ class _FakeRunner:
         pass
 
 
-class _FakeScheduler:
+class _FakeCore:
+    """Scripted engine core: ``schedule()`` pops the script, ``commit()`` records the pairing."""
+
+    num_running = 0
+    num_waiting = 0
+
     def __init__(self, events: list[str], script: list):
         self.events = events
         self._script = list(script)
         self.script_drained = threading.Event()
-        self.running: list = []
-        self.waiting: list = []
 
     def schedule(self):
         if self._script:
@@ -104,8 +107,8 @@ class _FakeScheduler:
         self.events.append(f"schedule:{out.tag}")
         return out
 
-    def update_from_output(self, scheduler_output, model_output):
-        assert scheduler_output.tag == model_output.tag, "update paired with the wrong step's output"
+    def commit(self, scheduler_output, model_output):
+        assert scheduler_output.tag == model_output.tag, "commit paired with the wrong step's output"
         self.events.append(f"update:{scheduler_output.tag}")
         return {}
 
@@ -116,10 +119,10 @@ class _LoopHarness:
     def __init__(self, script: list, *, fail_drain_tags: set[str] | None = None):
         self.events: list[str] = []
         self.runner = _FakeRunner(self.events, fail_drain_tags=fail_drain_tags)
-        self.scheduler = _FakeScheduler(self.events, script)
+        self.scheduler = _FakeCore(self.events, script)
         self.aborts: list[BaseException] = []
         self.loop = EngineLoop(
-            scheduler=self.scheduler,
+            core=self.scheduler,
             runner=self.runner,
             coordinator=None,
             scheduler_lock=threading.RLock(),

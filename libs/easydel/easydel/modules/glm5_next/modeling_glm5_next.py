@@ -99,6 +99,7 @@ from easydel.layers.indexer import (
     IndexerConfig,
     IndexerKind,
     SparseIndexer,
+    resolve_index_scoring_kernel,
 )
 from easydel.layers.linear_attention import KernelDeltaAttention, unnest_legacy_kda_forget_gate
 from easydel.layers.moe import fp32_router_logits, moe_group_topk_select
@@ -551,7 +552,10 @@ class Glm5NextTextMoE(BaseMoeModule):
         )
 
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
-        """Routes tokens through selected experts and combines outputs.
+        """Routes tokens through selected experts and combines outputs, plus the shared experts.
+
+        The shared experts go to ``moe_call``, which runs them inside the fused dispatch where it can (the
+        inference-mode deferred dispatch with W8A8 shared experts) and adds them after the routed experts otherwise.
 
         Args:
             hidden_states: Input tensor of shape ``(batch, seq_len, hidden_dim)``.
@@ -584,9 +588,8 @@ class Glm5NextTextMoE(BaseMoeModule):
             act_fn=self.experts.act_fn,
             ffn_activation=ffn_activation,
             hooks=hooks,
+            shared_expert=self.shared_experts,
         )
-        if self.shared_experts is not None:
-            out = out + self.shared_experts(hidden_states)
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
@@ -782,7 +785,7 @@ class Glm5NextIndexer(SparseIndexer):
                 kpool_size=config.index_kpool,
                 select_tail=config.index_kpool_always_select_tail,
                 initializer_range=config.initializer_range,
-                scoring_kernel=config.index_scoring_kernel,
+                scoring_kernel=resolve_index_scoring_kernel(config.index_scoring_kernel),
             ),
             layer_idx=layer_idx,
             dtype=dtype,
@@ -1460,6 +1463,50 @@ class Glm5NextForCausalLM(_Glm5NextIndexerCacheMixin, BaseCausalLMModule[Glm5Nex
             ``True`` iff an MTP head is attached.
         """
         return getattr(self, "mtp", None) is not None
+
+    def drafter(
+        self,
+        method: str = "auto",
+        *,
+        nextn_checkpoint: str | None = None,
+        nextn_cache_length: int | None = None,
+        **kwargs: typing.Any,
+    ) -> typing.Any:
+        """Build a speculative-decoding drafter; optionally load the checkpoint's own nextn layer first.
+
+        GLM-5-Next checkpoints ship their nextn (MTP) layer as ``layers.{num_hidden_layers}.*``. A converted
+        checkpoint may lack it, so ``nextn_checkpoint`` names a Hugging Face checkpoint directory that holds it
+        (any path ``ePath`` reads); the layer is loaded and attached as ``self.mtp`` before the drafter is built
+        (:func:`~easydel.modules.glm5_next.modeling_glm5_next_mtp.load_glm5_next_mtp_checkpoint`).
+
+        Args:
+            method: Drafter family (see :meth:`EasyDeLBaseModule.drafter`).
+            nextn_checkpoint: Hugging Face checkpoint holding the nextn layer, or ``None`` to use an attached head.
+            nextn_cache_length: Slots per request of the drafter-local MTP cache. The cache holds a request's
+                drafted history only (not its prompt); a request whose drafted history reaches it stops drafting.
+            **kwargs: Forwarded to :meth:`EasyDeLBaseModule.drafter`.
+
+        Returns:
+            The drafter.
+
+        Raises:
+            ValueError: If ``nextn_checkpoint`` is given while a head is already attached.
+        """
+        from .modeling_glm5_next_mtp import DEFAULT_MTP_CACHE_LENGTH, load_glm5_next_mtp_checkpoint
+
+        if nextn_checkpoint is not None:
+            if self.has_mtp():
+                raise ValueError("A nextn head is already attached; pass nextn_checkpoint only to load one.")
+            load_glm5_next_mtp_checkpoint(
+                self,
+                str(nextn_checkpoint),
+                param_dtype=self.param_dtype,
+                precision=self.precision,
+                max_cache_length=int(nextn_cache_length or DEFAULT_MTP_CACHE_LENGTH),
+            )
+        elif nextn_cache_length is not None and self.has_mtp():
+            self.mtp.max_cache_length = int(nextn_cache_length)
+        return super().drafter(method, **kwargs)
 
 
 @register_module(TaskType.CAUSAL_LM, config=Glm5NextTextConfig, model_type="glm5_next")

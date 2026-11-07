@@ -646,6 +646,7 @@ class SparseIndexer(BaseIndexer):
             constrain_pages=cache_view.constrain_indexer_pages,
             kernel_mesh=cache_view.indexer_kernel_mesh(),
             dp_sharding=cache_view.indexer_dp_sharding(),
+            constrain_heads=getattr(cache_view, "constrain_indexer_heads", None),
         )
         return selected, cache_view.replace(indexer_token_pages=token_pages, indexer_pool_pages=pool_pages)
 

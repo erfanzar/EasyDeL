@@ -68,6 +68,10 @@ Available Operations:
             single-step GDR decode (XLA reference + TPU Pallas for head sharding);
             ``gated_delta_rule_grouped_decode_op`` is a back-compat alias of the functional op.
         - RaggedGatedDeltaRule / ragged_gated_delta_rule: GDR for ragged sequences.
+        - RaggedKDA / ragged_kda: Per-channel-decay KDA over a flat packed token stream with a
+            recurrent-state pool (``query_start_loc`` / ``state_indices``); single-token rows take one
+            vectorised decode step, longer rows run the chunked math on their own chunks only.
+            ``ragged_kda_head_sharded`` adds the head-axis ``shard_map`` path.
         - RaggedGatedDeltaRuleV2 / ragged_gated_delta_rule_v2: Packed continuous-batch
             GDN v2 (mixed prefill+decode); consumes a packed mixed-QKV buffer plus
             per-token gates and a recurrent state pool, returns the updated state pool
@@ -224,6 +228,8 @@ from .configs import (
     RaggedGatedDeltaRuleV2Config,
     RaggedGatherConfig,
     RaggedGatherReduceConfig,
+    RaggedKDAConfig,
+    RaggedKDADecodeConfig,
     RaggedPageAttentionv2Config,
     RaggedPageAttentionv2TurboQuantConfig,
     RaggedPageAttentionv3Config,
@@ -325,6 +331,8 @@ from .ragged_gated_delta_rule_v2 import (
 )
 from .ragged_gather import RaggedGather, ragged_gather
 from .ragged_gather_reduce import RaggedGatherReduce, ragged_gather_reduce
+from .ragged_kda import RaggedKDA, ragged_kda, ragged_kda_head_sharded
+from .ragged_kda_decode import RaggedKDADecode, ragged_kda_decode, ragged_kda_decode_head_sharded
 from .ragged_page_attention_v2 import RaggedPageAttentionv2, ragged_page_attention_v2
 from .ragged_page_attention_v2_turboquant import (
     RaggedPageAttentionv2TurboQuant,
@@ -464,6 +472,10 @@ __all__ = (
     "RaggedGatherConfig",
     "RaggedGatherReduce",
     "RaggedGatherReduceConfig",
+    "RaggedKDA",
+    "RaggedKDAConfig",
+    "RaggedKDADecode",
+    "RaggedKDADecodeConfig",
     "RaggedPageAttentionv2",
     "RaggedPageAttentionv2Config",
     "RaggedPageAttentionv2TurboQuant",
@@ -560,6 +572,10 @@ __all__ = (
     "ragged_gated_delta_rule_v2_with_window_states",
     "ragged_gather",
     "ragged_gather_reduce",
+    "ragged_kda",
+    "ragged_kda_decode",
+    "ragged_kda_decode_head_sharded",
+    "ragged_kda_head_sharded",
     "ragged_page_attention_v2",
     "ragged_page_attention_v2_turboquant",
     "ragged_page_attention_v3",

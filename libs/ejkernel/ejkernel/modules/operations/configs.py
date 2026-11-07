@@ -1003,8 +1003,10 @@ class KdaChunkConfig(BaseOperationConfig):
     """Configuration for the fused chunked per-channel-decay KDA (``kda_chunk``).
 
     Args:
-        block_h: Heads per Pallas grid step (``num_heads`` must be a multiple; 1 keeps the
-            ``[cs, cs, K]`` temporaries at one head).
+        block_h: Heads per Pallas grid step. ``num_heads`` must be a multiple, otherwise the call runs the XLA
+            implementation; 1 keeps the ``[cs, cs, K]`` temporaries at one head. ``None`` (default) picks the
+            heads per step from the call's shapes and pairwise form (see
+            :func:`ejkernel.modules.operations.kda_chunk.auto_block_h`).
         backward: ``"pallas"`` (fused reverse-sweep kernel) or ``"xla"`` (reversed-scan recompute).
         bwd_reduce: ``"vpu"`` or ``"mxu"`` evaluation of the backward's weighted reductions (both exact).
         pairwise: ``"auto"`` (factored MXU pairwise decay whenever the call passes a ``decay_lower_bound`` that
@@ -1013,10 +1015,47 @@ class KdaChunkConfig(BaseOperationConfig):
         backend: Backend specification (default: "any").
     """
 
-    block_h: int = 1
+    block_h: int | None = None
     backward: str = "pallas"
     bwd_reduce: str = "vpu"
     pairwise: str = "auto"
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedKDAConfig(BaseOperationConfig):
+    """Configuration for ragged (flat-token) per-channel-decay KDA over a state pool (``ragged_kda``).
+
+    Args:
+        inverse: Chunk inverse of the multi-token path: ``"auto"`` (block-recursive ``"masked"`` inverse for
+            power-of-two chunks of at least 8 tokens, else ``"solve"``), ``"masked"`` (matmul-only) or ``"solve"``
+            (exact batched triangular solve).
+        pairwise: ``"auto"`` (factored MXU pairwise decay whenever the call passes a ``decay_lower_bound`` that
+            allows it) or ``"dense"`` (always the ``[cs, cs, K]`` form).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    inverse: str = "auto"
+    pairwise: str = "auto"
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedKDADecodeConfig(BaseOperationConfig):
+    """Configuration for the per-row KDA decode step over a state pool (``ragged_kda_decode``).
+
+    Args:
+        block_rows: Rows per grid step of the Pallas TPU kernel (``0``: automatic; must divide the row count).
+        block_h: Heads per inner step of the Pallas TPU kernel (``0``: automatic; must divide the local head count).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    block_rows: int = 0
+    block_h: int = 0
 
     __hash__ = hash_fn
 

@@ -200,7 +200,7 @@ class Control(msgspec.Struct, tag=True):
 class Admit(msgspec.Struct, tag=True):
     """Origin → owner: admit a request group into the owner's scheduler.
 
-    The payload frame carries the origin-built ``EngineRequest`` objects
+    The payload frame carries the origin-built ``AdmissionRecord`` objects
     (pickled) — post-truncation token ids, finalized sampling params, and the
     ``n>1`` child fan-out — so the owner schedules exactly what a local
     admission would have produced. The owner renames the request ids into its

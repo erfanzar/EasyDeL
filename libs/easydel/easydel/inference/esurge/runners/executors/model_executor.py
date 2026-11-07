@@ -236,6 +236,7 @@ class ModelStepExecutor:
         enable_spec_recurrent_commit: bool = False,
         input_sharding: jax.sharding.Sharding | None = None,
         slot_indexed_state: bool = False,
+        recurrent_slot_group_size: int = 1,
         cache_group_configs: tuple[RaggedPagesCacheConfig | UnifiedAttentionCacheConfig, ...] = (),
         layer_to_cache_group: tuple[int, ...] = (),
     ) -> None:
@@ -262,10 +263,10 @@ class ModelStepExecutor:
                 below this token count return all token hidden rows rather than
                 only sampled rows. Speculative verification uses this for tiny
                 draft windows while larger prompt buckets keep compact outputs.
-            slot_indexed_state: If True (compressed-window cache families),
-                the compiled steps thread ``recurrent_state_indices`` from the
-                batch metadata into the model's cache metadata even without
-                SPMD DP, so the model can address per-request slot state.
+            slot_indexed_state: If True (requests own pooled state slots: compressed-window caches and recurrent
+                layers that declare the eSurge slot contract), the compiled steps thread
+                ``recurrent_state_indices`` from the batch metadata into the model's cache metadata even without
+                SPMD DP.
             cache_group_configs: Independent pool configurations in runtime group
                 order, fixed before compilation. Empty preserves single-pool inputs.
             layer_to_cache_group: Static model-layer to pool-index ownership mapping.
@@ -293,6 +294,8 @@ class ModelStepExecutor:
         self.pipeline_plan = pipeline_plan
         self.enable_spec_recurrent_commit = bool(enable_spec_recurrent_commit)
         self._slot_indexed_state = bool(slot_indexed_state)
+        # W > 1: every request owns W recurrent slots (speculative verify contract, see runners/slot_contract.py).
+        self.recurrent_slot_group_size = max(1, int(recurrent_slot_group_size))
         # DSpark speculative decoding: the fused SPMD model step returns ``concat([last_hidden, main_hidden])`` rows.
         # Set by the runner before the first trace; read inside the traced step.
         self.main_hidden_enabled = False
@@ -492,6 +495,15 @@ class ModelStepExecutor:
             return hidden_states.squeeze(0)
         return hidden_states.reshape((-1, hidden_states.shape[-1]))
 
+    @property
+    def _plain_recurrent_slots(self) -> bool:
+        """Whether non-DP steps thread the per-row recurrent slots into ``cache_metadata.recurrent_state_indices``.
+
+        True when requests own pooled state slots (compressed-window caches, recurrent layers that declare the slot
+        contract). Read through ``getattr`` so executors assembled without ``__init__`` (tests) keep working.
+        """
+        return bool(getattr(self, "_slot_indexed_state", False))
+
     def _build_cache_metadata(self, metadata: BatchMetadata, num_reqs_max_model_len: int) -> RaggedPagesMetadata:
         """Build the per-step :class:`RaggedPagesMetadata` from packed batch metadata.
 
@@ -506,6 +518,21 @@ class ModelStepExecutor:
             The cache metadata consumed by the paged attention layers.
         """
         use_spmd_dp = self._uses_spmd_dp()
+        spec_recurrent_commit = metadata.spec_recurrent_commit
+        group = int(getattr(self, "recurrent_slot_group_size", 1) or 1)
+        read_offset = commit_lens = None
+        if group > 1 and spec_recurrent_commit is not None and not use_spmd_dp:
+            # Slot groups of W slots: the host ships, per row, the tokens covered by slot g after the request's last
+            # step (row 0 of the payload). A row reads slot g + o with o = (context before this step) - base, which is
+            # the drafts its previous verify step accepted; fresh rows read nothing (o = 0). Every short row captures
+            # its state after each token (commit length 1).
+            rows = num_reqs_max_model_len
+            qsl = metadata.query_start_loc[: rows + 1]
+            before = metadata.seq_lens[:rows] - (qsl[1:] - qsl[:-1])
+            base = spec_recurrent_commit[0, :rows]
+            read_offset = jnp.where(before > 0, jnp.clip(before - base, 0, group - 1), 0).astype(jnp.int32)
+            commit_lens = jnp.ones((rows,), jnp.int32)
+            spec_recurrent_commit = None
         return RaggedPagesMetadata(
             pages_tables=metadata.pages_tables,
             context_lens=(
@@ -522,10 +549,13 @@ class ModelStepExecutor:
             request_distribution=metadata.rank_request_distribution,
             slot_mapping=metadata.slot_mapping,
             num_kv_update_slices=metadata.num_kv_update_slices,
-            spec_recurrent_commit=metadata.spec_recurrent_commit,
+            spec_recurrent_commit=spec_recurrent_commit,
             recurrent_state_indices=(
-                metadata.rank_recurrent_state_indices if (use_spmd_dp or self._slot_indexed_state) else None
+                metadata.rank_recurrent_state_indices if (use_spmd_dp or self._plain_recurrent_slots) else None
             ),
+            recurrent_read_offset=read_offset,
+            recurrent_commit_lens=commit_lens,
+            recurrent_slot_group_size=group if read_offset is not None else 1,
             version=self._metadata_version,
             cache_groups=metadata.cache_groups,
             layer_to_cache_group=metadata.layer_to_cache_group,
@@ -788,7 +818,7 @@ class ModelStepExecutor:
             dp_query_start_loc=self._empty_sharding if use_spmd_dp else None,
             dp_request_distribution=self._empty_sharding if use_spmd_dp else None,
             dp_context_lens=self._empty_sharding if use_spmd_dp else None,
-            dp_recurrent_state_indices=self._empty_sharding if (use_spmd_dp or self._slot_indexed_state) else None,
+            dp_recurrent_state_indices=self._empty_sharding if (use_spmd_dp or self._plain_recurrent_slots) else None,
             input_token_handoff_positions=self._empty_sharding,
             input_token_handoff_ids=self._empty_sharding,
             input_token_handoff_count=self._empty_sharding,
@@ -812,7 +842,7 @@ class ModelStepExecutor:
                     num_kv_update_slices=self._empty_sharding if config.version == "v2" else None,
                     spec_recurrent_commit=self._empty_sharding if self.enable_spec_recurrent_commit else None,
                     recurrent_state_indices=(
-                        self._empty_sharding if (use_spmd_dp or self._slot_indexed_state) else None
+                        self._empty_sharding if (use_spmd_dp or self._plain_recurrent_slots) else None
                     ),
                     version=config.version,
                     num_slices_per_kv_cache_update_page=config.num_slices_per_kv_cache_update_page,

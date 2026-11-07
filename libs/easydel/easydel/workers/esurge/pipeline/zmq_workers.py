@@ -223,6 +223,7 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
             raise ValueError("Detokenizer worker endpoint must be provided.")
         super().__init__(endpoint, request_timeout=request_timeout)
         self._sent_lengths: dict[str, int] = {}
+        self._texts: dict[str, str] = {}
 
     def decode(
         self,
@@ -290,21 +291,39 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
                 msg["tokens"] = generated_tokens
             if prompt_context:
                 msg["prompt_context"] = prompt_context
+            # The worker replies with the new text only while its character count matches ours.
+            held_text = self._texts.get(request_id, "")
+            msg["text_offset"] = len(held_text)
             try:
                 resp = self._request(msg)
             except TimeoutError:
                 self._sent_lengths.pop(request_id, None)
+                self._texts.pop(request_id, None)
                 raise
             if resp.get("status") != "ok":
                 # Resend full tokens next time so a lost worker state can be rebuilt.
                 self._sent_lengths.pop(request_id, None)
+                self._texts.pop(request_id, None)
                 raise RuntimeError(resp.get("message", "Detokenizer worker failed"))
+            result_payload = resp["result"]
+            delta_text = result_payload.get("delta_text") or ""
+            if "accumulated_text" in result_payload:
+                accumulated_text = result_payload["accumulated_text"]
+            else:
+                accumulated_text = held_text + delta_text
             if finished:
                 self._sent_lengths.pop(request_id, None)
+                self._texts.pop(request_id, None)
             else:
                 self._sent_lengths[request_id] = total_tokens
-            result_payload = resp["result"]
-            return DetokenizerResult(**result_payload)
+                self._texts[request_id] = accumulated_text
+            return DetokenizerResult(
+                accumulated_text=accumulated_text,
+                delta_text=delta_text,
+                last_decoded_index=result_payload["last_decoded_index"],
+                finished=result_payload["finished"],
+                detoktook=result_payload.get("detoktook", 0.0),
+            )
 
     def reset(self, request_id: str) -> None:
         """Drop per-request state on both client and worker.
@@ -318,6 +337,7 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
         with self._lock:
             self._request({"cmd": "reset", "request_id": request_id})
             self._sent_lengths.pop(request_id, None)
+            self._texts.pop(request_id, None)
 
     def drain(self) -> None:
         """Flush every per-request decoder state on the worker.
@@ -333,6 +353,7 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
             if resp.get("status") != "ok":
                 raise RuntimeError(resp.get("message", "Detokenizer worker failed to drain"))
             self._sent_lengths.clear()
+            self._texts.clear()
 
     def shutdown(self) -> None:
         """Send ``shutdown`` to the worker then close the local socket.
@@ -343,6 +364,7 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
         socket is always released.
         """
         self._sent_lengths.clear()
+        self._texts.clear()
         try:
             self._request({"cmd": "shutdown"})
         except Exception:

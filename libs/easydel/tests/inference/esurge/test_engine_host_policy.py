@@ -11,7 +11,6 @@ from easydel.inference.esurge.runners.execution_manager import ExecutionManager
 from easydel.inference.esurge.runners.executors.batch_preparer import BatchMetadataPreparer
 from easydel.inference.esurge.runners.executors.sampler_executor import SamplerRuntime
 from easydel.inference.esurge.runners.model_runner import eSurgeRunner
-from easydel.inference.esurge.scheduler import Scheduler
 
 pytestmark = pytest.mark.cpu_ok
 
@@ -52,13 +51,10 @@ def test_constructor_sets_instance_policy_before_start_without_changing_other_en
     monkeypatch.setattr(eSurge, "_warn_if_data_parallel_axis_shards_the_model", lambda *args: None)
     monkeypatch.setattr(eSurge, "_install_side_input_tokenizer_state", lambda *args: None)
 
-    def scheduler_factory(self):
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.max_num_scheduled_tokens = 32
-        scheduler.policy = "fcfs"
-        return scheduler
+    def core_factory(self):
+        return SimpleNamespace(max_num_scheduled_tokens=32, policy="fcfs")
 
-    monkeypatch.setattr(eSurge, "_build_scheduler", scheduler_factory)
+    monkeypatch.setattr(eSurge, "_build_core", core_factory)
     monkeypatch.setattr(
         esurge_engine,
         "WorkerManager",

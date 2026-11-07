@@ -119,7 +119,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
         Returns:
             Total allocatable bytes across all devices on the page axis.
         """
-        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
+        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free", mesh=mesh)
         page_axis_size = mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
         available_alloc = budget * page_axis_size
         logger.info(f"{page_axis_size=} {budget=} {available_alloc=} {hbm_utilization=}")
@@ -585,6 +585,34 @@ class MLARaggedPagesCacheView(RaggedPagesCacheView):
         if resolver is None:
             return x
         return resolver.shard(x, axes=[common_types.EMPTY] * x.ndim, mode=common_types.MODE_PREFILL)
+
+    def constrain_indexer_heads(self, x: jax.Array) -> jax.Array:
+        """Pin per-head indexer activations ``[T, heads, ...]`` to the head-sharded (tensor-parallel) layout.
+
+        The indexer's query and head-weight projections are column-parallel, so their outputs are sharded over the
+        head axis. Where the fused top-k splits its rows over every device, pinning that layout makes XLA reshard
+        the small activation (an all-to-all) instead of all-gathering the projection weights on every call.
+
+        Args:
+            x: Activation ``[T, heads, ...]``.
+
+        Returns:
+            ``x`` constrained to ``P(None, head_axes, None, ...)``; ``x`` unchanged without a resolver, on a
+            pipeline mesh, without a sharded head axis, or when the head count does not divide it.
+        """
+        resolver = getattr(self, "runtime_sharding_resolver", None)
+        if resolver is None or x.ndim < 2:
+            return x
+        mesh = getattr(resolver, "mesh", None)
+        if mesh is None or is_mpmd_mesh(mesh):
+            return x
+        heads = int(x.shape[1])
+        spec = resolver.resolve(axes=[common_types.HEAD], mode=common_types.MODE_PREFILL, shape=(heads,))
+        size = mesh_axis_size(mesh, normalize_axis_names(spec[0] if len(spec) > 0 else None))
+        if size <= 1 or heads % size:
+            return x
+        axes = [common_types.EMPTY, common_types.HEAD] + [common_types.EMPTY] * (x.ndim - 2)
+        return resolver.shard(x, axes=axes, mode=common_types.MODE_PREFILL)
 
     def flattened_kv_pages(self) -> jax.Array:
         """Materialize and return the KV page buffer as a concrete JAX array.

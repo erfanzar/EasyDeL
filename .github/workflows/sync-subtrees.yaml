@@ -3,11 +3,11 @@ name: Sync subtree mirrors
 # Pushes that touch a library under libs/ are automatically synced to that
 # library's standalone repository via scripts/subtree-sync.sh push, so the
 # mirrors (erfanzar/Spectrax, erfanzar/ejkernel, erfanzar/eformer,
-# erfanzar/eray) always track the monorepo. The script replays only NEW
+# erfanzar/eray, erfanzar/esurgecore) always track the monorepo. The script replays only NEW
 # commits onto the mirror's current main (message-prefixed, fast-forward) and
 # tolerates the squashed `subtree pull` commits in monorepo history that a
 # plain `git subtree split` chokes on. Requires the SUBTREE_SYNC_TOKEN
-# secret: a fine-grained PAT with Contents read/write on the four mirror
+# secret: a fine-grained PAT with Contents read/write on the five mirror
 # repositories.
 #
 # If a mirror has diverged (someone pushed to it directly), the sync here
@@ -23,6 +23,7 @@ on:
       - "libs/ejkernel/**"
       - "libs/eformer/**"
       - "libs/eray/**"
+      - "libs/surgecore/**"
   workflow_dispatch:
 
 concurrency:
@@ -44,6 +45,8 @@ jobs:
             repo: erfanzar/eformer
           - lib: eray
             repo: erfanzar/eray
+          - lib: surgecore
+            repo: erfanzar/esurgecore
     steps:
       - name: Checkout (full history — subtree split walks it)
         uses: actions/checkout@v4

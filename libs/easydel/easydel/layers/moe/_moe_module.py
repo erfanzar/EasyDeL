@@ -82,6 +82,7 @@ from ._communication_utils import (
     MoEMethods,
     MoeMetrics,
     MoeRoutingStrategy,
+    _moe_row_gather_sum_entry,
     build_ep_traffic_matrix,
     chunk_group_sizes,
     ep_batch_receive_buffer_rows,
@@ -97,7 +98,7 @@ from ._communication_utils import (
     unpermute,
 )
 from ._expert_stats import maybe_record_group_sizes
-from ._layout_planner import ep_carries_batch_inactive_reason, validate_moe_layout
+from ._layout_planner import auto_moe_chunk_size, ep_carries_batch_inactive_reason, validate_moe_layout
 
 if typing.TYPE_CHECKING:
     from easydel.infra.base_config import EasyDeLBaseConfig
@@ -137,13 +138,58 @@ def _default_ffn_activation(
     return ffn_activation
 
 
+_A8_PALLAS_MAX_ROWS = 1024
+"""Dispatch rows up to which inference-mode W8A8 experts run ejkernel's Pallas channelwise entry on any fitting slab.
+
+The entry's whole-slab A8 path (ejkernel ``_a8_slab_tiles``) covers the same calls: int8 codes whose 128-aligned
+``(K, N)`` expert slab fits ``_A8_PALLAS_MAX_SLAB_BYTES``; longer row buffers only on ``_A8_PALLAS_PREFILL_FAMILIES``.
+"""
+_A8_PALLAS_MAX_SLAB_BYTES = 2 * 1024 * 1024
+_A8_PALLAS_PREFILL_FAMILIES = frozenset({(72, 4096, 512), (72, 512, 4096)})
+"""Expert-stacked ``(E, K, N)`` int8 families measured at prefill rows on TPU v5p: the per-chip routed experts
+(gate/up, down) of GLM-5.3-Flash served at ep4 x tp4; the set of ejkernel's ``_A8_PREFILL_SLAB_FAMILIES``."""
+_A8_PALLAS_PREFILL_MAX_ROWS = 81920
+"""Largest measured prefill buffer: the deferred dispatch's window of one 32,768-token step at ep4 (top-8)."""
+
+
 def _channelwise_grouped_platform(rows, codes, activation_bits, *, force_xla=False):
     """Select measured v5p decode and W4A4 prefill matrix families.
 
     Large native INT4 ragged dots on these v5p shapes were much slower than
     exact INT8 arithmetic with packed INT4 HBM storage. Keep A16 decode-only,
     retain forced-XLA, and do not extrapolate past the measured row range.
+
+    Under inference mode, W8A8 calls (A8 activations, int8 codes, bf16 rows) whose 128-aligned ``(K, N)`` slab fits
+    ``_A8_PALLAS_MAX_SLAB_BYTES`` run the Pallas entry on v5p at up to ``_A8_PALLAS_MAX_ROWS`` rows, and on
+    ``_A8_PALLAS_PREFILL_FAMILIES`` up to ``_A8_PALLAS_PREFILL_MAX_ROWS`` rows; the entry reads one whole slab per
+    expert that has rows and applies both scales in the kernel. Measured on TPU v5p at the per-chip expert shapes of
+    GLM-5.3-Flash served at ep4 x tp4 (int8 [72, 4096, 512] gate/up, [72, 512, 4096] down), bit-identical outputs:
+    one W8A8 routed-MoE layer with 32 / 64 / 128 decode tokens (256 / 512 / 1024 dispatch rows) 0.331 / 0.435 /
+    0.513 -> 0.236 / 0.321 / 0.397 ms; the gate + up + down FFN at the ep4 prefill windows of 512 / 2,048 / 32,768
+    tokens (2,048 / 5,120 / 81,920 rows) 0.477 / 0.754 / 6.355 -> 0.317 / 0.532 / 4.564 ms per layer. Training keeps
+    XLA.
     """
+    if activation_bits == 8 and is_inference_mode():
+        m = rows.shape[0]
+        k_dim, n_dim = codes.shape[-2], codes.shape[-1]
+        slab_rows = 0 < m <= _A8_PALLAS_MAX_ROWS or (
+            _A8_PALLAS_MAX_ROWS < m <= _A8_PALLAS_PREFILL_MAX_ROWS
+            and tuple(int(d) for d in codes.shape) in _A8_PALLAS_PREFILL_FAMILIES
+        )
+        if (
+            force_xla
+            or rows.dtype != jnp.bfloat16
+            or codes.dtype != jnp.int8
+            or not slab_rows
+            or k_dim % 128
+            or n_dim % 128
+            or k_dim * n_dim > _A8_PALLAS_MAX_SLAB_BYTES
+            or jax.default_backend() != "tpu"
+        ):
+            return "xla"
+        from jax.experimental.pallas import tpu as pltpu
+
+        return "pallas" if pltpu.get_tpu_info().chip_version.value == "v5p" else "xla"
     measured_rows = 0 < rows.shape[0] <= 128 or (activation_bits == 4 and 1280 <= rows.shape[0] <= 81920)
     if (
         force_xla
@@ -384,6 +430,228 @@ DP = common_types.DP
 FSDP = common_types.FSDP
 TP = common_types.TP
 SP = common_types.SP
+
+
+_DEFERRED_WINDOW_ALIGN = 1024
+"""Row granularity of the deferred-dispatch windows: few distinct window shapes, each a multiple of every row tile."""
+
+
+def _deferred_window_rows(total_rows: int, ep_size: int, override: int | None) -> int:
+    """Static rows per window of the inference-mode ``moe_defer_tp_reduce`` dispatch (``_local_row_windows``).
+
+    ``override`` (``moe_local_ffn_window_rows``) wins, capped at ``total_rows``. Otherwise ``5/4`` of one expert
+    shard's expected local rows ``total_rows / ep_size``, rounded up to 1024 rows and capped at ``total_rows``:
+    balanced routing then runs a single window, and so does a shard holding up to a quarter more than its share.
+
+    Args:
+        total_rows: ``tokens * top_k`` (static).
+        ep_size: Expert-axis size.
+        override: Explicit window rows, or ``None``.
+
+    Returns:
+        Rows per window, in ``[1, total_rows]``.
+    """
+    if override is not None:
+        return max(1, min(int(override), total_rows))
+    if ep_size <= 1:
+        return total_rows
+    rows = -(-5 * total_rows // (4 * ep_size))
+    rows = -(-rows // _DEFERRED_WINDOW_ALIGN) * _DEFERRED_WINDOW_ALIGN
+    return min(rows, total_rows)
+
+
+_LIVE_COMBINE_MIN_LOCAL_ROWS = 8192
+"""Expected local (token, expert) rows per expert shard, ``tokens * top_k / ep``, from which the inference-mode deferred
+dispatch combines through the Pallas TPU ``moe_row_gather_sum`` entry (its live-slot kernel) instead of the XLA entry.
+
+Measured on TPU v5p per W8A8 GLM-5.3-Flash routed-MoE layer (hidden 4096, 288 experts top-8, bf16 rows), ms per layer
+with the live-slot kernel vs the XLA entry: ep4 x tp1 (72 local experts) at 1,024 / 2,048 / 8,192 / 32,768 tokens,
+i.e. 2,048 / 4,096 / 16,384 / 65,536 local rows: 1.033 vs 0.985, 1.494 vs 1.440, 4.895 vs 6.901, 17.93 vs 26.02;
+ep2 x tp2 (144 local experts) at 2,048 / 8,192 tokens (8,192 / 32,768 local rows): 2.406 vs 2.774, 7.981 vs 9.392.
+Below it the kernel's fixed cost (packing the window rows, sorting the per-block live-slot lists) exceeds the
+``[tokens * k, H]`` XLA gather it replaces.
+"""
+
+
+def resolve_moe_defer_tp_reduce(
+    setting: bool | None,
+    *,
+    path: tp.Literal["replicated", "chunked"],
+    blockers: tp.Sequence[str],
+    ep_size: int,
+) -> bool:
+    """Whether the fused MoE reduces over TP after the top-k combine (``moe_defer_tp_reduce``) on ``path``.
+
+    ``True`` turns the deferral on wherever ``path``'s preconditions hold and warns once, naming ``blockers``, where
+    they do not. ``False`` keeps it off (the escape hatch). ``None`` is automatic and silent: on TPU the chunked
+    dispatch defers wherever its preconditions hold, and the inference-mode single-pass dispatch with tokens
+    replicated over an expert axis defers when that axis has more than one device (``path="replicated"`` with
+    ``ep_size > 1``; its ``blockers`` include "not in inference mode", so training never takes it).
+
+    Measured on TPU v5p. Chunked dispatch, GLM-5.3-Flash training on 16 sequences of 131072 tokens with 4-way tensor
+    parallelism: the 45-layer grad step took 48.66 s deferred against 50.95 s, and at 12 layers the cross-entropy
+    gradient norm moved by 0.01%, inside the 0.013% between two identical runs. Replicated dispatch, per W8A8
+    GLM-5.3-Flash layer (hidden 4096, 288 experts top-8): 1.2-1.6x at ep4 x tp1 and ep2 x tp2, neutral (0.98-1.00x)
+    at ep1 x tp4.
+
+    Args:
+        setting: The config value: ``True``, ``False`` or ``None`` (automatic).
+        path: ``"replicated"`` (single-pass dispatch, tokens replicated over the expert axis) or ``"chunked"``.
+        blockers: Unmet preconditions of ``path``; empty when it can run.
+        ep_size: Expert-axis size.
+
+    Returns:
+        Whether ``path`` defers its TP reduction.
+    """
+    if setting is None:
+        if path == "chunked":
+            return not blockers and jax.default_backend() == "tpu"
+        return not blockers and ep_size > 1
+    if not bool(setting):
+        return False
+    if blockers:
+        logger.warn_once(f"moe_defer_tp_reduce is set but inactive here: {', '.join(blockers)}.")
+        return False
+    return True
+
+
+SharedExpertKernels = tuple[jax.Array, jax.Array, jax.Array, jax.Array]
+"""``(gate_up_codes [H, 2I], gate_up_scales [1, 2I], down_codes [I, H], down_scales [1, H])``: int8 codes, f32 scales."""
+
+
+def _shared_expert_fold_spec(
+    shared_expert: tp.Any,
+    *,
+    hidden_size: int,
+    tp_size: int,
+) -> tuple[SharedExpertKernels, Callable[[jax.Array, jax.Array], jax.Array]] | None:
+    """Weights and combine for running ``shared_expert`` inside the deferred dispatch, or ``None`` to add it outside.
+
+    The shared expert folds when it is a gated MLP that ``gated_mlp_forward`` (``easydel/layers/mlp.py``) runs on its
+    fused integer route in W8A8: its forward is that helper (a ``GatedMLP``, or a module declaring its combine through
+    ``fused_act_name``), ``use_fused_mlp`` is on and ``FORCE_NATIVE_RUNTIME`` off, the fused ``gate_up_proj`` and
+    ``down_proj`` are bias-free per-channel int8 quantized linears with an explicit 8-bit activation contract (no output
+    scale, no runtime re-pack), and the fused gate/up layout has one interleave segment per TP rank, so each rank's
+    column shard is its own ``[gate | up]`` pair. Anything else returns ``None`` and runs exactly as before.
+
+    Args:
+        shared_expert: The module ``moe_call`` received as ``shared_expert``.
+        hidden_size: Width of the expert input.
+        tp_size: TP size of the expert mesh.
+
+    Returns:
+        ``(kernels, combine)``: the weights (scales as float32) and the ``(gate, up) -> hidden`` combine, or ``None``.
+    """
+    from ejkernel.modules import resolve_mlp_combine  # pyright: ignore[reportMissingTypeStubs]
+
+    from easydel.layers.layouts import tensor_parallel_size
+    from easydel.layers.linears import ParallelLinearQuantized
+    from easydel.layers.mlp import GatedMLP, _act_name, _declared_combine, _mesh_supported
+
+    config = getattr(shared_expert, "config", None)
+    gate_up = getattr(shared_expert, "gate_up_proj", None)
+    down = getattr(shared_expert, "down_proj", None)
+    if config is None or not all(isinstance(proj, ParallelLinearQuantized) for proj in (gate_up, down)):
+        return None
+    if not getattr(config, "use_fused_mlp", True) or check_bool_flag("FORCE_NATIVE_RUNTIME", False):
+        return None
+    if _mesh_supported(config) is None:
+        return None
+    for proj in (gate_up, down):
+        runtime_cfg = getattr(proj, "_runtime_config", None)
+        proj_cfg = getattr(proj, "config", None)
+        if (
+            getattr(proj, "use_bias", False)
+            or getattr(proj, "output_scale", 1.0) != 1.0
+            or (runtime_cfg is not None and runtime_cfg() is not None)
+            or getattr(proj_cfg, "activation_policy", "auto") != "explicit"
+            or getattr(proj_cfg, "activation_bits", None) != 8
+        ):
+            return None
+        try:
+            mode, _group_size, bits, needs_biases = proj._resolve_ejkernel_params()
+        except Exception:
+            return None
+        if mode != "channelwise" or bits != 8 or needs_biases:
+            return None
+    declared = _declared_combine(shared_expert)
+    if declared is None and not isinstance(shared_expert, GatedMLP):
+        # A module without a declared combine may compute something other than ``act(gate) * up`` in its own forward.
+        return None
+    act, act_params = declared if declared is not None else (_act_name(config, shared_expert), ())
+    if act is None:
+        return None
+    gu_codes, gu_scales, dn_codes, dn_scales = (
+        getattr(leaf, "value", leaf)
+        for leaf in (gate_up.quant_kernel, gate_up.quant_scales, down.quant_kernel, down.quant_scales)
+    )
+    if any(leaf is None for leaf in (gu_codes, gu_scales, dn_codes, dn_scales)):
+        return None
+    if gu_codes.dtype != jnp.int8 or dn_codes.dtype != jnp.int8 or gu_codes.ndim != 2 or dn_codes.ndim != 2:
+        return None
+    inter = int(dn_codes.shape[0])
+    if tuple(gu_codes.shape) != (hidden_size, 2 * inter) or int(dn_codes.shape[1]) != hidden_size:
+        return None
+    if int(gu_scales.size) != 2 * inter or int(dn_scales.size) != hidden_size:
+        return None
+    if max(1, int(tensor_parallel_size(config, arr=gu_codes))) != tp_size or inter % tp_size:
+        return None
+    kernels = (
+        gu_codes,
+        gu_scales.reshape(1, -1).astype(jnp.float32),
+        dn_codes,
+        dn_scales.reshape(1, -1).astype(jnp.float32),
+    )
+    return kernels, resolve_mlp_combine(act, tuple(act_params))
+
+
+def _shared_expert_rows(
+    rows: jax.Array,
+    kernels: SharedExpertKernels,
+    combine: Callable[[jax.Array, jax.Array], jax.Array],
+) -> jax.Array:
+    """W8A8 shared expert on ``rows`` with one TP rank's weight shards, inside the fused MoE ``shard_map``.
+
+    Both projections run as one-group int8 ``grouped_matmul_channelwise`` calls, the int8 ragged dot of the routed
+    experts, which reads the stored ``[K, N]`` codes in place (a plain int8 dot re-tiles the weight shard on every call
+    on TPU v5p): per-row int8 activations, exact int32 accumulation, per-channel scales. This rank's gate/up shard
+    splits in halves (one interleave segment per rank), the combine runs in float32 as ``fused_mlp``'s XLA composition
+    does, and the down projection quantizes this rank's slice of each hidden row, as the routed experts' down
+    projection does.
+
+    Args:
+        rows: Token rows ``[r, H]`` (floating).
+        kernels: This rank's ``(gate_up_codes [H, 2I/tp], gate_up_scales [1, 2I/tp], down_codes [I/tp, H],
+            down_scales [1, H])``.
+        combine: The ``(gate, up) -> hidden`` combine.
+
+    Returns:
+        float32 ``[r, H]``: this rank's down-projection partial sums (to be summed over TP).
+    """
+    from ejkernel.modules import grouped_matmul_channelwise  # pyright: ignore[reportMissingTypeStubs]
+
+    gu_codes, gu_scales, dn_codes, dn_scales = kernels
+    sizes = jnp.full((1,), rows.shape[0], dtype=jnp.int32)
+    gate_up = grouped_matmul_channelwise(
+        rows,
+        gu_codes[None],
+        gu_scales[None],
+        sizes,
+        activation_bits=8,
+        preferred_element_type=rows.dtype,
+        platform="xla",
+    )
+    gate, up = jnp.split(gate_up, 2, axis=-1)
+    hidden = combine(gate.astype(jnp.float32), up.astype(jnp.float32)).astype(rows.dtype)
+    return grouped_matmul_channelwise(
+        hidden,
+        dn_codes[None],
+        dn_scales[None],
+        sizes,
+        activation_bits=8,
+        preferred_element_type=jnp.float32,
+        platform="xla",
+    )
 
 
 class BaseMoeModule(spx.Module, ABC):
@@ -1528,6 +1796,7 @@ class BaseMoeModule(spx.Module, ABC):
         act_fn: Callable[[jax.Array], jax.Array],
         layer_idx: int | None = None,
         gated: bool = True,
+        shared_expert: spx.Module | None = None,
     ):
         """Fused MoE path using grouped matmul and shard_map.
 
@@ -1576,11 +1845,15 @@ class BaseMoeModule(spx.Module, ABC):
             act_fn: Activation used when `ffn_activation` is not provided.
             gated: ``False`` selects ungated experts (``wu_kernel=None``):
                 ``out = wd(act(x @ wi))``. See :meth:`moe_call`.
+            shared_expert: Optional shared expert (see :meth:`moe_call`). It is folded into the inference-mode
+                deferred dispatch when that dispatch runs, the input is already in ``self.dtype`` and
+                ``_shared_expert_fold_spec`` accepts the module; otherwise it is left to the caller.
 
         Returns:
-            Tuple `(output, router_logits)` where:
-            - output: MoE layer output. Shape: [B, S, H].
+            Tuple `(output, router_logits, shared_folded)` where:
+            - output: MoE layer output. Shape: [B, S, H]. Includes the shared expert when ``shared_folded``.
             - router_logits: Pre-softmax router logits for auxiliary losses. Shape: [B*S, E].
+            - shared_folded: Whether ``shared_expert`` ran inside the dispatch (the caller adds it otherwise).
 
         Raises:
             ValueError: If the expert kernels do not match ``gated`` (see
@@ -1611,7 +1884,7 @@ class BaseMoeModule(spx.Module, ABC):
             >>>
             >>> # Call fused MoE
             >>> hidden_states = jnp.ones((2, 512, 768))  # (batch, seq, hidden)
-            >>> output, logits = moe_layer._sparse_moe_call(
+            >>> output, logits, _shared_folded = moe_layer._sparse_moe_call(
             ...     hidden_state=hidden_states,
             ...     gate_layer=gate,
             ...     wi_kernel=wi_kernel,
@@ -1662,6 +1935,8 @@ class BaseMoeModule(spx.Module, ABC):
         wd_kernel, wd_activation_bits, wd_grouped_platform = _unpack_precision(wd_kernel)
         gate_up_kernel, gate_up_activation_bits, gate_up_grouped_platform = _unpack_precision(gate_up_kernel)
 
+        # The folded shared expert reads the dispatch's input, so it folds only when this cast changes nothing.
+        input_in_module_dtype = jnp.dtype(hidden_state.dtype) == jnp.dtype(self.dtype)
         hidden_state = hidden_state.astype(self.dtype)
         gate_hidden_state = hidden_state if gate_hidden_state is None else gate_hidden_state.astype(self.dtype)
         if hooks is not None and hooks.before_gate is not None:
@@ -1769,13 +2044,12 @@ class BaseMoeModule(spx.Module, ABC):
                 f"dropped from compute."
             )
 
-        moe_chunk_size = getattr(self.config, "moe_chunk_size", None)
-        if moe_chunk_size is not None:
-            moe_chunk_size = int(moe_chunk_size)
-            if moe_chunk_size <= 0:
-                raise ValueError(f"`moe_chunk_size` must be a positive integer, got {moe_chunk_size}.")
-        # Pallas TPU row gathers for the dispatch/combine (permute/unpermute warn once where they cannot apply).
-        row_gather_kernel = bool(getattr(self.config, "moe_row_gather_kernel", False))
+        chunk_setting = getattr(self.config, "moe_chunk_size", None)
+        if chunk_setting is not None and int(chunk_setting) < 0:
+            raise ValueError(f"`moe_chunk_size` must be a non-negative integer, got {chunk_setting}.")
+        # Pallas TPU row gathers for the dispatch/combine: permute / unpermute use them where they apply under ``None``
+        # (the default) and ``True``, and under ``True`` warn once where they do not.
+        row_gather_kernel = getattr(self.config, "moe_row_gather_kernel", None)
 
         # ZeRO-3-style expert weights (moe_fsdp_shard_expert_weights): fsdp-sharded
         # at rest, all-gathered over the fsdp axis inside the shard_map right
@@ -1871,11 +2145,6 @@ class BaseMoeModule(spx.Module, ABC):
                         "reduces the combined [tokens, H] output over the expert axis."
                     )
         local_ffn_window_rows = getattr(self.config, "moe_local_ffn_window_rows", None)
-        if local_ffn_window_rows is not None and not use_local_expert_ffn:
-            logger.warn_once(
-                "moe_local_ffn_window_rows is set but not used: it only sizes the row windows of the active "
-                "moe_local_expert_ffn path."
-            )
         # Under the decode-replicated serving scope the residual stream is replicated over tp, so the local path
         # sums its partials in full instead of reduce-scattering them.
         local_out_replicated = use_local_expert_ffn and inference_mode_forces_decode()
@@ -1901,26 +2170,98 @@ class BaseMoeModule(spx.Module, ABC):
                 )
                 ep_carries_batch = False
 
-        # Deferred tp reduce (moe_defer_tp_reduce): only the chunked non-ring ep=1 dispatch applies it; anywhere else
-        # it warns once (the local expert FFN path warns above).
+        # Token chunks of the dispatch (``moe_chunk_size``): ``0`` is a single pass. ``None`` sizes the chunks from this
+        # shard's dispatch buffer (``auto_moe_chunk_size``) on TPU, on the regular dispatch outside inference mode.
+        if chunk_setting is not None:
+            moe_chunk_size = int(chunk_setting) or None
+        elif (
+            use_local_expert_ffn
+            or ep_carries_batch
+            or is_inference_mode()
+            or inference_mode_forces_decode()
+            or jax.default_backend() != "tpu"
+        ):
+            moe_chunk_size = None
+        else:
+            mesh_sizes = dict(expert_mesh.jax_mesh.shape)
+            shard_ways = 1
+            for axis_name in self._moe_batch_axis_names(expert_mesh, dp_axis_name, ep_carries_batch=False):
+                shard_ways *= int(mesh_sizes.get(axis_name, 1))
+            # Under the ring of experts every expert shard holds this same share of the tokens.
+            dispatch_tokens = -(-int(_BS) // shard_ways) * int(_SQLN)
+            moe_chunk_size = auto_moe_chunk_size(
+                dispatch_tokens,
+                num_experts_per_tok=self.num_experts_per_tok,
+                hidden_size=HD,
+                dtype_bytes=jnp.dtype(self.dtype).itemsize,
+            )
+
+        # Deferred tp reduce (``moe_defer_tp_reduce``), decided by ``resolve_moe_defer_tp_reduce``: under inference
+        # mode the single-pass non-ring dispatch switches to ``_replicated_deferred_dispatch`` (``True``, or automatic
+        # with an expert axis); the chunked non-ring ep=1 dispatch defers inside its scan (``True`` or automatic).
+        defer_setting = getattr(self.config, "moe_defer_tp_reduce", None)
         defer_tp_reduce = False
-        if bool(getattr(self.config, "moe_defer_tp_reduce", False)) and not use_local_expert_ffn:
-            defer_blockers = [
-                why
-                for why, bad in (
-                    ("moe_chunk_size is None (only the chunked dispatch defers the reduce)", moe_chunk_size is None),
-                    ("the ep-carries-batch dispatch is active", ep_carries_batch),
-                    ("tp_size == 1", tp_size <= 1),
-                    ("ep_size > 1", ep_size > 1),
-                    ("use_ring_of_experts", bool(self.config.use_ring_of_experts)),
-                    ("a down-projection bias", wd_bias is not None),
+        replicated_deferred_dispatch = False
+        if not use_local_expert_ffn and (defer_setting is None or bool(defer_setting)):
+            if moe_chunk_size is None:
+                replicated_blockers = [
+                    why
+                    for why, bad in (
+                        (
+                            "not in inference mode (the single-pass deferred dispatch is forward-only)",
+                            not is_inference_mode(),
+                        ),
+                        ("the ep-carries-batch dispatch is active", ep_carries_batch),
+                        ("use_ring_of_experts", bool(self.config.use_ring_of_experts)),
+                        ("use_expert_tensor_mode", bool(self.config.use_expert_tensor_mode)),
+                        ("a down-projection bias", wd_bias is not None),
+                        ("a scale_replicated_inputs hook", scale_replicated_inputs is not None),
+                        ("ep_size == tp_size == 1", ep_size <= 1 and tp_size <= 1),
+                        (
+                            f"n_routed_experts={self.n_routed_experts} not divisible by ep_size={ep_size}",
+                            self.n_routed_experts % ep_size != 0,
+                        ),
+                    )
+                    if bad
+                ]
+                replicated_deferred_dispatch = resolve_moe_defer_tp_reduce(
+                    defer_setting, path="replicated", blockers=replicated_blockers, ep_size=ep_size
                 )
-                if bad
-            ]
-            if defer_blockers:
-                logger.warn_once(f"moe_defer_tp_reduce is set but inactive here: {', '.join(defer_blockers)}.")
+                if replicated_deferred_dispatch and row_gather_kernel:
+                    # This dispatch picks its own row gathers (an XLA dispatch gather and a top-k combine chosen by
+                    # row count), so the knob does not apply; warn instead of dropping it silently.
+                    logger.warn_once(
+                        "moe_row_gather_kernel set but not used: the inference-mode deferred MoE dispatch keeps its "
+                        "XLA dispatch gather and picks its moe_row_gather_sum combine from the step's row count."
+                    )
             else:
-                defer_tp_reduce = True
+                defer_blockers = [
+                    why
+                    for why, bad in (
+                        ("the ep-carries-batch dispatch is active", ep_carries_batch),
+                        ("tp_size == 1", tp_size <= 1),
+                        ("ep_size > 1", ep_size > 1),
+                        ("use_ring_of_experts", bool(self.config.use_ring_of_experts)),
+                        ("a down-projection bias", wd_bias is not None),
+                    )
+                    if bad
+                ]
+                defer_tp_reduce = resolve_moe_defer_tp_reduce(
+                    defer_setting, path="chunked", blockers=defer_blockers, ep_size=ep_size
+                )
+        if local_ffn_window_rows is not None and not (use_local_expert_ffn or replicated_deferred_dispatch):
+            logger.warn_once(
+                "moe_local_ffn_window_rows is set but not used: it only sizes the row windows of the active "
+                "moe_local_expert_ffn path and of the inference-mode moe_defer_tp_reduce dispatch."
+            )
+        # The shared expert joins the deferred dispatch's one reduction where ``_shared_expert_fold_spec`` accepts it;
+        # anywhere else ``moe_call`` adds it after the routed experts, as before.
+        shared_fold = (
+            _shared_expert_fold_spec(shared_expert, hidden_size=HD, tp_size=tp_size)
+            if shared_expert is not None and replicated_deferred_dispatch and input_in_module_dtype
+            else None
+        )
+        shared_kernels, shared_combine = shared_fold if shared_fold is not None else (None, None)
 
         expert_params_bytes = 0
         for _param in (wi_kernel, wu_kernel, gate_up_kernel, wd_kernel, wi_bias, wu_bias, gate_up_bias, wd_bias):
@@ -2020,6 +2361,18 @@ class BaseMoeModule(spx.Module, ABC):
             else None
         )
         wdbps = wspec("row", use_expert_tensor, is_bias=True) if wd_bias is not None else None
+        # Folded shared expert: each TP rank receives its own column shard of the fused gate/up codes (one
+        # ``[gate | up]`` interleave segment) and the matching row shard of the down codes, as the weights are stored.
+        shared_ps = (
+            (
+                PartitionSpec(None, tensor_axis_name),
+                PartitionSpec(None, tensor_axis_name),
+                PartitionSpec(tensor_axis_name, None),
+                PartitionSpec(None, None),
+            )
+            if shared_kernels is not None
+            else None
+        )
 
         preferred_element_type = jnp.bfloat16
         if jnp.dtype(self.dtype) == jnp.float32:
@@ -2295,6 +2648,214 @@ class BaseMoeModule(spx.Module, ABC):
                 combined = combined[:tokens]
             return combined.reshape(local_batch, local_seq, -1)
 
+        def _local_row_windows(
+            x2d: jax.Array,
+            order: jax.Array,
+            sort_keys: jax.Array,
+            group_sizes: jax.Array,
+            is_local: jax.Array,
+            combine_weights: jax.Array,
+            expert_ffn: Callable[..., jax.Array],
+            *,
+            window_rows: int,
+            experts_per_shard: int,
+        ) -> jax.Array:
+            """Expert FFN and top-k combine over this shard's local pairs only, in static row windows.
+
+            Inference-only helper of ``_replicated_deferred_dispatch``, whose stable sort lists the ``n_local`` local
+            pairs first, grouped by local expert. Window ``w`` covers sorted rows ``[w * R, (w + 1) * R)``: it
+            gathers those ``R`` token rows, runs the expert FFN with window-local group sizes (rows past the window's
+            local count form the FFN's masked dispatch tail) and adds every pair sitting in the window, weighted,
+            into an fp32 ``[tokens, H]`` sum through the ejkernel ``moe_row_gather_sum`` op with ``skip_negative``:
+            slot ``-1`` marks a pair outside the window or not local and is never read (the FFN's tail rows are not
+            guaranteed finite on TPU). From ``_LIVE_COMBINE_MIN_LOCAL_ROWS`` expected local rows per shard the Pallas
+            TPU entry runs, whose live-slot kernel copies only the live slots' rows where its shapes apply
+            (``row_gather_sum_unsupported_reason``); below that, and off TPU, the XLA entry gathers every slot,
+            selects the live ones and sums. With ``R >= tokens * k`` (decode buckets, ep == 1) one window holds every
+            pair. Window 0 always runs and later windows run only while ``w * R < n_local`` (a ``while_loop``), so
+            the dispatch is dropless under any routing skew while balanced routing runs one window of ``R`` rows
+            instead of the full ``tokens * k`` buffer.
+
+            Args:
+                x2d: Token rows ``[tokens, H]``.
+                order: Stable argsort of ``sort_keys`` (local pairs first), ``[tokens * k]`` int32.
+                sort_keys: Per-pair local expert id; ``experts_per_shard`` for non-local pairs.
+                group_sizes: Local pairs per local expert, ``[experts_per_shard]`` int32.
+                is_local: Per-pair locality, ``[tokens * k]``.
+                combine_weights: fp32 combine weights ``[tokens, k]``.
+                expert_ffn: The ``_expert_ffn`` closure; called with ``tp_reduce=False``.
+                window_rows: Static rows per window ``R``.
+                experts_per_shard: Local experts on this shard.
+
+            Returns:
+                fp32 ``[tokens, H]``: this shard's weighted expert rows summed per token, not yet reduced over TP
+                or the expert axis.
+            """
+            tokens = x2d.shape[0]
+            top_k = self.num_experts_per_tok
+            total_rows = tokens * top_k
+            n_windows = -(-total_rows // window_rows)
+            pad = n_windows * window_rows - total_rows
+            # Pair p sits at sorted row positions[p]; local pairs fill sorted rows [0, n_local).
+            positions = jnp.argsort(order).astype(jnp.int32)
+            sorted_ids = jnp.minimum(sort_keys[order], experts_per_shard - 1).astype(jnp.int32)
+            if pad:
+                # Padding rows follow every local row of the last window: masked FFN tail, never combined.
+                order = jnp.concatenate([order, jnp.zeros((pad,), order.dtype)])
+                sorted_ids = jnp.concatenate([sorted_ids, jnp.full((pad,), experts_per_shard - 1, jnp.int32)])
+            ends = jnp.cumsum(group_sizes).astype(jnp.int32)
+            starts = ends - group_sizes.astype(jnp.int32)
+            n_local = ends[-1]
+            x_src = x2d.astype(self.dtype)
+            gather_sum = _moe_row_gather_sum_entry(
+                live_slot_kernel=total_rows >= _LIVE_COMBINE_MIN_LOCAL_ROWS * max(ep_size, 1)
+            )
+
+            def _window(w) -> jax.Array:
+                if n_windows == 1:
+                    rows, ids, sizes, rel, live = order, sorted_ids, group_sizes.astype(jnp.int32), positions, is_local
+                else:
+                    start = w * window_rows
+                    rows = jax.lax.dynamic_slice_in_dim(order, start, window_rows)
+                    ids = jax.lax.dynamic_slice_in_dim(sorted_ids, start, window_rows)
+                    sizes = jnp.clip(
+                        jnp.minimum(ends, start + window_rows) - jnp.maximum(starts, start), 0, window_rows
+                    ).astype(jnp.int32)
+                    rel = positions - start
+                    live = is_local & (rel >= 0) & (rel < window_rows)
+                inter = expert_ffn(x_src[rows // top_k], sizes, ids, tp_reduce=False)
+                # Window rows past its local count are the FFN's unwritten tail (not guaranteed finite on TPU): dead
+                # slots are -1, which the live-slot combine never reads (its XLA entry selects them away).
+                slots = jnp.where(live, rel, -1).reshape(tokens, top_k)
+                return gather_sum(inter, slots, combine_weights, jnp.float32, skip_negative=True)
+
+            partial = _window(0)
+            if n_windows > 1:
+
+                def _more(carry):
+                    w, _ = carry
+                    return (w < n_windows) & (w * window_rows < n_local)
+
+                def _next(carry):
+                    w, acc = carry
+                    return w + 1, acc + _window(w)
+
+                _, partial = jax.lax.while_loop(_more, _next, (jnp.asarray(1, jnp.int32), partial))
+            return partial
+
+        def _replicated_deferred_dispatch(
+            x: jax.Array,
+            gate_logits: jax.Array,
+            expert_ffn: Callable[..., jax.Array],
+            expert_shard_id: jax.Array,
+            shared_kernels: SharedExpertKernels | None = None,
+        ) -> jax.Array:
+            """Inference-only single-pass dispatch with the TP reduction after the top-k combine.
+
+            ``moe_defer_tp_reduce`` under inference mode for the non-ring, non-chunked dispatch, where tokens are
+            replicated over the expert axis. One stable sort puts this shard's ``(token, expert)`` pairs first,
+            grouped by local expert (the default dispatch's row order); one gather builds the expert rows; the FFN
+            runs without its per-row TP ``psum_scatter``; one gather-combine sums each token's local rows in fp32;
+            and the ``[tokens, H]`` partial is reduced once: ``psum_scatter`` over TP then ``psum`` over the expert
+            axis, or a single ``psum`` over both under the decode-replicated boundary (which then needs no output
+            all-gather). Against the default dispatch this drops the ``local_permute`` sort and gather, the
+            placement gather, and the TP reduction of the top-k-expanded ``[tokens * k, H]`` rows. When the static
+            row window (``_deferred_window_rows``: ``5/4`` of one shard's expected ``tokens * k / ep`` local rows
+            rounded up to 1024, or ``moe_local_ffn_window_rows``) is shorter than ``tokens * k``, the gather, FFN
+            and combine cover only the local prefix of the sorted pairs, window by window (``_local_row_windows``;
+            balanced routing runs one window), instead of all ``tokens * k`` rows. Forward only.
+
+            Args:
+                x: Local hidden states ``[b, s, H]`` (replicated over the expert and TP axes).
+                gate_logits: Normalized gate scores ``[b * s, E]`` aligned with ``x``.
+                expert_ffn: The ``_expert_ffn`` closure; called with ``tp_reduce=False``.
+                expert_shard_id: This shard's index along the expert axis.
+                shared_kernels: This TP rank's shards of the folded W8A8 shared expert (``shared_ps``), or ``None``.
+                    Each expert shard runs it on its ``ceil(tokens / ep)`` rows of ``x`` (``_shared_expert_rows``)
+                    and adds the float32 result into the routed partial before the one reduction, which then sums it
+                    over TP and the expert axis with the routed rows: the shared expert needs no collective of its own.
+
+            Returns:
+                ``[b, s, H]`` summed over the expert and TP axes when ``decode_replicated_out``, otherwise
+                ``[b, s, H // tp_size]`` (TP-scattered, summed over the expert axis), in ``self.dtype``.
+            """
+            local_batch, local_seq, _hd = x.shape
+            tokens = local_batch * local_seq
+            top_k = self.num_experts_per_tok
+            experts_per_shard = self.n_routed_experts // ep_size
+            x2d = x.reshape(tokens, HD)
+            weights, experts = get_experts_location(
+                gate_logits=gate_logits,
+                pre_bias_logits=None,
+                select_hook=select_hook,
+                refine_weights_hook=refine_weights_hook,
+                num_experts_per_tok=top_k,
+            )
+            shared_source = x2d  # the shared expert reads the block input, as it does outside the dispatch
+            if refine_inputs_hook is not None:
+                x2d = refine_inputs_hook(x2d, weights, x.shape)
+            flat_experts = jnp.ravel(experts).astype(jnp.int32)
+            maybe_record_group_sizes(
+                jnp.bincount(flat_experts, length=self.n_routed_experts),
+                num_experts=self.n_routed_experts,
+                layer_idx=layer_idx,
+                replica_id=expert_shard_id * tp_size + jax.lax.axis_index(tensor_axis_name),
+            )
+            local_ids = flat_experts - expert_shard_id * experts_per_shard
+            is_local = (local_ids >= 0) & (local_ids < experts_per_shard)
+            # Non-local pairs take key ``experts_per_shard`` and sort past every local group; the stable sort keeps
+            # pair order inside each group.
+            sort_keys = jnp.where(is_local, local_ids, experts_per_shard)
+            order = jnp.argsort(sort_keys).astype(jnp.int32)
+            group_sizes = jnp.bincount(sort_keys, length=experts_per_shard + 1)[:experts_per_shard].astype(jnp.int32)
+            total_rows = tokens * top_k
+            combine_weights = weights if output_weights_hook is None else output_weights_hook(weights)
+            partial = _local_row_windows(
+                x2d,
+                order,
+                sort_keys,
+                group_sizes,
+                is_local,
+                combine_weights.astype(jnp.float32),
+                expert_ffn,
+                window_rows=_deferred_window_rows(total_rows, ep_size, local_ffn_window_rows),
+                experts_per_shard=experts_per_shard,
+            )
+            if shared_kernels is not None:
+                # Expert shard s runs the shared expert on rows [s * r, (s + 1) * r). The slice start is clamped so it
+                # stays in bounds when tokens % ep != 0; rows it then covers outside its own range are zeroed, so
+                # every token is counted by exactly one expert shard.
+                rows_per_shard = -(-tokens // ep_size)
+                own_start = expert_shard_id * rows_per_shard
+                start = jnp.minimum(own_start, tokens - rows_per_shard)
+                shared_out = _shared_expert_rows(
+                    jax.lax.dynamic_slice_in_dim(shared_source, start, rows_per_shard),
+                    shared_kernels,
+                    shared_combine,
+                )
+                if tokens % ep_size:
+                    row_ids = start + jnp.arange(rows_per_shard)
+                    own = (row_ids >= own_start) & (row_ids < own_start + rows_per_shard)
+                    shared_out = jnp.where(own[:, None], shared_out, jnp.zeros((), shared_out.dtype))
+                current = jax.lax.dynamic_slice_in_dim(partial, start, rows_per_shard)
+                partial = jax.lax.dynamic_update_slice_in_dim(partial, current + shared_out, start, axis=0)
+            ep_axes = tuple(expert_axis_name) if isinstance(expert_axis_name, tuple) else (expert_axis_name,)
+            if decode_replicated_out:
+                # Decode: one small fp32 all-reduce over both axes replaces the default dispatch's TP
+                # reduce-scatter, expert-axis psum and output all-gather.
+                partial = jax.lax.psum(partial, (*ep_axes, tensor_axis_name))
+            else:
+                if tp_size > 1:
+                    # The TP reduction moves the combined [tokens, H] partial in the activation dtype, as the
+                    # default dispatch does for its top-k-expanded rows; the expert-axis psum stays fp32 like
+                    # ``replicated_expert_psum_unpermute``.
+                    partial = jax.lax.psum_scatter(
+                        partial.astype(self.dtype), tensor_axis_name, scatter_dimension=1, tiled=True
+                    ).astype(jnp.float32)
+                if ep_size > 1:
+                    partial = jax.lax.psum(partial, ep_axes)
+            return partial.astype(self.dtype).reshape(local_batch, local_seq, -1)
+
         def _local_expert_dispatch(
             x: jax.Array,
             gate_logits: jax.Array,
@@ -2396,6 +2957,7 @@ class BaseMoeModule(spx.Module, ABC):
             wu_bias: jax.Array | None,
             gate_up_bias: jax.Array | None,
             wd_bias: jax.Array | None,
+            shared_kernels: SharedExpertKernels | None = None,
         ):
             """Per-shard fused-MoE body executed under :func:`jax.shard_map`.
 
@@ -2414,6 +2976,8 @@ class BaseMoeModule(spx.Module, ABC):
                 wi_bias: Optional gate bias ``[E, H]`` or ``None``.
                 wu_bias: Optional up bias ``[E, H]`` or ``None``.
                 wd_bias: Optional down bias ``[E, M]`` or ``None``.
+                shared_kernels: This TP rank's folded shared-expert shards, or ``None``; only the inference-mode
+                    deferred dispatch receives them.
 
             Returns:
                 Per-shard MoE output sharded according to ``output_ps``;
@@ -2979,6 +3543,9 @@ class BaseMoeModule(spx.Module, ABC):
                 # after the dispatch all-to-all.
                 return _dispatch_ep_batch(x, gate_logits)
 
+            if replicated_deferred_dispatch:
+                return _replicated_deferred_dispatch(x, gate_logits, _expert_ffn, expert_shard_id, shared_kernels)
+
             if moe_chunk_size is not None:
                 partial_output = _chunked_dispatch(
                     x,
@@ -3171,7 +3738,7 @@ class BaseMoeModule(spx.Module, ABC):
         @partial(
             shard_map,
             mesh=expert_mesh.jax_mesh,
-            in_specs=(input_ps, glps, wikps, wukps, wgukps, wdkps, wibps, wubps, wgubps, wdbps),
+            in_specs=(input_ps, glps, wikps, wukps, wgukps, wdkps, wibps, wubps, wgubps, wdbps, shared_ps),
             out_specs=output_ps,
             check_vma=False,
         )
@@ -3181,10 +3748,11 @@ class BaseMoeModule(spx.Module, ABC):
             In decode-replicated mode the body's tp-sharded ``[B, S, H/tp]``
             result is all-gathered back to full hidden so the block's output
             matches the replicated decode residual stream declared by
-            ``output_ps``.
+            ``output_ps``. The replicated deferred dispatch already returns
+            the full hidden width there (one psum over the expert and TP axes).
             """
             out = _sparse_call_body(*call_args)
-            if decode_replicated_out:
+            if decode_replicated_out and not replicated_deferred_dispatch:
                 out = jax.lax.all_gather(out, tensor_axis_name, axis=2, tiled=True)
             return out
 
@@ -3199,6 +3767,7 @@ class BaseMoeModule(spx.Module, ABC):
             wu_bias,
             gate_up_bias,
             wd_bias,
+            shared_kernels,
         )
 
         # Reshard output back to original 5D mesh for compatibility with rest of model
@@ -3224,7 +3793,7 @@ class BaseMoeModule(spx.Module, ABC):
         if self.config.use_sharding_constraint:
             output = spx.with_sharding_constraint(output, original_output_ps, mesh=self.mesh)
 
-        return output, prein_gate_logits
+        return output, prein_gate_logits, shared_kernels is not None
 
     def moe_call(
         self,
@@ -3248,6 +3817,7 @@ class BaseMoeModule(spx.Module, ABC):
         output_metrics: bool = False,
         layer_idx: int | None = None,
         gated: bool = True,
+        shared_expert: spx.Module | None = None,
     ):
         """Dispatch to the configured MoE execution path with auto-configured hooks.
 
@@ -3323,9 +3893,19 @@ class BaseMoeModule(spx.Module, ABC):
                 ``wd(act(x @ wi) * (x @ wu))``; ``False`` for ungated experts
                 with a single up projection (requires ``wu_kernel=None`` and no
                 fused ``gate_up_kernel``).
+            shared_expert: Optional shared expert, a module every token runs
+                whose output is added to the routed output. Under inference
+                mode the fused engine's deferred dispatch
+                (``moe_defer_tp_reduce``) runs a W8A8 gated-MLP shared expert
+                inside its ``shard_map`` and sums it with the routed rows in
+                its one reduction (``_shared_expert_fold_spec`` lists the
+                conditions). Everywhere else ``shared_expert(hidden_state)``
+                is added after the routed experts, exactly as a caller adding
+                it itself would.
 
         Returns:
             Tuple ``(output, aux)`` where ``output`` has shape ``[B, S, H]``
+            (routed plus shared expert output when ``shared_expert`` is given)
             and ``aux`` is the pre-softmax router logits of shape ``[B*S, E]``
             (or :class:`MoeMetrics` when ``output_metrics`` is requested via
             the standard path).
@@ -3345,13 +3925,14 @@ class BaseMoeModule(spx.Module, ABC):
             raise NotImplementedError(
                 "Quantized (codes, scales) expert kernels are only supported on the FUSED_MOE path."
             )
+        shared_folded = False
         with self._active_auto_expert_mesh(hidden_state):
             match self.module_moe_method:
                 case MoEMethods.STANDARD_MOE:
                     logger.warn_once(
                         "You are using MoEMethods.STANDARD_MOE which is not really recommended please switch to FUSED_MOE"
                     )
-                    return self._moe_call_standard(
+                    output, aux = self._moe_call_standard(
                         gate_layer=gate_layer,
                         expert_layer=expert_layer,
                         hidden_state=hidden_state,
@@ -3364,7 +3945,7 @@ class BaseMoeModule(spx.Module, ABC):
                         hooks=hooks,
                     )
                 case MoEMethods.FUSED_MOE:
-                    return self._sparse_moe_call(
+                    output, aux, shared_folded = self._sparse_moe_call(
                         hidden_state=hidden_state,
                         gate_hidden_state=gate_hidden_state,
                         gate_layer=gate_layer,
@@ -3381,12 +3962,13 @@ class BaseMoeModule(spx.Module, ABC):
                         hooks=hooks,
                         layer_idx=getattr(self, "layer_idx", None) if layer_idx is None else layer_idx,
                         gated=gated,
+                        shared_expert=shared_expert,
                     )
                 case MoEMethods.DENSE_MOE:
                     logger.warn_once(
                         "You are using MoEMethods.DENSE_MOE which is not really recommended please switch to FUSED_MOE"
                     )
-                    return self._moe_call_dense(
+                    output, aux = self._moe_call_dense(
                         hidden_state=hidden_state,
                         gate_hidden_state=gate_hidden_state,
                         gate_layer=gate_layer,
@@ -3405,6 +3987,10 @@ class BaseMoeModule(spx.Module, ABC):
                     )
                 case _:
                     raise NotImplementedError()
+        if shared_expert is not None and not shared_folded:
+            # Outside the expert mesh, on the block input, as a caller adding the shared expert itself does.
+            output = output + shared_expert(hidden_state)
+        return output, aux
 
     def _moe_call_dense(
         self,

@@ -193,3 +193,47 @@ def test_registry_entries_share_one_signature():
         assert kernel_registry.get(name, backend=Backend.TPU) is kernel_registry.get(
             name, platform=Platform.PALLAS, backend=Backend.TPU
         )
+
+
+@pytest.mark.parametrize("platform", ["pallas", "xla"])
+def test_registry_gather_sum_skip_negative_never_reads_dead_slot_rows(platform):
+    # Both registry entries under ``skip_negative``, as the deferred MoE dispatch calls them. Rows only dead slots
+    # could reach are NaN: row 0 (the XLA entry clamps a dead slot's -1 to it) and the upper half (the unwritten tail
+    # of an expert window on TPU). The output stays finite and matches a float64 reference of the live slots.
+    rng = np.random.default_rng(8)
+    y = np.array(jnp.asarray(rng.standard_normal((SRC, H)), F32).astype(BF16).astype(F32))  # writable copy
+    tail = SRC // 2
+    y[0] = np.nan
+    y[tail:] = np.nan
+    y = jnp.asarray(y, F32).astype(BF16)
+    tokens = 4 * gather_sum_block_tokens(K)
+    idx = rng.integers(1, tail, (tokens, K)).astype(np.int32)
+    idx[rng.uniform(size=(tokens, K)) < 0.75] = -1
+    w = jnp.asarray(rng.uniform(0.1, 1.0, (tokens, K)), F32)
+    if platform == "pallas":
+        fn = kernel_registry.get("moe_row_gather_sum", platform=Platform.PALLAS, backend=Backend.TPU)
+        assert row_gather_sum_unsupported_reason(y, jnp.asarray(idx), w, F32, skip_negative=True) is None
+    else:
+        fn = kernel_registry.get("moe_row_gather_sum", platform=Platform.XLA, backend=Backend.ANY)
+    out = _np(jax.jit(lambda a, i, ww: fn(a, i, ww, F32, skip_negative=True))(y, jnp.asarray(idx), w))
+    live = idx >= 0
+    rows = np.nan_to_num(_np(y))[np.where(live, idx, 1)]
+    ref = np.einsum("tkh,tk->th", rows, np.where(live, _np(w), 0.0))
+    assert np.isfinite(out).all()
+    assert np.all(np.abs(out - ref) <= 1e-6 * np.abs(ref) + 1e-5)
+    if platform == "pallas":
+        calls = _custom_calls(lambda a, i, ww: fn(a, i, ww, F32, skip_negative=True), y, jnp.asarray(idx), w)
+        assert calls >= 2
+
+
+def test_skip_negative_reason_guards_the_live_slot_sort_keys():
+    big = (2**28, K)  # 2 * tokens * k = 2**31 overflows the int32 live-slot sort keys
+    args = (
+        jax.ShapeDtypeStruct((SRC, H), BF16),
+        jax.ShapeDtypeStruct(big, jnp.int32),
+        jax.ShapeDtypeStruct(big, F32),
+        F32,
+    )
+    reason = row_gather_sum_unsupported_reason(*args, skip_negative=True)
+    assert reason is not None and "overflow" in reason, reason
+    assert row_gather_sum_unsupported_reason(*args) is None

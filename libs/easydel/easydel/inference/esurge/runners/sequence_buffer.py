@@ -44,7 +44,6 @@ import numpy as np
 from eformer.loggings import get_logger
 from jax import numpy as jnp
 
-from easydel.inference.esurge.request import EngineRequest
 from easydel.utils.compiling_utils import ejit
 
 from ...sampling_params import SamplingParams, SamplingType
@@ -487,7 +486,7 @@ class SequenceBuffer:
             tuple(decode_rows),
         )
 
-    def add_request(self, request: EngineRequest | CachedRequestState, req_index: int | None = None) -> None:
+    def add_request(self, request: CachedRequestState, req_index: int | None = None) -> None:
         """Add a new request to the buffer.
 
         Adds a request with its tokens, sampling parameters, and metadata.
@@ -898,7 +897,7 @@ class SequenceBuffer:
 
     def _process_optional_params(
         self,
-        request: EngineRequest,
+        request: CachedRequestState,
         sampling_params: SamplingParams,
         req_id: str,
         req_index: int,

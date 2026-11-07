@@ -64,6 +64,8 @@ def _host_boundaries(monkeypatch):
     monkeypatch.setattr(sampling, "jnp", host_numpy)
     monkeypatch.setattr(sampling, "_device_put_tree_uniform", lambda values, sharding: _host_put(values))
     monkeypatch.setattr(host_sync.jax, "process_count", lambda: 2)
+    # put_host_payload resolves jax inside host_sync: keep its placements on the host as well.
+    monkeypatch.setattr(host_sync.jax, "device_put", _host_put)
 
     def compiled(packed_f32, packed_i32, packed_misc, logits, key, counts):
         # Expose seed transport through a deterministic executable stand-in:

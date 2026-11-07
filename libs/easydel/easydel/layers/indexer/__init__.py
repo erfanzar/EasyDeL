@@ -65,13 +65,19 @@ from ._shared_key import (
     IndexerScoreInputs,
     SharedKeyIndexer,
     SharedKeyIndexerConfig,
+    resolve_index_scoring_kernel,
     select_candidate_blocks,
     selection_bias,
     shared_key_scores,
     warn_unsupported_scoring_kernel,
 )
 from ._token import TokenIndexer, TokenIndexerConfig
-from ._training import AUTO_SPARSE_MIN_SEQ, pool_bitmap_tail_error, use_sparse_training_attention
+from ._training import (
+    AUTO_SPARSE_MIN_SEQ,
+    pool_bitmap_tail_error,
+    resolve_dsa_pool_kernel,
+    use_sparse_training_attention,
+)
 
 __all__ = (
     "AUTO_SPARSE_MIN_SEQ",
@@ -112,6 +118,8 @@ __all__ = (
     "paged_token_select",
     "permute_tokens",
     "pool_bitmap_tail_error",
+    "resolve_dsa_pool_kernel",
+    "resolve_index_scoring_kernel",
     "running_entry_topk",
     "select_candidate_blocks",
     "selection_bias",

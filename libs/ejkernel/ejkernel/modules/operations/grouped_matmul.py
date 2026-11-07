@@ -840,7 +840,10 @@ def grouped_matmul_channelwise(
     RHS INT4 storage remains packed in HBM. Scales apply after the dot.
     Tiling is (M,K,N): an XLA hint or explicit Pallas tiles. A16 uses full K
     on measured decode matrix families; A4/A8 choose M=32 and full K subject
-    to the RHS buffer budget. Explicit tiles override these heuristics.
+    to the RHS buffer budget, and A8 with int8 codes streams one whole
+    128-aligned (K, N) expert slab that fits 2 MiB, with both scales applied
+    in the kernel, at up to 1024 rows and on the measured prefill families up
+    to 81,920 rows. Explicit tiles override these heuristics.
     Pallas AD uses the XLA reference for activation/scale derivatives and
     may materialize floating weights: no backward memory saving is promised.
     There is no automatic mode or platform selection.

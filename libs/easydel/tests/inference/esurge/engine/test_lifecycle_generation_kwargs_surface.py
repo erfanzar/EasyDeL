@@ -21,7 +21,7 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 from easydel.inference.esurge.engine.loop import EngineLoop
 from easydel.inference.esurge.esurge_engine import eSurge
-from easydel.inference.esurge.request import EngineRequest
+from easydel.inference.esurge.request import AdmissionRecord
 from easydel.inference.esurge.runners import model_runner as model_runner_module
 from easydel.inference.esurge.runners.model_runner import eSurgeRunner
 from easydel.inference.esurge.scheduler.output import CachedRequestData, SchedulerOutput
@@ -352,61 +352,51 @@ def test_lifecycle_split_graph_components_prefers_compatible_model_for_wrapper_d
     )
 
 
-def test_lifecycle_prefetch_waits_for_async_decode_batches():
-    request = EngineRequest(
-        request_id="req-decode",
-        prompt_token_ids=[1, 2, 3],
-        sampling_params=SamplingParams(max_tokens=4),
-        eos_token_id=2,
-    )
-    request.num_computed_tokens = request.num_tokens
-    request.num_output_placeholders = 1
-    scheduler = SimpleNamespace(requests={request.request_id: request})
-    scheduler_output = SchedulerOutput(
-        scheduled_new_reqs=[],
-        scheduled_cached_reqs=CachedRequestData.make_empty(),
-        num_scheduled_tokens={request.request_id: 1},
-        total_num_scheduled_tokens=1,
-        scheduled_spec_decode_tokens={},
-        num_common_prefix_pages=[],
-        finished_req_ids=set(),
-        async_scheduling=True,
+def _lifecycle_core(*, async_scheduling: bool, budget: int):
+    """A one-group engine core (host bookkeeping only) holding one admitted request."""
+    import numpy as np
+    from easydel.inference.esurge.core.interface import CacheGroupSpec, FullAttentionSpec
+    from easydel.inference.esurge.engine.core_driver import EngineCoreDriver
+
+    spec = FullAttentionSpec(page_size=4, num_kv_heads=1, head_size=4, dtype=np.float32, use_mla=False)
+    return EngineCoreDriver(
+        kv_cache_groups=[CacheGroupSpec(kv_cache_spec=spec, layer_names=None)],
+        max_num_seqs=2,
+        max_num_batched_tokens=budget,
+        max_model_len=64,
+        num_pages=32,
+        enable_prefix_caching=False,
+        async_scheduling=async_scheduling,
+        chunked_prefill_enabled=True,
     )
 
-    assert not EngineLoop._can_prefetch_scheduler_output(scheduler, scheduler_output)
+
+def test_lifecycle_prefetch_waits_for_async_decode_batches():
+    core = _lifecycle_core(async_scheduling=True, budget=16)
+    try:
+        core.add_requests([AdmissionRecord("req-decode", [1, 2, 3], SamplingParams(max_tokens=4), eos_token_id=2)])
+        scheduler_output = core.schedule()
+        assert scheduler_output.num_scheduled_tokens == {"req-decode": 3}
+        assert not EngineLoop._can_prefetch_scheduler_output(core, scheduler_output)
+    finally:
+        core.shutdown()
 
 
 def test_lifecycle_prefetch_allows_pure_prefill_batches():
-    request = EngineRequest(
-        request_id="req-prefill",
-        prompt_token_ids=[1, 2, 3, 4, 5],
-        sampling_params=SamplingParams(max_tokens=4),
-        eos_token_id=2,
-    )
-    request.num_computed_tokens = request.num_tokens - 1
-    scheduler = SimpleNamespace(requests={request.request_id: request})
-    scheduler_output = SchedulerOutput(
-        scheduled_new_reqs=[],
-        scheduled_cached_reqs=CachedRequestData.make_empty(),
-        num_scheduled_tokens={request.request_id: 1},
-        total_num_scheduled_tokens=1,
-        scheduled_spec_decode_tokens={},
-        num_common_prefix_pages=[],
-        finished_req_ids=set(),
-        async_scheduling=True,
-    )
-
-    assert EngineLoop._can_prefetch_scheduler_output(scheduler, scheduler_output)
+    core = _lifecycle_core(async_scheduling=False, budget=4)
+    try:
+        core.add_requests(
+            [AdmissionRecord("req-prefill", [1, 2, 3, 4, 5], SamplingParams(max_tokens=4), eos_token_id=2)]
+        )
+        scheduler_output = core.schedule()
+        assert scheduler_output.num_scheduled_tokens == {"req-prefill": 4}
+        assert EngineLoop._can_prefetch_scheduler_output(core, scheduler_output)
+    finally:
+        core.shutdown()
 
 
 def test_lifecycle_aborts_after_prefetched_overlap_drain_failure():
-    request = EngineRequest(
-        request_id="req-prefill",
-        prompt_token_ids=[1, 2, 3, 4, 5],
-        sampling_params=SamplingParams(max_tokens=4),
-        eos_token_id=2,
-    )
-    request.num_computed_tokens = request.num_tokens - 2
+    request = SimpleNamespace(request_id="req-prefill")
 
     current_output = SchedulerOutput(
         scheduled_new_reqs=[],
@@ -429,12 +419,16 @@ def test_lifecycle_aborts_after_prefetched_overlap_drain_failure():
         async_scheduling=False,
     )
 
-    class DummyScheduler:
+    class DummyCore:
+        num_running = 0
+        num_waiting = 0
+
         def __init__(self):
-            self.requests = {request.request_id: request}
-            self.running = []
-            self.waiting = []
             self.schedule_calls = 0
+
+        def can_prefetch(self, scheduler_output):
+            # The request is mid-prefill: the next step does not depend on its sampled token.
+            return scheduler_output is current_output
 
         def schedule(self):
             self.schedule_calls += 1
@@ -465,7 +459,7 @@ def test_lifecycle_aborts_after_prefetched_overlap_drain_failure():
         def shutdown(self):
             pass
 
-    scheduler = DummyScheduler()
+    scheduler = DummyCore()
     runner = DummyRunner()
     recorded: dict = {"exc": None}
 
@@ -475,7 +469,7 @@ def test_lifecycle_aborts_after_prefetched_overlap_drain_failure():
         raise AssertionError("engine outputs should not be processed after the drain failure")
 
     loop = EngineLoop(
-        scheduler=scheduler,
+        core=scheduler,
         runner=runner,
         coordinator=None,
         scheduler_lock=threading.Lock(),
@@ -538,11 +532,11 @@ def test_lifecycle_pp_async_dispatches_next_step_before_draining_previous():
     events: list[str] = []
     loop_holder: dict = {"loop": None}
 
-    class DummyScheduler:
+    class DummyCore:
+        num_running = 0
+        num_waiting = 0
+
         def __init__(self):
-            self.running = []
-            self.waiting = []
-            self.requests = {}
             self.schedule_calls = 0
             self.update_calls = 0
 
@@ -555,7 +549,7 @@ def test_lifecycle_pp_async_dispatches_next_step_before_draining_previous():
                 return next_output
             return empty_output
 
-        def update_from_output(self, scheduler_output, model_output):
+        def commit(self, scheduler_output, model_output):
             del scheduler_output, model_output
             self.update_calls += 1
             events.append(f"update{self.update_calls}")
@@ -595,12 +589,12 @@ def test_lifecycle_pp_async_dispatches_next_step_before_draining_previous():
         def log_it(self, *_args, **_kwargs):
             pass
 
-    scheduler = DummyScheduler()
+    scheduler = DummyCore()
     runner = DummyRunner()
     recorded: dict = {"exc": None}
 
     loop = EngineLoop(
-        scheduler=scheduler,
+        core=scheduler,
         runner=runner,
         coordinator=None,
         scheduler_lock=threading.Lock(),

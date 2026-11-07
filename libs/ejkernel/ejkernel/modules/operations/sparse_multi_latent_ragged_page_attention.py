@@ -57,7 +57,9 @@ _OP_ID = "sparse_multi_latent_ragged_page_attention"
 class SparseMultiLatentRaggedPageAttention(Kernel[SparseMultiLatentRaggedPageAttentionConfig, tuple[Array, Array]]):
     """Sparse MLA ragged paged attention over per-token selected chunks."""
 
-    version = "1"
+    # 2: ``num_queries_per_block`` also selects the Pallas query-block prefill kernel; configs cached under version 1
+    # meant XLA rows per step only and must not switch it on.
+    version = "2"
 
     def __init__(self):
         """Initialize with the registry operation identifier."""
@@ -168,10 +170,14 @@ class SparseMultiLatentRaggedPageAttention(Kernel[SparseMultiLatentRaggedPageAtt
         self,
         inv: Invocation[SparseMultiLatentRaggedPageAttentionConfig, tuple[Array, Array]],
     ) -> SparseMultiLatentRaggedPageAttentionConfig:
-        """Default configuration: 8 query rows and 128 selected tokens per KV step."""
+        """Default configuration: 128 selected tokens per KV step and ``num_queries_per_block`` unset.
+
+        Unset keeps one Pallas program per query token and the XLA fallback's default of 8 query rows per step;
+        callers opt into the Pallas query-block prefill kernel by setting it (for example 16).
+        """
         chunk_size = max(1, int(inv.kwargs.get("chunk_size", 1) or 1))
         return SparseMultiLatentRaggedPageAttentionConfig(
-            num_queries_per_block=8,
+            num_queries_per_block=None,
             num_chunks_per_block=max(1, 128 // chunk_size),
             platform="auto",
             backend="any",
@@ -181,7 +187,11 @@ class SparseMultiLatentRaggedPageAttention(Kernel[SparseMultiLatentRaggedPageAtt
         self,
         inv: Invocation[SparseMultiLatentRaggedPageAttentionConfig, tuple[Array, Array]],
     ):
-        """Autotuning candidates over the query-block size."""
+        """Autotuning candidates over the query-block size.
+
+        Unset (per-token Pallas kernel; 8 XLA rows per step) and 16 (Pallas query-block prefill kernel; 16 XLA rows
+        per step).
+        """
         chunk_size = max(1, int(inv.kwargs.get("chunk_size", 1) or 1))
         return [
             SparseMultiLatentRaggedPageAttentionConfig(
@@ -190,7 +200,7 @@ class SparseMultiLatentRaggedPageAttention(Kernel[SparseMultiLatentRaggedPageAtt
                 platform="auto",
                 backend="any",
             )
-            for q_block in (8, 16)
+            for q_block in (None, 16)
         ]
 
 

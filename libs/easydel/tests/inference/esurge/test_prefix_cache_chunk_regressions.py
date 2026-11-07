@@ -54,7 +54,7 @@ def test_cold_unaligned_chunk_does_not_claim_missing_kv(include_full, eagle):
     assert length == 0
     assert all(not pages for pages in cached.pages)
     assert manager.allocate_slots(request, num_new_tokens=25) is not None
-    assert all(not page.is_null for pages in manager.coordinator.get_pages("cold") for page in pages)
+    assert all(page != 0 for pages in manager.get_page_ids("cold") for page in pages)
 
 
 @pytest.mark.cpu_ok
@@ -77,10 +77,10 @@ def test_single_and_hybrid_chunks_reuse_prefix_with_eagle(include_full, chunk, e
         is not None
     )
     # Every page containing needed tokens at the resumed endpoint must be real.
-    for group, pages in zip(manager.coordinator.kv_cache_groups, cached.pages, strict=True):
+    for group, pages in zip(manager.kv_cache_groups, cached.pages, strict=True):
         size = getattr(group.kv_cache_spec, "attention_chunk_size", None)
         start = (length // size * size) // 16 if size else 0
-        assert all(not page.is_null for page in pages[start:])
+        assert all(page != 0 for page in pages[start:])
 
 
 @pytest.mark.cpu_ok
@@ -95,7 +95,7 @@ def test_eagle_shortening_rechecks_previously_null_chunk_pages():
     # moving the endpoint back to 16; the needed page 0 must be recovered.
     assert length == 16
     assert cached.pages[0] == allocated.pages[0]
-    assert not cached.pages[0][0].is_null
+    assert cached.pages[0][0] != 0
 
 
 @pytest.mark.cpu_ok

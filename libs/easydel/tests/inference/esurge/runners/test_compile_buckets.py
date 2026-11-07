@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 from easydel.inference.esurge.runners.execution_manager import ExecutionManager
 from easydel.inference.esurge.runners.executors.sampler_executor import SamplerRuntime
+from easydel.inference.esurge.runners.model_runner import eSurgeRunner
 from easydel.inference.esurge.runners.window_planner import WindowPlanner
 
 
@@ -283,3 +284,54 @@ def test_runtime_bucket_validation_accepts_precompiled_mpmd_split_bucket():
         sampler_padded_num_reqs=4,
         use_pipeline_runtime=True,
     )
+
+
+_LADDER = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+
+
+def _bare_runner(*, data_parallel_size, compiled):
+    """An eSurgeRunner shell whose ``compile`` records the token buckets it hands to the execution manager."""
+
+    class _ExecutionManager:
+        @staticmethod
+        def compile(**kwargs):
+            compiled.append(list(kwargs["num_tokens_paddings"]))
+
+    class _Metadata:
+        pass
+
+    metadata = _Metadata()
+    if data_parallel_size is not None:
+        metadata.data_parallel_size = data_parallel_size
+    runner = eSurgeRunner.__new__(eSurgeRunner)
+    runner.num_tokens_paddings = list(_LADDER)
+    runner.metadata = metadata
+    runner.executor_manager = _ExecutionManager()
+    runner.num_reqs_max_model_len = 32
+    runner.max_pages_per_req = 1
+    runner.max_num_reqs = 32
+    runner.active_num_seq_buckets = [32]
+    runner._allow_sparse_window_packing = False
+    runner._precompile_vlm_vision_helpers = lambda **kwargs: None
+    runner._precompile_draft_schedule_variants = lambda: None
+    runner._precompile_draft_in_verify_variants = lambda: None
+    runner._precompile_whole_block_drafter = lambda: None
+    return runner
+
+
+@pytest.mark.parametrize(
+    ("data_parallel_size", "budget", "largest"),
+    [
+        pytest.param(None, 2048, 2048, id="no-dp-size"),
+        pytest.param(1, 2048, 2048, id="dp1"),
+        pytest.param(4, 2048, 8192, id="dp4"),
+        pytest.param(4, 1500, 8192, id="dp4-budget-between-buckets"),
+        pytest.param(16, 2048, 16384, id="dp16-past-the-ladder"),
+    ],
+)
+def test_compile_reaches_the_token_budget_times_the_dp_size(data_parallel_size, budget, largest):
+    """Rank-major SPMD DP: every rank scheduler gets the whole budget and a step runs its busiest rank's tokens times
+    the DP size, so the compiled buckets must reach the smallest bucket >= budget x DP size (or the ladder's end)."""
+    compiled: list[list[int]] = []
+    _bare_runner(data_parallel_size=data_parallel_size, compiled=compiled).compile(max_num_batched_tokens=budget)
+    assert compiled == [[bucket for bucket in _LADDER if bucket <= largest]]

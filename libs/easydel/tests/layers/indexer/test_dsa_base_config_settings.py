@@ -68,6 +68,7 @@ def _primitive_counts(fn, *args):
         ("dsa_pool_query_chunk", 0, 512),
         ("dsa_pool_query_chunk", 1.5, 1024),
         ("dsa_sparse_training", "yes", True),
+        ("dsa_serving_ep_split", "yes", True),
     ],
 )
 def test_dsa_settings_are_validated_by_both_config_entry_points(field, bad, good):
@@ -81,7 +82,7 @@ def test_dsa_settings_are_validated_by_both_config_entry_points(field, bad, good
 
 
 @pytest.mark.cpu_ok
-def test_dsa_settings_have_backward_compatible_defaults_and_survive_serialization():
+def test_dsa_settings_defaults_and_serialization():
     default = ed.LlamaConfig(hidden_size=64, num_attention_heads=4)
     assert (
         default.index_scoring_kernel,
@@ -89,13 +90,20 @@ def test_dsa_settings_have_backward_compatible_defaults_and_survive_serializatio
         default.dsa_pool_training,
         default.dsa_pool_query_chunk,
         default.dsa_pool_kernel,
-    ) == ("xla", None, False, 2048, "bitmap")
+        default.dsa_serving_ep_split,
+    ) == (None, None, False, 2048, None, None)
+    # Configs saved while the defaults were "xla" and "bitmap" store those values; they load as automatic.
+    reloaded = ed.LlamaConfig.from_dict(
+        {**default.to_dict(), "index_scoring_kernel": "xla", "dsa_pool_kernel": "bitmap"}
+    )
+    assert (reloaded.index_scoring_kernel, reloaded.dsa_pool_kernel) == (None, None)
     settings = dict(
         index_scoring_kernel="pallas",
         dsa_sparse_training=False,
         dsa_pool_training=True,
         dsa_pool_query_chunk=512,
         dsa_pool_kernel="gather",
+        dsa_serving_ep_split=True,
     )
     config = ed.LlamaConfig(hidden_size=64, num_attention_heads=4, **settings)
     restored = ed.LlamaConfig.from_dict(config.to_dict())
@@ -113,6 +121,35 @@ def test_glm5_next_keeps_its_family_constraints_on_the_shared_fields():
     assert (config.dsa_pool_training, config.dsa_pool_kernel, config.dsa_pool_query_chunk) == (True, "gather", 64)
     with pytest.raises(ValueError, match="even index_kpool"):
         ed.Glm5NextTextConfig(dsa_pool_kernel="gather", **{**common, "index_kpool": 1, "index_topk": 7})
+    # The default kernel (``None``) is the bitmap kernel for an odd pool size or a latent width that is not a multiple
+    # of 128, so the config checks its tail limit there.
+    with pytest.raises(ValueError, match="tail keys"):
+        ed.Glm5NextTextConfig(dsa_pool_training=True, **{**common, "index_kpool": 11, "index_topk": 11})
+    with pytest.raises(ValueError, match="tail keys"):
+        ed.Glm5NextTextConfig(dsa_pool_training=True, kv_lora_rank=64, **{**common, "index_kpool": 10, "index_topk": 10})
+    gather_eligible = ed.Glm5NextTextConfig(dsa_pool_training=True, **{**common, "index_kpool": 10, "index_topk": 10})
+    assert (gather_eligible.index_kpool, gather_eligible.dsa_pool_kernel) == (10, None)
+
+
+@pytest.mark.cpu_ok
+def test_automatic_indexer_kernels_follow_the_backend():
+    from easydel.layers.indexer import resolve_dsa_pool_kernel, resolve_index_scoring_kernel
+
+    on_tpu = jax.default_backend() == "tpu"
+    assert resolve_index_scoring_kernel(None) == ("pallas" if on_tpu else "xla")
+    assert resolve_index_scoring_kernel("xla") == "xla"
+    assert resolve_index_scoring_kernel("pallas") == "pallas"
+    with pytest.raises(ValueError, match="scoring_kernel"):
+        resolve_index_scoring_kernel("fused")
+    gather = "gather" if on_tpu else "bitmap"
+    bf16 = dict(latent_dim=128, latent_dtype=jnp.bfloat16)
+    kernels = [resolve_dsa_pool_kernel(None, kpool, **bf16) for kpool in (2, 3, 4, 9)]
+    assert kernels == [gather, "bitmap", gather, "bitmap"]
+    assert resolve_dsa_pool_kernel(None, 4, latent_dim=512, latent_dtype=jnp.float32) == gather
+    assert resolve_dsa_pool_kernel(None, 4, latent_dim=64, latent_dtype=jnp.bfloat16) == "bitmap"
+    assert resolve_dsa_pool_kernel(None, 4, latent_dim=128, latent_dtype=jnp.float8_e4m3fn) == "bitmap"
+    assert resolve_dsa_pool_kernel("bitmap", 4, **bf16) == "bitmap"
+    assert resolve_dsa_pool_kernel("gather", 4, latent_dim=64, latent_dtype=jnp.bfloat16) == "gather"
 
 
 def _v4_indexer(kernel):

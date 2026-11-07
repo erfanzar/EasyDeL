@@ -2,15 +2,13 @@
 
 import jax
 import pytest
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 
 try:
-    from ._common import make_tiny_qwen35
+    from ._common import make_core_for_runner, make_tiny_qwen35, served_request
 except ImportError:  # standalone `python test_x.py`
-    from _common import make_tiny_qwen35
+    from _common import make_core_for_runner, make_tiny_qwen35, served_request
 
 PAGE_SIZE = 16
 PROMPT = [((7 * i + 3) % 250) + 2 for i in range(53)]
@@ -45,9 +43,9 @@ def _runner(model, snapshots: int) -> eSurgeRunner:
     return runner
 
 
-def _generate(runner, scheduler, prompts: dict[str, list[int]]) -> list[EngineRequest]:
+def _generate(runner, scheduler, prompts: dict[str, list[int]]) -> list:
     requests = [
-        EngineRequest(
+        served_request(
             request_id=name,
             prompt_token_ids=list(prompt),
             sampling_params=SamplingParams(max_tokens=8, temperature=0.0, ignore_eos=True),
@@ -59,7 +57,7 @@ def _generate(runner, scheduler, prompts: dict[str, list[int]]) -> list[EngineRe
         scheduler.add_request(request)
     for _ in range(400):
         output = scheduler.schedule()
-        scheduler.update_from_output(output, runner.execute_model(output))
+        scheduler.commit(output, runner.execute_model(output))
         if all(request.is_finished() for request in requests):
             return requests
     raise AssertionError("generation did not finish")
@@ -67,7 +65,7 @@ def _generate(runner, scheduler, prompts: dict[str, list[int]]) -> list[EngineRe
 
 def _run(model, *, enable_prefix_caching: bool, snapshots: int):
     runner = _runner(model, snapshots)
-    scheduler = Scheduler.from_runner(
+    scheduler = make_core_for_runner(
         runner, max_num_batched_tokens=64, enable_prefix_caching=enable_prefix_caching, async_scheduling=False
     )
     finished = _generate(runner, scheduler, {"seq-0": PROMPT})
@@ -152,7 +150,7 @@ def _run_on_mesh(model, *, enable_prefix_caching: bool, snapshots: int, dp: int)
         recurrent_prefix_snapshots=snapshots,
     )
     runner.compile(max_num_batched_tokens=tokens)
-    scheduler = Scheduler.from_runner(
+    scheduler = make_core_for_runner(
         runner, max_num_batched_tokens=64, enable_prefix_caching=enable_prefix_caching, async_scheduling=False
     )
     try:

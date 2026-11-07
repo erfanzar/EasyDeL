@@ -297,13 +297,108 @@ def load_glm5_next_mtp(
     return head
 
 
+def glm5_next_mtp_checkpoint_files(
+    checkpoint: str, nextn_layer_index: int
+) -> tuple[list[str], dict[str, tp.Any] | None]:
+    """The shards of a Hugging Face checkpoint that hold its nextn layer, and the checkpoint's quantization config.
+
+    Reads ``model.safetensors.index.json`` (and ``config.json`` when present) through ``ePath``, so local and
+    remote (``gs://``) checkpoints both work; no shard is opened.
+
+    Args:
+        checkpoint: The checkpoint directory.
+        nextn_layer_index: Index of the nextn layer (the backbone's ``num_hidden_layers``).
+
+    Returns:
+        ``(shard_names, quantization_config)``: sorted shard file names relative to ``checkpoint``, and the top-level
+        or ``text_config`` ``quantization_config`` (``None`` when absent).
+
+    Raises:
+        ValueError: If the index maps no key of the nextn layer.
+    """
+    import json
+
+    from eformer.paths import ePath
+
+    root = ePath(str(checkpoint))
+    weight_map = json.loads((root / "model.safetensors.index.json").read_text())["weight_map"]
+    rules = glm5_next_mtp_key_rules(nextn_layer_index)
+    files = sorted({str(name) for key, name in weight_map.items() if rules(key) is not None})
+    if not files:
+        raise ValueError(f"{checkpoint}: the index maps no key of nextn layer {int(nextn_layer_index)}.")
+    quantization_config = None
+    config_path = root / "config.json"
+    if config_path.exists():
+        raw = json.loads(config_path.read_text())
+        quantization_config = raw.get("quantization_config") or (raw.get("text_config") or {}).get("quantization_config")
+    return files, quantization_config
+
+
+def load_glm5_next_mtp_checkpoint(
+    model: tp.Any,
+    checkpoint: str,
+    *,
+    param_dtype: jnp.dtype = jnp.bfloat16,
+    precision: jax.lax.PrecisionLike = None,
+    max_cache_length: int = DEFAULT_MTP_CACHE_LENGTH,
+) -> Glm5NextMTPHead:
+    """Load the nextn layer of a Hugging Face GLM-5-Next checkpoint directory and attach it to ``model``.
+
+    The shards holding ``layers.{num_hidden_layers}.*`` are found through the checkpoint's index
+    (:func:`glm5_next_mtp_checkpoint_files`); block-fp8 weights are dequantized with the checkpoint's own
+    ``quantization_config``. A remote checkpoint's shards are copied to a temporary directory one at a time.
+
+    Args:
+        model: The loaded GLM-5-Next causal LM.
+        checkpoint: Checkpoint directory (any path ``ePath`` reads, ``gs://`` included).
+        param_dtype: Parameter storage dtype of the head.
+        precision: Matmul precision of the head.
+        max_cache_length: Token capacity of the drafter-local MTP cache.
+
+    Returns:
+        The loaded head (also attached as ``model.mtp``).
+    """
+    import contextlib
+    import os
+    import tempfile
+
+    from eformer.paths import ePath, is_local_path
+
+    files, quantization_config = glm5_next_mtp_checkpoint_files(checkpoint, int(model.config.num_hidden_layers))
+    root = ePath(str(checkpoint))
+    kwargs = dict(
+        quantization_config=quantization_config,
+        param_dtype=param_dtype,
+        precision=precision,
+        max_cache_length=max_cache_length,
+    )
+    if is_local_path(str(checkpoint)):
+        return load_glm5_next_mtp(model, [str(root / name) for name in files], **kwargs)
+
+    @contextlib.contextmanager
+    def staged(stage: int) -> tp.Iterator[list[str]]:
+        del stage  # one draft stage: every nextn shard
+        with tempfile.TemporaryDirectory() as tmp:
+            local = []
+            for name in files:
+                path = os.path.join(tmp, name)
+                with open(path, "wb") as handle:
+                    handle.write((root / name).read_bytes())
+                local.append(path)
+            yield local
+
+    return load_glm5_next_mtp(model, stage_shards=staged, **kwargs)
+
+
 __all__ = [
     "DEFAULT_MTP_CACHE_LENGTH",
     "Glm5NextMTPHead",
     "Glm5NextMTPLayer",
     "attach_glm5_next_mtp",
+    "glm5_next_mtp_checkpoint_files",
     "glm5_next_mtp_config",
     "glm5_next_mtp_key_rules",
     "load_glm5_next_mtp",
+    "load_glm5_next_mtp_checkpoint",
     "scan_glm5_next_mtp_keys",
 ]

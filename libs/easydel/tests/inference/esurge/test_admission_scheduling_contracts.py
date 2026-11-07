@@ -21,11 +21,12 @@ from easydel.inference.esurge import esurge_engine
 from easydel.inference.esurge.config import eSurgeContextConfig, eSurgeRuntimeConfig
 from easydel.inference.esurge.core.interface import CacheGroupSpec, FullAttentionSpec
 from easydel.inference.esurge.engine.admission import RequestAdmission
+from easydel.inference.esurge.engine.core_driver import FINISH_ABORT
 from easydel.inference.esurge.engine.loop import EngineLoop
 from easydel.inference.esurge.engine.registry import RequestRegistry
 from easydel.inference.esurge.esurge_engine import eSurge
 from easydel.inference.esurge.outputs import ModelRunnerOutput
-from easydel.inference.esurge.request import EngineRequest, EngineRequestStatus
+from easydel.inference.esurge.request import AdmissionRecord
 from easydel.inference.reasoning.parsers.gemma4_reasoning_parser import Gemma4ReasoningParser
 from easydel.inference.sampling_params import SamplingParams
 from jax import numpy as jnp
@@ -98,7 +99,7 @@ def test_zero_token_schedule_retains_all_bookkeeping_cases(work):
     assert EngineLoop._zero_schedule_needs_update(output) is (work is not None)
 
 
-def test_engine_scheduler_rebuild_retains_optional_capabilities():
+def test_engine_core_rebuild_retains_optional_capabilities():
     engine = eSurge.__new__(eSurge)
     engine.runtime_config = eSurgeRuntimeConfig.from_dict(
         chunked_prefill_enabled=True, token_safety_margin=999, include_finished_set=True
@@ -125,18 +126,20 @@ def test_engine_scheduler_rebuild_retains_optional_capabilities():
     )
     # Both initial construction and a rebuild use the same real factory.
     for _ in range(2):
-        scheduler = engine._build_scheduler()
+        scheduler = engine._build_core()
         try:
             for rid in ("a", "b"):
-                scheduler.add_request(EngineRequest(rid, [1, 2, 3, 4], SamplingParams(max_tokens=4), eos_token_id=0))
+                scheduler.add_requests(
+                    [AdmissionRecord(rid, [1, 2, 3, 4], SamplingParams(max_tokens=4), eos_token_id=0)]
+                )
             assert scheduler.schedule().num_scheduled_tokens == {"a": 4, "b": 2}
             # Safety reserves govern fresh admission, not progress in pages
             # already owned by b's unfinished prefill. Blocking that progress
             # would strand the request without any way to release its pages.
             assert scheduler.schedule().num_scheduled_tokens == {"b": 2}
             assert scheduler.schedule().total_num_scheduled_tokens == 0
-            scheduler.finish_requests(["a", "b"], EngineRequestStatus.FINISHED_ABORTED)
-            outputs = scheduler.update_from_output(
+            scheduler.finish_requests(["a", "b"], FINISH_ABORT)
+            outputs = scheduler.commit(
                 scheduler.schedule(),
                 ModelRunnerOutput(
                     req_ids=[],

@@ -21,16 +21,21 @@ classification put the prefill inside the decode range — desyncing the
 kernel's offsets and hanging the TPU (reproduced: qwen3_5-4B and
 qwen3-30B-A3B, any run with more requests than seats; scheduler heartbeat
 stale within ~2 min of the first admission-after-completion).
+
+eSurge's step-input builder lives in surgecore; ``surgecore.request_distribution_prefix`` is its rule.
 """
 
 import numpy as np
-from easydel.inference.esurge.runners.executors.batch_preparer import compute_request_distribution_prefix
+import pytest
+from surgecore import request_distribution_prefix
+
+pytestmark = pytest.mark.cpu_ok
 
 
 def _dist(scheduled, computed):
     scheduled = np.asarray(scheduled, dtype=np.int32)
     computed = np.asarray(computed, dtype=np.int32)
-    return compute_request_distribution_prefix(scheduled, computed, len(scheduled))
+    return request_distribution_prefix(scheduled, computed, len(scheduled))
 
 
 def test_pure_decode_batch_keeps_fast_path():
