@@ -501,6 +501,31 @@ impl EngineCore {
         })
     }
 
+    /// Turns on the load-aware verification budget of synchronous speculative steps: `buckets` (ascending) are the
+    /// compiled token buckets of the model step and `step_ms` their measured times. `prior` starts every draft
+    /// position's acceptance estimate, `alpha` weighs each observation, `correction` each measured step time.
+    #[pyo3(signature = (buckets, step_ms, *, prior=0.7, alpha=0.2, correction=0.1))]
+    fn set_verify_budget(
+        &self,
+        py: Python<'_>,
+        buckets: PyArrayLike1<'_, i64, AllowTypeChange>,
+        step_ms: PyArrayLike1<'_, f64, AllowTypeChange>,
+        prior: f64,
+        alpha: f64,
+        correction: f64,
+    ) -> PyResult<()> {
+        let (b, t) = (values(&buckets), values(&step_ms));
+        self.with(py, |core| core.set_verify_budget(&b, &t, prior, alpha, correction))
+    }
+
+    /// The verification budget's global acceptance prior per draft position and its step-time correction (ms), or
+    /// `None` without a budget.
+    fn verify_state(&self, py: Python<'_>) -> PyResult<Option<(Vec<f64>, f64)>> {
+        self.with(py, |core| {
+            Ok(core.verify_budget().map(|v| (v.prior().to_vec(), v.offset())))
+        })
+    }
+
     /// The speculative drafts a live request carries into its next step, or `None`.
     fn drafts_of<'py>(&self, py: Python<'py>, handle: i64) -> PyResult<Option<Bound<'py, PyArray1<i32>>>> {
         let d = self.with(py, |core| Ok(core.drafts_of(handle as u64).map(<[i32]>::to_vec)))?;
@@ -624,6 +649,14 @@ impl PyPlan {
     #[getter]
     fn req_bucket(&self) -> i64 {
         self.inner.req_bucket
+    }
+    #[getter]
+    fn num_draft_tokens_next(&self) -> i64 {
+        self.inner.num_draft_tokens_next
+    }
+    #[getter]
+    fn spec_slots<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i32>> {
+        arr(py, &self.inner.spec_slots)
     }
 }
 

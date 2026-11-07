@@ -18,8 +18,9 @@
 //! [`add`](EngineCore::add) (admission, with routing to a rank), [`schedule`](EngineCore::schedule) (one [`Plan`]),
 //! [`commit`](EngineCore::commit) (a plan's sampled tokens, in dispatch order, giving [`Events`]) and
 //! [`finish`](EngineCore::finish) (aborts and stop strings). The decisions are those of eSurge's former Python
-//! scheduler (single-rank, async and data-parallel), pinned by goldens. Speculative decoding is not part of this
-//! core yet.
+//! scheduler (single-rank, async and data-parallel), pinned by goldens. Synchronous speculative steps carry each
+//! request's drafts, and [`verify`] can cut them per step to a load-aware verification budget
+//! ([`set_verify_budget`](EngineCore::set_verify_budget)).
 //!
 //! This module stays free of PyO3; its bindings live in the extension module's `engine` binding file.
 
@@ -28,12 +29,16 @@ pub mod plan;
 pub mod record;
 pub mod request;
 pub mod sched;
+pub mod verify;
 
+#[cfg(test)]
+mod async_spec;
 #[cfg(test)]
 mod golden;
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::time::Instant;
 
 use crate::kv::group::Group;
 use crate::kv::snapshot::SnapshotIndex;
@@ -46,6 +51,7 @@ use plan::{
 use request::{FinishReason, Handle, NewRequest, Request, RequestTable, Status, FLAG_GRAMMAR};
 use sched::commit::{commit_plan, Output};
 use sched::{free_request, schedule::schedule_rank, Policy, Queue, SchedParams, TokenBudget};
+use verify::VerifyBudget;
 
 /// An engine-core error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +138,9 @@ pub struct EngineCore {
     ranks: Vec<RankState>,
     inflight: VecDeque<u64>,
     next_plan: u64,
+    verify: Option<VerifyBudget>,
+    /// `(plan id, step tokens, time schedule returned)` of the synchronous plan whose step time is measured.
+    timing: Option<(u64, i64, Instant)>,
 }
 
 fn value<T>(msg: impl Into<String>) -> Result<T, CoreError> {
@@ -232,7 +241,37 @@ impl EngineCore {
             ranks,
             inflight: VecDeque::new(),
             next_plan: 0,
+            verify: None,
+            timing: None,
         })
+    }
+
+    /// Turns on the load-aware verification budget (see [`verify`]) for synchronous speculative steps: `buckets`
+    /// are the compiled token buckets of the model step (ascending) and `ms` their measured step times. Replaces a
+    /// previous budget (per-request estimates are kept).
+    pub fn set_verify_budget(
+        &mut self,
+        buckets: &[i64],
+        ms: &[f64],
+        prior: f64,
+        alpha: f64,
+        correction: f64,
+    ) -> Result<(), CoreError> {
+        if self.params.num_spec_tokens <= 0 {
+            return value("a verification budget needs num_spec_tokens > 0");
+        }
+        if self.params.async_scheduling {
+            return value("the verification budget runs on synchronous steps only");
+        }
+        let k = self.params.num_spec_tokens as usize;
+        self.verify = Some(VerifyBudget::new(buckets, ms, k, prior, alpha, correction).map_err(CoreError::Value)?);
+        self.timing = None;
+        Ok(())
+    }
+
+    /// The verification budget, when one is set.
+    pub fn verify_budget(&self) -> Option<&VerifyBudget> {
+        self.verify.as_ref()
     }
 
     /// Data-parallel ranks.
@@ -359,6 +398,8 @@ impl EngineCore {
                 cached_tokens: -1,
                 stop_reason: None,
                 drafts: Vec::new(),
+                accept: Vec::new(),
+                inflight_drafts: 0,
             };
             let rank = match r.dp_rank {
                 Some(rank) => rank,
@@ -386,7 +427,12 @@ impl EngineCore {
             ..Plan::default()
         };
         self.next_plan += 1;
+        plan.num_draft_tokens_next = p.num_spec_tokens;
+        if let Some(v) = self.verify.as_ref() {
+            plan.num_draft_tokens_next = verify::apply(v, &self.ranks, &mut self.reqs, &p)?;
+        }
         let mut grammar_pending = false;
+        let spec_async = p.async_scheduling && p.num_spec_tokens > 0;
         let mut all_single = true;
         let mut prefill = false;
         let mut pages_changed = false;
@@ -419,7 +465,9 @@ impl EngineCore {
                 let emit = if p.async_scheduling {
                     grammar_pending |= r.flags & FLAG_GRAMMAR != 0 && r.placeholders > 0;
                     if r.computed == r.num_tokens() + r.placeholders + cur_spec {
+                        // Optimistic advance: every draft counts as accepted until this step's commit.
                         r.placeholders += 1 + cur_spec;
+                        r.inflight_drafts += cur_spec;
                         r.drafts = vec![-1; p.num_spec_tokens as usize];
                         true
                     } else {
@@ -428,7 +476,18 @@ impl EngineCore {
                 } else {
                     r.computed >= r.num_tokens()
                 };
-                all_single &= e.scheduled == 1;
+                all_single &= if spec_async {
+                    // A verify step may overlap only when every entry is a running decode window of 1 + k (or 1
+                    // without drafts) whose next window of 1 + k still fits the model length.
+                    let k = p.num_spec_tokens;
+                    e.kind == KIND_RUNNING
+                        && emit
+                        && ((cur_spec == 0 && e.scheduled == 1) || (cur_spec == k && e.scheduled == 1 + k))
+                        && r.computed + 1 + k < p.max_model_len
+                } else {
+                    e.scheduled == 1
+                };
+                plan.spec_slots.push(if emit { (1 + cur_spec) as i32 } else { 0 });
                 prefill |= e.computed < r.num_prompt;
                 pages_changed |= e.kind != KIND_RUNNING;
                 rank_tokens += e.scheduled;
@@ -497,6 +556,11 @@ impl EngineCore {
             plan.flags |= PLAN_STRUCTURED_PENDING;
         }
         if !plan.is_empty() {
+            // A step is timed only when it runs alone (no plan in flight), from here to its commit.
+            if self.verify.is_some() && self.inflight.is_empty() {
+                let tokens = self.ranks.len() as i64 * plan.stats[7];
+                self.timing = Some((plan.id, tokens, Instant::now()));
+            }
             self.inflight.push_back(plan.id);
         }
         Ok(plan)
@@ -520,6 +584,30 @@ impl EngineCore {
             }
             out.validate(plan.len()).map_err(CoreError::Value)?;
             self.inflight.pop_front();
+            if let Some(v) = self.verify.as_mut() {
+                if let Some((id, tokens, start)) = self.timing {
+                    if id == plan.id {
+                        v.observe_step(tokens, start.elapsed().as_secs_f64() * 1e3);
+                        self.timing = None;
+                    }
+                }
+                let mut step = vec![(0.0, 0.0); v.k()];
+                for i in 0..plan.len() {
+                    if !out.is_present(i) || plan.emits[i] == 0 {
+                        continue;
+                    }
+                    let verified = plan.drafts(i).len();
+                    let accepted = match out.accepted_of(i) {
+                        Some(a) => a.max(0) as usize,
+                        None if verified == 0 => 0,
+                        None => continue,
+                    };
+                    if let Some(r) = self.reqs.get_mut(plan.handles[i]) {
+                        v.observe_request(&mut r.accept, verified, accepted, &mut step);
+                    }
+                }
+                v.observe_prior(&step);
+            }
             commit_plan(&mut self.ranks, &mut self.reqs, &self.params, plan, out, &mut events)?;
         }
         for rank in &mut self.ranks {

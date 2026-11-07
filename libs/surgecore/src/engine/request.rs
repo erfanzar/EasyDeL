@@ -213,6 +213,11 @@ pub struct Request {
     /// Speculative drafts the next step may verify (the runner's last proposal, trimmed to what was scheduled;
     /// `-1` placeholders under async scheduling).
     pub drafts: Vec<i32>,
+    /// Estimated conditional acceptance per draft position (empty until the verification budget observes it).
+    pub accept: Vec<f64>,
+    /// Drafts of the request's async steps that sample and are not committed yet: `computed` counts them as
+    /// accepted, so the committed position may lie up to this many tokens lower.
+    pub inflight_drafts: i64,
 }
 
 impl Request {
@@ -374,6 +379,8 @@ mod tests {
             cached_tokens: -1,
             stop_reason: None,
             drafts: Vec::new(),
+            accept: Vec::new(),
+            inflight_drafts: 0,
         }
     }
 

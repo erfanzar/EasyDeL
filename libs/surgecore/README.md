@@ -19,6 +19,14 @@ It holds:
   buckets) with synchronous speculative drafts (draft trimming, EAGLE lookahead, acceptance rollback) and the stop
   checks. `schedule()` returns a `Plan`; `commit()` takes the runner's sampled lists, accepted counts and new drafts
   and returns `Events`. Every call releases the GIL.
+- The verification budget of synchronous speculative steps (`EngineCore.set_verify_budget`): from a step-time table
+  per compiled token bucket (measured by the runner after compile, corrected online from measured step times) and
+  per-request acceptance estimates per draft position, each schedule verifies 0..k drafts per request, the count
+  that maximises expected emitted tokens per millisecond, and sets `Plan.num_draft_tokens_next`.
+- Async speculative steps: a verify window of `1 + k` may be scheduled while the request's previous window is in
+  flight. The core advances `computed` as if every draft were accepted (`Plan.spec_slots` per entry), each commit
+  rolls back only its own rejected drafts, and the device corrects the later step's start. Windowed groups drop
+  pages only below the lowest position the request may really be at.
 
 Only eSurge imports it; `import easydel` and training do not need it.
 
@@ -37,13 +45,19 @@ so plain cargo builds link against libpython.
 
 ```bash
 cd libs/surgecore
+export PYO3_PYTHON=$(which python)          # a Python 3.11-3.13 interpreter: clippy and the tests link libpython
+# (if the test binary cannot find libpython at run time, add that interpreter's LIBDIR to LD_LIBRARY_PATH)
 cargo fmt --check
-cargo clippy --release --all-targets -- -D warnings
-PYO3_PYTHON=$(which python) LD_LIBRARY_PATH=$(python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))') \
-  cargo test --locked                       # Rust unit tests (with the Python bindings compiled)
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked                         # Rust unit tests (with the Python bindings compiled)
 cargo test --locked --no-default-features   # the pure-Rust core alone, no Python needed
 python -m pytest tests                      # parity against the goldens in tests/data plus invariant tests (CPU)
 ```
+
+Workspace CI (`.github/workflows/workspace-ci.yaml`, job `surgecore`) runs these and a wheel build whenever
+`libs/surgecore` changes. Releases go through `scripts/release.sh surgecore <version>` and
+`scripts/publish.sh surgecore` (see the workspace's `WORKSPACE.md`); a `surgecore-v*` tag builds and publishes the
+wheels and the sdist.
 
 The pytest files carry `pytest.mark.cpu_ok`: they do no JAX computation. The fixtures in `tests/data` hold inputs and
 outputs captured from the Python code each piece replaced, and each header names its source commit:

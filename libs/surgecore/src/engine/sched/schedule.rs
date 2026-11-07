@@ -266,9 +266,12 @@ pub fn schedule_rank(
         loop {
             let r = get_mut(reqs, h)?;
             let slot = kv_slot(&mut rank.kv, r);
+            // `computed` counts the drafts of uncommitted async steps as accepted: windowed groups drop pages from
+            // the lowest position the request may really be at (the same slots are reserved either way).
+            let pend = r.inflight_drafts.clamp(0, r.computed);
             if let Some(pages) = rank
                 .kv
-                .allocate(slot, r.computed, n, 0, None, p.lookahead, None, None)?
+                .allocate(slot, r.computed - pend, n + pend, 0, None, p.lookahead, None, None)?
             {
                 new_pages = Some(pages);
                 break;
@@ -329,10 +332,11 @@ pub fn schedule_rank(
         };
         let r = get_mut(reqs, h)?;
         let computed = r.computed;
-        // The drafts covered by this chunk are trimmed to what was scheduled and verified this step.
+        // The drafts covered by this chunk are trimmed to what was scheduled and verified this step: the chunk first
+        // feeds the request's tokens and async placeholders it has not fed yet.
         let mut drafts = Vec::new();
         if !r.drafts.is_empty() {
-            let k = n + computed - r.num_tokens();
+            let k = n + computed - r.num_tokens() - r.placeholders;
             if k > 0 {
                 r.drafts.truncate(k as usize);
                 drafts.clone_from(&r.drafts);

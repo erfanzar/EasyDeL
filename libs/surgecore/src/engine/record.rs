@@ -22,7 +22,7 @@ use crate::engine::plan::Plan;
 use crate::engine::CoreError;
 
 /// Record format version (the first varint).
-pub const RECORD_VERSION: i64 = 2;
+pub const RECORD_VERSION: i64 = 4;
 
 /// Appends `v` as a zigzag LEB128 varint.
 pub fn put_varint(out: &mut Vec<u8>, v: i64) {
@@ -126,6 +126,8 @@ pub fn encode(plan: &Plan) -> Vec<u8> {
     put_list(&mut out, &plan.new_token_offsets);
     put_list(&mut out, &plan.common_prefix_pages);
     put_varint(&mut out, plan.req_bucket);
+    put_varint(&mut out, plan.num_draft_tokens_next);
+    put_list(&mut out, &plan.spec_slots);
     out
 }
 
@@ -175,6 +177,8 @@ pub fn decode(bytes: &[u8]) -> Result<Plan, CoreError> {
         new_token_offsets: narrow(get_list(&mut r)?)?,
         common_prefix_pages: narrow(get_list(&mut r)?)?,
         req_bucket: r.next_i64()?,
+        num_draft_tokens_next: r.next_i64()?,
+        spec_slots: narrow(get_list(&mut r)?)?,
     };
     if !r.done() {
         return Err(CoreError::Value("trailing bytes after a step record".into()));
@@ -185,6 +189,7 @@ pub fn decode(bytes: &[u8]) -> Result<Plan, CoreError> {
         plan.computed.len(),
         plan.kinds.len(),
         plan.emits.len(),
+        plan.spec_slots.len(),
     ]
     .iter()
     .any(|&l| l != n)
@@ -236,6 +241,8 @@ mod tests {
             new_token_offsets: vec![0, 1, 1],
             common_prefix_pages: vec![1],
             req_bucket: 4,
+            num_draft_tokens_next: 2,
+            spec_slots: vec![3, 0],
         };
         let bytes = encode(&plan);
         assert_eq!(decode(&bytes).unwrap(), plan);

@@ -143,6 +143,7 @@ pub fn commit_plan(
     out: &Output<'_>,
     events: &mut Events,
 ) -> Result<(), CoreError> {
+    let spec_async = p.async_scheduling && p.num_spec_tokens > 0;
     for (k, rank) in ranks.iter_mut().enumerate() {
         let (lo, hi) = (plan.rank_offsets[k] as usize, plan.rank_offsets[k + 1] as usize);
         for save in &plan.snapshot_saves {
@@ -168,14 +169,25 @@ pub fn commit_plan(
                 continue;
             }
             let sampled = out.sampled_of(i);
+            let slots = i64::from(plan.spec_slots.get(i).copied().unwrap_or(0));
+            let verified = plan.drafts(i).len() as i64;
             if let Some(d) = out.drafts_of(i) {
-                r.drafts = d.to_vec();
+                // With drafts in flight a later step was already dispatched with placeholder drafts (the device
+                // holds their values): the request keeps them.
+                if !(spec_async && r.placeholders > slots) {
+                    r.drafts = d.to_vec();
+                }
             }
             if let Some(a) = out.accepted_of(i) {
-                let rejected = (plan.drafts(i).len() as i64 - a).max(0);
+                // Rolls back this step's rejected drafts; a later in-flight step's entry keeps its optimistic start
+                // (the device corrects it by the same amount).
+                let rejected = (verified - a).max(0);
                 if rejected > 0 {
                     r.computed = (r.computed - rejected).max(0);
                 }
+            }
+            if spec_async && slots > 0 {
+                r.inflight_drafts = (r.inflight_drafts - verified).max(0);
             }
             let before = r.status;
             let mut stopped = false;
@@ -189,7 +201,8 @@ pub fn commit_plan(
                 }
             }
             if p.async_scheduling && emitted > 0 {
-                r.placeholders -= emitted as i64;
+                // A verify step gives back all its `1 + drafts` slots, however many of its drafts were accepted.
+                r.placeholders -= if verified > 0 { slots } else { emitted as i64 };
                 if r.placeholders < 0 {
                     return Err(CoreError::Invariant(format!(
                         "request {h:#x} has negative placeholders"

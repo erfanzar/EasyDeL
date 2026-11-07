@@ -295,6 +295,16 @@ class Plan:
         """The request-count bucket selected after scheduling, summed over ranks (the former ``suggested_bucket``)."""
         ...
     @property
+    def num_draft_tokens_next(self) -> int:
+        """Drafts the runner produces for the next step (0 skips the drafter): the configured count, or the
+        verification budget's choice when one is set."""
+        ...
+    @property
+    def spec_slots(self) -> npt.NDArray[np.int32]:
+        """``int32[n]``: output slots per entry, ``1 + drafts`` for an entry that samples, else 0. An async step counts
+        every slot as accepted until its commit; the device corrects a later step's start by the rejected drafts."""
+        ...
+    @property
     def stats(self) -> npt.NDArray[np.int64]:
         """``int64[8 + 4 * dp]``: scheduled tokens, running, waiting, free pages, initial budget, remaining budget,
         preemptions, the busiest rank's tokens (``max_num_scheduled_tokens_per_dp_rank``); then per rank: scheduled
@@ -503,7 +513,7 @@ class EngineCore:
         """``int64[4 + 4 * dp]``: running, waiting, free pages, pending prefill tokens; then the same per rank."""
         ...
     def record(self, plan: Plan) -> bytes:
-        """The plan as a step record (zigzag LEB128 varints, version 2)."""
+        """The plan as a step record (zigzag LEB128 varints, version 4)."""
         ...
     def digest(self) -> int:
         """A hash of every live request's status, tokens, counters and global page ids (never page keys)."""
@@ -523,6 +533,36 @@ class EngineCore:
         ...
     def drafts_of(self, handle: int) -> npt.NDArray[np.int32] | None:
         """The drafts a live request carries into its next step (-1 placeholders under async), or ``None``."""
+        ...
+    def set_verify_budget(
+        self,
+        buckets: npt.ArrayLike,
+        step_ms: npt.ArrayLike,
+        *,
+        prior: float = 0.7,
+        alpha: float = 0.2,
+        correction: float = 0.1,
+    ) -> None:
+        """Turns on the load-aware verification budget of synchronous speculative steps.
+
+        Each schedule then cuts every running request's drafts to its share (0..k), adding draft positions in
+        decreasing estimated cumulative acceptance while the expected emitted tokens per millisecond of the step's
+        bucket grow, and sets ``Plan.num_draft_tokens_next``. Commits update per-request acceptance estimates, the
+        global prior and the step-time correction.
+
+        Args:
+            buckets: ``int64[B]``, ascending: the compiled token buckets of the model step.
+            step_ms: ``float64[B]``: their measured step times in milliseconds.
+            prior: Starting conditional acceptance of every draft position.
+            alpha: Weight of each acceptance observation in the moving averages.
+            correction: Weight of each measured step time in the table's correction (0 off).
+
+        Raises:
+            ValueError: No speculative tokens, or a bad table or weight.
+        """
+        ...
+    def verify_state(self) -> tuple[list[float], float] | None:
+        """The budget's global acceptance prior per draft position and its step-time correction (ms), or ``None``."""
         ...
     def shutdown(self) -> None:
         """Closes the core; later calls raise ``CoreClosed``."""

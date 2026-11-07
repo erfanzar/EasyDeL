@@ -379,3 +379,16 @@ class SchedulerOutput:
 
     recurrent_snapshot_saves: dict[str, int] = field(default_factory=dict)
     """Request id -> recurrent snapshot slot to fill from the request's state row after this step's forward."""
+
+    num_draft_tokens_next: int = -1
+    """Drafts the runner produces for the next step: 0 skips the drafter, -1 (not set by an engine core) is the
+    runner's configured count. The engine core sets the configured count, or its verification budget's choice."""
+
+    spec_slots: dict[str, int] = field(default_factory=dict)
+    """Request id -> output slots of a request that samples this step: 1 + the drafts it verifies. Under async
+    scheduling the engine core counts every one of them as accepted until the step's commit."""
+
+    async_safe: bool = False
+    """The engine core's ``PLAN_ASYNC_SAFE``: the next step may be dispatched before this one's tokens reach the host.
+    With speculation, every entry is a running decode window of 1 + k (or 1 without drafts) and the device corrects
+    the next step's starts by this step's rejected drafts."""

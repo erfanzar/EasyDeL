@@ -26,8 +26,10 @@ pub const KIND_NEW: u8 = 1;
 /// Entry kind: a preempted request scheduled again.
 pub const KIND_RESUMED: u8 = 2;
 
-/// Plan flag: every entry is one token, async scheduling is on and no grammar row has a pending token, so the next
-/// step may be dispatched before this one's tokens are on the host (model-level checks stay with the caller).
+/// Plan flag: async scheduling is on, no grammar row has a pending token and every entry is one token (with
+/// speculation: every entry is a running decode window of `1 + k`, or 1 without drafts, whose next window of `1 + k`
+/// fits the model length), so the next step may be dispatched before this one's tokens are on the host
+/// (model-level checks stay with the caller).
 pub const PLAN_ASYNC_SAFE: u32 = 1;
 /// Plan flag: some entry prefills prompt tokens.
 pub const PLAN_HAS_PREFILL: u32 = 2;
@@ -59,6 +61,9 @@ pub struct Plan {
     pub kinds: Vec<u8>,
     /// Whether the entry samples a token this step.
     pub emits: Vec<u8>,
+    /// Output slots per entry: `1 + drafts` for an entry that samples, 0 otherwise. An async step reserves them as
+    /// placeholders (every draft counted as accepted) until its commit.
+    pub spec_slots: Vec<i32>,
     /// Global page ids per entry and group: all of a new or resumed entry's pages, the newly allocated ones of a
     /// running entry. Entry `i`, group `g` is `new_pages[new_page_offsets[i*G+g]..new_page_offsets[i*G+g+1]]`.
     pub new_pages: Vec<i32>,
@@ -79,6 +84,9 @@ pub struct Plan {
     pub common_prefix_pages: Vec<i32>,
     /// The request-count bucket selected after scheduling, summed over ranks (the former `suggested_bucket`).
     pub req_bucket: i64,
+    /// Drafts the runner produces for the next step (0 skips the drafter): the configured count, or the verification
+    /// budget's choice when one is set.
+    pub num_draft_tokens_next: i64,
     /// Requests preempted this step.
     pub preempted: Vec<Handle>,
     /// Requests finished since the previous plan (stops, finishes and aborts, zero-token drops).

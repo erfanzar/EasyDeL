@@ -60,7 +60,7 @@ FINISH_ABORT = 3
 _FINISH_REASON = (None, FinishReason.STOP, FinishReason.LENGTH, FinishReason.ABORT)
 _GROUP_KIND = {FullAttentionSpec: 0, SlidingWindowSpec: 1, ChunkedLocalAttentionSpec: 2}
 _FLAG_GRAMMAR, _FLAG_NO_PREFIX_HIT, _FLAG_VISION = 1, 2, 4
-_PLAN_STRUCTURED_PENDING = 16
+_PLAN_ASYNC_SAFE, _PLAN_STRUCTURED_PENDING = 1, 16
 _KIND_NEW, _KIND_RESUMED = 1, 2
 _U64 = (1 << 64) - 1
 _RECURRENT_LAYER_TYPES = frozenset({"linear_attention", "kda_linear_attention", "parallel_hybrid", "hybrid"})
@@ -199,6 +199,37 @@ class EngineCoreDriver:
         """Admitted requests with an empty prompt: dropped (aborted) at the next schedule, as the former scheduler did."""
         self._empty_freed: list[str] = []
 
+    def set_verify_budget(
+        self,
+        step_ms: dict[int, float],
+        *,
+        prior: float = 0.7,
+        alpha: float = 0.2,
+        correction: float = 0.1,
+    ) -> None:
+        """Turn on the core's load-aware verification budget for synchronous speculative steps.
+
+        Each schedule then verifies 0..k drafts per request, chosen to maximise the expected emitted tokens per
+        millisecond of the step's token bucket, and sets ``SchedulerOutput.num_draft_tokens_next``.
+
+        Args:
+            step_ms: Measured model-step time in milliseconds per compiled token bucket.
+            prior: Starting conditional acceptance of every draft position.
+            alpha: Weight of each acceptance observation in the moving averages.
+            correction: Weight of each measured step time in the table's online correction (0 off).
+
+        Raises:
+            ValueError: No speculative tokens, async scheduling, or a bad table or weight.
+        """
+        buckets = sorted(int(b) for b in step_ms)
+        self._core.set_verify_budget(
+            np.asarray(buckets, np.int64),
+            np.asarray([float(step_ms[b]) for b in buckets], np.float64),
+            prior=float(prior),
+            alpha=float(alpha),
+            correction=float(correction),
+        )
+
     @classmethod
     def from_runner(
         cls,
@@ -247,7 +278,7 @@ class EngineCoreDriver:
                 use_mla=False,
             )
         expander_builder = getattr(type(runner.model), "esurge_image_expander_builder", None)
-        return cls(
+        driver = cls(
             kv_cache_groups=kv_cache_groups,
             max_num_seqs=runner.max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
@@ -265,6 +296,10 @@ class EngineCoreDriver:
             recurrent_prefix_snapshot_slots=snapshot_slots,
             image_expander=expander_builder(runner.model) if expander_builder is not None else None,
         )
+        step_ms = getattr(runner, "step_time_table", None)
+        if step_ms and driver.num_draft_tokens > 0 and not driver.async_scheduling:
+            driver.set_verify_budget(step_ms)
+        return driver
 
     # ------------------------------------------------------------------------------------------------ admission
     def add_requests(self, records: list[AdmissionRecord]) -> None:
@@ -589,6 +624,9 @@ class EngineCoreDriver:
             pending_structured_output_tokens=bool(plan.flags & _PLAN_STRUCTURED_PENDING),
             recurrent_snapshot_restores=pairs(plan.snapshot_restores),
             recurrent_snapshot_saves=pairs(plan.snapshot_saves),
+            num_draft_tokens_next=int(plan.num_draft_tokens_next),
+            spec_slots={rids[i]: s for i, s in enumerate(plan.spec_slots.tolist()) if s > 0},
+            async_safe=bool(plan.flags & _PLAN_ASYNC_SAFE),
         )
         if n or zero_schedule_needs_update(so):
             self._steps[id(so)] = _Step(so, plan, handles, rids)
