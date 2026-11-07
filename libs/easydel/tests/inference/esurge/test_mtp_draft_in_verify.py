@@ -454,15 +454,17 @@ def _serve(runner, prompts, *, max_new=10):
 
 
 def test_runner_fused_engages_by_default_and_flag_falls_back(monkeypatch):
-    """B=3 greedy serving: the fused program is the default steady-state path
-    (>= 2 spec rows per call, no two-dispatch drafter dispatch), and the escape
-    hatch restores the two-dispatch flow."""
+    """B=3 greedy serving: the fused program serves the steady-state verify windows (>= 2 spec rows per call; the
+    two-dispatch drafter drafts only the requests with nothing to verify yet and a request verifying alone), and the
+    escape hatch restores the two-dispatch flow."""
     monkeypatch.setenv("EASYDEL_MTP_PERSIST_KV", "1")
     monkeypatch.delenv("EASYDEL_DISABLE_DRAFT_IN_VERIFY", raising=False)
     model = make_tiny_model()
 
     fused_rows: list[int] = []
-    two_dispatch_calls: list[int] = []
+    # Per two-dispatch drafter call: (rows drafted, rows with drafter history). A row without history belongs to a
+    # request with nothing to verify yet (its first window), which always drafts through the two-dispatch drafter.
+    two_dispatch_calls: list[tuple[int, int]] = []
     orig_fused = Qwen3_5MTPDrafter.verify_draft_batched
     orig_batched = Qwen3_5MTPDrafter.draft_batched
 
@@ -471,7 +473,9 @@ def test_runner_fused_engages_by_default_and_flag_falls_back(monkeypatch):
         return orig_fused(self, **kwargs)
 
     def _spy_batched(self, **kwargs):
-        two_dispatch_calls.append(int(np.asarray(kwargs["collected_mask"]).sum()))
+        rows = np.asarray(kwargs["collected_mask"]).astype(bool)
+        history = rows & (np.asarray(kwargs["committed_lens"]) > 0)
+        two_dispatch_calls.append((int(rows.sum()), int(history.sum())))
         return orig_batched(self, **kwargs)
 
     drafter = Qwen3_5MTPDrafter(model, num_draft_tokens=3, persist_kv=True)
@@ -484,7 +488,10 @@ def test_runner_fused_engages_by_default_and_flag_falls_back(monkeypatch):
         assert min(out) >= 0 and max(out) < _VOCAB
     engaged = [c for c in fused_rows if c >= 2]
     assert engaged, "fused draft-in-verify never engaged for a 3-request greedy batch"
-    assert two_dispatch_calls == [], (
+    assert (3, 0) in two_dispatch_calls, f"the three first windows were not drafted together: {two_dispatch_calls}"
+    # Verify windows of two or more requests draft inside the fused program; only a request verifying alone still
+    # takes the two-dispatch drafter.
+    assert all(history == 0 or rows == 1 for rows, history in two_dispatch_calls), (
         f"steady-state serving still dispatched the two-dispatch batched drafter: {two_dispatch_calls}"
     )
 
@@ -498,7 +505,9 @@ def test_runner_fused_engages_by_default_and_flag_falls_back(monkeypatch):
     for rid, out in toks2.items():
         assert len(out) == 10, f"{rid} did not complete: {out}"
     assert fused_rows == [], "EASYDEL_DISABLE_DRAFT_IN_VERIFY=1 must silence the fused program"
-    assert any(c >= 2 for c in two_dispatch_calls), "fallback did not engage the two-dispatch batched drafter"
+    assert any(history >= 2 for _rows, history in two_dispatch_calls), (
+        "fallback did not engage the two-dispatch batched drafter"
+    )
 
 
 def test_runner_fused_executable_count_one_per_bucket_k(monkeypatch):
@@ -523,6 +532,48 @@ def test_runner_fused_executable_count_one_per_bucket_k(monkeypatch):
     _ = _serve(runner, _PROMPTS)
     assert set(drafter._jit_verify_draft.keys()) == warmed, (
         "serving compiled new fused draft-in-verify variants beyond the warmed (bucket, K) grid"
+    )
+
+
+def test_runner_serving_runs_the_warmed_drafter_executables(monkeypatch):
+    """Serving calls the drafter programs ``compile()`` warmed and compiles none of them again.
+
+    A warmed program compiles again when serving passes an input placed differently from the warm-up's (the verify
+    rows and the draft seeds are committed to the model mesh), and a request's first window must not compile the
+    per-request draft, whose programs are keyed on the prompt length.
+    """
+    from easydel.inference.esurge.runners.spec import strategy as _strategy
+    from easydel.infra.sharding import replicated_named_sharding
+
+    monkeypatch.setenv("EASYDEL_MTP_PERSIST_KV", "1")
+    monkeypatch.delenv("EASYDEL_DISABLE_DRAFT_IN_VERIFY", raising=False)
+    model = make_tiny_model()
+    drafter = Qwen3_5MTPDrafter(model, num_draft_tokens=3, persist_kv=True)
+    runner = _make_runner(model, n_seqs=3, drafter=drafter)
+
+    def executables():
+        return {
+            (name, key): fn._cache_size()
+            for name, table in (("verify", drafter._jit_verify_draft), ("batched", drafter._jit_batched))
+            for key, fn in table.items()
+        }
+
+    # The verify-row and seed gathers, warmed on the placement of the model step's hidden output.
+    gathers = _strategy._hidden_row_programs(replicated_named_sharding(runner.mesh))
+    gather_placements = _strategy._hidden_row_programs.cache_info().currsize
+    warmed_gathers = [fn._cache_size() for fn in gathers]
+    assert all(size > 0 for size in warmed_gathers), f"the warm-up placed the hidden rows elsewhere: {warmed_gathers}"
+
+    warmed = executables()
+    assert warmed and set(warmed.values()) == {1}, warmed
+    toks = _serve(runner, _PROMPTS)
+    for rid, out in toks.items():
+        assert len(out) == 10, f"{rid} did not complete: {out}"
+    assert executables() == warmed, "serving compiled a warmed drafter program again"
+    assert not drafter._jit_mtp, "a first window compiled the per-request draft"
+    assert [fn._cache_size() for fn in gathers] == warmed_gathers, "serving compiled a hidden-row gather again"
+    assert _strategy._hidden_row_programs.cache_info().currsize == gather_placements, (
+        "serving placed the hidden rows differently from the warm-up"
     )
 
 

@@ -106,7 +106,14 @@ from .slot_contract import resolve_recurrent_slot_contract, uses_pooled_recurren
 from .slot_pool import RecurrentSlotPool
 from .spec.interface import NullSpeculation, SpeculativeStrategy
 from .spec.sampling import score_sampled_tokens, summarize_logprobs
-from .spec.strategy import DrafterSpeculation, snapshot_recurrent_state, window_hidden_row
+from .spec.strategy import (
+    DrafterSpeculation,
+    pool_seed_hidden,
+    snapshot_recurrent_state,
+    take_hidden_rows,
+    window_hidden_index,
+    window_hidden_row,
+)
 from .state_sync import SequenceStateSync
 from .states import CachedRequestState
 from .vlm_prefill import VlmPrefillHelper
@@ -1806,11 +1813,17 @@ class eSurgeRunner:
         hidden_dtype = getattr(self.model, "dtype", None) or jnp.float32
         for k in sorted(k_values):
             try:
+                # Every input placed as serving passes it (host seeds and bounds; the seed rows replicated over the
+                # model mesh, as ``pool_seed_hidden`` returns them): a differently placed input would compile the
+                # program again.
+                seed_hidden = jnp.zeros(
+                    (n, 1, hidden_size), dtype=hidden_dtype, device=replicated_named_sharding(self.mesh)
+                )
                 _ = self.drafter.draft_batched(
-                    seed_tokens=jnp.zeros((n,), dtype=jnp.int32),
-                    seed_hidden=jnp.zeros((n, 1, hidden_size), dtype=hidden_dtype),
-                    seed_positions=jnp.zeros((n,), dtype=jnp.int32),
-                    # Host arrays: an all-idle host call warms every drafter-cache window width.
+                    seed_tokens=np.zeros((n,), dtype=np.int32),
+                    seed_hidden=seed_hidden,
+                    seed_positions=np.zeros((n,), dtype=np.int32),
+                    # An all-idle call warms every drafter-cache window width.
                     committed_lens=np.zeros((n,), dtype=np.int32),
                     collected_mask=np.zeros((n,), dtype=bool),
                     num_draft_tokens=int(k),
@@ -1855,8 +1868,13 @@ class eSurgeRunner:
             for k in sorted(k_values):
                 rows = int(pnr) * (int(k) + 1)
                 try:
+                    # The verify rows placed as serving passes them (``take_hidden_rows`` replicates them over the
+                    # model mesh): a differently placed input would compile the program again.
+                    gathered_hidden = jnp.zeros(
+                        (rows, hidden_size), dtype=hidden_dtype, device=replicated_named_sharding(self.mesh)
+                    )
                     _ = self.drafter.verify_draft_batched(
-                        gathered_hidden=jnp.zeros((rows, hidden_size), dtype=hidden_dtype),
+                        gathered_hidden=gathered_hidden,
                         row_offsets=np.zeros((n,), dtype=np.int32),
                         draft_tokens=np.zeros((n, int(k)), dtype=np.int32),
                         draft_counts=np.zeros((n,), dtype=np.int32),
@@ -1870,6 +1888,55 @@ class eSurgeRunner:
                     logger.debug(f"Draft-in-verify precompiled for (reqs={pnr}, k={k}, pool={n})")
                 except Exception as e:
                     logger.debug(f"Draft-in-verify precompile skip (reqs={pnr}, k={k}): {e}")
+
+    def _precompile_spec_row_gathers(self) -> None:
+        """Warm the programs a speculative step runs on its hidden output, for every shape that output can take.
+
+        ``take_hidden_rows`` (the verify rows of a step) and ``pool_seed_hidden`` (the seeds of a pooled draft) compile
+        once per hidden output length: a token bucket at or below the executor's full-hidden limit (one row per
+        token), a request bucket (one row per request), or a verify stripe (``pool_seed_hidden`` over the gathered
+        verify rows). A request verifying alone, which the fused draft-in-verify program does not take, projects its
+        stripe through the runner's LM head and reads the greedy argmax back. Each program is warmed on zeros placed
+        as the model step places its hidden output, so serving compiles none of them. Failures are logged and
+        skipped; serving then compiles lazily.
+        """
+        if self.drafter is None or int(self.num_draft_tokens) <= 0:
+            return
+        k_values = {int(self.num_draft_tokens)}
+        if self.draft_schedule is not None:
+            k_values |= {int(k) for (_start, _end, k) in self.draft_schedule if int(k) > 0}
+        if bool(getattr(self.drafter, "needs_main_hidden", False)):
+            # DSpark: the step's hidden rows are wider than the model's hidden size (they also carry ``main_hidden``),
+            # so programs warmed on that size would never run.
+            return
+        n = max(1, int(self.max_num_reqs))
+        full_max = int(getattr(self.executor_manager, "full_hidden_state_max_tokens", 0) or 0)
+        request_buckets = sorted({int(b) for b in self.active_num_seq_buckets})
+        verify_rows = sorted({b * (k + 1) for b in request_buckets for k in k_values})
+        lengths = {int(b) for b in self.num_tokens_paddings if int(b) <= full_max}
+        lengths |= set(request_buckets) | set(verify_rows)
+        try:
+            hidden_size = int(self.model.config.get_text_config().hidden_size)
+            hidden_dtype = getattr(self.model, "dtype", None) or jnp.float32
+            replicated = replicated_named_sharding(self.mesh)
+        except Exception as e:
+            logger.debug(f"Speculative row-gather precompile skip: {e}")
+            return
+        for length in sorted(lengths):
+            try:
+                hidden = jnp.zeros((length, hidden_size), dtype=hidden_dtype, device=replicated)
+                pool_seed_hidden(hidden, np.zeros((n,), dtype=np.int32), np.zeros((n,), dtype=bool))
+                for rows in verify_rows:
+                    take_hidden_rows(hidden, np.zeros((rows,), dtype=np.int32))
+            except Exception as e:
+                logger.debug(f"Speculative row-gather precompile skip (rows={length}): {e}")
+        for rows in verify_rows:
+            try:
+                stripe = jnp.zeros((rows, hidden_size), dtype=hidden_dtype, device=replicated)
+                # The executor's projection, which the strategy's ``project_hidden_rows`` runs for these rows.
+                jax.block_until_ready(jnp.argmax(self.executor_manager.project_hidden_rows(stripe), axis=-1))
+            except Exception as e:
+                logger.debug(f"Speculative verify-projection precompile skip (rows={rows}): {e}")
 
     def compile(self, *, max_num_batched_tokens: int | None = None) -> None:
         """Compile the model for token/request bucket sizes.
@@ -1931,6 +1998,7 @@ class eSurgeRunner:
 
         self._precompile_draft_schedule_variants()
         self._precompile_draft_in_verify_variants()
+        self._precompile_spec_row_gathers()
         self._precompile_whole_block_drafter()
 
     def _precompile_whole_block_drafter(self) -> None:
@@ -3027,6 +3095,17 @@ class eSurgeRunner:
         # forwards then run as ONE jitted program instead of k separate per-token draft dispatches.
         _single_ok = not bool(getattr(self.spec, "rolls_back_cache", False)) and not self.spec_decode_recurrent_replay
         step_allows_batch = step_batch_candidate_count >= (1 if _single_ok else 2)
+        # A request the step leaves without drafts to verify (its first window after prefill, or a window that
+        # drafted nothing) drafts through the same pooled program, under the same gate counted over every
+        # batch-draftable request of the step, instead of a per-request prefix draft compiled per prompt length.
+        step_pool_candidate_count = 0
+        if self.drafter is not None:
+            step_pool_candidate_count = sum(
+                1
+                for _pool_rid in scheduler_output.num_scheduled_tokens
+                if self.spec.can_batch_draft(self.requests.get(_pool_rid))
+            )
+        first_window_pool_ok = step_pool_candidate_count >= (1 if _single_ok else 2)
         token_buckets_used: set[int] = set()
         req_buckets_used: set[int] = set()
         request_seq_lens: list[tuple[int, int, CachedRequestState, int]] = []
@@ -3699,9 +3778,11 @@ class eSurgeRunner:
             # consumed by the emission loop below, which then does only host
             # bookkeeping. Gated exactly like the batched drafter: only greedy,
             # spec-eligible, full-hidden-available rows, and only when >= 2 are
-            # verified together (a single request stays bit-identical to the
-            # per-request path). ``EASYDEL_DISABLE_BATCHED_EMIT=1`` forces the
-            # legacy per-request project/argmax (A/B + isolated parity proof).
+            # verified together, or a lone request when no replay follows its
+            # verify (``_single_ok``; under a replay a single request stays
+            # bit-identical to the per-request path).
+            # ``EASYDEL_DISABLE_BATCHED_EMIT=1`` forces the legacy per-request
+            # project/argmax (A/B + isolated parity proof).
             batched_verify_by_row: dict[int, _BatchedVerifyRow] = {}
             verify_meta_by_row: dict[int, typing.Any] = {}
             # Populated either by the fused draft-in-verify pre-pass (drafts
@@ -3754,10 +3835,13 @@ class eSurgeRunner:
                     _idxs = [*_meta.target_local_indices, int(_meta.bonus_local_index)]
                     _pending_bv.append((int(_rp), len(_flat_indices), len(_idxs), _meta))
                     _flat_indices.extend(int(_x) for _x in _idxs)
-                # Kept at >= 2: a lone request routed through the fused draft-in-verify program changed greedy
-                # output vs plain on the real GLM-5.3 checkpoint (in-program LM-head argmax != runner lm_head
-                # executable on near-ties) with no throughput gain over the pooled post-loop draft.
-                if len(_pending_bv) >= 2:
+                # A lone request takes this pre-pass too when no replay follows its verify (``_single_ok``): its rows
+                # then run the programs a multi-request step runs, instead of a per-request gather and an LM head
+                # compiled for its row count. The fused draft-in-verify program below stays at >= 2 requests: a
+                # lone request routed through it changed greedy output vs plain on the real GLM-5.3 checkpoint
+                # (in-program LM-head argmax != runner lm_head executable on near-ties) with no throughput gain
+                # over the pooled draft.
+                if len(_pending_bv) >= (1 if _single_ok else 2):
                     _total_rows = len(_flat_indices)
                     # Pad to a stable ``padded_num_reqs * (k+1)`` bucket so the
                     # on-demand LM-head executable count stays bounded (<= one
@@ -3777,7 +3861,7 @@ class eSurgeRunner:
                         _flat_indices.extend([_flat_indices[0]] * (_pad_target - _total_rows))
                     _idx_arr = np.asarray(_flat_indices, dtype=np.int32)
                     _project_start = time.time()
-                    _gathered_hidden = hidden_states_for_spec[_idx_arr]
+                    _gathered_hidden = take_hidden_rows(hidden_states_for_spec, _idx_arr)
                     total_spec_project_time += time.time() - _project_start
                     # Fold the greedy argmax, the acceptance compare, and the K
                     # recursive MTP draft forwards into ONE compiled program:
@@ -3796,6 +3880,7 @@ class eSurgeRunner:
                     fused_verify_results: dict | None = None
                     if (
                         step_allows_batch
+                        and len(_pending_bv) >= 2
                         and spec_token_ids_all is not None
                         and not self.spec_decode_recurrent_replay
                         and int(getattr(self.spec, "reject_backoff_steps", 0) or 0) <= 0
@@ -3912,7 +3997,7 @@ class eSurgeRunner:
                     _seed_pos = max(0, _known_len - 2)
                     _early_seeds.append((_rid2, int(_meta.req_idx), _corrected, _seed_pos, int(_off) + _acc))
                     early_draft_by_rid[_rid2] = (int(_meta.req_idx), _known_len)
-                if len(_early_seeds) >= 2:
+                if len(_early_seeds) >= (1 if _single_ok else 2):
                     early_draft_handle = self.spec.begin_batched_draft(
                         _early_seeds,
                         seed_hidden_matrix=_gathered_hidden,
@@ -3926,6 +4011,11 @@ class eSurgeRunner:
             # after the emission loop (before the commit replay), instead of one draft pass + host sync per request.
             whole_block_batch_ok = self.drafter is not None and self.spec.can_batch_whole_block_draft()
             pending_whole_block_drafts: list[tuple[str, int, int, int, CachedRequestState, int, int]] = []
+            # Requests of this window with no drafts to verify, drafted together after the loop: one
+            # ``(req_id, req_idx, seed_token, seed_position, seed row of the window's hidden)`` each, and per request
+            # the ``(req_idx, known_len, output slot)`` the read-back after the last window writes.
+            first_window_seeds: list[tuple[str, int, int, int, int]] = []
+            first_window_by_rid: dict[str, tuple[int, int, int]] = {}
             for row_pos, rid, req_state, req_idx, seq_len, is_valid in window_entries:
                 if not is_valid:
                     sampled_token_ids_all.append([])
@@ -4358,73 +4448,91 @@ class eSurgeRunner:
                             and seq_len is not None
                             and self.spec.is_spec_request(req_state)
                         ):
-                            seed_hidden = window_hidden_row(
-                                hidden_states_for_spec,
+                            known_len = int(seq_len) + 1
+                            token_offset_i = int(window_token_offsets[int(row_pos)])
+                            # Row of this window's hidden output at the request's last scheduled token: the seed.
+                            seed_row = window_hidden_index(
+                                hidden_np_len,
                                 row_pos=int(row_pos),
-                                token_offset=int(window_token_offsets[int(row_pos)]),
+                                token_offset=token_offset_i,
                                 token_index=max(0, scheduled_n - 1),
                                 total_window_tokens=int(total_scheduled),
                                 padded_reqs=int(padded_num_reqs),
                             )
-                            known_len = int(seq_len) + 1
-                            prefix_input_ids = None
-                            prefix_hidden_states = None
-                            prefix_position_ids = None
-                            token_offset_i = int(window_token_offsets[int(row_pos)])
+                            seed_hidden = None
                             if (
-                                scheduled_n > 1
-                                and bool(getattr(self.drafter, "supports_prefix_draft", False))
-                                and hidden_np_len >= token_offset_i + int(scheduled_n)
+                                not whole_block_batch_ok
+                                and first_window_pool_ok
+                                and hidden_np_len > 0
+                                and self.spec.can_batch_draft(req_state)
                             ):
-                                prefix_start = int(num_computed_tokens_window_cpu[int(row_pos)])
-                                row_tokens = np.asarray(token_ids_window_cpu[int(row_pos)])
-                                shifted = row_tokens[prefix_start + 1 : prefix_start + int(scheduled_n)]
-                                if int(shifted.shape[0]) == int(scheduled_n) - 1:
-                                    prefix_input_ids = jnp.asarray(
-                                        np.concatenate(
-                                            [shifted.astype(np.int32), np.asarray([tid], dtype=np.int32)],
-                                            axis=0,
-                                        )[None, :],
-                                        dtype=jnp.int32,
-                                    )
-                                    prefix_hidden_states = hidden_states_for_spec[
-                                        token_offset_i : token_offset_i + int(scheduled_n)
-                                    ][None, :, :]
-                                    prefix_position_ids = jnp.arange(
-                                        prefix_start,
-                                        prefix_start + int(scheduled_n),
-                                        dtype=jnp.int32,
-                                    )[None, :]
-                            if whole_block_batch_ok:
-                                # Whole-block drafters ignore the prefix inputs: draft with the window's other
-                                # requests after the loop; the flush fills the slot reserved by the append below
-                                # (``next_drafts`` stays ``[]`` here) and writes the drafts into the buffer.
-                                pending_whole_block_drafts.append(
-                                    (
-                                        str(rid),
-                                        int(req_idx),
-                                        int(tid),
-                                        max(0, int(known_len) - 2),
-                                        req_state,
-                                        int(known_len),
-                                        len(spec_token_ids_all),
-                                    )
+                                # Drafted after this loop with the window's other requests that have no drafts to
+                                # verify, in one pass of the pooled program the runner precompiles: the per-request
+                                # draft below runs programs compiled for each prompt length. The drafter row starts
+                                # at the seed (the target hidden carries the prompt).
+                                first_window_by_rid[str(rid)] = (int(req_idx), int(known_len), len(spec_token_ids_all))
+                                first_window_seeds.append(
+                                    (str(rid), int(req_idx), int(tid), max(0, int(known_len) - 2), int(seed_row))
                                 )
                             else:
-                                draft_timer_start = time.time()
-                                next_drafts = self.spec.draft_next(
-                                    req_id=rid,
-                                    seed_token=tid,
-                                    seed_position=max(0, int(known_len) - 2),
-                                    seed_hidden=seed_hidden,
-                                    req_state=req_state,
-                                    prefix_input_ids=prefix_input_ids,
-                                    prefix_hidden_states=prefix_hidden_states,
-                                    prefix_position_ids=prefix_position_ids,
-                                    # Stable KV-pool slot (see the sequential-greedy call above).
-                                    row_pos=int(req_idx),
-                                )
-                                total_spec_draft_time += time.time() - draft_timer_start
+                                seed_hidden = hidden_states_for_spec[seed_row]
+                                prefix_input_ids = None
+                                prefix_hidden_states = None
+                                prefix_position_ids = None
+                                if (
+                                    scheduled_n > 1
+                                    and bool(getattr(self.drafter, "supports_prefix_draft", False))
+                                    and hidden_np_len >= token_offset_i + int(scheduled_n)
+                                ):
+                                    prefix_start = int(num_computed_tokens_window_cpu[int(row_pos)])
+                                    row_tokens = np.asarray(token_ids_window_cpu[int(row_pos)])
+                                    shifted = row_tokens[prefix_start + 1 : prefix_start + int(scheduled_n)]
+                                    if int(shifted.shape[0]) == int(scheduled_n) - 1:
+                                        prefix_input_ids = jnp.asarray(
+                                            np.concatenate(
+                                                [shifted.astype(np.int32), np.asarray([tid], dtype=np.int32)],
+                                                axis=0,
+                                            )[None, :],
+                                            dtype=jnp.int32,
+                                        )
+                                        prefix_hidden_states = hidden_states_for_spec[
+                                            token_offset_i : token_offset_i + int(scheduled_n)
+                                        ][None, :, :]
+                                        prefix_position_ids = jnp.arange(
+                                            prefix_start,
+                                            prefix_start + int(scheduled_n),
+                                            dtype=jnp.int32,
+                                        )[None, :]
+                                if whole_block_batch_ok:
+                                    # Whole-block drafters ignore the prefix inputs: draft with the window's other
+                                    # requests after the loop; the flush fills the slot reserved by the append below
+                                    # (``next_drafts`` stays ``[]`` here) and writes the drafts into the buffer.
+                                    pending_whole_block_drafts.append(
+                                        (
+                                            str(rid),
+                                            int(req_idx),
+                                            int(tid),
+                                            max(0, int(known_len) - 2),
+                                            req_state,
+                                            int(known_len),
+                                            len(spec_token_ids_all),
+                                        )
+                                    )
+                                else:
+                                    draft_timer_start = time.time()
+                                    next_drafts = self.spec.draft_next(
+                                        req_id=rid,
+                                        seed_token=tid,
+                                        seed_position=max(0, int(known_len) - 2),
+                                        seed_hidden=seed_hidden,
+                                        req_state=req_state,
+                                        prefix_input_ids=prefix_input_ids,
+                                        prefix_hidden_states=prefix_hidden_states,
+                                        prefix_position_ids=prefix_position_ids,
+                                        # Stable KV-pool slot (see the sequential-greedy call above).
+                                        row_pos=int(req_idx),
+                                    )
+                                    total_spec_draft_time += time.time() - draft_timer_start
                             self.sequence_buffer.num_tokens_no_spec[req_idx] = min(known_len, self.max_model_len)
                             self.sequence_buffer.num_tokens[req_idx] = min(known_len, self.max_model_len)
                             if next_drafts:
@@ -4435,7 +4543,7 @@ class eSurgeRunner:
                                     dtype=np.int32,
                                 )
                                 self.sequence_buffer.num_tokens[req_idx] = draft_end
-                            if hidden_states_by_req is not None:
+                            if hidden_states_by_req is not None and seed_hidden is not None:
                                 hidden_states_by_req[rid] = seed_hidden
                             if accepted_spec_tokens_by_req is not None:
                                 accepted_spec_tokens_by_req.setdefault(rid, 0)
@@ -4448,6 +4556,18 @@ class eSurgeRunner:
                     and row_pos < logits_np.shape[0]
                 ):
                     token_logprobs[rid] = float(logits_np[row_pos])
+
+            if first_window_seeds and spec_token_ids_all is not None:
+                # One pass of the pooled program for this window's requests that had no drafts to verify; their
+                # drafts are read back with the step's other pooled drafts after the last window.
+                draft_timer_start = time.time()
+                early_draft_batches.append(
+                    (
+                        self.spec.begin_batched_draft(first_window_seeds, seed_hidden_matrix=hidden_states_for_spec),
+                        first_window_by_rid,
+                    )
+                )
+                total_spec_draft_time += time.time() - draft_timer_start
 
             if pending_whole_block_drafts and spec_token_ids_all is not None:
                 draft_timer_start = time.time()

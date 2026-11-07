@@ -366,6 +366,89 @@ def _host_vector(x: typing.Any, dtype: typing.Any) -> np.ndarray | None:
     return np.asarray(x, dtype=dtype).reshape(-1)
 
 
+def _device_column(x: typing.Any) -> jax.Array:
+    """``x`` as an ``(N, 1)`` int32 device array.
+
+    A host array is cast and shaped on the host and transferred with ``jax.device_put``: ``jnp.asarray`` of an ndarray
+    without a dtype, and a cast or reshape of a device array, run a device program, and on a multi-host mesh every
+    launch waits for every host. A device array is cast and reshaped.
+    """
+    if isinstance(x, jax.Array):
+        return x.astype(jnp.int32).reshape(-1, 1)
+    return jax.device_put(np.asarray(x, dtype=np.int32).reshape(-1, 1))
+
+
+def _device_vector(x: typing.Any, dtype: typing.Any) -> jax.Array:
+    """``x`` as a flat device array of ``dtype`` (a host array is converted as in :func:`_device_column`)."""
+    if isinstance(x, jax.Array):
+        return x.astype(dtype).reshape(-1)
+    return jax.device_put(np.asarray(x, dtype=dtype).reshape(-1))
+
+
+def _named_sharding(leaf: typing.Any) -> jax.sharding.NamedSharding | None:
+    """The ``NamedSharding`` a device array ``leaf`` is placed on, or ``None``."""
+    sharding = getattr(leaf, "sharding", None) if isinstance(leaf, jax.Array) else None
+    return sharding if isinstance(sharding, jax.sharding.NamedSharding) else None
+
+
+def _place_cache(cache: TransformerCache | None) -> TransformerCache | None:
+    """Commit every array leaf of a drafter cache to a sharding over the cache's mesh.
+
+    A leaf already on a ``NamedSharding`` keeps it; any other array leaf is replicated over the mesh of the first leaf
+    that has one. The drafter programs then hand the cache back placed exactly as it went in
+    (:func:`_cache_out_shardings`), so every program sees the placement it was compiled for.
+
+    Args:
+        cache: A newly allocated drafter cache, or ``None``.
+
+    Returns:
+        The placed cache; ``cache`` itself when no leaf is on a mesh.
+    """
+    if cache is None:
+        return None
+    mesh = next((s.mesh for s in map(_named_sharding, jax.tree.leaves(cache)) if s is not None), None)
+    if mesh is None:
+        return cache
+    replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+    def place(leaf: typing.Any) -> typing.Any:
+        if not isinstance(leaf, jax.Array) or _named_sharding(leaf) is not None or not leaf.is_fully_addressable:
+            return leaf
+        # Each process places its own copy: ``device_put`` of a process-local array onto a sharding that spans
+        # processes would compare the value across hosts.
+        host = np.asarray(jax.device_get(leaf))
+        return jax.make_array_from_callback(host.shape, replicated, lambda index: host[index])
+
+    return jax.tree.map(place, cache)
+
+
+def _cache_out_shardings(cache: TransformerCache | None, num_outputs: int) -> tuple | None:
+    """``out_shardings`` for a drafter program that returns ``num_outputs`` small arrays and then the cache.
+
+    Without them the compiler picks the placement of the returned cache. When that placement is written differently
+    from the cache's input placement (an equivalent layout under another spec counts), the next drafter program,
+    compiled for the input placement, compiles again in serving. Every cache leaf therefore keeps its input
+    placement, and the small outputs (drafts, argmaxes, counts) are replicated over the cache's mesh, so every host
+    reads them locally.
+
+    Args:
+        cache: The drafter cache the program is built for, or ``None``.
+        num_outputs: Arrays the program returns before the cache.
+
+    Returns:
+        The ``out_shardings`` tuple, or ``None`` (the compiler chooses) when there is no cache or an array leaf of it
+        is not on a ``NamedSharding``.
+    """
+    if cache is None:
+        return None
+    leaves = jax.tree.leaves(cache)
+    shardings = [_named_sharding(leaf) for leaf in leaves]
+    if not leaves or any(sharding is None for sharding in shardings):
+        return None
+    replicated = jax.sharding.NamedSharding(shardings[0].mesh, jax.sharding.PartitionSpec())
+    return (*([replicated] * int(num_outputs)), jax.tree.map(_named_sharding, cache))
+
+
 def _select_draft_widths(capacity: int | None, reach: typing.Any) -> tuple[int | None, ...]:
     """Cache widths one batched draft call runs on (``None`` = the whole capacity).
 
@@ -987,11 +1070,13 @@ class Qwen3_5MTPDrafter:
                 value_dim=int(spec["value_dim"]),
                 auxiliary_dim=spec.get("auxiliary_dim"),
             )
-            return TransformerCache.init_cache(
-                mesh=mesh,
-                config=cache_config,
-                runtime_sharding_resolver=getattr(text_cfg, "runtime_sharding_resolver", None),
-                dtype=getattr(self.model, "dtype", jnp.bfloat16),
+            return _place_cache(
+                TransformerCache.init_cache(
+                    mesh=mesh,
+                    config=cache_config,
+                    runtime_sharding_resolver=getattr(text_cfg, "runtime_sharding_resolver", None),
+                    dtype=getattr(self.model, "dtype", jnp.bfloat16),
+                )
             )
         max_length = self._mtp_cache_max_length
         if max_length is None:
@@ -1025,11 +1110,13 @@ class Qwen3_5MTPDrafter:
             value_dim=head_dim,
             auxiliary_dim=auxiliary_dim,
         )
-        return TransformerCache.init_cache(
-            mesh=mesh,
-            config=cache_config,
-            runtime_sharding_resolver=getattr(text_cfg, "runtime_sharding_resolver", None),
-            dtype=getattr(self.model, "dtype", jnp.bfloat16),
+        return _place_cache(
+            TransformerCache.init_cache(
+                mesh=mesh,
+                config=cache_config,
+                runtime_sharding_resolver=getattr(text_cfg, "runtime_sharding_resolver", None),
+                dtype=getattr(self.model, "dtype", jnp.bfloat16),
+            )
         )
 
     def _ensure_mtp_cache(self, batch_size: int) -> TransformerCache | None:
@@ -1663,8 +1750,11 @@ class Qwen3_5MTPDrafter:
             return drafts, cache
 
         # Donate the pool cache (arg 7): its leading slots are updated in place instead of the whole pool being
-        # copied on every call (as ``_get_verify_draft_fn`` does).
-        fn = jax.jit(_run, donate_argnums=(7,))
+        # copied on every call (as ``_get_verify_draft_fn`` does). The cache comes back placed as it went in, so the
+        # drafter program called next runs the placement it was compiled for (``_cache_out_shardings``).
+        out_shardings = _cache_out_shardings(mtp_cache, 1)
+        jit_kwargs = {} if out_shardings is None else {"out_shardings": out_shardings}
+        fn = jax.jit(_run, donate_argnums=(7,), **jit_kwargs)
         self._jit_batched[key] = fn
         return fn
 
@@ -1702,8 +1792,8 @@ class Qwen3_5MTPDrafter:
             ``(N, k)`` device array of drafted token ids. Row ``r`` is valid only
             when ``collected_mask[r]`` is ``True``.
         """
-        ids0 = jnp.asarray(seed_tokens, dtype=jnp.int32).reshape(-1, 1)
-        pos0 = jnp.asarray(seed_positions, dtype=jnp.int32).reshape(-1, 1)
+        ids0 = _device_column(seed_tokens)
+        pos0 = _device_column(seed_positions)
         hidden0 = jnp.asarray(seed_hidden)
         if hidden0.ndim == 2:
             hidden0 = hidden0[:, None, :]
@@ -1717,8 +1807,8 @@ class Qwen3_5MTPDrafter:
         collected = _host_vector(collected_mask, bool)
         committed_host = _host_vector(committed_lens, np.int64)
         reach = None if collected is None or committed_host is None else committed_host[collected] + k
-        committed = jnp.asarray(committed_lens, dtype=jnp.int32).reshape(-1)
-        mask = jnp.asarray(collected_mask).astype(bool).reshape(-1)
+        committed = _device_vector(committed_lens, np.int32)
+        mask = _device_vector(collected_mask, np.bool_)
         drafts = None
         with set_inference_mode():
             for width in _select_draft_widths(_cache_capacity(mtp_cache), reach):
@@ -1927,7 +2017,12 @@ class Qwen3_5MTPDrafter:
 
         # Donate the MTP pool cache (arg 12): the program aliases the pool
         # buffers input->output instead of copying the whole pool each step.
-        fn = jax.jit(_run, donate_argnums=(12,))
+        # The cache comes back placed as it went in, so the drafter program
+        # called next runs the placement it was compiled for
+        # (``_cache_out_shardings``).
+        out_shardings = _cache_out_shardings(mtp_cache, 4)
+        jit_kwargs = {} if out_shardings is None else {"out_shardings": out_shardings}
+        fn = jax.jit(_run, donate_argnums=(12,), **jit_kwargs)
         self._jit_verify_draft[key] = fn
         return fn
 
@@ -2013,8 +2108,8 @@ class Qwen3_5MTPDrafter:
             jnp.asarray(draft_counts, dtype=jnp.int32).reshape(-1),
             jnp.asarray(seed_pos_base, dtype=jnp.int32).reshape(-1),
             jnp.asarray(committed_base, dtype=jnp.int32).reshape(-1),
-            jnp.asarray(fresh_mask).astype(bool).reshape(-1),
-            jnp.asarray(collected_mask).astype(bool).reshape(-1),
+            _device_vector(fresh_mask, np.bool_),
+            _device_vector(collected_mask, np.bool_),
         )
         outputs: list = []
         with set_inference_mode():
