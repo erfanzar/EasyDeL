@@ -689,6 +689,8 @@ def test_grpo_tool_call_loop_appends_tool_result_and_regenerates():
     tool = _EchoTool()
     captured = {}
     prompts_seen = []
+    followup_ids = []
+    followup_masks = []
     trainer = object.__new__(GRPOTrainer)
     trainer.arguments = SimpleNamespace(
         max_length=64,
@@ -761,6 +763,8 @@ def test_grpo_tool_call_loop_appends_tool_result_and_regenerates():
                 raw_text=["<tool_call>{}</tool_call>"],
             )
         prompts_seen.extend(kwargs["prompts"])
+        followup_ids.append(np.asarray(kwargs["input_ids"]).tolist())
+        followup_masks.append(np.asarray(kwargs["attention_mask"]).tolist())
         return GenerationResults(
             generation_results=["final"],
             prompt_ids=jnp.asarray([[1, 2, 11, 70]], dtype=jnp.int32),
@@ -789,6 +793,9 @@ def test_grpo_tool_call_loop_appends_tool_result_and_regenerates():
     )
 
     assert prompts_seen and "echo:ok" in prompts_seen[0]
+    # The follow-up request is the exact prompt row, the sampled completion and the observation tokens.
+    assert followup_ids == [[[1, 2, 11, 70]]]
+    assert followup_masks == [[[1, 1, 1, 1]]]
     assert captured["raw_text"] == [f"<tool_call>{{}}</tool_call>\n[{tool.name}]: echo:ok\nfinal"]
     assert captured["completions"] == [f"need tool\n[{tool.name}]: echo:ok\nfinal"]
     assert captured["tool_calls"] == [None]

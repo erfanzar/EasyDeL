@@ -3078,6 +3078,7 @@ class eSurge:
         request_id: str | list[str] | None = None,
         use_tqdm: bool = True,
         tool_parser_request: Any | None = None,
+        prompt_token_ids: list[list[int]] | None = None,
     ) -> list[RequestOutput]:
         """Generate completions for one or more prompts (blocking).
 
@@ -3093,6 +3094,11 @@ class eSurge:
                 Can be a single string (for single prompt) or list of strings.
             use_tqdm: Show progress bar for batch generation. Useful for tracking
                 progress with multiple prompts.
+            prompt_token_ids: Optional token ids, one list per prompt. When given,
+                tokenization is skipped and each request is admitted with exactly these
+                ids (truncated only when they exceed the context budget); each prompt
+                string stays the request's text for the output parsers and
+                ``RequestOutput.prompt``.
 
         Returns:
             List of RequestOutput objects containing:
@@ -3103,7 +3109,8 @@ class eSurge:
 
         Raises:
             RuntimeError: If background scheduler is not running. Call initiate() first.
-            ValueError: If prompts and request_ids have mismatched lengths.
+            ValueError: If prompts and request_ids, or prompts and prompt_token_ids,
+                have mismatched lengths.
 
         Example:
             >>> # Single prompt generation
@@ -3135,25 +3142,40 @@ class eSurge:
             if len(request_ids) != len(prompts):
                 raise ValueError("Length of request_id list must match number of prompts.")
 
+        if prompt_token_ids is not None:
+            prompt_token_ids = [[int(token) for token in ids] for ids in prompt_token_ids]
+            if len(prompt_token_ids) != len(prompts):
+                raise ValueError("prompt_token_ids must hold one list of token ids per prompt.")
+
         registry = getattr(self, "_registry", None)
         if len(set(request_ids)) != len(request_ids) or (
             registry is not None and any(registry.output_is_retained(rid) for rid in request_ids)
         ):
             raise ValueError("Request ids must be unique and cannot have an active consumer")
         try:
-            return self._generate_batch(prompts, sampling_params, request_ids, use_tqdm, tool_parser_request)
+            return self._generate_batch(
+                prompts, sampling_params, request_ids, use_tqdm, tool_parser_request, prompt_token_ids
+            )
         finally:
             for rid in request_ids:
                 self._release_output_consumer(rid)
 
-    def _generate_batch(self, prompts, sampling_params, request_ids, use_tqdm, tool_parser_request):
-        """Admit and collect a batch while the public caller owns its output leases."""
+    def _generate_batch(
+        self, prompts, sampling_params, request_ids, use_tqdm, tool_parser_request, prompt_token_ids=None
+    ):
+        """Admit and collect a batch while the public caller owns its output leases.
+
+        ``prompt_token_ids`` (one id list per prompt), when given, replaces tokenization of the prompts.
+        """
         base_sampling_params = sampling_params or SamplingParams(max_tokens=128)
 
         defer_batch_enqueue = len(prompts) > 1
         deferred_scheduler_requests = []
-        for prompt, req_id in zip(prompts, request_ids, strict=True):
-            prompt_tokens = self._tokenize_prompt(req_id, prompt)
+        for index, (prompt, req_id) in enumerate(zip(prompts, request_ids, strict=True)):
+            if prompt_token_ids is None:
+                prompt_tokens = self._tokenize_prompt(req_id, prompt)
+            else:
+                prompt_tokens = prompt_token_ids[index]
             effective_params = self._prepare_sampling_params_for_request(
                 base_sampling_params,
                 request_id=req_id,
