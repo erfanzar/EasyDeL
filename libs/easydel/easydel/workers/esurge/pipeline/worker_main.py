@@ -350,10 +350,14 @@ def _detokenizer_worker(
     Supported commands:
 
     * ``decode`` — feed new tokens into the request's
-      :class:`FastIncrementalDecoder`, returning ``accumulated_text``,
-      ``delta_text``, ``last_decoded_index`` and ``finished``. On
+      :class:`FastIncrementalDecoder`, returning ``delta_text``,
+      ``last_decoded_index`` and ``finished``. The reply carries
+      ``accumulated_text`` only when the message's ``text_offset`` (the
+      characters the client holds) differs from what was emitted, so a
+      streaming step costs the new text, not the whole output. On
       ``finished=True`` the full string is re-decoded once for
-      consistency and the per-request state is dropped.
+      consistency, returned as ``accumulated_text``, and the per-request
+      state is dropped.
     * ``reset`` — drop the state for a single ``request_id``.
     * ``drain`` — clear every state entry.
     * ``shutdown`` — exit the loop after replying ``ok``.
@@ -402,7 +406,8 @@ def _detokenizer_worker(
                     rid,
                     {
                         "last_index": 0,
-                        "previous_text": "",
+                        "chunks": [],
+                        "num_chars": 0,
                         "buffered": [],
                         "prompt_context": None,
                         "tokens": [],
@@ -443,7 +448,10 @@ def _detokenizer_worker(
                     if pc:
                         state["prompt_context"] = pc
 
-                previously_emitted = state["previous_text"]
+                # The client sends how many characters of this request's text it holds. When that matches what
+                # was emitted, only the new delta goes back; otherwise the reply carries the whole text once.
+                client_chars = message.get("text_offset")
+                emitted_chars = state["num_chars"]
                 last_idx = min(state["last_index"], len(generated_tokens))
                 new_tokens = generated_tokens[last_idx:]
                 detokstart = time.time()
@@ -463,16 +471,15 @@ def _detokenizer_worker(
                         context_tokens = []
                     delta, new_buffered, _ = decoder.decode(
                         new_tokens,
-                        state["previous_text"],
+                        "",
                         buffered,
                         skip_special_tokens=skip_special,
                         spaces_between_special_tokens=spaces_between_special,
                         context_tokens=context_tokens,
                     )
                     state["buffered"] = new_buffered
-                    accumulated = state["previous_text"] + delta
-                    state["previous_text"] = accumulated
                     state["last_index"] = len(generated_tokens)
+                    accumulated = None
 
                     if finished:
                         try:
@@ -484,22 +491,24 @@ def _detokenizer_worker(
                             )
                         except TypeError:
                             full_decoded = tokenizer.decode(generated_tokens, skip_special_tokens=skip_special)
-                        delta = _compute_suffix_delta(full_decoded, previously_emitted)
+                        delta = _compute_suffix_delta(full_decoded, "".join(state["chunks"]))
                         accumulated = full_decoded
                         states.pop(rid, None)
-                    result = {
-                        "accumulated_text": accumulated,
-                        "delta_text": delta,
-                        "last_decoded_index": state["last_index"],
-                        "finished": finished,
-                    }
+                    elif delta:
+                        state["chunks"].append(delta)
+                        state["num_chars"] += len(delta)
                 else:
-                    result = {
-                        "accumulated_text": state["previous_text"],
-                        "delta_text": "",
-                        "last_decoded_index": state["last_index"],
-                        "finished": finished,
-                    }
+                    delta = ""
+                    accumulated = None
+                result = {
+                    "delta_text": delta,
+                    "last_decoded_index": state["last_index"],
+                    "finished": finished,
+                }
+                if accumulated is not None:
+                    result["accumulated_text"] = accumulated
+                elif client_chars != emitted_chars:
+                    result["accumulated_text"] = "".join(state["chunks"])
                 detoktook = time.time() - detokstart
                 result["detoktook"] = detoktook
                 evict()

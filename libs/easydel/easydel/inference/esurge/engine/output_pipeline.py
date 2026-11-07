@@ -31,6 +31,7 @@ matches are forwarded to the scheduler through the injected
 
 from __future__ import annotations
 
+import itertools
 import queue
 import threading
 import time
@@ -52,20 +53,22 @@ if typing.TYPE_CHECKING:
 _STOP_SENTINEL = None
 
 
-class _TokenPrefixView(Sequence[int]):
-    """Fixed-length view over an append-only token list.
+class _PrefixView(Sequence):
+    """Fixed-length view over an append-only list.
 
-    Streaming parsers need the previous token count to compute the current
-    delta. Keeping a prefix view avoids copying the full token history every
-    token while still behaving like the previous list for ``len()``,
-    iteration, indexing, and membership checks.
+    Streaming parsers need the previous token count, and every streamed
+    snapshot needs the token ids and log probabilities emitted so far. A
+    prefix view of the growing list gives each of them a stable value without
+    copying the whole history on every step, while behaving like the list it
+    stands for under ``len()``, iteration, indexing, slicing, membership and
+    equality. Finished outputs get a real list instead.
     """
 
-    __slots__ = ("_length", "_tokens")
+    __slots__ = ("_items", "_length")
 
-    def __init__(self, tokens: list[int], length: int):
-        """Bind this view to the live ``tokens`` list at the given prefix ``length``."""
-        self._tokens = tokens
+    def __init__(self, items: list, length: int):
+        """Bind this view to the live ``items`` list at the given prefix ``length``."""
+        self._items = items
         self._length = int(length)
 
     def __len__(self) -> int:
@@ -82,19 +85,47 @@ class _TokenPrefixView(Sequence[int]):
         """
         if isinstance(index, slice):
             start, stop, step = index.indices(self._length)
-            return [self._tokens[idx] for idx in range(start, stop, step)]
+            if step == 1:
+                return self._items[start:stop]
+            return [self._items[idx] for idx in range(start, stop, step)]
         if index < 0:
             index += self._length
         if index < 0 or index >= self._length:
             raise IndexError(index)
-        return self._tokens[index]
+        return self._items[index]
+
+    def __iter__(self):
+        """Iterate over the prefix window without copying it."""
+        return itertools.islice(self._items, self._length)
 
     def __contains__(self, value: object) -> bool:
         """Return whether ``value`` appears in the prefix window."""
-        for idx in range(self._length):
-            if self._tokens[idx] == value:
-                return True
-        return False
+        try:
+            self._items.index(value, 0, self._length)
+        except ValueError:
+            return False
+        return True
+
+    def __eq__(self, other: object) -> bool:
+        """Compare element-wise with any sequence, like the list it stands for."""
+        if not isinstance(other, list | _PrefixView):
+            return NotImplemented
+        return len(other) == self._length and all(a == b for a, b in zip(self, other, strict=False))
+
+    __hash__ = None
+
+    def __repr__(self) -> str:
+        """Render like the list prefix it views."""
+        return repr(self._items[: self._length])
+
+    @property
+    def items(self) -> list:
+        """The live backing list."""
+        return self._items
+
+    def covers_items(self) -> bool:
+        """Whether this view spans the whole backing list, so the list may grow in place."""
+        return self._length == len(self._items)
 
 
 class OutputPipeline:
@@ -385,9 +416,25 @@ class OutputPipeline:
             stop_sequences = [str(s) for s in (getattr(sampling_params, "stop", None) or []) if s]
             include_stop = bool(getattr(sampling_params, "include_stop_str_in_output", False))
             if stop_sequences:
-                matched = self._find_first_stop_string(accumulated_text, stop_sequences)
+                # Text already scanned without a match cannot hold one, so a streaming step searches only the
+                # new text plus the longest stop's length - 1 characters before it. The final step scans it all.
+                # The window is used only while the scanned text still ends the same way (append-only growth).
+                scan_from = 0
+                scanned = rd.stop_scan_chars
+                overlap = max(len(stop) for stop in stop_sequences) - 1
+                if (
+                    not finished
+                    and 0 < scanned <= len(accumulated_text)
+                    and accumulated_text[max(0, scanned - overlap) : scanned] == rd.stop_scan_tail
+                ):
+                    scan_from = max(0, scanned - overlap)
+                matched = self._find_first_stop_string(accumulated_text[scan_from:], stop_sequences)
+                if matched is None:
+                    rd.stop_scan_chars = len(accumulated_text)
+                    rd.stop_scan_tail = accumulated_text[max(0, len(accumulated_text) - overlap) :]
                 if matched is not None:
                     stop_index, stop_reason = matched
+                    stop_index += scan_from
                     cutoff = stop_index + len(stop_reason) if include_stop else stop_index
                     visible_text = accumulated_text[:cutoff]
                     stop_triggered = True
@@ -587,7 +634,7 @@ class OutputPipeline:
             result = dp.process_delta(accumulated_text, delta_text, token_ids, prev_text, prev_token_ids)
 
         rd.parser_previous_text = accumulated_text
-        rd.parser_previous_token_ids = _TokenPrefixView(token_ids, len(token_ids))
+        rd.parser_previous_token_ids = _PrefixView(token_ids, len(token_ids))
 
         return result.to_dict()
 
@@ -674,6 +721,7 @@ class OutputPipeline:
             return
 
         comp = ro.outputs[sample_index]
+        self._materialize_completion(rd, comp)
         if comp.finish_reason is None:
             logger.warning(
                 "Finishing request %s from scheduler finished_requests without a terminal EngineCoreOutput; "
@@ -811,7 +859,9 @@ class OutputPipeline:
         rollout consumers look up each sampled id in the corresponding map.
         A backend may omit probabilities altogether, but partially populated
         sequences or malformed rows are rejected rather than silently shifted.
-        Fresh lists preserve previously yielded streaming snapshots.
+        The maps are appended in place to the completion's backing list and
+        exposed as a new prefix view, so previously yielded streaming
+        snapshots keep their length without copying the whole history.
 
         Args:
             comp: Completion receiving the token maps and sampled logprob sum.
@@ -848,8 +898,21 @@ class OutputPipeline:
                 raise ValueError(f"Engine log probabilities omit sampled token {token}.")
             maps.append(probabilities)
             sampled_sum += probabilities[token]
-        comp.logprobs = [*(comp.logprobs or []), *maps]
+        existing = comp.logprobs
+        if isinstance(existing, _PrefixView) and existing.covers_items():
+            backing = existing.items
+        else:
+            backing = list(existing or [])
+        backing.extend(maps)
+        comp.logprobs = _PrefixView(backing, len(backing))
         comp.cumulative_logprob = (comp.cumulative_logprob or 0.0) + sampled_sum
+
+    @staticmethod
+    def _materialize_completion(rd, comp) -> None:
+        """Give a finishing completion real lists, built once from the streamed prefix views."""
+        comp.token_ids = list(rd.generated_tokens)
+        if isinstance(comp.logprobs, _PrefixView):
+            comp.logprobs = list(comp.logprobs)
 
     def _append_decodable_tokens(self, rd, new_tokens: list[int]) -> list[int]:
         """Append newly generated tokens to the per-request decode stream.
@@ -1091,8 +1154,8 @@ class OutputPipeline:
         if stop_hit and stop_reason:
             stop_string_finishes[request_id] = stop_reason
 
+        self._materialize_completion(rd, comp)
         if parsed is not None:
-            comp.token_ids = list(rd.generated_tokens)
             if parsed["tool_calls"]:
                 comp.finish_reason = "tool_calls"
             text_changed, structured_changed = self._update_outputs(
@@ -1191,7 +1254,7 @@ class OutputPipeline:
                         rd.generated_tokens.extend(new_tokens)
                         # Token/probability alignment is independent of decoding
                         # intervals, EOS-only updates and text stop trimming.
-                        comp.token_ids = list(rd.generated_tokens)
+                        comp.token_ids = _PrefixView(rd.generated_tokens, len(rd.generated_tokens))
                         num_generated = len(rd.generated_tokens)
 
                         if rd.first_token_time is None and num_generated > 0:
