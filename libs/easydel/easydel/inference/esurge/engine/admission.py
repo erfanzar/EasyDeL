@@ -798,8 +798,8 @@ class RequestAdmission:
         # Use the first EOS token as the primary one for backwards compatibility
         primary_eos_token_id = eos_token_ids[0] if eos_token_ids else self._primary_eos_token_id
 
-        # Add all EOS tokens to sampling_params.stop_token_ids if not already present
-        if eos_token_ids:
+        # Every EOS id stops the request unless it asked to ignore EOS; stop ids the caller passed always stop.
+        if eos_token_ids and not sampling_params.ignore_eos:
             current_stop_ids = set(sampling_params.stop_token_ids or [])
             all_stop_ids = getattr(sampling_params, "_all_stop_token_ids", None)
             if all_stop_ids is None:

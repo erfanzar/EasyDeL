@@ -20,9 +20,14 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from easydel.inference.esurge.config import eSurgeContextConfig
 from easydel.inference.esurge.core.interface import CacheGroupSpec, FullAttentionSpec
+from easydel.inference.esurge.engine.admission import RequestAdmission
 from easydel.inference.esurge.engine.core_driver import FINISH_ABORT, EngineCoreDriver
+from easydel.inference.esurge.engine.registry import RequestRegistry
+from easydel.inference.esurge.engine_types import FinishReason
 from easydel.inference.esurge.multimodal.types import MultiModalFeature, PlaceholderRange
+from easydel.inference.esurge.outputs import ModelRunnerOutput
 from easydel.inference.esurge.request import AdmissionRecord, EngineRequest
 from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
@@ -176,6 +181,69 @@ def test_duplicate_live_id_is_rejected():
         core.add_requests([_record("dup")])
         with pytest.raises(ValueError, match="already scheduled"):
             core.add_requests([_record("dup")])
+    finally:
+        core.shutdown()
+
+
+_EOS_IDS = (154820, 154827, 154829)
+
+
+def _admission_with_three_eos_ids() -> RequestAdmission:
+    return RequestAdmission(
+        registry=RequestRegistry(),
+        scheduler_submit=lambda requests: None,
+        tokenizer_client=None,
+        tokenizer=None,
+        context_config=eSurgeContextConfig.coerce_config(None),
+        reserve_tokens=0,
+        max_model_len=64,
+        tool_parser_class=None,
+        reasoning_parser_class=None,
+        sampling_params_callback=lambda: None,
+        generation_config_dict={"eos_token_id": list(_EOS_IDS)},
+        primary_eos_token_id=_EOS_IDS[0],
+        eos_token_ids=list(_EOS_IDS),
+        extra_stops=[],
+        ignore_stop_strings_in_reasoning=False,
+        on_activity=lambda: None,
+        info=lambda *args, **kwargs: None,
+    )
+
+
+@pytest.mark.parametrize("ignore_eos", [False, True])
+def test_every_eos_id_stops_unless_ignore_eos_and_caller_stop_ids_always_stop(ignore_eos):
+    admission = _admission_with_three_eos_ids()
+    # One request samples each EOS id; the last samples a stop id the caller passed.
+    sampled = {f"eos{i}": token for i, token in enumerate(_EOS_IDS)} | {"caller-stop": 777}
+    records = []
+    for rid in sampled:
+        params = admission.prepare_sampling_params_for_request(
+            SamplingParams(max_tokens=8, ignore_eos=ignore_eos, stop_token_ids=[777]), request_id=rid, prompt="p"
+        )
+        records += admission.add_request(rid, "p", params, prompt_token_ids=[1, 2, 3, 4], defer_scheduler_enqueue=True)
+    core = _core(dp=1)
+    try:
+        core.add_requests(records)
+        step = core.schedule()
+        assert step.num_scheduled_tokens == dict.fromkeys(sampled, 4)
+        rids = list(sampled)
+        outputs = core.commit(
+            step,
+            ModelRunnerOutput(
+                req_ids=rids,
+                req_id_to_index={rid: i for i, rid in enumerate(rids)},
+                sampled_token_ids=[[sampled[rid]] for rid in rids],
+                spec_token_ids=None,
+                logprobs=None,
+                prompt_logprobs_dict={},
+            ),
+        )
+        finish = {out.request_id: out.finish_reason for out in outputs[0].outputs}
+        for i in range(len(_EOS_IDS)):
+            assert finish[f"eos{i}"] == (None if ignore_eos else FinishReason.STOP)
+            assert core.is_live(f"eos{i}") is ignore_eos
+        assert finish["caller-stop"] == FinishReason.STOP
+        assert not core.is_live("caller-stop")
     finally:
         core.shutdown()
 
