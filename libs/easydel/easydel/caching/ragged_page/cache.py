@@ -522,11 +522,15 @@ def per_device_hbm_budget_bytes(
     mode: str = "free",
     safety_margin: int = 256 << 20,
     mesh: tp.Any = None,
+    largest_allocation_share: float = 1.0,
 ) -> int:
     """Calculate available HBM budget per device for cache allocation.
 
     Queries device memory statistics and computes usable memory based
-    on utilization target and safety margin.
+    on utilization target and safety margin. The budget is the free memory, not one free block: a pool made of
+    several arrays only needs each array to fit in a free block. In ``"free"`` mode, when the largest free block
+    is substantially smaller than total free memory, the largest array (holding ``largest_allocation_share`` of
+    the pool) is checked against it; nearly unfragmented memory keeps the old single-block pool bound.
 
     Args:
         util: Target utilization fraction (0.0 to 1.0). Default: 0.9.
@@ -538,13 +542,21 @@ def per_device_hbm_budget_bytes(
             when its devices cannot be read); a mesh of this process's own devices needs no agreement. ``None``
             keeps this process's own budget without any agreement, so a caller that runs on only some processes
             never waits for the others.
+        largest_allocation_share: Fraction of the pool held by its largest single array, in ``(0, 1]``: ``1 /
+            num_layers`` for one equal array per layer, ``1.0`` for a pool allocated as one array.
 
     Returns:
         int: Available bytes for cache allocation per device: the minimum over this process's devices and, when
             ``mesh`` spans several processes, over those processes, so all of them size identical cache pools
             (see :func:`easydel.caching.budget.min_across_processes`). Returns 4GB as fallback if device stats
             unavailable.
+
+    Raises:
+        ValueError: If ``largest_allocation_share`` is not in ``(0, 1]``.
     """
+    share = float(largest_allocation_share)
+    if not 0.0 < share <= 1.0:
+        raise ValueError(f"largest_allocation_share must be in (0, 1], got {largest_allocation_share}")
     budgets = []
     for d in jax.local_devices():
         try:
@@ -561,11 +573,17 @@ def per_device_hbm_budget_bytes(
             continue
 
         free = max(0, int(limit) - int(used))
-        largest_free = s.get("largest_free_block_bytes")
-        if largest_free is not None:
-            free = min(free, max(0, int(largest_free)))
         if mode == "free":
             usable = max(0, int(free * float(util)) - safety_margin)
+            largest_free = s.get("largest_free_block_bytes")
+            if largest_free is not None:
+                block = max(0, int(max(0, int(largest_free)) * float(util)) - safety_margin)
+                if share < 1.0 and block * 5 < usable * 4:
+                    usable = min(usable, int(block / share))
+                else:
+                    # Nearly unfragmented HBM keeps the old pool bound; only real fragmentation opts into
+                    # the per-layer budget, so the fix cannot change serving shapes on healthy devices.
+                    usable = min(usable, block)
         else:
             usable = max(0, int(int(limit) * float(util)) - int(used) - safety_margin)
         budgets.append(usable)
@@ -654,6 +672,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         runtime_sharding_resolver: RuntimeShardingResolver,
         hbm_utilization: float,
         kv_head_shards: int | None = None,
+        largest_allocation_share: float = 1.0,
     ):
         """Compute available HBM for cache allocation across mesh.
 
@@ -663,6 +682,8 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             hbm_utilization: Target memory utilization fraction.
             kv_head_shards: Effective KV-head shard count to scale by. When
                 ``None``, the physical mesh axis size is used instead.
+            largest_allocation_share: Fraction of the pool held by its largest single array (see
+                :func:`per_device_hbm_budget_bytes`).
 
         Returns:
             int: Available bytes used for KV page-pool sizing, scaled by
@@ -671,7 +692,9 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         physical_kv_head_axis = runtime_sharding_resolver.paxis.kv_head_axis
         physical_kv_head_size = mesh_axis_size(mesh, physical_kv_head_axis)
         kv_head_size = physical_kv_head_size if kv_head_shards is None else max(1, int(kv_head_shards))
-        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free", mesh=mesh)
+        budget = per_device_hbm_budget_bytes(
+            hbm_utilization, mode="free", mesh=mesh, largest_allocation_share=largest_allocation_share
+        )
         page_axis_size = mesh_axis_size(
             mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver, mode=MODE_PREFILL)
         )
@@ -792,6 +815,8 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             runtime_sharding_resolver=runtime_sharding_resolver,
             hbm_utilization=hbm_utilization,
             kv_head_shards=effective_kv_head_shards,
+            # init_cache allocates one equal page array per layer (RaggedPagesCacheView.init).
+            largest_allocation_share=1.0 / max(1, int(num_hidden_layers)),
         )
         if version == "v3":
             # Budget the bytes of the *allocated* v3 layout (see ``get_shape_and_axes``): the packed combined-KV

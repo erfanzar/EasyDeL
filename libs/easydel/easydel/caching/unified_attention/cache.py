@@ -178,6 +178,7 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
         mesh: MeshLike,
         runtime_sharding_resolver: RuntimeShardingResolver,
         hbm_utilization: float,
+        largest_allocation_share: float = 1.0,
     ) -> int:
         """Compute available HBM for cache allocation across mesh.
 
@@ -185,6 +186,8 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
             mesh: JAX device mesh.
             runtime_sharding_resolver: Partition manager with axis configuration.
             hbm_utilization: Target memory utilization fraction.
+            largest_allocation_share: Fraction of the pool held by its largest single array (see
+                :func:`~easydel.caching.ragged_page.cache.per_device_hbm_budget_bytes`).
 
         Returns:
             int: Available bytes used for KV page-pool sizing, scaled by
@@ -192,7 +195,9 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
         """
         kv_head_axis = runtime_sharding_resolver.paxis.kv_head_axis
         kv_head_size = mesh_axis_size(mesh, kv_head_axis)
-        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free", mesh=mesh)
+        budget = per_device_hbm_budget_bytes(
+            hbm_utilization, mode="free", mesh=mesh, largest_allocation_share=largest_allocation_share
+        )
         page_axis_size = mesh_axis_size(
             mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver, mode=MODE_PREFILL)
         )
@@ -260,6 +265,8 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
             mesh=mesh,
             runtime_sharding_resolver=runtime_sharding_resolver,
             hbm_utilization=hbm_utilization,
+            # init_cache allocates one key and one value array per layer, each this share of the pool.
+            largest_allocation_share=1.0 / (2 * int(num_hidden_layers)),
         )
         bytes_av = jnp.finfo(kvdtype).bits // 8
         # Two tensors (K+V) per layer.

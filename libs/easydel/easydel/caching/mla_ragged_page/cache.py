@@ -103,6 +103,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
         mesh: MeshLike,
         runtime_sharding_resolver: RuntimeShardingResolver,
         hbm_utilization: float,
+        largest_allocation_share: float = 1.0,
     ):
         """Compute free HBM budget available for MLA cache pages.
 
@@ -115,11 +116,15 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
             runtime_sharding_resolver: Provides the data-parallel axis name.
             hbm_utilization: Fraction of total HBM to consider available
                 (0.0-1.0).
+            largest_allocation_share: Fraction of the pool held by its largest single array (see
+                :func:`~easydel.caching.ragged_page.cache.per_device_hbm_budget_bytes`).
 
         Returns:
             Total allocatable bytes across all devices on the page axis.
         """
-        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free", mesh=mesh)
+        budget = per_device_hbm_budget_bytes(
+            hbm_utilization, mode="free", mesh=mesh, largest_allocation_share=largest_allocation_share
+        )
         page_axis_size = mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
         available_alloc = budget * page_axis_size
         logger.info(f"{page_axis_size=} {budget=} {available_alloc=} {hbm_utilization=}")
@@ -236,11 +241,6 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
         if data_parallel_size > 1:
             logger.info(f"Scaling MLA KV page budget by data-parallel page axis: {data_parallel_size=}.")
 
-        free = cls._compute_free_hbm(
-            mesh=mesh,
-            runtime_sharding_resolver=runtime_sharding_resolver,
-            hbm_utilization=hbm_utilization,
-        )
         bytes_av = jnp.finfo(kvdtype).bits // 8
         kv_dim_padded = align_to_multiple(int(kv_lora_rank), HEAD_DIM_ALIGNMENT) + align_to_multiple(
             int(qk_rope_head_dim), HEAD_DIM_ALIGNMENT
@@ -283,6 +283,15 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
             indexer_num_layers = num_hidden_layers
         indexer_num_layers = max(0, min(int(indexer_num_layers), int(num_hidden_layers)))
         page_bytes = num_hidden_layers * page_bytes_per_layer + indexer_num_layers * indexer_page_bytes
+        # init_cache allocates one latent page array per layer and the indexer arrays per owner layer, so the
+        # largest single array holds at most this share of the pool.
+        largest_array_bytes = max(page_bytes_per_layer, indexer_page_bytes if indexer_num_layers else 0)
+        free = cls._compute_free_hbm(
+            mesh=mesh,
+            runtime_sharding_resolver=runtime_sharding_resolver,
+            hbm_utilization=hbm_utilization,
+            largest_allocation_share=largest_array_bytes / page_bytes,
+        )
         num_pages = int(free) // int(page_bytes)
         num_pages = cap_paged_cache_pages(
             num_pages,
