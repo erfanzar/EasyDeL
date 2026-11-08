@@ -55,6 +55,7 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import spectrax as spx
 from eformer.loggings import get_logger
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
@@ -64,6 +65,7 @@ from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
+    MLARaggedPagesCacheView,
     OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesMetadata,
@@ -73,7 +75,9 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
+    CausalLMOutput,
     DecoderLayerOutput,
+    MoeCausalLMOutput,
     MoeModelOutput,
     SparseDecoderLayerOutput,
 )
@@ -1451,6 +1455,118 @@ class Glm5NextForCausalLM(_Glm5NextIndexerCacheMixin, BaseCausalLMModule[Glm5Nex
         )
 
     checkpoint_key_rules: ClassVar[KeyRuleSet] = GLM5_NEXT_KEY_RULES
+
+    def _nextn_cache_view(self, past_key_values):
+        """Return the MTP layer's MLA view, allocating it from the target's page layout once."""
+        if past_key_values is None or not hasattr(past_key_values, "views"):
+            return None
+        views = past_key_values.views
+        index = len(self.base_model.layers)
+        if len(views) <= index:
+            base = next((view for view in views if isinstance(view, MLARaggedPagesCacheView)), None)
+            if base is None:
+                return None
+            views.append(
+                MLARaggedPagesCacheView.init(base.metadata, layer_index=index, mesh=base.runtime_sharding_resolver.mesh)
+            )
+        return views[index]
+
+    @staticmethod
+    def _nextn_metadata(cache_metadata):
+        """Shorten ragged-page metadata by one token per request for the next-token MTP step."""
+        if cache_metadata is None:
+            return None
+
+        def _shorten(inner):
+            query_start_loc = np.asarray(inner.query_start_loc)
+            query_start_loc = query_start_loc - np.arange(len(query_start_loc))
+            scheduled = getattr(inner, "scheduled_full", None)
+            changes = {"query_start_loc": query_start_loc}
+            if scheduled is not None:
+                changes["scheduled_full"] = np.maximum(np.asarray(scheduled) - 1, 0)
+            context = getattr(inner, "context_lens", None)
+            context = None if context is None else np.maximum(np.asarray(context) - 1, 0)
+            if context is not None:
+                changes["context_lens"] = context
+            return inner.replace(**changes)
+
+        if isinstance(cache_metadata, OperationsMetadata) and cache_metadata.ragged is not None:
+            return cache_metadata.replace(ragged=_shorten(cache_metadata.ragged))
+        if isinstance(cache_metadata, RaggedPagesMetadata):
+            return _shorten(cache_metadata)
+        return cache_metadata
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ):
+        """Run the backbone, write the next-token MTP cache view, then compute the LM head."""
+        base_model_kwargs = {
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "mask_info": mask_info,
+            "mode": mode,
+            "past_key_values": past_key_values,
+            "cache_metadata": cache_metadata,
+            "output_attentions": output_attentions,
+            "output_hidden_states": output_hidden_states,
+        }
+        if inputs_embeds is not None:
+            base_model_kwargs["inputs_embeds"] = inputs_embeds
+        else:
+            base_model_kwargs["input_ids"] = input_ids
+        outputs = self.base_model(**base_model_kwargs)
+
+        if self.has_mtp() and outputs.last_hidden_state.shape[1] > 1:
+            mtp_view = self._nextn_cache_view(outputs.past_key_values)
+            if mtp_view is not None:
+                next_embeds = (
+                    inputs_embeds[:, 1:] if inputs_embeds is not None else self.base_model.embed_tokens(input_ids)[:, 1:]
+                )
+                _, new_view = self.mtp.forward(
+                    prev_hidden_states=outputs.last_hidden_state[:, :-1],
+                    next_token_embeds=next_embeds,
+                    position_ids=None if position_ids is None else position_ids[:, :-1],
+                    mode=mode,
+                    cache_view=mtp_view,
+                    cache_metadata=self._nextn_metadata(cache_metadata),
+                    return_cache=True,
+                )
+                outputs.past_key_values.views[-1] = new_view
+
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = self.compute_lm_logits(self.prepare_lm_head_inputs(outputs.last_hidden_state))
+        aux_loss = self.compute_aux_loss(outputs, attention_mask=attention_mask)
+        if aux_loss is not None or hasattr(outputs, "all_router_losses"):
+            return MoeCausalLMOutput(
+                logits=lm_logits,
+                hidden_states=outputs.hidden_states,
+                last_hidden_state=outputs.last_hidden_state,
+                attentions=outputs.attentions,
+                past_key_values=outputs.past_key_values,
+                aux_loss=aux_loss,
+                router_logits=getattr(outputs, "router_logits", None),
+                all_router_losses=getattr(outputs, "all_router_losses", None),
+                indexer_aux_loss=getattr(outputs, "indexer_aux_loss", None),
+            )
+        return CausalLMOutput(
+            logits=lm_logits,
+            hidden_states=outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
+            attentions=outputs.attentions,
+            past_key_values=outputs.past_key_values,
+        )
 
     def has_mtp(self) -> bool:
         """Whether a nextn (MTP) head is attached as ``self.mtp``.

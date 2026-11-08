@@ -34,6 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
+from easydel.caching import HybridCache, MLARaggedPagesCacheView, RaggedPagesMetadata
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.speculative import Qwen3_5MTPDrafter
@@ -60,7 +61,7 @@ def _default_fast_recurrent_path(monkeypatch):
     monkeypatch.delenv("EASYDEL_SPEC_RECURRENT_REPLAY", raising=False)
 
 
-def _make_model():
+def _make_model(*, paged: bool = False):
     config = ed.Glm5NextTextConfig(
         vocab_size=VOCAB,
         hidden_size=32,
@@ -90,6 +91,8 @@ def _make_model():
         initializer_range=0.2,
         sharding_axis_dims=(1, 1, 1, 1, 1, 1),
     )
+    if paged:
+        config.attn_mechanism = "multi_latent_ragged_page_attention_v2"
     config.attn_dtype = jnp.float32
     config.kvdtype = jnp.float32
     kwargs = dict(dtype=jnp.float32, param_dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST)
@@ -99,8 +102,8 @@ def _make_model():
     return model
 
 
-def _make_model_with_head():
-    model = _make_model()
+def _make_model_with_head(*, paged: bool = False):
+    model = _make_model(paged=paged)
     kwargs = dict(dtype=jnp.float32, param_dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST)
     with model.config.mesh:
         head = Glm5NextMTPHead(model.config, rngs=spx.Rngs(1), max_cache_length=128, **kwargs)
@@ -289,6 +292,47 @@ def test_cached_drafter_matches_stateless_head(model):
             got.append(lg)
     got = jnp.concatenate(got, axis=1)
     np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=2e-4, atol=2e-4)
+
+
+def test_nextn_paged_view_and_metadata():
+    model = _make_model_with_head(paged=True)
+    cfg = model._create_mla_ragged_page_cache_config(max_length=64, num_hidden_layers_override=1, max_cache_tokens=256)
+    base = MLARaggedPagesCacheView.init(cfg, layer_index=3, mesh=model.mesh)
+    past = HybridCache(views=[None, None, None, base])
+    view = model._nextn_cache_view(past)
+    assert isinstance(view, MLARaggedPagesCacheView)
+    assert view.layer_index == 4
+    assert view.metadata.num_pages == base.metadata.num_pages
+    assert len(past.views) == 5
+
+    meta = RaggedPagesMetadata(
+        pages_tables=jnp.asarray([[0, 1], [2, 3]], dtype=jnp.int32),
+        context_lens=jnp.asarray([8, 8], dtype=jnp.int32),
+        query_start_loc=jnp.asarray([0, 8, 16], dtype=jnp.int32),
+        num_seqs=jnp.asarray([2, 2], dtype=jnp.int32),
+    )
+    short = model._nextn_metadata(meta)
+    np.testing.assert_array_equal(np.asarray(short.query_start_loc), np.asarray([0, 7, 14]))
+    np.testing.assert_array_equal(np.asarray(short.context_lens), np.asarray([7, 7]))
+
+
+def test_nextn_forward_writes_paged_view():
+    model = _make_model_with_head(paged=True)
+    cfg = model._create_mla_ragged_page_cache_config(max_length=64, num_hidden_layers_override=1, max_cache_tokens=256)
+    base = MLARaggedPagesCacheView.init(cfg, layer_index=3, mesh=model.mesh)
+    past = HybridCache(views=[None, None, None, base])
+    meta = RaggedPagesMetadata(
+        pages_tables=jnp.asarray([[0, 1]], dtype=jnp.int32),
+        context_lens=jnp.asarray([4], dtype=jnp.int32),
+        query_start_loc=jnp.asarray([0, 4], dtype=jnp.int32),
+        num_seqs=jnp.asarray([1], dtype=jnp.int32),
+    )
+    ids = jnp.asarray([[3, 1, 4, 1]], dtype=jnp.int32)
+    out = model(input_ids=ids, past_key_values=past, cache_metadata=meta)
+    view = out.past_key_values.views[-1]
+    assert isinstance(view, MLARaggedPagesCacheView)
+    assert view.layer_index == 4
+    assert bool(jnp.any(view.kv_pages != 0))
 
 
 class _Harness:

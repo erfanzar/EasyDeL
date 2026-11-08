@@ -65,7 +65,7 @@ def glm5_next_mtp_config(config: Glm5NextTextConfig) -> Glm5NextTextConfig:
     draft.layer_types = [DEEPSEEK_SPARSE_ATTENTION_LAYER_TYPE]
     draft.mlp_layer_types = ["sparse"]
     draft.indexer_types = ["full"]
-    draft.attn_mechanism = "vanilla"
+    draft.attn_mechanism = getattr(config, "attn_mechanism", "vanilla")
     draft.decode_attn_mechanism = None
     return draft
 
@@ -180,7 +180,10 @@ class Glm5NextMTPHead(spx.Module):
         next_token_embeds: Float[Array, "batch seq hidden"],
         position_ids: Int[Array, "batch seq"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
-    ) -> Float[Array, "batch seq hidden"]:
+        cache_view: tp.Any = None,
+        cache_metadata: tp.Any = None,
+        return_cache: bool = False,
+    ) -> Float[Array, "batch seq hidden"] | tuple[Float[Array, "batch seq hidden"], tp.Any]:
         """Stateless forward (no cache): normed nextn hidden states for the shared LM head."""
         h = self.fc(
             jnp.concatenate(
@@ -192,9 +195,11 @@ class Glm5NextMTPHead(spx.Module):
         if position_ids is None:
             position_ids = jnp.broadcast_to(jnp.arange(seq, dtype=jnp.int32)[None], (batch, seq))
         mode = common_types.MODE_TRAIN if mode is None else mode
+        new_cache = None
         for layer in self.layers:
-            h, _ = layer(h, mask_info, position_ids, mode, None, None, None)
-        return self.norm(h)
+            h, new_cache = layer(h, mask_info, position_ids, mode, cache_view, cache_metadata, None)
+        hidden = self.norm(h)
+        return (hidden, new_cache) if return_cache else hidden
 
 
 def attach_glm5_next_mtp(model: tp.Any, head: Glm5NextMTPHead) -> tp.Any:

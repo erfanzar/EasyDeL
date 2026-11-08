@@ -97,6 +97,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
     # which cache-view indices own them. ``init_cache`` allocates exactly that set (r11 S09-1).
     indexer_num_layers: int | None = field(pytree_node=False, default=None)
     indexer_layer_indices: tuple[int, ...] | None = field(pytree_node=False, default=None)
+    num_draft_layers: int = field(pytree_node=False, default=0)
 
     @staticmethod
     def _compute_free_hbm(
@@ -155,6 +156,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
         indexer_dtype: jnp.dtype | None = None,
         indexer_num_layers: int | None = None,
         indexer_layer_indices: tp.Sequence[int] | None = None,
+        num_draft_layers: int = 0,
     ) -> "MLARaggedPagesCacheConfig":
         """Create an MLA ragged-page cache config from model hyperparameters.
 
@@ -282,7 +284,12 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
         if indexer_num_layers is None:
             indexer_num_layers = num_hidden_layers
         indexer_num_layers = max(0, min(int(indexer_num_layers), int(num_hidden_layers)))
-        page_bytes = num_hidden_layers * page_bytes_per_layer + indexer_num_layers * indexer_page_bytes
+        if int(num_draft_layers) < 0:
+            raise ValueError(f"num_draft_layers must be non-negative, got {num_draft_layers}.")
+        num_draft_layers = int(num_draft_layers)
+        page_bytes = (num_hidden_layers + num_draft_layers) * page_bytes_per_layer + (
+            indexer_num_layers + num_draft_layers
+        ) * indexer_page_bytes
         # init_cache allocates one latent page array per layer and the indexer arrays per owner layer, so the
         # largest single array holds at most this share of the pool.
         largest_array_bytes = max(page_bytes_per_layer, indexer_page_bytes if indexer_num_layers else 0)
@@ -326,6 +333,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
             _indexer_dtype_str=DTYPE_TO_STRING_MAP[jnp.dtype(indexer_dtype).type],
             indexer_num_layers=int(indexer_num_layers) if indexer_key_dim > 0 else None,
             indexer_layer_indices=indexer_layer_indices if indexer_key_dim > 0 else None,
+            num_draft_layers=num_draft_layers,
         )
 
     @property
