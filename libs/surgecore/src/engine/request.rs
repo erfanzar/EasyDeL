@@ -139,7 +139,7 @@ pub struct NewRequest<'a> {
     pub prompt: &'a [i32],
     /// Output-token limit.
     pub max_tokens: i64,
-    /// Minimum output tokens (stored; not enforced, as today).
+    /// Minimum output tokens before EOS or a caller stop id may finish the request.
     pub min_tokens: i64,
     /// EOS token, if any.
     pub eos: Option<i32>,
@@ -182,7 +182,7 @@ pub struct Request {
     pub placeholders: i64,
     /// Output-token limit.
     pub max_tokens: i64,
-    /// Minimum output tokens (stored only).
+    /// Minimum output tokens before EOS or a caller stop id may finish the request.
     pub min_tokens: i64,
     /// EOS token.
     pub eos: Option<i32>,
@@ -252,6 +252,9 @@ impl Request {
         let Some(&last) = self.tokens.last() else {
             return false;
         };
+        if self.num_output() < self.min_tokens {
+            return false;
+        }
         if !self.ignore_eos && self.eos == Some(last) {
             self.status = Status::Stopped;
             return true;
@@ -416,6 +419,24 @@ mod tests {
         let mut r = req(1);
         r.tokens.push(2);
         assert!(r.check_stop(3), "length is checked before EOS");
+        assert_eq!(r.status, Status::Length);
+    }
+
+    #[test]
+    fn min_tokens_delays_eos_and_stop_ids_but_not_length() {
+        let mut r = req(1);
+        r.min_tokens = 2;
+        r.tokens.push(2);
+        assert!(!r.check_stop(100), "EOS must wait for min_tokens");
+        r.tokens.push(5);
+        assert!(r.check_stop(100));
+        assert_eq!((r.status, r.stop_reason), (Status::Stopped, Some(5)));
+
+        let mut r = req(1);
+        r.min_tokens = 2;
+        r.max_tokens = 1;
+        r.tokens.push(2);
+        assert!(r.check_stop(100), "the length cap wins over min_tokens");
         assert_eq!(r.status, Status::Length);
     }
 }
