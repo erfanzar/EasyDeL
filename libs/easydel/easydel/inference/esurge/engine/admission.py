@@ -713,13 +713,15 @@ class RequestAdmission:
         if requested_new < 1:
             # A request that fills its context budget still samples one token and finishes on length. A prompt that
             # fills the whole model length has no position for that token, so it loses one more prompt token.
-            if prompt_len >= max_model_len:
-                if not self.context_config.auto_truncate_prompt or max_model_len < 2:
+            if prompt_len + self.reserve_tokens >= max_model_len:
+                if not self.context_config.auto_truncate_prompt or max_model_len - self.reserve_tokens < 2:
                     raise ValueError(
                         f"Prompt leaves no room for a new token: prompt_len={prompt_len}, "
                         f"max_model_len={max_model_len}, reserve={self.reserve_tokens}."
                     )
-                new_tokens, dropped = truncate_tokens(token_ids, max_model_len - 1, self.context_config.truncate_mode)
+                new_tokens, dropped = truncate_tokens(
+                    token_ids, max_model_len - self.reserve_tokens - 1, self.context_config.truncate_mode
+                )
                 token_ids = new_tokens
                 prompt_len = len(token_ids)
                 truncated = truncated or dropped > 0

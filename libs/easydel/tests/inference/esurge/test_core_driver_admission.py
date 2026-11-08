@@ -266,13 +266,39 @@ def test_a_prompt_that_fills_the_context_is_truncated_so_one_token_fits(requeste
         core.shutdown()
 
 
+def test_a_prompt_that_fills_the_budget_after_reserve_is_truncated_once_more_for_one_token():
+    admission = _admission_with_three_eos_ids()
+    admission._max_model_len = 200
+    admission.reserve_tokens = 8
+    prompt = list(range(2, 194))  # 192 tokens: prompt + reserve = max_model_len
+    params = admission.prepare_sampling_params_for_request(SamplingParams(max_tokens=64), request_id="r", prompt="p")
+    (record,) = admission.add_request("r", "p", params, prompt_token_ids=prompt, defer_scheduler_enqueue=True)
+    assert record.prompt_token_ids == prompt[1:]
+    assert record.sampling_params.max_tokens == 1
+    core = EngineCoreDriver(
+        kv_cache_groups=_groups(),
+        max_num_seqs=4,
+        max_num_batched_tokens=64,
+        max_model_len=200,
+        num_pages=64,
+        data_parallel_size=1,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+    )
+    try:
+        core.add_requests([record])
+        assert core.schedule().num_scheduled_tokens == {"r": 64}
+    finally:
+        core.shutdown()
+
+
 def test_a_prompt_that_fills_the_budget_below_the_model_length_samples_one_token_and_finishes_on_length():
     admission = _admission_with_three_eos_ids()
     admission.reserve_tokens = 4
     prompt = list(range(2, 62))  # 60 tokens = max_model_len - reserve
     params = admission.prepare_sampling_params_for_request(SamplingParams(max_tokens=8), request_id="r", prompt="p")
     (record,) = admission.add_request("r", "p", params, prompt_token_ids=prompt, defer_scheduler_enqueue=True)
-    assert record.prompt_token_ids == prompt
+    assert record.prompt_token_ids == prompt[1:]
     core = EngineCoreDriver(
         kv_cache_groups=_groups(),
         max_num_seqs=4,
@@ -286,7 +312,7 @@ def test_a_prompt_that_fills_the_budget_below_the_model_length_samples_one_token
     try:
         core.add_requests([record])
         step = core.schedule()
-        assert step.num_scheduled_tokens == {"r": 60}
+        assert step.num_scheduled_tokens == {"r": 59}
         outputs = core.commit(
             step,
             ModelRunnerOutput(
