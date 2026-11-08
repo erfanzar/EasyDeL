@@ -3660,7 +3660,8 @@ class BaseTrainer(BaseTrainerProtocol):
             attention_mask: Optional attention mask for input_ids.
             prompts: Optional text prompt(s). If None, must provide input_ids.
             state: Model state to use for generation. Defaults to self.model_state.
-            use_esurge: Whether to use eSurge generation. Defaults to self.arguments.use_esurge_generation.
+            use_esurge: Whether to use eSurge generation. Defaults to True; only Nash-MD's mixture
+                rollout passes False.
             apply_chat_template: Whether to apply chat template to prompts. Default False.
                 If True and prompts is a string, wraps it in [{"role": "user", "content": prompt}].
             generation_config: Optional generation configuration.
@@ -3727,7 +3728,7 @@ class BaseTrainer(BaseTrainerProtocol):
         has_model_kwargs = bool(compact_generation_model_kwargs(normalized_model_kwargs))
 
         if use_esurge is None:
-            use_esurge = args.use_esurge_generation
+            use_esurge = True
         if has_model_kwargs and prompts is not None and input_ids is None:
             raise ValueError(
                 "Raw model kwargs require pretokenized `input_ids`/`attention_mask`. "
@@ -4517,7 +4518,8 @@ class BaseTrainer(BaseTrainerProtocol):
     ) -> None:
         """Optionally run preview generation to monitor training progress.
 
-        Uses `rollout` for consistent generation across both eSurge and compiled modes.
+        Uses `rollout`, which generates through eSurge. Encoder-decoder models, which eSurge does not
+        serve, are skipped with a one-time warning.
         """
 
         args = self.arguments
@@ -4530,6 +4532,10 @@ class BaseTrainer(BaseTrainerProtocol):
             return
 
         if interval <= 0 or step % interval != 0:
+            return
+
+        if getattr(getattr(getattr(state, "model", None), "config", None), "is_encoder_decoder", False):
+            logger.warning_once("Skipping preview generation: eSurge does not serve encoder-decoder models.")
             return
 
         prompts = self._collect_generation_prompts()
@@ -4724,7 +4730,6 @@ class BaseTrainer(BaseTrainerProtocol):
                 input_ids=batched_input_ids,
                 attention_mask=batched_attention_mask,
                 state=state,
-                use_esurge=args.use_esurge_generation,
                 apply_chat_template=False,  # Prompts are already formatted
                 shard_inputs=args.generation_shard_inputs,
                 all_gather=False,  # Keep on device for now
@@ -4737,7 +4742,6 @@ class BaseTrainer(BaseTrainerProtocol):
                         input_ids=prepared["input_ids"],
                         attention_mask=prepared["attention_mask"],
                         state=state,
-                        use_esurge=args.use_esurge_generation,
                         apply_chat_template=False,  # Prompts are already formatted
                         shard_inputs=args.generation_shard_inputs,
                         all_gather=False,  # Keep on device for now

@@ -13,9 +13,9 @@ pytestmark = pytest.mark.cpu_ok
 
 
 class Trainer:
-    arguments = SimpleNamespace(use_esurge_generation=False)
+    arguments = SimpleNamespace()
 
-    def rollout(self, *, prompts, use_esurge, apply_chat_template, config_overrides, release_runtime_after_generation):
+    def rollout(self, *, prompts, apply_chat_template, config_overrides, release_runtime_after_generation):
         prefix = "chat:" if apply_chat_template else "text:"
         suffix = str(config_overrides["max_new_tokens"])
         return SimpleNamespace(

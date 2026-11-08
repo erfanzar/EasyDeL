@@ -129,7 +129,6 @@ def make_config(
     mpmd_overrides["use_wandb"] = False
     mpmd_overrides["do_last_save"] = False
     mpmd_overrides["save_optimizer_state"] = False
-    mpmd_overrides.setdefault("use_esurge_generation", False)
     mpmd_overrides.setdefault("esurge_max_num_batched_tokens", 256)
     mpmd_overrides.setdefault("esurge_max_num_seqs", 2)
     mpmd_overrides.setdefault("esurge_max_num_seq_buckets", [1, 2])

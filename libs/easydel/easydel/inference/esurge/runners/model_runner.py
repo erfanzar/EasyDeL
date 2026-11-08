@@ -2909,6 +2909,18 @@ class eSurgeRunner:
     ) -> tuple[typing.Any, typing.Any, typing.Any]:
         """Enqueue compact behavior-policy scores without host token readback."""
         params = sampling_params
+        logits_sharding = getattr(logits, "sharding", None)
+        tokens_sharding = getattr(sampled_tokens, "sharding", None)
+        if (
+            isinstance(logits_sharding, jax.sharding.NamedSharding)
+            and tokens_sharding is not None
+            and tokens_sharding.device_set != logits_sharding.device_set
+        ):
+            # Pipeline-parallel steps leave the logits on the final stage's devices while the sampled tokens
+            # span the whole mesh; score them on the logits' devices.
+            sampled_tokens = jax.device_put(
+                sampled_tokens, jax.sharding.NamedSharding(logits_sharding.mesh, jax.sharding.PartitionSpec())
+            )
         arrays = score_sampled_tokens(
             logits,
             sampled_tokens,

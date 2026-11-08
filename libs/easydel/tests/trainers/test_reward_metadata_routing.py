@@ -169,7 +169,6 @@ def test_agentic_generate_fn_keeps_raw_text_but_returns_post_strip_action_text()
 def test_agentic_rollout_releases_esurge_after_rollout_failure():
     trainer = object.__new__(AgenticMoshPitTrainer)
     trainer.arguments = SimpleNamespace(
-        use_esurge_generation=True,
         group_size=1,
         num_env_groups=1,
     )

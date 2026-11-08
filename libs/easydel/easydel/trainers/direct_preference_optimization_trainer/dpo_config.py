@@ -408,7 +408,6 @@ class DPOConfig(TrainingArguments):
             raise ValueError("`rpo_alpha` must be non-negative when set.")
         if self.generate_during_eval:
             self.generation_interval = self.generation_interval or self.evaluation_steps or 1
-            self.use_esurge_generation = True
         self.logprob_vocab_chunk_size = normalize_logprob_vocab_chunk_size(self.logprob_vocab_chunk_size)
         if hasattr(super(), "__post_init__"):
             super().__post_init__(

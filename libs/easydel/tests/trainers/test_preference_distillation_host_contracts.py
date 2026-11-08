@@ -112,38 +112,15 @@ def test_generated_labels_do_not_corrupt_or_require_writable_tokens(monkeypatch,
     np.testing.assert_array_equal(result["completion_mask"], [[0, 0, 1, 0]])
 
 
-def test_sequence_kd_generator_uses_teacher_contract(monkeypatch):
-    monkeypatch.setattr(gkd, "replicated_named_sharding", lambda mesh: "replicated")
-    monkeypatch.setattr(gkd, "compile_trainer_step", compile_contract)
-    outputs = SimpleNamespace(sequences=[[2, 3, 5]])
-    model = SimpleNamespace(mesh=SimpleNamespace(__enter__=lambda: None), generate=lambda **kwargs: outputs)
-
-    class Mesh:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            pass
-
-    model.mesh = Mesh()
-    trainer = object.__new__(gkd.GKDTrainer)
-    trainer.teacher_state = State("teacher-architecture", model=model)
-    trainer.generation_config = SimpleNamespace()
-    trainer._prepare_generation_config = lambda config: config
-    generated = trainer._create_teacher_generate_function(shard_inputs=False)
-    assert generated(trainer.teacher_state, [2, 3], [1, 1]) == ([[2, 3, 5]], [2, 3], [1, 1])
-    with pytest.raises(ValueError, match="optimizer metadata"):
-        generated(trainer.teacher_state.replace(tx="adam", opt_state="slots"), [2, 3], [1, 1])
-
-
 def test_sequence_kd_does_not_silently_fall_back_on_generation_failure(monkeypatch):
     trainer = object.__new__(gkd.GKDTrainer)
+    trainer.arguments = SimpleNamespace(max_new_tokens=4, temperature=0.9)
     trainer._extract_prompts = lambda batch: (np.array([[2, 3]]), np.ones((1, 2)), np.array([2]))
 
-    def fail(*args):
+    def fail(**kwargs):
         raise ValueError("bad generation state")
 
-    trainer.gkd_teacher_generate_function = fail
+    trainer.rollout = fail
     with pytest.raises(RuntimeError, match="Sequence-KD teacher generation failed") as error:
         trainer._apply_generation(State("teacher"), {}, source="teacher")
     assert isinstance(error.value.__cause__, ValueError)
