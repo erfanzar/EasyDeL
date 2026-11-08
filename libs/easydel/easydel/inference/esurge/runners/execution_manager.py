@@ -1355,6 +1355,8 @@ class ExecutionManager:
         presence_penalties_cpu: numpy.ndarray,
         repetition_penalties_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,
+        logit_bias_cpu: numpy.ndarray | None = None,
+        allowed_token_ids_mask_cpu: numpy.ndarray | None = None,
         recurrent_slot_indices_cpu: numpy.ndarray | None = None,
         page_table_version: int | None = None,
         spec_recurrent_commit_cpu: numpy.ndarray | None = None,
@@ -1374,6 +1376,7 @@ class ExecutionManager:
         wait_for_outputs: bool = True,
         model_side_inputs_cpu: dict[str, numpy.ndarray] | None = None,
         cache_group_inputs: tuple[CacheGroupInputs, ...] = (),
+        **kwargs,
     ) -> tuple[
         jax.Array,
         jax.Array,
@@ -1528,6 +1531,8 @@ class ExecutionManager:
                 presence_penalties_cpu=presence_penalties_cpu,
                 repetition_penalties_cpu=repetition_penalties_cpu,
                 page_table_cpu=page_table_cpu,
+                logit_bias_cpu=logit_bias_cpu,
+                allowed_token_ids_mask_cpu=allowed_token_ids_mask_cpu,
                 mrope_position_ids_cpu=mrope_position_ids_cpu,
                 prefill_embeds_cpu=prefill_embeds_cpu,
                 prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
@@ -1546,6 +1551,7 @@ class ExecutionManager:
                 logger.info("[esurge-prof-exec] microbatch path returned tok=%d", int(num_tokens))
             return microbatch_result
 
+        bad_words_token_ids_cpu = locals().get("bad_words_token_ids_cpu")
         start_prep = time.time()
         prep_phase_start = start_prep
         (
@@ -1571,6 +1577,8 @@ class ExecutionManager:
             presence_penalties_cpu=presence_penalties_cpu,
             repetition_penalties_cpu=repetition_penalties_cpu,
             page_table_cpu=page_table_cpu,
+            logit_bias_cpu=logit_bias_cpu,
+            allowed_token_ids_mask_cpu=allowed_token_ids_mask_cpu,
             page_table_version=page_table_version,
             window_row_indices_cpu=window_row_indices_cpu,
             recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
@@ -1598,6 +1606,9 @@ class ExecutionManager:
             input_ids_buf = batch_metadata.input_ids_buf
             prep_handoff_took = time.time() - prep_phase_start
 
+        batch_metadata.logit_bias = logit_bias_cpu
+        batch_metadata.allowed_token_ids_mask = allowed_token_ids_mask_cpu
+        batch_metadata.bad_words_token_ids = kwargs.get("bad_words_token_ids_cpu")
         window_emits_token = self._window_emits_token(
             scheduled_full_cpu=scheduled_full_cpu,
             active_mask_full_cpu=active_mask_full_cpu,
@@ -1897,6 +1908,9 @@ class ExecutionManager:
                 compact_presence_penalties_cpu=self._sampler_presence_penalties_cpu,
                 compact_repetition_penalties_cpu=self._sampler_repetition_penalties_cpu,
                 need_penalties=need_penalties,
+                logit_bias=batch_metadata.logit_bias,
+                allowed_token_ids_mask=batch_metadata.allowed_token_ids_mask,
+                bad_words_token_ids=batch_metadata.bad_words_token_ids,
             )
             sampler_enqueue_took = time.time() - sampler_enqueue_start
             if self._verbose and num_tokens > 0:
@@ -2605,6 +2619,7 @@ class ExecutionManager:
                         numpy.zeros((int(num_tokens), hidden_size), dtype=numpy.float16) for _ in range(deepstack_layers)
                     ]
 
+        logit_bias_cpu = allowed_token_ids_mask_cpu = None
         # Model-declared per-token side inputs: present in every runtime step of such models, so the compiled
         # signature must carry them too (inert for every other model).
         model_side_inputs_cpu = empty_side_inputs(self.model, int(num_tokens))
@@ -2643,6 +2658,8 @@ class ExecutionManager:
             presence_penalties_cpu=temp_buffer.presence_penalties,
             repetition_penalties_cpu=temp_buffer.repetition_penalties,
             page_table_cpu=page_table_cpu_dummy,
+            logit_bias_cpu=logit_bias_cpu,
+            allowed_token_ids_mask_cpu=allowed_token_ids_mask_cpu,
             padded_num_reqs_in=padded_num_reqs,
             window_row_indices_cpu=window_row_indices_cpu,
             recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,

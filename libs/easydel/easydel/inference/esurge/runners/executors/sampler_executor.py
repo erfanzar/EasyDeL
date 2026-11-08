@@ -78,6 +78,7 @@ from jax import numpy as jnp
 from jax.experimental import multihost_utils
 from numpy.typing import DTypeLike
 
+from easydel.inference.sampling_processors import apply_sampling_constraints
 from easydel.utils import ejit
 
 from ...core.sampler import (
@@ -330,6 +331,9 @@ class SamplerExecutor:
             logits: jax.Array,
             rng_key: jax.Array,
             token_counts_full: jax.Array,
+            logit_bias: jax.Array | None = None,
+            allowed_token_ids_mask: jax.Array | None = None,
+            bad_words_token_ids: jax.Array | None = None,
         ):
             del packed_f32
             with jax.named_scope("easydel/esurge/greedy_sampler_step"):
@@ -344,6 +348,7 @@ class SamplerExecutor:
                 total_tokens = packed_misc_i32[1]
 
                 active_mask = (i_reqs < num_requests) & active_mask[:batch_size]
+                logits = apply_sampling_constraints(logits, logit_bias, allowed_token_ids_mask, bad_words_token_ids)
                 sampled_flat = jnp.argmax(logits, axis=-1).astype(jnp.int32)
 
                 scheduled_slice = scheduled[:batch_size]
@@ -387,6 +392,9 @@ class SamplerExecutor:
             logits: jax.Array,
             rng_key: jax.Array,
             token_counts_full: jax.Array,
+            logit_bias: jax.Array | None = None,
+            allowed_token_ids_mask: jax.Array | None = None,
+            bad_words_token_ids: jax.Array | None = None,
         ):
             """Compiled sampler core consuming packed sampler-side metadata.
 
@@ -458,6 +466,7 @@ class SamplerExecutor:
                         logits,
                     )
 
+                logits = apply_sampling_constraints(logits, logit_bias, allowed_token_ids_mask, bad_words_token_ids)
                 sampling_metadata = SamplingMetadata(
                     temperatures=temp,
                     top_ps=topp,
@@ -1067,6 +1076,9 @@ class SamplerRuntime:
         compact_presence_penalties_cpu: numpy.ndarray,
         compact_repetition_penalties_cpu: numpy.ndarray,
         need_penalties: bool,
+        logit_bias: jax.Array | None = None,
+        allowed_token_ids_mask: jax.Array | None = None,
+        bad_words_token_ids: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         """Run the compiled sampler step over only the rows that need sampling.
 
@@ -1226,6 +1238,9 @@ class SamplerRuntime:
                 compact_logits,
                 rng_key,
                 token_counts_full,
+                logit_bias,
+                allowed_token_ids_mask,
+                bad_words_token_ids,
             )
         if prefix_scatter_layout and int(sampler_padded_num_reqs) == int(padded_num_reqs):
             return rng_key, compact_tokens, compact_valid_mask, token_counts_full
