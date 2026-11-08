@@ -1606,9 +1606,16 @@ class ExecutionManager:
             input_ids_buf = batch_metadata.input_ids_buf
             prep_handoff_took = time.time() - prep_phase_start
 
-        batch_metadata.logit_bias = logit_bias_cpu
-        batch_metadata.allowed_token_ids_mask = allowed_token_ids_mask_cpu
-        batch_metadata.bad_words_token_ids = kwargs.get("bad_words_token_ids_cpu")
+        if (
+            logit_bias_cpu is not None
+            or allowed_token_ids_mask_cpu is not None
+            or kwargs.get("bad_words_token_ids_cpu") is not None
+        ):
+            batch_metadata = batch_metadata.replace(
+                logit_bias=logit_bias_cpu,
+                allowed_token_ids_mask=allowed_token_ids_mask_cpu,
+                bad_words_token_ids=kwargs.get("bad_words_token_ids_cpu"),
+            )
         window_emits_token = self._window_emits_token(
             scheduled_full_cpu=scheduled_full_cpu,
             active_mask_full_cpu=active_mask_full_cpu,
