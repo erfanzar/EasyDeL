@@ -1623,12 +1623,8 @@ class ExecutionManager:
             position_ids_buf = batch_metadata.position_ids_buf
             prep_handoff_took += time.time() - prep_phase_start
 
-        if logit_bias_cpu is not None or allowed_token_ids_mask_cpu is not None or bad_words_token_ids_cpu is not None:
-            batch_metadata = batch_metadata.replace(
-                logit_bias=logit_bias_cpu,
-                allowed_token_ids_mask=allowed_token_ids_mask_cpu,
-                bad_words_token_ids=bad_words_token_ids_cpu,
-            )
+        # Per-request logit bias, allow-list and bad-word masks go to the sampler only: the batch metadata is an
+        # argument of the compiled model step, whose signature has none of them.
         self.last_batch_metadata = batch_metadata
         window_emits_token = self._window_emits_token(
             scheduled_full_cpu=scheduled_full_cpu,
@@ -1818,8 +1814,13 @@ class ExecutionManager:
             & (self._sampler_scheduled_cpu[: int(sampler_padded_num_reqs)] > 0)
             & (self._sampler_seq_lens_cpu[: int(sampler_padded_num_reqs)] >= req_num_tokens_for_sampler)
         )
+        # The fused greedy argmax applies no logit bias, allow-list or bad-word mask; a step carrying one samples
+        # through the sampler, which does.
         use_greedy_argmax_fastpath = bool(
             not need_penalties
+            and logit_bias_cpu is None
+            and allowed_token_ids_mask_cpu is None
+            and bad_words_token_ids_cpu is None
             # Under an MPMD/PP mesh the logits live on the final stage's
             # submesh, but the fastpath's helper tensors (valid mask, RNG
             # fold scalar) are replicated over the full mesh — a device-set
@@ -1937,9 +1938,9 @@ class ExecutionManager:
                 compact_presence_penalties_cpu=self._sampler_presence_penalties_cpu,
                 compact_repetition_penalties_cpu=self._sampler_repetition_penalties_cpu,
                 need_penalties=need_penalties,
-                logit_bias=batch_metadata.logit_bias,
-                allowed_token_ids_mask=batch_metadata.allowed_token_ids_mask,
-                bad_words_token_ids=batch_metadata.bad_words_token_ids,
+                logit_bias=logit_bias_cpu,
+                allowed_token_ids_mask=allowed_token_ids_mask_cpu,
+                bad_words_token_ids=bad_words_token_ids_cpu,
             )
             sampler_enqueue_took = time.time() - sampler_enqueue_start
             if self._verbose and num_tokens > 0:
