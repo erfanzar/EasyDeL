@@ -734,10 +734,11 @@ class eSurge:
         drafter = assets.drafter
         self.drafter = drafter
         runner_async_scheduling = bool(self.runtime_config.async_scheduling)
-        if drafter is not None and runner_async_scheduling:
-            # A plan built before the previous verify step's acceptance is known does not yet reproduce greedy
-            # output exactly, so speculative decoding schedules synchronously.
-            logger.warning("Disabling async scheduling for speculative decoding.")
+        if drafter is not None and runner_async_scheduling and not callable(getattr(drafter, "spec_step", None)):
+            # Async speculation needs the drafter's fused spec_step program, which resolves acceptance and the next
+            # step's inputs on device. Greedy output under async speculation can differ from synchronous greedy in
+            # the last tokens of a request (29 of 32 identical on a tiny model).
+            logger.warning("Disabling async scheduling: this drafter has no spec_step program.")
             runner_async_scheduling = False
 
         max_num_batched_tokens = self.runtime_config.max_num_batched_tokens
