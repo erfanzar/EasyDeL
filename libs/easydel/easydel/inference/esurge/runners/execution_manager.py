@@ -1510,11 +1510,16 @@ class ExecutionManager:
         # The runner supplies recurrent_slot_indices_cpu for every model, including ordinary attention models.
         # BatchMetadataPreparer consumes those indices only for slot-indexed state or SPMD DP, so gate on those
         # capabilities rather than the presence of the always-allocated bookkeeping array.
+        # Its sampler does not apply per-request logit bias, allowed-token or bad-word constraints either; a step
+        # whose requests carry any of them samples on the full-window path, which does.
         microbatch_unsupported = (
             bool(model_side_inputs_cpu)
             or self._slot_indexed_state
             or self._batch_preparer._uses_spmd_dp()
             or spec_recurrent_commit_cpu is not None
+            or logit_bias_cpu is not None
+            or allowed_token_ids_mask_cpu is not None
+            or bad_words_token_ids_cpu is not None
         )
         if self._pp_microbatch is not None and not microbatch_unsupported:
             microbatch_result = self._pp_microbatch.try_execute(
@@ -1536,9 +1541,6 @@ class ExecutionManager:
                 presence_penalties_cpu=presence_penalties_cpu,
                 repetition_penalties_cpu=repetition_penalties_cpu,
                 page_table_cpu=page_table_cpu,
-                logit_bias_cpu=logit_bias_cpu,
-                allowed_token_ids_mask_cpu=allowed_token_ids_mask_cpu,
-                bad_words_token_ids_cpu=bad_words_token_ids_cpu,
                 mrope_position_ids_cpu=mrope_position_ids_cpu,
                 prefill_embeds_cpu=prefill_embeds_cpu,
                 prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
