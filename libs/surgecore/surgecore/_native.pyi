@@ -14,13 +14,51 @@
 
 """Typed stubs of the compiled extension module ``surgecore._native``.
 
-One delimited section per Rust module (payload, kv, engine). Edit only between a section's begin and end markers.
+One delimited section per Rust module (payload, kv, engine, detokenization). Edit only between a section's begin and end markers.
 """
 
 import numpy as np
 import numpy.typing as npt
 
 __version__: str
+
+# ---- begin section: detokenization ----
+
+class DetokenizerResult:
+    """One incremental decode result; full text is present only at finish or resynchronization."""
+
+    accumulated_text: str | None
+    delta_text: str
+    last_decoded_index: int
+    finished: bool
+    detoktook: float
+
+    def __init__(
+        self,
+        accumulated_text: str | None,
+        delta_text: str,
+        last_decoded_index: int,
+        finished: bool,
+        detoktook: float = 0.0,
+    ) -> None: ...
+
+class Detokenizer:
+    """In-process batched incremental detokenization over a HuggingFace tokenizer.
+
+    Each request dictionary contains ``request_id``, ``tokens_delta``, ``token_offset``, ``finished``,
+    ``skip_special_tokens``, ``spaces_between_special_tokens``, optional ``prompt_context`` and ``text_offset``.
+    The native state owns the complete token and text history; steady-state calls and results carry only deltas.
+    """
+
+    def __init__(self, tokenizer: object, *, context_window: int = 4, max_states: int = 65536) -> None: ...
+    def decode_batch(self, requests: list[dict[str, object]]) -> list[DetokenizerResult]: ...
+    def reset(self, request_id: str) -> None: ...
+    def drain(self) -> None: ...
+    def shutdown(self) -> None: ...
+    @property
+    def num_states(self) -> int: ...
+
+# ---- end section: detokenization ----
 
 # ---- begin section: payload ----
 
@@ -303,6 +341,11 @@ class Plan:
     def spec_slots(self) -> npt.NDArray[np.int32]:
         """``int32[n]``: output slots per entry, ``1 + drafts`` for an entry that samples, else 0. An async step counts
         every slot as accepted until its commit; the device corrects a later step's start by the rejected drafts."""
+        ...
+    @property
+    def inflight_drafts(self) -> npt.NDArray[np.int64]:
+        """``int64[n]``: drafts of earlier uncommitted steps counted as accepted by an optimistic start; -1 when
+        the entry starts from committed state. Zero means the earlier step verified no drafts."""
         ...
     @property
     def stats(self) -> npt.NDArray[np.int64]:

@@ -39,23 +39,17 @@ class _ScriptedDetokenizer(_DetokenizerStub):
         self._decoded_text = decoded_text
         self._delta_text = delta_text
 
-    def decode(
-        self,
-        request_id,
-        tokens,
-        *,
-        finished=False,
-        skip_special_tokens=False,
-        spaces_between_special_tokens=True,
-        prompt_context=None,
-    ):
-        return DetokenizerResult(
-            accumulated_text=self._decoded_text,
-            delta_text=self._delta_text,
-            last_decoded_index=len(tokens),
-            finished=finished,
-            detoktook=0.0,
-        )
+    def decode_batch(self, requests):
+        return [
+            DetokenizerResult(
+                accumulated_text=self._decoded_text,
+                delta_text=self._delta_text,
+                last_decoded_index=request["token_offset"] + len(request["tokens_delta"]),
+                finished=request["finished"],
+                detoktook=0.0,
+            )
+            for request in requests
+        ]
 
 
 def _make_pipeline(

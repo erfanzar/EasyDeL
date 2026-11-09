@@ -592,7 +592,6 @@ class eSurgeContextConfig(TypedDict, total=False):
     defaults={
         "detokenizer_max_states": 1 << 16,
         "tokenizer_endpoint": None,
-        "detokenizer_endpoint": None,
         "worker_startup_timeout": None,
         "max_request_outputs": 1000,
         "idle_reset_seconds": None,
@@ -600,26 +599,24 @@ class eSurgeContextConfig(TypedDict, total=False):
     },
 )
 class eSurgeWorkerConfig(TypedDict, total=False):
-    """Tokenizer / detokenizer worker pool and idle-reset configuration.
+    """Tokenizer worker, native detokenizer and idle-reset configuration.
 
-    Tokenization and streaming detokenization run in helper threads (or
-    out-of-process workers when an endpoint is configured) so they don't
-    serialize on the GIL with the scheduler thread. This config sizes those
+    Tokenization runs in a CPU-isolated subprocess (or an attached worker
+    when an endpoint is configured). Native batched detokenization runs on
+    the output worker thread in the engine process. This config sizes those
     helpers and the in-memory output retention buffer, and controls the
     optional automatic-reset that fires after the engine is idle for a while.
 
     Attributes:
         detokenizer_max_states: Maximum number of concurrent streaming
             detokenizer states the worker pool may keep alive (one per
-            in-flight request). Pool spills over to LRU eviction once the
+            in-flight request). The native pool spills over to FIFO eviction once the
             limit is reached. Default is intentionally generous (``2**16``)
             because each state is small.
-        tokenizer_endpoint: HTTP/RPC endpoint of an external tokenizer
-            worker. ``None`` runs tokenization in-process. Useful for
-            offloading expensive tokenizers (e.g. SentencePiece) off the
-            scheduler thread or the host process entirely.
-        detokenizer_endpoint: Same as ``tokenizer_endpoint`` but for the
-            detokenizer side, which is invoked once per generated chunk.
+        tokenizer_endpoint: ZMQ endpoint of an external tokenizer worker.
+            ``None`` starts an owned CPU-isolated subprocess, keeping
+            expensive tokenizers (e.g. SentencePiece) off the scheduler
+            thread and model process.
         worker_startup_timeout: Seconds to wait for an external worker to
             become healthy before the engine fails to initiate. ``None``
             uses the framework default. Increase for slow cold-starts (e.g.
@@ -639,7 +636,6 @@ class eSurgeWorkerConfig(TypedDict, total=False):
 
     detokenizer_max_states: NotRequired[int]
     tokenizer_endpoint: NotRequired[str | None]
-    detokenizer_endpoint: NotRequired[str | None]
     worker_startup_timeout: NotRequired[float | None]
     max_request_outputs: NotRequired[int | None]
     idle_reset_seconds: NotRequired[float | None]

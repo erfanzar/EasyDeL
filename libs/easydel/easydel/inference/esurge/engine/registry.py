@@ -51,6 +51,8 @@ class RequestRecord:
         decodable_tokens: Incrementally-filtered tokens for detokenization.
         reported_generated_count: Last generated-count reported to metrics.
         last_decoded_index: Index into decodable tokens of the last decode.
+        detokenizer_token_count: Tokens already submitted to native detokenization.
+        detokenized_text: Raw text reconstructed from bounded native deltas.
         start_time: ``perf_counter`` timestamp at admission.
         first_token_time: Seconds from admission to the first token, once known.
         last_decode_time: ``perf_counter`` timestamp of the last decode flush.
@@ -77,6 +79,8 @@ class RequestRecord:
     decodable_tokens: list[int] = field(default_factory=list)
     reported_generated_count: int = 0
     last_decoded_index: int = 0
+    detokenizer_token_count: int = 0
+    detokenized_text: str = ""
     start_time: float = 0.0
     first_token_time: float | None = None
     last_decode_time: float = 0.0

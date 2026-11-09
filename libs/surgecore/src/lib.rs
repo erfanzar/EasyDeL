@@ -17,7 +17,8 @@
 //! The pure-Rust modules own eSurge's host computation: [`payload`] builds a forward window's step inputs, [`kv`]
 //! holds the KV core and [`engine`] the scheduler core. The `python` feature (on by default) adds the PyO3 extension
 //! module `surgecore._native`, with one binding file per module, which binds that logic over preallocated numpy
-//! buffers and releases the GIL while it runs.
+//! buffers and releases the GIL while it runs. The `detok` binding owns in-process batched streaming detokenization
+//! around a Python HuggingFace tokenizer, returning only deltas on normal steps.
 
 pub mod engine;
 pub mod kv;

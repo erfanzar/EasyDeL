@@ -242,13 +242,6 @@ EASYDEL_TOKENIZER_ENDPOINT = _register(
     "eSurge engine",
     "Overrides the tokenizer worker ZeroMQ endpoint.",
 )
-EASYDEL_DETOKENIZER_ENDPOINT = _register(
-    "EASYDEL_DETOKENIZER_ENDPOINT",
-    "str",
-    None,
-    "eSurge engine",
-    "Overrides the detokenizer worker ZeroMQ endpoint.",
-)
 EASYDEL_WORKER_STARTUP_TIMEOUT = _register(
     "EASYDEL_WORKER_STARTUP_TIMEOUT",
     "float",

@@ -8,6 +8,9 @@ It holds:
   inputs, with the GIL released: token and position packing, query start locations and sequence lengths, rank-major DP
   packing, page-table rows, the DP-local page check, the v2 KV slot mapping, the positional request distribution and
   the packed sampling vectors.
+- `Detokenizer`, in-process batched incremental detokenization over a HuggingFace tokenizer. Rust owns request token
+  history, context windows, incomplete UTF-8 buffering, bounded FIFO state and terminal suffix reconciliation; normal
+  results carry only new text, with a full snapshot at finish or resynchronization.
 - `KvCore`, eSurge's KV-cache core: the page pool with its LRU free list and null page 0, the chained page keys and the
   prefix map, the full, sliding-window and chunked-local group rules, transactional allocation with rollback, and
   publication of pages once their KV is computed. eSurge's `CacheManager` is its binding.

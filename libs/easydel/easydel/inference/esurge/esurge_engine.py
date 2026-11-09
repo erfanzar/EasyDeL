@@ -467,8 +467,6 @@ class eSurge:
                   streaming states.
                 - ``tokenizer_endpoint`` (str | None): Out-of-process tokenizer
                   endpoint URL.
-                - ``detokenizer_endpoint`` (str | None): Out-of-process
-                  detokenizer endpoint URL.
                 - ``worker_startup_timeout`` (float | None): Startup timeout, secs.
                 - ``max_request_outputs`` (int | None): Cap of retained finished
                   outputs.
@@ -718,9 +716,6 @@ class eSurge:
         )
 
         tokenizer_endpoint = self.worker_config.tokenizer_endpoint or flags.get_str(flags.EASYDEL_TOKENIZER_ENDPOINT)
-        detokenizer_endpoint = self.worker_config.detokenizer_endpoint or flags.get_str(
-            flags.EASYDEL_DETOKENIZER_ENDPOINT
-        )
 
         self._worker_manager = WorkerManager(
             assets.tokenizer_source, startup_timeout=self.worker_config.worker_startup_timeout
@@ -728,10 +723,8 @@ class eSurge:
         self._tokenizer_client, self._detokenizer_client = self._worker_manager.start(
             detokenizer_max_states=self.worker_config.detokenizer_max_states,
             tokenizer_endpoint=tokenizer_endpoint,
-            detokenizer_endpoint=detokenizer_endpoint,
         )
         self._tokenizer_endpoint = self._worker_manager.tokenizer_endpoint
-        self._detokenizer_endpoint = self._worker_manager.detokenizer_endpoint
 
         self.tool_parser = assets.tool_parser_name
         self.reasoning_parser_name = assets.reasoning_parser_name
@@ -742,7 +735,9 @@ class eSurge:
         self.drafter = drafter
         runner_async_scheduling = bool(self.runtime_config.async_scheduling)
         if drafter is not None and runner_async_scheduling:
-            logger.warning("Disabling async scheduling for runner-native speculative decoding.")
+            # A plan built before the previous verify step's acceptance is known does not yet reproduce greedy
+            # output exactly, so speculative decoding schedules synchronously.
+            logger.warning("Disabling async scheduling for speculative decoding.")
             runner_async_scheduling = False
 
         max_num_batched_tokens = self.runtime_config.max_num_batched_tokens

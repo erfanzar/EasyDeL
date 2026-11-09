@@ -310,7 +310,7 @@ class EngineAssets:
         model: The loaded (and MLA-compat-adjusted) EasyDeL module.
         processor: Unified text/multimodal processor object.
         tokenizer: The resolved tokenizer.
-        tokenizer_source: Id/path used to spawn tokenizer/detokenizer workers.
+        tokenizer_source: Id/path used by the tokenizer worker and native detokenizer.
         drafter: Constructed speculative-decoding drafter, or ``None``.
         tool_parser_name: Resolved tool-parser name (possibly auto-detected),
             or ``None`` when function calling is disabled.

@@ -19,13 +19,10 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
-import threading
 
 import pytest
-import zmq
 from easydel.workers.esurge.auth import AuthWorkerManager
 from easydel.workers.esurge.pipeline.worker_manager import WorkerManager
-from easydel.workers.esurge.pipeline.zmq_workers import DetokenizerWorkerClient
 from easydel.workers.response_store.worker_manager import ResponseStoreWorkerManager
 
 pytestmark = pytest.mark.cpu_ok
@@ -136,30 +133,24 @@ class _FakeProcess:
         self.terminated = True
 
 
-@pytest.mark.parametrize("failure_stage", ["spawn", "bind"])
-def test_failed_detokenizer_startup_terminates_tokenizer_worker(monkeypatch, tmp_path, failure_stage):
-    manager = WorkerManager("dummy-tokenizer", startup_timeout=1.0, ipc_dir=str(tmp_path))
-    spawned: dict[str, _FakeProcess] = {}
+def test_failed_native_detokenizer_startup_terminates_tokenizer_worker(monkeypatch, short_dir):
+    from easydel.workers.esurge.pipeline import worker_manager
+    from transformers import AutoTokenizer
 
-    def fake_spawn(mode, endpoint, *, detokenizer_max_states):
-        if mode == "detokenizer" and failure_stage == "spawn":
-            raise OSError("detokenizer could not launch")
-        spawned[mode] = _FakeProcess()
-        return spawned[mode]
+    manager = WorkerManager("dummy-tokenizer", startup_timeout=1.0, ipc_dir=str(short_dir))
+    process = _FakeProcess()
+    monkeypatch.setattr(manager, "_spawn_worker", lambda endpoint: process)
+    monkeypatch.setattr(manager, "_wait_for_endpoint", lambda *args: None)
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *args, **kwargs: object())
 
-    def fake_wait(worker_name, endpoint, process):
-        if worker_name == "detokenizer":
-            raise TimeoutError("detokenizer never bound")
+    def fail_detokenizer(*args, **kwargs):
+        raise OSError("native detokenizer could not start")
 
-    monkeypatch.setattr(manager, "_spawn_worker", fake_spawn)
-    monkeypatch.setattr(manager, "_wait_for_endpoint", fake_wait)
+    monkeypatch.setattr(worker_manager, "Detokenizer", fail_detokenizer)
+    with pytest.raises(OSError, match="native detokenizer"):
+        manager.start(detokenizer_max_states=8, tokenizer_endpoint=None)
 
-    with pytest.raises(OSError):
-        manager.start(detokenizer_max_states=8, tokenizer_endpoint=None, detokenizer_endpoint=None)
-
-    assert spawned["tokenizer"].terminated
-    if "detokenizer" in spawned:
-        assert spawned["detokenizer"].terminated
+    assert process.terminated
     assert manager.tokenizer_endpoint is None
     manager.shutdown()
 
@@ -174,58 +165,9 @@ def test_startup_timeout_flag_rejects_non_positive_values(monkeypatch, tmp_path,
     monkeypatch.setattr(worker_manager.time, "time", lambda: clock[0])
     monkeypatch.setattr(worker_manager.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
     manager = WorkerManager("dummy-tokenizer", ipc_dir=str(tmp_path))
-    monkeypatch.setattr(manager, "_spawn_worker", lambda *args, **kwargs: process)
+    monkeypatch.setattr(manager, "_spawn_worker", lambda endpoint: process)
     with pytest.raises(TimeoutError, match="Timed out waiting"):
-        manager.start(detokenizer_max_states=8, tokenizer_endpoint=None, detokenizer_endpoint=None)
+        manager.start(detokenizer_max_states=8, tokenizer_endpoint=None)
     assert expected_deadline <= clock[0] < expected_deadline + 0.1
     assert process.terminated
     assert manager.tokenizer_endpoint is None
-
-
-def test_detokenizer_drain_forces_full_token_resync(tmp_path):
-    endpoint = f"ipc://{tmp_path / 'detok.sock'}"
-    ctx = zmq.Context()
-    server = ctx.socket(zmq.REP)
-    server.bind(endpoint)
-    received: list[dict] = []
-
-    def serve():
-        while True:
-            msg = server.recv_pyobj()
-            received.append(msg)
-            if msg["cmd"] == "decode":
-                server.send_pyobj(
-                    {
-                        "status": "ok",
-                        "result": {
-                            "accumulated_text": "",
-                            "delta_text": "",
-                            "last_decoded_index": len(msg["tokens_delta"]),
-                            "finished": msg["finished"],
-                            "detoktook": 0.0,
-                        },
-                    }
-                )
-            else:
-                server.send_pyobj({"status": "ok"})
-                if msg["cmd"] == "shutdown":
-                    return
-
-    thread = threading.Thread(target=serve, daemon=True)
-    thread.start()
-
-    client = DetokenizerWorkerClient(endpoint)
-    try:
-        kwargs = {"finished": False, "skip_special_tokens": True}
-        client.decode("r1", [1, 2, 3], **kwargs)
-        client.decode("r1", [1, 2, 3, 4], **kwargs)
-        assert "tokens" not in received[-1]  # steady state: delta only
-        client.drain()
-        client.decode("r1", [1, 2, 3, 4, 5], **kwargs)
-        assert received[-1]["tokens"] == [1, 2, 3, 4, 5]
-        assert received[-1]["token_offset"] == 0
-    finally:
-        client.shutdown()
-        thread.join(timeout=10)
-        server.close(0)
-        ctx.term()

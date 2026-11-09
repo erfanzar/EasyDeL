@@ -16,7 +16,8 @@
 
 The compiled extension module ``surgecore._native`` is built from this package's Rust crate with maturin. It holds
 the per-step host computation of eSurge's runner: :class:`HostPayloadBuilder` fills a batch preparer's preallocated
-numpy staging arrays with one forward window's step inputs, with the GIL released. :class:`KvCore` is the KV core of
+numpy staging arrays with one forward window's step inputs, with the GIL released. :class:`Detokenizer` owns batched
+in-process incremental detokenization and bounded delta-only streaming results. :class:`KvCore` is the KV core of
 one page pool (LRU free list, prefix map, cache-group rules, transactional allocation) and :class:`SnapshotIndex`
 the recurrent-snapshot slot index. :class:`EngineCore` is eSurge's host state machine: the request table, every
 data-parallel rank's queues, budgets, KV pages, prefix cache and snapshots, and the scheduler over them, with
@@ -32,6 +33,8 @@ try:
         PLAN_PAGES_CHANGED,
         PLAN_STRUCTURED_PENDING,
         CoreClosed,
+        Detokenizer,
+        DetokenizerResult,
         EngineCore,
         Events,
         HostPayloadBuilder,
@@ -56,6 +59,8 @@ __all__ = (
     "PLAN_PAGES_CHANGED",
     "PLAN_STRUCTURED_PENDING",
     "CoreClosed",
+    "Detokenizer",
+    "DetokenizerResult",
     "EngineCore",
     "Events",
     "HostPayloadBuilder",

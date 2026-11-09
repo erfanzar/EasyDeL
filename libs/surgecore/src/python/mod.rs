@@ -15,11 +15,13 @@
 //! The `surgecore._native` extension module.
 //!
 //! Each Rust module of the crate has one binding file here whose `register` function adds that module's classes and
-//! functions: `payload` (the step-input builder), `kv` (the KV core) and `engine` (the scheduler core). The crate-root
-//! modules hold the logic and stay free of PyO3, so `cargo test --no-default-features` tests them without Python.
+//! functions: `payload` (the step-input builder), `kv` (the KV core), `engine` (the scheduler core) and `detok`
+//! (in-process batched detokenization). The crate-root modules hold the logic and stay free of PyO3, so
+//! `cargo test --no-default-features` tests them without Python.
 
 use pyo3::prelude::*;
 
+mod detok;
 mod engine;
 mod kv;
 mod payload;
@@ -30,5 +32,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     payload::register(m)?;
     kv::register(m)?;
     engine::register(m)?;
+    detok::register(m)?;
     Ok(())
 }

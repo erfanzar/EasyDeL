@@ -58,9 +58,7 @@ def test_constructor_sets_instance_policy_before_start_without_changing_other_en
     monkeypatch.setattr(
         esurge_engine,
         "WorkerManager",
-        lambda *args, **kwargs: SimpleNamespace(
-            start=lambda **kwargs: (None, None), tokenizer_endpoint=None, detokenizer_endpoint=None
-        ),
+        lambda *args, **kwargs: SimpleNamespace(start=lambda **kwargs: (None, None), tokenizer_endpoint=None),
     )
 
     def runner_factory(**kwargs):

@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-step cost of streaming through the output pipeline and the detokenizer worker stays bounded."""
-
-import pickle
-import threading
+"""Native streaming detokenization and stop scanning stay bounded per output step."""
 
 import pytest
 from easydel.inference.esurge.engine.output_pipeline import OutputPipeline
@@ -23,8 +20,7 @@ from easydel.inference.esurge.engine.registry import RequestRecord, RequestRegis
 from easydel.inference.esurge.engine_types import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput
 from easydel.inference.sampling_params import SamplingParams
-from easydel.workers.esurge.pipeline import worker_main
-from easydel.workers.esurge.pipeline.zmq_workers import DetokenizerWorkerClient
+from easydel.workers.esurge.pipeline import Detokenizer
 
 pytestmark = pytest.mark.cpu_ok
 
@@ -36,21 +32,33 @@ class _CharacterTokenizer:
         return "".join(chr(token) for token in tokens)
 
 
+class _Client:
+    """Recording wrapper; all decoding still executes in the native object."""
+
+    def __init__(self):
+        self.native = Detokenizer(_CharacterTokenizer(), context_window=0, max_states=8)
+        self.batch_sizes = []
+
+    def decode_batch(self, requests):
+        self.batch_sizes.append(len(requests))
+        return self.native.decode_batch(requests)
+
+    def reset(self, request_id):
+        self.native.reset(request_id)
+
+    def shutdown(self):
+        self.native.shutdown()
+
+
 @pytest.fixture
-def client(monkeypatch, tmp_path):
-    monkeypatch.setattr(worker_main.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: _CharacterTokenizer())
-    uri = f"ipc://{tmp_path / 'd.sock'}"
-    thread = threading.Thread(target=worker_main._detokenizer_worker, args=(uri, "unused", {}, 8), daemon=True)
-    thread.start()
-    client = DetokenizerWorkerClient(uri, request_timeout=30)
-    yield client
-    client.shutdown()
-    thread.join(timeout=5)
-    assert not thread.is_alive()
+def client():
+    detokenizer = _Client()
+    yield detokenizer
+    detokenizer.shutdown()
 
 
 def _stream(client, text: str, *, include_stop: bool = False):
-    """Stream ``text`` one character token per step; return the output and per-step reply bytes and scan lengths."""
+    """Stream one character token per step; return output, result text sizes and stop-scan lengths."""
     registry = RequestRegistry()
     output = RequestOutput(
         request_id="r",
@@ -71,22 +79,24 @@ def _stream(client, text: str, *, include_stop: bool = False):
         on_activity=lambda: None,
         on_fatal=lambda exc, tb: pytest.fail(f"output pipeline failed: {exc}"),
     )
-    reply_bytes: list[int] = []
+    result_text_sizes: list[int] = []
     scanned: list[int] = []
-    request = client._request
+    decode_batch = client.decode_batch
     find = OutputPipeline._find_first_stop_string
 
-    def recording_request(payload):
-        reply = request(payload)
-        if payload.get("cmd") == "decode":
-            reply_bytes.append(len(pickle.dumps(reply)))
-        return reply
+    def recording_decode_batch(requests):
+        results = decode_batch(requests)
+        for request, result in zip(requests, results, strict=True):
+            if not request["finished"]:
+                # Normal native results contain only their delta. A resync snapshot is allowed but remains bounded here.
+                result_text_sizes.append(len(result.accumulated_text or result.delta_text))
+        return results
 
     def recording_find(text, stop_sequences):
         scanned.append(len(text))
         return find(text, stop_sequences)
 
-    client._request = recording_request
+    client.decode_batch = recording_decode_batch
     pipeline._find_first_stop_string = recording_find
     try:
         for step, char in enumerate(text):
@@ -98,29 +108,81 @@ def _stream(client, text: str, *, include_stop: bool = False):
             outputs = [EngineCoreOutput("r", [], finish_reason=FinishReason.LENGTH)]
             pipeline.submit({0: EngineCoreOutputs(outputs=outputs, timestamp=float(len(text) + 1))})
     finally:
-        client._request = request
-    return output, reply_bytes, scanned, stops
+        client.decode_batch = decode_batch
+    return output, result_text_sizes, scanned, stops
 
 
 def _letters(n: int) -> str:
     return "".join(chr(97 + i % 26) for i in range(n))
 
 
-def test_per_step_reply_bytes_and_stop_scan_do_not_grow_with_the_output(client):
+def test_per_step_result_text_and_stop_scan_do_not_grow_with_the_output(client):
     peaks = {}
     for n in (2048, 32768):
         text = _letters(n)
-        output, reply_bytes, scanned, stops = _stream(client, text)
+        output, result_text_sizes, scanned, stops = _stream(client, text)
         completion = output.outputs[0]
         assert output.finished and completion.finish_reason == "length" and not stops
         assert completion.text == text
         assert completion.token_ids == [ord(c) for c in text]
         assert isinstance(completion.token_ids, list)
         # The terminal step returns and scans the whole text once; every streaming step is bounded.
-        peaks[n] = (max(reply_bytes[:-1]), max(scanned[:-1]))
-    assert peaks[32768][0] <= peaks[2048][0] + 16
+        peaks[n] = (max(result_text_sizes), max(scanned[:-1]))
+    assert peaks[32768][0] <= peaks[2048][0] + 1
     assert peaks[32768][1] <= peaks[2048][1]
     assert peaks[32768][1] <= 2 * len(_STOP)
+
+
+def test_output_bundle_uses_one_native_batch_for_all_due_decodes(client):
+    registry = RequestRegistry()
+    output = RequestOutput(
+        request_id="parent",
+        prompt="p",
+        prompt_token_ids=[[1]],
+        outputs=[CompletionOutput(index=index, text="", token_ids=[]) for index in range(2)],
+    )
+    registry.outputs["parent"] = output
+    for index, request_id in enumerate(("r0", "r1")):
+        registry.register(
+            request_id,
+            RequestRecord(
+                prompt_token_ids=[1],
+                sampling_params=SamplingParams(max_tokens=2),
+                sample_index=index,
+                parent_request_id="parent",
+            ),
+            output,
+        )
+    pipeline = OutputPipeline(
+        registry=registry,
+        detokenizer_client=client,
+        eos_token_ids=[],
+        decode_interval_tokens=1,
+        decode_interval_secs=1000.0,
+        on_stop_strings=lambda stops: None,
+        on_activity=lambda: None,
+        on_fatal=lambda exc, tb: pytest.fail(f"output pipeline failed: {exc}"),
+    )
+    pipeline.submit(
+        {0: EngineCoreOutputs(outputs=[EngineCoreOutput("r0", [65]), EngineCoreOutput("r1", [66])], timestamp=1.0)}
+    )
+    assert client.batch_sizes == [2]
+    assert [completion.text for completion in output.outputs] == ["A", "B"]
+
+    pipeline.submit(
+        {
+            0: EngineCoreOutputs(
+                outputs=[
+                    EngineCoreOutput("r0", [], finish_reason=FinishReason.LENGTH),
+                    EngineCoreOutput("r1", [], finish_reason=FinishReason.LENGTH),
+                ],
+                timestamp=2.0,
+            )
+        }
+    )
+    assert client.batch_sizes == [2, 2]
+    assert output.finished
+    assert [completion.text for completion in output.outputs] == ["A", "B"]
 
 
 @pytest.mark.parametrize("include_stop", [False, True])

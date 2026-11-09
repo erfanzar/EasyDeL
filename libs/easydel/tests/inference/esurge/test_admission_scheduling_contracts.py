@@ -250,9 +250,7 @@ def test_public_engine_forwards_speculation_options(monkeypatch, route):
     monkeypatch.setattr(
         esurge_engine,
         "WorkerManager",
-        lambda *args, **kwargs: SimpleNamespace(
-            start=lambda **kwargs: (None, None), tokenizer_endpoint=None, detokenizer_endpoint=None
-        ),
+        lambda *args, **kwargs: SimpleNamespace(start=lambda **kwargs: (None, None), tokenizer_endpoint=None),
     )
 
     def runner(**kwargs):
