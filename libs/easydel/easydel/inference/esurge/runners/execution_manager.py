@@ -1852,6 +1852,14 @@ class ExecutionManager:
             padded_num_reqs=model_logits_padded_num_reqs,
             inputs=inputs,
             use_pipeline_runtime=use_pipeline_runtime_for_window,
+            decode_only=bool(
+                not self.model.mesh.is_mpmd
+                and self._is_decode_only_window(
+                    scheduled_full_cpu=scheduled_full_cpu,
+                    active_mask_full_cpu=active_mask_full_cpu,
+                    padded_num_reqs=padded_num_reqs,
+                )
+            ),
         )
         model_enqueue_took = time.time() - model_enqueue_start
         if self._verbose and num_tokens > 0:
@@ -2060,6 +2068,7 @@ class ExecutionManager:
         padded_num_reqs: int,
         inputs: StepFunctionInputs,
         use_pipeline_runtime: bool = True,
+        decode_only: bool = False,
     ) -> ModelStepOutputs:
         """Run the compiled model forward step and update self.kv_pages.
 
@@ -2074,6 +2083,9 @@ class ExecutionManager:
             use_pipeline_runtime: Select the resident PP-runtime backbone
                 variant for true decode wavefronts, or the direct SpectraX
                 variant for prompt prefill chunks.
+            decode_only: Whether every active row of the window schedules exactly one token. On SPMD meshes such
+                a window runs the decode-layout program of its bucket when one was compiled; the key that ran is
+                recorded in ``last_model_step_key``.
 
         Returns:
             ModelStepOutputs containing updated kv_pages, hidden_states, and
@@ -2089,7 +2101,12 @@ class ExecutionManager:
             num_tokens=num_tokens,
             padded_num_reqs=padded_num_reqs,
             use_pipeline_runtime=use_pipeline_runtime,
+            decode_only=decode_only,
         )
+        if not self.model.mesh.is_mpmd:
+            self.last_model_step_key = self._model_executor.model_step_key(
+                num_tokens, padded_num_reqs, decode_only=decode_only
+            )
         # Do not block here: allow the caller to pipeline dependent work
         # (e.g. enqueue sampling) before synchronizing.
         graphstate_arg, graphother_arg = self._model_executor.runtime_graph_args()
@@ -2602,6 +2619,18 @@ class ExecutionManager:
         active_reqs = max(1, min(padded_num_reqs, max_num_reqs, num_tokens))
         scheduled_full_cpu[:active_reqs] = 1
         active_mask_full_cpu[:active_reqs] = True
+        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+        if dp_size > 1 and int(max_num_reqs) % dp_size == 0:
+            # Rank-major DP gives every rank ``num_tokens / dp`` tokens and ``max_num_reqs / dp`` rows. Dealing the
+            # dummy rows round-robin over the ranks keeps each rank within both budgets for every compiled pair
+            # (``active_reqs <= num_tokens`` and ``num_tokens % dp == 0``); packing them into the first rows would
+            # put up to ``padded_num_reqs`` tokens on rank 0 alone.
+            rows_per_rank = int(max_num_reqs) // dp_size
+            slot_group = max(1, int(getattr(self, "recurrent_slot_group_size", 1) or 1))
+            dummy = numpy.arange(active_reqs, dtype=numpy.int32)
+            global_rows = (dummy % dp_size) * rows_per_rank + dummy // dp_size
+            window_row_indices_cpu[:active_reqs] = global_rows
+            recurrent_slot_indices_cpu[:active_reqs] = global_rows * slot_group
         input_ids_buf = jax.device_put(jnp.zeros((self.max_num_tokens,), dtype=jnp.int32), self._empty_sharding)
         position_ids_buf = jax.device_put(jnp.zeros((self.max_num_tokens,), dtype=jnp.int32), self._empty_sharding)
 

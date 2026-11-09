@@ -358,6 +358,18 @@ class ModelStepExecutor:
                 graphother_template=graphother_template,
             )
         )
+        # Decode-layout twin of ``_model_step_fn`` for pairs whose token bucket exceeds the request bucket (a
+        # token-bucket floor above the request bucket). A separate jit keeps its trace cache disjoint from the
+        # general program of the same shapes, as for ``_backbone_fn_decode``.
+        self._model_step_fn_decode = (
+            None
+            if self._uses_mpmd_mesh()
+            else self._build_model_step_fn(
+                kv_pages_template=kv_pages_template,
+                graphstate_template=graphstate_template,
+                graphother_template=graphother_template,
+            )
+        )
         self._can_fuse_pipeline_model_step = (
             self._uses_mpmd_mesh()
             and not self._lm_head_uses_tied_projection
@@ -1364,6 +1376,42 @@ class ModelStepExecutor:
         mode = self._compile_mode()
         return (int(num_tokens), int(padded_num_reqs), "model_step", mode) in self._cache
 
+    def has_decode_model_step(self, num_tokens: int, padded_num_reqs: int) -> bool:
+        """Whether a decode-layout program serves pure-decode windows of this bucket pair.
+
+        Pairs with equal buckets are traced under the decode layout by :meth:`compile_model_step`; other pairs
+        need the separate ``"model_step_decode"`` variant.
+
+        Args:
+            num_tokens: Token bucket.
+            padded_num_reqs: Request bucket.
+
+        Returns:
+            Whether pure-decode windows of the pair have a compiled decode-layout program.
+        """
+        if int(num_tokens) == int(padded_num_reqs):
+            return self.has_model_step(num_tokens, padded_num_reqs)
+        return (int(num_tokens), int(padded_num_reqs), "model_step_decode", self._compile_mode()) in self._cache
+
+    def model_step_key(self, num_tokens: int, padded_num_reqs: int, *, decode_only: bool = False) -> tuple:
+        """Return the SPMD model-step cache key that runs a window of this bucket pair.
+
+        Args:
+            num_tokens: Token bucket of the window.
+            padded_num_reqs: Request bucket of the window.
+            decode_only: Whether every active row of the window schedules exactly one token.
+
+        Returns:
+            ``(num_tokens, padded_num_reqs, kind, mode)`` where ``kind`` is ``"model_step_decode"`` when a
+            pure-decode window has a compiled decode-layout variant distinct from the general program, and
+            ``"model_step"`` otherwise (equal buckets are always traced under the decode layout).
+        """
+        mode = self._compile_mode()
+        decode_key = (int(num_tokens), int(padded_num_reqs), "model_step_decode", mode)
+        if decode_only and int(num_tokens) != int(padded_num_reqs) and decode_key in self._cache:
+            return decode_key
+        return (int(num_tokens), int(padded_num_reqs), "model_step", mode)
+
     def _backbone_cache_key(self, num_tokens: int, *, use_pipeline_runtime: bool) -> tuple[int, str, str, bool]:
         """Build the cache key for a PP backbone variant.
 
@@ -1449,6 +1497,7 @@ class ModelStepExecutor:
         num_tokens: int,
         padded_num_reqs: int,
         use_pipeline_runtime: bool = True,
+        decode_only: bool = False,
     ) -> tp.Any:
         """Stitch backbone + LM head into a single combined callable.
 
@@ -1468,6 +1517,8 @@ class ModelStepExecutor:
             use_pipeline_runtime: Selects the PP backbone runtime mode. Decode
                 wavefronts use the resident stage runtime; prefill chunks use
                 direct SpectraX dispatch.
+            decode_only: SPMD only: the window is pure decode, so its
+                decode-layout program is preferred (see :meth:`model_step_key`).
 
         Returns:
             Callable producing :class:`ModelStepOutputs` from
@@ -1478,7 +1529,9 @@ class ModelStepExecutor:
         """
         mode = self._compile_mode()
         if not self._uses_mpmd_mesh():
-            return self._cache_lookup(self._cache, (int(num_tokens), int(padded_num_reqs), "model_step", mode))
+            return self._cache_lookup(
+                self._cache, self.model_step_key(num_tokens, padded_num_reqs, decode_only=decode_only)
+            )
         fused_key = (int(num_tokens), int(padded_num_reqs), "model_step", mode)
         if fused_key in self._cache:
             return self._cache_lookup(self._cache, fused_key)
@@ -1752,8 +1805,13 @@ class ModelStepExecutor:
         graphstate: tp.Any,
         graphother: tp.Any,
         inputs: StepFunctionInputs,
+        decode_layout: bool = False,
     ) -> ModelStepOutputs | None:
         """Compile the fused SPMD model step for one token/request bucket pair.
+
+        ``decode_layout=True`` with unequal buckets compiles the separate decode-layout variant
+        (``"model_step_decode"`` key) that pure-decode windows of the pair run; equal buckets are always traced
+        under the decode layout.
 
         The MPMD path intentionally keeps the backbone and LM head separate so
         stage-local placement can be controlled. On SPMD there is no stage
@@ -1769,9 +1827,12 @@ class ModelStepExecutor:
 
         self.graphdef = graphdef
         mode = self._compile_mode()
-        key = (int(num_tokens), int(padded_num_reqs), "model_step", mode)
+        separate_decode = bool(decode_layout) and int(num_tokens) != int(padded_num_reqs)
+        decode_only = separate_decode or int(num_tokens) == int(padded_num_reqs)
+        key = (int(num_tokens), int(padded_num_reqs), "model_step_decode" if separate_decode else "model_step", mode)
         if key in self._cache:
             return None
+        step_fn = self._model_step_fn_decode if separate_decode else self._model_step_fn
 
         graphstate_arg, graphother_arg = self._graph_call_args(graphstate, graphother)
         # Pure-decode buckets (every request contributes exactly one token) are
@@ -1781,9 +1842,9 @@ class ModelStepExecutor:
         # condition is derivable from the bucket key itself, so the compiled
         # cache stays consistent (a given (num_tokens, padded_num_reqs) shape
         # always traces in the same mode).
-        with decode_mode_specs(int(num_tokens) == int(padded_num_reqs)):
+        with decode_mode_specs(decode_only):
             if self.use_aot_forward:
-                compiled = self._model_step_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
+                compiled = step_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
                     *(
                         graphdef,
                         graphstate_arg,
@@ -1804,7 +1865,7 @@ class ModelStepExecutor:
                 the wrapper's ``(graphstate, graphother, kv_pages, metadata)``
                 signature symmetric with the AOT-compiled variant.
                 """
-                return self._model_step_fn(
+                return step_fn(
                     self.graphdef,
                     graphstate_,
                     graphother_,

@@ -173,6 +173,35 @@ class CompileOrchestrator:
                 feasible_pairs.append((int(num_tokens), int(reqs_padd)))
         return feasible_pairs
 
+    @staticmethod
+    def _decode_layout_pairs(
+        model_compile_pairs: list[tuple[int, int]],
+        reqs_padds: list[int],
+    ) -> list[tuple[int, int]]:
+        """Return the extra decode-layout pairs: one per request bucket that is not a token bucket.
+
+        A pure-decode window of ``r`` requests runs the smallest token bucket ``t >= r``. When ``t == r`` the
+        ``(r, r)`` program is already traced under the decode layout; otherwise (a token-bucket floor above the
+        request bucket) ``(t, r)`` gets a decode-layout twin of its general program. This adds at most one program
+        per request bucket instead of doubling the grid.
+
+        Args:
+            model_compile_pairs: The general ``(num_tokens, padded_num_reqs)`` pairs being compiled.
+            reqs_padds: Request buckets.
+
+        Returns:
+            ``(num_tokens, padded_num_reqs)`` pairs needing a separate decode-layout variant.
+        """
+        compiled = set(model_compile_pairs)
+        token_buckets = sorted({int(t) for t, _ in model_compile_pairs})
+        pairs: list[tuple[int, int]] = []
+        for reqs_padd in sorted({int(r) for r in reqs_padds}):
+            num_tokens = next((t for t in token_buckets if t >= reqs_padd), None)
+            if num_tokens is None or num_tokens == reqs_padd or (num_tokens, reqs_padd) not in compiled:
+                continue
+            pairs.append((num_tokens, reqs_padd))
+        return pairs
+
     def compile(
         self,
         num_tokens_paddings: list[int],
@@ -338,6 +367,17 @@ class CompileOrchestrator:
                     metadata=metadata,
                 )
             model_step_progress.complete(f"All {len(model_compile_pairs)} fused model-step compilations completed")
+            decode_pairs = self._decode_layout_pairs(model_compile_pairs, reqs_padds)
+            for num_tokens, reqs_padd in decode_pairs:
+                self._manager._compile_model_step_variant(
+                    num_tokens=num_tokens,
+                    padded_num_reqs=reqs_padd,
+                    max_num_reqs=max_num_reqs,
+                    metadata=metadata,
+                    decode_layout=True,
+                )
+            if decode_pairs:
+                logger.info(f"Compiled {len(decode_pairs)} decode-layout model-step variants: {decode_pairs}")
 
             lm_head_progress = ProgressLogger("eSurge-sampler", logger)
             total_phase2 = len(sampler_reqs_padds_to_compile)
@@ -369,9 +409,17 @@ class CompileOrchestrator:
         padded_num_reqs: int,
         max_num_reqs: int,
         metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig,
+        decode_layout: bool = False,
     ) -> None:
-        """Compile the fused SPMD model step for one token/request bucket pair."""
-        if self._manager._model_executor.has_model_step(num_tokens, padded_num_reqs):
+        """Compile the fused SPMD model step for one token/request bucket pair.
+
+        ``decode_layout=True`` compiles the pair's decode-layout variant for pure-decode windows.
+        """
+        executor = self._manager._model_executor
+        if decode_layout:
+            if executor.has_decode_model_step(num_tokens, padded_num_reqs):
+                return
+        elif executor.has_model_step(num_tokens, padded_num_reqs):
             return
 
         compargs = self._manager.get_compile_configurations(
@@ -390,6 +438,7 @@ class CompileOrchestrator:
             graphstate=graphstate,
             graphother=graphother,
             inputs=inputs,
+            decode_layout=decode_layout,
         )
         if model_out is not None and not self._manager.model.mesh.is_mpmd:
             self._manager.kv_pages = model_out.kv_pages
