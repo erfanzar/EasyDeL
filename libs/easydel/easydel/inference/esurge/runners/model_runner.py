@@ -286,6 +286,15 @@ def _host_packed_rows(rows: typing.Any) -> np.ndarray | None:
     return np.asarray(jax.device_get(rows))
 
 
+@jax.jit
+def _take_handoff_tokens(sampled: jax.Array, rows: jax.Array) -> jax.Array:
+    """Gather the previous step's sampled tokens at ``rows`` in one device program (int32).
+
+    A row index past the end of ``sampled`` (the padding of an unused handoff slot) yields 0.
+    """
+    return jnp.take(sampled.astype(jnp.int32), rows, axis=0, mode="fill", fill_value=0)
+
+
 class _AsyncExecutionHandle:
     """Deferred host-materialized model output for overlap execution.
 
@@ -2926,23 +2935,35 @@ class eSurgeRunner:
             input_positions = self._get_handoff_positions(max_handoff)
             token_ids = pre_results.windows[patch_sources[0][0]].sampled_token_ids
         else:
+            # One gather for every patched row, with its row index built on the host: indexing each request's
+            # sampled token separately launched one device program per row (one per request under rank-major DP,
+            # whose positions are never the dense prefix above), each coordinated across every host of the mesh.
+            window_ids = sorted({window_idx for window_idx, _ in patch_sources})
+            if len(window_ids) == 1:
+                source = pre_results.windows[window_ids[0]].sampled_token_ids
+                rows_np = np.asarray([row_pos for _, row_pos in patch_sources], dtype=np.int32)
+            else:
+                bases: dict[int, int] = {}
+                parts = []
+                base = 0
+                for window_idx in window_ids:
+                    part = pre_results.windows[window_idx].sampled_token_ids
+                    bases[window_idx] = base
+                    parts.append(part)
+                    base += int(part.shape[0])
+                source = jnp.concatenate(parts)
+                rows_np = np.asarray([bases[w] + row_pos for w, row_pos in patch_sources], dtype=np.int32)
             input_positions_np = np.asarray(patch_positions, dtype=np.int32)
-            if input_positions_np.shape[0] < max_handoff:
-                input_positions_np = np.pad(input_positions_np, (0, max_handoff - int(input_positions_np.shape[0])))
-            input_positions = put_host_payload(
-                input_positions_np,
+            pad = max_handoff - int(input_positions_np.shape[0])
+            if pad > 0:
+                input_positions_np = np.pad(input_positions_np, (0, pad))
+                rows_np = np.pad(rows_np, (0, pad), constant_values=int(source.shape[0]))
+            input_positions, rows = put_host_payload(
+                (input_positions_np, rows_np),
                 self.executor_manager._empty_sharding,
                 host_payloads_replicated=getattr(self, "host_payloads_replicated", None),
             )
-            token_ids = jnp.stack(
-                [
-                    jnp.asarray(sampled_tokens[row_pos], dtype=jnp.int32)
-                    for sampled_tokens, row_pos in patch_token_sources
-                ]
-            )
-            if token_ids.shape[0] < max_handoff:
-                token_ids = jnp.pad(token_ids, ((0, max_handoff - int(token_ids.shape[0])),))
-            token_ids = jax.device_put(token_ids, self.executor_manager._empty_sharding)
+            token_ids = jax.device_put(_take_handoff_tokens(source, rows), self.executor_manager._empty_sharding)
         return DeviceInputTokenHandoff(input_positions=input_positions, token_ids=token_ids, count=count, offset=offset)
 
     def _get_handoff_positions(self, size: int) -> jax.Array:
