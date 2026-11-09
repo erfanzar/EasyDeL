@@ -2678,8 +2678,8 @@ class eSurgeRunner:
             return False
         if self.drafter is not None:
             return self._can_defer_spec_step(scheduler_output)
-        if any(int(n) != 1 for n in scheduler_output.num_scheduled_tokens.values()):
-            return False
+        # Prefill chunks may ride along with decode rows: their tokens are already on the host, and the final chunk
+        # of a prompt leaves an output placeholder that the next step patches from the device like a decode row's.
         if bool(getattr(scheduler_output, "pending_structured_output_tokens", False)):
             return False
         if self._model_uses_vlm_inputs():
@@ -2814,11 +2814,15 @@ class eSurgeRunner:
             return False
         if int(scheduler_output.total_num_scheduled_tokens or 0) <= 0:
             return False
-        if any(int(n) != 1 for n in scheduler_output.num_scheduled_tokens.values()):
+        if self.drafter is not None and any(int(n) != 1 for n in scheduler_output.num_scheduled_tokens.values()):
+            # Verify windows rebuild their inputs through the speculative window handoff instead.
             return False
         if bool(getattr(scheduler_output, "pending_structured_output_tokens", False)):
             return False
         if is_vlm_model or model_has_side_inputs(self.model):
+            return False
+        if getattr(self.sequence_buffer, "bad_words_token_ids", None):
+            # Bad-word masks match against the host token history, whose last slot may still hold a placeholder.
             return False
         if bool(np.any(frequency_penalties_cpu != 0.0)):
             return False
@@ -2895,18 +2899,18 @@ class eSurgeRunner:
                 flat_offset += scheduled
                 continue
 
+            # Only a request the previous step sampled for has a placeholder, at its last token. Every other row, such
+            # as a prefill chunk (the final one ends on a real prompt token), feeds host tokens unpatched.
+            sampled = sampled_by_req.get(str(rid))
             start_tok = int(self.sequence_buffer.num_computed_tokens[global_row])
             placeholder_pos = int(self.sequence_buffer.num_tokens_no_spec[global_row]) - 1
-            touches_placeholder = start_tok <= placeholder_pos < start_tok + scheduled
+            touches_placeholder = sampled is not None and start_tok <= placeholder_pos < start_tok + scheduled
             if not touches_placeholder:
                 if use_spmd_dp:
                     rank_used_tokens[rank] += scheduled
                 flat_offset += scheduled
                 continue
             if scheduled != 1 or start_tok != placeholder_pos:
-                return None
-            sampled = sampled_by_req.get(str(rid))
-            if sampled is None:
                 return None
 
             sampled_window_idx, sampled_tokens, sampled_row_pos = sampled

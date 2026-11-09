@@ -46,6 +46,51 @@ def test_device_token_handoff_patches_flattened_input_ids_without_host_tokens():
     assert patched.position_ids_buf is metadata.position_ids_buf
 
 
+def test_device_token_handoff_skips_prefill_rows_of_a_mixed_step():
+    """A prompt's final prefill chunk ends on a real prompt token: only the decode row is patched."""
+    sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    runner = object.__new__(eSurgeRunner)
+    runner.async_scheduling = True
+    runner.metadata = SimpleNamespace(data_parallel_size=1)
+    runner.num_reqs_max_model_len = 4
+    runner.sequence_buffer = SimpleNamespace(
+        # Row 0 decodes at its placeholder (position 5); row 1 is a new request whose 3-token prompt is one chunk.
+        num_computed_tokens=np.array([0, 5, 0, 0], dtype=np.int32),
+        num_tokens_no_spec=np.array([3, 6, 0, 0], dtype=np.int32),
+    )
+    runner.executor_manager = SimpleNamespace(max_num_reqs=4, _empty_sharding=sharding)
+    runner._handoff_positions_cache = {}
+    runner._handoff_scalar_cache = {}
+    pre_results = AsyncPreResults(
+        windows=[
+            AsyncWindowResult(
+                req_ids=["decode"],
+                row_positions=[0],
+                sampled_token_ids=jnp.array([111, 0, 0, 0], dtype=jnp.int32),
+                valid_mask=[True],
+            )
+        ],
+        request_seq_lens=[],
+    )
+
+    handoff = runner._build_device_token_handoff(
+        pre_results=pre_results,
+        req_ids_window=["new", "decode"],
+        scheduled_list=[3, 1],
+        window_row_indices=np.array([0, 1], dtype=np.int32),
+        num_tokens_static=8,
+    )
+
+    assert handoff is not None
+    assert int(np.asarray(handoff.count)) == 1
+    metadata = _metadata(jnp.array([7, 8, 9, 0, 0, 0, 0, 0], dtype=jnp.int32))
+    patched = ExecutionManager._apply_device_token_handoff(metadata, handoff)
+    np.testing.assert_array_equal(
+        np.asarray(patched.model_input_ids),
+        np.array([7, 8, 9, 111, 0, 0, 0, 0], dtype=np.int32),
+    )
+
+
 def test_device_token_handoff_uses_rank_major_spmd_offsets():
     sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
     runner = object.__new__(eSurgeRunner)

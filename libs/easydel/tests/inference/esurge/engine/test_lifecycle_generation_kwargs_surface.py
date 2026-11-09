@@ -624,6 +624,7 @@ def test_lifecycle_pp_async_dispatches_next_step_before_draining_previous():
 def test_runner_async_drain_handoff_gate_allows_tp_decode():
     runner = SimpleNamespace(
         async_scheduling=True,
+        drafter=None,
         model=None,
         _model_uses_vlm_inputs=lambda: False,
         _has_default_sampling_penalties=lambda: True,
@@ -645,6 +646,7 @@ def test_runner_async_drain_handoff_gate_allows_tp_decode():
 def test_runner_async_drain_handoff_gate_rejects_structured_placeholders():
     runner = SimpleNamespace(
         async_scheduling=True,
+        drafter=None,
         model=None,
         _model_uses_vlm_inputs=lambda: False,
         _has_default_sampling_penalties=lambda: True,
@@ -662,6 +664,28 @@ def test_runner_async_drain_handoff_gate_rejects_structured_placeholders():
     scheduler_output.pending_structured_output_tokens = True
 
     assert not eSurgeRunner.can_dispatch_next_before_async_drain(runner, scheduler_output)
+
+
+def test_runner_async_drain_handoff_gate_allows_prefill_chunks_beside_decode_rows():
+    runner = SimpleNamespace(
+        async_scheduling=True,
+        drafter=None,
+        model=None,
+        _model_uses_vlm_inputs=lambda: False,
+        _has_default_sampling_penalties=lambda: True,
+    )
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={"decode": 1, "prefill": 96},
+        total_num_scheduled_tokens=97,
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_pages=[],
+        finished_req_ids=set(),
+        async_scheduling=True,
+    )
+
+    assert eSurgeRunner.can_dispatch_next_before_async_drain(runner, scheduler_output)
 
 
 def test_model_runner_update_model_weights_replaces_explicit_graphdef_with_compatible_graphdef(monkeypatch):

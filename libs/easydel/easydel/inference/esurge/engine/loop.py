@@ -477,17 +477,16 @@ class EngineLoop:
         def _execute_positive_schedule(
             scheduler_output: SchedulerOutput,
         ) -> tuple[typing.Any, SchedulerOutput] | None:
-            """Dispatch decode asynchronously and prefill synchronously.
+            """Dispatch a step the runner can defer asynchronously, any other synchronously.
 
             The async-overlap path defers sampled-token materialization
-            so decode step ``N+1`` can consume step ``N``'s sampled
-            token through device-side handoff. That contract only holds
-            for one-token decode windows. Chunked prefill windows do
-            not produce a client-visible sampled token, so running them
-            through an async handle only adds a deferred host copy that
-            the scheduler cannot use. Execute those synchronously and
-            return ``None``; return a pending async handle only for
-            decode-shaped schedules.
+            so step ``N+1`` can consume step ``N``'s sampled tokens
+            through device-side handoff. The runner decides which steps
+            qualify (``can_dispatch_next_before_async_drain``): decode
+            rows, and prefill chunks riding with them, whose inputs are
+            on the host or patched from the device. A step it refuses
+            runs synchronously and returns ``None``; a deferred step
+            returns its pending async handle.
             """
             defer_safe = self.runner.can_dispatch_next_before_async_drain(scheduler_output)
             if self._runner_verbose:
