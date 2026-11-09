@@ -80,6 +80,7 @@ from easydel.inference.esurge.config import (
     resolve_num_draft_tokens,
     token_bucket_floor,
 )
+from easydel.inference.sampling_processors import SamplingConstraints
 from easydel.inference.speculative import DrafterProtocol, accept_or_reject, resample_rejected
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.side_inputs import SideInputWindow
@@ -3129,46 +3130,43 @@ class eSurgeRunner:
         num_computed_tokens_window_cpu: np.ndarray,
         scheduled_full_cpu: np.ndarray,
     ):
-        """Build per-row logit-bias, allow-list and bad-next-token masks from request state."""
+        """Collect the window's per-request logit bias, allow-lists and banned next tokens as sparse entries.
+
+        Returns:
+            The window rows' :class:`SamplingConstraints`, or ``None`` when no request in the window carries one.
+            Tokens outside the vocabulary are dropped.
+        """
         vocab = int(self.model.config.get_text_config().vocab_size)
-        n = len(req_ids_window)
-        if n == 0:
-            return None, None, None
-        bias = np.zeros((n, vocab), dtype=np.float32)
-        allowed = np.ones((n, vocab), dtype=bool)
-        bad_next = np.zeros((n, vocab), dtype=bool)
-        any_bias = any_allowed = any_bad = False
+        bias: list[tuple[int, int, float]] = []
+        restricted: list[int] = []
+        allowed: list[tuple[int, int]] = []
+        banned: list[tuple[int, int]] = []
         for i, rid in enumerate(req_ids_window):
-            state = self.requests.get(rid)
+            state = self.requests.get(rid) if rid is not None else None
             if state is None:
                 continue
             params = state.sampling_params
             if params.logit_bias:
-                any_bias = True
-                for token, value in params.logit_bias.items():
-                    bias[i, int(token)] = float(value)
+                bias.extend(
+                    (i, int(token), float(value))
+                    for token, value in params.logit_bias.items()
+                    if 0 <= int(token) < vocab
+                )
             if params.allowed_token_ids is not None:
-                any_allowed = True
-                allowed[i, :] = False
-                for token in params.allowed_token_ids:
-                    allowed[i, int(token)] = True
+                restricted.append(i)
+                allowed.extend((i, int(token)) for token in params.allowed_token_ids if 0 <= int(token) < vocab)
             if params.bad_words_token_ids:
                 seq_len = int(num_computed_tokens_window_cpu[i]) + int(scheduled_full_cpu[i])
                 history = token_ids_window_cpu[i, : max(0, seq_len)]
                 for sequence in params.bad_words_token_ids:
-                    if not sequence:
+                    if not sequence or not 0 <= int(sequence[-1]) < vocab:
                         continue
                     prefix = sequence[:-1]
                     if len(prefix) == 0 or (
                         len(prefix) <= len(history) and np.array_equal(history[-len(prefix) :], np.asarray(prefix))
                     ):
-                        any_bad = True
-                        bad_next[i, int(sequence[-1])] = True
-        return (
-            bias if any_bias else None,
-            allowed if any_allowed else None,
-            bad_next if any_bad else None,
-        )
+                        banned.append((i, int(sequence[-1])))
+        return SamplingConstraints.from_entries(bias, restricted, allowed, banned)
 
     def _execute_model_impl(
         self,
@@ -3792,7 +3790,7 @@ class eSurgeRunner:
                     spec_recurrent_commit_cpu[0, int(_row_pos)] = 1
                     spec_recurrent_commit_cpu[1, int(_row_pos)] = int(_prefix)
                     applied_pending_commit_req_ids.append(str(_rid))
-            logit_bias_cpu, allowed_mask_cpu, bad_words_mask_cpu = self._sampling_processors_for_window(
+            sampling_constraints = self._sampling_processors_for_window(
                 req_ids_window,
                 token_ids_window_cpu,
                 num_computed_tokens_window_cpu,
@@ -3827,9 +3825,7 @@ class eSurgeRunner:
                 presence_penalties_cpu=presence_penalties_window_cpu,
                 repetition_penalties_cpu=repetition_penalties_window_cpu,
                 page_table_cpu=page_table_window_cpu,
-                logit_bias_cpu=logit_bias_cpu,
-                allowed_token_ids_mask_cpu=allowed_mask_cpu,
-                bad_words_token_ids_cpu=bad_words_mask_cpu,
+                sampling_constraints=sampling_constraints,
                 page_table_version=page_table_window_version,
                 cache_group_inputs=self.cache_group_inputs_for_execute(
                     window_row_indices_cpu=window_row_indices_cpu,

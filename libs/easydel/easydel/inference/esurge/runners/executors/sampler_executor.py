@@ -78,7 +78,11 @@ from jax import numpy as jnp
 from jax.experimental import multihost_utils
 from numpy.typing import DTypeLike
 
-from easydel.inference.sampling_processors import apply_sampling_constraints, compact_sampling_constraints
+from easydel.inference.sampling_processors import (
+    SamplingConstraints,
+    apply_sparse_sampling_constraints,
+    compact_sampling_constraints,
+)
 from easydel.utils import ejit
 
 from ...core.sampler import (
@@ -1068,9 +1072,7 @@ class SamplerRuntime:
         compact_presence_penalties_cpu: numpy.ndarray,
         compact_repetition_penalties_cpu: numpy.ndarray,
         need_penalties: bool,
-        logit_bias: jax.Array | None = None,
-        allowed_token_ids_mask: jax.Array | None = None,
-        bad_words_token_ids: jax.Array | None = None,
+        sampling_constraints: SamplingConstraints | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         """Run the compiled sampler step over only the rows that need sampling.
 
@@ -1105,6 +1107,8 @@ class SamplerRuntime:
             compact_presence_penalties_cpu: Presence penalty per compact row.
             compact_repetition_penalties_cpu: Repetition penalty per compact row.
             need_penalties: Whether any request in the window uses penalties.
+            sampling_constraints: The window rows' sparse logit bias, allow-lists and banned next tokens, or
+                ``None``. Applied to the compact logits before sampling.
 
         Returns:
             Tuple of (updated_rng_key, sampled_tokens, valid_mask, updated_token_counts) where:
@@ -1222,21 +1226,13 @@ class SamplerRuntime:
             if getattr(compact_logits, "sharding", None) != sampler_sharding:
                 compact_logits = jax.device_put(compact_logits, sampler_sharding)
 
-        constraints = compact_sampling_constraints(
-            gather_positions_cpu[:sampler_padded_num_reqs],
-            logit_bias,
-            allowed_token_ids_mask,
-            bad_words_token_ids,
-            int(compact_logits.shape[-1]),
-        )
+        constraints = compact_sampling_constraints(gather_positions_cpu[:sampler_padded_num_reqs], sampling_constraints)
         if constraints is not None:
-            # Only steps whose requests carry a constraint pay this; the compiled sampler signature is unchanged.
+            # Only steps whose requests carry a constraint pay this (a few sparse entries, one scatter program); the
+            # compiled sampler signature is unchanged.
             with jax.named_scope("easydel/esurge/sampler/constraints"):
-                placed = tuple(
-                    None if c is None else put_host_payload(c, sampler_sharding, host_payloads_replicated=replicated)
-                    for c in constraints
-                )
-                compact_logits = apply_sampling_constraints(compact_logits, *placed)
+                placed = put_host_payload(constraints, sampler_sharding, host_payloads_replicated=replicated)
+                compact_logits = apply_sparse_sampling_constraints(compact_logits, *placed)
 
         with jax.named_scope("easydel/esurge/sampler/run_jit"):
             rng_key, compact_tokens, compact_valid_mask, token_counts_full = sampler_fn(

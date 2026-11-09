@@ -202,9 +202,6 @@ class BatchMetadata:
     # v2-specific fields (optional, only populated when version="v2")
     slot_mapping: jax.Array | None = None
     num_kv_update_slices: jax.Array | None = None
-    logit_bias: jax.Array | None = None
-    allowed_token_ids_mask: jax.Array | None = None
-    bad_words_token_ids: jax.Array | None = None
 
     # Vision-language model data (None for text-only requests)
     pixel_values: jax.Array | None = None

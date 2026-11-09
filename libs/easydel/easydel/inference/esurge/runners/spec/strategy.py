@@ -2270,14 +2270,14 @@ class DrafterSpeculation:
         return view, metadata
 
     def _drafter_sampling_processors(self):
-        """Per-request logit-bias and token masks for this step's sampler rows."""
-        manager = getattr(self._runner, "executor_manager", None)
-        if manager is None:
-            return None, None, None
-        batch = getattr(manager, "last_batch_metadata", None)
-        if batch is None:
-            return None, None, None
-        return batch.logit_bias, batch.allowed_token_ids_mask, batch.bad_words_token_ids
+        """Per-request constraints for the drafter and verify programs: none.
+
+        Those programs index logits by pool or verify row, while a step's constraints are keyed by its window rows
+        (``SamplingConstraints``), so they are not applied there. A drafted token only changes acceptance; a verified
+        draft position is emitted without the request's logit bias, allow-list or banned tokens. The step's bonus
+        token, drawn by the step sampler, applies them.
+        """
+        return None, None, None
 
     def begin_batched_draft(
         self,

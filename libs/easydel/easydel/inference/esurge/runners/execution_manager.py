@@ -95,6 +95,7 @@ from easydel.caching import (
     UnifiedAttentionCache,
     UnifiedAttentionCacheConfig,
 )
+from easydel.inference.sampling_processors import SamplingConstraints
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.layers.quantization import TurboQuantConfig
 from easydel.utils import flags
@@ -1355,9 +1356,7 @@ class ExecutionManager:
         presence_penalties_cpu: numpy.ndarray,
         repetition_penalties_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,
-        logit_bias_cpu: numpy.ndarray | None = None,
-        allowed_token_ids_mask_cpu: numpy.ndarray | None = None,
-        bad_words_token_ids_cpu: numpy.ndarray | None = None,
+        sampling_constraints: SamplingConstraints | None = None,
         recurrent_slot_indices_cpu: numpy.ndarray | None = None,
         page_table_version: int | None = None,
         spec_recurrent_commit_cpu: numpy.ndarray | None = None,
@@ -1425,6 +1424,8 @@ class ExecutionManager:
             presence_penalties_cpu: Per-request presence penalty values.
             repetition_penalties_cpu: Per-request repetition penalty values.
             page_table_cpu: Host-side KV-cache page-table block ids.
+            sampling_constraints: The window rows' sparse logit bias, allow-lists and banned next tokens, or
+                ``None``. They reach the sampler only, never the compiled model step.
             page_table_version: Optional monotonic version for page-table cache
                 reuse; bump on allocator/swap/condense changes.
             spec_recurrent_commit_cpu: Optional speculative recurrent commit
@@ -1517,9 +1518,7 @@ class ExecutionManager:
             or self._slot_indexed_state
             or self._batch_preparer._uses_spmd_dp()
             or spec_recurrent_commit_cpu is not None
-            or logit_bias_cpu is not None
-            or allowed_token_ids_mask_cpu is not None
-            or bad_words_token_ids_cpu is not None
+            or sampling_constraints is not None
         )
         if self._pp_microbatch is not None and not microbatch_unsupported:
             microbatch_result = self._pp_microbatch.try_execute(
@@ -1584,9 +1583,6 @@ class ExecutionManager:
             presence_penalties_cpu=presence_penalties_cpu,
             repetition_penalties_cpu=repetition_penalties_cpu,
             page_table_cpu=page_table_cpu,
-            logit_bias_cpu=logit_bias_cpu,
-            allowed_token_ids_mask_cpu=allowed_token_ids_mask_cpu,
-            bad_words_token_ids_cpu=bad_words_token_ids_cpu,
             page_table_version=page_table_version,
             window_row_indices_cpu=window_row_indices_cpu,
             recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
@@ -1623,7 +1619,7 @@ class ExecutionManager:
             position_ids_buf = batch_metadata.position_ids_buf
             prep_handoff_took += time.time() - prep_phase_start
 
-        # Per-request logit bias, allow-list and bad-word masks go to the sampler only: the batch metadata is an
+        # Per-request logit bias, allow-list and bad-word constraints go to the sampler only: the batch metadata is an
         # argument of the compiled model step, whose signature has none of them.
         self.last_batch_metadata = batch_metadata
         window_emits_token = self._window_emits_token(
@@ -1818,9 +1814,7 @@ class ExecutionManager:
         # through the sampler, which does.
         use_greedy_argmax_fastpath = bool(
             not need_penalties
-            and logit_bias_cpu is None
-            and allowed_token_ids_mask_cpu is None
-            and bad_words_token_ids_cpu is None
+            and sampling_constraints is None
             # Under an MPMD/PP mesh the logits live on the final stage's
             # submesh, but the fastpath's helper tensors (valid mask, RNG
             # fold scalar) are replicated over the full mesh — a device-set
@@ -1938,9 +1932,7 @@ class ExecutionManager:
                 compact_presence_penalties_cpu=self._sampler_presence_penalties_cpu,
                 compact_repetition_penalties_cpu=self._sampler_repetition_penalties_cpu,
                 need_penalties=need_penalties,
-                logit_bias=logit_bias_cpu,
-                allowed_token_ids_mask=allowed_token_ids_mask_cpu,
-                bad_words_token_ids=bad_words_token_ids_cpu,
+                sampling_constraints=sampling_constraints,
             )
             sampler_enqueue_took = time.time() - sampler_enqueue_start
             if self._verbose and num_tokens > 0:
@@ -2670,7 +2662,6 @@ class ExecutionManager:
                         numpy.zeros((int(num_tokens), hidden_size), dtype=numpy.float16) for _ in range(deepstack_layers)
                     ]
 
-        logit_bias_cpu = allowed_token_ids_mask_cpu = bad_words_token_ids_cpu = None
         # Model-declared per-token side inputs: present in every runtime step of such models, so the compiled
         # signature must carry them too (inert for every other model).
         model_side_inputs_cpu = empty_side_inputs(self.model, int(num_tokens))
@@ -2709,9 +2700,6 @@ class ExecutionManager:
             presence_penalties_cpu=temp_buffer.presence_penalties,
             repetition_penalties_cpu=temp_buffer.repetition_penalties,
             page_table_cpu=page_table_cpu_dummy,
-            logit_bias_cpu=logit_bias_cpu,
-            allowed_token_ids_mask_cpu=allowed_token_ids_mask_cpu,
-            bad_words_token_ids_cpu=bad_words_token_ids_cpu,
             padded_num_reqs_in=padded_num_reqs,
             window_row_indices_cpu=window_row_indices_cpu,
             recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
