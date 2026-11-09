@@ -106,7 +106,7 @@ def _make_model_with_head(*, paged: bool = False):
     model = _make_model(paged=paged)
     kwargs = dict(dtype=jnp.float32, param_dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST)
     with model.config.mesh:
-        head = Glm5NextMTPHead(model.config, rngs=spx.Rngs(1), max_cache_length=128, **kwargs)
+        head = Glm5NextMTPHead(model.config, rngs=spx.Rngs(1), max_cache_length=128, paged_pool=paged, **kwargs)
     return attach_glm5_next_mtp(model, head)
 
 
@@ -294,16 +294,32 @@ def test_cached_drafter_matches_stateless_head(model):
     np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=2e-4, atol=2e-4)
 
 
-def test_nextn_paged_view_and_metadata():
-    model = _make_model_with_head(paged=True)
+def _paged_past(model):
+    """A paged cache shaped as ``init_operations_cache`` builds it: the decoder layers, then the nextn view."""
     cfg = model._create_mla_ragged_page_cache_config(max_length=64, num_hidden_layers_override=1, max_cache_tokens=256)
     base = MLARaggedPagesCacheView.init(cfg, layer_index=3, mesh=model.mesh)
-    past = HybridCache(views=[None, None, None, base])
+    draft = MLARaggedPagesCacheView.init(cfg, layer_index=4, mesh=model.mesh)
+    return cfg, HybridCache(views=[None, None, None, base, draft])
+
+
+def test_nextn_paged_view_and_metadata():
+    model = _make_model_with_head(paged=True)
+    assert model.num_draft_cache_layers() == 1
+    assert _make_model(paged=True).num_draft_cache_layers() == 0
+    # The default head runs dense attention on the drafter-local cache and needs no pool view.
+    assert _make_model_with_head(paged=False).num_draft_cache_layers() == 0
+    assert model.mtp.config.attn_mechanism == model.config.attn_mechanism
+    assert _make_model_with_head(paged=False).mtp.config.attn_mechanism == "vanilla"
+    cfg, past = _paged_past(model)
+    # The pool budgets the draft layer's pages.
+    assert cfg.num_draft_layers == 1
     view = model._nextn_cache_view(past)
     assert isinstance(view, MLARaggedPagesCacheView)
     assert view.layer_index == 4
-    assert view.metadata.num_pages == base.metadata.num_pages
-    assert len(past.views) == 5
+    # A cache built without the draft view is never grown by the model.
+    short_past = HybridCache(views=list(past.views[:4]))
+    assert model._nextn_cache_view(short_past) is None
+    assert len(short_past.views) == 4
 
     meta = RaggedPagesMetadata(
         pages_tables=jnp.asarray([[0, 1], [2, 3]], dtype=jnp.int32),
@@ -318,9 +334,7 @@ def test_nextn_paged_view_and_metadata():
 
 def test_nextn_forward_writes_paged_view():
     model = _make_model_with_head(paged=True)
-    cfg = model._create_mla_ragged_page_cache_config(max_length=64, num_hidden_layers_override=1, max_cache_tokens=256)
-    base = MLARaggedPagesCacheView.init(cfg, layer_index=3, mesh=model.mesh)
-    past = HybridCache(views=[None, None, None, base])
+    _, past = _paged_past(model)
     meta = RaggedPagesMetadata(
         pages_tables=jnp.asarray([[0, 1]], dtype=jnp.int32),
         context_lens=jnp.asarray([4], dtype=jnp.int32),
@@ -328,7 +342,10 @@ def test_nextn_forward_writes_paged_view():
         num_seqs=jnp.asarray([1], dtype=jnp.int32),
     )
     ids = jnp.asarray([[3, 1, 4, 1]], dtype=jnp.int32)
+    in_structure = jax.tree_util.tree_structure(past)
     out = model(input_ids=ids, past_key_values=past, cache_metadata=meta)
+    # A compiled serving step's out_shardings come from the input cache: the output must keep its structure.
+    assert jax.tree_util.tree_structure(out.past_key_values) == in_structure
     view = out.past_key_values.views[-1]
     assert isinstance(view, MLARaggedPagesCacheView)
     assert view.layer_index == 4

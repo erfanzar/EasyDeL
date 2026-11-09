@@ -658,6 +658,10 @@ impl PyPlan {
     fn spec_slots<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i32>> {
         arr(py, &self.inner.spec_slots)
     }
+    #[getter]
+    fn inflight_drafts<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i64>> {
+        arr(py, &self.inner.inflight_drafts)
+    }
 }
 
 /// A commit's outcome in plan order: one entry per request that received a token.

@@ -101,7 +101,7 @@ from easydel.utils import flags
 
 from ..multimodal.side_inputs import empty_side_inputs, prefill_embeds_dtype
 from ..utils import model_uses_mrope
-from .async_types import DeviceInputTokenHandoff
+from .async_types import DeviceInputTokenHandoff, DeviceSpecWindowHandoff
 from .execution_types import CacheGroupInputs, ModelStepOutputs, StepFunctionInputs
 from .executors import BatchMetadataPreparer, ModelStepExecutor, SamplerExecutor, SamplerRuntime
 from .executors.compile_orchestrator import CompileOrchestrator, _tree_hash, _tree_hash_diff
@@ -1357,6 +1357,7 @@ class ExecutionManager:
         page_table_cpu: numpy.ndarray,
         logit_bias_cpu: numpy.ndarray | None = None,
         allowed_token_ids_mask_cpu: numpy.ndarray | None = None,
+        bad_words_token_ids_cpu: numpy.ndarray | None = None,
         recurrent_slot_indices_cpu: numpy.ndarray | None = None,
         page_table_version: int | None = None,
         spec_recurrent_commit_cpu: numpy.ndarray | None = None,
@@ -1376,7 +1377,7 @@ class ExecutionManager:
         wait_for_outputs: bool = True,
         model_side_inputs_cpu: dict[str, numpy.ndarray] | None = None,
         cache_group_inputs: tuple[CacheGroupInputs, ...] = (),
-        **kwargs,
+        spec_window_handoff: DeviceSpecWindowHandoff | None = None,
     ) -> tuple[
         jax.Array,
         jax.Array,
@@ -1439,6 +1440,10 @@ class ExecutionManager:
             video_grid_thw: Optional video grid shape ``(T, H, W)``.
             device_token_handoff: Optional device-resident sampled-token handoff
                 from the previous PP step (avoids host token materialization).
+            spec_window_handoff: Optional previous verify step's device results; the step's optimistic verify
+                windows are rewritten from them on the device (see
+                ``BatchMetadataPreparer.apply_spec_window_handoff``), and the per-row correction is left in
+                ``last_spec_window_delta``.
             wait_for_outputs: If ``True``, block on the device-side output
                 arrays before returning so the timing metrics reflect full
                 completion; otherwise the returned arrays may still be running.
@@ -1533,6 +1538,7 @@ class ExecutionManager:
                 page_table_cpu=page_table_cpu,
                 logit_bias_cpu=logit_bias_cpu,
                 allowed_token_ids_mask_cpu=allowed_token_ids_mask_cpu,
+                bad_words_token_ids_cpu=bad_words_token_ids_cpu,
                 mrope_position_ids_cpu=mrope_position_ids_cpu,
                 prefill_embeds_cpu=prefill_embeds_cpu,
                 prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
@@ -1551,7 +1557,6 @@ class ExecutionManager:
                 logger.info("[esurge-prof-exec] microbatch path returned tok=%d", int(num_tokens))
             return microbatch_result
 
-        bad_words_token_ids_cpu = locals().get("bad_words_token_ids_cpu")
         start_prep = time.time()
         prep_phase_start = start_prep
         (
@@ -1579,6 +1584,7 @@ class ExecutionManager:
             page_table_cpu=page_table_cpu,
             logit_bias_cpu=logit_bias_cpu,
             allowed_token_ids_mask_cpu=allowed_token_ids_mask_cpu,
+            bad_words_token_ids_cpu=bad_words_token_ids_cpu,
             page_table_version=page_table_version,
             window_row_indices_cpu=window_row_indices_cpu,
             recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
@@ -1605,17 +1611,23 @@ class ExecutionManager:
             batch_metadata = self._apply_device_token_handoff(batch_metadata, device_token_handoff)
             input_ids_buf = batch_metadata.input_ids_buf
             prep_handoff_took = time.time() - prep_phase_start
+        self.last_spec_window_delta = None
+        if spec_window_handoff is not None:
+            prep_phase_start = time.time()
+            batch_metadata, self.last_spec_window_delta = self._batch_preparer.apply_spec_window_handoff(
+                batch_metadata, spec_window_handoff
+            )
+            input_ids_buf = batch_metadata.input_ids_buf
+            position_ids_buf = batch_metadata.position_ids_buf
+            prep_handoff_took += time.time() - prep_phase_start
 
-        if (
-            logit_bias_cpu is not None
-            or allowed_token_ids_mask_cpu is not None
-            or kwargs.get("bad_words_token_ids_cpu") is not None
-        ):
+        if logit_bias_cpu is not None or allowed_token_ids_mask_cpu is not None or bad_words_token_ids_cpu is not None:
             batch_metadata = batch_metadata.replace(
                 logit_bias=logit_bias_cpu,
                 allowed_token_ids_mask=allowed_token_ids_mask_cpu,
-                bad_words_token_ids=kwargs.get("bad_words_token_ids_cpu"),
+                bad_words_token_ids=bad_words_token_ids_cpu,
             )
+        self.last_batch_metadata = batch_metadata
         window_emits_token = self._window_emits_token(
             scheduled_full_cpu=scheduled_full_cpu,
             active_mask_full_cpu=active_mask_full_cpu,
@@ -2626,7 +2638,7 @@ class ExecutionManager:
                         numpy.zeros((int(num_tokens), hidden_size), dtype=numpy.float16) for _ in range(deepstack_layers)
                     ]
 
-        logit_bias_cpu = allowed_token_ids_mask_cpu = None
+        logit_bias_cpu = allowed_token_ids_mask_cpu = bad_words_token_ids_cpu = None
         # Model-declared per-token side inputs: present in every runtime step of such models, so the compiled
         # signature must carry them too (inert for every other model).
         model_side_inputs_cpu = empty_side_inputs(self.model, int(num_tokens))
@@ -2667,6 +2679,7 @@ class ExecutionManager:
             page_table_cpu=page_table_cpu_dummy,
             logit_bias_cpu=logit_bias_cpu,
             allowed_token_ids_mask_cpu=allowed_token_ids_mask_cpu,
+            bad_words_token_ids_cpu=bad_words_token_ids_cpu,
             padded_num_reqs_in=padded_num_reqs,
             window_row_indices_cpu=window_row_indices_cpu,
             recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,

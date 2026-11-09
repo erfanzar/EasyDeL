@@ -245,6 +245,7 @@ class SequenceStateSync:
 
         # 5) Update cached requests and page tables
         req_data = scheduler_output.scheduled_cached_reqs
+        inflight_drafts = getattr(scheduler_output, "inflight_drafts", None) or {}
         upd_req_indices: list[int] = []
         upd_num_computed_vals: list[int] = []
         batched_page_rows: list[tuple[int, tuple[list[int], ...]]] = []
@@ -276,6 +277,9 @@ class SequenceStateSync:
 
             upd_req_indices.append(req_index)
             upd_num_computed_vals.append(int(nct))
+            if not resumed_from_preemption and req_id not in inflight_drafts:
+                new_tokens = req_data.new_token_ids[i] if i < len(req_data.new_token_ids) else ()
+                self._rewind_to_committed(req_state, req_index, int(nct), new_tokens, scheduler_output)
             if resumed_from_preemption:
                 # Resumed requests may provide a full replacement page table.
                 self.sequence_buffer.page_table.add_row(new_page_ids, req_index)
@@ -390,6 +394,48 @@ class SequenceStateSync:
 
         has_changes = len(scheduler_output.preempted_req_ids) > 0 or len(req_ids_to_add) > 0
         return has_changes
+
+    def _rewind_to_committed(
+        self,
+        req_state: CachedRequestState,
+        req_index: int,
+        num_computed: int,
+        new_tokens: typing.Sequence[int],
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        """Rebuild a decode row the engine core scheduled from committed state from the core's own tokens.
+
+        A step dispatched before its predecessor committed leaves the row as if every draft the predecessor verified
+        was accepted, and a draft verified on the device leaves its rejected drafts in the row. When the core plans
+        the request's next step from committed state, the row becomes exactly the core's view: the committed tokens
+        this step feeds (``new_tokens``, from ``num_computed``), then the scheduled drafts. Prefill chunks are left
+        untouched.
+        """
+        scheduled = int(scheduler_output.num_scheduled_tokens.get(req_state.req_id, 0) or 0)
+        num_prompt = int(req_state.num_prompt_tokens)
+        if scheduled <= 0 or num_computed < num_prompt:
+            return
+        drafts = [int(t) for t in (scheduler_output.scheduled_spec_decode_tokens or {}).get(req_state.req_id, [])]
+        real = scheduled - len(drafts)
+        if real <= 0:
+            return
+        buf = self.sequence_buffer
+        known = min(num_computed + real, self.max_model_len)
+        tokens = [int(t) for t in new_tokens][: known - num_computed]
+        out = req_state.output_token_ids
+        if len(tokens) == known - num_computed and len(out) >= num_computed - num_prompt:
+            buf.token_ids[req_index, num_computed:known] = np.asarray(tokens, dtype=np.int32)
+            del out[num_computed - num_prompt :]
+            out.extend(tokens)
+        elif int(buf.num_tokens_no_spec[req_index]) > known:
+            del out[max(0, known - num_prompt) :]
+        else:
+            return
+        buf.num_tokens_no_spec[req_index] = known
+        end = min(known + len(drafts), self.max_model_len)
+        if drafts and all(t >= 0 for t in drafts):
+            buf.token_ids[req_index, known:end] = np.asarray(drafts[: end - known], dtype=np.int32)
+        buf.num_tokens[req_index] = end
 
     def modify_prev_results(self, pre_results: AsyncPreResults | None) -> None:
         """Apply previous iteration's tokens to sequence buffer.

@@ -94,7 +94,13 @@ from ..multimodal.side_inputs import build_side_input_provider, model_has_side_i
 from ..outputs import LogprobsLists, ModelRunnerOutput
 from ..scheduler import SchedulerOutput
 from ..utils import model_uses_mrope
-from .async_types import AsyncPreResults, AsyncWindowResult, DeviceInputTokenHandoff
+from .async_types import (
+    AsyncPreResults,
+    AsyncWindowResult,
+    DeviceInputTokenHandoff,
+    DeviceSpecWindowHandoff,
+    SpecWindowCarry,
+)
 from .execution_types import CacheGroupInputs
 from .host_sync import host_payload_broadcast_needed, put_host_payload
 from .perf import RunnerPerfSample, RunnerPerfTracker
@@ -109,12 +115,14 @@ from .spec.sampling import score_sampled_tokens, summarize_logprobs
 from .spec.strategy import (
     DrafterSpeculation,
     _restore_recurrent_state,
+    fixed_width_ids,
     pool_seed_hidden,
     snapshot_recurrent_state,
     take_hidden_rows,
     window_hidden_index,
     window_hidden_row,
 )
+from .spec.verify import pack_pooled_drafts
 from .state_sync import SequenceStateSync
 from .states import CachedRequestState
 from .vlm_prefill import VlmPrefillHelper
@@ -262,6 +270,22 @@ def _materialize_logprobs(
     return LogprobsLists(ids_out, scores_out, ranks_out)
 
 
+def _host_packed_rows(rows: typing.Any) -> np.ndarray | None:
+    """A packed speculative view (emitted tokens or next drafts) as a host array.
+
+    Every process runs this while building or resolving its runner output, so a sharded view is gathered by all of
+    them together. The engine core's commit then reads plain host rows: indexing a device array there would launch a
+    device program on the leader alone, which the other processes of a multi-host mesh never join.
+    """
+    if rows is None or isinstance(rows, np.ndarray):
+        return rows
+    if isinstance(rows, jax.Array) and not rows.is_fully_addressable and not rows.is_fully_replicated:
+        from jax.experimental import multihost_utils
+
+        return np.asarray(multihost_utils.process_allgather(rows, tiled=True))
+    return np.asarray(jax.device_get(rows))
+
+
 class _AsyncExecutionHandle:
     """Deferred host-materialized model output for overlap execution.
 
@@ -278,6 +302,7 @@ class _AsyncExecutionHandle:
         windows: list[AsyncWindowResult],
         finalize: typing.Callable[[list[list[int]]], None] | None = None,
         resolve_logprobs: typing.Callable[[list[list[int]]], LogprobsLists | None] | None = None,
+        host_rows: dict[int, list[int]] | None = None,
     ) -> None:
         """Initialize the deferred handle.
 
@@ -291,9 +316,13 @@ class _AsyncExecutionHandle:
                 ``sampled_token_ids`` once the host data is ready.
             resolve_logprobs: Optional deferred position-major probability
                 materializer, independent of sampler metrics.
+            host_rows: Output index -> tokens of verify rows the host already
+                settled (accepted drafts plus one); reported verbatim instead of
+                the window's single sampled token.
         """
         self._model_runner_output = model_runner_output
         self._windows = windows
+        self._host_rows = dict(host_rows or {})
         self._finalize = finalize
         self._resolve_logprobs = resolve_logprobs
         self._resolved_output: ModelRunnerOutput | None = None
@@ -332,11 +361,17 @@ class _AsyncExecutionHandle:
                     except Exception:
                         pass
 
+        for out_idx, tokens in self._host_rows.items():
+            if 0 <= out_idx < len(sampled_token_ids):
+                sampled_token_ids[out_idx] = list(tokens)
+
         if self._finalize is not None:
             self._finalize(sampled_token_ids)
             self._finalize = None
 
         output = self._model_runner_output
+        output.spec_emitted = _host_packed_rows(output.spec_emitted)
+        output.spec_drafts = _host_packed_rows(output.spec_drafts)
         output.sampled_token_ids = sampled_token_ids
         output.token_logprobs = token_logprobs or None
         if self._resolve_logprobs is not None:
@@ -832,6 +867,8 @@ class eSurgeRunner:
         self._executor: typing.Any = None  # ThreadPoolExecutor, typed as Any to avoid circular import
         self._handoff_positions_cache: dict[int, jax.Array] = {}
         self._handoff_scalar_cache: dict[int, jax.Array] = {}
+        self._spec_carry: SpecWindowCarry | None = None
+        self._spec_recorded_this_step = False
         logger.debug("eSurgeRunner initialization complete")
         self._log_startup_summary()
 
@@ -1879,7 +1916,7 @@ class eSurgeRunner:
                     gathered_hidden = jnp.zeros(
                         (rows, hidden_size), dtype=hidden_dtype, device=replicated_named_sharding(self.mesh)
                     )
-                    _ = self.drafter.verify_draft_batched(
+                    _ = self.drafter.spec_step(
                         gathered_hidden=gathered_hidden,
                         row_offsets=np.zeros((n,), dtype=np.int32),
                         draft_tokens=np.zeros((n, int(k)), dtype=np.int32),
@@ -1889,6 +1926,10 @@ class eSurgeRunner:
                         fresh_mask=np.zeros((n,), dtype=bool),
                         collected_mask=np.zeros((n,), dtype=bool),
                         num_draft_tokens=int(k),
+                        output_rows=np.full((n,), -1, dtype=np.int32),
+                        input_ids=fixed_width_ids(self.input_ids_buf, int(self.max_num_tokens)),
+                        draft_indices=np.zeros((n, int(k)), dtype=np.int32),
+                        spec_delta=np.zeros((n,), dtype=np.int32),
                         project_fn=project_fn,
                     )
                     logger.debug(f"Draft-in-verify precompiled for (reqs={pnr}, k={k}, pool={n})")
@@ -1943,6 +1984,25 @@ class eSurgeRunner:
                 jax.block_until_ready(jnp.argmax(self.executor_manager.project_hidden_rows(stripe), axis=-1))
             except Exception as e:
                 logger.debug(f"Speculative verify-projection precompile skip (rows={rows}): {e}")
+        # The verify program reads the step's token ids padded to the largest bucket; warm that pad for every bucket.
+        for length in sorted({int(b) for b in self.num_tokens_paddings}):
+            try:
+                ids = jnp.zeros((length,), dtype=jnp.int32, device=self._empty_sharding)
+                jax.block_until_ready(fixed_width_ids(ids, int(self.max_num_tokens)))
+            except Exception as e:
+                logger.debug(f"Token-id pad precompile skip (tokens={length}): {e}")
+        from .spec.verify import pack_pooled_drafts
+
+        for k in sorted(k_values):
+            try:
+                pack_pooled_drafts(
+                    jnp.zeros((n,), dtype=jnp.int32),
+                    jnp.zeros((n, int(k)), dtype=jnp.int32),
+                    jnp.arange(n, dtype=jnp.int32),
+                    num_rows=n,
+                )
+            except Exception as e:
+                logger.debug(f"Pooled-draft output precompile skip (k={k}): {e}")
 
     def compile(self, *, max_num_batched_tokens: int | None = None) -> None:
         """Compile the model for token/request bucket sizes.
@@ -2607,6 +2667,8 @@ class eSurgeRunner:
             return False
         if int(scheduler_output.total_num_scheduled_tokens or 0) <= 0:
             return False
+        if self.drafter is not None:
+            return self._can_defer_spec_step(scheduler_output)
         if any(int(n) != 1 for n in scheduler_output.num_scheduled_tokens.values()):
             return False
         if bool(getattr(scheduler_output, "pending_structured_output_tokens", False)):
@@ -2617,6 +2679,104 @@ class eSurgeRunner:
             # Side inputs are computed from host token history, which still holds async placeholders.
             return False
         return self._has_default_sampling_penalties()
+
+    def _can_defer_spec_step(self, scheduler_output: SchedulerOutput) -> bool:
+        """Whether a speculative step may be dispatched before the previous one is drained."""
+        if not bool(getattr(scheduler_output, "async_safe", False)):
+            return False
+        if not callable(getattr(self.drafter, "spec_step", None)):
+            return False
+        if getattr(self, "_has_recurrent_layers", False) and getattr(self, "recurrent_slot_contract", None) != "verify":
+            # Only verify-contract recurrent layers keep one state per verify token, so a step dispatched before its
+            # predecessor commits can read the accepted prefix's state by index. Other recurrent layers stay sync.
+            return False
+        k = int(self.num_draft_tokens)
+        drafts = scheduler_output.scheduled_spec_decode_tokens or {}
+        for rid, n in scheduler_output.num_scheduled_tokens.items():
+            if int(n) != 1 + len(drafts.get(rid, ())) or len(drafts.get(rid, ())) not in (0, k):
+                return False
+        if bool(getattr(scheduler_output, "pending_structured_output_tokens", False)):
+            return False
+        if self._uses_spmd_dp() or self._model_uses_vlm_inputs() or model_has_side_inputs(self.model):
+            return False
+        configs = (self.metadata, *tuple(getattr(self.executor_manager, "cache_group_configs", ()) or ()))
+        if any(getattr(config, "version", None) == "v2" for config in configs):
+            return False
+        return self._has_default_sampling_penalties()
+
+    def record_spec_out(self, spec_out: jax.Array, *, replace: bool = False) -> None:
+        """Keep a dispatched step's packed speculative output, merging later pooled results by row."""
+        if replace or not self._spec_recorded_this_step or self._spec_carry is None:
+            merged = spec_out
+        else:
+            current = self._spec_carry.spec_out
+            keep = jnp.any(current >= 0, axis=1)
+            merged = jnp.where(keep[:, None], current, spec_out)
+        self._spec_recorded_this_step = True
+        self._spec_carry = SpecWindowCarry(
+            spec_out=merged,
+            num_draft_tokens=int(self.num_draft_tokens),
+            rows=dict(self.sequence_buffer.req_id_to_index),
+        )
+
+    def _record_plain_spec_out(self, windows: list[AsyncWindowResult]) -> None:
+        """Pack ordinary sampler outputs when a step has no drafter output (notably prefill)."""
+        if self.drafter is None or not self.async_scheduling:
+            return
+        merged = None
+        k = int(self.num_draft_tokens)
+        for window in windows:
+            valid = np.asarray(window.valid_mask, dtype=bool)
+            if not bool(valid.any()):
+                continue
+            output_rows = np.where(valid, np.asarray(window.row_positions, dtype=np.int32), -1)
+            part = pack_pooled_drafts(
+                window.sampled_token_ids,
+                jnp.full((len(window.row_positions), k), -1, dtype=jnp.int32),
+                jnp.asarray(output_rows, dtype=jnp.int32),
+                num_rows=int(self.max_num_reqs),
+            )
+            if merged is None:
+                merged = part
+            else:
+                take = jnp.any(part >= 0, axis=1)
+                merged = jnp.where(take[:, None], part, merged)
+        if merged is not None:
+            self.record_spec_out(merged)
+
+    def _spec_output_views(self) -> tuple[typing.Any, typing.Any]:
+        """The current step's packed emitted and next-draft views, without mutable last-output state."""
+        carry = getattr(self, "_spec_carry", None)
+        if carry is not None and self._spec_recorded_this_step:
+            k = int(self.num_draft_tokens)
+            return carry.spec_out[:, : k + 1], carry.spec_out[:, k + 2 :]
+        emitted = getattr(self.spec, "last_spec_emitted", None)
+        drafts = getattr(self.spec, "last_spec_drafts", None)
+        return emitted, drafts
+
+    def _spec_window_handoff_for(
+        self, scheduler_output: SchedulerOutput, req_ids_window: list[str | None]
+    ) -> DeviceSpecWindowHandoff | None:
+        """Build the device rewrite of one window's optimistic verify inputs, or ``None`` when exact."""
+        inflight = dict(getattr(scheduler_output, "inflight_drafts", None) or {})
+        if not inflight:
+            return None
+        carry = getattr(self, "_spec_carry", None)
+        if carry is None:
+            if any(int(d) != 0 for d in inflight.values()):
+                raise RuntimeError(
+                    "A plan runs ahead of an uncommitted speculative step, but no step output was carried."
+                )
+            # A prefill or a plain one-token decode has no speculative output yet; the ordinary token handoff
+            # covers that boundary and does not need a speculative carry.
+            return None
+        window = set(rid for rid in req_ids_window if rid is not None)
+        return carry.handoff_for(
+            req_ids_window,
+            {rid: d for rid, d in inflight.items() if rid in window},
+            int(self.max_num_reqs),
+            rewrite_recurrent_base=int(getattr(self, "recurrent_slot_group_size", 1) or 1) > 1,
+        )
 
     def _can_delay_async_result_repair(
         self,
@@ -3034,6 +3194,8 @@ class eSurgeRunner:
         )
         self._update_states(scheduler_output)
         self.spec.on_states_applied(scheduler_output)
+        if self.drafter is not None and return_async_output and not self._can_defer_spec_step(scheduler_output):
+            return_async_output = False
         updating_states_time = time.time() - updating_states_start
 
         # Apply previous async results if available. For safe PP decode windows,
@@ -3062,6 +3224,10 @@ class eSurgeRunner:
             # physical buffer row) in lockstep with condense/reorder row moves.
             self._sync_recurrent_rows(prev_recurrent_row_owner)
         if self.drafter is not None:
+            self._spec_recorded_this_step = False
+            self.spec.last_spec_emitted = None
+            self.spec.last_spec_accepted = None
+            self.spec.last_spec_drafts = None
             # Rows are final for this step: rewrite the sampler's device token counts of penalised speculative
             # requests that now take the plain sampler path (their counts drift during verify steps).
             self.spec.sync_penalty_counts(scheduler_output)
@@ -3092,8 +3258,8 @@ class eSurgeRunner:
             and self.can_dispatch_next_before_async_drain(scheduler_output)
         )
         needs_async_output = return_async_output or can_defer_async_output
-        if self.drafter is not None and return_async_output:
-            raise NotImplementedError("eSurge runner-native speculative decoding is synchronous-only for now.")
+        if self.drafter is not None and return_async_output and not callable(getattr(self.drafter, "spec_step", None)):
+            raise ValueError("This drafter requires synchronous scheduling because it has no spec_step program.")
         if self.drafter is not None:
             # Dynamic speculative-token scheduling: resolve the step's draft
             # budget ONCE from the live concurrency (requests scheduled this
@@ -3107,6 +3273,9 @@ class eSurgeRunner:
 
         req_ids_all: list[str] = []
         sampled_token_ids_all: list[list[int]] = []
+        # Output index -> tokens of a verify row the host settled this step (accepted drafts plus one). Their buffer
+        # rows and output lists are already final, so a deferred output reports them verbatim and skips placeholders.
+        host_emitted_by_out: dict[int, list[int]] = {}
         spec_token_ids_all: list[list[int]] | None = [] if self.drafter is not None else None
         accepted_spec_tokens_by_req: dict[str, int] | None = {} if self.drafter is not None else None
         hidden_states_by_req: dict[str, typing.Any] | None = {} if self.drafter is not None else None
@@ -3195,11 +3364,7 @@ class eSurgeRunner:
         step_batch_candidate_count = 0
         if self.drafter is not None and scheduler_output.scheduled_spec_decode_tokens:
             for _spec_rid, _spec_toks in scheduler_output.scheduled_spec_decode_tokens.items():
-                if (
-                    _spec_toks
-                    and all(int(_t) >= 0 for _t in _spec_toks)
-                    and self.spec.can_batch_draft(self.requests.get(_spec_rid))
-                ):
+                if _spec_toks and self.spec.can_batch_draft(self.requests.get(_spec_rid)):
                     step_batch_candidate_count += 1
         # A single request also takes the pooled path when no replay rollback follows the verify (candidate-row
         # commits are deferred into the next forward, so the draft pass is not reordered against a replay): its k
@@ -3652,6 +3817,7 @@ class eSurgeRunner:
                 visual_pos_masks_cpu=visual_pos_masks_cpu,
                 deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
                 device_token_handoff=device_token_handoff,
+                spec_window_handoff=self._spec_window_handoff_for(scheduler_output, req_ids_window),
                 wait_for_outputs=not needs_async_output,
                 model_side_inputs_cpu=model_side_inputs_cpu,
             )
@@ -3812,7 +3978,8 @@ class eSurgeRunner:
                 total_async_copy_enqueue_time += time.time() - copy_enqueue_start
                 total_post_proc_time += time.time() - up_wtime
                 start_index = next_start_index
-                continue
+                if self.drafter is None:
+                    continue
 
             token_materialize_start = time.time()
             tokens_np = np.asarray(out_tokens_win)
@@ -3930,9 +4097,7 @@ class eSurgeRunner:
                         continue
                     _sched_n = int(scheduled_list[_rp])
                     _spec_toks = scheduler_output.scheduled_spec_decode_tokens.get(_rid, [])
-                    if not (
-                        bool(_spec_toks) and all(int(_t) >= 0 for _t in _spec_toks) and self.spec.is_spec_request(_rs)
-                    ):
+                    if not (bool(_spec_toks) and self.spec.is_spec_request(_rs)):
                         continue
                     _real_count = _sched_n - len(_spec_toks)
                     if _real_count <= 0:
@@ -4438,6 +4603,7 @@ class eSurgeRunner:
                         )
                         if self.enable_sampler_metrics:
                             token_logprobs[rid] = float(np.asarray(logprob_payloads[rid][1])[-1, 0])
+                    host_emitted_by_out[len(sampled_token_ids_all)] = list(emitted)
                     sampled_token_ids_all.append(emitted)
                     req_state.output_token_ids.extend(emitted)
 
@@ -4823,8 +4989,24 @@ class eSurgeRunner:
         }
         req_id_to_out_index = {rid: i for i, rid in enumerate(req_ids_all)}
 
+        if not self._spec_recorded_this_step:
+            self._record_plain_spec_out(async_windows)
+
+        accepted_packed = getattr(self.spec, "last_spec_accepted", None)
+        if accepted_packed is None and self._spec_carry is not None and self._spec_recorded_this_step:
+            accepted_packed = self._spec_carry.spec_out[:, int(self.num_draft_tokens) + 1]
+        if accepted_packed is not None and accepted_spec_tokens_by_req is not None:
+            for rid, row in req_id_to_row_index.items():
+                if 0 <= int(row) < len(accepted_packed) and int(accepted_packed[row]) >= 0:
+                    accepted_spec_tokens_by_req[rid] = int(accepted_packed[row])
+
         final_output: ModelRunnerOutput | _AsyncExecutionHandle
         if needs_async_output:
+            if host_emitted_by_out:
+                request_seq_lens[:] = [entry for entry in request_seq_lens if entry[0] not in host_emitted_by_out]
+                for out_idx in host_emitted_by_out:
+                    if out_idx < len(sync_finalize_entries):
+                        sync_finalize_entries[out_idx] = (None, None, None)
             if scheduler_output.async_scheduling:
                 self._update_placeholder(
                     discard_sampled_tokens_req_indices,
@@ -4875,8 +5057,11 @@ class eSurgeRunner:
                     token_logprobs=None,
                     num_accepted_spec_tokens=accepted_spec_tokens_by_req,
                     hidden_states=hidden_states_by_req,
+                    spec_emitted=self._spec_output_views()[0],
+                    spec_drafts=getattr(self.spec, "last_spec_drafts", None),
                 ),
                 windows=async_windows,
+                host_rows=host_emitted_by_out,
                 resolve_logprobs=partial(
                     _materialize_logprobs,
                     req_ids_all,
@@ -4915,6 +5100,8 @@ class eSurgeRunner:
                 token_logprobs=token_logprobs or None,
                 num_accepted_spec_tokens=accepted_spec_tokens_by_req,
                 hidden_states=hidden_states_by_req,
+                spec_emitted=_host_packed_rows(self._spec_output_views()[0]),
+                spec_drafts=_host_packed_rows(getattr(self.spec, "last_spec_drafts", None)),
             )
 
         metrics_start = time.time()

@@ -388,6 +388,10 @@ class SchedulerOutput:
     """Request id -> output slots of a request that samples this step: 1 + the drafts it verifies. Under async
     scheduling the engine core counts every one of them as accepted until the step's commit."""
 
+    inflight_drafts: dict[str, int] = field(default_factory=dict)
+    """Drafts of earlier uncommitted steps counted as accepted by an optimistic start; entries starting from
+    committed state are absent. Zero means the earlier step verified no drafts."""
+
     async_safe: bool = False
     """The engine core's ``PLAN_ASYNC_SAFE``: the next step may be dispatched before this one's tokens reach the host.
     With speculation, every entry is a running decode window of 1 + k (or 1 without drafts) and the device corrects

@@ -1824,6 +1824,18 @@ class EasyGenerationMixin:
             max_cache_tokens=max_cache_tokens,
         )
 
+    def num_draft_cache_layers(self) -> int:
+        """Draft layers (a nextn/MTP head) that write into the target's paged attention pool.
+
+        The paged pool budgets their pages and :meth:`init_operations_cache` allocates their views after the decoder
+        layers, so a compiled model step returns the cache with the structure it was built from. Models with such a
+        head override this; the default is none.
+
+        Returns:
+            The number of draft layers needing a paged view.
+        """
+        return 0
+
     def _create_mla_ragged_page_cache_config(
         self,
         max_length: int,
@@ -1953,6 +1965,7 @@ class EasyGenerationMixin:
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             max_cache_tokens=max_cache_tokens,
+            num_draft_layers=int(self.num_draft_cache_layers()),
             **indexer_kwargs,
         )
 
@@ -2847,6 +2860,31 @@ class EasyGenerationMixin:
             # KV sharing: shared layers do NOT get their own cache views. They
             # are left as None and the model loop passes the donor's cache view
             # at runtime. This avoids duplicate JAX buffer donation errors.
+
+            # Draft layers writing into the paged MLA pool get their views after the decoder layers, from the pool's
+            # config (which budgets them), so no forward has to add a view inside a compiled step.
+            num_draft = int(self.num_draft_cache_layers())
+            base_mla = next((v for v in reversed(views) if isinstance(v, MLARaggedPagesCacheView)), None)
+            if num_draft > 0 and base_mla is not None:
+                last = num_hidden_layers - 1
+                if pipeline_plan is not None and pipeline_plan.is_enabled:
+                    stage = int(pipeline_plan.layer_to_stage[last])
+                    draft_mesh = pipeline_plan.stage_meshes[stage]
+                    draft_context = spx.assign_stage(total=int(pipeline_plan.mpmd_dim), current=stage)
+                else:
+                    draft_mesh = text_config.mesh
+                    draft_context = self._layer_stage_context(last, total_layers=num_hidden_layers)
+                with draft_context:
+                    for i in range(num_draft):
+                        views.append(
+                            MLARaggedPagesCacheView.init(
+                                config=base_mla.metadata,
+                                layer_index=num_hidden_layers + i,
+                                mesh=draft_mesh,
+                                runtime_sharding_resolver=text_config.runtime_sharding_resolver,
+                                quantizer=quantizer,
+                            )
+                        )
 
             return HybridCache(views=views)
 

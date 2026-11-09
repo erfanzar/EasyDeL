@@ -22,7 +22,9 @@ use crate::engine::plan::Plan;
 use crate::engine::CoreError;
 
 /// Record format version (the first varint).
-pub const RECORD_VERSION: i64 = 4;
+pub const RECORD_VERSION: i64 = 5;
+/// Oldest record format accepted by [`decode`]. Version 4 predates `Plan::inflight_drafts`.
+pub const RECORD_MIN_VERSION: i64 = 4;
 
 /// Appends `v` as a zigzag LEB128 varint.
 pub fn put_varint(out: &mut Vec<u8>, v: i64) {
@@ -128,6 +130,7 @@ pub fn encode(plan: &Plan) -> Vec<u8> {
     put_varint(&mut out, plan.req_bucket);
     put_varint(&mut out, plan.num_draft_tokens_next);
     put_list(&mut out, &plan.spec_slots);
+    put_list(&mut out, &plan.inflight_drafts);
     out
 }
 
@@ -150,7 +153,7 @@ fn pairs(values: Vec<i64>) -> Result<Vec<[i32; 2]>, CoreError> {
 pub fn decode(bytes: &[u8]) -> Result<Plan, CoreError> {
     let mut r = VarintReader::new(bytes);
     let version = r.next_i64()?;
-    if version != RECORD_VERSION {
+    if !(RECORD_MIN_VERSION..=RECORD_VERSION).contains(&version) {
         return Err(CoreError::Value(format!("unknown step record version {version}")));
     }
     let id = r.next_i64()? as u64;
@@ -179,6 +182,11 @@ pub fn decode(bytes: &[u8]) -> Result<Plan, CoreError> {
         req_bucket: r.next_i64()?,
         num_draft_tokens_next: r.next_i64()?,
         spec_slots: narrow(get_list(&mut r)?)?,
+        inflight_drafts: if version >= 5 {
+            narrow(get_list(&mut r)?)?
+        } else {
+            Vec::new()
+        },
     };
     if !r.done() {
         return Err(CoreError::Value("trailing bytes after a step record".into()));
@@ -194,6 +202,9 @@ pub fn decode(bytes: &[u8]) -> Result<Plan, CoreError> {
     .iter()
     .any(|&l| l != n)
     {
+        return Err(CoreError::Value("step record columns differ in length".into()));
+    }
+    if version >= 5 && !plan.inflight_drafts.is_empty() && plan.inflight_drafts.len() != n {
         return Err(CoreError::Value("step record columns differ in length".into()));
     }
     Ok(plan)
@@ -243,6 +254,7 @@ mod tests {
             req_bucket: 4,
             num_draft_tokens_next: 2,
             spec_slots: vec![3, 0],
+            inflight_drafts: vec![-1, -1],
         };
         let bytes = encode(&plan);
         assert_eq!(decode(&bytes).unwrap(), plan);

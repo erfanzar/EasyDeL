@@ -55,7 +55,6 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import spectrax as spx
 from eformer.loggings import get_logger
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
@@ -1456,19 +1455,22 @@ class Glm5NextForCausalLM(_Glm5NextIndexerCacheMixin, BaseCausalLMModule[Glm5Nex
 
     checkpoint_key_rules: ClassVar[KeyRuleSet] = GLM5_NEXT_KEY_RULES
 
+    def num_draft_cache_layers(self) -> int:
+        """One paged view for an attached nextn head that writes the target's paged pool, none otherwise."""
+        return 1 if self.has_mtp() and bool(getattr(self.mtp, "paged_pool", False)) else 0
+
     def _nextn_cache_view(self, past_key_values):
-        """Return the MTP layer's MLA view, allocating it from the target's page layout once."""
+        """Return the MTP layer's MLA view, which :meth:`init_operations_cache` allocates after the decoder layers.
+
+        A cache built without it (no head attached at allocation) returns ``None``: the forward never adds a view, so
+        a compiled step returns the cache with the structure it was built from.
+        """
         if past_key_values is None or not hasattr(past_key_values, "views"):
             return None
         views = past_key_values.views
         index = len(self.base_model.layers)
-        if len(views) <= index:
-            base = next((view for view in views if isinstance(view, MLARaggedPagesCacheView)), None)
-            if base is None:
-                return None
-            views.append(
-                MLARaggedPagesCacheView.init(base.metadata, layer_index=index, mesh=base.runtime_sharding_resolver.mesh)
-            )
+        if len(views) <= index or not isinstance(views[index], MLARaggedPagesCacheView):
+            return None
         return views[index]
 
     @staticmethod
@@ -1478,14 +1480,16 @@ class Glm5NextForCausalLM(_Glm5NextIndexerCacheMixin, BaseCausalLMModule[Glm5Nex
             return None
 
         def _shorten(inner):
-            query_start_loc = np.asarray(inner.query_start_loc)
-            query_start_loc = query_start_loc - np.arange(len(query_start_loc))
+            # jnp, not np: inside the compiled model step these fields are traced arrays.
+            query_start_loc = jnp.asarray(inner.query_start_loc)
+            offsets = jnp.arange(query_start_loc.shape[0], dtype=query_start_loc.dtype)
+            query_start_loc = query_start_loc - offsets
             scheduled = getattr(inner, "scheduled_full", None)
             changes = {"query_start_loc": query_start_loc}
             if scheduled is not None:
-                changes["scheduled_full"] = np.maximum(np.asarray(scheduled) - 1, 0)
+                changes["scheduled_full"] = jnp.maximum(jnp.asarray(scheduled) - 1, 0)
             context = getattr(inner, "context_lens", None)
-            context = None if context is None else np.maximum(np.asarray(context) - 1, 0)
+            context = None if context is None else jnp.maximum(jnp.asarray(context) - 1, 0)
             if context is not None:
                 changes["context_lens"] = context
             return inner.replace(**changes)

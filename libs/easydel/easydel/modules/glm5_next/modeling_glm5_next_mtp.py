@@ -53,10 +53,17 @@ from .modeling_glm5_next import Glm5NextDSAAttention, Glm5NextTextMoE
 DEFAULT_MTP_CACHE_LENGTH = 8192
 
 
-def glm5_next_mtp_config(config: Glm5NextTextConfig) -> Glm5NextTextConfig:
+def glm5_next_mtp_config(config: Glm5NextTextConfig, *, paged_pool: bool = False) -> Glm5NextTextConfig:
     """One-layer draft config: index 0 is a DSA/MLA attention + sparse-MoE block with a full indexer.
 
-    Dense (non-paged) attention is forced: the head keeps its own transformer cache, not the backbone's pages.
+    Args:
+        config: The target model's text config.
+        paged_pool: Run the block with the target's attention mechanism, writing its KV into the target's paged MLA
+            pool. Otherwise the block uses dense attention on the drafter-local cache, which every drafter program
+            (warm-up, batched draft, fused verify) can run.
+
+    Returns:
+        The draft config.
     """
     # Shallow copy (as the Qwen3.5 MTP head does): the config carries the mesh / sharding resolver, which must be
     # shared, and every schedule below is reassigned rather than mutated.
@@ -65,8 +72,12 @@ def glm5_next_mtp_config(config: Glm5NextTextConfig) -> Glm5NextTextConfig:
     draft.layer_types = [DEEPSEEK_SPARSE_ATTENTION_LAYER_TYPE]
     draft.mlp_layer_types = ["sparse"]
     draft.indexer_types = ["full"]
-    draft.attn_mechanism = getattr(config, "attn_mechanism", "vanilla")
-    draft.decode_attn_mechanism = None
+    if paged_pool:
+        draft.attn_mechanism = getattr(config, "attn_mechanism", "vanilla")
+        draft.decode_attn_mechanism = getattr(config, "decode_attn_mechanism", None) or draft.attn_mechanism
+    else:
+        draft.attn_mechanism = "vanilla"
+        draft.decode_attn_mechanism = None
     return draft
 
 
@@ -136,9 +147,12 @@ class Glm5NextMTPHead(spx.Module):
         *,
         rngs: spx.Rngs,
         max_cache_length: int = DEFAULT_MTP_CACHE_LENGTH,
+        paged_pool: bool = False,
     ):
-        draft = glm5_next_mtp_config(config)
+        draft = glm5_next_mtp_config(config, paged_pool=paged_pool)
         self.config = draft
+        #: Whether the block writes into the target's paged MLA pool (see :func:`glm5_next_mtp_config`).
+        self.paged_pool = bool(paged_pool)
         self.num_stages = 1
         self.max_cache_length = int(max_cache_length)
         norm_kwargs = dict(eps=draft.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs)

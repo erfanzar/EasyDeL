@@ -64,6 +64,9 @@ pub struct Plan {
     /// Output slots per entry: `1 + drafts` for an entry that samples, 0 otherwise. An async step reserves them as
     /// placeholders (every draft counted as accepted) until its commit.
     pub spec_slots: Vec<i32>,
+    /// Drafts of earlier uncommitted steps that this entry's optimistic start counted as accepted; -1 when the
+    /// entry starts from committed state. Zero is meaningful: the earlier step verified no drafts.
+    pub inflight_drafts: Vec<i64>,
     /// Global page ids per entry and group: all of a new or resumed entry's pages, the newly allocated ones of a
     /// running entry. Entry `i`, group `g` is `new_pages[new_page_offsets[i*G+g]..new_page_offsets[i*G+g+1]]`.
     pub new_pages: Vec<i32>,

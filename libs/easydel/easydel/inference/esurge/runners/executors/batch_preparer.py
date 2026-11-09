@@ -81,7 +81,7 @@ from easydel.inference.esurge.runners.host_sync import host_payload_broadcast_ne
 from easydel.utils import flags
 
 from ...page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
-from ..async_types import DeviceInputTokenHandoff
+from ..async_types import DeviceInputTokenHandoff, DeviceSpecWindowHandoff
 from ..execution_types import BatchMetadata, CacheGroupInputs
 
 #: Host-payload slots at or below this size are content-hashed and their
@@ -807,6 +807,7 @@ class BatchMetadataPreparer:
         padded_num_reqs_in: int,
         logit_bias_cpu: np.ndarray | None = None,
         allowed_token_ids_mask_cpu: np.ndarray | None = None,
+        bad_words_token_ids_cpu: np.ndarray | None = None,
         window_row_indices_cpu: np.ndarray | None = None,
         recurrent_slot_indices_cpu: np.ndarray | None = None,
         spec_recurrent_commit_cpu: np.ndarray | None = None,
@@ -1219,6 +1220,7 @@ class BatchMetadataPreparer:
         padded_num_reqs_in: int,
         logit_bias_cpu: np.ndarray | None = None,
         allowed_token_ids_mask_cpu: np.ndarray | None = None,
+        bad_words_token_ids_cpu: np.ndarray | None = None,
         window_row_indices_cpu: np.ndarray | None = None,
         recurrent_slot_indices_cpu: np.ndarray | None = None,
         spec_recurrent_commit_cpu: np.ndarray | None = None,
@@ -1599,3 +1601,151 @@ class BatchMetadataPreparer:
                 handoff.offset if handoff.offset is not None else jnp.zeros((), dtype=jnp.int32)
             ),
         )
+
+    def apply_spec_window_handoff(
+        self,
+        batch_metadata: BatchMetadata,
+        handoff: DeviceSpecWindowHandoff,
+    ) -> tuple[BatchMetadata, jax.Array]:
+        """Rewrite step ``N+1``'s optimistic verify windows from step ``N``'s device results.
+
+        The host built ``batch_metadata`` as if every draft step ``N`` verified was accepted. One compiled program
+        replaces each fed window's input ids with ``[last emitted token, next drafts]`` and moves its positions,
+        sequence length (and every cache group's) back by ``delta = d - a``; with slot-group recurrent state it also
+        rebases the slot read so the row reads slot ``g + a``. Nothing is read back to the host, so every host of a
+        multi-host run builds the same inputs from the same plan.
+
+        Args:
+            batch_metadata: Step ``N+1``'s metadata as the host built it.
+            handoff: Step ``N``'s device results and the window-row map.
+
+        Returns:
+            ``(metadata, delta)``: the corrected metadata, and int32 ``[max_num_reqs]`` per window row the tokens its
+            host-built start ran ahead (``d - a``, 0 for rows without a source). The verify program subtracts it
+            from its host-built seed positions and drafter-cache bases.
+
+        Raises:
+            ValueError: For layouts whose host-built KV write map depends on the position (the v2 slot mapping, in
+                the main pool or a cache group) or that pack rows rank-major (SPMD DP).
+        """
+        groups = tuple(batch_metadata.cache_groups)
+        if self._use_slot_mapping or any(group.slot_mapping is not None for group in groups):
+            raise ValueError("Speculative window handoff needs request-distribution (v3) metadata, not a slot mapping.")
+        if self._uses_spmd_dp():
+            raise ValueError("Speculative window handoff does not serve rank-major SPMD DP batches.")
+        sources = handoff.sources
+        if not isinstance(sources, jax.Array):
+            sources = put_host_payload(
+                np.asarray(sources, dtype=np.int32),
+                self._empty_sharding,
+                host_payloads_replicated=self.host_payloads_replicated,
+            )
+        # The verify program may run on another placement (the drafter's mesh); move its outputs device-to-device
+        # onto the step's input placement (no copy when it already matches, never a host read).
+        last_token, accepted, drafts = (
+            jax.device_put(x, self._empty_sharding) for x in (handoff.last_token, handoff.accepted, handoff.drafts)
+        )
+        recurrent_commit = batch_metadata.spec_recurrent_commit if handoff.rewrite_recurrent_base else None
+        group_commits = tuple(
+            group.spec_recurrent_commit if handoff.rewrite_recurrent_base else None for group in groups
+        )
+        delta, ids, positions, packed, commit, group_lens, group_positions, group_commits = _rewrite_spec_windows(
+            batch_metadata.input_ids_buf,
+            batch_metadata.position_ids_buf,
+            batch_metadata.packed_qsl_seqlens,
+            batch_metadata.packed_misc_i32[0],
+            sources,
+            last_token,
+            accepted,
+            drafts,
+            recurrent_commit,
+            tuple(group.context_lens for group in groups),
+            tuple(group.position_ids for group in groups),
+            group_commits,
+        )
+        new_groups = tuple(
+            group.replace(
+                context_lens=lens,
+                position_ids=pos,
+                spec_recurrent_commit=group.spec_recurrent_commit if group_commit is None else group_commit,
+            )
+            for group, lens, pos, group_commit in zip(groups, group_lens, group_positions, group_commits, strict=True)
+        )
+        fixed = batch_metadata.replace(
+            input_ids_buf=ids,
+            position_ids_buf=positions,
+            packed_qsl_seqlens=packed,
+            spec_recurrent_commit=batch_metadata.spec_recurrent_commit if commit is None else commit,
+            cache_groups=new_groups,
+        )
+        return fixed, delta
+
+
+@jax.jit
+def _rewrite_spec_windows(
+    input_ids: jax.Array,
+    positions: jax.Array,
+    packed_qsl_seqlens: jax.Array,
+    num_requests: jax.Array,
+    sources: jax.Array,
+    last_token: jax.Array,
+    accepted: jax.Array,
+    drafts: jax.Array,
+    recurrent_commit: jax.Array | None,
+    group_context_lens: tuple[jax.Array, ...],
+    group_positions: tuple[jax.Array | None, ...],
+    group_commits: tuple[jax.Array | None, ...],
+):
+    """The device half of :meth:`BatchMetadataPreparer.apply_spec_window_handoff` (see there)."""
+    qsl = packed_qsl_seqlens[0]
+    rows = qsl.shape[0] - 1
+    row_ids = jnp.arange(rows, dtype=jnp.int32)
+    src = sources[0, :rows]
+    fed = (row_ids < num_requests) & (src >= 0)
+    src = jnp.clip(src, 0, last_token.shape[0] - 1)
+    acc = accepted.astype(jnp.int32)[src]
+    delta = jnp.where(fed, sources[1, :rows] - acc, 0)
+
+    tok = jnp.arange(input_ids.shape[0], dtype=jnp.int32)
+    tok_row = jnp.clip(jnp.searchsorted(qsl[1:], tok, side="right"), 0, rows - 1).astype(jnp.int32)
+    live_end = qsl[jnp.clip(num_requests, 0, rows)]
+    tok_fed = (tok < live_end) & fed[tok_row]
+    j = tok - qsl[tok_row]
+    tok_src = src[tok_row]
+    window_token = jnp.where(
+        j == 0,
+        last_token.astype(jnp.int32)[tok_src],
+        drafts.astype(jnp.int32)[tok_src, jnp.clip(j - 1, 0, drafts.shape[1] - 1)],
+    )
+    ids = jnp.where(tok_fed & (j <= drafts.shape[1]), window_token.astype(input_ids.dtype), input_ids)
+    tok_delta = jnp.where(tok_fed, delta[tok_row], 0)
+    new_positions = positions - tok_delta.astype(positions.dtype)
+
+    seq_lens = packed_qsl_seqlens[1, :rows] - delta
+    packed = packed_qsl_seqlens.at[1, :rows].set(seq_lens)
+
+    query_lens = qsl[1:] - qsl[:-1]
+
+    def rebase(commit):
+        # Slot g covers the request's tokens through its last step's first token: corrected context before this
+        # step minus the drafts that step accepted. Bases count absolute tokens, so every pool uses the main lengths.
+        if commit is None:
+            return None
+        n = min(rows, commit.shape[1])
+        before = seq_lens[:n] - query_lens[:n]
+        return commit.at[0, :n].set(jnp.where(fed[:n], before - acc[:n], commit[0, :n]))
+
+    new_lens = tuple(lens - delta[: lens.shape[0]] for lens in group_context_lens)
+    new_group_positions = tuple(
+        None if pos is None else pos - tok_delta[: pos.shape[0]].astype(pos.dtype) for pos in group_positions
+    )
+    return (
+        delta,
+        ids,
+        new_positions,
+        packed,
+        rebase(recurrent_commit),
+        new_lens,
+        new_group_positions,
+        tuple(rebase(commit) for commit in group_commits),
+    )

@@ -462,6 +462,12 @@ impl EngineCore {
                 plan.draft_offsets.push(plan.draft_tokens.len() as i32);
                 verify |= !e.drafts.is_empty();
                 let cur_spec = e.drafts.len() as i64;
+                let inflight_before = if p.async_scheduling && r.placeholders > 0 {
+                    r.inflight_drafts
+                } else {
+                    -1
+                };
+                plan.inflight_drafts.push(inflight_before);
                 let emit = if p.async_scheduling {
                     grammar_pending |= r.flags & FLAG_GRAMMAR != 0 && r.placeholders > 0;
                     if r.computed == r.num_tokens() + r.placeholders + cur_spec {

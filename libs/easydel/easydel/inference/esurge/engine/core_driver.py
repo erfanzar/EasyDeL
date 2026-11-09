@@ -626,6 +626,7 @@ class EngineCoreDriver:
             recurrent_snapshot_saves=pairs(plan.snapshot_saves),
             num_draft_tokens_next=int(plan.num_draft_tokens_next),
             spec_slots={rids[i]: s for i, s in enumerate(plan.spec_slots.tolist()) if s > 0},
+            inflight_drafts={rids[i]: d for i, d in enumerate(plan.inflight_drafts.tolist()) if d >= 0},
             async_safe=bool(plan.flags & _PLAN_ASYNC_SAFE),
         )
         if n or zero_schedule_needs_update(so):
@@ -674,6 +675,8 @@ class EngineCoreDriver:
         index = model_output.req_id_to_index or {}
         sampled = model_output.sampled_token_ids
         spec = model_output.spec_token_ids
+        spec_emitted = model_output.spec_emitted
+        spec_drafts = model_output.spec_drafts
         logprobs = model_output.logprobs
         logprob_offsets: list[int] = []
         if logprobs is not None:
@@ -705,11 +708,28 @@ class EngineCoreDriver:
                         len(sampled),
                     )
                 else:
-                    if sampled:
-                        flat.extend(sampled[out])
-                    if spec is not None and out < len(spec):
-                        new_drafts.extend(spec[out])
+                    row = (model_output.req_id_to_row_index or {}).get(rid, out)
                     count = accepted_by_id.get(rid)
+                    row_tokens = None
+                    if count is not None and spec_emitted is not None and 0 <= row < len(spec_emitted):
+                        # Only a request that verified drafts this step has its emission packed: its accepted drafts
+                        # plus one token. Any other row (a plain decode row riding the same step, or a pooled draft's
+                        # seed packed by a path that resolved acceptance on the host) commits the runner's sampled
+                        # tokens.
+                        row_tokens = [int(t) for t in spec_emitted[row] if int(t) >= 0]
+                        if len(row_tokens) != int(count) + 1:
+                            row_tokens = None
+                    if row_tokens is not None:
+                        flat.extend(row_tokens)
+                    elif sampled:
+                        flat.extend(sampled[out])
+                    packed_drafts = None
+                    if spec_drafts is not None and 0 <= row < len(spec_drafts):
+                        packed_drafts = [int(t) for t in spec_drafts[row] if int(t) >= 0]
+                    if packed_drafts:
+                        new_drafts.extend(packed_drafts)
+                    elif spec is not None and out < len(spec):
+                        new_drafts.extend(spec[out])
                     if count is not None:
                         accepted[i] = int(count)
                 offsets.append(len(flat))
