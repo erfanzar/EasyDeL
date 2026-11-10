@@ -173,6 +173,11 @@ def kda_ragged_rows_rank_major_forward(
         raise TypeError(f"'ragged_kda' resolved to {type(op).__name__}, expected a RaggedKDAOp")
     if head_axis is None:
         head_axis = op.resolve_head_axis(int(beta.shape[-1]), int(query.shape[1]))
+    if head_axis == dp_axis or (isinstance(head_axis, tuple) and dp_axis in head_axis):
+        # DP over tp already owns every head shard on each rank. Repeating tp
+        # on the head dimension creates an invalid duplicate PartitionSpec;
+        # replicate heads instead of sharding them a second time.
+        head_axis = None
     local_metadata = _meshless_metadata(metadata)
     view_metadata, layer_index = cache_view.metadata, cache_view.layer_index
 

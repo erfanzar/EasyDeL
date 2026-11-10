@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from easydel.axis import reset_attention_data_parallel_axis
+from easydel.axis import register_attention_data_parallel_axis, reset_attention_data_parallel_axis
 from easydel.caching import KDACacheView
 from easydel.caching.kda.cache import KDACacheConfig
 from easydel.operations import OperationMetadata
@@ -206,10 +206,11 @@ def _view(leaves):
     return KDACacheView(**leaves, positions=jnp.zeros((pool,), jnp.int32), metadata=cfg, layer_index=0)
 
 
-def _serving_pools(case, mesh):
-    """The pools placed like ``KDACacheView.init``: slots over the batch axes, conv features / heads over ``tp``."""
-    conv = NamedSharding(mesh, PartitionSpec(("fsdp", "dp"), "tp", None))
-    rec = NamedSharding(mesh, PartitionSpec(("fsdp", "dp"), "tp", None, None))
+def _serving_pools(case, mesh, pool_axis="dp"):
+    """Place slots over the selected DP axis and heads over tp when distinct."""
+    head_axis = "tp" if pool_axis == "dp" else None
+    conv = NamedSharding(mesh, PartitionSpec(("fsdp", pool_axis), head_axis, None))
+    rec = NamedSharding(mesh, PartitionSpec(("fsdp", pool_axis), head_axis, None, None))
     leaves = {
         name: jax.device_put(jnp.asarray(pool, jnp.float32), conv)
         for name, pool in zip(LEAVES[:3], case["conv"], strict=True)
@@ -236,7 +237,7 @@ def _inputs(case, layout, slots_by_rank, explicit_slots):
     return inputs
 
 
-def _run(case, layout, mesh, *, explicit_slots, chunk_size, decay_lower_bound):
+def _run(case, layout, mesh, *, explicit_slots, chunk_size, decay_lower_bound, pool_axis="dp"):
     metadata = OperationMetadata(runtime_dtype=jnp.float32, _stored_mesh=mesh)
 
     @jax.jit
@@ -253,7 +254,7 @@ def _run(case, layout, mesh, *, explicit_slots, chunk_size, decay_lower_bound):
         return out, {name: getattr(view, name) for name in LEAVES}
 
     slots_by_rank = _slots(layout, explicit_slots)
-    return step(_inputs(case, layout, slots_by_rank, explicit_slots), _serving_pools(case, mesh))
+    return step(_inputs(case, layout, slots_by_rank, explicit_slots), _serving_pools(case, mesh, pool_axis))
 
 
 def _rel(a, b):
@@ -328,6 +329,15 @@ def test_rank_major_decode_shaped_steps_match_per_rank_reference(layout, dp, tp)
     case = _case(layout, seed=100 + dp * 10 + tp, heads=DECODE_HEADS, head_dim=DECODE_HEAD_DIM)
     result = _run(case, layout, mesh, explicit_slots=True, chunk_size=64, decay_lower_bound=LOWER_BOUND)
     _check(result, case, layout, _slots(layout, True), tol=1e-4)
+
+
+def test_rank_major_dp_over_tp_replicates_heads_and_matches_reference():
+    """DP over tp must not emit duplicate tp axes in the KDA shard_map specs."""
+    register_attention_data_parallel_axis("tp")
+    mesh = _mesh(1, 2)
+    case = _case(DP2, seed=77)
+    result = _run(case, DP2, mesh, explicit_slots=True, chunk_size=64, decay_lower_bound=LOWER_BOUND, pool_axis="tp")
+    _check(result, case, DP2, _slots(DP2, True), tol=1e-4)
 
 
 def test_rank_major_driver_needs_the_rank_count_on_the_attention_dp_axis():
