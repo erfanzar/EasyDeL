@@ -66,11 +66,13 @@ impl HitSearch {
             if fmax < omin || omax < fmin {
                 let fps = groups[full[0] as usize].page_size;
                 let ops = groups[other[0] as usize].page_size;
-                if ops % fps != 0 {
-                    return Err(KvError::Value(
-                        "CacheCoordinator assumes the page_size of full attention layers is divisible by other layers now."
-                            .into(),
-                    ));
+                // Page keys are chained at one page size and every group indexes them by its own page index, so a
+                // group with another page size would look up the wrong keys.
+                if ops != fps {
+                    return Err(KvError::Value(format!(
+                        "Hybrid prefix caching requires one token-page size for page hashes; got {fps} for full \
+                         attention and {ops} for the other layers."
+                    )));
                 }
                 return Ok(Self::Hybrid {
                     full,
@@ -193,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_needs_divisible_page_sizes_and_grouped_a_common_one() {
+    fn hybrid_and_grouped_searches_need_one_page_size() {
         let full = Group {
             kind: Kind::Full,
             page_size: 16,
@@ -205,9 +207,10 @@ mod tests {
             type_index: 1,
         };
         assert!(matches!(
-            HitSearch::select(&[full, sw(32)], true).unwrap(),
+            HitSearch::select(&[full, sw(16)], true).unwrap(),
             HitSearch::Hybrid { full_first: true, .. }
         ));
+        assert!(HitSearch::select(&[full, sw(32)], true).is_err());
         assert!(HitSearch::select(&[full, sw(24)], true).is_err());
         assert!(matches!(
             HitSearch::select(&[full, sw(24)], false).unwrap(),

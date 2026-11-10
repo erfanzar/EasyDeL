@@ -25,6 +25,15 @@ dependencies = ["numpy"]
 module-name = "surgecore._native"
 features = ["pyo3/extension-module"]
 
+[tool.uv]
+# Rebuild the extension when the crate changes, not only when this file does.
+cache-keys = [
+	{ file = "pyproject.toml" },
+	{ file = "Cargo.toml" },
+	{ file = "Cargo.lock" },
+	{ file = "src/**/*.rs" },
+]
+
 [tool.ruff]
 line-length = 121
 target-version = "py311"

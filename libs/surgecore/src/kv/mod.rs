@@ -517,7 +517,7 @@ impl KvCore {
         for (g, group) in self.groups.iter().enumerate() {
             let Some(cached) = req.cached[g] else { break };
             let full = n.div_euclid(group.page_size);
-            if cached == full {
+            if cached >= full {
                 continue;
             }
             if (known as i64) < cached {
@@ -568,7 +568,8 @@ impl KvCore {
                 return Err(KvError::Key("request has no published-page count".into()));
             };
             let full = n.div_euclid(group.page_size);
-            if cached == full {
+            // A publish of fewer tokens than already published changes nothing: the count never goes back.
+            if cached >= full {
                 continue;
             }
             if (req.keys.len() as i64) < cached {
@@ -736,6 +737,26 @@ mod tests {
         assert_eq!(kv.num_open(), 1);
         kv.check().unwrap();
         assert!(kv.reset());
+    }
+
+    #[test]
+    fn a_shorter_publish_never_lowers_the_published_count() {
+        let mut kv = core(vec![full(4)], 16);
+        let toks: Vec<i32> = (0..13).collect();
+        let t = Tokens {
+            tokens: &toks,
+            offset: 0,
+        };
+        let a = kv.open(0);
+        kv.allocate(a, 0, 13, 0, None, 13, None, None).unwrap().unwrap();
+        kv.publish(a, 12, Some(t)).unwrap();
+        // 5 computed tokens cover 1 full page; the 3 pages already published stay published.
+        kv.publish(a, 5, Some(t)).unwrap();
+        assert_eq!(kv.publish_tokens_needed(a, 12).unwrap(), None);
+        kv.publish(a, 12, Some(t)).unwrap();
+        kv.check().unwrap();
+        let b = kv.open(0);
+        assert_eq!(kv.lookup(b, Some(t), false, 12, None, None).unwrap().1, 12);
     }
 
     #[test]

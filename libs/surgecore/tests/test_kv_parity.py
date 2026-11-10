@@ -22,8 +22,8 @@ every operation, the free list's eviction order and every page's reference count
 (``KvCore.check``) are asserted after every operation as well.
 
 :func:`replay_case` drives any object with ``CacheManager``'s methods; this file drives ``KvCore`` through the small
-:class:`KvDriver` below (the binding protocol eSurge's ``CacheManager`` follows), and eSurge's tests drive the real
-``CacheManager`` through the same function.
+:class:`KvDriver` below, the binding protocol eSurge's ``CacheManager`` follows. The goldens are not replayed through
+``CacheManager`` itself.
 """
 
 from __future__ import annotations

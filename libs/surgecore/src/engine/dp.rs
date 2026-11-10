@@ -116,7 +116,8 @@ impl RankState {
 }
 
 /// The rank a new request goes to: the rank with the most prefix-cached tokens (read-only probes; ties to the
-/// lower rank), else the rank with the fewest pending prefill tokens (ties to the lower rank).
+/// lower rank), else the rank with the fewest pending prefill tokens (ties to the lower rank). This is the former
+/// Python DP scheduler's rule, which the engine goldens pin; requests past their prefill count no prefill tokens.
 pub fn route(ranks: &[RankState], reqs: &RequestTable, request: &Request) -> usize {
     let mut best: Option<usize> = None;
     let mut best_tokens = 0;
