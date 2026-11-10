@@ -18,6 +18,7 @@ pub mod budget;
 pub mod commit;
 pub mod queue;
 pub mod schedule;
+pub mod trim;
 
 pub use budget::{align_prefill_chunk, TokenBudget};
 pub use queue::{Policy, Queue};

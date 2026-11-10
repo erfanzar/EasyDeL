@@ -2079,20 +2079,20 @@ class eSurgeRunner:
         self.step_time_table = self._measure_step_times(num_tokens_paddings)
 
     def _measure_step_times(self, num_tokens_paddings: list[int]) -> dict[int, float] | None:
-        """Milliseconds per compiled token bucket of the model step, for the engine core's verification budget.
+        """Milliseconds per compiled token bucket of the model step, for the engine core's step-cost decisions.
 
-        Measured only with a drafter, over the token buckets up to the first one that holds every request verifying
-        every draft. Each bucket runs 1 warm-up and 5 timed steps on compile-shaped inputs, each ended by
-        ``block_until_ready``; its time is the mean of the timed runs without the fastest and the slowest.
+        The engine core trims prefill chunks to cheaper token buckets with it (``EngineCoreDriver.set_step_cost``)
+        and, with a drafter, sizes its verification budget (``EngineCoreDriver.set_verify_budget``). Every compiled
+        token bucket runs 1 warm-up and 5 timed steps on compile-shaped inputs, each ended by ``block_until_ready``;
+        its time is the mean of the timed runs without the fastest and the slowest.
 
         Returns:
-            ``{token_bucket: ms}``, or ``None`` without a drafter or when a bucket cannot be timed.
+            ``{token_bucket: ms}``, or ``None`` when a bucket cannot be timed, and on a pipeline-parallel runner
+            without a drafter.
         """
-        if self.drafter is None or int(self.num_draft_tokens) <= 0:
+        if (self.drafter is None or int(self.num_draft_tokens) <= 0) and self.pipeline_plan.is_enabled:
             return None
         manager = self.executor_manager
-        dp = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
-        limit = int(self.max_num_reqs) * (int(self.num_draft_tokens) + 1) * dp
         req_buckets = sorted({int(b) for b in self.active_num_seq_buckets})
         table: dict[int, float] = {}
         # The timed steps run compile-shaped inputs through the live cache. Recurrent rows are restored afterwards
@@ -2111,10 +2111,12 @@ class eSurgeRunner:
                     runs.append((time.perf_counter() - start) * 1e3)
                 timed = sorted(runs[1:])[1:-1]
                 table[num_tokens] = sum(timed) / len(timed)
-                if num_tokens >= limit:
-                    break
-        except Exception as exc:  # the budget is an optimisation: serve with every draft verified instead
-            logger.warning("Step-time table not measured (%s); speculative steps verify every draft.", exc)
+        except Exception as exc:  # the table only feeds optimisations: serve without them instead
+            logger.warning(
+                "Step-time table not measured (%s); prefill chunks are not bucket-aligned and speculative steps "
+                "verify every draft.",
+                exc,
+            )
             return None
         finally:
             manager.kv_pages = _restore_recurrent_state(manager.kv_pages, saved)

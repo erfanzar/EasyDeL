@@ -234,6 +234,25 @@ class EngineCoreDriver:
             correction=float(correction),
         )
 
+    def set_step_cost(self, step_ms: dict[int, float]) -> None:
+        """Turn on the core's bucket-aligned prefill chunks (only with chunked prefill).
+
+        A step a few tokens past a compiled token bucket then gives the excess back from its newest prefill chunks, to
+        be scheduled by the next step, when the measured step times predict that the lower bucket plus the deferred
+        tokens' share of a later step is faster.
+
+        Args:
+            step_ms: Measured model-step time in milliseconds per compiled token bucket.
+
+        Raises:
+            ValueError: A bad table (empty, non-ascending or non-positive buckets, non-positive times).
+        """
+        buckets = sorted(int(b) for b in step_ms)
+        self._core.set_step_cost(
+            np.asarray(buckets, np.int64),
+            np.asarray([float(step_ms[b]) for b in buckets], np.float64),
+        )
+
     @classmethod
     def from_runner(
         cls,
@@ -303,6 +322,8 @@ class EngineCoreDriver:
             dp_admission_hold=dp_admission_hold,
         )
         step_ms = getattr(runner, "step_time_table", None)
+        if step_ms:
+            driver.set_step_cost(step_ms)
         if step_ms and driver.num_draft_tokens > 0 and not driver.async_scheduling:
             driver.set_verify_budget(step_ms)
         return driver

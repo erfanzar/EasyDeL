@@ -63,6 +63,11 @@ impl SnapshotIndex {
         self.num_slots
     }
 
+    /// The key a pending reservation of `slot` was made for, or `None` when `slot` is not pending.
+    pub fn pending_key(&self, slot: i64) -> Option<SnapKey> {
+        self.pending.iter().find(|&&(s, _)| s == slot).map(|&(_, k)| k)
+    }
+
     /// First slot.
     pub fn offset(&self) -> i64 {
         self.offset

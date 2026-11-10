@@ -521,6 +521,21 @@ impl EngineCore {
         self.with(py, |core| core.set_verify_budget(&b, &t, prior, alpha, correction))
     }
 
+    /// Turns on bucket-aligned prefill chunks (only with chunked prefill): a step a few tokens past a compiled token
+    /// bucket gives the excess back from its newest prefill chunks, to the next step, when the measured step times
+    /// predict that is faster. `buckets` (ascending) are the compiled token buckets of the model step and `step_ms`
+    /// their measured times.
+    #[pyo3(signature = (buckets, step_ms))]
+    fn set_step_cost(
+        &self,
+        py: Python<'_>,
+        buckets: PyArrayLike1<'_, i64, AllowTypeChange>,
+        step_ms: PyArrayLike1<'_, f64, AllowTypeChange>,
+    ) -> PyResult<()> {
+        let (b, t) = (values(&buckets), values(&step_ms));
+        self.with(py, |core| core.set_step_cost(&b, &t))
+    }
+
     /// The verification budget's global acceptance prior per draft position and its step-time correction (ms), or
     /// `None` without a budget.
     fn verify_state(&self, py: Python<'_>) -> PyResult<Option<(Vec<f64>, f64)>> {

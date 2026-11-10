@@ -1116,3 +1116,100 @@ def test_kv_core_scheduler_trace_reproduces(index):
         assert got == want, (golden["name"], step)
         if plan.n:
             c.commit(plan, sampled)
+
+
+# ---- bucket-aligned prefill chunks (set_step_cost) ----
+
+_COST_BUCKETS = np.asarray([4, 8, 16, 32, 64], np.int64)
+_COST_MS = np.asarray([10.0, 10.0, 10.0, 40.0, 80.0])
+
+
+def _decoding_core(n=3, **kw) -> Core:
+    """A core whose ``n`` requests have finished their 4-token prompts and decode one token per step."""
+    args = dict(max_rows=8, token_budget=64, max_model_len=256, num_pages=256, page_size=4, chunked_prefill=True)
+    args.update(kw)
+    c = Core(**args)
+    for i in range(n):
+        c.add(f"d{i}", [10 + i, 11, 12, 13], max_tokens=64)
+    plan, _ = c.step()
+    assert plan.scheduled.tolist() == [4] * n
+    return c
+
+
+def _scheduled(c: Core, plan) -> dict[str, int]:
+    return {c.name[h]: n for h, n in zip(plan.handles.tolist(), plan.scheduled.tolist(), strict=True)}
+
+
+def test_step_cost_trims_a_prefill_chunk_to_the_bucket_below_and_defers_the_rest():
+    # 3 decode rows + a 20-token prompt = 23 tokens, bucket 32 (40 ms). Bucket 16 costs 10 ms and the 7 deferred
+    # tokens' share of bucket 8 costs 8.75 ms, so the prompt gives 7 tokens to the next step.
+    c = _decoding_core()
+    c.core.set_step_cost(_COST_BUCKETS, _COST_MS)
+    c.add("p", list(range(100, 120)), max_tokens=64)
+    plan = c.schedule()
+    assert _scheduled(c, plan) == {"d0": 1, "d1": 1, "d2": 1, "p": 13}
+    assert plan.emits.tolist() == [1, 1, 1, 0]
+    c.commit(plan)
+    # 3 + 7 = 10 tokens: cutting 2 to reach bucket 8 saves nothing (10 ms + 2 tokens of bucket 4 > 0.95 * 10 ms).
+    plan = c.schedule()
+    assert _scheduled(c, plan) == {"d0": 1, "d1": 1, "d2": 1, "p": 7}
+    assert plan.emits.tolist() == [1, 1, 1, 1]
+    c.commit(plan)
+
+
+@pytest.mark.parametrize("case", ["no_table", "flat_table", "no_chunked_prefill"])
+def test_step_cost_leaves_steps_it_cannot_speed_up(case):
+    c = _decoding_core(chunked_prefill=case != "no_chunked_prefill")
+    if case == "flat_table":
+        c.core.set_step_cost(_COST_BUCKETS, np.full(5, 10.0))
+    elif case == "no_chunked_prefill":
+        c.core.set_step_cost(_COST_BUCKETS, _COST_MS)
+    c.add("p", list(range(100, 120)), max_tokens=64)
+    assert _scheduled(c, c.schedule()) == {"d0": 1, "d1": 1, "d2": 1, "p": 20}
+
+
+def test_step_cost_never_trims_decode_rows():
+    # 5 decode rows run bucket 8 at 100 ms against 10 ms for bucket 4, but no row has a token to give back.
+    c = _decoding_core(n=5)
+    c.core.set_step_cost(np.asarray([4, 8, 32]), np.asarray([10.0, 100.0, 200.0]))
+    assert _scheduled(c, c.schedule()) == {f"d{i}": 1 for i in range(5)}
+
+
+def test_a_trimmed_chunk_hands_its_snapshot_save_to_the_next_chunk():
+    c = _decoding_core(prefix_caching=True, snapshot_slots=4)
+    c.core.set_step_cost(_COST_BUCKETS, _COST_MS)
+    # 21 tokens: the snapshot boundary is 20 (the last full page before the last token). The chunk that would end
+    # there is trimmed to 13 and gives up its save; the next chunk ends on the boundary and saves.
+    c.add("p", list(range(100, 121)), max_tokens=64)
+    plan = c.schedule()
+    assert _scheduled(c, plan) == {"d0": 1, "d1": 1, "d2": 1, "p": 13}
+    assert plan.snapshot_saves.tolist() == []
+    c.commit(plan)
+    plan = c.schedule()
+    assert _scheduled(c, plan) == {"d0": 1, "d1": 1, "d2": 1, "p": 7}
+    handles = plan.handles.tolist()
+    assert [c.name[handles[e]] for e, _ in plan.snapshot_saves.tolist()] == ["p"]
+    c.commit(plan)
+    plan = c.schedule()
+    assert _scheduled(c, plan) == {"d0": 1, "d1": 1, "d2": 1, "p": 1}
+    assert plan.emits.tolist() == [1, 1, 1, 1]
+    c.commit(plan)
+
+
+def test_step_cost_trims_the_busiest_rank_of_a_data_parallel_step():
+    c = _dp_core(chunked_prefill=True)
+    c.add("a0", 4, max_tokens=8, dp_rank=0)
+    c.add("a1", 4, max_tokens=8, dp_rank=1)
+    c.step()
+    # A step's tokens are its busiest rank's times 2: rank 0 holds 1 + 10 = 11 tokens, a 32-token step. Bucket 16
+    # allows 8 tokens per rank, so the prompt gives 3 tokens to the next step.
+    c.core.set_step_cost(np.asarray([4, 8, 16, 32]), np.asarray([10.0, 10.0, 10.0, 40.0]))
+    c.add("p0", list(range(100, 110)), max_tokens=8, dp_rank=0)
+    assert _scheduled(c, c.schedule()) == {"a0": 1, "a1": 1, "p0": 7}
+
+
+def test_set_step_cost_refuses_bad_tables():
+    c = Core()
+    for buckets, ms in (([], []), ([8, 4], [1.0, 1.0]), ([4], [0.0]), ([4, 8], [1.0])):
+        with pytest.raises(ValueError, match="step"):
+            c.core.set_step_cost(np.asarray(buckets, np.int64), np.asarray(ms, np.float64))

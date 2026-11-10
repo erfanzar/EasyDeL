@@ -318,6 +318,7 @@ def _bare_runner(*, data_parallel_size, compiled):
     runner._precompile_draft_schedule_variants = lambda: None
     runner._precompile_draft_in_verify_variants = lambda: None
     runner._precompile_whole_block_drafter = lambda: None
+    runner._measure_step_times = lambda num_tokens_paddings: None
     return runner
 
 

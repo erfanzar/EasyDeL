@@ -50,6 +50,7 @@ use plan::{
 };
 use request::{FinishReason, Handle, NewRequest, Request, RequestTable, Status, FLAG_GRAMMAR};
 use sched::commit::{commit_plan, Output};
+use sched::trim::{trim_prefill, StepCost};
 use sched::{free_request, schedule::schedule_rank, Policy, Queue, SchedParams, TokenBudget};
 use verify::VerifyBudget;
 
@@ -151,6 +152,9 @@ pub struct EngineCore {
     admission_hold: i64,
     /// Consecutive steps admission has been held so far.
     admission_held: i64,
+    /// The model step's measured time per token bucket; with it, steps trim prefill chunks to the bucket below when
+    /// that is predicted to be faster (see [`sched::trim`]).
+    step_cost: Option<StepCost>,
 }
 
 fn value<T>(msg: impl Into<String>) -> Result<T, CoreError> {
@@ -258,6 +262,7 @@ impl EngineCore {
             timing: None,
             admission_hold: if cfg.dp_size > 1 { cfg.dp_admission_hold } else { 0 },
             admission_held: 0,
+            step_cost: None,
         })
     }
 
@@ -307,6 +312,14 @@ impl EngineCore {
     /// The verification budget, when one is set.
     pub fn verify_budget(&self) -> Option<&VerifyBudget> {
         self.verify.as_ref()
+    }
+
+    /// Turns on bucket-aligned prefill chunks (see [`sched::trim`]; only with chunked prefill): `buckets` are the
+    /// compiled token buckets of the model step (ascending) and `ms` their measured step times. Replaces a previous
+    /// table.
+    pub fn set_step_cost(&mut self, buckets: &[i64], ms: &[f64]) -> Result<(), CoreError> {
+        self.step_cost = Some(StepCost::new(buckets, ms).map_err(CoreError::Value)?);
+        Ok(())
     }
 
     /// Data-parallel ranks.
@@ -473,9 +486,19 @@ impl EngineCore {
         let mut pages_changed = false;
         let mut verify = false;
         let admit = self.admission_gate();
+        // Every rank is scheduled before any step's tokens are applied, so the step can be trimmed as a whole (a
+        // rank's schedule reads only its own requests, so the order of decisions is unchanged).
+        let mut steps = Vec::with_capacity(self.ranks.len());
+        let mut finishes = Vec::with_capacity(self.ranks.len());
         for rank in self.ranks.iter_mut() {
             let mut finished = std::mem::take(&mut rank.finished);
-            let step = schedule_rank(rank, &mut self.reqs, &p, admit, &mut finished)?;
+            steps.push(schedule_rank(rank, &mut self.reqs, &p, admit, &mut finished)?);
+            finishes.push(finished);
+        }
+        if let Some(cost) = self.step_cost.as_ref() {
+            trim_prefill(cost, &mut self.ranks, &mut steps, &mut self.reqs, &p)?;
+        }
+        for ((rank, step), finished) in self.ranks.iter_mut().zip(steps).zip(finishes) {
             let base = plan.handles.len();
             for e in &step.entries {
                 let r = self

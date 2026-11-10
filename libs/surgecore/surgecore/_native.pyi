@@ -610,6 +610,23 @@ class EngineCore:
             ValueError: No speculative tokens, or a bad table or weight.
         """
         ...
+    def set_step_cost(self, buckets: npt.ArrayLike, step_ms: npt.ArrayLike) -> None:
+        """Turns on bucket-aligned prefill chunks (only with chunked prefill).
+
+        A step a few tokens past a compiled token bucket gives the excess back from its newest prefill chunks, to be
+        scheduled by the next step, when the lower bucket's time plus the deferred tokens' share of the bucket they
+        would fill stays under 0.95 of the time of the bucket the step would run. Under data parallelism a step's
+        tokens are its busiest rank's times the rank count. A trimmed chunk keeps its pages; one that ended on its
+        request's recurrent-snapshot boundary hands the save to the request's next chunk.
+
+        Args:
+            buckets: ``int64[B]``, ascending: the compiled token buckets of the model step.
+            step_ms: ``float64[B]``: their measured step times in milliseconds.
+
+        Raises:
+            ValueError: A bad table.
+        """
+        ...
     def verify_state(self) -> tuple[list[float], float] | None:
         """The budget's global acceptance prior per draft position and its step-time correction (ms), or ``None``."""
         ...
