@@ -2810,7 +2810,7 @@ class EasyGenerationMixin:
                         view = view_class.init(
                             config=config_classes,
                             layer_index=idx,
-                            dtype=dtype,
+                            dtype=recurrent_cache_dtype,
                         )
                     elif isinstance(view_class, type) and issubclass(
                         view_class, (RaggedPagesCacheView, MLARaggedPagesCacheView)
