@@ -47,6 +47,7 @@ from eformer.pytree import key_path_to_str
 from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
 
 from ..execution_types import StepFunctionInputs
+from .model_executor import traces_decode_layout
 from .sampler_executor import _get_padded_num_reqs_with_upper_limit
 
 if tp.TYPE_CHECKING:
@@ -178,12 +179,12 @@ class CompileOrchestrator:
         model_compile_pairs: list[tuple[int, int]],
         reqs_padds: list[int],
     ) -> list[tuple[int, int]]:
-        """Return the extra decode-layout pairs: one per request bucket that is not a token bucket.
+        """Return the extra decode-layout pairs: one per request bucket whose decode bucket keeps the general layout.
 
-        A pure-decode window of ``r`` requests runs the smallest token bucket ``t >= r``. When ``t == r`` the
-        ``(r, r)`` program is already traced under the decode layout; otherwise (a token-bucket floor above the
-        request bucket) ``(t, r)`` gets a decode-layout twin of its general program. This adds at most one program
-        per request bucket instead of doubling the grid.
+        A pure-decode window of ``r`` requests runs the smallest token bucket ``t >= r``. When ``(t, r)`` is within
+        ``DECODE_LAYOUT_MAX_TOKENS_PER_REQ`` (:func:`traces_decode_layout`), its one program is already traced under the
+        decode layout; otherwise (a token-bucket floor far above the request bucket) ``(t, r)`` gets a decode-layout
+        twin of its general program. This adds at most one program per request bucket instead of doubling the grid.
 
         Args:
             model_compile_pairs: The general ``(num_tokens, padded_num_reqs)`` pairs being compiled.
@@ -197,7 +198,11 @@ class CompileOrchestrator:
         pairs: list[tuple[int, int]] = []
         for reqs_padd in sorted({int(r) for r in reqs_padds}):
             num_tokens = next((t for t in token_buckets if t >= reqs_padd), None)
-            if num_tokens is None or num_tokens == reqs_padd or (num_tokens, reqs_padd) not in compiled:
+            if (
+                num_tokens is None
+                or traces_decode_layout(num_tokens, reqs_padd)
+                or (num_tokens, reqs_padd) not in compiled
+            ):
                 continue
             pairs.append((num_tokens, reqs_padd))
         return pairs

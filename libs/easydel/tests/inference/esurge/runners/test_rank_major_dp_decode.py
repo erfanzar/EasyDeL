@@ -19,6 +19,7 @@ from __future__ import annotations
 import jax
 import pytest
 import spectrax as spx
+from easydel.inference.esurge.runners.executors.model_executor import traces_decode_layout
 from easydel.inference.sampling_params import SamplingParams
 from jax import numpy as jnp
 
@@ -145,8 +146,8 @@ def test_warmup_fits_rank_budget_and_decode_runs_decode_layout(served, min_token
     decode_steps = [key for decode_only, key in steps if decode_only]
     assert decode_steps, "no pure-decode step ran"
     for key in decode_steps:
-        # Pure decode always runs a decode-layout program: an equal-bucket pair or the separate decode variant.
-        assert key[0] == key[1] or key[2] == "model_step_decode", key
+        # Pure decode always runs a decode-layout program: a pair traced under it or the separate decode variant.
+        assert traces_decode_layout(key[0], key[1]) or key[2] == "model_step_decode", key
     for decode_only, key in steps:
         if not decode_only:
             assert key[2] == "model_step", key
@@ -159,13 +160,13 @@ def test_decode_layout_variants_bounded(served):
     keys_128, _, _ = served[128]
     general_128 = {(k[0], k[1]) for k in keys_128 if k[2] == "model_step"}
     decode_128 = {(k[0], k[1]) for k in keys_128 if k[2] == "model_step_decode"}
-    # One decode twin at most per request bucket, only where the token floor exceeds the bucket.
+    # One decode twin at most per request bucket, only where the pair's own program keeps the general layout.
     assert decode_128 <= general_128
     assert len(decode_128) <= len({r for _, r in general_128})
-    assert all(t > r for t, r in decode_128)
+    assert not any(traces_decode_layout(t, r) for t, r in decode_128)
     assert not [k for k in keys_32 if k[2] == "model_step_decode"]
 
 
 def test_greedy_outputs_match_across_programs(served):
-    # min_token_pad=32 decodes on equal-bucket programs, 128 on the separate decode variants: same tokens.
+    # min_token_pad=32 and 128 decode on different decode-layout programs of different token buckets: same tokens.
     assert served[32][2] == served[128][2]

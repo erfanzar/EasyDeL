@@ -100,6 +100,33 @@ if tp.TYPE_CHECKING:
     from easydel.infra.etils import MpMdSchedulers
 
 
+DECODE_LAYOUT_MAX_TOKENS_PER_REQ = 4
+"""Largest token bucket, in slots per request-bucket slot, whose general SPMD model step traces under the decode layout.
+
+The decode layout (:func:`~easydel.infra.sharding.decode_mode_specs`) keeps the residual stream replicated over the
+tensor axis, which removes per-layer collectives and pays off while a step carries few tokens per request; it changes
+sharding only, so every row shape (decode, prefill chunk, verify window) runs under it. Measured on 16 TPU v5p chips
+(GLM-5.3-Flash W8A8 at ep4 x tp4, request bucket 32) on compile-shaped inputs, general program against its
+decode-layout twin: 32.57 / 28.63 ms at 64 tokens, 38.55 / 35.37 at 128, 45.21 / 45.00 at 256 and 57.85 / 66.09 at
+512. Pairs up to this ratio therefore trace their one program under the decode layout (mixed steps with a short prefill
+chunk and speculative verify windows run it too); larger pairs keep the general layout and get a decode-layout twin only
+where a pure-decode window lands on them (see ``CompileOrchestrator._decode_layout_pairs``).
+"""
+
+
+def traces_decode_layout(num_tokens: int, padded_num_reqs: int) -> bool:
+    """Whether the general SPMD model step of a bucket pair traces under the decode layout.
+
+    Args:
+        num_tokens: Token bucket.
+        padded_num_reqs: Request bucket.
+
+    Returns:
+        ``True`` when ``num_tokens <= DECODE_LAYOUT_MAX_TOKENS_PER_REQ * padded_num_reqs``.
+    """
+    return int(num_tokens) <= DECODE_LAYOUT_MAX_TOKENS_PER_REQ * int(padded_num_reqs)
+
+
 def resolve_lm_logit_postprocess(model: "EasyDeLBaseModule") -> tp.Callable[[jax.Array], jax.Array] | None:
     """Resolve the model's final logit post-processing for stage-local LM heads.
 
@@ -358,9 +385,10 @@ class ModelStepExecutor:
                 graphother_template=graphother_template,
             )
         )
-        # Decode-layout twin of ``_model_step_fn`` for pairs whose token bucket exceeds the request bucket (a
-        # token-bucket floor above the request bucket). A separate jit keeps its trace cache disjoint from the
-        # general program of the same shapes, as for ``_backbone_fn_decode``.
+        # Decode-layout twin of ``_model_step_fn`` for pairs whose general program keeps the general layout
+        # (``traces_decode_layout`` is False) but serve pure-decode windows (a token-bucket floor far above the
+        # request bucket). A separate jit keeps its trace cache disjoint from the general program of the same shapes,
+        # as for ``_backbone_fn_decode``.
         self._model_step_fn_decode = (
             None
             if self._uses_mpmd_mesh()
@@ -1379,8 +1407,8 @@ class ModelStepExecutor:
     def has_decode_model_step(self, num_tokens: int, padded_num_reqs: int) -> bool:
         """Whether a decode-layout program serves pure-decode windows of this bucket pair.
 
-        Pairs with equal buckets are traced under the decode layout by :meth:`compile_model_step`; other pairs
-        need the separate ``"model_step_decode"`` variant.
+        Pairs within :data:`DECODE_LAYOUT_MAX_TOKENS_PER_REQ` trace their general program under the decode layout
+        (:meth:`compile_model_step`); other pairs need the separate ``"model_step_decode"`` variant.
 
         Args:
             num_tokens: Token bucket.
@@ -1389,7 +1417,7 @@ class ModelStepExecutor:
         Returns:
             Whether pure-decode windows of the pair have a compiled decode-layout program.
         """
-        if int(num_tokens) == int(padded_num_reqs):
+        if traces_decode_layout(num_tokens, padded_num_reqs):
             return self.has_model_step(num_tokens, padded_num_reqs)
         return (int(num_tokens), int(padded_num_reqs), "model_step_decode", self._compile_mode()) in self._cache
 
@@ -1404,11 +1432,12 @@ class ModelStepExecutor:
         Returns:
             ``(num_tokens, padded_num_reqs, kind, mode)`` where ``kind`` is ``"model_step_decode"`` when a
             pure-decode window has a compiled decode-layout variant distinct from the general program, and
-            ``"model_step"`` otherwise (equal buckets are always traced under the decode layout).
+            ``"model_step"`` otherwise (pairs within :data:`DECODE_LAYOUT_MAX_TOKENS_PER_REQ` trace their general
+            program under the decode layout).
         """
         mode = self._compile_mode()
         decode_key = (int(num_tokens), int(padded_num_reqs), "model_step_decode", mode)
-        if decode_only and int(num_tokens) != int(padded_num_reqs) and decode_key in self._cache:
+        if decode_only and not traces_decode_layout(num_tokens, padded_num_reqs) and decode_key in self._cache:
             return decode_key
         return (int(num_tokens), int(padded_num_reqs), "model_step", mode)
 
@@ -1809,9 +1838,9 @@ class ModelStepExecutor:
     ) -> ModelStepOutputs | None:
         """Compile the fused SPMD model step for one token/request bucket pair.
 
-        ``decode_layout=True`` with unequal buckets compiles the separate decode-layout variant
-        (``"model_step_decode"`` key) that pure-decode windows of the pair run; equal buckets are always traced
-        under the decode layout.
+        ``decode_layout=True`` on a pair beyond :data:`DECODE_LAYOUT_MAX_TOKENS_PER_REQ` compiles the separate
+        decode-layout variant (``"model_step_decode"`` key) that pure-decode windows of the pair run; pairs within it
+        trace their general program under the decode layout.
 
         The MPMD path intentionally keeps the backbone and LM head separate so
         stage-local placement can be controlled. On SPMD there is no stage
@@ -1827,21 +1856,22 @@ class ModelStepExecutor:
 
         self.graphdef = graphdef
         mode = self._compile_mode()
-        separate_decode = bool(decode_layout) and int(num_tokens) != int(padded_num_reqs)
-        decode_only = separate_decode or int(num_tokens) == int(padded_num_reqs)
+        traced_decode = traces_decode_layout(num_tokens, padded_num_reqs)
+        separate_decode = bool(decode_layout) and not traced_decode
+        decode_only = separate_decode or traced_decode
         key = (int(num_tokens), int(padded_num_reqs), "model_step_decode" if separate_decode else "model_step", mode)
         if key in self._cache:
             return None
         step_fn = self._model_step_fn_decode if separate_decode else self._model_step_fn
 
         graphstate_arg, graphother_arg = self._graph_call_args(graphstate, graphother)
-        # Pure-decode buckets (every request contributes exactly one token) are
-        # traced under the decode-layout scope: the residual stream stays
-        # replicated over TP, removing the per-layer norm/qkv/router
-        # collectives self-inflicted by tp-sharded decode activations. The
-        # condition is derivable from the bucket key itself, so the compiled
-        # cache stays consistent (a given (num_tokens, padded_num_reqs) shape
-        # always traces in the same mode).
+        # Buckets with few tokens per request (``traces_decode_layout``) and
+        # decode twins are traced under the decode-layout scope: the residual
+        # stream stays replicated over TP, removing the per-layer
+        # norm/qkv/router collectives self-inflicted by tp-sharded activations.
+        # The condition is derivable from the bucket key itself, so the
+        # compiled cache stays consistent (a given (num_tokens,
+        # padded_num_reqs) shape always traces in the same mode).
         with decode_mode_specs(decode_only):
             if self.use_aot_forward:
                 compiled = step_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
