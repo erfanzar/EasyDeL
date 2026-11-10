@@ -53,8 +53,10 @@ def paged_pool_topk(
 
     Layouts the kernel cannot tile (``pools_per_page`` not dividing 128, or a key width that
     is not a lane multiple), and page tables too large to scalar-prefetch into SMEM, route to
-    XLA. ``pool_chunk`` only applies to the XLA path.
+    XLA. ``pool_chunk`` only applies to the XLA path. ``precision=None`` means HIGHEST on both paths, so which path a
+    call takes never changes its scores.
     """
+    precision = jax.lax.Precision.HIGHEST if precision is None else precision
     untileable = _LANES % int(pool_pages.shape[1]) or int(pool_pages.shape[2]) % _LANES
     too_big = _prefetch_bytes(query.shape[0], tuple(block_tables.shape)) > _SMEM_PREFETCH_BUDGET_BYTES
     if untileable or too_big:
@@ -81,7 +83,7 @@ def paged_pool_topk(
         k=int(k),
         sm_scale=float(sm_scale),
         relu=bool(relu),
-        precision=jax.lax.Precision.HIGHEST if precision is None else precision,
+        precision=precision,
     )
 
 
