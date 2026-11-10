@@ -767,7 +767,18 @@ class DelegatingParser:
         previous_visible_content = self._accumulated_content
 
         try:
-            tool_current_token_ids = self._tokenize_for_tool_view(content_text)
+            if (
+                self._tool_previous_text
+                and self._tool_previous_token_ids
+                and content_text.startswith(self._tool_previous_text)
+            ):
+                tool_current_token_ids = self._tokenize_for_tool_view_append(
+                    self._tool_previous_text,
+                    self._tool_previous_token_ids,
+                    content_text[len(self._tool_previous_text) :],
+                )
+            else:
+                tool_current_token_ids = self._tokenize_for_tool_view(content_text)
             tool_delta_token_ids = self._tokenize_for_tool_view(content_delta) if content_delta else []
             if self._tool_previous_text and not self._tool_previous_token_ids:
                 # The machinery gate keeps previous_text synced while
@@ -911,6 +922,35 @@ class DelegatingParser:
                 exc_info=True,
             )
         result.delta_content = self._compute_visible_content_delta(result.accumulated_content, original_visible_content)
+
+    def _tokenize_for_tool_view_append(
+        self,
+        previous_text: str,
+        previous_token_ids: list[int],
+        delta_text: str,
+    ) -> list[int]:
+        """Append a delta using only a bounded suffix re-tokenization.
+
+        The previous full tokenization is retained except for the last 32
+        tokens. Those are decoded, concatenated with the delta and re-encoded
+        so merges at the chunk boundary are handled without re-reading the
+        entire output. If the tokenizer cannot decode the suffix, the safe
+        fallback is a full re-tokenization.
+        """
+        tokenizer = getattr(self.tool_parser, "model_tokenizer", None)
+        decode = getattr(tokenizer, "decode", None)
+        if not previous_text or not previous_token_ids or not callable(decode):
+            return self._tokenize_for_tool_view(previous_text + delta_text)
+        suffix_ids = previous_token_ids[-32:]
+        try:
+            try:
+                suffix_text = decode(suffix_ids, skip_special_tokens=False)
+            except TypeError:
+                suffix_text = decode(suffix_ids)
+        except Exception:
+            return self._tokenize_for_tool_view(previous_text + delta_text)
+        suffix_token_ids = self._tokenize_for_tool_view(suffix_text + delta_text)
+        return [*previous_token_ids[:-32], *suffix_token_ids]
 
     def _tokenize_for_tool_view(self, text: str) -> list[int]:
         """Tokenize text for the tool parser's independent view.
