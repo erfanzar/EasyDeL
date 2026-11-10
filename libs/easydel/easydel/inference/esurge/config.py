@@ -444,6 +444,7 @@ def _validate_esurge_cache_runtime_config(self):
         "max_cache_tokens": None,
         "cache_capacity_margin": 0.92,
         "data_parallelism_axis": "dp",
+        "attention_data_parallel_axis": None,
         "destroy_pages_on_pause": True,
         "recurrent_prefix_snapshots": 16,
     },
@@ -487,6 +488,10 @@ class eSurgeCacheRuntimeConfig(TypedDict, total=False):
             across data-parallel ranks. The same axis is used by
             :mod:`easydel.inference.esurge.core.dp_sharding` to derive
             per-shard page bounds.
+        attention_data_parallel_axis: Optional independent mesh axis for KV-page
+            sharding. When set, request scheduling still uses
+            ``data_parallelism_axis`` while MLA pages use this axis instead.
+            ``None`` preserves the historical shared-axis behavior.
         destroy_pages_on_pause: When ``True``, calling :meth:`eSurge.pause`
             frees the entire page pool to reclaim HBM. Useful when the engine
             shares HBM with other workloads. The pages are reallocated by
@@ -504,6 +509,7 @@ class eSurgeCacheRuntimeConfig(TypedDict, total=False):
     max_cache_tokens: NotRequired[int | None]
     cache_capacity_margin: NotRequired[float]
     data_parallelism_axis: NotRequired[str]
+    attention_data_parallel_axis: NotRequired[str | None]
     destroy_pages_on_pause: NotRequired[bool]
     recurrent_prefix_snapshots: NotRequired[int]
 

@@ -203,6 +203,14 @@ def _normalize_data_parallelism_axis(axis: str) -> str:
     return axis_name
 
 
+def _resolve_cache_attention_axis(cache_config) -> str:
+    """Resolve KV-page sharding independently from request data parallelism."""
+    axis = cache_config.attention_data_parallel_axis
+    if axis is None:
+        axis = cache_config.data_parallelism_axis
+    return _normalize_data_parallelism_axis(axis)
+
+
 @dataclass
 class CompletionOutput:
     """Output of a single completion.
@@ -663,7 +671,7 @@ class eSurge:
             )
 
         self.data_parallelism_axis = _normalize_data_parallelism_axis(self.cache_config.data_parallelism_axis)
-        register_attention_data_parallel_axis(self.data_parallelism_axis)
+        register_attention_data_parallel_axis(_resolve_cache_attention_axis(self.cache_config))
 
         assets = build_engine_assets(
             model=model,
