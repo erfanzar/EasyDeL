@@ -35,16 +35,26 @@ from .interface import (
 from .manager import CacheManager, CachePages
 
 
+class _RemovedMeta(type):
+    """Metaclass of a removed name: any attribute access raises, as instantiation does."""
+
+    def __getattr__(cls, name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        raise RuntimeError(cls.__doc__)
+
+
 def _removed(name: str) -> type:
     """A placeholder class for a KV-core name that moved into surgecore's Rust KV core."""
+    message = (
+        f"easydel.inference.esurge.core.{name} was removed: the KV core is now surgecore's Rust KvCore. "
+        "Use easydel.inference.esurge.core.CacheManager (same methods as before) instead."
+    )
 
     def __new__(cls, *args, **kwargs):
-        raise RuntimeError(
-            f"easydel.inference.esurge.core.{name} was removed: the KV core is now surgecore's Rust KvCore. "
-            "Use easydel.inference.esurge.core.CacheManager (same methods as before) instead."
-        )
+        raise RuntimeError(message)
 
-    return type(name, (), {"__new__": __new__, "__doc__": f"Removed; use :class:`CacheManager`. ({name})"})
+    return _RemovedMeta(name, (), {"__new__": __new__, "__doc__": message})
 
 
 CacheCoordinator = _removed("CacheCoordinator")

@@ -479,7 +479,7 @@ class SequenceStateSync:
         output_pos = placeholder_idx - int(req_state.num_prompt_tokens)
         if 0 <= output_pos < len(req_state.output_token_ids):
             req_state.output_token_ids[output_pos] = token
-        else:
+        elif req_state.output_token_ids:
             req_state.output_token_ids[-1] = token
         req_idx = sequence_buffer.req_id_to_index.get(req_id)
         if req_idx is not None:

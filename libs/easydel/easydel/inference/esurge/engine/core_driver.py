@@ -359,6 +359,7 @@ class EngineCoreDriver:
         stop_offsets = np.zeros(n + 1, np.int32)
         span_offsets = np.zeros(n + 1, np.int32)
         max_tokens = np.empty(n, np.int64)
+        min_tokens = np.zeros(n, np.int64)
         eos = np.empty(n, np.int32)
         priority = np.empty(n, np.int64)
         arrival = np.empty(n, np.float64)
@@ -385,6 +386,7 @@ class EngineCoreDriver:
             priority[i] = int(r.priority)
             arrival[i] = float(r.arrival_time)
             if sp is not None:
+                min_tokens[i] = int(sp.min_tokens or 0)
                 ignore_eos[i] = bool(sp.ignore_eos)
                 stops.extend(int(t) for t in (sp.stop_token_ids or ()))
                 if getattr(sp, "guided_decoding", None) is not None:
@@ -407,6 +409,7 @@ class EngineCoreDriver:
             prompt_tokens=np.asarray(prompts, np.int32),
             prompt_offsets=prompt_offsets,
             max_tokens=max_tokens,
+            min_tokens=min_tokens,
             eos_token=eos,
             priority=priority,
             arrival=arrival,

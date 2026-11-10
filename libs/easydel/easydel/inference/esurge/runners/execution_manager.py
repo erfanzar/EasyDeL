@@ -2548,9 +2548,9 @@ class ExecutionManager:
         """Delegate to :meth:`CompileOrchestrator._compile_backbone_variant`."""
         self._get_compile_orchestrator()._compile_backbone_variant(**kwargs)
 
-    def _reset_kv_pages_after_compile_warmup(self) -> None:
+    def _reset_kv_pages_after_compile_warmup(self, *, force: bool = False) -> None:
         """Delegate to :meth:`CompileOrchestrator._reset_kv_pages_after_compile_warmup`."""
-        self._get_compile_orchestrator()._reset_kv_pages_after_compile_warmup()
+        self._get_compile_orchestrator()._reset_kv_pages_after_compile_warmup(force=force)
 
     def _compile_lm_head_variant(self, **kwargs) -> None:
         """Delegate to :meth:`CompileOrchestrator._compile_lm_head_variant`."""

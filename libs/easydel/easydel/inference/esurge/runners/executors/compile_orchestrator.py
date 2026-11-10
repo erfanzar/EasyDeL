@@ -539,7 +539,7 @@ class CompileOrchestrator:
             warm_args = (graphstate, graphother, inputs)
             self._manager._debug_baselines[f"{num_tokens}_hash_in_backbone"] = _tree_hash(warm_args)
 
-    def _reset_kv_pages_after_compile_warmup(self) -> None:
+    def _reset_kv_pages_after_compile_warmup(self, *, force: bool = False) -> None:
         """Replace compile warm-up cache pages with fresh runtime pages.
 
         Upfront MPMD compilation executes the same donated backbone functions
@@ -548,8 +548,12 @@ class CompileOrchestrator:
         deleted donated buffers and dummy KV writes from leaking into the first
         user request while preserving the compiled executables in the executor
         caches.
+
+        Args:
+            force: Rebuild on any mesh, not only MPMD: a warm-up or timing step that raised may have consumed the
+                donated cache, so the live pages can no longer be trusted.
         """
-        if not self._manager.model.mesh.is_mpmd:
+        if not force and not self._manager.model.mesh.is_mpmd:
             return
         if not hasattr(self._manager, "_cache_quantizer") or not hasattr(self._manager, "_cache_masking_details"):
             return

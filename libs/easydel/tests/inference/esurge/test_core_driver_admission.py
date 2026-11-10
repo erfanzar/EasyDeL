@@ -340,6 +340,56 @@ def test_a_full_prompt_without_truncation_raises_a_clear_error():
         admission.add_request("r", "p", params, prompt_token_ids=list(range(2, 66)), defer_scheduler_enqueue=True)
 
 
+@pytest.mark.parametrize("min_tokens", [0, 2])
+def test_min_tokens_holds_back_eos_until_enough_tokens_are_generated(min_tokens):
+    core = _core(dp=1)
+    try:
+        core.add_requests(
+            [
+                AdmissionRecord(
+                    request_id="m",
+                    prompt_token_ids=[1, 2, 3, 4],
+                    sampling_params=SamplingParams(max_tokens=8, min_tokens=min_tokens),
+                    eos_token_id=0,
+                )
+            ]
+        )
+        finishes = []
+        for _ in range(3):
+            step = core.schedule()
+            outputs = core.commit(
+                step,
+                ModelRunnerOutput(
+                    req_ids=["m"],
+                    req_id_to_index={"m": 0},
+                    sampled_token_ids=[[0]],
+                    spec_token_ids=None,
+                    logprobs=None,
+                    prompt_logprobs_dict={},
+                ),
+            )
+            (out,) = outputs[0].outputs
+            finishes.append(out.finish_reason)
+            if out.finish_reason is not None:
+                break
+        # Every step samples EOS: it stops at once without min_tokens, and only at the second token with min_tokens=2.
+        assert finishes == ([FinishReason.STOP] if min_tokens == 0 else [None, FinishReason.STOP])
+        assert not core.is_live("m")
+    finally:
+        core.shutdown()
+
+
+@pytest.mark.parametrize("name", ["PagePool", "CacheCoordinator", "SingleTypeCacheManager"])
+def test_removed_kv_core_names_raise_on_use_and_point_to_cache_manager(name):
+    from easydel.inference.esurge import core as esurge_core
+
+    removed = getattr(esurge_core, name)
+    with pytest.raises(RuntimeError, match="CacheManager"):
+        removed()
+    with pytest.raises(RuntimeError, match="CacheManager"):
+        removed.get_new_pages  # noqa: B018
+
+
 @pytest.mark.parametrize("name", [Scheduler, EngineRequest])
 def test_removed_names_raise_and_point_to_the_replacement(name):
     with pytest.raises(RuntimeError, match="EngineCore"):

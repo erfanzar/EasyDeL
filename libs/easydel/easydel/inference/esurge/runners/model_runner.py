@@ -2098,6 +2098,7 @@ class eSurgeRunner:
         # The timed steps run compile-shaped inputs through the live cache. Recurrent rows are restored afterwards
         # exactly as compile left them; paged KV receives the same dummy writes compile's own warm-up made.
         saved = snapshot_recurrent_state(manager.kv_pages)
+        failed = False
         try:
             for num_tokens in sorted({int(t) for t in num_tokens_paddings}):
                 padded = max([b for b in req_buckets if b <= num_tokens], default=req_buckets[0])
@@ -2112,6 +2113,7 @@ class eSurgeRunner:
                 timed = sorted(runs[1:])[1:-1]
                 table[num_tokens] = sum(timed) / len(timed)
         except Exception as exc:  # the table only feeds optimisations: serve without them instead
+            failed = True
             logger.warning(
                 "Step-time table not measured (%s); prefill chunks are not bucket-aligned and speculative steps "
                 "verify every draft.",
@@ -2119,8 +2121,12 @@ class eSurgeRunner:
             )
             return None
         finally:
-            manager.kv_pages = _restore_recurrent_state(manager.kv_pages, saved)
-            manager._reset_kv_pages_after_compile_warmup()
+            if failed:
+                # The step that raised may already have consumed the donated cache: serve from a fresh one.
+                manager._reset_kv_pages_after_compile_warmup(force=True)
+            else:
+                manager.kv_pages = _restore_recurrent_state(manager.kv_pages, saved)
+                manager._reset_kv_pages_after_compile_warmup()
         logger.info("Model-step time per token bucket (ms): %s", {t: round(ms, 3) for t, ms in table.items()})
         return table
 
