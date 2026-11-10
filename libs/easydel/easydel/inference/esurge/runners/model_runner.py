@@ -4003,7 +4003,16 @@ class eSurgeRunner:
                     continue
 
             token_materialize_start = time.time()
-            tokens_np = np.asarray(out_tokens_win)
+            # Only rows the fused verify+draft program does not resolve read this step's sampled tokens on the host.
+            # Fetching them on first use lets the drafter's inputs be built and dispatched while the target step still
+            # runs, instead of after it.
+            sampled_tokens_host: list[np.ndarray] = []
+
+            def sampled_token_at(row: int, _tokens=out_tokens_win, _host=sampled_tokens_host) -> int:
+                if not _host:
+                    _host.append(np.asarray(_tokens))
+                return int(_host[0][row])
+
             hidden_states_for_spec = _hidden_states
             hidden_np_len = (
                 int(getattr(hidden_states_for_spec, "shape", (0,))[0]) if hidden_states_for_spec is not None else 0
@@ -4490,7 +4499,7 @@ class eSurgeRunner:
                             source="full-hidden",
                         )
                     else:
-                        corrected_token = int(tokens_np[row_pos])
+                        corrected_token = sampled_token_at(row_pos)
                         seed_hidden = window_hidden_row(
                             hidden_states_for_spec,
                             row_pos=int(row_pos),
@@ -4578,7 +4587,7 @@ class eSurgeRunner:
                                 # Resample the target at the FIRST draft position, whose
                                 # context is the real tokens only — mirroring the
                                 # full-hidden branch (target_fulls[:1]). The pre-set
-                                # fallback `corrected_token = tokens_np[row_pos]` is the
+                                # fallback `corrected_token = sampled_token_at(row_pos)` is the
                                 # bonus-position sample taken with the drafts as context
                                 # and must not be emitted.
                                 _target_token, target_hidden = _replay_prefix_sample(row_pos, real_count)
@@ -4738,7 +4747,7 @@ class eSurgeRunner:
                             spec_window_requires_replay = True
                     tid = int(emitted[-1])
                 else:
-                    tid = int(tokens_np[row_pos])
+                    tid = sampled_token_at(row_pos)
                     if req_state is not None and seq_len is not None:
                         if req_idx is not None and 0 <= seq_len < self.max_model_len:
                             self.sequence_buffer.token_ids[req_idx, seq_len] = tid

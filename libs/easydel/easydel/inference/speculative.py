@@ -810,6 +810,8 @@ class Qwen3_5MTPDrafter:
         self._jit_batched: dict[tuple, typing.Callable] = {}
         self._jit_verify_draft: dict[tuple, typing.Callable] = {}
         self._jit_spec_step: dict[tuple, typing.Callable] = {}
+        # Constant greedy ``spec_step`` inputs (sampled, params, rng key) per row count: built once, never donated.
+        self._spec_step_defaults: dict[int, tuple[jax.Array, jax.Array, jax.Array]] = {}
         self.supports_batched_draft = True
         self.supports_draft_in_verify = True
         # Models whose forward writes the draft layer's KV into the target's paged pool expose that view.
@@ -2233,16 +2235,21 @@ class Qwen3_5MTPDrafter:
             spec_delta = jnp.zeros((n,), dtype=jnp.int32)
         if output_rows is None:
             output_rows = jnp.arange(n, dtype=jnp.int32)
-        if sampled is None:
-            sampled = jnp.zeros((n,), dtype=jnp.int32)
-        if params is None:
-            params = jnp.zeros((n, NUM_PARAM_FIELDS), dtype=jnp.float32)
-            params = params.at[:, PARAM_TEMPERATURE].set(1.0)
-            params = params.at[:, PARAM_TOP_P].set(1.0)
-            params = params.at[:, PARAM_TOP_K].set(0)
-            params = params.at[:, PARAM_MIN_P].set(0.0)
-        if rng_key is None:
-            rng_key = jax.random.PRNGKey(0)
+        if sampled is None or params is None or rng_key is None:
+            # Built once per row count with the same construction and placement as before, so every call passes the
+            # same arrays instead of dispatching seven small programs to rebuild them; the jit donates none of them.
+            defaults = self._spec_step_defaults.get(n)
+            if defaults is None:
+                default_params = jnp.zeros((n, NUM_PARAM_FIELDS), dtype=jnp.float32)
+                default_params = default_params.at[:, PARAM_TEMPERATURE].set(1.0)
+                default_params = default_params.at[:, PARAM_TOP_P].set(1.0)
+                default_params = default_params.at[:, PARAM_TOP_K].set(0)
+                default_params = default_params.at[:, PARAM_MIN_P].set(0.0)
+                defaults = (jnp.zeros((n,), dtype=jnp.int32), default_params, jax.random.PRNGKey(0))
+                self._spec_step_defaults[n] = defaults
+            sampled = defaults[0] if sampled is None else sampled
+            params = defaults[1] if params is None else params
+            rng_key = defaults[2] if rng_key is None else rng_key
         host = [
             _host_vector(collected_mask, bool),
             _host_vector(committed_base, np.int64),
