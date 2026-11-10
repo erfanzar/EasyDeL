@@ -425,6 +425,11 @@ class EngineCore:
         use_eagle: EAGLE-style drafting (only with ``num_draft_tokens > 0``): every allocation reserves
             ``num_draft_tokens`` lookahead slots and a prefix hit drops its last page.
         include_finished_set: Report every freed request in ``Events.finished_all``.
+        dp_admission_hold: Data-parallel admission alignment, in steps (0 off; used only with ``dp_size > 1``). A
+            data-parallel step runs one program sized by its busiest rank, so a prefill admitted on one rank makes
+            every rank run a prefill-sized step. While a rank with waiting requests has no free row and another has
+            one, no rank admits, so the ranks start their prefills in the same step. A rank with waiting requests and
+            nothing running admits at once, and no hold lasts more than this many consecutive steps.
     """
 
     def __init__(
@@ -447,6 +452,7 @@ class EngineCore:
         num_draft_tokens: int = 0,
         use_eagle: bool = False,
         include_finished_set: bool = False,
+        dp_admission_hold: int = 0,
     ) -> None: ...
     def add_requests(
         self,

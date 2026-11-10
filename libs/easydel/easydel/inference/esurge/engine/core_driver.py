@@ -125,6 +125,8 @@ class EngineCoreDriver:
         include_finished_set: Report every freed request in ``EngineCoreOutputs.finished_requests``.
         recurrent_prefix_snapshot_slots: Recurrent-snapshot slots per rank (0 off; needs prefix caching).
         image_expander: The model's image-placeholder expander (``esurge_image_expander_builder``), or ``None``.
+        dp_admission_hold: Data-parallel admission alignment, in steps (0 off; used only with more than one rank):
+            the ranks start new requests in the same step, holding admission at most this many steps.
     """
 
     def __init__(
@@ -148,6 +150,7 @@ class EngineCoreDriver:
         include_finished_set: bool = False,
         recurrent_prefix_snapshot_slots: int = 0,
         image_expander: typing.Any | None = None,
+        dp_admission_hold: int = 0,
     ) -> None:
         from surgecore import CoreClosed, EngineCore, InvariantError
 
@@ -185,6 +188,7 @@ class EngineCoreDriver:
             num_draft_tokens=self.num_draft_tokens,
             use_eagle=bool(use_eagle and self.num_draft_tokens > 0),
             include_finished_set=self.include_finished_set,
+            dp_admission_hold=max(0, int(dp_admission_hold)),
         )
         self.closed_error: type[BaseException] = CoreClosed
         """Raised by every call after :meth:`shutdown`; the loop exits cleanly on it."""
@@ -243,6 +247,7 @@ class EngineCoreDriver:
         chunked_prefill_enabled: bool = False,
         token_safety_margin: int | None = None,
         include_finished_set: bool = False,
+        dp_admission_hold: int = 0,
     ) -> EngineCoreDriver:
         """Build the core for a runner: its cache groups, pages, rows, request buckets, DP size and snapshots.
 
@@ -295,6 +300,7 @@ class EngineCoreDriver:
             include_finished_set=include_finished_set,
             recurrent_prefix_snapshot_slots=snapshot_slots,
             image_expander=expander_builder(runner.model) if expander_builder is not None else None,
+            dp_admission_hold=dp_admission_hold,
         )
         step_ms = getattr(runner, "step_time_table", None)
         if step_ms and driver.num_draft_tokens > 0 and not driver.async_scheduling:

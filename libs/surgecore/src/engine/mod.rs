@@ -115,6 +115,12 @@ pub struct EngineConfig {
     pub use_eagle: bool,
     /// Report the requests freed since the previous commit in [`Events::finished_all`].
     pub include_finished_set: bool,
+    /// Data-parallel admission alignment, in steps (0 is off; used only with `dp_size > 1`). A data-parallel step
+    /// runs one program sized by its busiest rank, so a prefill admitted on one rank makes every rank run a
+    /// prefill-sized step. While a rank with waiting requests has no free row, no rank admits, so the ranks start
+    /// their prefills in the same step. A rank with waiting requests and nothing running admits at once, and no hold
+    /// lasts more than this many consecutive steps.
+    pub dp_admission_hold: i64,
 }
 
 /// The request-count ladder of a single-rank core: the positive buckets, sorted and deduplicated, then `max_running`
@@ -141,6 +147,10 @@ pub struct EngineCore {
     verify: Option<VerifyBudget>,
     /// `(plan id, step tokens, time schedule returned)` of the synchronous plan whose step time is measured.
     timing: Option<(u64, i64, Instant)>,
+    /// The longest admission hold in steps (see [`EngineConfig::dp_admission_hold`]); 0 is off.
+    admission_hold: i64,
+    /// Consecutive steps admission has been held so far.
+    admission_held: i64,
 }
 
 fn value<T>(msg: impl Into<String>) -> Result<T, CoreError> {
@@ -169,6 +179,9 @@ impl EngineCore {
         let rows_per_rank = (cfg.max_rows / cfg.dp_size).max(1);
         if cfg.num_spec_tokens < 0 {
             return value("num_spec_tokens must not be negative");
+        }
+        if cfg.dp_admission_hold < 0 {
+            return value("dp_admission_hold must not be negative");
         }
         let page_size = cfg.groups[0].page_size;
         let eagle = cfg.use_eagle && cfg.num_spec_tokens > 0;
@@ -243,7 +256,29 @@ impl EngineCore {
             next_plan: 0,
             verify: None,
             timing: None,
+            admission_hold: if cfg.dp_size > 1 { cfg.dp_admission_hold } else { 0 },
+            admission_held: 0,
         })
+    }
+
+    /// Whether this step admits waiting requests: always, unless data-parallel admission alignment holds them.
+    ///
+    /// Admission is held while a rank with waiting requests has no free row and another such rank has one, unless a
+    /// rank with waiting requests runs nothing or the hold has lasted `admission_hold` consecutive steps.
+    fn admission_gate(&mut self) -> bool {
+        if self.admission_hold <= 0 {
+            return true;
+        }
+        let (mut any_free, mut blocked, mut idle) = (false, false, false);
+        for rank in self.ranks.iter().filter(|rank| !rank.waiting.is_empty()) {
+            let free = rank.running.len() < rank.max_running;
+            any_free |= free;
+            blocked |= !free;
+            idle |= rank.running.is_empty();
+        }
+        let admit = !any_free || !blocked || idle || self.admission_held >= self.admission_hold;
+        self.admission_held = if admit { 0 } else { self.admission_held + 1 };
+        admit
     }
 
     /// Turns on the load-aware verification budget (see [`verify`]) for synchronous speculative steps: `buckets`
@@ -437,9 +472,10 @@ impl EngineCore {
         let mut prefill = false;
         let mut pages_changed = false;
         let mut verify = false;
+        let admit = self.admission_gate();
         for rank in self.ranks.iter_mut() {
             let mut finished = std::mem::take(&mut rank.finished);
-            let step = schedule_rank(rank, &mut self.reqs, &p, &mut finished)?;
+            let step = schedule_rank(rank, &mut self.reqs, &p, admit, &mut finished)?;
             let base = plan.handles.len();
             for e in &step.entries {
                 let r = self

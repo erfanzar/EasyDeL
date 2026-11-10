@@ -18,7 +18,7 @@
 //! budget, `max_model_len - 1`, image-span alignment and its snapshot boundary), and a failed page allocation
 //! preempts (FCFS: the last running request; priority: the first request with the highest `(priority, arrival)`,
 //! un-scheduled and refunded when it was already scheduled this step). Waiting requests are admitted only when
-//! nothing was preempted: a prefix hit (through a ready recurrent snapshot when snapshots are on), the non-chunked
+//! nothing was preempted and the core's admission gate allows it (data-parallel admission alignment): a prefix hit (through a ready recurrent snapshot when snapshots are on), the non-chunked
 //! skip rule, the zero-token drop, image-span alignment, the snapshot boundary, and, while requests run, the rule
 //! that the pages for the whole remaining prompt must be free. The order of every list operation is the former
 //! Python scheduler's, quirks included, so the decisions are the same.
@@ -206,11 +206,13 @@ fn take_budget(rank: &mut RankState, budget: &mut i64, n: i64) {
     }
 }
 
-/// Schedules one rank. Requests dropped at admission are freed and recorded in `finished`.
+/// Schedules one rank; waiting requests are admitted only when `admit` holds. Requests dropped at admission are freed
+/// and recorded in `finished`.
 pub fn schedule_rank(
     rank: &mut RankState,
     reqs: &mut RequestTable,
     p: &SchedParams,
+    admit: bool,
     finished: &mut Vec<Handle>,
 ) -> Result<RankStep, CoreError> {
     let mut step = RankStep::default();
@@ -355,9 +357,9 @@ pub fn schedule_rank(
         req_index += 1;
     }
 
-    // Admission, only when nothing was preempted.
+    // Admission, only when nothing was preempted and the core's gate allows it.
     let mut skipped = Queue::new(p.policy);
-    if step.preempted.is_empty() {
+    if step.preempted.is_empty() && admit {
         if let Some(mut b) = rank.budget {
             let remaining = token_budget;
             let free = rank.kv.pool().num_free() as i64;

@@ -902,6 +902,7 @@ class eSurge:
                 "enable_window_aware_runtime_cap": self.runtime_config.enable_window_aware_runtime_cap,
                 "chunked_prefill_enabled": self.runtime_config.chunked_prefill_enabled,
                 "token_safety_margin": self.runtime_config.token_safety_margin,
+                "dp_admission_hold": self.runtime_config.dp_admission_hold,
                 "include_finished_set": self.runtime_config.include_finished_set,
                 "spec_debug_max_traces": self.spec_debug_max_traces,
                 "spec_adaptive_conf_threshold": self.spec_adaptive_conf_threshold,
@@ -2673,6 +2674,7 @@ class eSurge:
             chunked_prefill_enabled=runtime.chunked_prefill_enabled,
             token_safety_margin=runtime.token_safety_margin,
             include_finished_set=runtime.include_finished_set,
+            dp_admission_hold=runtime.dp_admission_hold,
         )
 
     def update_model_weights(

@@ -174,6 +174,7 @@ impl EngineCore {
         *, max_rows, max_model_len, num_pages, dp_size, groups, token_budget, long_prefill_threshold=0,
         chunked_prefill=false, token_safety_margin=-1, policy=0, prefix_caching=true, snapshot_slots=0,
         async_scheduling=true, req_buckets=None, num_draft_tokens=0, use_eagle=false, include_finished_set=false,
+        dp_admission_hold=0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -194,6 +195,7 @@ impl EngineCore {
         num_draft_tokens: i64,
         use_eagle: bool,
         include_finished_set: bool,
+        dp_admission_hold: i64,
     ) -> PyResult<Self> {
         let cols = groups.shape()[1];
         let groups = groups_of(values(&groups), cols).map_err(to_py)?;
@@ -217,6 +219,7 @@ impl EngineCore {
             num_spec_tokens: num_draft_tokens,
             use_eagle,
             include_finished_set,
+            dp_admission_hold,
         };
         let core = Core::new(&cfg).map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self {

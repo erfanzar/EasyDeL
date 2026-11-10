@@ -860,6 +860,50 @@ def test_dp_natural_completion_releases_the_request(include_finished_set):
     assert c.schedule().finished.tolist() == [h]
 
 
+@pytest.mark.parametrize("hold", [0, 8])
+def test_dp_admission_waits_until_every_rank_with_waiting_requests_has_a_free_row(hold):
+    c = _dp_core(dp_admission_hold=hold)
+    c.add("a0", 4, max_tokens=2, dp_rank=0)
+    c.add("a1", 4, max_tokens=32, dp_rank=0)
+    c.add("b0", 4, max_tokens=32, dp_rank=1)
+    c.step()
+    c.add("a2", 4, max_tokens=32, dp_rank=0)
+    c.add("b1", 4, max_tokens=32, dp_rank=1)
+    plan, _ = c.step()  # rank 0 is full; a0 emits its second token and finishes at this commit
+    if hold:
+        assert c.new(plan) == [] and c.sched(plan) == {"a0": 1, "a1": 1, "b0": 1}
+        plan, _ = c.step()
+        assert sorted(c.new(plan)) == ["a2", "b1"]  # both ranks start their prefills in the same step
+    else:
+        assert c.new(plan) == ["b1"]
+        assert c.new(c.step()[0]) == ["a2"]
+
+
+def test_dp_admission_hold_lasts_at_most_the_configured_steps():
+    c = _dp_core(dp_admission_hold=2)
+    for name, rank in (("a0", 0), ("a1", 0), ("b0", 1)):
+        c.add(name, 4, max_tokens=32, dp_rank=rank)
+    c.step()
+    c.add("a2", 4, max_tokens=32, dp_rank=0)
+    c.add("b1", 4, max_tokens=32, dp_rank=1)
+    assert [c.new(c.step()[0]) for _ in range(3)] == [[], [], ["b1"]]
+
+
+def test_dp_admission_rank_with_nothing_running_admits_at_once():
+    c = _dp_core(dp_admission_hold=64)
+    c.add("a0", 4, max_tokens=32, dp_rank=0)
+    c.add("a1", 4, max_tokens=32, dp_rank=0)
+    c.step()
+    c.add("a2", 4, max_tokens=32, dp_rank=0)
+    c.add("b0", 4, max_tokens=32, dp_rank=1)
+    assert c.new(c.step()[0]) == ["b0"]
+
+
+def test_dp_admission_hold_must_not_be_negative():
+    with pytest.raises(ValueError, match="dp_admission_hold"):
+        _dp_core(dp_admission_hold=-1)
+
+
 def test_image_span_longer_than_the_budget_is_rejected_and_nothing_is_admitted():
     c = _dp_core()
     with pytest.raises(ValueError):

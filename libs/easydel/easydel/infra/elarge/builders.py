@@ -128,6 +128,7 @@ _ESURGE_INT_FIELDS = frozenset(
         "max_num_batched_tokens",
         "long_prefill_token_threshold",
         "token_safety_margin",
+        "dp_admission_hold",
         "page_size",
         "max_cache_tokens",
         "reserve_tokens",

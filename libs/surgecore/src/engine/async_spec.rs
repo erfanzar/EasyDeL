@@ -128,6 +128,7 @@ impl Case {
             num_spec_tokens: self.k,
             use_eagle: false,
             include_finished_set: false,
+            dp_admission_hold: 0,
         }
     }
 }

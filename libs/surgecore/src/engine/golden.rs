@@ -153,6 +153,7 @@ fn config(c: &[i64]) -> EngineConfig {
         num_spec_tokens: 0,
         use_eagle: false,
         include_finished_set: false,
+        dp_admission_hold: 0,
     }
 }
 

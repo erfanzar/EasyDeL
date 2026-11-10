@@ -171,6 +171,13 @@ def _validate_esurge_runtime_config(self):
             )
         self.token_safety_margin = int(self.token_safety_margin)
     if (
+        isinstance(self.dp_admission_hold, bool)
+        or not isinstance(self.dp_admission_hold, Integral)
+        or self.dp_admission_hold < 0
+    ):
+        raise ValueError(f"dp_admission_hold must be a non-negative integer, got {self.dp_admission_hold!r}")
+    self.dp_admission_hold = int(self.dp_admission_hold)
+    if (
         isinstance(self.spec_debug_max_traces, bool)
         or not isinstance(self.spec_debug_max_traces, Integral)
         or self.spec_debug_max_traces < 0
@@ -218,6 +225,7 @@ def _validate_esurge_runtime_config(self):
         "long_prefill_token_threshold": None,
         "chunked_prefill_enabled": False,
         "token_safety_margin": None,
+        "dp_admission_hold": 64,
         "include_finished_set": False,
         "enable_window_aware_runtime_cap": False,
         "mpmd_scheduler": None,
@@ -324,6 +332,15 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
             per running request by the token-budget manager. ``None`` disables
             that manager; ``0`` enables cache-aware budgeting without an extra
             reserve.
+        dp_admission_hold: Data-parallel admission alignment, in scheduler
+            steps; used only when the engine has more than one data-parallel
+            rank. A data-parallel step runs one program sized by its busiest
+            rank, so a prefill admitted on one rank makes every rank run a
+            prefill-sized step. While a rank with waiting requests has no free
+            row and another has one, no rank admits, so the ranks start their
+            prefills together; a rank with waiting requests and nothing running
+            admits at once, and no hold lasts more than this many steps.
+            Defaults to ``64``; ``0`` admits on every rank as soon as it can.
         include_finished_set: Track finished request IDs per client in
             scheduler outputs. Defaults to ``False``.
         enable_window_aware_runtime_cap: When ``True``, the runner derives
@@ -364,6 +381,7 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
     long_prefill_token_threshold: NotRequired[int | None]
     chunked_prefill_enabled: NotRequired[bool]
     token_safety_margin: NotRequired[int | None]
+    dp_admission_hold: NotRequired[int]
     include_finished_set: NotRequired[bool]
     enable_window_aware_runtime_cap: NotRequired[bool]
     mpmd_scheduler: NotRequired[MpMdSchedulers | None]
