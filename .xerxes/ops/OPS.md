@@ -66,7 +66,8 @@ Start from these files:
 - `libs/easydel/easydel/inference/esurge/`
 - `libs/easydel/easydel/inference/esurge/runners/execution_manager.py`
 - `libs/easydel/easydel/inference/esurge/runners/executors/model_executor.py`
-- `libs/easydel/easydel/inference/esurge/scheduler/`
+- `libs/easydel/easydel/inference/esurge/engine/core_driver.py` (drives the scheduler, surgecore's Rust `EngineCore`
+  in `libs/surgecore/src/engine/`; page pool and prefix cache are its `KvCore` in `libs/surgecore/src/kv/`)
 - `libs/easydel/easydel/operations/kernels/ragged_page_attention.py`
 - `libs/easydel/docs/esurge.rst`
 - an eSurge benchmark harness
@@ -106,7 +107,7 @@ Symptom routes:
   `profile_by_total_tokens` buckets, not only aggregate tokens/sec.
 - Text-only serving: keep speculative/MTP disabled unless the user explicitly asks for speculative decoding.
 
-Set `EASURGE_SYNC_INPUTS_FOR_TIMING=1` only when measuring prep-time accuracy; it adds a device round trip and can hurt
+Set `EASYDEL_SYNC_INPUTS_FOR_TIMING=1` only when measuring prep-time accuracy; it adds a device round trip and can hurt
 throughput.
 
 ## Disk-Pressure Cascade
