@@ -1611,6 +1611,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             min_p=float(getattr(request, "min_p", 0.0)),
             n=int(request.n or 1),
             stop=request.stop,
+            ignore_eos=_coerce_optional_bool(getattr(request, "ignore_eos", None), False),
             skip_special_tokens=_coerce_optional_bool(getattr(request, "skip_special_tokens", None), False),
             spaces_between_special_tokens=_coerce_optional_bool(
                 getattr(request, "spaces_between_special_tokens", None), True

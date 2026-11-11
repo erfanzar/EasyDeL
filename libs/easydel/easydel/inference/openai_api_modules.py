@@ -385,6 +385,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     logit_bias: dict[str, float] | None = None  # Ignored by EasyDeL
     user: str | None = None  # Ignored by EasyDeL
     chat_template_kwargs: dict[str, int | float | str | bool] | None = None
+    ignore_eos: bool = False  # vLLM-compatible extension: generate until max_tokens or a stop string
 
 
 class ChatCompletionResponseChoice(OpenAIBaseModel):
@@ -496,6 +497,7 @@ class CompletionRequest(OpenAIBaseModel):
     stop: str | list[str] | None = None
     logit_bias: dict[str, float] | None = None
     user: str | None = None
+    ignore_eos: bool = False  # vLLM-compatible extension: generate until max_tokens or a stop string
 
 
 class ResponsesToolDefinition(FunctionDefinition):
