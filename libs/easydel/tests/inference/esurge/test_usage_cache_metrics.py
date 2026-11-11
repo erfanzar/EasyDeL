@@ -120,7 +120,9 @@ def test_model_summary_aggregates_one_model_within_the_window():
     assert agg["output_tps"] == pytest.approx(64 / 2.25)
 
     recent = summary["recent_requests"]
-    assert [row["request_id"] for row in recent] == ["r1", "r0", "r3"]
+    # The aggregate is windowed, but the recent rows still include "old" so idle periods keep a request list.
+    assert [row["request_id"] for row in recent] == ["r1", "r0", "r3", "old"]
+    assert recent[0]["end_time"] == pytest.approx(now - 7.75)
     assert recent[0]["cache_hit"] is True
     assert recent[0]["uncached_input_tokens"] == 64
     assert recent[0]["decode_tps"] == pytest.approx(31.0)

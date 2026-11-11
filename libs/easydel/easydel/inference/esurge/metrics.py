@@ -734,18 +734,18 @@ class MetricsCollector:
         Args:
             model_name: Engine name passed to :meth:`start_request`; ``None`` selects untagged requests.
             window_seconds: Only requests that finished within this many seconds are included.
-            recent_limit: Maximum number of per-request rows returned, newest first.
+            recent_limit: Maximum number of per-request rows returned, newest first. These rows are not limited to
+                the window, so a client still sees the latest requests after an idle period.
 
         Returns:
             JSON-serializable dict with ``window_seconds``, ``aggregate`` and ``recent_requests``.
         """
         cutoff = time.time() - float(window_seconds)
         with self._lock:
-            rows = [
-                req
-                for req in self.completed_requests
-                if req.model_name == model_name and req.end_time is not None and req.end_time >= cutoff
+            finished = [
+                req for req in self.completed_requests if req.model_name == model_name and req.end_time is not None
             ]
+        rows = [req for req in finished if float(req.end_time or 0.0) >= cutoff]
         ok = [req for req in rows if not req.error]
         prompt_tokens = sum(int(req.prompt_tokens) for req in ok)
         completion_tokens = sum(int(req.generated_tokens) for req in ok)
@@ -772,7 +772,7 @@ class MetricsCollector:
             output_tps = completion_tokens / span if span > 0 else None
 
         recent = []
-        for req in sorted(rows, key=lambda r: float(r.end_time or 0.0), reverse=True)[: max(0, int(recent_limit))]:
+        for req in sorted(finished, key=lambda r: float(r.end_time or 0.0), reverse=True)[: max(0, int(recent_limit))]:
             decode_span = (
                 float(req.total_latency) - float(req.time_to_first_token)
                 if req.total_latency is not None and req.time_to_first_token is not None
@@ -781,6 +781,7 @@ class MetricsCollector:
             recent.append(
                 {
                     "request_id": req.request_id,
+                    "end_time": req.end_time,
                     "finish_reason": req.finish_reason,
                     "error": req.error,
                     "prompt_tokens": int(req.prompt_tokens),

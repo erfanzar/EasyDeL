@@ -116,9 +116,15 @@ class ServerStatus(StrEnum):
     SHUTTING_DOWN = "shutting_down"
 
 
+MONITORING_PATHS = frozenset({"/metrics", "/health"})
+"""Paths excluded from the request counters and the active-request set: polling them is not traffic."""
+
+
 @dataclass
 class ServerMetrics:
     """Aggregate per-server counters surfaced through ``/metrics``.
+
+    Requests to :data:`MONITORING_PATHS` are not counted.
 
     Mutated by the request-tracking middleware in
     :meth:`BaseInferenceApiServer._setup_middleware` (``total_requests``,
@@ -553,6 +559,10 @@ class BaseInferenceApiServer(ABC):
             """Add unique request ID to each request."""
             request_id = f"req_{int(time.time() * 1000000)}"
             request.state.request_id = request_id
+            if request.url.path in MONITORING_PATHS:
+                response = await call_next(request)
+                response.headers["X-Request-ID"] = request_id
+                return response
 
             async with self._request_lock:
                 self._active_requests.add(request_id)
@@ -567,7 +577,9 @@ class BaseInferenceApiServer(ABC):
 
         @self.app.middleware("http")
         async def track_metrics(request: Request, call_next):  # pyright: ignore[reportUnusedFunction]
-            """Track request metrics."""
+            """Track request metrics. Monitoring polls are not counted, so a dashboard does not inflate them."""
+            if request.url.path in MONITORING_PATHS:
+                return await call_next(request)
             self.metrics.total_requests += 1
 
             try:
