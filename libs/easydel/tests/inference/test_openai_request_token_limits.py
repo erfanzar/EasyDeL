@@ -42,7 +42,12 @@ _FIELDS = [
 
 
 @pytest.mark.parametrize(("kind", "field"), _FIELDS)
-@pytest.mark.parametrize("value", [0, -1, -5])
+def test_minus_one_means_unlimited(kind, field):
+    assert getattr(_build(kind, field, -1), field) is None
+
+
+@pytest.mark.parametrize(("kind", "field"), _FIELDS)
+@pytest.mark.parametrize("value", [0, -2, -5])
 def test_non_positive_token_limits_are_rejected(kind, field, value):
     with pytest.raises(ValidationError) as excinfo:
         _build(kind, field, value)

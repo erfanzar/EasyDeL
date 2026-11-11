@@ -55,9 +55,20 @@ from collections.abc import Mapping
 from enum import StrEnum
 
 from eformer.loggings import get_logger
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 logger = get_logger("OpenAIApiModules")
+
+
+def _minus_one_means_unlimited(value: tp.Any) -> tp.Any:
+    """``-1`` asks for no limit (IDE clients send it); the server then fills the remaining context."""
+    if isinstance(value, int) and not isinstance(value, bool) and value == -1:
+        return None
+    return value
+
+
+TokenLimit = tp.Annotated[int | None, BeforeValidator(_minus_one_means_unlimited)]
+"""A request token limit: absent or ``-1`` is unlimited (remaining context); otherwise it must be >= 1."""
 
 
 class OpenAIBaseModel(BaseModel):
@@ -366,7 +377,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     model: str
     messages: list[ChatMessage]
-    max_tokens: int | None = Field(default=None, ge=1)
+    max_tokens: TokenLimit = Field(default=None, ge=1)
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
@@ -483,7 +494,7 @@ class CompletionRequest(OpenAIBaseModel):
 
     model: str
     prompt: str | list[str]
-    max_tokens: int | None = Field(default=None, ge=1)
+    max_tokens: TokenLimit = Field(default=None, ge=1)
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
@@ -568,11 +579,11 @@ class ResponsesRequest(OpenAIBaseModel):
     previous_response_id: str | None = None
     conversation: str | ConversationReference | None = None
 
-    # The token limits are validated here (>= 1) so a bad value is a 422 at the HTTP boundary; library callers of
-    # SamplingParams keep their "negative means infer" behaviour.
-    max_output_tokens: int | None = Field(default=None, ge=1)
-    max_tokens: int | None = Field(default=None, ge=1)
-    max_completion_tokens: int | None = Field(default=None, ge=1)
+    # The token limits are validated here so a bad value is a 422 at the HTTP boundary: absent or -1 is unlimited
+    # (the remaining context), anything else must be >= 1. Library callers of SamplingParams keep their own rule.
+    max_output_tokens: TokenLimit = Field(default=None, ge=1)
+    max_tokens: TokenLimit = Field(default=None, ge=1)
+    max_completion_tokens: TokenLimit = Field(default=None, ge=1)
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
