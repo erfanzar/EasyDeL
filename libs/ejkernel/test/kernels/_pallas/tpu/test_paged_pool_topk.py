@@ -195,6 +195,32 @@ def test_prefill_chunks_mixed_with_decode_rows_and_padding(layout, k):
     np.testing.assert_array_equal(got, xla)
 
 
+_DECODE_CONTEXTS = {
+    "one_row_61k": [61439],
+    "two_rows_61k": [61439, 63000],
+    "three_rows_one_padding": [61439, 20000, -1],
+    "five_rows_4k": [4095] * 5,
+    "eight_rows_mixed": [65535, 300, 61439, -1, 8191, 1151, 30000, 61000],
+}
+
+
+@pytest.mark.parametrize("contexts", list(_DECODE_CONTEXTS.values()), ids=list(_DECODE_CONTEXTS))
+@pytest.mark.parametrize("k", [512, 64])
+def test_decode_rows_of_long_context(contexts, k):
+    """Decode steps of 1-8 rows per device, one row per sequence, up to 65,536 tokens of context (16,384 pools).
+
+    From two rows on, the rows are dealt to two row blocks (one per TensorCore of a megacore chip), so a block may hold
+    a single scorable row next to padding rows (context -1). The ids equal XLA's and the float64 reference's top k.
+    """
+    args, ref = _packed_rows(11, [(i, c, 1) for i, c in enumerate(contexts)], num_seqs=len(contexts))
+    scale = D**-0.5
+    got = _run("pallas", args, k, scale)
+    xla = _run("xla", args, k, scale)
+    assert got.shape == (len(contexts), k)
+    _check_rows(got, ref, np.asarray(args[4]), k, scale)
+    np.testing.assert_array_equal(got, xla)
+
+
 def test_page_shared_scoring_equals_per_row_scoring():
     """The same rows over identical pools: one sequence (pages fetched once per row block) == eight (per row)."""
     k = 512

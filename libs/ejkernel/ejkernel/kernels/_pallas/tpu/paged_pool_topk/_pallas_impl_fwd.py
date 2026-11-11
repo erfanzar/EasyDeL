@@ -29,15 +29,18 @@ Blocks. A program takes a block of consecutive rows, a multiple of 8 so every ke
 keeps at least ``_MIN_BLOCKS`` programs and the block's VMEM stays within
 ``_BLOCK_VMEM_BUDGET_BYTES`` (long page tables keep 8 rows). Programs alternate between the two halves of the grid
 (even blocks first, then odd ones), which a megacore chip runs on its two TensorCores, so rows
-whose context grows along the batch split evenly between the cores.
+whose context grows along the batch split evenly between the cores. A call of 2 to 8 rows (decode
+with a few rows per device) also runs two programs: its rows are dealt alternately to two blocks,
+so both TensorCores score real rows (two decode rows then take one block each).
 
 Scoring. When every scorable row of a block reads one sequence (prefill: consecutive tokens of
-one prompt), each 128-pool chunk of that sequence is fetched once and scored for all rows in one
-``[rows * H, D] x [D, 128]`` matmul. Otherwise (decode rows, a prompt boundary inside the block)
-every row fetches its own pages and runs its own matmul. Both paths apply the same per-row
-operations to each row's ``[H, 128]`` products. f32 queries score in f32 at the given precision;
-bf16 queries over bf16 pages score in one bf16 MXU pass with f32 accumulation, whose products
-are exact, as an f32 HIGHEST matmul of the upcast values gives them.
+one prompt, or a block holding a single decode row), each 128-pool chunk of that sequence is
+fetched once and scored for all rows in one ``[rows * H, D] x [D, 128]`` matmul. Otherwise
+(decode rows, a prompt boundary inside the block) every row fetches its own pages and runs its own
+matmul. Both paths apply the same per-row operations to each row's ``[H, 128]`` products. f32
+queries score in f32 at the given precision; bf16 queries over bf16 pages score in one bf16 MXU
+pass with f32 accumulation, whose products are exact, as an f32 HIGHEST matmul of the upcast
+values gives them.
 
 Selection. Scores are written as order-preserving ``int32`` keys into VMEM. The exact k-th key
 ``tau`` is found by MSB-first bisection over the scored chunks; the chunks after them, up to a
@@ -56,6 +59,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -101,9 +105,25 @@ def _block_rows(total: int, row_bytes: int = 0) -> int:
 
 
 def _num_blocks(total: int, rows: int) -> int:
-    """Programs of ``rows`` rows covering ``total`` rows; an even count when there are two or more."""
+    """Programs of ``rows`` rows covering ``total`` rows; an even count when there are two or more.
+
+    Two to ``rows`` rows (decode on few rows per device) also take two programs, one per TensorCore of a megacore chip:
+    :func:`_split_rows` deals them over both blocks.
+    """
     blocks = -(-int(total) // rows)
+    if blocks == 1 and int(total) > 1:
+        return 2
     return blocks + blocks % 2 if blocks > 1 else blocks
+
+
+def _split_rows(total: int, rows: int) -> np.ndarray | None:
+    """Padded position of each query row when ``total`` rows fit one block of ``rows``: row ``i`` goes to block
+    ``i % 2`` at slot ``i // 2``, so both programs score real rows. ``None`` when rows stay in order."""
+    total = int(total)
+    if total < 2 or total > rows:
+        return None
+    ids = np.arange(total)
+    return (ids % 2) * rows + ids // 2
 
 
 def padded_rows(total: int) -> int:
@@ -399,10 +419,18 @@ def _paged_pool_topk_call(
     num_blocks = _num_blocks(total, block_rows)
     t_pad = num_blocks * block_rows
     pad = t_pad - total
-    q = jnp.pad(query, ((0, pad), (0, 0), (0, 0)))
-    w = jnp.pad(head_weights.astype(jnp.float32), ((0, pad), (0, 0)))[..., None]  # [T, H, 1]
-    seq = jnp.pad(jnp.clip(seq_ids.astype(jnp.int32), 0, num_seqs - 1), (0, pad))
-    npool = jnp.pad(jnp.clip(num_pools.astype(jnp.int32), 0, max_pools), (0, pad))
+    split = _split_rows(total, block_rows)
+
+    def place(x):
+        """Rows of ``x`` at their padded positions; padding rows are zero (``num_pools`` 0: output all -1)."""
+        if split is None:
+            return jnp.pad(x, ((0, pad),) + ((0, 0),) * (x.ndim - 1))
+        return jnp.zeros((t_pad, *x.shape[1:]), x.dtype).at[split].set(x)
+
+    q = place(query)
+    w = place(head_weights.astype(jnp.float32))[..., None]  # [T, H, 1]
+    seq = place(jnp.clip(seq_ids.astype(jnp.int32), 0, num_seqs - 1))
+    npool = place(jnp.clip(num_pools.astype(jnp.int32), 0, max_pools))
     bt = block_tables.astype(jnp.int32).reshape(-1)
 
     kernel = functools.partial(
@@ -447,7 +475,7 @@ def _paged_pool_topk_call(
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",), vmem_limit_bytes=_VMEM_LIMIT_BYTES),
         name="paged_pool_topk",
     )(seq, npool, bt, q, w, pool_pages)
-    return ids[:total, :k]
+    return ids[:total, :k] if split is None else ids[split, :k]
 
 
 @functools.partial(jax.jit, static_argnames=("k", "sm_scale", "relu", "precision"))
