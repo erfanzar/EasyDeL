@@ -485,7 +485,6 @@ def test_responses_handler_ignores_stale_slot_state():
             assert kwargs["request_id"].startswith("resp_")
             return output
 
-    server._extract_payload_api_keys = lambda request: []
     server._get_adapter = lambda model: SimpleNamespace(esurge=FakeSurge())
     server._parse_responses_max_tokens = lambda payload, esurge: (8, 8)
     server._authorize_request = lambda *args, **kwargs: None

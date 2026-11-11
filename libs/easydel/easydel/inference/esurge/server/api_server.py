@@ -75,7 +75,7 @@ import time
 import traceback
 import typing as tp
 import uuid
-from collections.abc import AsyncGenerator, Iterable, Iterator
+from collections.abc import AsyncGenerator, Iterator
 from http import HTTPStatus
 
 import anyio
@@ -92,6 +92,7 @@ from easydel.workers.esurge.auth import (
     QuotaExceeded,
     RateLimitExceeded,
 )
+from easydel.workers.esurge.auth.credentials import api_key_from_headers
 
 from ...inference_engine_interface import (
     BaseInferenceApiServer,
@@ -587,82 +588,11 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         return self.auth_manager.generate_api_key(name=name, role=role, **kwargs)
 
     def _extract_api_key(self, raw_request: Request) -> str | None:
-        """Extract API key from various request locations.
+        """Return the API key in ``Authorization: Bearer`` or ``X-API-Key``; see :func:`api_key_from_headers`.
 
-        Searches for an API key in the following locations (in order):
-        1. Authorization header with "Bearer " prefix
-        2. X-API-Key header
-        3. "api_key" query parameter
-        4. "user" query parameter (OpenAI compatibility)
-
-        Args:
-            raw_request: The incoming FastAPI request object.
-
-        Returns:
-            The extracted API key string if found, None otherwise.
+        Query parameters and request-body fields are never read as credentials.
         """
-        auth_header = raw_request.headers.get("Authorization")
-        if auth_header and auth_header.lower().startswith("bearer "):
-            return auth_header.split(" ", 1)[1].strip()
-
-        header_key = raw_request.headers.get("X-API-Key")
-        if header_key:
-            return header_key.strip()
-
-        query_key = raw_request.query_params.get("api_key")
-        if query_key:
-            return query_key.strip()
-
-        query_key = raw_request.query_params.get("user")
-        if query_key:
-            return query_key.strip()
-
-        return None
-
-    @staticmethod
-    def _extract_payload_api_keys(payload: tp.Any) -> list[str]:
-        """Extract API key candidates from the request JSON payload.
-
-        Searches for API keys embedded within the request body, checking
-        various field names commonly used for authentication. This allows
-        clients to pass API keys in the request body as an alternative to
-        headers or query parameters.
-
-        Args:
-            payload: The request payload, either as a Pydantic model or dict.
-                For Pydantic models, checks `model_extra` for extra fields.
-
-        Returns:
-            List of unique, non-empty API key candidate strings found in
-            the payload. The list preserves discovery order.
-
-        Note:
-            Checked field names include: api_key, apiKey, api-key, x-api-key,
-            auth, authorization, token, key, and user (for OpenAI compatibility).
-        """
-        candidates: list[str] = []
-
-        def add_candidate(value: tp.Any) -> None:
-            """Append a non-empty, stripped string to the candidates list if unique."""
-            if isinstance(value, str):
-                stripped = value.strip()
-                if stripped and stripped not in candidates:
-                    candidates.append(stripped)
-
-        extras: dict[str, tp.Any] | None = None
-        if hasattr(payload, "model_extra"):
-            extras = payload.model_extra or {}
-        elif isinstance(payload, dict):
-            extras = payload
-
-        if isinstance(extras, dict):
-            for field in ("api_key", "apiKey", "api-key", "x-api-key", "auth", "authorization", "token", "key"):
-                add_candidate(extras.get(field))
-
-        if hasattr(payload, "user"):
-            add_candidate(payload.user)
-
-        return candidates
+        return api_key_from_headers(raw_request.headers)
 
     def _auth_system_enabled(self) -> bool:
         """Determine whether authentication enforcement is active.
@@ -699,7 +629,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
     def _authorize_request(
         self,
         raw_request: Request,
-        payload_api_keys: str | Iterable[str | None] | None = None,
         endpoint: str | None = None,
         model: str | None = None,
         requested_tokens: int = 0,
@@ -710,7 +639,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
         Args:
             raw_request: FastAPI request object.
-            payload_api_keys: API keys from request payload.
             endpoint: Endpoint being accessed.
             model: Model being requested.
             requested_tokens: Number of tokens requested.
@@ -737,12 +665,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 stripped = value.strip()
                 if stripped and stripped not in candidate_keys:
                     candidate_keys.append(stripped)
-
-        if isinstance(payload_api_keys, str):
-            add_candidate(payload_api_keys)
-        elif payload_api_keys:
-            for value in payload_api_keys:
-                add_candidate(value)
 
         add_candidate(self._extract_api_key(raw_request))
 
@@ -1723,7 +1645,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             refined_request = self._refine_chat_request_callback(request)
             if refined_request is not None:
                 request = refined_request
-        payload_api_keys = self._extract_payload_api_keys(request)
 
         try:
             adapter = self._get_adapter(request.model)
@@ -1732,7 +1653,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             max_tokens = self._ensure_request_max_tokens(request, esurge)
             self._authorize_request(
                 raw_request,
-                payload_api_keys=payload_api_keys,
                 endpoint="/v1/chat/completions",
                 model=request.model,
                 requested_tokens=max_tokens,
@@ -1964,7 +1884,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         """
 
         response_id = f"resp_{uuid.uuid4().hex}"
-        payload_api_keys = self._extract_payload_api_keys(request)
 
         try:
             store_flag = request.store
@@ -1990,7 +1909,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             requested_tokens, max_tokens = self._parse_responses_max_tokens(request, esurge)
             self._authorize_request(
                 raw_request,
-                payload_api_keys=payload_api_keys,
                 endpoint="/v1/responses",
                 model=model,
                 requested_tokens=requested_tokens,
@@ -2677,7 +2595,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 404 model not found, 401/403/429 auth failures).
         """
         request_id = str(uuid.uuid4())
-        payload_api_keys = self._extract_payload_api_keys(request)
 
         try:
             adapter = self._get_adapter(request.model)
@@ -2686,7 +2603,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             max_tokens = self._ensure_request_max_tokens(request, esurge)
             self._authorize_request(
                 raw_request,
-                payload_api_keys=payload_api_keys,
                 endpoint="/v1/completions",
                 model=request.model,
                 requested_tokens=max_tokens,
