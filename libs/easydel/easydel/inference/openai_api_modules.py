@@ -366,7 +366,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     model: str
     messages: list[ChatMessage]
-    max_tokens: int | None = None
+    max_tokens: int | None = Field(default=None, ge=1)
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
@@ -482,7 +482,7 @@ class CompletionRequest(OpenAIBaseModel):
 
     model: str
     prompt: str | list[str]
-    max_tokens: int | None = None
+    max_tokens: int | None = Field(default=None, ge=1)
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
@@ -566,9 +566,11 @@ class ResponsesRequest(OpenAIBaseModel):
     previous_response_id: str | None = None
     conversation: str | ConversationReference | None = None
 
-    max_output_tokens: int | None = None
-    max_tokens: int | None = None
-    max_completion_tokens: int | None = None
+    # The token limits are validated here (>= 1) so a bad value is a 422 at the HTTP boundary; library callers of
+    # SamplingParams keep their "negative means infer" behaviour.
+    max_output_tokens: int | None = Field(default=None, ge=1)
+    max_tokens: int | None = Field(default=None, ge=1)
+    max_completion_tokens: int | None = Field(default=None, ge=1)
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
