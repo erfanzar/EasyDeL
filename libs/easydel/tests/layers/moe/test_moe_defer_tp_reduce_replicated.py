@@ -236,9 +236,11 @@ def test_deferred_dispatch_matches_default_bf16_w8a8(decode):
     out_deferred, text_deferred = _forward(block, x, defer=True, decode=decode)
     _assert_deferred_lowering(text_default, text_deferred, mesh="ep2tp2", decode=decode)
     if not decode:
-        # The combined partial is reduce-scattered over TP in bfloat16, as the default does with its expanded rows.
+        # The combined partial is reduce-scattered over TP in bfloat16, as the default does with its expanded rows, and
+        # then over the expert axis in float32 into token slices that are gathered back in bfloat16.
         deferred_ops = _reduce_scatter_operands(text_deferred)
-        assert deferred_ops == {(TOKENS, "bf16")}, deferred_ops
+        assert deferred_ops == {(TOKENS, "bf16"), (TOKENS, "f32")}, deferred_ops
+        assert "stablehlo.all_gather" in text_deferred, "the bfloat16 expert-axis gather is missing"
         assert (TOKENS * TOPK, "bf16") in _reduce_scatter_operands(text_default)
     assert np.isfinite(out_deferred).all() and float(np.max(np.abs(out_default))) > 0
     rel = _rel(out_deferred, out_default)

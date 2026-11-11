@@ -460,6 +460,33 @@ def _deferred_window_rows(total_rows: int, ep_size: int, override: int | None) -
     return min(rows, total_rows)
 
 
+def _expert_axis_sum(
+    partial: jax.Array, ep_axes: tuple[str, ...], ep_size: int, dtype, *, gather_rounded: bool
+) -> jax.Array:
+    """Sum an fp32 ``[rows, H]`` partial over the expert axis inside ``shard_map``, returned in ``dtype``.
+
+    With ``gather_rounded`` (prefill layout), an activation dtype narrower than fp32 and ``rows % ep_size == 0`` the
+    sum is an fp32 reduce-scatter into row slices, each slice is rounded to ``dtype`` and the rounded slices are
+    all-gathered: every element is the ``dtype`` rounding of the fp32 expert-axis sum, as with an all-reduce followed
+    by the cast (up to the collective's summation order), while the gather moves ``dtype`` bytes instead of fp32.
+    Otherwise one fp32 all-reduce, then the cast.
+
+    Args:
+        partial: fp32 partial rows of this expert shard.
+        ep_axes: Expert mesh axis names.
+        ep_size: Expert-axis size.
+        dtype: Activation dtype of the result.
+        gather_rounded: Allow the reduce-scatter + rounded all-gather form.
+
+    Returns:
+        ``[rows, H]`` summed over the expert axis, in ``dtype``.
+    """
+    if gather_rounded and partial.shape[0] % ep_size == 0 and jnp.dtype(dtype).itemsize < 4:
+        partial = jax.lax.psum_scatter(partial, ep_axes, scatter_dimension=0, tiled=True)
+        return jax.lax.all_gather(partial.astype(dtype), ep_axes, axis=0, tiled=True)
+    return jax.lax.psum(partial, ep_axes).astype(dtype)
+
+
 _LIVE_COMBINE_MIN_LOCAL_ROWS = 8192
 """Expected local (token, expert) rows per expert shard, ``tokens * top_k / ep``, from which the inference-mode deferred
 dispatch combines through the Pallas TPU ``moe_row_gather_sum`` entry (its live-slot kernel) instead of the XLA entry.
@@ -2765,6 +2792,9 @@ class BaseMoeModule(spx.Module, ABC):
             and combine cover only the local prefix of the sorted pairs, window by window (``_local_row_windows``;
             balanced routing runs one window), instead of all ``tokens * k`` rows. Forward only.
 
+            In the prefill layout the expert-axis reduction is ``_expert_axis_sum``: an fp32 reduce-scatter whose
+            row slices are rounded to the activation dtype and all-gathered. The decode layout keeps one all-reduce.
+
             Args:
                 x: Local hidden states ``[b, s, H]`` (replicated over the expert and TP axes).
                 gate_logits: Normalized gate scores ``[b * s, E]`` aligned with ``x``.
@@ -2844,17 +2874,21 @@ class BaseMoeModule(spx.Module, ABC):
                 # Decode: one small fp32 all-reduce over both axes replaces the default dispatch's TP
                 # reduce-scatter, expert-axis psum and output all-gather.
                 partial = jax.lax.psum(partial, (*ep_axes, tensor_axis_name))
+                return partial.astype(self.dtype).reshape(local_batch, local_seq, -1)
+            if tp_size > 1:
+                # The TP reduction moves the combined [tokens, H] partial in the activation dtype, as the default
+                # dispatch does for its top-k-expanded rows; the expert-axis sum stays fp32 like
+                # ``replicated_expert_psum_unpermute``.
+                partial = jax.lax.psum_scatter(
+                    partial.astype(self.dtype), tensor_axis_name, scatter_dimension=1, tiled=True
+                ).astype(jnp.float32)
+            if ep_size > 1:
+                out = _expert_axis_sum(
+                    partial, ep_axes, ep_size, self.dtype, gather_rounded=not inference_mode_forces_decode()
+                )
             else:
-                if tp_size > 1:
-                    # The TP reduction moves the combined [tokens, H] partial in the activation dtype, as the
-                    # default dispatch does for its top-k-expanded rows; the expert-axis psum stays fp32 like
-                    # ``replicated_expert_psum_unpermute``.
-                    partial = jax.lax.psum_scatter(
-                        partial.astype(self.dtype), tensor_axis_name, scatter_dimension=1, tiled=True
-                    ).astype(jnp.float32)
-                if ep_size > 1:
-                    partial = jax.lax.psum(partial, ep_axes)
-            return partial.astype(self.dtype).reshape(local_batch, local_seq, -1)
+                out = partial.astype(self.dtype)
+            return out.reshape(local_batch, local_seq, -1)
 
         def _local_expert_dispatch(
             x: jax.Array,
