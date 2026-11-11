@@ -53,6 +53,22 @@ if typing.TYPE_CHECKING:
 _STOP_SENTINEL = None
 
 
+def _cache_usage_metrics(num_prompt_tokens: int, cached_tokens: int, prefix_caching_enabled: bool | None) -> dict:
+    """Return request-level cache usage without exposing scheduler internals."""
+    cache_read = max(0, int(cached_tokens))
+    uncached_input = max(0, int(num_prompt_tokens) - cache_read)
+    if prefix_caching_enabled is None:
+        cache_written = None
+    else:
+        cache_written = uncached_input if prefix_caching_enabled else 0
+    return {
+        "cache_hit": cache_read > 0,
+        "cache_read": cache_read,
+        "cache_written": cache_written,
+        "uncached_input": uncached_input,
+    }
+
+
 class _PrefixView(Sequence):
     """Fixed-length view over an append-only list.
 
@@ -167,6 +183,7 @@ class OutputPipeline:
         on_stop_strings: typing.Callable[[dict[str, str]], None],
         on_activity: typing.Callable[[], None],
         on_fatal: typing.Callable[[BaseException, str], None],
+        prefix_caching_enabled: bool | None = None,
     ) -> None:
         self.queue: queue.Queue = queue.Queue()
         self._on_fatal = on_fatal
@@ -177,6 +194,7 @@ class OutputPipeline:
         self._eos_set = {int(tid) for tid in eos_token_ids if tid is not None}
         self.decode_interval_tokens = int(decode_interval_tokens)
         self.decode_interval_secs = float(decode_interval_secs)
+        self._prefix_caching_enabled = prefix_caching_enabled
         self._on_stop_strings = on_stop_strings
         self._on_activity = on_activity
 
@@ -1282,6 +1300,11 @@ class OutputPipeline:
             ro.tokens_per_second = ro.num_generated_tokens / generation_time if generation_time > 0 else 0.0
         else:
             ro.tokens_per_second = 0.0
+        cache_metrics = _cache_usage_metrics(
+            num_prompt_tokens,
+            engine_output.num_cached_tokens,
+            self._prefix_caching_enabled,
+        )
         ro.metrics = {
             "prompt_tokens": num_prompt_tokens,
             "generated_tokens": ro.num_generated_tokens,
@@ -1289,6 +1312,7 @@ class OutputPipeline:
             "processing_time": elapsed,
             "first_token_time": ro.first_token_time,
             "tokens_per_second": ro.tokens_per_second,
+            **cache_metrics,
         }
 
         if metrics_collector and ro.finished:

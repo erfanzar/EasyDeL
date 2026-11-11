@@ -869,6 +869,7 @@ class eSurge:
             on_stop_strings=self._enqueue_parser_stop_requests,
             on_activity=self._touch_activity,
             on_fatal=self._on_output_worker_fatal,
+            prefix_caching_enabled=bool(self.cache_config.enable_prefix_caching),
         )
 
         # Request admission: prompt -> admission records for the engine core.

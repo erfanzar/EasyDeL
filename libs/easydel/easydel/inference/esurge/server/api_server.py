@@ -2411,6 +2411,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             tokens_per_second=tokens_per_second,
             processing_time=processing_time,
             first_token_time=output.first_token_time,
+            **UsageInfo.cache_fields(output),
         )
 
         self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
@@ -2833,6 +2834,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 tokens_per_second=tokens_per_second,
                 processing_time=processing_time,
                 first_token_time=min(first_token_times) if first_token_times else None,
+                **UsageInfo.cache_fields(outputs),
             )
 
             self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
@@ -2874,6 +2876,11 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             prompt_tokens = 0
             completion_tokens = 0
             processing_time = 0.0
+            cache_hit = False
+            cache_read = 0
+            cache_written = 0
+            cache_written_unknown = False
+            uncached_input = 0
             for prompt_index, prompt in enumerate(prompts):
                 if await raw_request.is_disconnected():
                     return
@@ -2904,6 +2911,13 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                             prompt_tokens += usage["prompt_tokens"]
                             completion_tokens += usage["completion_tokens"]
                             processing_time += usage.get("processing_time", 0.0)
+                            cache_hit = cache_hit or bool(usage.get("cache_hit", False))
+                            cache_read += int(usage.get("cache_read", 0))
+                            uncached_input += int(usage.get("uncached_input", 0))
+                            if usage.get("cache_written") is None:
+                                cache_written_unknown = True
+                            else:
+                                cache_written += int(usage["cache_written"])
                             if prompt_index == len(prompts) - 1:
                                 # Reconcile before exposing terminal usage: the consumer
                                 # may disconnect without ever requesting the next event.
@@ -2914,6 +2928,10 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                                     total_tokens=prompt_tokens + completion_tokens,
                                     processing_time=processing_time,
                                     tokens_per_second=(completion_tokens / processing_time if processing_time else 0.0),
+                                    cache_hit=cache_hit,
+                                    cache_read=cache_read,
+                                    cache_written=None if cache_written_unknown else cache_written,
+                                    uncached_input=uncached_input,
                                 ).model_dump(exclude_none=True)
                         yield f"data: {json.dumps(chunk)}\n\n"
                 finally:
@@ -3049,6 +3067,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                         tokens_per_second=tokens_per_second,
                         processing_time=generation_time,
                         first_token_time=last_output.first_token_time,
+                        **UsageInfo.cache_fields(last_output),
                     )
 
                     final_chunk = {
@@ -3185,6 +3204,64 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         status_code = 200 if self.status == ServerStatus.READY else 503
         return JSONResponse(health_status, status_code=status_code)
 
+    def _engine_metrics_snapshot(self) -> dict[str, tp.Any]:
+        """Return per-model cache and recent-request metrics for lightweight dashboards."""
+        snapshots = {}
+        for model_name, engine in self.esurge_map.items():
+            registry = getattr(engine, "_registry", None)
+            if registry is None:
+                continue
+            with registry.output_lock:
+                outputs = list(registry.outputs.values())[-100:]
+            recent = []
+            for output in outputs:
+                metrics = output.metrics or {}
+                if not output.finished or not metrics:
+                    continue
+                recent.append(
+                    {
+                        "request_id": output.request_id,
+                        "prompt_tokens": int(metrics.get("prompt_tokens", 0)),
+                        "completion_tokens": int(output.num_generated_tokens),
+                        "first_token_time": output.first_token_time,
+                        "generation_tps": float(output.tokens_per_second),
+                        "processing_time": float(output.processing_time),
+                        "cache_hit": bool(metrics.get("cache_hit", False)),
+                        "cache_read": int(metrics.get("cache_read", 0)),
+                        "cache_written": metrics.get("cache_written"),
+                        "uncached_input": int(metrics.get("uncached_input", 0)),
+                        "finish_reason": output.outputs[0].finish_reason if output.outputs else None,
+                    }
+                )
+            cache_hits = sum(row["cache_hit"] for row in recent)
+            cache_read = sum(row["cache_read"] for row in recent)
+            uncached_input = sum(row["uncached_input"] for row in recent)
+            cache_written = sum(row["cache_written"] or 0 for row in recent)
+            ttft_total = sum(row["first_token_time"] or 0.0 for row in recent)
+            generation_time = sum(
+                max(0.0, row["processing_time"] - (row["first_token_time"] or 0.0)) for row in recent
+            )
+            snapshots[model_name] = {
+                "running_requests": int(getattr(engine, "num_running_requests", 0)),
+                "waiting_requests": int(getattr(engine, "num_pending_requests", 0)),
+                "aggregate": {
+                    "completed": len(recent),
+                    "cache_hits": cache_hits,
+                    "cache_hit_rate": cache_hits / len(recent) if recent else 0.0,
+                    "cache_read": cache_read,
+                    "cache_written": cache_written,
+                    "uncached_input": uncached_input,
+                    "prefill_tps": uncached_input / ttft_total if ttft_total > 0 else 0.0,
+                    "decode_tps": (
+                        sum(row["completion_tokens"] for row in recent) / generation_time
+                        if generation_time > 0
+                        else 0.0
+                    ),
+                },
+                "recent_requests": list(reversed(recent[-20:])),
+            }
+        return snapshots
+
     async def get_metrics(self, raw_request: Request) -> JSONResponse:
         """Get server performance metrics.
 
@@ -3213,6 +3290,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 "models_loaded": len(self.adapters),
                 "status": self.status.value,
                 "auth_stats": auth_stats,
+                "engine_metrics": self._engine_metrics_snapshot(),
             }
         )
 

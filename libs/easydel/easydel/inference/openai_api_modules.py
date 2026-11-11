@@ -221,6 +221,31 @@ class UsageInfo(OpenAIBaseModel):
     total_tokens: int = 0
     tokens_per_second: float = 0
     processing_time: float = 0.0
+    cache_hit: bool = False
+    cache_read: int = 0
+    cache_written: int | None = None
+    uncached_input: int = 0
+
+    @staticmethod
+    def cache_fields(output_or_outputs) -> dict[str, tp.Any]:
+        """Return prefix-cache usage fields from one output or an output sequence.
+
+        ``OutputPipeline`` records cache-read and uncached-input token counts on
+        every final request. Cache-written is ``None`` only when the producing
+        engine cannot report whether prefix caching is enabled (remote engines).
+        """
+        outputs = output_or_outputs if isinstance(output_or_outputs, list | tuple) else [output_or_outputs]
+        metrics = [(getattr(output, "metrics", None) or {}) for output in outputs]
+        cache_read = sum(int(metric.get("cache_read", 0)) for metric in metrics)
+        uncached_input = sum(int(metric.get("uncached_input", 0)) for metric in metrics)
+        written_values = [metric.get("cache_written") for metric in metrics]
+        cache_written = None if any(value is None for value in written_values) else sum(written_values)
+        return {
+            "cache_hit": cache_read > 0,
+            "cache_read": cache_read,
+            "cache_written": cache_written,
+            "uncached_input": uncached_input,
+        }
 
 
 class FunctionDefinition(OpenAIBaseModel):
