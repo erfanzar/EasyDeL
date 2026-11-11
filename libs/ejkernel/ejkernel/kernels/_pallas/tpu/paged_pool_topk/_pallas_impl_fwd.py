@@ -40,12 +40,13 @@ fetched once and scored for all rows in one ``[rows * H, D] x [D, 128]`` matmul.
 matmul. Both paths apply the same per-row operations to each row's ``[H, 128]`` products. f32
 queries score in f32 at the given precision; bf16 queries over bf16 pages score in one bf16 MXU
 pass with f32 accumulation, whose products are exact, as an f32 HIGHEST matmul of the upcast
-values gives them.
+values gives them. Chunks stream through ``_PAGE_SLOTS`` VMEM slots: while one chunk is scored,
+the fetches of the next ``_PAGE_SLOTS - 1`` are in flight.
 
 Selection. Scores are written as order-preserving ``int32`` keys into VMEM. The exact k-th key
 ``tau`` is found by MSB-first bisection over the scored chunks; the chunks after them, up to a
 multiple of ``_FILL_CHUNKS``, hold ``INT32_MIN``, which no bisection count includes. Survivors
-are compacted in ascending pool order, ``_COMPACT_CHUNKS`` chunks per loop step. When no row
+are compacted in ascending pool order, :func:`_compact_chunks` chunks per loop step. When no row
 has to cut its keys equal to ``tau`` (the usual case) compaction keeps every key ``>= tau``;
 otherwise it ranks the ties and keeps the lowest ids, as ``_pallas/tpu/topk`` does. Rows with
 no scorable pool (padding) are settled before the bisection: their output is all ``-1``. A block
@@ -72,7 +73,14 @@ _MAX_BLOCK_ROWS = 64
 _MIN_BLOCKS = 8
 _FILL_CHUNKS = 8
 _COUNT_VREGS = 16
-_COMPACT_CHUNKS = 2
+# Page-chunk slots in VMEM: while one chunk is scored, the fetches of the next _PAGE_SLOTS - 1 are in flight. Measured on
+# one TPU v5p chip at GLM-5.3-Flash per-device shapes (32 heads x 128, k = 512, bf16 queries), us per call with 2 / 4 / 8
+# slots: 2 decode rows at ~61K context 197.15 / 174.60 / 173.17; 2,048 prefill rows of one prompt at 32K (64-row
+# blocks) 2,496.97 / 2,445.59 with 2 / 4 slots. All give the same ids. Every slot holds one DMA semaphore per row, and
+# the TPU's semaphore memory does not fit 8 slots of 64-row blocks.
+_PAGE_SLOTS = 4
+# Row-chunks (rows x chunks) one compaction step covers at most (see _compact_chunks).
+_COMPACT_ROW_CHUNKS = 256
 _VMEM_LIMIT_BYTES = 96 * 1024 * 1024
 # VMEM a block may use for its rows (keys, page buffers, pipelined query / weight / output rows); larger blocks are
 # halved until they fit, down to 8 rows.
@@ -86,9 +94,11 @@ def _key_width(pages_per_seq: int, pools_per_page: int) -> int:
 
 
 def _row_vmem_bytes(heads: int, dim: int, q_itemsize: int, page_itemsize: int, key_width: int, k: int) -> int:
-    """VMEM one row of a block needs: its keys, its two page slots and its double-buffered query, weights and ids."""
+    """VMEM one row of a block needs: its keys, its ``_PAGE_SLOTS`` page slots and its double-buffered query, weights
+    and ids."""
     k_pad = -(-k // _LANES) * _LANES
-    return 4 * key_width + 2 * _LANES * dim * page_itemsize + 2 * heads * (dim * q_itemsize + _LANES * 4) + 8 * k_pad
+    pages = _PAGE_SLOTS * _LANES * dim * page_itemsize
+    return 4 * key_width + pages + 2 * heads * (dim * q_itemsize + _LANES * 4) + 8 * k_pad
 
 
 def _block_rows(total: int, row_bytes: int = 0) -> int:
@@ -102,6 +112,21 @@ def _block_rows(total: int, row_bytes: int = 0) -> int:
     ):
         rows *= 2
     return rows
+
+
+def _compact_chunks(rows: int) -> int:
+    """Chunks per compaction step for blocks of ``rows`` rows: ``_FILL_CHUNKS``, halved while one step would cover more
+    than ``_COMPACT_ROW_CHUNKS`` row-chunks (8 chunks for 8- to 32-row blocks, 4 for 64-row blocks).
+
+    Measured on one TPU v5p chip (4 page slots, 32 heads x 128, k = 512, bf16 queries, ~61K context unless noted), us
+    per call with 2 / 4 / 8 chunks per step: 2 decode rows (8-row blocks) 174.44 / 142.26 / 127.83; 128 rows of one
+    prompt (16-row blocks) 642.96 / 508.64 / 441.59; 256 rows of one prompt (32-row blocks) 792.58 / 656.82 / 614.29;
+    2,048 rows of one prompt at 32K (64-row blocks) 2,445.98 / 2,258.40 / 2,363.88. All give the same ids.
+    """
+    chunks = _FILL_CHUNKS
+    while chunks > 1 and chunks * int(rows) > _COMPACT_ROW_CHUNKS:
+        chunks //= 2
+    return chunks
 
 
 def _num_blocks(total: int, rows: int) -> int:
@@ -248,16 +273,21 @@ def _kernel(
         return [head_sum(r, products(q_ref[r], slot, r)) for r in range(rows)]
 
     def score(issue, sums):
-        @pl.when(n_steps > 0)
-        def _():
-            issue(0, 0, wait=False)
+        # The first _PAGE_SLOTS - 1 chunks start here; step c starts chunk c + _PAGE_SLOTS - 1 in the slot chunk c - 1
+        # used, so that many fetches are in flight while chunk c is scored.
+        for j in range(_PAGE_SLOTS - 1):
+
+            @pl.when(j < n_steps)
+            def _(j=j):
+                issue(j, j, wait=False)
 
         def step(c, carry):
-            slot = c % 2
+            slot = c % _PAGE_SLOTS
+            ahead = c + (_PAGE_SLOTS - 1)
 
-            @pl.when(c + 1 < n_steps)
+            @pl.when(ahead < n_steps)
             def _():
-                issue(c + 1, 1 - slot, wait=False)
+                issue(ahead, ahead % _PAGE_SLOTS, wait=False)
 
             issue(c, slot, wait=True)
             sc = jnp.concatenate(sums(slot), axis=0)  # [rows, 128]
@@ -466,8 +496,8 @@ def _paged_pool_topk_call(
             ],
             out_specs=pl.BlockSpec((block_rows, k_pad), lambda b, *_: (_block_of(b, num_blocks), 0)),
             scratch_shapes=[
-                pltpu.VMEM((2, block_rows, group, pools_per_page, dim), pool_pages.dtype),
-                pltpu.SemaphoreType.DMA((2, block_rows)),
+                pltpu.VMEM((_PAGE_SLOTS, block_rows, group, pools_per_page, dim), pool_pages.dtype),
+                pltpu.SemaphoreType.DMA((_PAGE_SLOTS, block_rows)),
                 pltpu.VMEM((block_rows, key_width), jnp.int32),
             ],
         ),
@@ -521,6 +551,7 @@ def paged_pool_topk_pallas(
         _key_width(int(block_tables.shape[1]), int(pool_pages.shape[1])),
         int(k),
     )
+    block_rows = _block_rows(query.shape[0], row_bytes)
     return _paged_pool_topk_call(
         query,
         head_weights,
@@ -532,8 +563,8 @@ def paged_pool_topk_pallas(
         sm_scale=sm_scale,
         relu=relu,
         precision=precision,
-        block_rows=_block_rows(query.shape[0], row_bytes),
-        compact_chunks=_COMPACT_CHUNKS,
+        block_rows=block_rows,
+        compact_chunks=_compact_chunks(block_rows),
     )
 
 
