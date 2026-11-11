@@ -714,11 +714,18 @@ class ExecutionManager:
             layer_to_cache_group=self.layer_to_cache_group,
         )
         self._sampler_vocab_size = int(self.model.config.get_text_config().vocab_size)
+        # The sampler's [rows, vocab] logits arrive replicated on every device; split its rows over the whole mesh so
+        # each device samples only its own rows (SPMD meshes only: an MPMD final stage keeps the replicated sampler).
+        sampler_row_sharding = None
+        if not bool(getattr(self.model.mesh, "is_mpmd", False)):
+            sampler_jax_mesh = getattr(self.model.mesh, "jax_mesh", self.model.mesh)
+            sampler_row_sharding = NamedSharding(sampler_jax_mesh, PartitionSpec(tuple(sampler_jax_mesh.axis_names)))
         self._sampler_executor = SamplerExecutor(
             model=self.model,
             max_model_len=self.max_model_len,
             empty_sharding=self._sampler_sharding,
             use_aot_forward=self.use_aot_forward,
+            row_sharding=sampler_row_sharding,
         )
         self._sampler_min_input_pad = 1
         # Sampler runtime (phase 11.1): CPU scratch buffers, penalty-count state,

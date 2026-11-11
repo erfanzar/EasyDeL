@@ -100,6 +100,22 @@ if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
 
 
+def _sampler_row_split(
+    row_sharding: jax.sharding.NamedSharding | None, batch_size: int
+) -> tuple[jax.sharding.NamedSharding | None, jax.sharding.NamedSharding | None]:
+    """``(rows, replicated)`` shardings of a sampler step over ``batch_size`` rows, or ``(None, None)``.
+
+    The rows are split only when ``row_sharding`` is set and ``batch_size`` divides over its mesh; ``replicated`` is
+    the same mesh's fully replicated sharding, which the per-row outputs return to.
+    """
+    if row_sharding is None:
+        return None, None
+    size = int(row_sharding.mesh.size)
+    if size <= 1 or int(batch_size) % size:
+        return None, None
+    return row_sharding, jax.sharding.NamedSharding(row_sharding.mesh, jax.sharding.PartitionSpec())
+
+
 class SamplerExecutor:
     """Compile, cache, and execute the token sampling step.
 
@@ -148,6 +164,7 @@ class SamplerExecutor:
         empty_sharding: jax.sharding.Sharding,
         use_aot_forward: bool,
         cache_capacity: int = 64,
+        row_sharding: jax.sharding.NamedSharding | None = None,
     ) -> None:
         """Initialize the SamplerExecutor.
 
@@ -163,11 +180,18 @@ class SamplerExecutor:
                 JIT compilation on first call.
             cache_capacity: Deprecated compatibility argument. Compiled
                 variants are retained until ``clear_cache()`` is called.
+            row_sharding: Optional sharding of the ``[rows, vocab]`` logits
+                over their rows (``P(all mesh axes)``). When the padded row
+                count divides over its mesh, every device samples only its own
+                rows of the replicated logits and the sampled tokens are
+                gathered back; each row's computation is unchanged. ``None``
+                samples every row on every device.
         """
         self.model = model
         self.max_model_len = int(max_model_len)
         self._empty_sharding = empty_sharding
         self.use_aot_forward = bool(use_aot_forward)
+        self._row_sharding = row_sharding
         del cache_capacity
 
         self._sampling_fn = self._build_sampling_fn()
@@ -326,6 +350,7 @@ class SamplerExecutor:
 
     def _build_greedy_sampling_fn(self) -> tp.Callable[..., tp.Any]:
         """Build an argmax-only sampler for all-greedy/no-penalty windows."""
+        row_sharding = getattr(self, "_row_sharding", None)
 
         @ejit
         def _greedy_sampling_fn(
@@ -339,6 +364,9 @@ class SamplerExecutor:
             del packed_f32
             with jax.named_scope("easydel/esurge/greedy_sampler_step"):
                 batch_size = logits.shape[0]
+                split_rows, replicated = _sampler_row_split(row_sharding, batch_size)
+                if split_rows is not None:
+                    logits = jax.lax.with_sharding_constraint(logits, split_rows)
                 i_reqs = jnp.arange(batch_size, dtype=jnp.int32)
 
                 scheduled = packed_i32[1]
@@ -357,6 +385,9 @@ class SamplerExecutor:
                 emits_next_token = seq_lens_now >= req_num_tokens_slice
                 valid_mask = (i_reqs < num_requests) & active_mask & (scheduled_slice > 0) & emits_next_token
                 out_tokens = jnp.where(valid_mask, sampled_flat, -1)
+                if replicated is not None:
+                    out_tokens = jax.lax.with_sharding_constraint(out_tokens, replicated)
+                    valid_mask = jax.lax.with_sharding_constraint(valid_mask, replicated)
                 rng_key = jax.random.fold_in(rng_key, jnp.int32(total_tokens))
                 return rng_key, out_tokens, valid_mask, token_counts_full
 
@@ -383,6 +414,7 @@ class SamplerExecutor:
                 token_counts_full,
             ) -> (updated_rng_key, sampled_tokens, valid_mask, updated_token_counts_full)
         """
+        row_sharding = getattr(self, "_row_sharding", None)
 
         @ejit
         def _sampling_fn(
@@ -409,6 +441,9 @@ class SamplerExecutor:
             """
             with jax.named_scope("easydel/esurge/sampler_step"):
                 batch_size = logits.shape[0]
+                split_rows, replicated = _sampler_row_split(row_sharding, batch_size)
+                if split_rows is not None:
+                    logits = jax.lax.with_sharding_constraint(logits, split_rows)
                 i_reqs = jnp.arange(batch_size, dtype=jnp.int32)
 
                 with jax.named_scope("easydel/esurge/sampler_step/unpack_metadata"):
@@ -547,6 +582,9 @@ class SamplerExecutor:
                         lambda counts: counts,
                         token_counts_full,
                     )
+                if replicated is not None:
+                    out_tokens = jax.lax.with_sharding_constraint(out_tokens, replicated)
+                    valid_mask = jax.lax.with_sharding_constraint(valid_mask, replicated)
                 return rng_key, out_tokens, valid_mask, token_counts_full
 
         return _sampling_fn
