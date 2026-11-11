@@ -766,7 +766,21 @@
     const engines = metrics.engine_metrics || {};
     const model = state.model;
     const engine = (model && engines[model]) || {};
-    const live = engine.aggregate || {};
+    const current = engine.aggregate || {};
+    // The engine aggregates over a 5-minute window; when it is empty, hold the last window that had requests.
+    let live = current;
+    let idleSince = null;
+    if (!(current.completed > 0)) {
+      for (let i = state.samples.length - 1; i >= 0; i--) {
+        const m = model && state.samples[i].models ? state.samples[i].models[model] : null;
+        if (m && m.aggregate && m.aggregate.completed > 0) {
+          live = m.aggregate;
+          idleSince = state.samples[i].t;
+          break;
+        }
+      }
+    }
+    const idle = idleSince === null ? "" : ` · idle since ${clock(idleSince, false)}`;
     const all = state.samples;
     const tEnd = all.length ? all[all.length - 1].t : Date.now() / 1000;
     const span = RANGES[state.range];
@@ -846,17 +860,17 @@
     bind("dec-big", num(phase ? decodeNow : null));
     bind("dec-big-d", phase ? `30 s rate · ${avgNote(phase.decode_tps)}` : "not reported by this server");
     bind("ttft-big", secs(live.ttft_p50_s));
-    bind("ttft-big-d", `p99 ${secs(live.ttft_p99_s)}`);
+    bind("ttft-big-d", `p99 ${secs(live.ttft_p99_s)}${idle}`);
     bind("hit-big", pct(live.token_cache_hit_rate));
-    bind("hit-big-d", `${tokens(live.cache_read_tokens)} prompt tokens from cache · 5 min`);
+    bind("hit-big-d", `${tokens(live.cache_read_tokens)} prompt tokens from cache · 5 min${idle}`);
 
     kpi("pre", num(phase ? prefillNow : null), "prefill-only tok/s · 30 s", prefillRate, COLOR.cyan);
     kpi("dec", num(phase ? decodeNow : null), "decode-only tok/s · 30 s", decodeRate, COLOR.violet);
     kpi("out", num(genNow), "tok/s returned · 30 s", generated, COLOR.amberSoft);
     kpi("run", int(engine.running_requests), "running in the engine", running, COLOR.amber);
     kpi("wait", int(engine.waiting_requests), "queued in the scheduler", waiting, COLOR.rose);
-    kpi("ttft", secs(live.ttft_p50_s), `p99 ${secs(live.ttft_p99_s)}`, ttftP50, COLOR.amber);
-    kpi("hit", pct(live.token_cache_hit_rate), `${pct(live.cache_hit_rate)} of requests`, tokenHit, COLOR.green);
+    kpi("ttft", secs(live.ttft_p50_s), `p99 ${secs(live.ttft_p99_s)}${idle}`, ttftP50, COLOR.amber);
+    kpi("hit", pct(live.token_cache_hit_rate), `${pct(live.cache_hit_rate)} of requests${idle}`, tokenHit, COLOR.green);
     kpi(
       "req",
       int(metrics.total_requests),
