@@ -207,13 +207,20 @@ pub fn dashboard(metrics: &ServerMetrics, refresh_seconds: u64) -> String {
         "<button class=\"kbd\" type=\"button\" data-action=\"pause\">pause</button>\
          <select data-role=\"model\" aria-label=\"model\" hidden></select></div></div><div class=\"hero-stats\">",
     );
-    big(&mut html, "out-big", "output tok/s", "—", true);
+    let phase = engine.and_then(|engine| engine.phase.as_ref());
     big(
         &mut html,
-        "run-big",
-        "running",
-        &engine.map_or_else(|| "—".to_string(), |engine| engine.running_requests.to_string()),
-        false,
+        "pre-big",
+        "prefill tok/s",
+        &optional_number(phase.and_then(|phase| phase.prefill_tps)),
+        true,
+    );
+    big(
+        &mut html,
+        "dec-big",
+        "decode tok/s",
+        &optional_number(phase.and_then(|phase| phase.decode_tps)),
+        true,
     );
     big(
         &mut html,
@@ -227,16 +234,16 @@ pub fn dashboard(metrics: &ServerMetrics, refresh_seconds: u64) -> String {
         "hit-big",
         "cache hit",
         &percent(aggregate.and_then(|agg| agg.token_cache_hit_rate)),
-        true,
+        false,
     );
     html.push_str("</div></div><div class=\"stats\">");
-    stat(&mut html, "out", "output", "—", true);
+    stat(&mut html, "pre", "prefill", "—", true);
+    stat(&mut html, "dec", "decode", "—", true);
+    stat(&mut html, "out", "output", "—", false);
     stat(&mut html, "run", "running", "—", false);
     stat(&mut html, "wait", "waiting", "—", false);
-    stat(&mut html, "dec", "decode", "—", false);
     stat(&mut html, "ttft", "ttft p50", "—", false);
-    stat(&mut html, "lat", "latency p50", "—", false);
-    stat(&mut html, "hit", "cache hit", "—", true);
+    stat(&mut html, "hit", "cache hit", "—", false);
     stat(&mut html, "req", "requests", &metrics.total_requests.to_string(), false);
     html.push_str("</div></div>");
 
@@ -244,20 +251,30 @@ pub fn dashboard(metrics: &ServerMetrics, refresh_seconds: u64) -> String {
         &mut html,
         "throughput",
         "01",
-        "Tokens <em>out</em>",
-        "Generated tokens per second from the server's counter (30 s trailing rate), the engine's output rate over its \
-         5-minute window, per-request decode speed, prefill speed and request rate.",
+        "Prefill <em>and</em> decode",
+        "The engine splits every step it runs: prompt tokens the step computes count as prefill, everything else as \
+         decode. The 30 s lines are trailing rates of the engine's step counters; the 5-minute lines are its windowed \
+         averages, which include idle time.",
     );
     html.push_str("<div class=\"grid\">");
-    chart(&mut html, "gen", "generation throughput", true, "");
     chart(
         &mut html,
         "prefill",
-        "prefill tok/s · 5 min",
+        "prefill only · tok/s",
         false,
-        "Uncached prompt tokens over time to first token. TTFT includes queueing, so this is a lower bound.",
+        "Prompt tokens computed per second. Prefix-cache hits are not counted. Dashed: one request's prompt tokens over \
+         its time to first token, which includes queueing.",
     );
+    chart(
+        &mut html,
+        "decode",
+        "decode only · tok/s",
+        false,
+        "Generated tokens computed per second across all running requests. Dashed: the speed of one request.",
+    );
+    chart(&mut html, "gen", "generation throughput", true, "");
     chart(&mut html, "reqrate", "request rate", false, "");
+    meters(&mut html, "phase", "engine step mix · 5 min");
     html.push_str("</div>");
     section_end(&mut html);
 
@@ -463,7 +480,8 @@ mod tests {
               "token_cache_hit_rate":0.5,"ttft_p50_s":null,"ttft_p99_s":2.1},
               "recent_requests":[{"request_id":"chat-<b>0123456789abcdef0123","finish_reason":"stop",
               "prompt_tokens":332,"completion_tokens":31,"ttft_s":1.88,"cache_hit":true,"cache_read_tokens":256,
-              "uncached_input_tokens":76},{"request_id":"short","cache_hit":false,"error":"<boom>"}]}},
+              "uncached_input_tokens":76},{"request_id":"short","cache_hit":false,"error":"<boom>"}],
+              "phase":{"prefill_tps":2048.0,"decode_tps":310.5}}},
               "auth_stats":{"active_keys":1,"total_keys":1}}"#,
         )
         .unwrap()
@@ -475,6 +493,7 @@ mod tests {
         for id in [
             "gen",
             "prefill",
+            "decode",
             "reqrate",
             "conc",
             "lengths",
@@ -493,6 +512,9 @@ mod tests {
             assert!(html.contains(&format!("data-chart=\"{id}\"")), "missing chart {id}");
         }
         assert!(html.contains("data-refresh=\"5\""));
+        assert!(html.contains("data-k=\"pre-big\">2048<"));
+        assert!(html.contains("data-k=\"dec-big\">310.5<"));
+        assert!(html.contains("data-meters=\"phase\""));
         assert!(html.contains("01h 02m 05s"));
         assert!(html.contains("50.0%"));
         assert!(html.contains("<td class=\"num\">256</td><td class=\"num\">76</td>"));

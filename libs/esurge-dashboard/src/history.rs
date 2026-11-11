@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use serde::Serialize;
 
-use crate::metrics::{Aggregate, RecentRequest, ServerMetrics};
+use crate::metrics::{Aggregate, Phase, RecentRequest, ServerMetrics};
 
 /// Snapshots closer together than this are recorded once, so several open browsers do not multiply the history.
 pub const MIN_SAMPLE_INTERVAL_SECONDS: f64 = 1.0;
@@ -36,6 +36,7 @@ pub struct ModelSample {
     pub running_requests: u64,
     pub waiting_requests: u64,
     pub aggregate: Aggregate,
+    pub phase: Option<Phase>,
 }
 
 /// A completed request, logged once the first time it appears in a model's `recent_requests`.
@@ -121,6 +122,7 @@ impl History {
                             running_requests: engine.running_requests,
                             waiting_requests: engine.waiting_requests,
                             aggregate: engine.aggregate.clone(),
+                            phase: engine.phase.clone(),
                         };
                         (name.clone(), sample)
                     })

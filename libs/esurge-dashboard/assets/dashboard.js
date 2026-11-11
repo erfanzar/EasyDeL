@@ -805,6 +805,26 @@
     const latencyP99 = agg("latency_p99_s");
     const tokenHit = agg("token_cache_hit_rate");
     const requestHit = agg("cache_hit_rate");
+    const phaseOf = (sample) => {
+      const m = per(sample);
+      return m && m.phase ? m.phase : null;
+    };
+    const phaseField = (key) =>
+      take((sample) => {
+        const p = phaseOf(sample);
+        return p ? p[key] : null;
+      });
+    const prefillRate = rate((sample) => {
+      const p = phaseOf(sample);
+      return p ? p.prefill_tokens_total : null;
+    });
+    const decodeRate = rate((sample) => {
+      const p = phaseOf(sample);
+      return p ? p.decode_tokens_total : null;
+    });
+    const prefillAvg = phaseField("prefill_tps");
+    const decodeAvg = phaseField("decode_tps");
+    const phase = engine.phase || null;
 
     const requests = state.requests.filter((r) => r.model === model && r.seen_at >= t0);
     const completed = requests.filter((r) => !r.error);
@@ -818,21 +838,24 @@
     if (model) bind("model", model);
 
     const genNow = lastValue(generated);
-    bind("out-big", num(genNow));
-    bind("out-big-d", `engine ${num(live.output_tps)} tok/s · 5 min`);
-    bind("run-big", int(engine.running_requests));
-    bind("run-big-d", `${int(engine.waiting_requests)} waiting · ${int(metrics.active_requests)} http in flight`);
+    const prefillNow = lastValue(prefillRate);
+    const decodeNow = lastValue(decodeRate);
+    const avgNote = (v) => `${num(v)} tok/s avg · 5 min`;
+    bind("pre-big", num(phase ? prefillNow : null));
+    bind("pre-big-d", phase ? `30 s rate · ${avgNote(phase.prefill_tps)}` : "not reported by this server");
+    bind("dec-big", num(phase ? decodeNow : null));
+    bind("dec-big-d", phase ? `30 s rate · ${avgNote(phase.decode_tps)}` : "not reported by this server");
     bind("ttft-big", secs(live.ttft_p50_s));
     bind("ttft-big-d", `p99 ${secs(live.ttft_p99_s)}`);
     bind("hit-big", pct(live.token_cache_hit_rate));
     bind("hit-big-d", `${tokens(live.cache_read_tokens)} prompt tokens from cache · 5 min`);
 
-    kpi("out", num(genNow), "tok/s generated · 30 s", generated, COLOR.amberSoft);
+    kpi("pre", num(phase ? prefillNow : null), "prefill-only tok/s · 30 s", prefillRate, COLOR.cyan);
+    kpi("dec", num(phase ? decodeNow : null), "decode-only tok/s · 30 s", decodeRate, COLOR.violet);
+    kpi("out", num(genNow), "tok/s returned · 30 s", generated, COLOR.amberSoft);
     kpi("run", int(engine.running_requests), "running in the engine", running, COLOR.amber);
     kpi("wait", int(engine.waiting_requests), "queued in the scheduler", waiting, COLOR.rose);
-    kpi("dec", num(live.decode_tps), "tok/s per request · 5 min", decodeTps, COLOR.violet);
     kpi("ttft", secs(live.ttft_p50_s), `p99 ${secs(live.ttft_p99_s)}`, ttftP50, COLOR.amber);
-    kpi("lat", secs(live.latency_p50_s), `p99 ${secs(live.latency_p99_s)}`, latencyP50, COLOR.blue);
     kpi("hit", pct(live.token_cache_hit_rate), `${pct(live.cache_hit_rate)} of requests`, tokenHit, COLOR.green);
     kpi(
       "req",
@@ -859,9 +882,39 @@
       x,
       fmt: tps,
       axisFmt: num,
-      series: [{ name: "prefill · 5 min", color: COLOR.cyan, area: true, points: prefillTps }],
+      series: [
+        { name: "prefill · 30 s", color: COLOR.cyan, area: true, points: prefillRate },
+        { name: "avg · 5 min", color: COLOR.blue, points: prefillAvg },
+        { name: "per request (prompt / ttft)", color: COLOR.grey, dashed: true, points: prefillTps },
+      ],
     });
-    bind("prefill-v", tps(live.prefill_tps));
+    bind("prefill-v", tps(phase ? prefillNow : live.prefill_tps));
+    put("decode", {
+      x,
+      fmt: tps,
+      axisFmt: num,
+      series: [
+        { name: "decode · 30 s", color: COLOR.violet, area: true, points: decodeRate },
+        { name: "avg · 5 min", color: COLOR.blue, points: decodeAvg },
+        { name: "per request", color: COLOR.grey, dashed: true, points: decodeTps },
+      ],
+    });
+    bind("decode-v", tps(phase ? decodeNow : live.decode_tps));
+    if (phase) {
+      const steps = phase.steps || 0;
+      const tokensIn = (phase.prefill_tokens || 0) + (phase.decode_tokens || 0);
+      meters("phase", [
+        { name: "prefill-only steps", frac: steps ? phase.prefill_steps / steps : 0, text: int(phase.prefill_steps), color: COLOR.cyan },
+        { name: "decode-only steps", frac: steps ? phase.decode_steps / steps : 0, text: int(phase.decode_steps), color: COLOR.violet },
+        { name: "mixed steps", frac: steps ? phase.mixed_steps / steps : 0, text: int(phase.mixed_steps), color: COLOR.amberSoft },
+        { name: "prefill tokens", frac: tokensIn ? phase.prefill_tokens / tokensIn : 0, text: tokens(phase.prefill_tokens), color: COLOR.cyan },
+        { name: "decode tokens", frac: tokensIn ? phase.decode_tokens / tokensIn : 0, text: tokens(phase.decode_tokens), color: COLOR.violet },
+      ]);
+      bind("phase-v", `${int(phase.steps)} steps`);
+    } else {
+      meters("phase", []);
+      bind("phase-v", "not reported");
+    }
     const perSecond = (v) => `${num(v)}/s`;
     put("reqrate", {
       x,
