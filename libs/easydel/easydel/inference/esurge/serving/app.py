@@ -146,9 +146,10 @@ def _serve(config: ServingConfig) -> None:
     started = time.monotonic()
     import jax
 
-    if config.compilation_cache_dir:
-        jax.config.update("jax_compilation_cache_dir", config.compilation_cache_dir)
     import easydel as ed  # joins the multi-host JAX world (TPU slices are detected from GCE metadata)
+    from easydel.utils.compilation_cache import cache_namespace, configure_compilation_cache
+
+    configure_compilation_cache(cache_namespace(config.model.checkpoint), explicit=config.compilation_cache_dir)
 
     world_size = int(jax.process_count())
     rank = int(jax.process_index())

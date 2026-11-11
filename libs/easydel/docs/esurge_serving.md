@@ -53,8 +53,16 @@ See `examples/inference/glm53_flash_w8a8_serving.yaml`. Sections:
 - `server`: `host` (`internal` = this VM's VPC address, the default), `port`, `api_key_file`, `log_level`,
   `max_concurrent_generations`.
 - `coordination`: `control_port`, `bind_host` (`internal`), `heartbeat_timeout_s`, `token_timeout_s`.
-- `compilation_cache_dir`: JAX persistent compilation cache. Use shared storage (`gs://…`) that every host can
-  read; see below.
+- `compilation_cache_dir`: JAX persistent compilation cache. Optional. Resolution order (also used by a plain
+  `eSurge(...)` in library code, `easydel.utils.compilation_cache`):
+  1. this setting, when given;
+  2. a directory JAX already has (`JAX_COMPILATION_CACHE_DIR`);
+  3. on Google Cloud, `gs://easydel-caching-<region>-<project number>/jax-<jax version>/<model>`, with the bucket
+     created on first use in the VM's project and region (uniform access, public access prevented, 90-day object
+     lifetime). A bucket of that name owned by another project is refused, because JAX runs the executables it
+     finds in its cache. If the bucket cannot be created or read (e.g. the service account lacks
+     `storage.buckets.create`), a warning is logged and the engine compiles without a shared cache;
+  4. otherwise no persistent cache.
 
 **Pin the KV pool.** Without `cache.max_cache_tokens` the page pool is sized from free HBM, which differs by a few
 hundred pages between launches. The page count is part of every compiled program's shape, so an unpinned pool

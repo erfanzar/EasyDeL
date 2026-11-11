@@ -593,6 +593,11 @@ class eSurge:
         loading_data["processor"] = processor
         self.loading_kwargs = PreTrainedLoading.coerce_config(loading_data)
 
+        # Before anything compiles: a directory the user set wins; on Google Cloud an owned regional bucket is used.
+        from easydel.utils.compilation_cache import cache_namespace, configure_compilation_cache
+
+        self.compilation_cache_dir = configure_compilation_cache(cache_namespace(model))
+
         if isinstance(drafter, Mapping):
             if drafter_config is not None:
                 raise ValueError("Pass either `drafter` as a config mapping or `drafter_config`, not both.")

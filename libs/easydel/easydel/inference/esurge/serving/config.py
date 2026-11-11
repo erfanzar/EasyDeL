@@ -189,7 +189,9 @@ class ServingConfig:
         esurge: Engine sections (``runtime``, ``cache``, ...) for :class:`eSurgeConfig`.
         server: HTTP server.
         coordination: Multi-host control plane.
-        compilation_cache_dir: JAX persistent compilation cache directory, or ``None`` to leave JAX's setting.
+        compilation_cache_dir: JAX persistent compilation cache directory. ``None`` keeps a directory JAX already
+            has and otherwise, on Google Cloud, uses an owned regional bucket automatically
+            (:mod:`easydel.utils.compilation_cache`).
     """
 
     model: ModelSpec
