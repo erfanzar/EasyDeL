@@ -869,9 +869,7 @@ class eSurge:
             on_stop_strings=self._enqueue_parser_stop_requests,
             on_activity=self._touch_activity,
             on_fatal=self._on_output_worker_fatal,
-            prefix_cache_page_size=(
-                int(self.cache_config.page_size) if self.cache_config.enable_prefix_caching else 0
-            ),
+            prefix_cache_page_size=(int(self.cache_config.page_size) if self.cache_config.enable_prefix_caching else 0),
         )
 
         # Request admission: prompt -> admission records for the engine core.
