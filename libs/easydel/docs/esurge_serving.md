@@ -141,6 +141,18 @@ from the prefix cache), 180 s per level, no errors:
 | 32 | 1,129 | 0.25 / 0.51 s | 14.5 / 14.8 s |
 | 128 | 1,705 | 0.33 / 2.7 s | 32.4 / 49.9 s |
 
+Long context: one wave of ~83K-token prompts (unique per request, no prefix-cache hits) with 8,192 forced output
+tokens (`ignore_eos`), streamed:
+
+| concurrency | output tok/s | TTFT p50 / max | decode tok/s per request (p50 / min) | longest stream stall | latency |
+|---|---|---|---|---|---|
+| 1 | 43 | 10.8 / 10.8 s | 45.5 / 45.5 | 0.07 s | 191 s |
+| 8 | 288 | 19.7 / 19.7 s | 39.4 / 38.6 | 3.8 s | 228 s |
+| 32 | 835 | 50.6 / 81.2 s | 31.1 / 27.4 | 3.9 s | 314 s |
+
+Prefill and decode share every step: while a long prompt prefills, every running stream on the slice pauses (the
+3.8 s stalls), and TTFT at 32 is bounded by about 33K prefill tokens/s across the slice.
+
 DP routing sends a request to the worker that already holds its prompt prefix while that worker has a free row,
 otherwise to the least-loaded worker with room. A shared system prompt therefore fills one DP worker before spreading
 (at concurrency 32 all requests ran on one worker); at 128 every worker is busy.
