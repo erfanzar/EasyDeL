@@ -461,6 +461,77 @@ def _deferred_window_rows(total_rows: int, ep_size: int, override: int | None) -
     return min(rows, total_rows)
 
 
+def _reduce_scatter(
+    x: jax.Array,
+    axis_name: str | tuple[str, ...],
+    axis_size: int,
+    scatter_dimension: int,
+    out_dtype=None,
+    *,
+    wire_dtype=None,
+) -> jax.Array:
+    """Sum ``x`` over ``axis_name`` inside ``shard_map`` and keep this shard's block along ``scatter_dimension``.
+
+    The value of ``jax.lax.psum_scatter(x.astype(wire_dtype), axis_name, scatter_dimension=..., tiled=True)`` up to
+    the summation order and roundings, in ``out_dtype`` (default ``x.dtype``). For a 2-D ``x`` over one mesh axis whose
+    size divides the scattered dimension, with an even other dimension, the sum runs as two rings of
+    ``jax.lax.ppermute`` steps in opposite directions, each carrying half of the other dimension, so both directions
+    of every link move data at once. Each step reads its block of ``x`` in place and adds in float32; only the running
+    sums that travel are rounded to ``wire_dtype`` (default ``x.dtype``), so a float32 ``x`` is never converted whole,
+    and the last addition is not rounded. Otherwise ``psum_scatter`` of ``x`` in ``wire_dtype``.
+
+    Measured on one TPU v5p host (4 chips, 42 calls in one program), ms per call with ``psum_scatter`` / the rings:
+    bfloat16 ``[T, 4096]`` scattered on the hidden dimension at T = 256 / 2,048 / 8,192 / 32,768 tokens: 0.0322 /
+    0.0304, 0.1388 / 0.0983, 0.5626 / 0.3234, 2.2215 / 1.2854; float32 ``[T, 1024]`` scattered on rows: 0.0268 /
+    0.0256, 0.0749 / 0.0605, 0.4185 / 0.1746, 1.5829 / 0.6554. A ring in one direction took 2.620 ms at the largest
+    bfloat16 shape. Across hosts the rings lose: in the 16-chip (4-host) serving step of 32,768 tokens the expert-axis
+    sum spent 32.67 ms waiting on and 29.86 ms starting its ring permutes per step against 51.93 ms for the fused
+    ``psum_scatter``, so the deferred dispatch uses the rings for its tensor-parallel reduction only.
+
+    Args:
+        x: This shard's partial sums.
+        axis_name: Mesh axis (or a one-element tuple of it) to sum over.
+        axis_size: Size of that axis.
+        scatter_dimension: Dimension of ``x`` split into ``axis_size`` blocks; shard ``i`` keeps block ``i``.
+        out_dtype: Result dtype (default ``x.dtype``).
+        wire_dtype: Dtype of the data sent between shards (default ``x.dtype``).
+
+    Returns:
+        Block ``i`` of the sum over the axis, in ``out_dtype``.
+    """
+    out_dtype = jnp.dtype(out_dtype or x.dtype)
+    wire_dtype = jnp.dtype(wire_dtype or x.dtype)
+    name = axis_name[0] if isinstance(axis_name, tuple) and len(axis_name) == 1 else axis_name
+    n = int(axis_size)
+    other = 1 - scatter_dimension
+    if not isinstance(name, str) or x.ndim != 2 or n < 2 or x.shape[scatter_dimension] % n or x.shape[other] % 2:
+        return jax.lax.psum_scatter(
+            x.astype(wire_dtype), axis_name, scatter_dimension=scatter_dimension, tiled=True
+        ).astype(out_dtype)
+    size = x.shape[scatter_dimension] // n
+    half = x.shape[other] // 2
+    index = jax.lax.axis_index(name)
+
+    def block(lead: int, j) -> jax.Array:
+        """Half ``lead`` of the other dimension and block ``j`` of the scattered one, read from ``x`` in place."""
+        starts, sizes = [0, 0], [0, 0]
+        starts[other], sizes[other] = lead * half, half
+        starts[scatter_dimension], sizes[scatter_dimension] = j * size, size
+        return jax.lax.dynamic_slice(x, starts, sizes).astype(jnp.float32)
+
+    def ring(lead: int, step: int) -> jax.Array:
+        # Shard i starts from its block i - step; each step it receives the running sum of shard i - step and adds
+        # its own block i - step * (s + 2), so after n - 1 steps it holds the sum of block i over every shard.
+        perm = [(j, (j + step) % n) for j in range(n)]
+        acc = block(lead, (index - step) % n)
+        for s in range(n - 1):
+            acc = jax.lax.ppermute(acc.astype(wire_dtype), name, perm).astype(jnp.float32)
+            acc = acc + block(lead, (index - step * (s + 2)) % n)
+        return acc.astype(out_dtype)
+
+    return jnp.concatenate([ring(0, 1), ring(1, -1)], axis=other)
+
+
 def _expert_axis_sum(
     partial: jax.Array, ep_axes: tuple[str, ...], ep_size: int, dtype, *, gather_rounded: bool
 ) -> jax.Array:
@@ -2799,9 +2870,9 @@ class BaseMoeModule(spx.Module, ABC):
             replicated over the expert axis. One stable sort puts this shard's ``(token, expert)`` pairs first,
             grouped by local expert (the default dispatch's row order); one gather builds the expert rows; the FFN
             runs without its per-row TP ``psum_scatter``; one gather-combine sums each token's local rows in fp32;
-            and the ``[tokens, H]`` partial is reduced once: ``psum_scatter`` over TP then ``psum`` over the expert
-            axis, or a single ``psum`` over both under the decode-replicated boundary (which then needs no output
-            all-gather). Against the default dispatch this drops the ``local_permute`` sort and gather, the
+            and the ``[tokens, H]`` partial is reduced once: a reduce-scatter over TP (``_reduce_scatter``, two
+            ppermute rings) then the expert-axis sum (``_expert_axis_sum``), or a single ``psum`` over both under
+            the decode-replicated boundary (which then needs no output all-gather). Against the default dispatch this drops the ``local_permute`` sort and gather, the
             placement gather, and the TP reduction of the top-k-expanded ``[tokens * k, H]`` rows. When the static
             row window (``_deferred_window_rows``: ``5/4`` of one shard's expected ``tokens * k / ep`` local rows
             rounded up to 1024, or ``moe_local_ffn_window_rows``) is shorter than ``tokens * k``, the gather, FFN
@@ -2894,10 +2965,9 @@ class BaseMoeModule(spx.Module, ABC):
             if tp_size > 1:
                 # The TP reduction moves the combined [tokens, H] partial in the activation dtype, as the default
                 # dispatch does for its top-k-expanded rows; the expert-axis sum stays fp32 like
-                # ``replicated_expert_psum_unpermute``.
-                partial = jax.lax.psum_scatter(
-                    partial.astype(self.dtype), tensor_axis_name, scatter_dimension=1, tiled=True
-                ).astype(jnp.float32)
+                # ``replicated_expert_psum_unpermute``. The TP reduction runs as ppermute rings that read the fp32
+                # partial in place and send activation-dtype running sums (``_reduce_scatter``).
+                partial = _reduce_scatter(partial, tensor_axis_name, tp_size, 1, jnp.float32, wire_dtype=self.dtype)
             if ep_size > 1:
                 out = _expert_axis_sum(
                     partial, ep_axes, ep_size, self.dtype, gather_rounded=not inference_mode_forces_decode()

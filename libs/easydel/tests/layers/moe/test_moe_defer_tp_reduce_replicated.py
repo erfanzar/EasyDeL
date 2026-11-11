@@ -25,8 +25,10 @@ combined ``[tokens, H]`` partial once. On four TPU devices these tests pin:
 * outputs match an independent float64 NumPy reference of GLM-5's routed experts,
 * each equivalence case really ran the deferred dispatch: its lowering differs from the default dispatch's (a gate
   fallback lowers the identical program, as the outside-inference-mode case pins), it never reduce-scatters the
-  top-k-expanded ``[tokens * k, H]`` rows, it reduce-scatters ``[tokens, H]`` rows in the TP-scattered layout and it
-  drops the boundary all-gather in the decode layout,
+  top-k-expanded ``[tokens * k, H]`` rows, in the TP-scattered layout it reduces the combined ``[tokens, H]`` rows
+  over TP with two ppermute rings (collective-permutes of half the tokens; the float32 expert-axis sum of bfloat16
+  activations keeps its reduce-scatter) and it drops the
+  boundary all-gather in the decode layout,
 * with row windows (``moe_local_ffn_window_rows`` forced, or enough routed rows that the automatic window is shorter
   than ``tokens * k``) the dispatch computes only each shard's local rows, window by window, and stays dropless:
   several windows per shard, a padded last window and routing that sends every route to one expert shard all match
@@ -69,6 +71,7 @@ SKEW_TOKENS = 1024
 # ``_forward(defer=FROM_CONFIG)`` leaves ``moe_defer_tp_reduce`` as the config was constructed.
 FROM_CONFIG = object()
 _REDUCE_SCATTER = re.compile(r"stablehlo\.reduce_scatter.*?\}\)\s*:\s*\(tensor<((?:\d+x)+)(\w+)>\)", re.S)
+_PERMUTE = re.compile(r'"stablehlo\.collective_permute"\([^)]*\)\s*<\{.*?\}>\s*:\s*\(tensor<((?:\d+x)+)(\w+)>\)')
 
 
 def _skip_without_four_devices():
@@ -179,6 +182,11 @@ def _reduce_scatter_operands(text: str) -> set[tuple[int, str]]:
     return {(int(dims.split("x")[0]), dtype) for dims, dtype in _REDUCE_SCATTER.findall(text)}
 
 
+def _permute_operands(text: str) -> set[tuple[int, str]]:
+    """``(leading dim, element type)`` of every collective-permute operand in a lowered forward."""
+    return {(int(dims.split("x")[0]), dtype) for dims, dtype in _PERMUTE.findall(text)}
+
+
 def _assert_deferred_lowering(
     text_default: str, text_deferred: str, *, mesh: str, decode: bool, tokens: int = TOKENS
 ) -> None:
@@ -195,7 +203,12 @@ def _assert_deferred_lowering(
         if tp > 1:
             assert "stablehlo.all_gather" in text_default, "the default decode dispatch has no boundary all-gather"
     elif tp > 1:
-        assert deferred_rows == {tokens}, f"deferred dispatch should reduce-scatter [tokens, H] rows: {deferred_rows}"
+        # The TP reduction of the combined [tokens, H] rows runs as two ppermute rings, each over half the tokens; the
+        # only reduce-scatter left is the float32 expert-axis sum of bfloat16 activations, over [tokens, H / tp] rows.
+        deferred_ops = _reduce_scatter_operands(text_deferred)
+        assert deferred_ops <= {(tokens, "f32")}, f"deferred dispatch should reduce over TP by rings: {deferred_ops}"
+        permuted = {rows for rows, _ in _permute_operands(text_deferred)}
+        assert tokens // 2 in permuted, f"deferred dispatch should permute [tokens / 2, H / tp] rows: {permuted}"
         assert tokens * TOPK in default_rows, f"default dispatch should reduce-scatter [tokens*k, H]: {default_rows}"
 
 
@@ -238,10 +251,13 @@ def test_deferred_dispatch_matches_default_bf16_w8a8(decode):
     out_deferred, text_deferred = _forward(block, x, defer=True, decode=decode)
     _assert_deferred_lowering(text_default, text_deferred, mesh="ep2tp2", decode=decode)
     if not decode:
-        # The combined partial is reduce-scattered over TP in bfloat16, as the default does with its expanded rows, and
-        # then over the expert axis in float32 into token slices that are gathered back in bfloat16.
+        # The float32 combined partial is reduced over TP by ppermute rings that send bfloat16 running sums, as the
+        # default sends its expanded rows in bfloat16, then over the expert axis by a float32 reduce-scatter into
+        # token slices that are gathered back in bfloat16.
         deferred_ops = _reduce_scatter_operands(text_deferred)
-        assert deferred_ops == {(TOKENS, "bf16"), (TOKENS, "f32")}, deferred_ops
+        assert deferred_ops == {(TOKENS, "f32")}, deferred_ops
+        permuted = _permute_operands(text_deferred)
+        assert (TOKENS // 2, "bf16") in permuted and (TOKENS // 2, "f32") not in permuted, permuted
         assert "stablehlo.all_gather" in text_deferred, "the bfloat16 expert-axis gather is missing"
         assert (TOKENS * TOPK, "bf16") in _reduce_scatter_operands(text_default)
     assert np.isfinite(out_deferred).all() and float(np.max(np.abs(out_default))) > 0
@@ -249,7 +265,7 @@ def test_deferred_dispatch_matches_default_bf16_w8a8(decode):
     assert rel < BF16_REL_TOL, rel
 
 
-def test_deferred_dispatch_reduce_scatters_combined_rows():
+def test_deferred_dispatch_reduces_combined_rows():
     _skip_without_four_devices()
     block = _build(MESHES["ep2tp2"])
     x = _x()
@@ -257,9 +273,11 @@ def test_deferred_dispatch_reduce_scatters_combined_rows():
     _, text_deferred = _forward(block, x, defer=True)
     default_rows = {rows for rows, _ in _reduce_scatter_operands(text_default)}
     deferred_rows = {rows for rows, _ in _reduce_scatter_operands(text_deferred)}
+    permuted = {rows for rows, _ in _permute_operands(text_deferred)}
     assert TOKENS * TOPK in default_rows, f"default dispatch should reduce [tokens*k, H] rows, saw {default_rows}"
-    assert TOKENS in deferred_rows, f"deferred dispatch should reduce [tokens, H] rows, saw {deferred_rows}"
+    assert TOKENS // 2 in permuted, f"deferred dispatch should reduce [tokens, H] rows in halves, saw {permuted}"
     assert TOKENS * TOPK not in deferred_rows, f"deferred dispatch still reduces expanded rows: {deferred_rows}"
+    assert TOKENS * TOPK // 2 not in permuted, f"deferred dispatch still moves expanded rows: {permuted}"
 
 
 def test_knob_is_inert_outside_inference_mode():
