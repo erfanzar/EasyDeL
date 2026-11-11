@@ -67,6 +67,11 @@ def _tokenizer_worker(endpoint: str, tokenizer_path: str, tokenizer_kwargs: dict
                     if token_ids and isinstance(token_ids[0], list):
                         token_ids = token_ids[0]
                     socket.send_pyobj({"status": "ok", "tokens": list(token_ids)})
+                elif cmd == "tokenize_batch":
+                    # One call over the whole list: the fast tokenizer encodes the prompts in parallel, and each
+                    # prompt's ids equal those of its own ``tokenize`` call.
+                    encoded = tokenizer(list(message["prompts"]), return_tensors=None)
+                    socket.send_pyobj({"status": "ok", "tokens": [list(ids) for ids in encoded["input_ids"]]})
                 elif cmd == "drain":
                     socket.send_pyobj({"status": "ok"})
                 elif cmd == "shutdown":

@@ -66,6 +66,9 @@ class _OutOfOrderEngine(eSurge):
     def _tokenize_prompt(self, request_id, prompt):
         return [1, 2, 3]
 
+    def _tokenize_prompts(self, request_ids, prompts):
+        return [[1, 2, 3] for _ in prompts]
+
     def _prepare_sampling_params_for_request(self, base, *, request_id, prompt):
         return base
 

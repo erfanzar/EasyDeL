@@ -1358,6 +1358,24 @@ class eSurge:
         """
         return self._tokenizer_client.tokenize(request_id, prompt)
 
+    def _tokenize_prompts(self, request_ids: list[str], prompts: list[str]) -> list[list[int]]:
+        """Tokenize a batch of prompts, in order, through the worker pipeline.
+
+        One prompt goes through :meth:`_tokenize_prompt`. Several go to the worker as batched requests, so a
+        ``generate`` call of many long prompts pays a few round trips and one parallel encode instead of one serial
+        round trip per prompt; each prompt's ids equal those of its own :meth:`_tokenize_prompt` call.
+
+        Args:
+            request_ids: Request IDs, aligned with ``prompts``.
+            prompts: Text prompts.
+
+        Returns:
+            One token-id list per prompt.
+        """
+        if len(prompts) == 1:
+            return [self._tokenize_prompt(request_ids[0], prompts[0])]
+        return self._tokenizer_client.tokenize_batch(list(prompts))
+
     @staticmethod
     def _compute_snapshot_delta_text(current_text: str, previous_text: str, fallback_delta: str) -> str:
         """Compute a safe streaming delta from accumulated text snapshots.
@@ -3177,11 +3195,10 @@ class eSurge:
 
         defer_batch_enqueue = len(prompts) > 1
         deferred_scheduler_requests = []
+        if prompt_token_ids is None:
+            prompt_token_ids = self._tokenize_prompts(request_ids, prompts)
         for index, (prompt, req_id) in enumerate(zip(prompts, request_ids, strict=True)):
-            if prompt_token_ids is None:
-                prompt_tokens = self._tokenize_prompt(req_id, prompt)
-            else:
-                prompt_tokens = prompt_token_ids[index]
+            prompt_tokens = prompt_token_ids[index]
             effective_params = self._prepare_sampling_params_for_request(
                 base_sampling_params,
                 request_id=req_id,

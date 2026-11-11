@@ -140,8 +140,9 @@ def test_spawn_overrides_model_environment_without_mutating_parent(monkeypatch):
     assert {name: os.environ[name] for name in inherited} == inherited
 
 
-def test_script_worker_serves_with_inherited_distributed_initialization(tmp_path):
-    """Run the real CLI/registry/ZMQ loop, guarding JAX imports before dispatch."""
+def test_script_worker_serves_with_inherited_distributed_initialization(tmp_path, monkeypatch):
+    """Run the real CLI/registry/ZMQ loop, guarding JAX imports before dispatch; batched tokenization through the
+    client keeps prompt order across its size-bounded requests."""
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
     from transformers import PreTrainedTokenizerFast
@@ -200,6 +201,15 @@ runpy.run_path(worker_path, run_name='__main__')
         try:
             socket.send_pyobj({"cmd": "tokenize", "prompt": "hello"})
             assert socket.recv_pyobj() == {"status": "ok", "tokens": [1]}
+            from easydel.workers.esurge.pipeline import zmq_workers
+
+            # Two prompts per request: three prompts take two round trips and come back in prompt order.
+            monkeypatch.setattr(zmq_workers, "_BATCH_MAX_PROMPTS", 2)
+            client = zmq_workers.TokenizerWorkerClient(endpoint, request_timeout=45.0)
+            try:
+                assert client.tokenize_batch(["hello", "bye", "hello"]) == [[1], [0], [1]]
+            finally:
+                client.close()
             socket.send_pyobj({"cmd": "shutdown"})
             assert socket.recv_pyobj() == {"status": "ok"}
             stdout, stderr = process.communicate(timeout=15)

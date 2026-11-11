@@ -24,6 +24,28 @@ import threading
 
 import zmq
 
+_BATCH_MAX_PROMPTS = 64
+"""Most prompts in one ``tokenize_batch`` request."""
+
+_BATCH_MAX_CHARS = 4_000_000
+"""Character budget of one ``tokenize_batch`` request (about 0.7M tokens of source text); a longer prompt goes alone."""
+
+
+def _prompt_chunks(prompts: list[str]) -> list[list[str]]:
+    """Split ``prompts``, in order, into chunks within ``_BATCH_MAX_PROMPTS`` and ``_BATCH_MAX_CHARS``."""
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    size = 0
+    for prompt in prompts:
+        if current and (len(current) >= _BATCH_MAX_PROMPTS or size + len(prompt) > _BATCH_MAX_CHARS):
+            chunks.append(current)
+            current, size = [], 0
+        current.append(prompt)
+        size += len(prompt)
+    if current:
+        chunks.append(current)
+    return chunks
+
 
 class TokenizerWorkerClient:
     """Thread-safe client for the bundled HuggingFace ``AutoTokenizer`` worker."""
@@ -70,6 +92,23 @@ class TokenizerWorkerClient:
         if resp.get("status") != "ok":
             raise RuntimeError(resp.get("message", "Tokenizer worker failed"))
         return resp["tokens"]
+
+    def tokenize_batch(self, prompts: list[str]) -> list[list[int]]:
+        """Encode several prompts, in order, in as few round trips as the per-request size budget allows.
+
+        Prompts go to the worker in chunks of at most ``_BATCH_MAX_PROMPTS`` prompts and about ``_BATCH_MAX_CHARS``
+        characters (a chunk always holds at least one prompt), so one request stays far inside the request deadline.
+        Each prompt's ids equal those of :meth:`tokenize`.
+        """
+        tokens: list[list[int]] = []
+        for chunk in _prompt_chunks(prompts):
+            resp = self._request({"cmd": "tokenize_batch", "prompts": chunk})
+            if resp.get("status") != "ok":
+                raise RuntimeError(resp.get("message", "Tokenizer worker failed"))
+            if len(resp["tokens"]) != len(chunk):
+                raise RuntimeError(f"Tokenizer worker returned {len(resp['tokens'])} encodings for {len(chunk)} prompts")
+            tokens.extend(resp["tokens"])
+        return tokens
 
     def drain(self) -> None:
         """Acknowledge a drain; prompt tokenization is stateless."""
