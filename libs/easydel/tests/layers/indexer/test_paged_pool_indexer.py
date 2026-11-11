@@ -318,6 +318,62 @@ def test_replicated_small_step_page_update_is_bitwise(monkeypatch):
     np.testing.assert_array_equal(replicated[2], row_split[2], err_msg="pool pages")
 
 
+@pytest.mark.parametrize("mesh_devices", [None, 4], ids=["no_mesh", "mesh4"])
+def test_page_granular_update_is_bitwise(monkeypatch, mesh_devices):
+    """Steps written one page at a time (``_pool_page_update_by_page``) leave the same token and pool pages, and select
+    the same pools, as the row update, over the multi-step schedule (chunked prefill, idle rows, decode across pool and
+    page boundaries, padding rows)."""
+    from easydel.layers.indexer import _paged
+
+    kernel_mesh = _kernel_mesh(mesh_devices)
+    kpool, topk, dim = 4, 12, 128
+    indexer = _indexer(kpool, topk, dim)
+    steps = _schedule()
+    lengths = [sum(s[i] for s in steps) for i in range(3)]
+    max_seqs, pages_per_seq = 4, -(-max(lengths) // PAGE)
+    num_pages = max_seqs * pages_per_seq + 3
+    rng = np.random.default_rng(0)
+    block_tables = jnp.asarray(
+        rng.permutation(num_pages)[: max_seqs * pages_per_seq].reshape(max_seqs, pages_per_seq), jnp.int32
+    )
+    batches, done = [], [0, 0, 0]
+    for step in steps:
+        total = sum(step)
+        pad = PAD_TOKENS + (-(total + PAD_TOKENS) % 4)
+        for s in range(3):
+            done[s] += step[s]
+        batches.append(
+            (
+                jnp.asarray(rng.standard_normal((total + pad, HID)), jnp.float32),
+                jnp.asarray(rng.standard_normal((total + pad, HID)), jnp.float32),
+                jnp.asarray([*done, 0], jnp.int32),
+                jnp.asarray(np.concatenate([[0], np.cumsum([*step, 0])]), jnp.int32),
+            )
+        )
+
+    def run(min_tokens):
+        monkeypatch.setattr(_paged, "_PAGE_GRANULAR_UPDATE_MIN_TOKENS", min_tokens)
+        select = jax.jit(lambda *a: paged_pool_select(indexer, *a, pool_chunk=1024, kernel_mesh=kernel_mesh))
+        token_pages = jnp.zeros((num_pages, PAGE, 2 * dim), jnp.float32)
+        pool_pages = jnp.zeros((num_pages, PAGE // kpool, dim), jnp.float32)
+        selections = []
+        with jax.default_matmul_precision("highest"):
+            for hidden, resid, kv_lens, qsl in batches:
+                selected, token_pages, pool_pages = select(
+                    hidden, resid, token_pages, pool_pages, block_tables, kv_lens, qsl, jnp.int32(3)
+                )
+                selections.append(np.asarray(selected))
+        return selections, np.asarray(token_pages), np.asarray(pool_pages)
+
+    by_page = run(0)
+    by_row = run(1 << 30)
+    assert np.any(by_row[2] != 0), "no pool summary was written"
+    for step, (a, b) in enumerate(zip(by_page[0], by_row[0], strict=True)):
+        np.testing.assert_array_equal(a, b, err_msg=f"selection of step {step}")
+    np.testing.assert_array_equal(by_page[1], by_row[1], err_msg="token pages")
+    np.testing.assert_array_equal(by_page[2], by_row[2], err_msg="pool pages")
+
+
 def test_paged_pool_select_rejects_unaligned_page_size():
     indexer = _indexer(4, 8)
     with pytest.raises(ValueError, match="multiple of kpool"):
