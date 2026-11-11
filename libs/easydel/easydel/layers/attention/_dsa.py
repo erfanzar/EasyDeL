@@ -71,6 +71,7 @@ from easydel.layers.indexer import (
 from easydel.operations.kernels import DsaGatherAttn, DsaPoolSparseAttn
 from easydel.operations.kernels.dsa_sparse_attention import sparse_selected_training_attention
 
+from ..linears import gather_shared_input, resolve_gather_shared_projection_input
 from ..rotary import apply_mla_rope
 from ._unified import UnifiedAttention
 
@@ -250,6 +251,12 @@ class DeepSeekSparseAttention(UnifiedAttention):
             ``[B, S, kv_lora_rank]`` and ``k_pe [B, 1, S, qk_rope]``.
         """
         bsz, q_len, _ = hidden_states.shape
+        if resolve_gather_shared_projection_input(self.config, hidden_states):
+            # The query and KV-latent projections both contract the whole hidden axis. Gathered over tensor
+            # parallelism once (eSurge prefill / mixed steps under the automatic rule), each projection contracts
+            # locally; left feature-sharded, the partitioner moves the contraction onto another mesh axis and
+            # all-reduces the partial sums (int32 for W8A8 projections) across it.
+            hidden_states = gather_shared_input(hidden_states, self.config)
         q_resid = None
         if self.use_mla_lora:
             q_resid = self.mla_q_a_layernorm(checkpoint_name(self.mla_q_a_proj(hidden_states), name="attn_query_a"))
