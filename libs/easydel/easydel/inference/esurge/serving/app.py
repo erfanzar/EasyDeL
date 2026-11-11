@@ -21,14 +21,47 @@ until it shuts the world down.
 
 from __future__ import annotations
 
+import contextlib
+import signal
 import time
 import typing as tp
+from collections.abc import Iterator
 
 from .cluster import public_urls, resolve_bind_host, shared_coordination_token
 from .config import EASYDEL_MESH_AXES, ServingConfig
 from .keys import load_or_create_api_key
 
 ENGINE_SECTIONS = frozenset({"runtime", "cache", "context", "workers", "parsing", "vision"})
+WORKER_SHUTDOWN_WAIT_S = 20.0
+"""How long a worker that got SIGTERM waits for the leader's Shutdown before closing on its own."""
+
+
+class ShutdownRequested(BaseException):
+    """Raised in the main thread by SIGTERM while serving, so the engine is closed on the way out.
+
+    A ``BaseException`` so ``except Exception`` blocks in loading or serving code cannot swallow it.
+    """
+
+
+@contextlib.contextmanager
+def sigterm_raises() -> Iterator[None]:
+    """Turn SIGTERM into :class:`ShutdownRequested` in the main thread while the context is open.
+
+    Enter it before the engine is built: the engine installs its diagnostic SIGTERM handler only over the default
+    action, so it stays out. Uvicorn captures SIGTERM for its graceful HTTP shutdown and re-raises it afterwards with
+    the previous handler restored; with this handler the leader then leaves ``server.run()`` through an exception and
+    still closes the engine, which tells the workers to stop. With the diagnostic handler the re-raised signal killed
+    the leader before ``close()`` and left every worker replaying until libtpu lost its peer.
+    """
+
+    def _raise(signum: int, frame: tp.Any) -> None:
+        raise ShutdownRequested(signal.Signals(signum).name)
+
+    previous = signal.signal(signal.SIGTERM, _raise)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def build_loading_kwargs(config: ServingConfig, text_config: tp.Any | None, *, ed: tp.Any) -> dict[str, tp.Any]:
@@ -98,7 +131,18 @@ def _log(rank: int, message: str) -> None:
 
 
 def serve(config: ServingConfig) -> None:
-    """Join the slice, build the engine, and serve (leader) or replay steps (workers) until shutdown."""
+    """Join the slice, build the engine, and serve (leader) or replay steps (workers) until shutdown.
+
+    SIGTERM (``eray tpu job stop``) ends it cleanly on every rank: the engine is closed and the call returns.
+    """
+    with sigterm_raises():
+        try:
+            _serve(config)
+        except ShutdownRequested as exc:
+            print(f"[esurge-serving] stopped by {exc}", flush=True)
+
+
+def _serve(config: ServingConfig) -> None:
     started = time.monotonic()
     import jax
 
@@ -130,7 +174,13 @@ def serve(config: ServingConfig) -> None:
     _log(rank, f"engine ready in {time.monotonic() - started:.1f}s (leader={engine.is_coordination_leader})")
     try:
         if not engine.is_coordination_leader:
-            engine.wait_for_shutdown()
+            try:
+                engine.wait_for_shutdown()
+            except ShutdownRequested:
+                # `eray tpu job stop` signals every host at once; let the leader's Shutdown arrive before closing.
+                _log(rank, f"SIGTERM; waiting up to {WORKER_SHUTDOWN_WAIT_S:.0f}s for the leader's shutdown")
+                engine.wait_for_shutdown(timeout=WORKER_SHUTDOWN_WAIT_S)
+                raise
             _log(rank, "leader shut the world down")
             return
         _serve_http(config, engine, rank, ed)
