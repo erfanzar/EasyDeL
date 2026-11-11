@@ -156,3 +156,22 @@ def detect_zone() -> str | None:
     except Exception:
         pass
     return None
+
+
+def detect_internal_ip() -> str | None:
+    """This VM's primary internal (VPC) IP address from the metadata server.
+
+    Returns:
+        The address of network interface 0, or None when not on GCE.
+    """
+    return _gce_metadata("instance/network-interfaces/0/ip")
+
+
+def detect_external_ip() -> str | None:
+    """This VM's external IP address from the metadata server.
+
+    Returns:
+        The NAT address of interface 0's first access config, or None when the VM has no external
+        address or is not on GCE.
+    """
+    return _gce_metadata("instance/network-interfaces/0/access-configs/0/external-ip")
