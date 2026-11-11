@@ -55,9 +55,20 @@ from collections.abc import Mapping
 from enum import StrEnum
 
 from eformer.loggings import get_logger
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 logger = get_logger("OpenAIApiModules")
+
+
+def _minus_one_means_unlimited(value: tp.Any) -> tp.Any:
+    """``-1`` asks for no limit (IDE clients send it); the server then fills the remaining context."""
+    if isinstance(value, int) and not isinstance(value, bool) and value == -1:
+        return None
+    return value
+
+
+TokenLimit = tp.Annotated[int | None, BeforeValidator(_minus_one_means_unlimited)]
+"""A request token limit: absent or ``-1`` is unlimited (remaining context); otherwise it must be >= 1."""
 
 
 class OpenAIBaseModel(BaseModel):
@@ -221,6 +232,31 @@ class UsageInfo(OpenAIBaseModel):
     total_tokens: int = 0
     tokens_per_second: float = 0
     processing_time: float = 0.0
+    cache_hit: bool = False
+    cache_read: int = 0
+    cache_written: int | None = None
+    uncached_input: int = 0
+
+    @staticmethod
+    def cache_fields(output_or_outputs) -> dict[str, tp.Any]:
+        """Return prefix-cache usage fields from one output or an output sequence.
+
+        ``OutputPipeline`` records cache-read and uncached-input token counts on
+        every final request. Cache-written is ``None`` only when the producing
+        engine cannot report whether prefix caching is enabled (remote engines).
+        """
+        outputs = output_or_outputs if isinstance(output_or_outputs, list | tuple) else [output_or_outputs]
+        metrics = [(getattr(output, "metrics", None) or {}) for output in outputs]
+        cache_read = sum(int(metric.get("cache_read", 0)) for metric in metrics)
+        uncached_input = sum(int(metric.get("uncached_input", 0)) for metric in metrics)
+        written_values = [metric.get("cache_written") for metric in metrics]
+        cache_written = None if any(value is None for value in written_values) else sum(written_values)
+        return {
+            "cache_hit": cache_read > 0,
+            "cache_read": cache_read,
+            "cache_written": cache_written,
+            "uncached_input": uncached_input,
+        }
 
 
 class FunctionDefinition(OpenAIBaseModel):
@@ -341,7 +377,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     model: str
     messages: list[ChatMessage]
-    max_tokens: int | None = None
+    max_tokens: TokenLimit = Field(default=None, ge=1)
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
@@ -360,6 +396,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     logit_bias: dict[str, float] | None = None  # Ignored by EasyDeL
     user: str | None = None  # Ignored by EasyDeL
     chat_template_kwargs: dict[str, int | float | str | bool] | None = None
+    ignore_eos: bool = False  # vLLM-compatible extension: generate until max_tokens or a stop string
 
 
 class ChatCompletionResponseChoice(OpenAIBaseModel):
@@ -457,7 +494,7 @@ class CompletionRequest(OpenAIBaseModel):
 
     model: str
     prompt: str | list[str]
-    max_tokens: int | None = None
+    max_tokens: TokenLimit = Field(default=None, ge=1)
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
@@ -471,6 +508,7 @@ class CompletionRequest(OpenAIBaseModel):
     stop: str | list[str] | None = None
     logit_bias: dict[str, float] | None = None
     user: str | None = None
+    ignore_eos: bool = False  # vLLM-compatible extension: generate until max_tokens or a stop string
 
 
 class ResponsesToolDefinition(FunctionDefinition):
@@ -541,9 +579,11 @@ class ResponsesRequest(OpenAIBaseModel):
     previous_response_id: str | None = None
     conversation: str | ConversationReference | None = None
 
-    max_output_tokens: int | None = None
-    max_tokens: int | None = None
-    max_completion_tokens: int | None = None
+    # The token limits are validated here so a bad value is a 422 at the HTTP boundary: absent or -1 is unlimited
+    # (the remaining context), anything else must be >= 1. Library callers of SamplingParams keep their own rule.
+    max_output_tokens: TokenLimit = Field(default=None, ge=1)
+    max_tokens: TokenLimit = Field(default=None, ge=1)
+    max_completion_tokens: TokenLimit = Field(default=None, ge=1)
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None

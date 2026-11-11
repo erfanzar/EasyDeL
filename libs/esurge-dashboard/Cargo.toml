@@ -1,0 +1,31 @@
+[package]
+name = "esurge-dashboard"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Server-rendered dashboard for the eSurge OpenAI-compatible API server"
+publish = false
+
+[lib]
+name = "esurge_dashboard"
+path = "src/lib.rs"
+
+[[bin]]
+name = "esurge-dashboard"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+cookie = "0.18"
+getrandom = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

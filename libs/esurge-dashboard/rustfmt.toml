@@ -1,0 +1,2 @@
+# Same line length as the workspace's Python (ruff line-length 121) and libs/surgecore.
+max_width = 121

@@ -283,7 +283,6 @@ def test_handle_chat_streaming_forwards_engine_chunks_without_api_delta_logic():
 
 def test_responses_streaming_forwards_engine_frames_without_api_parser_state():
     server = _make_streaming_server()
-    server._extract_payload_api_keys = lambda request: []
     server._authorize_request = lambda *args, **kwargs: None
     server._parse_responses_max_tokens = lambda payload, esurge: (8, 8)
     server._responses_payload_to_messages = lambda payload, include_instructions=False: [

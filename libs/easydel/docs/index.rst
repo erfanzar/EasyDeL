@@ -151,6 +151,7 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
 
    esurge
    esurge_examples
+   esurge_serving.md
    whisper_api.md
 
 .. toctree::
