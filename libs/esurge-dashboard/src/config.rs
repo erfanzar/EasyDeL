@@ -34,6 +34,14 @@ pub struct Config {
     #[arg(long, default_value_t = 43_200, value_parser = clap::value_parser!(u64).range(1..=MAX_SESSION_TTL_SECONDS))]
     pub session_ttl_seconds: u64,
 
+    /// Metrics snapshots kept in memory for the charts (one per second at most; 43200 is 12 h of continuous polling).
+    #[arg(long, default_value_t = 43_200, value_parser = clap::value_parser!(u64).range(1..=1_000_000))]
+    pub history_samples: u64,
+
+    /// Completed requests kept in memory for the request log and per-request charts.
+    #[arg(long, default_value_t = 5_000, value_parser = clap::value_parser!(u64).range(1..=1_000_000))]
+    pub history_requests: u64,
+
     /// Mark the session cookie `Secure` (set this when the dashboard is served over HTTPS).
     #[arg(long)]
     pub secure_cookie: bool,

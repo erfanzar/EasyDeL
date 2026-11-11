@@ -117,6 +117,30 @@ class RequestMetrics:
         return max(0, int(self.prompt_tokens) - int(self.cache_read_tokens))
 
 
+_PHASE_STEP_HISTORY = 65536
+"""Engine steps kept for :meth:`MetricsCollector.phase_summary` (minutes of 20 ms decode steps)."""
+
+
+def split_phase_tokens(scheduled: int, num_computed_tokens: int, num_prompt_tokens: int) -> tuple[int, int]:
+    """Split one request's scheduled tokens in an engine step into ``(prefill, decode)`` tokens.
+
+    Prompt tokens the step computes are prefill; the rest are decode. A prefix-cache hit starts the request with
+    ``num_computed_tokens`` past the cached pages, so cached tokens are never counted. Output tokens recomputed after
+    a preemption are counted as decode.
+
+    Args:
+        scheduled: Tokens scheduled for the request in this step.
+        num_computed_tokens: Tokens already computed before the step.
+        num_prompt_tokens: Prompt length of the request.
+
+    Returns:
+        ``(prefill_tokens, decode_tokens)``, which sum to ``max(0, scheduled)``.
+    """
+    scheduled = max(0, int(scheduled))
+    prefill = min(scheduled, max(0, int(num_prompt_tokens) - int(num_computed_tokens)))
+    return prefill, scheduled - prefill
+
+
 def _percentile(values: list[float], fraction: float) -> float | None:
     """Nearest-rank percentile of ``values`` (``None`` when empty)."""
     if not values:
@@ -332,6 +356,9 @@ class MetricsCollector:
         self.counters = defaultdict(int)
         # Bounded history of cache lifecycle events: ``(timestamp, event, details)``.
         self.cache_events: deque[tuple[float, str, dict[str, Any] | None]] = deque(maxlen=history_size)
+        # One row per engine step: ``(timestamp, prefill_tokens, decode_tokens)``.
+        self.phase_steps: deque[tuple[float, int, int]] = deque(maxlen=max(history_size, _PHASE_STEP_HISTORY))
+        self.created_at = time.time()
 
         self.last_log_time = time.time()
 
@@ -520,6 +547,66 @@ class MetricsCollector:
             )
             self.runner_metrics.append(metrics)
 
+    def record_step_tokens(self, prefill_tokens: int, decode_tokens: int) -> None:
+        """Record how many prefill and decode tokens one engine step computed.
+
+        Args:
+            prefill_tokens: Prompt tokens computed in the step (see :func:`split_phase_tokens`).
+            decode_tokens: Generation tokens computed in the step.
+
+        Note:
+            Thread-safe. Steps that computed nothing are ignored.
+        """
+        prefill = max(0, int(prefill_tokens))
+        decode = max(0, int(decode_tokens))
+        if prefill == 0 and decode == 0:
+            return
+        with self._lock:
+            self.phase_steps.append((time.time(), prefill, decode))
+            self.counters["prefill_tokens_total"] += prefill
+            self.counters["decode_tokens_total"] += decode
+            self.counters["engine_steps_total"] += 1
+
+    def phase_summary(self, window_seconds: float = 300.0) -> dict[str, Any]:
+        """Prefill and decode throughput of the engine steps that ran in a recent window.
+
+        Rates are tokens divided by the window, or by the collector's age when it is younger than the window, so they
+        are wall-clock throughput that includes idle time. The ``*_total`` counters cover the collector's lifetime and
+        let a client compute its own trailing rates.
+
+        Args:
+            window_seconds: Only steps recorded within this many seconds are included.
+
+        Returns:
+            JSON-serializable dict with token counts, ``prefill_tps``/``decode_tps``, the number of prefill-only,
+            decode-only and mixed steps, and lifetime totals.
+        """
+        now = time.time()
+        cutoff = now - float(window_seconds)
+        with self._lock:
+            rows = [row for row in self.phase_steps if row[0] >= cutoff]
+            prefill_total = int(self.counters.get("prefill_tokens_total", 0))
+            decode_total = int(self.counters.get("decode_tokens_total", 0))
+            steps_total = int(self.counters.get("engine_steps_total", 0))
+            age = now - self.created_at
+        span = min(float(window_seconds), age)
+        prefill = sum(row[1] for row in rows)
+        decode = sum(row[2] for row in rows)
+        return {
+            "window_seconds": float(window_seconds),
+            "prefill_tokens": prefill,
+            "decode_tokens": decode,
+            "prefill_tps": prefill / span if span > 0 else None,
+            "decode_tps": decode / span if span > 0 else None,
+            "steps": len(rows),
+            "prefill_steps": sum(1 for row in rows if row[1] and not row[2]),
+            "decode_steps": sum(1 for row in rows if row[2] and not row[1]),
+            "mixed_steps": sum(1 for row in rows if row[1] and row[2]),
+            "prefill_tokens_total": prefill_total,
+            "decode_tokens_total": decode_total,
+            "steps_total": steps_total,
+        }
+
     def record_cache_metrics(
         self,
         total_pages: int,
@@ -647,18 +734,18 @@ class MetricsCollector:
         Args:
             model_name: Engine name passed to :meth:`start_request`; ``None`` selects untagged requests.
             window_seconds: Only requests that finished within this many seconds are included.
-            recent_limit: Maximum number of per-request rows returned, newest first.
+            recent_limit: Maximum number of per-request rows returned, newest first. These rows are not limited to
+                the window, so a client still sees the latest requests after an idle period.
 
         Returns:
             JSON-serializable dict with ``window_seconds``, ``aggregate`` and ``recent_requests``.
         """
         cutoff = time.time() - float(window_seconds)
         with self._lock:
-            rows = [
-                req
-                for req in self.completed_requests
-                if req.model_name == model_name and req.end_time is not None and req.end_time >= cutoff
+            finished = [
+                req for req in self.completed_requests if req.model_name == model_name and req.end_time is not None
             ]
+        rows = [req for req in finished if float(req.end_time or 0.0) >= cutoff]
         ok = [req for req in rows if not req.error]
         prompt_tokens = sum(int(req.prompt_tokens) for req in ok)
         completion_tokens = sum(int(req.generated_tokens) for req in ok)
@@ -685,7 +772,7 @@ class MetricsCollector:
             output_tps = completion_tokens / span if span > 0 else None
 
         recent = []
-        for req in sorted(rows, key=lambda r: float(r.end_time or 0.0), reverse=True)[: max(0, int(recent_limit))]:
+        for req in sorted(finished, key=lambda r: float(r.end_time or 0.0), reverse=True)[: max(0, int(recent_limit))]:
             decode_span = (
                 float(req.total_latency) - float(req.time_to_first_token)
                 if req.total_latency is not None and req.time_to_first_token is not None
@@ -694,6 +781,7 @@ class MetricsCollector:
             recent.append(
                 {
                     "request_id": req.request_id,
+                    "end_time": req.end_time,
                     "finish_reason": req.finish_reason,
                     "error": req.error,
                     "prompt_tokens": int(req.prompt_tokens),
@@ -822,6 +910,8 @@ class MetricsCollector:
             self.cache_metrics.clear()
             self.counters.clear()
             self.cache_events.clear()
+            self.phase_steps.clear()
+            self.created_at = time.time()
 
 
 _global_metrics_collector: MetricsCollector | None = None
