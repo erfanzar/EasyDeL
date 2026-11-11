@@ -181,21 +181,28 @@ def stop_script(
     *,
     root: str = DEFAULT_ROOT,
     grace_s: float = 30.0,
+    kill_wait_s: float = 30.0,
     tpu_check: bool = True,
     device_glob: str = DEFAULT_DEVICE_GLOB,
 ) -> str:
     """Bash that sends SIGTERM to the job's process group, then SIGKILL after ``grace_s`` seconds.
 
-    Exits 7 when the group survives SIGKILL, 8 when (with the TPU check) the TPU devices are still held.
+    After SIGKILL it waits up to ``kill_wait_s`` seconds for the group to disappear: a process tearing down a TPU
+    runtime can take many seconds to exit even after SIGKILL. Exits 7 when the group is still there after that, 8
+    when (with the TPU check) the TPU devices are still held.
     """
     ticks = max(1, int(float(grace_s) * 10))
+    kill_ticks = max(1, int(float(kill_wait_s) * 10))
     script = (
         f"d={job_dir(root, name)}\n"
         'pid=$(cat "$d/pid" 2>/dev/null); forced=0\n'
         'if [ -n "$pid" ] && kill -0 -- "-$pid" 2>/dev/null; then\n'
         '  kill -TERM -- "-$pid" 2>/dev/null\n'
         f'  i=0; while kill -0 -- "-$pid" 2>/dev/null && [ "$i" -lt {ticks} ]; do sleep 0.1; i=$((i + 1)); done\n'
-        '  if kill -0 -- "-$pid" 2>/dev/null; then forced=1; kill -KILL -- "-$pid" 2>/dev/null; sleep 1; fi\n'
+        '  if kill -0 -- "-$pid" 2>/dev/null; then\n'
+        '    forced=1; kill -KILL -- "-$pid" 2>/dev/null\n'
+        f'    i=0; while kill -0 -- "-$pid" 2>/dev/null && [ "$i" -lt {kill_ticks} ]; do sleep 0.1; i=$((i + 1)); done\n'
+        "  fi\n"
         '  if kill -0 -- "-$pid" 2>/dev/null; then\n'
         f'    echo "{_MARK} state=running pid=$pid error=survived-kill"; exit 7\n'
         "  fi\n"
@@ -430,11 +437,19 @@ def register(
     @tpu_opt
     @glob_opt
     @click.option("--grace", default=30.0, show_default=True, help="Seconds between SIGTERM and SIGKILL.")
-    @click.option("--timeout", default=120, show_default=True)
-    def stop(tpu_name, project, zone, ips, tpu_type, user, ssh_key, name, root, tpu_check, device_glob, grace, timeout):
+    @click.option(
+        "--kill-wait", default=30.0, show_default=True, help="Seconds to wait for the group to exit after SIGKILL."
+    )
+    @click.option("--timeout", default=180, show_default=True)
+    def stop(
+        tpu_name, project, zone, ips, tpu_type, user, ssh_key, name, root, tpu_check, device_glob, grace, kill_wait,
+        timeout,
+    ):  # fmt: skip
         """Stop job NAME's process group on every host and confirm the TPU devices are free."""
         tpu, user, ssh_key = target(tpu_name, project, zone, ips, tpu_type, user, ssh_key)
-        script = stop_script(name, root=root, grace_s=grace, tpu_check=tpu_check, device_glob=device_glob)
+        script = stop_script(
+            name, root=root, grace_s=grace, kill_wait_s=kill_wait, tpu_check=tpu_check, device_glob=device_glob
+        )
         report(run_everywhere(tpu, script, timeout=timeout, user=user, ssh_key=ssh_key), f"stop '{name}'")
         success(f"'{name}' stopped on {tpu.num_hosts} host(s)")
 
