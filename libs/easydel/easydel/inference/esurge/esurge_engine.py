@@ -869,7 +869,9 @@ class eSurge:
             on_stop_strings=self._enqueue_parser_stop_requests,
             on_activity=self._touch_activity,
             on_fatal=self._on_output_worker_fatal,
-            prefix_caching_enabled=bool(self.cache_config.enable_prefix_caching),
+            prefix_cache_page_size=(
+                int(self.cache_config.page_size) if self.cache_config.enable_prefix_caching else 0
+            ),
         )
 
         # Request admission: prompt -> admission records for the engine core.
@@ -892,6 +894,7 @@ class eSurge:
             on_activity=self._touch_activity,
             info=self._info,
             callback_engine=self,
+            model_name=self.esurge_name,
         )
 
         needs_fingerprint = str(self.distributed_config.coordination or "replicated") == "zmq" and (

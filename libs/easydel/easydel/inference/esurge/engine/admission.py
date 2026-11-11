@@ -232,6 +232,7 @@ class RequestAdmission:
         on_activity: typing.Callable[[], None],
         info: typing.Callable[..., None],
         callback_engine: Any = None,
+        model_name: str | None = None,
     ) -> None:
         self._registry = registry
         self._scheduler_submit = scheduler_submit
@@ -251,6 +252,7 @@ class RequestAdmission:
         self._on_activity = on_activity
         self._info = info
         self._callback_engine = callback_engine
+        self._model_name = model_name
 
         # Registry aliases keep the moved method bodies verbatim.
         self._request_lock = registry.request_lock
@@ -772,7 +774,7 @@ class RequestAdmission:
 
         metrics_collector = get_metrics_collector()
         if metrics_collector:
-            metrics_collector.start_request(request_id, len(token_ids))
+            metrics_collector.start_request(request_id, len(token_ids), model_name=self._model_name)
 
         # Execution ids are authoritative: decoding and re-tokenizing can lose
         # processor-expanded placeholders or undo context truncation.

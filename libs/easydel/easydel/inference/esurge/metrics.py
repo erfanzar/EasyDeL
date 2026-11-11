@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass
@@ -107,6 +108,22 @@ class RequestMetrics:
     total_latency: float | None = None
     finish_reason: str | None = None
     error: str | None = None
+    model_name: str | None = None
+    cache_read_tokens: int = 0
+
+    @property
+    def uncached_input_tokens(self) -> int:
+        """Prompt tokens that had to be prefilled because the prefix cache did not hold them."""
+        return max(0, int(self.prompt_tokens) - int(self.cache_read_tokens))
+
+
+def _percentile(values: list[float], fraction: float) -> float | None:
+    """Nearest-rank percentile of ``values`` (``None`` when empty)."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, min(len(ordered), math.ceil(fraction * len(ordered))))
+    return float(ordered[rank - 1])
 
 
 @dataclass
@@ -325,12 +342,13 @@ class MetricsCollector:
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
 
-    def start_request(self, request_id: str, prompt_tokens: int = 0) -> None:
+    def start_request(self, request_id: str, prompt_tokens: int = 0, model_name: str | None = None) -> None:
         """Start tracking metrics for a new request.
 
         Args:
             request_id: Unique identifier for the request.
             prompt_tokens: Number of tokens in the input prompt.
+            model_name: Engine that serves the request, used to group :meth:`model_summary`.
 
         Note:
             Thread-safe. Creates a new RequestMetrics entry and increments
@@ -342,8 +360,22 @@ class MetricsCollector:
                 start_time=time.time(),
                 prompt_tokens=prompt_tokens,
                 total_tokens=prompt_tokens,
+                model_name=model_name,
             )
             self.counters["total_requests"] += 1
+
+    def record_cache_read(self, request_id: str, cached_tokens: int) -> None:
+        """Record how many prompt tokens a request read from the prefix cache.
+
+        Args:
+            request_id: Unique identifier for the request.
+            cached_tokens: Prompt tokens served from the prefix cache. Values are clamped to
+                ``[0, prompt_tokens]``. No-op if the request is not being tracked.
+        """
+        with self._lock:
+            metrics = self.request_metrics.get(request_id)
+            if metrics is not None:
+                metrics.cache_read_tokens = max(0, min(int(cached_tokens), int(metrics.prompt_tokens)))
 
     def record_first_token(self, request_id: str) -> None:
         """Record when the first token is generated for a request.
@@ -595,6 +627,112 @@ class MetricsCollector:
             average_throughput=avg_throughput,
             requests_per_second=requests_per_second,
         )
+
+    def model_summary(
+        self,
+        model_name: str | None,
+        window_seconds: float = 300.0,
+        recent_limit: int = 20,
+    ) -> dict[str, Any]:
+        """Aggregate completed requests of one model over a recent time window.
+
+        Rates are defined from the per-request timestamps the engine records:
+
+        * ``prefill_tps``: uncached prompt tokens divided by time to first token, summed over requests.
+          TTFT includes queueing, so this is a lower bound on raw prefill speed.
+        * ``decode_tps``: completion tokens after the first, divided by time after the first token.
+        * ``output_tps``: completion tokens of every request finished in the window, divided by the span
+          from the earliest start to the latest finish among them (aggregate throughput under concurrency).
+
+        Args:
+            model_name: Engine name passed to :meth:`start_request`; ``None`` selects untagged requests.
+            window_seconds: Only requests that finished within this many seconds are included.
+            recent_limit: Maximum number of per-request rows returned, newest first.
+
+        Returns:
+            JSON-serializable dict with ``window_seconds``, ``aggregate`` and ``recent_requests``.
+        """
+        cutoff = time.time() - float(window_seconds)
+        with self._lock:
+            rows = [
+                req
+                for req in self.completed_requests
+                if req.model_name == model_name and req.end_time is not None and req.end_time >= cutoff
+            ]
+        ok = [req for req in rows if not req.error]
+        prompt_tokens = sum(int(req.prompt_tokens) for req in ok)
+        completion_tokens = sum(int(req.generated_tokens) for req in ok)
+        cache_read = sum(int(req.cache_read_tokens) for req in ok)
+        uncached = sum(req.uncached_input_tokens for req in ok)
+        cache_hits = sum(1 for req in ok if req.cache_read_tokens > 0)
+        ttfts = [float(req.time_to_first_token) for req in ok if req.time_to_first_token is not None]
+        latencies = [float(req.total_latency) for req in ok if req.total_latency is not None]
+
+        prefill_time = sum(float(req.time_to_first_token) for req in ok if req.time_to_first_token)
+        prefill_tokens = sum(req.uncached_input_tokens for req in ok if req.time_to_first_token)
+        decode_time = 0.0
+        decode_tokens = 0
+        for req in ok:
+            if req.time_to_first_token is None or req.total_latency is None or req.generated_tokens <= 1:
+                continue
+            span = float(req.total_latency) - float(req.time_to_first_token)
+            if span > 0:
+                decode_time += span
+                decode_tokens += int(req.generated_tokens) - 1
+        output_tps = None
+        if ok:
+            span = max(float(req.end_time) for req in ok) - min(float(req.start_time) for req in ok)
+            output_tps = completion_tokens / span if span > 0 else None
+
+        recent = []
+        for req in sorted(rows, key=lambda r: float(r.end_time or 0.0), reverse=True)[: max(0, int(recent_limit))]:
+            decode_span = (
+                float(req.total_latency) - float(req.time_to_first_token)
+                if req.total_latency is not None and req.time_to_first_token is not None
+                else 0.0
+            )
+            recent.append(
+                {
+                    "request_id": req.request_id,
+                    "finish_reason": req.finish_reason,
+                    "error": req.error,
+                    "prompt_tokens": int(req.prompt_tokens),
+                    "completion_tokens": int(req.generated_tokens),
+                    "ttft_s": req.time_to_first_token,
+                    "latency_s": req.total_latency,
+                    "decode_tps": (
+                        (int(req.generated_tokens) - 1) / decode_span
+                        if decode_span > 0 and req.generated_tokens > 1
+                        else None
+                    ),
+                    "cache_hit": req.cache_read_tokens > 0,
+                    "cache_read_tokens": int(req.cache_read_tokens),
+                    "uncached_input_tokens": req.uncached_input_tokens,
+                }
+            )
+
+        return {
+            "window_seconds": float(window_seconds),
+            "aggregate": {
+                "completed": len(ok),
+                "failed": len(rows) - len(ok),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "cache_hits": cache_hits,
+                "cache_hit_rate": cache_hits / len(ok) if ok else None,
+                "cache_read_tokens": cache_read,
+                "uncached_input_tokens": uncached,
+                "token_cache_hit_rate": cache_read / prompt_tokens if prompt_tokens else None,
+                "ttft_p50_s": _percentile(ttfts, 0.50),
+                "ttft_p99_s": _percentile(ttfts, 0.99),
+                "latency_p50_s": _percentile(latencies, 0.50),
+                "latency_p99_s": _percentile(latencies, 0.99),
+                "prefill_tps": prefill_tokens / prefill_time if prefill_time > 0 else None,
+                "decode_tps": decode_tokens / decode_time if decode_time > 0 else None,
+                "output_tps": output_tps,
+            },
+            "recent_requests": recent,
+        }
 
     def log_summary(self, force: bool = False) -> None:
         """Log a summary of current metrics.

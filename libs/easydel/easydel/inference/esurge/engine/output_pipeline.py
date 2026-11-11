@@ -53,14 +53,24 @@ if typing.TYPE_CHECKING:
 _STOP_SENTINEL = None
 
 
-def _cache_usage_metrics(num_prompt_tokens: int, cached_tokens: int, prefix_caching_enabled: bool | None) -> dict:
-    """Return request-level cache usage without exposing scheduler internals."""
-    cache_read = max(0, int(cached_tokens))
-    uncached_input = max(0, int(num_prompt_tokens) - cache_read)
-    if prefix_caching_enabled is None:
-        cache_written = None
-    else:
-        cache_written = uncached_input if prefix_caching_enabled else 0
+def _cache_usage_metrics(num_prompt_tokens: int, cached_tokens: int, prefix_cache_page_size: int) -> dict:
+    """Return request-level prefix-cache usage.
+
+    Args:
+        num_prompt_tokens: Prompt length in tokens.
+        cached_tokens: Prompt tokens read from the prefix cache.
+        prefix_cache_page_size: KV page size when prefix caching is enabled, ``0`` when it is disabled.
+
+    Returns:
+        ``cache_read`` (prompt tokens served from cache), ``uncached_input`` (prompt tokens prefilled),
+        ``cache_written`` (prompt tokens newly committed to the prefix cache: only whole pages are hashed,
+        so a partial last page is not counted) and ``cache_hit``.
+    """
+    prompt = max(0, int(num_prompt_tokens))
+    cache_read = max(0, min(int(cached_tokens), prompt))
+    uncached_input = prompt - cache_read
+    page = int(prefix_cache_page_size)
+    cache_written = max(0, (prompt // page) * page - cache_read) if page > 0 else 0
     return {
         "cache_hit": cache_read > 0,
         "cache_read": cache_read,
@@ -183,7 +193,7 @@ class OutputPipeline:
         on_stop_strings: typing.Callable[[dict[str, str]], None],
         on_activity: typing.Callable[[], None],
         on_fatal: typing.Callable[[BaseException, str], None],
-        prefix_caching_enabled: bool | None = None,
+        prefix_cache_page_size: int = 0,
     ) -> None:
         self.queue: queue.Queue = queue.Queue()
         self._on_fatal = on_fatal
@@ -194,7 +204,7 @@ class OutputPipeline:
         self._eos_set = {int(tid) for tid in eos_token_ids if tid is not None}
         self.decode_interval_tokens = int(decode_interval_tokens)
         self.decode_interval_secs = float(decode_interval_secs)
-        self._prefix_caching_enabled = prefix_caching_enabled
+        self._prefix_cache_page_size = max(0, int(prefix_cache_page_size))
         self._on_stop_strings = on_stop_strings
         self._on_activity = on_activity
 
@@ -1303,7 +1313,7 @@ class OutputPipeline:
         cache_metrics = _cache_usage_metrics(
             num_prompt_tokens,
             engine_output.num_cached_tokens,
-            self._prefix_caching_enabled,
+            self._prefix_cache_page_size,
         )
         ro.metrics = {
             "prompt_tokens": num_prompt_tokens,
@@ -1315,6 +1325,8 @@ class OutputPipeline:
             **cache_metrics,
         }
 
+        if metrics_collector:
+            metrics_collector.record_cache_read(parent_request_id, cache_metrics["cache_read"])
         if metrics_collector and ro.finished:
             metrics_collector.complete_request(
                 parent_request_id,

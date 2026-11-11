@@ -115,6 +115,7 @@ from ...sampling_params import SamplingParams
 from ...stream_protocol import StreamEventFrame
 from ...typed_models import ResponseCompletedEvent, ResponsesFinalizationOptions, ResponsesOutputItem, ResponsesResponse
 from ..esurge_engine import RequestOutput, eSurge
+from ..metrics import get_metrics_collector, initialize_metrics
 from .auth_endpoints import AuthEndpointsMixin
 
 logger = get_logger("eSurgeApiServer")
@@ -131,6 +132,8 @@ __all__ = (
 _STREAM_DATA = "data"
 _STREAM_ERROR = "error"
 _STREAM_END = "end"
+# Completed requests older than this are left out of the per-model summary in ``/metrics``.
+_METRICS_WINDOW_S = 300.0
 
 
 class _AdmissionStream:
@@ -453,6 +456,10 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         max_slots = max(0, max_slots)
         self._resolved_generation_slot_cap = max_slots
         kwargs["max_workers"] = esurge_max_concurrency * 2
+
+        # The engines record per-request metrics only into an existing collector; monitoring may not have made one.
+        if get_metrics_collector() is None:
+            initialize_metrics(enable_detailed_logging=False)
 
         # Initialize authentication manager (either ZMQ worker or in-process)
         self._require_api_key = bool(require_api_key)
@@ -3205,60 +3212,23 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         return JSONResponse(health_status, status_code=status_code)
 
     def _engine_metrics_snapshot(self) -> dict[str, tp.Any]:
-        """Return per-model cache and recent-request metrics for lightweight dashboards."""
-        snapshots = {}
+        """Per-model windowed metrics from the engine's :class:`MetricsCollector`.
+
+        The collector owns the accounting (cache reads, TTFT, decode rate, percentiles); this method only adds
+        the live queue depths and keys the result by the served model name.
+        """
+        collector = get_metrics_collector()
+        snapshots: dict[str, tp.Any] = {}
         for model_name, engine in self.esurge_map.items():
-            registry = getattr(engine, "_registry", None)
-            if registry is None:
-                continue
-            with registry.output_lock:
-                outputs = list(registry.outputs.values())[-100:]
-            recent = []
-            for output in outputs:
-                metrics = output.metrics or {}
-                if not output.finished or not metrics:
-                    continue
-                recent.append(
-                    {
-                        "request_id": output.request_id,
-                        "prompt_tokens": int(metrics.get("prompt_tokens", 0)),
-                        "completion_tokens": int(output.num_generated_tokens),
-                        "first_token_time": output.first_token_time,
-                        "generation_tps": float(output.tokens_per_second),
-                        "processing_time": float(output.processing_time),
-                        "cache_hit": bool(metrics.get("cache_hit", False)),
-                        "cache_read": int(metrics.get("cache_read", 0)),
-                        "cache_written": metrics.get("cache_written"),
-                        "uncached_input": int(metrics.get("uncached_input", 0)),
-                        "finish_reason": output.outputs[0].finish_reason if output.outputs else None,
-                    }
-                )
-            cache_hits = sum(row["cache_hit"] for row in recent)
-            cache_read = sum(row["cache_read"] for row in recent)
-            uncached_input = sum(row["uncached_input"] for row in recent)
-            cache_written = sum(row["cache_written"] or 0 for row in recent)
-            ttft_total = sum(row["first_token_time"] or 0.0 for row in recent)
-            generation_time = sum(
-                max(0.0, row["processing_time"] - (row["first_token_time"] or 0.0)) for row in recent
+            summary = (
+                collector.model_summary(getattr(engine, "esurge_name", model_name), window_seconds=_METRICS_WINDOW_S)
+                if collector is not None
+                else {"window_seconds": _METRICS_WINDOW_S, "aggregate": {}, "recent_requests": []}
             )
             snapshots[model_name] = {
-                "running_requests": int(getattr(engine, "num_running_requests", 0)),
-                "waiting_requests": int(getattr(engine, "num_pending_requests", 0)),
-                "aggregate": {
-                    "completed": len(recent),
-                    "cache_hits": cache_hits,
-                    "cache_hit_rate": cache_hits / len(recent) if recent else 0.0,
-                    "cache_read": cache_read,
-                    "cache_written": cache_written,
-                    "uncached_input": uncached_input,
-                    "prefill_tps": uncached_input / ttft_total if ttft_total > 0 else 0.0,
-                    "decode_tps": (
-                        sum(row["completion_tokens"] for row in recent) / generation_time
-                        if generation_time > 0
-                        else 0.0
-                    ),
-                },
-                "recent_requests": list(reversed(recent[-20:])),
+                "running_requests": int(getattr(engine, "num_running_requests", 0) or 0),
+                "waiting_requests": int(getattr(engine, "num_pending_requests", 0) or 0),
+                **summary,
             }
         return snapshots
 
