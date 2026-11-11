@@ -73,6 +73,19 @@ def _a8_slab_tiles(m, activation_bits, e, k, n, dtype):
     return (tile_m, k, n)
 
 
+def _slab_core_count(n):
+    """TensorCores the A8 whole-slab kernel splits its ``N`` output columns over.
+
+    Every TensorCore of a megacore device (``TpuInfo.num_cores``; 2 on TPU v5p) when ``N`` splits into 128-aligned
+    column tiles, else 1. Each core streams its own column tile of every active expert's slab and writes its own output
+    columns; every output element keeps the same int32 contraction and scale epilogue, so the output is unchanged.
+    """
+    from jax.experimental.pallas import tpu as pltpu
+
+    cores = pltpu.get_tpu_info().num_cores
+    return cores if cores > 1 and n % (cores * 128) == 0 else 1
+
+
 # Expert-stacked ``(E, K, N)`` families whose full-K decode tiles were measured on TPU; others keep generic tiles.
 # DeepSeek-V4.1 tp=4 per-device families (TPU v5, 48 rows, int4, bit-exact vs XLA): gate/up [96,5120,2304]
 # 127 -> 62 us, fused gate_up [96,5120,4608] 204 -> 110 us, down [96,2304,5120] 107 -> 62 us.
@@ -179,7 +192,8 @@ def grouped_matmul_channelwise(
         raise ValueError("Pallas tiling K and N must be multiples of 128")
     if jax.default_backend() != "tpu":
         raise ValueError("Pallas CHANNELWISE requires TPU hardware; use platform='xla' elsewhere")
-    tiles = TileSizes(tile_m=tiling[0], tile_k=tiling[1], tile_n=tiling[2])
+    slab_cores = _slab_core_count(tiling[2]) if slab_epilogue else 1
+    tiles = TileSizes(tile_m=tiling[0], tile_k=tiling[1], tile_n=tiling[2] // slab_cores)
 
     if activation_bits != 16 and tiling[0] % 32:
         raise ValueError("integer activation tiling M must be a multiple of 32")
@@ -216,7 +230,9 @@ def grouped_matmul_channelwise(
                 # in the XLA entry's order ((acc * row scale) * channel scale), into an f32 output. The tail mask
                 # and the final cast stay in XLA, written as the XLA entry ends, so the graph after this op is the
                 # XLA entry's. A launch needs at least one grid step: with no routed row, group 0 owns the zero
-                # row 0, whose output the mask discards.
+                # row 0, whose output the mask discards. That mask also zeroes every dispatch-tail row, so the kernel
+                # skips its own zero-fill of those rows (zero_initialize=False), and on a megacore chip both
+                # TensorCores take a column half of every slab (``_slab_core_count``).
                 kernel_sizes = jnp.where(
                     (jnp.arange(sizes.shape[0]) == 0) & (jnp.sum(sizes) == 0), jnp.ones_like(sizes), sizes
                 )
@@ -228,8 +244,10 @@ def grouped_matmul_channelwise(
                     tile_info=tiles,
                     preferred_element_type=jnp.float32,
                     acc_dtype=jnp.int32,
+                    zero_initialize=False,
                     output_row_scale=jnp.pad(activation_scale, ((0, padded_m - x.shape[0]), (0, 0)), constant_values=1),
                     output_channel_scale=s.astype(jnp.float32),
+                    num_cores=slab_cores,
                 )[: x.shape[0]]
                 return jnp.where(valid[:, None], scaled, 0).astype(preferred_element_type)
             fuse_output = (
