@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import getpass
+import os
 import re
 import shlex
 import subprocess
@@ -285,17 +286,25 @@ def sync_tree(
     delete: bool = False,
     timeout: int = 900,
 ) -> list[tuple[int, subprocess.CompletedProcess]]:
-    """rsync directory ``src`` to ``dest`` on every host except this one (where ``src`` already is)."""
+    """rsync directory ``src`` to ``dest`` on every host of the slice.
+
+    On this host the copy is local, and it is skipped only when ``dest`` is ``src`` itself (the tree is already
+    there); a different ``dest`` is copied here too, so every host ends up with the same files.
+    """
     ssh = f"ssh -i {shlex.quote(ssh_key)} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15"
     local = _local_ips()
-    targets = [(index, ip) for index, ip in enumerate(tpu.internal_ips) if ip not in local]
+    same_path = os.path.realpath(os.path.expanduser(src)) == os.path.realpath(os.path.expanduser(dest))
+    targets = [(index, ip) for index, ip in enumerate(tpu.internal_ips) if ip not in local or not same_path]
 
     def push(index: int, ip: str) -> tuple[int, subprocess.CompletedProcess]:
-        cmd = ["rsync", "-a", "-e", ssh, "--rsync-path", f"mkdir -p {shlex.quote(dest)} && rsync"]
-        cmd += [f"--exclude={pattern}" for pattern in excludes]
-        if delete:
-            cmd.append("--delete")
-        cmd += [src.rstrip("/") + "/", f"{user}@{ip}:{dest.rstrip('/')}/"]
+        options = [f"--exclude={pattern}" for pattern in excludes] + (["--delete"] if delete else [])
+        if ip in local:
+            target = os.path.expanduser(dest)
+            os.makedirs(target, exist_ok=True)
+            cmd = ["rsync", "-a", *options, src.rstrip("/") + "/", target.rstrip("/") + "/"]
+        else:
+            cmd = ["rsync", "-a", "-e", ssh, "--rsync-path", f"mkdir -p {shlex.quote(dest)} && rsync", *options]
+            cmd += [src.rstrip("/") + "/", f"{user}@{ip}:{dest.rstrip('/')}/"]
         return index, subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(targets))) as pool:

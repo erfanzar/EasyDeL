@@ -150,3 +150,20 @@ def test_cli_start_refuses_everything_when_one_host_is_not_ready(monkeypatch):
     assert "nothing started" in result.output
     assert "holders=123" in result.output
     assert calls == ["preflight"], "no host may start while another is not ready"
+
+
+def test_sync_copies_to_a_different_path_on_this_host_and_skips_the_same_path(tmp_path, monkeypatch):
+    src = tmp_path / "src"
+    (src / "sub").mkdir(parents=True)
+    (src / "sub" / "serve.yaml").write_text("port: 8000\n")
+    (src / "skip.log").write_text("x")
+    monkeypatch.setattr(hostjob, "_local_ips", lambda: {"10.0.0.1"})
+    tpu = TpuInfo.from_ips(["10.0.0.1"], "v5p-8")
+
+    dest = tmp_path / "elsewhere" / "deploy"
+    results = hostjob.sync_tree(tpu, str(src), str(dest), user="u", ssh_key="/nonexistent", excludes=["*.log"])
+    assert [(index, result.returncode) for index, result in results] == [(0, 0)]
+    assert (dest / "sub" / "serve.yaml").read_text() == "port: 8000\n"
+    assert not (dest / "skip.log").exists()
+
+    assert hostjob.sync_tree(tpu, str(src), str(src) + "/", user="u", ssh_key="/nonexistent") == []
