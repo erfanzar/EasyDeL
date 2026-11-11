@@ -1,0 +1,39 @@
+# GLM-5.3-Flash W8A8 on one v5p-128 slice (16 hosts, 64 chips): four request-DP workers of EP4 x TP4.
+# Run on every host:  python -m easydel.inference.esurge.serving serve --config glm53_flash_w8a8_serving.yaml
+# Validate anywhere:  ENABLE_DISTRIBUTED_INIT=0 python -m easydel.inference.esurge.serving check --config ...
+model:
+  checkpoint: gs://<your-bucket>/GLM-5.3-Flash-easydel-bf16
+  # Hugging Face tokenizers cannot read gs://; point at a local copy of the checkpoint's tokenizer files.
+  tokenizer: /opt/models/GLM-5.3-Flash/tokenizer
+  served_name: GLM-5.3-Flash-W8A8
+  sharding_axis_dims: [1, 4, 1, 4, 4, 1] # (pp, dp, fsdp, ep, tp, sp)
+  attn_mechanism: multi_latent_ragged_page_attention_v2
+  quantization:
+    dtype: w8a8 # pattern: the model's default_quantization_pattern()
+
+esurge:
+  runtime:
+    max_model_len: 131072
+    max_num_seqs: 128 # 32 per DP worker
+    max_num_seq_buckets: [32]
+    max_num_batched_tokens: 32768
+    chunked_prefill_enabled: false
+  cache:
+    hbm_utilization: 0.97
+    page_size: 128
+    data_parallelism_axis: dp
+    # Pin the page pool. Without a cap it is sized from free HBM, which differs by a few hundred pages between
+    # launches; the page count is part of every compiled program's shape, so each launch would miss the
+    # persistent compilation cache. 100,000 pages x 128 tokens sits below every free-HBM size measured so far.
+    max_cache_tokens: 12800000
+
+server:
+  host: internal # this VM's internal IP; use 0.0.0.0 to also listen on the external address
+  port: 8000
+  api_key_file: ~/.config/esurge/api_key
+
+coordination:
+  control_port: 19666
+  bind_host: internal
+
+compilation_cache_dir: /dev/shm/esurge/jax_cc
