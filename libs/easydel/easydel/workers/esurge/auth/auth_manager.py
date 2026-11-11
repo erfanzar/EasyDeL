@@ -108,6 +108,15 @@ class PermissionDenied(Exception):
     pass
 
 
+class InvalidApiKey(PermissionDenied):
+    """Raised when the presented key is missing, unknown, revoked, suspended or expired.
+
+    An authentication failure (HTTP 401), as opposed to the other :class:`PermissionDenied` cases, where a
+    valid key lacks permission (HTTP 403). Subclasses :class:`PermissionDenied` so existing handlers still
+    catch it.
+    """
+
+
 class EnhancedApiKeyManager:
     """In-process API key manager with RBAC, rate limiting, and audit logging.
 
@@ -646,7 +655,7 @@ class EnhancedApiKeyManager:
                     ip_address=ip_address,
                     success=False,
                 )
-                raise PermissionDenied("Invalid or inactive API key")
+                raise InvalidApiKey("Invalid or inactive API key")
 
             metadata.update_last_used()
 

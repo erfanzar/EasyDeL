@@ -87,6 +87,7 @@ from transformers import ProcessorMixin
 from easydel.workers.esurge.auth import (
     ApiKeyRole,
     EnhancedApiKeyManager,
+    InvalidApiKey,
     PermissionDenied,
     QuotaExceeded,
     RateLimitExceeded,
@@ -666,22 +667,17 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
     def _auth_system_enabled(self) -> bool:
         """Determine whether authentication enforcement is active.
 
-        Checks multiple conditions to determine if the authentication system
-        should enforce API key validation:
-        1. Whether an auth_manager exists
-        2. Whether the manager has an `enabled` property set
-        3. Whether the manager supports `authorize_request` method
-        4. Falls back to the `_require_api_key` setting
+        ``require_api_key=True`` always enforces, whatever state the auth manager is in: a missing or
+        misconfigured manager must refuse requests, never open the server. Otherwise authentication is
+        active when the manager reports itself enabled (for example because keys are registered).
 
         Returns:
             True if authentication should be enforced, False otherwise.
         """
+        if getattr(self, "_require_api_key", False):
+            return True
 
-        try:
-            manager = self.auth_manager
-        except AttributeError:
-            return False
-
+        manager = getattr(self, "auth_manager", None)
         if manager is None:
             return False
 
@@ -729,6 +725,9 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         """
         if not self._auth_system_enabled():
             return None
+        if getattr(self, "auth_manager", None) is None:
+            # Enforcement is on but nothing can validate a key: refuse rather than serve unauthenticated.
+            raise HTTPException(status_code=401, detail="Missing or invalid API key")
 
         candidate_keys: list[str] = []
 
@@ -773,19 +772,16 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             except (PermissionDenied, RateLimitExceeded, QuotaExceeded) as e:
                 # If we have more candidates, try them. Otherwise, raise the exception.
                 if candidate == candidate_keys[-1]:
-                    if isinstance(e, RateLimitExceeded):
+                    if isinstance(e, RateLimitExceeded | QuotaExceeded):
                         raise HTTPException(status_code=429, detail=str(e)) from e
-                    elif isinstance(e, QuotaExceeded):
-                        raise HTTPException(status_code=429, detail=str(e)) from e
-                    else:
-                        raise HTTPException(status_code=403, detail=str(e)) from e
+                    if isinstance(e, InvalidApiKey):
+                        raise HTTPException(status_code=401, detail=str(e)) from e
+                    raise HTTPException(status_code=403, detail=str(e)) from e
                 continue
 
-        try:
-            require_key = self.auth_manager.require_api_key
-        except AttributeError:
-            require_key = self._require_api_key
-
+        require_key = bool(getattr(self, "_require_api_key", False)) or bool(
+            getattr(self.auth_manager, "require_api_key", False)
+        )
         if require_key:
             raise HTTPException(status_code=401, detail="Missing or invalid API key")
         return None
