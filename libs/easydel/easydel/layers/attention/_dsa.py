@@ -47,8 +47,9 @@ from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float, Int
-from spectrax import common_types
+from spectrax import common_types, with_sharding_constraint
 
+from easydel.axis import resolve_attention_data_parallel_axis
 from easydel.caching import (
     MLARaggedPagesCacheView,
     OperationsMetadata,
@@ -60,6 +61,7 @@ from easydel.caching import (
 )
 from easydel.infra.modeling_outputs import SparseAttentionLayerOutput
 from easydel.infra.sequence_packing import document_segment_ids, pairwise_attention_mask_from_mask_info
+from easydel.infra.sharding import inference_mode_forces_decode, mesh_axis_size, normalize_axis_names
 from easydel.layers.indexer import (
     IndexerSelection,
     ScoreRowSplit,
@@ -349,18 +351,67 @@ class DeepSeekSparseAttention(UnifiedAttention):
             frequencies=frequencies,
         )
 
-    def _project_output(self, attn_output: Array) -> Array:
+    def _project_output(self, attn_output: Array, token_split: PartitionSpec | None = None) -> Array:
         """Output projection between the hidden-state sharding constraints.
+
+        Args:
+            attn_output: Merged heads ``[batch, seq, heads * v_head_dim]``.
+            token_split: Layout of the projection's input from :meth:`_serving_token_split_spec`: the hidden-state
+                layout with the tokens also split over the expert-parallel axis. The projection then runs on each
+                shard's tokens only and the hidden-state constraint after it gathers the projected output.
+                ``None`` constrains the input to the hidden-state layout.
+
+        Returns:
+            The projected output ``[batch, seq, hidden]``.
+        """
+        if token_split is None:
+            attn_output = self.shard_attention_prod(attn_output, pre_projection=True)
+        else:
+            attn_output = with_sharding_constraint(attn_output, token_split, mesh=self.config.mesh)
+        attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
+        return self.shard_attention_prod(attn_output)
+
+    def _serving_token_split_spec(self, attn_output: Array) -> PartitionSpec | None:
+        """Layout keeping a serving step's attention output split over the expert-parallel axis through ``o_proj``.
+
+        The expert-parallel axis only replicates attention. With ``dsa_serving_ep_split`` the sparse attention already
+        returns its output token-sharded over it; constraining that output to the hidden-state layout before the output
+        projection all-gathered every token's heads and ran the projection (and, for W8A8 projections, its int32
+        reductions) for all tokens on every shard. Kept split, each shard projects its own tokens and only the
+        ``[tokens, hidden]`` output is gathered by the constraint after the projection. A replicated attention output
+        is sliced locally, so the projection still runs on ``1 / ep`` of the tokens.
+
+        Applies to MLA ragged-pages (serving) calls outside eSurge's decode layout (``decode_mode_specs``), unless
+        ``dsa_serving_ep_split`` is ``False``, on an expert-parallel axis of more than one device that the hidden-state
+        layout does not use, without data-parallel KV pages, and when the axes divide the token count.
 
         Args:
             attn_output: Merged heads ``[batch, seq, heads * v_head_dim]``.
 
         Returns:
-            The projected output ``[batch, seq, hidden]``.
+            The hidden-state spec with the expert-parallel axes added to the token entry, or ``None``.
         """
-        attn_output = self.shard_attention_prod(attn_output, pre_projection=True)
-        attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
-        return self.shard_attention_prod(attn_output)
+        if getattr(self.config, "dsa_serving_ep_split", None) is False or inference_mode_forces_decode():
+            return None
+        mesh = getattr(self.config, "mesh", None)
+        resolver = getattr(self.config, "runtime_sharding_resolver", None)
+        partition_axis = getattr(self.config, "partition_axis", None)
+        if mesh is None or resolver is None or partition_axis is None or getattr(mesh, "is_mpmd", False):
+            return None
+        if attn_output.ndim != 3 or mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_axis)) > 1:
+            return None
+        names = normalize_axis_names(getattr(partition_axis, "expert_parallel_axis", None))
+        names = tuple(name for name in names if mesh_axis_size(mesh, name) > 1)
+        if not names:
+            return None
+        spec = tuple(resolver.resolve(dynamic_axes=common_types.HiddenStateSharding, shape=tuple(attn_output.shape)))
+        spec = spec + (None,) * (3 - len(spec))
+        if {axis for entry in spec for axis in normalize_axis_names(entry)}.intersection(names):
+            return None
+        tokens = (*normalize_axis_names(spec[1]), *names)
+        if int(attn_output.shape[1]) % mesh_axis_size(mesh, tokens):
+            return None
+        return PartitionSpec(spec[0], tokens[0] if len(tokens) == 1 else tokens, spec[2])
 
     def _use_dsa_pool_training(
         self,
@@ -879,7 +930,9 @@ class DeepSeekSparseAttention(UnifiedAttention):
             attn_output = self._merge_heads(attentions.attention_outputs)
 
         result = SparseAttentionLayerOutput(
-            attention_output=self._project_output(attn_output),
+            attention_output=self._project_output(
+                attn_output, self._serving_token_split_spec(attn_output) if ragged else None
+            ),
             attention_weight=attentions.attention_weights if output_attentions else None,
             cache_view=cache_view,
             indexer_aux_loss=indexer_aux_loss,

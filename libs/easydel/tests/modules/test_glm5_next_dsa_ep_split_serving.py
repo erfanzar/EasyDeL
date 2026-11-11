@@ -43,14 +43,30 @@ PAD_TOKENS = 3
 # Tokens per row and step. With the padding tokens a step packs 25, 11, 14, 5, 5, 5 tokens; contexts exceed
 # index_topk, so the selection is sparse.
 STEPS = [[13, 9], [1, 7], [11, 0], [1, 1], [1, 1], [1, 1]]
+# Steps that pack 28, 8, 16, 4, 8, 4 tokens: every count divides the expert-parallel size, as eSurge's token buckets
+# do, so the output projection also runs on each expert-parallel shard's tokens.
+DIVISIBLE_STEPS = [[13, 12], [1, 4], [11, 2], [1, 0], [1, 4], [1, 0]]
+
+
+def _axis_names(entry) -> tuple:
+    if entry is None:
+        return ()
+    return (entry,) if isinstance(entry, str) else tuple(entry)
 
 
 def _primitive_counts(fn, *args) -> collections.Counter:
+    """Primitive counts of ``fn``'s jaxpr. ``token_split_constraint`` counts the sharding constraints of a
+    ``[batch, tokens, features]`` value whose token entry names the expert-parallel axis (the output projection's
+    input when it runs on each expert-parallel shard's tokens)."""
     counts = collections.Counter()
 
     def walk(jaxpr):
         for eqn in jaxpr.eqns:
             counts.update([eqn.primitive.name])
+            if eqn.primitive.name == "sharding_constraint":
+                spec = tuple(getattr(eqn.params.get("sharding"), "spec", None) or ())
+                if len(spec) == 3 and "ep" in _axis_names(spec[1]):
+                    counts.update(["token_split_constraint"])
             for param in eqn.params.values():
                 for sub in param if isinstance(param, (tuple, list)) else (param,):
                     sub = getattr(sub, "jaxpr", sub)
@@ -114,14 +130,14 @@ def _attention_output(layer, hidden, *, view, meta):
     return _forward(layer, hidden, view=view, meta=meta).attention_output
 
 
-def _run(config, layer, ep_split: bool | None, trace_only: bool = False):
-    """Run ``STEPS`` from an empty cache; returns per-step outputs, final cache arrays, first-step primitive counts.
+def _run(config, layer, ep_split: bool | None, trace_only: bool = False, steps=STEPS):
+    """Run ``steps`` from an empty cache; returns per-step outputs, final cache arrays, first-step primitive counts.
 
     ``trace_only`` returns only the first step's primitive counts, without running a step.
     """
     layer.config.dsa_serving_ep_split = ep_split
     rng = np.random.default_rng(0)
-    lengths = [sum(step[row] for step in STEPS) for row in range(2)]
+    lengths = [sum(step[row] for step in steps) for row in range(2)]
     streams = [jnp.asarray(rng.standard_normal((n, HID)), jnp.float32) for n in lengths]
     max_seqs, pages_per_seq = 3, -(-max(lengths) // PAGE)
     cache_cfg = MLARaggedPagesCacheConfig.create(
@@ -148,7 +164,7 @@ def _run(config, layer, ep_split: bool | None, trace_only: bool = False):
             cache_cfg, layer_index=0, mesh=config.mesh, runtime_sharding_resolver=config.runtime_sharding_resolver
         )
         done = [0, 0]
-        for index, step in enumerate(STEPS):
+        for index, step in enumerate(steps):
             chunks = []
             for row, n in enumerate(step):
                 chunks.append(streams[row][done[row] : done[row] + n])
@@ -217,6 +233,33 @@ def test_ep_split_serving_matches_unsplit(dims, compact_min_window, monkeypatch)
     bitwise = all(np.array_equal(a, b) for a, b in zip(on, off, strict=True))
     print(f"{dims}: per-step max|on - off| = {diffs}, bitwise={bitwise}")
     for step, (a, b) in enumerate(zip(on, off, strict=True)):
+        np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-5, err_msg=f"step {step}")
+    for a, b in zip(on_cache, off_cache, strict=True):
+        np.testing.assert_array_equal(a, b)
+
+
+@pytest.mark.parametrize(
+    ("dims", "compact_min_window"),
+    [((1, 1, 1, 4, 1, 1), None), ((1, 1, 1, 2, 2, 1), None), ((1, 1, 1, 4, 1, 1), 1)],
+    ids=["ep4tp1", "ep2tp2", "ep4tp1-compact"],
+)
+def test_ep_split_output_projection_matches_unsplit(dims, compact_min_window, monkeypatch):
+    """Token counts that divide the expert-parallel size (eSurge's buckets): with the flag, the output projection runs
+    on each expert-parallel shard's tokens and only its output is gathered. Every step's layer output matches the
+    unsplit layer's and the caches are bitwise equal."""
+    if jax.device_count() < int(np.prod(dims)):
+        pytest.skip(f"needs {int(np.prod(dims))} devices")
+    if compact_min_window is not None:
+        monkeypatch.setattr(mlrpa, "_EP_SPLIT_COMPACT_MIN_WINDOW", compact_min_window)
+    config, layer = _layer(dims)
+    off, off_cache, off_counts = _run(config, layer, False, steps=DIVISIBLE_STEPS)
+    on, on_cache, on_counts = _run(config, layer, True, steps=DIVISIBLE_STEPS)
+    assert on_counts["axis_index"] > off_counts["axis_index"], (on_counts["axis_index"], off_counts["axis_index"])
+    # Guard against a vacuous comparison: only the flag-on program projects each expert-parallel shard's tokens.
+    assert on_counts["token_split_constraint"] > 0, on_counts["token_split_constraint"]
+    assert off_counts["token_split_constraint"] == 0, off_counts["token_split_constraint"]
+    for step, (a, b) in enumerate(zip(on, off, strict=True)):
+        assert np.isfinite(a).all(), f"step {step}"
         np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-5, err_msg=f"step {step}")
     for a, b in zip(on_cache, off_cache, strict=True):
         np.testing.assert_array_equal(a, b)
