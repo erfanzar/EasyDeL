@@ -136,6 +136,9 @@ def _replay(log: bytes) -> int:
                 hash_extra=np.asarray([[(h0 << 32) | h1, (l0 << 32) | l1]], np.uint64),
                 image_spans=np.asarray(spans, np.int64).reshape(nsp, 2) if nsp else None,
                 span_offsets=np.asarray([0, nsp], np.int32),
+                # Pinned to the recorded rank: the cases check scheduling after admission; routing (which also weighs
+                # rank load) is tested in src/engine/dp.rs.
+                dp_rank=np.asarray([rank], np.int64),
             ).tolist()
             handle_of[idx], id_of[h] = h, idx
             assert core.rank_of(h) == rank, f"{where}: request {idx} routed to rank {core.rank_of(h)}, expected {rank}"

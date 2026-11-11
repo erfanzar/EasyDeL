@@ -16,7 +16,9 @@
 //! must be reproduced decision for decision.
 //!
 //! A case is one varint stream: a config block, then the calls in order. `ADD` admits a request (and names the rank
-//! the former scheduler routed it to), `FINISH` finishes one (abort or stop string), `SCHEDULE` carries the expected
+//! the former scheduler routed it to; the replay pins the request there through `dp_rank`, so the cases check every
+//! scheduling decision after admission while DP routing, which now also weighs rank load, is tested on its own in
+//! `dp.rs`), `FINISH` finishes one (abort or stop string), `SCHEDULE` carries the expected
 //! plan (per entry: request, scheduled tokens, computed tokens, whether it samples, its kind and its page ids per
 //! group; then the preempted and finished sets and the snapshot restore and save pairs), and `COMMIT` carries the
 //! sampled tokens of the oldest uncommitted plan and the expected events.
@@ -221,7 +223,7 @@ pub(crate) fn replay(log: &[u8]) -> Result<usize, String> {
                     },
                     stop_ids: &stops,
                     spans: &spans,
-                    dp_rank: None,
+                    dp_rank: Some(rank),
                     hash_extra: 0,
                     sampling: Sampling::default(),
                 };
@@ -409,7 +411,7 @@ pub(crate) fn replay_ext(log: &[u8]) -> Result<usize, String> {
                     flags: v[5] as u32,
                     stop_ids: &stops,
                     spans: &spans,
-                    dp_rank: None,
+                    dp_rank: Some(rank),
                     hash_extra: (u128::from(hi) << 64) | u128::from(lo),
                     sampling: Sampling::default(),
                 };
