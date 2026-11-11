@@ -82,6 +82,7 @@ from ._communication_utils import (
     MoEMethods,
     MoeMetrics,
     MoeRoutingStrategy,
+    _moe_row_gather_kernels,
     _moe_row_gather_sum_entry,
     build_ep_traffic_matrix,
     chunk_group_sizes,
@@ -497,6 +498,16 @@ i.e. 2,048 / 4,096 / 16,384 / 65,536 local rows: 1.033 vs 0.985, 1.494 vs 1.440,
 ep2 x tp2 (144 local experts) at 2,048 / 8,192 tokens (8,192 / 32,768 local rows): 2.406 vs 2.774, 7.981 vs 9.392.
 Below it the kernel's fixed cost (packing the window rows, sorting the per-block live-slot lists) exceeds the
 ``[tokens * k, H]`` XLA gather it replaces.
+"""
+
+_DMA_ROW_GATHER_MIN_ROWS = 20480
+"""Window rows from which the inference-mode deferred dispatch gathers its token rows through the Pallas TPU
+``moe_row_gather`` entry (one DMA per row) instead of an XLA gather; both give the same bits.
+
+Measured on one TPU v5p chip, bfloat16 rows of hidden 4096 gathered for expert shard 0 of 4 (288 experts top-8,
+random routing), ms per window gather with the DMA kernel vs XLA: 10,240 / 20,480 / 40,960 / 81,920 rows from
+4,096 / 8,192 / 16,384 / 32,768 tokens: 0.294 vs 0.191, 0.436 vs 0.651, 0.707 vs 1.145, 1.256 vs 2.118. Below it
+the XLA gather is faster.
 """
 
 
@@ -2691,7 +2702,9 @@ class BaseMoeModule(spx.Module, ABC):
 
             Inference-only helper of ``_replicated_deferred_dispatch``, whose stable sort lists the ``n_local`` local
             pairs first, grouped by local expert. Window ``w`` covers sorted rows ``[w * R, (w + 1) * R)``: it
-            gathers those ``R`` token rows, runs the expert FFN with window-local group sizes (rows past the window's
+            gathers those ``R`` token rows (from ``_DMA_ROW_GATHER_MIN_ROWS`` rows through the Pallas TPU
+            ``moe_row_gather`` entry, bit for bit the XLA gather), runs the expert FFN with window-local group sizes
+            (rows past the window's
             local count form the FFN's masked dispatch tail) and adds every pair sitting in the window, weighted,
             into an fp32 ``[tokens, H]`` sum through the ejkernel ``moe_row_gather_sum`` op with ``skip_negative``:
             slot ``-1`` marks a pair outside the window or not local and is never read (the FFN's tail rows are not
@@ -2737,6 +2750,7 @@ class BaseMoeModule(spx.Module, ABC):
             gather_sum = _moe_row_gather_sum_entry(
                 live_slot_kernel=total_rows >= _LIVE_COMBINE_MIN_LOCAL_ROWS * max(ep_size, 1)
             )
+            dma_gather = _moe_row_gather_kernels()[0] if window_rows >= _DMA_ROW_GATHER_MIN_ROWS else None
 
             def _window(w) -> jax.Array:
                 if n_windows == 1:
@@ -2750,7 +2764,9 @@ class BaseMoeModule(spx.Module, ABC):
                     ).astype(jnp.int32)
                     rel = positions - start
                     live = is_local & (rel >= 0) & (rel < window_rows)
-                inter = expert_ffn(x_src[rows // top_k], sizes, ids, tp_reduce=False)
+                src_rows = rows // top_k
+                gathered = x_src[src_rows] if dma_gather is None else dma_gather(x_src, src_rows)[0]
+                inter = expert_ffn(gathered, sizes, ids, tp_reduce=False)
                 # Window rows past its local count are the FFN's unwritten tail (not guaranteed finite on TPU): dead
                 # slots are -1, which the live-slot combine never reads (its XLA entry selects them away).
                 slots = jnp.where(live, rel, -1).reshape(tokens, top_k)

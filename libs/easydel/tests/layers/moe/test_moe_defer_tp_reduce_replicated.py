@@ -36,7 +36,9 @@ combined ``[tokens, H]`` partial once. On four TPU devices these tests pin:
   (ep > 1) and the program ``False`` lowers at ep == 1 and outside inference mode,
 * from ``_LIVE_COMBINE_MIN_LOCAL_ROWS`` expected local rows per expert shard the top-k combine runs the ejkernel
   Pallas live-slot kernel (``moe_row_gather_sum`` with ``skip_negative``): at the served precision it matches the
-  XLA combine to the fp32 summation order and the default dispatch within three bfloat16 roundings.
+  XLA combine to the fp32 summation order and the default dispatch within three bfloat16 roundings,
+* from ``_DMA_ROW_GATHER_MIN_ROWS`` window rows the dispatch gathers its token rows through the Pallas DMA kernel
+  (``moe_row_gather``), and the block output equals the XLA-gather program's bit for bit.
 """
 
 from __future__ import annotations
@@ -391,6 +393,24 @@ def test_live_slot_combine_matches_xla_combine_and_default(monkeypatch):
     # dropped or misplaced slot moves the output by about 1/k.
     assert _rel(out_live, out_xla) < 1e-3, _rel(out_live, out_xla)
     assert _rel(out_live, out_default) < BF16_REL_TOL, _rel(out_live, out_default)
+
+
+def test_dma_row_gather_matches_xla_gather(monkeypatch):
+    """Served precision where the window gather runs the Pallas DMA kernel: the output equals the XLA gather's bit for
+    bit. The threshold is lowered so this shape (ep2 x tp2, 10,240-row windows of 4096 tokens) takes the kernel."""
+    _skip_without_four_devices()
+    from easydel.layers.moe import _moe_module
+
+    block = _build(MESHES["ep2tp2"], quantize=True, dtype=jnp.bfloat16, hidden=LIVE_HIDDEN)
+    x = _x(jnp.bfloat16, tokens=LIVE_TOKENS, hidden=LIVE_HIDDEN)
+    monkeypatch.setattr(_moe_module, "_DMA_ROW_GATHER_MIN_ROWS", 2**31)
+    out_xla, compiled_xla = _forward(block, x, defer=True, compiled=True)
+    monkeypatch.setattr(_moe_module, "_DMA_ROW_GATHER_MIN_ROWS", 1)
+    out_dma, compiled_dma = _forward(block, x, defer=True, compiled=True)
+    # The DMA gather adds two Mosaic kernels (row pack + row gather) to the XLA-gather program.
+    assert compiled_dma.count("tpu_custom_call") >= compiled_xla.count("tpu_custom_call") + 2
+    assert np.isfinite(out_dma).all() and float(np.max(np.abs(out_xla))) > 0
+    np.testing.assert_array_equal(out_dma, out_xla)
 
 
 @pytest.mark.parametrize("passed", ["not_passed", "passed_none"])
