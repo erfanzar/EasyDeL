@@ -36,4 +36,6 @@ coordination:
   control_port: 19666
   bind_host: internal
 
-compilation_cache_dir: /dev/shm/esurge/jax_cc
+# Shared storage that every host reads. JAX writes cache entries only from distributed process 0, so a host-local
+# directory leaves every other host recompiling on every launch.
+compilation_cache_dir: gs://<your-bucket>/jax_cc/glm53-flash-w8a8-serving

@@ -53,7 +53,8 @@ See `examples/inference/glm53_flash_w8a8_serving.yaml`. Sections:
 - `server`: `host` (`internal` = this VM's VPC address, the default), `port`, `api_key_file`, `log_level`,
   `max_concurrent_generations`.
 - `coordination`: `control_port`, `bind_host` (`internal`), `heartbeat_timeout_s`, `token_timeout_s`.
-- `compilation_cache_dir`: JAX persistent compilation cache.
+- `compilation_cache_dir`: JAX persistent compilation cache. Use shared storage (`gs://…`) that every host can
+  read; see below.
 
 **Pin the KV pool.** Without `cache.max_cache_tokens` the page pool is sized from free HBM, which differs by a few
 hundred pages between launches. The page count is part of every compiled program's shape, so an unpinned pool
@@ -62,12 +63,11 @@ misses the persistent compilation cache on every launch and the full warmup reco
 **Share the compilation cache.** JAX writes persistent-cache entries only from the process whose distributed
 process id is 0. That is not necessarily the HTTP leader (on the slice this was measured on, the cache was written on
 worker 0 while `jax.process_index() == 0` was worker 12). With a host-local `compilation_cache_dir`, every other host
-misses and recompiles, and the slice runs at their pace. After the first full warmup, copy the one non-empty cache
-directory to every host:
-
-```bash
-eray tpu sync --ssh-key … /dev/shm/esurge/jax_cc /dev/shm/esurge/jax_cc   # run on the host that holds the entries
-```
+misses and recompiles, and the slice runs at their pace. Point `compilation_cache_dir` at one shared directory
+instead (for example `gs://<bucket>/jax_cc/<deployment>`; JAX reads and writes it through `etils[epath]`): process 0
+writes each entry once and every host reads it, so the next launch is warm everywhere with no copy step. Keep one
+directory per model, mesh and code version. A cache that has only ever lived on one host can be seeded once with
+`gsutil -m cp -n <local_dir>/*-cache gs://<bucket>/jax_cc/<deployment>/`.
 
 ## Auth
 
@@ -129,7 +129,7 @@ fall through to SIGKILL; that is expected.
 | | |
 |---|---|
 | cold start (empty compile cache, 28 model + 8 sampler variants) | 77 min |
-| warm start (pinned pool, process-0 cache copied to every host) | 17 min |
+| warm start (pinned pool, process-0 cache readable by every host) | 17 min |
 | clean stop of all 16 hosts by SIGTERM | ~70 s |
 
 Closed-loop streaming chat, 512 output tokens, ~940-token prompts sharing a system preamble (95 % of prompt tokens
@@ -150,7 +150,7 @@ otherwise to the least-loaded worker with room. A shared system prompt therefore
 - One model per deployment; one uvicorn worker (generation runs in the engine, not the HTTP workers).
 - A world is all or nothing: losing any host aborts it, and a restart is a full relaunch.
 - Full warmup compiles every token/request bucket; it is fast only when the compilation cache matches, which needs
-  a pinned KV pool, the same code and config, and the process-0 cache present on every host (see Config).
+  a pinned KV pool, the same code and config, and a `compilation_cache_dir` every host can read (see Config).
 - A shared prompt prefix concentrates moderate load on one DP worker (see the routing note above); latency at mid
   concurrency could improve with routing that also weighs per-worker load below the row cap.
 - `/health` requires the API key like every other route.
