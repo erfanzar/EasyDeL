@@ -631,6 +631,31 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
         """
         return self.layer_types[layer_idx] == DEEPSEEK_SPARSE_ATTENTION_LAYER_TYPE
 
+    def default_quantization_pattern(self, dtype: str) -> str:
+        """Parameter-path regex for load-time weight/activation quantization of this model.
+
+        Covers the routed, shared and dense MLP projections and the ``q_a``/``q_b``/``kv_a``/``o`` projections of
+        the DSA layers. KDA layers, the DSA indexer, ``kv_b_proj`` (its absorbed layout is not quantizable),
+        embeddings and the LM head stay in the activation dtype. Validated for ``w8a8`` serving of GLM-5.3-Flash.
+
+        Args:
+            dtype: Quantization dtype the pattern will be used with (kept for a uniform model API).
+
+        Returns:
+            A regex for :class:`~easydel.layers.quantization.QuantizationConfig` ``pattern``.
+        """
+        del dtype
+        mlp = r"(?:\.mlp\.(?:experts\.|shared_experts\.)?(?:gate_up_proj|gate_proj|up_proj|down_proj)$)"
+        dsa_layers = [str(idx) for idx in range(self.num_hidden_layers) if self.is_dsa_layer(idx)]
+        if not dsa_layers:
+            return mlp
+        attention = (
+            r"(?:\.layers\.(?:"
+            + "|".join(dsa_layers)
+            + r")\.self_attn\.(?:q_a_proj|q_b_proj|kv_a_proj_with_mqa|o_proj)$)"
+        )
+        return mlp + "|" + attention
+
     def get_layer_types(self) -> tuple[str, ...]:
         """Get the per-layer cache schedule for :class:`HybridCache` init.
 
