@@ -59,6 +59,16 @@ See `examples/inference/glm53_flash_w8a8_serving.yaml`. Sections:
 hundred pages between launches. The page count is part of every compiled program's shape, so an unpinned pool
 misses the persistent compilation cache on every launch and the full warmup recompiles.
 
+**Share the compilation cache.** JAX writes persistent-cache entries only from the process whose distributed
+process id is 0. That is not necessarily the HTTP leader (on the slice this was measured on, the cache was written on
+worker 0 while `jax.process_index() == 0` was worker 12). With a host-local `compilation_cache_dir`, every other host
+misses and recompiles, and the slice runs at their pace. After the first full warmup, copy the one non-empty cache
+directory to every host:
+
+```bash
+eray tpu sync --ssh-key … /dev/shm/esurge/jax_cc /dev/shm/esurge/jax_cc   # run on the host that holds the entries
+```
+
 ## Auth
 
 - One API key, stored in `server.api_key_file`. It is created (mode 0600) on first launch and reused on every later
@@ -100,18 +110,51 @@ behind an HttpOnly SameSite=Strict session cookie) is forwarded to the API's `/m
 ```bash
 eray tpu job status --name esurge --ssh-key …        # running / exited (rc) / stopped, per host
 eray tpu job logs   --name esurge --ssh-key … --host 0 -n 100
-eray tpu job stop   --name esurge --ssh-key …        # SIGTERM the process group, SIGKILL after --grace,
-                                                    # then report any process still holding the TPU
+eray tpu job stop   --name esurge --ssh-key …        # SIGTERM the process group, SIGKILL after --grace (30 s),
+                                                    # wait up to --kill-wait (30 s), then report TPU holders
 ```
 
 Logs live on each host in `~/.eray/hostjobs/<name>/log` (previous run in `log.1`). Restart = `stop`, then `start`.
-Stopping the leader shuts the world down; workers then exit through `wait_for_shutdown()`.
+
+`stop` signals every host at once. `serve()` turns SIGTERM into a clean exit: the leader finishes uvicorn's graceful
+HTTP shutdown and then closes the engine, which sends Shutdown to the workers. A worker that gets SIGTERM waits up to
+20 s for that Shutdown before closing on its own. Each host logs `[esurge-serving] stopped by SIGTERM`. A process
+busy inside an XLA compile cannot run the Python handler until the compile returns, so a stop during warmup can
+fall through to SIGKILL; that is expected.
+
+`eray tpu sync SRC DEST` copies to every host, including this one when `DEST` is a different path from `SRC`.
+
+## Measured on a v5p-128 (64 chips, GLM-5.3-Flash W8A8, 4 DP × EP4×TP4)
+
+| | |
+|---|---|
+| cold start (empty compile cache, 28 model + 8 sampler variants) | 77 min |
+| warm start (pinned pool, process-0 cache copied to every host) | 17 min |
+| clean stop of all 16 hosts by SIGTERM | ~70 s |
+
+Closed-loop streaming chat, 512 output tokens, ~940-token prompts sharing a system preamble (95 % of prompt tokens
+from the prefix cache), 180 s per level, no errors:
+
+| concurrency | output tok/s | TTFT p50 / p99 | latency p50 / p99 |
+|---|---|---|---|
+| 1 | 50 | 0.07 / 0.58 s | 10.2 / 10.7 s |
+| 32 | 1,129 | 0.25 / 0.51 s | 14.5 / 14.8 s |
+| 128 | 1,705 | 0.33 / 2.7 s | 32.4 / 49.9 s |
+
+DP routing sends a request to the worker that already holds its prompt prefix while that worker has a free row,
+otherwise to the least-loaded worker with room. A shared system prompt therefore fills one DP worker before spreading
+(at concurrency 32 all requests ran on one worker); at 128 every worker is busy.
 
 ## Known limits
 
 - One model per deployment; one uvicorn worker (generation runs in the engine, not the HTTP workers).
 - A world is all or nothing: losing any host aborts it, and a restart is a full relaunch.
 - Full warmup compiles every token/request bucket; it is fast only when the compilation cache matches, which needs
-  a pinned KV pool and the same code and config.
+  a pinned KV pool, the same code and config, and the process-0 cache present on every host (see Config).
+- A shared prompt prefix concentrates moderate load on one DP worker (see the routing note above); latency at mid
+  concurrency could improve with routing that also weighs per-worker load below the row cap.
+- `/health` requires the API key like every other route.
+- Workarounds that exist only in the batch data-generation harness (an explicit KV budget, EOS seeding) are not part
+  of this serving path.
 - `external` URLs are reachable only if a firewall rule allows the port.
 - Prefill tok/s in `/metrics` includes queueing time, so it is a lower bound on raw prefill speed.
