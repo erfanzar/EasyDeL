@@ -1016,6 +1016,45 @@ class eSurge:
         return self._generation_alive
 
     @property
+    def is_coordination_leader(self) -> bool:
+        """Whether this rank owns scheduling and may serve requests.
+
+        True on a single host and on rank 0 of a ZMQ-coordinated multi-host world; False on worker ranks,
+        which only replay the leader's step stream (see :meth:`wait_for_shutdown`).
+        """
+        coordinator = getattr(self, "_step_coordinator", None)
+        return coordinator is None or bool(getattr(coordinator, "is_leader", True))
+
+    def wait_for_shutdown(self, timeout: float | None = None) -> bool:
+        """Block a coordination worker rank until the leader shuts the world down.
+
+        Worker ranks have no scheduler or HTTP server; their only job is replaying the leader's steps. This
+        returns when the replay loop ends: the leader broadcast Shutdown, or :meth:`close` was called.
+
+        Args:
+            timeout: Seconds to wait; ``None`` waits indefinitely.
+
+        Returns:
+            ``True`` when the replay loop ended cleanly, ``False`` when ``timeout`` expired first.
+
+        Raises:
+            RuntimeError: On the leader rank, when the replay loop was never started, or when it failed
+                (the original exception is chained).
+        """
+        if self.is_coordination_leader:
+            raise RuntimeError("wait_for_shutdown() is for coordination worker ranks; the leader serves requests.")
+        thread = getattr(self, "_worker_replay_thread", None)
+        if thread is None:
+            raise RuntimeError("The worker replay loop is not running; call initiate() first.")
+        thread.join(timeout)
+        if thread.is_alive():
+            return False
+        failure = getattr(self, "_scheduler_exception", None)
+        if failure is not None:
+            raise RuntimeError("The worker replay loop failed.") from failure
+        return True
+
+    @property
     def _generation_alive(self) -> bool:
         """Whether requests can make progress on this rank.
 
@@ -1247,47 +1286,45 @@ class eSurge:
         """Tokenizer ID for :attr:`think_end_token`, if resolvable."""
         return self._resolve_reasoning_boundary_token_id("_end_token_id", "end_token")
 
-    def __del__(self):
-        """Destructor that cleans up resources.
+    def close(self) -> None:
+        """Release every resource the engine holds; the engine cannot be used afterwards.
 
-        Attempts to gracefully terminate all running services including:
-        - Background scheduler thread
-        - Monitoring services (Prometheus, Grafana)
-        - Profiler trace
-        - Worker processes (tokenizer/detokenizer)
-        - Model runner
+        Unlike :meth:`terminate` (which only stops the scheduler or replay loop and can be undone with
+        :meth:`initiate`), this also stops monitoring and profiling, the tokenizer/detokenizer workers, the
+        step coordinator and the runner. Works on leader and worker ranks and on partially constructed
+        engines. Idempotent; each step is attempted even if an earlier one fails.
         """
-        if getattr(self, "_scheduler_running", False):
-            try:
-                self.terminate()
-            except Exception:
-                pass
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        if getattr(self, "_scheduler_running", False) or getattr(self, "_worker_replay_thread", None) is not None:
+            self._close_step("terminate", self.terminate)
         monitoring = getattr(self, "_monitoring", None)
         if monitoring is not None and monitoring.monitoring_active:
-            try:
-                self.stop_monitoring()
-            except Exception:
-                pass
+            self._close_step("stop monitoring", self.stop_monitoring)
         if getattr(self, "_profiling_active", False):
-            try:
-                self.stop_profiling()
-            except Exception:
-                pass
-        if hasattr(self, "_worker_manager"):
-            try:
-                self._worker_manager.shutdown()
-            except Exception:
-                pass
-        if getattr(self, "_step_coordinator", None) is not None:
-            try:
-                self._step_coordinator.shutdown("engine deleted")
-            except Exception:
-                pass
-        if hasattr(self, "runner"):
-            try:
-                self.runner.shutdown()
-            except Exception:
-                pass
+            self._close_step("stop profiling", self.stop_profiling)
+        worker_manager = getattr(self, "_worker_manager", None)
+        if worker_manager is not None:
+            self._close_step("worker shutdown", worker_manager.shutdown)
+        coordinator = getattr(self, "_step_coordinator", None)
+        if coordinator is not None:
+            self._close_step("coordinator shutdown", lambda: coordinator.shutdown("engine closed"))
+        runner = getattr(self, "runner", None)
+        if runner is not None and hasattr(runner, "shutdown"):
+            self._close_step("runner shutdown", runner.shutdown)
+
+    @staticmethod
+    def _close_step(name: str, step: typing.Callable[[], typing.Any]) -> None:
+        """Run one :meth:`close` step, logging instead of raising so later steps still run."""
+        try:
+            step()
+        except Exception:
+            logger.debug("eSurge close: %s failed", name, exc_info=True)
+
+    def __del__(self):
+        """Release resources through :meth:`close` when the engine is garbage-collected."""
+        self.close()
 
     def __repr__(self):
         """Return a detailed string representation of the engine.
