@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -40,7 +40,7 @@ pub struct EngineMetrics {
     pub recent_requests: Vec<RecentRequest>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Aggregate {
     pub completed: u64,
@@ -61,11 +61,12 @@ pub struct Aggregate {
     pub output_tps: Option<f64>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RecentRequest {
     pub request_id: String,
     pub finish_reason: Option<String>,
+    pub error: Option<String>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub ttft_s: Option<f64>,

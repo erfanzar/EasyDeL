@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod history;
 pub mod metrics;
 pub mod render;
 pub mod routes;

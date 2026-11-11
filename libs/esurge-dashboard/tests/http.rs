@@ -69,7 +69,8 @@ async fn header_credentials_are_forwarded_and_judged_by_upstream() {
     assert_eq!(good.status(), StatusCode::OK);
     assert_eq!(good.headers()["cache-control"], "no-store");
     let body = good.text().await.unwrap();
-    assert!(body.contains("Decode / prefill cache matrix") && body.contains("HIT"));
+    assert!(body.contains("Inference <span class=\"hl\">cockpit</span>") && body.contains("HIT"));
+    assert!(body.contains("data-chart=\"gen\"") && body.contains("/assets/dashboard.js"));
 
     let lowercase_scheme = client
         .get(&url)
@@ -220,6 +221,79 @@ async fn api_metrics_passthrough_health_and_unknown_paths() {
         client.get(format!("{base}/nope")).send().await.unwrap().status(),
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test]
+async fn history_is_gated_by_upstream_and_returns_deltas() {
+    let (addr, client) = setup().await;
+    let base = format!("http://{addr}");
+
+    let anonymous = client.get(format!("{base}/api/history")).send().await.unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    let rejected = client
+        .get(format!("{base}/api/history"))
+        .bearer_auth("wrong")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+    let first = client
+        .get(format!("{base}/api/history?after=0"))
+        .bearer_auth(GOOD_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.headers()["cache-control"], "no-store");
+    let body: serde_json::Value = serde_json::from_str(&first.text().await.unwrap()).unwrap();
+    assert_eq!(body["metrics"]["status"], "ready");
+    let history = &body["history"];
+    assert_eq!(history["samples"].as_array().unwrap().len(), 1);
+    assert_eq!(history["samples"][0]["models"]["GLM"]["running_requests"], 2);
+    let requests = history["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["request_id"], "chat-1");
+    assert_eq!(requests[0]["model"], "GLM");
+    assert_eq!(requests[0]["cache_read_tokens"], 256);
+
+    // The same request is logged once; a second poll inside one second adds no sample either.
+    let seq = history["seq"].as_u64().unwrap();
+    let second = client
+        .get(format!("{base}/api/history?after={seq}"))
+        .bearer_auth(GOOD_KEY)
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&second.text().await.unwrap()).unwrap();
+    assert!(body["history"]["requests"].as_array().unwrap().is_empty());
+    assert!(body["history"]["samples"].as_array().unwrap().is_empty());
+    assert_eq!(body["history"]["reset"], false);
+}
+
+#[tokio::test]
+async fn assets_and_security_headers() {
+    let (addr, client) = setup().await;
+    let base = format!("http://{addr}");
+
+    let css = client.get(format!("{base}/assets/dashboard.css")).send().await.unwrap();
+    assert_eq!(css.status(), StatusCode::OK);
+    assert!(css.headers()["content-type"].to_str().unwrap().starts_with("text/css"));
+    assert!(css.text().await.unwrap().contains("--bg: #f4f5f8"));
+
+    let js = client.get(format!("{base}/assets/dashboard.js")).send().await.unwrap();
+    assert_eq!(js.status(), StatusCode::OK);
+    assert!(js.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/javascript"));
+
+    let page = client.get(format!("{base}/login")).send().await.unwrap();
+    let csp = page.headers()["content-security-policy"].to_str().unwrap();
+    assert!(csp.contains("script-src 'self'") && csp.contains("frame-ancestors 'none'"));
+    assert!(!csp.contains("unsafe-inline"));
+    assert_eq!(page.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(page.headers()["x-frame-options"], "DENY");
 }
 
 #[tokio::test]
