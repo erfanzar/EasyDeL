@@ -36,6 +36,7 @@ import pytest
 import spectrax as spx
 from easydel.caching import MLARaggedPagesCacheConfig, MLARaggedPagesCacheView, RaggedPagesMetadata
 from easydel.operations.kernels import multi_latent_ragged_page_attention as mlrpa
+from ejkernel.types import MaskInfo
 from spectrax import common_types
 
 HID, HEADS, KPOOL, TOPK, PAGE = 64, 4, 4, 8, 8
@@ -77,7 +78,8 @@ def _primitive_counts(fn, *args) -> collections.Counter:
     return counts
 
 
-def _layer(dims):
+def _layer(dims, ragged: bool = True):
+    """One GLM-5 DSA attention layer on ``dims``; ``ragged`` selects eSurge's MLA ragged-pages op (else the default)."""
     config = ed.Glm5NextTextConfig(
         vocab_size=128,
         hidden_size=HID,
@@ -103,7 +105,8 @@ def _layer(dims):
         sharding_axis_dims=dims,
     )
     config.attn_dtype = jnp.float32
-    config.attn_mechanism = "multi_latent_ragged_page_attention_v2"
+    if ragged:
+        config.attn_mechanism = "multi_latent_ragged_page_attention_v2"
     with config.mesh:
         model = ed.Glm5NextForCausalLM(
             config=config,
@@ -263,3 +266,36 @@ def test_ep_split_output_projection_matches_unsplit(dims, compact_min_window, mo
         np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-5, err_msg=f"step {step}")
     for a, b in zip(on_cache, off_cache, strict=True):
         np.testing.assert_array_equal(a, b)
+
+
+def _train_attention(layer, hidden):
+    """A training-mode forward of the layer: no cache view, a causal mask over one packed row."""
+    n = hidden.shape[1]
+    return layer.forward_mla(
+        hidden,
+        MaskInfo.dynamic_init(input_ids=jnp.ones((1, n), jnp.int32)),
+        jnp.arange(n, dtype=jnp.int32)[None, :],
+        common_types.MODE_TRAIN,
+    ).attention_output
+
+
+@pytest.mark.parametrize("dims", [(1, 1, 1, 4, 1, 1), (1, 1, 1, 2, 2, 1)], ids=["ep4tp1", "ep2tp2"])
+def test_training_forward_ignores_the_serving_split(dims):
+    """Training never splits the attention or the output projection over the expert axis: on expert-parallel meshes a
+    training forward traces the same program for ``dsa_serving_ep_split`` False, True and None, without the output
+    projection's token-split constraint, and gives the same output bit for bit."""
+    if jax.device_count() < int(np.prod(dims)):
+        pytest.skip(f"needs {int(np.prod(dims))} devices")
+    config, layer = _layer(dims, ragged=False)
+    hidden = jnp.asarray(np.random.default_rng(2).standard_normal((1, 32, HID)), jnp.float32)
+    counts, outs = {}, {}
+    with jax.default_matmul_precision("highest"), config.mesh:
+        for setting in (False, True, None):
+            layer.config.dsa_serving_ep_split = setting
+            counts[setting] = _primitive_counts(functools.partial(_train_attention, layer), hidden)
+            outs[setting] = np.asarray(_train_attention(layer, hidden))
+    assert counts[True] == counts[False] == counts[None]
+    assert counts[False]["token_split_constraint"] == 0, counts[False]["token_split_constraint"]
+    assert np.isfinite(outs[False]).all() and float(np.max(np.abs(outs[False]))) > 0
+    for setting in (True, None):
+        np.testing.assert_array_equal(outs[setting], outs[False], err_msg=str(setting))
