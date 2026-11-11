@@ -117,6 +117,30 @@ class RequestMetrics:
         return max(0, int(self.prompt_tokens) - int(self.cache_read_tokens))
 
 
+_PHASE_STEP_HISTORY = 65536
+"""Engine steps kept for :meth:`MetricsCollector.phase_summary` (minutes of 20 ms decode steps)."""
+
+
+def split_phase_tokens(scheduled: int, num_computed_tokens: int, num_prompt_tokens: int) -> tuple[int, int]:
+    """Split one request's scheduled tokens in an engine step into ``(prefill, decode)`` tokens.
+
+    Prompt tokens the step computes are prefill; the rest are decode. A prefix-cache hit starts the request with
+    ``num_computed_tokens`` past the cached pages, so cached tokens are never counted. Output tokens recomputed after
+    a preemption are counted as decode.
+
+    Args:
+        scheduled: Tokens scheduled for the request in this step.
+        num_computed_tokens: Tokens already computed before the step.
+        num_prompt_tokens: Prompt length of the request.
+
+    Returns:
+        ``(prefill_tokens, decode_tokens)``, which sum to ``max(0, scheduled)``.
+    """
+    scheduled = max(0, int(scheduled))
+    prefill = min(scheduled, max(0, int(num_prompt_tokens) - int(num_computed_tokens)))
+    return prefill, scheduled - prefill
+
+
 def _percentile(values: list[float], fraction: float) -> float | None:
     """Nearest-rank percentile of ``values`` (``None`` when empty)."""
     if not values:
@@ -332,6 +356,9 @@ class MetricsCollector:
         self.counters = defaultdict(int)
         # Bounded history of cache lifecycle events: ``(timestamp, event, details)``.
         self.cache_events: deque[tuple[float, str, dict[str, Any] | None]] = deque(maxlen=history_size)
+        # One row per engine step: ``(timestamp, prefill_tokens, decode_tokens)``.
+        self.phase_steps: deque[tuple[float, int, int]] = deque(maxlen=max(history_size, _PHASE_STEP_HISTORY))
+        self.created_at = time.time()
 
         self.last_log_time = time.time()
 
@@ -519,6 +546,66 @@ class MetricsCollector:
                 memory_usage=memory_usage,
             )
             self.runner_metrics.append(metrics)
+
+    def record_step_tokens(self, prefill_tokens: int, decode_tokens: int) -> None:
+        """Record how many prefill and decode tokens one engine step computed.
+
+        Args:
+            prefill_tokens: Prompt tokens computed in the step (see :func:`split_phase_tokens`).
+            decode_tokens: Generation tokens computed in the step.
+
+        Note:
+            Thread-safe. Steps that computed nothing are ignored.
+        """
+        prefill = max(0, int(prefill_tokens))
+        decode = max(0, int(decode_tokens))
+        if prefill == 0 and decode == 0:
+            return
+        with self._lock:
+            self.phase_steps.append((time.time(), prefill, decode))
+            self.counters["prefill_tokens_total"] += prefill
+            self.counters["decode_tokens_total"] += decode
+            self.counters["engine_steps_total"] += 1
+
+    def phase_summary(self, window_seconds: float = 300.0) -> dict[str, Any]:
+        """Prefill and decode throughput of the engine steps that ran in a recent window.
+
+        Rates are tokens divided by the window, or by the collector's age when it is younger than the window, so they
+        are wall-clock throughput that includes idle time. The ``*_total`` counters cover the collector's lifetime and
+        let a client compute its own trailing rates.
+
+        Args:
+            window_seconds: Only steps recorded within this many seconds are included.
+
+        Returns:
+            JSON-serializable dict with token counts, ``prefill_tps``/``decode_tps``, the number of prefill-only,
+            decode-only and mixed steps, and lifetime totals.
+        """
+        now = time.time()
+        cutoff = now - float(window_seconds)
+        with self._lock:
+            rows = [row for row in self.phase_steps if row[0] >= cutoff]
+            prefill_total = int(self.counters.get("prefill_tokens_total", 0))
+            decode_total = int(self.counters.get("decode_tokens_total", 0))
+            steps_total = int(self.counters.get("engine_steps_total", 0))
+            age = now - self.created_at
+        span = min(float(window_seconds), age)
+        prefill = sum(row[1] for row in rows)
+        decode = sum(row[2] for row in rows)
+        return {
+            "window_seconds": float(window_seconds),
+            "prefill_tokens": prefill,
+            "decode_tokens": decode,
+            "prefill_tps": prefill / span if span > 0 else None,
+            "decode_tps": decode / span if span > 0 else None,
+            "steps": len(rows),
+            "prefill_steps": sum(1 for row in rows if row[1] and not row[2]),
+            "decode_steps": sum(1 for row in rows if row[2] and not row[1]),
+            "mixed_steps": sum(1 for row in rows if row[1] and row[2]),
+            "prefill_tokens_total": prefill_total,
+            "decode_tokens_total": decode_total,
+            "steps_total": steps_total,
+        }
 
     def record_cache_metrics(
         self,
@@ -822,6 +909,8 @@ class MetricsCollector:
             self.cache_metrics.clear()
             self.counters.clear()
             self.cache_events.clear()
+            self.phase_steps.clear()
+            self.created_at = time.time()
 
 
 _global_metrics_collector: MetricsCollector | None = None

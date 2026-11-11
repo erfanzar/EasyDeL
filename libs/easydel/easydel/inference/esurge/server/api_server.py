@@ -3142,6 +3142,9 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 "running_requests": int(getattr(engine, "num_running_requests", 0) or 0),
                 "waiting_requests": int(getattr(engine, "num_pending_requests", 0) or 0),
                 **summary,
+                # Engine-step prefill/decode split. The collector is process-wide, so with several engines in one
+                # process every model reports the same totals.
+                "phase": collector.phase_summary(window_seconds=_METRICS_WINDOW_S) if collector is not None else None,
             }
         return snapshots
 

@@ -89,7 +89,7 @@ from easydel.utils import flags
 
 from ..core.dp_sharding import dp_shard_page_bounds, pages_per_dp_shard
 from ..core.interface import create_kv_cache_specs_from_config, estimate_runtime_page_budget
-from ..metrics import get_metrics_collector
+from ..metrics import get_metrics_collector, split_phase_tokens
 from ..multimodal.cache import VisionEncoderCache
 from ..multimodal.side_inputs import build_side_input_provider, model_has_side_inputs
 from ..outputs import LogprobsLists, ModelRunnerOutput
@@ -2584,6 +2584,25 @@ class eSurgeRunner:
         """
         self.vlm.precompute_prefill(req_state)
 
+    def _phase_token_split(self, scheduler_output: SchedulerOutput) -> tuple[int, int]:
+        """Prefill and decode tokens this step computes, summed over its requests.
+
+        Call after :meth:`_update_states`, when each request's ``num_computed_tokens`` is its progress before the
+        step. Requests the runner does not track are skipped.
+        """
+        prefill_total = 0
+        decode_total = 0
+        for rid, scheduled in scheduler_output.num_scheduled_tokens.items():
+            req_state = self.requests.get(rid)
+            if req_state is None:
+                continue
+            prefill, decode = split_phase_tokens(
+                int(scheduled), int(req_state.num_computed_tokens), int(req_state.num_prompt_tokens)
+            )
+            prefill_total += prefill
+            decode_total += decode
+        return prefill_total, decode_total
+
     def _update_states(self, scheduler_output: SchedulerOutput) -> bool:
         """Update internal states based on scheduler output.
 
@@ -3222,6 +3241,7 @@ class eSurgeRunner:
         if self.drafter is not None and return_async_output and not self._can_defer_spec_step(scheduler_output):
             return_async_output = False
         updating_states_time = time.time() - updating_states_start
+        step_prefill_tokens, step_decode_tokens = self._phase_token_split(scheduler_output)
 
         # Apply previous async results if available. For safe PP decode windows,
         # this repair is delayed until after the next device dispatch is queued:
@@ -5144,6 +5164,7 @@ class eSurgeRunner:
                 batch_size=len(req_ids_all),
                 num_tokens=scheduler_output.total_num_scheduled_tokens,
             )
+            metrics_collector.record_step_tokens(step_prefill_tokens, step_decode_tokens)
         metrics_time = time.time() - metrics_start
 
         total_time = time.time() - execution_start_time
