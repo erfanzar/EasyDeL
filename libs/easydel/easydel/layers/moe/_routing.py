@@ -41,12 +41,15 @@ Every knob exists because some family needed it; none is speculative. See
 from __future__ import annotations
 
 import functools
+import math
 import typing as tp
 
 import jax
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+
+from easydel.infra.sharding import inference_mode_forces_decode
 
 ScoreFn = tp.Literal["sigmoid", "softmax", "none"]
 GroupScore = tp.Literal["topk_sum", "max"]
@@ -135,6 +138,43 @@ def _take_topk(scores: Array, indices: Array) -> Array:
 # Picks made one ``argmax`` at a time (see :func:`_topk_indices`); a larger ``k`` uses ``lax.top_k``.
 _ARGMAX_TOPK_MAX_K = 8
 
+# Inside eSurge's decode-layout programs (:func:`~easydel.infra.sharding.decode_mode_specs`) a small selection ranks
+# every expert in one pass instead (:func:`_ranked_topk_indices`). That pass makes ``tokens * experts**2`` compares
+# where the argmax picks make ``k`` dependent reductions over ``tokens * experts``. On one TPU v5p chip (k 2, 4 and 8;
+# 64 to 512 experts; 16 to 128 tokens) it was the faster form in every case with
+# ``tokens * experts**2 <= (k - 2) * 700_000`` (for example 9.67 against 15.54 us per selection at 32 tokens, 288 experts
+# and k = 8); outside that bound it was slower, or at most 12% faster.
+_RANKED_TOPK_COMPARES_PER_PICK = 700_000
+
+
+def _ranked_topk_pays(num_tokens: int, num_experts: int, k: int) -> bool:
+    """Whether one-pass ranking beats the argmax picks for this selection (see :data:`_RANKED_TOPK_COMPARES_PER_PICK`)."""
+    return num_tokens * num_experts * num_experts <= (k - 2) * _RANKED_TOPK_COMPARES_PER_PICK
+
+
+def _ranked_topk_indices(scores: Array, k: int) -> Int[Array, "tokens k"]:
+    """The argmax picks of :func:`_topk_indices` in one pass: every expert's rank by pairwise comparison.
+
+    An expert's rank counts the experts ahead of it (a higher key, or the same key and a lower index); the experts of
+    ranks ``0 .. k - 1`` are read off in order. Keys are the argmax picks' (``-inf`` raised to the lowest finite
+    value), so a row without NaN gets the same indices. NaN scores rank as ``+inf`` (ties to the lower index), so every
+    row yields ``k`` distinct experts; on a row with NaN the indices can differ from the argmax picks'.
+
+    Args:
+        scores: ``(tokens, experts)`` floating-point selection scores.
+        k: Entries kept per row.
+
+    Returns:
+        ``(tokens, k)`` int32 indices.
+    """
+    key = jnp.where(jnp.isnan(scores), jnp.inf, jnp.maximum(scores, jnp.finfo(scores.dtype).min))
+    ids = jnp.arange(key.shape[-1], dtype=jnp.int32)
+    other, mine = key[..., None, :], key[..., :, None]
+    ahead = (other > mine) | ((other == mine) & (ids[None, :] < ids[:, None]))
+    rank = jnp.sum(ahead, axis=-1, dtype=jnp.int32)
+    hit = rank[..., None, :] == jnp.arange(k, dtype=jnp.int32)[:, None]
+    return jnp.sum(jnp.where(hit, ids, 0), axis=-1, dtype=jnp.int32)
+
 
 def _topk_indices(scores: Array, k: int) -> Int[Array, "tokens k"]:
     """Indices of the ``k`` largest scores per row, in descending order and the lower index first on ties.
@@ -144,7 +184,9 @@ def _topk_indices(scores: Array, k: int) -> Int[Array, "tokens k"]:
     on wide rows. ``argmax`` does not, so up to :data:`_ARGMAX_TOPK_MAX_K` entries are picked one ``argmax`` at a
     time, each pick removed before the next. ``-inf`` scores are first raised to the lowest finite value, so they rank
     after every finite score and before removed entries: slots past a row's finite entries take the excluded experts
-    in index order, as ``top_k`` does.
+    in index order, as ``top_k`` does. Inside eSurge's decode-layout scope a selection small enough
+    (:func:`_ranked_topk_pays`) ranks every expert in one pass (:func:`_ranked_topk_indices`), with the same indices
+    on rows without NaN; every other trace, training included, keeps the argmax picks.
 
     Args:
         scores: ``(tokens, experts)`` floating-point selection scores.
@@ -155,6 +197,9 @@ def _topk_indices(scores: Array, k: int) -> Int[Array, "tokens k"]:
     """
     if k > _ARGMAX_TOPK_MAX_K:
         return jax.lax.top_k(scores, k=k)[1]
+    num_tokens = math.prod(int(d) for d in scores.shape[:-1])
+    if inference_mode_forces_decode() and _ranked_topk_pays(num_tokens, int(scores.shape[-1]), k):
+        return _ranked_topk_indices(scores, k)
     ids = jnp.arange(scores.shape[-1], dtype=jnp.int32)
     key = jnp.maximum(scores, jnp.finfo(scores.dtype).min)
     picks = []
