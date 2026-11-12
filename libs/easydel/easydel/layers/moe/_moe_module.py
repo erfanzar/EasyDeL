@@ -461,6 +461,41 @@ def _deferred_window_rows(total_rows: int, ep_size: int, override: int | None) -
     return min(rows, total_rows)
 
 
+_RANKED_ORDER_MAX_PAIRS = 2048
+"""Largest pair count whose deferred-dispatch order is ranked in one pass (:func:`_stable_order`).
+
+The pass makes ``pairs**2`` compares where the two stable argsorts it replaces sort twice. On one TPU v5p chip (16, 72
+and 128 local experts) it was faster up to 2048 pairs (4.25 against 12.75 us per layer at 256 pairs and 72 local
+experts, a decode step of 32 tokens with k = 8) and slower at 4096.
+"""
+
+
+def _stable_order(sort_keys: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """``(order, positions)``: the stable argsort of ``sort_keys`` and its inverse permutation, both int32.
+
+    Up to :data:`_RANKED_ORDER_MAX_PAIRS` pairs every pair's position is counted in one pass (the pairs with a smaller
+    key, plus the earlier pairs with the same key) and ``order`` is read off the positions; both equal the two stable
+    argsorts' results exactly. Longer inputs run the two argsorts.
+
+    Args:
+        sort_keys: Integer key of every pair ``[pairs]``.
+
+    Returns:
+        ``(order, positions)``, each ``[pairs]`` int32, with ``order[positions[p]] == p``.
+    """
+    pairs = int(sort_keys.shape[0])
+    if pairs > _RANKED_ORDER_MAX_PAIRS:
+        order = jnp.argsort(sort_keys).astype(jnp.int32)
+        return order, jnp.argsort(order).astype(jnp.int32)
+    ids = jnp.arange(pairs, dtype=jnp.int32)
+    keys = sort_keys.astype(jnp.int32)
+    other, mine = keys[None, :], keys[:, None]
+    ahead = (other < mine) | ((other == mine) & (ids[None, :] < ids[:, None]))
+    positions = jnp.sum(ahead, axis=1, dtype=jnp.int32)
+    order = jnp.sum(jnp.where(positions[None, :] == ids[:, None], ids[None, :], 0), axis=1, dtype=jnp.int32)
+    return order, positions
+
+
 def _reduce_scatter(
     x: jax.Array,
     axis_name: str | tuple[str, ...],
@@ -2760,6 +2795,7 @@ class BaseMoeModule(spx.Module, ABC):
         def _local_row_windows(
             x2d: jax.Array,
             order: jax.Array,
+            positions: jax.Array,
             sort_keys: jax.Array,
             group_sizes: jax.Array,
             is_local: jax.Array,
@@ -2790,6 +2826,7 @@ class BaseMoeModule(spx.Module, ABC):
             Args:
                 x2d: Token rows ``[tokens, H]``.
                 order: Stable argsort of ``sort_keys`` (local pairs first), ``[tokens * k]`` int32.
+                positions: Inverse permutation of ``order``: pair ``p`` sits at sorted row ``positions[p]``.
                 sort_keys: Per-pair local expert id; ``experts_per_shard`` for non-local pairs.
                 group_sizes: Local pairs per local expert, ``[experts_per_shard]`` int32.
                 is_local: Per-pair locality, ``[tokens * k]``.
@@ -2808,7 +2845,6 @@ class BaseMoeModule(spx.Module, ABC):
             n_windows = -(-total_rows // window_rows)
             pad = n_windows * window_rows - total_rows
             # Pair p sits at sorted row positions[p]; local pairs fill sorted rows [0, n_local).
-            positions = jnp.argsort(order).astype(jnp.int32)
             sorted_ids = jnp.minimum(sort_keys[order], experts_per_shard - 1).astype(jnp.int32)
             if pad:
                 # Padding rows follow every local row of the last window: masked FFN tail, never combined.
@@ -2923,13 +2959,14 @@ class BaseMoeModule(spx.Module, ABC):
             # Non-local pairs take key ``experts_per_shard`` and sort past every local group; the stable sort keeps
             # pair order inside each group.
             sort_keys = jnp.where(is_local, local_ids, experts_per_shard)
-            order = jnp.argsort(sort_keys).astype(jnp.int32)
+            order, positions = _stable_order(sort_keys)
             group_sizes = jnp.bincount(sort_keys, length=experts_per_shard + 1)[:experts_per_shard].astype(jnp.int32)
             total_rows = tokens * top_k
             combine_weights = weights if output_weights_hook is None else output_weights_hook(weights)
             partial = _local_row_windows(
                 x2d,
                 order,
+                positions,
                 sort_keys,
                 group_sizes,
                 is_local,
