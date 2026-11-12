@@ -178,31 +178,34 @@ class CompileOrchestrator:
     def _decode_layout_pairs(
         model_compile_pairs: list[tuple[int, int]],
         reqs_padds: list[int],
+        single_token_pairs: frozenset[tuple[int, int]] = frozenset(),
     ) -> list[tuple[int, int]]:
-        """Return the extra decode-layout pairs: one per request bucket whose decode bucket keeps the general layout.
+        """Return the pure-decode pairs: at most one per request bucket, where its general program does not serve.
 
         A pure-decode window of ``r`` requests runs the smallest token bucket ``t >= r``. When ``(t, r)`` is within
-        ``DECODE_LAYOUT_MAX_TOKENS_PER_REQ`` (:func:`traces_decode_layout`), its one program is already traced under the
-        decode layout; otherwise (a token-bucket floor far above the request bucket) ``(t, r)`` gets a decode-layout
-        twin of its general program. This adds at most one program per request bucket instead of doubling the grid.
+        ``DECODE_LAYOUT_MAX_TOKENS_PER_REQ`` (:func:`traces_decode_layout`) and its general trace never asked for the
+        single-token promise, its one program already serves those windows. Otherwise (a token-bucket floor far above
+        the request bucket, or a model whose layers take a cheaper path when every row holds at most one token,
+        ``single_token_pairs``) ``(t, r)`` gets a pure-decode twin of its general program. This adds at most one
+        program per request bucket instead of doubling the grid.
 
         Args:
             model_compile_pairs: The general ``(num_tokens, padded_num_reqs)`` pairs being compiled.
             reqs_padds: Request buckets.
+            single_token_pairs: Pairs whose general trace asked for the single-token promise
+                (``ModelStepExecutor.single_token_pairs``).
 
         Returns:
-            ``(num_tokens, padded_num_reqs)`` pairs needing a separate decode-layout variant.
+            ``(num_tokens, padded_num_reqs)`` pairs needing a separate pure-decode program.
         """
         compiled = set(model_compile_pairs)
         token_buckets = sorted({int(t) for t, _ in model_compile_pairs})
         pairs: list[tuple[int, int]] = []
         for reqs_padd in sorted({int(r) for r in reqs_padds}):
             num_tokens = next((t for t in token_buckets if t >= reqs_padd), None)
-            if (
-                num_tokens is None
-                or traces_decode_layout(num_tokens, reqs_padd)
-                or (num_tokens, reqs_padd) not in compiled
-            ):
+            if num_tokens is None or (num_tokens, reqs_padd) not in compiled:
+                continue
+            if traces_decode_layout(num_tokens, reqs_padd) and (num_tokens, reqs_padd) not in single_token_pairs:
                 continue
             pairs.append((num_tokens, reqs_padd))
         return pairs
@@ -372,7 +375,11 @@ class CompileOrchestrator:
                     metadata=metadata,
                 )
             model_step_progress.complete(f"All {len(model_compile_pairs)} fused model-step compilations completed")
-            decode_pairs = self._decode_layout_pairs(model_compile_pairs, reqs_padds)
+            # The general programs are compiled above, so the executor knows which pairs asked for the promise.
+            executor = getattr(self._manager, "_model_executor", None)
+            decode_pairs = self._decode_layout_pairs(
+                model_compile_pairs, reqs_padds, getattr(executor, "single_token_pairs", frozenset())
+            )
             for num_tokens, reqs_padd in decode_pairs:
                 self._manager._compile_model_step_variant(
                     num_tokens=num_tokens,

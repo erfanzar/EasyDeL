@@ -85,7 +85,14 @@ from easydel.caching import (
     UnifiedAttentionCache,
     UnifiedAttentionCacheConfig,
 )
-from easydel.infra.sharding import MeshLike, decode_mode_specs, replicate_on_array_mesh, resolve_stage_mesh
+from easydel.infra.sharding import (
+    MeshLike,
+    decode_mode_specs,
+    record_single_token_rows_queries,
+    replicate_on_array_mesh,
+    resolve_stage_mesh,
+    single_token_rows,
+)
 from easydel.utils import set_inference_mode
 
 from ..execution_types import BackboneOutputs, BatchMetadata, ModelStepOutputs, StepFunctionInputs
@@ -109,8 +116,10 @@ sharding only, so every row shape (decode, prefill chunk, verify window) runs un
 (GLM-5.3-Flash W8A8 at ep4 x tp4, request bucket 32) on compile-shaped inputs, general program against its
 decode-layout twin: 32.57 / 28.63 ms at 64 tokens, 38.55 / 35.37 at 128, 45.21 / 45.00 at 256 and 57.85 / 66.09 at
 512. Pairs up to this ratio therefore trace their one program under the decode layout (mixed steps with a short prefill
-chunk and speculative verify windows run it too); larger pairs keep the general layout and get a decode-layout twin only
-where a pure-decode window lands on them (see ``CompileOrchestrator._decode_layout_pairs``).
+chunk and speculative verify windows run it too); larger pairs keep the general layout and get a pure-decode twin only
+where a pure-decode window lands on them (see ``CompileOrchestrator._decode_layout_pairs``). A pair within the ratio gets
+that twin too when tracing its general program asked whether every row holds at most one token
+(:func:`~easydel.infra.sharding.inference_mode_single_token_rows`): the twin is traced under that promise.
 """
 
 
@@ -385,10 +394,11 @@ class ModelStepExecutor:
                 graphother_template=graphother_template,
             )
         )
-        # Decode-layout twin of ``_model_step_fn`` for pairs whose general program keeps the general layout
-        # (``traces_decode_layout`` is False) but serve pure-decode windows (a token-bucket floor far above the
-        # request bucket). A separate jit keeps its trace cache disjoint from the general program of the same shapes,
-        # as for ``_backbone_fn_decode``.
+        # Pure-decode twin of ``_model_step_fn`` (decode layout and the single-token promise, ``single_token_rows``):
+        # for pairs whose general program keeps the general layout (``traces_decode_layout`` is False) but serve
+        # pure-decode windows (a token-bucket floor far above the request bucket), and for pairs whose general trace
+        # asked for the promise. A separate jit keeps its trace cache disjoint from the general program of the same
+        # shapes, as for ``_backbone_fn_decode``.
         self._model_step_fn_decode = (
             None
             if self._uses_mpmd_mesh()
@@ -416,6 +426,9 @@ class ModelStepExecutor:
         self._pipeline_lm_head_cache: OrderedDict[tuple[int, tuple[int, ...], str, str], tp.Any] = OrderedDict()
         # Legacy combined cache (kept for backward compat with tests)
         self._cache: OrderedDict[tuple[int, int, str, str], tp.Any] = OrderedDict()
+        # (num_tokens, padded_num_reqs) pairs whose general SPMD trace asked for the single-token promise. A property
+        # of the model's code, so it survives ``clear_cache`` (a later lowering may reuse the trace and not ask again).
+        self._single_token_pairs: set[tuple[int, int]] = set()
         self._pipeline_kv_carry_map_cache: dict[tuple[int, tuple[tp.Hashable, ...]], dict[int, dict[int, int]]] = {}
         self._lm_head_graphdef: tp.Any | None = None
         self._lm_head_state: tp.Any | None = None
@@ -1404,22 +1417,33 @@ class ModelStepExecutor:
         mode = self._compile_mode()
         return (int(num_tokens), int(padded_num_reqs), "model_step", mode) in self._cache
 
-    def has_decode_model_step(self, num_tokens: int, padded_num_reqs: int) -> bool:
-        """Whether a decode-layout program serves pure-decode windows of this bucket pair.
+    @property
+    def single_token_pairs(self) -> frozenset[tuple[int, int]]:
+        """``(num_tokens, padded_num_reqs)`` pairs whose general SPMD trace asked for the single-token promise.
 
-        Pairs within :data:`DECODE_LAYOUT_MAX_TOKENS_PER_REQ` trace their general program under the decode layout
-        (:meth:`compile_model_step`); other pairs need the separate ``"model_step_decode"`` variant.
+        Read through ``getattr`` so executors assembled without ``__init__`` (tests) keep working.
+        """
+        return frozenset(getattr(self, "_single_token_pairs", ()))
+
+    def has_decode_model_step(self, num_tokens: int, padded_num_reqs: int) -> bool:
+        """Whether pure-decode windows of this bucket pair have the program they need.
+
+        The pure-decode program (``"model_step_decode"``) is traced under the decode layout and the single-token
+        promise (:func:`~easydel.infra.sharding.single_token_rows`). A pair within
+        :data:`DECODE_LAYOUT_MAX_TOKENS_PER_REQ` whose general trace never asked for the promise needs none: its
+        general program already traces the decode layout (:meth:`compile_model_step`) and is the same program.
 
         Args:
             num_tokens: Token bucket.
             padded_num_reqs: Request bucket.
 
         Returns:
-            Whether pure-decode windows of the pair have a compiled decode-layout program.
+            Whether pure-decode windows of the pair have their compiled program.
         """
-        if traces_decode_layout(num_tokens, padded_num_reqs):
-            return self.has_model_step(num_tokens, padded_num_reqs)
-        return (int(num_tokens), int(padded_num_reqs), "model_step_decode", self._compile_mode()) in self._cache
+        pair = (int(num_tokens), int(padded_num_reqs))
+        if (*pair, "model_step_decode", self._compile_mode()) in self._cache:
+            return True
+        return traces_decode_layout(*pair) and pair not in self.single_token_pairs and self.has_model_step(*pair)
 
     def model_step_key(self, num_tokens: int, padded_num_reqs: int, *, decode_only: bool = False) -> tuple:
         """Return the SPMD model-step cache key that runs a window of this bucket pair.
@@ -1427,17 +1451,17 @@ class ModelStepExecutor:
         Args:
             num_tokens: Token bucket of the window.
             padded_num_reqs: Request bucket of the window.
-            decode_only: Whether every active row of the window schedules exactly one token.
+            decode_only: Whether every row the window packs schedules at most one token
+                (``ExecutionManager._is_decode_only_window``).
 
         Returns:
             ``(num_tokens, padded_num_reqs, kind, mode)`` where ``kind`` is ``"model_step_decode"`` when a
-            pure-decode window has a compiled decode-layout variant distinct from the general program, and
-            ``"model_step"`` otherwise (pairs within :data:`DECODE_LAYOUT_MAX_TOKENS_PER_REQ` trace their general
-            program under the decode layout).
+            pure-decode window has a compiled pure-decode program, and ``"model_step"`` otherwise (the general
+            program is correct for every window).
         """
         mode = self._compile_mode()
         decode_key = (int(num_tokens), int(padded_num_reqs), "model_step_decode", mode)
-        if decode_only and not traces_decode_layout(num_tokens, padded_num_reqs) and decode_key in self._cache:
+        if decode_only and decode_key in self._cache:
             return decode_key
         return (int(num_tokens), int(padded_num_reqs), "model_step", mode)
 
@@ -1838,9 +1862,12 @@ class ModelStepExecutor:
     ) -> ModelStepOutputs | None:
         """Compile the fused SPMD model step for one token/request bucket pair.
 
-        ``decode_layout=True`` on a pair beyond :data:`DECODE_LAYOUT_MAX_TOKENS_PER_REQ` compiles the separate
-        decode-layout variant (``"model_step_decode"`` key) that pure-decode windows of the pair run; pairs within it
-        trace their general program under the decode layout.
+        ``decode_layout=True`` compiles the separate pure-decode program (``"model_step_decode"`` key, traced under the
+        decode layout and the single-token promise :func:`~easydel.infra.sharding.single_token_rows`) that pure-decode
+        windows of the pair run: for a pair beyond :data:`DECODE_LAYOUT_MAX_TOKENS_PER_REQ`, and for a pair within it
+        whose general trace asked for the promise (:attr:`single_token_pairs`, recorded while the general program is
+        traced, so the general program must be compiled first). Other pairs within the ratio trace their general
+        program under the decode layout and need nothing more.
 
         The MPMD path intentionally keeps the backbone and LM head separate so
         stage-local placement can be controlled. On SPMD there is no stage
@@ -1856,10 +1883,11 @@ class ModelStepExecutor:
 
         self.graphdef = graphdef
         mode = self._compile_mode()
+        pair = (int(num_tokens), int(padded_num_reqs))
         traced_decode = traces_decode_layout(num_tokens, padded_num_reqs)
-        separate_decode = bool(decode_layout) and not traced_decode
+        separate_decode = bool(decode_layout) and (not traced_decode or pair in self.single_token_pairs)
         decode_only = separate_decode or traced_decode
-        key = (int(num_tokens), int(padded_num_reqs), "model_step_decode" if separate_decode else "model_step", mode)
+        key = (*pair, "model_step_decode" if separate_decode else "model_step", mode)
         if key in self._cache:
             return None
         step_fn = self._model_step_fn_decode if separate_decode else self._model_step_fn
@@ -1871,8 +1899,14 @@ class ModelStepExecutor:
         # norm/qkv/router collectives self-inflicted by tp-sharded activations.
         # The condition is derivable from the bucket key itself, so the
         # compiled cache stays consistent (a given (num_tokens,
-        # padded_num_reqs) shape always traces in the same mode).
-        with decode_mode_specs(decode_only):
+        # padded_num_reqs) shape always traces in the same mode). The
+        # pure-decode twin also traces under the single-token promise; the
+        # general trace records whether the model asked for it.
+        with (
+            decode_mode_specs(decode_only),
+            single_token_rows(separate_decode),
+            record_single_token_rows_queries() as queries,
+        ):
             if self.use_aot_forward:
                 compiled = step_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
                     *(
@@ -1884,6 +1918,8 @@ class ModelStepExecutor:
                         int(padded_num_reqs),
                     )
                 ).compile()
+                if queries.asked and not separate_decode:
+                    self._single_token_pairs.add(pair)
                 self._cache_store(self._cache, key, compiled)
                 return None
 
@@ -1905,6 +1941,8 @@ class ModelStepExecutor:
                 )
 
             out = wrapped_model_step(graphstate_arg, graphother_arg, inputs.kv_pages, inputs.batch_metadata)
+        if queries.asked and not separate_decode:
+            self._single_token_pairs.add(pair)
         self._cache_store(self._cache, key, wrapped_model_step)
         return out
 

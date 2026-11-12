@@ -37,7 +37,7 @@ from jaxtyping import Array, Float
 from spectrax import common_types
 
 from easydel.caching import KDACacheView
-from easydel.infra.sharding import mesh_axis_size
+from easydel.infra.sharding import inference_mode_single_token_rows, mesh_axis_size
 
 from .._operation_impl import OperationImpl, OperationRegistry
 from .._operation_meta import OperationMetadata
@@ -407,8 +407,10 @@ def kda_rows_forward(
     most one token", so one compiled step serves decode, mixed and prefill batches; the pool leaves are the
     conditional's operands (updated in place in both branches). Mixed and prefill steps run ``flat_forward`` (default
     :func:`~easydel.operations.kernels.kda_ragged_rows_forward`) unchanged. Longer buckets compile ``flat_forward``
-    alone, without the conditional (a decode-only step fits a bucket of ``rows`` tokens). Arguments and results follow
-    :func:`~easydel.operations.kernels.kda_ragged_rows_forward`.
+    alone, without the conditional (a decode-only step fits a bucket of ``rows`` tokens). Inside eSurge's single-token
+    program (:func:`~easydel.infra.sharding.single_token_rows`, traced only for pure-decode windows) every row holds at
+    most one token, so the decode driver runs alone for any bucket, without the conditional and the copies of the pool
+    leaves it carries. Arguments and results follow :func:`~easydel.operations.kernels.kda_ragged_rows_forward`.
 
     Args:
         query: Packed Q projection (pre-conv) ``[1, T, key_dim]``.
@@ -451,11 +453,11 @@ def kda_rows_forward(
     flat_kwargs = dict(chunk_size=chunk_size, decay_lower_bound=decay_lower_bound, precision=precision)
     leaves = tuple(getattr(cache_view, name) for name in LEAF_NAMES)
     rows = int(query_start_loc.shape[-1]) - 1
-    if (
-        query_start_loc.ndim != 1
-        or int(query.shape[1]) > rows
-        or not all(isinstance(leaf, jax.Array) for leaf in leaves)
-    ):
+    eligible = query_start_loc.ndim == 1 and all(isinstance(leaf, jax.Array) for leaf in leaves)
+    if eligible and inference_mode_single_token_rows():
+        # eSurge's single-token program: every row holds at most one token, whatever the token bucket.
+        return kda_decode_rows_forward(cache_view=cache_view, **common)
+    if not eligible or int(query.shape[1]) > rows:
         # Rank-major DP metadata (the flat driver raises its own error), implicit (quantized) pool leaves, or a token
         # bucket longer than the row count. A decode-only step (at most one token per row) fits a bucket of ``rows``
         # tokens, so longer buckets compile the flat driver alone, as before (it is correct for every step).

@@ -180,11 +180,24 @@ def _close(runner: eSurgeRunner) -> None:
     gc.collect()
 
 
-def _serve_greedy(model) -> tuple[int, dict[str, list[int]]]:
-    """Serve every request greedily with all four resident at once; returns ``(rows per forward, tokens)``."""
+def _serve_greedy(model, steps: list[tuple[bool, tuple]] | None = None) -> tuple[int, dict[str, list[int]]]:
+    """Serve every request greedily with all four resident at once; returns ``(rows per forward, tokens)``.
+
+    With ``steps`` every model step appends ``(decode_only, compiled program key)``.
+    """
     runner = _runner(model)
     try:
         runner.compile(max_num_batched_tokens=64)
+        if steps is not None:
+            manager = runner.executor_manager
+            execute_model = manager.execute_model
+
+            def recording_execute_model(*args, **kwargs):
+                out = execute_model(*args, **kwargs)
+                steps.append((bool(kwargs.get("decode_only", False)), manager.last_model_step_key))
+                return out
+
+            manager.execute_model = recording_execute_model
         scheduler = make_core_for_runner(
             runner, max_num_batched_tokens=64, enable_prefix_caching=False, async_scheduling=False, num_draft_tokens=0
         )
@@ -256,6 +269,27 @@ def test_speculative_kda_slot_groups_serve_several_row_windows(tiny_model, monke
         assert int(state.shape[0]) == len(REQUESTS) * group
     finally:
         _close(runner)
+
+
+def test_pure_decode_steps_run_the_single_token_program(tiny_model, monkeypatch):
+    """The KDA layers ask for the single-token promise, so the request bucket's decode pair gets a pure-decode program
+    (KDA decode driver without its run-time conditional) that every pure-decode step runs; the greedy streams equal
+    those of the general program, which routes at run time."""
+    from easydel.inference.esurge.runners.executors.model_executor import ModelStepExecutor
+
+    steps: list[tuple[bool, tuple]] = []
+    _, single = _serve_greedy(tiny_model, steps)
+    decode_kinds = {key[2] for decode_only, key in steps if decode_only}
+    assert decode_kinds == {"model_step_decode"}, steps
+    assert all(key[2] == "model_step" for decode_only, key in steps if not decode_only), steps
+
+    # Without the recorded queries no pure-decode program is compiled: pure-decode steps run the general program.
+    monkeypatch.setattr(ModelStepExecutor, "single_token_pairs", property(lambda self: frozenset()))
+    general_steps: list[tuple[bool, tuple]] = []
+    _, general = _serve_greedy(tiny_model, general_steps)
+    assert {key[2] for _, key in general_steps} == {"model_step"}, general_steps
+    assert all(len(tokens) == MAX_TOKENS and len(set(tokens)) > 2 for tokens in single.values()), single
+    assert single == general
 
 
 def test_kda_layers_declare_the_slot_contract(tiny_model):

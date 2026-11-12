@@ -16,7 +16,9 @@
 The head sizes fill the 128 TPU lanes, so on TPU the recurrence runs in the in-place Pallas kernel. Decode steps are
 checked against a float64 per-request causal conv (SiLU) and per-channel KDA step: fresh rows start from zero, rows
 without a token (or with an out-of-range slot) leave every slot untouched, explicit slots are followed. Steps with
-multi-token rows must leave the router with the flat driver's results.
+multi-token rows must leave the router with the flat driver's results. Inside eSurge's pure-decode program
+(``single_token_rows``) the router asks for that promise and runs the decode driver alone, without its run-time
+conditional, for any token bucket.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import numpy as np
 import pytest
 from easydel.caching import KDACacheView
 from easydel.caching.kda.cache import KDACacheConfig
+from easydel.infra.sharding import record_single_token_rows_queries, single_token_rows
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import kda_ragged_rows_forward, kda_rows_forward
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -49,6 +52,10 @@ MIXED = ((1, 70, 0, 3, 1), (9, 70, 0, 12, 5), 80)
 # SHORT_MIXED: a bucket of exactly one token per row with a fresh 3-token prompt (row 1): the router traces its
 # conditional and must take the flat driver's branch.
 SHORT_MIXED = ((1, 3, 0, 1, 1, 0, 1, 1), (9, 3, 0, 40, 2, 5, 3, 17), 8)
+# DECODE's rows in a token bucket twice the row count (a token-bucket floor above the request bucket).
+DECODE_LONG_BUCKET = (DECODE[0], DECODE[1], 16)
+# StableHLO ops a ``lax.cond`` lowers to.
+CONDITIONAL_OPS = ("stablehlo.case", "stablehlo.if")
 
 
 def _starts(lens):
@@ -89,8 +96,11 @@ def _view(leaves):
     return KDACacheView(**leaves, positions=jnp.zeros((POOL,), jnp.int32), metadata=cfg, layer_index=0)
 
 
-def _run(driver, case, layout, dtype, *, tp, slots=None):
-    """One jitted step of ``driver`` with the pools in the eSurge KDA layout (conv windows by feature, states by head)."""
+def _run(driver, case, layout, dtype, *, tp, slots=None, text=False):
+    """One jitted step of ``driver`` with the pools in the eSurge KDA layout (conv windows by feature, states by head).
+
+    With ``text`` the lowered StableHLO of the step is returned too, as a third item.
+    """
     if len(jax.devices()) < tp:
         pytest.skip(f"needs {tp} devices")
     lens, context, _ = layout
@@ -129,7 +139,10 @@ def _run(driver, case, layout, dtype, *, tp, slots=None):
         )
         return out, {name: getattr(view, name) for name in LEAVES}
 
-    return step(inputs, leaves)
+    result = step(inputs, leaves)
+    if not text:
+        return result
+    return (*result, step.lower(inputs, leaves).as_text())
 
 
 def _silu(x):
@@ -187,11 +200,47 @@ def _f64(x):
     ],
 )
 def test_decode_step_matches_float64_reference(dtype, tp, slots, tol):
-    lens, _, bucket = DECODE
     case = _case(DECODE, seed=0, dtype=dtype)
     out, leaves = _run(kda_rows_forward, case, DECODE, dtype, tp=tp, slots=slots)
+    _assert_matches_reference(out, leaves, case, DECODE, slots, dtype, tol)
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        pytest.param(DECODE, id="bucket-of-one-token-per-row"),
+        pytest.param(DECODE_LONG_BUCKET, id="bucket-longer-than-rows"),
+    ],
+)
+def test_single_token_program_runs_the_decode_driver_alone(layout):
+    """Under ``single_token_rows`` the router asks for the promise and runs the decode driver without a conditional,
+    for the row-count bucket and a longer one, with the float64 reference results."""
+    case = _case(layout, seed=2, dtype=jnp.float32)
+    with single_token_rows(), record_single_token_rows_queries() as queries:
+        out, leaves, text = _run(kda_rows_forward, case, layout, jnp.float32, tp=4, slots=DECODE_SLOTS, text=True)
+    assert queries.asked, "the router did not ask for the single-token promise"
+    assert not any(op in text for op in CONDITIONAL_OPS), "the single-token program kept a conditional"
+    _assert_matches_reference(out, leaves, case, layout, DECODE_SLOTS, jnp.float32, 1e-4)
+
+
+def test_general_program_routes_at_run_time_like_the_single_token_program():
+    """Outside the scope the same decode step keeps its run-time conditional and gives the single-token results."""
+    case = _case(DECODE, seed=3, dtype=jnp.float32)
+    routed_out, routed, text = _run(kda_rows_forward, case, DECODE, jnp.float32, tp=4, text=True)
+    with single_token_rows():
+        single_out, single = _run(kda_rows_forward, case, DECODE, jnp.float32, tp=4)
+    assert any(op in text for op in CONDITIONAL_OPS), "the general program has no run-time conditional"
+    # The same driver, alone or inside the conditional's true branch: only XLA's fusion may differ (f32 rounding).
+    np.testing.assert_allclose(_f64(single_out), _f64(routed_out), rtol=1e-5, atol=1e-5)
+    for name in LEAVES:
+        np.testing.assert_allclose(_f64(single[name]), _f64(routed[name]), rtol=1e-5, atol=1e-5, err_msg=name)
+
+
+def _assert_matches_reference(out, leaves, case, layout, slots, dtype, tol):
+    """Check one decode step against :func:`_reference_decode` (row ``r`` owns slot ``r`` when ``slots`` is ``None``)."""
+    lens, _, bucket = layout
     slots = list(range(len(lens))) if slots is None else list(slots)
-    ref_out, ref_conv, ref_rec = _reference_decode(case, DECODE, slots)
+    ref_out, ref_conv, ref_rec = _reference_decode(case, layout, slots)
     starts = _starts(lens)
     out = _f64(out)
     assert out.shape == (1, bucket, H, HV)

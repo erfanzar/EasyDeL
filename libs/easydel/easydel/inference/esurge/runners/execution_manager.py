@@ -1115,7 +1115,10 @@ class ExecutionManager:
         padded requests``. The resident PP runtime is only valid for the true
         decode case, where every active scheduled row contributes exactly one
         token. This predicate looks at the unpadded scheduler payload rather
-        than the compile bucket.
+        than the compile bucket. It also selects the SPMD single-token program
+        (:func:`~easydel.infra.sharding.single_token_rows`), so every row the
+        batch builder packs (each row up to the last live one, live or not)
+        must schedule at most one token.
         """
         padded_num_reqs = int(padded_num_reqs)
         scheduled_window = ExecutionManager._padded_cpu_window(
@@ -1131,7 +1134,13 @@ class ExecutionManager:
             fill_value=False,
         )
         active_scheduled = scheduled_window[active_window & (scheduled_window > 0)]
-        return bool(active_scheduled.size > 0 and numpy.all(active_scheduled == 1))
+        if not (active_scheduled.size > 0 and numpy.all(active_scheduled == 1)):
+            return False
+        # The batch builder packs the scheduled tokens of every row up to the last live one and zeroes the rest.
+        last_live = int(numpy.flatnonzero(numpy.asarray(active_mask_full_cpu, dtype=numpy.bool_).reshape(-1))[-1])
+        if last_live >= padded_num_reqs:
+            return False
+        return bool(numpy.all(scheduled_window[: last_live + 1] <= 1))
 
     @staticmethod
     def _window_emits_token(
