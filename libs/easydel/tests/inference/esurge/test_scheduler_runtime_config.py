@@ -79,6 +79,16 @@ def test_dp_admission_hold_survives_nested_config_and_zero_turns_it_off():
 
 
 @pytest.mark.cpu_ok
+def test_freeze_startup_heap_defaults_on_and_survives_nested_config():
+    assert eSurgeRuntimeConfig.from_dict().freeze_startup_heap is True
+    assert eSurgeConfig.from_dict().runtime.freeze_startup_heap is True
+    config = eSurgeConfig.from_dict(runtime={"freeze_startup_heap": False})
+    assert config.runtime.freeze_startup_heap is False
+    assert eSurgeConfig.from_dict(config.to_dict()).runtime.freeze_startup_heap is False
+    assert config.runtime.replace(max_num_seqs=8).freeze_startup_heap is False
+
+
+@pytest.mark.cpu_ok
 @pytest.mark.parametrize("hold", [-1, 0.5, True, "8", None])
 def test_scheduler_runtime_rejects_invalid_dp_admission_hold(hold):
     with pytest.raises(ValueError, match="dp_admission_hold must be a non-negative integer"):

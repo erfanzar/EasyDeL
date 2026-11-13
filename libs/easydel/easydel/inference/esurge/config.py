@@ -227,6 +227,7 @@ def _validate_esurge_runtime_config(self):
         "token_safety_margin": None,
         "dp_admission_hold": 64,
         "include_finished_set": False,
+        "freeze_startup_heap": True,
         "enable_window_aware_runtime_cap": False,
         "mpmd_scheduler": None,
         "pp_microbatch_count": "auto",
@@ -343,6 +344,16 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
             Defaults to ``64``; ``0`` admits on every rank as soon as it can.
         include_finished_set: Track finished request IDs per client in
             scheduler outputs. Defaults to ``False``.
+        freeze_startup_heap: When ``True`` (the default), the engine runs one
+            full garbage collection after compiling and then moves every
+            surviving object out of the collector's reach (``gc.freeze``),
+            so a later full collection does not walk the startup heap (on a
+            large model, millions of objects and several seconds that every
+            other host of a multi-host mesh waits for). Taken when the
+            scheduler (or worker replay) loop starts and released by
+            :meth:`eSurge.terminate`. Objects alive at that point that later
+            become cyclic garbage are freed only after the release, so engines
+            that share the process with training (``get_esurge``) turn it off.
         enable_window_aware_runtime_cap: When ``True``, the runner derives
             the runtime request cap from per-attention-type page demand
             inferred from the live cache metadata, instead of trusting the
@@ -383,6 +394,7 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
     token_safety_margin: NotRequired[int | None]
     dp_admission_hold: NotRequired[int]
     include_finished_set: NotRequired[bool]
+    freeze_startup_heap: NotRequired[bool]
     enable_window_aware_runtime_cap: NotRequired[bool]
     mpmd_scheduler: NotRequired[MpMdSchedulers | None]
     pp_microbatch_count: NotRequired[PPMicrobatchPolicy]

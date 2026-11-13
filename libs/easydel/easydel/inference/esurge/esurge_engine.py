@@ -68,6 +68,7 @@ Technical Details:
 
 from __future__ import annotations
 
+import gc
 import os
 import queue
 import re
@@ -160,6 +161,37 @@ PURE_DATA_MESH_AXIS = "dp"
 #: axis is legal but forces per-layer activation resharding; see
 #: :meth:`eSurge._warn_if_data_parallel_axis_shards_the_model`.
 MODEL_SHARDING_MESH_AXES = ("pp", "fsdp", "ep", "tp", "sp")
+
+# Engines holding the process-wide ``gc.freeze`` (``freeze_startup_heap``); the last release unfreezes.
+_HEAP_FREEZE = {"holders": 0}
+_HEAP_FREEZE_LOCK = threading.Lock()
+
+
+def _freeze_heap() -> tuple[int, float]:
+    """Collect garbage once, then move every surviving object out of the collector's reach (``gc.freeze``).
+
+    Counts one more holder; :func:`_release_heap_freeze` drops it.
+
+    Returns:
+        ``(objects frozen, seconds the collection took)``.
+    """
+    with _HEAP_FREEZE_LOCK:
+        start = time.perf_counter()
+        gc.collect()
+        took = time.perf_counter() - start
+        gc.freeze()
+        _HEAP_FREEZE["holders"] += 1
+        return gc.get_freeze_count(), took
+
+
+def _release_heap_freeze() -> None:
+    """Drop one hold of :func:`_freeze_heap`; the last one returns the frozen objects to the collector."""
+    with _HEAP_FREEZE_LOCK:
+        if _HEAP_FREEZE["holders"] <= 0:
+            return
+        _HEAP_FREEZE["holders"] -= 1
+        if _HEAP_FREEZE["holders"] == 0:
+            gc.unfreeze()
 
 
 def data_parallel_axis_shards_model(axis: str, axis_sizes: typing.Mapping[str, int]) -> bool:
@@ -977,6 +1009,29 @@ class eSurge:
 
         self.initiate()
 
+    def _freeze_startup_heap(self) -> None:
+        """Run one full collection and freeze the survivors (``freeze_startup_heap``), once per serving start.
+
+        After loading and compiling a large model a process tracks millions of long-lived objects, and a full
+        collection walks all of them; it comes rarely, at a moment the allocator picks, and holds the GIL for
+        seconds while every other host of a multi-host mesh waits at the next collective. Frozen objects are skipped
+        by every later collection. The freeze is process-wide: this engine holds it while its scheduler loop (or
+        worker replay loop) runs, and :meth:`terminate` releases it.
+        """
+        if not bool(getattr(getattr(self, "runtime_config", None), "freeze_startup_heap", False)):
+            return
+        if getattr(self, "_holds_heap_freeze", False):
+            return
+        frozen, took = _freeze_heap()
+        self._holds_heap_freeze = True
+        self._info(f"Froze {frozen:,} objects after a full garbage collection of {took:.2f}s")
+
+    def _drop_heap_freeze(self) -> None:
+        """Release this engine's hold of the startup-heap freeze, if it has one."""
+        if getattr(self, "_holds_heap_freeze", False):
+            self._holds_heap_freeze = False
+            _release_heap_freeze()
+
     @property
     def _scheduler_running(self) -> bool:
         """Whether the background scheduler loop is running.
@@ -1316,6 +1371,7 @@ class eSurge:
         runner = getattr(self, "runner", None)
         if runner is not None and hasattr(runner, "shutdown"):
             self._close_step("runner shutdown", runner.shutdown)
+        self._close_step("heap unfreeze", self._drop_heap_freeze)
 
     @staticmethod
     def _close_step(name: str, step: typing.Callable[[], typing.Any]) -> None:
@@ -2478,6 +2534,8 @@ class eSurge:
         State on exit: ``_scheduler_running=True``, idle monitor armed,
         ``_paused=False``. No-op if the loop is already running.
         """
+        # Before any loop starts and outside the scheduler lock (the collection may run finalizers).
+        self._freeze_startup_heap()
         with self._scheduler_lock:
             step_coordinator = getattr(self, "_step_coordinator", None)
             if step_coordinator is not None and not step_coordinator.is_leader:
@@ -2591,6 +2649,7 @@ class eSurge:
         """
         self._stop_idle_monitor()
         self._stop_worker_replay_loop()
+        self._drop_heap_freeze()
         engine_loop: EngineLoop | None = None
         with self._scheduler_lock:
             if not self._scheduler_running:

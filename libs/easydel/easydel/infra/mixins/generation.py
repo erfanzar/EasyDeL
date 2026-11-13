@@ -5522,6 +5522,8 @@ class EasyGenerationMixin:
                     async_scheduling=extra_dict["async_scheduling"],
                     overlap_execution=extra_dict["overlap_execution"],
                     runner_verbose=extra_dict["runner_verbose"],
+                    # This engine shares the process with training and user code: leave their garbage collection alone.
+                    freeze_startup_heap=False,
                 ),
                 cache=eSurgeCacheRuntimeConfig.from_dict(
                     hbm_utilization=extra_dict["hbm_utilization"],
