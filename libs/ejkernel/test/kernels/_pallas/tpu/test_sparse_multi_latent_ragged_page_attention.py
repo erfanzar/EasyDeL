@@ -317,6 +317,47 @@ def test_pallas_tokens_before_first_query_start_are_ignored():
     np.testing.assert_array_equal(np.asarray(cache), np.asarray(base_cache))
 
 
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["f32", "bf16"])
+@pytest.mark.parametrize(
+    "kv_lens,q_lens",
+    [
+        ([40, 23, 17, 9], [1, 1, 1, 1]),  # 7 tokens with the padding
+        ([40, 23, 17, 9, 33], [1, 1, 1, 1, 1]),  # 8 tokens
+        ([40, 23, 17], [2, 6, 3]),  # 14 tokens
+        ([40, 23, 17], [2, 6, 4]),  # 15 tokens
+    ],
+    ids=["decode7", "decode8", "mixed14", "mixed15"],
+)
+def test_pallas_per_token_grid_order_any_token_count(dtype, kv_lens, q_lens):
+    """The per-token kernel runs its tokens interleaved over the two halves of its grid; outputs and caches follow the
+    reference and the XLA backend for odd and even token counts."""
+    case = _build(17, kv_lens=kv_lens, q_lens=q_lens, chunk_size=4, width=6, dtype=dtype)
+    out, cache = _pallas(case["inputs"], chunk_size=4)
+    _check_against_reference_and_xla(case, out, cache, chunk_size=4, dtype=dtype)
+
+
+@pytest.mark.parametrize("window", [(0, 4), (4, 8), (8, 12), (3, 10)])
+def test_pallas_rows_outside_an_attending_window_leave_it_unchanged(window):
+    """An expert-split decode call: only rows ``[a, b)`` carry queries and selections, the others zero queries and no
+    chunk. Those rows equal the same rows of the call in which every row attends, bit for bit; the others are zero,
+    and the cache is the same."""
+    kv_lens = [40, 23, 17, 9, 33, 12, 50, 28, 61, 5, 44, 19]
+    case = _build(19, kv_lens=kv_lens, q_lens=[1] * len(kv_lens), chunk_size=4, width=6, dtype=jnp.bfloat16)
+    full, full_cache = _pallas(case["inputs"], chunk_size=4)
+    start, stop = window
+    rows = np.zeros(int(case["inputs"][0].shape[0]), bool)
+    rows[start:stop] = True
+    live = jnp.asarray(rows)
+    inputs = list(case["inputs"])
+    inputs[0] = jnp.where(live[:, None, None], inputs[0], 0)
+    inputs[1] = jnp.where(live[:, None, None], inputs[1], 0)
+    inputs[9] = jnp.where(live[:, None], inputs[9], -1)
+    out, cache = _pallas(inputs, chunk_size=4)
+    np.testing.assert_array_equal(np.asarray(out)[rows], np.asarray(full)[rows])
+    assert np.all(np.asarray(out)[~rows] == 0)
+    np.testing.assert_array_equal(np.asarray(cache), np.asarray(full_cache))
+
+
 def test_supports_sub_word_chunks_but_not_word_straddling_ones():
     """Chunks narrower than a packed word are served whole-word; chunks that straddle words are not."""
     bf16_shape = (4, 8, 2, 256)  # page_size 16, 2 tokens per word

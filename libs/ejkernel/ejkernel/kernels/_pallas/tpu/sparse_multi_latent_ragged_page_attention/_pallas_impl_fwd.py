@@ -1221,30 +1221,46 @@ def _token_attention(
     page_size: int,
     vmem_limit_bytes: int | None,
 ) -> jax.Array:
-    """Per-token kernel (one program per query token): ``[T, H, L_pad]`` outputs; the cache is read-only here."""
+    """Per-token kernel (one program per query token): ``[T, H, L_pad]`` outputs; the cache is read-only here.
+
+    Program ``t`` runs token ``2 * (t % n_even) + t // n_even`` (``n_even = ceil(T / 2)``): the even tokens fill the
+    first half of the grid and the odd tokens the second. A megacore chip (TPU v5p) runs the two halves of a
+    ``"parallel"`` grid on its two TensorCores, so a call whose attending tokens are consecutive gives each core half
+    of them; in token order one core got them all (a DSA expert-split decode call attends only its own shard's rows).
+    Programs are independent (each reads its own token's metadata, block-table row and queries, resets its scratch and
+    writes only its own output row), so the outputs do not depend on the order. On one v5p chip, 11 chained calls of
+    32 tokens (16 heads, latent 512, 513 selected 4-token chunks, contexts of 61,440 to 65,535 tokens): with only 8
+    consecutive tokens attending, 66.4-67.6 instead of 121.2-122.4 us per call; with all 32 attending, 237.5 against
+    236.4 us.
+    """
     total_tokens, num_heads, nope_dim = (int(x) for x in q_nope.shape)
     pe_dim = int(q_pe.shape[-1])
     span = _fetch_span(chunk_size, kv_packing)
     cache_dim = int(kv_cache.shape[-1])
     meta_cols = int(meta.shape[1])
+    n_even = max((int(total_tokens) + 1) // 2, 1)
+
+    def tok(t):
+        """Token of program ``t``: a permutation of ``0 .. T - 1`` (even tokens first, then odd)."""
+        return 2 * (t % n_even) + t // n_even
 
     # 1-D SMEM block per token: Mosaic needs the minor block dims to be (8, 128)-aligned or full,
     # which a squeezed leading dim of a 2-D SMEM array is not. Index maps take ``*_`` so they also
     # accept the scalar-prefetched sequence map.
-    in_specs = [pl.BlockSpec((meta_cols,), lambda t, *_: (t,), memory_space=pltpu.SMEM)]
+    in_specs = [pl.BlockSpec((meta_cols,), lambda t, *_: (tok(t),), memory_space=pltpu.SMEM)]
     operands = [meta.reshape(-1)]
     if translate_pages:
-        # The token's block-table row; consecutive tokens of one sequence reuse the fetched block.
+        # The token's block-table row; consecutive programs on tokens of one sequence reuse the fetched block.
         bt_block = _smem_len(pages_per_seq)
         bt = jnp.asarray(block_tables, jnp.int32).reshape(max_num_seqs, pages_per_seq)
         if bt_block != pages_per_seq:
             bt = jnp.pad(bt, ((0, 0), (0, bt_block - pages_per_seq)))
-        in_specs.append(pl.BlockSpec((bt_block,), lambda t, seq_ref: (seq_ref[t],), memory_space=pltpu.SMEM))
+        in_specs.append(pl.BlockSpec((bt_block,), lambda t, seq_ref: (seq_ref[tok(t)],), memory_space=pltpu.SMEM))
         operands.append(bt.reshape(-1))
-    in_specs.append(pl.BlockSpec((None, num_heads, nope_dim), lambda t, *_: (t, 0, 0)))
+    in_specs.append(pl.BlockSpec((None, num_heads, nope_dim), lambda t, *_: (tok(t), 0, 0)))
     operands.append(q_nope)
     if has_pe:
-        in_specs.append(pl.BlockSpec((None, num_heads, pe_dim), lambda t, *_: (t, 0, 0)))
+        in_specs.append(pl.BlockSpec((None, num_heads, pe_dim), lambda t, *_: (tok(t), 0, 0)))
         operands.append(q_pe)
     in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))
     operands.append(kv_cache)
@@ -1275,7 +1291,7 @@ def _token_attention(
         k_scale=k_scale,
         v_scale=v_scale,
     )
-    out_spec = pl.BlockSpec((None, num_heads, nope_dim), lambda t, *_: (t, 0, 0))
+    out_spec = pl.BlockSpec((None, num_heads, nope_dim), lambda t, *_: (tok(t), 0, 0))
     compiler_params = pltpu.CompilerParams(dimension_semantics=("parallel",), vmem_limit_bytes=vmem_limit_bytes)
     out_shape = jax.ShapeDtypeStruct((int(total_tokens), num_heads, nope_dim), q_nope.dtype)
     name = f"SPARSE-MLA-c{chunk_size}-g{group}-p{page_size}"
