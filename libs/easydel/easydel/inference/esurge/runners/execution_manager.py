@@ -111,6 +111,8 @@ from .executors.sampler_executor import (
     _cpu_vector_size,
     _greedy_argmax_tokens,
     _padded_cpu_window,
+    _scratch_copy,
+    gather_handoff_tokens,
 )
 from .host_sync import put_host_payload
 from .pipeline_plan import PipelineInferencePlan, metadata_num_pages, set_metadata_num_pages
@@ -234,6 +236,25 @@ def _jit_snapshot_restore(output_shardings: tuple[jax.sharding.Sharding, ...]):
         ]
 
     return jax.jit(body, out_shardings=list(output_shardings))
+
+
+@lru_cache(maxsize=32)
+def _jit_snapshot_zeros(
+    shapes: tuple[tuple[tuple[int, ...], typing.Any], ...], output_shardings: tuple[jax.sharding.Sharding, ...]
+):
+    """Allocate a zeroed snapshot store, one ``(shape, dtype)`` per leaf, placed with ``output_shardings``."""
+
+    def make():
+        return [jnp.zeros(shape, dtype) for shape, dtype in shapes]
+
+    return jax.jit(make, out_shardings=list(output_shardings))
+
+
+def _snapshot_zeros_key(leaves: list[tuple[int, str, typing.Any]], positions: list[int], num_slots: int):
+    """``(shapes, shardings)`` of the snapshot arrays for the ``leaves`` at ``positions`` (one device group)."""
+    shapes = tuple(((num_slots, *leaves[i][2].shape[1:]), jnp.dtype(leaves[i][2].dtype)) for i in positions)
+    shardings = tuple(_snapshot_sharding(leaves[i][2]) for i in positions)
+    return shapes, shardings
 
 
 def _per_slot_state_leaves(views) -> list[tuple[int, str, typing.Any]]:
@@ -376,16 +397,17 @@ def _write_back_leaf_results(new_views, entries, results_by_pool) -> bool:
     return changed
 
 
-def _transform_recurrent_sidecars(views, make_indices):
-    """Apply the native slot mapping to positions and Qwen PLE continuation.
+def _recurrent_sidecar_pools(views) -> dict[tuple[int, tuple[int, ...]], list[tuple[int, str, typing.Any, int]]]:
+    """Per-slot sidecar leaves (positions, Qwen PLE continuation) as ``(view index, field, array, fill)``.
 
-    Paged attention leaves are intentionally excluded: their leading dimension
-    indexes physical pages, not recurrent request slots. Segment padding uses
-    -1 rather than zero, matching the PLE cache initialization contract. KDA
-    views contribute only their ``positions`` sidecar here — their state
-    leaves ride the fused zero/permute dispatches instead.
+    Grouped by (pool size, device set). Paged attention leaves are intentionally
+    excluded: their leading dimension indexes physical pages, not recurrent
+    request slots. Segment padding uses -1 rather than zero, matching the PLE
+    cache initialization contract. KDA views contribute only their
+    ``positions`` sidecar here — their state leaves ride the fused zero/permute
+    dispatches instead.
     """
-    by_pool = {}
+    by_pool: dict[tuple[int, tuple[int, ...]], list[tuple[int, str, typing.Any, int]]] = {}
     for index, view in enumerate(views):
         rec = view.recurrent if isinstance(view, ParallelHybridCacheView) else view
         if isinstance(rec, KDACacheView):
@@ -405,8 +427,13 @@ def _transform_recurrent_sidecars(views, make_indices):
             array = getattr(rec, name, None)
             if array is not None:
                 by_pool.setdefault((int(array.shape[0]), _device_key(array)), []).append((index, name, array, fill))
+    return by_pool
+
+
+def _transform_recurrent_sidecars(views, make_indices):
+    """Apply the native slot mapping to the sidecars of :func:`_recurrent_sidecar_pools`."""
     updates = {}
-    for (n_slots, _devices), entries in by_pool.items():
+    for (n_slots, _devices), entries in _recurrent_sidecar_pools(views).items():
         indices = make_indices(n_slots)
         if indices is None:
             continue
@@ -2269,13 +2296,8 @@ class ExecutionManager:
             raise RuntimeError("Recurrent prefix snapshots were requested but no snapshot slots are configured.")
         store: list[typing.Any] = [None] * len(leaves)
         for positions in _group_by_devices(leaves).values():
-            shapes = [((num_slots, *leaves[i][2].shape[1:]), leaves[i][2].dtype) for i in positions]
-            shardings = [_snapshot_sharding(leaves[i][2]) for i in positions]
-
-            def make(shapes=shapes):
-                return [jnp.zeros(shape, dtype) for shape, dtype in shapes]
-
-            for i, value in zip(positions, jax.jit(make, out_shardings=shardings)(), strict=True):
+            make = _jit_snapshot_zeros(*_snapshot_zeros_key(leaves, positions, num_slots))
+            for i, value in zip(positions, make(), strict=True):
                 store[i] = value
         self._recurrent_snapshot_arrays = store
         self._recurrent_snapshot_signature = signature
@@ -2575,6 +2597,107 @@ class ExecutionManager:
     def _compile_sampler_variant(self, **kwargs) -> None:
         """Delegate to :meth:`CompileOrchestrator._compile_sampler_variant`."""
         self._get_compile_orchestrator()._compile_sampler_variant(**kwargs)
+
+    def _warm_step_programs(self, *, logits_buckets: list[int], sampler_buckets: list[int]) -> None:
+        """Compile, before serving, the small per-step programs around the model step for the whole bucket grid.
+
+        The sampler's row compaction (slice or gather, scatter back), the fused greedy argmax and the async token
+        handoff gather each compile once per window bucket (and sampler bucket) the first time a step reaches that
+        layout. Requests finishing at different times reach new layouts mid-run, and on a multi-host mesh the one
+        host compiling then holds every other host in the next collective. Scratch inputs only: the live RNG key,
+        token counts and cache are neither read for their values nor written, and nothing called here donates.
+
+        Args:
+            logits_buckets: Request buckets of the model step's logits rows.
+            sampler_buckets: Compiled sampler request buckets.
+        """
+        logits_sharding = self._model_executor._lm_head_replicated_sharding() or self._empty_sharding
+        tokens = self.sampler_runtime.warm_compaction_programs(
+            logits_buckets=logits_buckets,
+            sampler_buckets=sampler_buckets,
+            logits_dtype=self.model.dtype,
+            logits_sharding=logits_sharding,
+            rng_key=self.rng_key,
+        )
+        replicated = self.host_payloads_replicated
+        if not self._model_executor._uses_mpmd_mesh():
+            key = _scratch_copy(self.rng_key)
+            vocab = int(self._sampler_vocab_size)
+            for m in sorted({int(b) for b in logits_buckets if int(b) > 0}):
+                logits = jnp.zeros((m, vocab), dtype=self.model.dtype, device=logits_sharding)
+                mask = put_host_payload(
+                    numpy.ones((m,), dtype=numpy.bool_), self._empty_sharding, host_payloads_replicated=replicated
+                )
+                total = put_host_payload(
+                    numpy.asarray(m, dtype=numpy.int32), self._empty_sharding, host_payloads_replicated=replicated
+                )
+                tokens.append(_greedy_argmax_tokens(logits, mask, key, total, padded_num_reqs=m)[1])
+        # The handoff reads a window's sampled tokens as the runner keeps them (``tokens[:rows]``), from either sampler.
+        rows = put_host_payload(
+            numpy.zeros((int(self.max_num_reqs),), dtype=numpy.int32),
+            self._empty_sharding,
+            host_payloads_replicated=replicated,
+        )
+        seen: set[tuple[int, typing.Any]] = set()
+        warmed = []
+        for out in tokens:
+            m = int(out.shape[0])
+            if (m, out.sharding) in seen:
+                continue
+            seen.add((m, out.sharding))
+            source = out[:m]
+            warmed.append(gather_handoff_tokens([source, source], [rows, rows], self._empty_sharding))
+        jax.block_until_ready(warmed)
+        self._warm_recurrent_slot_programs()
+
+    def _warm_recurrent_slot_programs(self) -> None:
+        """Compile the recurrent slot-maintenance programs from the live cache's shapes, before serving.
+
+        Zeroing a finished request's slots, moving rows and their sidecars when the batch layout changes, and the
+        prefix-snapshot store's allocation, save and restore each run one fused program per pool, compiled the first
+        time a request finishes, moves or hits the prefix cache. They are lowered here from abstract shapes and
+        shardings (with host index vectors where serving passes host arrays): nothing is allocated, read or written.
+        """
+        cache = self.kv_pages
+        if not isinstance(cache, HybridCache):
+            return
+
+        def abstract(array: jax.Array) -> jax.ShapeDtypeStruct:
+            return jax.ShapeDtypeStruct(array.shape, array.dtype, sharding=array.sharding)
+
+        views = list(cache.views)
+        for (n_slots, _devices), arrays in _bucket_leaf_arrays(_recurrent_leaf_entries(views)).items():
+            shardings = tuple(array.sharding for array in arrays)
+            leaves = [abstract(array) for array in arrays]
+            index = jax.ShapeDtypeStruct((n_slots,), jnp.int32)
+            keep = jax.ShapeDtypeStruct((n_slots,), jnp.bool_)
+            _jit_zero_rows(shardings).lower(leaves, keep).compile()
+            _jit_permute_rows(shardings).lower(leaves, index, keep).compile()
+        for (n_slots, _devices), entries in _recurrent_sidecar_pools(views).items():
+            arrays = [entry[2] for entry in entries]
+            transform = _jit_slot_sidecar_rows(
+                tuple(array.sharding for array in arrays), tuple(entry[3] for entry in entries)
+            )
+            transform.lower(
+                [abstract(array) for array in arrays],
+                jax.ShapeDtypeStruct((n_slots,), jnp.int32),
+                jax.ShapeDtypeStruct((n_slots,), jnp.bool_),
+            ).compile()
+        num_slots = int(getattr(self, "recurrent_snapshot_slots", 0) or 0)
+        leaves = _per_slot_state_leaves(views)
+        if num_slots <= 0 or not leaves or not all(isinstance(leaf[2], jax.Array) for leaf in leaves):
+            return
+        rows = jax.ShapeDtypeStruct((int(self.max_num_reqs),), jnp.int32)
+        for positions in _group_by_devices(leaves).values():
+            shapes, snapshot_shardings = _snapshot_zeros_key(leaves, positions, num_slots)
+            _jit_snapshot_zeros(shapes, snapshot_shardings).lower().compile()
+            pools = [abstract(leaves[i][2]) for i in positions]
+            snapshots = [
+                jax.ShapeDtypeStruct(shape, dtype, sharding=sharding)
+                for (shape, dtype), sharding in zip(shapes, snapshot_shardings, strict=True)
+            ]
+            _jit_snapshot_save(snapshot_shardings).lower(pools, snapshots, rows, rows).compile()
+            _jit_snapshot_restore(tuple(pool.sharding for pool in pools)).lower(pools, snapshots, rows, rows).compile()
 
     def get_compile_configurations(
         self,

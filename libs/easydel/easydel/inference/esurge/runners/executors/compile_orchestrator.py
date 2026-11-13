@@ -413,6 +413,14 @@ class CompileOrchestrator:
             lm_head_progress.complete(f"All {total_phase2} lm_head/sampler compilations completed")
         else:
             lm_head_progress.complete(f"All {total_phase2} sampler compilations completed")
+        # Logits rows follow the model request buckets; a fused PP step may size them to a sampler bucket instead.
+        logits_buckets = sorted({int(r) for r in reqs_padds})
+        if self._manager.model.mesh.is_mpmd:
+            logits_buckets = sorted({*logits_buckets, *(int(r) for r in sampler_reqs_padds_to_compile)})
+        self._manager._warm_step_programs(
+            logits_buckets=logits_buckets,
+            sampler_buckets=[int(r) for r in sampler_reqs_padds_to_compile],
+        )
 
     def _compile_model_step_variant(
         self,

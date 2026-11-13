@@ -264,7 +264,13 @@ class KDACacheView(BaseCacheView):
             k_conv_state=k_conv_state,
             v_conv_state=v_conv_state,
             recurrent_state=recurrent_state,
-            positions=jnp.zeros((config.batch_size,), dtype=jnp.int32),
+            # Committed replicated over the mesh, the layout the model step returns: an uncommitted single-device
+            # array changes layout after the first step, so every program keyed on its sharding (slot maintenance,
+            # prefix snapshots) compiled again mid-serving.
+            positions=with_sharding_constraint(
+                arr=jnp.zeros((config.batch_size,), dtype=jnp.int32),
+                sharding=PartitionSpec(),
+            ),
             metadata=config,
             layer_index=layer_index,
         )

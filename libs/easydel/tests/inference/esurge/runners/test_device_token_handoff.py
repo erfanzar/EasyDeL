@@ -91,6 +91,57 @@ def test_device_token_handoff_skips_prefill_rows_of_a_mixed_step():
     )
 
 
+def test_device_token_handoff_gathers_rows_sampled_in_two_row_windows():
+    """The previous step ran as two row windows: each row's token comes from its own window's sampled tokens."""
+    sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    runner = object.__new__(eSurgeRunner)
+    runner.async_scheduling = True
+    runner.metadata = SimpleNamespace(data_parallel_size=1)
+    runner.num_reqs_max_model_len = 4
+    runner.sequence_buffer = SimpleNamespace(
+        num_computed_tokens=np.array([5, 7, 0, 0], dtype=np.int32),
+        num_tokens_no_spec=np.array([6, 8, 0, 0], dtype=np.int32),
+    )
+    runner.executor_manager = SimpleNamespace(max_num_reqs=4, _empty_sharding=sharding)
+    runner._handoff_positions_cache = {}
+    runner._handoff_scalar_cache = {}
+    pre_results = AsyncPreResults(
+        windows=[
+            AsyncWindowResult(
+                req_ids=["a"],
+                row_positions=[1],
+                sampled_token_ids=jnp.array([0, 111], dtype=jnp.int32),
+                valid_mask=[True],
+            ),
+            AsyncWindowResult(
+                req_ids=["b"],
+                row_positions=[0],
+                sampled_token_ids=jnp.array([222, 0, 0, 0], dtype=jnp.int32),
+                valid_mask=[True],
+            ),
+        ],
+        request_seq_lens=[],
+    )
+
+    handoff = runner._build_device_token_handoff(
+        pre_results=pre_results,
+        req_ids_window=["a", "b"],
+        scheduled_list=[1, 1],
+        window_row_indices=np.array([0, 1], dtype=np.int32),
+        num_tokens_static=8,
+    )
+
+    assert handoff is not None
+    assert int(np.asarray(handoff.count)) == 2
+    np.testing.assert_array_equal(np.asarray(handoff.token_ids), np.array([111, 222, 0, 0], dtype=np.int32))
+    metadata = _metadata(jnp.array([0, 0, 9, 9, 9, 9, 9, 9], dtype=jnp.int32))
+    patched = ExecutionManager._apply_device_token_handoff(metadata, handoff)
+    np.testing.assert_array_equal(
+        np.asarray(patched.model_input_ids),
+        np.array([111, 222, 9, 9, 9, 9, 9, 9], dtype=np.int32),
+    )
+
+
 def test_device_token_handoff_uses_rank_major_spmd_offsets():
     sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
     runner = object.__new__(eSurgeRunner)

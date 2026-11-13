@@ -66,6 +66,8 @@ def test_spmd_compile_prepares_full_bucket_grid():
         (int(kwargs["num_tokens"]), int(kwargs["padded_num_reqs"]))
     )
     manager._compile_sampler_variant = lambda **kwargs: sampler_calls.append(int(kwargs["padded_num_reqs"]))
+    warm_calls: list[dict] = []
+    manager._warm_step_programs = lambda **kwargs: warm_calls.append(kwargs)
 
     ExecutionManager.compile(
         manager,
@@ -81,6 +83,8 @@ def test_spmd_compile_prepares_full_bucket_grid():
     assert model_step_calls == [(4, 4), (8, 4), (8, 8), (16, 4), (16, 8)]
     assert sampler_calls == [1, 2, 4, 8]
     assert manager._model_num_tokens_paddings == [4, 8, 16]
+    # Every (logits bucket, sampler bucket) pair the grid allows is warmed, not only the pairs a workload reaches.
+    assert warm_calls == [{"logits_buckets": [4, 8], "sampler_buckets": [1, 2, 4, 8]}]
 
 
 def test_mpmd_compile_prepares_fused_split_and_sampler_buckets():
@@ -109,6 +113,8 @@ def test_mpmd_compile_prepares_fused_split_and_sampler_buckets():
     )
     manager._compile_lm_head_variant = lambda **kwargs: lm_head_calls.append(int(kwargs["padded_num_reqs"]))
     manager._compile_sampler_variant = lambda **kwargs: sampler_calls.append(int(kwargs["padded_num_reqs"]))
+    warm_calls: list[dict] = []
+    manager._warm_step_programs = lambda **kwargs: warm_calls.append(kwargs)
 
     ExecutionManager.compile(
         manager,
@@ -125,6 +131,8 @@ def test_mpmd_compile_prepares_fused_split_and_sampler_buckets():
     assert backbone_calls == [(4, False), (4, True), (8, False), (8, True), (16, False), (16, True)]
     assert lm_head_calls == [4, 8]
     assert sampler_calls == [1, 2, 4, 8]
+    # A fused PP step may size its logits to a sampler bucket, so those are logits buckets too.
+    assert warm_calls == [{"logits_buckets": [1, 2, 4, 8], "sampler_buckets": [1, 2, 4, 8]}]
 
 
 def test_backbone_trace_mode_is_determined_by_the_cache_key():

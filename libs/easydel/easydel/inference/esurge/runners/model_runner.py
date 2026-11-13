@@ -103,6 +103,7 @@ from .async_types import (
     SpecWindowCarry,
 )
 from .execution_types import CacheGroupInputs
+from .executors.sampler_executor import gather_handoff_tokens
 from .host_sync import host_payload_broadcast_needed, put_host_payload
 from .perf import RunnerPerfSample, RunnerPerfTracker
 from .pipeline_execution_manager import PipelineExecutionManager
@@ -285,15 +286,6 @@ def _host_packed_rows(rows: typing.Any) -> np.ndarray | None:
 
         return np.asarray(multihost_utils.process_allgather(rows, tiled=True))
     return np.asarray(jax.device_get(rows))
-
-
-@jax.jit
-def _take_handoff_tokens(sampled: jax.Array, rows: jax.Array) -> jax.Array:
-    """Gather the previous step's sampled tokens at ``rows`` in one device program (int32).
-
-    A row index past the end of ``sampled`` (the padding of an unused handoff slot) yields 0.
-    """
-    return jnp.take(sampled.astype(jnp.int32), rows, axis=0, mode="fill", fill_value=0)
 
 
 class _AsyncExecutionHandle:
@@ -2967,35 +2959,28 @@ class eSurgeRunner:
             input_positions = self._get_handoff_positions(max_handoff)
             token_ids = pre_results.windows[patch_sources[0][0]].sampled_token_ids
         else:
-            # One gather for every patched row, with its row index built on the host: indexing each request's
-            # sampled token separately launched one device program per row (one per request under rank-major DP,
-            # whose positions are never the dense prefix above), each coordinated across every host of the mesh.
+            # One gather per row window for every patched row, with its row index built on the host: indexing each
+            # request's sampled token separately launched one device program per row (one per request under
+            # rank-major DP, whose positions are never the dense prefix above), each coordinated across every host
+            # of the mesh. A window's gather yields 0 on the rows other windows own, so the sum is each row's token.
             window_ids = sorted({window_idx for window_idx, _ in patch_sources})
-            if len(window_ids) == 1:
-                source = pre_results.windows[window_ids[0]].sampled_token_ids
-                rows_np = np.asarray([row_pos for _, row_pos in patch_sources], dtype=np.int32)
-            else:
-                bases: dict[int, int] = {}
-                parts = []
-                base = 0
-                for window_idx in window_ids:
-                    part = pre_results.windows[window_idx].sampled_token_ids
-                    bases[window_idx] = base
-                    parts.append(part)
-                    base += int(part.shape[0])
-                source = jnp.concatenate(parts)
-                rows_np = np.asarray([bases[w] + row_pos for w, row_pos in patch_sources], dtype=np.int32)
-            input_positions_np = np.asarray(patch_positions, dtype=np.int32)
-            pad = max_handoff - int(input_positions_np.shape[0])
-            if pad > 0:
-                input_positions_np = np.pad(input_positions_np, (0, pad))
-                rows_np = np.pad(rows_np, (0, pad), constant_values=int(source.shape[0]))
-            input_positions, rows = put_host_payload(
-                (input_positions_np, rows_np),
-                self.executor_manager._empty_sharding,
+            parts = [pre_results.windows[window_idx].sampled_token_ids for window_idx in window_ids]
+            rows_by_window = []
+            for window_idx, part in zip(window_ids, parts, strict=True):
+                rows_np = np.full((max_handoff,), int(part.shape[0]), dtype=np.int32)
+                for i, (source_window, row_pos) in enumerate(patch_sources):
+                    if source_window == window_idx:
+                        rows_np[i] = row_pos
+                rows_by_window.append(rows_np)
+            input_positions_np = np.zeros((max_handoff,), dtype=np.int32)
+            input_positions_np[: len(patch_positions)] = patch_positions
+            sharding = self.executor_manager._empty_sharding
+            input_positions, *rows = put_host_payload(
+                (input_positions_np, *rows_by_window),
+                sharding,
                 host_payloads_replicated=getattr(self, "host_payloads_replicated", None),
             )
-            token_ids = jax.device_put(_take_handoff_tokens(source, rows), self.executor_manager._empty_sharding)
+            token_ids = gather_handoff_tokens(parts, rows, sharding)
         return DeviceInputTokenHandoff(input_positions=input_positions, token_ids=token_ids, count=count, offset=offset)
 
     def _get_handoff_positions(self, size: int) -> jax.Array:

@@ -614,7 +614,11 @@ class HybridCacheView(BaseCacheView):
             q_conv_state=q_conv_state,
             k_conv_state=k_conv_state,
             v_conv_state=v_conv_state,
-            positions=jnp.zeros((metadata.batch_size,), dtype="i4"),
+            # Committed replicated over the mesh, the layout the model step returns (see the KDA cache).
+            positions=with_sharding_constraint(
+                arr=jnp.zeros((metadata.batch_size,), dtype="i4"),
+                sharding=PartitionSpec(),
+            ),
             metadata=metadata,
             layer_index=layer_index,
             layer_type=layer_type,
