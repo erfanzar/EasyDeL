@@ -12,18 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ZeroMQ-backed tokenizer and detokenizer workers.
+"""Prompt-tokenization worker and native in-process batched detokenization."""
 
-This module provides a pipeline infrastructure for running tokenizer and detokenizer
-services as external worker processes using ZeroMQ for inter-process communication.
-
-Note:
-    This module is for internal use only and is not part of EasyDeL's public API.
-    It is only accessible to EasyDeL modules that require external worker processes
-    to handle specific tasks.
-"""
+from surgecore import Detokenizer, DetokenizerResult
 
 from .worker_manager import WorkerManager
-from .zmq_workers import DetokenizerResult, DetokenizerWorkerClient, TokenizerWorkerClient
+from .zmq_workers import TokenizerWorkerClient
 
-__all__ = ["DetokenizerResult", "DetokenizerWorkerClient", "TokenizerWorkerClient", "WorkerManager"]
+__all__ = ["Detokenizer", "DetokenizerResult", "TokenizerWorkerClient", "WorkerManager"]

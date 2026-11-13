@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import threading
+from types import SimpleNamespace
 
 from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput, eSurge
 
@@ -20,13 +21,14 @@ from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutp
 class _DummyIOEngine(eSurge):
     """eSurge subclass with stubbed request state; no engine construction."""
 
-    def __init__(self, request_output: RequestOutput, *, scheduler_request_ids: set[str], active_request_ids: set[str]):
+    def __init__(self, request_output: RequestOutput, *, core_request_ids: set[str], active_request_ids: set[str]):
         self._output_lock = threading.RLock()
         self._scheduler_lock = threading.RLock()
         self._request_lock = threading.RLock()
         self._request_outputs = {request_output.request_id: request_output}
         self._active_requests = {rid: {} for rid in active_request_ids}
-        self.scheduler = type("Scheduler", (), {"requests": {rid: object() for rid in scheduler_request_ids}})()
+        live = frozenset(core_request_ids)
+        self.core = SimpleNamespace(is_live=lambda request_id: request_id in live)
         self.aborted: list[str] = []
 
     def abort_request(self, request_id: str) -> None:
@@ -58,7 +60,7 @@ def _make_request_output(request_id: str, n: int, finished_indices: set[int] | N
 
 def test_recover_orphaned_request_aborts_parent_when_children_disappear():
     ro = _make_request_output("req", n=4, finished_indices={0})
-    engine = _DummyIOEngine(ro, scheduler_request_ids=set(), active_request_ids={"req"})
+    engine = _DummyIOEngine(ro, core_request_ids=set(), active_request_ids={"req"})
 
     recovered = engine._recover_orphaned_request("req")
 
@@ -70,7 +72,7 @@ def test_recover_orphaned_request_aborts_parent_when_children_disappear():
 
 def test_recover_orphaned_request_skips_when_scheduler_still_has_pending_child():
     ro = _make_request_output("req", n=4, finished_indices={0})
-    engine = _DummyIOEngine(ro, scheduler_request_ids={"req-2"}, active_request_ids={"req", "req-2"})
+    engine = _DummyIOEngine(ro, core_request_ids={"req-2"}, active_request_ids={"req", "req-2"})
 
     recovered = engine._recover_orphaned_request("req")
 
@@ -82,7 +84,7 @@ def test_recover_orphaned_request_skips_when_scheduler_still_has_pending_child()
 
 def test_recover_orphaned_request_handles_single_sample_requests():
     ro = _make_request_output("req-single", n=1)
-    engine = _DummyIOEngine(ro, scheduler_request_ids=set(), active_request_ids=set())
+    engine = _DummyIOEngine(ro, core_request_ids=set(), active_request_ids=set())
 
     recovered = engine._recover_orphaned_request("req-single")
 

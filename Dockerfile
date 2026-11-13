@@ -71,6 +71,17 @@ ENV PYTHONUNBUFFERED=1
 COPY pyproject.toml README.md ./
 COPY libs ./libs
 
+# libs/surgecore is a Rust (PyO3) extension built by maturin and not on PyPI yet: install it from the copied
+# source before easydel, whose exact surgecore pin it then satisfies. Every base already has a C toolchain and curl
+# (build-essential and curl from the OS deps step above), so only a minimal rustup toolchain is added; it and the
+# cargo build directory are deleted in this same layer to keep the image small.
+RUN set -euxo pipefail; \
+    export RUSTUP_HOME=/tmp/rustup CARGO_HOME=/tmp/cargo CARGO_TARGET_DIR=/tmp/surgecore-target; \
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path; \
+    PATH="$CARGO_HOME/bin:$PATH" uv pip install ./libs/surgecore; \
+    rm -rf "$RUSTUP_HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR"
+
 # Install project deps
 RUN set -eux; \
     if [[ "$HARDWARE_TYPE" == "cuda" ]]; then \

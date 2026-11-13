@@ -124,7 +124,7 @@ class TurboQuantRaggedPagesCacheConfig(RaggedPagesCacheConfig):
         data_parallel_size = mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
         kv_head_size = mesh_axis_size(mesh, runtime_sharding_resolver.paxis.kv_head_axis)
 
-        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
+        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free", mesh=mesh)
         page_axis_size = data_parallel_size if data_parallel_size > 1 else 1
         available_alloc = budget * kv_head_size * page_axis_size
 

@@ -20,11 +20,173 @@ These payloads let the lifecycle loop prefetch the next scheduler step while
 the device is still producing the current batch's sampled tokens.
 """
 
-from dataclasses import dataclass
+from __future__ import annotations
 
+import typing as tp
+from dataclasses import dataclass
+from functools import partial
+
+import jax
+import numpy as np
 from jax import Array
+from jax import numpy as jnp
 
 from .states import CachedRequestState
+
+
+@partial(jax.jit, static_argnums=1)
+def _unpack_spec_out(spec_out: Array, num_draft_tokens: int) -> tuple[Array, Array, Array]:
+    """Split a step's packed ``spec_out[R, 2k+2]`` into (last emitted token, accepted drafts, next drafts) per row.
+
+    Columns ``[0, k+1)`` hold the emitted tokens (accepted drafts, then the bonus or corrected token), column ``k+1``
+    the accepted drafts ``a`` (``-1``: the row verified nothing, so it emitted one token) and ``[k+2, 2k+2)`` the next
+    drafts. ``-1`` drafts (drafter skipped for the row) become token ``0`` placeholders: verification of any proposed
+    token is lossless (greedy compare, point-mass rejection), so a placeholder only costs its verify slot.
+    """
+    k = int(num_draft_tokens)
+    spec_out = spec_out.astype(jnp.int32)
+    accepted = jnp.maximum(spec_out[:, k + 1], 0)
+    last = jnp.take_along_axis(spec_out[:, : k + 1], jnp.minimum(accepted, k)[:, None], axis=1)[:, 0]
+    drafts = jnp.maximum(spec_out[:, k + 2 : 2 * k + 2], 0)
+    return last, accepted, drafts
+
+
+def spec_window_sources(
+    window_req_ids: tp.Sequence[str | None],
+    fed_by: tp.Mapping[str, tuple[int, int]],
+    max_num_reqs: int,
+) -> np.ndarray:
+    """Host map from step ``N+1``'s window rows to step ``N``'s verify output rows.
+
+    Built from plan data only (which request each window row holds, and where step ``N`` put it), so every host of
+    a multi-host run computes the same map without reading step ``N``'s results.
+
+    Args:
+        window_req_ids: Step ``N+1``'s request per window row (``None`` for an empty row).
+        fed_by: Per request verified at step ``N``: ``(output row, drafts verified)``.
+        max_num_reqs: Width of the payload.
+
+    Returns:
+        int32 ``[2, max_num_reqs]``: row 0 the source output row (``-1``: none), row 1 the drafts verified (``d``).
+    """
+    sources = np.zeros((2, int(max_num_reqs)), dtype=np.int32)
+    sources[0] = -1
+    for row, rid in enumerate(window_req_ids[: int(max_num_reqs)]):
+        hit = None if rid is None else fed_by.get(str(rid))
+        if hit is not None:
+            sources[0, row], sources[1, row] = int(hit[0]), int(hit[1])
+    return sources
+
+
+@dataclass(frozen=True)
+class DeviceSpecWindowHandoff:
+    """Step ``N``'s verify results on the device, and the host map that turns them into step ``N+1``'s windows.
+
+    With drafts in flight, the host builds step ``N+1`` as if every draft step ``N`` verified was accepted: each
+    speculative row is a window of ``1 + k`` placeholder tokens whose positions and sequence length run
+    ``delta = d - a`` tokens ahead of the truth (``d`` drafts verified at step ``N``, ``a`` of them accepted). The
+    device rewrites the window before the model step (``BatchMetadataPreparer.apply_spec_window_handoff``), so the
+    host never reads step ``N``'s results to launch step ``N+1``.
+
+    Attributes:
+        last_token: int32 ``[P]``, per step-``N`` output row the token it emitted last (the bonus or corrected
+            token): the first input of the row's next window.
+        accepted: int32 ``[P]``, per step-``N`` output row the drafts it accepted (``a``).
+        drafts: int32 ``[P, k]``, per step-``N`` output row the drafts it produced for its next window.
+        sources: int32 ``[2, max_num_reqs]`` host payload in step ``N+1``'s window-row order. Row 0 is the step-``N``
+            output row that feeds the window row (``-1``: none, the row's host inputs are already exact); row 1 is
+            the drafts step ``N`` verified for it (``d``). The caller places it with the step's input sharding.
+        rewrite_recurrent_base: Whether the step reads recurrent state from slot groups. The host's per-row slot
+            base (``spec_recurrent_commit`` row 0) is then stale by step ``N - 1``'s rejected drafts, so the device
+            sets it to ``corrected context before the step - a``: the row reads slot ``g + a``.
+    """
+
+    last_token: Array
+    accepted: Array
+    drafts: Array
+    sources: tp.Any
+    rewrite_recurrent_base: bool = False
+
+    @classmethod
+    def from_spec_out(
+        cls,
+        *,
+        spec_out: Array,
+        num_draft_tokens: int,
+        sources: tp.Any,
+        rewrite_recurrent_base: bool = False,
+    ) -> DeviceSpecWindowHandoff:
+        """Build the handoff from a step's packed speculative output, on the device.
+
+        Args:
+            spec_out: int32 ``[max_num_reqs, 2k+2]``, rows = the sequence-buffer rows at that step's dispatch (see
+                :func:`_unpack_spec_out` for the columns).
+            num_draft_tokens: ``k``, the runner's compiled draft count.
+            sources: The ``[2, max_num_reqs]`` window-row map (see the class docstring).
+            rewrite_recurrent_base: See the class docstring.
+
+        Returns:
+            The handoff; nothing is read back to the host.
+        """
+        last_token, accepted, drafts = _unpack_spec_out(spec_out, int(num_draft_tokens))
+        return cls(
+            last_token=last_token,
+            accepted=accepted,
+            drafts=drafts,
+            sources=sources,
+            rewrite_recurrent_base=rewrite_recurrent_base,
+        )
+
+
+@dataclass(frozen=True)
+class SpecWindowCarry:
+    """What step ``N`` leaves for step ``N+1`` when ``N+1`` is dispatched before ``N`` is drained.
+
+    Attributes:
+        spec_out: Step ``N``'s packed device output ``[max_num_reqs, 2k+2]`` (never donated, so it stays readable
+            until step ``N+1``'s program has consumed it).
+        num_draft_tokens: ``k``.
+        rows: Per request in step ``N``, its sequence-buffer row at dispatch (the ``spec_out`` row).
+    """
+
+    spec_out: Array
+    num_draft_tokens: int
+    rows: tp.Mapping[str, int]
+
+    def handoff_for(
+        self,
+        window_req_ids: tp.Sequence[str | None],
+        inflight_drafts: tp.Mapping[str, int],
+        max_num_reqs: int,
+        *,
+        rewrite_recurrent_base: bool = False,
+    ) -> DeviceSpecWindowHandoff | None:
+        """The handoff for one of step ``N+1``'s windows, or ``None`` when none of its rows is optimistic.
+
+        Args:
+            window_req_ids: Step ``N+1``'s request per window row.
+            inflight_drafts: From step ``N+1``'s plan, per request scheduled while step ``N`` was still in flight,
+                the drafts step ``N`` verified for it (``d >= 0``; its host-built start counts all ``d`` as
+                accepted). Requests the core scheduled from committed state are absent and keep their host inputs.
+            max_num_reqs: Width of the payload.
+            rewrite_recurrent_base: See :class:`DeviceSpecWindowHandoff`.
+
+        Raises:
+            ValueError: When the plan names a request step ``N`` did not run.
+        """
+        missing = [rid for rid in inflight_drafts if rid not in self.rows]
+        if missing:
+            raise ValueError(f"Requests scheduled behind an in-flight step that it did not run: {missing[:4]}")
+        fed_by = {str(rid): (int(self.rows[rid]), int(d)) for rid, d in inflight_drafts.items()}
+        sources = spec_window_sources(window_req_ids, fed_by, max_num_reqs)
+        if not bool((sources[0] >= 0).any()):
+            return None
+        return DeviceSpecWindowHandoff.from_spec_out(
+            spec_out=self.spec_out,
+            num_draft_tokens=self.num_draft_tokens,
+            sources=sources,
+            rewrite_recurrent_base=rewrite_recurrent_base,
+        )
 
 
 @dataclass(frozen=True)

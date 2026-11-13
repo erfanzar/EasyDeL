@@ -7,6 +7,7 @@ easydel.inference.esurge.engine package
    admission
    bootstrap
    chat_templating
+   core_driver
    idle
    loop
    monitoring_stack

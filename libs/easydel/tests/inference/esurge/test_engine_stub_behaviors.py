@@ -106,6 +106,7 @@ class _SchedulerStub(eSurge):
         self._request_outputs = self._registry.outputs
         self._finished_request_ids = self._registry.finished_ids
         self._request_events = self._registry.events
+        self.core = SimpleNamespace(shutdown=lambda: None)
 
     @property
     def num_running_requests(self):
@@ -126,18 +127,21 @@ class _SchedulerStub(eSurge):
         return None
 
 
-def test_scheduler_rebuild_keeps_construction_settings(monkeypatch):
+def test_engine_core_rebuild_keeps_construction_settings(monkeypatch):
     def from_runner(runner, **kwargs):
         return SimpleNamespace(**kwargs)
 
-    monkeypatch.setattr(esurge_engine, "Scheduler", SimpleNamespace(from_runner=from_runner))
+    monkeypatch.setattr(esurge_engine, "EngineCoreDriver", SimpleNamespace(from_runner=from_runner))
     engine = _SchedulerStub()
+    closed = []
+    engine.core = SimpleNamespace(shutdown=lambda: closed.append(True))
     engine.update_model_weights(model=object(), graphdef="graph", graphstate={}, graphother={})
-    assert engine.scheduler.max_num_batched_tokens == 512
-    assert engine.scheduler.enable_prefix_caching is True
-    assert engine.scheduler.async_scheduling is False
-    assert engine.scheduler.long_prefill_token_threshold == 128
-    assert engine.scheduler.num_draft_tokens == 3
+    assert closed == [True]
+    assert engine.core.max_num_batched_tokens == 512
+    assert engine.core.enable_prefix_caching is True
+    assert engine.core.async_scheduling is False
+    assert engine.core.long_prefill_token_threshold == 128
+    assert engine.core.num_draft_tokens == 3
 
 
 class _MultimodalStreamStub(eSurge):

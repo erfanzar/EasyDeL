@@ -75,7 +75,7 @@ import time
 import traceback
 import typing as tp
 import uuid
-from collections.abc import AsyncGenerator, Iterable, Iterator
+from collections.abc import AsyncGenerator, Iterator
 from http import HTTPStatus
 
 import anyio
@@ -87,10 +87,12 @@ from transformers import ProcessorMixin
 from easydel.workers.esurge.auth import (
     ApiKeyRole,
     EnhancedApiKeyManager,
+    InvalidApiKey,
     PermissionDenied,
     QuotaExceeded,
     RateLimitExceeded,
 )
+from easydel.workers.esurge.auth.credentials import api_key_from_headers
 
 from ...inference_engine_interface import (
     BaseInferenceApiServer,
@@ -115,6 +117,7 @@ from ...sampling_params import SamplingParams
 from ...stream_protocol import StreamEventFrame
 from ...typed_models import ResponseCompletedEvent, ResponsesFinalizationOptions, ResponsesOutputItem, ResponsesResponse
 from ..esurge_engine import RequestOutput, eSurge
+from ..metrics import get_metrics_collector, initialize_metrics
 from .auth_endpoints import AuthEndpointsMixin
 
 logger = get_logger("eSurgeApiServer")
@@ -131,6 +134,8 @@ __all__ = (
 _STREAM_DATA = "data"
 _STREAM_ERROR = "error"
 _STREAM_END = "end"
+# Completed requests older than this are left out of the per-model summary in ``/metrics``.
+_METRICS_WINDOW_S = 300.0
 
 
 class _AdmissionStream:
@@ -454,6 +459,10 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         self._resolved_generation_slot_cap = max_slots
         kwargs["max_workers"] = esurge_max_concurrency * 2
 
+        # The engines record per-request metrics only into an existing collector; monitoring may not have made one.
+        if get_metrics_collector() is None:
+            initialize_metrics(enable_detailed_logging=False)
+
         # Initialize authentication manager (either ZMQ worker or in-process)
         self._require_api_key = bool(require_api_key)
 
@@ -579,102 +588,26 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         return self.auth_manager.generate_api_key(name=name, role=role, **kwargs)
 
     def _extract_api_key(self, raw_request: Request) -> str | None:
-        """Extract API key from various request locations.
+        """Return the API key in ``Authorization: Bearer`` or ``X-API-Key``; see :func:`api_key_from_headers`.
 
-        Searches for an API key in the following locations (in order):
-        1. Authorization header with "Bearer " prefix
-        2. X-API-Key header
-        3. "api_key" query parameter
-        4. "user" query parameter (OpenAI compatibility)
-
-        Args:
-            raw_request: The incoming FastAPI request object.
-
-        Returns:
-            The extracted API key string if found, None otherwise.
+        Query parameters and request-body fields are never read as credentials.
         """
-        auth_header = raw_request.headers.get("Authorization")
-        if auth_header and auth_header.lower().startswith("bearer "):
-            return auth_header.split(" ", 1)[1].strip()
-
-        header_key = raw_request.headers.get("X-API-Key")
-        if header_key:
-            return header_key.strip()
-
-        query_key = raw_request.query_params.get("api_key")
-        if query_key:
-            return query_key.strip()
-
-        query_key = raw_request.query_params.get("user")
-        if query_key:
-            return query_key.strip()
-
-        return None
-
-    @staticmethod
-    def _extract_payload_api_keys(payload: tp.Any) -> list[str]:
-        """Extract API key candidates from the request JSON payload.
-
-        Searches for API keys embedded within the request body, checking
-        various field names commonly used for authentication. This allows
-        clients to pass API keys in the request body as an alternative to
-        headers or query parameters.
-
-        Args:
-            payload: The request payload, either as a Pydantic model or dict.
-                For Pydantic models, checks `model_extra` for extra fields.
-
-        Returns:
-            List of unique, non-empty API key candidate strings found in
-            the payload. The list preserves discovery order.
-
-        Note:
-            Checked field names include: api_key, apiKey, api-key, x-api-key,
-            auth, authorization, token, key, and user (for OpenAI compatibility).
-        """
-        candidates: list[str] = []
-
-        def add_candidate(value: tp.Any) -> None:
-            """Append a non-empty, stripped string to the candidates list if unique."""
-            if isinstance(value, str):
-                stripped = value.strip()
-                if stripped and stripped not in candidates:
-                    candidates.append(stripped)
-
-        extras: dict[str, tp.Any] | None = None
-        if hasattr(payload, "model_extra"):
-            extras = payload.model_extra or {}
-        elif isinstance(payload, dict):
-            extras = payload
-
-        if isinstance(extras, dict):
-            for field in ("api_key", "apiKey", "api-key", "x-api-key", "auth", "authorization", "token", "key"):
-                add_candidate(extras.get(field))
-
-        if hasattr(payload, "user"):
-            add_candidate(payload.user)
-
-        return candidates
+        return api_key_from_headers(raw_request.headers)
 
     def _auth_system_enabled(self) -> bool:
         """Determine whether authentication enforcement is active.
 
-        Checks multiple conditions to determine if the authentication system
-        should enforce API key validation:
-        1. Whether an auth_manager exists
-        2. Whether the manager has an `enabled` property set
-        3. Whether the manager supports `authorize_request` method
-        4. Falls back to the `_require_api_key` setting
+        ``require_api_key=True`` always enforces, whatever state the auth manager is in: a missing or
+        misconfigured manager must refuse requests, never open the server. Otherwise authentication is
+        active when the manager reports itself enabled (for example because keys are registered).
 
         Returns:
             True if authentication should be enforced, False otherwise.
         """
+        if getattr(self, "_require_api_key", False):
+            return True
 
-        try:
-            manager = self.auth_manager
-        except AttributeError:
-            return False
-
+        manager = getattr(self, "auth_manager", None)
         if manager is None:
             return False
 
@@ -696,7 +629,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
     def _authorize_request(
         self,
         raw_request: Request,
-        payload_api_keys: str | Iterable[str | None] | None = None,
         endpoint: str | None = None,
         model: str | None = None,
         requested_tokens: int = 0,
@@ -707,7 +639,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
         Args:
             raw_request: FastAPI request object.
-            payload_api_keys: API keys from request payload.
             endpoint: Endpoint being accessed.
             model: Model being requested.
             requested_tokens: Number of tokens requested.
@@ -722,6 +653,9 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         """
         if not self._auth_system_enabled():
             return None
+        if getattr(self, "auth_manager", None) is None:
+            # Enforcement is on but nothing can validate a key: refuse rather than serve unauthenticated.
+            raise HTTPException(status_code=401, detail="Missing or invalid API key")
 
         candidate_keys: list[str] = []
 
@@ -731,12 +665,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 stripped = value.strip()
                 if stripped and stripped not in candidate_keys:
                     candidate_keys.append(stripped)
-
-        if isinstance(payload_api_keys, str):
-            add_candidate(payload_api_keys)
-        elif payload_api_keys:
-            for value in payload_api_keys:
-                add_candidate(value)
 
         add_candidate(self._extract_api_key(raw_request))
 
@@ -766,19 +694,16 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             except (PermissionDenied, RateLimitExceeded, QuotaExceeded) as e:
                 # If we have more candidates, try them. Otherwise, raise the exception.
                 if candidate == candidate_keys[-1]:
-                    if isinstance(e, RateLimitExceeded):
+                    if isinstance(e, RateLimitExceeded | QuotaExceeded):
                         raise HTTPException(status_code=429, detail=str(e)) from e
-                    elif isinstance(e, QuotaExceeded):
-                        raise HTTPException(status_code=429, detail=str(e)) from e
-                    else:
-                        raise HTTPException(status_code=403, detail=str(e)) from e
+                    if isinstance(e, InvalidApiKey):
+                        raise HTTPException(status_code=401, detail=str(e)) from e
+                    raise HTTPException(status_code=403, detail=str(e)) from e
                 continue
 
-        try:
-            require_key = self.auth_manager.require_api_key
-        except AttributeError:
-            require_key = self._require_api_key
-
+        require_key = bool(getattr(self, "_require_api_key", False)) or bool(
+            getattr(self.auth_manager, "require_api_key", False)
+        )
         if require_key:
             raise HTTPException(status_code=401, detail="Missing or invalid API key")
         return None
@@ -1686,6 +1611,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             min_p=float(getattr(request, "min_p", 0.0)),
             n=int(request.n or 1),
             stop=request.stop,
+            ignore_eos=_coerce_optional_bool(getattr(request, "ignore_eos", None), False),
             skip_special_tokens=_coerce_optional_bool(getattr(request, "skip_special_tokens", None), False),
             spaces_between_special_tokens=_coerce_optional_bool(
                 getattr(request, "spaces_between_special_tokens", None), True
@@ -1720,7 +1646,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             refined_request = self._refine_chat_request_callback(request)
             if refined_request is not None:
                 request = refined_request
-        payload_api_keys = self._extract_payload_api_keys(request)
 
         try:
             adapter = self._get_adapter(request.model)
@@ -1729,7 +1654,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             max_tokens = self._ensure_request_max_tokens(request, esurge)
             self._authorize_request(
                 raw_request,
-                payload_api_keys=payload_api_keys,
                 endpoint="/v1/chat/completions",
                 model=request.model,
                 requested_tokens=max_tokens,
@@ -1961,7 +1885,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         """
 
         response_id = f"resp_{uuid.uuid4().hex}"
-        payload_api_keys = self._extract_payload_api_keys(request)
 
         try:
             store_flag = request.store
@@ -1987,7 +1910,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             requested_tokens, max_tokens = self._parse_responses_max_tokens(request, esurge)
             self._authorize_request(
                 raw_request,
-                payload_api_keys=payload_api_keys,
                 endpoint="/v1/responses",
                 model=model,
                 requested_tokens=requested_tokens,
@@ -2411,6 +2333,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             tokens_per_second=tokens_per_second,
             processing_time=processing_time,
             first_token_time=output.first_token_time,
+            **UsageInfo.cache_fields(output),
         )
 
         self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
@@ -2673,7 +2596,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 404 model not found, 401/403/429 auth failures).
         """
         request_id = str(uuid.uuid4())
-        payload_api_keys = self._extract_payload_api_keys(request)
 
         try:
             adapter = self._get_adapter(request.model)
@@ -2682,7 +2604,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             max_tokens = self._ensure_request_max_tokens(request, esurge)
             self._authorize_request(
                 raw_request,
-                payload_api_keys=payload_api_keys,
                 endpoint="/v1/completions",
                 model=request.model,
                 requested_tokens=max_tokens,
@@ -2833,6 +2754,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 tokens_per_second=tokens_per_second,
                 processing_time=processing_time,
                 first_token_time=min(first_token_times) if first_token_times else None,
+                **UsageInfo.cache_fields(outputs),
             )
 
             self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
@@ -2874,6 +2796,11 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             prompt_tokens = 0
             completion_tokens = 0
             processing_time = 0.0
+            cache_hit = False
+            cache_read = 0
+            cache_written = 0
+            cache_written_unknown = False
+            uncached_input = 0
             for prompt_index, prompt in enumerate(prompts):
                 if await raw_request.is_disconnected():
                     return
@@ -2904,6 +2831,13 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                             prompt_tokens += usage["prompt_tokens"]
                             completion_tokens += usage["completion_tokens"]
                             processing_time += usage.get("processing_time", 0.0)
+                            cache_hit = cache_hit or bool(usage.get("cache_hit", False))
+                            cache_read += int(usage.get("cache_read", 0))
+                            uncached_input += int(usage.get("uncached_input", 0))
+                            if usage.get("cache_written") is None:
+                                cache_written_unknown = True
+                            else:
+                                cache_written += int(usage["cache_written"])
                             if prompt_index == len(prompts) - 1:
                                 # Reconcile before exposing terminal usage: the consumer
                                 # may disconnect without ever requesting the next event.
@@ -2914,6 +2848,10 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                                     total_tokens=prompt_tokens + completion_tokens,
                                     processing_time=processing_time,
                                     tokens_per_second=(completion_tokens / processing_time if processing_time else 0.0),
+                                    cache_hit=cache_hit,
+                                    cache_read=cache_read,
+                                    cache_written=None if cache_written_unknown else cache_written,
+                                    uncached_input=uncached_input,
                                 ).model_dump(exclude_none=True)
                         yield f"data: {json.dumps(chunk)}\n\n"
                 finally:
@@ -3049,6 +2987,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                         tokens_per_second=tokens_per_second,
                         processing_time=generation_time,
                         first_token_time=last_output.first_token_time,
+                        **UsageInfo.cache_fields(last_output),
                     )
 
                     final_chunk = {
@@ -3185,6 +3124,30 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         status_code = 200 if self.status == ServerStatus.READY else 503
         return JSONResponse(health_status, status_code=status_code)
 
+    def _engine_metrics_snapshot(self) -> dict[str, tp.Any]:
+        """Per-model windowed metrics from the engine's :class:`MetricsCollector`.
+
+        The collector owns the accounting (cache reads, TTFT, decode rate, percentiles); this method only adds
+        the live queue depths and keys the result by the served model name.
+        """
+        collector = get_metrics_collector()
+        snapshots: dict[str, tp.Any] = {}
+        for model_name, engine in self.esurge_map.items():
+            summary = (
+                collector.model_summary(getattr(engine, "esurge_name", model_name), window_seconds=_METRICS_WINDOW_S)
+                if collector is not None
+                else {"window_seconds": _METRICS_WINDOW_S, "aggregate": {}, "recent_requests": []}
+            )
+            snapshots[model_name] = {
+                "running_requests": int(getattr(engine, "num_running_requests", 0) or 0),
+                "waiting_requests": int(getattr(engine, "num_pending_requests", 0) or 0),
+                **summary,
+                # Engine-step prefill/decode split. The collector is process-wide, so with several engines in one
+                # process every model reports the same totals.
+                "phase": collector.phase_summary(window_seconds=_METRICS_WINDOW_S) if collector is not None else None,
+            }
+        return snapshots
+
     async def get_metrics(self, raw_request: Request) -> JSONResponse:
         """Get server performance metrics.
 
@@ -3213,6 +3176,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 "models_loaded": len(self.adapters),
                 "status": self.status.value,
                 "auth_stats": auth_stats,
+                "engine_metrics": self._engine_metrics_snapshot(),
             }
         )
 

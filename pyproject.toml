@@ -47,7 +47,7 @@ environments = [
 ]
 
 [tool.uv.workspace]
-members = ["libs/easydel", "libs/spectrax", "libs/ejkernel", "libs/eformer", "libs/eray"]
+members = ["libs/easydel", "libs/spectrax", "libs/ejkernel", "libs/eformer", "libs/eray", "libs/surgecore"]
 
 [tool.uv.sources]
 easydel = { workspace = true }
@@ -63,18 +63,18 @@ explicit = true
 # easydel AND of each other (ejkernel's eformer dep is a dev/test extra only).
 # Enforced in CI via `lint-imports`.
 [tool.importlinter]
-root_packages = ["easydel", "spectrax", "ejkernel", "eformer", "eray"]
+root_packages = ["easydel", "spectrax", "ejkernel", "eformer", "eray", "surgecore"]
 
 [[tool.importlinter.contracts]]
 name = "foundation libs must not import easydel"
 type = "forbidden"
-source_modules = ["spectrax", "ejkernel", "eformer", "eray"]
+source_modules = ["spectrax", "ejkernel", "eformer", "eray", "surgecore"]
 forbidden_modules = ["easydel"]
 
 [[tool.importlinter.contracts]]
 name = "foundation libs stay independent of each other"
 type = "independence"
-modules = ["spectrax", "ejkernel", "eformer", "eray"]
+modules = ["spectrax", "ejkernel", "eformer", "eray", "surgecore"]
 
 [tool.black]
 line-length = 121

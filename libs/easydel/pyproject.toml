@@ -35,6 +35,7 @@ dependencies = [
 	"ejkernel==0.0.82",
 	"eray==0.1.0",
 	"spectrax-lib==0.1.5",
+	"surgecore==0.0.1",
 	"ray[default]==2.54.0",
 	"einops~=0.8.0",
 	"transformers~=5.18.0",
@@ -238,3 +239,4 @@ spectrax-lib = { workspace = true }
 ejkernel = { workspace = true }
 eformer = { workspace = true }
 eray = { workspace = true }
+surgecore = { workspace = true }

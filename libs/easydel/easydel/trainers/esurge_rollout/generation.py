@@ -72,10 +72,8 @@ def generate_rollout_completions(
     rollout = getattr(trainer, "rollout", None)
     if rollout is None:
         raise TypeError("`trainer` must provide EasyDeL `rollout` for rollout generation.")
-    use_esurge = bool(getattr(getattr(trainer, "arguments", None), "use_esurge_generation", True))
     results = rollout(
         prompts=prompts,
-        use_esurge=use_esurge,
         apply_chat_template=bool(as_chat),
         config_overrides=generation_overrides,
         release_runtime_after_generation=False,

@@ -68,6 +68,8 @@ from easydel.layers.linears import (
     ColumnParallelLinear,
     ParallelLinearQuantized,
     RowParallelLinear,
+    gather_shared_input,
+    resolve_gather_shared_projection_input,
 )
 from easydel.utils.helpers import check_bool_flag
 from easydel.utils.inference_mode import is_inference_mode
@@ -526,6 +528,16 @@ def gated_mlp_forward(
         # backward pass and keeps the fused route.
         fused_route_allowed = False
     if fused_route_allowed:
+        if (
+            inference
+            and isinstance(mlp.gate_up_proj, ParallelLinearQuantized)
+            and resolve_gather_shared_projection_input(config, hidden_states)
+        ):
+            # The quantized fused route carries no shardings of its own: with a feature-sharded input the
+            # partitioner moves the gate/up contraction onto another mesh axis and all-reduces int32 partial sums
+            # across it. Gathered over tensor parallelism once, gate/up contract locally. The bf16 route keeps its
+            # input as is: its shard_map in_specs are resolved from the hidden-state layout.
+            hidden_states = gather_shared_input(hidden_states, config)
         lead = hidden_states.shape[:-1]
         x2d = hidden_states.reshape(-1, hidden_states.shape[-1])
         specs = _resolved_specs(mlp, config, hidden_states)

@@ -178,7 +178,8 @@ class SequenceStateSync:
         for req_id in sorted(scheduler_output.finished_req_ids):
             slot = self.slot_pool.release_slot(str(req_id), forget_rank=True)
             if slot is not None:
-                removed_recurrent_slots.append(int(slot))
+                # Every slot of the request's group is cleared for the group's next owner.
+                removed_recurrent_slots.extend(self.slot_pool.group_slots(int(slot)))
             self.requests.pop(req_id, None)
             self.pending_spec_recurrent_commit_by_req.pop(str(req_id), None)
 
@@ -201,7 +202,7 @@ class SequenceStateSync:
             self.pending_spec_recurrent_commit_by_req.pop(str(req_id), None)
             slot = self.slot_pool.release_slot(str(req_id), forget_rank=False)
             if slot is not None:
-                removed_recurrent_slots.append(int(slot))
+                removed_recurrent_slots.extend(self.slot_pool.group_slots(int(slot)))
             if req_index is not None:
                 removed_req_indices.append(req_index)
                 removed_req_index_by_id[req_id] = req_index
@@ -244,6 +245,7 @@ class SequenceStateSync:
 
         # 5) Update cached requests and page tables
         req_data = scheduler_output.scheduled_cached_reqs
+        inflight_drafts = getattr(scheduler_output, "inflight_drafts", None) or {}
         upd_req_indices: list[int] = []
         upd_num_computed_vals: list[int] = []
         batched_page_rows: list[tuple[int, tuple[list[int], ...]]] = []
@@ -275,6 +277,9 @@ class SequenceStateSync:
 
             upd_req_indices.append(req_index)
             upd_num_computed_vals.append(int(nct))
+            if not resumed_from_preemption and req_id not in inflight_drafts:
+                new_tokens = req_data.new_token_ids[i] if i < len(req_data.new_token_ids) else ()
+                self._rewind_to_committed(req_state, req_index, int(nct), new_tokens, scheduler_output)
             if resumed_from_preemption:
                 # Resumed requests may provide a full replacement page table.
                 self.sequence_buffer.page_table.add_row(new_page_ids, req_index)
@@ -390,6 +395,96 @@ class SequenceStateSync:
         has_changes = len(scheduler_output.preempted_req_ids) > 0 or len(req_ids_to_add) > 0
         return has_changes
 
+    def _rewind_to_committed(
+        self,
+        req_state: CachedRequestState,
+        req_index: int,
+        num_computed: int,
+        new_tokens: typing.Sequence[int],
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        """Rebuild a decode row the engine core scheduled from committed state from the core's own tokens.
+
+        A step dispatched before its predecessor committed leaves the row as if every draft the predecessor verified
+        was accepted, and a draft verified on the device leaves its rejected drafts in the row. When the core plans
+        the request's next step from committed state, the row becomes exactly the core's view: the committed tokens
+        this step feeds (``new_tokens``, from ``num_computed``), then the scheduled drafts. Only a step in which the
+        request samples (the core lists it in ``spec_slots``) is rebuilt: every other chunk is a prefill, including
+        a resumed request's recompute of its earlier outputs, which starts past the prompt and must keep the row's
+        full length so the chunk does not sample.
+        """
+        scheduled = int(scheduler_output.num_scheduled_tokens.get(req_state.req_id, 0) or 0)
+        num_prompt = int(req_state.num_prompt_tokens)
+        if scheduled <= 0 or num_computed < num_prompt:
+            return
+        if req_state.req_id not in (getattr(scheduler_output, "spec_slots", None) or {}):
+            return
+        drafts = [int(t) for t in (scheduler_output.scheduled_spec_decode_tokens or {}).get(req_state.req_id, [])]
+        real = scheduled - len(drafts)
+        if real <= 0:
+            return
+        buf = self.sequence_buffer
+        known = min(num_computed + real, self.max_model_len)
+        tokens = [int(t) for t in new_tokens][: known - num_computed]
+        out = req_state.output_token_ids
+        if len(tokens) == known - num_computed and len(out) >= num_computed - num_prompt:
+            buf.token_ids[req_index, num_computed:known] = np.asarray(tokens, dtype=np.int32)
+            del out[num_computed - num_prompt :]
+            out.extend(tokens)
+        elif int(buf.num_tokens_no_spec[req_index]) > known:
+            del out[max(0, known - num_prompt) :]
+        else:
+            return
+        buf.num_tokens_no_spec[req_index] = known
+        end = min(known + len(drafts), self.max_model_len)
+        if drafts and all(t >= 0 for t in drafts):
+            buf.token_ids[req_index, known:end] = np.asarray(drafts[: end - known], dtype=np.int32)
+        buf.num_tokens[req_index] = end
+
+    @staticmethod
+    def _repair_placeholder(
+        sequence_buffer: typing.Any,
+        requests: dict[str, CachedRequestState],
+        req_state: CachedRequestState,
+        placeholder_idx: int,
+        token: int,
+        max_model_len: int,
+    ) -> None:
+        """Replace one async placeholder with the token the step sampled.
+
+        The request's output list always takes the token. A request preempted while the step was in flight has
+        already left the sequence buffer, and its resume rebuilds the row from that list, so a placeholder left in
+        it would be recomputed into the KV cache as a real token. The buffer row is written only while the request
+        still holds one. A finished request (no longer tracked) is skipped.
+
+        Args:
+            sequence_buffer: Live sequence buffer.
+            requests: Live request-id to cached-request-state mapping.
+            req_state: The request state recorded when the placeholder was installed.
+            placeholder_idx: Token position of the placeholder.
+            token: The sampled token.
+            max_model_len: Maximum sequence length (token-position guard).
+
+        Raises:
+            RuntimeError: If the tracked request state no longer matches the registered request.
+            ValueError: If the placeholder position exceeds ``max_model_len``.
+        """
+        req_id = req_state.req_id
+        if req_id not in requests:
+            return
+        if req_state is not requests[req_id]:
+            raise RuntimeError("Request state mismatch")
+        if placeholder_idx < 0 or placeholder_idx + 1 > max_model_len:
+            raise ValueError(f"Token position {placeholder_idx} exceeds max_model_len {max_model_len}")
+        output_pos = placeholder_idx - int(req_state.num_prompt_tokens)
+        if 0 <= output_pos < len(req_state.output_token_ids):
+            req_state.output_token_ids[output_pos] = token
+        elif req_state.output_token_ids:
+            req_state.output_token_ids[-1] = token
+        req_idx = sequence_buffer.req_id_to_index.get(req_id)
+        if req_idx is not None:
+            sequence_buffer.token_ids[req_idx, placeholder_idx] = token
+
     def modify_prev_results(self, pre_results: AsyncPreResults | None) -> None:
         """Apply previous iteration's tokens to sequence buffer.
 
@@ -424,22 +519,14 @@ class SequenceStateSync:
             sampled_ids = valid_sampled_token_ids[pre_req_idx]
             if len(sampled_ids) == 0:
                 continue
-
-            req_id = req_state.req_id
-            if req_id not in self.sequence_buffer.req_id_to_index or req_id not in self.requests:
-                continue
-
-            req_idx = self.sequence_buffer.req_id_to_index[req_id]
-            if req_state is not self.requests[req_id]:
-                raise RuntimeError("Request state mismatch")
-
-            start_idx = int(placeholder_idx)
-            end_idx = start_idx + 1
-            if start_idx < 0 or end_idx > self.max_model_len:
-                raise ValueError(f"Token position {start_idx} exceeds max_model_len {self.max_model_len}")
-
-            self.sequence_buffer.token_ids[req_idx, start_idx:end_idx] = sampled_ids
-            req_state.output_token_ids[-1] = int(sampled_ids[-1])
+            self._repair_placeholder(
+                self.sequence_buffer,
+                self.requests,
+                req_state,
+                int(placeholder_idx),
+                int(sampled_ids[-1]),
+                self.max_model_len,
+            )
 
     @staticmethod
     def finalize_async_runner_state(
@@ -452,7 +539,7 @@ class SequenceStateSync:
     ) -> None:
         """Repair runner-side placeholders after async scheduler output drains.
 
-        AsyncScheduler inserts optimistic placeholders before the runner's
+        The engine core inserts optimistic placeholders before the runner's
         sampled token is host-visible. For PP decode we may launch the next
         step from the previous device token directly, so the CPU repair should
         happen when the previous async handle is drained, not inside the next
@@ -483,27 +570,9 @@ class SequenceStateSync:
             sampled_ids = sampled_token_ids[pre_req_idx]
             if len(sampled_ids) == 0:
                 continue
-
-            req_id = req_state.req_id
-            if req_id not in sequence_buffer.req_id_to_index or req_id not in requests:
-                continue
-
-            req_idx = sequence_buffer.req_id_to_index[req_id]
-            if req_state is not requests[req_id]:
-                raise RuntimeError("Request state mismatch")
-
-            start_idx = int(placeholder_idx)
-            end_idx = start_idx + 1
-            if start_idx < 0 or end_idx > max_model_len:
-                raise ValueError(f"Token position {start_idx} exceeds max_model_len {max_model_len}")
-
-            tid = int(sampled_ids[-1])
-            sequence_buffer.token_ids[req_idx, start_idx:end_idx] = np.asarray([tid], dtype=np.int32)
-            output_pos = start_idx - int(req_state.num_prompt_tokens)
-            if 0 <= output_pos < len(req_state.output_token_ids):
-                req_state.output_token_ids[output_pos] = tid
-            else:
-                req_state.output_token_ids[-1] = tid
+            SequenceStateSync._repair_placeholder(
+                sequence_buffer, requests, req_state, int(placeholder_idx), int(sampled_ids[-1]), max_model_len
+            )
 
     def reorder_decode_first(self, scheduler_output: SchedulerOutput) -> None:
         """Reorder active requests so decode requests are placed first.

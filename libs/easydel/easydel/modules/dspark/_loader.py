@@ -40,6 +40,7 @@ from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import spectrax as spx
 
 from easydel.utils.helpers import get_logger
@@ -123,8 +124,10 @@ def load_dspark_model(
 
     moe_path = _paths(ParallelMoELinear)
     moe_block_path = _paths(BaseMoeModule)
+    # This process's own CPU device: under a multi-process runtime ``jax.devices("cpu")`` lists every process's CPU
+    # devices, and arrays computed on another process's device cannot be read here.
     try:
-        host = jax.devices("cpu")[0]
+        host = jax.local_devices(backend="cpu")[0]
     except RuntimeError:
         host = None
     convert_kwargs = dict(
@@ -253,7 +256,10 @@ def _load_stage(
         leaf = targets[path][1]
         if tuple(array.shape) != tuple(leaf.shape):
             raise ValueError(f"{path}: converted shape {tuple(array.shape)} != draft model {tuple(leaf.shape)}")
-        placed[path] = jax.device_put(jnp.asarray(array, dtype=leaf.dtype), shardings[path])
+        # Every process reads the same shards, so each places only its own shards: no cross-process collective
+        # (``device_put`` of a host value onto a multi-process sharding all-gathers it to check equality).
+        values = np.asarray(jnp.asarray(array, dtype=leaf.dtype))
+        placed[path] = jax.make_array_from_callback(values.shape, shardings[path], lambda index, v=values: v[index])
     del converted
     logger.info(f"DSpark stage {stage}: {loaded} checkpoint tensors loaded.")
 

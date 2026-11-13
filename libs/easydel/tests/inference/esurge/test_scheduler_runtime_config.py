@@ -24,6 +24,7 @@ def test_scheduler_runtime_defaults_preserve_existing_behavior():
         assert runtime.chunked_prefill_enabled is False
         assert runtime.token_safety_margin is None
         assert runtime.include_finished_set is False
+        assert runtime.dp_admission_hold == 64
 
 
 @pytest.mark.cpu_ok
@@ -67,3 +68,28 @@ def test_scheduler_runtime_rejects_invalid_token_safety_margin(margin):
         eSurgeConfig.from_dict(runtime={"token_safety_margin": margin})
     with pytest.raises(ValueError, match="token_safety_margin must be a non-negative integer or None"):
         eSurgeRuntimeConfig.from_dict().replace(token_safety_margin=margin)
+
+
+@pytest.mark.cpu_ok
+def test_dp_admission_hold_survives_nested_config_and_zero_turns_it_off():
+    config = eSurgeConfig.from_dict(runtime={"dp_admission_hold": 0})
+    assert config.runtime.dp_admission_hold == 0
+    assert eSurgeConfig.from_dict(config.to_dict()).runtime.dp_admission_hold == 0
+    assert eSurgeRuntimeConfig.from_dict(dp_admission_hold=16).replace(max_num_seqs=8).dp_admission_hold == 16
+
+
+@pytest.mark.cpu_ok
+def test_freeze_startup_heap_defaults_on_and_survives_nested_config():
+    assert eSurgeRuntimeConfig.from_dict().freeze_startup_heap is True
+    assert eSurgeConfig.from_dict().runtime.freeze_startup_heap is True
+    config = eSurgeConfig.from_dict(runtime={"freeze_startup_heap": False})
+    assert config.runtime.freeze_startup_heap is False
+    assert eSurgeConfig.from_dict(config.to_dict()).runtime.freeze_startup_heap is False
+    assert config.runtime.replace(max_num_seqs=8).freeze_startup_heap is False
+
+
+@pytest.mark.cpu_ok
+@pytest.mark.parametrize("hold", [-1, 0.5, True, "8", None])
+def test_scheduler_runtime_rejects_invalid_dp_admission_hold(hold):
+    with pytest.raises(ValueError, match="dp_admission_hold must be a non-negative integer"):
+        eSurgeRuntimeConfig.from_dict(dp_admission_hold=hold)

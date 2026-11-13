@@ -85,7 +85,14 @@ from easydel.caching import (
     UnifiedAttentionCache,
     UnifiedAttentionCacheConfig,
 )
-from easydel.infra.sharding import MeshLike, decode_mode_specs, replicate_on_array_mesh, resolve_stage_mesh
+from easydel.infra.sharding import (
+    MeshLike,
+    decode_mode_specs,
+    record_single_token_rows_queries,
+    replicate_on_array_mesh,
+    resolve_stage_mesh,
+    single_token_rows,
+)
 from easydel.utils import set_inference_mode
 
 from ..execution_types import BackboneOutputs, BatchMetadata, ModelStepOutputs, StepFunctionInputs
@@ -98,6 +105,35 @@ logger = get_logger("eSurge-ModelExecutor")
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
     from easydel.infra.etils import MpMdSchedulers
+
+
+DECODE_LAYOUT_MAX_TOKENS_PER_REQ = 4
+"""Largest token bucket, in slots per request-bucket slot, whose general SPMD model step traces under the decode layout.
+
+The decode layout (:func:`~easydel.infra.sharding.decode_mode_specs`) keeps the residual stream replicated over the
+tensor axis, which removes per-layer collectives and pays off while a step carries few tokens per request; it changes
+sharding only, so every row shape (decode, prefill chunk, verify window) runs under it. Measured on 16 TPU v5p chips
+(GLM-5.3-Flash W8A8 at ep4 x tp4, request bucket 32) on compile-shaped inputs, general program against its
+decode-layout twin: 32.57 / 28.63 ms at 64 tokens, 38.55 / 35.37 at 128, 45.21 / 45.00 at 256 and 57.85 / 66.09 at
+512. Pairs up to this ratio therefore trace their one program under the decode layout (mixed steps with a short prefill
+chunk and speculative verify windows run it too); larger pairs keep the general layout and get a pure-decode twin only
+where a pure-decode window lands on them (see ``CompileOrchestrator._decode_layout_pairs``). A pair within the ratio gets
+that twin too when tracing its general program asked whether every row holds at most one token
+(:func:`~easydel.infra.sharding.inference_mode_single_token_rows`): the twin is traced under that promise.
+"""
+
+
+def traces_decode_layout(num_tokens: int, padded_num_reqs: int) -> bool:
+    """Whether the general SPMD model step of a bucket pair traces under the decode layout.
+
+    Args:
+        num_tokens: Token bucket.
+        padded_num_reqs: Request bucket.
+
+    Returns:
+        ``True`` when ``num_tokens <= DECODE_LAYOUT_MAX_TOKENS_PER_REQ * padded_num_reqs``.
+    """
+    return int(num_tokens) <= DECODE_LAYOUT_MAX_TOKENS_PER_REQ * int(padded_num_reqs)
 
 
 def resolve_lm_logit_postprocess(model: "EasyDeLBaseModule") -> tp.Callable[[jax.Array], jax.Array] | None:
@@ -236,6 +272,7 @@ class ModelStepExecutor:
         enable_spec_recurrent_commit: bool = False,
         input_sharding: jax.sharding.Sharding | None = None,
         slot_indexed_state: bool = False,
+        recurrent_slot_group_size: int = 1,
         cache_group_configs: tuple[RaggedPagesCacheConfig | UnifiedAttentionCacheConfig, ...] = (),
         layer_to_cache_group: tuple[int, ...] = (),
     ) -> None:
@@ -262,10 +299,10 @@ class ModelStepExecutor:
                 below this token count return all token hidden rows rather than
                 only sampled rows. Speculative verification uses this for tiny
                 draft windows while larger prompt buckets keep compact outputs.
-            slot_indexed_state: If True (compressed-window cache families),
-                the compiled steps thread ``recurrent_state_indices`` from the
-                batch metadata into the model's cache metadata even without
-                SPMD DP, so the model can address per-request slot state.
+            slot_indexed_state: If True (requests own pooled state slots: compressed-window caches and recurrent
+                layers that declare the eSurge slot contract), the compiled steps thread
+                ``recurrent_state_indices`` from the batch metadata into the model's cache metadata even without
+                SPMD DP.
             cache_group_configs: Independent pool configurations in runtime group
                 order, fixed before compilation. Empty preserves single-pool inputs.
             layer_to_cache_group: Static model-layer to pool-index ownership mapping.
@@ -293,6 +330,8 @@ class ModelStepExecutor:
         self.pipeline_plan = pipeline_plan
         self.enable_spec_recurrent_commit = bool(enable_spec_recurrent_commit)
         self._slot_indexed_state = bool(slot_indexed_state)
+        # W > 1: every request owns W recurrent slots (speculative verify contract, see runners/slot_contract.py).
+        self.recurrent_slot_group_size = max(1, int(recurrent_slot_group_size))
         # DSpark speculative decoding: the fused SPMD model step returns ``concat([last_hidden, main_hidden])`` rows.
         # Set by the runner before the first trace; read inside the traced step.
         self.main_hidden_enabled = False
@@ -355,6 +394,20 @@ class ModelStepExecutor:
                 graphother_template=graphother_template,
             )
         )
+        # Pure-decode twin of ``_model_step_fn`` (decode layout and the single-token promise, ``single_token_rows``):
+        # for pairs whose general program keeps the general layout (``traces_decode_layout`` is False) but serve
+        # pure-decode windows (a token-bucket floor far above the request bucket), and for pairs whose general trace
+        # asked for the promise. A separate jit keeps its trace cache disjoint from the general program of the same
+        # shapes, as for ``_backbone_fn_decode``.
+        self._model_step_fn_decode = (
+            None
+            if self._uses_mpmd_mesh()
+            else self._build_model_step_fn(
+                kv_pages_template=kv_pages_template,
+                graphstate_template=graphstate_template,
+                graphother_template=graphother_template,
+            )
+        )
         self._can_fuse_pipeline_model_step = (
             self._uses_mpmd_mesh()
             and not self._lm_head_uses_tied_projection
@@ -373,6 +426,9 @@ class ModelStepExecutor:
         self._pipeline_lm_head_cache: OrderedDict[tuple[int, tuple[int, ...], str, str], tp.Any] = OrderedDict()
         # Legacy combined cache (kept for backward compat with tests)
         self._cache: OrderedDict[tuple[int, int, str, str], tp.Any] = OrderedDict()
+        # (num_tokens, padded_num_reqs) pairs whose general SPMD trace asked for the single-token promise. A property
+        # of the model's code, so it survives ``clear_cache`` (a later lowering may reuse the trace and not ask again).
+        self._single_token_pairs: set[tuple[int, int]] = set()
         self._pipeline_kv_carry_map_cache: dict[tuple[int, tuple[tp.Hashable, ...]], dict[int, dict[int, int]]] = {}
         self._lm_head_graphdef: tp.Any | None = None
         self._lm_head_state: tp.Any | None = None
@@ -492,6 +548,15 @@ class ModelStepExecutor:
             return hidden_states.squeeze(0)
         return hidden_states.reshape((-1, hidden_states.shape[-1]))
 
+    @property
+    def _plain_recurrent_slots(self) -> bool:
+        """Whether non-DP steps thread the per-row recurrent slots into ``cache_metadata.recurrent_state_indices``.
+
+        True when requests own pooled state slots (compressed-window caches, recurrent layers that declare the slot
+        contract). Read through ``getattr`` so executors assembled without ``__init__`` (tests) keep working.
+        """
+        return bool(getattr(self, "_slot_indexed_state", False))
+
     def _build_cache_metadata(self, metadata: BatchMetadata, num_reqs_max_model_len: int) -> RaggedPagesMetadata:
         """Build the per-step :class:`RaggedPagesMetadata` from packed batch metadata.
 
@@ -506,6 +571,21 @@ class ModelStepExecutor:
             The cache metadata consumed by the paged attention layers.
         """
         use_spmd_dp = self._uses_spmd_dp()
+        spec_recurrent_commit = metadata.spec_recurrent_commit
+        group = int(getattr(self, "recurrent_slot_group_size", 1) or 1)
+        read_offset = commit_lens = None
+        if group > 1 and spec_recurrent_commit is not None and not use_spmd_dp:
+            # Slot groups of W slots: the host ships, per row, the tokens covered by slot g after the request's last
+            # step (row 0 of the payload). A row reads slot g + o with o = (context before this step) - base, which is
+            # the drafts its previous verify step accepted; fresh rows read nothing (o = 0). Every short row captures
+            # its state after each token (commit length 1).
+            rows = num_reqs_max_model_len
+            qsl = metadata.query_start_loc[: rows + 1]
+            before = metadata.seq_lens[:rows] - (qsl[1:] - qsl[:-1])
+            base = spec_recurrent_commit[0, :rows]
+            read_offset = jnp.where(before > 0, jnp.clip(before - base, 0, group - 1), 0).astype(jnp.int32)
+            commit_lens = jnp.ones((rows,), jnp.int32)
+            spec_recurrent_commit = None
         return RaggedPagesMetadata(
             pages_tables=metadata.pages_tables,
             context_lens=(
@@ -522,10 +602,13 @@ class ModelStepExecutor:
             request_distribution=metadata.rank_request_distribution,
             slot_mapping=metadata.slot_mapping,
             num_kv_update_slices=metadata.num_kv_update_slices,
-            spec_recurrent_commit=metadata.spec_recurrent_commit,
+            spec_recurrent_commit=spec_recurrent_commit,
             recurrent_state_indices=(
-                metadata.rank_recurrent_state_indices if (use_spmd_dp or self._slot_indexed_state) else None
+                metadata.rank_recurrent_state_indices if (use_spmd_dp or self._plain_recurrent_slots) else None
             ),
+            recurrent_read_offset=read_offset,
+            recurrent_commit_lens=commit_lens,
+            recurrent_slot_group_size=group if read_offset is not None else 1,
             version=self._metadata_version,
             cache_groups=metadata.cache_groups,
             layer_to_cache_group=metadata.layer_to_cache_group,
@@ -788,7 +871,7 @@ class ModelStepExecutor:
             dp_query_start_loc=self._empty_sharding if use_spmd_dp else None,
             dp_request_distribution=self._empty_sharding if use_spmd_dp else None,
             dp_context_lens=self._empty_sharding if use_spmd_dp else None,
-            dp_recurrent_state_indices=self._empty_sharding if (use_spmd_dp or self._slot_indexed_state) else None,
+            dp_recurrent_state_indices=self._empty_sharding if (use_spmd_dp or self._plain_recurrent_slots) else None,
             input_token_handoff_positions=self._empty_sharding,
             input_token_handoff_ids=self._empty_sharding,
             input_token_handoff_count=self._empty_sharding,
@@ -812,7 +895,7 @@ class ModelStepExecutor:
                     num_kv_update_slices=self._empty_sharding if config.version == "v2" else None,
                     spec_recurrent_commit=self._empty_sharding if self.enable_spec_recurrent_commit else None,
                     recurrent_state_indices=(
-                        self._empty_sharding if (use_spmd_dp or self._slot_indexed_state) else None
+                        self._empty_sharding if (use_spmd_dp or self._plain_recurrent_slots) else None
                     ),
                     version=config.version,
                     num_slices_per_kv_cache_update_page=config.num_slices_per_kv_cache_update_page,
@@ -1334,6 +1417,54 @@ class ModelStepExecutor:
         mode = self._compile_mode()
         return (int(num_tokens), int(padded_num_reqs), "model_step", mode) in self._cache
 
+    @property
+    def single_token_pairs(self) -> frozenset[tuple[int, int]]:
+        """``(num_tokens, padded_num_reqs)`` pairs whose general SPMD trace asked for the single-token promise.
+
+        Read through ``getattr`` so executors assembled without ``__init__`` (tests) keep working.
+        """
+        return frozenset(getattr(self, "_single_token_pairs", ()))
+
+    def has_decode_model_step(self, num_tokens: int, padded_num_reqs: int) -> bool:
+        """Whether pure-decode windows of this bucket pair have the program they need.
+
+        The pure-decode program (``"model_step_decode"``) is traced under the decode layout and the single-token
+        promise (:func:`~easydel.infra.sharding.single_token_rows`). A pair within
+        :data:`DECODE_LAYOUT_MAX_TOKENS_PER_REQ` whose general trace never asked for the promise needs none: its
+        general program already traces the decode layout (:meth:`compile_model_step`) and is the same program.
+
+        Args:
+            num_tokens: Token bucket.
+            padded_num_reqs: Request bucket.
+
+        Returns:
+            Whether pure-decode windows of the pair have their compiled program.
+        """
+        pair = (int(num_tokens), int(padded_num_reqs))
+        if (*pair, "model_step_decode", self._compile_mode()) in self._cache:
+            return True
+        return traces_decode_layout(*pair) and pair not in self.single_token_pairs and self.has_model_step(*pair)
+
+    def model_step_key(self, num_tokens: int, padded_num_reqs: int, *, decode_only: bool = False) -> tuple:
+        """Return the SPMD model-step cache key that runs a window of this bucket pair.
+
+        Args:
+            num_tokens: Token bucket of the window.
+            padded_num_reqs: Request bucket of the window.
+            decode_only: Whether every row the window packs schedules at most one token
+                (``ExecutionManager._is_decode_only_window``).
+
+        Returns:
+            ``(num_tokens, padded_num_reqs, kind, mode)`` where ``kind`` is ``"model_step_decode"`` when a
+            pure-decode window has a compiled pure-decode program, and ``"model_step"`` otherwise (the general
+            program is correct for every window).
+        """
+        mode = self._compile_mode()
+        decode_key = (int(num_tokens), int(padded_num_reqs), "model_step_decode", mode)
+        if decode_only and decode_key in self._cache:
+            return decode_key
+        return (int(num_tokens), int(padded_num_reqs), "model_step", mode)
+
     def _backbone_cache_key(self, num_tokens: int, *, use_pipeline_runtime: bool) -> tuple[int, str, str, bool]:
         """Build the cache key for a PP backbone variant.
 
@@ -1419,6 +1550,7 @@ class ModelStepExecutor:
         num_tokens: int,
         padded_num_reqs: int,
         use_pipeline_runtime: bool = True,
+        decode_only: bool = False,
     ) -> tp.Any:
         """Stitch backbone + LM head into a single combined callable.
 
@@ -1438,6 +1570,8 @@ class ModelStepExecutor:
             use_pipeline_runtime: Selects the PP backbone runtime mode. Decode
                 wavefronts use the resident stage runtime; prefill chunks use
                 direct SpectraX dispatch.
+            decode_only: SPMD only: the window is pure decode, so its
+                decode-layout program is preferred (see :meth:`model_step_key`).
 
         Returns:
             Callable producing :class:`ModelStepOutputs` from
@@ -1448,7 +1582,9 @@ class ModelStepExecutor:
         """
         mode = self._compile_mode()
         if not self._uses_mpmd_mesh():
-            return self._cache_lookup(self._cache, (int(num_tokens), int(padded_num_reqs), "model_step", mode))
+            return self._cache_lookup(
+                self._cache, self.model_step_key(num_tokens, padded_num_reqs, decode_only=decode_only)
+            )
         fused_key = (int(num_tokens), int(padded_num_reqs), "model_step", mode)
         if fused_key in self._cache:
             return self._cache_lookup(self._cache, fused_key)
@@ -1722,8 +1858,16 @@ class ModelStepExecutor:
         graphstate: tp.Any,
         graphother: tp.Any,
         inputs: StepFunctionInputs,
+        decode_layout: bool = False,
     ) -> ModelStepOutputs | None:
         """Compile the fused SPMD model step for one token/request bucket pair.
+
+        ``decode_layout=True`` compiles the separate pure-decode program (``"model_step_decode"`` key, traced under the
+        decode layout and the single-token promise :func:`~easydel.infra.sharding.single_token_rows`) that pure-decode
+        windows of the pair run: for a pair beyond :data:`DECODE_LAYOUT_MAX_TOKENS_PER_REQ`, and for a pair within it
+        whose general trace asked for the promise (:attr:`single_token_pairs`, recorded while the general program is
+        traced, so the general program must be compiled first). Other pairs within the ratio trace their general
+        program under the decode layout and need nothing more.
 
         The MPMD path intentionally keeps the backbone and LM head separate so
         stage-local placement can be controlled. On SPMD there is no stage
@@ -1739,21 +1883,32 @@ class ModelStepExecutor:
 
         self.graphdef = graphdef
         mode = self._compile_mode()
-        key = (int(num_tokens), int(padded_num_reqs), "model_step", mode)
+        pair = (int(num_tokens), int(padded_num_reqs))
+        traced_decode = traces_decode_layout(num_tokens, padded_num_reqs)
+        separate_decode = bool(decode_layout) and (not traced_decode or pair in self.single_token_pairs)
+        decode_only = separate_decode or traced_decode
+        key = (*pair, "model_step_decode" if separate_decode else "model_step", mode)
         if key in self._cache:
             return None
+        step_fn = self._model_step_fn_decode if separate_decode else self._model_step_fn
 
         graphstate_arg, graphother_arg = self._graph_call_args(graphstate, graphother)
-        # Pure-decode buckets (every request contributes exactly one token) are
-        # traced under the decode-layout scope: the residual stream stays
-        # replicated over TP, removing the per-layer norm/qkv/router
-        # collectives self-inflicted by tp-sharded decode activations. The
-        # condition is derivable from the bucket key itself, so the compiled
-        # cache stays consistent (a given (num_tokens, padded_num_reqs) shape
-        # always traces in the same mode).
-        with decode_mode_specs(int(num_tokens) == int(padded_num_reqs)):
+        # Buckets with few tokens per request (``traces_decode_layout``) and
+        # decode twins are traced under the decode-layout scope: the residual
+        # stream stays replicated over TP, removing the per-layer
+        # norm/qkv/router collectives self-inflicted by tp-sharded activations.
+        # The condition is derivable from the bucket key itself, so the
+        # compiled cache stays consistent (a given (num_tokens,
+        # padded_num_reqs) shape always traces in the same mode). The
+        # pure-decode twin also traces under the single-token promise; the
+        # general trace records whether the model asked for it.
+        with (
+            decode_mode_specs(decode_only),
+            single_token_rows(separate_decode),
+            record_single_token_rows_queries() as queries,
+        ):
             if self.use_aot_forward:
-                compiled = self._model_step_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
+                compiled = step_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
                     *(
                         graphdef,
                         graphstate_arg,
@@ -1763,6 +1918,8 @@ class ModelStepExecutor:
                         int(padded_num_reqs),
                     )
                 ).compile()
+                if queries.asked and not separate_decode:
+                    self._single_token_pairs.add(pair)
                 self._cache_store(self._cache, key, compiled)
                 return None
 
@@ -1774,7 +1931,7 @@ class ModelStepExecutor:
                 the wrapper's ``(graphstate, graphother, kv_pages, metadata)``
                 signature symmetric with the AOT-compiled variant.
                 """
-                return self._model_step_fn(
+                return step_fn(
                     self.graphdef,
                     graphstate_,
                     graphother_,
@@ -1784,6 +1941,8 @@ class ModelStepExecutor:
                 )
 
             out = wrapped_model_step(graphstate_arg, graphother_arg, inputs.kv_pages, inputs.batch_metadata)
+        if queries.asked and not separate_decode:
+            self._single_token_pairs.add(pair)
         self._cache_store(self._cache, key, wrapped_model_step)
         return out
 

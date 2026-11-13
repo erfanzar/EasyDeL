@@ -239,6 +239,17 @@ _user_opt = click.option("--user", "-u", default=None, help="SSH user for direct
 _ssh_key_opt = click.option("--ssh-key", default=None, help="SSH key path for direct-IP mode.")
 
 
+# ── Per-host detached jobs and tree sync (`eray tpu job ...`, `eray tpu sync`) ──
+
+from .hostjob import register as _register_hostjob_commands  # noqa: E402
+
+_register_hostjob_commands(
+    tpu,
+    resolve_tpu=lambda *args: _resolve_tpu(*args),
+    target_options=(_tpu_name_opt, _project_opt, _zone_opt, _ips_opt, _tpu_type_opt, _user_opt, _ssh_key_opt),
+)
+
+
 @tpu.command()
 @_tpu_name_opt
 @_project_opt

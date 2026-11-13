@@ -152,7 +152,7 @@ def all_finished(requests) -> bool:
     """Return ``True`` when every request in ``requests`` has finished.
 
     Args:
-        requests: Iterable of :class:`EngineRequest` objects.
+        requests: Iterable of objects exposing ``is_finished()``.
 
     Returns:
         bool: ``True`` if every request is finished.
@@ -169,7 +169,7 @@ def zero_schedule_needs_update(scheduler_output) -> bool:
     bookkeeping fields are non-empty the model still needs to be invoked.
 
     Args:
-        scheduler_output: Output of :meth:`Scheduler.schedule`.
+        scheduler_output: Output of :meth:`EngineCoreDriver.schedule`.
 
     Returns:
         bool: ``True`` when a follow-up ``execute_model`` is required.

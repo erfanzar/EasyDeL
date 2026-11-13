@@ -42,5 +42,5 @@ Specialization of `.xerxes/skills/run-research/SKILL.md`. For deep kernel tuning
 
 Hardware, shapes, dtypes, sharding dims, exact commands, baseline vs candidate tables, and an explicit verdict per
 surface (improved / neutral / regressed with magnitude). CPU results are labeled indicative-only.
-`EASURGE_SYNC_INPUTS_FOR_TIMING=1` only when measuring input-prep accuracy — it costs a device round trip. Do not
+`EASYDEL_SYNC_INPUTS_FOR_TIMING=1` only when measuring input-prep accuracy — it costs a device round trip. Do not
 benchmark speculative decoding with an eSurge benchmark harness; use `bench_specdecode.py`.

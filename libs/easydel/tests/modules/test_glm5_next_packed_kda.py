@@ -26,13 +26,14 @@ import easydel as ed
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 import spectrax as spx
 from easydel.caching import KDACacheView
 
 HIDDEN, HEADS, HEAD_DIM, D_CONV = 32, 2, 8, 4
 
 
-def _layer(dtype=jnp.float32):
+def _layer(dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST):
     config = ed.Glm5NextTextConfig(
         vocab_size=128,
         hidden_size=HIDDEN,
@@ -64,7 +65,7 @@ def _layer(dtype=jnp.float32):
         config=config,
         dtype=dtype,
         param_dtype=jnp.float32,
-        precision=jax.lax.Precision.HIGHEST,
+        precision=precision,
         rngs=spx.Rngs(0),
     )
     return model, model.model.layers[0].self_attn
@@ -235,7 +236,7 @@ def test_packed_mixed_continuation_and_fresh_prefill_rows():
 
 
 def test_rank_major_query_start_loc_is_rejected():
-    """Per-channel KDA cannot advance rank-major DP rows; it must fail loudly rather than use rank 0."""
+    """Rank-major query_start_loc over a single-rank batch [1, T, D] fails loudly instead of advancing rank 0 only."""
     import pytest
 
     model, layer = _layer()
@@ -246,3 +247,219 @@ def test_rank_major_query_start_loc_is_rejected():
     )
     with model.mesh, pytest.raises(ValueError, match="rank-major"):
         layer(hidden_states=packed, cache_view=_empty_view(2), cache_metadata=meta)
+
+
+def _random_view(rows, seed):
+    """A pool of ``rows`` slots with random nonzero windows and states, so untouched slots can be checked."""
+    rng = np.random.default_rng(seed)
+    width = HEADS * HEAD_DIM
+
+    def normal(*shape):
+        return jnp.asarray(rng.normal(size=shape), jnp.float32)
+
+    return KDACacheView(
+        q_conv_state=normal(rows, width, D_CONV),
+        k_conv_state=normal(rows, width, D_CONV),
+        v_conv_state=normal(rows, width, D_CONV),
+        recurrent_state=0.1 * normal(rows, HEADS, HEAD_DIM, HEAD_DIM),
+        positions=jnp.zeros((rows,), jnp.int32),
+        metadata=None,
+    )
+
+
+def test_verify_step_equals_the_same_tokens_decoded_one_per_step():
+    """A speculative verify step over slot groups equals decoding its tokens one per step from slot ``g + o``.
+
+    Every request owns ``W`` slots ``g .. g + W - 1``. The verify step reads slot ``g + recurrent_read_offset`` and
+    writes the windows and state after its ``j``-th token into ``g + j``. Decoding the same tokens one per step from the
+    state of slot ``g + o`` must give the same outputs, and the state after the ``j``-th decode step must be the one
+    captured in ``g + j``; slots past a row's tokens keep their contents.
+    """
+    model, layer = _layer()
+    width = 4
+    names = ("q_conv_state", "k_conv_state", "v_conv_state", "recurrent_state")
+    base, offset, lens, context = [0, 4], [1, 2], [3, 2], [9, 5]
+    held = {name: np.asarray(getattr(_random_view(2 * width, seed=61), name)) for name in names}
+    tokens = jnp.asarray(np.random.default_rng(67).normal(size=(sum(lens), HIDDEN)), jnp.float32)
+    starts = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
+    verify_meta = SimpleNamespace(
+        query_start_loc=jnp.asarray(starts),
+        context_lens=jnp.asarray(context, jnp.int32),
+        recurrent_state_indices=jnp.asarray([base], jnp.int32),
+        recurrent_read_offset=jnp.asarray(offset, jnp.int32),
+        recurrent_commit_lens=jnp.ones((2,), jnp.int32),
+        recurrent_slot_group_size=width,
+    )
+    packed = jnp.zeros((1, 8, HIDDEN), jnp.float32).at[0, : sum(lens)].set(tokens)
+    read = [g + o for g, o in zip(base, offset, strict=True)]
+    with model.mesh:
+        verify = layer(hidden_states=packed, cache_view=_random_view(2 * width, seed=61), cache_metadata=verify_meta)
+        view = KDACacheView(
+            **{name: jnp.asarray(held[name][read]) for name in names},
+            positions=jnp.zeros((2,), jnp.int32),
+            metadata=None,
+        )
+        for j in range(max(lens)):
+            live = [j < n for n in lens]
+            step = jnp.zeros((1, 2, HIDDEN), jnp.float32)
+            qsl, pos = [0], 0
+            for r in range(2):
+                if live[r]:
+                    step = step.at[0, pos].set(tokens[starts[r] + j])
+                    pos += 1
+                qsl.append(pos)
+            meta = SimpleNamespace(
+                query_start_loc=jnp.asarray(qsl, jnp.int32),
+                context_lens=jnp.asarray([c - n + j + 1 for c, n in zip(context, lens, strict=True)], jnp.int32),
+            )
+            decoded = layer(hidden_states=step, cache_view=view, cache_metadata=meta)
+            view = decoded.cache_view
+            for r in range(2):
+                if not live[r]:
+                    continue
+                np.testing.assert_allclose(
+                    np.asarray(verify.attention_output[0, starts[r] + j]),
+                    np.asarray(decoded.attention_output[0, qsl[r]]),
+                    rtol=1e-5,
+                    atol=1e-6,
+                )
+                for name in names:
+                    np.testing.assert_allclose(
+                        np.asarray(getattr(verify.cache_view, name)[base[r] + j]),
+                        np.asarray(getattr(view, name)[r]),
+                        rtol=1e-5,
+                        atol=1e-6,
+                        err_msg=f"{name} row {r} token {j}",
+                    )
+    for name in names:
+        new = np.asarray(getattr(verify.cache_view, name))
+        for r in range(2):
+            untouched = list(range(base[r] + lens[r], base[r] + width))
+            np.testing.assert_array_equal(new[untouched], held[name][untouched], err_msg=name)
+
+
+def test_candidate_row_commit_metadata_is_refused():
+    """KDA layers serve speculative steps through slot groups; candidate-row commit metadata is a contract error."""
+    model, layer = _layer()
+    packed = jnp.zeros((1, 4, HIDDEN), jnp.float32)
+    meta = SimpleNamespace(
+        query_start_loc=jnp.asarray([0, 2, 3], jnp.int32),
+        context_lens=jnp.asarray([9, 5], jnp.int32),
+        spec_recurrent_commit=jnp.zeros((2, 2), jnp.int32),
+    )
+    with model.mesh, pytest.raises(ValueError, match="spec_recurrent_commit"):
+        layer(hidden_states=packed, cache_view=_random_view(2, seed=53), cache_metadata=meta)
+
+
+def test_packed_chunk_precision_applies_only_to_the_kda_chunk_impl():
+    """``kda_chunk_precision`` is documented for ``kda_chunk_impl="kda_chunk"``; under ``"scan"`` it is ignored."""
+    model, layer = _layer()
+    n = 12
+    tokens = jnp.asarray(np.random.default_rng(41).normal(size=(1, n, HIDDEN)), jnp.float32)
+    packed = jnp.zeros((1, 16, HIDDEN), jnp.float32).at[:, :n].set(tokens)
+    meta = SimpleNamespace(query_start_loc=jnp.asarray([0, n], jnp.int32), context_lens=jnp.asarray([n], jnp.int32))
+    config = layer.config
+    saved = (config.kda_chunk_impl, config.kda_chunk_precision)
+    outputs = {}
+    try:
+        with model.mesh:
+            for impl, precision in (("scan", "highest"), ("scan", "default"), ("kda_chunk", "default")):
+                config.kda_chunk_impl, config.kda_chunk_precision = impl, precision
+                out = layer(hidden_states=packed, cache_view=_empty_view(1), cache_metadata=meta)
+                outputs[impl, precision] = np.asarray(out.attention_output)
+    finally:
+        config.kda_chunk_impl, config.kda_chunk_precision = saved
+    np.testing.assert_array_equal(outputs["scan", "default"], outputs["scan", "highest"])
+    assert not np.array_equal(outputs["kda_chunk", "default"], outputs["scan", "highest"])
+
+
+def test_packed_rows_follow_recurrent_state_indices():
+    """With ``cache_metadata.recurrent_state_indices`` row r reads and writes pool slot ``indices[r]``.
+
+    eSurge names the slots when a step's row window does not start at slot 0. The same step on a pool holding only
+    those slots, in row order and without indices, gives the same outputs and states; the other slots stay intact.
+    """
+    model, layer = _layer()
+    names = ("q_conv_state", "k_conv_state", "v_conv_state", "recurrent_state")
+    slots = [3, 1]
+    held = {name: np.asarray(getattr(_random_view(4, seed=43), name)) for name in names}
+    window = KDACacheView(
+        **{name: jnp.asarray(held[name][slots]) for name in names},
+        positions=jnp.zeros((len(slots),), jnp.int32),
+        metadata=None,
+    )
+    tokens = jnp.asarray(np.random.default_rng(47).normal(size=(1, 4, HIDDEN)), jnp.float32)
+    packed = jnp.zeros((1, 8, HIDDEN), jnp.float32).at[:, :4].set(tokens)
+    # Row 0: one decode token continuing its request; row 1: a 3-token continuation (shorter than the conv window).
+    meta = SimpleNamespace(
+        query_start_loc=jnp.asarray([0, 1, 4], jnp.int32), context_lens=jnp.asarray([9, 7], jnp.int32)
+    )
+    indexed = SimpleNamespace(**vars(meta), recurrent_state_indices=jnp.asarray([slots], jnp.int32))
+
+    with model.mesh:
+        want = layer(hidden_states=packed, cache_view=window, cache_metadata=meta)
+        got = layer(hidden_states=packed, cache_view=_random_view(4, seed=43), cache_metadata=indexed)
+
+    np.testing.assert_allclose(np.asarray(got.attention_output), np.asarray(want.attention_output), rtol=1e-5, atol=1e-6)
+    for name in names:
+        new = np.asarray(getattr(got.cache_view, name))
+        np.testing.assert_allclose(
+            new[slots], np.asarray(getattr(want.cache_view, name)), rtol=1e-5, atol=1e-6, err_msg=name
+        )
+        np.testing.assert_array_equal(new[[0, 2]], held[name][[0, 2]], err_msg=name)
+
+
+def test_packed_chunk_dots_follow_the_layer_matmul_precision():
+    """eSurge's flat driver runs its chunk dots at the layer's matmul precision; an explicit ``kda_chunk`` keeps its own.
+
+    ``from_pretrained`` builds layers at ``Precision("fastest")`` (``DEFAULT``): with ``kda_chunk_impl`` ``None`` (the
+    default) or ``"scan"`` their multi-token rows take the single-pass chunk dots that ``kda_chunk_impl="kda_chunk"``
+    with ``kda_chunk_precision="default"`` selects, close to the exact ones. A layer built at ``HIGHEST`` keeps exact
+    chunk dots. Decode-only steps run no chunk dots, so their outputs and pools do not depend on the setting.
+    """
+    n, rows = 12, 4
+    rng = np.random.default_rng(59)
+    tokens = jnp.asarray(rng.normal(size=(1, n, HIDDEN)), jnp.float32)
+    prefill = jnp.zeros((1, 16, HIDDEN), jnp.float32).at[:, :n].set(tokens)
+    prefill_meta = SimpleNamespace(
+        query_start_loc=jnp.asarray([0, n], jnp.int32), context_lens=jnp.asarray([n], jnp.int32)
+    )
+    # A decode bucket as eSurge compiles it: one token per row and as many tokens as rows.
+    decode = jnp.asarray(rng.normal(size=(1, rows, HIDDEN)), jnp.float32)
+    decode_meta = SimpleNamespace(
+        query_start_loc=jnp.arange(rows + 1, dtype=jnp.int32), context_lens=jnp.asarray([9, 5, 13, 7], jnp.int32)
+    )
+    names = ("q_conv_state", "k_conv_state", "v_conv_state", "recurrent_state")
+    settings = {
+        "auto": (None, "highest"),
+        "scan": ("scan", "highest"),
+        "exact": ("kda_chunk", "highest"),
+        "fast": ("kda_chunk", "default"),
+    }
+
+    def serve(precision):
+        model, layer = _layer(precision=precision)
+        runs = {}
+        with model.mesh:
+            for label, (impl, chunk_precision) in settings.items():
+                layer.config.kda_chunk_impl, layer.config.kda_chunk_precision = impl, chunk_precision
+                p = layer(hidden_states=prefill, cache_view=_empty_view(1), cache_metadata=prefill_meta)
+                d = layer(hidden_states=decode, cache_view=_random_view(rows, seed=61), cache_metadata=decode_meta)
+                decoded = [np.asarray(d.attention_output)] + [np.asarray(getattr(d.cache_view, x)) for x in names]
+                runs[label] = (np.asarray(p.attention_output), np.asarray(p.cache_view.recurrent_state), decoded)
+        return runs
+
+    for precision, same, other in (
+        (jax.lax.Precision.DEFAULT, "fast", "exact"),
+        (jax.lax.Precision.HIGHEST, "exact", "fast"),
+    ):
+        runs = serve(precision)
+        for label in ("auto", "scan"):
+            np.testing.assert_array_equal(runs[label][0], runs[same][0], err_msg=f"{precision} {label}")
+            np.testing.assert_array_equal(runs[label][1], runs[same][1], err_msg=f"{precision} {label}")
+        assert not np.array_equal(runs["scan"][0], runs[other][0]), precision
+        assert _rel(runs["scan"][0], runs[other][0]) < 2e-2, precision
+        assert _rel(runs["scan"][1], runs[other][1]) < 2e-2, precision
+        for label in ("auto", "exact", "fast"):
+            for got, want in zip(runs[label][2], runs["scan"][2], strict=True):
+                np.testing.assert_array_equal(got, want, err_msg=f"{precision} {label}: decode step")

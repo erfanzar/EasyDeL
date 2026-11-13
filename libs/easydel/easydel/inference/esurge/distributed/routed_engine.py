@@ -17,7 +17,7 @@
 :class:`RoutedEngine` presents the engine-adapter surface while fanning
 requests across N members — local ``eSurge`` instances and/or
 :class:`RemoteEngineHandle` clients — with the routing policy lifted from
-the DP scheduler: **prefix affinity first, then join-shortest-queue**.
+the in-core DP routing: **prefix affinity first, then join-shortest-queue**.
 Affinity is tracked router-side in a :class:`PrefixAffinityMap` (LRU of
 block-aligned prompt-prefix hashes → member) instead of synchronously
 probing every replica's prefix cache; the JSQ signal is
@@ -126,20 +126,15 @@ def _member_alive(member) -> bool:
 
 
 def _member_pending_prefill_tokens(member) -> int:
-    """JSQ cost signal for a member (remote stats or a local scheduler read)."""
+    """JSQ cost signal for a member (remote stats or a local engine-core count)."""
     remote = getattr(member, "pending_prefill_tokens", None)
     if remote is not None:
         return int(remote)
-    scheduler = getattr(member, "scheduler", None)
-    if scheduler is None:
+    core = getattr(member, "core", None)
+    if core is None:
         return 0
     try:
-        total = 0
-        for request in scheduler.running:
-            total += max(0, int(request.num_prompt_tokens) - int(request.num_computed_tokens))
-        for request in scheduler.waiting:
-            total += int(request.num_prompt_tokens)
-        return total
+        return int(core.pending_prefill_tokens)
     except Exception:
         return 0
 

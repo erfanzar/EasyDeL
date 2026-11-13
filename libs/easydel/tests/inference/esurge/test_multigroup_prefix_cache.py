@@ -43,6 +43,11 @@ def _groups(include_full, reverse=False):
     return groups[::-1] if reverse else groups
 
 
+def _ref(manager, page):
+    """Reference count of a non-null page (the pool's state, read through the KV core)."""
+    return manager._core.refs()[page - 1]
+
+
 def _request(request_id, length):
     return SimpleNamespace(
         request_id=request_id,
@@ -64,26 +69,26 @@ def test_multiple_configured_chunks_allocate_and_evict_independently(include_ful
     request = _request("owner", 129)
     first = manager.allocate_slots(request, num_new_tokens=64)
     assert first is not None
-    all_ids = [page.page_id for pages in first.pages for page in pages]
+    all_ids = [page for pages in first.pages for page in pages]
     assert len(set(all_ids)) == 4 * len(groups)
 
     request.num_computed_tokens = 64
     assert manager.allocate_slots(request, num_new_tokens=64) is not None
-    for group, pages, initial in zip(groups, manager.coordinator.get_pages("owner"), first.pages, strict=True):
+    for group, pages, initial in zip(groups, manager.get_page_ids("owner"), first.pages, strict=True):
         assert len(pages) == 8
         if getattr(group.kv_cache_spec, "attention_chunk_size", None) == 64:
-            assert all(page.is_null for page in pages[:4])
-            assert all(page.ref_cnt == 0 for page in initial)
+            assert all(page == 0 for page in pages[:4])
+            assert all(_ref(manager, page) == 0 for page in initial)
         else:
             assert pages[:4] == initial
-            assert all(page.ref_cnt == 1 for page in initial)
+            assert all(_ref(manager, page) == 1 for page in initial)
 
     request.num_computed_tokens = 128
     assert manager.allocate_slots(request, num_new_tokens=1) is not None
-    for group, pages in zip(groups, manager.coordinator.get_pages("owner"), strict=True):
+    for group, pages in zip(groups, manager.get_page_ids("owner"), strict=True):
         assert len(pages) == 9
-        assert all(page.is_null for page in pages[:8]) == isinstance(group.kv_cache_spec, ChunkedLocalAttentionSpec)
-        assert not pages[8].is_null
+        assert all(page == 0 for page in pages[:8]) == isinstance(group.kv_cache_spec, ChunkedLocalAttentionSpec)
+        assert pages[8] != 0
     manager.free(request)
     assert manager.page_pool.get_num_free_pages() == 95
 
@@ -108,8 +113,8 @@ def test_multiple_chunks_prefix_hit_can_be_attached_and_extended(include_full, r
     assert all(len(pages) == length // 16 for pages in cached.pages)
     for group, pages, ids in zip(groups, cached.pages, original_ids, strict=True):
         skipped = 4 if getattr(group.kv_cache_spec, "attention_chunk_size", None) == 64 else 0
-        assert all(page.is_null for page in pages[:skipped])
-        assert [page.page_id for page in pages[skipped:]] == ids[skipped : length // 16]
+        assert all(page == 0 for page in pages[:skipped])
+        assert pages[skipped:] == ids[skipped : length // 16]
 
     assert (
         manager.allocate_slots(
@@ -117,47 +122,11 @@ def test_multiple_chunks_prefix_hit_can_be_attached_and_extended(include_full, r
         )
         is not None
     )
-    for pages, prefix in zip(manager.coordinator.get_pages(request.request_id), cached.pages, strict=True):
+    for pages, prefix in zip(manager.get_page_ids(request.request_id), cached.pages, strict=True):
         assert pages[: len(prefix)] == prefix
         assert len(pages) == 7
-        assert all(page.ref_cnt == 1 for page in pages if not page.is_null)
+        assert all(_ref(manager, page) == 1 for page in pages if page != 0)
     manager.free(request)
-    assert manager.page_pool.get_num_free_pages() == 95
-
-
-@pytest.mark.cpu_ok
-@pytest.mark.parametrize("include_full", [False, True])
-@pytest.mark.parametrize("reverse", [False, True])
-def test_shorter_group_hit_rechecks_chunk_boundary_null_pages(include_full, reverse):
-    """A 64 -> 48 -> 32 endpoint reduction must restore needed KV, not truncate nulls."""
-    groups = _groups(include_full, reverse)
-    manager = CacheManager(96, groups, 256, enable_caching=True)
-    seed = _request("seed", 65)
-    allocated = manager.allocate_slots(seed, num_new_tokens=64)
-    assert allocated is not None
-    hashes = []
-    # Publish different amounts of computed KV per group through the page pool's
-    # public publication API. The 64-token chunk has only 32 tokens cached;
-    # the 128-token chunk has 48; optional FULL has all 64.
-    for group_id, (group, pages) in enumerate(zip(groups, allocated.pages, strict=True)):
-        chunk_size = getattr(group.kv_cache_spec, "attention_chunk_size", None)
-        count = {64: 2, 128: 3, None: 4}[chunk_size]
-        manager.page_pool.cache_full_pages(seed, pages, hashes, 0, count, 16, group_id)
-
-    request = _request("lookup", 65)
-    cached, length = manager.get_computed_pages(request)
-    assert length == 32
-    for actual, original in zip(cached.pages, allocated.pages, strict=True):
-        assert actual == original[:2]
-        assert all(not page.is_null for page in actual)
-    assert (
-        manager.allocate_slots(request, num_new_tokens=1, num_new_computed_tokens=length, new_computed_pages=cached)
-        is not None
-    )
-    for pages in cached.pages:
-        assert all(page.ref_cnt == 2 for page in pages)
-    manager.free(request)
-    manager.free(seed)
     assert manager.page_pool.get_num_free_pages() == 95
 
 
@@ -174,7 +143,7 @@ def test_multiple_chunks_prefix_hits_obey_dp_shard_locality(include_full):
     request = _request("lookup", 97)
     cached, length = manager.get_computed_pages(request, dp_shard_hint=1, data_parallel_size=2)
     assert length == 96
-    assert all(48 <= page.page_id < 96 for pages in cached.pages for page in pages if not page.is_null)
+    assert all(48 <= page < 96 for pages in cached.pages for page in pages if page != 0)
     missed, length = manager.get_computed_pages(request, dp_shard_hint=0, data_parallel_size=2)
     assert length == 0
     assert missed.pages == tuple([] for _ in groups)

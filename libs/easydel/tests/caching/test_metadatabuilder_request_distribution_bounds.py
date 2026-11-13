@@ -80,8 +80,9 @@ def test_batch_preparer_packs_prefill_end_into_misc_buffer():
     """The preparer packs the POSITIONAL distribution, not the counted one.
 
     Same input as the two builder tests above, deliberately different answer.
-    ``BatchMetadataPreparer`` classifies slot-ordered rows with
-    :func:`compute_request_distribution_prefix`: row 0 is a 4-token prefill and
+    ``BatchMetadataPreparer`` classifies slot-ordered rows by position (the
+    rule of ``surgecore.request_distribution_prefix``, which its step-input
+    builder applies): row 0 is a 4-token prefill and
     row 1 a decode, so there is no leading decode run and the distribution is
     ``[0, 1, 2]``. The count-based helpers keep reporting ``[1, 2, 2]`` for the
     same rows. Only the preparer feeds the live eSurge v3 path, where counting
@@ -104,10 +105,12 @@ def test_batch_preparer_packs_prefill_end_into_misc_buffer():
         min_input_pad=1,
     )
 
-    host_payload, _, _, _ = preparer._build_host_payload(
+    metadata, *_ = preparer.prepare_batch_metadata(
         num_tokens_static=5,
         scheduled_full_cpu=np.asarray([4, 1, 0, 0], dtype=np.int32),
         active_mask_full_cpu=np.asarray([True, True, False, False]),
+        input_ids_buf=None,
+        position_ids_buf=None,
         token_ids_cpu=np.arange(64, dtype=np.int32).reshape(4, 16),
         num_computed_tokens_cpu=np.asarray([0, 8, 0, 0], dtype=np.int32),
         temperature_cpu=np.ones((4,), dtype=np.float32),
@@ -118,10 +121,7 @@ def test_batch_preparer_packs_prefill_end_into_misc_buffer():
         presence_penalties_cpu=np.zeros((4,), dtype=np.float32),
         repetition_penalties_cpu=np.ones((4,), dtype=np.float32),
         page_table_cpu=np.zeros((4, 4), dtype=np.int32),
-        page_table_version=None,
         padded_num_reqs_in=2,
-        copy_slot_mapping=True,
     )
 
-    packed_misc_i32 = host_payload[6]
-    np.testing.assert_array_equal(packed_misc_i32[2:5], np.asarray([0, 1, 2], dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(metadata.packed_misc_i32)[2:5], np.asarray([0, 1, 2], dtype=np.int32))

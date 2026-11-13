@@ -19,6 +19,10 @@ jobs:
         with:
           enable-cache: true
 
+      # uv sync builds libs/surgecore (a PyO3 extension) from source through maturin: install a stable Rust
+      # toolchain explicitly instead of relying on what the runner image ships.
+      - uses: dtolnay/rust-toolchain@stable
+
       # basedpyright resolves imports from the environment; without the workspace installed every
       # import of jax/spectrax/eformer/transformers is reported as missing.
       - name: Sync workspace

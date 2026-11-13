@@ -59,12 +59,22 @@ class WindowPlanner:
         self.num_tokens_paddings = list(num_tokens_paddings or [])
         self.max_num_seq_buckets = list(max_num_seq_buckets)
 
-    def get_token_bucket(self, num_tokens: int, active_buckets: list[int] | None = None) -> int:
+    def get_token_bucket(
+        self,
+        num_tokens: int,
+        active_buckets: list[int] | None = None,
+        request_bucket: int | None = None,
+    ) -> int:
         """Select a token compile bucket, preferring the live runtime ladder when supplied.
+
+        A window never takes a token bucket smaller than its request bucket when that request bucket is itself a
+        token bucket. A decode step of ``n`` requests then runs the ``(b, b)`` program of its request bucket ``b``,
+        which is the one traced under the decode layout, for every ``n <= b``.
 
         Args:
             num_tokens: Number of scheduled tokens.
             active_buckets: Runtime token buckets, or ``None`` to use the configured ladder.
+            request_bucket: The window's padded request count, or ``None``.
 
         Returns:
             Smallest sufficient bucket, or the largest bucket when the count exceeds the ladder.
@@ -75,7 +85,31 @@ class WindowPlanner:
         buckets = self.num_tokens_paddings if active_buckets is None else active_buckets
         if not buckets:
             raise ValueError("At least one token compile bucket is required")
+        if request_bucket is not None and int(request_bucket) in buckets:
+            num_tokens = max(int(num_tokens), int(request_bucket))
         return next((bucket for bucket in buckets if num_tokens <= bucket), buckets[-1])
+
+    @staticmethod
+    def add_request_token_buckets(token_paddings: list[int], request_buckets: list[int]) -> list[int]:
+        """Make every request bucket inside the token ladder's range a token bucket too.
+
+        A step whose token bucket equals its request bucket is a decode step and runs the decode-layout program.
+        Request buckets that are not powers of two (``max_num_seqs`` = 14, say) would otherwise pad a full decode
+        step to the next power of two and never reach that program. Buckets below the ladder's floor or above its
+        top add nothing, so a ladder that already holds every request bucket stays as it is.
+
+        Args:
+            token_paddings: Ascending token compile buckets.
+            request_buckets: Request-count compile buckets.
+
+        Returns:
+            The sorted union.
+        """
+        if not token_paddings:
+            return list(token_paddings)
+        low, high = int(token_paddings[0]), int(token_paddings[-1])
+        extra = {int(b) for b in request_buckets if low <= int(b) <= high}
+        return sorted({int(b) for b in token_paddings} | extra)
 
     @staticmethod
     def get_token_paddings(min_token_size: int, max_token_size: int, padding_gap: int) -> list[int]:

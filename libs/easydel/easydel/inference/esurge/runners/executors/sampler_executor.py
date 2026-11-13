@@ -78,6 +78,11 @@ from jax import numpy as jnp
 from jax.experimental import multihost_utils
 from numpy.typing import DTypeLike
 
+from easydel.inference.sampling_processors import (
+    SamplingConstraints,
+    apply_sparse_sampling_constraints,
+    compact_sampling_constraints,
+)
 from easydel.utils import ejit
 
 from ...core.sampler import (
@@ -89,10 +94,26 @@ from ...core.sampler import (
 from ...core.sampler import sample_tokens as sample_tokens_fn
 from ...core.sampling_metadata import SamplingMetadata
 from ..execution_types import StepFunctionInputs
-from ..host_sync import host_payload_broadcast_needed
+from ..host_sync import device_put_equality_check_redundant, host_payload_broadcast_needed, put_host_payload
 
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
+
+
+def _sampler_row_split(
+    row_sharding: jax.sharding.NamedSharding | None, batch_size: int
+) -> tuple[jax.sharding.NamedSharding | None, jax.sharding.NamedSharding | None]:
+    """``(rows, replicated)`` shardings of a sampler step over ``batch_size`` rows, or ``(None, None)``.
+
+    The rows are split only when ``row_sharding`` is set and ``batch_size`` divides over its mesh; ``replicated`` is
+    the same mesh's fully replicated sharding, which the per-row outputs return to.
+    """
+    if row_sharding is None:
+        return None, None
+    size = int(row_sharding.mesh.size)
+    if size <= 1 or int(batch_size) % size:
+        return None, None
+    return row_sharding, jax.sharding.NamedSharding(row_sharding.mesh, jax.sharding.PartitionSpec())
 
 
 class SamplerExecutor:
@@ -143,6 +164,7 @@ class SamplerExecutor:
         empty_sharding: jax.sharding.Sharding,
         use_aot_forward: bool,
         cache_capacity: int = 64,
+        row_sharding: jax.sharding.NamedSharding | None = None,
     ) -> None:
         """Initialize the SamplerExecutor.
 
@@ -158,11 +180,18 @@ class SamplerExecutor:
                 JIT compilation on first call.
             cache_capacity: Deprecated compatibility argument. Compiled
                 variants are retained until ``clear_cache()`` is called.
+            row_sharding: Optional sharding of the ``[rows, vocab]`` logits
+                over their rows (``P(all mesh axes)``). When the padded row
+                count divides over its mesh, every device samples only its own
+                rows of the replicated logits and the sampled tokens are
+                gathered back; each row's computation is unchanged. ``None``
+                samples every row on every device.
         """
         self.model = model
         self.max_model_len = int(max_model_len)
         self._empty_sharding = empty_sharding
         self.use_aot_forward = bool(use_aot_forward)
+        self._row_sharding = row_sharding
         del cache_capacity
 
         self._sampling_fn = self._build_sampling_fn()
@@ -321,6 +350,7 @@ class SamplerExecutor:
 
     def _build_greedy_sampling_fn(self) -> tp.Callable[..., tp.Any]:
         """Build an argmax-only sampler for all-greedy/no-penalty windows."""
+        row_sharding = getattr(self, "_row_sharding", None)
 
         @ejit
         def _greedy_sampling_fn(
@@ -334,6 +364,9 @@ class SamplerExecutor:
             del packed_f32
             with jax.named_scope("easydel/esurge/greedy_sampler_step"):
                 batch_size = logits.shape[0]
+                split_rows, replicated = _sampler_row_split(row_sharding, batch_size)
+                if split_rows is not None:
+                    logits = jax.lax.with_sharding_constraint(logits, split_rows)
                 i_reqs = jnp.arange(batch_size, dtype=jnp.int32)
 
                 scheduled = packed_i32[1]
@@ -352,6 +385,9 @@ class SamplerExecutor:
                 emits_next_token = seq_lens_now >= req_num_tokens_slice
                 valid_mask = (i_reqs < num_requests) & active_mask & (scheduled_slice > 0) & emits_next_token
                 out_tokens = jnp.where(valid_mask, sampled_flat, -1)
+                if replicated is not None:
+                    out_tokens = jax.lax.with_sharding_constraint(out_tokens, replicated)
+                    valid_mask = jax.lax.with_sharding_constraint(valid_mask, replicated)
                 rng_key = jax.random.fold_in(rng_key, jnp.int32(total_tokens))
                 return rng_key, out_tokens, valid_mask, token_counts_full
 
@@ -378,6 +414,7 @@ class SamplerExecutor:
                 token_counts_full,
             ) -> (updated_rng_key, sampled_tokens, valid_mask, updated_token_counts_full)
         """
+        row_sharding = getattr(self, "_row_sharding", None)
 
         @ejit
         def _sampling_fn(
@@ -404,6 +441,9 @@ class SamplerExecutor:
             """
             with jax.named_scope("easydel/esurge/sampler_step"):
                 batch_size = logits.shape[0]
+                split_rows, replicated = _sampler_row_split(row_sharding, batch_size)
+                if split_rows is not None:
+                    logits = jax.lax.with_sharding_constraint(logits, split_rows)
                 i_reqs = jnp.arange(batch_size, dtype=jnp.int32)
 
                 with jax.named_scope("easydel/esurge/sampler_step/unpack_metadata"):
@@ -542,6 +582,9 @@ class SamplerExecutor:
                         lambda counts: counts,
                         token_counts_full,
                     )
+                if replicated is not None:
+                    out_tokens = jax.lax.with_sharding_constraint(out_tokens, replicated)
+                    valid_mask = jax.lax.with_sharding_constraint(valid_mask, replicated)
                 return rng_key, out_tokens, valid_mask, token_counts_full
 
         return _sampling_fn
@@ -563,6 +606,71 @@ def _greedy_argmax_tokens(
         tokens = jnp.where(valid_mask, tokens, jnp.full_like(tokens, -1))
         rng_key = jax.random.fold_in(rng_key, jnp.asarray(total_tokens, dtype=jnp.int32))
         return rng_key, tokens, valid_mask
+
+
+@jax.jit
+def _take_handoff_tokens(sampled: jax.Array, rows: jax.Array) -> jax.Array:
+    """Gather the previous step's sampled tokens at ``rows`` in one device program (int32).
+
+    A row index past the end of ``sampled`` (the padding of an unused handoff slot) yields 0.
+    """
+    return jnp.take(sampled.astype(jnp.int32), rows, axis=0, mode="fill", fill_value=0)
+
+
+@jax.jit
+def _add_handoff_tokens(tokens: jax.Array, more: jax.Array) -> jax.Array:
+    """Sum of two row windows' handoff gathers (each one yields 0 on the rows the other owns)."""
+    return tokens + more
+
+
+def gather_handoff_tokens(
+    parts: tp.Sequence[jax.Array],
+    rows: tp.Sequence[jax.Array],
+    sharding: jax.sharding.Sharding,
+) -> jax.Array:
+    """The previous step's sampled token of every handoff row, placed with ``sharding``.
+
+    One gather per row window, so every program's shapes are one window bucket and the compile warm-up can reach
+    them all; concatenating the windows first would give one program per combination of window buckets.
+
+    Args:
+        parts: Each row window's sampled-token array.
+        rows: One device int32 row-index vector per window, all of one length. A row index past the end of its
+            window's tokens (a row another window owns, or padding) contributes 0.
+        sharding: Placement of the result.
+
+    Returns:
+        int32 tokens, one per entry of ``rows[0]``.
+    """
+    tokens = None
+    for part, part_rows in zip(parts, rows, strict=True):
+        taken = _take_handoff_tokens(part, part_rows)
+        tokens = taken if tokens is None else _add_handoff_tokens(tokens, taken)
+    return jax.device_put(tokens, sharding)
+
+
+@partial(jax.jit, static_argnames=("rows",))
+def _logit_rows_prefix(logits: jax.Array, *, rows: int) -> jax.Array:
+    """``logits[:rows]`` in one program per ``(logits rows, rows)`` pair."""
+    return logits[:rows]
+
+
+@jax.jit
+def _logit_rows_at(logits: jax.Array, positions: jax.Array) -> jax.Array:
+    """``logits[positions]`` in one program per ``(logits rows, positions)`` pair.
+
+    Eager indexing with an index array dispatches about six primitives (index normalisation, broadcasts, the gather),
+    each compiled the first time its shapes appear.
+    """
+    return logits[positions]
+
+
+def _scratch_copy(array: jax.Array) -> jax.Array:
+    """A fresh buffer equal to ``array``, with its sharding, for warm-up calls that must leave live state alone."""
+    if jax.dtypes.issubdtype(array.dtype, jax.dtypes.prng_key):
+        data = _scratch_copy(jax.random.key_data(array))
+        return jax.random.wrap_key_data(data, impl=jax.random.key_impl(array))
+    return jax.device_put(jnp.array(array, copy=True), array.sharding)
 
 
 def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pad: int) -> int:
@@ -890,6 +998,107 @@ class SamplerRuntime:
             self._sampler_token_counts, row_indices_dev, token_ids_dev, counts_dev
         )
 
+    def warm_compaction_programs(
+        self,
+        *,
+        logits_buckets: tp.Sequence[int],
+        sampler_buckets: tp.Sequence[int],
+        logits_dtype: DTypeLike,
+        logits_sharding: jax.sharding.Sharding,
+        rng_key: jax.Array,
+    ) -> list[jax.Array]:
+        """Run :meth:`sample_tokens` once per row layout the bucket grid allows, on scratch inputs.
+
+        A step's logits have a model request bucket ``m`` of rows, and the sampler compacts them to a sampler bucket
+        ``s <= m``: a slice when the sampled rows lead the window, a gather otherwise, then a scatter back to ``m`` rows
+        whenever ``s < m`` or the rows moved. Each ``(m, s)`` pair is its own program. Every pair runs here with the
+        rows leading and shifted by one, under the sampling and the greedy sampler, and once with a minimal sparse
+        constraint (8 entries per list, the smallest padded size); the penalty-count rebuild is compiled from its
+        shapes. None of these then compiles on the first step that reaches it, where on a multi-host mesh one host
+        compiling holds every other host in the next collective. Constraints with more than 8 entries per list still
+        compile once per larger power of two.
+
+        Nothing live is read or written: the logits are zeros, ``rng_key`` is copied, the token counts are a scratch
+        zero buffer, penalties are off, and no program called here donates an argument.
+
+        Args:
+            logits_buckets: Request buckets ``m`` of the model step's logits rows.
+            sampler_buckets: Compiled sampler request buckets ``s``; every pair with ``s <= m`` runs.
+            logits_dtype: Dtype of the model step's logits.
+            logits_sharding: Sharding of the model step's logits.
+            rng_key: A key with the live key's shape, dtype and sharding (copied, never consumed).
+
+        Returns:
+            The sampled-token arrays of the runs (``[m]`` int32 each, in the shardings serving produces), for warming
+            the programs that consume sampled tokens.
+        """
+        vocab = self._sampler_vocab_size
+        key = _scratch_copy(rng_key)
+        counts = jnp.zeros((self.max_num_reqs, vocab), dtype=jnp.uint32, device=self._sampler_sharding)
+        history = self._sampler_penalty_rebuild_token_ids_cpu
+        lengths = self._sampler_penalty_rebuild_seq_lens_cpu
+        if history is not None and lengths is not None:
+            self._rebuild_penalty_counts.lower(  # pyright: ignore[reportFunctionMemberAccess]
+                jax.ShapeDtypeStruct(
+                    history.shape, jax.dtypes.canonicalize_dtype(history.dtype), sharding=self._sampler_sharding
+                ),
+                jax.ShapeDtypeStruct(
+                    lengths.shape, jax.dtypes.canonicalize_dtype(lengths.dtype), sharding=self._sampler_sharding
+                ),
+            ).compile()
+        empty = numpy.zeros((0,), dtype=numpy.int32)
+        constraint = SamplingConstraints(
+            bias_rows=numpy.zeros((1,), dtype=numpy.int32),
+            bias_tokens=numpy.zeros((1,), dtype=numpy.int32),
+            bias_values=numpy.zeros((1,), dtype=numpy.float32),
+            restricted_rows=empty,
+            allowed_rows=empty,
+            allowed_tokens=empty,
+            banned_rows=empty,
+            banned_tokens=empty,
+        )
+        outputs: list[jax.Array] = []
+        sampler_sizes = sorted({int(b) for b in sampler_buckets if int(b) > 0})
+        for m in sorted({int(b) for b in logits_buckets if int(b) > 0}):
+            logits = jnp.zeros((m, vocab), dtype=logits_dtype, device=logits_sharding)
+            req_num_tokens = numpy.zeros((max(m, self.max_num_reqs),), dtype=numpy.int32)
+            for s in (b for b in sampler_sizes if b <= m):
+                lead = numpy.arange(s, dtype=numpy.int32)
+                shifted = (lead + 1) % m
+                runs = [(lead, 1.0, None), (shifted, 1.0, None), (lead, 0.0, None), (shifted, 0.0, None)]
+                runs.append((lead, 1.0, constraint))
+                for positions, temperature, constraints in runs:
+                    _, tokens, _, _ = self.sample_tokens(
+                        m,
+                        m,
+                        sampler_padded_num_reqs=s,
+                        sampler_num_reqs=s,
+                        sampler_total_tokens=s,
+                        req_num_tokens_full_cpu=req_num_tokens,
+                        logits=logits,
+                        rng_key=key,
+                        gather_positions_cpu=positions,
+                        sampling_seeds_cpu=positions,
+                        scatter_positions_cpu=positions,
+                        compact_window_row_indices_cpu=positions,
+                        compact_scheduled_cpu=numpy.ones((s,), dtype=numpy.int32),
+                        compact_seq_lens_cpu=numpy.ones((s,), dtype=numpy.int32),
+                        compact_active_mask_cpu=numpy.ones((s,), dtype=numpy.bool_),
+                        compact_temperature_cpu=numpy.full((s,), temperature, dtype=numpy.float32),
+                        compact_top_p_cpu=numpy.ones((s,), dtype=numpy.float32),
+                        compact_top_k_cpu=numpy.zeros((s,), dtype=numpy.int32),
+                        compact_min_p_cpu=numpy.zeros((s,), dtype=numpy.float32),
+                        compact_frequency_penalties_cpu=numpy.zeros((s,), dtype=numpy.float32),
+                        compact_presence_penalties_cpu=numpy.zeros((s,), dtype=numpy.float32),
+                        compact_repetition_penalties_cpu=numpy.ones((s,), dtype=numpy.float32),
+                        need_penalties=False,
+                        sampling_constraints=constraints,
+                        token_counts_full=counts,
+                    )
+                    outputs.append(tokens)
+        jax.block_until_ready(outputs)
+        return outputs
+
     def _prepare_compact_sampler_window(
         self,
         *,
@@ -1067,6 +1276,8 @@ class SamplerRuntime:
         compact_presence_penalties_cpu: numpy.ndarray,
         compact_repetition_penalties_cpu: numpy.ndarray,
         need_penalties: bool,
+        sampling_constraints: SamplingConstraints | None = None,
+        token_counts_full: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         """Run the compiled sampler step over only the rows that need sampling.
 
@@ -1101,6 +1312,10 @@ class SamplerRuntime:
             compact_presence_penalties_cpu: Presence penalty per compact row.
             compact_repetition_penalties_cpu: Repetition penalty per compact row.
             need_penalties: Whether any request in the window uses penalties.
+            sampling_constraints: The window rows' sparse logit bias, allow-lists and banned next tokens, or
+                ``None``. Applied to the compact logits before sampling.
+            token_counts_full: Token counts to sample with instead of the live ones (the compile warm-up passes
+                scratch counts). ``None`` uses the live counts, rebuilding them first when penalties need it.
 
         Returns:
             Tuple of (updated_rng_key, sampled_tokens, valid_mask, updated_token_counts) where:
@@ -1131,11 +1346,12 @@ class SamplerRuntime:
             greedy=use_greedy_sampler,
         )
         sampler_sharding = getattr(self, "_sampler_sharding", self._empty_sharding)
-        if need_penalties:
-            self._ensure_sampler_penalty_state()
-        token_counts_full = (
-            self._sampler_token_counts if self._sampler_penalty_state_ready else self._sampler_zero_token_counts
-        )
+        if token_counts_full is None:
+            if need_penalties:
+                self._ensure_sampler_penalty_state()
+            token_counts_full = (
+                self._sampler_token_counts if self._sampler_penalty_state_ready else self._sampler_zero_token_counts
+            )
         sampler_packed_i32 = self._sampler_packed_i32_cpu_by_reqs.get(int(sampler_padded_num_reqs))
         if sampler_packed_i32 is None:
             sampler_packed_i32 = numpy.zeros((10, int(sampler_padded_num_reqs)), dtype=numpy.int32)
@@ -1179,10 +1395,18 @@ class SamplerRuntime:
         self._sampler_packed_misc_i32_cpu[1] = numpy.int32(sampler_total_tokens)
 
         sampler_host_payload = (sampler_packed_f32, sampler_packed_i32, self._sampler_packed_misc_i32_cpu)
-        if host_payload_broadcast_needed(getattr(self, "host_payloads_replicated", False)):
+        replicated = getattr(self, "host_payloads_replicated", False)
+        if host_payload_broadcast_needed(replicated):
             sampler_host_payload = multihost_utils.broadcast_one_to_all(sampler_host_payload)
         with jax.named_scope("easydel/esurge/sampler/place_metadata"):
-            packed_f32, packed_i32, packed_misc_i32 = _device_put_tree_uniform(sampler_host_payload, sampler_sharding)
+            if device_put_equality_check_redundant(replicated):
+                packed_f32, packed_i32, packed_misc_i32 = put_host_payload(
+                    sampler_host_payload, sampler_sharding, host_payloads_replicated=replicated
+                )
+            else:
+                packed_f32, packed_i32, packed_misc_i32 = _device_put_tree_uniform(
+                    sampler_host_payload, sampler_sharding
+                )
         sampler_prefix = self._sampler_prefix_cpu_by_reqs.get(int(sampler_padded_num_reqs))
         if sampler_prefix is None:
             sampler_prefix = numpy.arange(sampler_padded_num_reqs, dtype=numpy.int32)
@@ -1197,14 +1421,27 @@ class SamplerRuntime:
         )
         with jax.named_scope("easydel/esurge/sampler/gather_logits"):
             if prefix_gather_layout:
-                compact_logits = logits[:sampler_padded_num_reqs]
+                rows = int(sampler_padded_num_reqs)
+                compact_logits = logits if rows == int(logits.shape[0]) else _logit_rows_prefix(logits, rows=rows)
             else:
                 logits_sharding = logits.sharding
-                gather_positions = jax.device_put(gather_positions_cpu[:sampler_padded_num_reqs], sampler_sharding)
+                gather_positions = put_host_payload(
+                    gather_positions_cpu[:sampler_padded_num_reqs],
+                    sampler_sharding,
+                    host_payloads_replicated=replicated,
+                )
                 gather_positions_for_logits = jax.device_put(gather_positions, logits_sharding)
-                compact_logits = logits[gather_positions_for_logits]
+                compact_logits = _logit_rows_at(logits, gather_positions_for_logits)
             if getattr(compact_logits, "sharding", None) != sampler_sharding:
                 compact_logits = jax.device_put(compact_logits, sampler_sharding)
+
+        constraints = compact_sampling_constraints(gather_positions_cpu[:sampler_padded_num_reqs], sampling_constraints)
+        if constraints is not None:
+            # Only steps whose requests carry a constraint pay this (a few sparse entries, one scatter program); the
+            # compiled sampler signature is unchanged.
+            with jax.named_scope("easydel/esurge/sampler/constraints"):
+                placed = put_host_payload(constraints, sampler_sharding, host_payloads_replicated=replicated)
+                compact_logits = apply_sparse_sampling_constraints(compact_logits, *placed)
 
         with jax.named_scope("easydel/esurge/sampler/run_jit"):
             rng_key, compact_tokens, compact_valid_mask, token_counts_full = sampler_fn(
@@ -1218,7 +1455,11 @@ class SamplerRuntime:
         if prefix_scatter_layout and int(sampler_padded_num_reqs) == int(padded_num_reqs):
             return rng_key, compact_tokens, compact_valid_mask, token_counts_full
         with jax.named_scope("easydel/esurge/sampler/scatter_to_model_rows"):
-            scatter_positions = jax.device_put(scatter_positions_cpu[:sampler_padded_num_reqs], sampler_sharding)
+            scatter_positions = put_host_payload(
+                scatter_positions_cpu[:sampler_padded_num_reqs],
+                sampler_sharding,
+                host_payloads_replicated=replicated,
+            )
             out_tokens_full, valid_mask_full = self._scatter_sampler_outputs(
                 compact_tokens,
                 compact_valid_mask,

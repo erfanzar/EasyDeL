@@ -171,6 +171,13 @@ def _validate_esurge_runtime_config(self):
             )
         self.token_safety_margin = int(self.token_safety_margin)
     if (
+        isinstance(self.dp_admission_hold, bool)
+        or not isinstance(self.dp_admission_hold, Integral)
+        or self.dp_admission_hold < 0
+    ):
+        raise ValueError(f"dp_admission_hold must be a non-negative integer, got {self.dp_admission_hold!r}")
+    self.dp_admission_hold = int(self.dp_admission_hold)
+    if (
         isinstance(self.spec_debug_max_traces, bool)
         or not isinstance(self.spec_debug_max_traces, Integral)
         or self.spec_debug_max_traces < 0
@@ -218,7 +225,9 @@ def _validate_esurge_runtime_config(self):
         "long_prefill_token_threshold": None,
         "chunked_prefill_enabled": False,
         "token_safety_margin": None,
+        "dp_admission_hold": 64,
         "include_finished_set": False,
+        "freeze_startup_heap": True,
         "enable_window_aware_runtime_cap": False,
         "mpmd_scheduler": None,
         "pp_microbatch_count": "auto",
@@ -324,8 +333,27 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
             per running request by the token-budget manager. ``None`` disables
             that manager; ``0`` enables cache-aware budgeting without an extra
             reserve.
+        dp_admission_hold: Data-parallel admission alignment, in scheduler
+            steps; used only when the engine has more than one data-parallel
+            rank. A data-parallel step runs one program sized by its busiest
+            rank, so a prefill admitted on one rank makes every rank run a
+            prefill-sized step. While a rank with waiting requests has no free
+            row and another has one, no rank admits, so the ranks start their
+            prefills together; a rank with waiting requests and nothing running
+            admits at once, and no hold lasts more than this many steps.
+            Defaults to ``64``; ``0`` admits on every rank as soon as it can.
         include_finished_set: Track finished request IDs per client in
             scheduler outputs. Defaults to ``False``.
+        freeze_startup_heap: When ``True`` (the default), the engine runs one
+            full garbage collection after compiling and then moves every
+            surviving object out of the collector's reach (``gc.freeze``),
+            so a later full collection does not walk the startup heap (on a
+            large model, millions of objects and several seconds that every
+            other host of a multi-host mesh waits for). Taken when the
+            scheduler (or worker replay) loop starts and released by
+            :meth:`eSurge.terminate`. Objects alive at that point that later
+            become cyclic garbage are freed only after the release, so engines
+            that share the process with training (``get_esurge``) turn it off.
         enable_window_aware_runtime_cap: When ``True``, the runner derives
             the runtime request cap from per-attention-type page demand
             inferred from the live cache metadata, instead of trusting the
@@ -364,7 +392,9 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
     long_prefill_token_threshold: NotRequired[int | None]
     chunked_prefill_enabled: NotRequired[bool]
     token_safety_margin: NotRequired[int | None]
+    dp_admission_hold: NotRequired[int]
     include_finished_set: NotRequired[bool]
+    freeze_startup_heap: NotRequired[bool]
     enable_window_aware_runtime_cap: NotRequired[bool]
     mpmd_scheduler: NotRequired[MpMdSchedulers | None]
     pp_microbatch_count: NotRequired[PPMicrobatchPolicy]
@@ -426,6 +456,7 @@ def _validate_esurge_cache_runtime_config(self):
         "max_cache_tokens": None,
         "cache_capacity_margin": 0.92,
         "data_parallelism_axis": "dp",
+        "attention_data_parallel_axis": None,
         "destroy_pages_on_pause": True,
         "recurrent_prefix_snapshots": 16,
     },
@@ -469,6 +500,10 @@ class eSurgeCacheRuntimeConfig(TypedDict, total=False):
             across data-parallel ranks. The same axis is used by
             :mod:`easydel.inference.esurge.core.dp_sharding` to derive
             per-shard page bounds.
+        attention_data_parallel_axis: Optional independent mesh axis for KV-page
+            sharding. When set, request scheduling still uses
+            ``data_parallelism_axis`` while MLA pages use this axis instead.
+            ``None`` preserves the historical shared-axis behavior.
         destroy_pages_on_pause: When ``True``, calling :meth:`eSurge.pause`
             frees the entire page pool to reclaim HBM. Useful when the engine
             shares HBM with other workloads. The pages are reallocated by
@@ -486,6 +521,7 @@ class eSurgeCacheRuntimeConfig(TypedDict, total=False):
     max_cache_tokens: NotRequired[int | None]
     cache_capacity_margin: NotRequired[float]
     data_parallelism_axis: NotRequired[str]
+    attention_data_parallel_axis: NotRequired[str | None]
     destroy_pages_on_pause: NotRequired[bool]
     recurrent_prefix_snapshots: NotRequired[int]
 
@@ -592,7 +628,6 @@ class eSurgeContextConfig(TypedDict, total=False):
     defaults={
         "detokenizer_max_states": 1 << 16,
         "tokenizer_endpoint": None,
-        "detokenizer_endpoint": None,
         "worker_startup_timeout": None,
         "max_request_outputs": 1000,
         "idle_reset_seconds": None,
@@ -600,26 +635,24 @@ class eSurgeContextConfig(TypedDict, total=False):
     },
 )
 class eSurgeWorkerConfig(TypedDict, total=False):
-    """Tokenizer / detokenizer worker pool and idle-reset configuration.
+    """Tokenizer worker, native detokenizer and idle-reset configuration.
 
-    Tokenization and streaming detokenization run in helper threads (or
-    out-of-process workers when an endpoint is configured) so they don't
-    serialize on the GIL with the scheduler thread. This config sizes those
+    Tokenization runs in a CPU-isolated subprocess (or an attached worker
+    when an endpoint is configured). Native batched detokenization runs on
+    the output worker thread in the engine process. This config sizes those
     helpers and the in-memory output retention buffer, and controls the
     optional automatic-reset that fires after the engine is idle for a while.
 
     Attributes:
         detokenizer_max_states: Maximum number of concurrent streaming
             detokenizer states the worker pool may keep alive (one per
-            in-flight request). Pool spills over to LRU eviction once the
+            in-flight request). The native pool spills over to FIFO eviction once the
             limit is reached. Default is intentionally generous (``2**16``)
             because each state is small.
-        tokenizer_endpoint: HTTP/RPC endpoint of an external tokenizer
-            worker. ``None`` runs tokenization in-process. Useful for
-            offloading expensive tokenizers (e.g. SentencePiece) off the
-            scheduler thread or the host process entirely.
-        detokenizer_endpoint: Same as ``tokenizer_endpoint`` but for the
-            detokenizer side, which is invoked once per generated chunk.
+        tokenizer_endpoint: ZMQ endpoint of an external tokenizer worker.
+            ``None`` starts an owned CPU-isolated subprocess, keeping
+            expensive tokenizers (e.g. SentencePiece) off the scheduler
+            thread and model process.
         worker_startup_timeout: Seconds to wait for an external worker to
             become healthy before the engine fails to initiate. ``None``
             uses the framework default. Increase for slow cold-starts (e.g.
@@ -639,7 +672,6 @@ class eSurgeWorkerConfig(TypedDict, total=False):
 
     detokenizer_max_states: NotRequired[int]
     tokenizer_endpoint: NotRequired[str | None]
-    detokenizer_endpoint: NotRequired[str | None]
     worker_startup_timeout: NotRequired[float | None]
     max_request_outputs: NotRequired[int | None]
     idle_reset_seconds: NotRequired[float | None]
@@ -870,11 +902,17 @@ class eSurgeDistributedConfig(TypedDict, total=False):
             and the leader being ready is a startup race rather than a fault.
             A dead leader is caught by the heartbeat once the plane is up, so
             waiting longer here costs nothing but a slower report of a genuine
-            failure.
+            failure. A worker without ``distributed_leader_addr`` first waits up
+            to this long for the leader to publish its address, then up to this
+            long again for the leader's HelloOk.
         distributed_leader_addr: Explicit leader host/IP for the
-            ``coordination="zmq"`` plane. ``None`` falls back to the JAX
-            distributed coordinator's host (correct for standard pod
-            launches), then DNS discovery via ``distributed_service_name``.
+            ``coordination="zmq"`` plane. ``None`` uses the address the leader
+            (``jax.process_index() == 0``) publishes in the ``jax.distributed``
+            key-value store, then the JAX distributed coordinator's host, then
+            DNS discovery via ``distributed_service_name``. The coordinator's
+            host alone is not enough: TPU slices number processes by chip
+            position, so process 0 can run on a different host than the
+            coordinator.
         distributed_ready_timeout_s: How long the ``coordination="zmq"``
             leader waits at startup for every worker to hello + ready.
             Compilation happens before ready, so this defaults generously

@@ -34,7 +34,6 @@ class NeMoGymConfig(GRPOConfig):
     """
 
     trainer_prefix: str | None = field(default="NeMoGym")
-    use_esurge_generation: bool = field(default=True)
     shuffle_dataset: bool | None = field(default=False)
     num_generations_eval: int | None = field(default=1)
     request_timeout: float = field(default=10800.0)
@@ -45,14 +44,11 @@ class NeMoGymConfig(GRPOConfig):
     def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None) -> None:
         """Normalize inherited GRPO fields and validate environment settings.
 
-        NeMo Gym always uses EasyDeL/eSurge generation for local rollouts, so
-        ``use_esurge_generation`` is forced after the parent config has
-        normalized generation lengths and sharding settings. The method rejects
+        Local rollouts go through eSurge, like every trainer's. The method rejects
         non-positive timeout and reward-weight values because those would make
         environment scoring either impossible or silently ignored.
         """
         super().__post_init__(max_sequence_length=max_sequence_length, quantization_block=quantization_block)
-        self.use_esurge_generation = True
         if self.request_timeout <= 0.0:
             raise ValueError("`request_timeout` must be positive.")
         if self.environment_reward_weight <= 0.0:

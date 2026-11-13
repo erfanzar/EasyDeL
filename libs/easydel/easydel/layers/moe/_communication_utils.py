@@ -409,6 +409,24 @@ def _moe_row_gather_kernels():
     )
 
 
+def _moe_row_gather_sum_entry(*, live_slot_kernel: bool):
+    """One ``moe_row_gather_sum`` registry entry: the Pallas TPU one or the XLA one.
+
+    Args:
+        live_slot_kernel: Take the Pallas TPU entry, which runs its DMA kernels (the live-slot kernel under
+            ``skip_negative``) where ``row_gather_sum_unsupported_reason`` allows and the XLA entry elsewhere;
+            ``False`` takes the XLA entry directly.
+
+    Returns:
+        The registered callable ``(y, indices, weights, out_dtype=None, skip_negative=False) -> [tokens, hidden]``.
+    """
+    from ejkernel.kernels import Backend, Platform, kernel_registry  # pyright: ignore[reportMissingTypeStubs]
+
+    if live_slot_kernel:
+        return kernel_registry.get("moe_row_gather_sum", platform=Platform.PALLAS, backend=Backend.TPU)
+    return kernel_registry.get("moe_row_gather_sum", platform=Platform.XLA, backend=Backend.ANY)
+
+
 def _float0_zeros(x: jax.Array) -> np.ndarray:
     return np.zeros(x.shape, dtype=jax.dtypes.float0)
 
@@ -533,16 +551,29 @@ def _kernel_unsort_combine_fwd(intermediate, weights, sort_indices, inverse_indi
     return out, (intermediate, weights, sort_indices, inverse_indices)
 
 
+def _permute_by_key(key: jax.Array, values: jax.Array) -> jax.Array:
+    """``out[key[i]] = values[i]`` for a permutation ``key`` of ``range(values.shape[0])``, as one key-value sort.
+
+    Element ``i`` lands at the rank of ``key[i]`` among the keys, which is ``key[i]`` itself. No value is computed, so
+    the result is bit-identical to a gather by the inverse permutation. In a 45-layer GLM-5.3-Flash training step on
+    TPU v5p at 131072 tokens per sequence, the combine backward's 1-D gathers (262,144 fp32 values per 32768-token
+    chunk) took 1.32 s of one chip's op time and the sorts that replace them 0.05 s.
+    """
+    return jax.lax.sort((key.astype(jnp.int32), values), num_keys=1)[1]
+
+
 def _kernel_unsort_combine_bwd(out_dtype, residuals, d_out):
     intermediate, weights, sort_indices, inverse_indices = residuals
     gather, _ = _moe_row_gather_kernels()
     k = weights.shape[1]
     rows = jax.lax.div(sort_indices, jnp.asarray(k, dtype=sort_indices.dtype))
-    scale = weights.reshape(-1).astype(jnp.float32)[sort_indices]
+    # weights.reshape(-1)[sort_indices], since sort_indices[inverse_indices[i]] == i.
+    scale = _permute_by_key(inverse_indices, weights.reshape(-1).astype(jnp.float32))
     # Expert row i belongs to route sort_indices[i]: d_intermediate[i] = w[route] * d_out[token], and the weight's
     # gradient is the dot of that token's output cotangent with the (unscaled) expert row.
     d_intermediate, d_sorted = gather(d_out, rows, scale, intermediate)
-    d_weights = d_sorted[inverse_indices].reshape(weights.shape).astype(weights.dtype)
+    # d_sorted[inverse_indices], since inverse_indices[sort_indices[j]] == j.
+    d_weights = _permute_by_key(sort_indices, d_sorted).reshape(weights.shape).astype(weights.dtype)
     return (
         d_intermediate.astype(intermediate.dtype),
         d_weights,
@@ -902,7 +933,7 @@ def replicated_expert_psum_unpermute(
     num_experts_per_tok: int,
     dtype: jnp.dtype,
     weight_modif_fn: typing.Callable[[jax.Array], jax.Array] | None = None,
-    row_gather_kernel: bool = False,
+    row_gather_kernel: bool | None = False,
 ) -> jax.Array:
     """Inference combine for replicated-batch expert parallelism: local unpermute + one ``psum``.
 
@@ -1109,7 +1140,7 @@ def permute(
     scale_replicated_inputs: typing.Callable[[jax.Array, jax.Array], jax.Array] | None = None,
     preselected_routing: tuple[jax.Array, jax.Array] | None = None,
     record_replica_id: jax.Array | int | None = None,
-    row_gather_kernel: bool = False,
+    row_gather_kernel: bool | None = False,
 ) -> tuple[Array, Array, Array, Array, Array]:
     """Permute tokens by expert assignment for grouped matmul.
 
@@ -1160,8 +1191,9 @@ def permute(
             each use zero so genuine calls/chunks remain additive.
         row_gather_kernel: Gather the sorted token copies with the ejkernel Pallas TPU row-gather kernels
             (:func:`kernel_repeat_sort_activations`; first-order reverse mode only). Applies with
-            ``use_custom_sort_vjp`` and no ``scale_replicated_inputs``; when the kernels cannot run these shapes
-            (see :func:`row_gather_dispatch_unsupported_reason`) it warns once and keeps the default gather.
+            ``use_custom_sort_vjp`` and no ``scale_replicated_inputs`` on shapes the kernels run (see
+            :func:`row_gather_dispatch_unsupported_reason`). ``True`` warns once where it does not apply, ``None``
+            keeps the default gather there silently, and ``False`` always keeps it.
 
     Returns:
         A 5-tuple `(sorted_inputs, sorted_selected_experts, weights, group_size, sorted_experts)`
@@ -1221,7 +1253,7 @@ def permute(
 
     sorted_selected_experts = jnp.argsort(flatten_selected_experts)
     use_kernel = False
-    if row_gather_kernel:
+    if row_gather_kernel is None or row_gather_kernel:
         blockers = []
         if scale_replicated_inputs is not None:
             blockers.append("a scale_replicated_inputs hook")
@@ -1230,10 +1262,10 @@ def permute(
         reason = row_gather_dispatch_unsupported_reason(inputs_2d, num_experts_per_tok)
         if reason is not None:
             blockers.append(reason)
-        if blockers:
-            logger.warn_once(f"moe_row_gather_kernel: dispatch uses the XLA gather here ({'; '.join(blockers)}).")
-        else:
+        if not blockers:
             use_kernel = True
+        elif row_gather_kernel:
+            logger.warn_once(f"moe_row_gather_kernel: dispatch uses the XLA gather here ({'; '.join(blockers)}).")
     if use_kernel:
         sorted_inputs = kernel_repeat_sort_activations(inputs_2d, sorted_selected_experts, num_experts_per_tok).astype(
             dtype
@@ -1287,7 +1319,7 @@ def unpermute(
     *,
     num_experts_per_tok: int,
     dtype: jnp.dtype,
-    row_gather_kernel: bool = False,
+    row_gather_kernel: bool | None = False,
 ):
     """Invert expert permutation and combine expert outputs per token.
 
@@ -1321,8 +1353,9 @@ def unpermute(
         dtype: Output dtype after combining.
         row_gather_kernel: Unsort and combine in one ejkernel Pallas TPU gather-sum
             (:func:`kernel_unsort_combine`; fp32 accumulation, first-order reverse mode only) instead of a sorted
-            copy plus an einsum. Applies with ``use_custom_sort_vjp``; when the kernels cannot run these shapes (see
-            :func:`row_gather_combine_unsupported_reason`) it warns once and keeps the default combine.
+            copy plus an einsum. Applies with ``use_custom_sort_vjp`` on shapes the kernels run (see
+            :func:`row_gather_combine_unsupported_reason`). ``True`` warns once where it does not apply, ``None``
+            keeps the default combine there silently, and ``False`` always keeps it.
 
     Returns:
         Output tensor with original layout. Shape: (batch_size, sequence_length, out_dim).
@@ -1349,7 +1382,7 @@ def unpermute(
         >>> # output[0,1] = 0.4*expert1_out + 0.3*expert3_out  # token 1's combined output
     """
 
-    if row_gather_kernel:
+    if row_gather_kernel is None or row_gather_kernel:
         kernel_weights = jnp.reshape(weights, (-1, num_experts_per_tok))
         if weight_modif_fn is not None:
             kernel_weights = weight_modif_fn(kernel_weights)
@@ -1360,7 +1393,8 @@ def unpermute(
         if not blockers:
             output = kernel_unsort_combine(intermediate, sorted_selected_experts, kernel_weights, dtype)
             return output.reshape(batch_size, sequence_length, -1)
-        logger.warn_once(f"moe_row_gather_kernel: combine uses the XLA path here ({'; '.join(blockers)}).")
+        if row_gather_kernel:
+            logger.warn_once(f"moe_row_gather_kernel: combine uses the XLA path here ({'; '.join(blockers)}).")
 
     unsort_intermediate = sort_activations(
         intermediate,

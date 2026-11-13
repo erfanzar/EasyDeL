@@ -34,6 +34,7 @@ failure.
 from __future__ import annotations
 
 import abc
+import functools
 import re
 import typing as tp
 from dataclasses import dataclass, field
@@ -147,10 +148,34 @@ def _module_pattern_matches(entry: str, path: str) -> bool:
     """
     if path.endswith(entry):
         return True
-    try:
-        return bool(re.match(f"{entry}\\.", path) or re.match(entry, path))
-    except re.error:
+    container = _compile_or_none(f"{entry}\\.")
+    if container is not None and container.match(path):
+        return True
+    whole = _compile_or_none(entry) if container is not None else None
+    if whole is None:
         return path == entry or path.startswith(f"{entry}.")
+    return bool(whole.match(path))
+
+
+@functools.cache
+def _compile_or_none(pattern: str) -> re.Pattern[str] | None:
+    """Compile a ``modules_to_not_convert`` regex once per process.
+
+    Checkpoints can list well over a thousand entries (GLM-5.3-Flash ships
+    1509) and every checkpoint key is matched against all of them. ``re``
+    caches only 512 compiled patterns, so uncached calls recompiled every
+    entry for every key and stalled checkpoint conversion for over an hour.
+
+    Args:
+        pattern: Regex source.
+
+    Returns:
+        The compiled pattern, or ``None`` when ``pattern`` is not a valid regex.
+    """
+    try:
+        return re.compile(pattern)
+    except re.error:
+        return None
 
 
 @dataclass(frozen=True, slots=True)

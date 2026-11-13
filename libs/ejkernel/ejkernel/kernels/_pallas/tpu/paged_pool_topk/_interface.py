@@ -20,19 +20,18 @@ import jax
 
 from ...._registry import Backend, Platform, kernel_registry
 from ...._xla.paged_pool_topk._interface import paged_pool_topk as _xla_paged_pool_topk
-from ._pallas_impl_fwd import _LANES, _ROWS, paged_pool_topk_pallas
+from ._pallas_impl_fwd import _LANES, padded_rows, paged_pool_topk_pallas
 
-# The kernel scalar-prefetches ``seq_ids``, ``num_pools`` (padded to 8 rows) and the flattened
-# ``block_tables`` into SMEM. TPU SMEM is ~1 MiB (a 2 MiB block table fails to compile with
-# RESOURCE_EXHAUSTED), so layouts above this budget take the XLA path instead.
+# The kernel scalar-prefetches ``seq_ids``, ``num_pools`` (padded to its row blocks) and the
+# flattened ``block_tables`` into SMEM. TPU SMEM is ~1 MiB (a 2 MiB block table fails to compile
+# with RESOURCE_EXHAUSTED), so layouts above this budget take the XLA path instead.
 _SMEM_PREFETCH_BUDGET_BYTES = 768 * 1024
 
 
 def _prefetch_bytes(num_rows: int, block_tables_shape: tuple[int, ...]) -> int:
     """Bytes of int32 scalars the Pallas kernel prefetches into SMEM."""
-    t_pad = -(-int(num_rows) // _ROWS) * _ROWS
     num_seqs, pages_per_seq = (int(d) for d in block_tables_shape)
-    return 4 * (2 * t_pad + num_seqs * pages_per_seq)
+    return 4 * (2 * padded_rows(num_rows) + num_seqs * pages_per_seq)
 
 
 @kernel_registry.register("paged_pool_topk", Platform.PALLAS, Backend.TPU, priority=10)
@@ -54,8 +53,10 @@ def paged_pool_topk(
 
     Layouts the kernel cannot tile (``pools_per_page`` not dividing 128, or a key width that
     is not a lane multiple), and page tables too large to scalar-prefetch into SMEM, route to
-    XLA. ``pool_chunk`` only applies to the XLA path.
+    XLA. ``pool_chunk`` only applies to the XLA path. ``precision=None`` means HIGHEST on both paths, so which path a
+    call takes never changes its scores.
     """
+    precision = jax.lax.Precision.HIGHEST if precision is None else precision
     untileable = _LANES % int(pool_pages.shape[1]) or int(pool_pages.shape[2]) % _LANES
     too_big = _prefetch_bytes(query.shape[0], tuple(block_tables.shape)) > _SMEM_PREFETCH_BUDGET_BYTES
     if untileable or too_big:
@@ -82,7 +83,7 @@ def paged_pool_topk(
         k=int(k),
         sm_scale=float(sm_scale),
         relu=bool(relu),
-        precision=jax.lax.Precision.HIGHEST if precision is None else precision,
+        precision=precision,
     )
 
 

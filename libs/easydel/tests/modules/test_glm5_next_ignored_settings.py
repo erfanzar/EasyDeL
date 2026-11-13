@@ -141,7 +141,7 @@ def test_scan_layers_lowers_one_body_for_identical_layers():
 
 def test_kda_chunk_impl_reaches_the_kda_operation():
     ids = _ids()
-    scan = _model(_config([KDA, KDA]))
+    scan = _model(_config([KDA, KDA], kda_chunk_impl="scan"))
     fused = _model(_config([KDA, KDA], kda_chunk_impl="kda_chunk"))
     for a, b in zip(jax.tree.leaves(spx.export(scan)[1]), jax.tree.leaves(spx.export(fused)[1]), strict=True):
         if jnp.issubdtype(a.dtype, jnp.inexact):

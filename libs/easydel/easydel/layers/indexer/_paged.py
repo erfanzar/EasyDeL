@@ -51,7 +51,6 @@ from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.layers.compressed_window import packed_row_of_token
 from easydel.layers.rotary import apply_rope_interleaved, apply_rope_split_half
 
 if tp.TYPE_CHECKING:
@@ -85,12 +84,16 @@ def _paged_pool_topk_impl(platform: str):
     return kernel_registry.get("paged_pool_topk", platform=platform, backend="any")
 
 
-def _run_pool_topk(kernel_mesh, *args, **kwargs) -> jax.Array:
+def _run_pool_topk(kernel_mesh, *args, constrain_heads=None, **kwargs) -> jax.Array:
     """Dispatch ``paged_pool_topk``: fused Pallas on TPU, XLA loop otherwise.
 
     A Pallas call cannot be SPMD-partitioned, so on a multi-device mesh it runs under a
     replicated ``shard_map`` over ``kernel_mesh`` (valid only while the indexer pages are
     replicated; the cache view returns ``None`` otherwise, which keeps the XLA path).
+
+    ``constrain_heads`` optionally pins the query ``[T, H, D]`` and head weights ``[T, H]`` to
+    their head-sharded projection layout (``MLARaggedPagesCacheView.constrain_indexer_heads``)
+    before the rows are split over the mesh; it is applied on that path only.
     """
     xla = _paged_pool_topk_impl("xla")
     if jax.default_backend() != "tpu":
@@ -110,10 +113,16 @@ def _run_pool_topk(kernel_mesh, *args, **kwargs) -> jax.Array:
     # Rows are independent, so split them over every mesh device: each device scores only its
     # slice and just the small [T, k] ids are gathered, instead of all-gathering the query and
     # repeating the whole top-k on every device. Pages and the block table stay replicated.
-    if int(args[0].shape[0]) % int(mesh.size) == 0:
+    if _pool_topk_row_mesh(kernel_mesh, int(args[0].shape[0])) is not None:
         row = PartitionSpec(tuple(mesh.axis_names))
         in_specs = (row, row, rep, rep, row, row)
         out_specs = row
+        if constrain_heads is not None:
+            # The query and head weights leave column-parallel projections sharded over heads. Pinned to that
+            # layout, XLA moves them to the row split with an all-to-all of the activation; unpinned, it
+            # all-gathers the projection weights on every call instead (GLM-5.3-Flash at tp4: the bf16
+            # [32, 128, 1536] indexer query weight in every DSA layer).
+            args = (constrain_heads(args[0]), constrain_heads(args[1]), *args[2:])
     else:
         in_specs = (rep,) * len(args)
         out_specs = rep
@@ -145,7 +154,12 @@ def paged_token_layout(
     """
     max_seqs = int(kv_lens.shape[0])
     tok = jnp.arange(total_tokens, dtype=jnp.int32)
-    seq = packed_row_of_token(query_start_loc, tok, max_row=max_seqs - 1)
+    # Row of each token: how many sequence starts lie at or before it, minus one, as one fused compare-and-count over
+    # the S + 1 offsets (T * (S + 1) compares). jnp.searchsorted's default method is a while loop of log2(S + 1)
+    # dependent steps: about 26 us per call on TPU v5p for a 32-row decode step over 33 offsets.
+    starts = jnp.asarray(query_start_loc, jnp.int32).reshape(-1)
+    rows = jnp.searchsorted(starts, tok, side="right", method="compare_all").astype(jnp.int32) - 1
+    seq = jnp.clip(rows, 0, max_seqs - 1)
     q_start = query_start_loc[seq]
     q_len = query_start_loc[seq + 1] - q_start
     kv_len = kv_lens[seq]
@@ -226,6 +240,181 @@ def _dp_rank_local(
 # ---------------------------------------------------------------------------------------
 
 
+# Steps of at most this many tokens run the paged indexer's page update replicated on every device of the fused
+# top-k's mesh (see _pool_select_core); larger steps keep it on the top-k's row split, which divides the pool-member
+# gathers between the devices. Chosen for decode-sized steps: GLM-5.3-Flash's 32-token decode step on 16 v5p chips
+# (kpool 4, 128-wide pool summaries, 2 rows per device) spent an all-gather of bf16[16, 2, 128] over all 16 devices in
+# every DSA layer, about 29 us each. Steps between 64 and 32,768 tokens were not measured either way.
+_REPLICATED_POOL_UPDATE_MAX_TOKENS = 64
+
+
+def _pool_topk_row_mesh(kernel_mesh, total_tokens: int):
+    """The mesh :func:`_run_pool_topk` splits the fused top-k's rows over, or ``None`` when it does not split them."""
+    if jax.default_backend() != "tpu":
+        return None
+    ambient = jax.sharding.get_abstract_mesh()
+    if not ambient.empty and ambient.manual_axes:
+        return None
+    mesh = getattr(kernel_mesh, "jax_mesh", kernel_mesh)
+    if mesh is None or int(mesh.size) == 1 or int(total_tokens) % int(mesh.size):
+        return None
+    return mesh
+
+
+def _pool_page_update(
+    current: jax.Array,
+    flat_tokens: jax.Array,
+    flat_pools: jax.Array,
+    block_tables: jax.Array,
+    seq: jax.Array,
+    pos: jax.Array,
+    valid: jax.Array,
+    ape: jax.Array,
+    *,
+    kpool: int,
+    page_size: int,
+    key_dtype: tp.Any,
+    rows_c: tp.Callable[[jax.Array], jax.Array],
+    pages_c: tp.Callable[[jax.Array], jax.Array],
+) -> tuple[jax.Array, jax.Array]:
+    """Write one step's ``key | gate`` rows and the summaries of the pools they complete.
+
+    Args:
+        current: ``[T, 2 * dim]`` rows to write, in the token-page dtype.
+        flat_tokens: ``[P * page_size, 2 * dim]`` flat token pages.
+        flat_pools: ``[P * page_size // kpool, dim]`` flat pool pages.
+        block_tables: ``[S, pages_per_seq]`` page table.
+        seq: ``[T]`` sequence row of each token.
+        pos: ``[T]`` absolute position of each token.
+        valid: ``[T]`` whether the token is live (others write nothing).
+        ape: ``[kpool, dim]`` float32 pool-slot bias of the gates.
+        kpool: Tokens per pool.
+        page_size: Tokens per page.
+        key_dtype: Dtype of the indexer keys (the summary is computed from members cast to it).
+        rows_c: Sharding constraint for the written rows.
+        pages_c: Sharding constraint keeping the page buffers in their allocation layout.
+
+    Returns:
+        ``(flat_tokens, flat_pools)`` after the writes.
+    """
+    pages_per_seq = int(block_tables.shape[1])
+    pools_per_page = page_size // kpool
+    dim = int(flat_pools.shape[-1])
+
+    def physical_row(token_pos: jax.Array, seq_ids: jax.Array) -> jax.Array:
+        logical = jnp.clip(token_pos // page_size, 0, pages_per_seq - 1)
+        return block_tables[seq_ids, logical] * page_size + token_pos % page_size
+
+    dst = jnp.where(valid, physical_row(jnp.maximum(pos, 0), seq), int(flat_tokens.shape[0]))
+    flat_tokens = pages_c(flat_tokens.at[dst].set(current, mode="drop"))
+
+    # Members of a pool share a page.
+    completes = valid & ((pos + 1) % kpool == 0)
+    member_pos = jnp.maximum(pos - (kpool - 1), 0)[:, None] + jnp.arange(kpool, dtype=jnp.int32)[None]
+    members = flat_tokens[physical_row(member_pos, seq[:, None])]  # [T, kpool, 2D]
+    member_keys = members[..., :dim].astype(key_dtype)
+    member_gates = members[..., dim:].astype(key_dtype).astype(jnp.float32)
+    probabilities = jax.nn.softmax(member_gates + ape[None], axis=1)
+    summary = jnp.sum(probabilities * member_keys.astype(jnp.float32), axis=1).astype(key_dtype)
+
+    pool_page = block_tables[seq, jnp.clip(jnp.maximum(pos, 0) // page_size, 0, pages_per_seq - 1)]
+    pool_dst = pool_page * pools_per_page + (jnp.maximum(pos, 0) % page_size) // kpool
+    pool_dst = jnp.where(completes, pool_dst, int(flat_pools.shape[0]))
+    flat_pools = pages_c(flat_pools.at[pool_dst].set(rows_c(summary.astype(flat_pools.dtype)), mode="drop"))
+    return flat_tokens, flat_pools
+
+
+# Steps of at least this many tokens write the paged indexer state a whole page at a time
+# (_pool_page_update_by_page) instead of one row at a time (_pool_page_update).
+_PAGE_GRANULAR_UPDATE_MIN_TOKENS = 1024
+
+
+def _pool_page_update_by_page(
+    current: jax.Array,
+    flat_tokens: jax.Array,
+    flat_pools: jax.Array,
+    block_tables: jax.Array,
+    kv_lens: jax.Array,
+    query_start_loc: jax.Array,
+    num_seqs: jax.Array,
+    ape: jax.Array,
+    *,
+    kpool: int,
+    page_size: int,
+    key_dtype: tp.Any,
+    rows_c: tp.Callable[[jax.Array], jax.Array],
+    pages_c: tp.Callable[[jax.Array], jax.Array],
+) -> tuple[jax.Array, jax.Array]:
+    """:func:`_pool_page_update` one page at a time: same pages out, fewer and larger writes.
+
+    A step writes new tokens into at most ``T // page_size + 2 * S`` pages (and never more pages than tokens). Each
+    such page is read once, its new ``key | gate`` rows are merged in from ``current``, and it is written back whole;
+    the summaries of its pools are computed from the merged page and written for the pools whose last member arrived
+    this step. The row update instead scatters every token row, gathers ``kpool`` member rows per token and scatters a
+    summary row per token. Both read the same member values, so they write the same pages.
+
+    A page that receives new tokens belongs to one sequence: prefix caching shares full pages only, and those receive
+    no new token.
+
+    Args:
+        current: ``[T, 2 * dim]`` rows to write, in the token-page dtype, packed by ``query_start_loc``.
+        flat_tokens: ``[P * page_size, 2 * dim]`` flat token pages.
+        flat_pools: ``[P * page_size // kpool, dim]`` flat pool pages.
+        block_tables: ``[S, pages_per_seq]`` page table.
+        kv_lens: ``[S]`` context length per sequence including this step.
+        query_start_loc: ``[S + 1]`` cumulative query counts (token offsets into ``current``).
+        num_seqs: Live sequences; later rows write nothing.
+        ape: ``[kpool, dim]`` float32 pool-slot bias of the gates.
+        kpool: Tokens per pool.
+        page_size: Tokens per page.
+        key_dtype: Dtype of the indexer keys (the summary is computed from members cast to it).
+        rows_c: Sharding constraint for the written pages and summaries.
+        pages_c: Sharding constraint keeping the page buffers in their allocation layout.
+
+    Returns:
+        ``(flat_tokens, flat_pools)`` after the writes.
+    """
+    total_tokens, packed_dim = (int(d) for d in current.shape)
+    dim = int(flat_pools.shape[-1])
+    pools_per_page = page_size // kpool
+    num_pages = int(flat_tokens.shape[0]) // page_size
+    max_seqs, pages_per_seq = (int(d) for d in block_tables.shape)
+    qsl = jnp.asarray(query_start_loc, jnp.int32).reshape(-1)
+    kv = jnp.asarray(kv_lens, jnp.int32).reshape(-1)
+    live = jnp.arange(max_seqs, dtype=jnp.int32) < jnp.clip(jnp.asarray(num_seqs, jnp.int32), 0, max_seqs)
+    q_start = qsl[:max_seqs]
+    q_len = jnp.where(live, qsl[1 : max_seqs + 1] - q_start, 0)
+    base = kv - q_len  # position of each sequence's first new token
+    first = base // page_size
+    count = jnp.where(q_len > 0, (kv - 1) // page_size - first + 1, 0)  # pages receiving new tokens
+    ends = jnp.cumsum(count, dtype=jnp.int32)
+    slots = min(total_tokens, total_tokens // page_size + 2 * max_seqs)
+    slot = jnp.arange(slots, dtype=jnp.int32)
+    row = jnp.minimum(jnp.searchsorted(ends, slot, side="right", method="compare_all").astype(jnp.int32), max_seqs - 1)
+    used = slot < ends[-1]
+    logical = first[row] + slot - (ends[row] - count[row])
+    page = jnp.clip(block_tables[row, jnp.clip(logical, 0, pages_per_seq - 1)], 0, num_pages - 1)
+    dst = jnp.where(used, page, num_pages)
+    position = logical[:, None] * page_size + jnp.arange(page_size, dtype=jnp.int32)[None, :]  # [slots, page]
+    new = used[:, None] & (position >= base[row][:, None]) & (position < kv[row][:, None])
+    token = jnp.clip(q_start[row][:, None] + position - base[row][:, None], 0, total_tokens - 1)
+
+    token_pages = flat_tokens.reshape(num_pages, page_size, packed_dim)
+    merged = rows_c(jnp.where(new[..., None], current[token], token_pages[page]))
+    token_pages = pages_c(token_pages.at[dst].set(merged, mode="drop"))
+
+    members = merged.reshape(slots, pools_per_page, kpool, packed_dim)
+    member_keys = members[..., :dim].astype(key_dtype)
+    member_gates = members[..., dim:].astype(key_dtype).astype(jnp.float32)
+    probabilities = jax.nn.softmax(member_gates + ape, axis=2)
+    summary = jnp.sum(probabilities * member_keys.astype(jnp.float32), axis=2).astype(key_dtype)
+    completes = new[:, kpool - 1 :: kpool]  # [slots, pools_per_page]: the pool's last member arrived this step
+    pool_pages = flat_pools.reshape(num_pages, pools_per_page, dim)
+    pools = rows_c(jnp.where(completes[..., None], summary.astype(flat_pools.dtype), pool_pages[page]))
+    pool_pages = pages_c(pool_pages.at[dst].set(pools, mode="drop"))
+    return token_pages.reshape(num_pages * page_size, packed_dim), pool_pages.reshape(num_pages * pools_per_page, dim)
+
+
 def _pool_select_core(
     query: jax.Array,
     key: jax.Array,
@@ -248,52 +437,72 @@ def _pool_select_core(
     rows_c: tp.Callable[[jax.Array], jax.Array],
     pages_c: tp.Callable[[jax.Array], jax.Array],
     kernel_mesh: object | None,
+    heads_c: tp.Callable[[jax.Array], jax.Array] | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Page update + pool selection for one set of 1-D ragged metadata (a whole batch or one DP rank)."""
     num_pages, page_size, packed_dim = token_pages.shape
     dim = packed_dim // 2
     pools_per_page = page_size // kpool
-    pages_per_seq = int(block_tables.shape[1])
     total_tokens = int(query.shape[0])
 
     seq, pos, valid = paged_token_layout(kv_lens, query_start_loc, num_seqs, total_tokens)
+    # Every device writes the whole step into its replica of the pages. Pinned replicated, the layout is computed on
+    # every device instead of on the fused top-k's row split below, which then had to regather it (once per step).
+    seq, pos, valid = rows_c(seq), rows_c(pos), rows_c(valid)
 
-    def physical_row(token_pos: jax.Array, seq_ids: jax.Array) -> jax.Array:
-        logical = jnp.clip(token_pos // page_size, 0, pages_per_seq - 1)
-        return block_tables[seq_ids, logical] * page_size + token_pos % page_size
-
-    # 1) Write the current tokens' ``key | gate`` rows.
+    # 1) Write the current tokens' ``key | gate`` rows; 2) summarise the pools whose last member arrived this step.
     current = rows_c(jnp.concatenate([key, gate.astype(key.dtype)], axis=-1).astype(token_pages.dtype))
     flat_tokens = pages_c(token_pages.reshape(num_pages * page_size, packed_dim))
-    dst = jnp.where(valid, physical_row(jnp.maximum(pos, 0), seq), num_pages * page_size)
-    flat_tokens = pages_c(flat_tokens.at[dst].set(current, mode="drop"))
-
-    # 2) Summarise the pools whose last member arrived this step (members share a page).
-    completes = valid & ((pos + 1) % kpool == 0)
-    member_pos = jnp.maximum(pos - (kpool - 1), 0)[:, None] + jnp.arange(kpool, dtype=jnp.int32)[None]
-    members = flat_tokens[physical_row(member_pos, seq[:, None])]  # [T, kpool, 2D]
-    member_keys = members[..., :dim].astype(key.dtype)
-    member_gates = members[..., dim:].astype(key.dtype).astype(jnp.float32)
-    probabilities = jax.nn.softmax(member_gates + ape[None], axis=1)
-    summary = jnp.sum(probabilities * member_keys.astype(jnp.float32), axis=1).astype(key.dtype)
-
     flat_pools = pool_pages.reshape(num_pages * pools_per_page, dim)
-    pool_page = block_tables[seq, jnp.clip(jnp.maximum(pos, 0) // page_size, 0, pages_per_seq - 1)]
-    pool_dst = pool_page * pools_per_page + (jnp.maximum(pos, 0) % page_size) // kpool
-    pool_dst = jnp.where(completes, pool_dst, num_pages * pools_per_page)
-    flat_pools = pages_c(flat_pools.at[pool_dst].set(rows_c(summary.astype(pool_pages.dtype)), mode="drop"))
+    by_page = total_tokens >= _PAGE_GRANULAR_UPDATE_MIN_TOKENS
+    if by_page:
+        update = functools.partial(_pool_page_update_by_page, kpool=kpool, page_size=page_size, key_dtype=key.dtype)
+        operands = (
+            current,
+            flat_tokens,
+            flat_pools,
+            block_tables,
+            jnp.asarray(kv_lens, jnp.int32),
+            jnp.asarray(query_start_loc, jnp.int32),
+            jnp.asarray(num_seqs, jnp.int32),
+            ape,
+        )
+    else:
+        update = functools.partial(_pool_page_update, kpool=kpool, page_size=page_size, key_dtype=key.dtype)
+        operands = (current, flat_tokens, flat_pools, block_tables, seq, pos, valid, ape)
+    row_mesh = _pool_topk_row_mesh(kernel_mesh, total_tokens)
+    if row_mesh is not None and (by_page or total_tokens <= _REPLICATED_POOL_UPDATE_MAX_TOKENS):
+        # Small steps, and every page-granular step: each device runs the whole update on its replica of the pages,
+        # inside a replicated shard_map the top-k's row split cannot reach. Left to the partitioner, the small row
+        # update's pool summaries and write indices are computed on each device's top-k rows and then gathered over
+        # the whole mesh in every layer.
+        rep = PartitionSpec()
+        flat_tokens, flat_pools = jax.shard_map(
+            functools.partial(update, rows_c=_identity, pages_c=_identity),
+            mesh=row_mesh,
+            in_specs=(rep,) * len(operands),
+            out_specs=(rep, rep),
+            check_vma=False,
+        )(*operands)
+        flat_tokens, flat_pools = pages_c(flat_tokens), pages_c(flat_pools)
+    else:
+        flat_tokens, flat_pools = update(*operands, rows_c=rows_c, pages_c=pages_c)
 
     # 3) Exact top-k over each token's complete pools through the page table, one fused
     #    pass on TPU (ejkernel ``paged_pool_topk``), the running-top-k loop elsewhere.
     num_complete = jnp.where(valid, (pos + 1) // kpool, 0)
+    # The query goes in its projection dtype: with bf16 queries over bf16 pool pages the TPU kernel scores in one bf16
+    # MXU pass with f32 accumulation (the products are exact), the same keys as an f32 HIGHEST matmul of the upcast
+    # values, and the row split moves half the bytes. The XLA path upcasts to f32 itself.
     best_ids = _run_pool_topk(
         kernel_mesh,
-        query.astype(jnp.float32),
+        query,
         head_weights,
         flat_pools.reshape(pool_pages.shape),
         block_tables,
         seq,
         num_complete,
+        constrain_heads=heads_c,
         k=select_k,
         sm_scale=sm_scale,
         relu=relu,
@@ -329,6 +538,7 @@ def paged_pool_select(
     constrain_pages: tp.Callable[[jax.Array], jax.Array] | None = None,
     kernel_mesh: object | None = None,
     dp_sharding: tuple[tp.Any, tp.Any] | None = None,
+    constrain_heads: tp.Callable[[jax.Array], jax.Array] | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Update the paged indexer state and select pools for every packed token.
 
@@ -356,6 +566,10 @@ def paged_pool_select(
             multi-device mesh keeps the partitioned XLA path.
         dp_sharding: ``(mesh, page_axis_names)`` of the DP-sharded indexer pages
             (``MLARaggedPagesCacheView.indexer_dp_sharding()``); required for rank-major metadata.
+        constrain_heads: Optional sharding constraint pinning the query ``[T, H, D]`` and head
+            weights ``[T, H]`` head-sharded (``MLARaggedPagesCacheView.constrain_indexer_heads``)
+            where the fused top-k splits rows over ``kernel_mesh``, so the activations are
+            resharded instead of the projection weights being gathered. Unused on the rank-major path.
 
     Returns:
         ``(selected [T, index_topk // kpool + 1], token_pages, pool_pages)``: chunk
@@ -422,6 +636,7 @@ def paged_pool_select(
             rows_c=constrain_rows or _identity,
             pages_c=constrain_pages or _identity,
             kernel_mesh=kernel_mesh,
+            heads_c=constrain_heads,
         )
 
     mesh, names, dp = _dp_setup(

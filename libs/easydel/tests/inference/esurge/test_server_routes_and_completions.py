@@ -106,7 +106,6 @@ def test_completions_with_prompt_list_returns_one_choice_per_prompt() -> None:
 def test_completions_rejects_empty_prompt_entries() -> None:
     async def run(prompt, stream):
         server = _server()
-        server._extract_payload_api_keys = lambda *_: []
         server._get_adapter = lambda *_: SimpleNamespace(esurge=SimpleNamespace())
         server._ensure_request_max_tokens = lambda *_: 8
         server._authorize_request = lambda *_, **__: None
@@ -125,7 +124,6 @@ def test_completions_rejects_empty_prompt_entries() -> None:
 def test_completions_streams_every_prompt_and_aggregates_usage(num_choices) -> None:
     async def run():
         server = _server()
-        server._extract_payload_api_keys = lambda *_: []
         server._ensure_request_max_tokens = lambda *_: 8
         server._authorize_request = lambda *_, **__: None
         server._close_stream_queue = lambda *_: None

@@ -17,8 +17,8 @@
 :class:`RemoteEngineHandle` speaks to a remote eSurge engine's request
 plane exactly like an in-group origin rank does — admissions forward as
 ``Admit`` messages, raw token deltas come back, and a private local
-rendering stack (request registry, tokenizer/detokenizer workers, output
-pipeline) turns them into ``RequestOutput`` objects — except it lives in a
+rendering stack (request registry, tokenizer worker, native detokenizer and
+output pipeline) turns them into ``RequestOutput`` objects — except it lives in a
 process that is *not* part of the engine's JAX world. It authenticates
 with the client role from the P0 handshake, bootstraps its admission
 limits from the ``HelloOk`` engine spec, and exposes the engine-adapter
@@ -341,7 +341,6 @@ class RemoteEngineHandle:
             self._tokenizer_client, self._detokenizer_client = self._worker_manager.start(
                 detokenizer_max_states=max(64, int(spec.max_num_seqs) * 4),
                 tokenizer_endpoint=None,
-                detokenizer_endpoint=None,
             )
             from transformers import AutoTokenizer
 

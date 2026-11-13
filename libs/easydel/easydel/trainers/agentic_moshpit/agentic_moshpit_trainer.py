@@ -694,11 +694,10 @@ class AgenticMoshPitTrainer(GRPOTrainer):
                     aux_rewards, aux_reward_breakdown = self._apply_auxiliary_rewards_to_trajectories(trajectories)
                     self._rollout_step += 1
                 finally:
-                    if self.arguments.use_esurge_generation:
-                        try:
-                            state.model.pause_esurge(release_model_state=True)
-                        except Exception as exc:  # pragma: no cover - best-effort rollout cleanup
-                            logger.debug("Failed to release eSurge runtime after agentic rollout: %s", exc)
+                    try:
+                        state.model.pause_esurge(release_model_state=True)
+                    except Exception as exc:  # pragma: no cover - best-effort rollout cleanup
+                        logger.debug("Failed to release eSurge runtime after agentic rollout: %s", exc)
 
             rollout_time = rollout_time_fn()
 

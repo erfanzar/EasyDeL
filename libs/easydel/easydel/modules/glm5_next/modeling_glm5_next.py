@@ -64,6 +64,7 @@ from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
+    MLARaggedPagesCacheView,
     OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesMetadata,
@@ -73,7 +74,9 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
+    CausalLMOutput,
     DecoderLayerOutput,
+    MoeCausalLMOutput,
     MoeModelOutput,
     SparseDecoderLayerOutput,
 )
@@ -99,6 +102,7 @@ from easydel.layers.indexer import (
     IndexerConfig,
     IndexerKind,
     SparseIndexer,
+    resolve_index_scoring_kernel,
 )
 from easydel.layers.linear_attention import KernelDeltaAttention, unnest_legacy_kda_forget_gate
 from easydel.layers.moe import fp32_router_logits, moe_group_topk_select
@@ -551,7 +555,10 @@ class Glm5NextTextMoE(BaseMoeModule):
         )
 
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
-        """Routes tokens through selected experts and combines outputs.
+        """Routes tokens through selected experts and combines outputs, plus the shared experts.
+
+        The shared experts go to ``moe_call``, which runs them inside the fused dispatch where it can (the
+        inference-mode deferred dispatch with W8A8 shared experts) and adds them after the routed experts otherwise.
 
         Args:
             hidden_states: Input tensor of shape ``(batch, seq_len, hidden_dim)``.
@@ -584,9 +591,8 @@ class Glm5NextTextMoE(BaseMoeModule):
             act_fn=self.experts.act_fn,
             ffn_activation=ffn_activation,
             hooks=hooks,
+            shared_expert=self.shared_experts,
         )
-        if self.shared_experts is not None:
-            out = out + self.shared_experts(hidden_states)
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
@@ -782,7 +788,7 @@ class Glm5NextIndexer(SparseIndexer):
                 kpool_size=config.index_kpool,
                 select_tail=config.index_kpool_always_select_tail,
                 initializer_range=config.initializer_range,
-                scoring_kernel=config.index_scoring_kernel,
+                scoring_kernel=resolve_index_scoring_kernel(config.index_scoring_kernel),
             ),
             layer_idx=layer_idx,
             dtype=dtype,
@@ -1449,6 +1455,123 @@ class Glm5NextForCausalLM(_Glm5NextIndexerCacheMixin, BaseCausalLMModule[Glm5Nex
 
     checkpoint_key_rules: ClassVar[KeyRuleSet] = GLM5_NEXT_KEY_RULES
 
+    def num_draft_cache_layers(self) -> int:
+        """One paged view for an attached nextn head that writes the target's paged pool, none otherwise."""
+        return 1 if self.has_mtp() and bool(getattr(self.mtp, "paged_pool", False)) else 0
+
+    def _nextn_cache_view(self, past_key_values):
+        """Return the MTP layer's MLA view, which :meth:`init_operations_cache` allocates after the decoder layers.
+
+        A cache built without it (no head attached at allocation) returns ``None``: the forward never adds a view, so
+        a compiled step returns the cache with the structure it was built from.
+        """
+        if past_key_values is None or not hasattr(past_key_values, "views"):
+            return None
+        views = past_key_values.views
+        index = len(self.base_model.layers)
+        if len(views) <= index or not isinstance(views[index], MLARaggedPagesCacheView):
+            return None
+        return views[index]
+
+    @staticmethod
+    def _nextn_metadata(cache_metadata):
+        """Shorten ragged-page metadata by one token per request for the next-token MTP step."""
+        if cache_metadata is None:
+            return None
+
+        def _shorten(inner):
+            # jnp, not np: inside the compiled model step these fields are traced arrays.
+            query_start_loc = jnp.asarray(inner.query_start_loc)
+            offsets = jnp.arange(query_start_loc.shape[0], dtype=query_start_loc.dtype)
+            query_start_loc = query_start_loc - offsets
+            scheduled = getattr(inner, "scheduled_full", None)
+            changes = {"query_start_loc": query_start_loc}
+            if scheduled is not None:
+                changes["scheduled_full"] = jnp.maximum(jnp.asarray(scheduled) - 1, 0)
+            context = getattr(inner, "context_lens", None)
+            context = None if context is None else jnp.maximum(jnp.asarray(context) - 1, 0)
+            if context is not None:
+                changes["context_lens"] = context
+            return inner.replace(**changes)
+
+        if isinstance(cache_metadata, OperationsMetadata) and cache_metadata.ragged is not None:
+            return cache_metadata.replace(ragged=_shorten(cache_metadata.ragged))
+        if isinstance(cache_metadata, RaggedPagesMetadata):
+            return _shorten(cache_metadata)
+        return cache_metadata
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ):
+        """Run the backbone, write the next-token MTP cache view, then compute the LM head."""
+        base_model_kwargs = {
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "mask_info": mask_info,
+            "mode": mode,
+            "past_key_values": past_key_values,
+            "cache_metadata": cache_metadata,
+            "output_attentions": output_attentions,
+            "output_hidden_states": output_hidden_states,
+        }
+        if inputs_embeds is not None:
+            base_model_kwargs["inputs_embeds"] = inputs_embeds
+        else:
+            base_model_kwargs["input_ids"] = input_ids
+        outputs = self.base_model(**base_model_kwargs)
+
+        if self.has_mtp() and outputs.last_hidden_state.shape[1] > 1:
+            mtp_view = self._nextn_cache_view(outputs.past_key_values)
+            if mtp_view is not None:
+                next_embeds = (
+                    inputs_embeds[:, 1:] if inputs_embeds is not None else self.base_model.embed_tokens(input_ids)[:, 1:]
+                )
+                _, new_view = self.mtp.forward(
+                    prev_hidden_states=outputs.last_hidden_state[:, :-1],
+                    next_token_embeds=next_embeds,
+                    position_ids=None if position_ids is None else position_ids[:, :-1],
+                    mode=mode,
+                    cache_view=mtp_view,
+                    cache_metadata=self._nextn_metadata(cache_metadata),
+                    return_cache=True,
+                )
+                outputs.past_key_values.views[-1] = new_view
+
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = self.compute_lm_logits(self.prepare_lm_head_inputs(outputs.last_hidden_state))
+        aux_loss = self.compute_aux_loss(outputs, attention_mask=attention_mask)
+        if aux_loss is not None or hasattr(outputs, "all_router_losses"):
+            return MoeCausalLMOutput(
+                logits=lm_logits,
+                hidden_states=outputs.hidden_states,
+                last_hidden_state=outputs.last_hidden_state,
+                attentions=outputs.attentions,
+                past_key_values=outputs.past_key_values,
+                aux_loss=aux_loss,
+                router_logits=getattr(outputs, "router_logits", None),
+                all_router_losses=getattr(outputs, "all_router_losses", None),
+                indexer_aux_loss=getattr(outputs, "indexer_aux_loss", None),
+            )
+        return CausalLMOutput(
+            logits=lm_logits,
+            hidden_states=outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
+            attentions=outputs.attentions,
+            past_key_values=outputs.past_key_values,
+        )
+
     def has_mtp(self) -> bool:
         """Whether a nextn (MTP) head is attached as ``self.mtp``.
 
@@ -1460,6 +1583,50 @@ class Glm5NextForCausalLM(_Glm5NextIndexerCacheMixin, BaseCausalLMModule[Glm5Nex
             ``True`` iff an MTP head is attached.
         """
         return getattr(self, "mtp", None) is not None
+
+    def drafter(
+        self,
+        method: str = "auto",
+        *,
+        nextn_checkpoint: str | None = None,
+        nextn_cache_length: int | None = None,
+        **kwargs: typing.Any,
+    ) -> typing.Any:
+        """Build a speculative-decoding drafter; optionally load the checkpoint's own nextn layer first.
+
+        GLM-5-Next checkpoints ship their nextn (MTP) layer as ``layers.{num_hidden_layers}.*``. A converted
+        checkpoint may lack it, so ``nextn_checkpoint`` names a Hugging Face checkpoint directory that holds it
+        (any path ``ePath`` reads); the layer is loaded and attached as ``self.mtp`` before the drafter is built
+        (:func:`~easydel.modules.glm5_next.modeling_glm5_next_mtp.load_glm5_next_mtp_checkpoint`).
+
+        Args:
+            method: Drafter family (see :meth:`EasyDeLBaseModule.drafter`).
+            nextn_checkpoint: Hugging Face checkpoint holding the nextn layer, or ``None`` to use an attached head.
+            nextn_cache_length: Slots per request of the drafter-local MTP cache. The cache holds a request's
+                drafted history only (not its prompt); a request whose drafted history reaches it stops drafting.
+            **kwargs: Forwarded to :meth:`EasyDeLBaseModule.drafter`.
+
+        Returns:
+            The drafter.
+
+        Raises:
+            ValueError: If ``nextn_checkpoint`` is given while a head is already attached.
+        """
+        from .modeling_glm5_next_mtp import DEFAULT_MTP_CACHE_LENGTH, load_glm5_next_mtp_checkpoint
+
+        if nextn_checkpoint is not None:
+            if self.has_mtp():
+                raise ValueError("A nextn head is already attached; pass nextn_checkpoint only to load one.")
+            load_glm5_next_mtp_checkpoint(
+                self,
+                str(nextn_checkpoint),
+                param_dtype=self.param_dtype,
+                precision=self.precision,
+                max_cache_length=int(nextn_cache_length or DEFAULT_MTP_CACHE_LENGTH),
+            )
+        elif nextn_cache_length is not None and self.has_mtp():
+            self.mtp.max_cache_length = int(nextn_cache_length)
+        return super().drafter(method, **kwargs)
 
 
 @register_module(TaskType.CAUSAL_LM, config=Glm5NextTextConfig, model_type="glm5_next")

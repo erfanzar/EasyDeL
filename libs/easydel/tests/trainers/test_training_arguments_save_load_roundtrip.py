@@ -220,7 +220,6 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
             {"name": "math", "tasks": "gsm8k", "limit": 20},
         ],
         # eSurge generation integration
-        "use_esurge_generation": False,
         "esurge_use_tqdm": False,
         "esurge_hbm_utilization": 0.6,
         "esurge_max_num_seqs": 32,
@@ -259,6 +258,24 @@ def test_save_load_arguments_roundtrip_is_idempotent_on_to_dict(tmp_path, full_a
     loaded = TrainingArguments.load_arguments(json_path)
 
     assert loaded.to_dict() == full_args.to_dict()
+
+
+@pytest.mark.parametrize("removed", [{"use_esurge_generation": False}, {"use_esurge_generation": True}])
+def test_load_arguments_drops_removed_generation_keys(tmp_path, full_args, removed):
+    """A saved config that still names a removed field loads, and the field is dropped."""
+    import json
+
+    json_path = tmp_path / "args.json"
+    full_args.save_arguments(json_path)
+    saved = json.loads(json_path.read_text())
+    saved.update(removed)
+    json_path.write_text(json.dumps(saved))
+
+    loaded = TrainingArguments.load_arguments(json_path)
+
+    assert loaded.to_dict() == full_args.to_dict()
+    assert all(not hasattr(loaded, key) for key in removed)
+    assert TrainingArguments.from_dict({**full_args.to_dict(), **removed}).to_dict() == full_args.to_dict()
 
 
 def test_to_dict_from_dict_roundtrip_is_idempotent(full_args):

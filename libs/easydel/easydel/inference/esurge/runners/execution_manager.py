@@ -95,13 +95,14 @@ from easydel.caching import (
     UnifiedAttentionCache,
     UnifiedAttentionCacheConfig,
 )
+from easydel.inference.sampling_processors import SamplingConstraints
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.layers.quantization import TurboQuantConfig
 from easydel.utils import flags
 
 from ..multimodal.side_inputs import empty_side_inputs, prefill_embeds_dtype
 from ..utils import model_uses_mrope
-from .async_types import DeviceInputTokenHandoff
+from .async_types import DeviceInputTokenHandoff, DeviceSpecWindowHandoff
 from .execution_types import CacheGroupInputs, ModelStepOutputs, StepFunctionInputs
 from .executors import BatchMetadataPreparer, ModelStepExecutor, SamplerExecutor, SamplerRuntime
 from .executors.compile_orchestrator import CompileOrchestrator, _tree_hash, _tree_hash_diff
@@ -110,7 +111,10 @@ from .executors.sampler_executor import (
     _cpu_vector_size,
     _greedy_argmax_tokens,
     _padded_cpu_window,
+    _scratch_copy,
+    gather_handoff_tokens,
 )
+from .host_sync import put_host_payload
 from .pipeline_plan import PipelineInferencePlan, metadata_num_pages, set_metadata_num_pages
 from .sequence_buffer import SequenceBuffer
 
@@ -232,6 +236,25 @@ def _jit_snapshot_restore(output_shardings: tuple[jax.sharding.Sharding, ...]):
         ]
 
     return jax.jit(body, out_shardings=list(output_shardings))
+
+
+@lru_cache(maxsize=32)
+def _jit_snapshot_zeros(
+    shapes: tuple[tuple[tuple[int, ...], typing.Any], ...], output_shardings: tuple[jax.sharding.Sharding, ...]
+):
+    """Allocate a zeroed snapshot store, one ``(shape, dtype)`` per leaf, placed with ``output_shardings``."""
+
+    def make():
+        return [jnp.zeros(shape, dtype) for shape, dtype in shapes]
+
+    return jax.jit(make, out_shardings=list(output_shardings))
+
+
+def _snapshot_zeros_key(leaves: list[tuple[int, str, typing.Any]], positions: list[int], num_slots: int):
+    """``(shapes, shardings)`` of the snapshot arrays for the ``leaves`` at ``positions`` (one device group)."""
+    shapes = tuple(((num_slots, *leaves[i][2].shape[1:]), jnp.dtype(leaves[i][2].dtype)) for i in positions)
+    shardings = tuple(_snapshot_sharding(leaves[i][2]) for i in positions)
+    return shapes, shardings
 
 
 def _per_slot_state_leaves(views) -> list[tuple[int, str, typing.Any]]:
@@ -374,16 +397,17 @@ def _write_back_leaf_results(new_views, entries, results_by_pool) -> bool:
     return changed
 
 
-def _transform_recurrent_sidecars(views, make_indices):
-    """Apply the native slot mapping to positions and Qwen PLE continuation.
+def _recurrent_sidecar_pools(views) -> dict[tuple[int, tuple[int, ...]], list[tuple[int, str, typing.Any, int]]]:
+    """Per-slot sidecar leaves (positions, Qwen PLE continuation) as ``(view index, field, array, fill)``.
 
-    Paged attention leaves are intentionally excluded: their leading dimension
-    indexes physical pages, not recurrent request slots. Segment padding uses
-    -1 rather than zero, matching the PLE cache initialization contract. KDA
-    views contribute only their ``positions`` sidecar here — their state
-    leaves ride the fused zero/permute dispatches instead.
+    Grouped by (pool size, device set). Paged attention leaves are intentionally
+    excluded: their leading dimension indexes physical pages, not recurrent
+    request slots. Segment padding uses -1 rather than zero, matching the PLE
+    cache initialization contract. KDA views contribute only their
+    ``positions`` sidecar here — their state leaves ride the fused zero/permute
+    dispatches instead.
     """
-    by_pool = {}
+    by_pool: dict[tuple[int, tuple[int, ...]], list[tuple[int, str, typing.Any, int]]] = {}
     for index, view in enumerate(views):
         rec = view.recurrent if isinstance(view, ParallelHybridCacheView) else view
         if isinstance(rec, KDACacheView):
@@ -403,8 +427,13 @@ def _transform_recurrent_sidecars(views, make_indices):
             array = getattr(rec, name, None)
             if array is not None:
                 by_pool.setdefault((int(array.shape[0]), _device_key(array)), []).append((index, name, array, fill))
+    return by_pool
+
+
+def _transform_recurrent_sidecars(views, make_indices):
+    """Apply the native slot mapping to the sidecars of :func:`_recurrent_sidecar_pools`."""
     updates = {}
-    for (n_slots, _devices), entries in by_pool.items():
+    for (n_slots, _devices), entries in _recurrent_sidecar_pools(views).items():
         indices = make_indices(n_slots)
         if indices is None:
             continue
@@ -526,6 +555,8 @@ class ExecutionManager:
         layer_to_cache_group: tuple[int, ...] = (),
         host_payloads_replicated: bool = False,
         request_seeds: tp.Mapping[int, int] | None = None,
+        recurrent_slots_pooled: bool = False,
+        recurrent_slot_group_size: int = 1,
     ):
         """Initialize the executor manager.
 
@@ -568,6 +599,11 @@ class ExecutionManager:
                 if the coordinator is initialized after the manager.
             request_seeds: Live mapping of global sequence-buffer rows to request seeds. Retained without copying
                 so row moves and removals are visible to the sampler.
+            recurrent_slots_pooled: Requests own stable pooled recurrent-state slots (recurrent layers that declare the
+                eSurge slot contract, where rows can leave their window-local index), shipped with every step as
+                ``cache_metadata.recurrent_state_indices``. Compressed-window caches are always pooled.
+            recurrent_slot_group_size: Recurrent slots per request, ``W`` (``1 + K_max`` for speculative verify,
+                else 1). The recurrent pools hold ``max_num_reqs * W`` slots.
         """
         if metadata is None:
             raise ValueError("ExecutionManager requires a paged cache config `metadata`.")
@@ -587,11 +623,20 @@ class ExecutionManager:
         self.pp_microbatch_count = pp_microbatch_count
         self.pp_microbatch_size = pp_microbatch_size
         self.speculative_recurrent_state_tokens = max(0, int(speculative_recurrent_state_tokens))
-        self.enable_spec_recurrent_commit_metadata = self.speculative_recurrent_state_tokens > 0
+        self.recurrent_slot_group_size = max(1, int(recurrent_slot_group_size))
+        # The [2, max_num_reqs] step payload carries the candidate-row commit (GDN candidate rows) or, with slot groups
+        # of W > 1 slots, the tokens covered by every row's slot g (row 0; see _recurrent_slot_bases).
+        self.enable_spec_recurrent_commit_metadata = (
+            self.speculative_recurrent_state_tokens > 0 or self.recurrent_slot_group_size > 1
+        )
+        self._recurrent_base_cpu = numpy.zeros((2, int(max_num_reqs)), dtype=numpy.int32)
+        self._recurrent_base_by_slot = numpy.zeros((int(max_num_reqs) * self.recurrent_slot_group_size,), numpy.int64)
         self.speculative_trace_tokens = max(0, int(speculative_trace_tokens))
-        # Slot-indexed state families (compressed-window caches) receive the
-        # per-row physical state-slot ids in the batch metadata every step.
-        self._slot_indexed_state = getattr(model, "esurge_cache_family", None) == "compressed_window"
+        # Requests with pooled state slots (compressed-window caches, recurrent layers that declare the slot contract)
+        # receive the per-row physical state-slot ids in the batch metadata every step.
+        self._slot_indexed_state = bool(recurrent_slots_pooled) or (
+            getattr(model, "esurge_cache_family", None) == "compressed_window"
+        )
         self.min_input_pad = min_input_pad
         self.max_model_len = max_model_len
         self.max_num_reqs = max_num_reqs
@@ -669,6 +714,7 @@ class ExecutionManager:
             enable_spec_recurrent_commit=self.enable_spec_recurrent_commit_metadata,
             input_sharding=self._input_sharding,
             slot_indexed_state=self._slot_indexed_state,
+            recurrent_slot_group_size=self.recurrent_slot_group_size,
             cache_group_configs=self.cache_group_configs,
             layer_to_cache_group=self.layer_to_cache_group,
             host_payloads_replicated=self.host_payloads_replicated,
@@ -690,15 +736,23 @@ class ExecutionManager:
             enable_spec_recurrent_commit=self.enable_spec_recurrent_commit_metadata,
             input_sharding=self._input_sharding,
             slot_indexed_state=self._slot_indexed_state,
+            recurrent_slot_group_size=self.recurrent_slot_group_size,
             cache_group_configs=self.cache_group_configs,
             layer_to_cache_group=self.layer_to_cache_group,
         )
         self._sampler_vocab_size = int(self.model.config.get_text_config().vocab_size)
+        # The sampler's [rows, vocab] logits arrive replicated on every device; split its rows over the whole mesh so
+        # each device samples only its own rows (SPMD meshes only: an MPMD final stage keeps the replicated sampler).
+        sampler_row_sharding = None
+        if not bool(getattr(self.model.mesh, "is_mpmd", False)):
+            sampler_jax_mesh = getattr(self.model.mesh, "jax_mesh", self.model.mesh)
+            sampler_row_sharding = NamedSharding(sampler_jax_mesh, PartitionSpec(tuple(sampler_jax_mesh.axis_names)))
         self._sampler_executor = SamplerExecutor(
             model=self.model,
             max_model_len=self.max_model_len,
             empty_sharding=self._sampler_sharding,
             use_aot_forward=self.use_aot_forward,
+            row_sharding=sampler_row_sharding,
         )
         self._sampler_min_input_pad = 1
         # Sampler runtime (phase 11.1): CPU scratch buffers, penalty-count state,
@@ -730,8 +784,8 @@ class ExecutionManager:
 
     @property
     def host_payloads_replicated(self) -> bool:
-        """Whether this manager's coordinator guarantees identical host payloads."""
-        return self._host_payloads_replicated
+        """Whether this manager's coordinator guarantees identical host payloads (``False`` until set)."""
+        return getattr(self, "_host_payloads_replicated", False)
 
     @host_payloads_replicated.setter
     def host_payloads_replicated(self, enabled: bool) -> None:
@@ -781,7 +835,8 @@ class ExecutionManager:
 
         def _allocate() -> tp.Any:
             """Single attempt at building the operations cache via the model API."""
-            cache_batch_size = int(self.max_num_reqs)
+            # Every request owns a group of ``recurrent_slot_group_size`` recurrent-state slots.
+            cache_batch_size = int(self.max_num_reqs) * int(getattr(self, "recurrent_slot_group_size", 1) or 1)
             if self.speculative_recurrent_state_tokens > 0:
                 cache_batch_size += cache_batch_size * int(self.speculative_recurrent_state_tokens)
             extra: dict[str, tp.Any] = {}
@@ -1087,7 +1142,10 @@ class ExecutionManager:
         padded requests``. The resident PP runtime is only valid for the true
         decode case, where every active scheduled row contributes exactly one
         token. This predicate looks at the unpadded scheduler payload rather
-        than the compile bucket.
+        than the compile bucket. It also selects the SPMD single-token program
+        (:func:`~easydel.infra.sharding.single_token_rows`), so every row the
+        batch builder packs (each row up to the last live one, live or not)
+        must schedule at most one token.
         """
         padded_num_reqs = int(padded_num_reqs)
         scheduled_window = ExecutionManager._padded_cpu_window(
@@ -1103,7 +1161,13 @@ class ExecutionManager:
             fill_value=False,
         )
         active_scheduled = scheduled_window[active_window & (scheduled_window > 0)]
-        return bool(active_scheduled.size > 0 and numpy.all(active_scheduled == 1))
+        if not (active_scheduled.size > 0 and numpy.all(active_scheduled == 1)):
+            return False
+        # The batch builder packs the scheduled tokens of every row up to the last live one and zeroes the rest.
+        last_live = int(numpy.flatnonzero(numpy.asarray(active_mask_full_cpu, dtype=numpy.bool_).reshape(-1))[-1])
+        if last_live >= padded_num_reqs:
+            return False
+        return bool(numpy.all(scheduled_window[: last_live + 1] <= 1))
 
     @staticmethod
     def _window_emits_token(
@@ -1335,6 +1399,7 @@ class ExecutionManager:
         presence_penalties_cpu: numpy.ndarray,
         repetition_penalties_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,
+        sampling_constraints: SamplingConstraints | None = None,
         recurrent_slot_indices_cpu: numpy.ndarray | None = None,
         page_table_version: int | None = None,
         spec_recurrent_commit_cpu: numpy.ndarray | None = None,
@@ -1354,6 +1419,7 @@ class ExecutionManager:
         wait_for_outputs: bool = True,
         model_side_inputs_cpu: dict[str, numpy.ndarray] | None = None,
         cache_group_inputs: tuple[CacheGroupInputs, ...] = (),
+        spec_window_handoff: DeviceSpecWindowHandoff | None = None,
     ) -> tuple[
         jax.Array,
         jax.Array,
@@ -1401,6 +1467,8 @@ class ExecutionManager:
             presence_penalties_cpu: Per-request presence penalty values.
             repetition_penalties_cpu: Per-request repetition penalty values.
             page_table_cpu: Host-side KV-cache page-table block ids.
+            sampling_constraints: The window rows' sparse logit bias, allow-lists and banned next tokens, or
+                ``None``. They reach the sampler only, never the compiled model step.
             page_table_version: Optional monotonic version for page-table cache
                 reuse; bump on allocator/swap/condense changes.
             spec_recurrent_commit_cpu: Optional speculative recurrent commit
@@ -1416,6 +1484,10 @@ class ExecutionManager:
             video_grid_thw: Optional video grid shape ``(T, H, W)``.
             device_token_handoff: Optional device-resident sampled-token handoff
                 from the previous PP step (avoids host token materialization).
+            spec_window_handoff: Optional previous verify step's device results; the step's optimistic verify
+                windows are rewritten from them on the device (see
+                ``BatchMetadataPreparer.apply_spec_window_handoff``), and the per-row correction is left in
+                ``last_spec_window_delta``.
             wait_for_outputs: If ``True``, block on the device-side output
                 arrays before returning so the timing metrics reflect full
                 completion; otherwise the returned arrays may still be running.
@@ -1473,16 +1545,23 @@ class ExecutionManager:
                 bool(wait_for_outputs),
             )
         microbatch_result = None
+        if int(getattr(self, "recurrent_slot_group_size", 1) or 1) > 1 and recurrent_slot_indices_cpu is not None:
+            spec_recurrent_commit_cpu = self._recurrent_slot_bases(
+                scheduled_full_cpu, num_computed_tokens_cpu, recurrent_slot_indices_cpu
+            )
         # The wavefront path builds per-microbatch metadata without model side inputs, physical recurrent-state slots
         # or speculative recurrent commits; a step that needs any of them must take the full-window path instead.
         # The runner supplies recurrent_slot_indices_cpu for every model, including ordinary attention models.
         # BatchMetadataPreparer consumes those indices only for slot-indexed state or SPMD DP, so gate on those
         # capabilities rather than the presence of the always-allocated bookkeeping array.
+        # Its sampler does not apply per-request logit bias, allowed-token or bad-word constraints either; a step
+        # whose requests carry any of them samples on the full-window path, which does.
         microbatch_unsupported = (
             bool(model_side_inputs_cpu)
             or self._slot_indexed_state
             or self._batch_preparer._uses_spmd_dp()
             or spec_recurrent_commit_cpu is not None
+            or sampling_constraints is not None
         )
         if self._pp_microbatch is not None and not microbatch_unsupported:
             microbatch_result = self._pp_microbatch.try_execute(
@@ -1573,7 +1652,19 @@ class ExecutionManager:
             batch_metadata = self._apply_device_token_handoff(batch_metadata, device_token_handoff)
             input_ids_buf = batch_metadata.input_ids_buf
             prep_handoff_took = time.time() - prep_phase_start
+        self.last_spec_window_delta = None
+        if spec_window_handoff is not None:
+            prep_phase_start = time.time()
+            batch_metadata, self.last_spec_window_delta = self._batch_preparer.apply_spec_window_handoff(
+                batch_metadata, spec_window_handoff
+            )
+            input_ids_buf = batch_metadata.input_ids_buf
+            position_ids_buf = batch_metadata.position_ids_buf
+            prep_handoff_took += time.time() - prep_phase_start
 
+        # Per-request logit bias, allow-list and bad-word constraints go to the sampler only: the batch metadata is an
+        # argument of the compiled model step, whose signature has none of them.
+        self.last_batch_metadata = batch_metadata
         window_emits_token = self._window_emits_token(
             scheduled_full_cpu=scheduled_full_cpu,
             active_mask_full_cpu=active_mask_full_cpu,
@@ -1640,13 +1731,13 @@ class ExecutionManager:
             sample_took = 0.0
             execute_total_took = time.time() - start_prep
             execute_overhead_took = max(0.0, float(execute_total_took - (prep_took + exec_took + sample_took)))
-            out_tokens_full = jax.device_put(
-                numpy.full((int(padded_num_reqs),), -1, dtype=numpy.int32),
+            out_tokens_full, valid_mask_full = put_host_payload(
+                (
+                    numpy.full((int(padded_num_reqs),), -1, dtype=numpy.int32),
+                    numpy.zeros((int(padded_num_reqs),), dtype=numpy.bool_),
+                ),
                 self._empty_sharding,
-            )
-            valid_mask_full = jax.device_put(
-                numpy.zeros((int(padded_num_reqs),), dtype=numpy.bool_),
-                self._empty_sharding,
+                host_payloads_replicated=self.host_payloads_replicated,
             )
             metrics = {
                 "exec_time": exec_took,
@@ -1762,8 +1853,11 @@ class ExecutionManager:
             & (self._sampler_scheduled_cpu[: int(sampler_padded_num_reqs)] > 0)
             & (self._sampler_seq_lens_cpu[: int(sampler_padded_num_reqs)] >= req_num_tokens_for_sampler)
         )
+        # The fused greedy argmax applies no logit bias, allow-list or bad-word mask; a step carrying one samples
+        # through the sampler, which does.
         use_greedy_argmax_fastpath = bool(
             not need_penalties
+            and sampling_constraints is None
             # Under an MPMD/PP mesh the logits live on the final stage's
             # submesh, but the fastpath's helper tensors (valid mask, RNG
             # fold scalar) are replicated over the full mesh — a device-set
@@ -1798,6 +1892,14 @@ class ExecutionManager:
             padded_num_reqs=model_logits_padded_num_reqs,
             inputs=inputs,
             use_pipeline_runtime=use_pipeline_runtime_for_window,
+            decode_only=bool(
+                not self.model.mesh.is_mpmd
+                and self._is_decode_only_window(
+                    scheduled_full_cpu=scheduled_full_cpu,
+                    active_mask_full_cpu=active_mask_full_cpu,
+                    padded_num_reqs=padded_num_reqs,
+                )
+            ),
         )
         model_enqueue_took = time.time() - model_enqueue_start
         if self._verbose and num_tokens > 0:
@@ -1873,6 +1975,7 @@ class ExecutionManager:
                 compact_presence_penalties_cpu=self._sampler_presence_penalties_cpu,
                 compact_repetition_penalties_cpu=self._sampler_repetition_penalties_cpu,
                 need_penalties=need_penalties,
+                sampling_constraints=sampling_constraints,
             )
             sampler_enqueue_took = time.time() - sampler_enqueue_start
             if self._verbose and num_tokens > 0:
@@ -1976,7 +2079,9 @@ class ExecutionManager:
         cached = self._greedy_mask_cache
         if cached is not None and cached[0] == key:
             return cached[1]
-        device_mask = jax.device_put(valid_mask_cpu, self._empty_sharding)
+        device_mask = put_host_payload(
+            valid_mask_cpu, self._empty_sharding, host_payloads_replicated=self.host_payloads_replicated
+        )
         self._greedy_mask_cache = (key, device_mask)
         return device_mask
 
@@ -1987,7 +2092,11 @@ class ExecutionManager:
         """
         cached = self._greedy_total_tokens_cache.get(total_tokens)
         if cached is None:
-            cached = jax.device_put(jnp.asarray(total_tokens, dtype=jnp.int32), self._empty_sharding)
+            cached = put_host_payload(
+                numpy.asarray(total_tokens, dtype=numpy.int32),
+                self._empty_sharding,
+                host_payloads_replicated=self.host_payloads_replicated,
+            )
             self._greedy_total_tokens_cache[total_tokens] = cached
         return cached
 
@@ -1997,6 +2106,7 @@ class ExecutionManager:
         padded_num_reqs: int,
         inputs: StepFunctionInputs,
         use_pipeline_runtime: bool = True,
+        decode_only: bool = False,
     ) -> ModelStepOutputs:
         """Run the compiled model forward step and update self.kv_pages.
 
@@ -2011,6 +2121,9 @@ class ExecutionManager:
             use_pipeline_runtime: Select the resident PP-runtime backbone
                 variant for true decode wavefronts, or the direct SpectraX
                 variant for prompt prefill chunks.
+            decode_only: Whether every active row of the window schedules exactly one token. On SPMD meshes such
+                a window runs the decode-layout program of its bucket when one was compiled; the key that ran is
+                recorded in ``last_model_step_key``.
 
         Returns:
             ModelStepOutputs containing updated kv_pages, hidden_states, and
@@ -2026,7 +2139,12 @@ class ExecutionManager:
             num_tokens=num_tokens,
             padded_num_reqs=padded_num_reqs,
             use_pipeline_runtime=use_pipeline_runtime,
+            decode_only=decode_only,
         )
+        if not self.model.mesh.is_mpmd:
+            self.last_model_step_key = self._model_executor.model_step_key(
+                num_tokens, padded_num_reqs, decode_only=decode_only
+            )
         # Do not block here: allow the caller to pipeline dependent work
         # (e.g. enqueue sampling) before synchronizing.
         graphstate_arg, graphother_arg = self._model_executor.runtime_graph_args()
@@ -2126,6 +2244,41 @@ class ExecutionManager:
         if changed:
             self.kv_pages = HybridCache(views=new_views)
 
+    def _recurrent_slot_bases(
+        self,
+        scheduled_cpu: numpy.ndarray,
+        num_computed_cpu: numpy.ndarray,
+        slot_indices_cpu: numpy.ndarray,
+    ) -> numpy.ndarray:
+        """Per window row, the tokens slot ``g`` covers before this step; then record what it covers after it.
+
+        With slot groups of ``W`` slots a row of at most ``W`` tokens writes the state after its first token into
+        slot ``g`` (and after token ``j`` into ``g + j``), a longer row its final state. So after a step slot ``g``
+        covers ``computed + 1`` tokens for a short row and ``computed + scheduled`` for a chunk row. The device reads
+        slot ``g + (context before the step - base)`` on the next step, which is the drafts the previous verify step
+        accepted; no acceptance result is needed here.
+
+        Args:
+            scheduled_cpu: Scheduled tokens per window row.
+            num_computed_cpu: Computed tokens per window row before this step.
+            slot_indices_cpu: Base slot ``g`` per window row.
+
+        Returns:
+            The ``[2, max_num_reqs]`` step payload: row 0 holds the bases, row 1 zeros.
+        """
+        width = self.recurrent_slot_group_size
+        out = self._recurrent_base_cpu
+        out.fill(0)
+        by_slot = self._recurrent_base_by_slot
+        n = min(out.shape[1], len(scheduled_cpu), len(num_computed_cpu), len(slot_indices_cpu))
+        sched = numpy.asarray(scheduled_cpu[:n], dtype=numpy.int64)
+        computed = numpy.asarray(num_computed_cpu[:n], dtype=numpy.int64)
+        slots = numpy.asarray(slot_indices_cpu[:n], dtype=numpy.int64)
+        live = (sched > 0) & (slots >= 0) & (slots < by_slot.shape[0])
+        out[0, :n] = numpy.where(live, by_slot[numpy.clip(slots, 0, by_slot.shape[0] - 1)], 0)
+        by_slot[slots[live]] = (computed + numpy.where(sched <= width, 1, sched))[live]
+        return out
+
     def _recurrent_snapshot_store(self, leaves: list[tuple[int, str, typing.Any]]) -> list[jax.Array]:
         """Return (allocating on first use) the snapshot arrays matching ``leaves``."""
         signature = tuple((idx, name, tuple(array.shape[1:]), str(array.dtype)) for idx, name, array in leaves)
@@ -2143,13 +2296,8 @@ class ExecutionManager:
             raise RuntimeError("Recurrent prefix snapshots were requested but no snapshot slots are configured.")
         store: list[typing.Any] = [None] * len(leaves)
         for positions in _group_by_devices(leaves).values():
-            shapes = [((num_slots, *leaves[i][2].shape[1:]), leaves[i][2].dtype) for i in positions]
-            shardings = [_snapshot_sharding(leaves[i][2]) for i in positions]
-
-            def make(shapes=shapes):
-                return [jnp.zeros(shape, dtype) for shape, dtype in shapes]
-
-            for i, value in zip(positions, jax.jit(make, out_shardings=shardings)(), strict=True):
+            make = _jit_snapshot_zeros(*_snapshot_zeros_key(leaves, positions, num_slots))
+            for i, value in zip(positions, make(), strict=True):
                 store[i] = value
         self._recurrent_snapshot_arrays = store
         self._recurrent_snapshot_signature = signature
@@ -2438,9 +2586,9 @@ class ExecutionManager:
         """Delegate to :meth:`CompileOrchestrator._compile_backbone_variant`."""
         self._get_compile_orchestrator()._compile_backbone_variant(**kwargs)
 
-    def _reset_kv_pages_after_compile_warmup(self) -> None:
+    def _reset_kv_pages_after_compile_warmup(self, *, force: bool = False) -> None:
         """Delegate to :meth:`CompileOrchestrator._reset_kv_pages_after_compile_warmup`."""
-        self._get_compile_orchestrator()._reset_kv_pages_after_compile_warmup()
+        self._get_compile_orchestrator()._reset_kv_pages_after_compile_warmup(force=force)
 
     def _compile_lm_head_variant(self, **kwargs) -> None:
         """Delegate to :meth:`CompileOrchestrator._compile_lm_head_variant`."""
@@ -2449,6 +2597,107 @@ class ExecutionManager:
     def _compile_sampler_variant(self, **kwargs) -> None:
         """Delegate to :meth:`CompileOrchestrator._compile_sampler_variant`."""
         self._get_compile_orchestrator()._compile_sampler_variant(**kwargs)
+
+    def _warm_step_programs(self, *, logits_buckets: list[int], sampler_buckets: list[int]) -> None:
+        """Compile, before serving, the small per-step programs around the model step for the whole bucket grid.
+
+        The sampler's row compaction (slice or gather, scatter back), the fused greedy argmax and the async token
+        handoff gather each compile once per window bucket (and sampler bucket) the first time a step reaches that
+        layout. Requests finishing at different times reach new layouts mid-run, and on a multi-host mesh the one
+        host compiling then holds every other host in the next collective. Scratch inputs only: the live RNG key,
+        token counts and cache are neither read for their values nor written, and nothing called here donates.
+
+        Args:
+            logits_buckets: Request buckets of the model step's logits rows.
+            sampler_buckets: Compiled sampler request buckets.
+        """
+        logits_sharding = self._model_executor._lm_head_replicated_sharding() or self._empty_sharding
+        tokens = self.sampler_runtime.warm_compaction_programs(
+            logits_buckets=logits_buckets,
+            sampler_buckets=sampler_buckets,
+            logits_dtype=self.model.dtype,
+            logits_sharding=logits_sharding,
+            rng_key=self.rng_key,
+        )
+        replicated = self.host_payloads_replicated
+        if not self._model_executor._uses_mpmd_mesh():
+            key = _scratch_copy(self.rng_key)
+            vocab = int(self._sampler_vocab_size)
+            for m in sorted({int(b) for b in logits_buckets if int(b) > 0}):
+                logits = jnp.zeros((m, vocab), dtype=self.model.dtype, device=logits_sharding)
+                mask = put_host_payload(
+                    numpy.ones((m,), dtype=numpy.bool_), self._empty_sharding, host_payloads_replicated=replicated
+                )
+                total = put_host_payload(
+                    numpy.asarray(m, dtype=numpy.int32), self._empty_sharding, host_payloads_replicated=replicated
+                )
+                tokens.append(_greedy_argmax_tokens(logits, mask, key, total, padded_num_reqs=m)[1])
+        # The handoff reads a window's sampled tokens as the runner keeps them (``tokens[:rows]``), from either sampler.
+        rows = put_host_payload(
+            numpy.zeros((int(self.max_num_reqs),), dtype=numpy.int32),
+            self._empty_sharding,
+            host_payloads_replicated=replicated,
+        )
+        seen: set[tuple[int, typing.Any]] = set()
+        warmed = []
+        for out in tokens:
+            m = int(out.shape[0])
+            if (m, out.sharding) in seen:
+                continue
+            seen.add((m, out.sharding))
+            source = out[:m]
+            warmed.append(gather_handoff_tokens([source, source], [rows, rows], self._empty_sharding))
+        jax.block_until_ready(warmed)
+        self._warm_recurrent_slot_programs()
+
+    def _warm_recurrent_slot_programs(self) -> None:
+        """Compile the recurrent slot-maintenance programs from the live cache's shapes, before serving.
+
+        Zeroing a finished request's slots, moving rows and their sidecars when the batch layout changes, and the
+        prefix-snapshot store's allocation, save and restore each run one fused program per pool, compiled the first
+        time a request finishes, moves or hits the prefix cache. They are lowered here from abstract shapes and
+        shardings (with host index vectors where serving passes host arrays): nothing is allocated, read or written.
+        """
+        cache = self.kv_pages
+        if not isinstance(cache, HybridCache):
+            return
+
+        def abstract(array: jax.Array) -> jax.ShapeDtypeStruct:
+            return jax.ShapeDtypeStruct(array.shape, array.dtype, sharding=array.sharding)
+
+        views = list(cache.views)
+        for (n_slots, _devices), arrays in _bucket_leaf_arrays(_recurrent_leaf_entries(views)).items():
+            shardings = tuple(array.sharding for array in arrays)
+            leaves = [abstract(array) for array in arrays]
+            index = jax.ShapeDtypeStruct((n_slots,), jnp.int32)
+            keep = jax.ShapeDtypeStruct((n_slots,), jnp.bool_)
+            _jit_zero_rows(shardings).lower(leaves, keep).compile()
+            _jit_permute_rows(shardings).lower(leaves, index, keep).compile()
+        for (n_slots, _devices), entries in _recurrent_sidecar_pools(views).items():
+            arrays = [entry[2] for entry in entries]
+            transform = _jit_slot_sidecar_rows(
+                tuple(array.sharding for array in arrays), tuple(entry[3] for entry in entries)
+            )
+            transform.lower(
+                [abstract(array) for array in arrays],
+                jax.ShapeDtypeStruct((n_slots,), jnp.int32),
+                jax.ShapeDtypeStruct((n_slots,), jnp.bool_),
+            ).compile()
+        num_slots = int(getattr(self, "recurrent_snapshot_slots", 0) or 0)
+        leaves = _per_slot_state_leaves(views)
+        if num_slots <= 0 or not leaves or not all(isinstance(leaf[2], jax.Array) for leaf in leaves):
+            return
+        rows = jax.ShapeDtypeStruct((int(self.max_num_reqs),), jnp.int32)
+        for positions in _group_by_devices(leaves).values():
+            shapes, snapshot_shardings = _snapshot_zeros_key(leaves, positions, num_slots)
+            _jit_snapshot_zeros(shapes, snapshot_shardings).lower().compile()
+            pools = [abstract(leaves[i][2]) for i in positions]
+            snapshots = [
+                jax.ShapeDtypeStruct(shape, dtype, sharding=sharding)
+                for (shape, dtype), sharding in zip(shapes, snapshot_shardings, strict=True)
+            ]
+            _jit_snapshot_save(snapshot_shardings).lower(pools, snapshots, rows, rows).compile()
+            _jit_snapshot_restore(tuple(pool.sharding for pool in pools)).lower(pools, snapshots, rows, rows).compile()
 
     def get_compile_configurations(
         self,
@@ -2504,6 +2753,18 @@ class ExecutionManager:
         active_reqs = max(1, min(padded_num_reqs, max_num_reqs, num_tokens))
         scheduled_full_cpu[:active_reqs] = 1
         active_mask_full_cpu[:active_reqs] = True
+        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+        if dp_size > 1 and int(max_num_reqs) % dp_size == 0:
+            # Rank-major DP gives every rank ``num_tokens / dp`` tokens and ``max_num_reqs / dp`` rows. Dealing the
+            # dummy rows round-robin over the ranks keeps each rank within both budgets for every compiled pair
+            # (``active_reqs <= num_tokens`` and ``num_tokens % dp == 0``); packing them into the first rows would
+            # put up to ``padded_num_reqs`` tokens on rank 0 alone.
+            rows_per_rank = int(max_num_reqs) // dp_size
+            slot_group = max(1, int(getattr(self, "recurrent_slot_group_size", 1) or 1))
+            dummy = numpy.arange(active_reqs, dtype=numpy.int32)
+            global_rows = (dummy % dp_size) * rows_per_rank + dummy // dp_size
+            window_row_indices_cpu[:active_reqs] = global_rows
+            recurrent_slot_indices_cpu[:active_reqs] = global_rows * slot_group
         input_ids_buf = jax.device_put(jnp.zeros((self.max_num_tokens,), dtype=jnp.int32), self._empty_sharding)
         position_ids_buf = jax.device_put(jnp.zeros((self.max_num_tokens,), dtype=jnp.int32), self._empty_sharding)
 

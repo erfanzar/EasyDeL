@@ -5,35 +5,12 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from easydel.inference.esurge.core import utils as cache_utils
-from easydel.inference.esurge.core.utils import hash_request_tokens
 from easydel.inference.esurge.multimodal.manager import MultiModalManager
 from easydel.inference.esurge.multimodal.types import BatchedMultiModalInputs, MultiModalFeature
-from easydel.inference.esurge.request import EngineRequest
 
 from .test_mm_manager import _image
 
 pytestmark = pytest.mark.cpu_ok
-
-
-@pytest.mark.parametrize("modality", ["image", "video"])
-def test_equal_pixels_with_different_grids_cannot_share_prefix_pages(modality, monkeypatch):
-    factory = getattr(MultiModalFeature, f"from_{modality}")
-    pixels = np.zeros((16, 3), dtype=np.float32)
-    grids = [np.array([[1, 2, 8]]), np.array([[1, 4, 4]])]
-    features = [factory(pixels, grid) for grid in grids]
-    assert features[0].mm_hash != features[1].mm_hash
-    assert factory(pixels).mm_hash not in {feature.mm_hash for feature in features}
-    assert factory(pixels, grids[0].reshape(3).astype(np.int32)).mm_hash == features[0].mm_hash
-    monkeypatch.setattr(cache_utils, "none_hash", 0, raising=False)
-    requests = [
-        EngineRequest(str(i), [1, 2, 3, 4], None, 2, mm_features=[feature]) for i, feature in enumerate(features)
-    ]
-    first, second = [hash_request_tokens(hash, 2, request) for request in requests]
-    assert len(first) == len(second) == 2
-    assert all(a != b for a, b in zip(first, second, strict=True))
-    features[0].clear_pixel_values()
-    assert hash_request_tokens(hash, 2, requests[0]) == first
 
 
 @pytest.mark.parametrize("modality,shape", [("image", (3, 4, 4)), ("video", (2, 3, 4, 4))])

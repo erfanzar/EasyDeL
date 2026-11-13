@@ -50,19 +50,22 @@ def moe_row_gather_sum(
     indices: Int[Array, "tokens k"],
     weights: Float[Array, "tokens k"],
     out_dtype: jax.typing.DTypeLike | None = None,
+    skip_negative: bool = False,
 ) -> Float[Array, "tokens hidden"]:
     """``out[t] = sum_j weights[t, j] * y[indices[t, j]]`` (fp32 accumulation), as a gather plus a reduction.
 
     Args:
         y: ``[src_rows, hidden]`` source rows.
-        indices: ``[tokens, k]`` row ids (clamped to range).
+        indices: ``[tokens, k]`` row ids (clamped to range; negative = inactive slot under ``skip_negative``).
         weights: ``[tokens, k]`` combine weights.
         out_dtype: Output dtype (default ``y.dtype``).
+        skip_negative: A negative index contributes exactly zero (selected away before the multiply, never
+            multiplied, so non-finite rows that only inactive slots point at cannot leak into the sum).
 
     Returns:
         ``[tokens, hidden]`` in ``out_dtype``.
     """
-    return moe_row_gather_sum_xla(y, indices, weights, out_dtype)
+    return moe_row_gather_sum_xla(y, indices, weights, out_dtype, skip_negative)
 
 
 __all__ = ("moe_row_gather", "moe_row_gather_sum")

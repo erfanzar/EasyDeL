@@ -67,6 +67,7 @@ Example:
 
 from .auth_manager import (
     EnhancedApiKeyManager,
+    InvalidApiKey,
     PermissionDenied,
     QuotaExceeded,
     RateLimitExceeded,
@@ -94,6 +95,7 @@ __all__ = [
     "AuthWorkerClient",
     "AuthWorkerManager",
     "EnhancedApiKeyManager",
+    "InvalidApiKey",
     "PermissionDenied",
     "QuotaConfig",
     "QuotaExceeded",

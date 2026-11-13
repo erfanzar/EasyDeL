@@ -36,6 +36,7 @@ migration.
 
 from __future__ import annotations
 
+import itertools
 import queue
 import threading
 import time
@@ -51,6 +52,9 @@ if typing.TYPE_CHECKING:
     from ..scheduler.output import SchedulerOutput
 
 _POLL_MS = 50
+
+# Distinct inproc endpoint per leader IO loop, so a restarted leader never rebinds a name a closing socket still holds.
+_LEADER_WAKE_IDS = itertools.count()
 
 # Outbox destination sentinels: the step stream broadcasts to worker ranks
 # only; _DEST_ALL additionally covers request-plane clients (shutdown).
@@ -237,6 +241,12 @@ class ZmqLeaderCoordinator:
         self._outbox: queue.Queue = queue.Queue()
         self._io_thread: threading.Thread | None = None
         self._stop_io = threading.Event()
+        # Caller threads hand frames to the IO thread (the ROUTER socket's only user) through the outbox and poke an
+        # inproc wakeup socket that interrupts its poll, so a queued Step or Drain leaves at once instead of after the
+        # poll interval: workers start a step only when its command arrives, and the leader's devices wait for them
+        # in the step's first collective. The IO loop owns the wakeup sockets; _wake_push is None while it is down.
+        self._wake_push = None
+        self._wake_lock = threading.Lock()
         self._client_identities: dict[str, bytes] = {}
         self._next_step_id = 0
         self._reset_control_state()
@@ -305,6 +315,16 @@ class ZmqLeaderCoordinator:
     def send_to_peer(self, identity: bytes, header: wire.WireMessage, payload: bytes | None = None) -> None:
         """Queue a message for one specific peer (worker or client) identity."""
         self._outbox.put((identity, wire.encode_message(header), payload))
+        self._wake_io()
+
+    def _wake_io(self) -> None:
+        """Interrupt the IO loop's poll so the frames just queued in the outbox leave now (callable from any thread)."""
+        with self._wake_lock:
+            if self._wake_push is not None:
+                try:
+                    self._wake_push.send(b"", flags=1)  # zmq.DONTWAIT
+                except Exception:
+                    pass
 
     def client_identity(self, client_id: str) -> bytes | None:
         """Resolve a request-plane client's ZMQ identity, if connected."""
@@ -325,6 +345,7 @@ class ZmqLeaderCoordinator:
         payload = wire.encode_payload(scheduler_output)
         self._ledger.expect(step_id, self._ledger.last_acked.keys())
         self._outbox.put((_DEST_WORKERS, wire.encode_message(header), payload))
+        self._wake_io()
 
     def execute_sync(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         """Mirror STEP(SYNC) to all workers, then execute locally."""
@@ -352,6 +373,7 @@ class ZmqLeaderCoordinator:
             header = wire.Drain(step_id=handle.step_id, want_digest=want_digest)
             self._ledger.expect(handle.step_id, self._ledger.last_acked.keys())
             self._outbox.put((_DEST_WORKERS, wire.encode_message(header), None))
+            self._wake_io()
         else:
             want_digest = False
         model_output = self._runner.wait_for_execution(handle.runner_handle)
@@ -380,8 +402,10 @@ class ZmqLeaderCoordinator:
         if self._io_thread is None:
             return
         self._outbox.put((_DEST_ALL, wire.encode_message(wire.Shutdown(reason=reason)), None))
+        self._wake_io()
         time.sleep(0.05)
         self._stop_io.set()
+        self._wake_io()
         self._io_thread.join(timeout=5.0)
         self._io_thread = None
 
@@ -423,8 +447,16 @@ class ZmqLeaderCoordinator:
         sock = ctx.socket(zmq.ROUTER)
         sock.setsockopt(zmq.LINGER, 500)
         sock.bind(self._bind_endpoint)
+        wake_endpoint = f"inproc://esurge-leader-wake-{next(_LEADER_WAKE_IDS)}"
+        wake_pull = ctx.socket(zmq.PULL)
+        wake_pull.bind(wake_endpoint)
+        wake_push = ctx.socket(zmq.PUSH)
+        wake_push.connect(wake_endpoint)
+        with self._wake_lock:
+            self._wake_push = wake_push
         poller = zmq.Poller()
         poller.register(sock, zmq.POLLIN)
+        poller.register(wake_pull, zmq.POLLIN)
         worker_identities: dict[int, bytes] = {}
         authed: set[bytes] = set()
         last_beat = 0.0
@@ -480,6 +512,9 @@ class ZmqLeaderCoordinator:
                     last_sweep = now
 
                 events = dict(poller.poll(_POLL_MS))
+                if wake_pull in events:
+                    while wake_pull.poll(0):
+                        wake_pull.recv()
                 if sock not in events:
                     continue
                 frames = sock.recv_multipart()
@@ -522,6 +557,11 @@ class ZmqLeaderCoordinator:
             # interval, so the top-of-loop drain can miss it. LINGER on
             # close() flushes the queued frames to peers.
             _drain_outbox()
+            with self._wake_lock:
+                if self._wake_push is wake_push:
+                    self._wake_push = None
+            wake_push.close(linger=0)
+            wake_pull.close(linger=0)
             sock.close(linger=500)
 
 

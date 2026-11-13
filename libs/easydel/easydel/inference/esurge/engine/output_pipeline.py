@@ -31,6 +31,7 @@ matches are forwarded to the scheduler through the injected
 
 from __future__ import annotations
 
+import itertools
 import queue
 import threading
 import time
@@ -52,20 +53,48 @@ if typing.TYPE_CHECKING:
 _STOP_SENTINEL = None
 
 
-class _TokenPrefixView(Sequence[int]):
-    """Fixed-length view over an append-only token list.
+def _cache_usage_metrics(num_prompt_tokens: int, cached_tokens: int, prefix_cache_page_size: int) -> dict:
+    """Return request-level prefix-cache usage.
 
-    Streaming parsers need the previous token count to compute the current
-    delta. Keeping a prefix view avoids copying the full token history every
-    token while still behaving like the previous list for ``len()``,
-    iteration, indexing, and membership checks.
+    Args:
+        num_prompt_tokens: Prompt length in tokens.
+        cached_tokens: Prompt tokens read from the prefix cache.
+        prefix_cache_page_size: KV page size when prefix caching is enabled, ``0`` when it is disabled.
+
+    Returns:
+        ``cache_read`` (prompt tokens served from cache), ``uncached_input`` (prompt tokens prefilled),
+        ``cache_written`` (prompt tokens newly committed to the prefix cache: only whole pages are hashed,
+        so a partial last page is not counted) and ``cache_hit``.
+    """
+    prompt = max(0, int(num_prompt_tokens))
+    cache_read = max(0, min(int(cached_tokens), prompt))
+    uncached_input = prompt - cache_read
+    page = int(prefix_cache_page_size)
+    cache_written = max(0, (prompt // page) * page - cache_read) if page > 0 else 0
+    return {
+        "cache_hit": cache_read > 0,
+        "cache_read": cache_read,
+        "cache_written": cache_written,
+        "uncached_input": uncached_input,
+    }
+
+
+class _PrefixView(Sequence):
+    """Fixed-length view over an append-only list.
+
+    Streaming parsers need the previous token count, and every streamed
+    snapshot needs the token ids and log probabilities emitted so far. A
+    prefix view of the growing list gives each of them a stable value without
+    copying the whole history on every step, while behaving like the list it
+    stands for under ``len()``, iteration, indexing, slicing, membership and
+    equality. Finished outputs get a real list instead.
     """
 
-    __slots__ = ("_length", "_tokens")
+    __slots__ = ("_items", "_length")
 
-    def __init__(self, tokens: list[int], length: int):
-        """Bind this view to the live ``tokens`` list at the given prefix ``length``."""
-        self._tokens = tokens
+    def __init__(self, items: list, length: int):
+        """Bind this view to the live ``items`` list at the given prefix ``length``."""
+        self._items = items
         self._length = int(length)
 
     def __len__(self) -> int:
@@ -82,19 +111,47 @@ class _TokenPrefixView(Sequence[int]):
         """
         if isinstance(index, slice):
             start, stop, step = index.indices(self._length)
-            return [self._tokens[idx] for idx in range(start, stop, step)]
+            if step == 1:
+                return self._items[start:stop]
+            return [self._items[idx] for idx in range(start, stop, step)]
         if index < 0:
             index += self._length
         if index < 0 or index >= self._length:
             raise IndexError(index)
-        return self._tokens[index]
+        return self._items[index]
+
+    def __iter__(self):
+        """Iterate over the prefix window without copying it."""
+        return itertools.islice(self._items, self._length)
 
     def __contains__(self, value: object) -> bool:
         """Return whether ``value`` appears in the prefix window."""
-        for idx in range(self._length):
-            if self._tokens[idx] == value:
-                return True
-        return False
+        try:
+            self._items.index(value, 0, self._length)
+        except ValueError:
+            return False
+        return True
+
+    def __eq__(self, other: object) -> bool:
+        """Compare element-wise with any sequence, like the list it stands for."""
+        if not isinstance(other, list | _PrefixView):
+            return NotImplemented
+        return len(other) == self._length and all(a == b for a, b in zip(self, other, strict=False))
+
+    __hash__ = None
+
+    def __repr__(self) -> str:
+        """Render like the list prefix it views."""
+        return repr(self._items[: self._length])
+
+    @property
+    def items(self) -> list:
+        """The live backing list."""
+        return self._items
+
+    def covers_items(self) -> bool:
+        """Whether this view spans the whole backing list, so the list may grow in place."""
+        return self._length == len(self._items)
 
 
 class OutputPipeline:
@@ -136,6 +193,7 @@ class OutputPipeline:
         on_stop_strings: typing.Callable[[dict[str, str]], None],
         on_activity: typing.Callable[[], None],
         on_fatal: typing.Callable[[BaseException, str], None],
+        prefix_cache_page_size: int = 0,
     ) -> None:
         self.queue: queue.Queue = queue.Queue()
         self._on_fatal = on_fatal
@@ -146,6 +204,7 @@ class OutputPipeline:
         self._eos_set = {int(tid) for tid in eos_token_ids if tid is not None}
         self.decode_interval_tokens = int(decode_interval_tokens)
         self.decode_interval_secs = float(decode_interval_secs)
+        self._prefix_cache_page_size = max(0, int(prefix_cache_page_size))
         self._on_stop_strings = on_stop_strings
         self._on_activity = on_activity
 
@@ -256,6 +315,37 @@ class OutputPipeline:
             return tokens
         return [tok for tok in tokens if tok not in eos_set]
 
+    @staticmethod
+    def _decode_request(
+        request_id: str,
+        tokens: list[int],
+        *,
+        token_offset: int,
+        text_offset: int,
+        finished: bool,
+        skip_special_tokens: bool,
+        spaces_between_special_tokens: bool,
+        prompt_context: list[int] | None,
+        tokens_delta: list[int] | None = None,
+    ) -> dict:
+        """Build one bounded native decode request, carrying only unsubmitted tokens."""
+        if tokens_delta is None:
+            if token_offset < 0 or token_offset > len(tokens):
+                token_offset = 0
+            delta = tokens[token_offset:]
+        else:
+            delta = tokens_delta
+        return {
+            "request_id": request_id,
+            "tokens_delta": delta,
+            "token_offset": token_offset,
+            "text_offset": text_offset,
+            "finished": finished,
+            "skip_special_tokens": skip_special_tokens,
+            "spaces_between_special_tokens": spaces_between_special_tokens,
+            "prompt_context": prompt_context,
+        }
+
     def _decode_with_pipeline(
         self,
         request_id: str,
@@ -266,35 +356,110 @@ class OutputPipeline:
         spaces_between_special_tokens: bool = True,
         prompt_context: list[int] | None = None,
         tokens_are_eos_filtered: bool = False,
+        token_offset: int = 0,
+        text_offset: int = 0,
+        decode_results: dict[tuple[str, bool], DetokenizerResult] | None = None,
     ) -> DetokenizerResult:
-        """Decode tokens using the detokenizer worker pipeline.
-
-        Performs incremental detokenization with streaming text delta support.
-
-        Args:
-            request_id: Request ID for tracking state in the detokenizer.
-            generated_tokens: Full list of generated tokens so far.
-            finished: Whether generation is complete (triggers final flush).
-            skip_special_tokens: Whether to skip special tokens in output.
-            spaces_between_special_tokens: Whether to preserve tokenizer-inserted
-                spacing between adjacent special tokens.
-            prompt_context: Last N prompt token IDs for first-token context.
-            tokens_are_eos_filtered: Set when ``generated_tokens`` has already
-                had EOS ids removed by the caller. This avoids another
-                full-list walk in the hot streaming path.
-
-        Returns:
-            DetokenizerResult with accumulated_text, delta_text, and indices.
-        """
+        """Consume a planned native decode or submit one terminal flush through the same batch API."""
         tokens_for_decode = generated_tokens if tokens_are_eos_filtered else self._filter_eos_tokens(generated_tokens)
-        return self._detokenizer_client.decode(
+        key = (request_id, finished)
+        if decode_results is not None:
+            planned = decode_results.pop(key, None)
+            if planned is not None:
+                if planned.last_decoded_index != len(tokens_for_decode):
+                    raise RuntimeError(
+                        f"Planned detokenization for {request_id!r} decoded {planned.last_decoded_index} tokens, "
+                        f"but the output stream has {len(tokens_for_decode)}."
+                    )
+                return planned
+        request = self._decode_request(
             request_id,
             tokens_for_decode,
+            token_offset=token_offset,
+            text_offset=text_offset,
             finished=finished,
             skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=spaces_between_special_tokens,
             prompt_context=prompt_context,
         )
+        return self._detokenizer_client.decode_batch([request])[0]
+
+    def _should_decode(self, rd, num_decodable: int, now: float, finished: bool) -> bool:
+        """Apply the streaming interval policy without mutating request state."""
+        last_idx = rd.last_decoded_index
+        if finished:
+            return num_decodable != 0 or last_idx != 0
+        sampling_params = rd.sampling_params
+        if getattr(sampling_params, "stop", None):
+            interval_tokens = min(self.decode_interval_tokens, 4)
+            interval_secs = min(self.decode_interval_secs, 0.02)
+        else:
+            interval_tokens = self.decode_interval_tokens
+            interval_secs = self.decode_interval_secs
+        should_decode = num_decodable - last_idx >= interval_tokens or (now - rd.last_decode_time) >= interval_secs
+        return should_decode and num_decodable > last_idx
+
+    def _plan_decode_batch(self, engine_outputs) -> dict[tuple[str, bool], DetokenizerResult]:
+        """Decode every due request in an output bundle with one native call.
+
+        Token/logprob bookkeeping still happens in the main ordered pass. This planning pass only reads it and sends
+        the unsubmitted suffix, so its cost does not grow with text already emitted. Terminal calls carrying new
+        tokens first need their ordinary streaming decode; their final flush is submitted later through the same API.
+        """
+        requests = []
+        keys = []
+        for client_outputs in engine_outputs.values():
+            now = float(client_outputs.timestamp or time.perf_counter())
+            for engine_output in client_outputs.outputs:
+                request_id = engine_output.request_id
+                rd = self._active_requests.get(request_id)
+                if rd is None:
+                    continue
+                parent_request_id = rd.parent_request_id or request_id
+                if parent_request_id not in self._request_outputs:
+                    continue
+                new_tokens = engine_output.new_token_ids
+                if new_tokens:
+                    decodable = rd.decodable_tokens
+                    filtered_new = [token for token in new_tokens if token not in self._eos_set]
+                    num_decodable = len(decodable) + len(filtered_new)
+                    finished = False
+                elif engine_output.finished:
+                    decodable = self._get_decodable_tokens_for_final(rd)
+                    filtered_new = []
+                    num_decodable = len(decodable)
+                    finished = True
+                else:
+                    continue
+                if not self._should_decode(rd, num_decodable, now, finished):
+                    continue
+
+                token_offset = rd.detokenizer_token_count
+                if token_offset < 0 or token_offset > num_decodable:
+                    token_offset = 0
+                previous = decodable[token_offset:] if token_offset <= len(decodable) else []
+                sampling_params = rd.sampling_params
+                prompt_ctx = rd.prompt_token_ids if rd.last_decoded_index == 0 else None
+                request = self._decode_request(
+                    request_id,
+                    decodable if not new_tokens else [],
+                    token_offset=token_offset,
+                    text_offset=len(rd.detokenized_text),
+                    finished=finished,
+                    skip_special_tokens=bool(getattr(sampling_params, "skip_special_tokens", False)),
+                    spaces_between_special_tokens=bool(getattr(sampling_params, "spaces_between_special_tokens", True)),
+                    prompt_context=prompt_ctx[-8:] if prompt_ctx else None,
+                    tokens_delta=[*previous, *filtered_new],
+                )
+                requests.append(request)
+                keys.append((request_id, finished))
+
+        if not requests:
+            return {}
+        results = self._detokenizer_client.decode_batch(requests)
+        if len(results) != len(keys):
+            raise RuntimeError(f"Detokenizer returned {len(results)} results for {len(keys)} requests.")
+        return dict(zip(keys, results, strict=True))
 
     # Stop-string policy and parser drive
 
@@ -385,9 +550,25 @@ class OutputPipeline:
             stop_sequences = [str(s) for s in (getattr(sampling_params, "stop", None) or []) if s]
             include_stop = bool(getattr(sampling_params, "include_stop_str_in_output", False))
             if stop_sequences:
-                matched = self._find_first_stop_string(accumulated_text, stop_sequences)
+                # Text already scanned without a match cannot hold one, so a streaming step searches only the
+                # new text plus the longest stop's length - 1 characters before it. The final step scans it all.
+                # The window is used only while the scanned text still ends the same way (append-only growth).
+                scan_from = 0
+                scanned = rd.stop_scan_chars
+                overlap = max(len(stop) for stop in stop_sequences) - 1
+                if (
+                    not finished
+                    and 0 < scanned <= len(accumulated_text)
+                    and accumulated_text[max(0, scanned - overlap) : scanned] == rd.stop_scan_tail
+                ):
+                    scan_from = max(0, scanned - overlap)
+                matched = self._find_first_stop_string(accumulated_text[scan_from:], stop_sequences)
+                if matched is None:
+                    rd.stop_scan_chars = len(accumulated_text)
+                    rd.stop_scan_tail = accumulated_text[max(0, len(accumulated_text) - overlap) :]
                 if matched is not None:
                     stop_index, stop_reason = matched
+                    stop_index += scan_from
                     cutoff = stop_index + len(stop_reason) if include_stop else stop_index
                     visible_text = accumulated_text[:cutoff]
                     stop_triggered = True
@@ -587,7 +768,7 @@ class OutputPipeline:
             result = dp.process_delta(accumulated_text, delta_text, token_ids, prev_text, prev_token_ids)
 
         rd.parser_previous_text = accumulated_text
-        rd.parser_previous_token_ids = _TokenPrefixView(token_ids, len(token_ids))
+        rd.parser_previous_token_ids = _PrefixView(token_ids, len(token_ids))
 
         return result.to_dict()
 
@@ -674,6 +855,7 @@ class OutputPipeline:
             return
 
         comp = ro.outputs[sample_index]
+        self._materialize_completion(rd, comp)
         if comp.finish_reason is None:
             logger.warning(
                 "Finishing request %s from scheduler finished_requests without a terminal EngineCoreOutput; "
@@ -726,6 +908,7 @@ class OutputPipeline:
         decodable_tokens: list[int],
         now: float,
         finished: bool,
+        decode_results: dict[tuple[str, bool], DetokenizerResult] | None = None,
     ) -> tuple[dict | None, str, str, bool, str | None]:
         """Decode tokens and run the parser pipeline for a single update.
 
@@ -758,21 +941,8 @@ class OutputPipeline:
         skip_special_tokens = bool(getattr(sampling_params, "skip_special_tokens", False))
         spaces_between_special_tokens = bool(getattr(sampling_params, "spaces_between_special_tokens", True))
 
-        if not finished:
-            has_stop_strings = bool(getattr(sampling_params, "stop", None))
-            if has_stop_strings:
-                interval_tokens = min(self.decode_interval_tokens, 4)
-                interval_secs = min(self.decode_interval_secs, 0.02)
-            else:
-                interval_tokens = self.decode_interval_tokens
-                interval_secs = self.decode_interval_secs
-
-            should_decode = num_decodable - last_idx >= interval_tokens or (now - rd.last_decode_time) >= interval_secs
-            if not should_decode or num_decodable <= last_idx:
-                return None, "", "", False, None
-        else:
-            if num_decodable == 0 and last_idx == 0:
-                return None, "", "", False, None
+        if not self._should_decode(rd, num_decodable, now, finished):
+            return None, "", "", False, None
 
         prompt_ctx = rd.prompt_token_ids if last_idx == 0 else None
         pipeline_result = self._decode_with_pipeline(
@@ -783,18 +953,26 @@ class OutputPipeline:
             spaces_between_special_tokens=spaces_between_special_tokens,
             prompt_context=prompt_ctx[-8:] if prompt_ctx else None,
             tokens_are_eos_filtered=True,
+            token_offset=rd.detokenizer_token_count,
+            text_offset=len(rd.detokenized_text),
+            decode_results=decode_results,
         )
         rd.last_decoded_index = pipeline_result.last_decoded_index
+        rd.detokenizer_token_count = len(decodable_tokens)
         if not finished:
             rd.last_decode_time = now
 
-        raw_accumulated = pipeline_result.accumulated_text
         raw_delta = pipeline_result.delta_text or ""
+        if pipeline_result.accumulated_text is None:
+            raw_accumulated = rd.detokenized_text + raw_delta
+        else:
+            raw_accumulated = pipeline_result.accumulated_text
+        rd.detokenized_text = raw_accumulated
 
         parsed, _visible, _vis_delta, stop_hit, stop_reason = self._parse_with_stop_string_policy(
             rd,
-            accumulated_text=pipeline_result.accumulated_text,
-            delta_text=pipeline_result.delta_text,
+            accumulated_text=raw_accumulated,
+            delta_text=raw_delta,
             token_ids=decodable_tokens,
             finished=finished,
         )
@@ -811,7 +989,9 @@ class OutputPipeline:
         rollout consumers look up each sampled id in the corresponding map.
         A backend may omit probabilities altogether, but partially populated
         sequences or malformed rows are rejected rather than silently shifted.
-        Fresh lists preserve previously yielded streaming snapshots.
+        The maps are appended in place to the completion's backing list and
+        exposed as a new prefix view, so previously yielded streaming
+        snapshots keep their length without copying the whole history.
 
         Args:
             comp: Completion receiving the token maps and sampled logprob sum.
@@ -848,8 +1028,21 @@ class OutputPipeline:
                 raise ValueError(f"Engine log probabilities omit sampled token {token}.")
             maps.append(probabilities)
             sampled_sum += probabilities[token]
-        comp.logprobs = [*(comp.logprobs or []), *maps]
+        existing = comp.logprobs
+        if isinstance(existing, _PrefixView) and existing.covers_items():
+            backing = existing.items
+        else:
+            backing = list(existing or [])
+        backing.extend(maps)
+        comp.logprobs = _PrefixView(backing, len(backing))
         comp.cumulative_logprob = (comp.cumulative_logprob or 0.0) + sampled_sum
+
+    @staticmethod
+    def _materialize_completion(rd, comp) -> None:
+        """Give a finishing completion real lists, built once from the streamed prefix views."""
+        comp.token_ids = list(rd.generated_tokens)
+        if isinstance(comp.logprobs, _PrefixView):
+            comp.logprobs = list(comp.logprobs)
 
     def _append_decodable_tokens(self, rd, new_tokens: list[int]) -> list[int]:
         """Append newly generated tokens to the per-request decode stream.
@@ -1028,6 +1221,7 @@ class OutputPipeline:
         stop_string_finishes: dict[str, str],
         metrics_collector,
         now: float,
+        decode_results: dict[tuple[str, bool], DetokenizerResult] | None = None,
     ) -> tuple[bool, bool]:
         """Run the terminal-step pipeline for a finishing request/sample.
 
@@ -1086,13 +1280,14 @@ class OutputPipeline:
             decodable_tokens,
             now,
             finished=True,
+            decode_results=decode_results,
         )
 
         if stop_hit and stop_reason:
             stop_string_finishes[request_id] = stop_reason
 
+        self._materialize_completion(rd, comp)
         if parsed is not None:
-            comp.token_ids = list(rd.generated_tokens)
             if parsed["tool_calls"]:
                 comp.finish_reason = "tool_calls"
             text_changed, structured_changed = self._update_outputs(
@@ -1115,6 +1310,11 @@ class OutputPipeline:
             ro.tokens_per_second = ro.num_generated_tokens / generation_time if generation_time > 0 else 0.0
         else:
             ro.tokens_per_second = 0.0
+        cache_metrics = _cache_usage_metrics(
+            num_prompt_tokens,
+            engine_output.num_cached_tokens,
+            self._prefix_cache_page_size,
+        )
         ro.metrics = {
             "prompt_tokens": num_prompt_tokens,
             "generated_tokens": ro.num_generated_tokens,
@@ -1122,8 +1322,11 @@ class OutputPipeline:
             "processing_time": elapsed,
             "first_token_time": ro.first_token_time,
             "tokens_per_second": ro.tokens_per_second,
+            **cache_metrics,
         }
 
+        if metrics_collector:
+            metrics_collector.record_cache_read(parent_request_id, cache_metrics["cache_read"])
         if metrics_collector and ro.finished:
             metrics_collector.complete_request(
                 parent_request_id,
@@ -1164,6 +1367,7 @@ class OutputPipeline:
         stop_string_finishes: dict[str, str] = {}
 
         with self._request_lock, self._output_lock:
+            decode_results = self._plan_decode_batch(engine_outputs)
             for client_outputs in engine_outputs.values():
                 now = float(client_outputs.timestamp or time.perf_counter())
                 for engine_output in client_outputs.outputs:
@@ -1191,7 +1395,7 @@ class OutputPipeline:
                         rd.generated_tokens.extend(new_tokens)
                         # Token/probability alignment is independent of decoding
                         # intervals, EOS-only updates and text stop trimming.
-                        comp.token_ids = list(rd.generated_tokens)
+                        comp.token_ids = _PrefixView(rd.generated_tokens, len(rd.generated_tokens))
                         num_generated = len(rd.generated_tokens)
 
                         if rd.first_token_time is None and num_generated > 0:
@@ -1213,6 +1417,7 @@ class OutputPipeline:
                             decodable_tokens,
                             now,
                             finished=False,
+                            decode_results=decode_results,
                         )
                         if stop_hit:
                             force_finished = True
@@ -1245,6 +1450,7 @@ class OutputPipeline:
                             stop_string_finishes,
                             metrics_collector,
                             now,
+                            decode_results=decode_results,
                         )
                         text_changed = text_changed or tc
                         structured_changed = structured_changed or sc

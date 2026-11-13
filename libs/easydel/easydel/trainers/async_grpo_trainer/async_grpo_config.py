@@ -48,12 +48,11 @@ class AsyncGRPOConfig(GRPOConfig):
         """Normalize GRPO settings and validate local async execution knobs.
 
         AsyncGRPO is only backed by local eSurge in EasyDeL. The inherited
-        eSurge runtime flags are therefore forced on here instead of relying on
-        engine defaults, so runtime logs and tests can verify that async
-        scheduler execution is active.
+        eSurge async scheduling and overlap flags are therefore forced on here
+        instead of relying on engine defaults, so runtime logs and tests can
+        verify that async scheduler execution is active.
         """
         super().__post_init__(max_sequence_length=max_sequence_length, quantization_block=quantization_block)
-        self.use_esurge_generation = True
         self.esurge_async_scheduling = True
         self.esurge_overlap_execution = True
         if self.max_inflight_tasks <= 0:

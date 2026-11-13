@@ -76,7 +76,7 @@ from easydel.infra.sharding import (
 from easydel.utils.helpers import check_bool_flag
 
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, OperationsMetadata, unwrap_metadata
-from ..budget import compute_paged_cache_budget
+from ..budget import compute_paged_cache_budget, mesh_process_indices, min_across_processes
 from .utils import kv_cache_update, kv_cache_update_jax
 
 if tp.TYPE_CHECKING:
@@ -517,11 +517,20 @@ def get_page_size_bytes(
     return page_size * num_combined_kv_heads * padded_head_size * kv_cache_dtype_bits // 8
 
 
-def per_device_hbm_budget_bytes(util: float = 0.9, mode: str = "free", safety_margin: int = 256 << 20) -> int:
+def per_device_hbm_budget_bytes(
+    util: float = 0.9,
+    mode: str = "free",
+    safety_margin: int = 256 << 20,
+    mesh: tp.Any = None,
+    largest_allocation_share: float = 1.0,
+) -> int:
     """Calculate available HBM budget per device for cache allocation.
 
     Queries device memory statistics and computes usable memory based
-    on utilization target and safety margin.
+    on utilization target and safety margin. The budget is the free memory, not one free block: a pool made of
+    several arrays only needs each array to fit in a free block. In ``"free"`` mode, when the largest free block
+    is substantially smaller than total free memory, the largest array (holding ``largest_allocation_share`` of
+    the pool) is checked against it; nearly unfragmented memory keeps the old single-block pool bound.
 
     Args:
         util: Target utilization fraction (0.0 to 1.0). Default: 0.9.
@@ -529,11 +538,25 @@ def per_device_hbm_budget_bytes(util: float = 0.9, mode: str = "free", safety_ma
             - "free": Use fraction of currently free memory
             - "total": Use fraction of total memory minus current usage
         safety_margin: Reserved bytes to keep free. Default: 256MB.
+        mesh: Mesh the cache is sharded over. The processes owning its devices agree on one budget (every process
+            when its devices cannot be read); a mesh of this process's own devices needs no agreement. ``None``
+            keeps this process's own budget without any agreement, so a caller that runs on only some processes
+            never waits for the others.
+        largest_allocation_share: Fraction of the pool held by its largest single array, in ``(0, 1]``: ``1 /
+            num_layers`` for one equal array per layer, ``1.0`` for a pool allocated as one array.
 
     Returns:
-        int: Available bytes for cache allocation per device.
-            Returns 4GB as fallback if device stats unavailable.
+        int: Available bytes for cache allocation per device: the minimum over this process's devices and, when
+            ``mesh`` spans several processes, over those processes, so all of them size identical cache pools
+            (see :func:`easydel.caching.budget.min_across_processes`). Returns 4GB as fallback if device stats
+            unavailable.
+
+    Raises:
+        ValueError: If ``largest_allocation_share`` is not in ``(0, 1]``.
     """
+    share = float(largest_allocation_share)
+    if not 0.0 < share <= 1.0:
+        raise ValueError(f"largest_allocation_share must be in (0, 1], got {largest_allocation_share}")
     budgets = []
     for d in jax.local_devices():
         try:
@@ -550,16 +573,27 @@ def per_device_hbm_budget_bytes(util: float = 0.9, mode: str = "free", safety_ma
             continue
 
         free = max(0, int(limit) - int(used))
-        largest_free = s.get("largest_free_block_bytes")
-        if largest_free is not None:
-            free = min(free, max(0, int(largest_free)))
         if mode == "free":
             usable = max(0, int(free * float(util)) - safety_margin)
+            largest_free = s.get("largest_free_block_bytes")
+            if largest_free is not None:
+                block = max(0, int(max(0, int(largest_free)) * float(util)) - safety_margin)
+                if share < 1.0 and block * 5 < usable * 4:
+                    usable = min(usable, int(block / share))
+                else:
+                    # Nearly unfragmented HBM keeps the old pool bound; only real fragmentation opts into
+                    # the per-layer budget, so the fix cannot change serving shapes on healthy devices.
+                    usable = min(usable, block)
         else:
             usable = max(0, int(int(limit) * float(util)) - int(used) - safety_margin)
         budgets.append(usable)
 
-    return min(budgets) if budgets else 4 * (1024**3)
+    local_budget = min(budgets) if budgets else 4 * (1024**3)
+    if mesh is None:
+        return local_budget
+    return min_across_processes(
+        local_budget, what="per-device HBM cache budget", participants=mesh_process_indices(mesh)
+    )
 
 
 @auto_pytree
@@ -638,6 +672,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         runtime_sharding_resolver: RuntimeShardingResolver,
         hbm_utilization: float,
         kv_head_shards: int | None = None,
+        largest_allocation_share: float = 1.0,
     ):
         """Compute available HBM for cache allocation across mesh.
 
@@ -647,6 +682,8 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             hbm_utilization: Target memory utilization fraction.
             kv_head_shards: Effective KV-head shard count to scale by. When
                 ``None``, the physical mesh axis size is used instead.
+            largest_allocation_share: Fraction of the pool held by its largest single array (see
+                :func:`per_device_hbm_budget_bytes`).
 
         Returns:
             int: Available bytes used for KV page-pool sizing, scaled by
@@ -655,7 +692,9 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         physical_kv_head_axis = runtime_sharding_resolver.paxis.kv_head_axis
         physical_kv_head_size = mesh_axis_size(mesh, physical_kv_head_axis)
         kv_head_size = physical_kv_head_size if kv_head_shards is None else max(1, int(kv_head_shards))
-        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
+        budget = per_device_hbm_budget_bytes(
+            hbm_utilization, mode="free", mesh=mesh, largest_allocation_share=largest_allocation_share
+        )
         page_axis_size = mesh_axis_size(
             mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver, mode=MODE_PREFILL)
         )
@@ -776,6 +815,8 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             runtime_sharding_resolver=runtime_sharding_resolver,
             hbm_utilization=hbm_utilization,
             kv_head_shards=effective_kv_head_shards,
+            # init_cache allocates one equal page array per layer (RaggedPagesCacheView.init).
+            largest_allocation_share=1.0 / max(1, int(num_hidden_layers)),
         )
         if version == "v3":
             # Budget the bytes of the *allocated* v3 layout (see ``get_shape_and_axes``): the packed combined-KV
@@ -1521,8 +1562,20 @@ class RaggedPagesMetadata:
         request_distribution (Array, optional): v3 distribution bounds.
             Shape: [3] containing [decode_end, prefill_end, total_count]
         recurrent_state_indices (Array, optional): Physical recurrent-state
-            slot ids aligned with request rows. Rank-major DP passes this as
-            [dp, rows_per_dp].
+            slot ids aligned with request rows: the base slot ``g`` of the
+            row's group of ``W`` slots. Rank-major DP passes this as
+            [dp, rows_per_dp] with rank-local slots.
+        recurrent_commit_lens (Array, optional): Per row, the tokens whose
+            state is certain (``c``): the row length for ordinary rows, the
+            real-token count (>= 1) for speculative verify rows. The row
+            writes the state after token ``c - 1 + j`` into slot ``g + j``
+            for ``j = 0 .. lens - c``. ``None`` means ``c = lens`` for every
+            row. Same layout as ``recurrent_state_indices``.
+        recurrent_read_offset (Array, optional): Per row, the drafts
+            accepted in the request's previous verify step (``a``, written
+            on the device); the row reads its initial state from slot
+            ``g + a``. ``None`` means ``a = 0``. Same layout as
+            ``recurrent_state_indices``.
         num_kv_update_slices (Array, optional): v2 update slice count.
             Shape: [1]
         version (str): Metadata format version ("v2" or "v3").
@@ -1556,6 +1609,11 @@ class RaggedPagesMetadata:
     num_kv_update_slices: Int[Array, "1"] | None = None
     spec_recurrent_commit: Int[Array, "2 max_num_reqs"] | None = None
     recurrent_state_indices: Int[Array, "..."] | None = None
+    recurrent_commit_lens: Int[Array, "..."] | None = None
+    recurrent_read_offset: Int[Array, "..."] | None = None
+    # Recurrent slots per request (``W``) of a step that ships ``recurrent_read_offset``; rows of at most ``W`` tokens
+    # capture their state after every token into ``g + j``.
+    recurrent_slot_group_size: int = field(pytree_node=False, default=1)
 
     version: str | tp.Literal["v3", "v2"] = field(pytree_node=False, default="v3")
 
