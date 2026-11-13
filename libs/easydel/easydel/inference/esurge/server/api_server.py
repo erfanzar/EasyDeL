@@ -2460,6 +2460,15 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
         sampling_params = self._prepare_sampling_params(request, esurge)
         tools = self.extract_tools(request=request)
+        # Refuse overload before the SSE response starts: a 503 raised inside the
+        # body iterator reaches the client as an empty, aborted stream instead.
+        self._check_generation_slot_capacity(
+            endpoint="/v1/chat/completions",
+            request_id=request_id,
+            model=request.model,
+            raw_request=raw_request,
+            stream=True,
+        )
 
         async def generate_stream():
             """Async generator yielding SSE events for chat completion streaming."""
@@ -2900,6 +2909,14 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         """
 
         sampling_params = self._prepare_sampling_params(request, esurge)
+        # Same pre-flight check as chat.
+        self._check_generation_slot_capacity(
+            endpoint="/v1/completions",
+            request_id=request_id,
+            model=request.model,
+            raw_request=raw_request,
+            stream=True,
+        )
 
         async def generate_stream():
             """Async generator yielding SSE events for text completion streaming.

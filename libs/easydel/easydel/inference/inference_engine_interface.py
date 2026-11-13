@@ -882,6 +882,52 @@ class BaseInferenceApiServer(ABC):
         """
         return compute_stream_delta_text(current_text, previous_text, fallback_delta)
 
+    def _check_generation_slot_capacity(
+        self,
+        *,
+        endpoint: str | None = None,
+        request_id: str | None = None,
+        model: str | None = None,
+        raw_request: Request | None = None,
+        stream: bool | None = None,
+    ) -> None:
+        """Reject an overloaded server with HTTP 503 without consuming a slot.
+
+        Streaming handlers call this *before* returning their
+        ``StreamingResponse``. Raising from inside the body iterator instead
+        would reach the client as an empty, aborted stream, because the SSE
+        response has already started; the slot itself is still taken inside the
+        generator, so this is only a pre-flight check.
+
+        Args:
+            endpoint: Endpoint name (diagnostics only).
+            request_id: Request identifier (diagnostics only).
+            model: Requested model name (diagnostics only).
+            raw_request: Raw FastAPI request, used for client attribution.
+            stream: Whether the request streams (diagnostics only).
+
+        Raises:
+            HTTPException: With ``503`` when every generation slot is taken.
+        """
+
+        queue = getattr(self, "_generation_slots", None)
+        if queue is None or queue.qsize() > 0:
+            return
+        max_generation_slots = int(getattr(self, "_max_generation_slots", 0) or 0)
+        logger.warning(
+            "Rejecting request with HTTP 503 before streaming because all generation slots are busy. "
+            "endpoint=%s request_id=%s model=%s stream=%s max_generation_slots=%s "
+            "active_http_requests=%s overload_message=%s",
+            endpoint,
+            request_id,
+            model,
+            stream,
+            max_generation_slots,
+            len(getattr(self, "_active_requests", ()) or ()),
+            self._overload_message,
+        )
+        raise HTTPException(status_code=HTTPStatus.SERVICE_UNAVAILABLE, detail=self._overload_message)
+
     @asynccontextmanager
     async def _acquire_generation_slot(
         self,

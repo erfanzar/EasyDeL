@@ -74,6 +74,9 @@ def _make_handler_server() -> eSurgeApiServer:
     server._generation_slots = asyncio.Queue(maxsize=1)
     server._generation_slots.put_nowait(0)
     server._max_generation_slots = 128
+    # These handlers are exercised with a stubbed slot queue (stale state on purpose), so the
+    # pre-flight overload check is disabled here; it has its own test file.
+    server._check_generation_slot_capacity = lambda **kwargs: None
     server._overload_message = "Server is busy, please try again later"
     server._record_api_key_usage = lambda *_args, **_kwargs: None
     server._default_store_responses = False
