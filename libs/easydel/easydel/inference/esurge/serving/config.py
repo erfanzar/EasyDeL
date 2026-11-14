@@ -146,6 +146,9 @@ class ServerSpec:
         key_name: Label of that key in the auth manager.
         log_level: uvicorn log level.
         max_concurrent_generations: In-flight generation cap; ``None`` uses the engine's request cap.
+        profiler_port: When set, the leader starts a JAX profiler server on this port (off by default). Capture
+            from the leader host with ``python -m jax.collect_profile <port> <duration_ms>``; keep the port off
+            any public firewall rule, it is unauthenticated.
     """
 
     host: str = INTERNAL_ADDRESS
@@ -154,9 +157,14 @@ class ServerSpec:
     key_name: str = "esurge-serving"
     log_level: str = "info"
     max_concurrent_generations: int | None = None
+    profiler_port: int | None = None
 
     def __post_init__(self) -> None:
         _port(self.port, "`server.port`")
+        if self.profiler_port is not None:
+            _port(self.profiler_port, "`server.profiler_port`")
+            if self.profiler_port == self.port:
+                raise ServingConfigError("`server.profiler_port` must differ from `server.port`")
         if not self.api_key_file:
             raise ServingConfigError("`server.api_key_file` is required: the server never runs without a key")
 

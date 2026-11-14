@@ -158,6 +158,9 @@ def _serve(config: ServingConfig) -> None:
     rank = int(jax.process_index())
     is_leader = rank == 0
     _log(rank, f"joined world of {world_size} processes; easydel {ed.__version__} from {ed.__file__}")
+    if is_leader and config.server.profiler_port is not None:
+        jax.profiler.start_server(config.server.profiler_port)
+        _log(rank, f"JAX profiler server on port {config.server.profiler_port}")
 
     token = control_host = None
     if world_size > 1:

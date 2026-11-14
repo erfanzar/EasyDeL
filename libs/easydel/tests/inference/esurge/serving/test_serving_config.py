@@ -52,6 +52,8 @@ def test_full_deployment_parses_with_defaults():
         ({"model": {"checkpoint": "x", "sharding_axis_dims": [-1, -1, 1, 1, 1, 1]}}, "at most one -1"),
         ({"server": {"port": 70000}}, "port"),
         ({"server": {"api_key_file": ""}}, "api_key_file"),
+        ({"server": {"profiler_port": 0}}, "profiler_port"),
+        ({"server": {"port": 8000, "profiler_port": 8000}}, "must differ"),
         ({"esurge": {"distributed": {}}}, "owned by the `coordination`"),
         ({"coordination": {"heartbeat_timeout_s": 0}}, "positive"),
     ],
