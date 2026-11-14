@@ -4038,7 +4038,9 @@ class eSurge:
                         snapshot = RequestOutput(
                             request_id=ro.request_id,
                             prompt=ro.prompt,
-                            prompt_token_ids=list(ro.prompt_token_ids),
+                            # Shared, not copied: the prompt ids are fixed at admission and only read downstream.
+                            # Copying them cost O(prompt) per stream per step (4K ints x 128 streams per decode step).
+                            prompt_token_ids=ro.prompt_token_ids,
                             outputs=outputs_copy,
                             finished=ro.finished,
                             metrics=dict(ro.metrics) if ro.metrics is not None else None,
