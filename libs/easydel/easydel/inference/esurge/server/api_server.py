@@ -3138,10 +3138,14 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 if collector is not None
                 else {"window_seconds": _METRICS_WINDOW_S, "aggregate": {}, "recent_requests": []}
             )
+            snapshot_stats_fn = getattr(engine, "prefix_snapshot_stats", None)
             snapshots[model_name] = {
                 "running_requests": int(getattr(engine, "num_running_requests", 0) or 0),
                 "waiting_requests": int(getattr(engine, "num_pending_requests", 0) or 0),
                 **summary,
+                # Cumulative recurrent prefix-snapshot counters (hybrid linear-attention models only; ``None``
+                # otherwise): restores, saves, evictions, and KV hits lost because no snapshot was ready.
+                "prefix_snapshots": snapshot_stats_fn() if callable(snapshot_stats_fn) else None,
                 # Engine-step prefill/decode split. The collector is process-wide, so with several engines in one
                 # process every model reports the same totals.
                 "phase": collector.phase_summary(window_seconds=_METRICS_WINDOW_S) if collector is not None else None,

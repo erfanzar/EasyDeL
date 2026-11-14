@@ -173,6 +173,8 @@ _ESURGE_BOOL_FIELDS = frozenset(
         "freeze_startup_heap",
         "enable_prefix_caching",
         "destroy_pages_on_pause",
+        "decode_prefix_snapshots",
+        "snapshot_aware_routing",
         "auto_truncate_prompt",
         "auto_cap_new_tokens",
         "strict_context",

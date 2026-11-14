@@ -459,6 +459,8 @@ def _validate_esurge_cache_runtime_config(self):
         "attention_data_parallel_axis": None,
         "destroy_pages_on_pause": True,
         "recurrent_prefix_snapshots": 16,
+        "decode_prefix_snapshots": False,
+        "snapshot_aware_routing": False,
     },
     post_init=_validate_esurge_cache_runtime_config,
 )
@@ -513,6 +515,19 @@ class eSurgeCacheRuntimeConfig(TypedDict, total=False):
             reuse prefix-cache hits. Each snapshot stores one request's conv and
             recurrent state at a page boundary. ``0`` disables prefix caching
             for such models; attention-only models ignore it.
+        decode_prefix_snapshots: Recurrent hybrids only (needs snapshot slots,
+            no speculative decoding). When ``True``, each decoding request keeps
+            one rolling snapshot slot, rewritten at every page boundary its
+            output crosses and committed under the last boundary when the
+            request ends. A follow-up turn whose prompt repeats the previous
+            output can then hit past the old prompt. Rolling slots take at most
+            half of a rank's snapshot slots. ``False`` keeps the former
+            prompt-only snapshots.
+        snapshot_aware_routing: Recurrent hybrids with data parallelism only.
+            When ``True``, a new request goes to the rank whose longest prefix
+            hit has a ready recurrent snapshot at its boundary, instead of the
+            rank holding the most matching KV pages (a hit without a snapshot
+            is not taken). ``False`` keeps KV-page routing.
     """
 
     hbm_utilization: NotRequired[float]
@@ -524,6 +539,8 @@ class eSurgeCacheRuntimeConfig(TypedDict, total=False):
     attention_data_parallel_axis: NotRequired[str | None]
     destroy_pages_on_pause: NotRequired[bool]
     recurrent_prefix_snapshots: NotRequired[int]
+    decode_prefix_snapshots: NotRequired[bool]
+    snapshot_aware_routing: NotRequired[bool]
 
     @classmethod
     def from_dict(

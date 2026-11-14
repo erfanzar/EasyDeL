@@ -95,7 +95,9 @@ class _SchedulerStub(eSurge):
             update_model_weights=lambda **kwargs: None,
             executor_manager=SimpleNamespace(has_compiled_variants=lambda: True, kv_pages=object()),
         )
-        self.cache_config = SimpleNamespace(enable_prefix_caching=True)
+        self.cache_config = SimpleNamespace(
+            enable_prefix_caching=True, decode_prefix_snapshots=False, snapshot_aware_routing=False
+        )
         self._scheduler_max_num_batched_tokens = 512
         self._runner_async_scheduling = False
         self._long_prefill_token_threshold = 128

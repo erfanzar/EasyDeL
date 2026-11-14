@@ -2080,6 +2080,13 @@ class eSurge:
         with self._scheduler_lock:
             return self.core.num_running
 
+    def prefix_snapshot_stats(self) -> dict[str, int] | None:
+        """Recurrent prefix-snapshot counters summed over data-parallel ranks (see
+        :meth:`EngineCoreDriver.snapshot_stats`); ``None`` when the engine keeps no snapshots.
+        """
+        with self._scheduler_lock:
+            return self.core.snapshot_stats()
+
     @staticmethod
     def _is_nonrecoverable_scheduler_error(exc: BaseException) -> bool:
         """Decide whether a scheduler exception should bypass the retry budget.
@@ -2804,6 +2811,8 @@ class eSurge:
             token_safety_margin=runtime.token_safety_margin,
             include_finished_set=runtime.include_finished_set,
             dp_admission_hold=runtime.dp_admission_hold,
+            decode_snapshots=bool(self.cache_config.decode_prefix_snapshots),
+            snapshot_routing=bool(self.cache_config.snapshot_aware_routing),
         )
 
     def update_model_weights(

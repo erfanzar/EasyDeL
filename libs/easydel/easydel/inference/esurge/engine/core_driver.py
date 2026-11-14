@@ -63,6 +63,19 @@ _FLAG_GRAMMAR, _FLAG_NO_PREFIX_HIT, _FLAG_VISION = 1, 2, 4
 _PLAN_ASYNC_SAFE, _PLAN_STRUCTURED_PENDING = 1, 16
 _KIND_NEW, _KIND_RESUMED = 1, 2
 _U64 = (1 << 64) - 1
+# The per-rank layout of ``EngineCore.snapshot_stats`` (surgecore ``SNAPSHOT_STATS``).
+_SNAPSHOT_STAT_KEYS = (
+    "restores",
+    "saves",
+    "decode_saves",
+    "evictions",
+    "cancels",
+    "ready",
+    "pending",
+    "free",
+    "lost_hits",
+    "lost_hit_tokens",
+)
 _RECURRENT_LAYER_TYPES = frozenset({"linear_attention", "kda_linear_attention", "parallel_hybrid", "hybrid"})
 
 
@@ -127,6 +140,10 @@ class EngineCoreDriver:
         image_expander: The model's image-placeholder expander (``esurge_image_expander_builder``), or ``None``.
         dp_admission_hold: Data-parallel admission alignment, in steps (0 off; used only with more than one rank):
             the ranks start new requests in the same step, holding admission at most this many steps.
+        decode_snapshots: Rolling recurrent snapshots during decode, committed under the last page boundary when the
+            request ends (needs snapshot slots and no speculation; off keeps prompt-only snapshots).
+        snapshot_routing: Route a new request to the rank whose longest prefix hit has a ready recurrent snapshot
+            (needs snapshot slots; off keeps KV-page routing).
     """
 
     def __init__(
@@ -151,6 +168,8 @@ class EngineCoreDriver:
         recurrent_prefix_snapshot_slots: int = 0,
         image_expander: typing.Any | None = None,
         dp_admission_hold: int = 0,
+        decode_snapshots: bool = False,
+        snapshot_routing: bool = False,
     ) -> None:
         from surgecore import CoreClosed, EngineCore, InvariantError
 
@@ -189,6 +208,8 @@ class EngineCoreDriver:
             use_eagle=bool(use_eagle and self.num_draft_tokens > 0),
             include_finished_set=self.include_finished_set,
             dp_admission_hold=max(0, int(dp_admission_hold)),
+            decode_snapshots=bool(decode_snapshots),
+            snapshot_routing=bool(snapshot_routing),
         )
         self.closed_error: type[BaseException] = CoreClosed
         """Raised by every call after :meth:`shutdown`; the loop exits cleanly on it."""
@@ -267,6 +288,8 @@ class EngineCoreDriver:
         token_safety_margin: int | None = None,
         include_finished_set: bool = False,
         dp_admission_hold: int = 0,
+        decode_snapshots: bool = False,
+        snapshot_routing: bool = False,
     ) -> EngineCoreDriver:
         """Build the core for a runner: its cache groups, pages, rows, request buckets, DP size and snapshots.
 
@@ -320,6 +343,8 @@ class EngineCoreDriver:
             recurrent_prefix_snapshot_slots=snapshot_slots,
             image_expander=expander_builder(runner.model) if expander_builder is not None else None,
             dp_admission_hold=dp_admission_hold,
+            decode_snapshots=decode_snapshots and snapshot_slots > 0,
+            snapshot_routing=snapshot_routing and snapshot_slots > 0,
         )
         step_ms = getattr(runner, "step_time_table", None)
         if step_ms:
@@ -506,6 +531,24 @@ class EngineCoreDriver:
     def counts(self) -> list[int]:
         """Running, waiting, free pages and pending prefill tokens, then the same four per data-parallel rank."""
         return self._core.counts().tolist()
+
+    def snapshot_stats(self) -> dict[str, int] | None:
+        """Recurrent-snapshot counters summed over data-parallel ranks; ``None`` without snapshots.
+
+        Keys: ``restores`` (prefix hits that loaded a snapshot), ``saves`` (snapshots committed), ``decode_saves``
+        (of those, rolling decode snapshots), ``evictions`` (ready snapshots recycled), ``cancels`` (reservations
+        dropped unwritten), ``ready`` / ``pending`` / ``free`` slots, ``lost_hits`` (first admissions whose KV pages
+        would have hit further than a ready snapshot allowed) and ``lost_hit_tokens`` (the prompt tokens they
+        prefilled again).
+        """
+        values = self._core.snapshot_stats().tolist()
+        if not values:
+            return None
+        totals = [0] * len(_SNAPSHOT_STAT_KEYS)
+        for start in range(0, len(values), len(_SNAPSHOT_STAT_KEYS)):
+            for k, v in enumerate(values[start : start + len(_SNAPSHOT_STAT_KEYS)]):
+                totals[k] += int(v)
+        return dict(zip(_SNAPSHOT_STAT_KEYS, totals, strict=True))
 
     def _counts(self) -> list[int]:
         return self.counts()
