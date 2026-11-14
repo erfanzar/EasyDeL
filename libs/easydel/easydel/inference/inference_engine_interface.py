@@ -50,6 +50,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.datastructures import MutableHeaders
 
 from .openai_api_modules import (
     ChatCompletionRequest,
@@ -118,6 +119,66 @@ class ServerStatus(StrEnum):
 
 MONITORING_PATHS = frozenset({"/metrics", "/health"})
 """Paths excluded from the request counters and the active-request set: polling them is not traffic."""
+
+
+class RequestTrackingMiddleware:
+    """Pure ASGI middleware: request id, ``X-Request-ID`` header, active-request set and request counters.
+
+    Replaces two ``@app.middleware("http")`` functions. Starlette runs those through ``BaseHTTPMiddleware``,
+    which pushes every streamed body chunk through an anyio memory stream and task group per middleware; at 128
+    concurrent SSE streams that per-chunk event-loop work competed for the GIL with the engine's scheduler thread.
+    Here body messages pass straight through; only ``http.response.start`` is touched.
+
+    Every HTTP request gets ``scope["state"]["request_id"]`` (``request.state.request_id``) and an
+    ``X-Request-ID`` response header carrying it. Requests outside :data:`MONITORING_PATHS` are also counted on the
+    server's ``metrics`` (success below status 400, failure from 400 or on an exception before the response starts)
+    and kept in its ``_active_requests`` set until the whole response, streamed body included, has been sent.
+
+    Args:
+        app: The wrapped ASGI app.
+        server: Object exposing ``metrics`` (:class:`ServerMetrics`) and ``_active_requests`` (``set[str]``).
+    """
+
+    def __init__(self, app: tp.Any, *, server: tp.Any) -> None:
+        self.app = app
+        self.server = server
+
+    async def __call__(self, scope: dict[str, tp.Any], receive: tp.Any, send: tp.Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        server = self.server
+        request_id = f"req_{int(time.time() * 1000000)}"
+        scope.setdefault("state", {})["request_id"] = request_id
+        tracked = scope.get("path") not in MONITORING_PATHS
+        status: int | None = None
+
+        async def send_with_request_id(message: dict[str, tp.Any]) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = int(message["status"])
+                MutableHeaders(scope=message)["X-Request-ID"] = request_id
+                if tracked:
+                    if status < 400:
+                        server.metrics.successful_requests += 1
+                    else:
+                        server.metrics.failed_requests += 1
+            await send(message)
+
+        if not tracked:
+            await self.app(scope, receive, send_with_request_id)
+            return
+        server.metrics.total_requests += 1
+        server._active_requests.add(request_id)
+        try:
+            await self.app(scope, receive, send_with_request_id)
+        except BaseException:
+            if status is None:
+                server.metrics.failed_requests += 1
+            raise
+        finally:
+            server._active_requests.discard(request_id)
+            server.metrics.uptime_seconds = time.time() - server.metrics.start_time
 
 
 @dataclass
@@ -375,7 +436,6 @@ class BaseInferenceApiServer(ABC):
         self.status = ServerStatus.STARTING
         self.metrics = ServerMetrics()
         self._active_requests: set[str] = set()
-        self._request_lock = asyncio.Lock()
         self.enable_function_calling = enable_function_calling
         self.default_function_format = default_function_format
         self._overload_message = overload_message
@@ -546,54 +606,8 @@ class BaseInferenceApiServer(ABC):
         )
 
     def _setup_middleware(self) -> None:
-        """Setup request middleware.
-
-        Configures middleware for request tracking, metrics collection,
-        and request ID generation. This method adds two middleware layers:
-        1. Request ID assignment for tracking
-        2. Metrics collection for monitoring
-        """
-
-        @self.app.middleware("http")
-        async def add_request_id(request: Request, call_next):  # pyright: ignore[reportUnusedFunction]
-            """Add unique request ID to each request."""
-            request_id = f"req_{int(time.time() * 1000000)}"
-            request.state.request_id = request_id
-            if request.url.path in MONITORING_PATHS:
-                response = await call_next(request)
-                response.headers["X-Request-ID"] = request_id
-                return response
-
-            async with self._request_lock:
-                self._active_requests.add(request_id)
-
-            try:
-                response = await call_next(request)
-                response.headers["X-Request-ID"] = request_id
-                return response
-            finally:
-                async with self._request_lock:
-                    self._active_requests.discard(request_id)
-
-        @self.app.middleware("http")
-        async def track_metrics(request: Request, call_next):  # pyright: ignore[reportUnusedFunction]
-            """Track request metrics. Monitoring polls are not counted, so a dashboard does not inflate them."""
-            if request.url.path in MONITORING_PATHS:
-                return await call_next(request)
-            self.metrics.total_requests += 1
-
-            try:
-                response = await call_next(request)
-                if response.status_code < 400:
-                    self.metrics.successful_requests += 1
-                else:
-                    self.metrics.failed_requests += 1
-                return response
-            except Exception:
-                self.metrics.failed_requests += 1
-                raise
-            finally:
-                self.metrics.uptime_seconds = time.time() - self.metrics.start_time
+        """Install :class:`RequestTrackingMiddleware` (request id, ``X-Request-ID``, active set, counters)."""
+        self.app.add_middleware(RequestTrackingMiddleware, server=self)
 
     @property
     def _endpoints(self) -> list[EndpointConfig]:
