@@ -202,13 +202,28 @@ def _jit_slot_sidecar_rows(output_shardings, fill_values):
 _SNAPSHOT_DROP_INDEX = 2**30
 
 
-def _snapshot_sharding(array: jax.Array) -> jax.sharding.Sharding:
-    """Sharding for a snapshot store: the live leaf's layout with the slot axis replicated."""
+def _snapshot_sharding(array: tp.Any, num_slots: int | None = None) -> jax.sharding.Sharding:
+    """Sharding for a snapshot store of ``num_slots`` slots: the live leaf's layout.
+
+    The slot axis keeps the live pool's slot-axis sharding when ``num_slots`` divides over it, so each device holds
+    only its share of the slots (with ``dp`` ranks a replicated store held every rank's slots on every device). It
+    is replicated otherwise, or when ``num_slots`` is not given.
+    """
     sharding = array.sharding
     if isinstance(sharding, NamedSharding):
         spec = tuple(sharding.spec)[: array.ndim]
         spec = spec + (None,) * (array.ndim - len(spec))
-        return NamedSharding(sharding.mesh, PartitionSpec(None, *spec[1:]))
+        slot_axis = spec[0]
+        if slot_axis is not None and num_slots is not None:
+            names = slot_axis if isinstance(slot_axis, tuple) else (slot_axis,)
+            size = 1
+            for name in names:
+                size *= int(sharding.mesh.shape[name])
+            if size <= 1 or int(num_slots) % size != 0:
+                slot_axis = None
+        else:
+            slot_axis = None
+        return NamedSharding(sharding.mesh, PartitionSpec(slot_axis, *spec[1:]))
     return sharding
 
 
@@ -253,7 +268,7 @@ def _jit_snapshot_zeros(
 def _snapshot_zeros_key(leaves: list[tuple[int, str, typing.Any]], positions: list[int], num_slots: int):
     """``(shapes, shardings)`` of the snapshot arrays for the ``leaves`` at ``positions`` (one device group)."""
     shapes = tuple(((num_slots, *leaves[i][2].shape[1:]), jnp.dtype(leaves[i][2].dtype)) for i in positions)
-    shardings = tuple(_snapshot_sharding(leaves[i][2]) for i in positions)
+    shardings = tuple(_snapshot_sharding(leaves[i][2], num_slots) for i in positions)
     return shapes, shardings
 
 
