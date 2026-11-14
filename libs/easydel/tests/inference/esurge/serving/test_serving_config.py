@@ -189,3 +189,18 @@ def test_loading_kwargs_use_the_model_quantization_pattern():
     assert kwargs["quantization_config"] == {"dtype": "w8a8", "pattern": "pattern-for-w8a8"}
     with pytest.raises(ValueError, match="default_quantization_pattern"):
         build_loading_kwargs(ServingConfig.from_mapping(GLM), object(), ed=ed)
+
+
+def test_model_config_overrides_reach_the_model_config():
+    ed = SimpleNamespace(QuantizationConfig=lambda **kw: kw)
+    text = SimpleNamespace(default_quantization_pattern=lambda dtype: "p")
+    data = {**GLM, "model": {**GLM["model"], "config_overrides": {"moe_defer_tp_reduce": True}}}
+    kwargs = build_loading_kwargs(ServingConfig.from_mapping(data), text, ed=ed)
+    assert kwargs["config_kwargs"] == {
+        "moe_defer_tp_reduce": True,
+        "attn_mechanism": "multi_latent_ragged_page_attention_v2",
+    }
+    with pytest.raises(ServingConfigError, match="attn_mechanism"):
+        ServingConfig.from_mapping({**GLM, "model": {**GLM["model"], "config_overrides": {"attn_mechanism": "x"}}})
+    with pytest.raises(ServingConfigError, match="config_overrides"):
+        ServingConfig.from_mapping({**GLM, "model": {**GLM["model"], "config_overrides": ["moe_method"]}})

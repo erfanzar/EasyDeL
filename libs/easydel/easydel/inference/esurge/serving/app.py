@@ -85,8 +85,11 @@ def build_loading_kwargs(config: ServingConfig, text_config: tp.Any | None, *, e
         "sharding_axis_names": EASYDEL_MESH_AXES,
         "auto_shard_model": True,
     }
+    config_kwargs = dict(model.config_overrides)
     if model.attn_mechanism:
-        kwargs["config_kwargs"] = {"attn_mechanism": model.attn_mechanism}
+        config_kwargs["attn_mechanism"] = model.attn_mechanism
+    if config_kwargs:
+        kwargs["config_kwargs"] = config_kwargs
     if model.quantization is not None:
         pattern = model.quantization.pattern
         if pattern is None:

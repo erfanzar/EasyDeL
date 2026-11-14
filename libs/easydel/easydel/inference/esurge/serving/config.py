@@ -94,6 +94,9 @@ class ModelSpec:
         param_dtype: Parameter storage dtype.
         attn_mechanism: Attention kernel name, or ``None`` for the model default.
         quantization: Optional load-time quantization.
+        config_overrides: Extra model-config attributes applied at load (for example the MoE dispatch knobs
+            ``moe_defer_tp_reduce`` or ``moe_row_gather_kernel``). Passed to the model config as-is, which owns
+            their validation. Set the attention kernel through ``attn_mechanism``, not here.
     """
 
     checkpoint: str
@@ -104,10 +107,17 @@ class ModelSpec:
     param_dtype: str = "bfloat16"
     attn_mechanism: str | None = None
     quantization: QuantizationSpec | None = None
+    config_overrides: Mapping[str, tp.Any] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.checkpoint:
             raise ServingConfigError("`model.checkpoint` is required")
+        overrides = self.config_overrides if self.config_overrides is not None else {}
+        if not isinstance(overrides, Mapping) or not all(isinstance(k, str) for k in overrides):
+            raise ServingConfigError("`model.config_overrides` must be a mapping of attribute names to values")
+        if "attn_mechanism" in overrides:
+            raise ServingConfigError("set `model.attn_mechanism` instead of `model.config_overrides.attn_mechanism`")
+        object.__setattr__(self, "config_overrides", dict(overrides))
         dims = tuple(int(d) for d in self.sharding_axis_dims)
         if len(dims) != len(EASYDEL_MESH_AXES):
             raise ServingConfigError(
