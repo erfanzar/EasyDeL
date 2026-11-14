@@ -84,12 +84,57 @@ def test_api_key_file_is_created_private_and_stable(tmp_path):
 def test_api_key_file_creation_race_yields_one_key(tmp_path):
     path = tmp_path / "key"
     keys: list[str] = []
-    threads = [threading.Thread(target=lambda: keys.append(load_or_create_api_key(path)[0])) for _ in range(8)]
+    errors: list[BaseException] = []
+
+    def load() -> None:
+        try:
+            keys.append(load_or_create_api_key(path)[0])
+        except BaseException as exc:  # a reader that saw an empty, half-created file
+            errors.append(exc)
+
+    threads = [threading.Thread(target=load) for _ in range(8)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-    assert len(set(keys)) == 1
+    assert errors == []
+    assert len(keys) == 8 and len(set(keys)) == 1
+    assert not [p for p in tmp_path.iterdir() if p.name != "key"]  # no temporary files left behind
+
+
+def test_api_key_reader_never_sees_a_half_created_file(tmp_path, monkeypatch):
+    # Deterministic version of the creation race: the creator is held right after opening its file and before writing
+    # the key, and a second loader runs in that window. It must not find an empty key file at the final path.
+    path = tmp_path / "key"
+    entered, release = threading.Event(), threading.Event()
+    creator: list[threading.Thread] = []
+    real_fdopen = os.fdopen
+
+    def held_fdopen(fd, *args, **kwargs):
+        if creator and threading.current_thread() is creator[0]:
+            entered.set()
+            release.wait(timeout=10.0)
+        return real_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fdopen", held_fdopen)
+    results: dict[str, object] = {}
+
+    def run(name: str) -> None:
+        try:
+            results[name] = load_or_create_api_key(path)[0]
+        except BaseException as exc:
+            results[name] = exc
+
+    first = threading.Thread(target=run, args=("first",))
+    creator.append(first)
+    first.start()
+    assert entered.wait(timeout=5.0)
+    run("second")  # inside the creator's open-to-write window
+    release.set()
+    first.join(timeout=10.0)
+    assert isinstance(results["second"], str), results["second"]
+    assert results["first"] == results["second"]
+    assert path.read_text().strip() == results["second"]
 
 
 def test_unusable_api_key_files_fail_closed(tmp_path):

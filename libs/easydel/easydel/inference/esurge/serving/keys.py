@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import secrets
 import stat
+import tempfile
 from pathlib import Path
 
 MIN_KEY_LENGTH = 32
@@ -45,8 +46,10 @@ def _check_private(path: Path) -> None:
 def load_or_create_api_key(path: str | Path) -> tuple[str, bool]:
     """Return the serving API key from ``path``, creating the file with a fresh key when it is absent.
 
-    Creation is exclusive (``O_EXCL``), so two processes racing on a missing file cannot end up with different
-    keys: the loser reads the winner's key.
+    Creation is atomic and exclusive: the key is written and flushed to a private temporary file in the same
+    directory, then hard-linked into place, which fails when ``path`` already exists. Two processes racing on a
+    missing file therefore cannot end up with different keys (the loser reads the winner's key), and no reader can
+    ever see the file empty or half-written.
 
     Args:
         path: Key file location (``~`` is expanded). Parent directories are created with mode 0700.
@@ -62,14 +65,20 @@ def load_or_create_api_key(path: str | Path) -> tuple[str, bool]:
     if not path.exists():
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         key = f"sk-{secrets.token_urlsafe(48)}"
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)  # mode 0600
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            pass
-        else:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(key + "\n")
-            created = True
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(tmp_name, path)
+            except FileExistsError:
+                pass  # another process won the race; read its key below
+            else:
+                created = True
+        finally:
+            os.unlink(tmp_name)
     try:
         _check_private(path)
         key = path.read_text(encoding="utf-8").strip()
