@@ -430,6 +430,12 @@ class EngineCore:
             every rank run a prefill-sized step. While a rank with waiting requests has no free row and another has
             one, no rank admits, so the ranks start their prefills in the same step. A rank with waiting requests and
             nothing running admits at once, and no hold lasts more than this many consecutive steps.
+        decode_snapshots: Rolling recurrent snapshots during decode (only with prefix caching, ``snapshot_slots`` and
+            no drafts): a decode chunk ending on a page boundary writes the request's state into one rolling slot of
+            its own, committed under the last boundary written when the request ends. At most half of a rank's slots
+            are rolling. Off keeps prompt-only snapshots (the goldens' decisions).
+        snapshot_routing: Route a new request to the rank whose longest prefix hit has a ready recurrent snapshot at
+            its boundary (only with ``snapshot_slots``). Off keeps KV-page routing.
     """
 
     def __init__(
@@ -453,6 +459,8 @@ class EngineCore:
         use_eagle: bool = False,
         include_finished_set: bool = False,
         dp_admission_hold: int = 0,
+        decode_snapshots: bool = False,
+        snapshot_routing: bool = False,
     ) -> None: ...
     def add_requests(
         self,
@@ -557,6 +565,11 @@ class EngineCore:
     def reset_prefix_cache(self) -> bool:
         """Forgets every published page and snapshot, rank by rank; ``False`` at the first rank whose pages are in
         use."""
+        ...
+    def snapshot_stats(self) -> npt.NDArray[np.int64]:
+        """``int64[10 * dp]`` (empty without snapshots), rank-major: restores, saves, keyed (decode) saves, evictions,
+        cancels, ready / pending / free slots, lost hits (first admissions whose KV pages would have hit further than
+        a ready snapshot allowed) and their re-prefilled tokens."""
         ...
     def counts(self) -> npt.NDArray[np.int64]:
         """``int64[4 + 4 * dp]``: running, waiting, free pages, pending prefill tokens; then the same per rank."""

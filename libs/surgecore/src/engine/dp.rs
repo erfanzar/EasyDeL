@@ -22,7 +22,7 @@
 use crate::engine::request::{Handle, Request, RequestTable};
 use crate::engine::sched::{Queue, TokenBudget};
 use crate::kv::snapshot::SnapshotIndex;
-use crate::kv::{KvCore, Tokens};
+use crate::kv::{KvCore, KvError, Tokens};
 
 /// One data-parallel rank's scheduling state.
 pub struct RankState {
@@ -50,6 +50,13 @@ pub struct RankState {
     pub page_offset: u32,
     /// Requests freed since the last commit, in free order (kept only with `include_finished_set`).
     pub finished_set: Option<Vec<Handle>>,
+    /// Decode snapshots: `(slot, plan)` rolling slots of requests that left while plan `plan` (in flight) still writes
+    /// them; dropped when that plan commits.
+    pub retiring: Vec<(i64, u64)>,
+    /// First admissions whose KV pages would have hit further than a ready recurrent snapshot allowed.
+    pub lost_hits: u64,
+    /// The prompt tokens those admissions prefilled again.
+    pub lost_hit_tokens: u64,
 }
 
 /// The request-count bucket ladder of a rank: the buckets in `(0, max_running]`, deduplicated, ending at
@@ -115,6 +122,28 @@ impl RankState {
     }
 }
 
+/// The hit tokens a new request would take on a rank with recurrent snapshots, read-only: the longest prefix hit
+/// whose boundary page has a ready snapshot (the admission rule of `snapshot_prefix_hit`), 0 when there is none.
+pub fn snapshot_probe(kv: &KvCore, snaps: &SnapshotIndex, request: &Request, ps: i64) -> Result<i64, KvError> {
+    if ps <= 0 {
+        return Ok(0);
+    }
+    let keys = kv.chain_keys(&request.tokens, request.hash_extra);
+    let last = (keys.len() as i64).min((request.num_tokens() - 1).div_euclid(ps));
+    let mut upper = last * ps;
+    for np in (1..=last).rev() {
+        if np * ps > upper || !snaps.is_ready(keys[np as usize - 1]) {
+            continue;
+        }
+        let tokens = kv.probe_keys(&keys, np * ps)?;
+        if tokens == np * ps {
+            return Ok(tokens);
+        }
+        upper = tokens;
+    }
+    Ok(0)
+}
+
 /// Whether a rank can take one more request without queueing behind its row cap (running plus waiting below it).
 fn has_room(rank: &RankState) -> bool {
     rank.running.len() + rank.waiting.len() < rank.max_running
@@ -128,7 +157,10 @@ fn has_room(rank: &RankState) -> bool {
 ///
 /// A full rank is never chosen for its prefix while another rank has room: a prompt prefix shared by every request
 /// (a common system prompt) would otherwise send all traffic to the one rank holding it and leave the others idle.
-pub fn route(ranks: &[RankState], reqs: &RequestTable, request: &Request) -> usize {
+///
+/// With `snapshot_page_size` (snapshot-aware routing) a rank's prefix tokens are those of its longest hit whose
+/// boundary page holds a ready recurrent snapshot ([`snapshot_probe`]), since a hit without one is not taken.
+pub fn route(ranks: &[RankState], reqs: &RequestTable, request: &Request, snapshot_page_size: Option<i64>) -> usize {
     let any_room = ranks.iter().any(has_room);
     let eligible = |rank: &RankState| !any_room || has_room(rank);
     let mut best: Option<usize> = None;
@@ -137,15 +169,19 @@ pub fn route(ranks: &[RankState], reqs: &RequestTable, request: &Request) -> usi
         if !eligible(rank) || !rank.kv.caching() || request.no_prefix_hit() {
             continue;
         }
-        let tokens = Tokens {
-            tokens: &request.tokens,
-            offset: 0,
+        let probed = match (snapshot_page_size, rank.snapshots.as_ref()) {
+            (Some(ps), Some(snaps)) => snapshot_probe(&rank.kv, snaps, request, ps),
+            _ => {
+                let tokens = Tokens {
+                    tokens: &request.tokens,
+                    offset: 0,
+                };
+                rank.kv
+                    .probe(None, Some(tokens), request.hash_extra, request.num_tokens() - 1)
+            }
         };
         // A failing probe is skipped, as the former rank probe skipped a rank that raised.
-        let Ok(cached) = rank
-            .kv
-            .probe(None, Some(tokens), request.hash_extra, request.num_tokens() - 1)
-        else {
+        let Ok(cached) = probed else {
             continue;
         };
         if cached > best_tokens {
@@ -210,6 +246,8 @@ mod tests {
             use_eagle: false,
             include_finished_set: false,
             dp_admission_hold: 0,
+            decode_snapshots: false,
+            snapshot_routing: false,
         })
         .unwrap()
     }

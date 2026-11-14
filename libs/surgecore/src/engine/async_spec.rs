@@ -129,6 +129,8 @@ impl Case {
             use_eagle: false,
             include_finished_set: false,
             dp_admission_hold: 0,
+            decode_snapshots: false,
+            snapshot_routing: false,
         }
     }
 }

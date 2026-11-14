@@ -35,6 +35,8 @@ pub mod verify;
 mod async_spec;
 #[cfg(test)]
 mod golden;
+#[cfg(test)]
+mod snapshot_tests;
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -51,7 +53,7 @@ use plan::{
 use request::{FinishReason, Handle, NewRequest, Request, RequestTable, Status, FLAG_GRAMMAR};
 use sched::commit::{commit_plan, Output};
 use sched::trim::{trim_prefill, StepCost};
-use sched::{free_request, schedule::schedule_rank, Policy, Queue, SchedParams, TokenBudget};
+use sched::{free_request, retire_decode_snapshot, schedule::schedule_rank, Policy, Queue, SchedParams, TokenBudget};
 use verify::VerifyBudget;
 
 /// An engine-core error.
@@ -76,6 +78,9 @@ impl From<KvError> for CoreError {
         Self::Invariant(format!("KV core: {err}"))
     }
 }
+
+/// Values per rank in [`EngineCore::snapshot_stats`].
+pub const SNAPSHOT_STATS: usize = 10;
 
 /// Configuration numbers of an [`EngineCore`].
 #[derive(Clone, Debug)]
@@ -122,6 +127,15 @@ pub struct EngineConfig {
     /// their prefills in the same step. A rank with waiting requests and nothing running admits at once, and no hold
     /// lasts more than this many consecutive steps.
     pub dp_admission_hold: i64,
+    /// Decode snapshots (only with prefix caching, snapshot slots and no speculation; off keeps the former
+    /// decisions): every decode chunk that ends on a page boundary writes the request's recurrent state into one
+    /// rolling snapshot slot of its own, and a request that stops or reaches its length commits that slot under the
+    /// page key of the last boundary written, so a follow-up whose prompt repeats the output can hit past the old
+    /// prompt. Rolling slots hold at most half of a rank's snapshot slots.
+    pub decode_snapshots: bool,
+    /// Snapshot-aware routing (only with snapshot slots): a new request goes to the rank with the longest prefix hit
+    /// whose boundary page holds a ready recurrent snapshot, instead of the longest KV-page hit.
+    pub snapshot_routing: bool,
 }
 
 /// The request-count ladder of a single-rank core: the positive buckets, sorted and deduplicated, then `max_running`
@@ -206,6 +220,11 @@ impl EngineCore {
             max_chunk,
             lookahead,
             num_spec_tokens: cfg.num_spec_tokens,
+            decode_snapshots: cfg.decode_snapshots
+                && cfg.prefix_caching
+                && cfg.snapshot_slots > 0
+                && cfg.num_spec_tokens == 0,
+            snapshot_routing: cfg.snapshot_routing && cfg.prefix_caching && cfg.snapshot_slots > 0,
         };
         let ladder = if cfg.dp_size > 1 {
             rank_buckets(&cfg.req_buckets, rows_per_rank)
@@ -246,6 +265,9 @@ impl EngineCore {
                 current_bucket: 0,
                 page_offset: (index * pages_per_rank) as u32,
                 finished_set: cfg.include_finished_set.then(Vec::new),
+                retiring: Vec::new(),
+                lost_hits: 0,
+                lost_hit_tokens: 0,
             };
             rank.current_bucket = rank.select_bucket(0);
             ranks.push(rank);
@@ -443,6 +465,8 @@ impl EngineCore {
                 sampling: r.sampling,
                 kv_slot: None,
                 save_target: None,
+                decode_snap: None,
+                decode_plan: 0,
                 cached_tokens: -1,
                 stop_reason: None,
                 drafts: Vec::new(),
@@ -452,7 +476,12 @@ impl EngineCore {
             let rank = match r.dp_rank {
                 Some(rank) => rank,
                 None if self.ranks.len() == 1 => 0,
-                None => route(&self.ranks, &self.reqs, &probe),
+                None => route(
+                    &self.ranks,
+                    &self.reqs,
+                    &probe,
+                    self.params.snapshot_routing.then_some(self.params.page_size),
+                ),
             };
             let h = self.reqs.insert(|handle| Request { rank, handle, ..probe });
             self.ranks[rank].waiting.push(h, (r.priority, r.arrival));
@@ -490,9 +519,17 @@ impl EngineCore {
         // rank's schedule reads only its own requests, so the order of decisions is unchanged).
         let mut steps = Vec::with_capacity(self.ranks.len());
         let mut finishes = Vec::with_capacity(self.ranks.len());
+        let oldest_inflight = self.inflight.front().copied();
         for rank in self.ranks.iter_mut() {
             let mut finished = std::mem::take(&mut rank.finished);
-            steps.push(schedule_rank(rank, &mut self.reqs, &p, admit, &mut finished)?);
+            steps.push(schedule_rank(
+                rank,
+                &mut self.reqs,
+                &p,
+                admit,
+                &mut finished,
+                oldest_inflight,
+            )?);
             finishes.push(finished);
         }
         if let Some(cost) = self.step_cost.as_ref() {
@@ -561,8 +598,8 @@ impl EngineCore {
                 plan.computed.push(e.computed as i32);
                 plan.kinds.push(e.kind);
                 plan.emits.push(u8::from(emit));
-                for gi in 0..ng {
-                    for &pg in &e.pages[gi] {
+                for group in &e.pages[..ng] {
+                    for &pg in group {
                         plan.new_pages.push(rank.global_page(pg) as i32);
                         pages_changed = true;
                     }
@@ -581,6 +618,11 @@ impl EngineCore {
             }
             for &(h, slot) in &step.saves {
                 plan.snapshot_saves.push([entry_of(h)?, slot as i32]);
+                if rank.snapshots.as_ref().is_some_and(|s| s.is_unkeyed(slot)) {
+                    if let Some(r) = self.reqs.get_mut(h) {
+                        r.decode_plan = plan.id;
+                    }
+                }
             }
             if rank.index == 0 {
                 plan.common_prefix_pages = step.common_prefix.iter().map(|&v| v as i32).collect();
@@ -673,7 +715,16 @@ impl EngineCore {
                 }
                 v.observe_prior(&step);
             }
-            commit_plan(&mut self.ranks, &mut self.reqs, &self.params, plan, out, &mut events)?;
+            let oldest_inflight = self.inflight.front().copied();
+            commit_plan(
+                &mut self.ranks,
+                &mut self.reqs,
+                &self.params,
+                plan,
+                out,
+                &mut events,
+                oldest_inflight,
+            )?;
         }
         for rank in &mut self.ranks {
             if let Some(set) = rank.finished_set.as_mut() {
@@ -701,6 +752,8 @@ impl EngineCore {
     /// Finishes live requests (aborts, stop strings) in order; returns the handles that were live.
     pub fn finish(&mut self, handles: &[Handle], reason: FinishReason) -> Result<Vec<Handle>, CoreError> {
         let mut out = Vec::new();
+        let oldest_inflight = self.inflight.front().copied();
+        let page_size = self.params.page_size;
         for &h in handles {
             let Some(r) = self.reqs.get_mut(h) else {
                 continue;
@@ -714,6 +767,14 @@ impl EngineCore {
                 rank.waiting.remove(&[h]);
             }
             r.status = reason.status();
+            retire_decode_snapshot(
+                &rank.kv,
+                &mut rank.snapshots,
+                &mut rank.retiring,
+                r,
+                page_size,
+                oldest_inflight,
+            );
             free_request(
                 &mut rank.kv,
                 &mut self.reqs,
@@ -729,6 +790,11 @@ impl EngineCore {
     /// Forgets every published page and snapshot, rank by rank; stops (`false`) at the first rank whose pages are
     /// in use, as the former per-rank reset did.
     pub fn reset_prefix_cache(&mut self) -> bool {
+        // Decode snapshots: a rolling slot of a live request, or a retiring slot an in-flight plan still writes, would
+        // go back to the free list while it is written. Both are empty with decode snapshots off.
+        if self.ranks.iter().any(|rank| !rank.retiring.is_empty()) || self.reqs.iter().any(|r| r.decode_snap.is_some()) {
+            return false;
+        }
         for rank in &mut self.ranks {
             if !rank.kv.reset() {
                 return false;
@@ -736,8 +802,36 @@ impl EngineCore {
             if let Some(s) = rank.snapshots.as_mut() {
                 s.reset();
             }
+            rank.retiring.clear();
         }
         true
+    }
+
+    /// Recurrent-snapshot counters, [`SNAPSHOT_STATS`] values per rank, rank-major (empty without snapshots):
+    /// restores, saves, keyed (decode) saves, evictions, cancels, ready / pending / free slots, then the first
+    /// admissions whose KV pages would have hit further than a ready snapshot allowed and their re-prefilled tokens.
+    pub fn snapshot_stats(&self) -> Vec<i64> {
+        let mut out = Vec::new();
+        for rank in &self.ranks {
+            let Some(s) = rank.snapshots.as_ref() else {
+                continue;
+            };
+            let st = s.stats();
+            let (ready, pending, free) = s.occupancy();
+            out.extend_from_slice(&[
+                st.restores as i64,
+                st.saves as i64,
+                st.keyed_saves as i64,
+                st.evictions as i64,
+                st.cancels as i64,
+                ready as i64,
+                pending as i64,
+                free as i64,
+                rank.lost_hits as i64,
+                rank.lost_hit_tokens as i64,
+            ]);
+        }
+        out
     }
 
     /// Running, waiting, free pages and pending prefill tokens, then the same four per rank.

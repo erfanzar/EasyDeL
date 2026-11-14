@@ -294,6 +294,42 @@ impl KvCore {
             .1)
     }
 
+    /// The chained page keys of every full page of `tokens` under identity `extra` (nothing is kept).
+    pub fn chain_keys(&self, tokens: &[i32], extra: u128) -> Vec<PageKey> {
+        self.hasher.chain(tokens, self.chain_page_size(), extra)
+    }
+
+    /// The hit token count of a lookup over the given page keys (at most `max_len` tokens); nothing is kept.
+    pub fn probe_keys(&self, keys: &[PageKey], max_len: i64) -> Result<i64, KvError> {
+        if !self.caching {
+            return Ok(0);
+        }
+        Ok(self
+            .search
+            .find(&self.groups, &self.pool, keys, max_len, None, self.eagle)?
+            .1)
+    }
+
+    /// The key of the request's page `j` (0-based): a known key, else chained from the known keys over `tokens`
+    /// (all of the request's tokens). `None` when `tokens` does not cover page `j`. Nothing is kept.
+    pub fn page_key_at(&self, slot: usize, j: usize, tokens: &[i32]) -> Result<Option<PageKey>, KvError> {
+        let req = self.req(slot)?;
+        if j < req.keys.len() {
+            return Ok(Some(req.keys[j]));
+        }
+        let ps = self.chain_page_size();
+        if ps == 0 || tokens.len() < (j + 1) * ps {
+            return Ok(None);
+        }
+        let mut parent = req.keys.last().copied().unwrap_or(ROOT);
+        for page in req.keys.len()..=j {
+            parent = self
+                .hasher
+                .page_key(parent, &tokens[page * ps..(page + 1) * ps], req.extra);
+        }
+        Ok(Some(parent))
+    }
+
     fn remove_skipped(&mut self, slot: usize, computed: i64) -> Result<(), KvError> {
         let mut req = self.reqs[slot].take().expect("live slot");
         let mut result = Ok(());

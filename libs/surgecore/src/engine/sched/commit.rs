@@ -25,7 +25,7 @@
 use crate::engine::dp::RankState;
 use crate::engine::plan::{Events, Plan};
 use crate::engine::request::{Handle, RequestTable, Status};
-use crate::engine::sched::{free_request, SchedParams};
+use crate::engine::sched::{free_request, retire_decode_snapshot, SchedParams};
 use crate::engine::CoreError;
 use crate::kv::Tokens;
 
@@ -135,6 +135,7 @@ impl<'a> Output<'a> {
 }
 
 /// Applies `out` to the plan's requests and appends their events.
+#[allow(clippy::too_many_arguments)]
 pub fn commit_plan(
     ranks: &mut [RankState],
     reqs: &mut RequestTable,
@@ -142,6 +143,7 @@ pub fn commit_plan(
     plan: &Plan,
     out: &Output<'_>,
     events: &mut Events,
+    oldest_inflight: Option<u64>,
 ) -> Result<(), CoreError> {
     let spec_async = p.async_scheduling && p.num_spec_tokens > 0;
     for (k, rank) in ranks.iter_mut().enumerate() {
@@ -150,11 +152,32 @@ pub fn commit_plan(
             let entry = save[0] as usize;
             if (lo..hi).contains(&entry) {
                 if let Some(index) = rank.snapshots.as_mut() {
-                    if out.is_listed(entry) {
-                        index.commit(i64::from(save[1]));
+                    let slot = i64::from(save[1]);
+                    if index.is_unkeyed(slot) {
+                        // A decode save into a rolling slot: a listed write moves the slot's boundary to the end of
+                        // the entry's chunk; an unlisted one may still have overwritten it, so the boundary is cleared
+                        // until the next listed write.
+                        if let Some(r) = reqs.get_mut(plan.handles[entry]) {
+                            if let Some((s, _)) = r.decode_snap.filter(|&(s, _)| s == slot) {
+                                let end = i64::from(plan.computed[entry]) + i64::from(plan.scheduled[entry]);
+                                r.decode_snap = Some((s, if out.is_listed(entry) { end } else { 0 }));
+                            }
+                        }
+                    } else if out.is_listed(entry) {
+                        index.commit(slot);
                     } else {
-                        index.cancel(i64::from(save[1]));
+                        index.cancel(slot);
                     }
+                }
+            }
+        }
+        // Rolling slots of requests that left while this plan still wrote them hold no boundary's state: dropped.
+        if !rank.retiring.is_empty() {
+            let (done, keep): (Vec<_>, Vec<_>) = rank.retiring.iter().partition(|&&(_, id)| id <= plan.id);
+            rank.retiring = keep;
+            if let Some(index) = rank.snapshots.as_mut() {
+                for (slot, _) in done {
+                    index.cancel(slot);
                 }
             }
         }
@@ -222,6 +245,14 @@ pub fn commit_plan(
             let (code, stop, cached) = (r.status.finish_code(), r.stop_reason.unwrap_or(-1), r.cached_tokens);
             if stopped {
                 r.drafts.clear();
+                retire_decode_snapshot(
+                    &rank.kv,
+                    &mut rank.snapshots,
+                    &mut rank.retiring,
+                    r,
+                    p.page_size,
+                    oldest_inflight,
+                );
                 free_request(&mut rank.kv, reqs, h, &mut rank.finished, rank.finished_set.as_mut())?;
                 if before == Status::Running {
                     stopped_running.push(h);

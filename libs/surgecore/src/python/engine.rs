@@ -174,7 +174,7 @@ impl EngineCore {
         *, max_rows, max_model_len, num_pages, dp_size, groups, token_budget, long_prefill_threshold=0,
         chunked_prefill=false, token_safety_margin=-1, policy=0, prefix_caching=true, snapshot_slots=0,
         async_scheduling=true, req_buckets=None, num_draft_tokens=0, use_eagle=false, include_finished_set=false,
-        dp_admission_hold=0,
+        dp_admission_hold=0, decode_snapshots=false, snapshot_routing=false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -196,6 +196,8 @@ impl EngineCore {
         use_eagle: bool,
         include_finished_set: bool,
         dp_admission_hold: i64,
+        decode_snapshots: bool,
+        snapshot_routing: bool,
     ) -> PyResult<Self> {
         let cols = groups.shape()[1];
         let groups = groups_of(values(&groups), cols).map_err(to_py)?;
@@ -220,6 +222,8 @@ impl EngineCore {
             use_eagle,
             include_finished_set,
             dp_admission_hold,
+            decode_snapshots,
+            snapshot_routing,
         };
         let core = Core::new(&cfg).map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self {
@@ -461,6 +465,13 @@ impl EngineCore {
     /// Forgets every published page and snapshot; `False` while pages are in use.
     fn reset_prefix_cache(&self, py: Python<'_>) -> PyResult<bool> {
         self.with(py, |core| Ok(core.reset_prefix_cache()))
+    }
+
+    /// Recurrent-snapshot counters, 10 per rank, rank-major (empty without snapshots): restores, saves, keyed
+    /// (decode) saves, evictions, cancels, ready / pending / free slots, lost hits, lost-hit tokens.
+    fn snapshot_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let c = self.with(py, |core| Ok(core.snapshot_stats()))?;
+        Ok(PyArray1::from_vec(py, c))
     }
 
     /// Running, waiting, free pages and pending prefill tokens, then the same four per rank.

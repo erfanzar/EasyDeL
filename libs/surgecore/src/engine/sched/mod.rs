@@ -25,6 +25,7 @@ pub use queue::{Policy, Queue};
 
 use crate::engine::request::{Handle, Request, RequestTable};
 use crate::engine::CoreError;
+use crate::kv::snapshot::SnapshotIndex;
 use crate::kv::KvCore;
 
 /// The request's slot in its rank's KV core, opened on first use.
@@ -88,4 +89,47 @@ pub struct SchedParams {
     pub lookahead: i64,
     /// Placeholder drafts an async step gives each request that samples (the configured draft count).
     pub num_spec_tokens: i64,
+    /// Decode snapshots are on (see [`EngineConfig::decode_snapshots`](crate::engine::EngineConfig)).
+    pub decode_snapshots: bool,
+    /// Snapshot-aware routing is on (see [`EngineConfig::snapshot_routing`](crate::engine::EngineConfig)).
+    pub snapshot_routing: bool,
+}
+
+/// Decode snapshots: retires the request's rolling snapshot slot when it leaves its rows (freed or preempted).
+///
+/// The slot is committed under the page key of the last page boundary a committed, listed step wrote into it; it is
+/// dropped when nothing valid was written. When a plan still in flight writes the slot, its content will not match
+/// that boundary once the plan runs: the slot is then dropped when that plan commits (`retiring`).
+pub fn retire_decode_snapshot(
+    kv: &KvCore,
+    snaps: &mut Option<SnapshotIndex>,
+    retiring: &mut Vec<(i64, u64)>,
+    r: &mut Request,
+    page_size: i64,
+    oldest_inflight: Option<u64>,
+) {
+    let Some((slot, boundary)) = r.decode_snap.take() else {
+        return;
+    };
+    let Some(index) = snaps.as_mut() else {
+        return;
+    };
+    if oldest_inflight.is_some_and(|f| r.decode_plan >= f) {
+        retiring.push((slot, r.decode_plan));
+        return;
+    }
+    if boundary > 0 && page_size > 0 && boundary % page_size == 0 {
+        let j = (boundary / page_size - 1) as usize;
+        let known = r.kv_slot.and_then(|s| kv.page_key_at(s, j, &r.tokens).ok().flatten());
+        let key = known.or_else(|| {
+            let end = (boundary as usize).min(r.tokens.len());
+            kv.chain_keys(&r.tokens[..end], r.hash_extra).get(j).copied()
+        });
+        if let Some(key) = key {
+            if index.commit_keyed(slot, key) {
+                return;
+            }
+        }
+    }
+    index.cancel(slot);
 }

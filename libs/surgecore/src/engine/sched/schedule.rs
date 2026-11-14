@@ -26,7 +26,9 @@
 use crate::engine::dp::RankState;
 use crate::engine::plan::{KIND_NEW, KIND_RESUMED, KIND_RUNNING};
 use crate::engine::request::{Handle, Request, RequestTable, Status};
-use crate::engine::sched::{align_prefill_chunk, free_request, kv_slot, Policy, Queue, SchedParams};
+use crate::engine::sched::{
+    align_prefill_chunk, free_request, kv_slot, retire_decode_snapshot, Policy, Queue, SchedParams,
+};
 use crate::engine::CoreError;
 use crate::kv::group::GroupPages;
 use crate::kv::hash::PageKey;
@@ -179,13 +181,54 @@ fn record_save(snaps: &mut Option<SnapshotIndex>, r: &mut Request, end: i64, ste
     }
 }
 
+/// Drops `h`'s save from the step. A prompt save's reservation is cancelled; a decode save's rolling slot stays the
+/// request's (only this step's write is dropped).
 fn cancel_save(snaps: &mut Option<SnapshotIndex>, h: Handle, step: &mut RankStep) {
     if let Some(pos) = step.saves.iter().position(|&(x, _)| x == h) {
         let (_, slot) = step.saves.remove(pos);
         if let Some(index) = snaps.as_mut() {
-            index.cancel(slot);
+            if !index.is_unkeyed(slot) {
+                index.cancel(slot);
+            }
         }
     }
+}
+
+/// Decode snapshots: when a decode chunk ends on a page boundary, writes the request's recurrent state into its rolling
+/// snapshot slot (reserved on first use; rolling slots hold at most half of the rank's slots, and slots restored this
+/// step are never recycled). The boundary is recorded when the step commits.
+fn record_decode_save(
+    snaps: &mut Option<SnapshotIndex>,
+    r: &mut Request,
+    computed: i64,
+    n: i64,
+    p: &SchedParams,
+    step: &mut RankStep,
+) {
+    if !p.decode_snapshots || p.page_size <= 0 || !r.spans.is_empty() || computed < r.num_prompt {
+        return;
+    }
+    if (computed + n) % p.page_size != 0 || step.saves.iter().any(|&(x, _)| x == r.handle) {
+        return;
+    }
+    let Some(index) = snaps.as_mut() else {
+        return;
+    };
+    let slot = match r.decode_snap {
+        Some((slot, _)) => slot,
+        None => {
+            if index.num_unkeyed() as i64 >= (index.num_slots() / 2).max(1) {
+                return;
+            }
+            let exclude: Vec<i64> = step.restores.iter().map(|&(_, s)| s).collect();
+            let Some(slot) = index.reserve_unkeyed(&exclude) else {
+                return;
+            };
+            r.decode_snap = Some((slot, 0));
+            slot
+        }
+    };
+    step.saves.push((r.handle, slot));
 }
 
 /// Free pages a running request still draws before it holds its whole prompt (0 once it decodes).
@@ -214,6 +257,7 @@ pub fn schedule_rank(
     p: &SchedParams,
     admit: bool,
     finished: &mut Vec<Handle>,
+    oldest_inflight: Option<u64>,
 ) -> Result<RankStep, CoreError> {
     let mut step = RankStep::default();
     let mut token_budget = match rank.budget {
@@ -314,6 +358,14 @@ pub fn schedule_rank(
                     .ok_or_else(|| CoreError::Invariant("preemption with nothing running".into()))?,
             };
             let vr = get_mut(reqs, victim)?;
+            retire_decode_snapshot(
+                &rank.kv,
+                &mut rank.snapshots,
+                &mut rank.retiring,
+                vr,
+                p.page_size,
+                oldest_inflight,
+            );
             if let Some(slot) = vr.kv_slot {
                 if rank.kv.free(slot)? {
                     vr.kv_slot = None;
@@ -353,6 +405,7 @@ pub fn schedule_rank(
             drafts,
         });
         record_save(&mut rank.snapshots, r, computed + n, &mut step);
+        record_decode_save(&mut rank.snapshots, r, computed, n, p, &mut step);
         take_budget(rank, &mut token_budget, n);
         req_index += 1;
     }
@@ -473,6 +526,16 @@ pub fn schedule_rank(
             record_save(&mut rank.snapshots, r, num_computed + n, &mut step);
             if r.cached_tokens < 0 {
                 r.cached_tokens = num_computed;
+                // A first admission whose KV pages would hit further than its ready recurrent snapshot allowed: the
+                // pages were there but the snapshot was not (counted only; the decision is unchanged).
+                if rank.snapshots.is_some() && !r.no_prefix_hit() {
+                    if let Ok(kv_hit) = rank.kv.probe(r.kv_slot, None, r.hash_extra, r.num_tokens() - 1) {
+                        if kv_hit > num_computed {
+                            rank.lost_hits += 1;
+                            rank.lost_hit_tokens += (kv_hit - num_computed) as u64;
+                        }
+                    }
+                }
             }
             step.entries.push(Entry {
                 handle: h,

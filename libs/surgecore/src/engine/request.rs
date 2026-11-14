@@ -206,6 +206,12 @@ pub struct Request {
     pub kv_slot: Option<usize>,
     /// The recurrent-snapshot save boundary and key the request still has to reach.
     pub save_target: Option<(i64, u128)>,
+    /// Decode snapshots only: `(slot, boundary)` of the request's rolling snapshot slot, pending without a key, and
+    /// the last page boundary a committed step wrote into it (0: none yet). The slot is committed under that
+    /// boundary's page key when the request is freed.
+    pub decode_snap: Option<(i64, i64)>,
+    /// Decode snapshots only: the id of the last plan that writes the rolling slot.
+    pub decode_plan: u64,
     /// Prefix-hit tokens of the first admission (-1 before it).
     pub cached_tokens: i64,
     /// The stop token that finished the request, if one did.
@@ -379,6 +385,8 @@ mod tests {
             sampling: Sampling::default(),
             kv_slot: None,
             save_target: None,
+            decode_snap: None,
+            decode_plan: 0,
             cached_tokens: -1,
             stop_reason: None,
             drafts: Vec::new(),

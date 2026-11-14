@@ -108,6 +108,10 @@ fn give_back_save(
         .snapshots
         .as_mut()
         .ok_or_else(|| CoreError::Invariant("a snapshot save without a snapshot index".into()))?;
+    if index.is_unkeyed(slot) {
+        // A decode save: the chunk no longer ends on its boundary, so only this step's write is dropped.
+        return Ok(());
+    }
     let key = index
         .pending_key(slot)
         .ok_or_else(|| CoreError::Invariant(format!("snapshot save slot {slot} is not pending")))?;
