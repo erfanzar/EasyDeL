@@ -3976,13 +3976,16 @@ class eSurge:
         last_accumulated_reasoning = ""
         try:
             while True:
-                req_event.wait(timeout=1.0)
+                woke = req_event.wait(timeout=1.0)
                 req_event.clear()
                 self._raise_if_scheduler_failed()
                 if not self._generation_alive:
                     self.abort_request(request_id)
                     raise RuntimeError(stopped_message)
-                if self._recover_orphaned_request(request_id):
+                # An orphan never signals its event, so only a silent (timed-out) wait needs the orphan check. Running
+                # it on every wakeup took the scheduler lock once per stream per step and contended with the engine
+                # loop at high stream concurrency.
+                if not woke and self._recover_orphaned_request(request_id):
                     continue
 
                 snapshot = None
@@ -4131,13 +4134,14 @@ class eSurge:
         """Collect one admitted request while its consumer holds the result lease."""
         output: RequestOutput | None = None
         while True:
-            req_event.wait(timeout=1.0)
+            woke = req_event.wait(timeout=1.0)
             req_event.clear()
             self._raise_if_scheduler_failed()
             if not self._generation_alive:
                 self.abort_request(request_id)
                 raise RuntimeError("Background scheduler stopped while waiting for request completion.")
-            if self._recover_orphaned_request(request_id):
+            # Orphan check only after a silent wait (see _iter_request_snapshots).
+            if not woke and self._recover_orphaned_request(request_id):
                 continue
             with self._output_lock:
                 output = self._request_outputs.get(request_id)

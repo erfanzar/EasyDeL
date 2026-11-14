@@ -82,6 +82,66 @@ def test_recover_orphaned_request_skips_when_scheduler_still_has_pending_child()
     assert ro.outputs[2].finish_reason is None
 
 
+class _StreamEngine(_DummyIOEngine):
+    """Adds what ``_iter_request_snapshots`` reads; counts orphan checks instead of running them."""
+
+    _generation_alive = True
+    _max_request_outputs = None
+
+    def __init__(self, request_output: RequestOutput):
+        super().__init__(request_output, core_request_ids={request_output.request_id}, active_request_ids=set())
+        self._request_events = {request_output.request_id: threading.Event()}
+        self.orphan_checks = 0
+        self.on_orphan_check = None
+
+    def _raise_if_scheduler_failed(self) -> None:
+        pass
+
+    def _recover_orphaned_request(self, request_id: str) -> bool:
+        self.orphan_checks += 1
+        if self.on_orphan_check is not None:
+            self.on_orphan_check()
+        return False
+
+
+def _publish(ro: RequestOutput, text: str, *, finished: bool = False) -> None:
+    ro.accumulated_text += text
+    ro.delta_text = text
+    ro.num_generated_tokens += 1
+    ro.finished = finished
+    ro.update_seq += 1
+
+
+def test_signalled_stream_wakeups_skip_the_orphan_check():
+    # The orphan check takes the scheduler lock; a woken waiter was signalled by real progress, so running it on every
+    # wakeup only contends with the engine loop (once per stream per step at high concurrency).
+    ro = _make_request_output("req", n=1)
+    engine = _StreamEngine(ro)
+    event = engine._request_events["req"]
+    stream = engine._iter_request_snapshots("req", stopped_message="stopped")
+    for piece in ("a", "b", "c"):
+        _publish(ro, piece)
+        event.set()
+        assert next(stream).delta_text == piece
+    _publish(ro, "d", finished=True)
+    event.set()
+    assert next(stream).finished
+    assert engine.orphan_checks == 0
+    stream.close()
+
+
+def test_silent_stream_wait_still_runs_the_orphan_check():
+    ro = _make_request_output("req", n=1)
+    engine = _StreamEngine(ro)
+    # Progress that never signals the event: only the timed-out wait's orphan check path can observe it.
+    engine.on_orphan_check = lambda: _publish(ro, "z", finished=True)
+    stream = engine._iter_request_snapshots("req", stopped_message="stopped")
+    snapshot = next(stream)
+    assert snapshot.finished and snapshot.delta_text == "z"
+    assert engine.orphan_checks == 1
+    stream.close()
+
+
 def test_recover_orphaned_request_handles_single_sample_requests():
     ro = _make_request_output("req-single", n=1)
     engine = _DummyIOEngine(ro, core_request_ids=set(), active_request_ids=set())
