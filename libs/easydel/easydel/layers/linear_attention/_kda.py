@@ -426,7 +426,11 @@ class KernelDeltaAttention(spx.Module):
         self.k_conv1d = depthwise_conv(in_channels=self.key_dim, out_channels=self.key_dim, groups=self.key_dim)
         self.v_conv1d = depthwise_conv(in_channels=self.value_dim, out_channels=self.value_dim, groups=self.value_dim)
 
-        self.f_a_proj = column_linear(config.hidden_size, self.gate_low_rank_dim)
+        # ``kda_replicate_gate_low_rank``: the low-rank gate inputs are computed whole on every device (no all-gather
+        # of the pair before ``f_b_proj`` / ``g_b_proj``); each output column is the same dot product either way, up to
+        # the accumulation order of the matmul.
+        gate_low_rank_layout = common_types.Replicated if getattr(config, "kda_replicate_gate_low_rank", False) else None
+        self.f_a_proj = column_linear(config.hidden_size, self.gate_low_rank_dim, sharding_layout=gate_low_rank_layout)
         self.f_b_proj = column_linear(self.gate_low_rank_dim, self.key_dim)
         # FLA initialisation (A_log = 0, dt_bias = _DT_BIAS_INIT), in float32 like HF's strict-fp32 gate.
         self.A_log = ArrayParam.bound(shape=(self.num_heads,), dtype=jnp.float32, init_method="zeros", key=rngs.param)
@@ -438,7 +442,7 @@ class KernelDeltaAttention(spx.Module):
             key=rngs.param,
         )
         self.b_proj = column_linear(config.hidden_size, self.num_heads)
-        self.g_a_proj = column_linear(config.hidden_size, self.gate_low_rank_dim)
+        self.g_a_proj = column_linear(config.hidden_size, self.gate_low_rank_dim, sharding_layout=gate_low_rank_layout)
         self.g_b_proj = column_linear(self.gate_low_rank_dim, self.value_dim)
 
         self.o_proj = RowParallelLinear(

@@ -57,7 +57,7 @@ def _need_four_devices():
         pytest.skip("needs 4 devices for the ep2 x tp2 mesh")
 
 
-def _config(dims=EP2_TP2, split=True, heads=8):
+def _config(dims=EP2_TP2, split=True, heads=8, replicate_gate=False):
     return ed.Glm5NextTextConfig(
         vocab_size=128,
         hidden_size=HIDDEN,
@@ -86,6 +86,7 @@ def _config(dims=EP2_TP2, split=True, heads=8):
         sharding_axis_dims=dims,
         gather_shared_projection_input=True,
         kda_serving_ep_split=split,
+        kda_replicate_gate_low_rank=replicate_gate,
     )
 
 
@@ -314,6 +315,62 @@ def test_split_decode_bucket_reduces_o_proj_once_and_gathers_the_gate_pair_once(
             assert np.linalg.norm(live_split - live_plain) / np.linalg.norm(live_plain) < 1e-2
             np.testing.assert_array_equal(outs["split"][0, 3:], outs["plain"][0, 3:])
     assert _collective_counts(texts["split"]) == {"all-gather": 1, "all-reduce": 1}
+
+
+def test_replicated_gate_low_rank_drops_the_gate_pair_gather_and_keeps_the_outputs():
+    """``kda_replicate_gate_low_rank``: ``f_a_proj`` / ``g_a_proj`` are stored replicated, so a head-split decode
+    bucket has no all-gather left (only o_proj's one reduction). With the same weights the pools are bitwise those of
+    the column-parallel layer and the outputs agree up to bf16 rounding: each low-rank column is the same dot product,
+    but the replicated and the column-split matmuls may accumulate it in a different order."""
+    from easydel.infra.sharding import decode_mode_specs
+
+    _need_four_devices()
+    runs = {}
+    for replicate in (False, True):
+        model, layer = _model(_config(replicate_gate=replicate))
+        model.wire_distributed_matmul()
+        for name in ("f_a_proj", "g_a_proj"):
+            spec = getattr(layer, name).weight.value.sharding.spec
+            assert all(entry is None for entry in spec) == replicate, (name, spec)
+        runs[replicate] = (model, layer)
+    # Same weights in both layers (initializers depend only on key and shape; copied to be independent of that).
+    _, base_layer = runs[False]
+    model, layer = runs[True]
+    for name in ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj", "o_proj"):
+        target = getattr(layer, name).weight
+        target.value = jax.device_put(getattr(base_layer, name).weight.value, target.value.sharding)
+    lens, slots = (1, 1, 1, 0), (5, 2, 7, 0)
+    rng = np.random.default_rng(5)
+    hidden_np = rng.standard_normal((1, 4, HIDDEN))
+    outs, pools_out, texts = {}, {}, {}
+    for replicate, (m, lay) in runs.items():
+        split_cfg, _ = _cache_configs(m)
+        pools = _random_pools(m, split_cfg, seed=13)
+        replicated = NamedSharding(_jax_mesh(m), P())
+        with m.mesh, decode_mode_specs(True):
+            fn, state, _ = _compiled_step(m, lay, split_cfg, pools, hidden_spec=P())
+            args = (
+                state,
+                jax.device_put(jnp.asarray(hidden_np, jnp.bfloat16), replicated),
+                pools,
+                jax.device_put(jnp.asarray(np.concatenate([[0], np.cumsum(lens)]), jnp.int32), replicated),
+                jax.device_put(jnp.asarray((40, 9, 25, 0), jnp.int32), replicated),
+                jax.device_put(jnp.asarray(slots, jnp.int32), replicated),
+            )
+            program = fn.lower(*args).compile()
+            texts[replicate] = program.as_text()
+            out, new_pools = program(*args)
+        outs[replicate] = np.asarray(out, np.float32)
+        pools_out[replicate] = [np.asarray(p).view(np.uint16) for p in new_pools]
+    assert _collective_counts(texts[False]) == {"all-gather": 1, "all-reduce": 1}
+    assert _collective_counts(texts[True]) == {"all-reduce": 1}
+    for name, a, b in zip(LEAVES, pools_out[True], pools_out[False], strict=True):
+        np.testing.assert_array_equal(a, b, name)
+    live_rep, live_col = outs[True][0, :3], outs[False][0, :3]
+    assert np.linalg.norm(live_rep - live_col) / np.linalg.norm(live_col) < 1e-2
+    # At most a couple of bf16 ulps of the output magnitude per element.
+    np.testing.assert_allclose(live_rep, live_col, rtol=2 * 2**-8, atol=2 * 2**-8 * float(np.max(np.abs(live_col))))
+    np.testing.assert_array_equal(outs[True][0, 3:], outs[False][0, 3:])
 
 
 def test_flag_leaves_the_cacheless_forward_unchanged():
