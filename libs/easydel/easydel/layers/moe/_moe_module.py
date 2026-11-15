@@ -416,20 +416,24 @@ SP = common_types.SP
 
 _DEFERRED_WINDOW_ALIGN = 1024
 """Row granularity of the deferred-dispatch windows: few distinct window shapes, each a multiple of every row tile."""
-_DEFERRED_WINDOW_ALIGN_SMALL = 256
+_DEFERRED_WINDOW_ALIGN_SMALL = 512
 """Granularity of windows whose expected size is below :data:`_DEFERRED_WINDOW_ALIGN` (decode steps).
 
 Rounding a decode window up to 1024 rows made it cover every ``tokens * top_k`` row: at 128 decode tokens, top-8 and
 ep8 each expert shard expects 128 local rows (window 160) but gathered, quantized and ran both grouped matmuls on all
-1,024. 256 is still a multiple of the grouped-matmul row tiles, keeps the number of window shapes small, and a shard
-holding more than its window runs a further window (the dispatch stays dropless)."""
+1,024. A shard holding more than its window runs a further window (the dispatch stays dropless), and every other shard
+then waits for it in the combine reduction. Measured on GLM-5.3-Flash at ep8 x tp8, cc=128 decode: 256-row windows
+spilled into a second window in about 2 of the 42 MoE layers per step and doubled the combine psum's p90 (57 -> 111
+us), while the expert matmuls, bound by weight reads, shortened only ~12% for 4x fewer rows. 512 rows tolerate a
+shard receiving up to half of all routed rows, stay a multiple of the grouped-matmul row tiles and keep the number of
+window shapes small."""
 
 
 def _deferred_window_rows(total_rows: int, ep_size: int, override: int | None) -> int:
     """Static rows per window of the inference-mode ``moe_defer_tp_reduce`` dispatch (``_local_row_windows``).
 
     ``override`` (``moe_local_ffn_window_rows``) wins, capped at ``total_rows``. Otherwise ``5/4`` of one expert
-    shard's expected local rows ``total_rows / ep_size``, rounded up to 1024 rows (256 rows when that estimate is below
+    shard's expected local rows ``total_rows / ep_size``, rounded up to 1024 rows (512 rows when that estimate is below
     1024, see :data:`_DEFERRED_WINDOW_ALIGN_SMALL`) and capped at ``total_rows``: balanced routing then runs a single
     window, and so does a shard holding up to a quarter more than its share.
 

@@ -27,7 +27,8 @@ pytestmark = pytest.mark.cpu_ok
 @pytest.mark.parametrize(
     ("total_rows", "ep", "expected"),
     [
-        (1024, 8, 256),  # 128 decode tokens x top-8 at ep8: 160 expected -> 256, not all 1,024 rows
+        (1024, 8, 512),  # 128 decode tokens x top-8 at ep8: 160 expected -> 512, not all 1,024 rows
+        (2048, 8, 512),  # 256 decode tokens at ep8: 320 expected -> 512
         (256, 8, 256),  # 32 decode tokens: the window covers every row
         (128, 8, 128),  # 16 decode tokens: capped at total_rows
         (1024, 4, 512),  # ep4: 320 -> 512
@@ -50,4 +51,4 @@ def test_override_wins_and_is_capped():
 def test_window_covers_five_quarters_of_a_balanced_share(total_rows, ep):
     rows = _deferred_window_rows(total_rows, ep, None)
     assert rows == total_rows or rows >= -(-5 * total_rows // (4 * ep))
-    assert rows == total_rows or rows % 256 == 0
+    assert rows == total_rows or rows % 512 == 0
