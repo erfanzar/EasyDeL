@@ -416,14 +416,22 @@ SP = common_types.SP
 
 _DEFERRED_WINDOW_ALIGN = 1024
 """Row granularity of the deferred-dispatch windows: few distinct window shapes, each a multiple of every row tile."""
+_DEFERRED_WINDOW_ALIGN_SMALL = 256
+"""Granularity of windows whose expected size is below :data:`_DEFERRED_WINDOW_ALIGN` (decode steps).
+
+Rounding a decode window up to 1024 rows made it cover every ``tokens * top_k`` row: at 128 decode tokens, top-8 and
+ep8 each expert shard expects 128 local rows (window 160) but gathered, quantized and ran both grouped matmuls on all
+1,024. 256 is still a multiple of the grouped-matmul row tiles, keeps the number of window shapes small, and a shard
+holding more than its window runs a further window (the dispatch stays dropless)."""
 
 
 def _deferred_window_rows(total_rows: int, ep_size: int, override: int | None) -> int:
     """Static rows per window of the inference-mode ``moe_defer_tp_reduce`` dispatch (``_local_row_windows``).
 
     ``override`` (``moe_local_ffn_window_rows``) wins, capped at ``total_rows``. Otherwise ``5/4`` of one expert
-    shard's expected local rows ``total_rows / ep_size``, rounded up to 1024 rows and capped at ``total_rows``:
-    balanced routing then runs a single window, and so does a shard holding up to a quarter more than its share.
+    shard's expected local rows ``total_rows / ep_size``, rounded up to 1024 rows (256 rows when that estimate is below
+    1024, see :data:`_DEFERRED_WINDOW_ALIGN_SMALL`) and capped at ``total_rows``: balanced routing then runs a single
+    window, and so does a shard holding up to a quarter more than its share.
 
     Args:
         total_rows: ``tokens * top_k`` (static).
@@ -438,7 +446,8 @@ def _deferred_window_rows(total_rows: int, ep_size: int, override: int | None) -
     if ep_size <= 1:
         return total_rows
     rows = -(-5 * total_rows // (4 * ep_size))
-    rows = -(-rows // _DEFERRED_WINDOW_ALIGN) * _DEFERRED_WINDOW_ALIGN
+    align = _DEFERRED_WINDOW_ALIGN if rows >= _DEFERRED_WINDOW_ALIGN else _DEFERRED_WINDOW_ALIGN_SMALL
+    rows = -(-rows // align) * align
     return min(rows, total_rows)
 
 
