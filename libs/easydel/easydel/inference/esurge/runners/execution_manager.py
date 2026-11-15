@@ -352,12 +352,33 @@ def _recurrent_leaf_entries(views):
     return entries
 
 
-def _device_key(array: typing.Any) -> tuple[int, ...]:
-    """Sorted device ids holding ``array``; PP stages own disjoint device sets."""
-    devices = getattr(getattr(array, "sharding", None), "device_set", None)
+def _sorted_device_ids(sharding: typing.Any) -> tuple[int, ...]:
+    devices = getattr(sharding, "device_set", None)
     if not devices:
         return ()
     return tuple(sorted(int(device.id) for device in devices))
+
+
+@lru_cache(maxsize=1024)
+def _sharding_device_key(sharding: jax.sharding.Sharding) -> tuple[int, ...]:
+    """:func:`_sorted_device_ids`, memoized per sharding.
+
+    Row maintenance keys every recurrent leaf by its device set on each row-move event (a hybrid model has
+    hundreds of such leaves, all sharing a handful of shardings), so rebuilding and sorting the id tuple each time
+    was a measurable share of the host time between decode steps.
+    """
+    return _sorted_device_ids(sharding)
+
+
+def _device_key(array: typing.Any) -> tuple[int, ...]:
+    """Sorted device ids holding ``array``; PP stages own disjoint device sets."""
+    sharding = getattr(array, "sharding", None)
+    if sharding is None:
+        return ()
+    try:
+        return _sharding_device_key(sharding)
+    except TypeError:  # an unhashable sharding: compute it uncached
+        return _sorted_device_ids(sharding)
 
 
 def _group_by_devices(leaves: list[tuple[int, str, typing.Any]]) -> dict[tuple[int, ...], list[int]]:
