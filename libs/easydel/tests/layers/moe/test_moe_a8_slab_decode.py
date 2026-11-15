@@ -14,14 +14,12 @@
 
 """Inference-mode W8A8 routed experts at decode and measured prefill rows run ejkernel's Pallas A8 whole-slab entry.
 
-``_channelwise_grouped_platform`` selects the Pallas channelwise entry for A8 activations with int8 codes at up to
-``_A8_PALLAS_MAX_ROWS`` dispatch rows under inference mode on TPU v5p, when one 128-aligned ``(K, N)`` expert slab
-fits ``_A8_PALLAS_MAX_SLAB_BYTES``; on ``_A8_PALLAS_PREFILL_FAMILIES`` up to ``_A8_PALLAS_PREFILL_MAX_ROWS`` rows.
-Pinned here:
+``_channelwise_grouped_platform`` selects the Pallas channelwise entry for A8 activations with int8 codes under
+inference mode on TPU v5p whenever ejkernel's ``grouped_matmul_channelwise_slab_tiles`` gives whole-slab tiles: one
+128-aligned ``(K, N)`` expert slab of at most 2 MiB, at up to 81,920 dispatch rows, for any expert count. Pinned here:
 
 * the selection: Pallas only under inference mode, on v5p, for bfloat16 rows, int8 codes and a fitting 128-aligned
-  slab, at most 1024 rows or, on the measured prefill families, at most 81,920 rows; XLA for training,
-  ``moe_force_xla_gmm``, other chips and other shapes;
+  slab at most 81,920 rows; XLA for training, ``moe_force_xla_gmm``, other chips and other shapes;
 * a W8A8 GLM-5-Next routed-MoE block at the served precision (bfloat16 activations) under inference mode, in the
   decode and the TP-scattered layout on ep2 x tp2 and ep4 x tp1: the automatic selection compiles the gate, up and
   down projections as Pallas grouped matmuls and no XLA ragged dot (``moe_force_xla_gmm`` the reverse), and the
@@ -69,10 +67,14 @@ _EXPERT_CUSTOM_CALL = re.compile(
         ((72, 5120, 512, 4096), True, False, "v5p", "pallas"),
         ((72, 81920, 4096, 512), True, False, "v5p", "pallas"),
         ((72, 81921, 4096, 512), True, False, "v5p", "xla"),
-        ((288, 1025, 4096, 128), True, False, "v5p", "xla"),
+        ((288, 1025, 4096, 128), True, False, "v5p", "pallas"),
+        ((32, 32768, 2048, 768), True, False, "v5p", "pallas"),
+        ((64, 81920, 512, 2048), True, False, "v5p", "pallas"),
+        ((64, 81921, 512, 2048), True, False, "v5p", "xla"),
+        ((32, 8192, 2048, 1536), True, False, "v5p", "xla"),
         ((72, 5120, 4096, 512), False, False, "v5p", "xla"),
         ((72, 5120, 4096, 512), True, True, "v5p", "xla"),
-        ((128, 5120, 640, 2560), True, False, "v5p", "xla"),
+        ((128, 5120, 640, 2560), True, False, "v5p", "pallas"),
         ((72, 256, 4096, 512), False, False, "v5p", "xla"),
         ((72, 256, 4096, 512), True, True, "v5p", "xla"),
         ((72, 256, 4096, 512), True, False, "v6e", "xla"),
