@@ -339,11 +339,10 @@ def kda_decode_rows_forward(
             window = jnp.where(fresh[:, None, None], jnp.zeros((), compute), held.astype(compute))
             x = stream[0][tok].astype(compute)
             new_window = jnp.concatenate([window[:, :, 1:], x[:, :, None]], axis=-1)  # [rows, dim, d_conv]
-            taps = new_window.astype(f32)
-            weights = kernel.astype(f32)
-            mixed = taps[:, :, 0] * weights[None, :, 0]
-            for j in range(1, int(kernel.shape[-1])):
-                mixed = mixed + taps[:, :, j] * weights[None, :, j]
+            # One reduce over d_conv instead of per-tap slices: slicing taps[:, :, j] made XLA re-tile every
+            # [rows, dim, d_conv] window into a dim-minor layout and back (GLM-5.3-Flash ep8 x tp8 decode: two
+            # bf16[128, 128, 4] copies per conv, 3 convs per KDA layer). Bitwise equal on TPU v5p.
+            mixed = jnp.sum(new_window.astype(f32) * kernel.astype(f32)[None], axis=-1)
             out = jax.nn.silu(mixed).astype(compute).astype(conv_dtype)
             new_window = new_window.astype(pool_leaf.dtype)
             if state_indices is not None:
