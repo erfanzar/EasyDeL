@@ -744,7 +744,13 @@ class SequenceBuffer:
         if not empty_req_indices:
             return
 
-        self.compact_holes_in_range(0, len(self._req_ids))
+        # Fill each hole below num_reqs with the last live row above it: one move per hole. Shifting every later row
+        # forward instead copied up to num_reqs full max_model_len-wide token rows when a request near row 0 finished.
+        live_end = min(num_reqs, len(self._req_ids))
+        holes = [i for i in range(live_end) if self._req_ids[i] is None]
+        sources = [i for i in range(len(self._req_ids) - 1, live_end - 1, -1) if self._req_ids[i] is not None]
+        for hole, src in zip(holes, sources, strict=True):
+            self._move_request(src, hole)
 
         del self._req_ids[self.num_reqs :]
         del self.req_output_token_ids[self.num_reqs :]

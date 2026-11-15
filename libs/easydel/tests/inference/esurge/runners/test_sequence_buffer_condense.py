@@ -52,7 +52,7 @@ def _make_buffer(max_num_reqs: int = 8) -> SequenceBuffer:
 
 
 def test_sequence_buffer_condense_preserves_all_live_requests_with_multiple_holes() -> None:
-    """Compaction should preserve request order while removing multiple gaps."""
+    """Compaction fills each hole below num_reqs with the last live row; rows that need no move keep their index."""
     buffer = _make_buffer()
     requests = [_make_request(f"req-{i}", i + 1) for i in range(5)]
 
@@ -63,8 +63,8 @@ def test_sequence_buffer_condense_preserves_all_live_requests_with_multiple_hole
     buffer.condense([idx for idx in removed if idx is not None])
 
     assert buffer.num_reqs == 3
-    assert buffer.req_ids == ["req-0", "req-2", "req-4"]
-    assert buffer.req_id_to_index == {"req-0": 0, "req-2": 1, "req-4": 2}
+    assert buffer.req_ids == ["req-0", "req-4", "req-2"]
+    assert buffer.req_id_to_index == {"req-0": 0, "req-4": 1, "req-2": 2}
 
 
 def test_condense_fewer_prompts_than_max_num_seqs() -> None:
@@ -131,10 +131,10 @@ def test_condense_preserves_page_table() -> None:
     r2 = buffer.remove_request("req-2")
     buffer.condense([idx for idx in [r0, r2] if idx is not None])
 
-    assert buffer.req_ids == ["req-1", "req-3"]
+    assert buffer.req_ids == ["req-3", "req-1"]
     pt = buffer.page_table.page_tables[0]
-    assert pt.page_table_cpu[0, 0] == 11
-    assert pt.page_table_cpu[1, 0] == 13
+    assert pt.page_table_cpu[0, 0] == 13
+    assert pt.page_table_cpu[1, 0] == 11
 
 
 def test_condense_clears_source_page_table_rows() -> None:
@@ -166,9 +166,10 @@ def test_condense_preserves_sampling_params() -> None:
     removed = buffer.remove_request("req-1")
     buffer.condense([removed])
 
+    assert buffer.req_ids == ["req-0", "req-3", "req-2"]
     assert buffer.temperature[0] == 0.1
-    assert buffer.temperature[1] == 0.3
-    assert buffer.temperature[2] == 0.4
+    assert buffer.temperature[1] == 0.4
+    assert buffer.temperature[2] == 0.3
 
 
 def test_compact_holes_in_range_within_shard() -> None:
@@ -315,9 +316,9 @@ def test_condense_handles_consecutive_holes() -> None:
 
     buffer.condense(removed)
     assert buffer.num_reqs == 2
-    assert buffer.req_ids == ["req-3", "req-4"]
-    assert buffer.token_ids[0, 0] == 4
-    assert buffer.token_ids[1, 0] == 5
+    assert buffer.req_ids == ["req-4", "req-3"]
+    assert buffer.token_ids[0, 0] == 5
+    assert buffer.token_ids[1, 0] == 4
 
 
 def test_source_arrays_zeroed_after_condense() -> None:
@@ -346,11 +347,30 @@ def test_condense_zeroes_every_vacated_token_row_including_tail_past_num_tokens(
     removed = [buffer.remove_request("req-0"), buffer.remove_request("req-2")]
     buffer.condense([idx for idx in removed if idx is not None])
 
-    assert buffer.req_ids == ["req-1", "req-3", "req-4", "req-5"]
-    for row, src in enumerate((1, 3, 4, 5)):
+    assert buffer.req_ids == ["req-5", "req-1", "req-4", "req-3"]
+    for row, src in enumerate((5, 1, 4, 3)):
         assert buffer.token_ids[row, 0] == src + 1
         assert (buffer.token_ids[row, 1:] == 100 + src).all()
     assert not buffer.token_ids[4:].any()
+
+
+def test_condense_moves_one_row_per_hole_and_leaves_other_rows_in_place() -> None:
+    """A hole at row 0 is filled by the last row only; every other live row keeps its index and data."""
+    buffer = _make_buffer()
+    for i in range(6):
+        buffer.add_request(_make_request(f"req-{i}", i + 1))
+    version_before = buffer.layout_version
+
+    removed = buffer.remove_request("req-0")
+    buffer.condense([removed])
+
+    assert buffer.req_ids == ["req-5", "req-1", "req-2", "req-3", "req-4"]
+    assert buffer.req_id_to_index == {f"req-{i}": i for i in range(1, 5)} | {"req-5": 0}
+    assert [int(buffer.token_ids[row, 0]) for row in range(5)] == [6, 2, 3, 4, 5]
+    pt = buffer.page_table.page_tables[0]
+    assert [int(pt.page_table_cpu[row, 0]) for row in range(5)] == [6, 2, 3, 4, 5]
+    assert pt.num_pages_per_row[5] == 0
+    assert buffer.layout_version == version_before + 2  # remove_request + exactly one move
 
 
 def test_condense_no_empty_indices_is_noop() -> None:
