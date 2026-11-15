@@ -936,10 +936,14 @@ class eSurgeRunner:
         to the kernel, so their device state is keyed by a stable slot and must
         not be permuted here.
         """
-        return bool(self._has_recurrent_layers) and not self.slot_pool.is_enabled()
+        return bool(getattr(self, "_has_recurrent_layers", False)) and not self.slot_pool.is_enabled()
 
-    def _sync_recurrent_rows(self, prev_row_owner: list[str | None] | None) -> None:
-        """Move device recurrent-state rows to follow SequenceBuffer row moves.
+    def _sync_recurrent_rows(
+        self,
+        prev_row_owner: list[str | None] | None,
+        removed_req_ids: typing.Collection[str] = (),
+    ) -> None:
+        """Move device recurrent-state rows to follow SequenceBuffer row moves, zeroing freed rows in the same pass.
 
         On the plain-recurrent path the conv/GDR/SSM cache is indexed by the
         physical ``SequenceBuffer`` row a request occupies in the packed batch.
@@ -951,19 +955,31 @@ class eSurgeRunner:
         the current layout and applies it via
         :meth:`ExecutionManager.permute_recurrent_slots`.
 
+        The state sync defers the zeroing of rows freed this step to here (``defer_row_clears``): every destination
+        row that does not carry a surviving request gets ``perm[t] == -1`` and is zeroed by the same dispatch that
+        moves the survivors, instead of a separate clear dispatch before it. A request removed this step (finished,
+        or preempted and re-admitted in the same step) never counts as a survivor, so its state is not carried.
+
         Args:
             prev_row_owner: Per-row request ids captured immediately before
                 ``_update_states`` this step, or ``None`` when the plain-recurrent
                 row sync is disabled (non-recurrent or slot-pooled models).
+            removed_req_ids: Requests finished or preempted this step.
         """
         if prev_row_owner is None:
             return
         n = int(self.max_num_reqs)
+        removed = {str(rid) for rid in removed_req_ids}
         new_ids = self.sequence_buffer.req_ids
         prev_index: dict[str, int] = {}
+        freed_rows: list[int] = []
         for f, rid in enumerate(prev_row_owner):
-            if rid is not None and f < n:
-                prev_index[str(rid)] = f
+            if rid is None or f >= n:
+                continue
+            if str(rid) in removed:
+                freed_rows.append(f)  # its old row must end up zeroed
+                continue
+            prev_index[str(rid)] = f
         perm = np.full((n,), -1, dtype=np.int32)
         moved = False
         for t in range(n):
@@ -972,15 +988,18 @@ class eSurgeRunner:
                 continue
             f = prev_index.get(str(rid))
             if f is None:
-                # Newly admitted this step: its row is (re)populated by prefill;
+                # Newly admitted (or re-admitted) this step: its row is (re)populated by prefill;
                 # leaving perm[t] == -1 zeroes any stale occupant first.
                 continue
             perm[t] = f
             if f != t:
                 moved = True
-        if not moved:
-            return
-        self.executor_manager.permute_recurrent_slots(perm)
+        if moved:
+            # One dispatch moves the survivors and zeroes every row left without one (freed rows included).
+            self.executor_manager.permute_recurrent_slots(perm)
+        elif freed_rows:
+            # Nothing moved: zeroing the freed rows is cheaper than a full-pool row gather.
+            self.executor_manager.clear_recurrent_slots(freed_rows)
 
     def _snapshot_rows(self, by_req: dict[str, int]) -> tuple[list[int], list[int]]:
         """Map ``request id -> snapshot slot`` to aligned (state row, slot) lists for live requests."""
@@ -1674,6 +1693,7 @@ class eSurgeRunner:
             spec_decode_recurrent_candidates=self.spec_decode_recurrent_candidates,
             spec_recurrent_commit_cpu=self._spec_recurrent_commit_cpu,
             pending_spec_recurrent_commit_by_req=self._pending_spec_recurrent_commit_by_req,
+            defer_row_clears=self._plain_recurrent_row_sync_enabled(),
         )
 
     def _get_vlm_cpu_buffers(
@@ -3258,7 +3278,10 @@ class eSurgeRunner:
             )
             # Keep the plain-recurrent conv/GDR/SSM device state (indexed by
             # physical buffer row) in lockstep with condense/reorder row moves.
-            self._sync_recurrent_rows(prev_recurrent_row_owner)
+            self._sync_recurrent_rows(
+                prev_recurrent_row_owner,
+                set(scheduler_output.finished_req_ids) | set(scheduler_output.preempted_req_ids),
+            )
         if self.drafter is not None:
             self._spec_recorded_this_step = False
             self.spec.last_spec_emitted = None

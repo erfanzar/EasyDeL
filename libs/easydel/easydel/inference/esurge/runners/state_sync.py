@@ -77,6 +77,7 @@ class SequenceStateSync:
         spec_decode_recurrent_candidates: bool,
         spec_recurrent_commit_cpu: np.ndarray,
         pending_spec_recurrent_commit_by_req: dict[str, int],
+        defer_row_clears: bool = False,
     ) -> None:
         """Capture the live state handles this synchronizer operates on.
 
@@ -91,7 +92,11 @@ class SequenceStateSync:
                 commits are enabled.
             spec_recurrent_commit_cpu: Pending spec-commit host scratch.
             pending_spec_recurrent_commit_by_req: Pending spec-commit counts.
+            defer_row_clears: Identity-layout runners (device recurrent rows follow SequenceBuffer rows) leave the
+                zeroing of freed rows to the runner's row sync, which zeroes them in the same dispatch that moves
+                the surviving rows. Slot-pooled runners always clear here.
         """
+        self.defer_row_clears = bool(defer_row_clears)
         self.sequence_buffer = sequence_buffer
         self.requests = requests
         self.slot_pool = slot_pool
@@ -212,7 +217,8 @@ class SequenceStateSync:
         # runners clear physical slots; row-identity runners clear buffer rows.
         slots_to_clear = removed_recurrent_slots if self.slot_pool.is_enabled() else removed_req_indices
         if slots_to_clear:
-            self.executor_manager.clear_recurrent_slots(slots_to_clear)
+            if self.slot_pool.is_enabled() or not self.defer_row_clears:
+                self.executor_manager.clear_recurrent_slots(slots_to_clear)
             if self.spec_decode_recurrent_candidates:
                 for req_index in removed_req_indices:
                     if 0 <= int(req_index) < int(self.spec_recurrent_commit_cpu.shape[1]):
