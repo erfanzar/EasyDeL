@@ -648,11 +648,18 @@ class SequenceBuffer:
             hi: End of the range (exclusive).
         """
         write = lo
+        vacated_sources: list[int] = []
         for read in range(lo, hi):
             if self._req_ids[read] is not None:
                 if read != write:
-                    self._move_request(read, write)
+                    # Every source row below the final write position is overwritten in full by a later move, so only
+                    # the sources left vacated at the tail need their (max_model_len-wide) token row zeroed.
+                    self._move_request(read, write, clear_source_tokens=False)
+                    vacated_sources.append(read)
                 write += 1
+        for row in vacated_sources:
+            if row >= write:
+                self.token_ids[row] = 0
         if write < hi:
             self._update_request_distribution()
 
@@ -743,7 +750,7 @@ class SequenceBuffer:
         del self.req_output_token_ids[self.num_reqs :]
         self._update_request_distribution()
 
-    def _move_request(self, from_idx: int, to_idx: int) -> None:
+    def _move_request(self, from_idx: int, to_idx: int, *, clear_source_tokens: bool = True) -> None:
         """Move a request from one index to another.
 
         Internal method for relocating a request within the buffer.
@@ -753,6 +760,8 @@ class SequenceBuffer:
         Args:
             from_idx: Source index of the request.
             to_idx: Destination index for the request.
+            clear_source_tokens: Zero the source's token row. A caller that overwrites or zeroes that row itself
+                (order-preserving compaction) passes False to skip the full-row write.
 
         Note:
             This is an internal method used by condense() and other
@@ -774,7 +783,8 @@ class SequenceBuffer:
         # Arrays - copy to destination then zero source to keep
         # JAX array pointers and internal bookkeeping in sync.
         self.token_ids = move_row(self.token_ids, from_idx, to_idx)
-        self.token_ids[from_idx] = 0
+        if clear_source_tokens:
+            self.token_ids[from_idx] = 0
         self.num_tokens = move_row(self.num_tokens, from_idx, to_idx)
         self.num_tokens[from_idx] = 0
         self.num_tokens_no_spec = move_row(self.num_tokens_no_spec, from_idx, to_idx)

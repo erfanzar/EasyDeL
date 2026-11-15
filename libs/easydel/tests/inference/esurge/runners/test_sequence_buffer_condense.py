@@ -335,6 +335,24 @@ def test_source_arrays_zeroed_after_condense() -> None:
     assert buffer.token_ids[3, 0] == 0
 
 
+def test_condense_zeroes_every_vacated_token_row_including_tail_past_num_tokens() -> None:
+    """Rows left empty by compaction are fully zeroed; moved rows keep their whole token row (incl. past num_tokens)."""
+    buffer = _make_buffer()
+    for i in range(6):
+        buffer.add_request(_make_request(f"req-{i}", i + 1))
+    for i in range(6):
+        buffer.token_ids[i, 1:] = 100 + i  # tokens past num_tokens, as an in-flight async write can leave
+
+    removed = [buffer.remove_request("req-0"), buffer.remove_request("req-2")]
+    buffer.condense([idx for idx in removed if idx is not None])
+
+    assert buffer.req_ids == ["req-1", "req-3", "req-4", "req-5"]
+    for row, src in enumerate((1, 3, 4, 5)):
+        assert buffer.token_ids[row, 0] == src + 1
+        assert (buffer.token_ids[row, 1:] == 100 + src).all()
+    assert not buffer.token_ids[4:].any()
+
+
 def test_condense_no_empty_indices_is_noop() -> None:
     """Calling condense with no empty indices should be a no-op."""
     buffer = _make_buffer()
