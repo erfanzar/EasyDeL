@@ -1,15 +1,16 @@
 """A8 whole-slab streaming of int8 experts (TPU only).
 
 A8 activations with int8 codes whose 128-aligned ``(K, N)`` expert slab fits 2 MiB stream one whole slab per expert
-that has rows, and the Pallas entry applies both scales inside the kernel (``_a8_slab_tiles``): at up to 1024 rows with
-32-row tiles, and on the measured prefill families (the per-chip experts of GLM-5.3-Flash served at ep4 x tp4) up to
-81,920 rows with a row tile chosen from the rows per expert. Pinned here: outputs bit-identical to the XLA entry
-(bfloat16 and float32) and equal to an exact float64 reference at decode rows, at the per-chip expert shapes with
-decode-like routing (one to a few rows on about half the experts, NaN dispatch-tail rows), at the 1024-row bound, at the
-tp16 per-chip shapes and at rows that are not a multiple of the 32-row tile; bit-identical to the XLA entry at ep4
-prefill windows with each prefill row tile, including one group spanning many row tiles; all-empty groups (with NaN
-scales on the unrouted experts) write zeros; the tile policy at its bounds; and the compiled program runs one Mosaic
-kernel that writes the scaled float32 rows.
+that has rows, and the Pallas entry applies both scales inside the kernel (``_a8_slab_tiles``), for any expert count:
+at up to 1024 rows with 32-row tiles, and up to 81,920 rows with a row tile chosen from the rows per expert (halved for
+slabs wider than 4096 in K or N). Pinned here: outputs bit-identical to the XLA entry (bfloat16 and float32) and equal
+to an exact float64 reference at decode rows, at the per-chip expert shapes with decode-like routing (one to a few rows
+on about half the experts, NaN dispatch-tail rows), at the 1024-row bound, at the tp16 per-chip shapes and at rows that
+are not a multiple of the 32-row tile; bit-identical to the XLA entry at ep4 prefill windows with each prefill row
+tile, including one group spanning many row tiles, and at prefill rows of other expert shapes (other expert counts,
+widths and a halved row tile); all-empty groups (with NaN scales on the unrouted experts) write zeros; the tile policy
+at its bounds; the per-chip GLM-5.3-Flash shapes keep the row tiles they were measured with at every row count; and
+the compiled program runs one Mosaic kernel that writes the scaled float32 rows.
 """
 
 import importlib
@@ -89,18 +90,31 @@ def test_slab_matches_xla_and_exact_reference(e, m, k, n, local, active, dtype):
 
 
 @pytest.mark.parametrize(
-    "m,k,n,local,skew",
+    "e,m,k,n,local,skew",
     [
-        (2048, 4096, 512, 1600, False),
-        (5120, 512, 4096, 4000, True),
-        (20480, 4096, 512, 16000, False),
-        (40960, 512, 4096, 32000, True),
+        (72, 2048, 4096, 512, 1600, False),
+        (72, 5120, 512, 4096, 4000, True),
+        (72, 20480, 4096, 512, 16000, False),
+        (72, 40960, 512, 4096, 32000, True),
+        (288, 2048, 4096, 128, 1600, False),
+        (32, 8192, 2048, 768, 6500, True),
+        (32, 8192, 768, 2048, 6500, False),
+        (64, 32768, 256, 7168, 26000, True),
     ],
-    ids=["w2048_gate_tm64", "w5120_down_tm128_skew", "w20480_gate_tm256", "w40960_down_tm512_skew"],
+    ids=[
+        "w2048_gate_tm64",
+        "w5120_down_tm128_skew",
+        "w20480_gate_tm256",
+        "w40960_down_tm512_skew",
+        "e288_gate_tm64",
+        "e32_gate_tm256_skew",
+        "e32_down_tm256",
+        "e64_wide_n_tm256_halved_skew",
+    ],
 )
-def test_prefill_slab_matches_xla(m, k, n, local, skew):
-    """ep4 prefill windows of the per-chip GLM-5.3-Flash experts, each row tile of the prefill rule."""
-    e = 72
+def test_prefill_slab_matches_xla(e, m, k, n, local, skew):
+    """Prefill row buffers: the ep4 windows of the per-chip GLM-5.3-Flash experts at each row tile of the prefill
+    rule, and other expert counts and widths, including a slab whose row tile is halved for its 7168-wide ``N``."""
     tiles = impl._a8_slab_tiles(m, 8, e, k, n, jnp.dtype(jnp.int8))
     assert tiles is not None and tiles[0] > 32 and tiles[1:] == (k, n), tiles
     rng = np.random.default_rng(m + k)
@@ -151,8 +165,15 @@ def test_slab_with_every_group_empty_writes_zeros():
         (40960, 8, 72, 512, 4096, jnp.int8, (512, 512, 4096)),
         (81920, 8, 72, 4096, 512, jnp.int8, (512, 4096, 512)),
         (81921, 8, 72, 4096, 512, jnp.int8, None),
-        (1025, 8, 288, 4096, 128, jnp.int8, None),
-        (5120, 8, 128, 640, 2560, jnp.int8, None),
+        (1025, 8, 288, 4096, 128, jnp.int8, (64, 4096, 128)),
+        (5120, 8, 128, 640, 2560, jnp.int8, (64, 640, 2560)),
+        (8192, 8, 32, 2048, 768, jnp.int8, (256, 2048, 768)),
+        (32768, 8, 32, 768, 2048, jnp.int8, (512, 768, 2048)),
+        (32768, 8, 64, 256, 7168, jnp.int8, (256, 256, 7168)),
+        (32768, 8, 64, 7168, 256, jnp.int8, (256, 7168, 256)),
+        (81920, 8, 8, 128, 16384, jnp.int8, (128, 128, 16384)),
+        (81921, 8, 8, 128, 16384, jnp.int8, None),
+        (8192, 8, 32, 2048, 1536, jnp.int8, None),
         (0, 8, 72, 4096, 512, jnp.int8, None),
         (256, 4, 72, 4096, 512, jnp.int4, None),
         (256, 16, 72, 4096, 512, jnp.int8, None),
@@ -165,6 +186,28 @@ def test_slab_with_every_group_empty_writes_zeros():
 )
 def test_slab_tile_policy(m, bits, e, k, n, dtype, expected):
     assert impl._a8_slab_tiles(m, bits, e, k, n, jnp.dtype(dtype)) == expected
+
+
+# The row tiles the per-chip GLM-5.3-Flash experts (ep4 x tp4) were measured and served with, as (last row, tile_m)
+# ranges over the dispatch rows: 32 up to 1024 rows, then by rows per expert (72 experts) 64 up to 55 (3,960 rows),
+# 128 up to 200 (14,400), 256 up to 400 (28,800) and 512 up to the 81,920-row cap; no slab tiles outside 1..81,920.
+_GLM_ROW_TILES = ((1024, 32), (3960, 64), (14400, 128), (28800, 256), (81920, 512))
+
+
+@pytest.mark.parametrize("k,n", [(4096, 512), (512, 4096)], ids=["gate_up", "down"])
+def test_glm_expert_shapes_keep_their_measured_tiles_at_every_row_count(k, n):
+    expected = {0: None, 81921: None, 100000: None}
+    first = 1
+    for last, tile_m in _GLM_ROW_TILES:
+        expected.update({m: (tile_m, k, n) for m in range(first, last + 1)})
+        first = last + 1
+    for m, tiles in expected.items():
+        assert impl._a8_slab_tiles(m, 8, 72, k, n, jnp.dtype(jnp.int8)) == tiles, m
+    # The public helper easydel's dispatch selection asks gives the same tiles.
+    from ejkernel.modules import grouped_matmul_channelwise_slab_tiles
+
+    for m in (1, 1024, 1025, 3960, 3961, 14400, 14401, 28800, 28801, 81920, 81921):
+        assert grouped_matmul_channelwise_slab_tiles(m, (72, k, n), jnp.int8, activation_bits=8) == expected.get(m)
 
 
 def test_slab_compiles_one_kernel_writing_scaled_f32_rows():

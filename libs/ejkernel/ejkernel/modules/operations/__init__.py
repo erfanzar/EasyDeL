@@ -285,6 +285,7 @@ from .grouped_matmul import (
     GroupedMatmulChannelwise,
     grouped_matmul,
     grouped_matmul_channelwise,
+    grouped_matmul_channelwise_slab_tiles,
     grouped_matmul_w8a8,
 )
 from .indexer_scores import IndexerScores, indexer_scores
@@ -541,6 +542,7 @@ __all__ = (
     "gla_attention",
     "grouped_matmul",
     "grouped_matmul_channelwise",
+    "grouped_matmul_channelwise_slab_tiles",
     "grouped_matmul_w8a8",
     "indexer_scores",
     "kda_attention",

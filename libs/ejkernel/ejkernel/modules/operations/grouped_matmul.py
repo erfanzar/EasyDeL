@@ -842,8 +842,9 @@ def grouped_matmul_channelwise(
     on measured decode matrix families; A4/A8 choose M=32 and full K subject
     to the RHS buffer budget, and A8 with int8 codes streams one whole
     128-aligned (K, N) expert slab that fits 2 MiB, with both scales applied
-    in the kernel, at up to 1024 rows and on the measured prefill families up
-    to 81,920 rows. Explicit tiles override these heuristics.
+    in the kernel, at up to 81,920 rows for any expert count, with a row tile
+    chosen from the rows per expert (:func:`grouped_matmul_channelwise_slab_tiles`).
+    Explicit tiles override these heuristics.
     Pallas AD uses the XLA reference for activation/scale derivatives and
     may materialize floating weights: no backward memory saving is promised.
     There is no automatic mode or platform selection.
@@ -873,6 +874,36 @@ def grouped_matmul_channelwise(
         tiling=tiling,
         _cfg=cfg,
     )
+
+
+def grouped_matmul_channelwise_slab_tiles(
+    rows: int,
+    codes_shape: tuple[int, int, int],
+    codes_dtype: DTypeLike,
+    *,
+    activation_bits: int,
+) -> tuple[int, int, int] | None:
+    """The whole-slab ``(tile_m, K, N)`` tiles of :func:`grouped_matmul_channelwise`'s TPU Pallas entry, or ``None``.
+
+    The rule ``platform='pallas'`` applies when ``tiling`` is not given: A8 activations with int8 codes whose
+    128-aligned ``(K, N)`` expert slab fits 2 MiB, at up to 81,920 rows, for any expert count; the row tile follows the
+    rows per expert. A caller that chooses the platform per call asks this, so its selection and the kernel follow one
+    rule. Pure shape policy: it queries no device.
+
+    Args:
+        rows: Rows of ``lhs`` (``M``).
+        codes_shape: ``(E, K, N)`` of the expert codes.
+        codes_dtype: Dtype of the codes.
+        activation_bits: Activation precision of the call (4, 8 or 16).
+
+    Returns:
+        ``(tile_m, K, N)`` when the entry streams one whole slab per expert, else ``None`` (it streams partial slabs).
+    """
+    import importlib
+
+    impl = importlib.import_module("ejkernel.kernels._pallas.tpu.grouped_matmul_channelwise._interface")
+    e, k, n = (int(d) for d in codes_shape)
+    return impl._a8_slab_tiles(int(rows), int(activation_bits), e, k, n, jnp.dtype(codes_dtype))
 
 
 def grouped_matmul_w8a8(

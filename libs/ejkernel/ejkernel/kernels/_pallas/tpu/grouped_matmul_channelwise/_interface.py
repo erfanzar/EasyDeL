@@ -30,22 +30,24 @@ _A8_SLAB_MAX_ROWS = 1024
 """Rows (decode buckets) up to which A8 int8 experts stream one whole (K, N) slab per grid step with 32-row tiles."""
 _SLAB_MAX_BYTES = 2 * 1024 * 1024
 """RHS bytes per pipeline buffer, the budget ``_integer_streaming_tiles`` keeps (three buffers: 6 MiB of VMEM)."""
-_A8_PREFILL_SLAB_FAMILIES = frozenset({(72, 4096, 512), (72, 512, 4096)})
-"""Expert-stacked ``(E, K, N)`` int8 families whose whole-slab A8 tiles were measured at prefill rows on TPU v5p: the
-per-chip routed experts (gate/up, down) of GLM-5.3-Flash served at ep4 x tp4."""
 _A8_PREFILL_SLAB_MAX_ROWS = 81920
-"""Largest measured prefill buffer: the deferred MoE dispatch's window of one 32,768-token step at ep4 (top-8)."""
+"""Largest measured row buffer: the deferred MoE dispatch's window of one 32,768-token step at ep4 (top-8)."""
 _A8_PREFILL_TILE_M = ((55, 64), (200, 128), (400, 256))
 """``(max rows per expert, tile_m)`` of the prefill slab tiles; 512 above the last bound (see ``_a8_slab_tiles``)."""
+_A8_SLAB_MAX_TILE_ELEMENTS = 512 * 4096
+"""Largest ``tile_m * K`` and ``tile_m * N`` of a slab tile: the measured 512-row tiles of the ``K = 4096`` gate/up and
+the ``N = 4096`` down slabs. A slab with a wider ``K`` or ``N`` halves its row tile until both products fit, keeping
+the row block and the output tile within the sizes that were compiled and measured."""
 
 
 def _a8_slab_tiles(m, activation_bits, e, k, n, dtype):
     """``(tile_m, K, N)`` tiles holding one whole int8 expert slab, or ``None`` (keep ``_integer_streaming_tiles``).
 
-    Applies to A8 activations with int8 codes whose ``(K, N)`` slab is 128-aligned and fits one 2 MiB RHS buffer:
-    at up to ``_A8_SLAB_MAX_ROWS`` rows with 32-row tiles, and on the measured ``_A8_PREFILL_SLAB_FAMILIES`` up to
-    ``_A8_PREFILL_SLAB_MAX_ROWS`` rows with the ``_A8_PREFILL_TILE_M`` row tile of the buffer's rows per expert
-    ``m / E``. Experts without rows are never read, and the entry applies both scales inside the kernel. Measured on
+    Applies to A8 activations with int8 codes whose ``(K, N)`` slab is 128-aligned and fits one 2 MiB RHS buffer, for
+    any expert count: at up to ``_A8_SLAB_MAX_ROWS`` rows with 32-row tiles, and up to ``_A8_PREFILL_SLAB_MAX_ROWS``
+    rows with the ``_A8_PREFILL_TILE_M`` row tile of the buffer's rows per expert ``m / E``, halved while
+    ``tile_m * max(K, N)`` exceeds ``_A8_SLAB_MAX_TILE_ELEMENTS``. Pure shape policy: it queries no device. Experts
+    without rows are never read, and the entry applies both scales inside the kernel. The row tiles were measured on
     TPU v5p, one chip, on the per-chip expert shapes of GLM-5.3-Flash served at ep4 x tp4 (int8 [72, 4096, 512]
     gate/up, [72, 512, 4096] down), every output bitwise equal to the XLA entry's:
 
@@ -66,10 +68,12 @@ def _a8_slab_tiles(m, activation_bits, e, k, n, dtype):
         return None
     if m <= _A8_SLAB_MAX_ROWS:
         return (32, k, n)
-    if m > _A8_PREFILL_SLAB_MAX_ROWS or (e, k, n) not in _A8_PREFILL_SLAB_FAMILIES:
+    if m > _A8_PREFILL_SLAB_MAX_ROWS:
         return None
     rows_per_expert = m / e
     tile_m = next((tile for bound, tile in _A8_PREFILL_TILE_M if rows_per_expert <= bound), 512)
+    while tile_m > 32 and tile_m * max(k, n) > _A8_SLAB_MAX_TILE_ELEMENTS:
+        tile_m //= 2
     return (tile_m, k, n)
 
 
@@ -153,7 +157,7 @@ def grouped_matmul_channelwise(
     families and retains prior defaults elsewhere. Integer activations use
     M=32, full K within the RHS buffer budget, and roughly N/2, except A8 with
     int8 codes whose whole 128-aligned (K, N) slab fits the 2 MiB buffer, at
-    up to 1024 rows and on the measured prefill families up to 81,920 rows
+    up to 81,920 rows with a row tile chosen from the rows per expert
     (``_a8_slab_tiles``): one slab per grid step, both scales applied in the
     kernel into f32, the tail mask and the cast in XLA.
     Group sizes must be nonnegative and sum to at most M. Trailing padding has
