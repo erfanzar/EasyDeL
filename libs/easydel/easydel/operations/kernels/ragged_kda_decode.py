@@ -493,19 +493,29 @@ def kda_rows_forward(
     qsl = jnp.asarray(query_start_loc, dtype=jnp.int32)
     decode_only = jnp.all(qsl[1:] - qsl[:-1] <= 1)
 
-    def branch(forward: Callable[..., tuple[Array, KDACacheView]], **extra):
+    def branch(forward: Callable[..., tuple[Array, KDACacheView]], args: dict, **extra):
         def run(pool_leaves):
-            out, new_view = forward(cache_view=cache_view.update_kda_states(*pool_leaves), **common, **extra)
+            out, new_view = forward(cache_view=cache_view.update_kda_states(*pool_leaves), **args, **extra)
             return out, tuple(getattr(new_view, name) for name in LEAF_NAMES)
 
         return run
 
-    out, new_leaves = lax.cond(
-        decode_only,
-        branch(kda_decode_rows_forward),
-        branch(flat_forward, **flat_kwargs),
-        leaves,
-    )
+    branches = [branch(flat_forward, common, **flat_kwargs), branch(kda_decode_rows_forward, common)]
+    index = decode_only.astype(jnp.int32)
+    seq_len = int(query.shape[1])
+    if state_indices is None and seq_len < rows:
+        # Prefix steps: the live rows are the leading ones and row r's token sits at position r (eSurge keeps running
+        # requests in the leading rows), so qsl[:T + 1] == min(arange(T + 1), qsl[-1]). Such a step is the row-major
+        # decode of the first T rows, which own the first T pool slots: windows and states are sliced and updated in
+        # place, with no gather or scatter (same per-row arithmetic, so the result is bit for bit the token-major one).
+        pos = jnp.arange(seq_len + 1, dtype=jnp.int32)
+        prefix = jnp.all(qsl[: seq_len + 1] == jnp.minimum(pos, qsl[-1]))
+        head = dict(common, query_start_loc=query_start_loc[: seq_len + 1])
+        if context_lens is not None:
+            head["context_lens"] = jnp.asarray(context_lens)[:seq_len]
+        branches.append(branch(kda_decode_rows_forward, head))
+        index = jnp.where(prefix, 2, index)
+    out, new_leaves = lax.switch(index, branches, leaves)
     return out, cache_view.update_kda_states(*new_leaves)
 
 

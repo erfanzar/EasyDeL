@@ -55,7 +55,27 @@ def test_token_major_decode_matches_row_major_bitwise(dtype, tp, implicit_slots,
         short_case[name] = long_case[name][:SHORT]
     short_out, short = _run(kda_rows_forward, short_case, (lens, context, SHORT), dtype, tp=tp, slots=slots)
     long_out, long = _run(kda_rows_forward, long_case, (lens, context, long_len), dtype, tp=tp, slots=slots)
-    assert entries == [SHORT, long_len], entries
+    # The short bucket traces the token-major and the prefix branch (both SHORT entries), the long one the row-major.
+    assert entries[-1] == long_len and set(entries[:-1]) == {SHORT}, entries
+    np.testing.assert_array_equal(_f64(short_out)[0], _f64(long_out)[0][:SHORT])
+    for name in LEAVES:
+        a, b = np.asarray(short[name]), np.asarray(long[name])
+        assert a.dtype == b.dtype and a.tobytes() == b.tobytes(), name
+
+
+@pytest.mark.parametrize(("dtype", "tp"), [(jnp.float32, 1), (jnp.bfloat16, 4)], ids=["f32-tp1", "bf16-tp4"])
+@pytest.mark.parametrize("live", [5, 8, 0], ids=["five-leading-rows", "bucket-full", "no-live-row"])
+def test_prefix_rows_decode_matches_row_major_bitwise(dtype, tp, live):
+    # Leading live rows (row r's token at position r) take the prefix branch in the short bucket; it must equal the
+    # row-major decode of the long bucket bit for bit, outputs and every pool leaf, slots past the prefix untouched.
+    lens = tuple([1] * live + [0] * (POOL - live))
+    context = tuple(([9, 1, 40, 2, 3, 17, 4, 6] * 2)[:live] + [0] * (POOL - live))
+    long_case = _case((lens, context, POOL), seed=5, dtype=dtype)
+    short_case = dict(long_case)
+    for name in ("q", "k", "v", "beta", "decay"):
+        short_case[name] = long_case[name][:SHORT]
+    short_out, short = _run(kda_rows_forward, short_case, (lens, context, SHORT), dtype, tp=tp, slots=None)
+    long_out, long = _run(kda_rows_forward, long_case, (lens, context, POOL), dtype, tp=tp, slots=None)
     np.testing.assert_array_equal(_f64(short_out)[0], _f64(long_out)[0][:SHORT])
     for name in LEAVES:
         a, b = np.asarray(short[name]), np.asarray(long[name])
