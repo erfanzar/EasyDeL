@@ -235,10 +235,11 @@ class RaggedKDADecodeOp(OperationImpl):
 
 
 # Decode steps with at most this many entries build the conv's shifted window with one iota select over a roll; larger
-# steps concatenate. GLM-5.3-Flash ep8 x tp8 on v5p: at 16 entries the concatenate relayouts each [16, dim, 1] column
-# (three copies per KDA call; decode conditional 29.4 -> 24.2 us with the select), at 128 entries the roll's slices cost
-# more than those copies (51.9 -> 57.0 us). Both forms hold the same values, so the threshold never changes results.
-_CONV_SELECT_MAX_ENTRIES = 16
+# steps concatenate. GLM-5.3-Flash ep8 x tp8 on v5p serving profiles: the concatenate relayouts each [rows, dim, 1]
+# column (three copies per KDA call) at 16 and 32 entries (decode conditional 29.4 -> 24.2 us at 16 with the select);
+# at 128 entries the roll's slices cost more than those copies (51.9 -> 57.0 us). Both forms hold the same values, so
+# the threshold never changes results.
+_CONV_SELECT_MAX_ENTRIES = 32
 
 
 def kda_decode_rows_forward(
