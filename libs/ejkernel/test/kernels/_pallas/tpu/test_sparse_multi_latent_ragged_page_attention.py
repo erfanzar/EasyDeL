@@ -245,9 +245,10 @@ def test_pallas_page_sizes_match_reference(page, dtype, chunk_size, group):
     np.testing.assert_array_equal(np.asarray(word_rows[1]), np.asarray(cache))
 
 
+@pytest.mark.parametrize("row_writer", [False, True], ids=["xla_scatter", "dma_writer"])
 @pytest.mark.parametrize("page", [16, 128])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32, jnp.int8], ids=["bf16", "f32", "int8"])
-def test_word_row_cache_write_equals_per_token_scatter(dtype, page):
+def test_word_row_cache_write_equals_per_token_scatter(dtype, page, row_writer):
     """The Pallas path writes the step's tokens as whole packed word rows; the cache must be bitwise the XLA
     reference's per-token scatter (1, 2 and 4 tokens per word).
 
@@ -276,8 +277,18 @@ def test_word_row_cache_write_equals_per_token_scatter(dtype, page):
     want = jax.jit(write_tokens_to_cache, static_argnames=("pages_per_seq",))(
         cache, keys_values, keys_pe, block_tables, seq, pos, valid, pages_per_seq=pages_per_seq
     )
-    got = jax.jit(write_token_rows, static_argnames=("pages_per_seq",))(
-        cache, keys_values, keys_pe, kv_lens_arr, block_tables, qsl, seq, pos, valid, pages_per_seq=pages_per_seq
+    got = jax.jit(write_token_rows, static_argnames=("pages_per_seq", "row_writer"))(
+        cache,
+        keys_values,
+        keys_pe,
+        kv_lens_arr,
+        block_tables,
+        qsl,
+        seq,
+        pos,
+        valid,
+        pages_per_seq=pages_per_seq,
+        row_writer=row_writer,
     )
     assert int(jnp.sum(valid)) == sum(q_lens)
     want, got, before = (np.asarray(x).view(np.uint8) for x in (want, got, cache))

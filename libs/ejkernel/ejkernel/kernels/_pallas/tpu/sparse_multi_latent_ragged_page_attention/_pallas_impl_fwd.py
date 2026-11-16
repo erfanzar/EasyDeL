@@ -59,6 +59,7 @@ and the lanes of neighbouring tokens are masked (see :func:`supports`).
 from __future__ import annotations
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -218,6 +219,254 @@ def build_metadata(
     return meta, seq, valid, pos, padded_width
 
 
+_ROW_WRITE_WINDOW = 32  # row DMAs in flight in the row writer
+
+
+def _row_write_kernel(target_ref, rows_hbm, pool_in, pool_out, sem, *, num_rows: int, num_updates: int):
+    """Copy update row ``i`` to pool row ``target[i]`` for every in-range target; other rows are dropped."""
+    del pool_in  # aliased with pool_out
+
+    def copy(i, t):
+        return pltpu.make_async_copy(rows_hbm.at[i], pool_out.at[t], sem)
+
+    def body(i, inflight):
+        t = target_ref[i]
+        ok = (t >= 0) & (t < num_rows)
+
+        @pl.when(ok)
+        def _():
+            copy(i, t).start()
+
+        inflight = inflight + ok.astype(jnp.int32)
+        full = inflight > _ROW_WRITE_WINDOW
+
+        @pl.when(full)
+        def _():
+            copy(0, 0).wait()  # every row copy has the same size, so any descriptor waits for one of them
+
+        return jnp.where(full, inflight - 1, inflight)
+
+    inflight = lax.fori_loop(0, num_updates, body, jnp.int32(0))
+
+    def drain(_, carry):
+        copy(0, 0).wait()
+        return carry
+
+    lax.fori_loop(0, inflight, drain, jnp.int32(0))
+
+
+def row_writer_supported(num_updates: int) -> bool:
+    """Whether :func:`write_rows_dma` can hold ``num_updates`` row targets in SMEM."""
+    return 0 < int(num_updates) and _smem_len(int(num_updates)) * 4 <= _MAX_PREFETCH_BYTES
+
+
+def write_rows_dma(flat: jax.Array, rows: jax.Array, target: jax.Array) -> jax.Array:
+    """``flat.at[target].set(rows, mode="drop")`` as an aliased Pallas DMA writer (bit-identical result).
+
+    ``flat [N, pack, D]`` is updated in place (``input_output_aliases``): every update row whose target lies in
+    ``[0, N)`` is copied HBM to HBM with one DMA, other rows are skipped, like the dropping scatter. Targets must be
+    unique among in-range rows (the scatter's result would otherwise depend on its update order).
+
+    Args:
+        flat: ``[N, pack, D]`` word-row view of the paged cache.
+        rows: ``[T, pack, D]`` update rows.
+        target: ``[T]`` int32 destination rows; out-of-range entries are dropped.
+
+    Returns:
+        The updated ``[N, pack, D]`` array.
+    """
+    num_rows = int(flat.shape[0])
+    num_updates = int(rows.shape[0])
+    kernel = functools.partial(_row_write_kernel, num_rows=num_rows, num_updates=num_updates)
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(1,),
+            in_specs=[pl.BlockSpec(memory_space=pl.ANY), pl.BlockSpec(memory_space=pl.ANY)],
+            out_specs=pl.BlockSpec(memory_space=pl.ANY),
+            scratch_shapes=[pltpu.SemaphoreType.DMA],
+        ),
+        out_shape=jax.ShapeDtypeStruct(flat.shape, flat.dtype),
+        input_output_aliases={2: 0},  # operand 2 (after the scalar-prefetch targets and the rows) is the pool
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
+        name="SPARSE-MLA-ROW-WRITE",
+    )(target.astype(jnp.int32), rows.astype(flat.dtype), flat)
+
+
+_ROW_RUN = 16  # word rows per run DMA of the word writer (aligned runs inside one page)
+
+
+def _word_write_kernel(
+    n_ref, code_ref, op_ref, rows_hbm, pool_in, pool_out, old_buf, new_buf, sem, run_sem, rmw_sem, *, pack, run
+):
+    """Run the compacted op list: ``code = target << pack | lane mask``, ``op = src << 2 | kind``.
+
+    Kind 1 copies one whole word row HBM to HBM, kind 3 copies ``run`` consecutive whole rows with one DMA, kind 2
+    reads the cache row back, takes the new lanes from the source row and writes it again (the other lanes keep the
+    cache's bits). Copies of one size share a semaphore, so waiting on any descriptor of that size retires one.
+    """
+    del pool_in  # aliased with pool_out
+    full = (1 << pack) - 1
+
+    def one(s, t):
+        return pltpu.make_async_copy(rows_hbm.at[s], pool_out.at[t], sem)
+
+    def many(s, t):
+        return pltpu.make_async_copy(rows_hbm.at[pl.ds(s, run)], pool_out.at[pl.ds(t, run)], run_sem)
+
+    def body(i, carry):
+        n1, nr = carry
+        c = code_ref[i]
+        o = op_ref[i]
+        t = jnp.right_shift(c, pack)
+        m = c & full
+        s = jnp.right_shift(o, 2)
+        kind = o & 3
+
+        @pl.when(kind == 1)
+        def _():
+            one(s, t).start()
+
+        @pl.when(kind == 3)
+        def _():
+            many(s, t).start()
+
+        @pl.when(kind == 2)
+        def _():
+            rd = pltpu.make_async_copy(pool_out.at[pl.ds(t, 1)], old_buf, rmw_sem)
+            rd.start()
+            rd.wait()
+            nw = pltpu.make_async_copy(rows_hbm.at[pl.ds(s, 1)], new_buf, rmw_sem)
+            nw.start()
+            nw.wait()
+            lanes = lax.broadcasted_iota(jnp.int32, old_buf.shape, 1)
+            take = (jnp.right_shift(m, lanes) & 1) == 1
+            old_buf[...] = jnp.where(take, new_buf[...], old_buf[...])
+            wr = pltpu.make_async_copy(old_buf, pool_out.at[pl.ds(t, 1)], rmw_sem)
+            wr.start()
+            wr.wait()
+
+        n1 = n1 + (kind == 1).astype(jnp.int32)
+        nr = nr + (kind == 3).astype(jnp.int32)
+        over1 = n1 > _ROW_WRITE_WINDOW
+        overr = nr > _ROW_WRITE_WINDOW
+
+        @pl.when(over1)
+        def _():
+            one(0, 0).wait()
+
+        @pl.when(overr)
+        def _():
+            many(0, 0).wait()
+
+        return jnp.where(over1, n1 - 1, n1), jnp.where(overr, nr - 1, nr)
+
+    n1, nr = lax.fori_loop(0, n_ref[0], body, (jnp.int32(0), jnp.int32(0)))
+
+    def drain1(_, carry):
+        one(0, 0).wait()
+        return carry
+
+    def drainr(_, carry):
+        many(0, 0).wait()
+        return carry
+
+    lax.fori_loop(0, n1, drain1, jnp.int32(0))
+    lax.fori_loop(0, nr, drainr, jnp.int32(0))
+
+
+def _shift_up(x: jax.Array, d: int, fill) -> jax.Array:
+    """``y[i] = x[i + d]`` (``fill`` past the end)."""
+    if d == 0:
+        return x
+    return jnp.pad(x[d:], (0, d), constant_values=fill)
+
+
+def _shift_down(x: jax.Array, d: int, fill) -> jax.Array:
+    """``y[i] = x[i - d]`` (``fill`` before the start)."""
+    if d == 0:
+        return x
+    return jnp.pad(x[:-d], (d, 0), constant_values=fill)
+
+
+def write_words_dma(
+    flat: jax.Array,
+    update: jax.Array,
+    pos: jax.Array,
+    lane: jax.Array,
+    first_new: jax.Array,
+    kv_len: jax.Array,
+    token_valid: jax.Array,
+    target: jax.Array,
+    writer: jax.Array,
+    *,
+    words_per_page: int,
+) -> jax.Array:
+    """The packed (``kv_packing > 1``) row write of :func:`write_token_rows` without gathering the cache's rows.
+
+    Lane ``j`` of a writer token's word row holds token ``tok - lane + j``; those rows are ``kv_packing`` shifted
+    reshapes of ``update`` (no gather). Lanes that are not new this step keep the cache's bits: the kernel merges
+    such rows with the cache row it reads back. Whole rows that tile an aligned run of ``_ROW_RUN`` rows of one page
+    (consecutive targets and sources) are written with one DMA. Same cache as the scatter, bit for bit.
+    """
+    num_rows, pack, dim = (int(x) for x in flat.shape)
+    total = int(update.shape[0])
+    run = math.gcd(int(words_per_page), _ROW_RUN)
+    tok = jnp.arange(total, dtype=jnp.int32)
+    mask = jnp.zeros((total,), jnp.int32)
+    for j in range(pack):
+        q = pos - lane + j
+        src = tok + (j - lane)
+        new = (q >= first_new) & (q < kv_len) & (src >= 0) & (src < total)
+        new = new & token_valid[jnp.clip(src, 0, total - 1)]
+        mask = mask | jnp.left_shift(new.astype(jnp.int32), j)
+    k_rows = (total + pack - 1) // pack + 1
+    up = jnp.pad(update.astype(flat.dtype), ((pack - 1, pack * k_rows - total), (0, 0)))
+    rows = jnp.concatenate([up[r : r + pack * k_rows].reshape(k_rows, pack, dim) for r in range(pack)], axis=0)
+    idx = tok - lane + (pack - 1)
+    src_row = ((idx % pack) * k_rows + idx // pack).astype(jnp.int32)
+    live = writer & (target >= 0) & (target < num_rows) & (mask != 0)
+    whole = live & (mask == (1 << pack) - 1)
+    # A run head: an aligned target whose next run - 1 rows are whole rows held by tokens head + k * pack.
+    head = whole & (target % run == 0)
+    for k in range(1, run):
+        d = k * pack
+        head = head & _shift_up(whole, d, False)
+        head = head & (_shift_up(target, d, -1) == target + k) & (_shift_up(src_row, d, -1) == src_row + k)
+    covered = head
+    for k in range(1, run):
+        covered = covered | _shift_down(head, k * pack, False)
+    kind = jnp.where(head, 3, jnp.where(covered, 0, jnp.where(whole, 1, jnp.where(live, 2, 0)))).astype(jnp.int32)
+    code = jnp.left_shift(target, pack) | mask
+    op = jnp.left_shift(src_row, 2) | kind
+    # Compact the ops to the front in token order (live keys unique, sentinels identical).
+    key = jnp.where(kind > 0, tok, _INT32_MAX)
+    _, code, op = lax.sort((key, code.astype(jnp.int32), op), dimension=0, is_stable=False, num_keys=1)
+    n_ops = jnp.sum(kind > 0).astype(jnp.int32).reshape(1)
+    kernel = functools.partial(_word_write_kernel, pack=pack, run=run)
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(1,),
+            in_specs=[pl.BlockSpec(memory_space=pl.ANY), pl.BlockSpec(memory_space=pl.ANY)],
+            out_specs=pl.BlockSpec(memory_space=pl.ANY),
+            scratch_shapes=[
+                pltpu.VMEM((1, pack, dim), flat.dtype),
+                pltpu.VMEM((1, pack, dim), flat.dtype),
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA,
+            ],
+        ),
+        out_shape=jax.ShapeDtypeStruct(flat.shape, flat.dtype),
+        input_output_aliases={4: 0},  # operand 4 (after the three prefetch tables and the rows) is the pool
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
+        name="SPARSE-MLA-WORD-WRITE",
+    )(n_ops, code, op, rows, flat)
+
+
 def write_token_rows(
     kv_cache: jax.Array,
     keys_values: jax.Array,
@@ -230,6 +479,7 @@ def write_token_rows(
     token_valid: jax.Array,
     *,
     pages_per_seq: int,
+    row_writer: bool = False,
 ) -> jax.Array:
     """Scatter the step's latent tokens into the paged cache as whole packed word rows.
 
@@ -285,6 +535,11 @@ def write_token_rows(
     writer = token_valid & ((lane == 0) | (pos == first_new))
     target = jnp.where(writer, row, num_rows)  # out of range -> dropped
     flat = kv_cache.reshape(num_rows, kv_packing, cache_dim)
+    if row_writer and kv_packing > 1 and (num_rows << kv_packing) <= _INT32_MAX:  # code = target << pack
+        out = write_words_dma(
+            flat, update, pos, lane, first_new, kv_len, token_valid, target, writer, words_per_page=words_per_page
+        )
+        return out.reshape(kv_cache.shape)
     if kv_packing == 1:
         rows = update[:, None, :]
     else:
@@ -300,6 +555,8 @@ def write_token_rows(
             new = new & token_valid[src]
             lanes.append(jnp.where(new[:, None], update[src], current[:, j]))
         rows = jnp.stack(lanes, axis=1)
+    if row_writer:
+        return write_rows_dma(flat, rows, target).reshape(kv_cache.shape)
     return flat.at[target].set(rows, mode="drop").reshape(kv_cache.shape)
 
 
@@ -1026,6 +1283,7 @@ def _sparse_mla_kernel(
         "translate_pages",
         "write_rows",
         "query_block",
+        "row_writer",
     ),
     donate_argnames=("kv_cache",),
 )
@@ -1054,6 +1312,7 @@ def sparse_mla_ragged_paged_attention_pallas(
     translate_pages: bool | None = None,
     write_rows: bool | None = None,
     query_block: int | None = None,
+    row_writer: bool | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Write new tokens into the cache, then run the sparse Pallas attention kernel.
 
@@ -1067,6 +1326,9 @@ def sparse_mla_ragged_paged_attention_pallas(
             :func:`write_token_rows`) or one token at a time with the XLA reference's scatter
             (``False``); ``None`` writes rows for buckets of more than ``_PER_TOKEN_WRITE_MAX_TOKENS``
             tokens. Both give identical caches.
+        row_writer: Write those word rows with the aliased Pallas DMA writer (:func:`write_rows_dma`, ``True``)
+            or XLA's scatter (``False``); ``None`` uses the writer whenever its targets fit SMEM. Both give
+            identical caches.
         query_block: Query tokens per program of the query-block kernel (``None`` = the per-token kernel only).
             When :func:`block_path_supported` holds (prefill buckets of at least ``_BLOCK_MIN_TOKENS`` tokens),
             each block of ``query_block`` consecutive tokens, of one or several sequences, fetches the union of
@@ -1138,6 +1400,7 @@ def sparse_mla_ragged_paged_attention_pallas(
             pos,
             valid,
             pages_per_seq=pages_per_seq,
+            row_writer=row_writer_supported(int(total_tokens)) if row_writer is None else bool(row_writer),
         )
     else:
         kv_cache = write_tokens_to_cache(
