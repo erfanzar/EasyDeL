@@ -811,8 +811,9 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             multiple of ``ep``), every shard still writes all tokens into its cache replica, and the attention
             output comes back token-sharded over ``ep``. Results are unchanged. No effect with ``ep == 1``, on dense
             MLA calls and in training. ``True`` applies it and warns once where it cannot (data-parallel KV pages);
-            ``None`` (default) applies it wherever it can, silently otherwise; ``False`` never does. A saved
-            ``false`` loads as ``None`` (see :meth:`from_dict`).
+            ``None`` (default) applies it wherever it can except decode steps whose per-shard window is under 4
+            tokens (faster unsplit), silently otherwise; ``False`` never does. A saved ``false`` loads as ``None``
+            (see :meth:`from_dict`).
         layer_scan_options: Lowering options for lowered repeated-layer scans
             (``block_scan``, ``barrier``, ``prefetch_axes``, ``prefetch_exclude``,
             ``prefetch_defer_dw``, ``unroll``); top-level keys apply to every scan,

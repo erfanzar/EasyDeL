@@ -299,3 +299,22 @@ def test_training_forward_ignores_the_serving_split(dims):
     assert np.isfinite(outs[False]).all() and float(np.max(np.abs(outs[False]))) > 0
     for setting in (True, None):
         np.testing.assert_array_equal(outs[setting], outs[False], err_msg=str(setting))
+
+
+@pytest.mark.parametrize("dims", [(1, 1, 1, 4, 1, 1), (1, 1, 1, 2, 2, 1)], ids=["ep4tp1", "ep2tp2"])
+def test_automatic_rule_keeps_small_windows_unsplit(dims, monkeypatch):
+    if jax.device_count() < int(np.prod(dims)):
+        pytest.skip(f"needs {int(np.prod(dims))} devices")
+    # Every step's per-shard window here (at most 13 tokens) is under this minimum, so the automatic rule must build the
+    # unsplit program for all of them, with the unsplit outputs and caches bit for bit; ``True`` must still split.
+    monkeypatch.setattr(mlrpa, "_EP_SPLIT_MIN_WINDOW", 64)
+    config, layer = _layer(dims)
+    auto, auto_cache, auto_counts = _run(config, layer, None)
+    off, off_cache, off_counts = _run(config, layer, False)
+    on_counts = _run(config, layer, True, trace_only=True)
+    assert auto_counts == off_counts
+    assert on_counts["axis_index"] > off_counts["axis_index"], (on_counts["axis_index"], off_counts["axis_index"])
+    for step, (a, b) in enumerate(zip(auto, off, strict=True)):
+        np.testing.assert_array_equal(a, b, err_msg=f"step {step}")
+    for a, b in zip(auto_cache, off_cache, strict=True):
+        np.testing.assert_array_equal(a, b)

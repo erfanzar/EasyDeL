@@ -85,6 +85,12 @@ logger = get_logger(__name__)
 # 8,192-token windows 224.6 vs 161.3.
 _EP_SPLIT_COMPACT_MIN_WINDOW = 64
 
+# dsa_serving_ep_split ``None`` (automatic): shortest per-shard token window worth splitting. GLM-5.3-Flash W8A8 at
+# ep 8 x tp 8 on v5p-128: 16-token decode steps (2-token windows) stepped in 14.74 ms split vs 14.38 ms unsplit (the
+# split's per-layer gathers cost more than the 7/8 of a tiny attention call they save), while 32-token decode steps
+# (4-token windows) and prefill were faster split. ``True`` still splits every window.
+_EP_SPLIT_MIN_WINDOW = 4
+
 
 def _mla_kernel_call(dense_fn, ignore: dict, total_tokens: int, common_call_kwargs: dict):
     """Return ``(selected, kernel)`` for the shard_map bodies.
@@ -146,6 +152,7 @@ def resolve_dsa_serving_ep_split(
     dp_local: bool,
     page_axis,
     query_specs: tuple[Ps, ...],
+    num_tokens: int | None = None,
 ) -> tuple[str, ...]:
     """Resolve ``dsa_serving_ep_split`` for one MLA ragged-pages call: the mesh axes its sparse queries split over.
 
@@ -155,8 +162,9 @@ def resolve_dsa_serving_ep_split(
     ragged-pages cache views), on an expert-parallel axis of more than one device, with the globally replicated page
     path (KV pages not sharded over data parallelism) and a query sharding that does not already use that axis.
 
-    The setting is tri-state: ``None`` (automatic) splits wherever the split applies and keeps the unsplit call
-    elsewhere without a message; ``True`` does the same and warns once where it cannot apply; ``False`` never splits.
+    The setting is tri-state: ``None`` (automatic) splits wherever the split applies and each shard's window holds at
+    least ``_EP_SPLIT_MIN_WINDOW`` of the call's ``num_tokens`` query tokens, and keeps the unsplit call elsewhere
+    without a message; ``True`` does the same and warns once where it cannot apply; ``False`` never splits.
     Training never reaches this function: it runs only for ragged-pages cache views.
 
     Args:
@@ -167,6 +175,7 @@ def resolve_dsa_serving_ep_split(
         dp_local: Whether the data-parallel local page path runs this call.
         page_axis: Logical KV-page axis of the cache view (``EMPTY`` when replicated).
         query_specs: Resolved partition specs of the two query tensors.
+        num_tokens: Query tokens of the call (static), or ``None`` to ignore the window rule.
 
     Returns:
         The expert-parallel mesh axis names to split over, or ``()`` for the unsplit call.
@@ -177,6 +186,12 @@ def resolve_dsa_serving_ep_split(
     names = tuple(name for name in names if mesh_axis_size(mesh, name) > 1)
     if not names:
         return ()  # nothing to split over (ep = 1): the unsplit call is the split call
+    if (
+        setting is None
+        and num_tokens is not None
+        and -(-int(num_tokens) // mesh_axis_size(mesh, names)) < (_EP_SPLIT_MIN_WINDOW)
+    ):
+        return ()  # automatic rule: windows this small (decode steps) run faster unsplit
     reasons = []
     if dp_local:
         reasons.append("the data-parallel local page path runs this call")
@@ -580,6 +595,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
         dp_local: bool,
         page_axis,
         query_specs: tuple[Ps, ...],
+        num_tokens: int | None = None,
     ) -> tuple[str, ...]:
         """Mesh axes to split the sparse kernel's query tokens over, or ``()`` to keep the unsplit call.
 
@@ -592,6 +608,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
             dp_local: Whether the data-parallel local page path runs this call.
             page_axis: Logical KV-page axis of the cache view (``EMPTY`` when replicated).
             query_specs: Resolved partition specs of the two query tensors.
+            num_tokens: Query tokens of the call (the automatic rule keeps small per-shard windows unsplit).
 
         Returns:
             The expert-parallel mesh axis names to split over, or ``()``.
@@ -608,6 +625,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
             dp_local=dp_local,
             page_axis=page_axis,
             query_specs=query_specs,
+            num_tokens=num_tokens,
         )
 
     def forward_core(
@@ -827,6 +845,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
             dp_local=can_use_dp_local,
             page_axis=page_axis,
             query_specs=(qaxes_nope, qaxes_pe),
+            num_tokens=int(queries_nope.shape[0]),
         )
 
         if can_use_dp_local:
