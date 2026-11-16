@@ -518,8 +518,9 @@ def kda_rows_forward(
     branches = [branch(flat_forward, common, **flat_kwargs), branch(kda_decode_rows_forward, common)]
     index = decode_only.astype(jnp.int32)
     seq_len = int(query.shape[1])
-    if state_indices is None and seq_len < rows:
-        # Prefix steps: the live rows are the leading ones and row r's token sits at position r (eSurge keeps running
+    if state_indices is None and seq_len <= rows:
+        # Prefix steps (any bucket up to the row count, the full 128-row decode bucket included): the live rows are the
+        # leading ones and row r's token sits at position r (eSurge keeps running
         # requests in the leading rows), so qsl[:T + 1] == min(arange(T + 1), qsl[-1]). Such a step is the row-major
         # decode of the first T rows, which own the first T pool slots: windows and states are sliced and updated in
         # place, with no gather or scatter (same per-row arithmetic, so the result is bit for bit the token-major one).

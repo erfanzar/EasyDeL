@@ -55,8 +55,8 @@ def test_token_major_decode_matches_row_major_bitwise(dtype, tp, implicit_slots,
         short_case[name] = long_case[name][:SHORT]
     short_out, short = _run(kda_rows_forward, short_case, (lens, context, SHORT), dtype, tp=tp, slots=slots)
     long_out, long = _run(kda_rows_forward, long_case, (lens, context, long_len), dtype, tp=tp, slots=slots)
-    # The short bucket traces the token-major and the prefix branch (both SHORT entries), the long one the row-major.
-    assert entries[-1] == long_len and set(entries[:-1]) == {SHORT}, entries
+    # Every traced branch runs SHORT entries in the short bucket and long_len entries in the long one.
+    assert set(entries) == {SHORT, long_len}, entries
     np.testing.assert_array_equal(_f64(short_out)[0], _f64(long_out)[0][:SHORT])
     for name in LEAVES:
         a, b = np.asarray(short[name]), np.asarray(long[name])
@@ -94,3 +94,24 @@ def test_rows_are_tokens_rejects_a_stream_longer_than_the_rows():
     case = _case((lens, context, 8), seed=2, dtype=jnp.float32)
     with pytest.raises(ValueError, match="rows_are_tokens"):
         _run(driver, case, (lens, context, 8), jnp.float32, tp=1)
+
+
+@pytest.mark.parametrize(("dtype", "tp"), [(jnp.float32, 1), (jnp.bfloat16, 4)], ids=["f32-tp1", "bf16-tp4"])
+@pytest.mark.parametrize("live", [POOL, 7], ids=["all-rows", "seven-leading-rows"])
+def test_full_bucket_prefix_matches_row_major_bitwise(dtype, tp, live):
+    # A bucket of exactly one position per row whose live rows lead takes the prefix branch; it must equal the
+    # row-major decode driver called directly (per-row gathers and output scatter) bit for bit.
+    from easydel.operations.kernels.ragged_kda_decode import kda_decode_rows_forward
+
+    def row_major(*, chunk_size, decay_lower_bound, precision, **kwargs):
+        del chunk_size, decay_lower_bound, precision
+        return kda_decode_rows_forward(**kwargs)
+
+    lens = tuple([1] * live + [0] * (POOL - live))
+    context = tuple(([9, 1, 40, 2, 3, 17, 4, 6, 12, 5] * 2)[:live] + [0] * (POOL - live))
+    case = _case((lens, context, POOL), seed=6, dtype=dtype)
+    routed_out, routed = _run(kda_rows_forward, case, (lens, context, POOL), dtype, tp=tp, slots=None)
+    direct_out, direct = _run(row_major, case, (lens, context, POOL), dtype, tp=tp, slots=None)
+    assert np.asarray(routed_out).tobytes() == np.asarray(direct_out).tobytes()
+    for name in LEAVES:
+        assert np.asarray(routed[name]).tobytes() == np.asarray(direct[name]).tobytes(), name
