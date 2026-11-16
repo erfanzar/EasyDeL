@@ -72,6 +72,7 @@ from easydel.layers.indexer import (
 )
 from easydel.operations.kernels import DsaGatherAttn, DsaPoolSparseAttn
 from easydel.operations.kernels.dsa_sparse_attention import sparse_selected_training_attention
+from easydel.operations.kernels.multi_latent_ragged_page_attention import restore_ep_split_token_order
 
 from ..linears import gather_shared_input, resolve_gather_shared_projection_input
 from ..rotary import apply_mla_rope
@@ -350,6 +351,23 @@ class DeepSeekSparseAttention(UnifiedAttention):
             position_ids=position_ids,
             frequencies=frequencies,
         )
+
+    @staticmethod
+    def _restore_token_order(projected: Array, token_order: dict | None) -> Array:
+        """Token order of the projected output when the sparse attention used a balanced expert-parallel split.
+
+        The output projection is row-independent, so it runs on the reordered tokens; the reorder is undone here,
+        after the hidden-state constraint has gathered the tokens (a local take).
+
+        Args:
+            projected: ``[batch, seq, hidden]`` from :meth:`_project_output`.
+            token_order: The holder the op filled (``{"shards": n}``), or ``None`` / empty when no reorder ran.
+
+        Returns:
+            ``projected`` in token order.
+        """
+        shards = (token_order or {}).get("shards")
+        return projected if not shards else restore_ep_split_token_order(projected, int(shards))
 
     def _project_output(self, attn_output: Array, token_split: PartitionSpec | None = None) -> Array:
         """Output projection between the hidden-state sharding constraints.
@@ -839,6 +857,7 @@ class DeepSeekSparseAttention(UnifiedAttention):
         )
 
         combined_mask = None
+        token_order = None
         if selection is not None and ragged:
             mla_kwargs["sparse_selected"] = selection.indices.reshape(bsz * q_len, -1)
             mla_kwargs["sparse_chunk_size"] = self.indexer.selection_chunk_size
@@ -846,6 +865,13 @@ class DeepSeekSparseAttention(UnifiedAttention):
             # ``True`` = on, ``False`` = off) against its mesh and cache layout, and where it applies splits the
             # sparse attention's query tokens over the expert-parallel axis (``resolve_dsa_serving_ep_split``).
             mla_kwargs["sparse_ep_split"] = getattr(self.config, "dsa_serving_ep_split", None)
+            from easydel.utils.inference_mode import is_inference_mode  # lazy: utils imports layers
+
+            if getattr(self.config, "dsa_serving_ep_balance", False) and is_inference_mode():
+                # Opt-in (dsa_serving_ep_balance, approximate): the expert-parallel split gives each shard an early and a late token window; the op records
+                # its token order here and the projected output is put back in token order below.
+                token_order = {}
+                mla_kwargs["sparse_token_order"] = token_order
         elif selection is not None:
             kv_len = key_states.shape[1]
             topk_mask = selection.to_mask(kv_len)
@@ -930,8 +956,9 @@ class DeepSeekSparseAttention(UnifiedAttention):
             attn_output = self._merge_heads(attentions.attention_outputs)
 
         result = SparseAttentionLayerOutput(
-            attention_output=self._project_output(
-                attn_output, self._serving_token_split_spec(attn_output) if ragged else None
+            attention_output=self._restore_token_order(
+                self._project_output(attn_output, self._serving_token_split_spec(attn_output) if ragged else None),
+                token_order,
             ),
             attention_weight=attentions.attention_weights if output_attentions else None,
             cache_view=cache_view,

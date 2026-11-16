@@ -826,6 +826,9 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             ``None`` (default) applies it wherever it can except decode steps whose per-shard window is under 4
             tokens (faster unsplit), silently otherwise; ``False`` never does. A saved ``false`` loads as ``None``
             (see :meth:`from_dict`).
+        dsa_serving_ep_balance: Serving only (inference mode, default ``False``), APPROXIMATE: with ``dsa_serving_ep_split`` each
+            expert-parallel shard attends one early and one late token window of a prefill step instead of one
+            contiguous window, balancing causal work across shards. Not bitwise in the served program.
         layer_scan_options: Lowering options for lowered repeated-layer scans
             (``block_scan``, ``barrier``, ``prefetch_axes``, ``prefetch_exclude``,
             ``prefetch_defer_dw``, ``unroll``); top-level keys apply to every scan,
@@ -923,6 +926,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     dsa_pool_query_chunk: NotRequired[int]
     dsa_pool_kernel: NotRequired[str | None]
     dsa_serving_ep_split: NotRequired[bool | None]
+    dsa_serving_ep_balance: NotRequired[bool]
     layer_scan_options: NotRequired[dict[str, tp.Any] | None]
     quantization_config: NotRequired[QuantizationConfig | None]
     operation_configs: NotRequired[dict[str, BaseOperationConfig] | None]
@@ -1048,6 +1052,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             default: ``"gather"`` on TPU where that kernel applies, ``"bitmap"`` otherwise).
         dsa_serving_ep_split: Split DSA serving attention over the expert-parallel axis (``None``, the default:
             wherever it applies; ``False``: never).
+        dsa_serving_ep_balance: Serving only, approximate: balance the DSA expert-parallel token windows (default ``False``).
         layer_scan_options: Per-scope ``ModuleList.scan`` lowering options (default ``None``).
         **kwargs: Forwarded to `PretrainedConfig`.
 
@@ -1608,6 +1613,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         dsa_pool_query_chunk: int = 2048,
         dsa_pool_kernel: str | None = None,
         dsa_serving_ep_split: bool | None = None,
+        dsa_serving_ep_balance: bool = False,
         layer_scan_options: dict[str, tp.Any] | None = None,
         operation_configs: dict[str, BaseOperationConfig] | None = None,
         **kwargs,
@@ -1797,6 +1803,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.dsa_serving_ep_split = _optional_bool(
             "dsa_serving_ep_split", getattr(self, "dsa_serving_ep_split", dsa_serving_ep_split)
         )
+        self.dsa_serving_ep_balance = bool(getattr(self, "dsa_serving_ep_balance", dsa_serving_ep_balance))
         self.layer_scan_options = getattr(self, "layer_scan_options", layer_scan_options)
         normalize_layer_scan_options(self.layer_scan_options)
         self._maybe_extend_batch_axis_for_ep()
@@ -2462,6 +2469,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "dsa_pool_query_chunk",
             "dsa_pool_kernel",
             "dsa_serving_ep_split",
+            "dsa_serving_ep_balance",
             "layer_scan_options",
             "use_fused_mlp",
             "collective_matmul_impl",
@@ -2648,6 +2656,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         dsa_pool_query_chunk: int = NOT_GIVEN,
         dsa_pool_kernel: str | None = NOT_GIVEN,
         dsa_serving_ep_split: bool | None = NOT_GIVEN,
+        dsa_serving_ep_balance: bool = NOT_GIVEN,
         layer_scan_options: dict[str, tp.Any] | None = NOT_GIVEN,
         **kwargs,
     ):
@@ -2758,6 +2767,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 default: ``"gather"`` on TPU where that kernel applies, ``"bitmap"`` otherwise).
             dsa_serving_ep_split: Split DSA serving attention over the expert-parallel axis (``None``, the
                 default: wherever it applies; ``False``: never).
+            dsa_serving_ep_balance: Serving only, approximate: balance the DSA expert-parallel token windows
+                (default ``False``).
             layer_scan_options: Per-scope ``ModuleList.scan`` lowering options (default ``None``).
             **kwargs: Extra attributes to attach to this config and any defined ``sub_configs``.
         """
@@ -2884,6 +2895,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.dsa_pool_kernel = _optional_one_of("dsa_pool_kernel", self.dsa_pool_kernel, DSA_POOL_KERNELS)
         set_attrs_smartly(self, "dsa_serving_ep_split", None, dsa_serving_ep_split)
         self.dsa_serving_ep_split = _optional_bool("dsa_serving_ep_split", self.dsa_serving_ep_split)
+        set_attrs_smartly(self, "dsa_serving_ep_balance", False, dsa_serving_ep_balance)
         set_attrs_smartly(self, "layer_scan_options", None, layer_scan_options)
         normalize_layer_scan_options(self.layer_scan_options)
         self._maybe_extend_batch_axis_for_ep()

@@ -41,6 +41,7 @@ entry point and config dataclass.
 from functools import partial
 
 import jax
+import numpy as np
 from eformer.loggings import get_logger
 from ejkernel.modules import (
     multi_latent_ragged_page_attention,  # pyright: ignore[reportMissingTypeStubs]
@@ -212,6 +213,32 @@ def resolve_dsa_serving_ep_split(
     return names
 
 
+def _serving() -> bool:
+    """Whether the call is traced inside ``set_inference_mode()``."""
+    from easydel.utils.inference_mode import is_inference_mode  # lazy: utils imports layers
+
+    return is_inference_mode()
+
+
+def ep_split_token_order(total: int, shards: int) -> np.ndarray:
+    """Token order of a balanced expert-parallel split: shard ``e`` holds windows ``e`` and ``2 * shards - 1 - e``.
+
+    The ``total`` tokens are cut into ``2 * shards`` equal windows; the returned ``[total]`` int32 indices list them
+    window by window in the order ``0, 2s-1, 1, 2s-2, ...``, so a contiguous split of the reordered tokens gives every
+    shard one early and one late window of a causal prefill step.
+    """
+    size = total // (2 * shards)
+    windows = [w for e in range(shards) for w in (e, 2 * shards - 1 - e)]
+    return np.concatenate([np.arange(w * size, (w + 1) * size, dtype=np.int32) for w in windows])
+
+
+def restore_ep_split_token_order(x: jax.Array, shards: int) -> jax.Array:
+    """Put ``x`` (tokens flattened over every axis but the last) back in token order after :func:`ep_split_token_order`."""
+    flat = x.reshape(-1, x.shape[-1])
+    inverse = np.argsort(ep_split_token_order(int(flat.shape[0]), shards)).astype(np.int32)
+    return jnp.take(flat, jnp.asarray(inverse), axis=0).reshape(x.shape)
+
+
 def _ep_split_sparse_attention(
     kernel,
     *,
@@ -228,7 +255,8 @@ def _ep_split_sparse_attention(
     query_start_loc: jax.Array,
     distribution: jax.Array,
     selected: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
+    balanced: bool = False,
+) -> tuple[jax.Array, jax.Array, int]:
     """Sparse MLA attention with its query tokens split over the ``axis_names`` mesh axes.
 
     ``T`` is padded to a multiple of the shard count ``n`` with tokens past ``query_start_loc[num_seqs]``, which the
@@ -280,6 +308,16 @@ def _ep_split_sparse_attention(
     total = int(queries_nope.shape[0])
     window = -(-total // num_shards)
     padded = window * num_shards
+    # ``balanced`` (serving prefill): causal windows get longer contexts the later they are, so the shard of the last
+    # window does the most work and the others wait for it at the output gather. Cut into 2n windows instead, shard e
+    # attends windows e and 2n-1-e: the queries and selection are reordered (ep_split_token_order; a local take, they
+    # are replicated over the split axes) and the output stays in that order for the caller to restore.
+    chunks = 2 * num_shards
+    if not (balanced and total % chunks == 0 and total // chunks >= _EP_SPLIT_COMPACT_MIN_WINDOW):
+        chunks = 0
+    if chunks:
+        order = jnp.asarray(ep_split_token_order(total, num_shards))
+        queries_nope, queries_pe, selected = (jnp.take(x, order, axis=0) for x in (queries_nope, queries_pe, selected))
     if padded != total:
 
         def _pad(x, value=0):
@@ -354,9 +392,9 @@ def _ep_split_sparse_attention(
             )
             return jax.lax.dynamic_slice_in_dim(output, start, window, axis=0), local_kv_pages
 
-        def window_call(index, window_queries_nope, window_queries_pe, window_selected, pages):
-            start = index * jnp.int32(window)
-            end = start + jnp.int32(window)
+        def window_call(index, window_queries_nope, window_queries_pe, window_selected, pages, size=window):
+            start = index * jnp.int32(size)
+            end = start + jnp.int32(size)
             # Window-local ragged metadata: a token's sequence and position are unchanged (see the docstring).
             window_query_start_loc = jnp.clip(full_query_start_loc, start, end) - start
             # Sequences without tokens in the window are never read; clamping keeps their length non-negative.
@@ -364,8 +402,8 @@ def _ep_split_sparse_attention(
             return kernel(
                 window_queries_nope,
                 window_queries_pe,
-                jax.lax.dynamic_slice_in_dim(all_keys_values, start, window, axis=0),
-                jax.lax.dynamic_slice_in_dim(all_keys_pe, start, window, axis=0),
+                jax.lax.dynamic_slice_in_dim(all_keys_values, start, size, axis=0),
+                jax.lax.dynamic_slice_in_dim(all_keys_pe, start, size, axis=0),
                 pages,
                 window_context_lens,
                 block_tables,
@@ -377,6 +415,29 @@ def _ep_split_sparse_attention(
         no_queries_nope = jnp.zeros_like(local_queries_nope)
         no_queries_pe = jnp.zeros_like(local_queries_pe)
         no_selection = jnp.full_like(local_selected, -1)
+        if chunks:
+            half = window // 2
+            last = jnp.int32(chunks - 1)
+            for step in range(1, num_shards):
+                # Cache write only: both windows of every other shard, before this shard's windows attend.
+                other = (own + step) % num_shards
+                for index in (other, last - other):
+                    _, local_kv_pages = window_call(
+                        index, no_queries_nope[:half], no_queries_pe[:half], no_selection[:half], local_kv_pages, half
+                    )
+            # The early window attends first; its call writes its tokens before the late window attends.
+            out_early, local_kv_pages = window_call(
+                own, local_queries_nope[:half], local_queries_pe[:half], local_selected[:half], local_kv_pages, half
+            )
+            out_late, local_kv_pages = window_call(
+                last - own,
+                local_queries_nope[half:],
+                local_queries_pe[half:],
+                local_selected[half:],
+                local_kv_pages,
+                half,
+            )
+            return jnp.concatenate([out_early, out_late], axis=0), local_kv_pages
         for step in range(1, num_shards):
             # Cache write only: the attention output of another shard's window is discarded.
             _, local_kv_pages = window_call(
@@ -398,7 +459,7 @@ def _ep_split_sparse_attention(
     )
     if padded != total:
         output = output[:total]
-    return output, kv_pages
+    return output, kv_pages, chunks
 
 
 def _reshape_query_tensor(x, name: str):
@@ -967,7 +1028,8 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                 *extra_args,
             )
         elif ep_split_axes:
-            output, kv_pages = _ep_split_sparse_attention(
+            token_order = ignore.get("sparse_token_order")
+            output, kv_pages, chunks = _ep_split_sparse_attention(
                 _kernel,
                 mesh=self.metadata.mesh,
                 axis_names=ep_split_axes,
@@ -982,7 +1044,11 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                 query_start_loc=cache_metadata.query_start_loc,
                 distribution=request_distribution,
                 selected=sparse_selected,
+                balanced=isinstance(token_order, dict) and _serving(),
             )
+            if chunks:
+                # The caller restores token order after its output projection (restore_ep_split_token_order).
+                token_order["shards"] = chunks // 2
         else:
 
             @partial(
