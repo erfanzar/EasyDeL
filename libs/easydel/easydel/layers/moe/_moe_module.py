@@ -3151,6 +3151,12 @@ class BaseMoeModule(spx.Module, ABC):
             if decode_replicated_out:
                 # Decode: one small fp32 all-reduce over both axes replaces the default dispatch's TP
                 # reduce-scatter, expert-axis psum and output all-gather.
+                if (
+                    bool(getattr(self.config, "decode_allreduce_bf16_wire", False))
+                    and jnp.dtype(self.dtype).itemsize < 4
+                ):
+                    # ``decode_allreduce_bf16_wire`` (approximate, off by default): reduce activation-dtype partials.
+                    partial = partial.astype(self.dtype)
                 partial = jax.lax.psum(partial, (*ep_axes, tensor_axis_name))
                 return partial.astype(self.dtype).reshape(local_batch, local_seq, -1)
             if tp_size > 1:

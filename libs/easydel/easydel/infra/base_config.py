@@ -794,6 +794,11 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             L2 norm, recurrence) as eJKernel's fused ``ragged_kda_conv_decode`` Pallas TPU kernel instead of the XLA conv
             glue plus the ``ragged_kda_decode`` kernel. Opt-in (default ``False``): the kernel matches the glue bit for
             bit in a standalone program, but a 16-chip serve was not bitwise (it passed the bf16 quality gate).
+        decode_allreduce_bf16_wire: Serving only (inference mode, decode layout): the eSurge decode reductions that
+            sum fp32 partials over every expert-parallel and tensor-parallel device (the deferred MoE dispatch's
+            replicated output and the head-split KDA ``o_proj``) round each device's partial to the activation dtype
+            before the all-reduce, so the collective moves and adds activation-dtype values. Opt-in (default
+            ``False``) and APPROXIMATE: the partial sums are rounded before they are added.
         index_scoring_kernel: Dense multi-query scoring of every learned sparse-attention indexer that has a fused
             path (GLM-5-Next's pooled indexer, DeepSeek-V4's compressed and DeepSeek-V4.1's shared-key indexers):
             ``"xla"`` (per-head logits as XLA ops) or ``"pallas"`` (the fused ``indexer_scores`` operation; Pallas
@@ -926,6 +931,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     kda_serving_ep_split: NotRequired[bool | None]
     kda_replicate_gate_low_rank: NotRequired[bool]
     kda_fused_decode_kernel: NotRequired[bool]
+    decode_allreduce_bf16_wire: NotRequired[bool]
     index_scoring_kernel: NotRequired[str | None]
     dsa_sparse_training: NotRequired[bool | None]
     dsa_pool_training: NotRequired[bool]
@@ -1048,6 +1054,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         kda_replicate_gate_low_rank: Replicate the KDA ``f_a_proj`` / ``g_a_proj`` weights (default ``False``).
         kda_fused_decode_kernel: Run eSurge KDA pure-decode steps in the fused ``ragged_kda_conv_decode`` kernel
             (default ``False``: the XLA conv glue plus ``ragged_kda_decode``).
+        decode_allreduce_bf16_wire: Activation-dtype wire for the eSurge decode MoE / KDA ``o_proj`` all-reduces
+            (default ``False``; approximate).
         index_scoring_kernel: Indexer multi-query scoring, ``"xla"`` or ``"pallas"`` (``None``, the default:
             ``"pallas"`` on TPU, ``"xla"`` elsewhere).
         dsa_sparse_training: Force (``True``) / forbid (``False``) the sparse DSA training kernel; ``None``
@@ -1614,6 +1622,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         kda_serving_ep_split: bool | None = None,
         kda_replicate_gate_low_rank: bool = False,
         kda_fused_decode_kernel: bool = False,
+        decode_allreduce_bf16_wire: bool = False,
         index_scoring_kernel: str | None = None,
         dsa_sparse_training: bool | None = None,
         dsa_pool_training: bool = False,
@@ -1795,6 +1804,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             getattr(self, "kda_replicate_gate_low_rank", kda_replicate_gate_low_rank)
         )
         self.kda_fused_decode_kernel = bool(getattr(self, "kda_fused_decode_kernel", kda_fused_decode_kernel))
+        self.decode_allreduce_bf16_wire = bool(getattr(self, "decode_allreduce_bf16_wire", decode_allreduce_bf16_wire))
         self.index_scoring_kernel = _optional_one_of(
             "index_scoring_kernel", getattr(self, "index_scoring_kernel", index_scoring_kernel), INDEX_SCORING_KERNELS
         )
@@ -2472,6 +2482,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "kda_serving_ep_split",
             "kda_replicate_gate_low_rank",
             "kda_fused_decode_kernel",
+            "decode_allreduce_bf16_wire",
             "index_scoring_kernel",
             "dsa_sparse_training",
             "dsa_pool_training",
@@ -2660,6 +2671,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         kda_serving_ep_split: bool | None = NOT_GIVEN,
         kda_replicate_gate_low_rank: bool = NOT_GIVEN,
         kda_fused_decode_kernel: bool = NOT_GIVEN,
+        decode_allreduce_bf16_wire: bool = NOT_GIVEN,
         index_scoring_kernel: str | None = NOT_GIVEN,
         dsa_sparse_training: bool | None = NOT_GIVEN,
         dsa_pool_training: bool = NOT_GIVEN,
@@ -2770,6 +2782,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
             kda_replicate_gate_low_rank: Replicate the KDA ``f_a_proj`` / ``g_a_proj`` weights (default ``False``).
             kda_fused_decode_kernel: Run eSurge KDA pure-decode steps in the fused ``ragged_kda_conv_decode`` kernel
                 (default ``False``).
+            decode_allreduce_bf16_wire: Activation-dtype wire for the eSurge decode MoE / KDA ``o_proj``
+                all-reduces (default ``False``; approximate).
             index_scoring_kernel: Indexer multi-query scoring, ``"xla"`` or ``"pallas"`` (``None``, the default:
                 ``"pallas"`` on TPU, ``"xla"`` elsewhere).
             dsa_sparse_training: Force / forbid the sparse DSA training kernel; ``None`` = automatic (default).
@@ -2895,6 +2909,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.kda_replicate_gate_low_rank = bool(self.kda_replicate_gate_low_rank)
         set_attrs_smartly(self, "kda_fused_decode_kernel", False, kda_fused_decode_kernel)
         self.kda_fused_decode_kernel = bool(self.kda_fused_decode_kernel)
+        set_attrs_smartly(self, "decode_allreduce_bf16_wire", False, decode_allreduce_bf16_wire)
+        self.decode_allreduce_bf16_wire = bool(self.decode_allreduce_bf16_wire)
         set_attrs_smartly(self, "index_scoring_kernel", None, index_scoring_kernel)
         self.index_scoring_kernel = _optional_one_of(
             "index_scoring_kernel", self.index_scoring_kernel, INDEX_SCORING_KERNELS

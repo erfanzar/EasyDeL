@@ -958,6 +958,9 @@ class KernelDeltaAttention(spx.Module):
         row_entry = (row_axes[0] if len(row_axes) == 1 else row_axes) if row_axes else None
         reduce_entry = heads[0] if len(heads) == 1 else heads
         scale = float(getattr(linear, "output_scale", 1.0))
+        bf16_wire = (
+            bool(getattr(self.config, "decode_allreduce_bf16_wire", False)) and jnp.dtype(linear.dtype).itemsize < 4
+        )
 
         def body(x: Array, w: Array) -> Array:
             x, w = promote_dtype((x, w), dtype=linear.dtype)
@@ -968,6 +971,9 @@ class KernelDeltaAttention(spx.Module):
                     index = index * mesh_axis_size(mesh, name) + jax.lax.axis_index(name)
                 w = jax.lax.dynamic_slice_in_dim(w, index * own, own, axis=0)
             y = jnp.einsum("...i,io->...o", x, w, precision=linear.precision, preferred_element_type=jnp.float32)
+            if bf16_wire:
+                # ``decode_allreduce_bf16_wire`` (approximate, off by default): reduce activation-dtype partials.
+                y = y.astype(x.dtype)
             return jax.lax.psum(y, reduce_entry).astype(x.dtype)
 
         y = jax.shard_map(
