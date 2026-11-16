@@ -508,6 +508,285 @@ def _paged_pool_topk_call(
     return ids[:total, :k] if split is None else ids[split, :k]
 
 
+# Calls of at most this many query rows (decode: a few rows per device) run one program per row (:func:`_row_kernel`).
+# Measured on one TPU v5p chip (32 heads x 128, k = 512, bf16 queries, ~61K context), us per call row path vs row
+# blocks: 1 row 74.1 / 104.2, 2 rows 79.9 / 116.5, 3 rows 128.4 / 176.2, 4 rows 131.8 / 179.2, 5 rows 178.5 / 175.2,
+# 6 rows 177.1 / 177.9, 8 rows 227.8 / 181.5 (beyond 4 rows a TensorCore runs rows serially that blocks overlap).
+_ROW_PROGRAM_MAX_ROWS = 4
+
+
+def _prefix_rows(col):
+    """Exclusive prefix sum down the 8 rows of ``col`` ``[8, 128]`` (equal lanes per row) and the column total."""
+    run = jnp.zeros((1, _LANES), jnp.int32)
+    parts = []
+    for j in range(_TILE_ROWS):
+        parts.append(run)
+        run = run + col[j : j + 1]
+    return jnp.concatenate(parts, axis=0), run
+
+
+def _row_kernel(
+    seq_ref,
+    npool_ref,
+    bt_ref,
+    q_ref,
+    w_ref,
+    pool_hbm,
+    idx_ref,
+    kbuf,
+    sems,
+    keys_ref,
+    *,
+    k: int,
+    k_pad: int,
+    group: int,
+    pools_per_page: int,
+    pages_per_seq: int,
+    num_pages: int,
+    sm_scale: float,
+    relu: bool,
+    precision,
+    low: bool,
+):
+    """Score and select the top ``k`` pools of one query row (program ``i`` takes row ``i``).
+
+    Same scores, threshold and survivors as :func:`_kernel`, with the row's keys stored densely: chunk ``c`` (pools
+    ``128 c .. 128 c + 127``) is row ``c % 8`` of key tile ``c // 8``, so the bisection counts and the compaction read
+    one ``(8, 128)`` tile per 8 chunks instead of one per chunk. Compaction takes a tile per step in ascending pool
+    order (row-major within the tile).
+    """
+    _, _, dim = q_ref.shape
+    row = pl.program_id(0)
+    seq = seq_ref[row]
+    npool = npool_ref[row]
+    n_steps = (npool + _LANES - 1) // _LANES
+    n_tiles = (n_steps + _TILE_ROWS - 1) // _TILE_ROWS
+
+    def dma(c, slot, wait: bool):
+        for g in range(group):
+            logical = jnp.minimum(c * group + g, pages_per_seq - 1)
+            page = jnp.clip(bt_ref[seq * pages_per_seq + logical], 0, num_pages - 1)
+            cp = pltpu.make_async_copy(pool_hbm.at[page], kbuf.at[slot, g], sems.at[slot])
+            if wait:
+                cp.wait()
+            else:
+                cp.start()
+
+    lane = jax.lax.broadcasted_iota(jnp.int32, (1, _LANES), 1)
+    neg_inf_key = _monotone_key(jnp.full((1, _LANES), -jnp.inf, jnp.float32))
+    min_key = jnp.full((1, _LANES), _INT_MIN, jnp.int32)
+
+    def tile_at(t):
+        return pl.ds(pl.multiple_of(t * _LANES, _LANES), _LANES)
+
+    def chunk_key(slot, c):
+        """Keys ``[1, 128]`` of chunk ``c`` (in slot ``slot``); pools past the row's last hold the key of -inf."""
+        kk = kbuf[slot].reshape(group * pools_per_page, dim)  # [128, D]
+        if low:
+            s = jax.lax.dot_general(
+                q_ref[0],
+                kk,
+                (((1,), (1,)), ((), ())),
+                precision=jax.lax.Precision.DEFAULT,
+                preferred_element_type=jnp.float32,
+            )
+        else:
+            s = jax.lax.dot_general(
+                q_ref[0].astype(jnp.float32),
+                kk.astype(jnp.float32),
+                (((1,), (1,)), ((), ())),
+                precision=precision,
+                preferred_element_type=jnp.float32,
+            )
+        s = s * sm_scale
+        if relu:
+            s = jnp.maximum(s, 0.0)
+        s = jnp.sum(s * w_ref[0].astype(jnp.float32), axis=0, keepdims=True)
+        return jnp.where(c * _LANES + lane < npool, _monotone_key(s), neg_inf_key)
+
+    for j in range(_PAGE_SLOTS - 1):
+
+        @pl.when(j < n_steps)
+        def _(j=j):
+            dma(j, j, wait=False)
+
+    def score_tile(t, carry):
+        for j in range(_TILE_ROWS):
+            c = t * _TILE_ROWS + j
+
+            @pl.when(c < n_steps)
+            def _(c=c, j=j):
+                ahead = c + (_PAGE_SLOTS - 1)
+
+                @pl.when(ahead < n_steps)
+                def _():
+                    dma(ahead, ahead % _PAGE_SLOTS, wait=False)
+
+                slot = c % _PAGE_SLOTS
+                dma(c, slot, wait=True)
+                keys_ref[j : j + 1, tile_at(t)] = chunk_key(slot, c)
+
+            # Rows of the last tile past the row's last chunk hold INT32_MIN, which no bisection count includes.
+            @pl.when(c >= n_steps)
+            def _(j=j):
+                keys_ref[j : j + 1, tile_at(t)] = min_key
+
+        return carry
+
+    jax.lax.fori_loop(0, n_tiles, score_tile, 0)
+
+    def count(predicate):
+        def body(t, acc):
+            return acc + predicate(keys_ref[:, tile_at(t)]).astype(jnp.int32)
+
+        acc = jax.lax.fori_loop(0, n_tiles, body, jnp.zeros((_TILE_ROWS, _LANES), jnp.int32))
+        return jnp.sum(jnp.sum(acc, axis=1, keepdims=True), axis=0, keepdims=True)  # [1, 1]
+
+    def bisect(state):
+        bit, biased, done = state
+        candidate = biased | jnp.left_shift(jnp.int32(1), 31 - bit)
+        n = count(lambda kc: kc >= (candidate ^ jnp.int32(_INT_MIN)))
+        accept = (n >= k) & (done == 0)
+        return bit + 1, jnp.where(accept, candidate, biased), jnp.where(accept & (n == k), 1, done)
+
+    def unfinished(state):
+        bit, _, done = state
+        return (bit < 32) & (jnp.min(done) == 0)
+
+    empty = npool == 0
+    # Fewer than k scored keys: every candidate would be rejected and tau would end at INT32_MIN, so skip the search.
+    settled = empty | (n_steps * _LANES < k)
+    init = (jnp.int32(0), jnp.zeros((1, 1), jnp.int32), jnp.full((1, 1), settled.astype(jnp.int32), jnp.int32))
+    _, biased, _ = jax.lax.while_loop(unfinished, bisect, init)
+    tau = biased ^ jnp.int32(_INT_MIN)  # [1, 1]
+    need = k - count(lambda kc: kc > tau)
+    filler = (n_tiles * _TILE_ROWS - n_steps) * _LANES
+    n_eq = count(lambda kc: kc == tau) - jnp.where(tau == _INT_MIN, filler, 0)
+    no_cut = empty | (jnp.min((n_eq <= need).astype(jnp.int32)) == 1)
+
+    sub = jax.lax.broadcasted_iota(jnp.int32, (_TILE_ROWS, _LANES), 0)
+    rlane = jax.lax.broadcasted_iota(jnp.int32, (_TILE_ROWS, _LANES), 1)
+    out_lane = jax.lax.broadcasted_iota(jnp.int32, (_TILE_ROWS, k_pad), 1)
+
+    def compact(t, carry, exact: bool):
+        offset, ties, ids = carry  # [1, 1], [1, 1], [1, k_pad]
+        kc = keys_ref[:, tile_at(t)]
+        chunk = t * _TILE_ROWS + sub
+        live = chunk < n_steps
+        if exact:
+            eq = ((kc == tau) & live).astype(jnp.int32)
+            incl_eq = _prefix_sum_lanes(eq, rlane)
+            before, total = _prefix_rows(jnp.broadcast_to(incl_eq[:, _LANES - 1 :], (_TILE_ROWS, _LANES)))
+            tie_rank = incl_eq - eq + before + ties
+            sel = (kc > tau) | ((eq == 1) & (tie_rank < need))
+            ties = ties + total[:, :1]
+        else:
+            sel = kc >= tau
+        sel = (sel & live).astype(jnp.int32)
+        incl = _prefix_sum_lanes(sel, rlane)
+        # Source lane of the t-th selected key of each chunk: the first lane with incl >= t + 1.
+        pos = jnp.zeros((_TILE_ROWS, _LANES), jnp.int32)
+        step = _LANES // 2
+        while step >= 1:
+            probe = jnp.take_along_axis(incl, pos + step - 1, axis=1, mode="promise_in_bounds")
+            pos = jnp.where(probe < rlane + 1, pos + step, pos)
+            step //= 2
+        cnt = incl[:, _LANES - 1 :]  # [8, 1]
+        before, total = _prefix_rows(jnp.broadcast_to(cnt, (_TILE_ROWS, _LANES)))
+        off = before[:, :1] + offset  # [8, 1]: first output slot of each chunk's survivors
+        rotate = (rlane - off) & (_LANES - 1)
+        src = jnp.take_along_axis(chunk * _LANES + pos, rotate, axis=1, mode="promise_in_bounds")
+        hit = (out_lane >= off) & (out_lane < off + cnt)  # disjoint across the 8 chunks
+        put = jnp.sum(jnp.where(hit, jnp.tile(src, (1, k_pad // _LANES)), 0), axis=0, keepdims=True)
+        any_hit = jnp.sum(hit.astype(jnp.int32), axis=0, keepdims=True) > 0
+        return offset + total[:, :1], ties, jnp.where(any_hit, put, ids)
+
+    start = (jnp.zeros((1, 1), jnp.int32), jnp.zeros((1, 1), jnp.int32), jnp.full((1, k_pad), -1, jnp.int32))
+
+    def finish(ids):
+        # Masked (unscorable) pools can only be picked when a row has fewer than k pools.
+        idx_ref[0] = jnp.where((ids >= 0) & (ids < npool), ids, -1)
+
+    @pl.when(no_cut)
+    def _():
+        finish(jax.lax.fori_loop(0, n_tiles, functools.partial(compact, exact=False), start)[2])
+
+    @pl.when(jnp.logical_not(no_cut))
+    def _():
+        finish(jax.lax.fori_loop(0, n_tiles, functools.partial(compact, exact=True), start)[2])
+
+
+def _paged_pool_topk_rows_call(
+    query: jax.Array,
+    head_weights: jax.Array,
+    pool_pages: jax.Array,
+    block_tables: jax.Array,
+    seq_ids: jax.Array,
+    num_pools: jax.Array,
+    *,
+    k: int,
+    sm_scale: float,
+    relu: bool,
+    precision,
+) -> jax.Array:
+    """:func:`paged_pool_topk_pallas` with one program per query row (decode-sized calls)."""
+    total, heads, dim = query.shape
+    num_pages, pools_per_page, _ = pool_pages.shape
+    if _LANES % pools_per_page:
+        raise ValueError(f"pools_per_page ({pools_per_page}) must divide {_LANES}.")
+    group = _LANES // pools_per_page
+    num_seqs, pages_per_seq = block_tables.shape
+    k_pad = -(-k // _LANES) * _LANES
+    max_pools = -(-(pages_per_seq * pools_per_page) // _LANES) * _LANES
+    key_width = _key_width(pages_per_seq, pools_per_page)
+    kernel = functools.partial(
+        _row_kernel,
+        k=int(k),
+        k_pad=int(k_pad),
+        group=int(group),
+        pools_per_page=int(pools_per_page),
+        pages_per_seq=int(pages_per_seq),
+        num_pages=int(num_pages),
+        sm_scale=float(sm_scale),
+        relu=bool(relu),
+        precision=precision,
+        low=jnp.dtype(query.dtype) == jnp.bfloat16 and jnp.dtype(pool_pages.dtype) == jnp.bfloat16,
+    )
+
+    def rows_map(i, *_):
+        return (i, 0, 0)
+
+    ids = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(total,),
+            in_specs=[
+                pl.BlockSpec((1, heads, dim), rows_map),
+                pl.BlockSpec((1, heads, 1), rows_map),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec((1, 1, k_pad), rows_map),
+            scratch_shapes=[
+                pltpu.VMEM((_PAGE_SLOTS, group, pools_per_page, dim), pool_pages.dtype),
+                pltpu.SemaphoreType.DMA((_PAGE_SLOTS,)),
+                pltpu.VMEM((_TILE_ROWS, key_width // _TILE_ROWS), jnp.int32),
+            ],
+        ),
+        out_shape=jax.ShapeDtypeStruct((total, 1, k_pad), jnp.int32),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",), vmem_limit_bytes=_VMEM_LIMIT_BYTES),
+        name="paged_pool_topk_rows",
+    )(
+        jnp.clip(seq_ids.astype(jnp.int32), 0, num_seqs - 1),
+        jnp.clip(num_pools.astype(jnp.int32), 0, max_pools),
+        block_tables.astype(jnp.int32).reshape(-1),
+        query,
+        head_weights.astype(jnp.float32)[..., None],
+        pool_pages,
+    )
+    return ids[:, 0, :k]
+
+
 @functools.partial(jax.jit, static_argnames=("k", "sm_scale", "relu", "precision"))
 def paged_pool_topk_pallas(
     query: jax.Array,
@@ -542,6 +821,19 @@ def paged_pool_topk_pallas(
         ``[T, k]`` int32 pool ids in ascending order, ``-1``-padded when a row has fewer
         than ``k`` pools. The set equals ``jax.lax.top_k`` over the row's scores.
     """
+    if int(query.shape[0]) <= _ROW_PROGRAM_MAX_ROWS:
+        return _paged_pool_topk_rows_call(
+            query,
+            head_weights,
+            pool_pages,
+            block_tables,
+            seq_ids,
+            num_pools,
+            k=k,
+            sm_scale=sm_scale,
+            relu=relu,
+            precision=precision,
+        )
     _, heads, dim = query.shape
     row_bytes = _row_vmem_bytes(
         heads,

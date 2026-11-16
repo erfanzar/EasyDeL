@@ -221,6 +221,19 @@ def test_decode_rows_of_long_context(contexts, k):
     np.testing.assert_array_equal(got, xla)
 
 
+@pytest.mark.parametrize("contexts", list(_DECODE_CONTEXTS.values()), ids=list(_DECODE_CONTEXTS))
+@pytest.mark.parametrize("tie", [False, True], ids=["random", "ties"])
+def test_row_programs_equal_row_blocks(contexts, tie):
+    """Decode-sized calls run one program per row; its ids equal the row-block kernel's on the same rows."""
+    from ejkernel.kernels._pallas.tpu.paged_pool_topk import _pallas_impl_fwd as impl
+
+    args, _ = _packed_rows(13, [(i, c, 1) for i, c in enumerate(contexts)], num_seqs=len(contexts), tie=tie)
+    kw = dict(k=512, sm_scale=D**-0.5, relu=True, precision=jax.lax.Precision.HIGHEST)
+    rows = np.asarray(impl._paged_pool_topk_rows_call(*args, **kw))
+    blocks = np.asarray(impl._paged_pool_topk_call(*args, **kw, block_rows=8, compact_chunks=8))
+    np.testing.assert_array_equal(rows, blocks)
+
+
 def test_page_shared_scoring_equals_per_row_scoring():
     """The same rows over identical pools: one sequence (pages fetched once per row block) == eight (per row)."""
     k = 512

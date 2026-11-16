@@ -77,6 +77,11 @@ from ...._xla.sparse_multi_latent_ragged_page_attention._xla_impl_fwd import (
 
 _FAR = 1 << 30  # token index that is never attendable (masks padding slots)
 _NUM_BUFFERS = 3  # VMEM ring depth: up to two groups in flight while one is computed
+# Ring depth of the per-token kernel (decode and short mixed steps). The depth only schedules DMAs, so outputs are the
+# same for any depth. Measured on one TPU v5p chip, kernel only, 11 chained calls of 32 tokens of which 8 attend (16
+# heads, latent 512, 513 selected 4-token chunks, ~61K context): 82.3 us per call with 3 slots, 78.9 with 6; the
+# whole op (cache write and metadata included) 158.2 / 157.5 / 154.6 / 155.0 us with 3 / 4 / 6 / 8 slots.
+_TOKEN_NUM_BUFFERS = 6
 _WORD_COL = 3  # metadata row: [n_valid, pos, last_start, words[0:Wp], (starts[0:Wp])]
 # In-kernel page translation keeps one block-table row per token in SMEM and scalar-prefetches the
 # token -> sequence map; beyond these sizes the translation runs in XLA instead (TPU SMEM is ~1 MiB).
@@ -190,9 +195,17 @@ def build_metadata(
     ok = (selected >= 0) & valid[:, None] & (start <= pos[:, None]) & (start < kv_len[:, None])
     if sliding_window is not None:
         ok = ok & (start + chunk_size - 1 > pos[:, None] - int(sliding_window))
-    # Selections are unique per row and every padding slot holds the same _FAR sentinel, so an unstable sort gives
-    # the same array; a stable one makes the TPU sort carry an extra iota operand.
-    key = lax.sort(jnp.where(ok, start, _FAR), dimension=1, is_stable=False)
+    key = jnp.where(ok, start, _FAR)
+    # Decode selections usually arrive ascending with unattendable slots last (top-k ids ascending, -1 padding, the
+    # tail chunk last); sorting rows that are already ascending returns them unchanged, so the sort is skipped then.
+    # Otherwise: selections are unique per row and every padding slot holds the same _FAR sentinel, so an unstable
+    # sort gives the same array; a stable one makes the TPU sort carry an extra iota operand.
+    key = lax.cond(
+        jnp.all(key[:, 1:] >= key[:, :-1]),
+        lambda x: x,
+        lambda x: lax.sort(x, dimension=1, is_stable=False),
+        key,
+    )
     n_valid = jnp.sum(ok, axis=1).astype(jnp.int32)
 
     padded_width = -(-width // group) * group
@@ -1532,8 +1545,8 @@ def _token_attention(
 
     group_words = group * (span // kv_packing)
     scratch_shapes = [
-        pltpu.VMEM((_NUM_BUFFERS, group_words, kv_packing, cache_dim), kv_cache.dtype),
-        pltpu.SemaphoreType.DMA((_NUM_BUFFERS,)),
+        pltpu.VMEM((_TOKEN_NUM_BUFFERS, group_words, kv_packing, cache_dim), kv_cache.dtype),
+        pltpu.SemaphoreType.DMA((_TOKEN_NUM_BUFFERS,)),
         pltpu.VMEM((num_heads, 128), jnp.float32),
         pltpu.VMEM((num_heads, 128), jnp.float32),
         pltpu.VMEM((num_heads, nope_dim), jnp.float32),
