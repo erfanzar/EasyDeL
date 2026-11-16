@@ -34,6 +34,7 @@ def grouped_matmul_channelwise(
     activation_bits=16,
     preferred_element_type=jnp.bfloat16,
     tiling=None,
+    mask_padding=True,
 ):
     """Multiply sorted activation rows by CHANNELWISE represented weights.
 
@@ -53,7 +54,10 @@ def grouped_matmul_channelwise(
     weights, NOT the natural derivative of round/absmax. Scale derivatives
     use the actual forward quantized activations, including at zero rows.
     ``preferred_element_type`` controls output dtype; tiling is an XLA hint.
+    ``mask_padding=False`` only allows unspecified padding rows; this
+    reference always zeroes them, so its result is the same either way.
     """
+    _ = bool(mask_padding)
     if activation_bits not in (4, 8, 16):
         raise ValueError("activation_bits must be 4, 8, or 16")
     if codes.dtype not in (jnp.dtype(jnp.int4), jnp.dtype(jnp.int8)):

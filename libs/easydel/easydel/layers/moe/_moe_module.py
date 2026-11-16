@@ -2910,8 +2910,24 @@ class BaseMoeModule(spx.Module, ABC):
             starts = ends - group_sizes.astype(jnp.int32)
             n_local = ends[-1]
             x_src = x2d.astype(self.dtype)
-            gather_sum = _moe_row_gather_sum_entry(
-                live_slot_kernel=total_rows >= _LIVE_COMBINE_MIN_LOCAL_ROWS * max(ep_size, 1)
+            live_slot_kernel = total_rows >= _LIVE_COMBINE_MIN_LOCAL_ROWS * max(ep_size, 1)
+            gather_sum = _moe_row_gather_sum_entry(live_slot_kernel=live_slot_kernel)
+            # The down projection may leave its dispatch tail unwritten (and write its output dtype from the kernel)
+            # only where the combine is the Pallas live-slot kernel: that kernel reads the FFN rows from HBM, so the
+            # skipped tail-mask + cast pass is a real saving. The XLA entry's gather fuses that pass into its own
+            # reads, so there the default (masked) call stays, unchanged.
+            from ejkernel.modules import row_gather_sum_unsupported_reason  # pyright: ignore[reportMissingTypeStubs]
+
+            unread_tail = (
+                live_slot_kernel
+                and row_gather_sum_unsupported_reason(
+                    jax.ShapeDtypeStruct((window_rows, x2d.shape[1]), self.dtype),
+                    jax.ShapeDtypeStruct((tokens, top_k), jnp.int32),
+                    jax.ShapeDtypeStruct((tokens, top_k), jnp.float32),
+                    jnp.float32,
+                    skip_negative=True,
+                )
+                is None
             )
             dma_gather = _moe_row_gather_kernels()[0] if window_rows >= _DMA_ROW_GATHER_MIN_ROWS else None
 
@@ -2929,7 +2945,7 @@ class BaseMoeModule(spx.Module, ABC):
                     live = is_local & (rel >= 0) & (rel < window_rows)
                 src_rows = rows // top_k
                 gathered = x_src[src_rows] if dma_gather is None else dma_gather(x_src, src_rows)[0]
-                inter = expert_ffn(gathered, sizes, ids, tp_reduce=False)
+                inter = expert_ffn(gathered, sizes, ids, tp_reduce=False, unread_tail=unread_tail)
                 # Window rows past its local count are the FFN's unwritten tail (not guaranteed finite on TPU): dead
                 # slots are -1, which the live-slot combine never reads (its XLA entry selects them away).
                 slots = jnp.where(live, rel, -1).reshape(tokens, top_k)
@@ -3321,6 +3337,7 @@ class BaseMoeModule(spx.Module, ABC):
                 selected_experts: jax.Array,
                 *,
                 tp_reduce: bool = True,
+                unread_tail: bool = False,
             ) -> jax.Array:
                 """Grouped-matmul expert FFN core over expert-sorted rows.
 
@@ -3339,6 +3356,8 @@ class BaseMoeModule(spx.Module, ABC):
                         returns the unreduced ``[rows, H]`` tp-partial sums so
                         the caller can reduce AFTER the (linear) top-k combine;
                         only valid without a down bias.
+                    unread_tail: The caller never reads the down projection's rows past ``sum(group_sizes)``
+                        (inference mode only), so they may be left unspecified.
 
                 Returns:
                     Down-projected rows ``[rows, H // tp_size]`` (``H`` when
@@ -3352,6 +3371,7 @@ class BaseMoeModule(spx.Module, ABC):
                     tp_sharded_contraction: bool = False,
                     activation_bits=None,
                     grouped_platform=None,
+                    mask_padding=True,
                 ):
                     """Dense bf16 grouped matmul, or — when the kernel is a
                     quantized ``(codes, scales)`` pair from ``kernel_view()`` —
@@ -3410,11 +3430,15 @@ class BaseMoeModule(spx.Module, ABC):
                         if activation_bits is not None:
                             from ejkernel.modules import grouped_matmul_channelwise
 
+                            # ``mask_padding=False`` only from the inference deferred dispatch's down projection,
+                            # whose dispatch-tail rows the skip_negative combine never reads.
+                            extra = {} if mask_padding else {"mask_padding": False}
                             return grouped_matmul_channelwise(
                                 rows,
                                 codes,
                                 scales,
                                 group_sizes,
+                                **extra,
                                 activation_bits=activation_bits,
                                 platform=grouped_platform
                                 or _channelwise_grouped_platform(
@@ -3536,6 +3560,9 @@ class BaseMoeModule(spx.Module, ABC):
                     tp_sharded_contraction=True,
                     activation_bits=wd_activation_bits,
                     grouped_platform=wd_grouped_platform,
+                    # ``_local_row_windows`` (inference only): its skip_negative combine reads only routed rows, so
+                    # the A8 slab kernel may write the output dtype itself and skip the tail mask + cast pass.
+                    mask_padding=not (unread_tail and is_inference_mode()),
                 )
                 intermediate_output = checkpoint_name(intermediate_output, "mlp_down")
 

@@ -196,6 +196,7 @@ def grouped_matmul_channelwise(
     activation_bits=16,
     preferred_element_type=jnp.bfloat16,
     tiling=None,
+    mask_padding=True,
 ):
     """Stream signed int4/int8 weights with explicit activation precision.
 
@@ -213,6 +214,10 @@ def grouped_matmul_channelwise(
     scales applied in the kernel into f32, the tail mask and the cast in XLA.
     Group sizes must be nonnegative and sum to at most M. Trailing padding has
     zero output/cotangents, including when every group is empty.
+    ``mask_padding=False`` allows the rows past ``sum(group_sizes)`` to be left
+    unspecified (possibly non-finite): the A8 whole-slab path then writes the
+    ``preferred_element_type`` output from the kernel, skipping the XLA tail
+    mask and cast (the same values on every routed row). Other paths mask.
     """
     if activation_bits not in (4, 8, 16):
         raise ValueError("activation_bits must be 4, 8, or 16")
@@ -280,7 +285,7 @@ def grouped_matmul_channelwise(
             q = q.astype(jnp.int8)
             padded_m = ((x.shape[0] + 31) // 32) * 32
             q = jnp.pad(q, ((0, padded_m - x.shape[0]), (0, 0)))
-            if slab_epilogue:
+            if slab_epilogue and mask_padding:
                 # Whole expert slabs: both scales are applied in the kernel after the complete int32 contraction,
                 # in the XLA entry's order ((acc * row scale) * channel scale), into an f32 output. The tail mask
                 # and the final cast stay in XLA, written as the XLA entry ends, so the graph after this op is the
@@ -305,6 +310,25 @@ def grouped_matmul_channelwise(
                     num_cores=slab_cores,
                 )[: x.shape[0]]
                 return jnp.where(valid[:, None], scaled, 0).astype(preferred_element_type)
+            if slab_epilogue and not mask_padding:
+                kernel_sizes = jnp.where(
+                    (jnp.arange(sizes.shape[0]) == 0) & (jnp.sum(sizes) == 0), jnp.ones_like(sizes), sizes
+                )
+                # Routed rows get the same ((acc * row scale) * channel scale) value and the same final cast, done in
+                # the kernel; rows past sum(sizes) stay unwritten (the caller allowed unspecified padding).
+                return grouped_matmulv3_pallas_impl(
+                    q,
+                    weights,
+                    kernel_sizes,
+                    maybe_quantize_lhs=False,
+                    tile_info=tiles,
+                    preferred_element_type=preferred_element_type,
+                    acc_dtype=jnp.int32,
+                    zero_initialize=False,
+                    output_row_scale=jnp.pad(activation_scale, ((0, padded_m - x.shape[0]), (0, 0)), constant_values=1),
+                    output_channel_scale=s.astype(jnp.float32),
+                    num_cores=slab_cores,
+                )[: x.shape[0]]
             # Prefill-sized calls write the scaled output from the kernel instead of materializing the raw M x N
             # int32 dot (same ((acc * row scale) * channel scale) order and final cast as the unfused path).
             fuse_output = _INTEGER_PREFILL_ROWS[0] <= x.shape[0] <= _INTEGER_PREFILL_ROWS[1] and jnp.dtype(

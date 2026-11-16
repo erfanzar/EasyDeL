@@ -795,6 +795,7 @@ class GroupedMatmulChannelwise(Kernel[GroupedMatmulConfig, Array]):
         activation_bits=16,
         preferred_element_type=jnp.bfloat16,
         tiling=None,
+        mask_padding=True,
         cfg: GroupedMatmulConfig,
     ):
         return self.get_impl(cfg)(
@@ -805,6 +806,7 @@ class GroupedMatmulChannelwise(Kernel[GroupedMatmulConfig, Array]):
             activation_bits=activation_bits,
             preferred_element_type=preferred_element_type,
             tiling=tiling,
+            mask_padding=mask_padding,
         )
 
 
@@ -823,6 +825,7 @@ def grouped_matmul_channelwise(
     preferred_element_type: DTypeLike = jnp.bfloat16,
     tiling: tuple[int, int, int] | None = None,
     platform: Literal["xla", "pallas"] = "xla",
+    mask_padding: bool = True,
 ) -> Array:
     """Explicit W4A16/W8A16/W4A4/W8A8 CHANNELWISE grouped matmul.
 
@@ -845,6 +848,11 @@ def grouped_matmul_channelwise(
     in the kernel, at up to 81,920 rows for any expert count, with a row tile
     chosen from the rows per expert (:func:`grouped_matmul_channelwise_slab_tiles`).
     Explicit tiles override these heuristics.
+    ``mask_padding=False`` lets the rows past ``sum(group_sizes)`` be
+    unspecified (possibly non-finite; forward use only, for consumers that
+    never read them): the Pallas A8 slab path then writes its output dtype
+    from the kernel and skips the tail mask and cast pass. Routed rows are
+    unchanged.
     Pallas AD uses the XLA reference for activation/scale derivatives and
     may materialize floating weights: no backward memory saving is promised.
     There is no automatic mode or platform selection.
@@ -872,6 +880,7 @@ def grouped_matmul_channelwise(
         activation_bits=activation_bits,
         preferred_element_type=preferred_element_type,
         tiling=tiling,
+        mask_padding=bool(mask_padding),
         _cfg=cfg,
     )
 
