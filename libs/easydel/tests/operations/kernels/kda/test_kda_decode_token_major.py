@@ -80,3 +80,17 @@ def test_prefix_rows_decode_matches_row_major_bitwise(dtype, tp, live):
     for name in LEAVES:
         a, b = np.asarray(short[name]), np.asarray(long[name])
         assert a.dtype == b.dtype and a.tobytes() == b.tobytes(), name
+
+
+def test_rows_are_tokens_rejects_a_stream_longer_than_the_rows():
+    # The flag is a static promise of one stream position per row; a mismatched call must fail at trace time.
+    from easydel.operations.kernels.ragged_kda_decode import kda_decode_rows_forward
+
+    def driver(*, chunk_size, decay_lower_bound, precision, **kwargs):
+        del chunk_size, decay_lower_bound, precision
+        return kda_decode_rows_forward(**kwargs, rows_are_tokens=True)
+
+    lens, context = (1, 1, 0, 0), (3, 4, 0, 0)
+    case = _case((lens, context, 8), seed=2, dtype=jnp.float32)
+    with pytest.raises(ValueError, match="rows_are_tokens"):
+        _run(driver, case, (lens, context, 8), jnp.float32, tp=1)

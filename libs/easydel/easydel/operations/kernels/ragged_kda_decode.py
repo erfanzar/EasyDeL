@@ -249,6 +249,7 @@ def kda_decode_rows_forward(
     conv_dtype: jnp.dtype = jnp.bfloat16,
     state_indices: Array | None = None,
     head_axis: str | tuple[str, ...] | None = None,
+    rows_are_tokens: bool = False,
 ) -> tuple[Float[Array, "1 seq_len num_heads d_state"], KDACacheView]:
     """Advance KDA state for an eSurge step in which every row has at most one token.
 
@@ -277,6 +278,9 @@ def kda_decode_rows_forward(
         state_indices: Pool slot of every row, ``[rows]`` or ``[1, rows]``, or ``None`` for slot ``r``.
         head_axis: Mesh axis (or tuple of axes) of the heads for the decode operation, or ``None`` for
             :meth:`RaggedKDADecodeOp.resolve_head_axis` (see :func:`~easydel.operations.kernels.kda_ragged_rows_forward`).
+        rows_are_tokens: Static promise that the stream has one position per row and every row with a token holds it
+            at its own position (``query_start_loc[r] == r``), as in :func:`kda_rows_forward`'s prefix steps: the
+            per-row reads of the streams and the output scatter are then identities and are skipped.
 
     Returns:
         tuple: ``(outputs, new_cache_view)``: outputs ``[1, T, heads, head_v_dim]`` float32 and the cache view with
@@ -315,6 +319,11 @@ def kda_decode_rows_forward(
     op = OperationRegistry.create("ragged_kda_decode", metadata)
     if not isinstance(op, RaggedKDADecodeOp):
         raise TypeError(f"'ragged_kda_decode' resolved to {type(op).__name__}, expected a RaggedKDADecodeOp")
+    if rows_are_tokens and int(query.shape[1]) != rows:
+        raise ValueError(
+            f"kda_decode_rows_forward: rows_are_tokens needs one stream position per row, got {int(query.shape[1])} "
+            f"positions for {rows} rows"
+        )
 
     with jax.named_scope("easydel-kda-decode-rows"):
         f32 = jnp.float32
@@ -358,12 +367,17 @@ def kda_decode_rows_forward(
             read_slots = jnp.where(owns, per_entry[:, 3], 0)
             write_slots = jnp.where(advance, entry_slots, num_slots)
         entries = seq_len if token_major else rows
+        # Token-major entries and rows_are_tokens rows read the streams position for position (no per-row gather).
+        direct = token_major or rows_are_tokens
+
+        def take(stream_rows: Array) -> Array:
+            return stream_rows if direct else stream_rows[tok]
 
         def causal_conv(stream: Array, kernel: Array, pool_leaf: Array) -> tuple[Array, Array]:
             compute = _conv_compute_dtype(stream.dtype, pool_leaf.dtype)
             held = pool_leaf[:rows] if state_indices is None else pool_leaf[read_slots]
             window = jnp.where(fresh[:, None, None], jnp.zeros((), compute), held.astype(compute))
-            x = (stream[0] if token_major else stream[0][tok]).astype(compute)
+            x = take(stream[0]).astype(compute)
             new_window = jnp.concatenate([window[:, :, 1:], x[:, :, None]], axis=-1)  # [rows, dim, d_conv]
             # One reduce over d_conv instead of per-tap slices: slicing taps[:, :, j] made XLA re-tile every
             # [rows, dim, d_conv] window into a dim-minor layout and back (GLM-5.3-Flash ep8 x tp8 decode: two
@@ -381,13 +395,13 @@ def kda_decode_rows_forward(
         q_conv, q_pool = causal_conv(query, conv_kernels[0], cache_view.q_conv_state)
         k_conv, k_pool = causal_conv(key, conv_kernels[1], cache_view.k_conv_state)
         v_conv, v_pool = causal_conv(value, conv_kernels[2], cache_view.v_conv_state)
-        row_beta = beta[0] if token_major else beta[0][tok]
+        row_beta = take(beta[0])
         row_out, recurrent_pool = op(
             q_conv.reshape(entries, num_heads, head_k),
             k_conv.reshape(entries, num_heads, head_k),
             v_conv.reshape(entries, num_heads, head_v),
             row_beta.astype(f32) if _is_lowfloat(row_beta.dtype) else row_beta,
-            decay[0] if token_major else decay[0][tok],
+            take(decay[0]),
             cache_view.recurrent_state,
             entry_slots,  # None: row r owns slot r (in-place kernel update)
             advance,
@@ -395,7 +409,8 @@ def kda_decode_rows_forward(
             num_tokens=seq_len,
             head_axis=head_axis,
         )
-        if token_major:
+        if direct:
+            # Entry / row t is position t: every position past the live tokens belongs to a row that does not advance.
             out = jnp.where(advance[:, None, None], row_out.astype(f32), jnp.zeros((), f32))
         else:
             out = jnp.zeros((seq_len, num_heads, head_v), f32)
@@ -513,7 +528,7 @@ def kda_rows_forward(
         head = dict(common, query_start_loc=query_start_loc[: seq_len + 1])
         if context_lens is not None:
             head["context_lens"] = jnp.asarray(context_lens)[:seq_len]
-        branches.append(branch(kda_decode_rows_forward, head))
+        branches.append(branch(kda_decode_rows_forward, head, rows_are_tokens=True))
         index = jnp.where(prefix, 2, index)
     out, new_leaves = lax.switch(index, branches, leaves)
     return out, cache_view.update_kda_states(*new_leaves)
