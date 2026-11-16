@@ -308,6 +308,10 @@ def kda_decode_rows_forward(
                 f"{tuple(state_indices.shape)}"
             )
         state_indices = state_indices[:rows]
+    if state_indices is None and int(query.shape[1]) < rows:
+        # Row r owns slot r; the token-major form below needs the slots explicitly (a bucket shorter than the row
+        # count addresses only the rows that own its tokens).
+        state_indices = jnp.arange(rows, dtype=jnp.int32)
     op = OperationRegistry.create("ragged_kda_decode", metadata)
     if not isinstance(op, RaggedKDADecodeOp):
         raise TypeError(f"'ragged_kda_decode' resolved to {type(op).__name__}, expected a RaggedKDADecodeOp")
@@ -332,12 +336,34 @@ def kda_decode_rows_forward(
             # Rows that do not advance (no token, out-of-range slot; eSurge points padding rows at slot 0) drop the write.
             write_slots = jnp.where(advance, state_indices, num_slots)
         tok = jnp.clip(qsl[:-1], 0, seq_len - 1)  # row r's token (rows without one read a clamped, unused token)
+        # Buckets shorter than the row count (a 16-token decode bucket of a 128-row engine) run one entry per token
+        # instead of one per row: entry t is the token at position t and the row that owns it. Every entry's
+        # arithmetic is the row's own (per-row ops only), so results equal the row-major form; only the gathers, the
+        # conv and the kernel shrink from ``rows`` to ``seq_len`` entries.
+        token_major = state_indices is not None and seq_len < rows
+        entry_slots = state_indices
+        if token_major:
+            # owner[t, r]: row r has a token and it sits at position t (at most one row per position). One compare and
+            # integer reduce gives every per-entry field; no binary search (a while loop) and no per-field gathers.
+            pos = jnp.arange(seq_len, dtype=jnp.int32)
+            owner = (qsl[None, :-1] == pos[:, None]) & (lens > 0)[None, :]
+            fields = jnp.stack(
+                [fresh.astype(jnp.int32), advance.astype(jnp.int32), state_indices, read_slots], axis=-1
+            )  # [rows, 4]
+            per_entry = jnp.sum(jnp.where(owner[:, :, None], fields[None], 0), axis=1)  # [seq_len, 4]
+            owns = jnp.any(owner, axis=1)
+            fresh = (per_entry[:, 0] != 0) & owns
+            advance = (per_entry[:, 1] != 0) & owns
+            entry_slots = jnp.where(owns, per_entry[:, 2], num_slots)
+            read_slots = jnp.where(owns, per_entry[:, 3], 0)
+            write_slots = jnp.where(advance, entry_slots, num_slots)
+        entries = seq_len if token_major else rows
 
         def causal_conv(stream: Array, kernel: Array, pool_leaf: Array) -> tuple[Array, Array]:
             compute = _conv_compute_dtype(stream.dtype, pool_leaf.dtype)
             held = pool_leaf[:rows] if state_indices is None else pool_leaf[read_slots]
             window = jnp.where(fresh[:, None, None], jnp.zeros((), compute), held.astype(compute))
-            x = stream[0][tok].astype(compute)
+            x = (stream[0] if token_major else stream[0][tok]).astype(compute)
             new_window = jnp.concatenate([window[:, :, 1:], x[:, :, None]], axis=-1)  # [rows, dim, d_conv]
             # One reduce over d_conv instead of per-tap slices: slicing taps[:, :, j] made XLA re-tile every
             # [rows, dim, d_conv] window into a dim-minor layout and back (GLM-5.3-Flash ep8 x tp8 decode: two
@@ -355,22 +381,25 @@ def kda_decode_rows_forward(
         q_conv, q_pool = causal_conv(query, conv_kernels[0], cache_view.q_conv_state)
         k_conv, k_pool = causal_conv(key, conv_kernels[1], cache_view.k_conv_state)
         v_conv, v_pool = causal_conv(value, conv_kernels[2], cache_view.v_conv_state)
-        row_beta = beta[0][tok]
+        row_beta = beta[0] if token_major else beta[0][tok]
         row_out, recurrent_pool = op(
-            q_conv.reshape(rows, num_heads, head_k),
-            k_conv.reshape(rows, num_heads, head_k),
-            v_conv.reshape(rows, num_heads, head_v),
+            q_conv.reshape(entries, num_heads, head_k),
+            k_conv.reshape(entries, num_heads, head_k),
+            v_conv.reshape(entries, num_heads, head_v),
             row_beta.astype(f32) if _is_lowfloat(row_beta.dtype) else row_beta,
-            decay[0][tok],
+            decay[0] if token_major else decay[0][tok],
             cache_view.recurrent_state,
-            state_indices,  # None: row r owns slot r (in-place kernel update)
+            entry_slots,  # None: row r owns slot r (in-place kernel update)
             advance,
             jnp.logical_not(fresh),
             num_tokens=seq_len,
             head_axis=head_axis,
         )
-        out = jnp.zeros((seq_len, num_heads, head_v), f32)
-        out = out.at[jnp.where(advance, tok, seq_len)].set(row_out.astype(f32), mode="drop")
+        if token_major:
+            out = jnp.where(advance[:, None, None], row_out.astype(f32), jnp.zeros((), f32))
+        else:
+            out = jnp.zeros((seq_len, num_heads, head_v), f32)
+            out = out.at[jnp.where(advance, tok, seq_len)].set(row_out.astype(f32), mode="drop")
     new_cache_view = cache_view.update_kda_states(
         new_q_conv_state=q_pool,
         new_k_conv_state=k_pool,
