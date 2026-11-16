@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Inference-mode W8A8 routed experts at decode and measured prefill rows run ejkernel's Pallas A8 whole-slab entry.
+"""Inference-mode W8A8 / W4A8 routed experts at decode and prefill rows run ejkernel's Pallas A8 whole-slab entry.
 
 ``_channelwise_grouped_platform`` selects the Pallas channelwise entry for A8 activations with int8 codes under
 inference mode on TPU v5p whenever ejkernel's ``grouped_matmul_channelwise_slab_tiles`` gives whole-slab tiles: one
@@ -110,13 +110,14 @@ def test_a8_selection_keeps_xla_for_other_operands(monkeypatch):
         int4 = jax.ShapeDtypeStruct((72, 4096, 512), jnp.int4)
         bf16_rows = jax.ShapeDtypeStruct((256, 4096), jnp.bfloat16)
         assert mm._channelwise_grouped_platform(f32_rows, int8, 8) == "xla"
-        assert mm._channelwise_grouped_platform(bf16_rows, int4, 8) == "xla"
+        # W4A8: int4 codes take the same whole-slab rule (the slab is counted at four bits).
+        assert mm._channelwise_grouped_platform(bf16_rows, int4, 8) == "pallas"
         monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
         assert mm._channelwise_grouped_platform(bf16_rows, int8, 8) == "xla"
 
 
-def _build(dims):
-    """W8A8 GLM-5-Next routed-MoE block (no shared expert) in bfloat16 on ``dims``."""
+def _build(dims, mode="w8a8"):
+    """W8A8 (or ``mode``) GLM-5-Next routed-MoE block (no shared expert) in bfloat16 on ``dims``."""
     import easydel as ed
     from easydel.layers.quantization import EasyQuantizer, QuantizationConfig
     from easydel.modules.glm5_next.modeling_glm5_next import Glm5NextTextMoE
@@ -146,10 +147,14 @@ def _build(dims):
     for projection in (block.experts.gate_proj, block.experts.up_proj, block.experts.down_proj):
         projection.weight.value = projection.weight.value * 5
     quantizer = EasyQuantizer(
-        quantization_config=QuantizationConfig(dtype="w8a8", pattern=r"experts\.(?:gate_proj|up_proj|down_proj)$")
+        quantization_config=QuantizationConfig(dtype=mode, pattern=r"experts\.(?:gate_proj|up_proj|down_proj)$")
     )
     block = quantizer.apply_quantization(block)
-    assert block.experts.down_proj.quant_kernel.value.dtype == jnp.int8
+    code_dtype = jnp.int4 if mode.startswith("w4") else jnp.int8
+    for projection in (block.experts.gate_proj, block.experts.up_proj, block.experts.down_proj):
+        assert projection.quant_kernel.value.dtype == code_dtype
+        assert projection.quant_scales.value.shape == (EXPERTS, 1, projection.quant_kernel.value.shape[2])
+        assert projection.kernel_view().activation_bits == 8
     return block
 
 
@@ -188,11 +193,12 @@ def _skip_unless_v5p_with_four_devices():
         pytest.skip("the A8 slab selection is measured on v5p only")
 
 
+@pytest.mark.parametrize("mode", ["w8a8", "w4a8"])
 @pytest.mark.parametrize("decode", [False, True], ids=["prefill_layout", "decode_layout"])
 @pytest.mark.parametrize("mesh", sorted(MESHES))
-def test_w8a8_block_runs_the_slab_kernels_bit_identically(mesh, decode):
+def test_w8a8_block_runs_the_slab_kernels_bit_identically(mesh, decode, mode):
     _skip_unless_v5p_with_four_devices()
-    block = _build(MESHES[mesh])
+    block = _build(MESHES[mesh], mode)
     x = jax.random.normal(jax.random.PRNGKey(0), (1, TOKENS, HIDDEN), jnp.float32).astype(jnp.bfloat16)
     out_auto, text_auto = _forward(block, x, force_xla=False, inference=True, decode=decode)
     out_xla, text_xla = _forward(block, x, force_xla=True, inference=True, decode=decode)
@@ -205,9 +211,10 @@ def test_w8a8_block_runs_the_slab_kernels_bit_identically(mesh, decode):
     np.testing.assert_array_equal(out_auto, out_xla)
 
 
-def test_w8a8_block_training_program_is_unchanged():
+@pytest.mark.parametrize("mode", ["w8a8", "w4a8"])
+def test_w8a8_block_training_program_is_unchanged(mode):
     _skip_unless_v5p_with_four_devices()
-    block = _build(MESHES["ep2tp2"])
+    block = _build(MESHES["ep2tp2"], mode)
     x = jax.random.normal(jax.random.PRNGKey(0), (1, TOKENS, HIDDEN), jnp.float32).astype(jnp.bfloat16)
     out_auto, text_auto = _forward(block, x, force_xla=False, inference=False, decode=False)
     out_xla, text_xla = _forward(block, x, force_xla=True, inference=False, decode=False)

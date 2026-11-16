@@ -885,10 +885,9 @@ def grouped_matmul_channelwise_slab_tiles(
 ) -> tuple[int, int, int] | None:
     """The whole-slab ``(tile_m, K, N)`` tiles of :func:`grouped_matmul_channelwise`'s TPU Pallas entry, or ``None``.
 
-    The rule ``platform='pallas'`` applies when ``tiling`` is not given: A8 activations with int8 codes whose
-    128-aligned ``(K, N)`` expert slab fits 2 MiB, at up to 81,920 rows, for any expert count; the row tile follows the
-    rows per expert. A caller that chooses the platform per call asks this, so its selection and the kernel follow one
-    rule. Pure shape policy: it queries no device.
+    The rule ``platform='pallas'`` applies when ``tiling`` is not given: A8 activations with int8 or int4 codes whose
+    128-aligned ``(K, N)`` expert slab fits one 2 MiB RHS buffer at the codes' bit width, at up to 81,920 rows, for any
+    expert count; the row tile follows the rows per expert. Pure shape policy: it queries no device.
 
     Args:
         rows: Rows of ``lhs`` (``M``).
@@ -904,6 +903,38 @@ def grouped_matmul_channelwise_slab_tiles(
     impl = importlib.import_module("ejkernel.kernels._pallas.tpu.grouped_matmul_channelwise._interface")
     e, k, n = (int(d) for d in codes_shape)
     return impl._a8_slab_tiles(int(rows), int(activation_bits), e, k, n, jnp.dtype(codes_dtype))
+
+
+def grouped_matmul_channelwise_pallas_tiles(
+    rows: int,
+    codes_shape: tuple[int, int, int],
+    codes_dtype: DTypeLike,
+    *,
+    activation_bits: int,
+) -> tuple[int, int, int] | None:
+    """Tiles of the measured-fast TPU Pallas path of :func:`grouped_matmul_channelwise` for a call, or ``None``.
+
+    One rule per activation width, from the weight shape, the codes' bit width (``jax.dtypes.itemsize_bits``),
+    128-alignment, the 2 MiB RHS buffer and row bounds only, for any expert count: A8 (int8 or int4 codes) the
+    whole-slab tiles of :func:`grouped_matmul_channelwise_slab_tiles`; A16 full-K tiles with the widest 128-multiple
+    ``N`` tile that divides ``N`` and fits the buffer, at up to 12,288 rows; A4 (int4 codes) the streaming tiles at up
+    to 128 and at 1,280 ... 81,920 rows. A caller that chooses the platform per call asks this, so its selection and the
+    kernel's tiles follow one rule. Pure shape policy: it queries no device.
+
+    Args:
+        rows: Rows of ``lhs`` (``M``).
+        codes_shape: ``(E, K, N)`` of the expert codes.
+        codes_dtype: Dtype of the codes.
+        activation_bits: Activation precision of the call (4, 8 or 16).
+
+    Returns:
+        ``(tile_m, tile_k, tile_n)`` when the Pallas entry has a measured-fast path for the call, else ``None``.
+    """
+    import importlib
+
+    impl = importlib.import_module("ejkernel.kernels._pallas.tpu.grouped_matmul_channelwise._interface")
+    e, k, n = (int(d) for d in codes_shape)
+    return impl._pallas_path_tiles(int(rows), int(activation_bits), e, k, n, jnp.dtype(codes_dtype))
 
 
 def grouped_matmul_w8a8(

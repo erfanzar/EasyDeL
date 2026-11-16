@@ -66,7 +66,7 @@ from eformer.loggings import get_logger
 from ejkernel.modules import (  # pyright: ignore[reportMissingTypeStubs]
     GroupedMatmulConfig,
     grouped_matmul,
-    grouped_matmul_channelwise_slab_tiles,
+    grouped_matmul_channelwise_pallas_tiles,
 )
 from jax import numpy as jnp
 from jax import shard_map
@@ -144,34 +144,52 @@ def _default_ffn_activation(
 
 
 def _channelwise_grouped_platform(rows, codes, activation_bits, *, force_xla=False):
-    """Select measured v5p decode and W4A4 prefill matrix families.
+    """Pick ``"pallas"`` or ``"xla"`` for an integer-mode (``activation_bits`` 4 / 8 / 16) expert grouped matmul.
 
-    Large native INT4 ragged dots on these v5p shapes were much slower than
-    exact INT8 arithmetic with packed INT4 HBM storage. Keep A16 decode-only,
-    retain forced-XLA, and do not extrapolate past the measured row range.
+    Under inference mode on TPU v5p, a call with bfloat16 rows and int4 / int8 codes runs ejkernel's Pallas entry
+    exactly when ``grouped_matmul_channelwise_pallas_tiles`` gives it tiles, so this selection and the kernel's tiles
+    follow one rule. That rule reads only the weight shape, the codes' bit width, 128-alignment, the 2 MiB RHS buffer
+    and row bounds, for any expert count: A8 (W8A8 and W4A8) streams one whole ``(K, N)`` expert slab that fits the
+    buffer at the codes' width, at up to 81,920 rows, both scales applied in the kernel; A16 (W4A16 / W8A16) reads the
+    full contraction with the widest fitting ``N`` tile at up to 12,288 rows; A4 (W4A4) streams at up to 128 and at
+    1,280 ... 81,920 rows. ``moe_force_xla_gmm`` and other chips keep XLA.
 
-    Under inference mode, W8A8 calls (A8 activations, int8 codes, bf16 rows) run the Pallas entry on v5p whenever
-    ejkernel's ``grouped_matmul_channelwise_slab_tiles`` gives whole-slab tiles (a 128-aligned ``(K, N)`` expert slab
-    of at most 2 MiB, at up to 81,920 rows, for any expert count), so this selection and the kernel's tiles follow one
-    rule; the entry reads one whole slab per expert that has rows and applies both scales in the kernel. Measured on
-    TPU v5p at the per-chip expert shapes of GLM-5.3-Flash served at ep4 x tp4 (int8 [72, 4096, 512] gate/up,
-    [72, 512, 4096] down), bit-identical outputs: one W8A8 routed-MoE layer with 32 / 64 / 128 decode tokens (256 /
+    Outside inference mode (training) the selection is the earlier one, unchanged: A8 keeps XLA, and A4 / A16 run
+    the Pallas entry only on the two expert families measured on v5p, at decode rows (and A4 also at 1,280 ... 81,920
+    rows), whose kernel tiles the general rule reproduces exactly.
+
+    Measured W8A8 on TPU v5p at the per-chip expert shapes of GLM-5.3-Flash served at ep4 x tp4 (int8 [72, 4096, 512]
+    gate/up, [72, 512, 4096] down), bit-identical outputs: one routed-MoE layer with 32 / 64 / 128 decode tokens (256 /
     512 / 1024 dispatch rows) 0.331 / 0.435 / 0.513 -> 0.236 / 0.321 / 0.397 ms; the gate + up + down FFN at the ep4
     prefill windows of 512 / 2,048 / 32,768 tokens (2,048 / 5,120 / 81,920 rows) 0.477 / 0.754 / 6.355 -> 0.317 /
-    0.532 / 4.564 ms per layer. Training keeps XLA.
+    0.532 / 4.564 ms per layer.
+
+    Args:
+        rows: Expert-sorted rows ``[M, K]`` (array or ``ShapeDtypeStruct``).
+        codes: Expert codes ``[E, K, N]`` (array or ``ShapeDtypeStruct``).
+        activation_bits: Activation precision of the call (4, 8 or 16).
+        force_xla: ``moe_force_xla_gmm``: always XLA.
+
+    Returns:
+        ``"pallas"`` or ``"xla"``.
     """
-    if activation_bits == 8 and is_inference_mode():
+    if is_inference_mode():
         if (
             force_xla
             or rows.dtype != jnp.bfloat16
             or len(codes.shape) != 3
-            or grouped_matmul_channelwise_slab_tiles(rows.shape[0], codes.shape, codes.dtype, activation_bits=8) is None
+            or codes.dtype not in (jnp.int4, jnp.int8)
+            or grouped_matmul_channelwise_pallas_tiles(
+                rows.shape[0], codes.shape, codes.dtype, activation_bits=int(activation_bits)
+            )
+            is None
             or jax.default_backend() != "tpu"
         ):
             return "xla"
         from jax.experimental.pallas import tpu as pltpu
 
         return "pallas" if pltpu.get_tpu_info().chip_version.value == "v5p" else "xla"
+    # Training: the earlier selection, verbatim (no inference-mode change reaches it).
     measured_rows = 0 < rows.shape[0] <= 128 or (activation_bits == 4 and 1280 <= rows.shape[0] <= 81920)
     if (
         force_xla
