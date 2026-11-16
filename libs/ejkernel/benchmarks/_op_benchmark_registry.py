@@ -3384,6 +3384,65 @@ def _all_to_all_wrapper(op_fn: Callable[..., Any], platform: str):
     return _fn
 
 
+def _cfgs_shared_expert_w8a8():
+    """Serving-shaped configs: GLM-5.3-Flash's folded shared expert per chip at ep4 x tp4 (8 rows) and at tp1."""
+    configs = [
+        {"rows": 8, "hidden": 4096, "inter": 512},
+        {"rows": 32, "hidden": 4096, "inter": 512},
+        {"rows": 8, "hidden": 4096, "inter": 2048},
+    ]
+    return _limit_configs(configs)
+
+
+def _gen_shared_expert_w8a8_inputs(config: dict[str, Any]):
+    """Generate bf16 rows, int8 gate/up and down codes and float32 per-channel scales.
+
+    Args:
+        config: Benchmark config. Reads ``rows``, ``hidden``, ``inter`` and ``seed``.
+
+    Returns:
+        ``(rows, gate_up_codes, gate_up_scales, down_codes, down_scales)``.
+    """
+    r, h, inter = config.get("rows", 8), config.get("hidden", 4096), config.get("inter", 512)
+    keys = jax.random.split(jax.random.PRNGKey(config.get("seed", 0)), 5)
+    rows = jax.random.normal(keys[0], (r, h), dtype=jnp.float32).astype(jnp.bfloat16)
+    gate_up = jax.random.randint(keys[1], (h, 2 * inter), -127, 128, dtype=jnp.int32).astype(jnp.int8)
+    down = jax.random.randint(keys[2], (inter, h), -127, 128, dtype=jnp.int32).astype(jnp.int8)
+    gate_up_scales = jax.random.uniform(keys[3], (1, 2 * inter), jnp.float32, 1e-5, 3e-4)
+    down_scales = jax.random.uniform(keys[4], (1, h), jnp.float32, 1e-5, 3e-4)
+    return rows, gate_up, gate_up_scales, down, down_scales
+
+
+def _shared_expert_w8a8_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap the shared expert with a static platform and GLM's clamped SwiGLU combine."""
+
+    def _fn(rows, gate_up_codes, gate_up_scales, down_codes, down_scales):
+        """Run the W8A8 shared expert.
+
+        Args:
+            rows: Input rows.
+            gate_up_codes: Gate/up codes.
+            gate_up_scales: Gate/up scales.
+            down_codes: Down codes.
+            down_scales: Down scales.
+
+        Returns:
+            float32 output rows.
+        """
+        return op_fn(
+            rows,
+            gate_up_codes,
+            gate_up_scales,
+            down_codes,
+            down_scales,
+            activation="clamped_swiglu",
+            act_params=(10.0,),
+            platform=platform,
+        )
+
+    return _fn
+
+
 def _ragged_gather_wrapper(op_fn: Callable[..., Any], platform: str):
     """Wrap the ragged gather with a static platform."""
 
@@ -3991,6 +4050,14 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         input_generator=_gen_ragged_gather_inputs,
         configs=_cfgs_collective(),
         wrapper_factory=_ragged_gather_wrapper,
+    ),
+    "shared_expert_w8a8": OpBenchmarkSpec(
+        op_name="shared_expert_w8a8",
+        algorithm="shared_expert_w8a8",
+        op_fn=ops.shared_expert_w8a8,
+        input_generator=_gen_shared_expert_w8a8_inputs,
+        configs=_cfgs_shared_expert_w8a8(),
+        wrapper_factory=_shared_expert_w8a8_wrapper,
     ),
     "ragged_gather_reduce": OpBenchmarkSpec(
         op_name="ragged_gather_reduce",

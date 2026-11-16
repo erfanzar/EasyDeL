@@ -97,6 +97,7 @@ from .reduce_scatter import reduce_scatter
 from .reduce_scatter_matmul import reduce_scatter_matmul
 from .ring_attention import ring_attention
 from .row_permute import row_permute
+from .shared_expert_w8a8 import shared_expert_w8a8
 from .sinkhorn_knopp import sinkhorn_knopp
 from .sparse_multi_latent_ragged_page_attention import sparse_multi_latent_ragged_page_attention
 from .sparse_selected_attention import sparse_selected_attention
@@ -154,6 +155,7 @@ __all__ = (
     "reduce_scatter_matmul",
     "ring_attention",
     "row_permute",
+    "shared_expert_w8a8",
     "sinkhorn_knopp",
     "sparse_multi_latent_ragged_page_attention",
     "sparse_selected_attention",

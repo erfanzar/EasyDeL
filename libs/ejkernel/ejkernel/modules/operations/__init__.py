@@ -245,6 +245,7 @@ from .configs import (
     RWKV7Config,
     RWKV7MulConfig,
     ScaledDotProductAttentionConfig,
+    SharedExpertW8A8Config,
     SparseMultiLatentRaggedPageAttentionConfig,
     StateSpaceV1Config,
     StateSpaceV2Config,
@@ -371,6 +372,7 @@ from .rwkv4 import RWKV4, rwkv4
 from .rwkv6 import RWKV6, rwkv6
 from .rwkv7 import RWKV7, RWKV7Mul, rwkv7, rwkv7_mul
 from .scaled_dot_product_attention import ScaledDotProductAttention, scaled_dot_product_attention
+from .shared_expert_w8a8 import SharedExpertW8A8, shared_expert_w8a8, shared_expert_w8a8_unsupported_reason
 from .sinkhorn_knopp import SinkhornKnopp, sinkhorn_knopp
 from .sparse_multi_latent_ragged_page_attention import (
     SparseMultiLatentRaggedPageAttention,
@@ -521,6 +523,8 @@ __all__ = (
     "RowPermuteConfig",
     "ScaledDotProductAttention",
     "ScaledDotProductAttentionConfig",
+    "SharedExpertW8A8",
+    "SharedExpertW8A8Config",
     "SinkhornKnopp",
     "SparseMultiLatentRaggedPageAttention",
     "SparseMultiLatentRaggedPageAttentionConfig",
@@ -630,6 +634,8 @@ __all__ = (
     "rwkv7_mul",
     "scaled_dot_product_attention",
     "set_gdn_kernel_tile_policy",
+    "shared_expert_w8a8",
+    "shared_expert_w8a8_unsupported_reason",
     "sinkhorn_knopp",
     "sparse_multi_latent_ragged_page_attention",
     "split_gate_up",

@@ -703,6 +703,11 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             uses the kernels wherever they apply and the XLA path elsewhere; ``True`` also warns once where they do
             not apply; ``False`` keeps the XLA path (needed for forward-mode or higher-order derivatives). A saved
             ``false`` loads as ``None``.
+        moe_shared_expert_fused_kernel: Serving only (inference mode, TPU): run the W8A8 shared expert folded into
+            the inference-mode ``moe_defer_tp_reduce`` dispatch as eJKernel's ``shared_expert_w8a8`` Pallas kernel
+            instead of two XLA int8 ragged dots. Opt-in (default ``False``) and APPROXIMATE: bitwise equal to the
+            XLA composition in a standalone program, but not in the served graph, where XLA fuses that glue
+            differently (measured on v5p: max |d| 0.08 on the shared-expert rows).
         moe_local_expert_ffn: In expert tensor mode (experts sharded over tp), run each shard's own experts over
             its tp-replicated tokens through ejkernel's ``moe_local_ffn`` op: one custom VJP over dropless dynamic
             row windows (empty windows are skipped) with in-place weight gradients, then reduce-scatter the partial
@@ -896,6 +901,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     moe_chunk_size: NotRequired[int | None]
     moe_defer_tp_reduce: NotRequired[bool | None]
     moe_row_gather_kernel: NotRequired[bool | None]
+    moe_shared_expert_fused_kernel: NotRequired[bool]
     moe_local_expert_ffn: NotRequired[bool]
     moe_local_ffn_window_rows: NotRequired[int | None]
     moe_fsdp_shard_expert_weights: NotRequired[bool]
@@ -1005,7 +1011,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
             decides; ``False``: off).
         moe_row_gather_kernel: Fused-MoE dispatch/combine row gathers via the Pallas TPU kernels (``None``, the
             default: wherever they apply; ``False``: off).
-        moe_local_expert_ffn: In expert-tensor mode, run each device's experts through the ejkernel
+        moe_local_expert_ffn: In expert-tensor mode, run each device
+        moe_shared_expert_fused_kernel: Run the folded W8A8 shared expert in eJKernel's ``shared_expert_w8a8``
+            kernel under inference mode (default ``False``; approximate).'s experts through the ejkernel
             ``moe_local_ffn`` op (dropless dynamic row windows, custom VJP; default ``False``).
         moe_local_ffn_window_rows: Rows per ``moe_local_expert_ffn`` window and per local-row window of the
             inference-mode ``moe_defer_tp_reduce`` dispatch (``None``: automatic).
@@ -1578,6 +1586,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_defer_tp_reduce: bool | None = None,
         moe_row_gather_kernel: bool | None = None,
         moe_local_expert_ffn: bool = False,
+        moe_shared_expert_fused_kernel: bool = False,
         moe_local_ffn_window_rows: int | None = None,
         moe_fsdp_shard_expert_weights: bool = False,
         moe_ep_carries_batch: bool = False,
@@ -1734,6 +1743,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         )
         self.moe_row_gather_kernel = _optional_bool(
             "moe_row_gather_kernel", getattr(self, "moe_row_gather_kernel", moe_row_gather_kernel)
+        )
+        self.moe_shared_expert_fused_kernel = bool(
+            getattr(self, "moe_shared_expert_fused_kernel", moe_shared_expert_fused_kernel)
         )
         self.moe_local_expert_ffn = bool(getattr(self, "moe_local_expert_ffn", moe_local_expert_ffn))
         self.moe_local_ffn_window_rows = _positive_int_or_none(
@@ -2425,6 +2437,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "moe_chunk_size",
             "moe_defer_tp_reduce",
             "moe_row_gather_kernel",
+            "moe_shared_expert_fused_kernel",
             "moe_local_expert_ffn",
             "moe_local_ffn_window_rows",
             "moe_fsdp_shard_expert_weights",
@@ -2610,6 +2623,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_defer_tp_reduce: bool | None = NOT_GIVEN,
         moe_row_gather_kernel: bool | None = NOT_GIVEN,
         moe_local_expert_ffn: bool = NOT_GIVEN,
+        moe_shared_expert_fused_kernel: bool = NOT_GIVEN,
         moe_local_ffn_window_rows: int | None = NOT_GIVEN,
         moe_fsdp_shard_expert_weights: bool = NOT_GIVEN,
         moe_ep_carries_batch: bool = NOT_GIVEN,
@@ -2703,7 +2717,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 decides; ``False``: off).
             moe_row_gather_kernel: Run the fused-MoE dispatch/combine row gathers through the Pallas TPU
                 row-gather kernels (``None``, the default: wherever they apply; ``False``: never).
-            moe_local_expert_ffn: In expert-tensor mode, run each device's experts through the ejkernel
+            moe_local_expert_ffn: In expert-tensor mode, run each device
+            moe_shared_expert_fused_kernel: Run the folded W8A8 shared expert in eJKernel's ``shared_expert_w8a8``
+                kernel under inference mode (default ``False``; approximate).'s experts through the ejkernel
                 ``moe_local_ffn`` op (default ``False``).
             moe_local_ffn_window_rows: Rows per ``moe_local_expert_ffn`` window and per local-row window of the
                 inference-mode ``moe_defer_tp_reduce`` dispatch (default ``None`` = automatic).
@@ -2818,6 +2834,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.moe_defer_tp_reduce = _optional_bool("moe_defer_tp_reduce", self.moe_defer_tp_reduce)
         set_attrs_smartly(self, "moe_row_gather_kernel", None, moe_row_gather_kernel)
         self.moe_row_gather_kernel = _optional_bool("moe_row_gather_kernel", self.moe_row_gather_kernel)
+        set_attrs_smartly(self, "moe_shared_expert_fused_kernel", False, moe_shared_expert_fused_kernel)
+        self.moe_shared_expert_fused_kernel = bool(self.moe_shared_expert_fused_kernel)
         set_attrs_smartly(self, "moe_local_expert_ffn", False, moe_local_expert_ffn)
         set_attrs_smartly(self, "moe_local_ffn_window_rows", None, moe_local_ffn_window_rows)
         self.moe_local_ffn_window_rows = _positive_int_or_none(

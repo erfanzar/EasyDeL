@@ -162,6 +162,7 @@ from .rwkv4 import rwkv4
 from .rwkv6 import rwkv6
 from .rwkv7 import rwkv7, rwkv7_mul
 from .scaled_dot_product_attention import scaled_dot_product_attention
+from .shared_expert_w8a8 import shared_expert_w8a8
 from .sinkhorn_knopp import sinkhorn_knopp
 from .sparse_multi_latent_ragged_page_attention import sparse_multi_latent_ragged_page_attention
 from .sparse_selected_attention import sparse_selected_attention
@@ -247,6 +248,7 @@ __all__ = [
     "rwkv7",
     "rwkv7_mul",
     "scaled_dot_product_attention",
+    "shared_expert_w8a8",
     "sinkhorn_knopp",
     "sparse_multi_latent_ragged_page_attention",
     "sparse_selected_attention",

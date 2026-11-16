@@ -810,6 +810,49 @@ def _shared_expert_rows(
     )
 
 
+def _shared_expert_fused_act(config: tp.Any, shared_expert: tp.Any) -> tuple[str, tuple[float, ...]] | None:
+    """``(activation, act_params)`` of the folded shared expert when ``moe_shared_expert_fused_kernel`` applies.
+
+    The switch is opt-in, serving only (inference mode) and TPU only; ``None`` keeps ``_shared_expert_rows``.
+    """
+    if not bool(getattr(config, "moe_shared_expert_fused_kernel", False)) or not is_inference_mode():
+        return None
+    if jax.default_backend() != "tpu":
+        return None
+    from easydel.layers.mlp import _act_name, _declared_combine
+
+    declared = _declared_combine(shared_expert)
+    act, act_params = declared if declared is not None else (_act_name(config, shared_expert), ())
+    if act is None:
+        return None
+    return str(act), tuple(float(v) for v in act_params)
+
+
+def _shared_expert_rows_fused(
+    rows: jax.Array,
+    kernels: SharedExpertKernels,
+    act: tuple[str, tuple[float, ...]],
+) -> jax.Array | None:
+    """``_shared_expert_rows`` through eJKernel's ``shared_expert_w8a8`` Pallas kernel (``None``: not supported here).
+
+    The bfloat16 rows are materialized first (``optimization_barrier``) so an upstream cast cannot fuse into the
+    kernel's quantization. Approximate against ``_shared_expert_rows`` in a served graph (see
+    ``EasyDeLBaseConfig.moe_shared_expert_fused_kernel``).
+    """
+    from ejkernel.modules import (  # pyright: ignore[reportMissingTypeStubs]
+        shared_expert_w8a8,
+        shared_expert_w8a8_unsupported_reason,
+    )
+
+    gu_codes, gu_scales, dn_codes, dn_scales = kernels
+    if shared_expert_w8a8_unsupported_reason(rows, gu_codes, gu_scales, dn_codes, dn_scales) is not None:
+        return None
+    rows = jax.lax.optimization_barrier(rows)
+    return shared_expert_w8a8(
+        rows, gu_codes, gu_scales, dn_codes, dn_scales, activation=act[0], act_params=act[1], platform="pallas"
+    )
+
+
 class BaseMoeModule(spx.Module, ABC):
     """Abstract base class shared by every Mixture-of-Experts module in EasyDeL.
 
@@ -2418,6 +2461,7 @@ class BaseMoeModule(spx.Module, ABC):
             else None
         )
         shared_kernels, shared_combine = shared_fold if shared_fold is not None else (None, None)
+        shared_fused_act = _shared_expert_fused_act(self.config, shared_expert) if shared_kernels is not None else None
 
         expert_params_bytes = 0
         for _param in (wi_kernel, wu_kernel, gate_up_kernel, wd_kernel, wi_bias, wu_bias, gate_up_bias, wd_bias):
@@ -2994,11 +3038,19 @@ class BaseMoeModule(spx.Module, ABC):
                 rows_per_shard = -(-tokens // ep_size)
                 own_start = expert_shard_id * rows_per_shard
                 start = jnp.minimum(own_start, tokens - rows_per_shard)
-                shared_out = _shared_expert_rows(
-                    jax.lax.dynamic_slice_in_dim(shared_source, start, rows_per_shard),
-                    shared_kernels,
-                    shared_combine,
-                )
+                shared_out = None
+                if shared_fused_act is not None:
+                    shared_out = _shared_expert_rows_fused(
+                        jax.lax.dynamic_slice_in_dim(shared_source, start, rows_per_shard),
+                        shared_kernels,
+                        shared_fused_act,
+                    )
+                if shared_out is None:
+                    shared_out = _shared_expert_rows(
+                        jax.lax.dynamic_slice_in_dim(shared_source, start, rows_per_shard),
+                        shared_kernels,
+                        shared_combine,
+                    )
                 if tokens % ep_size:
                     row_ids = start + jnp.arange(rows_per_shard)
                     own = (row_ids >= own_start) & (row_ids < own_start + rows_per_shard)

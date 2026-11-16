@@ -541,6 +541,20 @@ class RaggedGatherConfig(BaseOperationConfig):
 
 
 @dataclass
+class SharedExpertW8A8Config(BaseOperationConfig):
+    """Configuration for the W8A8 gated MLP on a few decode rows (``shared_expert_w8a8``).
+
+    Tiles of the Pallas TPU kernel come from the VMEM capacity, so only the platform is configurable.
+
+    Args:
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class RaggedGatherReduceConfig(BaseOperationConfig):
     """Configuration for the weighted grouped gather-sum (MoE top-k combine).
 
