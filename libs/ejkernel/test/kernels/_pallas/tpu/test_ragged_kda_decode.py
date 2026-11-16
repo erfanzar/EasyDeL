@@ -177,3 +177,38 @@ def test_head_sharded_operation_matches_float64_reference(heads, mesh_shape):
 
     out, new_pool = step(tokens, pool, jnp.asarray(live), jnp.asarray(init))
     _check(out, new_pool, case, np.arange(ROWS, dtype=np.int32), live, init, 2e-2)
+
+
+@pytest.mark.parametrize(
+    ("rows", "slots"),
+    [
+        pytest.param(10, 10, id="grid5-rows-eq-slots"),
+        pytest.param(10, 12, id="grid5-more-slots"),
+        pytest.param(14, 14, id="grid7-rows-eq-slots"),
+        pytest.param(16, 16, id="grid8-even"),
+    ],
+)
+def test_pallas_decode_odd_grid_matches_xla_reference(rows, slots):
+    # Two rows per grid step: 10 and 14 rows give odd grids, which once advanced the first step's rows twice.
+    rng = np.random.default_rng(7)
+    heads, f32 = 8, jnp.float32
+    q = jnp.asarray(rng.standard_normal((rows, heads, K)), f32)
+    k = jnp.asarray(rng.standard_normal((rows, heads, K)), f32)
+    v = jnp.asarray(rng.standard_normal((rows, heads, V)), f32)
+    beta = jnp.asarray(_sigmoid(rng.standard_normal((rows, heads))), f32)
+    decay = jnp.asarray(LOWER * _sigmoid(rng.standard_normal((rows, heads, K))), f32)
+    pool = jnp.asarray(0.1 * rng.standard_normal((slots, heads, K, V)), f32)
+    live = np.ones(rows, bool)
+    live[[3, rows - 2]] = False
+    args = (q, k, v, beta, decay, pool, None, jnp.asarray(live), None)
+    out, new_pool = jax.jit(ragged_kda_decode_pallas)(*args)
+    ref_out, ref_pool = jax.jit(ragged_kda_decode_xla)(*args)
+    out, new_pool, ref_out, ref_pool = map(_f64, (out, new_pool, ref_out, ref_pool))
+    for r in range(rows):
+        assert _rel(out[r], ref_out[r]) < 1e-5 or not live[r], f"row {r}"
+    np.testing.assert_array_equal(out[~live], 0.0)
+    for s in range(slots):
+        if s < rows and live[s]:
+            assert _rel(new_pool[s], ref_pool[s]) < 1e-5, f"slot {s}"
+        else:
+            np.testing.assert_array_equal(new_pool[s], _f64(pool[s]), err_msg=f"untouched slot {s}")

@@ -218,11 +218,16 @@ def ragged_kda_decode_pallas(
     tok_spec = pl.BlockSpec((br, num_heads, head_dim), lambda i, *_: (i, 0, 0))
     val_spec = pl.BlockSpec((br, num_heads, v_dim), lambda i, *_: (i, 0, 0))
     state_spec = pl.BlockSpec((br, num_heads, head_dim, v_dim), lambda i, *_: (i, 0, 0, 0))
+    grid = num_rows // br
+    # A "parallel" grid is split over the chip's TensorCores. With an odd step count that split computed the first
+    # step's rows twice on the in-place pool (v5p: 10 and 14 rows at br=2 advanced rows 0-1 twice), so odd grids run
+    # sequentially. Even grids (every eSurge decode bucket) keep the parallel split unchanged.
+    semantics = ("parallel",) if grid % 2 == 0 else ("arbitrary",)
     out, new_pool = pl.pallas_call(
         functools.partial(_decode_kernel, block_rows=br, num_heads=num_heads, block_h=bh, reduce=reduce),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
-            grid=(num_rows // br,),
+            grid=(grid,),
             in_specs=[tok_spec, tok_spec, val_spec, val_spec, tok_spec, state_spec],
             out_specs=[val_spec, state_spec],
         ),
@@ -233,7 +238,7 @@ def ragged_kda_decode_pallas(
         # operands: valid, init, q, k, v, b, eg, pool -> the pool (7) is updated in place as output 1.
         input_output_aliases={7: 1},
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel",),
+            dimension_semantics=semantics,
             vmem_limit_bytes=_vmem_limit_bytes(),
         ),
         name=f"ejkernel_ragged_kda_decode_br{br}_bh{bh}_{reduce}",
