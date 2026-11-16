@@ -711,6 +711,11 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
         moe_prefill_bf16_ep_reduce: Serving only (inference mode, prefill layout): the deferred MoE dispatch's
             expert-axis reduce-scatter moves activation-dtype rows (the TP reduction rounded once) instead of fp32,
             halving its cross-host bytes. Opt-in (default ``False``) and APPROXIMATE.
+        moe_decode_matmul_combine: Serving only (inference mode, decode layout): when the deferred MoE dispatch
+            combines through the XLA ``moe_row_gather_sum`` entry in one row window, it sums each token's weighted
+            expert rows as one fp32 matmul (a ``[tokens, rows]`` weight matrix with up to ``k`` nonzeros per row,
+            ``Precision.HIGHEST``) instead of a row gather, select and sum over ``k``. Opt-in (default ``False``) and
+            APPROXIMATE: the fp32 summation order differs from the gather-sum's.
         moe_local_expert_ffn: In expert tensor mode (experts sharded over tp), run each shard's own experts over
             its tp-replicated tokens through ejkernel's ``moe_local_ffn`` op: one custom VJP over dropless dynamic
             row windows (empty windows are skipped) with in-place weight gradients, then reduce-scatter the partial
@@ -909,6 +914,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     moe_row_gather_kernel: NotRequired[bool | None]
     moe_shared_expert_fused_kernel: NotRequired[bool]
     moe_prefill_bf16_ep_reduce: NotRequired[bool]
+    moe_decode_matmul_combine: NotRequired[bool]
     moe_local_expert_ffn: NotRequired[bool]
     moe_local_ffn_window_rows: NotRequired[int | None]
     moe_fsdp_shard_expert_weights: NotRequired[bool]
@@ -1597,6 +1603,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_local_expert_ffn: bool = False,
         moe_shared_expert_fused_kernel: bool = False,
         moe_prefill_bf16_ep_reduce: bool = False,
+        moe_decode_matmul_combine: bool = False,
         moe_local_ffn_window_rows: int | None = None,
         moe_fsdp_shard_expert_weights: bool = False,
         moe_ep_carries_batch: bool = False,
@@ -1759,6 +1766,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             getattr(self, "moe_shared_expert_fused_kernel", moe_shared_expert_fused_kernel)
         )
         self.moe_prefill_bf16_ep_reduce = bool(getattr(self, "moe_prefill_bf16_ep_reduce", moe_prefill_bf16_ep_reduce))
+        self.moe_decode_matmul_combine = bool(getattr(self, "moe_decode_matmul_combine", moe_decode_matmul_combine))
         self.moe_local_expert_ffn = bool(getattr(self, "moe_local_expert_ffn", moe_local_expert_ffn))
         self.moe_local_ffn_window_rows = _positive_int_or_none(
             "moe_local_ffn_window_rows", getattr(self, "moe_local_ffn_window_rows", moe_local_ffn_window_rows)
@@ -2452,6 +2460,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "moe_row_gather_kernel",
             "moe_shared_expert_fused_kernel",
             "moe_prefill_bf16_ep_reduce",
+            "moe_decode_matmul_combine",
             "moe_local_expert_ffn",
             "moe_local_ffn_window_rows",
             "moe_fsdp_shard_expert_weights",
@@ -2640,6 +2649,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_local_expert_ffn: bool = NOT_GIVEN,
         moe_shared_expert_fused_kernel: bool = NOT_GIVEN,
         moe_prefill_bf16_ep_reduce: bool = NOT_GIVEN,
+        moe_decode_matmul_combine: bool = NOT_GIVEN,
         moe_local_ffn_window_rows: int | None = NOT_GIVEN,
         moe_fsdp_shard_expert_weights: bool = NOT_GIVEN,
         moe_ep_carries_batch: bool = NOT_GIVEN,
@@ -2739,6 +2749,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 kernel under inference mode (default ``False``; approximate).'s experts through the ejkernel
                 ``moe_local_ffn`` op (default ``False``).
             moe_prefill_bf16_ep_reduce: bf16 expert-axis reduce-scatter in the inference prefill MoE dispatch
+                (default ``False``; approximate).
+            moe_decode_matmul_combine: fp32 matmul top-k combine in the inference decode MoE dispatch
                 (default ``False``; approximate).
             moe_local_ffn_window_rows: Rows per ``moe_local_expert_ffn`` window and per local-row window of the
                 inference-mode ``moe_defer_tp_reduce`` dispatch (default ``None`` = automatic).
@@ -2859,6 +2871,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.moe_shared_expert_fused_kernel = bool(self.moe_shared_expert_fused_kernel)
         set_attrs_smartly(self, "moe_prefill_bf16_ep_reduce", False, moe_prefill_bf16_ep_reduce)
         self.moe_prefill_bf16_ep_reduce = bool(self.moe_prefill_bf16_ep_reduce)
+        set_attrs_smartly(self, "moe_decode_matmul_combine", False, moe_decode_matmul_combine)
+        self.moe_decode_matmul_combine = bool(self.moe_decode_matmul_combine)
         set_attrs_smartly(self, "moe_local_expert_ffn", False, moe_local_expert_ffn)
         set_attrs_smartly(self, "moe_local_ffn_window_rows", None, moe_local_ffn_window_rows)
         self.moe_local_ffn_window_rows = _positive_int_or_none(

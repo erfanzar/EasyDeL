@@ -2967,6 +2967,15 @@ class BaseMoeModule(spx.Module, ABC):
                 is None
             )
             dma_gather = _moe_row_gather_kernels()[0] if window_rows >= _DMA_ROW_GATHER_MIN_ROWS else None
+            # ``moe_decode_matmul_combine`` (approximate, off by default): in decode-layout programs the single-window
+            # XLA combine runs as one fp32 matmul of a [tokens, rows] combine-weight matrix with the FFN rows.
+            matmul_combine = (
+                n_windows == 1
+                and not live_slot_kernel
+                and is_inference_mode()
+                and inference_mode_forces_decode()
+                and bool(getattr(self.config, "moe_decode_matmul_combine", False))
+            )
 
             def _window(w) -> jax.Array:
                 if n_windows == 1:
@@ -2986,6 +2995,13 @@ class BaseMoeModule(spx.Module, ABC):
                 # Window rows past its local count are the FFN's unwritten tail (not guaranteed finite on TPU): dead
                 # slots are -1, which the live-slot combine never reads (its XLA entry selects them away).
                 slots = jnp.where(live, rel, -1).reshape(tokens, top_k)
+                if matmul_combine:
+                    # Dead slots (-1) match no row, so they get weight 0 and their rows are never selected.
+                    row_ids = jnp.arange(inter.shape[0], dtype=slots.dtype)
+                    weight_matrix = jnp.sum(
+                        jnp.where(slots[..., None] == row_ids, combine_weights[..., None], 0.0), axis=1
+                    )
+                    return jnp.dot(weight_matrix, inter.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST)
                 return gather_sum(inter, slots, combine_weights, jnp.float32, skip_negative=True)
 
             partial = _window(0)
