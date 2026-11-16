@@ -53,12 +53,22 @@ def supported(head_dim: int, v_dim: int) -> bool:
     return int(head_dim) % 128 == 0 and int(v_dim) % 128 == 0
 
 
+# Automatic rows per grid step for buckets of at least _WIDE_ROWS rows. Each row is its own recurrence, so the block
+# size never changes results. v5p, 1 head x 128 x 128 bf16 pool, device time per call: 128 rows 34.85 us at 2 rows
+# per step, 31.70 us at 8 (per-step overhead dominates a 64 KB step); 16 and 32 rows are flat across block sizes.
+_WIDE_ROWS = 64
+_WIDE_BLOCK_ROWS = 8
+
+
 def pick_block_rows(num_rows: int, requested: int = 0) -> int:
-    """Rows per grid step: ``requested`` when given (must divide ``num_rows``), else 2 when it divides, else 1."""
+    """Rows per grid step: ``requested`` when given (must divide ``num_rows``), else 8 for buckets of at least 64 rows
+    that 16 divides (an even grid), else 2 when it divides, else 1."""
     if requested:
         if num_rows % requested:
             raise ValueError(f"block_rows={requested} must divide the row count {num_rows}")
         return int(requested)
+    if num_rows >= _WIDE_ROWS and num_rows % (2 * _WIDE_BLOCK_ROWS) == 0:
+        return _WIDE_BLOCK_ROWS
     return 2 if num_rows % 2 == 0 else 1
 
 

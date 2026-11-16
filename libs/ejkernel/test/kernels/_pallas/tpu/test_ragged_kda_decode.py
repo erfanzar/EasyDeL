@@ -29,6 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from ejkernel.kernels._pallas.tpu.ragged_kda_decode import ragged_kda_decode_pallas
+from ejkernel.kernels._pallas.tpu.ragged_kda_decode._pallas_impl import pick_block_rows
 from ejkernel.kernels._xla.ragged_kda_decode._xla_impl import ragged_kda_decode_xla
 from ejkernel.modules.operations import ragged_kda_decode_head_sharded
 from jax.sharding import Mesh
@@ -212,3 +213,27 @@ def test_pallas_decode_odd_grid_matches_xla_reference(rows, slots):
             assert _rel(new_pool[s], ref_pool[s]) < 1e-5, f"slot {s}"
         else:
             np.testing.assert_array_equal(new_pool[s], _f64(pool[s]), err_msg=f"untouched slot {s}")
+
+
+@pytest.mark.parametrize("rows", [64, 128], ids=["64-rows", "128-rows"])
+def test_wide_bucket_block_rows_match_two_row_blocks_bitwise(rows):
+    # Wide decode buckets run 8 rows per grid step; every row is its own recurrence, so outputs and the updated pool
+    # must equal the 2-rows-per-step kernel bit for bit (idle and fresh rows included).
+    assert pick_block_rows(rows) == 8 and pick_block_rows(16) == 2
+    rng = np.random.default_rng(11)
+    heads, bf16 = 1, jnp.bfloat16
+    q = jnp.asarray(rng.standard_normal((rows, heads, K)), bf16)
+    k = jnp.asarray(rng.standard_normal((rows, heads, K)), bf16)
+    v = jnp.asarray(rng.standard_normal((rows, heads, V)), bf16)
+    beta = jnp.asarray(_sigmoid(rng.standard_normal((rows, heads))), bf16)
+    decay = jnp.asarray(LOWER * _sigmoid(rng.standard_normal((rows, heads, K))), jnp.float32)
+    pool = jnp.asarray(0.1 * rng.standard_normal((rows, heads, K, V)), bf16)
+    live = np.ones(rows, bool)
+    live[[3, rows - 5]] = False
+    init = np.ones(rows, bool)
+    init[[0, 9]] = False
+    args = (q, k, v, beta, decay, pool, None, jnp.asarray(live), jnp.asarray(init))
+    auto_out, auto_pool = jax.jit(ragged_kda_decode_pallas)(*args)
+    two_out, two_pool = jax.jit(functools.partial(ragged_kda_decode_pallas, block_rows=2))(*args)
+    assert np.asarray(auto_out).tobytes() == np.asarray(two_out).tobytes()
+    assert np.asarray(auto_pool).tobytes() == np.asarray(two_pool).tobytes()
