@@ -509,41 +509,80 @@ def kda_rows_forward(
     leaves = tuple(getattr(cache_view, name) for name in LEAF_NAMES)
     rows = int(query_start_loc.shape[-1]) - 1
     eligible = query_start_loc.ndim == 1 and all(isinstance(leaf, jax.Array) for leaf in leaves)
+    seq_len = int(query.shape[1])
     if eligible and inference_mode_single_token_rows():
-        # eSurge's single-token program: every row holds at most one token, whatever the token bucket.
-        return kda_decode_rows_forward(cache_view=cache_view, **common)
-    if not eligible or int(query.shape[1]) > rows:
+        # eSurge's single-token program: every row holds at most one token, whatever the token bucket. With explicit
+        # pool slots the decode driver runs alone. With implicit slots (row r owns slot r) a step whose live rows lead
+        # (the common eSurge decode layout) takes the in-place leading-row path below at run time; the conditional's
+        # other branch is the same decode driver, so both give the decode driver's per-row results.
+        if state_indices is not None or seq_len > rows:
+            return kda_decode_rows_forward(cache_view=cache_view, **common)
+        return _leading_rows_or_decode(cache_view, common, query_start_loc, context_lens, seq_len, leaves)
+    if not eligible or seq_len > rows:
         # Rank-major DP metadata (the flat driver raises its own error), implicit (quantized) pool leaves, or a token
         # bucket longer than the row count. A decode-only step (at most one token per row) fits a bucket of ``rows``
         # tokens, so longer buckets compile the flat driver alone, as before (it is correct for every step).
         return flat_forward(cache_view=cache_view, **common, **flat_kwargs)
     qsl = jnp.asarray(query_start_loc, dtype=jnp.int32)
     decode_only = jnp.all(qsl[1:] - qsl[:-1] <= 1)
-
-    def branch(forward: Callable[..., tuple[Array, KDACacheView]], args: dict, **extra):
-        def run(pool_leaves):
-            out, new_view = forward(cache_view=cache_view.update_kda_states(*pool_leaves), **args, **extra)
-            return out, tuple(getattr(new_view, name) for name in LEAF_NAMES)
-
-        return run
-
-    branches = [branch(flat_forward, common, **flat_kwargs), branch(kda_decode_rows_forward, common)]
+    branches = [
+        _pool_branch(flat_forward, cache_view, common, **flat_kwargs),
+        _pool_branch(kda_decode_rows_forward, cache_view, common),
+    ]
     index = decode_only.astype(jnp.int32)
-    seq_len = int(query.shape[1])
-    if state_indices is None and seq_len <= rows:
-        # Prefix steps (any bucket up to the row count, the full 128-row decode bucket included): the live rows are the
-        # leading ones and row r's token sits at position r (eSurge keeps running
-        # requests in the leading rows), so qsl[:T + 1] == min(arange(T + 1), qsl[-1]). Such a step is the row-major
-        # decode of the first T rows, which own the first T pool slots: windows and states are sliced and updated in
-        # place, with no gather or scatter (same per-row arithmetic, so the result is bit for bit the token-major one).
-        pos = jnp.arange(seq_len + 1, dtype=jnp.int32)
-        prefix = jnp.all(qsl[: seq_len + 1] == jnp.minimum(pos, qsl[-1]))
-        head = dict(common, query_start_loc=query_start_loc[: seq_len + 1])
-        if context_lens is not None:
-            head["context_lens"] = jnp.asarray(context_lens)[:seq_len]
-        branches.append(branch(kda_decode_rows_forward, head, rows_are_tokens=True))
+    if state_indices is None:
+        prefix, head = _leading_rows(common, query_start_loc, context_lens, seq_len)
+        branches.append(_pool_branch(kda_decode_rows_forward, cache_view, head, rows_are_tokens=True))
         index = jnp.where(prefix, 2, index)
     out, new_leaves = lax.switch(index, branches, leaves)
+    return out, cache_view.update_kda_states(*new_leaves)
+
+
+def _pool_branch(forward: Callable[..., tuple[Array, KDACacheView]], cache_view: KDACacheView, args: dict, **extra):
+    """A ``lax.cond`` / ``lax.switch`` branch running ``forward`` on the pool leaves it receives as its operand."""
+
+    def run(pool_leaves):
+        out, new_view = forward(cache_view=cache_view.update_kda_states(*pool_leaves), **args, **extra)
+        return out, tuple(getattr(new_view, name) for name in LEAF_NAMES)
+
+    return run
+
+
+def _leading_rows(common: dict, query_start_loc: Array, context_lens: Array | None, seq_len: int):
+    """``(prefix, head_args)`` for a bucket of ``seq_len`` tokens with implicit slots (row r owns slot r).
+
+    Prefix steps (any bucket up to the row count, the full decode bucket included): the live rows are the leading ones
+    and row r's token sits at position r (eSurge keeps running requests in the leading rows), so
+    ``qsl[:T + 1] == min(arange(T + 1), qsl[-1])``. Such a step is the row-major decode of the first T rows, which own
+    the first T pool slots: windows and states are sliced and updated in place, with no gather or scatter (same per-row
+    arithmetic, so the result is bit for bit the token-major one). ``head_args`` are ``common`` cut to those T rows.
+    """
+    qsl = jnp.asarray(query_start_loc, dtype=jnp.int32)
+    pos = jnp.arange(seq_len + 1, dtype=jnp.int32)
+    prefix = jnp.all(qsl[: seq_len + 1] == jnp.minimum(pos, qsl[-1]))
+    head = dict(common, query_start_loc=query_start_loc[: seq_len + 1])
+    if context_lens is not None:
+        head["context_lens"] = jnp.asarray(context_lens)[:seq_len]
+    return prefix, head
+
+
+def _leading_rows_or_decode(
+    cache_view: KDACacheView,
+    common: dict,
+    query_start_loc: Array,
+    context_lens: Array | None,
+    seq_len: int,
+    leaves: tuple[Array, ...],
+) -> tuple[Array, KDACacheView]:
+    """Single-token program with implicit slots: the in-place leading-row decode when the live rows lead, else the
+    decode driver over every row (both are :func:`kda_decode_rows_forward`, so the results are the decode driver's)."""
+    prefix, head = _leading_rows(common, query_start_loc, context_lens, seq_len)
+    out, new_leaves = lax.cond(
+        prefix,
+        _pool_branch(kda_decode_rows_forward, cache_view, head, rows_are_tokens=True),
+        _pool_branch(kda_decode_rows_forward, cache_view, common),
+        leaves,
+    )
     return out, cache_view.update_kda_states(*new_leaves)
 
 

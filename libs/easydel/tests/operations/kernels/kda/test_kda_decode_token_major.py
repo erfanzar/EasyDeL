@@ -133,3 +133,29 @@ def test_conv_window_select_and_concat_forms_match_bitwise(dtype, tp, monkeypatc
     assert np.asarray(select_out).tobytes() == np.asarray(concat_out).tobytes()
     for name in LEAVES:
         assert np.asarray(select[name]).tobytes() == np.asarray(concat[name]).tobytes(), name
+
+
+@pytest.mark.parametrize(("dtype", "tp"), [(jnp.float32, 1), (jnp.bfloat16, 4)], ids=["f32-tp1", "bf16-tp4"])
+@pytest.mark.parametrize(
+    ("live", "gapped"), [(POOL, False), (7, False), (6, True), (0, False)], ids=["all", "seven", "gapped", "none"]
+)
+def test_single_token_program_keeps_the_leading_row_path_bitwise(dtype, tp, live, gapped):
+    # eSurge's pure-decode program (single_token_rows) with implicit slots must still take the in-place leading-row
+    # path when the live rows lead, and the plain decode driver otherwise; both must equal the general program bit
+    # for bit (outputs and every pool leaf).
+    from easydel.infra.sharding import single_token_rows
+
+    if gapped:
+        lens = (1, 0, 1, 1, 0, 0, 1, 1, 0, 1)
+        context = (9, 0, 1, 40, 0, 0, 3, 17, 0, 2)
+    else:
+        lens = tuple([1] * live + [0] * (POOL - live))
+        context = tuple(([9, 1, 40, 2, 3, 17, 4, 6, 12, 5] * 2)[:live] + [0] * (POOL - live))
+    layout = (lens, context, POOL)
+    case = _case(layout, seed=8, dtype=dtype)
+    general_out, general = _run(kda_rows_forward, case, layout, dtype, tp=tp)
+    with single_token_rows():
+        single_out, single = _run(kda_rows_forward, case, layout, dtype, tp=tp)
+    assert np.asarray(single_out).tobytes() == np.asarray(general_out).tobytes()
+    for name in LEAVES:
+        assert np.asarray(single[name]).tobytes() == np.asarray(general[name]).tobytes(), name
