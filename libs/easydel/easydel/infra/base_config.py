@@ -708,6 +708,9 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             instead of two XLA int8 ragged dots. Opt-in (default ``False``) and APPROXIMATE: bitwise equal to the
             XLA composition in a standalone program, but not in the served graph, where XLA fuses that glue
             differently (measured on v5p: max |d| 0.08 on the shared-expert rows).
+        moe_prefill_bf16_ep_reduce: Serving only (inference mode, prefill layout): the deferred MoE dispatch's
+            expert-axis reduce-scatter moves activation-dtype rows (the TP reduction rounded once) instead of fp32,
+            halving its cross-host bytes. Opt-in (default ``False``) and APPROXIMATE.
         moe_local_expert_ffn: In expert tensor mode (experts sharded over tp), run each shard's own experts over
             its tp-replicated tokens through ejkernel's ``moe_local_ffn`` op: one custom VJP over dropless dynamic
             row windows (empty windows are skipped) with in-place weight gradients, then reduce-scatter the partial
@@ -902,6 +905,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     moe_defer_tp_reduce: NotRequired[bool | None]
     moe_row_gather_kernel: NotRequired[bool | None]
     moe_shared_expert_fused_kernel: NotRequired[bool]
+    moe_prefill_bf16_ep_reduce: NotRequired[bool]
     moe_local_expert_ffn: NotRequired[bool]
     moe_local_ffn_window_rows: NotRequired[int | None]
     moe_fsdp_shard_expert_weights: NotRequired[bool]
@@ -1587,6 +1591,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_row_gather_kernel: bool | None = None,
         moe_local_expert_ffn: bool = False,
         moe_shared_expert_fused_kernel: bool = False,
+        moe_prefill_bf16_ep_reduce: bool = False,
         moe_local_ffn_window_rows: int | None = None,
         moe_fsdp_shard_expert_weights: bool = False,
         moe_ep_carries_batch: bool = False,
@@ -1747,6 +1752,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.moe_shared_expert_fused_kernel = bool(
             getattr(self, "moe_shared_expert_fused_kernel", moe_shared_expert_fused_kernel)
         )
+        self.moe_prefill_bf16_ep_reduce = bool(getattr(self, "moe_prefill_bf16_ep_reduce", moe_prefill_bf16_ep_reduce))
         self.moe_local_expert_ffn = bool(getattr(self, "moe_local_expert_ffn", moe_local_expert_ffn))
         self.moe_local_ffn_window_rows = _positive_int_or_none(
             "moe_local_ffn_window_rows", getattr(self, "moe_local_ffn_window_rows", moe_local_ffn_window_rows)
@@ -2438,6 +2444,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "moe_defer_tp_reduce",
             "moe_row_gather_kernel",
             "moe_shared_expert_fused_kernel",
+            "moe_prefill_bf16_ep_reduce",
             "moe_local_expert_ffn",
             "moe_local_ffn_window_rows",
             "moe_fsdp_shard_expert_weights",
@@ -2624,6 +2631,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_row_gather_kernel: bool | None = NOT_GIVEN,
         moe_local_expert_ffn: bool = NOT_GIVEN,
         moe_shared_expert_fused_kernel: bool = NOT_GIVEN,
+        moe_prefill_bf16_ep_reduce: bool = NOT_GIVEN,
         moe_local_ffn_window_rows: int | None = NOT_GIVEN,
         moe_fsdp_shard_expert_weights: bool = NOT_GIVEN,
         moe_ep_carries_batch: bool = NOT_GIVEN,
@@ -2721,6 +2729,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
             moe_shared_expert_fused_kernel: Run the folded W8A8 shared expert in eJKernel's ``shared_expert_w8a8``
                 kernel under inference mode (default ``False``; approximate).'s experts through the ejkernel
                 ``moe_local_ffn`` op (default ``False``).
+            moe_prefill_bf16_ep_reduce: bf16 expert-axis reduce-scatter in the inference prefill MoE dispatch
+                (default ``False``; approximate).
             moe_local_ffn_window_rows: Rows per ``moe_local_expert_ffn`` window and per local-row window of the
                 inference-mode ``moe_defer_tp_reduce`` dispatch (default ``None`` = automatic).
             moe_fsdp_shard_expert_weights: Shard MoE expert weights over FSDP at rest and gather at use
@@ -2836,6 +2846,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.moe_row_gather_kernel = _optional_bool("moe_row_gather_kernel", self.moe_row_gather_kernel)
         set_attrs_smartly(self, "moe_shared_expert_fused_kernel", False, moe_shared_expert_fused_kernel)
         self.moe_shared_expert_fused_kernel = bool(self.moe_shared_expert_fused_kernel)
+        set_attrs_smartly(self, "moe_prefill_bf16_ep_reduce", False, moe_prefill_bf16_ep_reduce)
+        self.moe_prefill_bf16_ep_reduce = bool(self.moe_prefill_bf16_ep_reduce)
         set_attrs_smartly(self, "moe_local_expert_ffn", False, moe_local_expert_ffn)
         set_attrs_smartly(self, "moe_local_ffn_window_rows", None, moe_local_ffn_window_rows)
         self.moe_local_ffn_window_rows = _positive_int_or_none(

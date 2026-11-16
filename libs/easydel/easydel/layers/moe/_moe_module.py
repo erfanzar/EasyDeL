@@ -516,6 +516,7 @@ def _reduce_scatter(
     out_dtype=None,
     *,
     wire_dtype=None,
+    row_add: tuple[jax.Array, jax.Array] | None = None,
 ) -> jax.Array:
     """Sum ``x`` over ``axis_name`` inside ``shard_map`` and keep this shard's block along ``scatter_dimension``.
 
@@ -542,6 +543,11 @@ def _reduce_scatter(
         scatter_dimension: Dimension of ``x`` split into ``axis_size`` blocks; shard ``i`` keeps block ``i``.
         out_dtype: Result dtype (default ``x.dtype``).
         wire_dtype: Dtype of the data sent between shards (default ``x.dtype``).
+        row_add: ``(rows [r, H], start)``: reduce ``x`` with ``rows`` added to its rows ``[start, start + r)`` (in
+            ``x.dtype``, as ``dynamic_update_slice(x, x[start:start + r] + rows, start)`` would) without
+            materializing that update: each ring step adds them to the block it reads. Only where
+            :func:`_ring_reduce_scatter_applies` holds with ``scatter_dimension == 1``, ``r`` divides half of
+            ``x``'s rows and ``start`` is a multiple of ``r``.
 
     Returns:
         Block ``i`` of the sum over the axis, in ``out_dtype``.
@@ -551,10 +557,14 @@ def _reduce_scatter(
     name = axis_name[0] if isinstance(axis_name, tuple) and len(axis_name) == 1 else axis_name
     n = int(axis_size)
     other = 1 - scatter_dimension
-    if not isinstance(name, str) or x.ndim != 2 or n < 2 or x.shape[scatter_dimension] % n or x.shape[other] % 2:
+    if not _ring_reduce_scatter_applies(x.shape, axis_name, axis_size, scatter_dimension):
+        if row_add is not None:
+            raise ValueError("row_add needs the ring reduce-scatter")
         return jax.lax.psum_scatter(
             x.astype(wire_dtype), axis_name, scatter_dimension=scatter_dimension, tiled=True
         ).astype(out_dtype)
+    if row_add is not None and (scatter_dimension != 1 or (x.shape[0] // 2) % row_add[0].shape[0]):
+        raise ValueError("row_add needs scatter_dimension 1 and rows dividing half of x's rows")
     size = x.shape[scatter_dimension] // n
     half = x.shape[other] // 2
     index = jax.lax.axis_index(name)
@@ -564,7 +574,18 @@ def _reduce_scatter(
         starts, sizes = [0, 0], [0, 0]
         starts[other], sizes[other] = lead * half, half
         starts[scatter_dimension], sizes[scatter_dimension] = j * size, size
-        return jax.lax.dynamic_slice(x, starts, sizes).astype(jnp.float32)
+        part = jax.lax.dynamic_slice(x, starts, sizes)
+        if row_add is not None:
+            # Rows [start, start + r) of x get ``rows`` added (same add, same dtype as the update it replaces). With r
+            # dividing half and start a multiple of r, that range lies wholly inside this half at ``seg`` or misses it.
+            rows, row_start = row_add
+            r = rows.shape[0]
+            seg = jnp.clip(row_start - lead * half, 0, half - r)
+            cur = jax.lax.dynamic_slice_in_dim(part, seg, r, axis=0)
+            add = jax.lax.dynamic_slice_in_dim(rows, j * size, size, axis=1)
+            new = jnp.where(lead * half + seg == row_start, (cur + add).astype(part.dtype), cur)
+            part = jax.lax.dynamic_update_slice_in_dim(part, new, seg, axis=0)
+        return part.astype(jnp.float32)
 
     def ring(lead: int, step: int) -> jax.Array:
         # Shard i starts from its block i - step; each step it receives the running sum of shard i - step and adds
@@ -579,8 +600,21 @@ def _reduce_scatter(
     return jnp.concatenate([ring(0, 1), ring(1, -1)], axis=other)
 
 
+def _ring_reduce_scatter_applies(shape, axis_name, axis_size: int, scatter_dimension: int) -> bool:
+    """Whether :func:`_reduce_scatter` runs its two ppermute rings (else one ``psum_scatter``) for this shape."""
+    name = axis_name[0] if isinstance(axis_name, tuple) and len(axis_name) == 1 else axis_name
+    n, other = int(axis_size), 1 - scatter_dimension
+    return (
+        isinstance(name, str)
+        and len(shape) == 2
+        and n >= 2
+        and not shape[scatter_dimension] % n
+        and not (shape[other] % 2)
+    )
+
+
 def _expert_axis_sum(
-    partial: jax.Array, ep_axes: tuple[str, ...], ep_size: int, dtype, *, gather_rounded: bool
+    partial: jax.Array, ep_axes: tuple[str, ...], ep_size: int, dtype, *, gather_rounded: bool, rounded_wire=False
 ) -> jax.Array:
     """Sum an fp32 ``[rows, H]`` partial over the expert axis inside ``shard_map``, returned in ``dtype``.
 
@@ -596,11 +630,14 @@ def _expert_axis_sum(
         ep_size: Expert-axis size.
         dtype: Activation dtype of the result.
         gather_rounded: Allow the reduce-scatter + rounded all-gather form.
+        rounded_wire: With that form, reduce-scatter ``partial`` already rounded to ``dtype`` (half the bytes of an
+            fp32 reduce-scatter over the expert axis; APPROXIMATE: a ``dtype`` sum, not the rounding of the fp32 sum).
 
     Returns:
         ``[rows, H]`` summed over the expert axis, in ``dtype``.
     """
     if gather_rounded and partial.shape[0] % ep_size == 0 and jnp.dtype(dtype).itemsize < 4:
+        partial = partial.astype(dtype) if rounded_wire else partial
         partial = jax.lax.psum_scatter(partial, ep_axes, scatter_dimension=0, tiled=True)
         return jax.lax.all_gather(partial.astype(dtype), ep_axes, axis=0, tiled=True)
     return jax.lax.psum(partial, ep_axes).astype(dtype)
@@ -3035,6 +3072,16 @@ class BaseMoeModule(spx.Module, ABC):
             group_sizes = jnp.bincount(sort_keys, length=experts_per_shard + 1)[:experts_per_shard].astype(jnp.int32)
             total_rows = tokens * top_k
             combine_weights = weights if output_weights_hook is None else output_weights_hook(weights)
+            shared_ring_add = None
+            # ``moe_prefill_bf16_ep_reduce`` (approximate, off by default): the prefill expert-axis reduce-scatter
+            # moves activation-dtype rows (the TP ring's result rounded once) instead of fp32.
+            bf16_ep = (
+                ep_size > 1
+                and not decode_replicated_out
+                and not inference_mode_forces_decode()
+                and bool(getattr(self.config, "moe_prefill_bf16_ep_reduce", False))
+                and jnp.dtype(self.dtype).itemsize < 4
+            )
             partial = _local_row_windows(
                 x2d,
                 order,
@@ -3071,8 +3118,19 @@ class BaseMoeModule(spx.Module, ABC):
                     row_ids = start + jnp.arange(rows_per_shard)
                     own = (row_ids >= own_start) & (row_ids < own_start + rows_per_shard)
                     shared_out = jnp.where(own[:, None], shared_out, jnp.zeros((), shared_out.dtype))
-                current = jax.lax.dynamic_slice_in_dim(partial, start, rows_per_shard)
-                partial = jax.lax.dynamic_update_slice_in_dim(partial, current + shared_out, start, axis=0)
+                if (
+                    not decode_replicated_out
+                    and tp_size > 1
+                    and tokens % ep_size == 0
+                    and (tokens // 2) % rows_per_shard == 0
+                    and _ring_reduce_scatter_applies(partial.shape, tensor_axis_name, tp_size, 1)
+                ):
+                    # The TP ring adds the shared rows to the blocks it reads: the same f32 values as the update
+                    # below, without rewriting the [tokens, H] partial.
+                    shared_ring_add = (shared_out, start)
+                else:
+                    current = jax.lax.dynamic_slice_in_dim(partial, start, rows_per_shard)
+                    partial = jax.lax.dynamic_update_slice_in_dim(partial, current + shared_out, start, axis=0)
             ep_axes = tuple(expert_axis_name) if isinstance(expert_axis_name, tuple) else (expert_axis_name,)
             if decode_replicated_out:
                 # Decode: one small fp32 all-reduce over both axes replaces the default dispatch's TP
@@ -3084,10 +3142,23 @@ class BaseMoeModule(spx.Module, ABC):
                 # dispatch does for its top-k-expanded rows; the expert-axis sum stays fp32 like
                 # ``replicated_expert_psum_unpermute``. The TP reduction runs as ppermute rings that read the fp32
                 # partial in place and send activation-dtype running sums (``_reduce_scatter``).
-                partial = _reduce_scatter(partial, tensor_axis_name, tp_size, 1, jnp.float32, wire_dtype=self.dtype)
+                partial = _reduce_scatter(
+                    partial,
+                    tensor_axis_name,
+                    tp_size,
+                    1,
+                    self.dtype if bf16_ep else jnp.float32,
+                    wire_dtype=self.dtype,
+                    row_add=shared_ring_add,
+                )
             if ep_size > 1:
                 out = _expert_axis_sum(
-                    partial, ep_axes, ep_size, self.dtype, gather_rounded=not inference_mode_forces_decode()
+                    partial,
+                    ep_axes,
+                    ep_size,
+                    self.dtype,
+                    gather_rounded=not inference_mode_forces_decode(),
+                    rounded_wire=bf16_ep,
                 )
             else:
                 out = partial.astype(self.dtype)
