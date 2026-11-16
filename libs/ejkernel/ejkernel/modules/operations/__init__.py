@@ -295,6 +295,16 @@ from .kernel_delta_attention import KernelDeltaAttention, kda_attention, kernel_
 from .lightning_attention import LightningAttention, lightning_attention
 from .mhc import MHCCollapse, MHCExpand, MHCFusedConfig, mhc_collapse, mhc_expand
 from .mhc_coefficients import MHCCoefficients, MHCCoefficientsConfig, mhc_coefficients
+from .mhc_decode_fused import (
+    MHCDecodeFusedConfig,
+    MHCDecodeRead,
+    MHCDecodeWrite,
+    mhc_decode_gate_layout,
+    mhc_decode_read,
+    mhc_decode_supports,
+    mhc_decode_table_gates,
+    mhc_decode_write,
+)
 from .moe_row_gather import row_gather_sum_unsupported_reason, row_gather_unsupported_reason
 from .multi_head_latent_attention import FlashMLA, flash_mla
 from .multi_latent_ragged_page_attention import (
@@ -447,6 +457,9 @@ __all__ = (
     "MHCCoefficients",
     "MHCCoefficientsConfig",
     "MHCCollapse",
+    "MHCDecodeFusedConfig",
+    "MHCDecodeRead",
+    "MHCDecodeWrite",
     "MHCExpand",
     "MHCFusedConfig",
     "MeanPooling",
@@ -561,6 +574,11 @@ __all__ = (
     "mean_pooling",
     "mhc_coefficients",
     "mhc_collapse",
+    "mhc_decode_gate_layout",
+    "mhc_decode_read",
+    "mhc_decode_supports",
+    "mhc_decode_table_gates",
+    "mhc_decode_write",
     "mhc_expand",
     "multi_latent_ragged_page_attention",
     "multi_latent_ragged_page_attention_v2",

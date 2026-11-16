@@ -962,6 +962,52 @@ def _cfgs_mhc_expand():
     return _limit_configs(configs)
 
 
+def _cfgs_mhc_decode():
+    """One device's decode block of GLM-5.3-Flash: 8 / 32 / 128 tokens of 4 x 4096 bf16 streams."""
+    configs = [dict(config, dtype="bfloat16") for config in _grid(tokens=[8, 32, 128], hc=[4], width=[4096])]
+    return _limit_configs(configs)
+
+
+def _gen_mhc_decode_read_inputs(config: dict[str, Any]):
+    """Generate fp32 logits, bf16-valued offsets / scales and flattened bf16 streams for the decode mHC read."""
+    tokens, hc, width = config["tokens"], config["hc"], config["width"]
+    mix = (2 + hc) * hc
+    keys = jax.random.split(jax.random.PRNGKey(config.get("seed", 0)), 4)
+    logits = 2.5 * jax.random.normal(keys[0], (tokens, mix), dtype=jnp.float32)
+    base = (0.5 * jax.random.normal(keys[1], (mix,), dtype=jnp.float32)).astype(jnp.bfloat16).astype(jnp.float32)
+    scale = jnp.asarray([0.7, 1.3, 1.1], dtype=jnp.float32)
+    streams = jax.random.normal(keys[2], (tokens, hc * width), dtype=_as_jax_dtype(config["dtype"]))
+    return logits, base, scale, streams
+
+
+def _gen_mhc_decode_write_inputs(config: dict[str, Any]):
+    """Generate streams, a sub-layer output and the gate table the XLA read computes for those streams."""
+    logits, base, scale, streams = _gen_mhc_decode_read_inputs(config)
+    table, _ = ops.mhc_decode_read(logits, base, scale, streams, platform="xla")
+    out = jax.random.normal(jax.random.PRNGKey(config.get("seed", 0) + 1), (streams.shape[0], config["width"]))
+    return streams, out.astype(streams.dtype), table
+
+
+def _mhc_decode_read_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Pin the platform for the decode mHC read; return the table and the collapse."""
+
+    def _fn(logits, base, scale, streams):
+        """Gate table and collapsed sub-layer input."""
+        return op_fn(logits, base, scale, streams, platform=platform)
+
+    return _fn
+
+
+def _mhc_decode_write_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Pin the platform for the decode mHC residual write."""
+
+    def _fn(streams, out, table):
+        """New flattened streams."""
+        return op_fn(streams, out, table, platform=platform)
+
+    return _fn
+
+
 def _cfgs_topk():
     """Router, DSA, and vocabulary/filter top-k workloads."""
     configs = [
@@ -4281,6 +4327,22 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         configs=_cfgs_mhc_expand(),
         wrapper_factory=_mhc_expand_wrapper,
         bench_bwd=True,
+    ),
+    "mhc_decode_read": OpBenchmarkSpec(
+        op_name="mhc_decode_read",
+        algorithm="mhc_decode_read",
+        op_fn=ops.mhc_decode_read,
+        input_generator=_gen_mhc_decode_read_inputs,
+        configs=_cfgs_mhc_decode(),
+        wrapper_factory=_mhc_decode_read_wrapper,
+    ),
+    "mhc_decode_write": OpBenchmarkSpec(
+        op_name="mhc_decode_write",
+        algorithm="mhc_decode_write",
+        op_fn=ops.mhc_decode_write,
+        input_generator=_gen_mhc_decode_write_inputs,
+        configs=_cfgs_mhc_decode(),
+        wrapper_factory=_mhc_decode_write_wrapper,
     ),
     "sinkhorn_knopp": OpBenchmarkSpec(
         op_name="sinkhorn_knopp",

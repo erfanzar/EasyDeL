@@ -74,6 +74,7 @@ from .indexer_scores import indexer_scores
 from .kda_chunk import kda_chunk
 from .kda_chunk_local import kda_chunk_local
 from .mhc_coefficients import mhc_coefficients
+from .mhc_decode_fused import mhc_decode_read, mhc_decode_write
 from .mhc_fused import mhc_collapse, mhc_expand
 from .moe_local_ffn import moe_local_ffn
 from .moe_row_gather import moe_row_gather, moe_row_gather_sum
@@ -128,6 +129,8 @@ __all__ = (
     "kda_chunk_local",
     "mhc_coefficients",
     "mhc_collapse",
+    "mhc_decode_read",
+    "mhc_decode_write",
     "mhc_expand",
     "moe_local_ffn",
     "moe_row_gather",

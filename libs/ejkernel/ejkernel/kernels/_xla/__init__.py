@@ -128,6 +128,7 @@ from .kernel_delta_attention import kda, kda_decay, kernel_delta_attention
 from .lightning_attn import lightning_attn
 from .mean_pooling import mean_pooling
 from .mhc_coefficients import mhc_coefficients
+from .mhc_decode_fused import mhc_decode_read, mhc_decode_write
 from .mhc_fused import mhc_collapse, mhc_expand
 from .moe_local_ffn import moe_local_ffn
 from .moe_row_gather import moe_row_gather, moe_row_gather_sum
@@ -209,6 +210,8 @@ __all__ = [
     "mean_pooling",
     "mhc_coefficients",
     "mhc_collapse",
+    "mhc_decode_read",
+    "mhc_decode_write",
     "mhc_expand",
     "moe_local_ffn",
     "moe_row_gather",

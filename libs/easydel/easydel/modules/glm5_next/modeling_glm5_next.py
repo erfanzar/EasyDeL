@@ -110,7 +110,6 @@ from easydel.layers.residual import (
     HyperStreamSharding,
     ManifoldHyperConnection,
     ManifoldHyperConnectionConfig,
-    manifold_residual_write,
     mean_hyper_head,
 )
 from easydel.modules._base import BaseCausalLMModule
@@ -1052,9 +1051,7 @@ class Glm5NextDecoderLayer(spx.Module):
                 output_attentions,
                 frequencies,
             )
-        hidden_states = manifold_residual_write(
-            hidden_states, attn_outputs.attention_output, post, comb, precision=self.precision
-        )
+        hidden_states = self.attn_hc.residual_write(hidden_states, attn_outputs.attention_output, post, comb)
 
         post, comb, collapsed = self.ffn_hc(hidden_states)
         mlp_input = self.post_attention_layernorm(collapsed)
@@ -1069,9 +1066,7 @@ class Glm5NextDecoderLayer(spx.Module):
         router_logits = None
         if isinstance(feed_forward_hidden_states, tuple):
             feed_forward_hidden_states, router_logits = feed_forward_hidden_states
-        hidden_states = manifold_residual_write(
-            hidden_states, feed_forward_hidden_states, post, comb, precision=self.precision
-        )
+        hidden_states = self.ffn_hc.residual_write(hidden_states, feed_forward_hidden_states, post, comb)
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=HyperStreamSharding,

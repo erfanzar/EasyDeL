@@ -1600,6 +1600,16 @@ class MHCCoefficientsConfig(BaseOperationConfig):
 
 
 @dataclass
+class MHCDecodeFusedConfig(BaseOperationConfig):
+    """Dispatch settings of the decode-size mHC read / write (``mhc_decode_read`` / ``mhc_decode_write``).
+
+    Tiles come from the TPU info, so only the inherited ``platform`` and ``backend`` select the implementation.
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class MHCFusedConfig(BaseOperationConfig):
     """Configuration for the mHC site operations ``mhc_collapse`` / ``mhc_expand``.
 
