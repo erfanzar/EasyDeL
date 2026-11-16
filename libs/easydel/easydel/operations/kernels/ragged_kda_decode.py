@@ -234,6 +234,13 @@ class RaggedKDADecodeOp(OperationImpl):
         return self._run(*args, **kwargs, num_tokens=num_tokens, use_qk_l2norm=use_qk_l2norm, platform=None)
 
 
+# Decode steps with at most this many entries build the conv's shifted window with one iota select over a roll; larger
+# steps concatenate. GLM-5.3-Flash ep8 x tp8 on v5p: at 16 entries the concatenate relayouts each [16, dim, 1] column
+# (three copies per KDA call; decode conditional 29.4 -> 24.2 us with the select), at 128 entries the roll's slices cost
+# more than those copies (51.9 -> 57.0 us). Both forms hold the same values, so the threshold never changes results.
+_CONV_SELECT_MAX_ENTRIES = 16
+
+
 def kda_decode_rows_forward(
     query: Float[Array, "1 seq_len key_dim"],
     key: Float[Array, "1 seq_len key_dim"],
@@ -378,7 +385,11 @@ def kda_decode_rows_forward(
             held = pool_leaf[:rows] if state_indices is None else pool_leaf[read_slots]
             window = jnp.where(fresh[:, None, None], jnp.zeros((), compute), held.astype(compute))
             x = take(stream[0]).astype(compute)
-            new_window = jnp.concatenate([window[:, :, 1:], x[:, :, None]], axis=-1)  # [rows, dim, d_conv]
+            if window.shape[0] <= _CONV_SELECT_MAX_ENTRIES:
+                last_tap = lax.broadcasted_iota(jnp.int32, window.shape, 2) == window.shape[-1] - 1
+                new_window = jnp.where(last_tap, x[:, :, None], jnp.roll(window, -1, axis=-1))
+            else:
+                new_window = jnp.concatenate([window[:, :, 1:], x[:, :, None]], axis=-1)  # [rows, dim, d_conv]
             # One reduce over d_conv instead of per-tap slices: slicing taps[:, :, j] made XLA re-tile every
             # [rows, dim, d_conv] window into a dim-minor layout and back (GLM-5.3-Flash ep8 x tp8 decode: two
             # bf16[128, 128, 4] copies per conv, 3 convs per KDA layer). Bitwise equal on TPU v5p.

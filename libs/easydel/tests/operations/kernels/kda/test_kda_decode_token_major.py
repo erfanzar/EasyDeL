@@ -115,3 +115,21 @@ def test_full_bucket_prefix_matches_row_major_bitwise(dtype, tp, live):
     assert np.asarray(routed_out).tobytes() == np.asarray(direct_out).tobytes()
     for name in LEAVES:
         assert np.asarray(routed[name]).tobytes() == np.asarray(direct[name]).tobytes(), name
+
+
+@pytest.mark.parametrize(("dtype", "tp"), [(jnp.float32, 1), (jnp.bfloat16, 4)], ids=["f32-tp1", "bf16-tp4"])
+def test_conv_window_select_and_concat_forms_match_bitwise(dtype, tp, monkeypatch):
+    # Small steps build the shifted conv window with a select, large ones with a concatenate; forcing the
+    # concatenate on a small step must not change any output or pool leaf.
+    from easydel.operations.kernels import ragged_kda_decode
+
+    lens = tuple([1] * 7 + [0] * (POOL - 7))
+    context = tuple([9, 1, 40, 2, 3, 17, 4] + [0] * (POOL - 7))
+    case = _case((lens, context, POOL), seed=7, dtype=dtype)
+    assert POOL <= ragged_kda_decode._CONV_SELECT_MAX_ENTRIES
+    select_out, select = _run(kda_rows_forward, case, (lens, context, POOL), dtype, tp=tp, slots=None)
+    monkeypatch.setattr(ragged_kda_decode, "_CONV_SELECT_MAX_ENTRIES", 0)
+    concat_out, concat = _run(kda_rows_forward, case, (lens, context, POOL), dtype, tp=tp, slots=None)
+    assert np.asarray(select_out).tobytes() == np.asarray(concat_out).tobytes()
+    for name in LEAVES:
+        assert np.asarray(select[name]).tobytes() == np.asarray(concat[name]).tobytes(), name
