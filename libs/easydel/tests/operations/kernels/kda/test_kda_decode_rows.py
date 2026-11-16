@@ -96,7 +96,7 @@ def _view(leaves):
     return KDACacheView(**leaves, positions=jnp.zeros((POOL,), jnp.int32), metadata=cfg, layer_index=0)
 
 
-def _run(driver, case, layout, dtype, *, tp, slots=None, text=False):
+def _run(driver, case, layout, dtype, *, tp, slots=None, text=False, compiled=False):
     """One jitted step of ``driver`` with the pools in the eSurge KDA layout (conv windows by feature, states by head).
 
     With ``text`` the lowered StableHLO of the step is returned too, as a third item.
@@ -142,7 +142,8 @@ def _run(driver, case, layout, dtype, *, tp, slots=None, text=False):
     result = step(inputs, leaves)
     if not text:
         return result
-    return (*result, step.lower(inputs, leaves).as_text())
+    lowered = step.lower(inputs, leaves)
+    return (*result, (lowered.compile() if compiled else lowered).as_text())
 
 
 def _silu(x):
@@ -276,3 +277,35 @@ def test_steps_with_multi_token_rows_keep_the_flat_driver_results(layout):
     np.testing.assert_allclose(_f64(routed_out), _f64(flat_out), rtol=1e-5, atol=1e-5)
     for name in LEAVES:
         np.testing.assert_allclose(_f64(routed[name]), _f64(flat[name]), rtol=1e-5, atol=1e-5, err_msg=name)
+
+
+@pytest.mark.parametrize("fused", [False, True], ids=["default-glue", "opt-in-fused"])
+def test_fused_decode_kernel_is_opt_in(fused):
+    """The fused ``ragged_kda_conv_decode`` kernel runs only with ``fused_decode`` (``kda_fused_decode_kernel``).
+
+    Without it the single-token program compiles the XLA glue plus ``ragged_kda_decode`` (no fused kernel); with it the
+    step is one fused kernel per device and still matches the float64 reference (bf16, four chips).
+    """
+    if jax.devices()[0].platform != "tpu":
+        pytest.skip("the fused kernel is TPU-only")
+    case = _case(DECODE, seed=4, dtype=jnp.bfloat16)
+
+    def driver(**kwargs):
+        return kda_rows_forward(**kwargs, fused_decode=fused)
+
+    with single_token_rows():
+        out, leaves, text = _run(driver, case, DECODE, jnp.bfloat16, tp=4, text=True, compiled=True)
+    assert ("ejkernel_ragged_kda_conv_decode" in text) is fused, "fused kernel presence does not follow the switch"
+    assert ("ejkernel_ragged_kda_decode" in text) is not fused, "glue kernel presence does not follow the switch"
+    _assert_matches_reference(out, leaves, case, DECODE, None, jnp.bfloat16, 3e-2)
+
+
+def test_fused_decode_kernel_config_defaults_off():
+    """``kda_fused_decode_kernel`` is opt-in: off by default, settable at construction and through the overrides."""
+    from easydel.infra.base_config import EasyDeLBaseConfig
+
+    assert EasyDeLBaseConfig().kda_fused_decode_kernel is False
+    assert EasyDeLBaseConfig(kda_fused_decode_kernel=True).kda_fused_decode_kernel is True
+    config = EasyDeLBaseConfig()
+    config.add_basic_configurations(kda_fused_decode_kernel=True)
+    assert config.kda_fused_decode_kernel is True

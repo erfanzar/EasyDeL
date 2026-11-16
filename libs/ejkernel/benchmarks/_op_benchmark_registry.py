@@ -3840,6 +3840,86 @@ def _ragged_kda_decode_wrapper(op_fn: Callable[..., Any], platform: str):
     return _fn
 
 
+def _cfgs_ragged_kda_conv_decode():
+    """Generate serving-shaped configs for the fused KDA decode step (conv windows, conv, L2 norm, recurrence).
+
+    One device's share of GLM-5.3-Flash at ep4 x tp4 (32 decode tokens, 4 heads, 128-wide keys and values, 32 slots in
+    the identity slot layout), and a GLM-5-Next KDA layer at tensor parallel 4 (128 tokens, 16 heads, shuffled slots).
+    """
+    configs = [
+        {"num_tokens": 32, "num_heads": 4, "head_dim": 128, "num_slots": 32, "identity_slots": True},
+        {"num_tokens": 128, "num_heads": 16, "head_dim": 128, "num_slots": 128, "identity_slots": False},
+    ]
+    return _limit_configs(configs)
+
+
+def _gen_ragged_kda_conv_decode_inputs(config: dict[str, Any]):
+    """Generate one decode token per row for the fused KDA decode step.
+
+    Every token advances its own slot from its carried windows and state (bf16 pools, as in eSurge serving).
+
+    Args:
+        config: Benchmark config. Reads ``num_tokens``, ``num_heads``, ``head_dim`` (key and value width),
+            ``num_slots`` (at least ``num_tokens``), ``identity_slots`` and ``seed``.
+
+    Returns:
+        ``(query, key, value, beta, decay, wq, wk, wv, q_pool, k_pool, v_pool, recurrent_state, token_slots,
+        token_init)``.
+    """
+    num_tokens = config.get("num_tokens", 32)
+    num_heads = config.get("num_heads", 4)
+    head_dim = config.get("head_dim", 128)
+    num_slots = config.get("num_slots", 32)
+    d_conv = 4
+    dim = num_heads * head_dim
+    dtype = _default_dtype()
+    keys = jax.random.split(jax.random.PRNGKey(config.get("seed", 0)), 9)
+    query = jax.random.normal(keys[0], (num_tokens, dim), dtype=dtype)
+    key_tensor = jax.random.normal(keys[1], (num_tokens, dim), dtype=dtype)
+    value = jax.random.normal(keys[2], (num_tokens, dim), dtype=dtype)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[3], (num_tokens, num_heads), dtype=jnp.float32)).astype(dtype)
+    decay = -5.0 * jax.nn.sigmoid(jax.random.normal(keys[4], (num_tokens, num_heads, head_dim), dtype=jnp.float32))
+    weights = tuple(
+        (0.5 * jax.random.normal(k, (dim, d_conv), dtype=jnp.float32)).astype(dtype)
+        for k in jax.random.split(keys[5], 3)
+    )
+    pools = tuple(
+        jax.random.normal(k, (num_slots, dim, d_conv), dtype=jnp.float32).astype(jnp.bfloat16)
+        for k in jax.random.split(keys[6], 3)
+    )
+    state_shape = (num_slots, num_heads, head_dim, head_dim)
+    recurrent_state = (jax.random.normal(keys[7], state_shape, dtype=jnp.float32) * 0.05).astype(jnp.bfloat16)
+    if config.get("identity_slots", True):
+        token_slots = jnp.arange(num_tokens, dtype=jnp.int32)
+    else:
+        token_slots = jax.random.permutation(keys[8], num_slots)[:num_tokens].astype(jnp.int32)
+    token_init = jnp.ones((num_tokens,), dtype=jnp.bool_)
+    return (query, key_tensor, value, beta, decay, *weights, *pools, recurrent_state, token_slots, token_init)
+
+
+def _ragged_kda_conv_decode_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap the fused KDA decode step with the platform (conv weights and pools passed as separate arrays)."""
+
+    def _fn(query, key, value, beta, decay, wq, wk, wv, cq, ck, cv, recurrent_state, token_slots, token_init):
+        """Run one fused KDA decode step; one element of two updated pools is added so the writes stay reachable."""
+        out, pools = op_fn(
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            (wq, wk, wv),
+            (cq, ck, cv),
+            recurrent_state,
+            token_slots,
+            token_init,
+            platform=platform,
+        )
+        return out + pools[0][0, 0, 0].astype(out.dtype) + pools[3][0, 0, 0, 0].astype(out.dtype)
+
+    return _fn
+
+
 SPECS: dict[str, OpBenchmarkSpec] = {
     "all_gather": OpBenchmarkSpec(
         op_name="all_gather",
@@ -4509,5 +4589,13 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         configs=_cfgs_ragged_kda_decode(),
         wrapper_factory=_ragged_kda_decode_wrapper,
         static_kwargs=["identity_slots"],
+    ),
+    "ragged_kda_conv_decode": OpBenchmarkSpec(
+        op_name="ragged_kda_conv_decode",
+        algorithm="ragged_kda_conv_decode",
+        op_fn=ops.ragged_kda_conv_decode,
+        input_generator=_gen_ragged_kda_conv_decode_inputs,
+        configs=_cfgs_ragged_kda_conv_decode(),
+        wrapper_factory=_ragged_kda_conv_decode_wrapper,
     ),
 }

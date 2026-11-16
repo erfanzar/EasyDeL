@@ -1209,6 +1209,7 @@ class KernelDeltaAttention(spx.Module):
                 precision=chunk_precision,
                 state_indices=recurrent_state_indices,
                 head_axis=None if split is None else split.axes,
+                fused_decode=bool(getattr(self.config, "kda_fused_decode_kernel", False)),
             )
         else:
             if recurrent_state_indices is None or context_lens is None:

@@ -87,6 +87,7 @@ from .ragged_decode_attention import ragged_decode_attention
 from .ragged_gated_delta_rule import ragged_gated_delta_rule as ragged_gated_delta_rule
 from .ragged_gated_delta_rule_v2 import ragged_gated_delta_rule_v2
 from .ragged_kda import ragged_kda
+from .ragged_kda_conv_decode import ragged_kda_conv_decode
 from .ragged_kda_decode import ragged_kda_decode
 from .ragged_kda_short import ragged_kda_short
 from .ragged_page_attention_v2 import ragged_page_attention_v2
@@ -141,6 +142,7 @@ __all__ = (
     "ragged_gated_delta_rule",
     "ragged_gated_delta_rule_v2",
     "ragged_kda",
+    "ragged_kda_conv_decode",
     "ragged_kda_decode",
     "ragged_kda_short",
     "ragged_page_attention_v2",

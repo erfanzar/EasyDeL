@@ -1061,6 +1061,21 @@ class RaggedKDADecodeConfig(BaseOperationConfig):
 
 
 @dataclass
+class RaggedKDAConvDecodeConfig(BaseOperationConfig):
+    """Configuration for the fused KDA decode step with its causal convs (``ragged_kda_conv_decode``).
+
+    Args:
+        block_tokens: Tokens per grid step of the Pallas TPU kernel (``0``: from the VMEM capacity).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    block_tokens: int = 0
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class RowPermuteConfig(BaseOperationConfig):
     """Configuration for the run-table row permutation (``row_permute``).
 

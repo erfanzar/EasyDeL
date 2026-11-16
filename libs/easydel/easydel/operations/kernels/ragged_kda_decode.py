@@ -20,24 +20,32 @@ XLA reference.
 
 :func:`kda_decode_rows_forward` is the eSurge driver for steps in which every row has at most one token: each short
 causal convolution becomes a window shift plus a ``d_conv``-tap dot product per row (SiLU fused), and the recurrence
-runs in :class:`RaggedKDADecodeOp`. :func:`kda_rows_forward` takes it at run time (``lax.cond``) when a step whose
-token bucket holds at most one token per row is decode-only, and otherwise runs the flat-stream driver
-:func:`~easydel.operations.kernels.kda_ragged_rows_forward` unchanged.
+runs in :class:`RaggedKDADecodeOp`. Opt-in (``fused_decode``, the model config's ``kda_fused_decode_kernel``), on TPU
+the whole step (window update, conv, SiLU, L2 norm, recurrence, pool writes) instead runs as one Pallas kernel through
+:class:`RaggedKDAConvDecodeOp` (``"ragged_kda_conv_decode"``); it is close to the glue, not guaranteed bitwise. :func:`kda_rows_forward` takes the decode driver at
+run time (``lax.cond``) when a step whose token bucket holds at most one token per row is decode-only, and otherwise runs
+the flat-stream driver :func:`~easydel.operations.kernels.kda_ragged_rows_forward` unchanged.
 """
 
 from __future__ import annotations
 
+import typing as tp
 from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
-from ejkernel.modules.operations import ragged_kda_decode_head_sharded  # pyright: ignore[reportMissingTypeStubs]
+from ejkernel.modules.operations import (  # pyright: ignore[reportMissingTypeStubs]
+    ragged_kda_conv_decode_head_sharded,
+    ragged_kda_conv_decode_unsupported_reason,
+    ragged_kda_decode_head_sharded,
+)
 from jax import lax
 from jaxtyping import Array, Float
 from spectrax import common_types
 
 from easydel.caching import KDACacheView
 from easydel.infra.sharding import inference_mode_single_token_rows, mesh_axis_size
+from easydel.utils.helpers import check_bool_flag
 
 from .._operation_impl import OperationImpl, OperationRegistry
 from .._operation_meta import OperationMetadata
@@ -234,6 +242,211 @@ class RaggedKDADecodeOp(OperationImpl):
         return self._run(*args, **kwargs, num_tokens=num_tokens, use_qk_l2norm=use_qk_l2norm, platform=None)
 
 
+@OperationRegistry.register
+class RaggedKDAConvDecodeOp(OperationImpl):
+    """The whole KDA decode step of one token per row, causal convs included, over in-place pools.
+
+    Inputs are the step's packed pre-conv streams: ``query`` / ``key`` ``[T, H*K]``, ``value`` ``[T, H*V]``, ``beta``
+    ``[T, H]`` (sigmoid applied), the per-channel log-decay ``decay`` ``[T, H, K]``, the depthwise conv kernels
+    ``(q, k, v)`` ``[dim, d_conv]``, the conv-window pools ``(q, k, v)`` ``[S, dim, d_conv]`` and the state pool
+    ``[S, H, K, V]``. Token ``t`` advances slot ``token_slots[t]`` (out of range: zero output, nothing written) from its
+    windows and state (``token_init[t]``) or from zeros. On TPU (``forward_tpu``) eJKernel's ``ragged_kda_conv_decode``
+    Pallas kernel runs the conv window update, conv, SiLU, L2 norm and recurrence in one ``pallas_call`` with the pools
+    updated in place; ``forward_native`` runs its XLA reference. Heads split over the head axis as for
+    :class:`RaggedKDADecodeOp` (``shard_map``, no collectives). ``metadata.get_operation_config("ragged_kda_conv_decode")``
+    may supply an ``ejkernel.modules.operations.RaggedKDAConvDecodeConfig``; its ``platform="xla"`` keeps
+    :func:`kda_decode_rows_forward` on the unfused glue.
+    """
+
+    @classmethod
+    def get_impl_name(cls) -> str:
+        """Return the registry key.
+
+        Returns:
+            ``"ragged_kda_conv_decode"``.
+        """
+        return "ragged_kda_conv_decode"
+
+    @classmethod
+    def get_requirements(cls, mode: ExecutionMode = ExecutionMode.MIXED) -> OperationRequirements:
+        """Declare the packed-serving metadata and the KDA cache view this operation reads.
+
+        Args:
+            mode: Execution mode; the requirements are the same for every mode.
+
+        Returns:
+            The requirements of :class:`RaggedKDADecodeOp`.
+        """
+        return (
+            RequirementsBuilder("ragged_kda_conv_decode")
+            .require_metadata(
+                MetadataField.SEQ_LENS
+                | MetadataField.POSITIONS
+                | MetadataField.HAS_INITIAL_STATE
+                | MetadataField.STATE_INDICES
+            )
+            .support_cache(CacheType.RECURRENT | CacheType.HYBRID)
+            .use_cache_view(KDACacheView)
+            .build()
+        )
+
+    def resolve_head_axis(self, num_heads: int, num_tokens: int) -> str | tuple[str, ...] | None:
+        """Return the mesh axis the heads are split over (:meth:`RaggedKDADecodeOp.resolve_head_axis`), or ``None``.
+
+        Args:
+            num_heads: Global head count.
+            num_tokens: Length of the step's packed token stream.
+
+        Returns:
+            A mesh axis name (or tuple of names), or ``None``.
+        """
+        return _head_axis(self.get_impl_metadata(), num_heads, num_tokens)
+
+    def fused_kernel_unsupported_reason(
+        self,
+        query: tp.Any,
+        key: tp.Any,
+        value: tp.Any,
+        beta: tp.Any,
+        decay: tp.Any,
+        conv_weights: tuple[tp.Any, ...],
+        conv_pools: tuple[tp.Any, ...],
+        recurrent_state: tp.Any,
+        *,
+        conv_dtype: jnp.dtype,
+        head_axis: str | tuple[str, ...] | None,
+    ) -> str | None:
+        """Why this call would not run the fused Pallas TPU kernel, or ``None`` when it would.
+
+        Args:
+            query: ``[T, H*K]`` (array or ``jax.ShapeDtypeStruct``).
+            key: ``[T, H*K]``.
+            value: ``[T, H*V]``.
+            beta: ``[T, H]``.
+            decay: ``[T, H, K]``.
+            conv_weights: ``(q, k, v)`` ``[dim, d_conv]``.
+            conv_pools: ``(q, k, v)`` ``[S, dim, d_conv]``.
+            recurrent_state: ``[S, H, K, V]``.
+            conv_dtype: Dtype of the conv outputs.
+            head_axis: Head axis of the call (see :meth:`resolve_head_axis`).
+
+        Returns:
+            A short reason, or ``None``.
+        """
+        metadata = self.get_impl_metadata()
+        backend = getattr(metadata.backend, "value", metadata.backend)
+        if backend != "tpu":
+            return f"backend {backend} is not TPU"
+        if check_bool_flag("FORCE_NATIVE_RUNTIME", False):
+            return "FORCE_NATIVE_RUNTIME selects the native path"
+        cfg = metadata.get_operation_config("ragged_kda_conv_decode")
+        if cfg is not None and getattr(cfg, "platform", "auto") == "xla":
+            return "the operation config selects the XLA platform"
+        if not all(isinstance(leaf, jax.Array) for leaf in (*conv_pools, recurrent_state)):
+            return "implicit (quantized) pool leaves"
+        return ragged_kda_conv_decode_unsupported_reason(
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            conv_weights,
+            conv_pools,
+            recurrent_state,
+            conv_dtype=conv_dtype,
+            mesh=metadata.mesh,
+            head_axis=head_axis,
+            cfg=cfg,
+        )
+
+    def _run(self, *arrays, conv_dtype, use_qk_l2norm, platform, head_axis):
+        metadata = self.get_impl_metadata()
+        if head_axis is None:
+            head_axis = self.resolve_head_axis(int(arrays[3].shape[-1]), int(arrays[0].shape[0]))
+        return ragged_kda_conv_decode_head_sharded(
+            *arrays,
+            mesh=metadata.mesh,
+            head_axis=head_axis,
+            conv_dtype=conv_dtype,
+            use_qk_l2norm=bool(use_qk_l2norm),
+            platform=platform,
+            cfg=metadata.get_operation_config("ragged_kda_conv_decode"),
+        )
+
+    @jax.named_scope("easydel-ragged-kda-conv-decode")
+    def forward_native(
+        self,
+        query: Float[Array, "num_tokens key_dim"],
+        key: Float[Array, "num_tokens key_dim"],
+        value: Float[Array, "num_tokens value_dim"],
+        beta: Float[Array, "num_tokens num_heads"],
+        decay: Float[Array, "num_tokens num_heads head_dim"],
+        conv_weights: tuple[Array, Array, Array],
+        conv_pools: tuple[Array, Array, Array],
+        recurrent_state: Float[Array, "num_slots num_heads head_dim v_dim"],
+        token_slots: Array,
+        token_init: Array,
+        *,
+        conv_dtype: jnp.dtype = jnp.bfloat16,
+        use_qk_l2norm: bool = True,
+        head_axis: str | tuple[str, ...] | None = None,
+    ) -> tuple[Array, tuple[Array, Array, Array, Array]]:
+        """Run the XLA reference of ``ejkernel.modules.operations.ragged_kda_conv_decode`` (head-sharded).
+
+        Args:
+            query: Raw (pre-conv) queries ``[T, H*K]``.
+            key: Raw keys ``[T, H*K]``.
+            value: Raw values ``[T, H*V]``.
+            beta: Write strengths ``[T, H]`` (sigmoid applied).
+            decay: Per-channel log-decay ``[T, H, K]``.
+            conv_weights: Depthwise conv kernels ``(q, k, v)``, each ``[dim, d_conv]``.
+            conv_pools: Conv windows ``(q, k, v)``, each ``[S, dim, d_conv]``.
+            recurrent_state: State pool ``[S, H, K, V]``.
+            token_slots: ``[T]`` pool slot advanced by each token (out of range: none).
+            token_init: ``[T]`` whether that slot's windows and state carry over.
+            conv_dtype: Dtype of the conv outputs fed to the recurrence.
+            use_qk_l2norm: L2-normalise queries and keys.
+            head_axis: Mesh axis (or tuple of axes) of the heads, or ``None`` for :meth:`resolve_head_axis`.
+
+        Returns:
+            ``(out [T, H, V] float32, (q_pool, k_pool, v_pool, recurrent_state))``.
+        """
+        return self._run(
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            tuple(conv_weights),
+            tuple(conv_pools),
+            recurrent_state,
+            token_slots,
+            token_init,
+            conv_dtype=conv_dtype,
+            use_qk_l2norm=use_qk_l2norm,
+            platform="xla",
+            head_axis=head_axis,
+        )
+
+    @jax.named_scope("easydel-ragged-kda-conv-decode")
+    def forward_tpu(self, *args, **kwargs) -> tuple[Array, tuple[Array, Array, Array, Array]]:
+        """TPU path: the operation config's platform (default ``"auto"``: the fused in-place Pallas TPU kernel).
+
+        Args:
+            *args: Same as :meth:`forward_native`.
+            **kwargs: Same as :meth:`forward_native`.
+
+        Returns:
+            ``(out [T, H, V] float32, (q_pool, k_pool, v_pool, recurrent_state))``.
+        """
+        conv_dtype = kwargs.pop("conv_dtype", jnp.bfloat16)
+        use_qk_l2norm = kwargs.pop("use_qk_l2norm", True)
+        head_axis = kwargs.pop("head_axis", None)
+        return self._run(
+            *args, **kwargs, conv_dtype=conv_dtype, use_qk_l2norm=use_qk_l2norm, platform=None, head_axis=head_axis
+        )
+
+
 # Decode steps with at most this many entries build the conv's shifted window with one iota select over a roll; larger
 # steps concatenate. GLM-5.3-Flash ep8 x tp8 on v5p serving profiles: the concatenate relayouts each [rows, dim, 1]
 # column (three copies per KDA call) at 16 and 32 entries (decode conditional 29.4 -> 24.2 us at 16 with the select);
@@ -258,6 +471,7 @@ def kda_decode_rows_forward(
     state_indices: Array | None = None,
     head_axis: str | tuple[str, ...] | None = None,
     rows_are_tokens: bool = False,
+    fused_decode: bool = False,
 ) -> tuple[Float[Array, "1 seq_len num_heads d_state"], KDACacheView]:
     """Advance KDA state for an eSurge step in which every row has at most one token.
 
@@ -269,7 +483,13 @@ def kda_decode_rows_forward(
     SiLU fused; the conv meets stream and windows in their common dtype, float32 when either is an 8- or 4-bit float,
     and windows keep the pool's dtype); the recurrence runs in :class:`RaggedKDADecodeOp`. A row that starts a request
     (``context_lens <= lens``) starts from a zero window and a zero state. Rows without a token (or with an out-of-range
-    slot) write nothing; tokens at or past ``query_start_loc[-1]`` are bucket padding (zero output).
+    slot) write nothing; tokens at or past ``query_start_loc[-1]`` are bucket padding (zero output). With
+    ``fused_decode`` (opt-in, the model config's ``kda_fused_decode_kernel``) and no objection from
+    :meth:`RaggedKDAConvDecodeOp.fused_kernel_unsupported_reason` (TPU, plain bfloat16 / float32 pools, lane-aligned
+    heads, no ``FORCE_NATIVE_RUNTIME``), the whole step runs in eJKernel's fused ``ragged_kda_conv_decode`` Pallas
+    kernel instead (pools updated in place). It matches the glue bit for bit in a standalone program, but the
+    surrounding graph can change how XLA rounds the glue's bf16 intermediates, so a full serve is close (it passed the
+    bf16 quality gate) rather than bitwise. Without ``fused_decode`` the glue below runs unchanged.
 
     Args:
         query: Packed Q projection (pre-conv) ``[1, T, key_dim]``.
@@ -289,6 +509,7 @@ def kda_decode_rows_forward(
         rows_are_tokens: Static promise that the stream has one position per row and every row with a token holds it
             at its own position (``query_start_loc[r] == r``), as in :func:`kda_rows_forward`'s prefix steps: the
             per-row reads of the streams and the output scatter are then identities and are skipped.
+        fused_decode: Take the fused ``ragged_kda_conv_decode`` kernel where it runs (default ``False``: the glue).
 
     Returns:
         tuple: ``(outputs, new_cache_view)``: outputs ``[1, T, heads, head_v_dim]`` float32 and the cache view with
@@ -297,8 +518,8 @@ def kda_decode_rows_forward(
     Raises:
         ValueError: For 2-D ``query_start_loc``, a stream without rows, ``state_indices`` with fewer entries than rows,
             or (without ``state_indices``) a pool with fewer slots than rows.
-        TypeError: If the registry resolves ``"ragged_kda_decode"`` to something other than a
-            :class:`RaggedKDADecodeOp`.
+        TypeError: If the registry resolves ``"ragged_kda_decode"`` / ``"ragged_kda_conv_decode"`` to something other
+            than a :class:`RaggedKDADecodeOp` / :class:`RaggedKDAConvDecodeOp`.
     """
     if query_start_loc.ndim != 1:
         raise ValueError(f"kda_decode_rows_forward requires 1-D query_start_loc, got {tuple(query_start_loc.shape)}")
@@ -332,6 +553,28 @@ def kda_decode_rows_forward(
             f"kda_decode_rows_forward: rows_are_tokens needs one stream position per row, got {int(query.shape[1])} "
             f"positions for {rows} rows"
         )
+    use_fused = False
+    if fused_decode:
+        fused = OperationRegistry.create("ragged_kda_conv_decode", metadata)
+        if not isinstance(fused, RaggedKDAConvDecodeOp):
+            raise TypeError(
+                f"'ragged_kda_conv_decode' resolved to {type(fused).__name__}, expected a RaggedKDAConvDecodeOp"
+            )
+        conv_pools = (cache_view.q_conv_state, cache_view.k_conv_state, cache_view.v_conv_state)
+        fused_head_axis = (
+            fused.resolve_head_axis(int(beta.shape[-1]), int(query.shape[1])) if head_axis is None else head_axis
+        )
+        use_fused = (
+            fused.fused_kernel_unsupported_reason(
+                *(jax.ShapeDtypeStruct(x.shape[1:], x.dtype) for x in (query, key, value, beta, decay)),
+                tuple(conv_kernels),
+                conv_pools,
+                cache_view.recurrent_state,
+                conv_dtype=conv_dtype,
+                head_axis=fused_head_axis,
+            )
+            is None
+        )
 
     with jax.named_scope("easydel-kda-decode-rows"):
         f32 = jnp.float32
@@ -353,6 +596,33 @@ def kda_decode_rows_forward(
             # Rows that do not advance (no token, out-of-range slot; eSurge points padding rows at slot 0) drop the write.
             write_slots = jnp.where(advance, state_indices, num_slots)
         tok = jnp.clip(qsl[:-1], 0, seq_len - 1)  # row r's token (rows without one read a clamped, unused token)
+        if use_fused:
+            # Token-major tables: the token of every advancing row names the row's slot; other tokens name none.
+            row_slots = jnp.arange(rows, dtype=jnp.int32) if state_indices is None else state_indices
+            dest = jnp.where(advance, tok, seq_len)
+            token_slots = jnp.full((seq_len,), -1, jnp.int32).at[dest].set(row_slots, mode="drop")
+            token_init = jnp.zeros((seq_len,), jnp.bool_).at[dest].set(jnp.logical_not(fresh), mode="drop")
+            out, (q_pool, k_pool, v_pool, recurrent_pool) = fused(
+                query[0],
+                key[0],
+                value[0],
+                beta[0],
+                decay[0],
+                tuple(conv_kernels),
+                conv_pools,
+                cache_view.recurrent_state,
+                token_slots,
+                token_init,
+                conv_dtype=conv_dtype,
+                head_axis=fused_head_axis,
+            )
+            new_cache_view = cache_view.update_kda_states(
+                new_q_conv_state=q_pool,
+                new_k_conv_state=k_pool,
+                new_v_conv_state=v_pool,
+                new_recurrent_state=recurrent_pool,
+            )
+            return out.astype(f32)[None], new_cache_view
         # Buckets shorter than the row count (a 16-token decode bucket of a 128-row engine) run one entry per token
         # instead of one per row: entry t is the token at position t and the row that owns it. Every entry's
         # arithmetic is the row's own (per-row ops only), so results equal the row-major form; only the gathers, the
@@ -455,6 +725,7 @@ def kda_rows_forward(
     state_indices: Array | None = None,
     flat_forward: Callable[..., tuple[Array, KDACacheView]] = kda_ragged_rows_forward,
     head_axis: str | tuple[str, ...] | None = None,
+    fused_decode: bool = False,
 ) -> tuple[Float[Array, "1 seq_len num_heads d_state"], KDACacheView]:
     """eSurge KDA serving driver: :func:`kda_decode_rows_forward` on decode-only steps, else ``flat_forward``.
 
@@ -486,6 +757,8 @@ def kda_rows_forward(
         flat_forward: Driver for steps with multi-token rows (same signature as ``kda_ragged_rows_forward``).
         head_axis: Mesh axis (or tuple of axes) of the heads, passed to both drivers when given (``None``: each
             operation resolves its own).
+        fused_decode: Let the decode driver take the fused ``ragged_kda_conv_decode`` kernel (default ``False``; see
+            :func:`kda_decode_rows_forward`).
 
     Returns:
         tuple: ``(outputs [1, T, heads, head_v_dim] float32, new_cache_view)``.
@@ -510,14 +783,16 @@ def kda_rows_forward(
     rows = int(query_start_loc.shape[-1]) - 1
     eligible = query_start_loc.ndim == 1 and all(isinstance(leaf, jax.Array) for leaf in leaves)
     seq_len = int(query.shape[1])
+    # With the fused switch off no extra keyword reaches the decode driver, so every call below is the unfused one.
+    fused_kw = {"fused_decode": True} if fused_decode else {}
     if eligible and inference_mode_single_token_rows():
         # eSurge's single-token program: every row holds at most one token, whatever the token bucket. With explicit
         # pool slots the decode driver runs alone. With implicit slots (row r owns slot r) a step whose live rows lead
         # (the common eSurge decode layout) takes the in-place leading-row path below at run time; the conditional's
         # other branch is the same decode driver, so both give the decode driver's per-row results.
         if state_indices is not None or seq_len > rows:
-            return kda_decode_rows_forward(cache_view=cache_view, **common)
-        return _leading_rows_or_decode(cache_view, common, query_start_loc, context_lens, seq_len, leaves)
+            return kda_decode_rows_forward(cache_view=cache_view, **common, **fused_kw)
+        return _leading_rows_or_decode(cache_view, common, query_start_loc, context_lens, seq_len, leaves, **fused_kw)
     if not eligible or seq_len > rows:
         # Rank-major DP metadata (the flat driver raises its own error), implicit (quantized) pool leaves, or a token
         # bucket longer than the row count. A decode-only step (at most one token per row) fits a bucket of ``rows``
@@ -527,12 +802,12 @@ def kda_rows_forward(
     decode_only = jnp.all(qsl[1:] - qsl[:-1] <= 1)
     branches = [
         _pool_branch(flat_forward, cache_view, common, **flat_kwargs),
-        _pool_branch(kda_decode_rows_forward, cache_view, common),
+        _pool_branch(kda_decode_rows_forward, cache_view, common, **fused_kw),
     ]
     index = decode_only.astype(jnp.int32)
     if state_indices is None:
         prefix, head = _leading_rows(common, query_start_loc, context_lens, seq_len)
-        branches.append(_pool_branch(kda_decode_rows_forward, cache_view, head, rows_are_tokens=True))
+        branches.append(_pool_branch(kda_decode_rows_forward, cache_view, head, rows_are_tokens=True, **fused_kw))
         index = jnp.where(prefix, 2, index)
     out, new_leaves = lax.switch(index, branches, leaves)
     return out, cache_view.update_kda_states(*new_leaves)
@@ -573,17 +848,21 @@ def _leading_rows_or_decode(
     context_lens: Array | None,
     seq_len: int,
     leaves: tuple[Array, ...],
+    *,
+    fused_decode: bool = False,
 ) -> tuple[Array, KDACacheView]:
     """Single-token program with implicit slots: the in-place leading-row decode when the live rows lead, else the
-    decode driver over every row (both are :func:`kda_decode_rows_forward`, so the results are the decode driver's)."""
+    decode driver over every row (both are :func:`kda_decode_rows_forward`, so the results are the decode driver's).
+    ``fused_decode`` is passed to both branches (see :func:`kda_decode_rows_forward`)."""
     prefix, head = _leading_rows(common, query_start_loc, context_lens, seq_len)
+    extra = {"fused_decode": True} if fused_decode else {}
     out, new_leaves = lax.cond(
         prefix,
-        _pool_branch(kda_decode_rows_forward, cache_view, head, rows_are_tokens=True),
-        _pool_branch(kda_decode_rows_forward, cache_view, common),
+        _pool_branch(kda_decode_rows_forward, cache_view, head, rows_are_tokens=True, **extra),
+        _pool_branch(kda_decode_rows_forward, cache_view, common, **extra),
         leaves,
     )
     return out, cache_view.update_kda_states(*new_leaves)
 
 
-__all__ = ("RaggedKDADecodeOp", "kda_decode_rows_forward", "kda_rows_forward")
+__all__ = ("RaggedKDAConvDecodeOp", "RaggedKDADecodeOp", "kda_decode_rows_forward", "kda_rows_forward")
