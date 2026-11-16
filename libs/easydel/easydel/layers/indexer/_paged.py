@@ -93,7 +93,8 @@ def _run_pool_topk(kernel_mesh, *args, constrain_heads=None, **kwargs) -> jax.Ar
 
     ``constrain_heads`` optionally pins the query ``[T, H, D]`` and head weights ``[T, H]`` to
     their head-sharded projection layout (``MLARaggedPagesCacheView.constrain_indexer_heads``)
-    before the rows are split over the mesh; it is applied on that path only.
+    on both multi-device paths, so XLA moves the small activation (an all-to-all onto the row split, an
+    all-gather onto the replicated call) instead of all-gathering the projection weights.
     """
     xla = _paged_pool_topk_impl("xla")
     if jax.default_backend() != "tpu":
@@ -113,16 +114,17 @@ def _run_pool_topk(kernel_mesh, *args, constrain_heads=None, **kwargs) -> jax.Ar
     # Rows are independent, so split them over every mesh device: each device scores only its
     # slice and just the small [T, k] ids are gathered, instead of all-gathering the query and
     # repeating the whole top-k on every device. Pages and the block table stay replicated.
+    if constrain_heads is not None:
+        # The query and head weights leave column-parallel projections sharded over heads. Pinned to that layout,
+        # XLA reshards the small activation (an all-to-all onto the row split, an all-gather onto the replicated
+        # call); unpinned, it all-gathers the projection weights on every call instead (GLM-5.3-Flash: the bf16
+        # [32, 128, 1536] indexer query weight in every DSA layer, ~1.3 ms of a 17 ms cc=1 decode step at ep8 x tp8,
+        # whose 16- and 32-token buckets take the replicated call).
+        args = (constrain_heads(args[0]), constrain_heads(args[1]), *args[2:])
     if _pool_topk_row_mesh(kernel_mesh, int(args[0].shape[0])) is not None:
         row = PartitionSpec(tuple(mesh.axis_names))
         in_specs = (row, row, rep, rep, row, row)
         out_specs = row
-        if constrain_heads is not None:
-            # The query and head weights leave column-parallel projections sharded over heads. Pinned to that
-            # layout, XLA moves them to the row split with an all-to-all of the activation; unpinned, it
-            # all-gathers the projection weights on every call instead (GLM-5.3-Flash at tp4: the bf16
-            # [32, 128, 1536] indexer query weight in every DSA layer).
-            args = (constrain_heads(args[0]), constrain_heads(args[1]), *args[2:])
     else:
         in_specs = (rep,) * len(args)
         out_specs = rep
