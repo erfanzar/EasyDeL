@@ -75,6 +75,7 @@ import jax
 import spectrax as spx
 from eformer.loggings import get_logger
 from jax import numpy as jnp
+from jax.experimental.layout import Format, Layout
 from jax.sharding import NamedSharding, PartitionSpec
 
 from easydel.caching import (
@@ -106,6 +107,13 @@ if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
     from easydel.infra.etils import MpMdSchedulers
 
+
+_MAX_RELAYOUT_SHARED_BYTES = 256 * 1024**2
+"""Per-device budget for graph-argument leaves copied into the layout the decode program prefers.
+
+Leaves the executor owns (stacked :class:`StatePacker` groups) are relayouted in place of their old buffer; leaves
+shared with the model state (passthrough leaves) coexist with the model's copy, so only those count against this budget.
+"""
 
 DECODE_LAYOUT_MAX_TOKENS_PER_REQ = 4
 """Largest token bucket, in slots per request-bucket slot, whose general SPMD model step traces under the decode layout.
@@ -362,6 +370,10 @@ class ModelStepExecutor:
                 )
         self._runtime_graphstate_arg: tp.Any = graphstate_template
         self._runtime_graphother_arg: tp.Any = graphother_template
+        # Per flat graph argument: the ``Format`` the compiled programs expect, or ``None`` (default layout). ``None``
+        # for the whole attribute until the first SPMD model step is compiled (see ``_adopt_decode_graph_layouts``).
+        self._graph_arg_formats: tuple[tuple[tp.Any, ...], tuple[tp.Any, ...]] | None = None
+        self._graph_arg_formats_resolved = False
         self.set_runtime_graph_args(graphstate_template, graphother_template)
         self._pipeline_runtime = (
             PipelineStageRuntime(plan=pipeline_plan) if pipeline_plan is not None and pipeline_plan.is_enabled else None
@@ -477,6 +489,9 @@ class ModelStepExecutor:
             self._runtime_graphother_arg = (
                 self._graphother_packer.pack(go_leaves) if self._graphother_packer is not None else go_leaves
             )
+            self._runtime_graphstate_arg, self._runtime_graphother_arg = self._apply_graph_arg_formats(
+                self._runtime_graphstate_arg, self._runtime_graphother_arg
+            )
             self._packed_source_leaves = (gs_leaves, go_leaves)
         else:
             self._runtime_graphstate_arg = graphstate
@@ -518,7 +533,119 @@ class ModelStepExecutor:
                 return self._runtime_graphstate_arg, self._runtime_graphother_arg
         gs_arg = self._graphstate_packer.pack(gs_leaves) if self._graphstate_packer is not None else gs_leaves
         go_arg = self._graphother_packer.pack(go_leaves) if self._graphother_packer is not None else go_leaves
-        return gs_arg, go_arg
+        return self._apply_graph_arg_formats(gs_arg, go_arg)
+
+    def _apply_graph_arg_formats(self, gs_arg: tp.Any, go_arg: tp.Any) -> tuple[tp.Any, tp.Any]:
+        """Place flat graph arguments in the layouts the compiled programs were built for.
+
+        Layouts never change values: this is a device copy into another physical layout, done when the graph state
+        is (re)bound, so the compiled programs do not re-copy those weights on every call.
+
+        Args:
+            gs_arg: Flat (possibly packed) graphstate argument tuple.
+            go_arg: Flat (possibly packed) graphother argument tuple.
+
+        Returns:
+            ``(gs_arg, go_arg)`` with every leaf that has a recorded format placed in it.
+        """
+        if self._graph_arg_formats is None:
+            return gs_arg, go_arg
+        placed = []
+        for arg, formats in zip((gs_arg, go_arg), self._graph_arg_formats, strict=True):
+            leaves = list(arg)
+            for idx, fmt in enumerate(formats):
+                if fmt is None:
+                    continue
+                current = getattr(leaves[idx], "format", None)
+                if current is None or current.layout != fmt.layout:
+                    leaves[idx] = jax.device_put(leaves[idx], fmt)
+            placed.append(tuple(leaves))
+        return placed[0], placed[1]
+
+    def _adopt_decode_graph_layouts(
+        self,
+        auto_fn: tp.Callable[..., tp.Any],
+        lower_args: tuple[tp.Any, ...],
+    ) -> tp.Any | None:
+        """Compile the first (decode-layout) model step with free graph-argument layouts and adopt them.
+
+        Weights stored in the default row-major layout are re-laid out by a program that consumes them transposed
+        (e.g. a ``[rank, heads * dim]`` projection contracted on its leading axis) on EVERY call. Compiling the first
+        model step with ``Layout.AUTO`` graph arguments lets XLA pick the layouts that program wants; the arguments
+        are then stored in those layouts once, and every later program is compiled against the committed arrays, so
+        it follows them. Values are untouched (a layout is a physical arrangement of the same elements).
+
+        Args:
+            auto_fn: The model-step jit whose graph-argument ``in_shardings`` carry ``Layout.AUTO``.
+            lower_args: ``(graphdef, gs_arg, go_arg, kv_pages, metadata, padded_num_reqs)`` as for the plain jit.
+
+        Returns:
+            The compiled AUTO executable when every chosen layout was adopted (it can serve the bucket directly),
+            else ``None`` (the caller compiles the plain program against the adopted arguments).
+        """
+        graphdef, gs_arg, go_arg, *rest = lower_args
+
+        def _abstract(arg):
+            return jax.ShapeDtypeStruct(arg.shape, arg.dtype, sharding=arg.sharding)
+
+        compiled = auto_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
+            graphdef, tuple(map(_abstract, gs_arg)), tuple(map(_abstract, go_arg)), *rest
+        ).compile()
+        arg_formats = compiled.input_formats[0]
+        if len(arg_formats) < 2 or len(arg_formats[0]) != len(gs_arg) or len(arg_formats[1]) != len(go_arg):
+            return None
+        budget = _MAX_RELAYOUT_SHARED_BYTES
+        all_adopted = True
+        over_budget = 0
+        adopted_bytes = 0
+        num_adopted = 0
+        formats_out = []
+        for arg, formats, packer in (
+            (gs_arg, arg_formats[0], self._graphstate_packer),
+            (go_arg, arg_formats[1], self._graphother_packer),
+        ):
+            owned = len(packer.groups) if packer is not None else 0
+            targets: list[tp.Any] = []
+            for idx, (leaf, fmt) in enumerate(zip(arg, formats, strict=True)):
+                current = getattr(leaf, "format", None)
+                layout = getattr(fmt, "layout", None)
+                if (
+                    not isinstance(layout, Layout)
+                    or current is None
+                    or current.layout == layout
+                    or not jnp.issubdtype(leaf.dtype, jnp.integer)
+                ):
+                    # Only integer leaves (quantized codes) are relaid: their consumers are integer dots whose
+                    # accumulation is exact in any order. A floating leaf in another layout can change the fusion
+                    # and the f32 accumulation order of its consumer, so it keeps the default layout.
+                    if isinstance(layout, Layout) and current is not None and current.layout != layout:
+                        all_adopted = False
+                    targets.append(None)
+                    continue
+                cost = 0 if idx < owned else int(leaf.addressable_shards[0].data.nbytes)
+                if cost > budget:
+                    all_adopted = False
+                    over_budget += 1
+                    targets.append(None)
+                    continue
+                budget -= cost
+                adopted_bytes += cost
+                num_adopted += 1
+                targets.append(Format(layout, leaf.sharding))
+            formats_out.append(tuple(targets))
+        self._graph_arg_formats = (formats_out[0], formats_out[1])
+        if num_adopted:
+            self._runtime_graphstate_arg, self._runtime_graphother_arg = self._apply_graph_arg_formats(
+                self._runtime_graphstate_arg, self._runtime_graphother_arg
+            )
+        logger.info(
+            "eSurge graph-argument layouts: %d integer leaves re-laid out for the decode program (%.1f MB/device of "
+            "copies shared with the model state; %d over budget)",
+            num_adopted,
+            adopted_bytes / 1024**2,
+            over_budget,
+        )
+        return compiled if all_adopted else None
 
     def _uses_spmd_dp(self) -> bool:
         """Return whether compiled model inputs use rank-major DP layout."""
@@ -1908,16 +2035,45 @@ class ModelStepExecutor:
             record_single_token_rows_queries() as queries,
         ):
             if self.use_aot_forward:
-                compiled = step_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
-                    *(
-                        graphdef,
-                        graphstate_arg,
-                        graphother_arg,
-                        inputs.kv_pages,
-                        inputs.batch_metadata,
-                        int(padded_num_reqs),
+                compiled = None
+                if not self._graph_arg_formats_resolved:
+                    # Once per executor, before any program exists: only the decode layout's preferences are
+                    # adopted (the first pair compiled is the smallest token bucket).
+                    self._graph_arg_formats_resolved = True
+                    auto_fn = (
+                        self._build_model_step_fn(
+                            kv_pages_template=inputs.kv_pages,
+                            graphstate_template=graphstate,
+                            graphother_template=graphother,
+                            auto_graph_layouts=True,
+                        )
+                        if decode_only and self._flat_state_args and not self._cache
+                        else None
                     )
-                ).compile()
+                    if auto_fn is not None:
+                        compiled = self._adopt_decode_graph_layouts(
+                            auto_fn,
+                            (
+                                graphdef,
+                                graphstate_arg,
+                                graphother_arg,
+                                inputs.kv_pages,
+                                inputs.batch_metadata,
+                                int(padded_num_reqs),
+                            ),
+                        )
+                        graphstate_arg, graphother_arg = self._graph_call_args(graphstate, graphother)
+                if compiled is None:
+                    compiled = step_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
+                        *(
+                            graphdef,
+                            graphstate_arg,
+                            graphother_arg,
+                            inputs.kv_pages,
+                            inputs.batch_metadata,
+                            int(padded_num_reqs),
+                        )
+                    ).compile()
                 if queries.asked and not separate_decode:
                     self._single_token_pairs.add(pair)
                 self._cache_store(self._cache, key, compiled)
@@ -2787,8 +2943,12 @@ class ModelStepExecutor:
         kv_pages_template: HybridCache | RaggedPagesCache | UnifiedAttentionCache,
         graphstate_template: tp.Any,
         graphother_template: tp.Any,
-    ) -> tp.Callable[..., ModelStepOutputs]:
+        auto_graph_layouts: bool = False,
+    ) -> tp.Callable[..., ModelStepOutputs] | None:
         """Build the fused SPMD model step.
+
+        ``auto_graph_layouts=True`` builds the variant whose graph arguments carry ``Layout.AUTO`` (used once, by
+        :meth:`_adopt_decode_graph_layouts`); it returns ``None`` when the graph shardings cannot be resolved.
 
         This is the same transformer forward as :meth:`_build_backbone_fn`,
         but it also gathers the sampled rows and applies the LM head inside the
@@ -2819,6 +2979,15 @@ class ModelStepExecutor:
             ),
             "out_shardings": model_step_out_shardings,
         }
+        if auto_graph_layouts:
+            gs_sharding, go_sharding, *other_shardings = jit_kwargs["in_shardings"]
+            if not isinstance(gs_sharding, tuple) or not isinstance(go_sharding, tuple):
+                return None
+            jit_kwargs["in_shardings"] = (
+                tuple(Format(Layout.AUTO, s) for s in gs_sharding),
+                tuple(Format(Layout.AUTO, s) for s in go_sharding),
+                *other_shardings,
+            )
         flat_state_args = bool(self._flat_state_args)
         graphstate_treedef = self._graphstate_treedef
         graphother_treedef = self._graphother_treedef
