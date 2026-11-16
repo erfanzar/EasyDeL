@@ -189,7 +189,9 @@ def build_metadata(
     ok = (selected >= 0) & valid[:, None] & (start <= pos[:, None]) & (start < kv_len[:, None])
     if sliding_window is not None:
         ok = ok & (start + chunk_size - 1 > pos[:, None] - int(sliding_window))
-    key = jnp.sort(jnp.where(ok, start, _FAR), axis=1)
+    # Selections are unique per row and every padding slot holds the same _FAR sentinel, so an unstable sort gives
+    # the same array; a stable one makes the TPU sort carry an extra iota operand.
+    key = lax.sort(jnp.where(ok, start, _FAR), dimension=1, is_stable=False)
     n_valid = jnp.sum(ok, axis=1).astype(jnp.int32)
 
     padded_width = -(-width // group) * group
