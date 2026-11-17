@@ -89,6 +89,7 @@ from ...core.sampler import (
     apply_history_penalties_from_counts,
     build_history_token_counts,
     overwrite_token_count_rows,
+    sample_top_p_rows,
     update_token_counts,
 )
 from ...core.sampler import sample_tokens as sample_tokens_fn
@@ -196,7 +197,10 @@ class SamplerExecutor:
 
         self._sampling_fn = self._build_sampling_fn()
         self._greedy_sampling_fn = self._build_greedy_sampling_fn()
+        self._top_p_sampling_fn = build_top_p_sampling_fn(row_sharding)
         self._cache: OrderedDict[tuple[int, int, str, str], tp.Any] = OrderedDict()
+        # Plain top-p programs, compiled together with the general sampler of the same key (see ``compile``).
+        self._top_p_cache: dict[tuple[int, int, str, str], tp.Any] = {}
 
     def clear_cache(self) -> None:
         """Clear all cached compiled functions.
@@ -206,6 +210,7 @@ class SamplerExecutor:
         needs to be freed.
         """
         self._cache.clear()
+        getattr(self, "_top_p_cache", {}).clear()
 
     def _cache_put(self, key: tuple[int, int, str, str], value: tp.Any) -> None:
         """Add a compiled function to the cache.
@@ -269,12 +274,25 @@ class SamplerExecutor:
         """
         return key in self._cache
 
+    def get_top_p_compiled(self, *, padded_num_reqs: int) -> tp.Any | None:
+        """The compiled plain top-p sampler of a bucket (:func:`build_top_p_sampling_fn`), or ``None``.
+
+        Args:
+            padded_num_reqs: Padded request count (for bucket selection).
+
+        Returns:
+            The compiled program with the sampler ABI returning ``(rng_key, tokens, valid_mask)``, or ``None`` when
+            the bucket's general sampler was compiled without it.
+        """
+        return getattr(self, "_top_p_cache", {}).get(self.cache_key(padded_num_reqs=padded_num_reqs))
+
     def get_compiled(self, *, num_tokens: int, padded_num_reqs: int, greedy: bool = False) -> tp.Any:
         """Retrieve a pre-compiled sampler function for given dimensions.
 
         Args:
             num_tokens: Number of tokens (for bucket selection).
             padded_num_reqs: Padded request count (for bucket selection).
+            greedy: Return the argmax-only sampler.
 
         Returns:
             Compiled sampler function matching the specified dimensions.
@@ -340,12 +358,18 @@ class SamplerExecutor:
         )
 
         sampling_fn = self._greedy_sampling_fn if greedy else self._sampling_fn
+        top_p_fn = getattr(self, "_top_p_sampling_fn", None)
         if self.use_aot_forward:
             compiled = sampling_fn.lower(*sampler_args).compile()  # pyright: ignore[reportFunctionMemberAccess]
+            if not greedy and top_p_fn is not None:
+                self._top_p_cache[key] = top_p_fn.lower(*sampler_args).compile()  # pyright: ignore
             self._cache_put(key, compiled)
             return
 
         _ = sampling_fn(*sampler_args)
+        if not greedy and top_p_fn is not None:
+            _ = top_p_fn(*sampler_args)
+            self._top_p_cache[key] = top_p_fn
         self._cache_put(key, sampling_fn)
 
     def _build_greedy_sampling_fn(self) -> tp.Callable[..., tp.Any]:
@@ -588,6 +612,94 @@ class SamplerExecutor:
                 return rng_key, out_tokens, valid_mask, token_counts_full
 
         return _sampling_fn
+
+
+def build_top_p_sampling_fn(row_sharding: jax.sharding.NamedSharding | None) -> tp.Callable[..., tp.Any]:
+    """Build the straight-line sampler for windows the host classified as plain top-p.
+
+    A plain top-p window has no history penalties, no top-k, no min-p and no seeded rows, and every live row with
+    ``temperature > 0`` uses ``top_p < 1`` (greedy rows are allowed). For such a window every batch flag of the general
+    sampler is decided, so this program takes the same branch of each of its ``lax.cond`` statically (top-p masking,
+    temperature scaling, Gumbel-max with ``fold_in(rng_key, sampling_seed)``, argmax for greedy rows) with no runtime
+    conditionals, no flag all-reduces and no copy of the token counts. The top-p threshold search is unrolled.
+
+    With a row sharding whose mesh divides the rows, each device samples its own rows inside one ``shard_map`` and the
+    tokens are all-gathered; a row's computation does not depend on the split.
+
+    Args:
+        row_sharding: Row sharding of the logits over the whole mesh, or ``None`` to sample every row everywhere.
+
+    Returns:
+        JIT-decorated function ``(packed_f32, packed_i32, packed_misc_i32, logits, rng_key, token_counts_full) ->
+        (updated_rng_key, sampled_tokens, valid_mask)``; ``token_counts_full`` is unused.
+    """
+
+    def _rows(logits, offset, packed_f32, packed_i32, packed_misc_i32, rng_key):
+        rows = logits.shape[0]
+        active = _sampler_active_mask(packed_i32, packed_misc_i32, packed_f32.shape[1])
+        temp = packed_f32[0].reshape(-1, 1).astype(logits.dtype)
+        temp = jnp.where(active[:, None], temp, jnp.ones_like(temp))
+
+        def local(values):
+            return jax.lax.dynamic_slice_in_dim(values, offset, rows, axis=0)
+
+        temp = local(temp)
+        tokens = sample_top_p_rows(
+            logits,
+            temp,
+            local(packed_f32[1].astype(logits.dtype)),
+            local(packed_i32[0]),
+            rng_key,
+            unroll_search=True,
+        )
+        greedy = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+        return jnp.where(temp[:, 0] <= 0.0, greedy, tokens)
+
+    @ejit
+    def _top_p_sampling_fn(packed_f32, packed_i32, packed_misc_i32, logits, rng_key, token_counts_full):
+        del token_counts_full
+        with jax.named_scope("easydel/esurge/top_p_sampler_step"):
+            batch_size = logits.shape[0]
+            split_rows, _ = _sampler_row_split(row_sharding, batch_size)
+            if split_rows is None:
+                sampled = _rows(logits, jnp.int32(0), packed_f32, packed_i32, packed_misc_i32, rng_key)
+            else:
+                mesh = split_rows.mesh
+                axes = tuple(mesh.axis_names)
+                per_device = batch_size // int(mesh.size)
+
+                def _local(logits_rows, packed_f32, packed_i32, packed_misc_i32, rng_key):
+                    offset = jax.lax.axis_index(axes).astype(jnp.int32) * per_device
+                    tokens = _rows(logits_rows, offset, packed_f32, packed_i32, packed_misc_i32, rng_key)
+                    return jax.lax.all_gather(tokens, axes, tiled=True)
+
+                replicated = jax.sharding.PartitionSpec()
+                sampled = jax.shard_map(
+                    _local,
+                    mesh=mesh,
+                    in_specs=(split_rows.spec, replicated, replicated, replicated, replicated),
+                    out_specs=replicated,
+                    check_vma=False,
+                )(logits, packed_f32, packed_i32, packed_misc_i32, rng_key)
+            valid_mask = _sampler_valid_mask(packed_i32, packed_misc_i32, batch_size)
+            out_tokens = jnp.where(valid_mask, sampled, -1)
+            rng_key = jax.random.fold_in(rng_key, jnp.int32(packed_misc_i32[1]))
+            return rng_key, out_tokens, valid_mask
+
+    return _top_p_sampling_fn
+
+
+def _sampler_active_mask(packed_i32: jax.Array, packed_misc_i32: jax.Array, batch_size: int) -> jax.Array:
+    """Active rows of a sampler window: inside ``num_requests`` and flagged active."""
+    i_reqs = jnp.arange(batch_size, dtype=jnp.int32)
+    return (i_reqs < packed_misc_i32[0]) & packed_i32[4][:batch_size].astype(jnp.bool_)
+
+
+def _sampler_valid_mask(packed_i32: jax.Array, packed_misc_i32: jax.Array, batch_size: int) -> jax.Array:
+    """Rows that emit a token this step: active, scheduled, and past their prompt (the general sampler's mask)."""
+    active_mask = _sampler_active_mask(packed_i32, packed_misc_i32, batch_size)
+    emits_next_token = packed_i32[2][:batch_size] >= packed_i32[6][:batch_size]
+    return active_mask & (packed_i32[1][:batch_size] > 0) & emits_next_token
 
 
 @partial(jax.jit, static_argnames=("padded_num_reqs",))
@@ -998,6 +1110,45 @@ class SamplerRuntime:
             self._sampler_token_counts, row_indices_dev, token_ids_dev, counts_dev
         )
 
+    def _plain_top_p_sampler(
+        self,
+        *,
+        sampler_padded_num_reqs: int,
+        need_penalties: bool,
+        packed_f32: numpy.ndarray,
+        packed_i32: numpy.ndarray,
+        num_reqs: int,
+    ) -> tp.Any | None:
+        """The compiled plain top-p sampler when this window qualifies for it, else ``None``.
+
+        A window qualifies when no row uses a history penalty and every live row either is greedy (temperature
+        ``<= 0``) or samples with ``top_p < 1``, no top-k, no min-p and no configured seed. The general sampler then
+        takes exactly the branches the plain program hard-codes, so both produce the same tokens and rng key.
+
+        Args:
+            sampler_padded_num_reqs: Sampler request bucket.
+            need_penalties: Whether any request of the window uses penalties.
+            packed_f32: Host float metadata ``[6, bucket]`` (temperature, top-p, min-p, penalties).
+            packed_i32: Host int metadata ``[10, bucket]`` (top-k in row 5, seeded flag in row 9).
+            num_reqs: Live rows of the window.
+
+        Returns:
+            The compiled program, or ``None``.
+        """
+        if need_penalties or num_reqs <= 0:
+            return None
+        f32 = packed_f32[:3, :num_reqs]
+        live = packed_i32[4, :num_reqs] != 0
+        sampled = live & (f32[0] > 0.0)
+        # One pass: a live row disqualifies the window when it samples without top-p, or uses top-k, min-p or a seed.
+        blocked = (sampled & (f32[1] >= 1.0)) | (packed_i32[5, :num_reqs] > 0) | (f32[2] > 0.0)
+        if packed_i32.shape[0] >= 10:
+            blocked |= packed_i32[9, :num_reqs] != 0
+        if not sampled.any() or (live & blocked).any():
+            return None
+        getter = getattr(self._sampler_executor, "get_top_p_compiled", None)
+        return None if getter is None else getter(padded_num_reqs=int(sampler_padded_num_reqs))
+
     def warm_compaction_programs(
         self,
         *,
@@ -1394,6 +1545,15 @@ class SamplerRuntime:
         self._sampler_packed_misc_i32_cpu[0] = numpy.int32(sampler_num_reqs)
         self._sampler_packed_misc_i32_cpu[1] = numpy.int32(sampler_total_tokens)
 
+        top_p_fn = None
+        if not use_greedy_sampler:
+            top_p_fn = self._plain_top_p_sampler(
+                sampler_padded_num_reqs=int(sampler_padded_num_reqs),
+                need_penalties=need_penalties,
+                packed_f32=sampler_packed_f32,
+                packed_i32=sampler_packed_i32,
+                num_reqs=int(sampler_num_reqs),
+            )
         sampler_host_payload = (sampler_packed_f32, sampler_packed_i32, self._sampler_packed_misc_i32_cpu)
         replicated = getattr(self, "host_payloads_replicated", False)
         if host_payload_broadcast_needed(replicated):
@@ -1444,14 +1604,20 @@ class SamplerRuntime:
                 compact_logits = apply_sparse_sampling_constraints(compact_logits, *placed)
 
         with jax.named_scope("easydel/esurge/sampler/run_jit"):
-            rng_key, compact_tokens, compact_valid_mask, token_counts_full = sampler_fn(
-                packed_f32,
-                packed_i32,
-                packed_misc_i32,
-                compact_logits,
-                rng_key,
-                token_counts_full,
-            )
+            if top_p_fn is not None:
+                # Penalties are off for this window, so the token counts are neither read nor updated.
+                rng_key, compact_tokens, compact_valid_mask = top_p_fn(
+                    packed_f32, packed_i32, packed_misc_i32, compact_logits, rng_key, token_counts_full
+                )
+            else:
+                rng_key, compact_tokens, compact_valid_mask, token_counts_full = sampler_fn(
+                    packed_f32,
+                    packed_i32,
+                    packed_misc_i32,
+                    compact_logits,
+                    rng_key,
+                    token_counts_full,
+                )
         if prefix_scatter_layout and int(sampler_padded_num_reqs) == int(padded_num_reqs):
             return rng_key, compact_tokens, compact_valid_mask, token_counts_full
         with jax.named_scope("easydel/esurge/sampler/scatter_to_model_rows"):
