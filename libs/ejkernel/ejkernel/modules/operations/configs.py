@@ -1638,6 +1638,17 @@ class MHCDecodeFusedConfig(BaseOperationConfig):
 
 
 @dataclass
+class MHCPrefillFusedConfig(BaseOperationConfig):
+    """Dispatch settings of the prefill-size mHC project / read / write (``mhc_prefill_*``).
+
+    Tiles come from a VMEM rule inside the kernels, so only the inherited ``platform`` and ``backend`` select the
+    implementation.
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class MHCFusedConfig(BaseOperationConfig):
     """Configuration for the mHC site operations ``mhc_collapse`` / ``mhc_expand``.
 
