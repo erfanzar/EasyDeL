@@ -47,6 +47,8 @@ DEFAULT_VMEM_LIMIT = 64 * 2**20
 VMEM_BUDGET = 48 * 2**20
 LIVE_WAIT_ROWS = 64
 """Row copies retired per semaphore wait in the sparse (``skip_negative``) gather-sum."""
+LIVE_ISSUE_UNROLL = 32
+"""Row copies issued per unrolled group in the sparse gather-sum (divides 128, so a group shares one list row)."""
 _PACK_BLOCKS = (256, 128, 64, 32, 16)
 
 
@@ -398,26 +400,52 @@ def _gather_sum_kernel(idx_ref, w_ref, src_hbm, out_ref, buf, sem, *, block, k, 
 
 
 def _gather_sum_live_kernel(
-    count_ref, key_ref, row_ref, w_ref, src_hbm, out_ref, buf, sem, *, block, k, sub, half, wait_rows, pair_width=None
+    count_ref,
+    src_ref,
+    dst_ref,
+    w_ref,
+    src_hbm,
+    out_ref,
+    buf,
+    sem,
+    *,
+    block,
+    k,
+    sub,
+    half,
+    wait_rows,
+    unroll,
+    pair_width=None,
 ):
-    # Grid step i owns entries [0, count[i]) of its (key, row) list block (:func:`live_slot_lists`): buffer row
-    # ``key mod (block * k)`` (laid out as in the dense kernel) receives source row ``row``. Only live slots are
-    # visited; dead slots leave stale buffer rows, which their zeroed weights mask in the sum.
+    # Grid step i owns entries [0, count[i]) of its (source, destination) offset list block
+    # (:func:`_live_slot_offsets`): packed buffer rows ``[dst, dst + sub)`` (buffer row ``j * block + t`` as in the
+    # dense kernel) receive packed source rows ``[src, src + sub)``. Only live slots are visited; dead slots leave
+    # stale buffer rows, which their zeroed weights mask in the sum. Copies are issued in unrolled groups of
+    # ``unroll`` entries (one list row and lane base per group), so the scalar issue loop stays below the DMA rate.
     n = count_ref[pl.program_id(0)]
-    span = block * k
 
-    def issue(q, carry):
-        r, c = lax.div(q, LANES), lax.rem(q, LANES)
-        dst = lax.rem(key_ref[r, c], span)
-        row = row_ref[r, c]
+    def copy(r, c):
         pltpu.make_async_copy(
-            src_hbm.at[pl.ds(pl.multiple_of(row * sub, sub), sub)],
-            buf.at[pl.ds(pl.multiple_of(dst * sub, sub), sub)],
+            src_hbm.at[pl.ds(pl.multiple_of(src_ref[r, c], sub), sub)],
+            buf.at[pl.ds(pl.multiple_of(dst_ref[r, c], sub), sub)],
             sem,
         ).start()
+
+    def group(g, carry):
+        base = g * unroll
+        r, c0 = lax.shift_right_logical(base, jnp.int32(7)), lax.bitwise_and(base, jnp.int32(LANES - 1))
+        for u in range(unroll):
+            copy(r, c0 + u)
         return carry
 
-    lax.fori_loop(0, n, issue, 0)
+    groups = lax.div(n, unroll)
+    lax.fori_loop(0, groups, group, 0)
+
+    def single(q, carry):
+        copy(lax.shift_right_logical(q, jnp.int32(7)), lax.bitwise_and(q, jnp.int32(LANES - 1)))
+        return carry
+
+    lax.fori_loop(groups * unroll, n, single, 0)
 
     def waiter(rows):
         # A descriptor of ``rows`` source rows: its byte count equals that many row copies signalled.
@@ -490,6 +518,13 @@ def live_slot_lists(indices: jax.Array, block: int, n_src: int) -> tuple[jax.Arr
     keys, rows = lax.sort((key.astype(I32).reshape(-1), rows.reshape(-1)), num_keys=1)
     counts = jnp.sum(live.reshape(nb, span), axis=1, dtype=I32)
     return counts, keys.reshape(-1, LANES), rows.reshape(-1, LANES)
+
+
+def _live_slot_offsets(indices: jax.Array, block: int, n_src: int, sub: int):
+    """:func:`live_slot_lists` as packed-row DMA offsets: ``(counts, src = rows * sub, dst = (keys mod span) * sub)``."""
+    counts, keys, rows = live_slot_lists(indices, block, n_src)
+    span = block * indices.shape[1]
+    return counts, rows * sub, lax.rem(keys, jnp.int32(span)) * sub
 
 
 def gather_sum_rows(
@@ -606,7 +641,7 @@ def _gather_sum_packed(packed, m, h, pair_width, indices, weights, out_dtype, *,
             name=f"moe_row_gather_sum_k{k}",
         )(indices.astype(I32).reshape(tokens * k // LANES, LANES), weights.astype(F32), packed)
     weights = jnp.where(indices >= 0, weights.astype(F32), 0.0)
-    counts, keys, rows = live_slot_lists(indices, block, m)
+    counts, src, dst = _live_slot_offsets(indices, block, m, sub)
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=1,
         grid=(tokens // block,),
@@ -627,10 +662,11 @@ def _gather_sum_packed(packed, m, h, pair_width, indices, weights, out_dtype, *,
             sub=sub,
             half=h // 2,
             wait_rows=LIVE_WAIT_ROWS,
+            unroll=LIVE_ISSUE_UNROLL,
             pair_width=pair_width,
         ),
         grid_spec=grid_spec,
         out_shape=out_shape,
         compiler_params=params,
         name=f"moe_row_gather_sum_k{k}_live",
-    )(counts, keys, rows, weights, packed)
+    )(counts, src, dst, weights, packed)
