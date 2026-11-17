@@ -14,15 +14,22 @@
 
 """Public eligibility checks for the MoE row-gather kernels.
 
-The kernels are registry entries (``moe_row_gather`` / ``moe_row_gather_sum``; Pallas TPU with an XLA fallback). A
-caller that must not fall back silently asks these helpers first: each returns why the Pallas kernel would not run for
-the given shapes and dtypes, or ``None`` when it would. Only ``.shape`` / ``.dtype`` are read, so
-``jax.ShapeDtypeStruct`` arguments work.
+The kernels are registry entries (``moe_row_gather`` / ``moe_row_gather_quantized`` / ``moe_row_gather_sum``;
+Pallas TPU with an XLA fallback). A caller that must not fall back silently asks these helpers first: each returns why
+the Pallas kernel would not run for the given shapes and dtypes, or ``None`` when it would. Only ``.shape`` /
+``.dtype`` are read, so ``jax.ShapeDtypeStruct`` arguments work.
 """
 
 from ejkernel.kernels._pallas.tpu.moe_row_gather import (
+    packed_row_gather_sum_unsupported_reason,
+    quantized_row_gather_unsupported_reason,
     row_gather_sum_unsupported_reason,
     row_gather_unsupported_reason,
 )
 
-__all__ = ("row_gather_sum_unsupported_reason", "row_gather_unsupported_reason")
+__all__ = (
+    "packed_row_gather_sum_unsupported_reason",
+    "quantized_row_gather_unsupported_reason",
+    "row_gather_sum_unsupported_reason",
+    "row_gather_unsupported_reason",
+)

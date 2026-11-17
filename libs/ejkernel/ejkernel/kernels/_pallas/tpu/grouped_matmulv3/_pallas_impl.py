@@ -275,6 +275,7 @@ class GmmConfigs:
     acc_dtype: jnp.dtype
     zero_init: bool
     fuse_act: str | None
+    packed_out: bool = False
 
     @property
     def num_quant_blocks_per_tile_k(self) -> int:
@@ -420,10 +421,22 @@ def generate_block_specs(
         bias=rhs_bias_block_spec,
     )
 
-    out_block_spec = pl.BlockSpec(
-        (bounded_slice_gm, cfgs.dims.size_lhs_sublane, cfgs.tiles.tile_n),
-        index_map.out_index_map,
-    )
+    if cfgs.packed_out:
+        # int32 paired layout [M / sublane, sublane, N / 256, 128]: this N tile owns tile_n / 256 packed rows of
+        # every source row (``packed_out`` in :func:`grouped_matmulv3_pallas_impl`).
+        def packed_out_index_map(n_id, gm_id, k_id):
+            rows, _, n_blk = index_map.out_index_map(n_id, gm_id, k_id)
+            return (rows, 0, n_blk, 0)
+
+        out_block_spec = pl.BlockSpec(
+            (bounded_slice_gm, cfgs.dims.size_lhs_sublane, cfgs.tiles.tile_n // 256, 128),
+            packed_out_index_map,
+        )
+    else:
+        out_block_spec = pl.BlockSpec(
+            (bounded_slice_gm, cfgs.dims.size_lhs_sublane, cfgs.tiles.tile_n),
+            index_map.out_index_map,
+        )
 
     return (lhs_block_spec, rhs_block_spec), out_block_spec
 
@@ -484,6 +497,7 @@ def inner_kernel(
     partial_out_ref: jax.Array,
     acc_ref: jax.Array,
     metadata_ref: MetadataRef,
+    stage_ref: jax.Array | None = None,
     *,
     cfgs: GmmConfigs,
 ):
@@ -713,30 +727,35 @@ def inner_kernel(
             m_start_local = m_start - m_offset
             m_end_local = m_end - m_offset
 
+            # ``packed_out``: the output tile is first written in its own dtype to a VMEM stage (every merge below
+            # unchanged), then repacked bit for bit into the int32 paired layout of the HBM output block.
+            out_tile_ref = stage_ref if cfgs.packed_out else tiled_out_ref
             iota = lax.broadcasted_iota(jnp.int32, acc.shape, 0)
             mask = jnp.logical_and(m_start_local <= iota, iota < m_end_local)
-            acc_masked = jnp.where(mask, acc, 0).reshape(tiled_out_ref.shape)
-            tiled_out_ref[...] = acc_masked.astype(tiled_out_ref.dtype)
+            acc_masked = jnp.where(mask, acc, 0).reshape(out_tile_ref.shape)
+            out_tile_ref[...] = acc_masked.astype(out_tile_ref.dtype)
 
             partial_out_zeros = jnp.zeros_like(partial_out_ref)
             if tiled_output_row_scale_ref is not None:
                 # Only preceding owned rows come from the previous group.
                 # Adding masked +0 would destroy a valid negative zero.
                 preceding_rows = lax.broadcasted_iota(jnp.int32, partial_out_ref.shape, 0) < m_start_local
-                tiled_out_ref[0] = jnp.where(
+                out_tile_ref[0] = jnp.where(
                     (gm_id != 0) & preceding_rows,
                     partial_out_ref[...],
-                    tiled_out_ref[0],
+                    out_tile_ref[0],
                 )
             else:
-                tiled_out_ref[0] += jnp.where(gm_id == 0, partial_out_zeros, partial_out_ref[...])
+                out_tile_ref[0] += jnp.where(gm_id == 0, partial_out_zeros, partial_out_ref[...])
 
             last_row = m_end_local // cfgs.dims.size_lhs_sublane
             partial_out_ref[...] = jnp.where(
                 m_end_local % cfgs.dims.size_lhs_sublane == 0,
                 partial_out_zeros,
-                tiled_out_ref[last_row],
+                out_tile_ref[last_row],
             )
+            if cfgs.packed_out:
+                _store_packed_tile(stage_ref, tiled_out_ref, tile_n=cfgs.tiles.tile_n)
         else:
             acc_ref[...] = acc
 
@@ -766,6 +785,23 @@ def inner_kernel(
         lambda: lax.cond(is_last_k_step, matmul_first_last, matmul_first),
         lambda: lax.cond(is_last_k_step, matmul_last, matmul),
     )
+
+
+def _store_packed_tile(stage_ref: jax.Array, out_ref: jax.Array, *, tile_n: int):
+    """Repack a bfloat16 ``(rows / s, s, tile_n)`` tile into int32 ``(rows / s, s, tile_n / 256, 128)``.
+
+    Word ``(a, l)`` of a row = column ``a * 128 + l`` (low 16 bits) | column ``tile_n / 2 + a * 128 + l`` (high 16
+    bits): the ``moe_row_gather`` paired layout with pair width ``tile_n``. Pure bit movement (bf16 -> f32 is exact).
+    """
+    rows = stage_ref.shape[0] * stage_ref.shape[1]
+    sub = tile_n // 256
+    half = tile_n // 2
+    src = stage_ref.reshape(rows, tile_n)
+    dst = out_ref.reshape(rows * sub, 128)
+    for a in range(sub):
+        lo = lax.bitcast_convert_type(src[:, a * 128 : (a + 1) * 128].astype(jnp.float32), jnp.int32)
+        hi = lax.bitcast_convert_type(src[:, half + a * 128 : half + (a + 1) * 128].astype(jnp.float32), jnp.int32)
+        dst[pl.ds(a, rows, stride=sub), :] = lax.shift_right_logical(lo, jnp.int32(16)) | (hi & jnp.int32(-65536))
 
 
 def fill_metadata(
@@ -961,6 +997,7 @@ def kernel_main(
     metadata_ref: MetadataRef,
     zero_ref: jax.Array | None,
     semaphore_ref: jax.Array | None,
+    stage_ref: jax.Array | None = None,
     *,
     cfgs: GmmConfigs,
     num_cores: int = 1,
@@ -1060,8 +1097,12 @@ def kernel_main(
     )
 
     lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
-    out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
-    scratches = [partial_out_ref, acc_ref, metadata_ref]
+    if cfgs.packed_out:
+        out_in = out_ref
+        scratches = [partial_out_ref, acc_ref, metadata_ref, stage_ref]
+    else:
+        out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
+        scratches = [partial_out_ref, acc_ref, metadata_ref]
     pipeline_fn(lhs_in, rhs_ref, output_row_scale_in, output_channel_scale_ref, out_in, scratches=scratches)
 
     if cfgs.zero_init:
@@ -1433,6 +1474,7 @@ def get_metadata(cfgs: GmmConfigs):
         "fuse_act",
         "interpret",
         "num_cores",
+        "packed_out",
     ]
 )
 def grouped_matmulv3_pallas_impl(
@@ -1455,6 +1497,7 @@ def grouped_matmulv3_pallas_impl(
     output_row_scale: jax.Array | None = None,
     output_channel_scale: jax.Array | None = None,
     num_cores: int = 1,
+    packed_out: bool = False,
 ) -> jax.Array:
     """Core TPU Pallas grouped matmul v3 using ``pltpu.emit_pipeline``.
 
@@ -1532,6 +1575,17 @@ def grouped_matmulv3_pallas_impl(
             ``zero_initialize=False`` call), no ``fuse_act``, and a number of
             N tiles divisible by ``num_cores``. The default 1 keeps the
             single-program launch.
+        packed_out: Return the bfloat16 output as int32
+            ``[size_m * size_n / 256, 128]`` in the ``moe_row_gather`` paired
+            layout with pair width ``tile_n`` (each source row spans
+            ``size_n / 256`` packed rows; packed row ``n * tile_n / 256 + a``,
+            lane ``l`` holds column ``n * tile_n + a * 128 + l`` in its low and
+            column ``n * tile_n + tile_n / 2 + a * 128 + l`` in its high 16
+            bits): the same bits as the bfloat16 output, ready for per-row DMA.
+            Requires the output-scale epilogue, a bfloat16
+            ``preferred_element_type``, ``zero_initialize=False``, no
+            ``fuse_act``, ``size_m`` a multiple of the LHS sublane tiling and
+            ``size_n`` and ``tile_n`` multiples of 256.
 
     Returns:
         Output tensor ``[size_m, out_size_n]`` where ``out_size_n == size_n``
@@ -1599,6 +1653,15 @@ def grouped_matmulv3_pallas_impl(
         if pl.cdiv(cfgs.out_size_n, tiles.tile_n) % num_cores:
             raise ValueError("num_cores must divide the number of N tiles")
 
+    if packed_out:
+        if output_row_scale is None or zero_initialize or cfgs.fuse_act is not None:
+            raise ValueError("packed_out requires output scales, zero_initialize=False and no fuse_act")
+        if cfgs.out_dtype != jnp.dtype(jnp.bfloat16):
+            raise ValueError("packed_out requires a bfloat16 preferred_element_type")
+        if dims.size_m % dims.size_lhs_sublane or cfgs.out_size_n % 256 or tiles.tile_n % 256:
+            raise ValueError("packed_out requires M a multiple of the LHS sublane tiling and N, tile_n multiples of 256")
+        cfgs = dataclasses.replace(cfgs, packed_out=True)
+
     rhs_scale_spec = rhs_bias_spec = None
     if rhs_scale is not None:
         rhs_scale = rhs_scale.astype(jnp.float32)
@@ -1634,13 +1697,20 @@ def grouped_matmulv3_pallas_impl(
         ]
     else:
         scratch_shapes += [None, None]
+    if cfgs.packed_out:
+        sub_m = dims.size_lhs_sublane
+        scratch_shapes.append(pltpu.VMEM((tiles.tile_m // sub_m, sub_m, tiles.tile_n), cfgs.out_dtype))
 
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
+    if cfgs.packed_out:
+        out_init = jax.ShapeDtypeStruct(
+            (dims.size_m // dims.size_lhs_sublane, dims.size_lhs_sublane, cfgs.out_size_n // 256, 128), jnp.int32
+        )
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
     core_params = {"dimension_semantics": ("parallel",)} if num_cores > 1 else {}
-    return pl.pallas_call(
+    out = pl.pallas_call(
         functools.partial(kernel_main, cfgs=cfgs, num_cores=num_cores),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -1668,7 +1738,10 @@ def grouped_matmulv3_pallas_impl(
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
         interpret=interpret,
-    )(group_sizes, group_offset, lhs, rhs_weights, output_row_scale, output_channel_scale)[:, : cfgs.out_size_n]
+    )(group_sizes, group_offset, lhs, rhs_weights, output_row_scale, output_channel_scale)
+    if cfgs.packed_out:
+        return out.reshape(dims.size_m * cfgs.out_size_n // 256, 128)
+    return out[:, : cfgs.out_size_n]
 
 
 __all__ = (

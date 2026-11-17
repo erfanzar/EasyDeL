@@ -36,6 +36,7 @@ def grouped_matmul_channelwise(
     tiling=None,
     mask_padding=True,
     lhs_scale=None,
+    packed_pair_width=None,
 ):
     """Multiply sorted activation rows by CHANNELWISE represented weights.
 
@@ -63,6 +64,8 @@ def grouped_matmul_channelwise(
     ``preferred_element_type`` controls output dtype; tiling is an XLA hint.
     ``mask_padding=False`` only allows unspecified padding rows; this
     reference always zeroes them, so its result is the same either way.
+    ``packed_pair_width=W`` (forward only, bfloat16 output) returns the
+    output's bits as int32 ``pack_rows_paired(out, W)``.
     """
     _ = bool(mask_padding)
     if activation_bits not in (4, 8, 16):
@@ -141,6 +144,12 @@ def grouped_matmul_channelwise(
             _mask_rows(tangent, sizes).astype(preferred_element_type),
         )
 
+    if packed_pair_width is not None:
+        if jnp.dtype(preferred_element_type) != jnp.dtype(jnp.bfloat16):
+            raise ValueError("packed_pair_width needs a bfloat16 output")
+        from ..moe_row_gather._xla_impl import pack_rows_paired
+
+        return pack_rows_paired(apply.fun(lhs, scales, codes, group_sizes), int(packed_pair_width))
     if lhs_scale is not None:
         # Pre-quantized codes carry no tangent: run the primal function without the custom JVP.
         return apply.fun(lhs, scales, codes, group_sizes)

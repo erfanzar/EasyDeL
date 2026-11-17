@@ -87,7 +87,9 @@ from ._communication_utils import (
     MoeMetrics,
     MoeRoutingStrategy,
     _moe_row_gather_kernels,
+    _moe_row_gather_quantized_kernel,
     _moe_row_gather_sum_entry,
+    _moe_row_gather_sum_packed_kernel,
     build_ep_traffic_matrix,
     chunk_group_sizes,
     ep_batch_receive_buffer_rows,
@@ -148,6 +150,14 @@ class _QuantizedRows(tp.NamedTuple):
 
     codes: jax.Array
     scale: jax.Array
+
+
+class _PackedRows(tp.NamedTuple):
+    """Down-projection rows as int32 in the ``moe_row_gather`` paired layout (the bf16 bits, DMA-ready)."""
+
+    packed: jax.Array
+    hidden: int
+    pair_width: int
 
 
 def _prefill_prequantize_dispatch_rows(consumers: tp.Sequence[tuple[tp.Any, int | None]]) -> bool:
@@ -3003,7 +3013,27 @@ class BaseMoeModule(spx.Module, ABC):
                 is None
             )
             dma_gather = _moe_row_gather_kernels()[0] if window_rows >= _DMA_ROW_GATHER_MIN_ROWS else None
+            # Prefill: the live-slot combine reads the down projection's rows in its int32 paired layout, which the
+            # A8 slab kernel then writes from its epilogue (no separate pack pass; same bits, same sums).
+            packed_down = False
+            if unread_tail and is_inference_mode() and not inference_mode_forces_decode():
+                from ejkernel.modules import packed_row_gather_sum_unsupported_reason  # pyright: ignore
+
+                hidden = x2d.shape[1]
+                packed_down = (
+                    packed_row_gather_sum_unsupported_reason(
+                        jax.ShapeDtypeStruct((window_rows * hidden // 256, 128), jnp.int32),
+                        jax.ShapeDtypeStruct((tokens, top_k), jnp.int32),
+                        jax.ShapeDtypeStruct((tokens, top_k), jnp.float32),
+                        hidden,
+                        hidden,
+                        jnp.float32,
+                        skip_negative=True,
+                    )
+                    is None
+                )
             q_src = None
+            quantized_gather = False
             if prequantize_dispatch_rows and dma_gather is not None:
                 from ejkernel.modules import grouped_matmul_channelwise_quantize_rows  # pyright: ignore
 
@@ -3011,7 +3041,21 @@ class BaseMoeModule(spx.Module, ABC):
                 # gathers their int8 codes (carried as bf16, which holds every int8 value exactly, through the same
                 # bf16 row gather) and f32 row scales, bit for bit what the A8 entry computes from the gathered rows.
                 codes, scale = grouped_matmul_channelwise_quantize_rows(x_src, 8)
-                q_src = jax.lax.optimization_barrier((codes.astype(self.dtype), scale[:, 0]))
+                from ejkernel.modules import quantized_row_gather_unsupported_reason  # pyright: ignore
+
+                # Where the quantized row gather runs, each row's int8 codes and f32 scale travel in one DMA (no
+                # separate scale gather, no bf16 carry); elsewhere the codes ride the bf16 row gather.
+                quantized_gather = (
+                    quantized_row_gather_unsupported_reason(
+                        jax.ShapeDtypeStruct(codes.shape, jnp.int8),
+                        jax.ShapeDtypeStruct((codes.shape[0],), jnp.float32),
+                        jax.ShapeDtypeStruct((window_rows,), jnp.int32),
+                    )
+                    is None
+                )
+                q_src = jax.lax.optimization_barrier(
+                    (codes if quantized_gather else codes.astype(self.dtype), scale[:, 0])
+                )
             # ``moe_decode_matmul_combine`` (approximate, off by default): in decode-layout programs the single-window
             # XLA combine runs as one fp32 matmul of a [tokens, rows] combine-weight matrix with the FFN rows.
             matmul_combine = (
@@ -3035,14 +3079,19 @@ class BaseMoeModule(spx.Module, ABC):
                     rel = positions - start
                     live = is_local & (rel >= 0) & (rel < window_rows)
                 src_rows = rows // top_k
-                if q_src is not None:
+                if q_src is not None and quantized_gather:
+                    codes_rows, scale_rows = _moe_row_gather_quantized_kernel()(q_src[0], q_src[1], src_rows)
+                    gathered = _QuantizedRows(codes_rows, scale_rows[:, None])
+                elif q_src is not None:
                     # The row gather writes the integer-valued bf16 rows as int8 itself (no separate convert pass).
                     codes_rows = dma_gather(q_src[0], src_rows, out_dtype=jnp.int8)[0]
                     scale_rows = jnp.take(q_src[1], src_rows, axis=0, mode="clip")[:, None]
                     gathered = _QuantizedRows(codes_rows, scale_rows)
                 else:
                     gathered = x_src[src_rows] if dma_gather is None else dma_gather(x_src, src_rows)[0]
-                inter = expert_ffn(gathered, sizes, ids, tp_reduce=False, unread_tail=unread_tail)
+                inter = expert_ffn(
+                    gathered, sizes, ids, tp_reduce=False, unread_tail=unread_tail, packed_down=packed_down
+                )
                 # Window rows past its local count are the FFN's unwritten tail (not guaranteed finite on TPU): dead
                 # slots are -1, which the live-slot combine never reads (its XLA entry selects them away).
                 slots = jnp.where(live, rel, -1).reshape(tokens, top_k)
@@ -3053,6 +3102,16 @@ class BaseMoeModule(spx.Module, ABC):
                         jnp.where(slots[..., None] == row_ids, combine_weights[..., None], 0.0), axis=1
                     )
                     return jnp.dot(weight_matrix, inter.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST)
+                if isinstance(inter, _PackedRows):
+                    return _moe_row_gather_sum_packed_kernel()(
+                        inter.packed,
+                        slots,
+                        combine_weights,
+                        inter.hidden,
+                        inter.pair_width,
+                        jnp.float32,
+                        skip_negative=True,
+                    )
                 return gather_sum(inter, slots, combine_weights, jnp.float32, skip_negative=True)
 
             partial = _window(0)
@@ -3482,6 +3541,7 @@ class BaseMoeModule(spx.Module, ABC):
                 *,
                 tp_reduce: bool = True,
                 unread_tail: bool = False,
+                packed_down: bool = False,
             ) -> jax.Array:
                 """Grouped-matmul expert FFN core over expert-sorted rows.
 
@@ -3502,6 +3562,8 @@ class BaseMoeModule(spx.Module, ABC):
                         only valid without a down bias.
                     unread_tail: The caller never reads the down projection's rows past ``sum(group_sizes)``
                         (inference mode only), so they may be left unspecified.
+                    packed_down: The caller combines from the int32 paired layout: where the A8 whole-slab
+                        Pallas kernel writes it from its epilogue, return :class:`_PackedRows` (same bits).
 
                 Returns:
                     Down-projected rows ``[rows, H // tp_size]`` (``H`` when
@@ -3516,6 +3578,7 @@ class BaseMoeModule(spx.Module, ABC):
                     activation_bits=None,
                     grouped_platform=None,
                     mask_padding=True,
+                    packed_out=False,
                 ):
                     """Dense bf16 grouped matmul, or — when the kernel is a
                     quantized ``(codes, scales)`` pair from ``kernel_view()`` —
@@ -3598,6 +3661,35 @@ class BaseMoeModule(spx.Module, ABC):
                             # ``mask_padding=False`` only from the inference deferred dispatch's down projection,
                             # whose dispatch-tail rows the skip_negative combine never reads.
                             extra = {} if mask_padding else {"mask_padding": False}
+                            platform = grouped_platform or _channelwise_grouped_platform(
+                                rows,
+                                codes,
+                                activation_bits,
+                                force_xla=self.config.moe_force_xla_gmm,
+                            )
+                            out_dtype = gmm_kws.get("preferred_element_type", jnp.bfloat16)
+                            pair_width = None
+                            if packed_out and platform == "pallas" and not mask_padding:
+                                from ejkernel.modules import grouped_matmul_channelwise_packed_pair_width
+
+                                if jnp.dtype(out_dtype) == jnp.dtype(jnp.bfloat16) and rows.shape[0] % 32 == 0:
+                                    pair_width = grouped_matmul_channelwise_packed_pair_width(
+                                        rows.shape[0], codes.shape, codes.dtype, activation_bits=activation_bits
+                                    )
+                            if pair_width is not None:
+                                # ``_local_row_windows`` prefill: the slab epilogue writes the combine's DMA layout.
+                                packed = grouped_matmul_channelwise(
+                                    rows,
+                                    codes,
+                                    scales,
+                                    group_sizes,
+                                    **extra,
+                                    activation_bits=activation_bits,
+                                    platform=platform,
+                                    preferred_element_type=out_dtype,
+                                    packed_pair_width=pair_width,
+                                )
+                                return _PackedRows(packed, int(codes.shape[2]), int(pair_width))
                             return grouped_matmul_channelwise(
                                 rows,
                                 codes,
@@ -3605,14 +3697,8 @@ class BaseMoeModule(spx.Module, ABC):
                                 group_sizes,
                                 **extra,
                                 activation_bits=activation_bits,
-                                platform=grouped_platform
-                                or _channelwise_grouped_platform(
-                                    rows,
-                                    codes,
-                                    activation_bits,
-                                    force_xla=self.config.moe_force_xla_gmm,
-                                ),
-                                preferred_element_type=gmm_kws.get("preferred_element_type", jnp.bfloat16),
+                                platform=platform,
+                                preferred_element_type=out_dtype,
                             )
                         n_groups, k_dim, n_dim = codes.shape
                         # Channelwise-int8 codes go through the dedicated w8a8
@@ -3730,7 +3816,10 @@ class BaseMoeModule(spx.Module, ABC):
                     # ``_local_row_windows`` (inference only): its skip_negative combine reads only routed rows, so
                     # the A8 slab kernel may write the output dtype itself and skip the tail mask + cast pass.
                     mask_padding=not (unread_tail and is_inference_mode()),
+                    packed_out=packed_down and unread_tail and is_inference_mode() and not tp_reduce,
                 )
+                if isinstance(intermediate_output, _PackedRows):
+                    return intermediate_output
                 intermediate_output = checkpoint_name(intermediate_output, "mlp_down")
 
                 # TP reduction: psum_scatter to shard output across TP on hidden dimension

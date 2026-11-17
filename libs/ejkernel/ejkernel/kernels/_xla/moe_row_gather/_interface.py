@@ -20,7 +20,12 @@ import jax
 from jaxtyping import Array, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
-from ._xla_impl import moe_row_gather_sum_xla, moe_row_gather_xla
+from ._xla_impl import (
+    moe_row_gather_quantized_xla,
+    moe_row_gather_sum_packed_xla,
+    moe_row_gather_sum_xla,
+    moe_row_gather_xla,
+)
 
 
 @kernel_registry.register("moe_row_gather", Platform.XLA, Backend.ANY)
@@ -47,6 +52,25 @@ def moe_row_gather(
     return moe_row_gather_xla(x, indices, scale, dot_with, out_dtype)
 
 
+@kernel_registry.register("moe_row_gather_quantized", Platform.XLA, Backend.ANY)
+def moe_row_gather_quantized(
+    codes: Int[Array, "src_rows hidden"],
+    scale: Float[Array, "src_rows"],
+    indices: Int[Array, "rows"],
+) -> tuple[Int[Array, "rows hidden"], Float[Array, "rows"]]:
+    """``(codes[indices], scale[indices])``: int8 code rows with their fp32 row scales, as two gathers.
+
+    Args:
+        codes: ``[src_rows, hidden]`` int8 codes.
+        scale: ``[src_rows]`` fp32 row scales.
+        indices: ``[rows]`` row ids (clamped to range).
+
+    Returns:
+        ``(codes [rows, hidden] int8, scale [rows] fp32)``.
+    """
+    return moe_row_gather_quantized_xla(codes, scale, indices)
+
+
 @kernel_registry.register("moe_row_gather_sum", Platform.XLA, Backend.ANY)
 def moe_row_gather_sum(
     y: Float[Array, "src_rows hidden"],
@@ -71,4 +95,31 @@ def moe_row_gather_sum(
     return moe_row_gather_sum_xla(y, indices, weights, out_dtype, skip_negative)
 
 
-__all__ = ("moe_row_gather", "moe_row_gather_sum")
+@kernel_registry.register("moe_row_gather_sum_packed", Platform.XLA, Backend.ANY)
+def moe_row_gather_sum_packed(
+    packed: Int[Array, "packed_rows lanes"],
+    indices: Int[Array, "tokens k"],
+    weights: Float[Array, "tokens k"],
+    hidden: int,
+    pair_width: int,
+    out_dtype: jax.typing.DTypeLike | None = None,
+    skip_negative: bool = False,
+) -> Float[Array, "tokens hidden"]:
+    """``moe_row_gather_sum`` of bfloat16 rows given in the int32 ``pack_rows_paired`` layout.
+
+    Args:
+        packed: int32 ``[src_rows * hidden / 256, 128]`` (``pack_rows_paired(y, pair_width)``).
+        indices: ``[tokens, k]`` row ids (clamped; negative = inactive slot under ``skip_negative``).
+        weights: ``[tokens, k]`` combine weights.
+        hidden: Row width of the packed bfloat16 rows.
+        pair_width: Column-pairing block width of the layout.
+        out_dtype: Output dtype (default bfloat16).
+        skip_negative: As in ``moe_row_gather_sum``.
+
+    Returns:
+        ``[tokens, hidden]`` in ``out_dtype``.
+    """
+    return moe_row_gather_sum_packed_xla(packed, indices, weights, hidden, pair_width, out_dtype, skip_negative)
+
+
+__all__ = ("moe_row_gather", "moe_row_gather_quantized", "moe_row_gather_sum", "moe_row_gather_sum_packed")

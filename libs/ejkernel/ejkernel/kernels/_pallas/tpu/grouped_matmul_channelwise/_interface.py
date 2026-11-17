@@ -179,6 +179,18 @@ def _pallas_path_tiles(m, activation_bits, e, k, n, dtype):
     return None
 
 
+def packed_pair_width_for(m, activation_bits, e, k, n, dtype):
+    """Pair width at which the A8 whole-slab kernel writes the packed output itself (its per-core ``N`` tile), or None.
+
+    Pure shape policy plus the TPU core count (``_slab_core_count``).
+    """
+    tiles = _a8_slab_tiles(m, activation_bits, e, k, n, dtype)
+    if tiles is None:
+        return None
+    width = tiles[2] // _slab_core_count(tiles[2])
+    return width if width % 256 == 0 and n % 256 == 0 else None
+
+
 def _expand_channel_scales(scales, sizes, count):
     """Avoid repeat's scatter-based construction on bounded decode shapes."""
     from ...._xla.grouped_matmul_quant._scale_rows import expand_group_scales
@@ -198,8 +210,15 @@ def grouped_matmul_channelwise(
     tiling=None,
     mask_padding=True,
     lhs_scale=None,
+    packed_pair_width=None,
 ):
     """Stream signed int4/int8 weights with explicit activation precision.
+
+    ``packed_pair_width=W`` (forward only, bfloat16 output) returns the output's bits as int32
+    ``[M * N / 256, 128]`` in the ``moe_row_gather`` paired layout (``pack_rows_paired(out, W)``), ready for the
+    packed per-row DMA combine. Where ``W`` equals the A8 whole-slab kernel's per-core column tile
+    (:func:`packed_pair_width_for`) with ``mask_padding=False``, the kernel writes that layout from its epilogue (no
+    separate pack pass); otherwise the bfloat16 result is packed afterwards. Same bits either way.
 
     ``lhs_scale[M,1]`` (A8 only, forward only) marks ``lhs`` as int8 codes already produced by this entry's row
     quantization (``quantize_rows``), e.g. once per token before a dispatch gather: the quantization is skipped, masked
@@ -261,7 +280,17 @@ def grouped_matmul_channelwise(
         raise ValueError("Pallas tiling K and N must be multiples of 128")
     if jax.default_backend() != "tpu":
         raise ValueError("Pallas CHANNELWISE requires TPU hardware; use platform='xla' elsewhere")
+    if packed_pair_width is not None:
+        pw = int(packed_pair_width)
+        if jnp.dtype(preferred_element_type) != jnp.dtype(jnp.bfloat16) or pw % 256 or codes.shape[2] % pw:
+            raise ValueError("packed_pair_width needs a bfloat16 output and a 256-aligned width dividing N")
     slab_cores = _slab_core_count(tiling[2]) if slab_epilogue else 1
+    kernel_packs = (
+        packed_pair_width is not None
+        and slab_epilogue
+        and not mask_padding
+        and tiling[2] // slab_cores == int(packed_pair_width)
+    )
     tiles = TileSizes(tile_m=tiling[0], tile_k=tiling[1], tile_n=tiling[2] // slab_cores)
 
     if activation_bits != 16 and tiling[0] % 32:
@@ -332,6 +361,24 @@ def grouped_matmul_channelwise(
                 )
                 # Routed rows get the same ((acc * row scale) * channel scale) value and the same final cast, done in
                 # the kernel; rows past sum(sizes) stay unwritten (the caller allowed unspecified padding).
+                if kernel_packs:
+                    # The epilogue writes the same bf16 bits in the paired int32 layout (pair width = N tile).
+                    return grouped_matmulv3_pallas_impl(
+                        q,
+                        weights,
+                        kernel_sizes,
+                        maybe_quantize_lhs=False,
+                        tile_info=tiles,
+                        preferred_element_type=preferred_element_type,
+                        acc_dtype=jnp.int32,
+                        zero_initialize=False,
+                        output_row_scale=jnp.pad(
+                            activation_scale, ((0, padded_m - x.shape[0]), (0, 0)), constant_values=1
+                        ),
+                        output_channel_scale=s.astype(jnp.float32),
+                        num_cores=slab_cores,
+                        packed_out=True,
+                    )[: x.shape[0] * weights.shape[2] // 256]
                 return grouped_matmulv3_pallas_impl(
                     q,
                     weights,
@@ -416,10 +463,18 @@ def grouped_matmul_channelwise(
         _, tangent = jax.jvp(reference, primals, tangents)
         return apply(*primals), tangent
 
+    if packed_pair_width is not None:
+        # Forward only: the packed int32 output carries no tangent.
+        out = apply.fun(lhs, codes, scales, group_sizes)
+        if kernel_packs:
+            return out
+        from ...._xla.moe_row_gather._xla_impl import pack_rows_paired
+
+        return pack_rows_paired(out, int(packed_pair_width))
     if lhs_scale is not None:
         # Pre-quantized codes carry no tangent: run the primal function without the custom JVP.
         return apply.fun(lhs, codes, scales, group_sizes)
     return apply(lhs, codes, scales, group_sizes)
 
 
-__all__ = ("grouped_matmul_channelwise",)
+__all__ = ("grouped_matmul_channelwise", "packed_pair_width_for")

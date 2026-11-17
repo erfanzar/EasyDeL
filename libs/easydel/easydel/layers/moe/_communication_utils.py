@@ -409,6 +409,20 @@ def _moe_row_gather_kernels():
     )
 
 
+def _moe_row_gather_quantized_kernel():
+    """The registered Pallas TPU ``moe_row_gather_quantized`` entry (int8 code rows + f32 row scales; XLA fallback)."""
+    from ejkernel.kernels import Backend, Platform, kernel_registry  # pyright: ignore[reportMissingTypeStubs]
+
+    return kernel_registry.get("moe_row_gather_quantized", platform=Platform.PALLAS, backend=Backend.TPU)
+
+
+def _moe_row_gather_sum_packed_kernel():
+    """The registered Pallas TPU ``moe_row_gather_sum_packed`` entry (rows in the int32 paired layout; XLA fallback)."""
+    from ejkernel.kernels import Backend, Platform, kernel_registry  # pyright: ignore[reportMissingTypeStubs]
+
+    return kernel_registry.get("moe_row_gather_sum_packed", platform=Platform.PALLAS, backend=Backend.TPU)
+
+
 def _moe_row_gather_sum_entry(*, live_slot_kernel: bool):
     """One ``moe_row_gather_sum`` registry entry: the Pallas TPU one or the XLA one.
 

@@ -797,9 +797,12 @@ class GroupedMatmulChannelwise(Kernel[GroupedMatmulConfig, Array]):
         tiling=None,
         mask_padding=True,
         lhs_scale=None,
+        packed_pair_width=None,
         cfg: GroupedMatmulConfig,
     ):
         extra = {} if lhs_scale is None else {"lhs_scale": lhs_scale}
+        if packed_pair_width is not None:
+            extra["packed_pair_width"] = int(packed_pair_width)
         return self.get_impl(cfg)(
             lhs,
             codes,
@@ -830,8 +833,14 @@ def grouped_matmul_channelwise(
     platform: Literal["xla", "pallas"] = "xla",
     mask_padding: bool = True,
     lhs_scale: Array | None = None,
+    packed_pair_width: int | None = None,
 ) -> Array:
     """Explicit W4A16/W8A16/W4A4/W8A8 CHANNELWISE grouped matmul.
+
+    ``packed_pair_width=W`` (forward only, bfloat16 output) returns the output's
+    bits as int32 ``[M * N / 256, 128]`` in the ``moe_row_gather_sum_packed``
+    layout; with ``W`` from :func:`grouped_matmul_channelwise_packed_pair_width`
+    the TPU Pallas A8 slab kernel writes it from its epilogue.
 
     With ``lhs_scale[M,1]`` (A8, forward only) ``lhs`` holds the int8 codes of
     :func:`grouped_matmul_channelwise_quantize_rows`, e.g. token rows quantized
@@ -892,7 +901,26 @@ def grouped_matmul_channelwise(
         mask_padding=bool(mask_padding),
         _cfg=cfg,
         **({} if lhs_scale is None else {"lhs_scale": lhs_scale}),
+        **({} if packed_pair_width is None else {"packed_pair_width": int(packed_pair_width)}),
     )
+
+
+def grouped_matmul_channelwise_packed_pair_width(
+    rows: int,
+    codes_shape: tuple[int, int, int],
+    codes_dtype: DTypeLike,
+    *,
+    activation_bits: int,
+) -> int | None:
+    """Pair width at which the TPU Pallas A8 slab path writes ``packed_pair_width`` output itself, or ``None``.
+
+    The per-TensorCore output-column tile of the whole-slab kernel (:func:`grouped_matmul_channelwise_slab_tiles`).
+    """
+    import importlib
+
+    impl = importlib.import_module("ejkernel.kernels._pallas.tpu.grouped_matmul_channelwise._interface")
+    e, k, n = (int(d) for d in codes_shape)
+    return impl.packed_pair_width_for(int(rows), int(activation_bits), e, k, n, jnp.dtype(codes_dtype))
 
 
 def grouped_matmul_channelwise_quantize_rows(x: Array, activation_bits: int = 8) -> tuple[Array, Array]:

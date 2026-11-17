@@ -287,6 +287,7 @@ from .grouped_matmul import (
     GroupedMatmulChannelwise,
     grouped_matmul,
     grouped_matmul_channelwise,
+    grouped_matmul_channelwise_packed_pair_width,
     grouped_matmul_channelwise_pallas_tiles,
     grouped_matmul_channelwise_quantize_rows,
     grouped_matmul_channelwise_slab_tiles,
@@ -308,7 +309,12 @@ from .mhc_decode_fused import (
     mhc_decode_table_gates,
     mhc_decode_write,
 )
-from .moe_row_gather import row_gather_sum_unsupported_reason, row_gather_unsupported_reason
+from .moe_row_gather import (
+    packed_row_gather_sum_unsupported_reason,
+    quantized_row_gather_unsupported_reason,
+    row_gather_sum_unsupported_reason,
+    row_gather_unsupported_reason,
+)
 from .multi_head_latent_attention import FlashMLA, flash_mla
 from .multi_latent_ragged_page_attention import (
     MultiLatentRaggedPageAttention,
@@ -570,6 +576,7 @@ __all__ = (
     "gla_attention",
     "grouped_matmul",
     "grouped_matmul_channelwise",
+    "grouped_matmul_channelwise_packed_pair_width",
     "grouped_matmul_channelwise_pallas_tiles",
     "grouped_matmul_channelwise_quantize_rows",
     "grouped_matmul_channelwise_slab_tiles",
@@ -594,9 +601,11 @@ __all__ = (
     "normalize_kernel_tile_policy",
     "pack_int4_adjacent",
     "pack_pool_bits",
+    "packed_row_gather_sum_unsupported_reason",
     "page_attention",
     "prefill_page_attention",
     "quantized_matmul",
+    "quantized_row_gather_unsupported_reason",
     "ragged_causal_conv1d",
     "ragged_causal_conv1d_head_sharded",
     "ragged_causal_conv1d_op",
