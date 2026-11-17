@@ -143,6 +143,37 @@ def _default_ffn_activation(
     return ffn_activation
 
 
+class _QuantizedRows(tp.NamedTuple):
+    """Dispatch rows in the A8 form of ``grouped_matmul_channelwise``: int8 codes ``[rows, H]``, f32 scale ``[rows, 1]``."""
+
+    codes: jax.Array
+    scale: jax.Array
+
+
+def _prefill_prequantize_dispatch_rows(consumers: tp.Sequence[tuple[tp.Any, int | None]]) -> bool:
+    """Whether the prefill deferred dispatch quantizes its token rows once, before the dispatch gather.
+
+    With 8-bit activations ``grouped_matmul_channelwise`` quantizes every input row on its own (a row absmax, then
+    elementwise divide, round and clip), so quantizing the ``tokens`` source rows and gathering their int8 codes and
+    f32 scales gives the dispatch rows' codes and scales bit for bit, on ``tokens`` rows instead of ``tokens * k``.
+    The entry's tail mask gives masked rows codes ``0`` and scale ``1``, which is what the quantization gives the
+    all-zero rows it masks. Only eSurge's prefill layout under inference mode takes this, and only when every
+    projection reading the dispatch rows is an int8 ``(codes, scales)`` pair with 8-bit activations.
+
+    Args:
+        consumers: ``(kernel, activation_bits)`` of every projection that reads the dispatch rows.
+
+    Returns:
+        Whether the expert FFN may receive :class:`_QuantizedRows`.
+    """
+    if not consumers or not is_inference_mode() or inference_mode_forces_decode():
+        return False
+    return all(
+        isinstance(kernel, tuple) and bits == 8 and jnp.dtype(kernel[0].dtype) == jnp.dtype(jnp.int8)
+        for kernel, bits in consumers
+    )
+
+
 def _channelwise_grouped_platform(rows, codes, activation_bits, *, force_xla=False):
     """Pick ``"pallas"`` or ``"xla"`` for an integer-mode (``activation_bits`` 4 / 8 / 16) expert grouped matmul.
 
@@ -2170,6 +2201,11 @@ class BaseMoeModule(spx.Module, ABC):
         wu_kernel, wu_activation_bits, wu_grouped_platform = _unpack_precision(wu_kernel)
         wd_kernel, wd_activation_bits, wd_grouped_platform = _unpack_precision(wd_kernel)
         gate_up_kernel, gate_up_activation_bits, gate_up_grouped_platform = _unpack_precision(gate_up_kernel)
+        prequantize_dispatch_rows = _prefill_prequantize_dispatch_rows(
+            [(gate_up_kernel, gate_up_activation_bits)]
+            if gate_up_kernel is not None
+            else [(k, b) for k, b in ((wi_kernel, wi_activation_bits), (wu_kernel, wu_activation_bits)) if k is not None]
+        )
 
         # The folded shared expert reads the dispatch's input, so it folds only when this cast changes nothing.
         input_in_module_dtype = jnp.dtype(hidden_state.dtype) == jnp.dtype(self.dtype)
@@ -2967,6 +3003,15 @@ class BaseMoeModule(spx.Module, ABC):
                 is None
             )
             dma_gather = _moe_row_gather_kernels()[0] if window_rows >= _DMA_ROW_GATHER_MIN_ROWS else None
+            q_src = None
+            if prequantize_dispatch_rows and dma_gather is not None:
+                from ejkernel.modules import grouped_matmul_channelwise_quantize_rows  # pyright: ignore
+
+                # Prefill (``_prefill_prequantize_dispatch_rows``): quantize the ``tokens`` rows once; the window then
+                # gathers their int8 codes (carried as bf16, which holds every int8 value exactly, through the same
+                # bf16 row gather) and f32 row scales, bit for bit what the A8 entry computes from the gathered rows.
+                codes, scale = grouped_matmul_channelwise_quantize_rows(x_src, 8)
+                q_src = jax.lax.optimization_barrier((codes.astype(self.dtype), scale[:, 0]))
             # ``moe_decode_matmul_combine`` (approximate, off by default): in decode-layout programs the single-window
             # XLA combine runs as one fp32 matmul of a [tokens, rows] combine-weight matrix with the FFN rows.
             matmul_combine = (
@@ -2990,7 +3035,13 @@ class BaseMoeModule(spx.Module, ABC):
                     rel = positions - start
                     live = is_local & (rel >= 0) & (rel < window_rows)
                 src_rows = rows // top_k
-                gathered = x_src[src_rows] if dma_gather is None else dma_gather(x_src, src_rows)[0]
+                if q_src is not None:
+                    # The row gather writes the integer-valued bf16 rows as int8 itself (no separate convert pass).
+                    codes_rows = dma_gather(q_src[0], src_rows, out_dtype=jnp.int8)[0]
+                    scale_rows = jnp.take(q_src[1], src_rows, axis=0, mode="clip")[:, None]
+                    gathered = _QuantizedRows(codes_rows, scale_rows)
+                else:
+                    gathered = x_src[src_rows] if dma_gather is None else dma_gather(x_src, src_rows)[0]
                 inter = expert_ffn(gathered, sizes, ids, tp_reduce=False, unread_tail=unread_tail)
                 # Window rows past its local count are the FFN's unwritten tail (not guaranteed finite on TPU): dead
                 # slots are -1, which the live-slot combine never reads (its XLA entry selects them away).
@@ -3493,6 +3544,27 @@ class BaseMoeModule(spx.Module, ABC):
                     Returns:
                         The projected rows.
                     """
+                    if isinstance(rows, _QuantizedRows):
+                        from ejkernel.modules import grouped_matmul_channelwise
+
+                        codes, scales = kernel
+                        # Platform chosen as for the bf16 rows these codes were quantized from.
+                        platform = grouped_platform or _channelwise_grouped_platform(
+                            jax.ShapeDtypeStruct(rows.codes.shape, jnp.bfloat16),
+                            codes,
+                            activation_bits,
+                            force_xla=self.config.moe_force_xla_gmm,
+                        )
+                        return grouped_matmul_channelwise(
+                            rows.codes,
+                            codes,
+                            scales,
+                            group_sizes,
+                            activation_bits=activation_bits,
+                            platform=platform,
+                            preferred_element_type=gmm_kws.get("preferred_element_type", jnp.bfloat16),
+                            lhs_scale=rows.scale,
+                        )
                     collective_axis = tensor_axis_name if (tp_sharded_contraction and tp_size > 1) else None
                     if use_quantized_ragged_dot and not isinstance(kernel, tuple):
                         return spx.quantization.qragged_dot(
@@ -3603,7 +3675,9 @@ class BaseMoeModule(spx.Module, ABC):
                             return _xla_ct_first_dw_gmm(rows, kernel, group_sizes, xla_kws=gmm_kws)
                     return grouped_matmul(rows, kernel, group_sizes, **gmm_kws)
 
-                x_rows = _mask_dispatch_tail(x_rows, group_sizes)
+                if not isinstance(x_rows, _QuantizedRows):
+                    # Pre-quantized rows are masked by the A8 entry itself (codes 0, scale 1 past sum(group_sizes)).
+                    x_rows = _mask_dispatch_tail(x_rows, group_sizes)
                 if gate_up_kernel is not None:
                     layer_gate_up = _expert_gmm(
                         x_rows,

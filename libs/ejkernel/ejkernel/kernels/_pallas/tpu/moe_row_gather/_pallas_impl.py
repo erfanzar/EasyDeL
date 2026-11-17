@@ -183,6 +183,9 @@ def _gather_kernel(idx_ref, *refs, block, sub, half, n_src, has_scale, has_dot):
                 acc = term if acc is None else acc + term
             if has_scale:
                 lo, hi = lo * factor, hi * factor
+            if jnp.issubdtype(out_ref.dtype, jnp.integer):
+                # Integer-valued rows (e.g. int8 codes carried as bfloat16): f32 -> int32 -> int8 is exact.
+                lo, hi = lo.astype(I32), hi.astype(I32)
             out_ref[r0:r1, cols_lo] = lo.astype(out_ref.dtype)
             out_ref[r0:r1, cols_hi] = hi.astype(out_ref.dtype)
         if has_dot:
@@ -195,11 +198,13 @@ def gather_rows(
     scale: jax.Array | None = None,
     dot_with: jax.Array | None = None,
     *,
+    out_dtype=None,
     vmem_limit_bytes: int | None = None,
 ) -> tuple[jax.Array, jax.Array | None]:
     """``out[i] = scale[i] * x[indices[i]]`` and ``dot[i] = <x[indices[i]], dot_with[i]>`` by per-row DMA.
 
-    Shapes must satisfy :func:`gather_unsupported_reason`.
+    ``out_dtype`` int8 (no ``scale``) writes integer-valued source rows (int8 codes carried as bfloat16) as int8
+    directly, bit for bit ``x[indices].astype(int8)``. Shapes must satisfy :func:`gather_unsupported_reason`.
     """
     n, h = x.shape
     rows = indices.shape[0]
@@ -216,8 +221,11 @@ def gather_rows(
     if has_dot:
         in_specs.append(pl.BlockSpec((block, h), lambda i: (i, 0)))
         args.append(dot_with)
+    out_dtype = jnp.dtype(out_dtype or x.dtype)
+    if out_dtype not in (jnp.dtype(x.dtype), jnp.dtype(jnp.int8)) or (out_dtype == jnp.int8 and has_scale):
+        raise ValueError(f"out_dtype {out_dtype} unsupported (x.dtype, or int8 without scale)")
     out_specs = [pl.BlockSpec((block, h), lambda i: (i, 0))]
-    out_shape = [jax.ShapeDtypeStruct((rows, h), x.dtype)]
+    out_shape = [jax.ShapeDtypeStruct((rows, h), out_dtype)]
     if has_dot:
         out_specs.append(pl.BlockSpec((block, 1), lambda i: (i, 0)))
         out_shape.append(jax.ShapeDtypeStruct((rows, 1), F32))
@@ -233,7 +241,7 @@ def gather_rows(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",), vmem_limit_bytes=int(vmem_limit_bytes or DEFAULT_VMEM_LIMIT)
         ),
-        name=f"moe_row_gather_s{int(has_scale)}_d{int(has_dot)}",
+        name=f"moe_row_gather_s{int(has_scale)}_d{int(has_dot)}" + ("_i8" if out_dtype == jnp.int8 else ""),
     )(*args)
     return (res[0], res[1][:, 0]) if has_dot else (res[0], None)
 

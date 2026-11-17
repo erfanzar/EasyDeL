@@ -28,8 +28,11 @@ def moe_row_gather_xla(
     indices: Array,
     scale: Array | None = None,
     dot_with: Array | None = None,
+    out_dtype: jax.typing.DTypeLike | None = None,
 ) -> tuple[Array, Array | None]:
     """``out[i] = scale[i] * x[indices[i]]`` (in ``x.dtype``) and ``dot[i] = <x[indices[i]], dot_with[i]>`` (fp32).
+
+    ``out_dtype`` (default ``x.dtype``) casts the gathered rows at the end, e.g. int8 for integer-valued rows.
 
     Indices are clamped to ``[0, src_rows)``.
 
@@ -49,6 +52,8 @@ def moe_row_gather_xla(
     if scale is not None:
         factor = scale.astype(F32).reshape((*scale.shape, *((1,) * (rows.ndim - 1))))
         rows = (rows.astype(F32) * factor).astype(x.dtype)
+    if out_dtype is not None and jnp.dtype(out_dtype) != rows.dtype:
+        rows = rows.astype(out_dtype)
     return rows, dot
 
 

@@ -65,8 +65,11 @@ def moe_row_gather(
     indices: Int[Array, "rows"],
     scale: Float[Array, "rows"] | None = None,
     dot_with: Float[Array, "rows hidden"] | None = None,
+    out_dtype: jax.typing.DTypeLike | None = None,
 ) -> tuple[Float[Array, "rows hidden"], Float[Array, "rows"] | None]:
     """``out[i] = scale[i] * x[indices[i]]`` and optionally ``dot[i] = <x[indices[i]], dot_with[i]>`` by row DMA.
+
+    ``out_dtype=int8`` (no ``scale``): integer-valued rows (int8 codes carried as bfloat16) are written as int8.
 
     Args:
         x: ``[src_rows, hidden]`` source rows.
@@ -78,8 +81,8 @@ def moe_row_gather(
         ``(out [rows, hidden] in x.dtype, dot [rows] fp32 or None)``; bit-identical to the XLA entry for ``out``.
     """
     if row_gather_unsupported_reason(x, indices, scale, dot_with) is not None:
-        return moe_row_gather_xla(x, indices, scale, dot_with)
-    return gather_rows(x, indices, scale, dot_with)
+        return moe_row_gather_xla(x, indices, scale, dot_with, out_dtype)
+    return gather_rows(x, indices, scale, dot_with, out_dtype=out_dtype)
 
 
 @kernel_registry.register("moe_row_gather_sum", Platform.PALLAS, Backend.TPU, priority=10)

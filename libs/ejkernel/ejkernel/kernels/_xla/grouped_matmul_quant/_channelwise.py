@@ -35,8 +35,15 @@ def grouped_matmul_channelwise(
     preferred_element_type=jnp.bfloat16,
     tiling=None,
     mask_padding=True,
+    lhs_scale=None,
 ):
     """Multiply sorted activation rows by CHANNELWISE represented weights.
+
+    ``lhs_scale[M,1]`` (A8 only, forward only) marks ``lhs`` as int8 codes
+    already produced by this entry's row quantization (``quantize_rows``),
+    e.g. once per token before a dispatch gather. Masked rows take codes 0
+    and scale 1, what the quantization gives the all-zero rows it masks, so
+    the output is bit for bit the float-``lhs`` result.
 
     ``codes[E,K,N]`` must be signed int4/int8; ``scales[E,1,N]`` are
     floating point. Nonnegative ``group_sizes[E]`` must sum to at most M.
@@ -70,7 +77,12 @@ def grouped_matmul_channelwise(
         raise ValueError("expected scales[E,1,N]")
     if group_sizes.shape != (codes.shape[0],) or not jnp.issubdtype(group_sizes.dtype, jnp.integer):
         raise ValueError("expected integer group_sizes[E]")
-    if not jnp.issubdtype(lhs.dtype, jnp.floating) or not jnp.issubdtype(scales.dtype, jnp.floating):
+    if lhs_scale is not None and (
+        activation_bits != 8 or lhs.dtype != jnp.dtype(jnp.int8) or tuple(lhs_scale.shape) != (lhs.shape[0], 1)
+    ):
+        raise ValueError("lhs_scale requires activation_bits=8, int8 lhs codes [M,K] and lhs_scale [M,1]")
+    lhs_ok = lhs_scale is not None or jnp.issubdtype(lhs.dtype, jnp.floating)
+    if not lhs_ok or not jnp.issubdtype(scales.dtype, jnp.floating):
         raise TypeError("lhs and scales must be floating point")
     if not jnp.issubdtype(jnp.dtype(preferred_element_type), jnp.floating):
         raise TypeError("preferred_element_type must be floating point")
@@ -96,7 +108,12 @@ def grouped_matmul_channelwise(
             return _dot(x, weights.astype(x.dtype), sizes, jnp.float32, tiling)
         from ..quantized_matmul._integer_quantization import quantize_rows
 
-        q, act_scale = quantize_rows(_mask_rows(x, sizes), activation_bits)
+        if lhs_scale is None:
+            q, act_scale = quantize_rows(_mask_rows(x, sizes), activation_bits)
+        else:
+            valid = jnp.arange(x.shape[0]) < jnp.sum(sizes)
+            q = _mask_rows(x, sizes)
+            act_scale = jnp.where(valid[:, None], lhs_scale.astype(jnp.float32), 1.0)
         if widen_int4:
             q = q.astype(jnp.int8)
         acc = _dot(q, weights.astype(q.dtype), sizes, jnp.int32, tiling)
@@ -124,6 +141,9 @@ def grouped_matmul_channelwise(
             _mask_rows(tangent, sizes).astype(preferred_element_type),
         )
 
+    if lhs_scale is not None:
+        # Pre-quantized codes carry no tangent: run the primal function without the custom JVP.
+        return apply.fun(lhs, scales, codes, group_sizes)
     return apply(lhs, scales, codes, group_sizes)
 
 

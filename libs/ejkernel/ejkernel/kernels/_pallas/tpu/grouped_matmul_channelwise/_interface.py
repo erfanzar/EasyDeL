@@ -197,8 +197,14 @@ def grouped_matmul_channelwise(
     preferred_element_type=jnp.bfloat16,
     tiling=None,
     mask_padding=True,
+    lhs_scale=None,
 ):
     """Stream signed int4/int8 weights with explicit activation precision.
+
+    ``lhs_scale[M,1]`` (A8 only, forward only) marks ``lhs`` as int8 codes already produced by this entry's row
+    quantization (``quantize_rows``), e.g. once per token before a dispatch gather: the quantization is skipped, masked
+    rows take codes 0 and scale 1 (what the quantization gives the all-zero rows it masks), and the kernel and epilogue
+    are unchanged, so the result equals the float-``lhs`` call's bit for bit.
 
     A16 uses BF16 inputs and FP32 accumulation. A4/A8 quantize each input row,
     then use INT8 arithmetic with INT32 accumulation; the A4 grid is unchanged
@@ -223,7 +229,10 @@ def grouped_matmul_channelwise(
         raise ValueError("activation_bits must be 4, 8, or 16")
     if activation_bits == 4 and codes.dtype != jnp.dtype(jnp.int4):
         raise ValueError("activation_bits=4 requires int4 weights")
-    if lhs.dtype != jnp.dtype(jnp.bfloat16):
+    if lhs_scale is not None:
+        if activation_bits != 8 or lhs.dtype != jnp.dtype(jnp.int8) or tuple(lhs_scale.shape) != (lhs.shape[0], 1):
+            raise ValueError("lhs_scale requires activation_bits=8, int8 lhs codes [M,K] and lhs_scale [M,1]")
+    elif lhs.dtype != jnp.dtype(jnp.bfloat16):
         raise TypeError("Pallas CHANNELWISE requires bfloat16 lhs; use platform='xla' for other dtypes")
     if codes.dtype not in (jnp.dtype(jnp.int4), jnp.dtype(jnp.int8)):
         raise TypeError("codes must have signed int4 or int8 dtype")
@@ -279,7 +288,14 @@ def grouped_matmul_channelwise(
             from ...._xla.quantized_matmul._integer_quantization import quantize_rows
 
             valid = jnp.arange(x.shape[0]) < jnp.sum(sizes)
-            q, activation_scale = quantize_rows(jnp.where(valid[:, None], x, 0), activation_bits)
+            if lhs_scale is None:
+                q, activation_scale = quantize_rows(jnp.where(valid[:, None], x, 0), activation_bits)
+            else:
+                # Codes from ``quantize_rows``: masked rows become what it gives an all-zero row (codes 0, scale 1).
+                # The whole-slab kernel only multiplies rows inside the groups and masks (or leaves unspecified)
+                # every row past sum(sizes), so its finite tail codes need no mask; other paths mask them.
+                q = x if slab_epilogue else jnp.where(valid[:, None], x, jnp.zeros((), x.dtype))
+                activation_scale = jnp.where(valid[:, None], lhs_scale.astype(jnp.float32), 1.0)
             # INT4 grid is preserved exactly; only arithmetic widens to INT8.
             # RHS stays packed in HBM and is widened inside VMEM as needed.
             q = q.astype(jnp.int8)
@@ -400,6 +416,9 @@ def grouped_matmul_channelwise(
         _, tangent = jax.jvp(reference, primals, tangents)
         return apply(*primals), tangent
 
+    if lhs_scale is not None:
+        # Pre-quantized codes carry no tangent: run the primal function without the custom JVP.
+        return apply.fun(lhs, codes, scales, group_sizes)
     return apply(lhs, codes, scales, group_sizes)
 
 

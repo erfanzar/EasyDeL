@@ -796,8 +796,10 @@ class GroupedMatmulChannelwise(Kernel[GroupedMatmulConfig, Array]):
         preferred_element_type=jnp.bfloat16,
         tiling=None,
         mask_padding=True,
+        lhs_scale=None,
         cfg: GroupedMatmulConfig,
     ):
+        extra = {} if lhs_scale is None else {"lhs_scale": lhs_scale}
         return self.get_impl(cfg)(
             lhs,
             codes,
@@ -807,6 +809,7 @@ class GroupedMatmulChannelwise(Kernel[GroupedMatmulConfig, Array]):
             preferred_element_type=preferred_element_type,
             tiling=tiling,
             mask_padding=mask_padding,
+            **extra,
         )
 
 
@@ -826,8 +829,14 @@ def grouped_matmul_channelwise(
     tiling: tuple[int, int, int] | None = None,
     platform: Literal["xla", "pallas"] = "xla",
     mask_padding: bool = True,
+    lhs_scale: Array | None = None,
 ) -> Array:
     """Explicit W4A16/W8A16/W4A4/W8A8 CHANNELWISE grouped matmul.
+
+    With ``lhs_scale[M,1]`` (A8, forward only) ``lhs`` holds the int8 codes of
+    :func:`grouped_matmul_channelwise_quantize_rows`, e.g. token rows quantized
+    once before a dispatch gather; the result equals the float-``lhs`` call's
+    bit for bit.
 
     Codes are signed int4/int8 [E,K,N], scales floating [E,1,N], lhs [M,K].
     Group sizes [E] must be nonnegative and sum to at most M. Empty groups
@@ -882,7 +891,34 @@ def grouped_matmul_channelwise(
         tiling=tiling,
         mask_padding=bool(mask_padding),
         _cfg=cfg,
+        **({} if lhs_scale is None else {"lhs_scale": lhs_scale}),
     )
+
+
+def grouped_matmul_channelwise_quantize_rows(x: Array, activation_bits: int = 8) -> tuple[Array, Array]:
+    """Row quantization of :func:`grouped_matmul_channelwise`'s A8 path, for rows quantized before a gather.
+
+    Per row: an absmax (a max, so any reduction order gives the same value), then elementwise divide, round to
+    nearest even and clip. Gathering rows of the result therefore equals quantizing the gathered rows bit for bit.
+
+    Args:
+        x: Floating rows ``[M, K]``.
+        activation_bits: Activation bits; only ``8`` is supported.
+
+    Returns:
+        ``(codes int8 [M, K], scale float32 [M, 1])`` for ``grouped_matmul_channelwise(..., lhs_scale=scale)``.
+
+    Raises:
+        ValueError: ``activation_bits`` is not 8 or ``x`` is not a floating ``[M, K]`` array.
+    """
+    from ejkernel.kernels._xla.quantized_matmul._integer_quantization import quantize_rows
+
+    if activation_bits != 8 or x.ndim != 2 or not jnp.issubdtype(x.dtype, jnp.floating):
+        raise ValueError("expected floating rows [M, K] and activation_bits=8")
+    # The barrier keeps ``x`` rounded to its own dtype. Without it XLA may fold an upstream f32 -> bf16 cast into the
+    # quantization's bf16 -> f32 cast (excess precision), which never happens to the materialized rows the entry reads.
+    codes, scale = quantize_rows(jax.lax.optimization_barrier(x), activation_bits)
+    return codes.astype(jnp.int8), scale.astype(jnp.float32)
 
 
 def grouped_matmul_channelwise_slab_tiles(
