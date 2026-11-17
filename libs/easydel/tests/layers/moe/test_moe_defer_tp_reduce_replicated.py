@@ -37,8 +37,9 @@ combined ``[tokens, H]`` partial once. On four TPU devices these tests pin:
 * ``moe_defer_tp_reduce=None`` (automatic) lowers the program ``True`` lowers under inference mode with an expert axis
   (ep > 1) and the program ``False`` lowers at ep == 1 and outside inference mode,
 * from ``_LIVE_COMBINE_MIN_LOCAL_ROWS`` expected local rows per expert shard the top-k combine runs the ejkernel
-  Pallas live-slot kernel (``moe_row_gather_sum`` with ``skip_negative``): at the served precision it matches the
-  XLA combine to the fp32 summation order and the default dispatch within three bfloat16 roundings,
+  Pallas live-slot kernel (``moe_row_gather_sum`` with ``skip_negative``; in prefill ``moe_row_gather_sum_packed``
+  over the down projection's packed rows, bit for bit the unpacked kernel's output): at the served precision it
+  matches the XLA combine to the fp32 summation order and the default dispatch within three bfloat16 roundings,
 * from ``_DMA_ROW_GATHER_MIN_ROWS`` window rows the dispatch gathers its token rows through the Pallas DMA kernel
   (``moe_row_gather``), and the block output equals the XLA-gather program's bit for bit.
 """
@@ -385,9 +386,15 @@ def test_automatic_setting_defers_only_with_an_expert_axis(mesh):
 LIVE_HIDDEN, LIVE_TOKENS = 2048, 4096
 
 
+def _mosaic_calls(compiled: str, name: str = "") -> int:
+    """How many ``tpu_custom_call`` instructions of the compiled program text mention ``name`` (all by default)."""
+    return sum('custom_call_target="tpu_custom_call"' in line and name in line for line in compiled.splitlines())
+
+
 def test_live_slot_combine_matches_xla_combine_and_default(monkeypatch):
     """Served precision (bfloat16 activations, W8A8 experts) where the combine runs the Pallas live-slot kernel."""
     _skip_without_four_devices()
+    import ejkernel.modules
     from easydel.layers.moe import _moe_module
 
     dims = MESHES["ep2tp2"]
@@ -397,15 +404,28 @@ def test_live_slot_combine_matches_xla_combine_and_default(monkeypatch):
     out_default, text_default = _forward(block, x, defer=False)
     out_live, text_live = _forward(block, x, defer=True)
     _, compiled_live = _forward(block, x, defer=True, compiled=True)
+    # In inference-mode prefill the down projection writes the int32 paired layout that the packed live-slot combine
+    # reads. Refusing that layout gives the unpacked live-slot combine (row pack + gather-sum kernels); taking the XLA
+    # entry as well gives the XLA combine.
+    monkeypatch.setattr(
+        ejkernel.modules, "packed_row_gather_sum_unsupported_reason", lambda *args, **kwargs: "refused by the test"
+    )
+    out_unpacked, compiled_unpacked = _forward(block, x, defer=True, compiled=True)
     entry = _moe_module._moe_row_gather_sum_entry
     monkeypatch.setattr(
         _moe_module, "_moe_row_gather_sum_entry", lambda *, live_slot_kernel: entry(live_slot_kernel=False)
     )
     out_xla, compiled_xla = _forward(block, x, defer=True, compiled=True)
     _assert_deferred_lowering(text_default, text_live, mesh="ep2tp2", decode=False, tokens=LIVE_TOKENS)
-    # The live-slot combine adds two Mosaic kernels (row pack + gather-sum) to the XLA-combine program.
-    assert compiled_live.count("tpu_custom_call") >= compiled_xla.count("tpu_custom_call") + 2
+    # The unpacked live-slot combine adds two Mosaic kernels (row pack + gather-sum) to the XLA-combine program. The
+    # packed one adds only the gather-sum: the down projection's epilogue writes the packed rows.
+    assert _mosaic_calls(compiled_unpacked) >= _mosaic_calls(compiled_xla) + 2
+    assert _mosaic_calls(compiled_unpacked, "moe_row_pack") > 0
+    assert _mosaic_calls(compiled_live) >= _mosaic_calls(compiled_xla) + 1
+    assert _mosaic_calls(compiled_live, "moe_row_pack") == 0
     assert np.isfinite(out_live).all() and float(np.max(np.abs(out_default))) > 0
+    # The packed layout holds the same bfloat16 rows, and its combine adds the same fp32 terms in the same order.
+    np.testing.assert_array_equal(out_live, out_unpacked)
     # Only the fp32 order of the top-k sum differs from the XLA combine. It can flip the bfloat16 rounding of a few
     # partials before the TP reduce-scatter (measured rel_l2 1.9e-5 at the served GLM-5.3 shapes on ep2 x tp2), while a
     # dropped or misplaced slot moves the output by about 1/k.
