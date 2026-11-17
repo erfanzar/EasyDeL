@@ -300,6 +300,28 @@ def test_fused_decode_kernel_is_opt_in(fused):
     _assert_matches_reference(out, leaves, case, DECODE, None, jnp.bfloat16, 3e-2)
 
 
+@pytest.mark.parametrize("fused", [False, True], ids=["default-glue-keeps-conditional", "opt-in-fused-no-conditional"])
+def test_single_token_program_drops_the_leading_row_conditional_only_with_the_fused_kernel(fused):
+    """Implicit slots in the single-token program: the fused kernel runs without the leading-row conditional.
+
+    With ``fused_decode`` both branches of the leading-row conditional would call the same fused kernel with the same
+    token-slot table, so the decode driver is called directly and the step lowers with no conditional. Without it the
+    leading-row conditional stays. Both match the float64 reference (bf16, four chips).
+    """
+    if jax.devices()[0].platform != "tpu":
+        pytest.skip("the fused kernel is TPU-only")
+    case = _case(DECODE, seed=9, dtype=jnp.bfloat16)
+
+    def driver(**kwargs):
+        return kda_rows_forward(**kwargs, fused_decode=fused)
+
+    with single_token_rows():
+        out, leaves, text = _run(driver, case, DECODE, jnp.bfloat16, tp=4, text=True)
+    has_conditional = any(op in text for op in CONDITIONAL_OPS)
+    assert has_conditional is not fused, "the leading-row conditional does not follow the fused switch"
+    _assert_matches_reference(out, leaves, case, DECODE, None, jnp.bfloat16, 3e-2)
+
+
 def test_fused_decode_kernel_config_defaults_off():
     """``kda_fused_decode_kernel`` is opt-in: off by default, settable at construction and through the overrides."""
     from easydel.infra.base_config import EasyDeLBaseConfig

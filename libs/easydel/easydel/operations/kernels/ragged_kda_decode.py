@@ -455,6 +455,59 @@ class RaggedKDAConvDecodeOp(OperationImpl):
 _CONV_SELECT_MAX_ENTRIES = 32
 
 
+def _fused_decode_plan(
+    query: Array,
+    key: Array,
+    value: Array,
+    beta: Array,
+    decay: Array,
+    conv_kernels: tuple[Array, Array, Array],
+    cache_view: KDACacheView,
+    metadata: OperationMetadata,
+    conv_dtype: jnp.dtype,
+    head_axis: str | tuple[str, ...] | None,
+) -> tuple[RaggedKDAConvDecodeOp, str | tuple[str, ...] | None, bool]:
+    """Resolve the fused ``ragged_kda_conv_decode`` operation for one decode call.
+
+    The check reads only static shapes, dtypes and metadata, so every row-count view of the same streams and pools
+    (all rows, or the leading rows of a prefix step) gets the same answer.
+
+    Args:
+        query: Packed Q projection ``[1, T, key_dim]``.
+        key: Packed K projection ``[1, T, key_dim]``.
+        value: Packed V projection ``[1, T, value_dim]``.
+        beta: Packed write strength ``[1, T, heads]``.
+        decay: Packed per-channel log-decay ``[1, T, heads, head_dim]``.
+        conv_kernels: Depthwise causal conv kernels for q, k, v.
+        cache_view: Per-layer KDA cache view.
+        metadata: Operation metadata.
+        conv_dtype: Dtype of the conv outputs.
+        head_axis: Head axis of the call, or ``None`` for the operation's own choice.
+
+    Returns:
+        tuple: ``(operation, head_axis, runs)``; ``runs`` is ``True`` when the fused Pallas kernel takes the call.
+
+    Raises:
+        TypeError: If the registry resolves ``"ragged_kda_conv_decode"`` to something other than a
+            :class:`RaggedKDAConvDecodeOp`.
+    """
+    fused = OperationRegistry.create("ragged_kda_conv_decode", metadata)
+    if not isinstance(fused, RaggedKDAConvDecodeOp):
+        raise TypeError(f"'ragged_kda_conv_decode' resolved to {type(fused).__name__}, expected a RaggedKDAConvDecodeOp")
+    fused_head_axis = (
+        fused.resolve_head_axis(int(beta.shape[-1]), int(query.shape[1])) if head_axis is None else head_axis
+    )
+    reason = fused.fused_kernel_unsupported_reason(
+        *(jax.ShapeDtypeStruct(x.shape[1:], x.dtype) for x in (query, key, value, beta, decay)),
+        tuple(conv_kernels),
+        (cache_view.q_conv_state, cache_view.k_conv_state, cache_view.v_conv_state),
+        cache_view.recurrent_state,
+        conv_dtype=conv_dtype,
+        head_axis=fused_head_axis,
+    )
+    return fused, fused_head_axis, reason is None
+
+
 def kda_decode_rows_forward(
     query: Float[Array, "1 seq_len key_dim"],
     key: Float[Array, "1 seq_len key_dim"],
@@ -555,26 +608,10 @@ def kda_decode_rows_forward(
         )
     use_fused = False
     if fused_decode:
-        fused = OperationRegistry.create("ragged_kda_conv_decode", metadata)
-        if not isinstance(fused, RaggedKDAConvDecodeOp):
-            raise TypeError(
-                f"'ragged_kda_conv_decode' resolved to {type(fused).__name__}, expected a RaggedKDAConvDecodeOp"
-            )
+        fused, fused_head_axis, use_fused = _fused_decode_plan(
+            query, key, value, beta, decay, conv_kernels, cache_view, metadata, conv_dtype, head_axis
+        )
         conv_pools = (cache_view.q_conv_state, cache_view.k_conv_state, cache_view.v_conv_state)
-        fused_head_axis = (
-            fused.resolve_head_axis(int(beta.shape[-1]), int(query.shape[1])) if head_axis is None else head_axis
-        )
-        use_fused = (
-            fused.fused_kernel_unsupported_reason(
-                *(jax.ShapeDtypeStruct(x.shape[1:], x.dtype) for x in (query, key, value, beta, decay)),
-                tuple(conv_kernels),
-                conv_pools,
-                cache_view.recurrent_state,
-                conv_dtype=conv_dtype,
-                head_axis=fused_head_axis,
-            )
-            is None
-        )
 
     with jax.named_scope("easydel-kda-decode-rows"):
         f32 = jnp.float32
@@ -791,6 +828,16 @@ def kda_rows_forward(
         # (the common eSurge decode layout) takes the in-place leading-row path below at run time; the conditional's
         # other branch is the same decode driver, so both give the decode driver's per-row results.
         if state_indices is not None or seq_len > rows:
+            return kda_decode_rows_forward(cache_view=cache_view, **common, **fused_kw)
+        if (
+            fused_decode
+            and _fused_decode_plan(
+                query, key, value, beta, decay, conv_kernels, cache_view, metadata, conv_dtype, head_axis
+            )[2]
+        ):
+            # The fused kernel writes only the advancing slots in place, and both branches of the leading-row
+            # conditional would hand it the same token-slot table (row r's token sits at position r on prefix steps).
+            # Calling it directly keeps the pool leaves out of a conditional, whose operands XLA copies every step.
             return kda_decode_rows_forward(cache_view=cache_view, **common, **fused_kw)
         return _leading_rows_or_decode(cache_view, common, query_start_loc, context_lens, seq_len, leaves, **fused_kw)
     if not eligible or seq_len > rows:
