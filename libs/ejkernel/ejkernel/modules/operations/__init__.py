@@ -216,6 +216,7 @@ from .configs import (
     KernelDeltaAttentionConfig,
     LightningAttentionConfig,
     MeanPoolingConfig,
+    MoeDecodeFusedW8A8Config,
     MultiLatentRaggedPageAttentionConfig,
     MultiLatentRaggedPageAttentionV2Config,
     NativeSparseAttentionConfig,
@@ -308,6 +309,11 @@ from .mhc_decode_fused import (
     mhc_decode_supports,
     mhc_decode_table_gates,
     mhc_decode_write,
+)
+from .moe_decode_fused_w8a8 import (
+    MoeDecodeFusedW8A8,
+    moe_decode_fused_w8a8,
+    moe_decode_fused_w8a8_unsupported_reason,
 )
 from .moe_row_gather import (
     packed_row_gather_sum_unsupported_reason,
@@ -474,6 +480,8 @@ __all__ = (
     "MHCFusedConfig",
     "MeanPooling",
     "MeanPoolingConfig",
+    "MoeDecodeFusedW8A8",
+    "MoeDecodeFusedW8A8Config",
     "MultiLatentRaggedPageAttention",
     "MultiLatentRaggedPageAttentionConfig",
     "MultiLatentRaggedPageAttentionV2",
@@ -595,6 +603,8 @@ __all__ = (
     "mhc_decode_table_gates",
     "mhc_decode_write",
     "mhc_expand",
+    "moe_decode_fused_w8a8",
+    "moe_decode_fused_w8a8_unsupported_reason",
     "multi_latent_ragged_page_attention",
     "multi_latent_ragged_page_attention_v2",
     "native_sparse_attention",

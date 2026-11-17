@@ -76,6 +76,7 @@ from .kda_chunk_local import kda_chunk_local
 from .mhc_coefficients import mhc_coefficients
 from .mhc_decode_fused import mhc_decode_read, mhc_decode_write
 from .mhc_fused import mhc_collapse, mhc_expand
+from .moe_decode_fused_w8a8 import moe_decode_fused_w8a8
 from .moe_local_ffn import moe_local_ffn
 from .moe_row_gather import moe_row_gather, moe_row_gather_quantized, moe_row_gather_sum, moe_row_gather_sum_packed
 from .multi_latent_ragged_page_attention import multi_latent_ragged_page_attention
@@ -133,6 +134,7 @@ __all__ = (
     "mhc_decode_read",
     "mhc_decode_write",
     "mhc_expand",
+    "moe_decode_fused_w8a8",
     "moe_local_ffn",
     "moe_row_gather",
     "moe_row_gather_quantized",

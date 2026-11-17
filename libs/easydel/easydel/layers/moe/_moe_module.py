@@ -931,6 +931,81 @@ def _shared_expert_rows_fused(
     )
 
 
+def _fused_segment_acts(
+    expert_layer: tp.Any, shared_expert: tp.Any
+) -> tuple[tuple[str, tuple[float, ...]], tuple[str, tuple[float, ...]] | None] | None:
+    """Routed and shared ``(activation, act_params)`` for ``moe_decode_fused_segment_kernel``, or ``None``.
+
+    The routed combine must be declared on the expert module (``fused_act_name``); the shared expert's comes from its
+    declaration or its config's activation, as for ``moe_shared_expert_fused_kernel``.
+    """
+    from easydel.layers.mlp import _act_name, _declared_combine
+
+    routed = _declared_combine(expert_layer) if expert_layer is not None else None
+    if routed is None:
+        return None
+    if shared_expert is None:
+        return routed, None
+    shared = _declared_combine(shared_expert)
+    if shared is None:
+        name = _act_name(getattr(shared_expert, "config", None), shared_expert)
+        if name is None:
+            return None
+        shared = (name, ())
+    return routed, (str(shared[0]), tuple(float(v) for v in shared[1]))
+
+
+def _fused_decode_segment(
+    x2d: jax.Array,
+    experts: jax.Array,
+    combine_weights: jax.Array,
+    kernels: tuple[tp.Any, tp.Any, tp.Any],
+    shared_kernels: SharedExpertKernels | None,
+    acts: tuple[tuple[str, tuple[float, ...]], tuple[str, tuple[float, ...]] | None],
+    control: jax.Array,
+) -> jax.Array | None:
+    """One expert shard's decode MoE segment through eJKernel's ``moe_decode_fused_w8a8`` (``None``: unsupported).
+
+    Args:
+        x2d: Token rows ``[tokens, H]`` in the module dtype.
+        experts: Global top-k expert ids ``[tokens, k]``.
+        combine_weights: float32 combine weights ``[tokens, k]``.
+        kernels: This shard's ``(gate, up, down)`` ``(codes, scales)`` pairs.
+        shared_kernels: This TP rank's folded shared-expert shards, or ``None``.
+        acts: Routed and shared ``(activation, act_params)`` (``_fused_segment_acts``).
+        control: int32 ``[3]``: global id of local expert 0, shared-expert row start and end.
+
+    Returns:
+        float32 ``[tokens, H]`` partial sums (routed plus shared rows) of this shard, not reduced over TP or ep.
+    """
+    from ejkernel.modules import (  # pyright: ignore[reportMissingTypeStubs]
+        moe_decode_fused_w8a8,
+        moe_decode_fused_w8a8_unsupported_reason,
+    )
+
+    (gate_codes, gate_scales), (up_codes, up_scales), (down_codes, down_scales) = kernels
+    shared = tuple(shared_kernels) if shared_kernels is not None else (None, None, None, None)
+    operands = (x2d, experts, combine_weights, gate_codes, gate_scales, up_codes, up_scales, down_codes, down_scales)
+    if moe_decode_fused_w8a8_unsupported_reason(*operands, control, *shared) is not None:
+        return None
+    routed_act, shared_act = acts
+    if shared_kernels is not None and shared_act is None:
+        return None
+    # Materialize the rows so an upstream cast cannot fuse into the kernel's quantization.
+    x2d = jax.lax.optimization_barrier(x2d)
+    return moe_decode_fused_w8a8(
+        x2d,
+        *operands[1:],
+        control,
+        *shared,
+        activation=routed_act[0],
+        act_params=routed_act[1],
+        shared_activation=shared_act[0] if shared_act is not None else "silu",
+        shared_act_params=shared_act[1] if shared_act is not None else (),
+        platform="pallas",
+    )
+
+
 class BaseMoeModule(spx.Module, ABC):
     """Abstract base class shared by every Mixture-of-Experts module in EasyDeL.
 
@@ -2074,6 +2149,7 @@ class BaseMoeModule(spx.Module, ABC):
         layer_idx: int | None = None,
         gated: bool = True,
         shared_expert: spx.Module | None = None,
+        expert_layer: spx.Module | None = None,
     ):
         """Fused MoE path using grouped matmul and shard_map.
 
@@ -2125,6 +2201,8 @@ class BaseMoeModule(spx.Module, ABC):
             shared_expert: Optional shared expert (see :meth:`moe_call`). It is folded into the inference-mode
                 deferred dispatch when that dispatch runs, the input is already in ``self.dtype`` and
                 ``_shared_expert_fold_spec`` accepts the module; otherwise it is left to the caller.
+            expert_layer: The routed expert module; read only for its declared combine under
+                ``moe_decode_fused_segment_kernel``.
 
         Returns:
             Tuple `(output, router_logits, shared_folded)` where:
@@ -2602,6 +2680,49 @@ class BaseMoeModule(spx.Module, ABC):
 
         if ffn_activation is None:
             ffn_activation = _default_ffn_activation(act_fn)
+
+        # ``moe_decode_fused_segment_kernel`` (approximate, off by default): in decode-layout serving programs the
+        # deferred dispatch runs each expert shard's segment between top-k and the output all-reduce as one kernel.
+        fused_segment_acts = None
+        if bool(getattr(self.config, "moe_decode_fused_segment_kernel", False)):
+            fused_blockers = [
+                why
+                for why, bad in (
+                    (
+                        "not the decode-layout inference deferred dispatch",
+                        not (replicated_deferred_dispatch and decode_replicated_out),
+                    ),
+                    ("not on TPU", jax.default_backend() != "tpu"),
+                    (
+                        "not gated split int8 W8A8 experts",
+                        not (
+                            gated
+                            and gate_up_kernel is None
+                            and all(isinstance(k, tuple) for k in (wi_kernel, wu_kernel, wd_kernel))
+                            and wi_activation_bits == 8
+                            and wu_activation_bits == 8
+                            and wd_activation_bits == 8
+                        ),
+                    ),
+                    ("expert biases", any(b is not None for b in (wi_bias, wu_bias, wd_bias))),
+                    (
+                        "fsdp gather-at-use, a quantization rule or an input hook",
+                        (gather_expert_weights_over_fsdp or quant_rule is not None or refine_inputs_hook is not None),
+                    ),
+                    ("input not in the module dtype", not input_in_module_dtype),
+                )
+                if bad
+            ]
+            if not fused_blockers:
+                fused_segment_acts = _fused_segment_acts(
+                    expert_layer, shared_expert if shared_kernels is not None else None
+                )
+                if fused_segment_acts is None:
+                    fused_blockers.append("no declared routed/shared combine")
+            if fused_blockers and inference_mode_forces_decode():
+                logger.warn_once(
+                    f"moe_decode_fused_segment_kernel is set but inactive here: {', '.join(fused_blockers)}."
+                )
 
         # Generate weight sharding specs using helper function
         use_expert_tensor = self.config.use_expert_tensor_mode
@@ -3134,6 +3255,7 @@ class BaseMoeModule(spx.Module, ABC):
             expert_ffn: Callable[..., jax.Array],
             expert_shard_id: jax.Array,
             shared_kernels: SharedExpertKernels | None = None,
+            fused_kernels: tuple[tp.Any, tp.Any, tp.Any] | None = None,
         ) -> jax.Array:
             """Inference-only single-pass dispatch with the TP reduction after the top-k combine.
 
@@ -3162,6 +3284,9 @@ class BaseMoeModule(spx.Module, ABC):
                     Each expert shard runs it on its ``ceil(tokens / ep)`` rows of ``x`` (``_shared_expert_rows``)
                     and adds the float32 result into the routed partial before the one reduction, which then sums it
                     over TP and the expert axis with the routed rows: the shared expert needs no collective of its own.
+                fused_kernels: This shard's ``(gate, up, down)`` quantized kernels when
+                    ``moe_decode_fused_segment_kernel`` applies (``_fused_decode_segment``); ``None`` runs the XLA
+                    dispatch.
 
             Returns:
                 ``[b, s, H]`` summed over the expert and TP axes when ``decode_replicated_out``, otherwise
@@ -3189,6 +3314,35 @@ class BaseMoeModule(spx.Module, ABC):
                 layer_idx=layer_idx,
                 replica_id=expert_shard_id * tp_size + jax.lax.axis_index(tensor_axis_name),
             )
+            if fused_kernels is not None and fused_segment_acts is not None:
+                rows_per_shard = -(-tokens // ep_size)
+                own_start = (expert_shard_id * rows_per_shard).astype(jnp.int32)
+                control = jnp.stack(
+                    [
+                        (expert_shard_id * experts_per_shard).astype(jnp.int32),
+                        own_start,
+                        jnp.minimum(own_start + rows_per_shard, tokens).astype(jnp.int32),
+                    ]
+                )
+                fused_weights = weights if output_weights_hook is None else output_weights_hook(weights)
+                fused = _fused_decode_segment(
+                    x2d,
+                    experts.astype(jnp.int32),
+                    fused_weights.astype(jnp.float32),
+                    fused_kernels,
+                    shared_kernels,
+                    fused_segment_acts,
+                    control,
+                )
+                if fused is not None:
+                    fused_axes = tuple(expert_axis_name) if isinstance(expert_axis_name, tuple) else (expert_axis_name,)
+                    if (
+                        bool(getattr(self.config, "decode_allreduce_bf16_wire", False))
+                        and jnp.dtype(self.dtype).itemsize < 4
+                    ):
+                        fused = fused.astype(self.dtype)
+                    fused = jax.lax.psum(fused, (*fused_axes, tensor_axis_name))
+                    return fused.astype(self.dtype).reshape(local_batch, local_seq, -1)
             local_ids = flat_experts - expert_shard_id * experts_per_shard
             is_local = (local_ids >= 0) & (local_ids < experts_per_shard)
             # Non-local pairs take key ``experts_per_shard`` and sort past every local group; the stable sort keeps
@@ -4048,7 +4202,14 @@ class BaseMoeModule(spx.Module, ABC):
                 return _dispatch_ep_batch(x, gate_logits)
 
             if replicated_deferred_dispatch:
-                return _replicated_deferred_dispatch(x, gate_logits, _expert_ffn, expert_shard_id, shared_kernels)
+                return _replicated_deferred_dispatch(
+                    x,
+                    gate_logits,
+                    _expert_ffn,
+                    expert_shard_id,
+                    shared_kernels,
+                    fused_kernels=(wi_kernel, wu_kernel, wd_kernel) if fused_segment_acts is not None else None,
+                )
 
             if moe_chunk_size is not None:
                 partial_output = _chunked_dispatch(
@@ -4467,6 +4628,7 @@ class BaseMoeModule(spx.Module, ABC):
                         layer_idx=getattr(self, "layer_idx", None) if layer_idx is None else layer_idx,
                         gated=gated,
                         shared_expert=shared_expert,
+                        expert_layer=expert_layer,
                     )
                 case MoEMethods.DENSE_MOE:
                     logger.warn_once(

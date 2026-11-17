@@ -271,6 +271,10 @@ class Glm5NextTextExperts(spx.Module):
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.moe_intermediate_size
         self.limit = float(config.swiglu_limit)
+        # Declared routed combine (``_declared_combine``): read only by the fused decode MoE segment kernel.
+        if str(config.hidden_act).lower() in ("silu", "swish"):
+            self.fused_act_name = "clamped_swiglu"
+            self.fused_act_params = (self.limit,)
         moe_kwargs = dict(
             rngs=rngs,
             use_bias=False,

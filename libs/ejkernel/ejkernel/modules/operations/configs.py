@@ -555,6 +555,20 @@ class SharedExpertW8A8Config(BaseOperationConfig):
 
 
 @dataclass
+class MoeDecodeFusedW8A8Config(BaseOperationConfig):
+    """Configuration for the fused decode MoE segment (``moe_decode_fused_w8a8``).
+
+    The Pallas TPU kernel sizes its weight ring from the VMEM capacity, so only the platform is configurable.
+
+    Args:
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class RaggedGatherReduceConfig(BaseOperationConfig):
     """Configuration for the weighted grouped gather-sum (MoE top-k combine).
 
