@@ -74,6 +74,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, ReasoningParserName] = {
     "phimoe": "deepseek_r1",
     "phi3": "deepseek_r1",
     "phi": "deepseek_r1",
+    "glm5_next": "glm45",
     "glm_moe_dsa": "glm45",
     "glm4_moe_lite": "glm45",
     "glm4_moe": "glm45",
