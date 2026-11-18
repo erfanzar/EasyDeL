@@ -726,10 +726,10 @@ def build_esurge(cfg_like: eLMConfig | Mapping[str, Any], model: EasyDeLBaseModu
     ]:
         raise NotImplementedError(f"eSurge supports [CAUSAL_LM, IMAGE_TEXT_TO_TEXT, ANY_TO_ANY, VISION_LM]; got {task}")
     if model is None:
-        # dp > 1 from a Ray driver: one independent engine per dp slice, routed from here.
-        from easydel.inference.esurge.serving.ray_replicas import maybe_launch_replicas
+        # dp > 1 from a Ray driver, or the same script on every host: one independent engine per dp slice.
+        from easydel.inference.esurge.serving.host_replicas import launch_dp_replicas
 
-        replicas = maybe_launch_replicas(cfg)
+        replicas = launch_dp_replicas(cfg)
         if replicas is not None:
             return replicas
     loader_cfg = cfg.get("loader", {})

@@ -263,6 +263,7 @@ def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
             plan.num_processes,
             plan.rank,
             initialization_timeout=int(config.coordination.token_timeout_s),
+            coordinator_bind_address=plan.coordinator,  # the replica leader's internal address, not every interface
         )
 
     import easydel as ed  # joins the multi-host JAX world (TPU slices are detected from GCE metadata)

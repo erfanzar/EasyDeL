@@ -962,6 +962,29 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     lmhead_chunksize: NotRequired[int | None]
 
 
+def _default_backend_name() -> str:
+    """JAX's default platform name, without starting a backend that is not running yet.
+
+    Building a config must not start the TPU: a multi-host script may still have to choose which JAX world (and which
+    sub-slice) this process joins before the backend starts (dp replicas in ``build_esurge``). Once a backend runs,
+    this is ``jax.default_backend()``. Before that, the first entry of ``jax_platforms`` is the platform JAX will pick
+    first; with none configured, a TPU host (``/dev/vfio`` or ``/dev/accel*`` present) is ``"tpu"``; anything else
+    falls back to ``jax.default_backend()`` as before.
+    """
+    import glob
+
+    from jax._src import xla_bridge
+
+    if xla_bridge.backends_are_initialized():
+        return jax.default_backend()
+    platforms = [p.strip() for p in str(jax.config.jax_platforms or "").split(",") if p.strip()]
+    if platforms:
+        return {"cuda": "gpu", "rocm": "gpu"}.get(platforms[0], platforms[0])
+    if glob.glob("/dev/vfio/[0-9]*") or glob.glob("/dev/accel*"):
+        return "tpu"
+    return jax.default_backend()
+
+
 class EasyDeLBaseConfig(PretrainedConfig):
     """Base configuration shared across EasyDeL models.
 
@@ -1673,7 +1696,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             resolved_backend: str = backend
         else:
             try:
-                resolved_backend = jax.default_backend()
+                resolved_backend = _default_backend_name()
             except Exception as err:
                 logger.warning(f"Unable to resolve JAX default backend ({err}); falling back to 'cpu' for config init.")
                 resolved_backend = "cpu"

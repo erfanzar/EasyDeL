@@ -1401,10 +1401,10 @@ class eLargeModel:
         """
         with phase_timer("build_esurge.total", tag="eLargeModel"):
             if self._model is None:
-                # dp > 1 from a Ray driver: replicas load the model on their own hosts, never here.
-                from easydel.inference.esurge.serving.ray_replicas import maybe_launch_replicas
+                # dp > 1: each replica loads the model inside its own JAX world, never in the slice-wide one.
+                from easydel.inference.esurge.serving.host_replicas import launch_dp_replicas
 
-                replicas = maybe_launch_replicas(self._config)
+                replicas = launch_dp_replicas(self._config)
                 if replicas is not None:
                     return replicas
             self.build_model()

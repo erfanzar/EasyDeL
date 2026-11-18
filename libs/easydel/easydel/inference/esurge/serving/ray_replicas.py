@@ -254,7 +254,11 @@ def _run_replica(cfg: dict[str, tp.Any], plan: tp.Any, timeout_s: float) -> None
     _tolerate_foreign_libtpu_lockfile()
     _require_free_chips()
     jax.distributed.initialize(
-        plan.coordinator, plan.num_processes, plan.rank, initialization_timeout=max(1, int(timeout_s))
+        plan.coordinator,
+        plan.num_processes,
+        plan.rank,
+        initialization_timeout=max(1, int(timeout_s)),
+        coordinator_bind_address=plan.coordinator,  # the replica leader's internal address, not every interface
     )
     from easydel.infra.elarge.builders import build_esurge
 
