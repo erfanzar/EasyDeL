@@ -501,6 +501,29 @@ def test_leader_shutdown_delivers_shutdown_broadcast_to_client():
             client.close()
 
 
+def test_ledger_failure_tells_request_plane_clients_while_the_step_thread_is_stuck():
+    """A failed world must reach routers even when the leader's step thread never returns.
+
+    When a worker dies mid-step the leader's main thread can stay blocked inside a device collective, while its IO
+    thread keeps heartbeating request-plane clients; a router then keeps routing to a dead engine. Once the ledger
+    records a failure (missed ack deadline, silent worker), the IO thread itself must send Shutdown to every client.
+    """
+    from easydel.inference.esurge.distributed import wire
+
+    with _Plane() as plane:
+        port = int(plane.leader._bind_endpoint.rsplit(":", 1)[1])
+        client = _RawClient(port)
+        try:
+            assert isinstance(client.hello(), wire.HelloOk)
+            _wait_until(lambda: plane.leader.client_identity("client-a") is not None)
+            with plane.leader._ledger.cond:
+                plane.leader._ledger.failure = "worker rank=1 missed the ack deadline for step 7 (5.0s)"
+            message = client.recv_until(lambda m: isinstance(m, wire.Shutdown), timeout_s=5.0)
+            assert "engine world failed" in message.reason and "rank=1" in message.reason
+        finally:
+            client.close()
+
+
 def test_leader_restarts_after_shutdown():
     port = _free_port()
 

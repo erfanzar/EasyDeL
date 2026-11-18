@@ -461,6 +461,7 @@ class ZmqLeaderCoordinator:
         authed: set[bytes] = set()
         last_beat = 0.0
         last_sweep = 0.0
+        failure_announced = False
 
         def _send_to(identity: bytes, header: bytes, payload: bytes | None) -> None:
             frames = [identity, header]
@@ -509,6 +510,16 @@ class ZmqLeaderCoordinator:
                 if now - last_sweep >= 0.5:
                     if self._ready_event.is_set():
                         self._ledger.sweep()
+                        failure = self._ledger.failure
+                        if failure is not None and not failure_announced and self._client_identities:
+                            # The step thread may be blocked inside a device collective with a dead worker and
+                            # never return to raise; this IO thread keeps heartbeating meanwhile. Tell request-plane
+                            # clients now, so a router stops routing here and fails in-flight requests at once.
+                            notice = wire.encode_message(wire.Shutdown(reason=f"engine world failed: {failure}"))
+                            for identity in self._client_identities.values():
+                                sock.send_multipart([identity, notice])
+                            failure_announced = True
+                            logger.error("eSurge coordinator: told request-plane clients the world failed: %s", failure)
                     last_sweep = now
 
                 events = dict(poller.poll(_POLL_MS))
