@@ -113,6 +113,52 @@ It has no key of its own: each request's key (Bearer, `X-API-Key`, or a browser 
 behind an HttpOnly SameSite=Strict session cookie) is forwarded to the API's `/metrics`, which decides. Routes: `/`,
 `/api/metrics`, `/login`, `/logout`, `/healthz`.
 
+## Data-parallel replicas (dp > 1)
+
+`dp: N` in `model.sharding_axis_dims` runs N independent engines behind one endpoint. Nothing else changes: same
+YAML sections, same `serving serve --config X.yaml` on every host, no extra keys, flags or environment variables.
+See `examples/inference/dp_replicas_serving.yaml`.
+
+How it starts:
+
+1. Every process joins the whole slice and builds the deployment's global mesh.
+2. If every `dp` slice of that mesh is a contiguous box of whole hosts (true for the usual layouts on a TPU pod
+   slice), each process works out its replica and its place in it, publishes its address through the slice's
+   key-value store, leaves the slice world and re-executes the same command inside its replica's own JAX world.
+   Otherwise (several dp slices on one host, non-TPU backends, `pp > 1`) the launch keeps one rank-major engine.
+3. Each replica is a complete `dp = 1` engine: its own weights, KV and prefix cache, scheduler and step loop. Its
+   JAX coordination service listens on `coordination.control_port + 1`, its request plane on `control_port`.
+4. Launch-wide limits (`runtime.max_num_seqs`, `max_num_batched_tokens`, `max_num_seq_buckets`,
+   `cache.max_cache_tokens`) are split evenly over the replicas, so the same config serves the same totals.
+5. Replica 0's leader starts the **front**: the same command as a host-only process (JAX on CPU, no distributed
+   world) that serves the OpenAI endpoint. It goes READY as soon as one replica answers and attaches the others as
+   they come up. If the front exits, replica 0's leader restarts it with backoff.
+
+Routing: prefix affinity sends a request to the replica that holds its prompt prefix while that replica has at most
+4 more in-flight requests than the least-loaded one; beyond that it joins the shortest queue. A shared system prompt
+therefore no longer concentrates load on one replica. Requests past the replicas' rows queue; they are not rejected.
+
+Failures: a replica fails alone. When one of its hosts dies, its leader's step bookkeeping notices the missed ack
+after `step_timeout_s` (30 s), tells the front, and the front ends that replica's in-flight requests with a 500 and
+routes everything new to the remaining replicas. A failed replica refuses new router connections until its process
+exits. It is not restarted automatically: bring it back with a relaunch.
+
+Measured on a v5p-128 (GLM-5.3-Flash W8A8, `[1, 2, 1, 4, 8, 1]`, two replicas of 8 hosts):
+
+| | dp = 1 engine on 32 chips | replica 0 | replica 1 |
+|---|---|---|---|
+| model step, 16 tokens | 14.98 ms | 14.88 ms | 15.22 ms |
+| model step, 128 tokens | 25.64 ms | 25.57 ms | 25.83 ms |
+
+| | |
+|---|---|
+| warm start, both replicas reading the shared compile cache | ~24 min |
+| 256 concurrent 4K-token chats, one wave | 5,079-5,456 output tok/s (83-89 % of 2x one engine) |
+| replica-0 host killed under 16 parallel streams | front stayed up; requests in flight on replica 0 got a 500 at +31 s; nothing hung; replica 1 kept serving |
+
+For comparison, one rank-major engine over the same 64 chips stepped 21.6 ms at 16 tokens and 34.7 ms at 128,
+because every step ran cross-rank collectives over both dp halves.
+
 ## Operations
 
 ```bash
@@ -168,11 +214,12 @@ otherwise to the least-loaded worker with room. A shared system prompt therefore
 ## Known limits
 
 - One model per deployment; one uvicorn worker (generation runs in the engine, not the HTTP workers).
-- A world is all or nothing: losing any host aborts it, and a restart is a full relaunch.
+- A world is all or nothing: losing any host aborts it, and a restart is a full relaunch. With dp replicas the world
+  is one replica: the others keep serving, but the failed replica comes back only with a relaunch.
 - Full warmup compiles every token/request bucket; it is fast only when the compilation cache matches, which needs
   a pinned KV pool, the same code and config, and a `compilation_cache_dir` every host can read (see Config).
-- A shared prompt prefix concentrates moderate load on one DP worker (see the routing note above); latency at mid
-  concurrency could improve with routing that also weighs per-worker load below the row cap.
+- With rank-major DP (one engine, `cache.data_parallelism_axis: dp`), a shared prompt prefix concentrates moderate
+  load on one DP worker (see the routing note above). dp replicas use bounded affinity instead.
 - `/health` requires the API key like every other route.
 - Workarounds that exist only in the batch data-generation harness (an explicit KV budget, EOS seeding) are not part
   of this serving path.

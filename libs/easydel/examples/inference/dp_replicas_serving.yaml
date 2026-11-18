@@ -1,0 +1,59 @@
+# GLM-5.3-Flash W8A8 on one v5p-128 slice (16 hosts, 64 chips) as two independent dp replicas of EP4 x TP8.
+#
+# The launch is the same as for a single engine; `dp: 2` in sharding_axis_dims is the only thing that asks for
+# replicas. Run on every host:
+#
+#   python -m easydel.inference.esurge.serving serve --config dp_replicas_serving.yaml
+#
+# Validate anywhere:
+#
+#   ENABLE_DISTRIBUTED_INIT=0 python -m easydel.inference.esurge.serving check --config dp_replicas_serving.yaml
+#
+# Every process joins the whole slice, works out its replica from the global mesh, leaves the slice world and
+# re-executes the same command inside its replica's own JAX world (8 hosts each here). Each replica is a complete
+# dp=1 engine with its own weights, KV and prefix cache and scheduler, and fails alone. Replica 0's leader then starts
+# the front: a host-only process that serves the one OpenAI endpoint below and routes over both replicas.
+# See docs/esurge_serving.md, "Data-parallel replicas".
+model:
+  checkpoint: gs://<your-bucket>/GLM-5.3-Flash-easydel-bf16
+  # Hugging Face tokenizers cannot read gs://; point at a local copy of the checkpoint's tokenizer files.
+  tokenizer: /opt/models/GLM-5.3-Flash/tokenizer
+  served_name: GLM-5.3-Flash-W8A8
+  # (pp, dp, fsdp, ep, tp, sp): 2 replicas, each EP4 x TP8 over 32 chips. Replicas are used when every dp slice of
+  # the mesh is a whole-host box of the slice; otherwise the launch keeps one rank-major engine over all 64 chips.
+  sharding_axis_dims: [1, 2, 1, 4, 8, 1]
+  attn_mechanism: multi_latent_ragged_page_attention_v2
+  quantization:
+    dtype: w8a8 # pattern: the model's default_quantization_pattern()
+
+esurge:
+  # Limits are stated for the whole launch; each replica gets 1/dp of them (rounded up): here 128 rows, buckets
+  # [16, 32, 128], 16,384 batched tokens and 4,059,264 cached tokens per replica.
+  runtime:
+    max_model_len: 131072
+    max_num_seqs: 256
+    max_num_seq_buckets: [32, 64, 256]
+    max_num_batched_tokens: 32768
+    chunked_prefill_enabled: true
+    long_prefill_token_threshold: 8192
+  cache:
+    hbm_utilization: 0.97
+    page_size: 128
+    data_parallelism_axis: dp
+    # Pin the page pool so every launch compiles the same shapes and hits the persistent compilation cache.
+    max_cache_tokens: 8118528
+
+server:
+  host: internal # this VM's internal IP; use 0.0.0.0 to also listen on the external address
+  port: 8000
+  api_key_file: ~/.config/esurge/api_key
+
+coordination:
+  # Each replica's request plane listens on control_port on its leader; each replica's JAX coordination service
+  # uses control_port + 1. Keep both free on every host.
+  control_port: 19666
+  bind_host: internal
+
+# One shared directory every host reads (see docs/esurge_serving.md, Config). Each replica's process 0 writes its
+# own entries, so replicas warm each other's cache only when their programs match.
+compilation_cache_dir: gs://<your-bucket>/jax_cc/glm53-flash-w8a8-dp2-ep4-tp8
