@@ -20,6 +20,7 @@ import dataclasses
 import itertools
 import json
 import os
+import sys
 
 import numpy as np
 import pytest
@@ -29,6 +30,8 @@ from easydel.inference.esurge.serving.replicas import (
     ReplicaPlan,
     box_layout,
     plan_replicas,
+    relaunch_argv,
+    spawn_front,
     split_dp_slices,
 )
 
@@ -133,8 +136,9 @@ def test_each_dp_half_of_a_v5p_128_becomes_its_own_slice():
         assert hostnames == [f"10.0.0.{p}" for p in ordered]
         assert plans[ordered[0]][0].coordinator == f"10.0.0.{ordered[0]}:19667"
         assert all(plans[p][0].leaders == plans[ordered[0]][0].leaders for _, p in members)
-    front = [p for p, (plan, _) in plans.items() if plan.is_front]
-    assert front == [0]
+    # Replica 0's leader starts the front; no replica process is the front itself.
+    assert [p for p, (plan, _) in plans.items() if plan.spawns_front] == [0]
+    assert not any(plan.is_front for plan, _ in plans.values())
 
 
 def test_dp_slices_sharing_a_host_keep_one_engine():
@@ -161,6 +165,98 @@ def test_plan_round_trips_and_hands_the_token_through_a_pipe():
     assert back.leaders == ("a", "b") and not back.is_front
     assert back.read_token() == "tok-123"
     assert "tok-123" not in back.to_json()
+
+
+def test_relaunch_replaces_the_plan_it_was_started_with(monkeypatch):
+    old = ReplicaPlan(index=0, rank=0, num_processes=8, coordinator="h:1", leaders=("a", "b"))
+    monkeypatch.setattr(
+        sys, "orig_argv", [sys.executable, "-B", "-m", "pkg", "serve", "--config", "x.yaml", "--replica-plan", "{}"]
+    )
+    argv = relaunch_argv(dataclasses.replace(old, role="front"))
+    assert argv[:7] == [sys.executable, "-B", "-m", "pkg", "serve", "--config", "x.yaml"]
+    assert argv.count("--replica-plan") == 1
+    assert ReplicaPlan.from_json(argv[-1]).is_front
+
+
+def test_front_starts_host_only_with_its_plan_and_the_token_in_a_pipe(monkeypatch):
+    """The front is the same command, re-run as a separate process: CPU JAX, no distributed world, role=front."""
+    child = (
+        "import json, os, sys\n"
+        "plan = json.loads(sys.argv[sys.argv.index('--replica-plan') + 1])\n"
+        "token = os.read(plan['token_fd'], 64).decode()\n"
+        "print(json.dumps({'role': plan['role'], 'index': plan['index'], 'token': token,\n"
+        "                  'jax': os.environ['JAX_PLATFORMS'], 'dist': os.environ['ENABLE_DISTRIBUTED_INIT']}))\n"
+    )
+    monkeypatch.setattr(sys, "orig_argv", [sys.executable, "-I", "-c", child])
+    plan = ReplicaPlan(index=0, rank=0, num_processes=8, coordinator="h:1", leaders=("a", "b"))
+    assert plan.spawns_front and not plan.is_front
+    front = spawn_front(plan, "tok-xyz")
+    assert front.wait(timeout=60) == 0
+    assert "tok-xyz" not in " ".join(front.args)
+    front_plan = ReplicaPlan.from_json(front.args[-1])
+    assert front_plan.is_front and not front_plan.spawns_front
+
+
+def test_front_reports_what_it_received(monkeypatch, capfd):
+    child = (
+        "import json, os, sys\n"
+        "plan = json.loads(sys.argv[sys.argv.index('--replica-plan') + 1])\n"
+        "print(json.dumps({'role': plan['role'], 'token': os.read(plan['token_fd'], 64).decode(),\n"
+        "                  'jax': os.environ['JAX_PLATFORMS'], 'dist': os.environ['ENABLE_DISTRIBUTED_INIT']}))\n"
+    )
+    monkeypatch.setattr(sys, "orig_argv", [sys.executable, "-I", "-c", child])
+    plan = ReplicaPlan(index=0, rank=0, num_processes=8, coordinator="h:1", leaders=("a", "b"))
+    assert spawn_front(plan, "tok-xyz").wait(timeout=60) == 0
+    seen = json.loads(capfd.readouterr().out.strip().splitlines()[-1])
+    assert seen == {"role": "front", "token": "tok-xyz", "jax": "cpu", "dist": "0"}
+
+
+class _Handle:
+    def __init__(self, addr: str):
+        self.addr = addr
+        self.alive = True
+        self.closed = False
+        self.esurge_name = "m"
+        self.max_model_len = 128
+        self.max_num_seqs = 128
+        self.page_size = 16
+
+    def close(self):
+        self.closed = True
+
+
+def test_front_serves_with_the_first_ready_replica_and_attaches_late_and_returning_ones():
+    from easydel.inference.esurge.distributed.request_plane import RequestPlaneUnavailable
+    from easydel.inference.esurge.serving.app import ReplicaAttacher
+
+    up = {"a": True, "b": False}
+    opened: list[_Handle] = []
+
+    def connect(addr):
+        if not up[addr]:
+            raise RequestPlaneUnavailable(f"{addr} not up")
+        opened.append(_Handle(addr))
+        return opened[-1]
+
+    attacher = ReplicaAttacher(("a", "b"), connect=connect, log=lambda m: None, interval_s=0.01)
+    router = attacher.wait_for_first()
+    # Serving with one of two replicas: the router already reports the planned capacity for the server's slots.
+    assert [m.addr for m in router.members] == ["a"]
+    assert router.max_num_seqs == 256
+    assert router.select_member("hello") == 0
+    # Nothing new while replica b is still down; then it comes up and is attached in the background round.
+    assert attacher.attach_round() == 0
+    up["b"] = True
+    assert attacher.attach_round() == 1
+    assert [m.addr for m in router.members] == ["a", "b"] and router.max_num_seqs == 256
+    # Replica a's engine dies: traffic goes to b, and a is re-attached in its own slot when it answers again.
+    router.members[0].alive = False
+    up["a"] = False
+    assert attacher.attach_round() == 0
+    assert router.select_member("hello") == 1
+    up["a"] = True
+    assert attacher.attach_round() == 1
+    assert opened[0].closed and router.members[0] is opened[-1] and len(router.members) == 2
 
 
 def test_launch_wide_limits_split_over_replicas():

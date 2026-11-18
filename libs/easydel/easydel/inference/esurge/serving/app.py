@@ -34,6 +34,12 @@ from .keys import load_or_create_api_key
 ENGINE_SECTIONS = frozenset({"runtime", "cache", "context", "workers", "parsing", "vision"})
 WORKER_SHUTDOWN_WAIT_S = 20.0
 """How long a worker that got SIGTERM waits for the leader's Shutdown before closing on its own."""
+FRONT_STABLE_S = 300.0
+"""A front that ran this long before exiting is restarted without backoff growth."""
+FRONT_MAX_BACKOFF_S = 60.0
+"""Longest wait between restarts of a front that keeps exiting."""
+REPLICA_ATTACH_INTERVAL_S = 5.0
+"""How often the front retries replicas it has not attached yet (or whose engine died)."""
 
 
 class ShutdownRequested(BaseException):
@@ -244,6 +250,9 @@ def _split_into_replicas(config: ServingConfig, rank: int, token: str | None, ed
 
 
 def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
+    if plan is not None and plan.is_front:
+        _serve_front(config, plan)
+        return
     started = time.monotonic()
     import jax
 
@@ -278,8 +287,8 @@ def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
         control_host = resolve_bind_host(config.coordination.bind_host)
         _split_into_replicas(config, rank, token, ed)  # returns only when the launch stays one rank-major engine
 
-    is_front = is_leader if plan is None else plan.is_front
-    if is_front and config.server.profiler_port is not None:
+    profiles = is_leader if plan is None else plan.spawns_front
+    if profiles and config.server.profiler_port is not None:
         jax.profiler.start_server(config.server.profiler_port)
         _log(rank, f"JAX profiler server on port {config.server.profiler_port}")
 
@@ -305,10 +314,32 @@ def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
             steps = {t: round(ms, 3) for t, ms in table.items()}
             _log(rank, f"replica {plan.index} model-step ms per token bucket: {steps}")
     try:
-        if plan is not None and engine.is_coordination_leader and not plan.is_front:
-            # Another replica's leader: the front's router reaches its engine over its request plane.
+        if plan is not None and engine.is_coordination_leader:
+            # A replica leader: the front's router reaches its engine over its request plane.
             _log(rank, f"replica {plan.index} leader serving its request plane on {control_host}")
+            front = None
+            front_started = time.monotonic()
+            restarts = 0
+            if plan.spawns_front:
+                from .replicas import spawn_front
+
+                front = spawn_front(plan, str(token))
+                _log(rank, f"started the front (pid {front.pid}) for the OpenAI endpoint over {plan.count} replicas")
             while True:
+                if front is not None and front.poll() is not None:
+                    # The front holds no engine state: restart it instead of taking this replica down with it.
+                    lived = time.monotonic() - front_started
+                    restarts = 0 if lived > FRONT_STABLE_S else restarts + 1
+                    wait = min(FRONT_MAX_BACKOFF_S, 2.0**restarts)
+                    _log(
+                        rank,
+                        f"the front (pid {front.pid}) exited with code {front.returncode} after {lived:.0f}s; "
+                        f"restarting it in {wait:.0f}s",
+                    )
+                    time.sleep(wait)
+                    front = spawn_front(plan, str(token))
+                    front_started = time.monotonic()
+                    _log(rank, f"restarted the front (pid {front.pid})")
                 time.sleep(1.0)
         if not engine.is_coordination_leader:
             try:
@@ -320,57 +351,150 @@ def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
                 raise
             _log(rank, "leader shut the world down")
             return
-        if plan is None:
-            _serve_http(config, engine, rank, ed)
-            return
-        routed = _route_replicas(config, engine, plan, token, rank)
-        try:
-            _serve_http(config, routed, rank, ed)
-        finally:
-            routed.close()
+        _serve_http(config, engine, rank, ed)
     finally:
         engine.close()
 
 
-def _route_replicas(config: ServingConfig, local: tp.Any, plan: tp.Any, token: str | None, rank: int) -> tp.Any:
-    """Front the local replica and a request-plane client per other replica leader with a load-aware prefix router.
+def _serve_front(config: ServingConfig, plan: tp.Any) -> None:
+    """The front of a dp>1 launch: host-only, a router over every replica's request plane, the OpenAI endpoint.
 
-    Raises:
-        RuntimeError: When a replica's request plane does not come up within ``coordination.token_timeout_s``.
+    Started by replica 0's leader with JAX on the host CPU and no distributed world, so it never touches the TPU.
     """
-    from easydel.inference.esurge.distributed.remote_engine import RemoteEngineHandle
-    from easydel.inference.esurge.distributed.request_plane import RequestPlaneUnavailable
-    from easydel.inference.esurge.distributed.routed_engine import RoutedEngine
+    import easydel as ed
 
-    port = config.coordination.control_port
-    deadline = time.monotonic() + float(config.coordination.token_timeout_s)
-    handles: list[tp.Any] = []
+    token = plan.read_token()
+    _log(0, f"front of {plan.count} dp replicas (host-only); easydel {ed.__version__} from {ed.__file__}")
+    attacher = ReplicaAttacher(plan.leaders, connect=_replica_connector(config, token), log=lambda m: _log(0, m))
+    routed = attacher.wait_for_first()
+    attacher.start()
     try:
-        for index, addr in enumerate(plan.leaders):
-            if index == plan.index:
+        _serve_http(config, routed, 0, ed)
+    finally:
+        attacher.stop()
+        routed.close()
+
+
+def _replica_connector(config: ServingConfig, token: str) -> tp.Callable[[str], tp.Any]:
+    """Open a request-plane client to one replica leader; raises ``RequestPlaneUnavailable`` while it is not up."""
+    from easydel.inference.esurge.distributed.remote_engine import RemoteEngineHandle
+
+    def connect(addr: str) -> tp.Any:
+        return RemoteEngineHandle(
+            addr,
+            config.coordination.control_port,
+            auth_token=str(token),
+            tokenizer_source=config.model.tokenizer_source,
+            connect_timeout_s=10.0,
+        )
+
+    return connect
+
+
+class ReplicaAttacher:
+    """Builds the front's router from the replicas that are up, and keeps attaching the rest.
+
+    The front serves as soon as one replica answers. Replicas still compiling (or restarting after a failure) are
+    attached in the background when their request plane comes up, so one slow or dead replica never holds the
+    endpoint down; a replica whose engine died is re-attached in its slot when it comes back.
+
+    Args:
+        leaders: Each replica leader's address, by replica index.
+        connect: Opens a client to one leader; raises ``RequestPlaneUnavailable`` while it is not up.
+        log: Progress logger.
+        interval_s: Wait between attach rounds.
+    """
+
+    def __init__(
+        self,
+        leaders: tp.Sequence[str],
+        *,
+        connect: tp.Callable[[str], tp.Any],
+        log: tp.Callable[[str], None],
+        interval_s: float = REPLICA_ATTACH_INTERVAL_S,
+    ) -> None:
+        import threading
+
+        self.leaders = tuple(leaders)
+        self._connect = connect
+        self._log = log
+        self._interval_s = float(interval_s)
+        self._slots: dict[int, int] = {}  # replica index -> router member index
+        self.router: tp.Any | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _try(self, index: int) -> tp.Any | None:
+        from easydel.inference.esurge.distributed.request_plane import RequestPlaneError, RequestPlaneUnavailable
+
+        try:
+            return self._connect(self.leaders[index])
+        except RequestPlaneUnavailable:
+            return None
+        except RequestPlaneError as exc:
+            # Up but refusing (its world failed and the process has not exited yet): try again next round.
+            self._log(f"replica {index} at {self.leaders[index]} refused: {exc}")
+            return None
+
+    def attach_round(self) -> int:
+        """Try every replica that is not attached or whose engine died once; returns how many were attached."""
+        from easydel.inference.esurge.distributed.routed_engine import RoutedEngine
+
+        attached = 0
+        for index in range(len(self.leaders)):
+            slot = self._slots.get(index)
+            old = None if slot is None or self.router is None else self.router.members[slot]
+            if old is not None and getattr(old, "alive", True):
                 continue
-            while True:
+            handle = self._try(index)
+            if handle is None:
+                continue
+            if self.router is None:
+                self.router = RoutedEngine([handle], planned_members=len(self.leaders))
+                self._slots[index] = 0
+            elif slot is None:
+                self._slots[index] = self.router.add_member(handle)
+            else:
+                self.router.replace_member(slot, handle)
+                close = getattr(old, "close", None)
+                if close is not None:
+                    close()
+            attached += 1
+            verb = "re-attached" if old is not None else "attached"
+            self._log(f"replica {index} {verb} at {self.leaders[index]} ({len(self._slots)}/{len(self.leaders)})")
+        return attached
+
+    def wait_for_first(self) -> tp.Any:
+        """Block until at least one replica is attached; returns the router."""
+        started = time.monotonic()
+        last_note = started
+        while self.router is None:
+            self.attach_round()
+            if self.router is None:
+                if time.monotonic() - last_note > 60.0:
+                    self._log(f"no replica up yet after {time.monotonic() - started:.0f}s; still waiting")
+                    last_note = time.monotonic()
+                time.sleep(self._interval_s)
+        return self.router
+
+    def start(self) -> None:
+        """Keep attaching missing and dead replicas in the background."""
+        import threading
+
+        def _loop() -> None:
+            while not self._stop.wait(self._interval_s):
                 try:
-                    handles.append(
-                        RemoteEngineHandle(
-                            addr,
-                            port,
-                            auth_token=str(token),
-                            tokenizer_source=config.model.tokenizer_source,
-                            connect_timeout_s=10.0,
-                        )
-                    )
-                    break
-                except RequestPlaneUnavailable:
-                    if time.monotonic() > deadline:
-                        raise RuntimeError(f"replica {index} at {addr}:{port} did not come up in time") from None
-                    time.sleep(5.0)
-            _log(rank, f"replica {index} attached at {addr}:{port}")
-    except BaseException:
-        for handle in handles:
-            handle.close()
-        raise
-    return RoutedEngine([local, *handles])
+                    self.attach_round()
+                except Exception as exc:
+                    self._log(f"replica attach round failed: {exc!r}")
+
+        self._thread = threading.Thread(target=_loop, name="esurge-replica-attacher", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=30.0)
 
 
 def _serve_http(config: ServingConfig, engine: tp.Any, rank: int, ed: tp.Any) -> None:

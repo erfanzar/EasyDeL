@@ -162,12 +162,16 @@ class RoutedEngine:
         *,
         affinity_block_chars: int | None = None,
         affinity_max_imbalance: int = 4,
+        planned_members: int | None = None,
     ) -> None:
         if not members:
             raise ValueError("RoutedEngine needs at least one member")
         if int(affinity_max_imbalance) < 0:
             raise ValueError(f"affinity_max_imbalance must be >= 0, got {affinity_max_imbalance}")
+        if planned_members is not None and int(planned_members) < len(members):
+            raise ValueError(f"planned_members={planned_members} is below the {len(members)} members given")
         self.members = list(members)
+        self.planned_members = None if planned_members is None else int(planned_members)
         self.affinity_max_imbalance = int(affinity_max_imbalance)
         if affinity_block_chars is None:
             page_size = next((int(getattr(m, "page_size", 0) or 0) for m in self.members), 0)
@@ -178,6 +182,25 @@ class RoutedEngine:
         # QueueStats ride 1s heartbeats, so a burst arriving between beats
         # would otherwise dump entirely on the lowest-indexed member.
         self._inflight = [0] * len(self.members)
+
+    def add_member(self, member) -> int:
+        """Attach a member that came up after the router started serving (a late replica).
+
+        Returns:
+            The new member's index.
+        """
+        with self._route_lock:
+            # In-flight first: a reader that sees the member under the lock also sees its counter.
+            self._inflight.append(0)
+            self.members.append(member)
+            return len(self.members) - 1
+
+    def replace_member(self, index: int, member) -> None:
+        """Put a fresh member in a dead member's slot (a replica that came back on the same address)."""
+        with self._route_lock:
+            self.members[index] = member
+            self._inflight[index] = 0
+        self.affinity.drop_member(index)
 
     def _alive_indices(self) -> list[int]:
         alive = []
@@ -247,8 +270,15 @@ class RoutedEngine:
 
     @property
     def max_num_seqs(self) -> int:
-        """Aggregate concurrency limit (sum across members)."""
-        return sum(int(member.max_num_seqs) for member in self.members)
+        """Aggregate concurrency limit: the sum across members, or the planned total while members attach late.
+
+        A server sizes its generation slots from this once, at start-up; a router that starts with the first ready
+        replica of ``planned_members`` reports the full deployment so late replicas are not capped away.
+        """
+        attached = sum(int(member.max_num_seqs) for member in self.members)
+        if self.planned_members is None or len(self.members) >= self.planned_members:
+            return attached
+        return max(attached, max(int(member.max_num_seqs) for member in self.members) * self.planned_members)
 
     @property
     def tokenizer(self):

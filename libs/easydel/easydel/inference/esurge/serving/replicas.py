@@ -19,8 +19,9 @@ With ``dp = N > 1`` in ``model.sharding_axis_dims`` the launch is unchanged: eve
 a contiguous box of TPU hosts owned by no other slice, every process works out its replica from that mesh, exchanges
 its address through the slice's key-value store, leaves the slice world and re-executes the same command inside its
 replica's own sub-slice world. Each replica is then a complete ``dp = 1`` engine (weights, KV and prefix cache,
-scheduler, step loop, JAX coordination service) and fails alone. Replica 0's leader serves the one OpenAI endpoint
-over a router whose members are its own engine and a request-plane client per other replica leader.
+scheduler, step loop, JAX coordination service) and fails alone. Once its engine is up, replica 0's leader starts the
+front: the same command as a host-only process that serves the one OpenAI endpoint over a router whose members are a
+request-plane client per replica leader. No replica shares an interpreter with the HTTP and routing work.
 
 When the slices are not separate host boxes (several slices on one host, non-TPU backends, pipeline stages), the
 launch keeps the single rank-major engine.
@@ -31,6 +32,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import subprocess
 import sys
 import typing as tp
 
@@ -93,6 +95,7 @@ class ReplicaPlan:
         coordinator: ``host:port`` of the replica world's JAX coordination service (its rank 0).
         leaders: Address of every replica's leader, by replica index.
         token_fd: Inherited pipe holding the shared request-plane token (never on the command line).
+        role: ``"engine"`` for a replica process, ``"front"`` for the process serving the OpenAI endpoint.
     """
 
     index: int
@@ -101,6 +104,7 @@ class ReplicaPlan:
     coordinator: str
     leaders: tuple[str, ...]
     token_fd: int = -1
+    role: str = "engine"
 
     @property
     def count(self) -> int:
@@ -108,8 +112,13 @@ class ReplicaPlan:
 
     @property
     def is_front(self) -> bool:
-        """Whether this process serves the OpenAI endpoint (replica 0's leader)."""
-        return self.index == 0 and self.rank == 0
+        """Whether this process is the front: no TPU work, a router over every replica, the OpenAI endpoint."""
+        return self.role == "front"
+
+    @property
+    def spawns_front(self) -> bool:
+        """Whether this process starts the front (replica 0's leader, once its engine is up)."""
+        return self.role == "engine" and self.index == 0 and self.rank == 0
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self))
@@ -240,9 +249,7 @@ def reexec_into_replica(plan: ReplicaPlan, env: tp.Mapping[str, str], token: str
     without close-on-exec; every inherited descriptor is marked close-on-exec here so the kernel releases the chips
     during ``execve``, otherwise the new image finds them busy. The token travels in a pipe, not on the command line.
     """
-    read_fd, write_fd = os.pipe()
-    os.write(write_fd, token.encode())
-    os.close(write_fd)
+    read_fd = _token_pipe(token)
     for name in os.listdir("/proc/self/fd"):
         fd = int(name)
         if fd > 2 and fd != read_fd:
@@ -252,8 +259,50 @@ def reexec_into_replica(plan: ReplicaPlan, env: tp.Mapping[str, str], token: str
                 pass
     os.set_inheritable(read_fd, True)
     child_env = {**os.environ, **env, "ENABLE_DISTRIBUTED_INIT": "0"}
-    plan = dataclasses.replace(plan, token_fd=read_fd)
-    argv = [sys.executable, *sys.orig_argv[1:], "--replica-plan", plan.to_json()]
+    argv = relaunch_argv(dataclasses.replace(plan, token_fd=read_fd))
     sys.stdout.flush()
     sys.stderr.flush()
     os.execve(sys.executable, argv, child_env)
+
+
+def spawn_front(plan: ReplicaPlan, token: str) -> subprocess.Popen:
+    """Start the front: the same command, as a host-only process serving the OpenAI endpoint over every replica.
+
+    The front runs JAX on the host CPU with no distributed world, so HTTP handling, routing and per-request
+    tokenisation and streaming never share an interpreter with a replica's step loop. It stays in the launch's process
+    group (``eray tpu job stop`` stops it with the rest) and is a separate process from replica 0, so it keeps routing
+    to the other replicas when replica 0's world fails.
+
+    Args:
+        plan: The calling replica-0 leader's plan.
+        token: The shared request-plane token, handed over through a pipe.
+
+    Returns:
+        The front's process.
+    """
+    read_fd = _token_pipe(token)
+    front = dataclasses.replace(plan, role="front", token_fd=read_fd)
+    env = {**os.environ, "JAX_PLATFORMS": "cpu", "ENABLE_DISTRIBUTED_INIT": "0"}
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        return subprocess.Popen(relaunch_argv(front), env=env, pass_fds=(read_fd,))
+    finally:
+        os.close(read_fd)
+
+
+def relaunch_argv(plan: ReplicaPlan) -> list[str]:
+    """This process's own command line, carrying ``plan`` (any plan it was started with is replaced)."""
+    argv = list(sys.orig_argv[1:])
+    if "--replica-plan" in argv:
+        at = argv.index("--replica-plan")
+        del argv[at : at + 2]
+    return [sys.executable, *argv, "--replica-plan", plan.to_json()]
+
+
+def _token_pipe(token: str) -> int:
+    """A pipe already holding ``token`` and closed for writing; returns its read end."""
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, token.encode())
+    os.close(write_fd)
+    return read_fd
