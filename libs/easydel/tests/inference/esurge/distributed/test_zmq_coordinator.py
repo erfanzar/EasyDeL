@@ -524,6 +524,23 @@ def test_ledger_failure_tells_request_plane_clients_while_the_step_thread_is_stu
             client.close()
 
 
+def test_failed_world_refuses_new_request_plane_clients():
+    """A router reconnecting while the failed world's process is still alive must not re-attach a dead engine."""
+    from easydel.inference.esurge.distributed import wire
+
+    with _Plane() as plane:
+        port = int(plane.leader._bind_endpoint.rsplit(":", 1)[1])
+        with plane.leader._ledger.cond:
+            plane.leader._ledger.failure = "worker rank=1 missed the ack deadline for step 9 (5.0s)"
+        late = _RawClient(port, client_id="late")
+        try:
+            reply = late.hello()
+            assert isinstance(reply, wire.Shutdown) and "engine world failed" in reply.reason
+            assert plane.leader.client_identity("late") is None
+        finally:
+            late.close()
+
+
 def test_leader_restarts_after_shutdown():
     port = _free_port()
 

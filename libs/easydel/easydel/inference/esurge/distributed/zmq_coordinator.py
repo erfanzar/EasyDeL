@@ -415,6 +415,14 @@ class ZmqLeaderCoordinator:
             logger.warning("eSurge coordinator: rejecting peer with bad auth token")
             return
         if message.role == wire.ROLE_CLIENT:
+            failure = self._ledger.failure
+            if failure is not None:
+                # This IO thread outlives a failed world until the process aborts; answering HelloOk would let a
+                # router re-attach a dead engine. Refuse with Shutdown so the client treats it as down.
+                sock.send_multipart(
+                    [identity, wire.encode_message(wire.Shutdown(reason=f"engine world failed: {failure}"))]
+                )
+                return
             # Request-plane clients attach to whatever engine the owner runs:
             # no world/fingerprint requirements, never counted toward Ready.
             self._client_identities[message.client_id] = identity
