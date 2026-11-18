@@ -64,13 +64,20 @@ def sigterm_raises() -> Iterator[None]:
         signal.signal(signal.SIGTERM, previous)
 
 
-def build_loading_kwargs(config: ServingConfig, text_config: tp.Any | None, *, ed: tp.Any) -> dict[str, tp.Any]:
+def build_loading_kwargs(
+    config: ServingConfig,
+    text_config: tp.Any | None,
+    *,
+    ed: tp.Any,
+    sharding_axis_dims: tp.Sequence[int] | None = None,
+) -> dict[str, tp.Any]:
     """Pretrained-loader kwargs for ``config.model``.
 
     Args:
         config: The deployment.
         text_config: The checkpoint's text config, needed only when quantization uses the model's default pattern.
         ed: The ``easydel`` module (injected so this stays importable without loading JAX in tests).
+        sharding_axis_dims: Mesh dims to load with instead of the deployment's (one dp replica's dims).
 
     Raises:
         ValueError: When quantization asks for the model's default pattern and the model has none.
@@ -78,10 +85,11 @@ def build_loading_kwargs(config: ServingConfig, text_config: tp.Any | None, *, e
     import jax.numpy as jnp
 
     model = config.model
+    dims = tuple(sharding_axis_dims) if sharding_axis_dims is not None else model.sharding_axis_dims
     kwargs: dict[str, tp.Any] = {
         "dtype": jnp.dtype(model.dtype),
         "param_dtype": jnp.dtype(model.param_dtype),
-        "sharding_axis_dims": model.sharding_axis_dims,
+        "sharding_axis_dims": dims,
         "sharding_axis_names": EASYDEL_MESH_AXES,
         "auto_shard_model": True,
     }
@@ -129,25 +137,124 @@ def build_engine_sections(
     return sections
 
 
+# Engine limits a deployment states for the whole launch: with dp replicas each replica gets its share.
+_PER_REPLICA_LIMITS = (("runtime", "max_num_seqs"), ("runtime", "max_num_batched_tokens"), ("cache", "max_cache_tokens"))
+
+
+def per_replica_sections(sections: dict[str, tp.Any], replicas: int) -> dict[str, tp.Any]:
+    """Split launch-wide engine limits over ``replicas`` independent engines.
+
+    A dp>1 deployment states rows, batched tokens, token buckets and KV capacity for the whole launch (the rank-major
+    engine splits them over its dp ranks). Run as one engine per dp replica, each engine gets ``1/replicas`` of them,
+    rounded up, so the same config serves the same totals.
+
+    Args:
+        sections: Engine sections as built by :func:`build_engine_sections`.
+        replicas: Number of replicas.
+
+    Returns:
+        New sections; ``sections`` is not modified.
+    """
+    out = {name: dict(value) for name, value in sections.items()}
+
+    def share(value: tp.Any) -> int:
+        return max(1, -(-int(value) // replicas))
+
+    for section, key in _PER_REPLICA_LIMITS:
+        if out.get(section, {}).get(key) is not None:
+            out[section][key] = share(out[section][key])
+    buckets = out.get("runtime", {}).get("max_num_seq_buckets")
+    if buckets:
+        out["runtime"]["max_num_seq_buckets"] = sorted({share(b) for b in buckets})
+    return out
+
+
+def replica_dims(config: ServingConfig) -> tuple[int, ...]:
+    """One dp replica's mesh dims: the deployment's dims with ``dp`` collapsed to 1."""
+    dims = [int(v) for v in config.model.sharding_axis_dims]
+    dims[EASYDEL_MESH_AXES.index("dp")] = 1
+    return tuple(dims)
+
+
 def _log(rank: int, message: str) -> None:
     print(f"[esurge-serving rank={rank}] {message}", flush=True)
 
 
-def serve(config: ServingConfig) -> None:
+def serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
     """Join the slice, build the engine, and serve (leader) or replay steps (workers) until shutdown.
+
+    With ``dp > 1`` and dp slices that are separate host boxes, every host first leaves the slice world and re-executes
+    the same command inside its replica's own JAX world (``plan`` is then set); see :mod:`.replicas`.
 
     SIGTERM (``eray tpu job stop``) ends it cleanly on every rank: the engine is closed and the call returns.
     """
     with sigterm_raises():
         try:
-            _serve(config)
+            _serve(config, plan)
         except ShutdownRequested as exc:
             print(f"[esurge-serving] stopped by {exc}", flush=True)
 
 
-def _serve(config: ServingConfig) -> None:
+def _replica_port(config: ServingConfig) -> int:
+    """Port of each replica world's JAX coordination service (next to the ZMQ control port)."""
+    return int(config.coordination.control_port) + 1
+
+
+def _split_into_replicas(config: ServingConfig, rank: int, token: str | None, ed: tp.Any) -> None:
+    """In the slice world: re-execute this host inside its dp replica's own JAX world, or return to stay rank-major."""
+    dims = tuple(int(v) for v in config.model.sharding_axis_dims)
+    if dims[EASYDEL_MESH_AXES.index("dp")] == 1 or dims[EASYDEL_MESH_AXES.index("pp")] != 1 or not token:
+        return
+    import jax
+    import spectrax as spx
+    from jax.experimental import multihost_utils
+
+    from .replicas import plan_replicas, reexec_into_replica
+
+    if jax.default_backend() != "tpu":
+        return
+    mesh = spx.to_jax_mesh(
+        ed.EasyDeLBaseConfig.create_mesh(sharding_axis_dims=dims, sharding_axis_names=EASYDEL_MESH_AXES)
+    )
+    from jax._src.distributed import global_state
+
+    planned = plan_replicas(
+        mesh.devices,
+        mesh.axis_names,
+        process_index=rank,
+        all_devices=jax.devices(),
+        local_devices=jax.local_devices(),
+        address=resolve_bind_host("internal"),
+        client=global_state.client,
+        port=_replica_port(config),
+        timeout_s=float(config.coordination.token_timeout_s),
+    )
+    if planned is None:
+        _log(rank, "dp slices are not separate host boxes; keeping one rank-major engine over the whole mesh")
+        return
+    plan, env = planned
+    _log(
+        rank,
+        f"dp={plan.count}: re-executing into replica {plan.index} as worker {plan.rank}/{plan.num_processes} "
+        f"(topology {env['TPU_TOPOLOGY']}, coordinator {plan.coordinator})",
+    )
+    multihost_utils.sync_global_devices("easydel-esurge-serving-replica-split")
+    jax.distributed.shutdown()
+    reexec_into_replica(plan, env, token)
+
+
+def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
     started = time.monotonic()
     import jax
+
+    if plan is not None:
+        # Inside a dp replica: its own JAX world, joined before anything touches the TPU backend.
+        jax.distributed.initialize(
+            plan.coordinator,
+            plan.num_processes,
+            plan.rank,
+            initialization_timeout=int(config.coordination.token_timeout_s),
+        )
 
     import easydel as ed  # joins the multi-host JAX world (TPU slices are detected from GCE metadata)
     from easydel.utils.compilation_cache import cache_namespace, configure_compilation_cache
@@ -157,29 +264,52 @@ def _serve(config: ServingConfig) -> None:
     world_size = int(jax.process_count())
     rank = int(jax.process_index())
     is_leader = rank == 0
-    _log(rank, f"joined world of {world_size} processes; easydel {ed.__version__} from {ed.__file__}")
-    if is_leader and config.server.profiler_port is not None:
-        jax.profiler.start_server(config.server.profiler_port)
-        _log(rank, f"JAX profiler server on port {config.server.profiler_port}")
+    tag = "" if plan is None else f" (dp replica {plan.index} of {plan.count})"
+    _log(rank, f"joined world of {world_size} processes{tag}; easydel {ed.__version__} from {ed.__file__}")
 
     token = control_host = None
-    if world_size > 1:
+    if plan is not None:
+        token = plan.read_token()
+        control_host = resolve_bind_host(config.coordination.bind_host)
+    elif world_size > 1:
         token = shared_coordination_token(
             config.coordination.control_port, is_leader=is_leader, timeout_s=config.coordination.token_timeout_s
         )
         control_host = resolve_bind_host(config.coordination.bind_host)
+        _split_into_replicas(config, rank, token, ed)  # returns only when the launch stays one rank-major engine
+
+    is_front = is_leader if plan is None else plan.is_front
+    if is_front and config.server.profiler_port is not None:
+        jax.profiler.start_server(config.server.profiler_port)
+        _log(rank, f"JAX profiler server on port {config.server.profiler_port}")
 
     text_config = None
     if config.model.quantization is not None and config.model.quantization.pattern is None:
         text_config = ed.AutoEasyDeLConfig.from_pretrained(config.model.checkpoint).get_text_config()
+    sections = build_engine_sections(config, world_size=world_size, token=token, control_bind_host=control_host)
+    if plan is None:
+        loading = build_loading_kwargs(config, text_config, ed=ed)
+    else:
+        loading = build_loading_kwargs(config, text_config, ed=ed, sharding_axis_dims=replica_dims(config))
+        sections = per_replica_sections(sections, plan.count)
     engine = ed.eSurge(
         model=config.model.checkpoint,
         processor=config.model.tokenizer_source,
-        loading_kwargs=build_loading_kwargs(config, text_config, ed=ed),
-        **build_engine_sections(config, world_size=world_size, token=token, control_bind_host=control_host),
+        loading_kwargs=loading,
+        **sections,
     )
     _log(rank, f"engine ready in {time.monotonic() - started:.1f}s (leader={engine.is_coordination_leader})")
+    if plan is not None and engine.is_coordination_leader:
+        table = getattr(getattr(engine, "runner", None), "step_time_table", None)
+        if table:
+            steps = {t: round(ms, 3) for t, ms in table.items()}
+            _log(rank, f"replica {plan.index} model-step ms per token bucket: {steps}")
     try:
+        if plan is not None and engine.is_coordination_leader and not plan.is_front:
+            # Another replica's leader: the front's router reaches its engine over its request plane.
+            _log(rank, f"replica {plan.index} leader serving its request plane on {control_host}")
+            while True:
+                time.sleep(1.0)
         if not engine.is_coordination_leader:
             try:
                 engine.wait_for_shutdown()
@@ -190,9 +320,57 @@ def _serve(config: ServingConfig) -> None:
                 raise
             _log(rank, "leader shut the world down")
             return
-        _serve_http(config, engine, rank, ed)
+        if plan is None:
+            _serve_http(config, engine, rank, ed)
+            return
+        routed = _route_replicas(config, engine, plan, token, rank)
+        try:
+            _serve_http(config, routed, rank, ed)
+        finally:
+            routed.close()
     finally:
         engine.close()
+
+
+def _route_replicas(config: ServingConfig, local: tp.Any, plan: tp.Any, token: str | None, rank: int) -> tp.Any:
+    """Front the local replica and a request-plane client per other replica leader with a load-aware prefix router.
+
+    Raises:
+        RuntimeError: When a replica's request plane does not come up within ``coordination.token_timeout_s``.
+    """
+    from easydel.inference.esurge.distributed.remote_engine import RemoteEngineHandle
+    from easydel.inference.esurge.distributed.request_plane import RequestPlaneUnavailable
+    from easydel.inference.esurge.distributed.routed_engine import RoutedEngine
+
+    port = config.coordination.control_port
+    deadline = time.monotonic() + float(config.coordination.token_timeout_s)
+    handles: list[tp.Any] = []
+    try:
+        for index, addr in enumerate(plan.leaders):
+            if index == plan.index:
+                continue
+            while True:
+                try:
+                    handles.append(
+                        RemoteEngineHandle(
+                            addr,
+                            port,
+                            auth_token=str(token),
+                            tokenizer_source=config.model.tokenizer_source,
+                            connect_timeout_s=10.0,
+                        )
+                    )
+                    break
+                except RequestPlaneUnavailable:
+                    if time.monotonic() > deadline:
+                        raise RuntimeError(f"replica {index} at {addr}:{port} did not come up in time") from None
+                    time.sleep(5.0)
+            _log(rank, f"replica {index} attached at {addr}:{port}")
+    except BaseException:
+        for handle in handles:
+            handle.close()
+        raise
+    return RoutedEngine([local, *handles])
 
 
 def _serve_http(config: ServingConfig, engine: tp.Any, rank: int, ed: tp.Any) -> None:

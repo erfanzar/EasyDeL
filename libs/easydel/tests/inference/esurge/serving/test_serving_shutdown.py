@@ -54,7 +54,7 @@ def test_serve_closes_the_engine_and_returns_on_sigterm(monkeypatch):
         def close(self):
             closed.append(True)
 
-    def fake_serve(config):
+    def fake_serve(config, plan=None):
         engine = Engine()
         try:
             os.kill(os.getpid(), signal.SIGTERM)  # arrives while the leader serves HTTP

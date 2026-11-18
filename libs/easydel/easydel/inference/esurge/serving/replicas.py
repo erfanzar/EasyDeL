@@ -1,0 +1,259 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Data-parallel replicas of one serving launch, each in its own JAX world.
+
+With ``dp = N > 1`` in ``model.sharding_axis_dims`` the launch is unchanged: every host runs the same
+``serving serve --config X.yaml`` and joins the whole slice. When each ``dp`` slice of the deployment's global mesh is
+a contiguous box of TPU hosts owned by no other slice, every process works out its replica from that mesh, exchanges
+its address through the slice's key-value store, leaves the slice world and re-executes the same command inside its
+replica's own sub-slice world. Each replica is then a complete ``dp = 1`` engine (weights, KV and prefix cache,
+scheduler, step loop, JAX coordination service) and fails alone. Replica 0's leader serves the one OpenAI endpoint
+over a router whose members are its own engine and a request-plane client per other replica leader.
+
+When the slices are not separate host boxes (several slices on one host, non-TPU backends, pipeline stages), the
+launch keeps the single rank-major engine.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import sys
+import typing as tp
+
+import numpy as np
+
+DP_AXIS = "dp"
+_HOST_KEY = "easydel/esurge/serving/replica_host/{port}/{process}"
+
+
+@dataclasses.dataclass(frozen=True)
+class BoxLayout:
+    """A replica's devices as a contiguous box of the slice's chip torus.
+
+    Attributes:
+        origin: Lowest chip coordinate of the box.
+        extent: Chips per dimension of the box.
+        slice_extent: Chips per dimension of the whole slice (a box dimension spanning it keeps its wraparound).
+        chips_per_host: Chips per dimension of one host.
+    """
+
+    origin: tuple[int, int, int]
+    extent: tuple[int, int, int]
+    slice_extent: tuple[int, int, int]
+    chips_per_host: tuple[int, int, int]
+
+    @property
+    def host_bounds(self) -> tuple[int, int, int]:
+        return tuple(e // c for e, c in zip(self.extent, self.chips_per_host, strict=True))  # type: ignore[return-value]
+
+    def host_position(self, chip: tp.Sequence[int]) -> tuple[int, int, int]:
+        """(z, y, x) position, inside the box, of the host owning ``chip``: libtpu's worker order."""
+        x, y, z = ((int(chip[i]) - self.origin[i]) // self.chips_per_host[i] for i in range(3))
+        return (z, y, x)
+
+    def libtpu_env(self, hostnames: tp.Sequence[str], rank: int) -> dict[str, str]:
+        """The libtpu environment that makes this box its own TPU slice, for the worker at ``rank``."""
+        chips = int(np.prod(self.extent))
+        return {
+            "TPU_WORKER_HOSTNAMES": ",".join(hostnames),
+            "TPU_WORKER_ID": str(int(rank)),
+            "TPU_SKIP_MDS_QUERY": "1",
+            "TPU_ACCELERATOR_TYPE": f"v5p-{2 * chips}",
+            "TPU_TOPOLOGY": "x".join(str(v) for v in self.extent),
+            "TPU_TOPOLOGY_WRAP": ",".join(
+                "true" if e == s else "false" for e, s in zip(self.extent, self.slice_extent, strict=True)
+            ),
+            "TPU_HOST_BOUNDS": ",".join(str(v) for v in self.host_bounds),
+            "TPU_CHIPS_PER_HOST_BOUNDS": ",".join(str(v) for v in self.chips_per_host),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ReplicaPlan:
+    """This process's place in its replica's JAX world, handed across the re-exec.
+
+    Attributes:
+        index: Replica index.
+        rank: This process's index in the replica world.
+        num_processes: Processes in the replica world.
+        coordinator: ``host:port`` of the replica world's JAX coordination service (its rank 0).
+        leaders: Address of every replica's leader, by replica index.
+        token_fd: Inherited pipe holding the shared request-plane token (never on the command line).
+    """
+
+    index: int
+    rank: int
+    num_processes: int
+    coordinator: str
+    leaders: tuple[str, ...]
+    token_fd: int = -1
+
+    @property
+    def count(self) -> int:
+        return len(self.leaders)
+
+    @property
+    def is_front(self) -> bool:
+        """Whether this process serves the OpenAI endpoint (replica 0's leader)."""
+        return self.index == 0 and self.rank == 0
+
+    def to_json(self) -> str:
+        return json.dumps(dataclasses.asdict(self))
+
+    @classmethod
+    def from_json(cls, text: str) -> ReplicaPlan:
+        data = json.loads(text)
+        data["leaders"] = tuple(data["leaders"])
+        return cls(**data)
+
+    def read_token(self) -> str:
+        """Read (once) the request-plane token the slice world handed over through the inherited pipe."""
+        chunks = []
+        while chunk := os.read(self.token_fd, 4096):
+            chunks.append(chunk)
+        os.close(self.token_fd)
+        return b"".join(chunks).decode()
+
+
+def split_dp_slices(device_mesh: np.ndarray, axis_names: tp.Sequence[str]) -> list[np.ndarray] | None:
+    """The devices of each ``dp`` slice of a global mesh (flattened in mesh order), when no process owns two slices.
+
+    Returns:
+        One device array per slice, or ``None`` for ``dp <= 1``, no ``dp`` axis, or processes straddling slices.
+    """
+    names = tuple(axis_names)
+    if DP_AXIS not in names:
+        return None
+    axis = names.index(DP_AXIS)
+    devices = np.asarray(device_mesh, dtype=object)
+    if int(devices.shape[axis]) <= 1:
+        return None
+    slices = [np.take(devices, [r], axis=axis).reshape(-1) for r in range(int(devices.shape[axis]))]
+    owners = [{int(d.process_index) for d in s} for s in slices]
+    if sum(len(o) for o in owners) != len(set().union(*owners)):
+        return None
+    return slices
+
+
+def box_layout(box: tp.Sequence[tp.Any], all_devices: tp.Sequence[tp.Any], local_devices: tp.Sequence[tp.Any]):
+    """The box a replica's chips form inside the slice torus, or ``None`` when they are not a whole-host box."""
+    coords = np.asarray([tuple(d.coords)[:3] for d in box])
+    origin = coords.min(axis=0)
+    extent = coords.max(axis=0) - origin + 1
+    if int(np.prod(extent)) != len(box) or len({tuple(c) for c in coords}) != len(box):
+        return None
+    full = np.asarray([tuple(d.coords)[:3] for d in all_devices]).max(axis=0) + 1
+    local = np.asarray([tuple(d.coords)[:3] for d in local_devices])
+    per_host = local.max(axis=0) - local.min(axis=0) + 1
+    if np.any(extent % per_host) or np.any(origin % per_host):
+        return None
+    as_tuple = lambda a: tuple(int(v) for v in a)  # noqa: E731
+    return BoxLayout(as_tuple(origin), as_tuple(extent), as_tuple(full), as_tuple(per_host))
+
+
+def plan_replicas(
+    device_mesh: np.ndarray,
+    axis_names: tp.Sequence[str],
+    *,
+    process_index: int,
+    all_devices: tp.Sequence[tp.Any],
+    local_devices: tp.Sequence[tp.Any],
+    address: str,
+    client: tp.Any,
+    port: int,
+    timeout_s: float,
+) -> tuple[ReplicaPlan, dict[str, str]] | None:
+    """Work out this process's replica world from the global mesh and the slice's key-value store.
+
+    Every process of the slice must call this with the same mesh: the decision to split (or not) is a pure function
+    of it, so all processes agree. Each publishes its address and host position and reads every other's.
+
+    Args:
+        device_mesh: The deployment's global device mesh.
+        axis_names: Its axis names.
+        process_index: This process's index in the slice world.
+        all_devices: Every device of the slice.
+        local_devices: This process's devices.
+        address: This host's internal address.
+        client: The slice world's ``jax.distributed`` key-value client.
+        port: Port of each replica world's coordination service.
+        timeout_s: How long to wait for the other processes' addresses.
+
+    Returns:
+        ``(plan, libtpu environment)``, or ``None`` when the launch keeps one rank-major engine.
+    """
+    slices = split_dp_slices(device_mesh, axis_names)
+    if slices is None:
+        return None
+    layouts = [box_layout(s, all_devices, local_devices) for s in slices]
+    if any(layout is None for layout in layouts):
+        return None
+    me = int(process_index)
+    mine = next(r for r, s in enumerate(slices) if any(int(d.process_index) == me for d in s))
+    layout = layouts[mine]
+    own_chip = min(tuple(d.coords)[:3] for d in local_devices)
+    client.key_value_set(
+        _HOST_KEY.format(port=int(port), process=me),
+        json.dumps({"address": address, "position": layout.host_position(own_chip)}),
+        allow_overwrite=True,
+    )
+    timeout_ms = max(1, int(float(timeout_s) * 1000))
+    orders: list[list[tuple[tuple[int, ...], str, int]]] = []
+    for s in slices:
+        members = sorted({int(d.process_index) for d in s})
+        entries = []
+        for p in members:
+            info = json.loads(client.blocking_key_value_get(_HOST_KEY.format(port=int(port), process=p), timeout_ms))
+            entries.append((tuple(info["position"]), str(info["address"]), p))
+        orders.append(sorted(entries))
+    order = orders[mine]
+    rank = next(i for i, (_, _, p) in enumerate(order) if p == me)
+    hostnames = [addr for _, addr, _ in order]
+    plan = ReplicaPlan(
+        index=mine,
+        rank=rank,
+        num_processes=len(order),
+        coordinator=f"{hostnames[0]}:{int(port)}",
+        leaders=tuple(o[0][1] for o in orders),
+    )
+    return plan, layout.libtpu_env(hostnames, rank)
+
+
+def reexec_into_replica(plan: ReplicaPlan, env: tp.Mapping[str, str], token: str) -> tp.NoReturn:
+    """Replace this process with the same command inside its replica's world.
+
+    Call after leaving the slice world (``jax.distributed.shutdown``). libtpu opens ``/dev/vfio`` and its lock file
+    without close-on-exec; every inherited descriptor is marked close-on-exec here so the kernel releases the chips
+    during ``execve``, otherwise the new image finds them busy. The token travels in a pipe, not on the command line.
+    """
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, token.encode())
+    os.close(write_fd)
+    for name in os.listdir("/proc/self/fd"):
+        fd = int(name)
+        if fd > 2 and fd != read_fd:
+            try:
+                os.set_inheritable(fd, False)
+            except OSError:
+                pass
+    os.set_inheritable(read_fd, True)
+    child_env = {**os.environ, **env, "ENABLE_DISTRIBUTED_INIT": "0"}
+    plan = dataclasses.replace(plan, token_fd=read_fd)
+    argv = [sys.executable, *sys.orig_argv[1:], "--replica-plan", plan.to_json()]
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execve(sys.executable, argv, child_env)

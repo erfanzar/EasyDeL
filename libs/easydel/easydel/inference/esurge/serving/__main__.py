@@ -30,6 +30,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m easydel.inference.esurge.serving", description=__doc__)
     parser.add_argument("command", choices=("serve", "check"))
     parser.add_argument("--config", required=True, help="Serving YAML (see easydel/docs/esurge_serving.md).")
+    # Internal: set by the launch itself when it re-executes a host into its dp replica's own JAX world.
+    parser.add_argument("--replica-plan", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
         config = ServingConfig.load(args.config)
@@ -41,7 +43,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     from .app import serve
 
-    serve(config)
+    plan = None
+    if args.replica_plan is not None:
+        from .replicas import ReplicaPlan
+
+        plan = ReplicaPlan.from_json(args.replica_plan)
+    serve(config, plan)
     return 0
 
 
