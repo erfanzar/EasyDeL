@@ -868,7 +868,7 @@ requires-dist = [
     { name = "xprof-nightly", marker = "extra == 'profile'", specifier = ">=2.21.6a20250820" },
     { name = "zstandard", specifier = ">=0.23.0" },
 ]
-provides-extras = ["torch", "cuda", "tpu", "tensorflow", "lm-eval", "profile", "podutils", "mm"]
+provides-extras = ["torch", "cuda", "tpu", "tensorflow", "lm-eval", "profile", "podutils", "mm", "rl"]
 
 [[package]]
 name = "easydel-foundation"

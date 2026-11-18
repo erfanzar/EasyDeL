@@ -1768,11 +1768,14 @@ class eLargeModel:
             )
 
         prompt_only_trainers = {
+            "agent_flow",
             "agentic-moshpit",
             "async_grpo",
             "compaction_rl",
             "dppo",
+            "gdpo",
             "gfpo",
+            "gmpo",
             "grpo",
             "grpo_with_replay_buffer",
             "gspo",
@@ -1783,6 +1786,7 @@ class eLargeModel:
             "on_policy_distillation",
             "papo",
             "ppo",
+            "reinforce_plus_plus",
             "rlvr",
             "rloo",
             "sao",
@@ -1791,11 +1795,14 @@ class eLargeModel:
             "seq_kd",
             "sparse_distillation",
             "ssd",
+            "vapo",
             "xpo",
         }
         if trainer_type in prompt_only_trainers:
             transform_cls = (
-                PPOPreprocessTransform if trainer_type in {"compaction_rl", "ppo", "sao"} else GRPOPreprocessTransform
+                PPOPreprocessTransform
+                if trainer_type in {"compaction_rl", "ppo", "sao", "vapo"}
+                else GRPOPreprocessTransform
             )
             return transform_cls(
                 tokenizer=tokenizer,
@@ -2654,21 +2661,70 @@ class eLargeModel:
             trainer_kwargs["eval_dataset"] = eval_dataset
             trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
 
+        elif trainer_type == "agent_flow":
+            base_type = str(getattr(training_args, "base_trainer_type", "grpo") or "grpo").lower()
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            if reward_funcs is not None or reward_model is not None:
+                trainer_kwargs["reward_funcs"] = reward_funcs if reward_funcs is not None else reward_model
+            elif base_type in {"ppo", "vapo"}:
+                reward_model = self.build_reward_model()
+                if reward_model is not None:
+                    trainer_kwargs["reward_funcs"] = reward_model
+            if base_type not in {"ppo", "vapo", "gkd", "on_policy_distillation", "seq_kd", "sdft", "ssd"}:
+                if kwargs.get("reward_processing_classes") is not None:
+                    trainer_kwargs["reward_processing_classes"] = kwargs["reward_processing_classes"]
+                if kwargs.get("data_tokenize_fn") is not None:
+                    trainer_kwargs["data_tokenize_fn"] = kwargs["data_tokenize_fn"]
+            if kwargs.get("environment") is not None:
+                trainer_kwargs["environment"] = kwargs["environment"]
+            if kwargs.get("environment_factory") is not None:
+                trainer_kwargs["environment_factory"] = kwargs["environment_factory"]
+
         elif trainer_type in {
             "grpo",
+            "gdpo",
             "gfpo",
+            "gmpo",
             "gspo",
             "async_grpo",
             "dppo",
             "grpo_with_replay_buffer",
             "gspo_token",
             "papo",
+            "reinforce_plus_plus",
             "rloo",
         }:
             if reward_funcs is None and reward_model is None:
                 reward_model = self.build_reward_model()
 
+            env_spec = self.config.get("trainer", {}).get("environment")
+            env_factory = kwargs.get("environment_factory", kwargs.get("env_factory", None))
             resolved_reward = reward_funcs if reward_funcs is not None else reward_model
+            if env_spec is not None and (env_factory is None or resolved_reward is None):
+                from easydel.environments import (
+                    AutoEnvironment,
+                    KiriRuntime,
+                    SandboxPool,
+                    make_environment_reward_fn,
+                )
+
+                tcfg = self.config.get("trainer", {})
+                env_backend = str(tcfg.get("environment_backend", "kiri"))
+                env_endpoints = tcfg.get("environment_endpoints")
+                env_runtime = (
+                    SandboxPool(endpoints=env_endpoints, backend=env_backend)
+                    if env_endpoints
+                    else KiriRuntime(backend=env_backend)
+                )
+                if env_factory is None:
+                    env_factory = AutoEnvironment.as_factory(env_spec, runtime=env_runtime)
+                if resolved_reward is None:
+                    resolved_reward = make_environment_reward_fn(env_spec, runtime=env_runtime)
+
             if resolved_reward is None:
                 raise ValueError(
                     f"{trainer_type} training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg)."
@@ -2683,7 +2739,7 @@ class eLargeModel:
             trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
             trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
             trainer_kwargs["tools"] = kwargs.get("tools", None)
-            trainer_kwargs["environment_factory"] = kwargs.get("environment_factory", kwargs.get("env_factory", None))
+            trainer_kwargs["environment_factory"] = env_factory
 
         elif trainer_type == "nemo_gym":
             trainer_kwargs["arguments"] = training_args
@@ -2779,7 +2835,7 @@ class eLargeModel:
                 trainer_kwargs["compaction_controller"] = kwargs.get("compaction_controller")
                 trainer_kwargs["tool_guard"] = kwargs.get("tool_guard")
 
-        elif trainer_type == "ppo":
+        elif trainer_type in {"ppo", "vapo"}:
             if reward_funcs is None and reward_model is None:
                 reward_model = self.build_reward_model()
 
