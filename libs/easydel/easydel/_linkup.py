@@ -543,6 +543,37 @@ def apply_linkup() -> None:
     _apply_auto_environment()
 
 
+def _is_ray_driver() -> bool:
+    """Whether this process is a connected Ray driver (``ray.init()`` ran before ``import easydel``)."""
+    import sys as _sys
+
+    ray = _sys.modules.get("ray")
+    if ray is None:
+        return False
+    try:
+        if not ray.is_initialized():
+            return False
+        from ray._private import worker as _worker
+
+        return _worker.global_worker.mode == _worker.SCRIPT_MODE
+    except Exception:
+        return False
+
+
+def _ray_driver_dispatches_to_other_tpu_hosts() -> bool:
+    """Whether the connected Ray cluster has live TPU nodes other than this driver's own node."""
+    try:
+        import ray
+
+        me = ray.get_runtime_context().get_node_id()
+        return any(
+            n.get("Alive") and float((n.get("Resources") or {}).get("TPU", 0) or 0) > 0 and n.get("NodeID") != me
+            for n in ray.nodes()
+        )
+    except Exception:
+        return False
+
+
 def initialize_distributed(logger) -> bool:
     """Initialize distributed JAX when enabled.
 
@@ -551,6 +582,21 @@ def initialize_distributed(logger) -> bool:
     """
     _os.environ.setdefault("JAX_ENABLE_PREEMPTION_SERVICE", "true")
     distributed_init_enabled = _check_bool_flag("ENABLE_DISTRIBUTED_INIT", True)
+    if _is_ray_driver():
+        if distributed_init_enabled:
+            # A Ray driver dispatches work to the slice's hosts; joining the slice world here would block until every
+            # host joined it too. Engines built from the driver run in Ray tasks that join their own worlds.
+            logger.debug("Ray driver: not joining the JAX distributed world at import.")
+            distributed_init_enabled = False
+        if _ray_driver_dispatches_to_other_tpu_hosts():
+            # Outside the slice world this process cannot drive the slice's TPU, and taking this host's chips would
+            # starve the task scheduled here. A local single-host Ray cluster keeps its TPU.
+            import jax as _jax
+            from jax._src import xla_bridge as _xb
+
+            if not _xb._backends:
+                _jax.config.update("jax_platforms", "cpu")
+                logger.debug("Ray driver over other TPU hosts: JAX stays on CPU in this process.")
     if distributed_init_enabled:
         import jax as _jax
 

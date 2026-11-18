@@ -403,6 +403,7 @@ class ReplicaAttacher:
         connect: Opens a client to one leader; raises ``RequestPlaneUnavailable`` while it is not up.
         log: Progress logger.
         interval_s: Wait between attach rounds.
+        router_factory: Builds the router from the first attached member; defaults to ``RoutedEngine``.
     """
 
     def __init__(
@@ -412,10 +413,12 @@ class ReplicaAttacher:
         connect: tp.Callable[[str], tp.Any],
         log: tp.Callable[[str], None],
         interval_s: float = REPLICA_ATTACH_INTERVAL_S,
+        router_factory: tp.Callable[..., tp.Any] | None = None,
     ) -> None:
         import threading
 
         self.leaders = tuple(leaders)
+        self._router_factory = router_factory
         self._connect = connect
         self._log = log
         self._interval_s = float(interval_s)
@@ -450,7 +453,8 @@ class ReplicaAttacher:
             if handle is None:
                 continue
             if self.router is None:
-                self.router = RoutedEngine([handle], planned_members=len(self.leaders))
+                factory = self._router_factory or RoutedEngine
+                self.router = factory([handle], planned_members=len(self.leaders))
                 self._slots[index] = 0
             elif slot is None:
                 self._slots[index] = self.router.add_member(handle)

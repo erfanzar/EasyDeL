@@ -1400,6 +1400,13 @@ class eLargeModel:
             >>> results = engine.generate(prompts, max_tokens=100)
         """
         with phase_timer("build_esurge.total", tag="eLargeModel"):
+            if self._model is None:
+                # dp > 1 from a Ray driver: replicas load the model on their own hosts, never here.
+                from easydel.inference.esurge.serving.ray_replicas import maybe_launch_replicas
+
+                replicas = maybe_launch_replicas(self._config)
+                if replicas is not None:
+                    return replicas
             self.build_model()
             with phase_timer("build_esurge.engine", tag="eLargeModel"):
                 return build_esurge(self._config, self._model)
