@@ -36,6 +36,7 @@ from easydel.utils import Registry
 from easydel.utils.helpers import capture_time
 
 from .._shared import drop_optimizer_state
+from ..async_rollout_mixin import AsyncRolloutMixin
 from ..metrics import _host_mean_float
 from ..prompt_transforms import GRPOPreprocessTransform
 from ..trainer import Trainer
@@ -53,7 +54,7 @@ logger = get_logger(__name__)
 
 
 @Registry.register("trainer", "on_policy_distillation")
-class OnPolicyDistillationTrainer(Trainer):
+class OnPolicyDistillationTrainer(AsyncRolloutMixin, Trainer):
     """On-policy knowledge distillation trainer.
 
     Unlike standard (offline) distillation which distills on a fixed dataset,

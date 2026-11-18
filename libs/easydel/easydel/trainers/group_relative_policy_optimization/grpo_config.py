@@ -49,8 +49,8 @@ class GRPOConfig(TrainingArguments):
     ``"dr_grpo"``, the dynamic-clipping ``"dapo"`` (default in EasyDeL),
     the constant-importance-sampling ``"cispo"``, the
     soft-advantage-policy-optimization ``"sapo"``, the
-    length-unbiased sequence ``"luspo"``, and the variational sequence
-    soft-policy ``"vespo"`` variants. Importance
+    length-unbiased sequence ``"luspo"``, the variational sequence
+    soft-policy ``"vespo"``, and the geometric-mean ``"gmpo"`` variants. Importance
     sampling can be applied at the token level (``"token"``) or
     aggregated per sequence (``"sequence"``).
 
@@ -98,7 +98,16 @@ class GRPOConfig(TrainingArguments):
             generated/scored GRPO batch before sampling again.
         loss_type: One of ``"grpo"``, ``"bnpo"``, ``"dr_grpo"``,
             ``"dapo"``, ``"cispo"``, ``"sapo"``, ``"luspo"``,
-            ``"vespo"``. Default ``"dapo"``.
+            ``"vespo"``, ``"gmpo"``. Default ``"dapo"``. ``"gmpo"``
+            (arXiv:2507.20673) optimises the geometric mean of the
+            advantage-sign-aware clipped token ratios of each sequence
+            and requires token-level importance sampling and
+            ``epsilon < 1``.
+        kl_estimator: Per-token estimator of ``KL(pi || pi_ref)`` used
+            for the ``beta`` penalty: ``"k1"`` (``log r``), ``"k2"``
+            (``0.5 * (log r)^2``), ``"k3"`` (``1/r - 1 + log r``,
+            default), or ``"l2"`` (``(log r)^2``), with
+            ``r = pi / pi_ref``.
         disable_dropout: Whether to put policy, reference, and reward
             model modules into eval mode during trainer construction.
         sapo_temperature_pos: Positive-advantage soft-clipping
@@ -114,6 +123,12 @@ class GRPOConfig(TrainingArguments):
             functions. Length must match the reward-function list.
         multi_objective_aggregation: Reward aggregation strategy when
             multiple reward functions are configured.
+        decouple_reward_normalization: GDPO (arXiv:2601.05242) switch.
+            When ``True`` each reward function is normalised within its
+            prompt group before the weighted sum, and the summed reward
+            is then normalised over the batch. This forces
+            ``multi_objective_aggregation="normalize_then_sum"``; after
+            ``__post_init__`` the flag mirrors that setting.
         scale_rewards: Reward scaling strategy: ``"group"`` (default),
             ``"batch"``, ``"none"``. ``True``/``False`` are accepted
             and mapped to ``"group"``/``"none"``.
@@ -166,6 +181,48 @@ class GRPOConfig(TrainingArguments):
         logprob_vocab_chunk_size: Vocab-axis chunk size for
             :func:`compute_token_logps_and_entropies_chunked` when
             scoring completions. ``None`` disables chunking.
+        esurge_importance_sampling_correction: When ``True``, apply
+            importance-sampling correction between learner and eSurge
+            rollout log-probabilities.
+        esurge_importance_sampling_mode: Granularity and masking mode
+            for rollout-to-learner mismatch correction. One of
+            ``"token_truncate"``, ``"token_mask"``, ``"token_icepop"``,
+            ``"token_log_mask"``, ``"sequence_truncate"``,
+            ``"sequence_mask"``, ``"sequence_icepop"``, or
+            ``"sequence_log_mask"``. ``"token_icepop"`` implements
+            IcePop's double-sided token mask outside
+            ``[cap_low, cap]``; ``"sequence_icepop"`` is a
+            sequence-level extension of the same band mask. The
+            ``*_log_mask`` modes (Kimi K2.5, arXiv:2602.02276) drop
+            tokens/sequences with ``|log ratio| > log(cap)`` and keep
+            the rest with weight ``1`` (no ratio re-weighting); the
+            sequence variant uses the summed token log ratio and both
+            require ``cap > 1``.
+        esurge_importance_sampling_cap: Upper ratio bound (``beta``) for
+            eSurge importance-sampling correction.
+        esurge_importance_sampling_cap_low: Optional lower ratio bound
+            (``alpha``) for IcePop modes. When ``None``, defaults to
+            ``1.0 / esurge_importance_sampling_cap`` (symmetric
+            ``[1/beta, beta]``).
+        toggle_budget_interval: Kimi "Toggle" budget alternation period
+            in optimizer steps. ``0`` disables it. Otherwise steps in
+            ``[k * interval, (k + 1) * interval)`` with odd ``k``
+            generate with ``toggle_max_completion_length`` new tokens and
+            even ``k`` use the full budget. Budget-phase completions are
+            right-padded to the full width so compiled shapes stay
+            fixed.
+        toggle_max_completion_length: Completion budget of the
+            constrained Toggle phase. Required when
+            ``toggle_budget_interval > 0``; must be in
+            ``(0, max_completion_length]``.
+        dynamic_sampling: DAPO dynamic sampling (arXiv:2503.14476). When
+            ``True``, training batches whose prompt groups have zero
+            reward variance are re-sampled; groups that stay
+            uninformative after ``dynamic_sampling_max_attempts`` are
+            removed from the loss by zeroing their completion mask.
+            Requires ``num_generations >= 2``.
+        dynamic_sampling_max_attempts: Total rollout attempts per
+            training batch (the first rollout included).
     """
 
     trainer_prefix: str | None = field(
@@ -255,7 +312,19 @@ class GRPOConfig(TrainingArguments):
     loss_type: str = field(
         default="dapo",
         metadata={
-            "help": "Loss variant to use. One of ['grpo', 'bnpo', 'dr_grpo', 'dapo', 'cispo', 'sapo', 'luspo', 'vespo']."
+            "help": (
+                "Loss variant to use. One of ['grpo', 'bnpo', 'dr_grpo', 'dapo', 'cispo', 'sapo', 'luspo', "
+                "'vespo', 'gmpo']."
+            )
+        },
+    )
+    kl_estimator: str = field(
+        default="k3",
+        metadata={
+            "help": (
+                "Per-token estimator of KL(pi || pi_ref) used by the beta penalty: 'k1' (log r), "
+                "'k2' (0.5 * (log r)^2), 'k3' (1/r - 1 + log r), or 'l2' ((log r)^2), with r = pi / pi_ref."
+            )
         },
     )
     disable_dropout: bool = field(
@@ -307,6 +376,15 @@ class GRPOConfig(TrainingArguments):
                 "Multi-reward aggregation strategy. 'sum_then_normalize' first sums weighted reward functions and "
                 "then normalizes. 'normalize_then_sum' normalizes each reward function within prompt groups before "
                 "weighted summation and batch-level advantage normalization."
+            )
+        },
+    )
+    decouple_reward_normalization: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "GDPO: normalize each reward function within its prompt group before the weighted sum, then "
+                "batch-normalize the summed reward. Forces multi_objective_aggregation='normalize_then_sum'."
             )
         },
     )
@@ -436,11 +514,48 @@ class GRPOConfig(TrainingArguments):
     )
     esurge_importance_sampling_mode: str = field(
         default="sequence_mask",
-        metadata={"help": "eSurge importance-sampling mode."},
+        metadata={
+            "help": (
+                "eSurge importance-sampling mode. One of 'token_truncate', 'token_mask', 'token_icepop', "
+                "'token_log_mask', 'sequence_truncate', 'sequence_mask', 'sequence_icepop', or 'sequence_log_mask'."
+            )
+        },
     )
     esurge_importance_sampling_cap: float = field(
         default=3.0,
-        metadata={"help": "eSurge importance-sampling cap."},
+        metadata={"help": "Upper ratio bound for eSurge importance-sampling correction."},
+    )
+    esurge_importance_sampling_cap_low: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional lower ratio bound for IcePop importance-sampling modes. "
+                "When None, defaults to 1.0 / esurge_importance_sampling_cap."
+            )
+        },
+    )
+    toggle_budget_interval: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Kimi Toggle budget alternation period in optimizer steps. 0 disables it; otherwise odd "
+                "periods generate with toggle_max_completion_length new tokens."
+            )
+        },
+    )
+    toggle_max_completion_length: int | None = field(
+        default=None,
+        metadata={"help": "Completion budget of the constrained Toggle phase. Required when toggling is enabled."},
+    )
+    dynamic_sampling: bool = field(
+        default=False,
+        metadata={
+            "help": "DAPO dynamic sampling: re-sample training batches whose prompt groups have zero reward variance."
+        },
+    )
+    dynamic_sampling_max_attempts: int = field(
+        default=3,
+        metadata={"help": "Total rollout attempts per training batch when dynamic_sampling=True."},
     )
     log_completions: bool = field(
         default=False,
@@ -585,12 +700,40 @@ class GRPOConfig(TrainingArguments):
             self.generation_temperature = self.temperature
 
         self.loss_type = self.loss_type.lower() if isinstance(self.loss_type, str) else self.loss_type
-        if self.loss_type not in {"grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo", "dppo"}:
+        if self.loss_type not in {"grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo", "dppo", "gmpo"}:
             raise ValueError(
                 "`loss_type` must be one of 'grpo', 'bnpo', 'dr_grpo', 'dapo', 'cispo', 'sapo', "
-                "'luspo', 'vespo', or 'dppo'. "
+                "'luspo', 'vespo', 'dppo', or 'gmpo'. "
                 f"Got {self.loss_type!r}."
             )
+        if self.loss_type == "gmpo":
+            level = self.importance_sampling_level.lower() if isinstance(self.importance_sampling_level, str) else None
+            if level != "token":
+                raise ValueError(
+                    "`loss_type='gmpo'` builds its own sequence geometric mean and requires "
+                    f"`importance_sampling_level='token'`; got {self.importance_sampling_level!r}."
+                )
+            if not (0.0 < self.epsilon < 1.0):
+                raise ValueError(f"`loss_type='gmpo'` requires `0 < epsilon < 1`; got {self.epsilon}.")
+        self.kl_estimator = self.kl_estimator.lower() if isinstance(self.kl_estimator, str) else self.kl_estimator
+        if self.kl_estimator not in {"k1", "k2", "k3", "l2"}:
+            raise ValueError(f"`kl_estimator` must be one of 'k1', 'k2', 'k3', or 'l2'. Got {self.kl_estimator!r}.")
+        if self.toggle_budget_interval < 0:
+            raise ValueError(f"`toggle_budget_interval` must be non-negative; got {self.toggle_budget_interval}.")
+        if self.toggle_budget_interval > 0:
+            if self.toggle_max_completion_length is None:
+                raise ValueError("`toggle_max_completion_length` is required when `toggle_budget_interval > 0`.")
+            if not (0 < self.toggle_max_completion_length <= self.max_completion_length):
+                raise ValueError(
+                    "`toggle_max_completion_length` must be in (0, max_completion_length] "
+                    f"(max_completion_length={self.max_completion_length}); got {self.toggle_max_completion_length}."
+                )
+        if self.dynamic_sampling_max_attempts <= 0:
+            raise ValueError(
+                f"`dynamic_sampling_max_attempts` must be positive; got {self.dynamic_sampling_max_attempts}."
+            )
+        if self.dynamic_sampling and int(self.num_generations or 0) < 2:
+            raise ValueError("`dynamic_sampling=True` requires `num_generations >= 2` so group variance is defined.")
         if self.sapo_temperature_pos <= 0.0:
             raise ValueError(f"`sapo_temperature_pos` must be positive; got {self.sapo_temperature_pos}.")
         if self.sapo_temperature_neg <= 0.0:
@@ -616,15 +759,34 @@ class GRPOConfig(TrainingArguments):
         if self.esurge_importance_sampling_mode not in {
             "token_truncate",
             "token_mask",
+            "token_icepop",
+            "token_log_mask",
             "sequence_truncate",
             "sequence_mask",
+            "sequence_icepop",
+            "sequence_log_mask",
         }:
             raise ValueError(
-                "`esurge_importance_sampling_mode` must be one of 'token_truncate', 'token_mask', "
-                "'sequence_truncate', or 'sequence_mask'."
+                "`esurge_importance_sampling_mode` must be one of 'token_truncate', 'token_mask', 'token_icepop', "
+                "'token_log_mask', 'sequence_truncate', 'sequence_mask', 'sequence_icepop', or 'sequence_log_mask'."
             )
         if self.esurge_importance_sampling_cap <= 0.0:
             raise ValueError("`esurge_importance_sampling_cap` must be positive.")
+        if self.esurge_importance_sampling_mode.endswith("_log_mask") and self.esurge_importance_sampling_cap <= 1.0:
+            raise ValueError(
+                "`esurge_importance_sampling_cap` must be > 1.0 for log-mask modes so the band "
+                "|log ratio| <= log(cap) is non-empty."
+            )
+        if self.esurge_importance_sampling_cap_low is not None:
+            if self.esurge_importance_sampling_cap_low <= 0.0:
+                raise ValueError("`esurge_importance_sampling_cap_low` must be positive when set.")
+            if self.esurge_importance_sampling_cap_low > self.esurge_importance_sampling_cap:
+                raise ValueError("`esurge_importance_sampling_cap_low` must be <= `esurge_importance_sampling_cap`.")
+        elif self.esurge_importance_sampling_mode.endswith("_icepop") and self.esurge_importance_sampling_cap < 1.0:
+            raise ValueError(
+                "`esurge_importance_sampling_cap` must be >= 1.0 for IcePop modes when "
+                "`esurge_importance_sampling_cap_low` is None so [1/cap, cap] is non-empty."
+            )
         if self.use_transformers_paged:
             raise ValueError("`use_transformers_paged=True` is unsupported; use EasyDeL eSurge generation instead.")
         if self.num_completions_to_print is not None and self.num_completions_to_print <= 0:
@@ -644,6 +806,9 @@ class GRPOConfig(TrainingArguments):
                 "`multi_objective_aggregation` must be 'sum_then_normalize' or 'normalize_then_sum'. "
                 f"Got {self.multi_objective_aggregation!r}."
             )
+        if self.decouple_reward_normalization:
+            self.multi_objective_aggregation = "normalize_then_sum"
+        self.decouple_reward_normalization = self.multi_objective_aggregation == "normalize_then_sum"
 
         if self.ref_logps_chunk_size is not None:
             normalized_ref_chunk_size = int(self.ref_logps_chunk_size)

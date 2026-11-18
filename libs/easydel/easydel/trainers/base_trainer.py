@@ -345,6 +345,8 @@ class BaseTrainer(BaseTrainerProtocol):
         _eval_source: Internal ShardedDataSource for evaluation data
     """
 
+    supports_async_rollout: tp.ClassVar[bool] = False
+
     # Type annotations for internal data sources
     arguments: TrainingArguments | None
     model_state: EasyDeLState | None
@@ -517,6 +519,11 @@ class BaseTrainer(BaseTrainerProtocol):
         self._runtime_trace("__init__.begin")
         if arguments is None:
             raise ValueError("training argument must be passed to Trainers.")
+        if bool(getattr(arguments, "async_mode", False)) and not self.supports_async_rollout:
+            raise ValueError(
+                f"{type(self).__name__} does not support `async_mode=True`. "
+                "`async_mode=True` is only supported on rollout-capable trainers."
+            )
         if model_state is not None and model is not None:
             raise ValueError("Either model or model_state should be passed, not both.")
         elif model_state is None and model is None:

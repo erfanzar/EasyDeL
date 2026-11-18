@@ -35,6 +35,7 @@ from easydel.utils import Registry
 from easydel.utils.helpers import capture_time
 
 from .._shared import drop_optimizer_state
+from ..async_rollout_mixin import AsyncRolloutMixin
 from ..metrics import _host_mean_float
 from ..prompt_transforms import GRPOPreprocessTransform
 from ..trainer import Trainer
@@ -49,7 +50,7 @@ logger = get_logger(__name__)
 
 
 @Registry.register("trainer", "seq_kd")
-class SeqKDTrainer(Trainer):
+class SeqKDTrainer(AsyncRolloutMixin, Trainer):
     """Sequence-level Knowledge Distillation trainer.
 
     The teacher generates text completions from prompts and the student is

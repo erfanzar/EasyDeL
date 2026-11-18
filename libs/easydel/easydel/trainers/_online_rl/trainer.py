@@ -115,6 +115,7 @@ class OnlineActorCriticTrainer(PPOTrainer):
     adapted into the same target-aligned schema.
     """
 
+    supports_async_rollout: tp.ClassVar[bool] = False
     actor_algorithm: tp.ClassVar[tp.Literal["sao", "ppo"]] = "ppo"
     requires_value_head: tp.ClassVar[bool] = False
     _RUNTIME_MODEL_OVERRIDE_STATE_ATTRS: tp.ClassVar[frozenset[str]] = PPOTrainer._RUNTIME_MODEL_OVERRIDE_STATE_ATTRS | {
@@ -550,12 +551,13 @@ class OnlineActorCriticTrainer(PPOTrainer):
         behavior_logps = behavior_logps.at[:, start : start + completion_length].set(ppo_batch["old_logps"])
 
         contiguous_advantages = ppo_batch["returns"] - ppo_batch["old_values"]
+        critic_lam = getattr(self.arguments, "gae_lambda_critic", None)
         completion_rewards = recover_rewards_from_gae(
             contiguous_advantages,
             ppo_batch["old_values"],
             completion_mask,
             gamma=float(self.arguments.gamma),
-            gae_lambda=float(self.arguments.lam),
+            gae_lambda=float(critic_lam if critic_lam is not None else self.arguments.lam),
         )
         rewards = jnp.zeros_like(action_mask)
         rewards = rewards.at[:, start : start + completion_length].set(completion_rewards)

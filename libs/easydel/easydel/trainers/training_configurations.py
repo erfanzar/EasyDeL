@@ -961,6 +961,44 @@ class TrainingArguments:
             "help": "Enable/disable eSurge double-buffered execution overlap. None keeps eSurge default behavior."
         },
     )
+    async_mode: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable asynchronous background rollout generation with policy snapshots and staleness "
+                "control on rollout-capable trainers (GRPO/GSPO/GFPO/RLOO/RLVR/DPPO/SDPO/SDFT/SSD/PAPO/"
+                "NashMD/XPO/MiniLLM/AgenticMoshPit/NeMoGym/PPO/OnlineDPO/OnPolicyDistillation/GKD/SeqKD)."
+            )
+        },
+    )
+    max_inflight_tasks: int = field(
+        default=32,
+        metadata={"help": "Maximum number of queued/inflight async rollout tasks when `async_mode=True`."},
+    )
+    max_staleness: int = field(
+        default=1,
+        metadata={"help": "Maximum allowed optimizer-step lag between rollout generation and consumption."},
+    )
+    queue_maxsize: int = field(
+        default=0,
+        metadata={"help": "Optional cap on buffered async rollout tasks (0 uses `max_inflight_tasks`)."},
+    )
+    weight_sync_steps: int = field(
+        default=1,
+        metadata={"help": "Optimizer steps between rollout policy snapshot refreshes when `async_mode=True`."},
+    )
+    request_timeout: float = field(
+        default=120.0,
+        metadata={"help": "Timeout in seconds waiting for a background async rollout task."},
+    )
+    first_rollout_timeout: float = field(
+        default=3600.0,
+        metadata={"help": "Timeout in seconds for the very first async rollout (covers cold XLA compile)."},
+    )
+    heartbeat_stale_after_s: float = field(
+        default=120.0,
+        metadata={"help": "Timeout in seconds before an async rollout worker is treated as stalled."},
+    )
     num_train_epochs: int = field(
         default=10,
         metadata={"help": "The number of training epochs."},
@@ -1502,6 +1540,24 @@ class TrainingArguments:
             raise ValueError("`gradient_accumulation_mode='execution'` is not supported with `mpmd_scheduler`.")
         if self.training_time_limit is not None:
             self._time_to_seconds(self.training_time_limit)
+
+        if bool(self.async_mode):
+            self.esurge_async_scheduling = True
+            self.esurge_overlap_execution = True
+            if self.max_inflight_tasks <= 0:
+                raise ValueError("`max_inflight_tasks` must be positive.")
+            if self.max_staleness < 0:
+                raise ValueError("`max_staleness` must be non-negative.")
+            if self.queue_maxsize < 0:
+                raise ValueError("`queue_maxsize` must be non-negative.")
+            if self.weight_sync_steps <= 0:
+                raise ValueError("`weight_sync_steps` must be positive.")
+            if self.request_timeout <= 0:
+                raise ValueError("`request_timeout` must be positive.")
+            if self.first_rollout_timeout <= 0:
+                raise ValueError("`first_rollout_timeout` must be positive.")
+            if self.heartbeat_stale_after_s <= 0:
+                raise ValueError("`heartbeat_stale_after_s` must be positive.")
 
         self.sequence_packing = bool(self.sequence_packing)
 

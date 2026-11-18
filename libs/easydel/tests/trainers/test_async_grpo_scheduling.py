@@ -122,3 +122,62 @@ class _Context:
 
     def __exit__(self, *args):
         return False
+
+
+def test_stuck_first_rollout_raises_timeout_error(monkeypatch):
+    import threading
+
+    monkeypatch.setattr(async_grpo.jax, "device_get", lambda value: value)
+    unblock = threading.Event()
+
+    def slow_preprocess(*, state, batch, produced_at_step):
+        unblock.wait(timeout=5.0)
+        return async_grpo._AsyncRolloutResult(batch, {}, produced_at_step, 0.0)
+
+    def take(state, *, policy_step, **kwargs):
+        return SimpleNamespace(
+            state=SimpleNamespace(step=policy_step),
+            policy_step=policy_step,
+            nbytes=0,
+            release=lambda: None,
+        )
+
+    trainer = SimpleNamespace(
+        data_collator=None,
+        max_training_steps=2,
+        arguments=SimpleNamespace(
+            async_mode=True,
+            max_inflight_tasks=1,
+            queue_maxsize=1,
+            max_staleness=1,
+            weight_sync_steps=1,
+            request_timeout=0.05,
+            first_rollout_timeout=0.05,
+            heartbeat_stale_after_s=0.05,
+            learning_rate=0.1,
+            max_length=4,
+            merge_lora_before_save=False,
+        ),
+        _async_grpo_train_compiled_once=False,
+        _get_next_batch=lambda it, ds: (next(it), it),
+        _sync_rollout_snapshot=lambda *a, **kw: async_grpo.AsyncGRPOTrainer._sync_rollout_snapshot(trainer, *a, **kw),
+        _take_rollout_snapshot=take,
+        _preprocess_async_rollout=slow_preprocess,
+        on_step_start=lambda **kwargs: kwargs["state"],
+    )
+    try:
+        with pytest.raises(TimeoutError, match="First async rollout timed out"):
+            async_grpo.AsyncGRPOTrainer._train_epoch(
+                trainer,
+                SimpleNamespace(step=0, esurge_cache_scope_key="test"),
+                None,
+                iter([{"index": 0}]),
+                SimpleNamespace(update=lambda **kw: (0.0, None)),
+                SimpleNamespace(start_step=lambda: None, calculate=lambda **kw: {}),
+                None,
+                0,
+                epoch_start_step=0,
+                epoch_end_step=2,
+            )
+    finally:
+        unblock.set()

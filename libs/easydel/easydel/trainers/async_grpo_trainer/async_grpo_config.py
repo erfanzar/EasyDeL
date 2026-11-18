@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import typing as tp
 from dataclasses import dataclass, field
 
 from easydel.utils import Registry
@@ -37,35 +38,32 @@ class AsyncGRPOConfig(GRPOConfig):
 
     trainer_prefix: str | None = field(default="AsyncGRPO")
     learning_rate: float = field(default=1e-6)
-    request_timeout: float = field(default=120.0)
-    max_inflight_tasks: int = field(default=32)
-    max_staleness: int = field(default=1)
-    queue_maxsize: int = field(default=0)
-    weight_sync_steps: int = field(default=1)
-    heartbeat_stale_after_s: float = field(default=120.0)
+    async_mode: bool = field(default=True)
+    environment: str | dict[str, tp.Any] | None = field(
+        default=None,
+        metadata={
+            "help": "Optional registered environment name, 'auto', or config mapping resolved via AutoEnvironment."
+        },
+    )
+    environment_backend: str = field(
+        default="kiri",
+        metadata={"help": "Sandbox backend for environment rollouts: 'kiri', 'auto', 'docker', or 'local'."},
+    )
+    environment_endpoints: list[str] | str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional Kiri/Docker endpoints, or 'shm:N' / 'pod-shm:N' to auto-boot RAM-backed daemons."
+        },
+    )
 
     def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None) -> None:
-        """Normalize GRPO settings and validate local async execution knobs.
-
-        AsyncGRPO is only backed by local eSurge in EasyDeL. The inherited
-        eSurge async scheduling and overlap flags are therefore forced on here
-        instead of relying on engine defaults, so runtime logs and tests can
-        verify that async scheduler execution is active.
-        """
+        """Normalize GRPO settings and validate local async execution knobs."""
+        self.async_mode = True
         super().__post_init__(max_sequence_length=max_sequence_length, quantization_block=quantization_block)
-        self.esurge_async_scheduling = True
-        self.esurge_overlap_execution = True
-        if self.max_inflight_tasks <= 0:
-            raise ValueError("`max_inflight_tasks` must be positive.")
-        if self.max_staleness < 0:
-            raise ValueError("`max_staleness` must be non-negative.")
-        if self.queue_maxsize < 0:
-            raise ValueError("`queue_maxsize` must be non-negative.")
-        if self.weight_sync_steps <= 0:
-            raise ValueError("`weight_sync_steps` must be positive.")
-        if self.request_timeout <= 0:
-            raise ValueError("`request_timeout` must be positive.")
-        if self.heartbeat_stale_after_s <= 0:
-            raise ValueError("`heartbeat_stale_after_s` must be positive.")
+        if self.environment_backend not in {"local", "auto", "kiri", "docker"}:
+            raise ValueError(
+                "`environment_backend` must be one of 'local', 'auto', 'kiri', or 'docker'; "
+                f"got {self.environment_backend!r}."
+            )
 
     __hash__ = hash_fn

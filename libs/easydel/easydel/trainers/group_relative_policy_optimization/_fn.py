@@ -164,6 +164,86 @@ def _compute_importance_weights(
     )
 
 
+def _compute_per_token_kl(
+    per_token_logps: jax.Array,
+    ref_per_token_logps: jax.Array,
+    kl_estimator: str = "k3",
+) -> jax.Array:
+    """Estimate ``KL(pi || pi_ref)`` per token from sampled-token log-probs.
+
+    With ``log_r = log pi - log pi_ref`` the estimators are ``"k1"`` -> ``log_r``,
+    ``"k2"`` -> ``0.5 * log_r**2``, ``"k3"`` -> ``exp(-log_r) - 1 + log_r`` (the
+    non-negative unbiased GRPO default) and ``"l2"`` -> ``log_r**2``.
+
+    Args:
+        per_token_logps: Current-policy log-probs, shape ``[batch, seq]``.
+        ref_per_token_logps: Reference-policy log-probs, same shape.
+        kl_estimator: One of ``"k1"``, ``"k2"``, ``"k3"``, ``"l2"``.
+
+    Returns:
+        Per-token KL estimate with the shape of ``per_token_logps``.
+
+    Raises:
+        ValueError: If ``kl_estimator`` is unknown.
+    """
+    ref_minus_policy = ref_per_token_logps - per_token_logps
+    if kl_estimator == "k3":
+        return jnp.exp(ref_minus_policy) - ref_minus_policy - 1
+    if kl_estimator == "k1":
+        return -ref_minus_policy
+    if kl_estimator == "k2":
+        return 0.5 * jnp.square(ref_minus_policy)
+    if kl_estimator == "l2":
+        return jnp.square(ref_minus_policy)
+    raise ValueError(f"Unknown kl_estimator: {kl_estimator!r}. Possible values are 'k1', 'k2', 'k3', and 'l2'.")
+
+
+def _gmpo_sequence_ratio(
+    *,
+    per_token_logps: jax.Array,
+    old_per_token_logps: jax.Array,
+    advantages: jax.Array,
+    completion_mask: jax.Array,
+    epsilon: float,
+    epsilon_high: float,
+    delta: float | None = None,
+) -> jax.Array:
+    """Geometric mean of the advantage-sign-aware clipped token ratios (GMPO).
+
+    Each token ratio ``r_t`` is clipped as ``min(r_t, clip(r_t))`` for positive
+    advantages (capped at ``1 + epsilon_high``) and ``max(r_t, clip(r_t))`` for
+    non-positive ones (floored at ``1 - epsilon``), clamped at ``1e-6``, and the
+    sequence ratio is ``exp(mean_t log(clipped r_t))`` over completion tokens.
+    Everything is computed in log space, so padded tokens with extreme
+    log-ratios cannot overflow; clipped tokens receive no gradient.
+
+    Args:
+        per_token_logps: Current-policy log-probs ``[batch, seq]``.
+        old_per_token_logps: Behaviour-policy log-probs ``[batch, seq]``.
+        advantages: Per-sequence advantages ``[batch, 1]``.
+        completion_mask: Completion-token mask ``[batch, seq]``.
+        epsilon: Lower clip offset; must satisfy ``0 < epsilon < 1``.
+        epsilon_high: Upper clip offset.
+        delta: Optional absolute cap on every token ratio.
+
+    Returns:
+        Sequence geometric-mean ratio of shape ``[batch, 1]``.
+    """
+    mask = completion_mask > 0
+    log_ratio = jnp.where(mask, per_token_logps - old_per_token_logps, 0.0)
+    clipped = jnp.where(
+        advantages > 0,
+        jnp.minimum(log_ratio, math.log1p(epsilon_high)),
+        jnp.maximum(log_ratio, math.log1p(-epsilon)),
+    )
+    if delta is not None:
+        clipped = jnp.minimum(clipped, math.log(delta))
+    clipped = jnp.maximum(clipped, math.log(1e-6))
+    token_count = jnp.maximum(jnp.sum(mask, axis=-1, keepdims=True).astype(jnp.float32), 1.0)
+    sequence_log_ratio = jnp.sum(jnp.where(mask, clipped, 0.0), axis=-1, keepdims=True) / token_count
+    return jnp.exp(sequence_log_ratio)
+
+
 def _compute_off_policy_sequence_mask(
     *,
     per_token_logps: jax.Array,
@@ -284,6 +364,17 @@ def _compute_grpo_policy_loss_terms(
             lambda_neg=vespo_lambda_neg,
         )
         return -jax.lax.stop_gradient(phi_seq) * advantages * per_token_logps, coef_1
+    if loss_type == "gmpo":
+        sequence_ratio = _gmpo_sequence_ratio(
+            per_token_logps=per_token_logps,
+            old_per_token_logps=old_per_token_logps,
+            advantages=advantages,
+            completion_mask=completion_mask,
+            epsilon=epsilon,
+            epsilon_high=epsilon_high,
+            delta=delta,
+        )
+        return jnp.broadcast_to(-advantages * sequence_ratio, per_token_logps.shape), coef_1
     if loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
         coef_2 = jnp.clip(coef_1, 1 - epsilon, 1 + epsilon_high)
         if delta is not None:
@@ -753,6 +844,7 @@ def grpo_step(
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
     dppo_divergence_type: str | None = None,
     dppo_clip_ratio_c: float = 20.0,
+    kl_estimator: str = "k3",
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Perform a single GRPO training or evaluation step.
 
@@ -770,6 +862,8 @@ def grpo_step(
         - ``"sapo"``: Soft advantage policy optimization.
         - ``"luspo"``: Length-unbiased sequence policy optimization.
         - ``"vespo"``: Variational sequence-level soft policy optimization.
+        - ``"gmpo"``: Geometric-mean policy optimization (sequence-level
+          geometric mean of sign-aware clipped token ratios).
 
     Args:
         state: Current model state including parameters and optimizer.
@@ -809,6 +903,11 @@ def grpo_step(
             un-clipped importance weights.
         straight_through_emulator: Optional function for quantization-aware
             straight-through gradient estimation.
+        dppo_divergence_type: DPPO trust-region divergence; ``None`` for
+            non-DPPO losses.
+        dppo_clip_ratio_c: Upper cap on DPPO importance ratios.
+        kl_estimator: Per-token KL estimator for the ``beta`` penalty:
+            ``"k1"``, ``"k2"``, ``"k3"`` (default), or ``"l2"``.
 
     Returns:
         tuple[EasyDeLState, LossMetrics] | LossMetrics: When ``is_training``
@@ -1010,9 +1109,7 @@ def grpo_step(
                     else jnp.zeros_like(chunk_per_token_logps)
                 )
                 chunk_per_token_kl = (
-                    jnp.exp(chunk_ref_per_token_logps - chunk_per_token_logps)
-                    - (chunk_ref_per_token_logps - chunk_per_token_logps)
-                    - 1
+                    _compute_per_token_kl(chunk_per_token_logps, chunk_ref_per_token_logps, kl_estimator)
                     if beta != 0.0
                     else jnp.zeros_like(chunk_per_token_logps)
                 )
@@ -1098,7 +1195,7 @@ def grpo_step(
                     chunk_per_token_loss = chunk_per_token_loss + beta * chunk_per_token_kl
                 chunk_per_token_loss = chunk_per_token_loss * chunk_difficulty_weights
 
-                if loss_type in {"grpo", "sapo"}:
+                if loss_type in {"grpo", "sapo", "gmpo"}:
                     loss_numerator = loss_numerator + jnp.sum(
                         jnp.sum(chunk_per_token_loss * chunk_completion_mask, axis=1)
                         / jnp.maximum(jnp.sum(chunk_completion_mask, axis=1), 1.0)
@@ -1124,7 +1221,7 @@ def grpo_step(
                     ref_logps_num = ref_logps_num + chunk_ref_num
                     ref_logps_den = ref_logps_den + chunk_ref_den
 
-                if loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
+                if loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo", "gmpo"]:
                     is_low_clipped = (coef_1 < 1 - epsilon) & (chunk_advantages < 0)
                     is_high_clipped = (coef_1 > 1 + epsilon_high) & (chunk_advantages > 0)
                     is_region_clipped = is_low_clipped | is_high_clipped
@@ -1155,7 +1252,7 @@ def grpo_step(
                     cispo_clip_num = cispo_clip_num + chunk_cispo_num
                     cispo_clip_den = cispo_clip_den + chunk_cispo_den
 
-            if loss_type in {"grpo", "sapo"}:
+            if loss_type in {"grpo", "sapo", "gmpo"}:
                 loss = loss_numerator / jnp.maximum(grpo_weight_den, 1.0)
             elif loss_type == "luspo":
                 # Match the non-chunked path's ``jnp.mean(per_token_loss * completion_lengths)`` which divides
@@ -1183,7 +1280,7 @@ def grpo_step(
                 other_metrics["ref_per_token_logps"] = ref_logps_num / jnp.maximum(ref_logps_den, 1.0)
             else:
                 mean_kl = None
-            if loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
+            if loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo", "gmpo"]:
                 other_metrics["clip_ratio/low_mean"] = low_clip_num / jnp.maximum(low_clip_den, 1.0)
                 other_metrics["clip_ratio/high_mean"] = high_clip_num / jnp.maximum(high_clip_den, 1.0)
                 other_metrics["clip_ratio/region_mean"] = region_clip_num / jnp.maximum(region_clip_den, 1.0)
@@ -1234,9 +1331,7 @@ def grpo_step(
             ref_per_token_logps = None
             if beta != 0.0:
                 ref_per_token_logps = minibatch["ref_per_token_logps"][:, : completion_ids.shape[1]]
-                per_token_kl = (
-                    jnp.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-                )
+                per_token_kl = _compute_per_token_kl(per_token_logps, ref_per_token_logps, kl_estimator)
             else:
                 per_token_kl = jnp.zeros_like(per_token_logps)
 
@@ -1323,7 +1418,7 @@ def grpo_step(
         per_token_loss = per_token_loss * difficulty_weights
 
         with jax.named_scope(scope_root + "/loss_fn/reduce_loss"):
-            if loss_type in {"grpo", "sapo"}:
+            if loss_type in {"grpo", "sapo", "gmpo"}:
                 sequence_loss = jnp.sum(per_token_loss * completion_mask, axis=1) / jnp.maximum(
                     completion_lengths,
                     1.0,
@@ -1384,7 +1479,7 @@ def grpo_step(
         else:
             mean_kl = None
 
-        if loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
+        if loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo", "gmpo"]:
             is_low_clipped = (coef_1 < 1 - epsilon) & (advantages < 0)
             is_high_clipped = (coef_1 > 1 + epsilon_high) & (advantages > 0)
             is_region_clipped = is_low_clipped | is_high_clipped
@@ -1478,6 +1573,7 @@ def _grpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
             "use_bias_correction_kl",
             "dppo_divergence_type",
             "dppo_clip_ratio_c",
+            "kl_estimator",
         ),
         object_fields=("loss_config", "learning_rate_fn", "straight_through_emulator"),
     )
@@ -1529,6 +1625,7 @@ def _make_grpo_scheduled_loss(call):
     straight_through_emulator = call.get("straight_through_emulator")
     dppo_divergence_type = call.get("dppo_divergence_type")
     dppo_clip_ratio_c = call.get("dppo_clip_ratio_c", 20.0)
+    kl_estimator = call.get("kl_estimator", "k3")
 
     def scheduled_loss(tree, batch):
         """Compute the scalar GRPO loss inside the SpectraX scheduled VJP.
@@ -1581,6 +1678,7 @@ def _make_grpo_scheduled_loss(call):
                 straight_through_emulator=None,
                 dppo_divergence_type=dppo_divergence_type,
                 dppo_clip_ratio_c=dppo_clip_ratio_c,
+                kl_estimator=kl_estimator,
             )
             return metrics.loss
 

@@ -286,8 +286,55 @@ def test_grpo_esurge_generation_knobs_validate():
     with pytest.raises(ValueError, match="log_completions_hub_repo"):
         GRPOConfig(log_completions_hub_repo="repo")
     assert GRPOConfig(log_completions=True, log_completions_hub_repo="repo").log_completions_hub_repo == "repo"
+    cfg_tok = GRPOConfig(
+        esurge_importance_sampling_mode="token_icepop",
+        esurge_importance_sampling_cap=5.0,
+        esurge_importance_sampling_cap_low=0.5,
+    )
+    assert cfg_tok.esurge_importance_sampling_mode == "token_icepop"
+    assert cfg_tok.esurge_importance_sampling_cap_low == 0.5
+    cfg_seq = GRPOConfig(
+        esurge_importance_sampling_mode="sequence_icepop",
+        esurge_importance_sampling_cap=2.0,
+    )
+    assert cfg_seq.esurge_importance_sampling_mode == "sequence_icepop"
     with pytest.raises(ValueError, match="esurge_importance_sampling_mode"):
         GRPOConfig(esurge_importance_sampling_mode="bad")
+    with pytest.raises(ValueError, match="esurge_importance_sampling_cap"):
+        GRPOConfig(esurge_importance_sampling_mode="token_icepop", esurge_importance_sampling_cap=0.5)
+    with pytest.raises(ValueError, match="esurge_importance_sampling_cap_low"):
+        GRPOConfig(
+            esurge_importance_sampling_mode="token_icepop",
+            esurge_importance_sampling_cap=2.0,
+            esurge_importance_sampling_cap_low=3.0,
+        )
+
+
+@pytest.mark.cpu_ok
+def test_elarge_grpo_icepop_config_roundtrip():
+    from easydel.infra.elarge import eLargeModel
+
+    elm = eLargeModel(
+        {
+            "model": {"name_or_path": "Qwen/Qwen2.5-0.5B"},
+            "trainer": {
+                "trainer_type": "grpo",
+                "loss_type": "grpo",
+                "beta": 0.0,
+                "epsilon": 0.2,
+                "epsilon_high": 0.28,
+                "esurge_importance_sampling_correction": True,
+                "esurge_importance_sampling_mode": "token_icepop",
+                "esurge_importance_sampling_cap": 5.0,
+                "esurge_importance_sampling_cap_low": 0.5,
+            },
+        }
+    )
+    args = elm.build_training_arguments()
+    assert isinstance(args, GRPOConfig)
+    assert args.esurge_importance_sampling_mode == "token_icepop"
+    assert args.esurge_importance_sampling_cap == 5.0
+    assert args.esurge_importance_sampling_cap_low == 0.5
 
 
 @pytest.mark.cpu_ok

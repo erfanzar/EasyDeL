@@ -51,6 +51,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 
 from .._shared import copy_frozen_policy, drop_optimizer_state
+from ..async_rollout_mixin import AsyncRolloutMixin
 from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..supervised_fine_tuning_trainer import SFTTrainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
@@ -66,7 +67,7 @@ logger = get_logger(__name__)
 
 
 @Registry.register("trainer", "gkd")
-class GKDTrainer(SFTTrainer):
+class GKDTrainer(AsyncRolloutMixin, SFTTrainer):
     """Trainer for Generalized Knowledge Distillation (GKD).
 
     Implements the GKD objective from Agarwal et al. 2024: a
