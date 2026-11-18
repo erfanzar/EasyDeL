@@ -81,6 +81,27 @@ def test_routed_generate_all_explicit_ids_is_accepted():
     assert router._inflight == [0]
 
 
+def test_shared_prefix_burst_spreads_once_the_pinned_member_is_busy():
+    # One prompt shared by a burst (a system prompt, a benchmark wave): affinity pins it to member 0, but only while
+    # member 0 holds at most `affinity_max_imbalance` more in-flight requests than the idle member.
+    members = [_FakeMember(name="a"), _FakeMember(name="b")]
+    router = RoutedEngine(members, affinity_max_imbalance=2)
+    prompt = "shared system prompt " * 64
+    chosen = []
+    for _ in range(8):
+        index = router.select_member(prompt)
+        router.affinity.record(prompt, index)
+        router._acquire(index)
+        chosen.append(index)
+    assert chosen.count(0) >= 1 and chosen.count(1) >= 1
+    assert abs(router._inflight[0] - router._inflight[1]) <= 3
+    # With both members equally loaded the prefix stays on the member that last served it.
+    pinned, _ = router.affinity.lookup(prompt)
+    assert router.select_member(prompt) == pinned
+    with pytest.raises(ValueError, match="affinity_max_imbalance"):
+        RoutedEngine(members, affinity_max_imbalance=-1)
+
+
 def test_routed_generate_surfaces_member_errors_and_releases_slots():
     member = _FakeMember(generate_error=RuntimeError("member exploded"))
     router = RoutedEngine([member])

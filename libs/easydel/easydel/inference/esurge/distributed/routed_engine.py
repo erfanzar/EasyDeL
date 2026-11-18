@@ -149,12 +149,26 @@ class RoutedEngine:
         affinity_block_chars: Prefix block width for the affinity map;
             defaults to a page-size-derived estimate when a member reports
             one (≈4 characters per token), else ``512`` characters.
+        affinity_max_imbalance: How many more router-local in-flight requests
+            the prefix-pinned member may hold than the least-loaded live member
+            before affinity yields to join-shortest-queue. A prefix shared by a
+            burst (one system prompt, one benchmark prompt) otherwise lands
+            every request on one member while the others idle.
     """
 
-    def __init__(self, members: list, *, affinity_block_chars: int | None = None) -> None:
+    def __init__(
+        self,
+        members: list,
+        *,
+        affinity_block_chars: int | None = None,
+        affinity_max_imbalance: int = 4,
+    ) -> None:
         if not members:
             raise ValueError("RoutedEngine needs at least one member")
+        if int(affinity_max_imbalance) < 0:
+            raise ValueError(f"affinity_max_imbalance must be >= 0, got {affinity_max_imbalance}")
         self.members = list(members)
+        self.affinity_max_imbalance = int(affinity_max_imbalance)
         if affinity_block_chars is None:
             page_size = next((int(getattr(m, "page_size", 0) or 0) for m in self.members), 0)
             affinity_block_chars = page_size * 4 if page_size > 0 else _DEFAULT_BLOCK_CHARS
@@ -192,11 +206,15 @@ class RoutedEngine:
             self._release(member_index)
 
     def select_member(self, prompt: str) -> int:
-        """Pick the member for one prompt: prefix affinity, then JSQ.
+        """Pick the member for one prompt: bounded prefix affinity, then JSQ.
 
-        The queue key is (router-local in-flight, owner-reported pending
-        prefill tokens, index): the local count is instantaneous, the
-        remote signal covers load from other clients.
+        The prefix-pinned member wins while its router-local in-flight count
+        is at most ``affinity_max_imbalance`` above the least-loaded live
+        member's; beyond that the request joins the shortest queue (the
+        caller then re-pins the prefix there). The queue key is (router-local
+        in-flight, owner-reported pending prefill tokens, index): the local
+        count is instantaneous, the remote signal covers load from other
+        clients.
 
         Args:
             prompt: The incoming prompt text.
@@ -206,10 +224,12 @@ class RoutedEngine:
         """
         alive = self._alive_indices()
         pinned, _depth = self.affinity.lookup(prompt)
-        if pinned is not None and pinned in alive:
-            return pinned
         with self._route_lock:
             inflight = list(self._inflight)
+        if pinned is not None and pinned in alive:
+            least = min(inflight[index] for index in alive)
+            if inflight[pinned] - least <= self.affinity_max_imbalance:
+                return pinned
         return min(
             alive,
             key=lambda index: (inflight[index], _member_pending_prefill_tokens(self.members[index]), index),
