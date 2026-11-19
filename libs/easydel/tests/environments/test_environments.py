@@ -1175,3 +1175,78 @@ def test_kiri_installer_mock_release_tarball(monkeypatch, tmp_path):
     deb_bytes = b"!<arch>\n" + ar_header + tar_bytes + (b"\n" if len(tar_bytes) % 2 else b"")
     extracted = kiri_installer._extract_ar_data_tar(deb_bytes)
     assert extracted == tar_bytes
+
+
+class _FlakyGate:
+    """Verification-gate stub: raises for the first ``fail_times`` calls, then accepts."""
+
+    def __init__(self, fail_times: int):
+        self.fail_times = fail_times
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def verify(self, task):
+        from easydel.environments import TaskSanityReport
+
+        with self._lock:
+            self.calls += 1
+            failing = self.calls <= self.fail_times
+        if failing:
+            raise ConnectionError("gate backend hiccup")
+        return TaskSanityReport(accepted=True, reason="ok")
+
+    def stats(self):
+        return {"accepted": max(0, self.calls - self.fail_times)}
+
+
+def test_synthetic_stream_transient_gate_error_does_not_poison_stream():
+    from easydel.environments import SyntheticTaskStream
+
+    def _gen(seed: int):
+        return {"task_id": "only", "prompt": "p"} if seed == 0 else None
+
+    stream = SyntheticTaskStream(_gen, verification_gate=_FlakyGate(1), num_workers=1, generator_backoff=0.001)
+    try:
+        # The single real task hit the transient gate error; a later timeout is a TimeoutError, not that stale error.
+        with pytest.raises(TimeoutError):
+            stream.next_task(timeout=0.5)
+    finally:
+        stream.close()
+
+    tasks = iter(range(100))
+
+    def _gen2(seed: int):
+        return {"task_id": f"t{next(tasks)}", "prompt": "p"}
+
+    stream = SyntheticTaskStream(
+        _gen2,
+        verification_gate=_FlakyGate(2),
+        num_workers=1,
+        max_consecutive_generator_failures=3,
+        generator_backoff=0.001,
+    )
+    try:
+        assert stream.next_task(timeout=5.0)["task_id"] == "t2"
+    finally:
+        stream.close()
+
+
+def test_synthetic_stream_persistent_gate_errors_stop_the_stream():
+    from easydel.environments import SyntheticTaskStream
+
+    gate = _FlakyGate(10**9)
+    stream = SyntheticTaskStream(
+        lambda seed: {"task_id": f"t{seed}", "prompt": "p"},
+        verification_gate=gate,
+        num_workers=1,
+        max_consecutive_generator_failures=3,
+        generator_backoff=0.001,
+    )
+    try:
+        with pytest.raises(ConnectionError):
+            stream.next_task(timeout=10.0)
+        calls = gate.calls
+        time.sleep(0.1)
+        assert gate.calls == calls == 3
+    finally:
+        stream.close()

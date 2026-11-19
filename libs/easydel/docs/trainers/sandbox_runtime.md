@@ -75,7 +75,10 @@ Only `"off"` runs unjailed. `swe_repo`, `terminal` and `harness` default to `Con
 
 ### Installation (opt-in)
 
-Nothing is downloaded implicitly. Install a pinned, SHA-256-verified release with:
+Nothing is downloaded implicitly. Only the tags in `PINNED_KIRI_SHA256` (currently `v0.2.1`, the default) are
+pinned: their asset digests live in this source tree. Any other `--version` is refused unless you pass the asset's
+expected SHA-256 yourself (`install_kiri(expected_sha256=...)` / `easydel-install-kiri --sha256 ...`); the release
+API's own `digest` field is never trusted, because it comes from the same source as the download. Install with:
 
 ```bash
 easydel setup kiri [--version v0.2.1] [--install-dir DIR] [--force] [--start] [--data-dir /dev/shm/kiri] [--num-daemons N]
@@ -95,7 +98,10 @@ leaves it running.
 
 ### `KiriDaemonBudget`
 
-Per-daemon caps for RAM-backed pools; every container created on that daemon is clamped by `clamp_host_config`.
+Per-daemon caps for RAM-backed pools, applied by `clamp_host_config` (a missing, zero or negative limit becomes the
+cap). Containers are clamped by `EngineSocketClient` in the process that booted the daemon and by that process's TCP
+bridges for every forwarded container create, so remote hosts of a pod pool are clamped too. A client of another
+process that talks to the daemon's Unix socket directly is not clamped.
 
 | field        | default | caps                                                                 |
 |--------------|---------|----------------------------------------------------------------------|
@@ -120,8 +126,12 @@ budget=None, expose_bridge=False, bridge_token=None, allowed_peers=None)`:
   peers outside the allow-list are rejected.
 - Refused requests: container creates with `Privileged`, host `Binds`, `VolumesFrom`, non-local volume drivers,
   mounts other than `volume`/`tmpfs`, devices, `CapAdd`, host or `container:` namespace modes, or `unconfined`
-  security options; volume creates with non-local drivers or `DriverOpts`; privileged execs; and the
-  `/plugins`, `/swarm`, `/services`, `/secrets`, `/configs`, `/nodes`, `/session`, `/build` API prefixes.
+  security options (inside `HostConfig` or at the body root, the legacy layout); volume creates with non-local
+  drivers or `DriverOpts`; privileged execs; and the `/plugins`, `/swarm`, `/services`, `/secrets`, `/configs`,
+  `/nodes`, `/session`, `/build` API prefixes.
+- Malformed heads are refused with `400`: a bare CR or LF anywhere in the head, header names that are not RFC 7230
+  tokens, and control characters in header values or in the request target (including its query string).
+- Approved container creates are clamped to the daemon's `KiriDaemonBudget` before they are forwarded.
 
 ## Remote CPU VMs
 
@@ -154,4 +164,13 @@ Not guaranteed:
 - The bridge policy filters the Docker API surface; isolation of permitted containers is whatever the engine
   provides.
 - `swe_repo` restores a fixed list of test-infrastructure file names; other ways a repository can hook its own test
-  run are not covered.
+  run are not covered. The restore itself never runs agent-controlled git configuration: protected files are
+  rewritten from blob ids recorded at reset (hash-checked), and grading git commands (`diff`, `apply`) run against a
+  throw-away git dir with no system/global config, hooks, attributes, filters or fsmonitor. Agent processes are killed
+  before the restore and again right before the test commands. The test commands themselves run with the repository
+  as it is; if they call git, the repository's config applies.
+- `code_judge` with `test_code` grades every step after the first in a fresh session, so a multi-step solution cannot
+  replace the interpreter or leave a process behind for the next evaluation. This is covered only against a fake
+  container engine, not a real Kiri or Docker daemon.
+- Local `read_file` refuses anything that is not a regular file (FIFOs, sockets, devices, final-component
+  symlinks); `edit_file` refuses files over `SandboxEditFileTool.max_file_chars` (4 Mi characters).

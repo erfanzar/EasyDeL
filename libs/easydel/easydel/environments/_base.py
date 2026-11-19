@@ -176,6 +176,8 @@ class SandboxEditFileTool(Tool):
     """Replace one exact substring in a file inside an episode's :class:`SandboxSession`."""
 
     name = "edit_file"
+    max_file_chars = 4 * 1024 * 1024
+    """Largest file (in characters) the tool loads; bigger files are refused instead of read whole."""
 
     def __init__(self, session_getter: tp.Callable[[], SandboxSession]):
         self._get_session = session_getter
@@ -189,9 +191,12 @@ class SandboxEditFileTool(Tool):
         """
         session = self._get_session()
         try:
-            current = session.read_file(path)
+            # read_file returns at most max_chars + 1 characters, so a longer result means the file is too large.
+            current = session.read_file(path, max_chars=self.max_file_chars)
         except Exception as exc:
             return f"Error reading '{path}': {exc}"
+        if len(current) > self.max_file_chars:
+            return f"Error: '{path}' is larger than {self.max_file_chars} characters; edit_file refuses to load it."
         count = current.count(old_text)
         if count == 0:
             return f"Error: `old_text` not found in '{path}'."

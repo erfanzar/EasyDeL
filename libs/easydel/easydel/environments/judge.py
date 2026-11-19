@@ -625,9 +625,11 @@ class PairwiseJudge:
     """Group scorer from pairwise judge comparisons.
 
     For a group of responses to one prompt it compares pairs, either all
-    ``n * (n - 1) / 2`` of them or, when ``max_pairs`` is smaller, a round-robin
-    schedule (offsets ``1, 2, ...`` around the circle) so every member appears in
-    a balanced number of comparisons. A member's score is its win rate
+    ``n * (n - 1) / 2`` of them or, when ``max_pairs`` is smaller, a balanced
+    schedule of ``max_pairs`` distinct pairs in which every member appears in at
+    least one comparison and per-member counts differ by at most one. A
+    ``max_pairs`` below ``ceil(n / 2)`` cannot cover every member and raises
+    ``ValueError`` when a group of ``n`` is scheduled. A member's score is its win rate
     ``(wins + 0.5 * ties) / completed comparisons`` in ``[0, 1]``. Failed
     comparisons are excluded; a member with no completed comparison, and every
     member of a single-member group, is unscorable (``None``).
@@ -666,18 +668,27 @@ class PairwiseJudge:
         total = n * (n - 1) // 2
         if self.max_pairs is None or self.max_pairs >= total:
             return list(itertools.combinations(range(n), 2))
-        seen: set[tuple[int, int]] = set()
+        if self.max_pairs < math.ceil(n / 2):
+            raise ValueError(
+                f"`max_pairs={self.max_pairs}` cannot give each of {n} group members a comparison; "
+                f"it must be at least ceil(n / 2) = {math.ceil(n / 2)}."
+            )
+        # Near-regular target degrees (max - min <= 1, every member >= 1) realised as a simple graph with the
+        # Havel-Hakimi construction; such a degree sequence is always graphical, so the loop never runs short.
+        q, r = divmod(2 * self.max_pairs, n)
+        remaining = [q + 1 if i < r else q for i in range(n)]
         schedule: list[tuple[int, int]] = []
-        for offset in range(1, n // 2 + 1):
-            for i in range(n):
-                pair = tuple(sorted((i, (i + offset) % n)))
-                if pair in seen:
-                    continue
-                seen.add(pair)
-                schedule.append(pair)
-                if len(schedule) == self.max_pairs:
-                    return schedule
-        return schedule
+        while True:
+            v = max(range(n), key=lambda i: (remaining[i], -i))
+            if remaining[v] == 0:
+                break
+            partners = sorted((u for u in range(n) if u != v and remaining[u] > 0), key=lambda u: (-remaining[u], u))
+            partners = partners[: remaining[v]]
+            for u in partners:
+                remaining[u] -= 1
+                schedule.append((min(u, v), max(u, v)))
+            remaining[v] = 0
+        return sorted(schedule)
 
     def compare(self, prompt: tp.Any, first: tp.Any, second: tp.Any, reference: str | None = None) -> float | None:
         """Return ``first``'s outcome against ``second``: ``1`` win, ``0.5`` tie, ``0`` loss, ``None`` on failure."""
@@ -902,6 +913,9 @@ def make_judge_reward_fn(
                 )
             references = [None] * n
         groups = _group_slices([_join_text(p) for p in prompt_list], num_generations)
+        if isinstance(judge, PairwiseJudge):
+            for rows in groups:
+                judge.pairs(len(rows))  # a too-small ``max_pairs`` is a config error, not an unscorable group
 
         def _judge_group(rows: range) -> list[float | None]:
             prompt = prompt_list[rows.start]

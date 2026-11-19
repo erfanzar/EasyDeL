@@ -278,6 +278,21 @@ def test_reward_shaper_structural_gate_never_lifts_invalid_above_valid_incorrect
                     assert rewards[i] <= rewards[j]
 
 
+def test_reward_shaper_keeps_base_discard_unscorable_marker():
+    def judged(*, completions, **_kw):
+        return [None if c == "?" else 1.0 for c in completions]
+
+    judged.discard_unscorable = True
+
+    def plain(*, completions, **_kw):
+        return [1.0 for _ in completions]
+
+    shaped = RewardShaper(judged)
+    assert shaped.discard_unscorable is True
+    assert shaped(prompts=["p", "p"], completions=["ok", "?"])[1] is None
+    assert RewardShaper(plain).discard_unscorable is False
+
+
 def test_reward_shaper_rejects_bad_configs():
     with pytest.raises(ValueError):
         RewardShaper(lambda completions, **kw: [0.0], correct_reward=0.0, incorrect_ceiling=0.0)

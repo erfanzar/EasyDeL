@@ -495,10 +495,14 @@ class CodeJudgeEnvironment(SandboxEnvironment):
         self._reward_mode = reward_mode
         self._compile_timeout = float(compile_timeout)
         self._test_timeout = float(test_timeout)
+        self._reset_seed: int | None = None
+        self._session_evaluated = False
 
     _infra_failure_step = staticmethod(unscorable_step)
 
     def reset(self, seed: int | None = None) -> ResetResult:
+        self._reset_seed = seed
+        self._session_evaluated = False
         try:
             session = self._open_session(seed=seed)
         except SandboxInfraError as exc:
@@ -526,6 +530,13 @@ class CodeJudgeEnvironment(SandboxEnvironment):
 
             from .runtime import LocalSandboxSession
 
+            if self._session_evaluated:
+                # An earlier step's solution ran in this session and could have replaced the interpreter or left a
+                # process behind that reads the runner's stdin; grade every later step in a fresh session.
+                step_count = self._step_count
+                session = self._open_session(seed=self._reset_seed)
+                self._step_count = step_count
+            self._session_evaluated = True
             nonce = f"__ED_RESULT_{secrets.token_hex(16)}__"
             session.write_files({src_name: code})
             runner_src = _build_unit_test_runner(nonce, src_name, self._test_code, self._test_timeout)

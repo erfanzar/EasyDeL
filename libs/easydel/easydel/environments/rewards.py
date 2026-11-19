@@ -448,6 +448,8 @@ class RewardShaper(RewardProtocol):
 
     Non-finite outputs (NaN/inf, including numpy scalars) of any wrapped callable
     are treated like ``None``: unscorable for ``base_reward``, ``0`` for shaping.
+    The wrapper copies ``base_reward``'s ``discard_unscorable`` marker, so a base
+    that asks the trainer to drop groups with unscorable samples keeps doing so.
 
     ``base_reward`` and every entry in ``shaping_funcs`` use the trainer's reward
     calling convention (keyword batch payload in, one value per completion out),
@@ -497,6 +499,8 @@ class RewardShaper(RewardProtocol):
         base_name = getattr(base_reward, "__name__", type(base_reward).__name__)
         super().__init__(weight=weight, name=name or f"shaped_{base_name}")
         self.base_reward = base_reward
+        # A ``None`` from the base stays ``None`` here, so the base's group-discard policy must carry over too.
+        self.discard_unscorable = bool(getattr(base_reward, "discard_unscorable", False))
         self.shaping_funcs = tuple(shaping_funcs)
         self.correct_threshold = float(correct_threshold)
         self.correct_reward = float(correct_reward)

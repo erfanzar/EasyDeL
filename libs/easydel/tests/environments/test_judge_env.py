@@ -242,6 +242,30 @@ def test_pairwise_round_robin_respects_max_pairs_and_balance():
     assert len(PairwiseJudge(_client(RecordingTransport(_longer_wins))).pairs(5)) == 10
 
 
+@pytest.mark.parametrize(("n", "max_pairs"), [(8, 4), (8, 6), (16, 8), (4, 2), (5, 3), (7, 10)])
+def test_pairwise_capped_schedule_covers_every_member_balanced(n, max_pairs):
+    schedule = PairwiseJudge(_client(RecordingTransport(_longer_wins)), max_pairs=max_pairs).pairs(n)
+    assert len(schedule) == max_pairs and len(set(schedule)) == max_pairs
+    assert all(0 <= i < j < n for i, j in schedule)
+    counts = [sum(k in pair for pair in schedule) for k in range(n)]
+    assert min(counts) >= 1 and max(counts) - min(counts) <= 1
+
+
+def test_pairwise_capped_group_scores_every_member():
+    judge = PairwiseJudge(_client(RecordingTransport(_longer_wins)), max_pairs=4)
+    scores = judge.score_group("q", ["a" * (k + 1) for k in range(8)])
+    assert len(scores) == 8 and all(s is not None for s in scores)
+
+
+def test_pairwise_max_pairs_too_small_to_cover_group_raises():
+    judge = PairwiseJudge(_client(RecordingTransport(_longer_wins)), max_pairs=3)
+    with pytest.raises(ValueError, match="max_pairs"):
+        judge.pairs(8)
+    reward_fn = make_judge_reward_fn(judge, num_generations=8)
+    with pytest.raises(ValueError, match="max_pairs"):
+        reward_fn(prompts=["p"] * 8, completions=["a" * (k + 1) for k in range(8)])
+
+
 def test_reward_fn_judge_failure_gives_none_not_zero():
     transport = RecordingTransport(lambda t, i: (500, {}, b""))
     reward_fn = make_judge_reward_fn(RubricJudge(_client(transport, max_retries=1)), num_generations=2)

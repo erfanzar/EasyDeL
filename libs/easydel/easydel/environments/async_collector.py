@@ -175,6 +175,11 @@ class AsyncEnvironmentRolloutCollector:
         self._traj_id_lock = threading.Lock()
         self._aside_lock = threading.Lock()
         self._aside: collections.deque[CompletedRollout[EpisodeRecord] | AsyncRolloutError] = collections.deque()
+        # Single consumer: the drain loops of ``collect_episodes`` / ``collect_groups`` never run concurrently, so
+        # one call can never take a completion another call is waiting for.
+        self._drain_lock = threading.Lock()
+        # Submissions of an aborted ``collect_groups`` call; their completions are discarded on arrival.
+        self._orphans: set[int] = set()
 
         self._snapshot_lock = threading.Lock()
         self._latest_snapshot: PolicySnapshot[tp.Any] | None = None
@@ -207,6 +212,28 @@ class AsyncEnvironmentRolloutCollector:
     def _pop_aside(self) -> CompletedRollout[EpisodeRecord] | AsyncRolloutError | None:
         with self._aside_lock:
             return self._aside.popleft() if self._aside else None
+
+    def _pop_own_aside(self, ours: set[int]) -> CompletedRollout[EpisodeRecord] | AsyncRolloutError | None:
+        """Remove and return the first set-aside completion whose submission id is in ``ours``."""
+        with self._aside_lock:
+            for index, outcome in enumerate(self._aside):
+                if outcome.ticket.submission_id in ours:
+                    del self._aside[index]
+                    return outcome
+        return None
+
+    def _orphan(self, submission_ids: collections.abc.Iterable[int]) -> None:
+        """Cancel ``submission_ids`` where possible and mark all of them so later drains discard their completions."""
+        for submission_id in list(submission_ids):
+            self._orphans.add(submission_id)
+            self._coordinator.cancel(submission_id)
+
+    def _take_orphan(self, submission_id: int) -> bool:
+        """Return ``True`` (and forget the id) when ``submission_id`` belongs to an aborted ``collect_groups`` call."""
+        if submission_id in self._orphans:
+            self._orphans.discard(submission_id)
+            return True
+        return False
 
     @property
     def set_aside_count(self) -> int:
@@ -427,34 +454,63 @@ class AsyncEnvironmentRolloutCollector:
         current_policy_version: int,
         timeout_per_episode: float | None = None,
     ) -> tuple[list[EpisodeRecord], dict[str, int]]:
-        """Drain ``count`` valid episodes in completion order, filtering stale/crashed runs."""
+        """Drain ``count`` episodes with a trajectory in completion order, filtering stale/crashed runs.
+
+        With ``drop_env_errors=False`` trajectory-less env-error records are returned too (flag set, counted in
+        ``stats["kept_env_error"]``) but never count toward ``count``. Completions of an aborted
+        :meth:`collect_groups` call are discarded (``stats["dropped_orphaned"]``).
+
+        The collector is single-consumer: this drain and the one in :meth:`collect_groups` hold the same lock, so
+        concurrent calls run one after the other.
+        """
         if count <= 0:
             raise ValueError(f"count must be positive, got {count}")
         valid: list[EpisodeRecord] = []
-        stats = {"dropped_stale": 0, "dropped_env_error": 0, "worker_errors": 0}
+        stats = {
+            "dropped_stale": 0,
+            "dropped_env_error": 0,
+            "worker_errors": 0,
+            "kept_env_error": 0,
+            "dropped_orphaned": 0,
+        }
+        with_trajectory = 0
 
-        while len(valid) < count and (self.set_aside_count > 0 or self._coordinator.outstanding_count > 0):
-            # Completions set aside by ``collect_groups`` (submissions it did not make) are consumed first.
-            aside = self._pop_aside()
-            try:
-                if isinstance(aside, AsyncRolloutError):
-                    raise aside
-                completed = aside if aside is not None else self._coordinator.next_completed(timeout=timeout_per_episode)
-            except AsyncRolloutCancelled:
-                continue
-            except AsyncRolloutWorkerError:
-                stats["worker_errors"] += 1
-                continue
+        with self._drain_lock:
+            while with_trajectory < count and (self.set_aside_count > 0 or self._coordinator.outstanding_count > 0):
+                # Completions set aside by ``collect_groups`` (submissions it did not make) are consumed first.
+                aside = self._pop_aside()
+                try:
+                    if isinstance(aside, AsyncRolloutError):
+                        raise aside
+                    completed = (
+                        aside if aside is not None else self._coordinator.next_completed(timeout=timeout_per_episode)
+                    )
+                except AsyncRolloutCancelled as exc:
+                    self._take_orphan(exc.ticket.submission_id)
+                    continue
+                except AsyncRolloutWorkerError as exc:
+                    if self._take_orphan(exc.ticket.submission_id):
+                        stats["dropped_orphaned"] += 1
+                    else:
+                        stats["worker_errors"] += 1
+                    continue
 
-            ep = completed.value
-            verdict = self._classify(ep, current_policy_version)
-            if verdict == "env_error":
-                stats["dropped_env_error"] += 1
-                continue
-            if verdict == "stale":
-                stats["dropped_stale"] += 1
-                continue
-            valid.append(ep)
+                if self._take_orphan(completed.ticket.submission_id):
+                    stats["dropped_orphaned"] += 1
+                    continue
+                ep = completed.value
+                verdict = self._classify(ep, current_policy_version)
+                if verdict == "env_error":
+                    stats["dropped_env_error"] += 1
+                    continue
+                if verdict == "stale":
+                    stats["dropped_stale"] += 1
+                    continue
+                valid.append(ep)
+                if ep.trajectory is None:
+                    stats["kept_env_error"] += 1
+                else:
+                    with_trajectory += 1
 
         return valid, stats
 
@@ -472,6 +528,8 @@ class AsyncEnvironmentRolloutCollector:
             current_policy_version=current_policy_version,
             timeout_per_episode=timeout_per_episode,
         )
+        # Kept env-error records (``drop_env_errors=False``) have no trajectory: never collated or averaged.
+        episodes = [ep for ep in episodes if ep.trajectory is not None]
         if not episodes:
             raise RuntimeError(f"No valid episodes survived filtering; stats={stats}")
         trajectories = [ep.trajectory for ep in episodes if ep.trajectory is not None]
@@ -483,6 +541,8 @@ class AsyncEnvironmentRolloutCollector:
             "async_env/collected": len(episodes),
             "async_env/dropped_stale": stats["dropped_stale"],
             "async_env/dropped_env_error": stats["dropped_env_error"],
+            "async_env/kept_env_error": stats["kept_env_error"],
+            "async_env/dropped_orphaned": stats["dropped_orphaned"],
             "async_env/worker_errors": stats["worker_errors"],
             "async_env/mean_staleness": mean_lag,
             "async_env/mean_turns": mean_turns,
@@ -529,38 +589,53 @@ class AsyncEnvironmentRolloutCollector:
         # call's own submission ids count as in flight; capacity is recomputed from the live coordinator count
         # each iteration (other callers may hold credits), and at zero capacity the loop drains instead of
         # blocking in ``submit``. Completions of foreign submissions are set aside for ``collect_episodes``.
-        while next_idx < len(pending) or ours:
-            while next_idx < len(pending) and self._free_capacity() > 0:
-                g, seed, kw = pending[next_idx]
-                ticket = self.submit_episode(prompt_index=g, group_id=g, seed=seed, env_kwargs=kw)
-                ours.add(ticket.submission_id)
-                next_idx += 1
-            if self._coordinator.outstanding_count == 0:
-                break
+        # The drain holds the single-consumer lock shared with ``collect_episodes``. If it raises (for example a
+        # ``TimeoutError`` from ``timeout_per_episode``), this call's in-flight submissions are cancelled where
+        # possible and orphaned, so no later call ever returns them, and the exception propagates.
+        with self._drain_lock:
             try:
-                completed = self._coordinator.next_completed(timeout=timeout_per_episode)
-            except (AsyncRolloutCancelled, AsyncRolloutWorkerError) as exc:
-                if exc.ticket.submission_id in ours:
-                    ours.discard(exc.ticket.submission_id)
-                    dropped_env_error += 1
-                else:
-                    self._set_aside(exc)
-                continue
-            if completed.ticket.submission_id not in ours:
-                self._set_aside(completed)
-                continue
-            ours.discard(completed.ticket.submission_id)
-            ep = completed.value
-            verdict = self._classify(ep, current_policy_version)
-            if verdict == "env_error":
-                dropped_env_error += 1
-            elif verdict == "stale":
-                dropped_stale += 1
-            elif ep.env_error:
-                # Kept (drop_env_errors=False) but reported separately: never a valid member or padding source.
-                env_error_episodes.append(ep)
-            else:
-                by_group.setdefault(ep.group_id, []).append(ep)
+                while next_idx < len(pending) or ours:
+                    while next_idx < len(pending) and self._free_capacity() > 0:
+                        g, seed, kw = pending[next_idx]
+                        ticket = self.submit_episode(prompt_index=g, group_id=g, seed=seed, env_kwargs=kw)
+                        ours.add(ticket.submission_id)
+                        next_idx += 1
+                    outcome = self._pop_own_aside(ours)
+                    if outcome is None:
+                        if self._coordinator.outstanding_count == 0:
+                            break
+                        try:
+                            outcome = self._coordinator.next_completed(timeout=timeout_per_episode)
+                        except (AsyncRolloutCancelled, AsyncRolloutWorkerError) as exc:
+                            outcome = exc
+                    submission_id = outcome.ticket.submission_id
+                    if submission_id not in ours:
+                        if not self._take_orphan(submission_id):
+                            self._set_aside(outcome)
+                        continue
+                    ours.discard(submission_id)
+                    if isinstance(outcome, AsyncRolloutError):
+                        dropped_env_error += 1
+                        continue
+                    ep = outcome.value
+                    verdict = self._classify(ep, current_policy_version)
+                    if verdict == "env_error":
+                        dropped_env_error += 1
+                    elif verdict == "stale":
+                        dropped_stale += 1
+                    elif ep.env_error:
+                        # Kept (drop_env_errors=False) but reported separately: never a valid member or padding.
+                        env_error_episodes.append(ep)
+                    else:
+                        by_group.setdefault(ep.group_id, []).append(ep)
+            except BaseException:
+                self._orphan(ours)
+                raise
+            if ours:
+                # Submissions whose completion never reached this call (consumed outside the collector): count
+                # them as dropped and make sure a late arrival is discarded rather than handed to another call.
+                dropped_env_error += len(ours)
+                self._orphan(ours)
 
         min_valid = max(1, math.ceil(group_size / 2)) if group_size > 1 else 1
         final_episodes: list[EpisodeRecord] = []

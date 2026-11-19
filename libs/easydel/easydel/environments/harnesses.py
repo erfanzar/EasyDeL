@@ -51,9 +51,12 @@ from .runtime import (
     SandboxSession,
 )
 from .swe_repo import (
+    GradingSnapshot,
     capture_base_revision,
+    capture_grading_snapshot,
     kill_agent_processes,
     restore_grading_files,
+    run_clean_git,
     unscorable_step,
     verification_resolved,
 )
@@ -1032,6 +1035,7 @@ class HarnessEnvironment(SandboxEnvironment):
         self._verify_timeout = float(verify_timeout)
         self._last_trajectories: list[OnlineRLTrajectory] = []
         self._base_sha: str | None = None
+        self._grading_snapshot: GradingSnapshot | None = None
 
     _infra_failure_step = staticmethod(unscorable_step)
 
@@ -1043,6 +1047,7 @@ class HarnessEnvironment(SandboxEnvironment):
     def reset(self, seed: int | None = None) -> ResetResult:
         self._last_trajectories = []
         self._base_sha = None
+        self._grading_snapshot = None
         try:
             session = self._open_session(seed=seed)
             try:
@@ -1083,6 +1088,12 @@ class HarnessEnvironment(SandboxEnvironment):
                     self._prompt,
                     info={"env_error": True, "env_error_message": "Could not record the workspace base revision."},
                 )
+            if needs_base:
+                snapshot, snap_err = capture_grading_snapshot(session, base_sha, self._test_patch)
+                if snapshot is None:
+                    message = snap_err or "Could not record the protected files of the base revision."
+                    return ResetResult(self._prompt, info={"env_error": True, "env_error_message": message})
+                self._grading_snapshot = snapshot
             self._base_sha = base_sha
         except SandboxInfraError as exc:
             return ResetResult(self._prompt, info={"env_error": True, "env_error_message": str(exc)})
@@ -1110,18 +1121,23 @@ class HarnessEnvironment(SandboxEnvironment):
         if kill_err is not None:
             return 0.0, {}, kill_err
         if self._test_patch or self._fail_to_pass or self._pass_to_pass:
-            if self._base_sha is None:
+            if self._base_sha is None or self._grading_snapshot is None:
                 return 0.0, {}, "Base revision was not recorded at reset; cannot grade safely."
-            restore_err = restore_grading_files(session, self._base_sha, self._test_patch)
+            restore_err = restore_grading_files(session, self._base_sha, self._test_patch, self._grading_snapshot)
             if restore_err is not None:
                 return 0.0, {}, restore_err
         if self._test_patch:
             session.write_files({".ed_harness_eval.patch": self._test_patch})
-            ap = session.exec(["git", "apply", ".ed_harness_eval.patch"], timeout=10.0)
+            ap = run_clean_git(session, ["apply", ".ed_harness_eval.patch"], timeout=10.0)
             if ap.infra_error:
                 return 0.0, {}, ap.infra_error
             if not ap.ok:
                 return 0.0, {"resolved": False, "error": ap.stderr.strip()}, None
+
+        # Second kill: anything started between the first kill and now must not race the verification.
+        kill_err = kill_agent_processes(session)
+        if kill_err is not None:
+            return 0.0, {}, kill_err
 
         if self._verify_script is not None:
             vres = session.run_bash(self._verify_script, timeout=self._verify_timeout)

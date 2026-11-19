@@ -108,10 +108,16 @@ Grading, in order:
 2. Capture `git diff` as the model patch.
 3. **Restore test infrastructure** (`restore_grading_files`): every path touched by `test_patch` and every
    `conftest.py`, `pytest.ini`, `.pytest.ini`, `pytest.toml`, `.pytest.toml`, `tox.ini`, `setup.cfg`,
-   `pyproject.toml`, `noxfile.py`, `.coveragerc`, `sitecustomize.py`, `usercustomize.py` or `*.pth` is checked out
-   from the base revision, or deleted if it did not exist there.
+   `pyproject.toml`, `noxfile.py`, `.coveragerc`, `.gitattributes`, `sitecustomize.py`, `usercustomize.py` or `*.pth`
+   is deleted and rewritten from the blob ids recorded at reset (`capture_grading_snapshot`), or stays deleted if it
+   did not exist at the base revision.
 4. Apply `test_patch`; a patch that fails to apply scores `0.0`.
-5. Run `fail_to_pass` and `pass_to_pass` commands.
+5. Kill agent processes a second time, then run the `fail_to_pass` and `pass_to_pass` commands.
+
+The diff, restore and apply steps run git through `run_clean_git`: a fresh git dir that borrows only the object
+store and index, with system/global config, hooks, attributes filters and fsmonitor disabled, so nothing the agent
+wrote under `.git/` runs during grading. The test commands themselves still run in the agent's repository; a test
+command that calls git reads that repository's config.
 
 **Resolved** (reward `1.0`) iff at least one test list is non-empty, every fail-to-pass command passed **and** every
 pass-to-pass command passed (`verification_resolved`). Info reports `f2p_passed/f2p_total/p2p_passed/p2p_total`.
@@ -175,7 +181,9 @@ With a container session, `reset` raises `ValueError` if the advertised URL is l
 Single-turn; `step` scores the action with a `RubricJudge` (pass `judge=`, or `base_url` + `model` and optional
 `criteria` / `client_kwargs` for a `JudgeClient`). When the judge cannot score, the step carries
 `info["env_error"] = True` and `info["unscorable"] = True`. `make_judge_reward_fn` builds a judge-backed
-`reward_funcs` callable directly; `PairwiseJudge` scores a group by pairwise win rate.
+`reward_funcs` callable directly; `PairwiseJudge` scores a group by pairwise win rate. With `max_pairs` below
+the full `n * (n - 1) / 2`, the schedule gives every member at least one comparison and per-member counts differ
+by at most one; `max_pairs < ceil(n / 2)` raises `ValueError`.
 
 ## Reward helpers (`rewards.py`)
 
@@ -187,7 +195,7 @@ Single-turn; `step` scores the action with a `RubricJudge` (pass `judge=`, or `b
 | `gate_invalid(reward, valid, *, cap=0.0)`    | caps the reward of invalid samples                                                                            |
 | `lexicographic_blend`                        | ordered combination of reward terms                                                                           |
 | `think_budget_penalty`, `count_think_tokens` | thinking-length penalty                                                                                       |
-| `RewardShaper(base_reward, ...)`             | `RewardProtocol` wrapper applying the above; `None` / non-finite base scores stay `None`                       |
+| `RewardShaper(base_reward, ...)`             | `RewardProtocol` wrapper applying the above; `None` / non-finite base scores stay `None`; copies the base's `discard_unscorable` marker |
 
 ## Async collector
 
@@ -199,7 +207,13 @@ returns them in completion order.
   one, and episodes track their oldest and newest policy version.
 - Generated tokens carry `action_mask=1` and behaviour log-probs; observation tokens carry `action_mask=0`.
 - Episodes whose oldest version lags by more than `max_staleness` are dropped as stale; `env_error` episodes are
-  dropped unless `drop_env_errors=False` (then kept with the flag set and `trajectory=None`).
+  dropped unless `drop_env_errors=False` (then kept with the flag set and `trajectory=None`). Kept env-error
+  records never count toward `collect_episodes(count)` and are never collated or included in the
+  `collect_collated_batch` metrics; if no episode has a trajectory, it raises `RuntimeError`.
 - `collect_groups(num_groups=, group_size=, current_policy_version=)` pads a group with at least
-  `ceil(group_size / 2)` valid episodes by repeating valid members and drops sparser groups.
+  `ceil(group_size / 2)` valid episodes by repeating valid members and drops sparser groups. If it raises
+  (for example a `TimeoutError` from `timeout_per_episode`), its in-flight submissions are cancelled where
+  possible and the rest are discarded when they complete, so no later call returns them.
 - `collect_episodes`, `collect_collated_batch`, `close()`.
+- The collector is single-consumer: the drain loops of `collect_episodes` and `collect_groups` share a lock,
+  so concurrent calls run one after another instead of taking each other's completions.

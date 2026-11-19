@@ -312,7 +312,8 @@ class SyntheticTaskStream(ShardedDataSource[dict[str, tp.Any]]):
             base_seed: First seed handed to ``generator_fn``.
             strip_reference: Remove ``reference_solution``/``reference_actions`` before yielding.
             max_consecutive_generator_failures: Consecutive ``generator_fn`` exceptions (across workers) after
-                which the stream stops and re-raises the last exception from :meth:`next_task` / iteration.
+                which the stream stops and re-raises the last exception from :meth:`next_task` / iteration. The
+                same threshold applies separately to consecutive ``verification_gate.verify`` exceptions.
             generator_backoff: Initial sleep after a ``generator_fn`` exception; doubles per consecutive failure.
             generator_backoff_max: Cap on the back-off sleep.
         """
@@ -327,6 +328,7 @@ class SyntheticTaskStream(ShardedDataSource[dict[str, tp.Any]]):
         self._backoff_max = max(self._backoff_base, float(generator_backoff_max))
         self._failure_lock = threading.Lock()
         self._consecutive_generator_failures = 0
+        self._consecutive_gate_failures = 0
         self._last_generator_error: BaseException | None = None
         self._generator_fn = generator_fn
         self._gate = verification_gate
@@ -392,6 +394,22 @@ class SyntheticTaskStream(ShardedDataSource[dict[str, tp.Any]]):
                 self._stop.set()
         return min(self._backoff_max, self._backoff_base * (2.0 ** (count - 1)))
 
+    def _record_gate_failure(self, exc: BaseException) -> float:
+        """Record a ``verification_gate.verify`` exception and return the back-off delay before the next task.
+
+        Uses the same consecutive-failure threshold as generator failures; any gate verdict (accepted or not)
+        resets the count. Only once the threshold is reached does the stream stop with ``exc`` as its fatal error.
+        """
+        with self._failure_lock:
+            self._consecutive_gate_failures += 1
+            self._last_generator_error = exc
+            count = self._consecutive_gate_failures
+            if count >= self._max_generator_failures:
+                if self._fatal_error is None:
+                    self._fatal_error = exc
+                self._stop.set()
+        return min(self._backoff_max, self._backoff_base * (2.0 ** (count - 1)))
+
     def _producer_loop(self) -> None:
         consecutive_infra = 0
         while not self._stop.is_set():
@@ -418,8 +436,14 @@ class SyntheticTaskStream(ShardedDataSource[dict[str, tp.Any]]):
                 try:
                     report = self._gate.verify(task)
                 except Exception as exc:
-                    self._fatal_error = exc
+                    # Transient gate failures are retried like generator failures; only a run of
+                    # ``max_consecutive_generator_failures`` stops the stream with ``exc`` as its fatal error.
+                    delay = self._record_gate_failure(exc)
+                    if self._stop.wait(delay):
+                        return
                     continue
+                with self._failure_lock:
+                    self._consecutive_gate_failures = 0
                 if not report.accepted:
                     if report.env_error:
                         consecutive_infra += 1

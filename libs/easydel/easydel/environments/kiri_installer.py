@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Installer, daemon lifecycle and pod bridge for the Kiri container engine (``github.com/libracoder/kiri``).
+"""Installer, daemon lifecycle and pod bridge for the Kiri container engine (release repo: ``KIRI_GITHUB_REPO``).
 
-Installing Kiri downloads a pinned, SHA256-verified release and only happens on
+Installing Kiri downloads a SHA256-verified release (pinned digests for the tags
+in ``PINNED_KIRI_SHA256``, a caller-supplied digest for any other tag) and only happens on
 an explicit request (``easydel setup kiri``, ``easydel-install-kiri`` or
 ``auto_install=True``). Daemons booted through :func:`ensure_kiri_daemon` or
 :func:`ensure_kiri_shm_pool` are owned by this process: they are tracked in a
@@ -80,7 +81,7 @@ _KIRI_BOOT_LOCK = threading.Lock()
 _MISSING_KIRI_MESSAGE = (
     "No `kiri` binary was found and automatic installation is disabled. Install it explicitly with "
     "`easydel setup kiri` (or `easydel-install-kiri`), pass `kiri_bin=`, or pass `auto_install=True` to "
-    "download the pinned, SHA256-verified release."
+    f"download the pinned, SHA256-verified {DEFAULT_KIRI_VERSION} release."
 )
 _MIN_BRIDGE_TOKEN_CHARS = 16
 
@@ -118,8 +119,26 @@ def resolve_kiri_asset_url(
     machine: str | None = None,
     system: str | None = None,
     timeout: float = 20.0,
+    expected_sha256: str | None = None,
 ) -> tuple[str, str, str, str]:
-    """Resolve ``(tag_name, asset_name, download_url, sha256_hex)`` for ``libracoder/kiri``."""
+    """Resolve ``(tag_name, asset_name, download_url, sha256_hex)`` for a :data:`KIRI_GITHUB_REPO` release.
+
+    Only the tags in :data:`PINNED_KIRI_SHA256` are pinned: their digest is part of this source tree. The
+    release API's own ``digest`` field comes from the same place as the download, so it is never trusted; any
+    other tag needs a caller-supplied ``expected_sha256``.
+
+    Args:
+        version: Release tag (``""``/``"latest"`` mean :data:`DEFAULT_KIRI_VERSION`).
+        machine: Machine architecture (defaults to this host's).
+        system: Operating system name (defaults to this host's).
+        timeout: Release-API request timeout in seconds.
+        expected_sha256: SHA256 hex digest of the selected asset, required for tags without a pinned digest.
+            For a pinned asset it must equal the pinned value.
+
+    Raises:
+        RuntimeError: When no asset matches, or the tag has no pinned digest and ``expected_sha256`` is missing,
+            or ``expected_sha256`` contradicts the pinned digest.
+    """
     resolved_ver = DEFAULT_KIRI_VERSION if version in ("", "latest") else version
     arch_tar, arch_deb = _normalize_arch(machine)
     sys_name = (system or platform.system()).lower()
@@ -136,12 +155,21 @@ def resolve_kiri_asset_url(
     pinned_for_tag = PINNED_KIRI_SHA256.get(tag, {})
 
     def _pick_digest(asset: dict[str, object], name: str) -> str:
-        if name in pinned_for_tag:
-            return pinned_for_tag[name]
-        digest = str(asset.get("digest") or "")
-        if digest.startswith("sha256:"):
-            return digest.removeprefix("sha256:")
-        raise RuntimeError(f"No pinned or release SHA256 digest available for {name!r} ({tag!r}).")
+        del asset  # The API's own digest field is not a pin (same source as the download).
+        expected = expected_sha256.strip().lower() if expected_sha256 else None
+        pinned = pinned_for_tag.get(name)
+        if pinned is not None:
+            if expected is not None and expected != pinned.lower():
+                raise RuntimeError(f"expected_sha256 for {name!r} contradicts the pinned digest of {tag!r}.")
+            return pinned
+        if expected is None:
+            raise RuntimeError(
+                f"{tag!r} has no pinned SHA256 for {name!r}; pinned tags are {sorted(PINNED_KIRI_SHA256)}. "
+                "Pass the asset's expected SHA256 explicitly (expected_sha256= / --sha256) to install it."
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise RuntimeError("expected_sha256 must be 64 hexadecimal characters.")
+        return expected
 
     if sys_name == "linux":
         deb_suffix = f"_{arch_deb}.deb"
@@ -190,13 +218,16 @@ def install_kiri(
     force: bool = False,
     start_daemon: bool = False,
     timeout: float = 60.0,
+    expected_sha256: str | None = None,
 ) -> str:
-    """Download, SHA256-verify, and install the ``kiri`` binary from ``libracoder/kiri``.
+    """Download, SHA256-verify, and install the ``kiri`` binary from a :data:`KIRI_GITHUB_REPO` release.
 
     Installs into ``install_dir`` (default ``~/.local/bin``) without requiring
-    ``sudo``. Verifies the downloaded archive's SHA256 digest before extracting.
-    A daemon started with ``start_daemon=True`` is persistent: it keeps running
-    after this process exits.
+    ``sudo``. Verifies the downloaded archive's SHA256 digest before extracting:
+    the pinned digest for tags in :data:`PINNED_KIRI_SHA256`, otherwise the
+    caller's ``expected_sha256`` (a tag with neither is refused). A daemon
+    started with ``start_daemon=True`` is persistent: it keeps running after
+    this process exits.
     """
     existing = shutil.which("kiri")
     if existing and not force:
@@ -212,7 +243,9 @@ def install_kiri(
             ensure_kiri_daemon(kiri_bin=target_bin, persist=True)
         return target_bin
 
-    _tag, asset_name, url, expected_sha256 = resolve_kiri_asset_url(version=version, timeout=min(timeout, 20.0))
+    _tag, asset_name, url, expected_sha256 = resolve_kiri_asset_url(
+        version=version, timeout=min(timeout, 20.0), expected_sha256=expected_sha256
+    )
     req = urllib.request.Request(url, headers={"User-Agent": "easydel-kiri-installer"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         archive_bytes = resp.read()
@@ -511,6 +544,19 @@ _HOP_HEADERS = ("connection", "keep-alive", "proxy-connection")
 _ALLOWED_MOUNT_TYPES = ("volume", "tmpfs")
 _LOCAL_VOLUME_DRIVERS = ("", "local")
 _PATH_SAFE_CHARS = "/:@!$&'()*+,;=-._~"
+_HEADER_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+_BUDGET_HOST_KEYS = ("Memory", "NanoCpus", "PidsLimit", "Tmpfs")
+
+
+def _has_control_chars(text: str, *, allow_tab: bool) -> bool:
+    """Whether ``text`` holds a C0 control character, DEL, or (for targets) a space."""
+    for ch in text:
+        code = ord(ch)
+        if code == 0x7F or (code < 0x20 and not (allow_tab and ch == "\t")):
+            return True
+        if not allow_tab and ch == " ":
+            return True
+    return False
 
 
 class _BridgePolicyError(ValueError):
@@ -581,10 +627,21 @@ def _normalize_bridge_target(target: str) -> tuple[str, str]:
 
 
 def _container_create_violations(spec: dict) -> list[str]:
-    """List the sandbox-escaping settings requested by a case-folded container-create body."""
+    """List the sandbox-escaping settings requested by a case-folded container-create body.
+
+    HostConfig fields are checked both inside ``HostConfig`` and at the body root, where engines that keep the
+    legacy embedded-HostConfig layout still honour them.
+    """
     host_config = spec.get("hostconfig") or {}
     if not isinstance(host_config, dict):
         return ["HostConfig must be an object"]
+    root = {k: v for k, v in spec.items() if k != "hostconfig"}
+    found = [f"{v} (at the body root)" for v in _host_config_violations(root)]
+    return found + _host_config_violations(host_config)
+
+
+def _host_config_violations(host_config: dict) -> list[str]:
+    """List the sandbox-escaping settings in one case-folded HostConfig-shaped mapping."""
     found: list[str] = []
     if host_config.get("privileged"):
         found.append("Privileged")
@@ -629,8 +686,42 @@ def _volume_create_violations(spec: dict) -> list[str]:
     return found
 
 
-def _bridge_policy_check(method: str, target: str, body: bytes) -> tuple[str, bytes]:
+def _clamp_create_spec(spec: dict[str, tp.Any], budget: KiriDaemonBudget) -> None:
+    """Clamp a container-create body's resource limits to ``budget`` in place.
+
+    Limit keys are matched case-insensitively (as the engine does) and rewritten under their canonical names
+    inside ``HostConfig``; body-root copies (legacy layout) are dropped so they cannot override the clamp.
+
+    Raises:
+        _BridgePolicyError: When a limit is not an integer.
+    """
+    folded_limits = {k.casefold(): k for k in _BUDGET_HOST_KEYS}
+    hc_key = next((k for k in spec if k.casefold() == "hostconfig"), "HostConfig")
+    host_config = dict(spec.get(hc_key) or {})
+    for key in list(host_config):
+        canon = folded_limits.get(key.casefold())
+        if canon is not None and key != canon:
+            host_config[canon] = host_config.pop(key)
+    try:
+        host_config = budget.clamp_host_config(host_config)
+    except (TypeError, ValueError) as exc:
+        raise _BridgePolicyError(f"container create refused: invalid resource limit ({exc})") from exc
+    for key in list(spec):
+        if key.casefold() in folded_limits:
+            del spec[key]
+    spec[hc_key] = host_config
+
+
+def _bridge_policy_check(
+    method: str, target: str, body: bytes, budget: KiriDaemonBudget | None = None
+) -> tuple[str, bytes]:
     """Apply the sandbox policy to one bridged request.
+
+    Args:
+        method: Request method.
+        target: Origin-form request target.
+        body: Request body.
+        budget: Resource budget of the bridged daemon; approved container creates are clamped to it.
 
     Returns:
         ``(forwarded_target, forwarded_body)``: the normalised target and, for
@@ -667,6 +758,9 @@ def _bridge_policy_check(method: str, target: str, body: bytes) -> tuple[str, by
         found = _container_create_violations(folded)
         if found:
             raise _BridgePolicyError("container create refused: " + ", ".join(found))
+        if budget is not None:
+            _clamp_create_spec(spec, budget)
+            return forwarded, json.dumps(spec).encode("utf-8")
     elif kind == "volume":
         found = _volume_create_violations(folded)
         if found:
@@ -716,18 +810,27 @@ def _read_bridge_request(conn: socket.socket) -> tuple[str, str, str, list[tuple
             raise _BridgeRejected(400, "Bad Request", "incomplete request head")
         buf += chunk
     head, _, rest = bytes(buf).partition(b"\r\n\r\n")
+    # Engines may treat a bare CR or LF as a line break; the bridge must see exactly the lines they see.
+    if b"\r" in head.replace(b"\r\n", b"") or b"\n" in head.replace(b"\r\n", b""):
+        raise _BridgeRejected(400, "Bad Request", "bare CR or LF in request head")
     lines = head.decode("latin-1").split("\r\n")
     parts = lines[0].split(" ")
     if len(parts) != 3 or not parts[2].startswith("HTTP/1."):
         raise _BridgeRejected(400, "Bad Request", "malformed request line")
     method, target, version = parts
+    if _has_control_chars(target, allow_tab=False):
+        raise _BridgeRejected(400, "Bad Request", "control characters in request target")
     headers: list[tuple[str, str]] = []
     seen: dict[str, str] = {}
     for line in lines[1:]:
         if ":" not in line:
             raise _BridgeRejected(400, "Bad Request", "malformed header line")
         key, value = line.split(":", 1)
-        key, value = key.strip(), value.strip()
+        if not _HEADER_TOKEN_RE.fullmatch(key):
+            raise _BridgeRejected(400, "Bad Request", "header name is not an RFC 7230 token")
+        value = value.strip(" \t")
+        if _has_control_chars(value, allow_tab=True):
+            raise _BridgeRejected(400, "Bad Request", f"control characters in {key} header")
         lowered = key.lower()
         if lowered in seen and lowered in ("content-length", SANDBOX_TOKEN_HEADER.lower()):
             raise _BridgeRejected(400, "Bad Request", f"duplicate {key} header")
@@ -776,7 +879,7 @@ def _handle_bridge_connection(client: socket.socket, sock_path: str, token: str 
                 if presented is None or not hmac.compare_digest(presented.encode("utf-8"), token.encode("utf-8")):
                     raise _BridgeRejected(401, "Unauthorized", f"missing or invalid {SANDBOX_TOKEN_HEADER}")
             try:
-                target, body = _bridge_policy_check(method, target, body)
+                target, body = _bridge_policy_check(method, target, body, kiri_daemon_budget(f"unix://{sock_path}"))
             except _BridgePolicyError as exc:
                 raise _BridgeRejected(403, "Forbidden", str(exc)) from exc
         except _BridgeRejected as rejected:
@@ -1179,12 +1282,16 @@ def ensure_kiri_pod_shm_pool(
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point for ``easydel-install-kiri``."""
-    parser = argparse.ArgumentParser(description="Install the Kiri container runtime (libracoder/kiri).")
+    parser = argparse.ArgumentParser(description=f"Install the Kiri container runtime ({KIRI_GITHUB_REPO}).")
     parser.add_argument(
         "--version",
         default=DEFAULT_KIRI_VERSION,
-        help=f"Pinned GitHub release tag (default: {DEFAULT_KIRI_VERSION}).",
+        help=(
+            f"GitHub release tag (default: {DEFAULT_KIRI_VERSION}). Only {sorted(PINNED_KIRI_SHA256)} are pinned; "
+            "any other tag also needs --sha256."
+        ),
     )
+    parser.add_argument("--sha256", default=None, help="Expected SHA256 of the release asset (unpinned tags).")
     parser.add_argument("--install-dir", default=None, help="Target directory (default: ~/.local/bin).")
     parser.add_argument("--force", action="store_true", help="Reinstall even if kiri is already present.")
     parser.add_argument(
@@ -1197,6 +1304,7 @@ def main(argv: list[str] | None = None) -> int:
         install_dir=args.install_dir,
         force=args.force,
         start_daemon=args.start,
+        expected_sha256=args.sha256,
     )
     print(f"Installed Kiri at: {path}")
     return 0

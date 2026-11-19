@@ -42,6 +42,7 @@ import posixpath
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -230,9 +231,12 @@ class ContainerConfig:
 class KiriDaemonBudget:
     """Per-daemon resource budget for RAM-backed (``/dev/shm``) Kiri pools.
 
-    Every container created on a daemon with a budget is clamped to it, so a
-    single daemon can never hand one sandbox more than its share of the host.
-    The defaults are deliberately conservative; raise them explicitly for
+    Containers are clamped to the budget in two places: by
+    :class:`EngineSocketClient` in the process that booted the daemon, and by
+    that process's TCP bridges for every container-create request they forward
+    (so remote hosts of a pod pool are clamped too). A client that talks to the
+    daemon's Unix socket directly from another process is not clamped. The
+    defaults are deliberately conservative; raise them explicitly for
     heavyweight tasks.
 
     Attributes:
@@ -250,17 +254,25 @@ class KiriDaemonBudget:
     tmpfs_mb: int = 4096
 
     def clamp_host_config(self, host_config: dict[str, tp.Any]) -> dict[str, tp.Any]:
-        """Return ``host_config`` with CPU, memory, pids and tmpfs limits capped by this budget."""
+        """Return ``host_config`` with CPU, memory, pids and tmpfs limits capped by this budget.
+
+        A missing, zero or negative limit (unlimited for the engine) is replaced by the cap.
+
+        Raises:
+            ValueError: When a limit is not an integer.
+        """
         out = dict(host_config)
+
+        def _capped(key: str, cap: int) -> int:
+            value = int(out.get(key) or 0)
+            return cap if value <= 0 else min(value, cap)
+
         if self.memory_mb > 0:
-            cap = int(self.memory_mb) * 1024 * 1024
-            out["Memory"] = min(int(out.get("Memory") or cap), cap)
+            out["Memory"] = _capped("Memory", int(self.memory_mb) * 1024 * 1024)
         if self.cpus > 0:
-            cap = int(float(self.cpus) * 1_000_000_000)
-            out["NanoCpus"] = min(int(out.get("NanoCpus") or cap), cap)
+            out["NanoCpus"] = _capped("NanoCpus", int(float(self.cpus) * 1_000_000_000))
         if self.pids_limit > 0:
-            cap = int(self.pids_limit)
-            out["PidsLimit"] = min(int(out.get("PidsLimit") or cap), cap)
+            out["PidsLimit"] = _capped("PidsLimit", int(self.pids_limit))
         tmpfs = out.get("Tmpfs")
         if isinstance(tmpfs, dict) and self.tmpfs_mb > 0:
             capped: dict[str, str] = {}
@@ -1533,7 +1545,20 @@ class LocalSandboxSession(SandboxSession):
         if self._closed:
             raise SandboxInfraError("Session is closed.")
         target = self._resolve_local_path(path)
-        with open(target, "rb") as f:
+        # O_NONBLOCK keeps an agent-created FIFO from blocking the open; O_NOFOLLOW refuses a symlink swapped in
+        # after the path was resolved. Anything that is not a regular file (FIFO, socket, device) is refused.
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(target, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(f"'{path}' is not a regular file.")
+            if hasattr(os, "set_blocking"):
+                os.set_blocking(fd, True)
+            f = os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
             # UTF-8 uses at most 4 bytes per character; read only what max_chars can need.
             raw = f.read() if max_chars is None else f.read(max(0, int(max_chars)) * 4 + 4)
         text = raw.decode("utf-8", errors="replace")

@@ -25,7 +25,12 @@ import subprocess
 import sys
 import time
 
-from easydel.environments.kiri_installer import DEFAULT_KIRI_VERSION, install_kiri, resolve_kiri_asset_url
+from easydel.environments.kiri_installer import (
+    DEFAULT_KIRI_VERSION,
+    KIRI_GITHUB_REPO,
+    install_kiri,
+    resolve_kiri_asset_url,
+)
 from easydel.environments.runtime import EngineSocketClient
 
 _UNSAFE_REMOTE_PATH_CHARS = frozenset('"`\\$\n\r')
@@ -189,13 +194,17 @@ def cmd_setup_cpu_vm(args: argparse.Namespace) -> int:
         pinned = PINNED_KIRI_SHA256.get(ver, {})
         amd64_name = f"kiri-lite_{ver_num}_amd64.deb"
         arm64_name = f"kiri-lite_{ver_num}_arm64.deb"
-        deb_amd64 = f"https://github.com/libracoder/kiri/releases/download/{ver}/{amd64_name}"
-        sha_amd64 = pinned.get(amd64_name, "<sha256-unavailable>")
-        deb_arm64 = f"https://github.com/libracoder/kiri/releases/download/{ver}/{arm64_name}"
-        sha_arm64 = pinned.get(arm64_name, "<sha256-unavailable>")
+        deb_amd64 = f"https://github.com/{KIRI_GITHUB_REPO}/releases/download/{ver}/{amd64_name}"
+        sha_amd64 = pinned.get(amd64_name, args.sha256_amd64 or "<sha256-unavailable>")
+        deb_arm64 = f"https://github.com/{KIRI_GITHUB_REPO}/releases/download/{ver}/{arm64_name}"
+        sha_arm64 = pinned.get(arm64_name, args.sha256_arm64 or "<sha256-unavailable>")
     else:
-        _, _, deb_amd64, sha_amd64 = resolve_kiri_asset_url(version=args.kiri_version, machine="x86_64", system="linux")
-        _, _, deb_arm64, sha_arm64 = resolve_kiri_asset_url(version=args.kiri_version, machine="arm64", system="linux")
+        _, _, deb_amd64, sha_amd64 = resolve_kiri_asset_url(
+            version=args.kiri_version, machine="x86_64", system="linux", expected_sha256=args.sha256_amd64
+        )
+        _, _, deb_arm64, sha_arm64 = resolve_kiri_asset_url(
+            version=args.kiri_version, machine="arm64", system="linux", expected_sha256=args.sha256_arm64
+        )
 
     endpoints: list[str] = []
     for host_idx, raw_host in enumerate(args.hosts):
@@ -274,6 +283,7 @@ def cmd_setup_kiri(args: argparse.Namespace) -> int:
         install_dir=args.install_dir,
         force=args.force,
         start_daemon=bool(args.start and args.data_dir is None and args.num_daemons == 1),
+        expected_sha256=args.sha256,
     )
     print(f"Kiri ready at: {path}")
     if args.start and (args.data_dir is not None or args.num_daemons > 1):
@@ -319,8 +329,10 @@ def build_parser() -> argparse.ArgumentParser:
     cpu_vm.add_argument(
         "--kiri-version",
         default=DEFAULT_KIRI_VERSION,
-        help=f"Pinned Kiri release tag (default: {DEFAULT_KIRI_VERSION}).",
+        help=f"Kiri release tag (default: {DEFAULT_KIRI_VERSION}); unpinned tags also need --sha256-amd64/-arm64.",
     )
+    cpu_vm.add_argument("--sha256-amd64", default=None, help="Expected SHA256 of the amd64 .deb (unpinned tags).")
+    cpu_vm.add_argument("--sha256-arm64", default=None, help="Expected SHA256 of the arm64 .deb (unpinned tags).")
     cpu_vm.add_argument("--dry-run", action="store_true", help="Print provisioning script without running SSH.")
     cpu_vm.set_defaults(func=cmd_setup_cpu_vm)
 
@@ -328,8 +340,9 @@ def build_parser() -> argparse.ArgumentParser:
     kiri_local.add_argument(
         "--version",
         default=DEFAULT_KIRI_VERSION,
-        help=f"Pinned Kiri release tag (default: {DEFAULT_KIRI_VERSION}).",
+        help=f"Kiri release tag (default: {DEFAULT_KIRI_VERSION}); unpinned tags also need --sha256.",
     )
+    kiri_local.add_argument("--sha256", default=None, help="Expected SHA256 of the release asset (unpinned tags).")
     kiri_local.add_argument("--install-dir", default=None, help="Target directory (default: ~/.local/bin).")
     kiri_local.add_argument("--data-dir", default=None, help="Optional RAM-backed data dir (e.g. /dev/shm/kiri).")
     kiri_local.add_argument("--num-daemons", type=int, default=1, help="Number of local Kiri daemons to start.")

@@ -25,7 +25,7 @@ import typing as tp
 from easydel.trainers._shared.environment import ResetResult, StepResult, create_tool_call_parser
 
 from ._base import SandboxEnvironment, register_environment
-from .runtime import ContainerConfig, KiriRuntime, SandboxInfraError, SandboxPool, SandboxSession
+from .runtime import ContainerConfig, ExecResult, KiriRuntime, SandboxInfraError, SandboxPool, SandboxSession
 
 # Files that configure or hook test collection/interpreter start-up. Before grading, every such file is reset to
 # its base-revision content (or deleted when the agent added it) so a policy cannot rig the verification tests.
@@ -43,6 +43,7 @@ _TEST_INFRA_BASENAMES = frozenset(
         ".coveragerc",
         "sitecustomize.py",
         "usercustomize.py",
+        ".gitattributes",
     }
 )
 _TEST_INFRA_SUFFIXES = (".pth",)
@@ -110,47 +111,155 @@ def capture_base_revision(session: SandboxSession) -> tuple[str | None, str | No
     return (sha if res.ok and sha else None), None
 
 
-def restore_grading_files(session: SandboxSession, base_sha: str, test_patch: str | None) -> str | None:
-    """Reset test-patch paths and test-infrastructure files to ``base_sha`` before grading.
+# Grading never lets the agent-writable repository configuration run anything: no system/global config, no
+# replace refs, and every grading git command runs against a throw-away git dir (empty config, no hooks, no
+# attributes, no filters, no fsmonitor) that only borrows the workspace's object store and index.
+_CLEAN_GIT_ENV = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_TERMINAL_PROMPT": "0",
+}
+_CLEAN_GIT_PRELUDE = (
+    "e=$(mktemp -d /tmp/.ed_git.XXXXXXXX) || exit 125; trap 'rm -rf \"$e\"' EXIT; "
+    'export HOME="$e" XDG_CONFIG_HOME="$e"; '
+    'git init -q "$e/w" >/dev/null 2>&1 || exit 125; w=$(pwd -P); '
+    'export GIT_DIR="$e/w/.git" GIT_WORK_TREE="$w" GIT_OBJECT_DIRECTORY="$w/.git/objects" '
+    'GIT_INDEX_FILE="$w/.git/index"; '
+)
+_CLEAN_GIT_SCRIPT = _CLEAN_GIT_PRELUDE + 'git -c core.fsmonitor= -c core.hooksPath=/dev/null "$@"'
 
-    Paths that exist at ``base_sha`` are checked out from it (undoing edits, deletions and symlink swaps);
-    paths that do not exist there are deleted, so agent-planted ``conftest.py`` / ``sitecustomize.py`` /
-    ``*.pth`` files or pre-created copies of test-patch files cannot influence verification.
+# Arguments: delete paths, "--", then (mode, blob id, path) triples. Every parent directory that is a symlink is
+# removed first (so writes cannot escape through it), each blob is hash-checked against the id recorded at reset
+# (so a tampered object store cannot substitute content) and written as plain bytes; nothing runs a filter.
+_RESTORE_SCRIPT = (
+    _CLEAN_GIT_PRELUDE
+    + r"""set -f
+unlink_dirs() {
+  acc=.; old_ifs=$IFS; IFS=/
+  for c in $(dirname -- "$1"); do
+    [ "$c" = . ] && continue
+    acc="$acc/$c"
+    if [ -L "$acc" ]; then rm -f -- "$acc" || { IFS=$old_ifs; return 1; }; fi
+  done
+  IFS=$old_ifs
+}
+while [ $# -gt 0 ] && [ "$1" != -- ]; do
+  unlink_dirs "$1" || exit 1; rm -rf -- "$1" || exit 1; shift
+done
+[ $# -gt 0 ] && shift
+while [ $# -ge 3 ]; do
+  mode=$1; blob=$2; p=$3; shift 3
+  unlink_dirs "$p" || exit 1
+  rm -rf -- "$p" || exit 1
+  mkdir -p -- "$(dirname -- "$p")" || exit 1
+  git cat-file blob "$blob" > "$e/blob" || { echo "base blob of $p is missing" >&2; exit 1; }
+  got=$(git hash-object --no-filters -t blob "$e/blob") || exit 1
+  [ "$got" = "$blob" ] || { echo "base blob of $p failed its hash check" >&2; exit 1; }
+  if [ "$mode" = 120000 ]; then
+    ln -s -- "$(cat "$e/blob")" "$p" || exit 1
+  else
+    cp -- "$e/blob" "$p" || exit 1
+    if [ "$mode" = 100755 ]; then chmod 755 "$p"; else chmod 644 "$p"; fi
+  fi
+done
+"""
+)
+_BASE_TREE_FILE = ".git/.ed_base_tree"
+
+GradingSnapshot = dict[str, tuple[str, str]]
+"""``path -> (git mode, blob id)`` of every protected path that exists at the base revision."""
+
+
+def run_clean_git(session: SandboxSession, args: list[str], *, timeout: float = 30.0) -> ExecResult:
+    """Run ``git <args>`` in ``session`` without reading or executing anything the repository configures.
+
+    The command runs against a fresh, empty git dir that only borrows the workspace's object store and index,
+    with system/global config, replace refs, hooks and fsmonitor disabled, so agent-written ``.git/config``,
+    ``.git/info/attributes`` filters or hooks never run.
+    """
+    return session.exec(["/bin/sh", "-c", _CLEAN_GIT_SCRIPT, "sh", *args], env=_CLEAN_GIT_ENV, timeout=timeout)
+
+
+def capture_grading_snapshot(
+    session: SandboxSession, base_sha: str, test_patch: str | None
+) -> tuple[GradingSnapshot | None, str | None]:
+    """Record the base-revision blob of every path grading protects. Call it at reset, before the agent acts.
+
+    Args:
+        session: Episode sandbox session whose working directory is a git checkout.
+        base_sha: Commit recorded at reset.
+        test_patch: Evaluation patch whose touched paths are protected too.
+
+    Returns:
+        ``(snapshot, infra_error)``; ``snapshot`` is ``None`` when the listing failed.
+    """
+    list_script = _CLEAN_GIT_PRELUDE + 'git ls-tree -r -z --full-tree "$1" > "$w/$2"'
+    res = session.exec(
+        ["/bin/sh", "-c", list_script, "sh", base_sha, _BASE_TREE_FILE],
+        env=_CLEAN_GIT_ENV,
+        timeout=60.0,
+    )
+    if res.infra_error or not res.ok:
+        return None, res.infra_error or f"git ls-tree failed: {res.combined_output(1024)}"
+    try:
+        listing = session.read_file(_BASE_TREE_FILE)
+    finally:
+        session.exec(["rm", "-f", "--", _BASE_TREE_FILE], timeout=10.0)
+    patch_paths = _patch_touched_paths(test_patch or "")
+    snapshot: GradingSnapshot = {}
+    for entry in listing.split("\0"):
+        meta, sep, path = entry.partition("\t")
+        fields = meta.split()
+        if not sep or len(fields) != 3 or fields[1] != "blob":
+            continue
+        if _is_test_infra_path(path) or path in patch_paths:
+            snapshot[path] = (fields[0], fields[2])
+    return snapshot, None
+
+
+def restore_grading_files(
+    session: SandboxSession,
+    base_sha: str,
+    test_patch: str | None,
+    snapshot: GradingSnapshot | None = None,
+) -> str | None:
+    """Reset test-patch paths and test-infrastructure files to their base content before grading.
+
+    Every live test-infrastructure file and every test-patch path is deleted, then each one that exists at the
+    base revision is rewritten from its recorded blob (undoing edits, deletions and symlink swaps). Agent-planted
+    ``conftest.py`` / ``sitecustomize.py`` / ``*.pth`` files or pre-created copies of test-patch files therefore
+    cannot influence verification. No git command here reads the repository's own config, attributes or hooks.
 
     Args:
         session: Episode sandbox session whose working directory is a git checkout.
         base_sha: Commit recorded at reset, before the agent acted.
         test_patch: Evaluation patch that will be applied afterwards (its paths are reset too).
+        snapshot: Result of :func:`capture_grading_snapshot` taken at reset. When omitted the base tree is
+            listed now, which trusts an object store the agent could have written to.
 
     Returns:
         An error message when the restore could not run (treated as unscorable), else ``None``.
     """
-    base_res = session.exec(["git", "ls-tree", "-r", "-z", "--name-only", base_sha], timeout=30.0)
-    if base_res.infra_error or not base_res.ok:
-        return base_res.infra_error or f"git ls-tree failed: {base_res.combined_output(1024)}"
-    base_paths = {p for p in base_res.stdout.split("\0") if p}
-
-    live_res = session.exec(["git", "ls-files", "-z", "--cached", "--others"], timeout=30.0)
-    if live_res.infra_error or not live_res.ok:
-        return live_res.infra_error or f"git ls-files failed: {live_res.combined_output(1024)}"
-    live_paths = {p for p in live_res.stdout.split("\0") if p}
-
-    protected = {p for p in base_paths | live_paths if _is_test_infra_path(p)}
-    protected |= _patch_touched_paths(test_patch or "")
-    to_restore = sorted(p for p in protected if p in base_paths)
-    to_delete = sorted(p for p in protected if p not in base_paths)
-
-    if to_delete:
-        rm_res = session.exec(["rm", "-rf", "--", *to_delete], timeout=30.0)
-        if rm_res.infra_error or not rm_res.ok:
-            return rm_res.infra_error or f"failed to remove agent-added test files: {rm_res.combined_output(1024)}"
-    if to_restore:
-        co_res = session.exec(
-            ["git", "-c", "core.hooksPath=/dev/null", "checkout", base_sha, "--", *to_restore],
-            timeout=30.0,
-        )
-        if co_res.infra_error or not co_res.ok:
-            return co_res.infra_error or f"failed to restore test files: {co_res.combined_output(1024)}"
+    if snapshot is None:
+        snapshot, err = capture_grading_snapshot(session, base_sha, test_patch)
+        if snapshot is None:
+            return err or "could not list the base revision"
+    name_tests: list[str] = []
+    for name in sorted(_TEST_INFRA_BASENAMES) + [f"*{s}" for s in _TEST_INFRA_SUFFIXES]:
+        name_tests += [*(["-o"] if name_tests else []), "-name", name]
+    find_argv = ["find", ".", "-path", "./.git", "-prune", "-o", "(", *name_tests, ")", "-prune"]
+    find_res = session.exec([*find_argv, "-exec", "rm", "-rf", "--", "{}", "+"], timeout=60.0)
+    if find_res.infra_error or not find_res.ok:
+        return find_res.infra_error or f"failed to remove test-infrastructure files: {find_res.combined_output(1024)}"
+    to_delete = sorted(p for p in _patch_touched_paths(test_patch or "") if p not in snapshot)
+    triples = [item for path in sorted(snapshot) for item in (*snapshot[path], path)]
+    res = session.exec(
+        ["/bin/sh", "-c", _RESTORE_SCRIPT, "sh", *to_delete, "--", *triples], env=_CLEAN_GIT_ENV, timeout=120.0
+    )
+    if res.infra_error or not res.ok:
+        return res.infra_error or f"failed to restore test files: {res.combined_output(1024)}"
     return None
 
 
@@ -228,6 +337,7 @@ class SWERepoEnvironment(SandboxEnvironment):
         self._test_timeout = float(test_timeout)
         self._tools_map = {t.name: t for t in self.build_workspace_tools(enable_bash=True, enable_files=True)}
         self._base_sha: str | None = None
+        self._grading_snapshot: GradingSnapshot | None = None
 
     _infra_failure_step = staticmethod(unscorable_step)
 
@@ -276,11 +386,16 @@ class SWERepoEnvironment(SandboxEnvironment):
             return infra_err
         if base_sha is None:
             return "Could not resolve the base revision of the seeded repository."
+        snapshot, snap_err = capture_grading_snapshot(session, base_sha, self._test_patch)
+        if snapshot is None:
+            return snap_err or "Could not record the protected files of the base revision."
         self._base_sha = base_sha
+        self._grading_snapshot = snapshot
         return None
 
     def reset(self, seed: int | None = None) -> ResetResult:
         self._base_sha = None
+        self._grading_snapshot = None
         try:
             self._open_session(seed=seed)
             infra_err = self._seed_repository()
@@ -304,20 +419,20 @@ class SWERepoEnvironment(SandboxEnvironment):
         kill_err = kill_agent_processes(session)
         if kill_err is not None:
             return 0.0, {}, kill_err
-        diff_res = session.exec(["git", "diff"], timeout=10.0)
+        diff_res = run_clean_git(session, ["diff"], timeout=10.0)
         if diff_res.infra_error:
             return 0.0, {}, diff_res.infra_error
         model_patch = diff_res.stdout
 
-        if self._base_sha is None:
+        if self._base_sha is None or self._grading_snapshot is None:
             return 0.0, {}, "Base revision was not recorded at reset; cannot grade safely."
-        restore_err = restore_grading_files(session, self._base_sha, self._test_patch)
+        restore_err = restore_grading_files(session, self._base_sha, self._test_patch, self._grading_snapshot)
         if restore_err is not None:
             return 0.0, {}, restore_err
 
         if self._test_patch:
             session.write_files({".ed_eval_tests.patch": self._test_patch})
-            apply_res = session.exec(["git", "apply", ".ed_eval_tests.patch"], timeout=10.0)
+            apply_res = run_clean_git(session, ["apply", ".ed_eval_tests.patch"], timeout=10.0)
             if apply_res.infra_error:
                 return 0.0, {}, apply_res.infra_error
             if not apply_res.ok:
@@ -326,6 +441,11 @@ class SWERepoEnvironment(SandboxEnvironment):
                     {"patch": model_patch, "test_patch_applied": False, "error": apply_res.stderr.strip()},
                     None,
                 )
+
+        # Second kill: anything that slipped in between the first kill and now must not race the test runs.
+        kill_err = kill_agent_processes(session)
+        if kill_err is not None:
+            return 0.0, {}, kill_err
 
         f2p_results: list[bool] = []
         for cmd in self._fail_to_pass:
